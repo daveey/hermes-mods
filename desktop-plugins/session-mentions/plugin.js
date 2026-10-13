@@ -132,7 +132,9 @@ export function findGateway(conns, name) {
 /** `@session:<profile>/<id>` relative to `relativeTo` (a connection id); qualified with
  *  `@<gateway key>` when the session lives on another gateway. */
 export function sessionRef({ connectionId, profile, sessionId }, relativeTo, conns) {
-  const p = profile || 'default'
+  // Profile names never contain `@`; a row labelled `default@mac-mini` (a qualified
+  // ref that leaked into Desktop routing) must not stack a second `@mac-mini`.
+  const p = String(profile || '').split('@')[0].trim() || 'default'
   if (!connectionId || connectionId === relativeTo) return `@session:${p}/${sessionId}`
   const gw = conns.find(c => c.id === connectionId)
   return `@session:${p}@${gw ? gw.key : connectionId}/${sessionId}`
@@ -156,7 +158,8 @@ export function parseRef(raw, origin, conns) {
     sessionId = text.slice(slash + 1).trim()
     const at = head.indexOf('@')
     if (at !== -1) {
-      gateway = head.slice(at + 1)
+      // `default@mac-mini@mac-mini` (stacked qualifier) still names one gateway.
+      gateway = head.slice(head.lastIndexOf('@') + 1)
       head = head.slice(0, at)
     }
     profile = head || 'default'

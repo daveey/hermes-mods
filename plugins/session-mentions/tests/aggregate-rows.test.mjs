@@ -54,3 +54,14 @@ test('a direct (non-aggregate) pinned answer tagged by Desktop keeps the pinned 
  const rows = m.tagRows([{ id: 'r9', profile: 'default', connection_id: 'skint-polycentrism' }], conns[1], conns)
  assert.equal(rows[0]._conn, 'skint-polycentrism')
 })
+
+test('a row profile carrying `@gateway` never stacks a second qualifier', async () => {
+ const m = await load({ state: {} })
+ assert.equal(m.sessionRef({ connectionId: 'mac-mini', profile: 'default@mac-mini', sessionId: 'x1' }, 'local', conns), '@session:default@mac-mini/x1')
+ assert.equal(m.sessionRef({ connectionId: 'mac-mini', profile: 'default@mac-mini', sessionId: 'x1' }, 'mac-mini', conns), '@session:default/x1')
+})
+
+test('stacked `profile@gw@gw` refs parse to one gateway and a bare profile', async () => {
+ const m = await load({ state: {} })
+ assert.deepEqual(m.parseRef('@session:default@mac-mini@mac-mini/20261012_154823_4069d7', 'local', conns), { connectionId: 'mac-mini', profile: 'default', sessionId: '20261012_154823_4069d7' })
+})
