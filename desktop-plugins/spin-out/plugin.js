@@ -1,8 +1,9 @@
 /**
- * Spin Out — ⇧⌘F on a session: find the follow-up work at the END of the session and start one
- * new session per task. Each child gets a self-contained brief (written by the spin-out backend
- * from the parent transcript) plus an @session pointer back to the parent, and starts working
- * right away in the background. A banner above the composer lists the children (click to open).
+ * Spin Out — ⇧⌘F on a session: find the follow-up work at the END of the session and offer it as
+ * choices in a banner above the composer. Click a task to launch it as a new session, or [All] to
+ * launch every remaining one. Each child gets a self-contained brief (written by the spin-out
+ * backend from the parent transcript) plus an @session pointer back to the parent, and starts
+ * working in the background. Launched rows turn into links to the child session.
  *
  * Backend: plugins/spin-out (core.py, dashboard/plugin_api.py → POST /api/plugins/spin-out/plan).
  *
@@ -28,7 +29,7 @@ const setJob = next => {
   emit()
 }
 const patchJob = patch => job && setJob({ ...job, ...patch })
-const useJob = () => useSyncExternalStore(fn => (subs.add(fn), () => subs.delete(fn)), () => job)
+const useJob = () => useSyncExternalStore(fn => (subs.add(fn), () => subs.delete(fn)), () => job, () => job)
 const log = (...a) => console.info('[spin-out]', ...a)
 
 // ── free ⇧⌘F from the built-in "focus session search" ───────────────────
@@ -47,69 +48,111 @@ function freeChord() {
 }
 
 // ── spin out ────────────────────────────────────────────────────────────
+// Phase flow: planning → choosing (pick tasks; click one or [All]) → done when every task is
+// launched or dismissed. Child state: {title, message, prompt, status: 'idle'|'launching'|'ok'|'error', stored, error}
 async function spinOut() {
-  if (job && (job.phase === 'planning' || job.phase === 'spawning')) return
+  if (job && job.phase === 'planning') return
   const parent = host.state.focusedStoredSessionId.get()
   if (!parent) {
     host.notify({ kind: 'info', message: 'Spin out: open a session first' })
     return
   }
   const profile = host.state.focusedSessionProfile.get() || 'default'
-  setJob({ parent, phase: 'planning', step: 'Reading the session and planning follow-ups…', children: [], skipped: [] })
+  setJob({ parent, profile, phase: 'planning', step: 'Reading the session and planning follow-ups…', children: [], skipped: [] })
   let plan
   try {
     plan = await ctxRef.rest('/plan', { method: 'POST', body: { session_id: parent, profile }, timeoutMs: 180000 })
   } catch (err) {
-    patchJob({ phase: 'error', error: `planning failed: ${err?.message || err}` })
+    patchJob({ phase: 'error', step: null, error: `planning failed: ${err?.message || err}` })
     return
   }
   log('plan', plan)
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
   if (!tasks.length) {
-    patchJob({ phase: 'error', error: plan?.error || 'no follow-up work found at the end of this session', skipped: plan?.skipped || [] })
+    patchJob({ phase: 'error', step: null, error: plan?.error || 'no follow-up work found at the end of this session', skipped: plan?.skipped || [] })
     return
   }
-  patchJob({ phase: 'spawning', skipped: plan.skipped || [], children: tasks.map(t => ({ title: t.title })) })
-  const children = []
-  for (const [i, t] of tasks.entries()) {
-    patchJob({ step: `Starting ${i + 1}/${tasks.length}: ${t.title}` })
-    const child = { title: t.title }
-    try {
-      const created = await host.request(
-        'session.create',
-        { profile: plan.profile || profile, ...(plan.cwd ? { cwd: plan.cwd } : {}), title: t.title },
-        60000
-      )
-      const sid = created?.session_id
-      if (!sid) throw new Error('session.create returned no id')
-      child.stored = created?.stored_session_id || null
-      const sub = await host.request('prompt.submit', { session_id: sid, text: t.message, profile: plan.profile || profile }, 60000)
-      if (!['streaming', 'queued'].includes(sub?.status)) child.error = `submit status ${sub?.status || 'unknown'}`
-    } catch (err) {
-      child.error = String(err?.message || err)
+  patchJob({
+    phase: 'choosing',
+    step: null,
+    plan: { profile: plan.profile || profile, cwd: plan.cwd || null },
+    skipped: plan.skipped || [],
+    children: tasks.map(t => ({ title: t.title, message: t.message, prompt: t.prompt, status: 'idle' }))
+  })
+}
+
+const patchChild = (i, patch) => {
+  if (!job) return
+  const children = job.children.map((c, k) => (k === i ? { ...c, ...patch } : c))
+  const allLaunched = children.every(c => c.status === 'ok' || c.status === 'error')
+  setJob({ ...job, children, phase: allLaunched ? 'done' : job.phase })
+}
+
+async function launchOne(i) {
+  const j = job
+  const c = j?.children?.[i]
+  if (!c || c.status !== 'idle') return false
+  const profile = j.plan?.profile || j.profile || 'default'
+  patchChild(i, { status: 'launching' })
+  try {
+    const created = await host.request('session.create', { profile, ...(j.plan?.cwd ? { cwd: j.plan.cwd } : {}), title: c.title }, 60000)
+    const sid = created?.session_id
+    if (!sid) throw new Error('session.create returned no id')
+    const stored = created?.stored_session_id || null
+    const sub = await host.request('prompt.submit', { session_id: sid, text: c.message, profile }, 60000)
+    if (!['streaming', 'queued'].includes(sub?.status)) {
+      patchChild(i, { status: 'error', stored, error: `submit status ${sub?.status || 'unknown'}` })
+      return false
     }
-    children.push(child)
-    patchJob({ children: [...children, ...tasks.slice(i + 1).map(x => ({ title: x.title }))] })
+    patchChild(i, { status: 'ok', stored })
+    return true
+  } catch (err) {
+    patchChild(i, { status: 'error', error: String(err?.message || err) })
+    return false
   }
-  const failed = children.filter(c => c.error).length
-  patchJob({ phase: 'done', step: null, children })
+}
+
+async function launchAll() {
+  if (!job) return
+  const idle = job.children.map((c, i) => (c.status === 'idle' ? i : -1)).filter(i => i >= 0)
+  let ok = 0
+  for (const i of idle) if (await launchOne(i)) ok++
+  const failed = idle.length - ok
   host.notify({
     kind: failed ? 'warning' : 'success',
-    message: `Spun out ${children.length - failed} session${children.length - failed === 1 ? '' : 's'}${failed ? `, ${failed} failed` : ''}`
+    message: `Spun out ${ok} session${ok === 1 ? '' : 's'}${failed ? `, ${failed} failed` : ''}`
   })
+}
+
+async function launchSingle(i) {
+  const ok = await launchOne(i)
+  if (ok) host.notify({ kind: 'success', message: `Spun out: ${job?.children?.[i]?.title || 'session'}` })
 }
 
 // ── UI ──────────────────────────────────────────────────────────────────
 const BTN = 'inline-flex h-6 items-center rounded-md px-2 text-[0.75rem] font-medium transition-colors disabled:opacity-50 '
 const GHOST = BTN + 'border border-(--ui-stroke-secondary) text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground'
-const CHIP =
-  'inline-flex max-w-[22rem] items-center gap-1 truncate rounded-md border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[0.75rem] '
+const PRIMARY = BTN + 'border border-(--ui-accent) text-(--ui-accent) hover:bg-(--chrome-action-hover)'
+const ROW =
+  'flex w-full items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2 py-1 text-left text-[0.75rem] transition-colors disabled:cursor-default '
 
 function Banner() {
   const j = useJob()
   const focused = useValue(host.state.focusedStoredSessionId)
   if (!j || j.parent !== focused) return null
-  const busy = j.phase === 'planning' || j.phase === 'spawning'
+  const kids = j.children || []
+  const launching = kids.some(c => c.status === 'launching')
+  const idle = kids.filter(c => c.status === 'idle').length
+  const started = kids.filter(c => c.status === 'ok').length
+  const busy = j.phase === 'planning' || launching
+  const summary =
+    j.phase === 'choosing'
+      ? started
+        ? `${started} started · ${idle} more to pick`
+        : `${kids.length} follow-up${kids.length === 1 ? '' : 's'} found — click to launch`
+      : j.phase === 'done'
+        ? `${started} child session(s) started`
+        : null
   return jsxs('div', {
     'data-slot': 'spin-out-banner',
     className: 'flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-1.5 text-[0.75rem]',
@@ -123,36 +166,61 @@ function Banner() {
             children: [
               jsx('span', { className: 'font-medium text-foreground', children: 'Spin out' }),
               j.step && jsx('span', { className: 'ml-1.5', children: `· ${j.step}` }),
-              j.phase === 'done' && jsx('span', { className: 'ml-1.5', children: `· ${j.children.filter(c => !c.error).length} child session(s) started` }),
+              summary && jsx('span', { className: 'ml-1.5', children: `· ${summary}` }),
               j.error && jsx('span', { className: 'ml-1.5 text-(--ui-danger,#f85149)', children: `· ${j.error}` })
             ]
           }),
+          j.phase === 'choosing' &&
+            idle > 1 &&
+            jsx('button', { type: 'button', 'data-slot': 'spin-out-all', className: PRIMARY, disabled: launching, onClick: () => void launchAll(), children: `All (${idle})` }),
           !busy && jsx('button', { type: 'button', className: GHOST, onClick: () => setJob(null), children: 'Dismiss' })
         ]
       }),
-      j.children.length > 0 &&
+      kids.length > 0 &&
         jsx('div', {
-          className: 'flex flex-wrap gap-1.5',
-          children: j.children.map((c, i) =>
-            jsx(
+          className: 'flex flex-col gap-1',
+          children: kids.map((c, i) => {
+            const icon = c.status === 'error' ? '✕' : c.status === 'ok' ? '↳' : c.status === 'launching' ? '…' : '▸'
+            const clickable = c.status === 'idle' ? !launching : c.status === 'ok' && !!c.stored
+            return jsxs(
               'button',
               {
                 type: 'button',
-                disabled: !c.stored,
-                title: c.error || (c.stored ? 'Open child session' : 'pending'),
+                'data-slot': 'spin-out-choice',
+                disabled: !clickable,
+                title:
+                  c.status === 'idle'
+                    ? `Launch: ${c.prompt || c.title}`
+                    : c.status === 'ok'
+                      ? 'Open child session'
+                      : c.status === 'error'
+                        ? c.error
+                        : 'starting…',
                 className:
-                  CHIP +
-                  (c.error
+                  ROW +
+                  (c.status === 'error'
                     ? 'text-(--ui-danger,#f85149)'
-                    : c.stored
+                    : c.status === 'ok'
                       ? 'text-foreground hover:bg-(--chrome-action-hover)'
-                      : 'text-(--ui-text-tertiary)'),
-                onClick: () => c.stored && void host.openSession?.(c.stored),
-                children: `${c.error ? '✕' : c.stored ? '↳' : '…'} ${c.title}`
+                      : c.status === 'launching'
+                        ? 'text-(--ui-text-tertiary)'
+                        : 'text-foreground hover:border-(--ui-accent) hover:bg-(--chrome-action-hover)'),
+                onClick: () => {
+                  if (c.status === 'idle') void launchSingle(i)
+                  else if (c.status === 'ok' && c.stored) void host.openSession?.(c.stored)
+                },
+                children: [
+                  jsx('span', { className: 'shrink-0 w-3 text-center', children: icon }),
+                  jsx('span', { className: 'min-w-0 flex-1 truncate', children: c.title }),
+                  jsx('span', {
+                    className: 'shrink-0 text-(--ui-text-tertiary)',
+                    children: c.status === 'idle' ? 'launch' : c.status === 'ok' ? 'open' : c.status === 'launching' ? 'starting' : 'failed'
+                  })
+                ]
               },
               i
             )
-          )
+          })
         }),
       j.skipped?.length > 0 &&
         jsx('div', {
@@ -189,7 +257,7 @@ export default {
     })
     ctx.register({ id: 'banner', area: COMPOSER_AREAS.top, render: () => jsx(Banner, {}) })
 
-    window.__spinOut = { get job() { return job }, spinOut, setJob }
+    window.__spinOut = { get job() { return job }, spinOut, setJob, launchOne, launchAll }
     ctx.onDispose?.(() => {
       delete window.__spinOut
     })
