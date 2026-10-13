@@ -1,6 +1,6 @@
 ---
 name: messaging-bridges
-description: "Use when connecting Slack/WhatsApp/Signal chat to Hermes."
+description: "Use when linking Slack/WhatsApp/Signal or posting as user."
 version: 0.2.0
 platforms: [macos]
 ---
@@ -17,6 +17,7 @@ Wire local CLIs/bridges to third-party chat networks using **persistent-session*
 | Slack | Hermes gateway Slack adapter, Socket Mode app (bot `xoxb-` + app `xapp-` tokens) | `~/.hermes/.env` |
 
 Slack setup procedure: `references/slack-gateway-setup.md`.
+Posting/replying in Slack **as the user** (connector, or the signed-in Chrome tab via chrome-devtools + `chat.postMessage`), with pre/post thread read-back: `references/slack-post-as-user.md`.
 
 User is terse and dislikes multi-choice menus — just execute the next concrete step and surface a single actionable artifact (QR image, URL, path) at a time. Don't ask "which first?" when the obvious order is: start the bridge → render QR → ask them to scan.
 
