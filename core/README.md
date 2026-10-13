@@ -15,10 +15,10 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
-| [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 | ⌘]/⌘[ next/prev session that needs you, ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume, ⇧⌘R reload |
-| [ai-session-rename.md](ai-session-rename.md) | 0020 | ⌘⇧N rename, pre-filled with an AI short name (`session.title.suggest` RPC) |
+| [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 | ⌘]/⌘[ next/prev session that needs you, ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume, ⇧⌘R reload |
+| [ai-session-rename.md](ai-session-rename.md) | 0020 0032 | ⌘⇧N rename, pre-filled with an AI short name (`session.title.suggest` RPC) |
 | [project-palette.md](project-palette.md) | 0004 0018 0030 | ⌘⇧P moves a session to a project by typeahead; a new name offers "Create project" with an empty `~/code/<slug>` |
-| [multi-gateway-projects.md](multi-gateway-projects.md) | 0023 0024 0025 0028 0029 | Sidebar shows every connected gateway's projects (colored, with show/hide toggles); move a session into any gateway's project; archive on the owning gateway |
+| [multi-gateway-projects.md](multi-gateway-projects.md) | 0023 0024 0025 0028 0029 0031 | Sidebar shows every connected gateway's projects (colored, with show/hide toggles); move a session into any gateway's project; archive on the owning gateway |
 | [session-takeover.md](session-takeover.md) | 0013 0014 0015 | "Take over here" for a chat that's live in another Hermes window; a hidden chat's agent keeps its Browser page |
 | [auto-continue-resume.md](auto-continue-resume.md) | 0008 0010 | `desktop.auto_continue.resume_on_startup`: interrupted sessions resume when the backend boots, including turns cut off by a backend shutdown |
 | [fork-updates-and-relaunch.md](fork-updates-and-relaunch.md) | 0007 0011 0012 0016 | **Start here if you'll carry patches.** `updates.fork_merge_upstream` lets `hermes update` merge upstream into your fork. Also: the app relaunches after a headless rebuild, `hermes serve --stop` spares Desktop's backend, and no "Switch to This device?" prompt |
@@ -37,7 +37,7 @@ git switch -c mods                     # or work on your fork's main; see fork-u
 git am -3 ~/code/hermes-mods/core/patches/*.patch
 ```
 
-When I last tested (Oct 2026), all 30 applied on `upstream/main` except **0013**, which conflicts in
+When I last tested (Oct 2026), all 34 applied on `upstream/main` except **0013**, which conflicts in
 `tui_gateway/server.py`. [session-takeover.md](session-takeover.md) explains how to resolve it. After
 resolving: `git add tui_gateway/server.py && git am --continue`.
 
@@ -63,8 +63,12 @@ the hunk. Each doc's **Code** and **Tests** sections are the spec.
 3. **Tests.** Python: `scripts/run_tests.sh <files>` from the repo root. A bare `venv/bin/python -m pytest`
    can fail on a missing `ruamel`. Desktop: `cd apps/desktop && npx vitest run <file>`; vitest needs a
    current Node (v18 is too old). `npm run typecheck` checks types, and `npx eslint --fix <files>` fixes
-   import/prop sort lint (0002 and 0022 trip it as committed). Run the tests each doc lists before you
-   trust a rebased patch.
+   import/prop sort lint. Run the tests each doc lists before you trust a rebased patch.
+   When I last ran the full series (Oct 2026): every test the patches add or touch passes, lint has 0 errors,
+   and tsc is clean. The rest of the desktop suite had 13 failures (`mac-sign`, `desktop-uninstall`,
+   `remote-lifecycle`, native-deps and similar). Those fail the same way on the unpatched base on a Mac, so
+   they're environment-dependent, not caused by these patches. One `hermes-bots/group-activity` test is flaky
+   with or without the patches.
 
 ## Gotchas
 
@@ -82,12 +86,17 @@ the hunk. Each doc's **Code** and **Tests** sections are the spec.
   conflict, regenerate them from the Python contracts (`tui_gateway/contracts/`) with
   `python scripts/gen_gateway_contracts.py`; don't hand-merge them.
 - **i18n.** Every new UI string has to be translated in each `apps/desktop/src/i18n/*.ts` locale or
-  listed in `overlay-gaps.json`, or `overlay-completeness.test.ts` fails. 0024's `sidebar.filter.*`
-  keys trip this as committed; regenerate the list with `OVERLAY_GAPS_UPDATE=1`. After changing
-  `en.ts`, run `npm run i18n:keys`.
-- **Contract coverage.** 0020 adds the `session.title.suggest` RPC without a contract in
-  `tui_gateway/contracts/`, so the contract-coverage test flags it. See
-  [ai-session-rename.md](ai-session-rename.md).
+  listed in `overlay-gaps.json`, or `overlay-completeness.test.ts` fails. After changing `en.ts`, run
+  `npm run i18n:keys` and commit `locales/_keys.desktop.json`.
+- **Fix-up patches 0031–0034.** These close test and lint gaps in earlier patches. Take each one with the
+  patch it fixes:
+
+  | Patch | Fixes | Goes with |
+  |---|---|---|
+  | 0031 | translations for the `sidebar.filter.*` labels | 0024 |
+  | 0032 | `session.title.suggest` wire contract + regenerated contract files | 0020 |
+  | 0033 | import order lint in `use-desktop-integrations.ts` | 0022 |
+  | 0034 | regenerated `locales/_keys.desktop.json` | 0019–0024 |
 - **Keybinds.** The defaults live in `apps/desktop/src/lib/keybinds/actions.ts` and the handlers in
   `apps/desktop/src/app/hooks/use-keybinds.ts`. `actions.test.ts` rejects chord conflicts.
 - **Tags.** I tag my commits `[daveey]` in the subject so they're easy to list

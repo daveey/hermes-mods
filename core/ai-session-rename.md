@@ -356,21 +356,15 @@ after 0020.
 
 ## Gotchas
 
-- **The RPC contract is missing from the patch.** Upstream checks the RPC wire against `tui_gateway/contracts/`:
-  - `tests/tui_gateway/contracts/test_generated.py::test_catalog_covers_the_whole_wire` calls
-    `contracts.registry.assert_complete(server._methods, …)`, which compares every `@method` name with
-    `contracts.registry.METHODS`. It fails with "methods without a contract: ['session.title.suggest']". The patch
-    adds no contract.
-  - The runtime is fine: `tui_gateway/rpc_dispatch.py` skips param validation when `METHODS.get(method)` is `None`.
-  - To make CI green, add the following to `tui_gateway/contracts/sessions.py`:
-    - a params model with optional `session_key`, `session_id` and `profile` (e.g. subclass `ProfileParams`);
-    - a result model with `session_key: str` and `title: str | None`;
-    - `method("session.title.suggest", params=…, result=…, doc=…)`.
-
-    Then regenerate `apps/shared/src/gateway-contract.generated.ts` and `apps/shared/src/gateway-contract.openrpc.json`
-    with `python scripts/gen_gateway_contracts.py`. `test_generated_files_are_current` diffs them byte-for-byte.
-  - Once a contract exists, unknown param keys are rejected with code `4000`, so declare every key the desktop
-    sends.
+- **The RPC contract is in a follow-up patch, 0032.** 0020 alone adds `session.title.suggest`
+  without a contract in `tui_gateway/contracts/`, so
+  `tests/tui_gateway/contracts/test_generated.py::test_catalog_covers_the_whole_wire` fails with
+  "methods without a contract". At runtime nothing breaks, because `rpc_dispatch.py` skips validation for a
+  method without a contract. Patch 0032 adds `SessionTitleSuggestParams`/`SessionTitleSuggestResult` and
+  `method("session.title.suggest", …)` in `tui_gateway/contracts/sessions.py`, and regenerates
+  `apps/shared/src/gateway-contract.generated.ts` and `openrpc.json` with
+  `bash scripts/run-in-hermes-env python3 scripts/gen_gateway_contracts.py`. Apply 0032 with 0020.
+  0034 regenerates `locales/_keys.desktop.json` for the new labels.
 - **Live-session lookup only checks `session_id`.** The desktop sends only `session_key`, so the RPC always takes
   the DB path (`_profile_db(params)` + `resolve_session_id`). That is fine for persisted sessions. A brand-new chat
   with no stored messages gets `title: null`, and the dialog falls back to a plain rename.

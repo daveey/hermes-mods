@@ -155,8 +155,8 @@ src/app/chat/sidebar/sessions-section-new-session-drag.test.tsx`.
 
 **Gotcha.** The patch as committed fails `eslint` with two `perfectionist/sort-jsx-props` errors: `aria-expanded`
 must come before `aria-label`, and `className` before `name` on the `Codicon`. It also raises five
-`padding-line-between-statements` warnings. Run `npx eslint --fix src/app/chat/sidebar/index.tsx` before
-upstreaming. The aria labels are hard-coded English. The `[-webkit-app-region:no-drag]` class matters because
+`padding-line-between-statements` warnings. Patch 0020 reformats the same file and clears them, so the
+full series lints clean. If you take 0002 alone, run `npx eslint --fix src/app/chat/sidebar/index.tsx`. The aria labels are hard-coded English. The `[-webkit-app-region:no-drag]` class matters because
 the button sits inside the titlebar drag region; without it, clicks drag the window.
 
 ---

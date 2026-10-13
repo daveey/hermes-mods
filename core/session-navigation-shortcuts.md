@@ -375,7 +375,8 @@ gateway RPC contract, so there's nothing to regenerate.
   or the build is ad-hoc signed.
 - **Lint:** 0022 adds imports to `use-desktop-integrations.ts` in an order that `perfectionist/sort-imports`
   rejects (`@/lib/hermes-open-target` must come before `@/lib/keybinds/plugin-actions`). Run
-  `npx eslint --fix src/app/contrib/hooks/use-desktop-integrations.ts` in `apps/desktop`. Verified on the fork.
+  `npx eslint --fix src/app/contrib/hooks/use-desktop-integrations.ts` in `apps/desktop`. Patch 0033 is
+  exactly that fix, so apply it after 0022.
 - **i18n:** every new action id needs a label in `en.ts` (the `Translations` type is the contract) and either a
   translation or an `overlay-gaps.json` entry for each other locale. `src/i18n/overlay-completeness.test.ts`
   fails on a new untranslated key without a gap entry. After changing `en.ts`, regenerate

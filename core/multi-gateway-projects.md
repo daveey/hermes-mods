@@ -407,11 +407,11 @@ npx vitest run src/store/gateway-project-merge.test.ts src/store/gateway-visibil
 npm run typecheck
 ```
 Verified on `upstream/main` with `0004 0018 0023 0024 0025 0028 0029` applied: all 7 feature test
-files pass (63 tests). `overlay-completeness.test.ts` fails, as described under Gotchas.
+files pass (63 tests). `overlay-completeness.test.ts` passes once 0031 is applied too (see Gotchas).
 
 ## Applying
 
-Order: `0023 → 0024 → 0025 → 0028 → 0029`.
+Order: `0023 → 0024 → 0025 → 0028 → 0029`, then `0031` (translations for 0024's labels).
 - 0028 rewrites code that 0025 added.
 - 0025 needs 0024 (`remoteTrees`, `ownerGatewayId`, `isRemoteProjectId`).
 - 0023 and 0029 can each be applied on their own.
@@ -441,11 +441,12 @@ upstream pieces:
 
 ## Gotchas
 
-- **`overlay-completeness.test.ts` fails after 0024.** The three new `sidebar.filter.*` keys exist
-  only in `en.ts`, and `src/i18n/overlay-gaps.json` doesn't list them. Either add translations to
-  each locale overlay (`ar de es fr ja ru zh zh-hant`), or regenerate the gap list from
-  `apps/desktop` with `OVERLAY_GAPS_UPDATE=1 npx vitest run src/i18n/overlay-completeness.test.ts`.
-  The UI isn't affected, because missing keys fall back to English through `defineLocale`.
+- **Apply 0031 with 0024.** 0024 adds three `sidebar.filter.*` keys only to `en.ts`, so on its own
+  `overlay-completeness.test.ts` fails. Patch 0031 translates them in every locale overlay
+  (`ar de es fr ja ru zh` and `zh-hant_chrome.ts`). The rule for any new key: translate it in each
+  overlay, or list it in `overlay-gaps.json` (`OVERLAY_GAPS_UPDATE=1 npx vitest run
+  src/i18n/overlay-completeness.test.ts` regenerates the list). Missing keys only fall back to English
+  in the UI; the test is what breaks.
 - **No generated contract to rebuild.** No RPC method or schema changes, so
   `apps/shared/src/gateway-contract.generated.ts` and `openrpc.json` stay as they are.
 - **The remote gateway must allow `shell.exec`.** Creating a missing project on the session's
