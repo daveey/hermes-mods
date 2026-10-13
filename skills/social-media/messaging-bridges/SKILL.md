@@ -1,11 +1,11 @@
 ---
 name: messaging-bridges
-description: "WhatsApp/Signal bridges: QR-pair once, session persists."
-version: 0.1.0
+description: "Use when connecting Slack/WhatsApp/Signal chat to Hermes."
+version: 0.2.0
 platforms: [macos]
 ---
 
-# Messaging Bridges (WhatsApp, Signal)
+# Messaging Bridges (Slack, WhatsApp, Signal)
 
 Wire local CLIs/bridges to third-party chat networks using **persistent-session** auth so there is no repeat login. Each network has one durable pattern:
 
@@ -14,6 +14,9 @@ Wire local CLIs/bridges to third-party chat networks using **persistent-session*
 | WhatsApp | whatsmeow Multi-Device: scan QR from phone → session file | `whatsapp-bridge/store/whatsapp.db` |
 | Signal | `signal-cli link` as secondary device: scan QR from Signal app | `~/.local/share/signal-cli/` |
 | iMessage/SMS | `imsg` reads Messages.app directly | macOS Messages signed-in state |
+| Slack | Hermes gateway Slack adapter, Socket Mode app (bot `xoxb-` + app `xapp-` tokens) | `~/.hermes/.env` |
+
+Slack setup procedure: `references/slack-gateway-setup.md`.
 
 User is terse and dislikes multi-choice menus — just execute the next concrete step and surface a single actionable artifact (QR image, URL, path) at a time. Don't ask "which first?" when the obvious order is: start the bridge → render QR → ask them to scan.
 
