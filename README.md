@@ -36,6 +36,7 @@ backend after enabling a backend plugin.
 | [oauth-keepalive](plugins/oauth-keepalive/) | — | Refreshes pooled OAuth tokens (Claude, ChatGPT/Codex) before they expire, including idle accounts. |
 | [quiet-mode](plugins/quiet-mode/) | — | `/quiet` (`/movie`) blocks every Hermes session on the Mac from opening windows, driving the GUI or browser, changing lights or TVs, or making sound. |
 | [session-mentions](plugins/session-mentions/) | [yes](desktop-plugins/session-mentions/) | `cross_session` tool: list, read and message sessions on any gateway connected to the Desktop app (local, Nous-hosted, remote). |
+| [spin-out](plugins/spin-out/) | [yes](desktop-plugins/spin-out/) | ⇧⌘F on a session: finds the follow-up work at its end and starts one new session per task, each with a self-contained brief and an @session pointer to the parent. Moves the built-in session-search shortcut to ⌥⌘F. |
 | [topic-shift](plugins/topic-shift/) | [yes](desktop-plugins/topic-shift/) | After you send a message, detects a topic change and offers *New session* (with a carried-over brief and an @session link), *Fork* or *Send here*. |
 
 ## Desktop-only plugins
