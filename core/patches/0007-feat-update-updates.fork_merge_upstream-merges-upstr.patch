@@ -1,0 +1,204 @@
+From 6cc73692e0fcc806721dca4849e807beb64db87f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:07:46 -0700
+Subject: [PATCH] feat(update): updates.fork_merge_upstream merges upstream
+ into a fork that carries its own commits [daveey]
+
+---
+ hermes_cli/update_cmd_git.py                  | 75 +++++++++++++++----
+ .../test_update_fork_merge_upstream.py        | 56 ++++++++++++++
+ 2 files changed, 117 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_fork_merge_upstream.py
+
+diff --git a/hermes_cli/update_cmd_git.py b/hermes_cli/update_cmd_git.py
+index 3a8786f2e5..192b8c65b5 100644
+--- a/hermes_cli/update_cmd_git.py
++++ b/hermes_cli/update_cmd_git.py
+@@ -365,6 +365,37 @@ def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, i
+     return True
+ 
+ 
++def _fork_merges_upstream() -> bool:
++    """``updates.fork_merge_upstream`` (default off): merge upstream into a fork that has its own commits."""
++    with suppress(Exception):
++        from hermes_cli.config import load_config
++        return bool((load_config().get("updates") or {}).get("fork_merge_upstream", False))
++    return False
++
++
++def _synthesize_upstream_merge(git_cmd: list[str], cwd: Path, upstream: str) -> Optional[str]:
++    """Merge commit of ``upstream`` into HEAD built without touching the work tree; None on conflict/error."""
++    head = _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd)
++    if not head:
++        print("  ✗ Could not resolve HEAD. Skipping upstream merge.")
++        return None
++    tree_proc = subprocess.run([*git_cmd, "merge-tree", "--write-tree", "--no-messages", head, upstream],
++                               cwd=cwd, capture_output=True, text=True)
++    tree = (tree_proc.stdout or "").split("\n", 1)[0].strip()
++    if tree_proc.returncode != 0 or not tree:
++        conflicts = subprocess.run([*git_cmd, "merge-tree", "--write-tree", "--name-only", "--no-messages", head, upstream],
++                                   cwd=cwd, capture_output=True, text=True).stdout.splitlines()[1:]
++        print("  ✗ Upstream does not merge cleanly into your fork — nothing changed.\n"
++              "    Conflicting paths: " + (", ".join(p for p in conflicts if p.strip())[:400] or "?") + "\n"
++              "    Resolve by hand: git merge upstream/main, fix, commit, git push origin main")
++        return None
++    msg = f"Merge upstream/main ({upstream[:10]}) into fork"
++    commit = _git_stdout(git_cmd, ["commit-tree", tree, "-p", head, "-p", upstream, "-m", msg], cwd)
++    if not commit:
++        print("  ✗ Could not create the upstream merge commit. Skipping upstream merge.")
++    return commit or None
++
++
+ class UpstreamTargetBroken(Exception):
+     """The fork sync's upstream target fails the startup syntax check: refused before its move."""
+ 
+@@ -408,17 +439,32 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes:
+     if origin_ahead < 0 or upstream_ahead < 0:
+         print("  ✗ Could not compare branches. Skipping upstream sync.")
+         return False
++    target = upstream  # what the live tree fast-forwards to: upstream itself, or a merge of it into the fork
+     if origin_ahead > 0:
+-        print(
+-            f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
+-            "  Skipping upstream sync to preserve your changes.\n"
+-            "  If you want to merge upstream changes, run:\n    git pull upstream main"
+-        )
+-        return True
+-    if upstream_ahead == 0:
++        if upstream_ahead == 0:
++            print(f"  ✓ Fork is up to date with upstream ({origin_ahead} fork commit(s) on top)")
++            return True
++        if not _fork_merges_upstream():
++            print(
++                f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
++                "  Skipping upstream sync to preserve your changes.\n"
++                "  If you want to merge upstream changes, run:\n    git pull upstream main\n"
++                "  (or set updates.fork_merge_upstream: true to merge on every update)"
++            )
++            return True
++        # updates.fork_merge_upstream: carry the fork's commits forward by merging upstream into HEAD.
++        # The merge is computed off-tree (merge-tree + commit-tree), so the live checkout only ever
++        # fast-forwards — the same custody path as a plain upstream pull — and a conflict moves nothing.
++        merged = _synthesize_upstream_merge(git_cmd, cwd, upstream)
++        if merged is None:
++            return False
++        target = merged
++        print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Merging upstream into the fork ({target[:10]})...")
++    elif upstream_ahead == 0:
+         print("  ✓ Fork is up to date with upstream")
+         return True
+-    print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
++    else:
++        print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
+     # A tree move like the pull itself: the marker and the owed tail are armed before git writes,
+     # and the just-fetched ref is merged (a second `git pull` fetch could move past the marker's target).
+     from hermes_cli import update_cmd_commit as _commit
+@@ -428,7 +474,6 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes:
+         # The marker's ``pre`` is what a killed move is restored to: never arm ``pre=``.
+         print("  ✗ Could not resolve HEAD. Skipping upstream sync.")
+         return False
+-    target = upstream  # the counted commit is the marker's target and the merge's (m2)
+     # Judged BEFORE the move, like the origin target's preflight: the marker goes on git's exit 0,
+     # so a broken target must never land on the strength of the caller's later guard (review G1).
+     from hermes_cli.update_cmd import _UPDATE_CRITICAL_FILES
+@@ -442,8 +487,8 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes:
+         # very commit counted above.
+         if refused:
+             raise subprocess.CalledProcessError(1, "merge", stderr=refused)  # no marker, no move
+-        with (checkout_move or _no_move)(upstream):
+-            run_git(git_cmd, ["merge", "--ff-only", upstream], cwd=cwd, check=True, **_no_prompt_git_kwargs())
++        with (checkout_move or _no_move)(target):
++            run_git(git_cmd, ["merge", "--ff-only", target], cwd=cwd, check=True, **_no_prompt_git_kwargs())
+     except (OSError, subprocess.SubprocessError) as exc:  # CustodyRefused is an OSError; a timeout too
+         if refused or _commit.settle_failed_tree_move(cwd):
+             # Back at ``pre``; that is still new code when the origin pull moved first, and disarm
+@@ -457,11 +502,11 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes:
+             print(f"    ({detail})")
+         return False
+     interrupted_pull_marker(cwd).unlink(missing_ok=True)  # git exited 0: whole at what it landed on
+-    if (landed := _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "HEAD"], cwd)) != upstream:
++    if (landed := _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "HEAD"], cwd)) != target:
+         # Not the commit the debt was armed for (O3's check, here): owed for the HEAD it is on, or
+         # handed back at the run's start commit; the caller's HEAD check refuses the update.
+         _commit.disarm_commit_obligations()
+-        print(f"  ✗ HEAD is on {(landed or '?')[:10]} after the upstream merge, not {upstream[:10]}.")
++        print(f"  ✗ HEAD is on {(landed or '?')[:10]} after the upstream merge, not {target[:10]}.")
+         return False
+     print("  ✓ Updated from upstream")
+     # The fork push waits for a validated update: ``_push_synced_fork`` after the syntax guard.
+@@ -478,7 +523,9 @@ def _push_synced_fork(git_cmd: list[str], cwd: Path) -> None:
+     # Full ref names: a local branch called upstream/main or origin/main must not answer (m2).
+     upstream = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/upstream/main^{commit}"], cwd)
+     origin = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/origin/main^{commit}"], cwd)
+-    if not head or head != upstream or head == origin:
++    if not head or not upstream or head == origin:
++        return
++    if head != upstream and not (_fork_merges_upstream() and _git_ok(git_cmd, ["merge-base", "--is-ancestor", upstream, head], cwd)):
+         return
+     if origin and not _git_ok(git_cmd, ["merge-base", "--is-ancestor", origin, head], cwd):
+         return
+diff --git a/tests/hermes_cli/test_update_fork_merge_upstream.py b/tests/hermes_cli/test_update_fork_merge_upstream.py
+new file mode 100644
+index 0000000000..63032a5bce
+--- /dev/null
++++ b/tests/hermes_cli/test_update_fork_merge_upstream.py
+@@ -0,0 +1,56 @@
++"""Functional test: fork with own commits + updates.fork_merge_upstream merges upstream via ff of a synthesized merge."""
++import subprocess
++from pathlib import Path
++from unittest import mock
++import hermes_cli.update_cmd_git as g
++
++def sh(*a, cwd=None):
++    return subprocess.run(a, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
++
++def mkrepo(tmp):
++    up = tmp / "up"; up.mkdir(); sh("git", "init", "-q", "-b", "main", cwd=up)
++    for k, v in {"user.email": "t@t", "user.name": "t"}.items(): sh("git", "config", k, v, cwd=up)
++    (up / "a.txt").write_text("a\n"); (up / "b.txt").write_text("b\n")
++    sh("git", "add", "-A", cwd=up); sh("git", "commit", "-qm", "base", cwd=up)
++    fork = tmp / "fork.git"; sh("git", "clone", "-q", "--bare", str(up), str(fork))
++    live = tmp / "live"; sh("git", "clone", "-q", str(fork), str(live))
++    for k, v in {"user.email": "t@t", "user.name": "t"}.items(): sh("git", "config", k, v, cwd=live)
++    sh("git", "remote", "add", "upstream", str(up), cwd=live)
++    (live / "a.txt").write_text("a fork\n"); sh("git", "commit", "-qam", "fork change", cwd=live); sh("git", "push", "-q", "origin", "main", cwd=live)
++    return up, fork, live
++
++def run(live, merge_flag, upstream_edit):
++    up = live.parent / "up"
++    (up / upstream_edit[0]).write_text(upstream_edit[1]); sh("git", "commit", "-qam", "upstream change", cwd=up)
++    with mock.patch.object(g, "_fork_merges_upstream", return_value=merge_flag), \
++         mock.patch("hermes_cli.update_cmd_commit.arm_commit_point", return_value=None), \
++         mock.patch("hermes_cli.update_cmd_commit.target_syntax_error", return_value=None), \
++         mock.patch("hermes_cli.update_cmd._should_skip_upstream_prompt", return_value=False):
++        ok = g._sync_with_upstream_if_needed(["git"], live, assume_yes=True)
++        if ok: g._push_synced_fork(["git"], live)
++    return ok
++
++
++
++def test_flag_off_leaves_fork_untouched(tmp_path):
++    up, fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
++    assert run(live, False, ("b.txt", "b up\n"))
++    assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
++
++
++def test_flag_on_merges_upstream_and_pushes(tmp_path):
++    up, fork, live = mkrepo(tmp_path)
++    assert run(live, True, ("b.txt", "b up\n"))
++    head = sh("git", "rev-parse", "HEAD", cwd=live)
++    assert (live / "a.txt").read_text() == "a fork\n" and (live / "b.txt").read_text() == "b up\n"
++    assert len(sh("git", "rev-list", "--parents", "-n1", "HEAD", cwd=live).split()) == 3
++    assert sh("git", "rev-parse", "main", cwd=fork) == head
++    assert sh("git", "status", "--porcelain", cwd=live) == ""
++
++
++def test_conflict_moves_nothing(tmp_path):
++    up, fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
++    assert not run(live, True, ("a.txt", "a upstream conflict\n"))
++    assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
++    assert sh("git", "rev-parse", "main", cwd=fork) == pre
++    assert sh("git", "status", "--porcelain", cwd=live) == ""
+-- 
+2.54.0 (Apple Git-157)
+

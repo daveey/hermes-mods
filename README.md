@@ -11,19 +11,34 @@ can be deleted once upstream ships the fix.
 
 ```bash
 git clone https://github.com/daveey/hermes-mods ~/code/hermes-mods
+cd ~/code/hermes-mods
+./install.sh                # link + enable every plugin and desktop plugin, add the skills
+./install.sh --community    # ...plus the community plugins I run (hermes-pack.yaml, pinned SHAs)
+./install.sh --extras       # ...plus Home Assistant and Spotify (hermes-pack-extras.yaml)
+```
+
+`install.sh` symlinks, so `git pull` updates the mods in place (`--copy` freezes a version instead).
+It never overwrites a real file or folder that's already there. Restart the gateway or Desktop backend
+afterwards so the backend plugins load; desktop plugins hot-reload.
+
+Doing it by hand, one mod at a time:
+
+```bash
 M=~/code/hermes-mods
-
-# agent plugin (backend + optional dashboard API)
 ln -s $M/plugins/topic-shift ~/.hermes/plugins/topic-shift && hermes plugins enable topic-shift
-# its Desktop half, if it has one (hot-reloaded by the running app)
-ln -s $M/desktop-plugins/topic-shift ~/.hermes/desktop-plugins/topic-shift
-
-# all skills, read in place (git pull updates them)
+ln -s $M/desktop-plugins/topic-shift ~/.hermes/desktop-plugins/topic-shift   # its Desktop half
 hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 ```
 
-Copy instead of symlink (`cp -R`) if you'd rather freeze a version. Restart the gateway or Desktop
-backend after enabling a backend plugin.
+## What isn't a plugin
+
+- **[core/](core/)**: my changes to Hermes's own source: keyboard shortcuts, multi-gateway projects,
+  session takeover, fork-friendly `hermes update`, and more. There's one doc per feature (behavior,
+  code, tests, gotchas), plus `git am`-ready patches, so you or your agent can add them to your
+  Hermes. Start with [core/README.md](core/README.md).
+- **[shortcuts.md](shortcuts.md)**: every keyboard shortcut these mods add, and how to get each one.
+- **[hermes-pack.yaml](hermes-pack.yaml)**: the community plugins I use, pinned
+  (`hermes plugins pack install hermes-pack.yaml`).
 
 ## Plugins
 

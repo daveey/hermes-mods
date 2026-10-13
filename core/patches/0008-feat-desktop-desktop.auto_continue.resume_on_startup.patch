@@ -1,0 +1,278 @@
+From d06310d51d5b21e9bb720d0d9c34dc0c069c8aa0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:14:31 -0700
+Subject: [PATCH] feat(desktop): desktop.auto_continue.resume_on_startup
+ resumes every interrupted session at backend boot [daveey]
+
+---
+ hermes_cli/config_defaults.py            |   3 +
+ hermes_cli/web_server.py                 |   9 ++
+ tests/tui_gateway/test_startup_resume.py |  80 ++++++++++++++
+ tui_gateway/startup_resume.py            | 134 +++++++++++++++++++++++
+ 4 files changed, 226 insertions(+)
+ create mode 100644 tests/tui_gateway/test_startup_resume.py
+ create mode 100644 tui_gateway/startup_resume.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 9fa095eefc..0d26efc903 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2671,6 +2671,9 @@ DEFAULT_CONFIG = {
+             # How recent the interruption must be to auto-continue (minutes).
+             "freshness_minutes": 15,
+             "max_attempts": 2,  # Crash-loop breaker: max automatic re-runs of one interrupted turn.
++            # Resume every interrupted session when the backend starts (app relaunch, `hermes update`),
++            # not only the ones the user re-opens. Same freshness/attempt guards apply.
++            "resume_on_startup": False,
+         },
+     },
+ 
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index b314f74391..1e4fdf8fb4 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -243,6 +243,15 @@ async def _lifespan(app: FastAPI):
+     )
+     hosted_room_start_thread.start()
+ 
++    # desktop.auto_continue.resume_on_startup: continue every turn the last backend died in the
++    # middle of, instead of waiting for the user to re-open each session (tui_gateway/startup_resume.py).
++    try:
++        from tui_gateway.startup_resume import start_startup_resume_sweep
++
++        start_startup_resume_sweep()
++    except Exception:
++        _log.warning("startup resume sweep did not start", exc_info=True)
++
+     # Desktop-spawned backends fire cron jobs themselves, since the app has no
+     # gateway running the scheduler. Server `hermes dashboard` is unaffected —
+     # it relies on its own gateway.
+diff --git a/tests/tui_gateway/test_startup_resume.py b/tests/tui_gateway/test_startup_resume.py
+new file mode 100644
+index 0000000000..b9f4575635
+--- /dev/null
++++ b/tests/tui_gateway/test_startup_resume.py
+@@ -0,0 +1,80 @@
++"""desktop.auto_continue.resume_on_startup: the backend resumes every interrupted Desktop turn at boot."""
++
++import json
++import os
++import time
++
++from tui_gateway import startup_resume as sr
++
++DEAD_PID = 2 ** 22 - 3  # far above macOS/Linux pid_max defaults: never a live process
++
++
++def _write(home, entries):
++    p = home / "desktop" / "interrupted_turns.json"
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(json.dumps(entries))
++
++
++def _entry(prompt="do the thing", age=60, attempts=0, pid=DEAD_PID, auto=True):
++    return {"prompt": prompt, "started_at": time.time() - age, "attempts": attempts, "auto_continue": auto,
++            "writer_pid": pid}
++
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 60,
++                                     "max_attempts": 2}}}
++
++
++def test_disabled_by_default():
++    assert sr._settings({})[0] is False
++    assert sr._settings(CFG)[0] is True
++    off = {"desktop": {"auto_continue": {"enabled": False, "resume_on_startup": True}}}
++    assert sr._settings(off)[0] is False
++
++
++def test_filters_stale_capped_live_and_opted_out(tmp_path):
++    _write(tmp_path, {
++        "fresh": _entry(age=60),
++        "stale": _entry(age=2 * 3600),
++        "capped": _entry(attempts=2),
++        "live": _entry(pid=os.getpid()),
++        "mailbox": _entry(auto=False),
++        "empty": _entry(prompt="  "),
++    })
++    keys = [r["session_key"] for r in sr.pending_resumes(tmp_path, CFG)]
++    assert keys == ["fresh"]
++
++
++def test_profiles_are_swept_with_profile_param(tmp_path):
++    _write(tmp_path, {"a": _entry(age=30)})
++    _write(tmp_path / "profiles" / "work", {"b": _entry(age=10)})
++    calls = []
++
++    def resume(rid, params):
++        calls.append(params)
++        return {"result": {"auto_continue": {"attempt": 1}}}
++
++    out = sr.resume_interrupted_sessions(resume, tmp_path, CFG)
++    assert calls == [{"session_id": "b", "omit_messages": True, "profile": "work"},
++                     {"session_id": "a", "omit_messages": True}]
++    assert all(r["ok"] and r["scheduled"] for r in out)
++
++
++def test_one_failure_does_not_stop_the_sweep(tmp_path):
++    _write(tmp_path, {"x": _entry(age=10), "y": _entry(age=20)})
++    seen = []
++
++    def resume(rid, params):
++        seen.append(params["session_id"])
++        if params["session_id"] == "x":
++            raise RuntimeError("boom")
++        return {"error": {"code": 4007, "message": "session not found"}}
++
++    out = sr.resume_interrupted_sessions(resume, tmp_path, CFG)
++    assert seen == ["x", "y"]
++    assert [r["ok"] for r in out] == [False, False]
++
++
++def test_start_is_noop_when_disabled(monkeypatch):
++    import hermes_cli.config as config
++    monkeypatch.setattr(config, "load_config", lambda: {})
++    assert sr.start_startup_resume_sweep() is None
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+new file mode 100644
+index 0000000000..f6f4e8bcd1
+--- /dev/null
++++ b/tui_gateway/startup_resume.py
+@@ -0,0 +1,134 @@
++"""Resume every crash/restart-interrupted Desktop turn when the backend starts.
++
++Auto-continue (``session_auto_continue._maybe_schedule_auto_continue``) only fires from ``session.resume``, i.e. when
++the user re-opens each interrupted session. After an app restart or ``hermes update`` that means visiting every
++session that was mid-turn and telling it to continue. With ``desktop.auto_continue.resume_on_startup: true`` the
++backend does that itself at boot: for each fresh turn marker (``turn_marker``) whose writer process is gone, it runs
++an in-process ``session.resume`` — the same handler the Desktop calls — which schedules the continuation turn. The
++sessions run detached until a client attaches; opening one later reuses the live session and streams the turn.
++
++All the existing auto-continue guards still apply inside ``session.resume`` (freshness window, ``max_attempts``
++crash-loop breaker, live-writer ownership, hosted-room exclusion); this module only pre-filters to avoid resuming
++sessions that would not continue anyway.
++"""
++
++from __future__ import annotations
++
++import itertools
++import logging
++import threading
++import time
++from pathlib import Path
++from typing import Any, Callable
++
++from tui_gateway.turn_marker import _load, _marker_path, marker_writer_state, read_turn_marker
++
++logger = logging.getLogger(__name__)
++
++_ids = itertools.count(1)
++
++
++def _settings(cfg: dict | None) -> tuple[bool, float, int, float]:
++    """(resume_on_startup, freshness seconds, max_attempts, startup delay seconds) from ``desktop.auto_continue``."""
++    desktop = (cfg or {}).get("desktop")
++    ac = desktop.get("auto_continue") if isinstance(desktop, dict) else None
++    ac = ac if isinstance(ac, dict) else {}
++    enabled = ac.get("enabled", True) not in (False, "false", "False", 0, "0", "off", "no")
++    on_start = ac.get("resume_on_startup", False) in (True, "true", "True", 1, "1", "on", "yes")
++    try:
++        fresh = max(0.0, float(ac.get("freshness_minutes", 15))) * 60.0
++    except (TypeError, ValueError):
++        fresh = 15 * 60.0
++    try:
++        attempts = max(0, int(ac.get("max_attempts", 2)))
++    except (TypeError, ValueError):
++        attempts = 2
++    try:
++        delay = max(0.0, float(ac.get("resume_on_startup_delay_seconds", 5)))
++    except (TypeError, ValueError):
++        delay = 5.0
++    return enabled and on_start, fresh, attempts, delay
++
++
++def _homes(home: Path) -> list[tuple[str | None, Path]]:
++    """The launch home plus every named profile under it: markers are stored per HERMES_HOME."""
++    out: list[tuple[str | None, Path]] = [(None, home)]
++    with_profiles = home / "profiles"
++    if with_profiles.is_dir():
++        for p in sorted(with_profiles.iterdir()):
++            if p.is_dir() and _marker_path(p).exists():
++                out.append((p.name, p))
++    return out
++
++
++def pending_resumes(home: Path, cfg: dict | None, *, now: float | None = None) -> list[dict[str, Any]]:
++    """Markers the sweep would resume: fresh, auto-continuable, under the attempt cap, writer process gone."""
++    _, fresh, max_attempts, _ = _settings(cfg)
++    now = time.time() if now is None else now
++    out = []
++    for profile, h in _homes(home):
++        for key in list(_load(_marker_path(h))):
++            m = read_turn_marker(h, key)
++            if m is None or not m.get("auto_continue", True):
++                continue
++            if now - m["started_at"] > fresh or m["attempts"] >= max_attempts:
++                continue
++            if marker_writer_state(m) == "alive":
++                continue  # a live sibling backend owns this turn
++            out.append({"profile": profile, "home": str(h), "session_key": key, "started_at": m["started_at"]})
++    out.sort(key=lambda r: r["started_at"], reverse=True)
++    return out
++
++
++def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path, cfg: dict | None) -> list[dict]:
++    """Call ``resume(rid, params)`` (the ``session.resume`` handler) for each pending marker; returns outcomes."""
++    results = []
++    for row in pending_resumes(home, cfg):
++        params: dict[str, Any] = {"session_id": row["session_key"], "omit_messages": True}
++        if row["profile"]:
++            params["profile"] = row["profile"]
++        try:
++            env = resume(f"startup-resume-{next(_ids)}", params) or {}
++        except Exception as exc:  # one bad session must not stop the rest
++            logger.warning("startup resume of %s failed", row["session_key"], exc_info=True)
++            results.append({**row, "ok": False, "error": str(exc)})
++            continue
++        err = env.get("error") if isinstance(env, dict) else None
++        res = env.get("result") if isinstance(env, dict) else None
++        scheduled = bool(isinstance(res, dict) and res.get("auto_continue"))
++        logger.info("startup resume %s (profile=%s): %s", row["session_key"], row["profile"] or "default",
++                    "auto-continue scheduled" if scheduled else (err or "resumed, no continuation scheduled"))
++        results.append({**row, "ok": err is None, "scheduled": scheduled, **({"error": err} if err else {})})
++    return results
++
++
++def start_startup_resume_sweep() -> threading.Thread | None:
++    """Backend boot hook: run the sweep on a daemon thread after a short settle delay (no-op unless enabled)."""
++    try:
++        from hermes_cli.config import load_config
++        from hermes_constants import get_hermes_home
++        cfg = load_config()
++    except Exception:
++        logger.debug("startup resume: config unavailable", exc_info=True)
++        return None
++    enabled, _, _, delay = _settings(cfg)
++    if not enabled:
++        return None
++
++    def _run() -> None:
++        time.sleep(delay)
++        try:
++            import tui_gateway.server as server
++            handler = server._methods.get("session.resume")
++            if handler is None:
++                logger.warning("startup resume: session.resume handler not installed")
++                return
++            done = resume_interrupted_sessions(handler, Path(get_hermes_home()), cfg)
++            if done:
++                logger.info("startup resume: %d interrupted session(s) processed", len(done))
++        except Exception:
++            logger.exception("startup resume sweep failed")
++
++    t = threading.Thread(target=_run, daemon=True, name="startup-resume-sweep")
++    t.start()
++    return t
+-- 
+2.54.0 (Apple Git-157)
+

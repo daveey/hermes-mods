@@ -1,0 +1,219 @@
+From 643b962f3dbad6ea2e5f9ca9f8a307e8b587b55d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:11:02 -0700
+Subject: [PATCH] fix(desktop): a gateway-qualified @session ref never becomes
+ a profile name [daveey]
+
+`@session:<profile>@<gateway>/<id>` (session-mentions' cross-gateway form) was
+parsed as profile 'default@mac-mini'. That dialed a phantom pool backend
+conn:mac-mini::default@mac-mini whose rows relabelled every mac-mini sidebar
+session with the bogus profile, so resume/move/archive failed with
+"Profile 'default@mac-mini' does not exist."
+
+- parseSessionRefValue splits the @gateway qualifier off the profile
+- ensureRegistryBackend refuses invalid profile names; the sidebar aggregator
+  skips any such pool key
+- owner hints and persisted tile routes drop profiles containing '@'
+---
+ apps/desktop/electron/main.ts                 | 16 ++++++++
+ apps/desktop/src/lib/session-refs.test.ts     | 16 ++++++++
+ apps/desktop/src/lib/session-refs.ts          | 28 +++++++++++---
+ .../session-owner-hint-qualified.test.ts      | 37 +++++++++++++++++++
+ apps/desktop/src/store/session-states.ts      |  7 +++-
+ apps/desktop/src/store/session.ts             |  5 ++-
+ 6 files changed, 101 insertions(+), 8 deletions(-)
+ create mode 100644 apps/desktop/src/store/session-owner-hint-qualified.test.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 778699aa78..8d5e1456f7 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -11072,6 +11072,16 @@ async function ensureRegistryBackend(
+   }
+ 
+   const profileKey = String(profile ?? '').trim() || 'default'
++
++  // Never pool a backend under a name no profile can have. A gateway-qualified
++  // session ref (`default@mac-mini/<id>`) once leaked its `profile@gateway` head
++  // here as a profile: the phantom `conn:mac-mini::default@mac-mini` entry then
++  // relabelled every mac-mini sidebar row with that profile, so resume/move/
++  // archive on them all failed with "Profile 'default@mac-mini' does not exist."
++  if (!PROFILE_NAME_RE.test(profileKey)) {
++    throw new Error(`Profile '${profileKey}' does not exist.`)
++  }
++
+   let resolvedRegistrySshConfig
+   let registryEffectiveFingerprintPromise: null | Promise<string> = null
+ 
+@@ -17443,6 +17453,12 @@ async function pooledRegistrySessionSources(includeLocal = false): Promise<Regis
+     const perProfile = connection.kind === 'ssh' || (includeLocal && connection.kind === 'local')
+ 
+     for (const [key, entry] of perProfile ? pooled : pooled.slice(0, 1)) {
++      // A pool key whose profile part is not a valid profile name would stamp
++      // that bogus label onto every row this backend serves.
++      if (perProfile && !PROFILE_NAME_RE.test(key.slice(prefix.length) || 'default')) {
++        continue
++      }
++
+       try {
+         // Already-resolved for a connected backend; a still-dialing entry is
+         // skipped via the timeout guard rather than blocking the sidebar.
+diff --git a/apps/desktop/src/lib/session-refs.test.ts b/apps/desktop/src/lib/session-refs.test.ts
+index 5d4b1371a6..5c5897f9fd 100644
+--- a/apps/desktop/src/lib/session-refs.test.ts
++++ b/apps/desktop/src/lib/session-refs.test.ts
+@@ -22,6 +22,22 @@ describe('parseSessionRefValue', () => {
+   it('treats bare values as session ids', () => {
+     expect(parseSessionRefValue('20260101_abc123')).toEqual({ sessionId: '20260101_abc123' })
+   })
++
++  it('splits a gateway qualifier off the profile (`<profile>@<gateway>/<id>`)', () => {
++    expect(parseSessionRefValue('default@mac-mini/20261012_154823_4069d7')).toEqual({
++      gateway: 'mac-mini',
++      profile: 'default',
++      sessionId: '20261012_154823_4069d7'
++    })
++  })
++
++  it('reads a stacked qualifier as one gateway, never a profile containing `@`', () => {
++    expect(parseSessionRefValue('default@mac-mini@mac-mini/20261012_154823_4069d7')).toEqual({
++      gateway: 'mac-mini',
++      profile: 'default',
++      sessionId: '20261012_154823_4069d7'
++    })
++  })
+ })
+ 
+ describe('sessionRefFallbackLabel', () => {
+diff --git a/apps/desktop/src/lib/session-refs.ts b/apps/desktop/src/lib/session-refs.ts
+index 3ec9fbc62b..0bdc1caff1 100644
+--- a/apps/desktop/src/lib/session-refs.ts
++++ b/apps/desktop/src/lib/session-refs.ts
+@@ -44,8 +44,14 @@ export function splitSessionRefValue(raw: string): { trailing: string; value: st
+ }
+ 
+ /** Session ids never contain a slash, so a slash unambiguously means
+- *  `<profile>/<id>` — same split as `tools/session_search_tool.py`. */
+-export function parseSessionRefValue(value: string): { profile?: string; sessionId: string } {
++ *  `<profile>/<id>` — same split as `tools/session_search_tool.py`.
++ *
++ *  The head may carry a gateway qualifier, `<profile>@<gateway>/<id>` (the
++ *  cross-gateway form the session-mentions plugin inserts). Profile names can
++ *  never contain `@` (backend rule: `[a-z0-9][a-z0-9_-]*`), so everything from
++ *  the first `@` is routing, not profile — treating `default@mac-mini` as a
++ *  profile name dialed a phantom backend and poisoned sidebar rows. */
++export function parseSessionRefValue(value: string): { gateway?: string; profile?: string; sessionId: string } {
+   const trimmed = value.trim()
+   const slash = trimmed.indexOf('/')
+ 
+@@ -53,16 +59,26 @@ export function parseSessionRefValue(value: string): { profile?: string; session
+     return { sessionId: trimmed }
+   }
+ 
+-  const profile = trimmed.slice(0, slash).trim()
++  const head = trimmed.slice(0, slash).trim()
+   const sessionId = trimmed.slice(slash + 1).trim()
+ 
+-  return sessionId ? { profile: profile || undefined, sessionId } : { sessionId: trimmed }
++  if (!sessionId) {
++    return { sessionId: trimmed }
++  }
++
++  const at = head.indexOf('@')
++  const profile = (at === -1 ? head : head.slice(0, at)).trim()
++  // `default@mac-mini@mac-mini` (a qualifier stacked on an already-qualified
++  // profile) still names one gateway: the last segment.
++  const gateway = at === -1 ? '' : head.slice(head.lastIndexOf('@') + 1).trim()
++
++  return { ...(gateway ? { gateway } : {}), profile: profile || undefined, sessionId }
+ }
+ 
+ export function sessionRefCacheKey(value: string): string {
+-  const { profile, sessionId } = parseSessionRefValue(value)
++  const { gateway, profile, sessionId } = parseSessionRefValue(value)
+ 
+-  return sessionId ? `${profile ?? ''}/${sessionId}` : ''
++  return sessionId ? `${profile ?? ''}${gateway ? `@${gateway}` : ''}/${sessionId}` : ''
+ }
+ 
+ /** Chip label before (or without) a resolved title — a short, still-identifying id. */
+diff --git a/apps/desktop/src/store/session-owner-hint-qualified.test.ts b/apps/desktop/src/store/session-owner-hint-qualified.test.ts
+new file mode 100644
+index 0000000000..52a0361760
+--- /dev/null
++++ b/apps/desktop/src/store/session-owner-hint-qualified.test.ts
+@@ -0,0 +1,37 @@
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { _resetSessionOwnerHintsForTests, getSessionOwnerHints, hydrateSessionOwnerHints, setSessionOwnerHint } from '@/store/session'
++
++const KEY = 'hermes.desktop.sessionOwnerHints.v1'
++
++describe('session owner hints reject gateway-qualified profiles', () => {
++  afterEach(() => {
++    _resetSessionOwnerHintsForTests({ storage: true })
++  })
++
++  it('never remembers a `profile@gateway` route', () => {
++    setSessionOwnerHint('s-bad', { connectionId: 'mac-mini', profile: 'default@mac-mini' })
++    setSessionOwnerHint('s-bad2', { connectionId: 'mac-mini', profile: 'default', targetProfile: 'default@mac-mini' })
++    setSessionOwnerHint('s-ok', { connectionId: 'mac-mini', profile: 'default' })
++
++    expect(getSessionOwnerHints('s-bad')).toEqual([])
++    expect(getSessionOwnerHints('s-bad2')).toEqual([])
++    expect(getSessionOwnerHints('s-ok')).toEqual([{ connectionId: 'mac-mini', profile: 'default' }])
++  })
++
++  it('drops poisoned persisted hints on hydrate and keeps valid ones', () => {
++    _resetSessionOwnerHintsForTests({ storage: true })
++    window.localStorage.setItem(
++      KEY,
++      JSON.stringify([
++        ['s-bad', { connectionId: 'mac-mini', profile: 'default@mac-mini', targetProfile: 'default@mac-mini' }],
++        ['s-ok', { connectionId: 'mac-mini', profile: 'default' }]
++      ])
++    )
++
++    hydrateSessionOwnerHints()
++
++    expect(getSessionOwnerHints('s-bad')).toEqual([])
++    expect(getSessionOwnerHints('s-ok')).toEqual([{ connectionId: 'mac-mini', profile: 'default' }])
++  })
++})
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 390f2fb493..9f231934fe 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -1303,7 +1303,12 @@ function parseTileList(value: unknown): StoredTile[] {
+             ownerRoute:
+               raw.ownerRoute &&
+               typeof raw.ownerRoute.connectionId === 'string' &&
+-              typeof raw.ownerRoute.profile === 'string'
++              typeof raw.ownerRoute.profile === 'string' &&
++              // A `profile@gateway` head from a qualified session ref is not a
++              // profile (names can't hold `@`); persisted routes carrying one
++              // re-dial a backend that cannot exist. Drop and re-resolve.
++              !raw.ownerRoute.profile.includes('@') &&
++              !(typeof raw.ownerRoute.targetProfile === 'string' && raw.ownerRoute.targetProfile.includes('@'))
+                 ? {
+                     connectionId: raw.ownerRoute.connectionId,
+                     mode: raw.ownerRoute.mode,
+diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
+index 52ad884207..d02e30ff12 100644
+--- a/apps/desktop/src/store/session.ts
++++ b/apps/desktop/src/store/session.ts
+@@ -1211,7 +1211,10 @@ function rememberSessionOwnerHint(sessionId: string, route: SessionOwnerRoute):
+   const id = sessionId.trim()
+   const normalized = normalizeOwnerRoute(route)
+ 
+-  if (!id || !normalized.connectionId) {
++  // Profile names never contain `@`: a `profile@gateway` head is a qualified
++  // session ref leaking into routing, and a hint carrying it re-dials a backend
++  // that cannot exist ("Profile 'default@mac-mini' does not exist.").
++  if (!id || !normalized.connectionId || normalized.profile.includes('@') || normalized.targetProfile?.includes('@')) {
+     return false
+   }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

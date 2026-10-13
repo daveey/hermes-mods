@@ -1,0 +1,103 @@
+From af13725b88f1ed810f7d71b5460c217af2fbcbb9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:06:38 -0700
+Subject: [PATCH] fix(tui-gateway): host sleep doesn't count as turn idleness
+ for the WS-orphan reaper [daveey]
+
+---
+ agent/activity_tracking.py                    |  3 ++
+ .../test_ws_orphan_sleep_activity.py          | 47 +++++++++++++++++++
+ tui_gateway/session_lifecycle.py              |  9 +++-
+ 3 files changed, 58 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tui_gateway/test_ws_orphan_sleep_activity.py
+
+diff --git a/agent/activity_tracking.py b/agent/activity_tracking.py
+index 984b6d8fbe..7c1e54eb66 100644
+--- a/agent/activity_tracking.py
++++ b/agent/activity_tracking.py
+@@ -66,6 +66,9 @@ class ActivityTrackingMixin:
+                 getattr(self, "_turn_liveness_activity_generation", 0) + 1
+             )
+             self._last_activity_ts = time.time()
++            # Awake-time stamp: time.monotonic() stops while the host sleeps (macOS), so readers that must not
++            # count a closed lid as idleness (the WS-orphan reaper) measure against this, not the wall clock.
++            self._last_activity_mono = time.monotonic()
+             self._last_activity_desc = bound_activity_description(desc)
+             self._last_activity_provenance = resolved_provenance
+             # Real progress invalidates a reserved abort claim; an in-flight watchdog interrupt must abandon
+diff --git a/tests/tui_gateway/test_ws_orphan_sleep_activity.py b/tests/tui_gateway/test_ws_orphan_sleep_activity.py
+new file mode 100644
+index 0000000000..3dea364672
+--- /dev/null
++++ b/tests/tui_gateway/test_ws_orphan_sleep_activity.py
+@@ -0,0 +1,47 @@
++"""A host sleep must not count as turn idleness for the WS-orphan reaper (lid-close interrupts)."""
++
++import types
++
++from tui_gateway import server
++
++
++def _session(agent):
++    return {"agent": agent, "running": True}
++
++
++def test_sleep_gap_in_wall_clock_does_not_make_turn_stale(monkeypatch):
++    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 600.0)
++    # Wall clock says 635s since the last activity (the Mac slept ~10 min), awake time says 5s.
++    agent = types.SimpleNamespace(
++        _last_activity_mono=1000.0,
++        get_activity_summary=lambda: {"seconds_since_activity": 635.0},
++    )
++    monkeypatch.setattr(server.time, "monotonic", lambda: 1005.0)
++    assert server._ws_orphan_turn_activity_is_fresh(_session(agent)) is True
++
++
++def test_awake_idle_past_threshold_is_still_stale(monkeypatch):
++    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 600.0)
++    agent = types.SimpleNamespace(
++        _last_activity_mono=1000.0,
++        get_activity_summary=lambda: {"seconds_since_activity": 1.0},
++    )
++    monkeypatch.setattr(server.time, "monotonic", lambda: 1601.0)
++    assert server._ws_orphan_turn_activity_is_fresh(_session(agent)) is False
++
++
++def test_agent_without_mono_stamp_falls_back_to_summary(monkeypatch):
++    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 600.0)
++    agent = types.SimpleNamespace(get_activity_summary=lambda: {"seconds_since_activity": 700.0})
++    assert server._ws_orphan_turn_activity_is_fresh(_session(agent)) is False
++
++
++def test_touch_activity_stamps_monotonic(monkeypatch):
++    from agent import activity_tracking
++
++    touch = next(obj._touch_activity for obj in vars(activity_tracking).values()
++                 if isinstance(obj, type) and hasattr(obj, "_touch_activity"))
++    agent = types.SimpleNamespace(_persist_session_activity_if_due=lambda: None)
++    monkeypatch.setattr(activity_tracking.time, "monotonic", lambda: 4242.0)
++    touch(agent, "probe")
++    assert agent._last_activity_mono == 4242.0
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index c8f9e589bc..19fc4f77cb 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -866,7 +866,14 @@ def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
+             stamp = session.get("_compute_host_activity_ns")
+             return (session.get("running", False) and isinstance(stamp, int)
+                     and 0 <= (time.perf_counter_ns() - stamp) / 1_000_000_000 < _WS_ORPHAN_ACTIVITY_STALE_S)
+-    if not callable(summary_fn := getattr(session.get("agent"), "get_activity_summary", None)):
++    agent = session.get("agent")
++    # Awake-time first: the wall-clock summary counts host sleep as idleness, so a turn that was healthy when
++    # the lid closed looked >600s stale the instant the Mac woke and got interrupted before the Desktop could
++    # reattach (same sleep/wake class as #44183, but on the activity clock instead of the reap Timer).
++    mono = getattr(agent, "_last_activity_mono", None)
++    if isinstance(mono, (int, float)) and not isinstance(mono, bool):
++        return 0 <= time.monotonic() - float(mono) < _WS_ORPHAN_ACTIVITY_STALE_S
++    if not callable(summary_fn := getattr(agent, "get_activity_summary", None)):
+         return False
+     try:
+         elapsed = summary_fn().get("seconds_since_activity")
+-- 
+2.54.0 (Apple Git-157)
+

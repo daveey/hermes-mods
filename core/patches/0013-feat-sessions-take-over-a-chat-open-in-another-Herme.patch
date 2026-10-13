@@ -1,0 +1,1430 @@
+From fcf1d736909780f56c17da11fbe6abaa2eb4bfa9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 20:32:22 -0700
+Subject: [PATCH] feat(sessions): take over a chat open in another Hermes
+ window [daveey]
+
+A chat whose active-session lease a different LIVE process holds (e.g. a
+second Desktop app whose SSH backend runs on this Mac) could never be
+moved: every submit was refused SESSION_NOT_OWNED until that process let go.
+
+- hermes_cli/active_sessions.py: take_over_active_session() replaces the
+  live owner's registry entry under the same lock and strict read as
+  try_acquire (unreadable registry fails closed), recording took_over_from
+  / took_over_at; find_takeover_of(), acknowledge_takeover() and
+  takeover_acknowledged() (acked, or the old pid is dead).
+- New RPC session.take_over (methods_session_takeover.py, long handler):
+  in-process detached sibling first, else the registry takeover; waits up
+  to HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S (8s) for the old owner's ack,
+  then reloads history from state.db. Refusal -> 4090 + reason.
+- Revocation watcher (daemon, HERMES_SESSION_TAKEOVER_POLL_S=2s, stat-gated):
+  a backend whose lease was taken over drops it (never the new owner's
+  entry), marks _lease_taken_over, interrupts the turn, cancels open
+  clarify/approval/sudo requests, emits an `error` event with
+  error_surface SESSION_NOT_OWNED, and acknowledges. Its next submit
+  re-claims and is refused SESSION_NOT_OWNED.
+- ErrorPayload gains optional error_surface; contracts regenerated.
+- Tests: registry takeover (real live foreign pid), watcher (idle, running
+  turn, pending clarify), RPC (ack / timeout / already_owner / fail closed),
+  and a two-process end-to-end.
+---
+ apps/shared/src/gateway-contract.generated.ts |  37 ++-
+ apps/shared/src/gateway-contract.openrpc.json | 106 +++++-
+ hermes_cli/active_sessions.py                 | 135 ++++++++
+ .../test_active_session_takeover.py           | 209 ++++++++++++
+ tests/tui_gateway/test_session_takeover.py    | 308 ++++++++++++++++++
+ .../tui_gateway/test_session_takeover_e2e.py  | 161 +++++++++
+ tui_gateway/contracts/events.py               |   7 +-
+ tui_gateway/contracts/sessions.py             |  22 ++
+ tui_gateway/methods_session_interrupt.py      |   2 +
+ tui_gateway/methods_session_takeover.py       | 222 +++++++++++++
+ tui_gateway/server.py                         |   2 +-
+ 11 files changed, 1197 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_active_session_takeover.py
+ create mode 100644 tests/tui_gateway/test_session_takeover.py
+ create mode 100644 tests/tui_gateway/test_session_takeover_e2e.py
+ create mode 100644 tui_gateway/methods_session_takeover.py
+
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 6c49e4eb96..e306df9f57 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -3513,6 +3513,17 @@ export interface SessionInterruptResult {
+   turn_isolation?: boolean | null
+ }
+ export type InterruptStatus = 'interrupted' | 'not_interrupted'
++export interface SessionTakeOverResult {
++  status: TakeOverStatus
++  previous_owner?: SessionPreviousOwner | null
++  acknowledged: boolean
++}
++export type TakeOverStatus = 'taken_over' | 'already_owner'
++export interface SessionPreviousOwner {
++  surface: string
++  pid?: number | null
++  started_at?: number | null
++}
+ export interface SessionCorrectionParams {
+   session_id: string
+   profile?: string | null
+@@ -4660,9 +4671,20 @@ export interface SetupReadyPayload {
+   finished_at: number
+   [key: string]: unknown
+ }
+-/** Every ``_emit("error", …)`` site sets exactly ``message``. */
++/** Every ``_emit("error", …)`` site sets ``message``; ``error_surface`` rides when the gateway already knows the machine code (the takeover watcher's ``SESSION_NOT_OWNED``). */
+ export interface ErrorPayload {
+   message: string
++  error_surface?: ErrorSurface | null
++}
++/** ``agent/error_surface.py::_surface`` — advisory {layer, code, retryable} (+ identity, + auth hint, + ``resets_at`` epoch seconds when the provider named when its limit lifts). */
++export interface ErrorSurface {
++  layer: string
++  code: string
++  retryable: boolean
++  provider?: string | null
++  model?: string | null
++  resets_at?: number | null
++  [key: string]: unknown
+ }
+ /** ``tui_gateway/model_switch.py`` capability-refresh notice. */
+ export interface NoticePayload {
+@@ -4710,16 +4732,6 @@ export interface BillingBlock {
+   message: string
+   unverified?: boolean | null
+ }
+-/** ``agent/error_surface.py::_surface`` — advisory {layer, code, retryable} (+ identity, + auth hint, + ``resets_at`` epoch seconds when the provider named when its limit lifts). */
+-export interface ErrorSurface {
+-  layer: string
+-  code: string
+-  retryable: boolean
+-  provider?: string | null
+-  model?: string | null
+-  resets_at?: number | null
+-  [key: string]: unknown
+-}
+ /** Committed SQLite row addresses for the agent's current-turn suffix. Missing ids are unproven, never negative acknowledgements. ``complete`` permits retiring the whole local turn only when the original turn boundary, every row and final body are still accounted for; compaction, redirects and partial writes conservatively leave it false. Row ids are scoped to the owning profile's store, as in ``SessionMessage.row_id``. */
+ export interface PersistedTurn {
+   row_ids: number[]
+@@ -5410,6 +5422,8 @@ export interface RpcMethods {
+   'session.status': { params: SessionStatusParams; result: SessionStatusResult }
+   /** Inject text into the next tool result without interrupting the turn. */
+   'session.steer': { params: SessionCorrectionParams; result: SessionCorrectionResult }
++  /** Move this chat's active-session lease here from another Hermes window/process; the old owner stops its turn and acknowledges (``acknowledged`` false when it did not within the timeout). */
++  'session.take_over': { params: SessionParams; result: SessionTakeOverResult }
+   /** Read or set a live session's title; a title set before the row exists is queued. */
+   'session.title': { params: SessionTitleParams; result: SessionTitleResult }
+   /** Drop the last user turn (and everything after it) from an idle session. */
+@@ -5727,6 +5741,7 @@ export const RPC_METHODS = [
+   'session.start_chat',
+   'session.status',
+   'session.steer',
++  'session.take_over',
+   'session.title',
+   'session.undo',
+   'session.usage',
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index fb9663d6ca..87faad93b7 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -3642,6 +3642,24 @@
+         }
+       }
+     },
++    {
++      "name": "session.take_over",
++      "summary": "Move this chat's active-session lease here from another Hermes window/process; the old owner stops its turn and acknowledges (``acknowledged`` false when it did not within the timeout).",
++      "params": [
++        {
++          "name": "params",
++          "schema": {
++            "$ref": "#/components/schemas/SessionParams"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/SessionTakeOverResult"
++        }
++      }
++    },
+     {
+       "name": "session.title",
+       "summary": "Read or set a live session's title; a title set before the row exists is queued.",
+@@ -13944,11 +13962,22 @@
+       },
+       "ErrorPayload": {
+         "additionalProperties": false,
+-        "description": "Every ``_emit(\"error\", \u2026)`` site sets exactly ``message``.",
++        "description": "Every ``_emit(\"error\", \u2026)`` site sets ``message``; ``error_surface`` rides when the gateway\nalready knows the machine code (the takeover watcher's ``SESSION_NOT_OWNED``).",
+         "properties": {
+           "message": {
+             "title": "Message",
+             "type": "string"
++          },
++          "error_surface": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/ErrorSurface"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null
+           }
+         },
+         "required": [
+@@ -31768,6 +31797,44 @@
+         "title": "SessionParams",
+         "type": "object"
+       },
++      "SessionPreviousOwner": {
++        "additionalProperties": false,
++        "properties": {
++          "surface": {
++            "title": "Surface",
++            "type": "string"
++          },
++          "pid": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Pid"
++          },
++          "started_at": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Started At"
++          }
++        },
++        "required": [
++          "surface"
++        ],
++        "title": "SessionPreviousOwner",
++        "type": "object"
++      },
+       "SessionReclaimedPayload": {
+         "additionalProperties": false,
+         "description": "``session_lifecycle._announce_session_reclaimed`` (broadcast).",
+@@ -32396,6 +32463,35 @@
+         "title": "SessionStatusResult",
+         "type": "object"
+       },
++      "SessionTakeOverResult": {
++        "additionalProperties": false,
++        "properties": {
++          "status": {
++            "$ref": "#/components/schemas/TakeOverStatus"
++          },
++          "previous_owner": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/SessionPreviousOwner"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null
++          },
++          "acknowledged": {
++            "title": "Acknowledged",
++            "type": "boolean"
++          }
++        },
++        "required": [
++          "status",
++          "acknowledged"
++        ],
++        "title": "SessionTakeOverResult",
++        "type": "object"
++      },
+       "SessionTitleParams": {
+         "additionalProperties": false,
+         "properties": {
+@@ -36597,6 +36693,14 @@
+         "title": "SystemBatteryResult",
+         "type": "object"
+       },
++      "TakeOverStatus": {
++        "enum": [
++          "taken_over",
++          "already_owner"
++        ],
++        "title": "TakeOverStatus",
++        "type": "string"
++      },
+       "TaskIdResult": {
+         "additionalProperties": false,
+         "description": "The side agent runs detached; its answer lands on the parent session as an event carrying\nthis ``task_id``.",
+diff --git a/hermes_cli/active_sessions.py b/hermes_cli/active_sessions.py
+index 7a279f9737..976fa0fc9b 100644
+--- a/hermes_cli/active_sessions.py
++++ b/hermes_cli/active_sessions.py
+@@ -574,6 +574,141 @@ def try_acquire_active_session(
+     return lease, None
+ 
+ 
++def take_over_active_session(
++    *, session_id: str, surface: str, metadata: Optional[dict[str, Any]] = None,
++    registry_home: str | Path | None = None, track_liveness: bool = False, config: Any = None,
++) -> tuple[Optional[ActiveSessionLease], list[dict[str, Any]], Optional[ActiveSessionRefusal]]:
++    """Explicit user takeover: ``(lease, removed_entries, None)`` or ``(None, [], refusal)``.
++
++    Same lock and same strict live read as :func:`try_acquire_active_session`, so an unreadable
++    registry still fails CLOSED. Every live entry for ``session_id`` is replaced by one for this
++    process whose metadata names the displaced leases (``took_over_from``); the displaced owners
++    notice via :func:`find_takeover_of` and stop writing. The capacity cap does not apply when an
++    entry was displaced (net slot count is unchanged); with nothing to displace this is a normal
++    acquire, cap included. A same-writer entry is re-entrant and displaces nothing.
++    """
++    key = str(session_id or "")
++    if not key:
++        lease, refusal = try_acquire_active_session(
++            session_id=key, surface=surface, config=config, metadata=metadata,
++            registry_home=registry_home, track_liveness=track_liveness)
++        return lease, [], refusal  # type: ignore[return-value]
++    lease_id = uuid.uuid4().hex
++    state_path, lock_path = _lease_paths(registry_home=registry_home)
++    lease = ActiveSessionLease(
++        lease_id=lease_id, session_id=key, surface=str(surface), state_path=state_path,
++        lock_path=lock_path, track_liveness=track_liveness,
++    )
++    with _FileLock(lock_path):
++        try:
++            loaded = _read_live_entries(
++                state_path, track_liveness=track_liveness,
++                warn="Active-session registry is unavailable; refusing the takeover rather than "
++                     "risking a concurrent writer",
++                target_session_id=key,
++            )
++        except ActiveSessionRegistryError:
++            logger.warning("Active-session registry is unavailable; refusing the takeover of %s", key)
++            loaded = None
++        if loaded is None:
++            return None, [], ActiveSessionRefusal(
++                "Hermes could not read the active-session registry at "
++                f"{state_path}, so it cannot safely move this session here. Fix or remove that "
++                "file and try again.",
++                SESSION_COORDINATION_UNAVAILABLE,
++            )
++        entries = loaded[1]
++        held = [e for e in entries if str(e.get("session_id") or "") == key]
++        # The same writer is not a previous owner (re-entrancy, exactly as in try_acquire).
++        owned = [e for e in held if not _is_same_writer(e, metadata)]
++        if held and not owned:
++            entry = _lease_entry(lease_id=lease_id, session_id=key, surface=str(surface),
++                                 metadata=metadata, track_liveness=track_liveness)
++            kept = [e for e in entries if str(e.get("session_id") or "") != key]
++            _write_entries(state_path, [*kept, entry])
++            return lease, [], None
++        if not held:
++            max_sessions = resolve_max_concurrent_sessions(config)
++            if max_sessions is not None and len(entries) >= max_sessions:
++                _write_entries(state_path, entries)
++                return None, [], ActiveSessionRefusal(
++                    active_session_limit_message(len(entries), max_sessions, entries),
++                    MAX_CONCURRENT_SESSIONS)
++        took_over_from = [str(e.get("lease_id") or "") for e in owned]
++        md = dict(metadata or {})
++        if owned:
++            md.update(took_over_from=took_over_from, took_over_at=time.time())
++        entry = _lease_entry(lease_id=lease_id, session_id=key, surface=str(surface),
++                             metadata=md or None, track_liveness=track_liveness)
++        kept = [e for e in entries if str(e.get("session_id") or "") != key]
++        kept.append(entry)
++        _write_entries(state_path, kept)
++    if owned:
++        logger.info("Session %s taken over by pid=%s from lease(s) %s", key, os.getpid(), took_over_from)
++    return lease, owned, None
++
++
++def _registry_state_path(registry_home: str | Path | None, state_path: str | Path | None) -> Path:
++    return Path(state_path) if state_path is not None else _state_path(registry_home)
++
++
++def find_takeover_of(
++    lease_id: str, *, registry_home: str | Path | None = None, state_path: str | Path | None = None,
++) -> Optional[dict[str, Any]]:
++    """The entry that displaced ``lease_id`` (its ``metadata.took_over_from`` names it), else None.
++    Lock-free, tolerant read: a polling watcher must never block writers or crash on a torn file."""
++    target = str(lease_id or "")
++    if not target:
++        return None
++    for entry in _read_entries(_registry_state_path(registry_home, state_path)):
++        taken = (entry.get("metadata") or {}).get("took_over_from") if isinstance(entry.get("metadata"), dict) else None
++        if isinstance(taken, list) and target in taken:
++            return entry
++    return None
++
++
++def acknowledge_takeover(
++    old_lease_id: str, *, registry_home: str | Path | None = None, state_path: str | Path | None = None,
++) -> bool:
++    """Record (under the registry lock) that the displaced owner of ``old_lease_id`` has stopped:
++    appends it to the new entry's ``metadata.handoff_acked``. False when no entry names it."""
++    path = _registry_state_path(registry_home, state_path)
++    target = str(old_lease_id or "")
++    with _FileLock(path.parent / "active_sessions.lock"):
++        try:
++            entries = _read_entries(path, strict=True)
++        except ActiveSessionRegistryError:
++            logger.warning("Active-session registry unreadable; cannot acknowledge takeover of %s", target)
++            return False
++        for entry in entries:
++            md = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else None
++            if md is None or target not in (md.get("took_over_from") or []):
++                continue
++            acked = [str(x) for x in (md.get("handoff_acked") or [])]
++            if target not in acked:
++                acked.append(target)
++                md["handoff_acked"] = acked
++                entry["updated_at"] = time.time()
++                _write_entries(path, entries)
++            return True
++    return False
++
++
++def takeover_acknowledged(new_lease: ActiveSessionLease, old_entries: list[dict[str, Any]]) -> bool:
++    """True when every displaced lease acked the handoff, or its owner process is gone."""
++    if not old_entries:
++        return True
++    own = next((e for e in _read_entries(_registry_state_path(None, new_lease.state_path))
++                if str(e.get("lease_id") or "") == new_lease.lease_id), None)
++    md = (own or {}).get("metadata")
++    acked = set((md.get("handoff_acked") or []) if isinstance(md, dict) else [])
++    return all(
++        str(old.get("lease_id") or "") in acked
++        or _pid_liveness(old.get("pid"), old.get("process_start_time"), lenient=True) is False
++        for old in old_entries
++    )
++
++
+ def release_active_session(lease: ActiveSessionLease) -> None:
+     # Prefer the registry the lease was acquired against: the caller may be
+     # running under a profile HERMES_HOME override.
+diff --git a/tests/hermes_cli/test_active_session_takeover.py b/tests/hermes_cli/test_active_session_takeover.py
+new file mode 100644
+index 0000000000..d1029fdd06
+--- /dev/null
++++ b/tests/hermes_cli/test_active_session_takeover.py
+@@ -0,0 +1,209 @@
++"""Explicit cross-process takeover of a chat's active-session lease.
++
++A chat whose lease another LIVE process holds is refused (SESSION_NOT_OWNED); the user can still
++move it here on purpose ("Take over here"). The takeover replaces the foreign owner's registry entry
++with one for this process that names the displaced lease (``took_over_from``), so the old owner can
++find out, stand down, and acknowledge.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import active_sessions
++from hermes_cli.active_sessions import (
++    SESSION_COORDINATION_UNAVAILABLE,
++    SESSION_NOT_OWNED,
++    acknowledge_takeover,
++    active_session_registry_snapshot,
++    find_takeover_of,
++    take_over_active_session,
++    takeover_acknowledged,
++    try_acquire_active_session,
++)
++
++
++@pytest.fixture(autouse=True)
++def _isolated_registry(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++
++
++def _registry_path() -> Path:
++    return Path(os.environ["HERMES_HOME"]) / "runtime" / "active_sessions.json"
++
++
++def _entries() -> list[dict]:
++    return json.loads(_registry_path().read_text())["entries"]
++
++
++@pytest.fixture
++def foreign_owner():
++    """A real live process (``sleep``) recorded as the owner of session ``S``."""
++    proc = subprocess.Popen(["sleep", "60"])
++    try:
++        start = active_sessions._process_start_time(proc.pid)
++        entry = {
++            "lease_id": "foreign-lease", "session_id": "S", "surface": "desktop", "pid": proc.pid,
++            "process_start_time": start, "started_at": 1000.0, "updated_at": 1000.0,
++            "track_liveness": True, "metadata": {"live_session_id": "other-window"},
++        }
++        _registry_path().parent.mkdir(parents=True, exist_ok=True)
++        _registry_path().write_text(json.dumps({"entries": [entry]}))
++        yield proc, entry
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def test_foreign_live_owner_refuses_a_plain_acquire(foreign_owner):
++    lease, refusal = try_acquire_active_session(
++        session_id="S", surface="desktop", config={}, metadata={"live_session_id": "here"},
++        track_liveness=True)
++    assert lease is None and refusal.reason == SESSION_NOT_OWNED
++
++
++def test_takeover_replaces_a_foreign_live_owner(foreign_owner):
++    proc, _old = foreign_owner
++    lease, removed, refusal = take_over_active_session(
++        session_id="S", surface="desktop", metadata={"live_session_id": "here"}, track_liveness=True)
++
++    assert refusal is None and lease is not None
++    assert [e["lease_id"] for e in removed] == ["foreign-lease"]
++    entries = _entries()
++    assert len(entries) == 1
++    (mine,) = entries
++    assert mine["lease_id"] == lease.lease_id
++    assert mine["pid"] == os.getpid() and mine["session_id"] == "S"
++    assert mine["metadata"]["took_over_from"] == ["foreign-lease"]
++    assert isinstance(mine["metadata"]["took_over_at"], float)
++    assert mine["metadata"]["live_session_id"] == "here"
++    # The old owner is still alive and has not acked yet.
++    assert proc.poll() is None
++    assert takeover_acknowledged(lease, removed) is False
++    # And a plain acquire by the displaced writer now hits the new owner.
++    entry_lease, refused = try_acquire_active_session(
++        session_id="S", surface="desktop", config={}, metadata={"live_session_id": "other-window"})
++    assert entry_lease is None and refused.reason == SESSION_NOT_OWNED
++
++
++def test_takeover_ignores_the_capacity_cap_when_it_displaces(foreign_owner):
++    lease, removed, refusal = take_over_active_session(
++        session_id="S", surface="desktop", metadata={"live_session_id": "here"}, track_liveness=True,
++        config={"max_concurrent_sessions": 1})
++    assert refusal is None and lease is not None and len(removed) == 1
++
++
++def test_takeover_with_nothing_to_displace_is_a_normal_acquire_including_the_cap():
++    _first, refused = try_acquire_active_session(
++        session_id="A", surface="tui", config={}, metadata={"live_session_id": "a"})
++    assert refused is None
++    lease, removed, refusal = take_over_active_session(
++        session_id="B", surface="tui", metadata={"live_session_id": "b"}, config={"max_concurrent_sessions": 1})
++    assert lease is None and removed == [] and refusal.reason == "MAX_CONCURRENT_SESSIONS"
++    lease, removed, refusal = take_over_active_session(
++        session_id="B", surface="tui", metadata={"live_session_id": "b"}, config={})
++    assert refusal is None and removed == []
++    assert "took_over_from" not in (_entries()[-1].get("metadata") or {})
++
++
++def test_same_writer_takeover_is_reentrant():
++    _first, refused = try_acquire_active_session(
++        session_id="S", surface="tui", config={}, metadata={"live_session_id": "me"})
++    assert refused is None
++    lease, removed, refusal = take_over_active_session(
++        session_id="S", surface="tui", metadata={"live_session_id": "me"})
++    assert refusal is None and lease is not None and removed == []
++    entries = _entries()
++    assert [e["lease_id"] for e in entries] == [lease.lease_id]
++    assert "took_over_from" not in entries[0]["metadata"]
++
++
++def test_unreadable_registry_fails_closed():
++    _registry_path().parent.mkdir(parents=True, exist_ok=True)
++    _registry_path().write_text("{not json")
++    for tracked in (False, True):
++        lease, removed, refusal = take_over_active_session(
++            session_id="S", surface="desktop", metadata={"live_session_id": "here"}, track_liveness=tracked)
++        assert lease is None and removed == []
++        assert refusal.reason == SESSION_COORDINATION_UNAVAILABLE
++    assert _registry_path().read_text() == "{not json"  # never overwritten
++
++
++def test_find_acknowledge_and_acknowledged(foreign_owner):
++    lease, removed, _ = take_over_active_session(
++        session_id="S", surface="desktop", metadata={"live_session_id": "here"}, track_liveness=True)
++    found = find_takeover_of("foreign-lease")
++    assert found is not None and found["lease_id"] == lease.lease_id
++    assert find_takeover_of(lease.lease_id) is None
++    assert find_takeover_of("foreign-lease", state_path=_registry_path())["lease_id"] == lease.lease_id
++
++    assert takeover_acknowledged(lease, removed) is False
++    assert acknowledge_takeover("foreign-lease") is True
++    assert acknowledge_takeover("foreign-lease") is True  # idempotent
++    assert _entries()[0]["metadata"]["handoff_acked"] == ["foreign-lease"]
++    assert takeover_acknowledged(lease, removed) is True
++    assert acknowledge_takeover("never-displaced") is False
++
++
++def test_dead_old_owner_counts_as_acknowledged(foreign_owner):
++    proc, _ = foreign_owner
++    lease, removed, _ = take_over_active_session(
++        session_id="S", surface="desktop", metadata={"live_session_id": "here"}, track_liveness=True)
++    assert takeover_acknowledged(lease, removed) is False
++    proc.kill()
++    proc.wait()
++    assert takeover_acknowledged(lease, removed) is True
++
++
++def test_find_takeover_of_tolerates_a_torn_registry():
++    _registry_path().parent.mkdir(parents=True, exist_ok=True)
++    _registry_path().write_text("{torn")
++    assert find_takeover_of("anything") is None
++
++
++def test_registry_snapshot_shows_only_the_new_owner(foreign_owner):
++    lease, _, _ = take_over_active_session(
++        session_id="S", surface="desktop", metadata={"live_session_id": "here"}, track_liveness=True)
++    assert [e["lease_id"] for e in active_session_registry_snapshot()] == [lease.lease_id]
++
++
++def test_takeover_from_another_python_process_is_visible_to_it(tmp_path):
++    """The displaced owner (a real second process) finds the takeover through find_takeover_of."""
++    home = Path(os.environ["HERMES_HOME"])
++    holder = subprocess.Popen(
++        [sys.executable, "-c", (
++            "import sys, time\n"
++            "from hermes_cli.active_sessions import try_acquire_active_session, find_takeover_of, "
++            "acknowledge_takeover\n"
++            "lease, r = try_acquire_active_session(session_id='S', surface='desktop', config={}, "
++            "metadata={'live_session_id': 'a'}, track_liveness=True)\n"
++            "assert r is None, r\n"
++            "print(lease.lease_id, flush=True)\n"
++            "deadline = time.monotonic() + 30\n"
++            "while time.monotonic() < deadline and find_takeover_of(lease.lease_id) is None:\n"
++            "    time.sleep(0.05)\n"
++            "print('acked' if acknowledge_takeover(lease.lease_id) else 'missing', flush=True)\n"
++        )],
++        env={**os.environ, "HERMES_HOME": str(home),
++             "PYTHONPATH": os.pathsep.join(filter(None, [str(Path(__file__).resolve().parents[2]),
++                                                         os.environ.get("PYTHONPATH", "")]))},
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    try:
++        old_lease_id = holder.stdout.readline().strip()
++        assert old_lease_id, holder.stderr.read()
++        lease, removed, refusal = take_over_active_session(
++            session_id="S", surface="desktop", metadata={"live_session_id": "b"}, track_liveness=True)
++        assert refusal is None and [e["lease_id"] for e in removed] == [old_lease_id]
++        assert holder.stdout.readline().strip() == "acked"
++        holder.wait(timeout=30)
++        assert takeover_acknowledged(lease, removed) is True
++    finally:
++        if holder.poll() is None:
++            holder.kill()
++        holder.communicate()
+diff --git a/tests/tui_gateway/test_session_takeover.py b/tests/tui_gateway/test_session_takeover.py
+new file mode 100644
+index 0000000000..cdd5fe5d9c
+--- /dev/null
++++ b/tests/tui_gateway/test_session_takeover.py
+@@ -0,0 +1,308 @@
++"""Cross-process "Take over here": the revocation watcher and the ``session.take_over`` RPC.
++
++The displaced owner is modelled as a REAL live process (``sleep``) recorded in the registry, so the
++liveness checks the production code relies on are exercised, not stubbed.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import threading
++import types
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import active_sessions
++from hermes_cli.active_sessions import SESSION_NOT_OWNED, acknowledge_takeover, take_over_active_session
++from tui_gateway import server, server_requests
++
++SID = "takeover-sid"
++KEY = "takeover-session-key"
++
++
++def _session(**extra) -> dict:
++    return {
++        "agent": None, "session_key": KEY, "history": [], "history_lock": threading.Lock(),
++        "history_version": 0, "running": False, "attached_images": [], "image_counter": 0, "cols": 80,
++        "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "source": "desktop",
++        **extra}
++
++
++def _registry_path() -> Path:
++    return Path(os.environ["HERMES_HOME"]) / "runtime" / "active_sessions.json"
++
++
++def _entries() -> list[dict]:
++    return json.loads(_registry_path().read_text())["entries"]
++
++
++def _write_entries(entries: list[dict]) -> None:
++    _registry_path().parent.mkdir(parents=True, exist_ok=True)
++    _registry_path().write_text(json.dumps({"entries": entries}))
++
++
++@pytest.fixture
++def sleeper():
++    procs = []
++
++    def spawn():
++        proc = subprocess.Popen(["sleep", "60"])
++        procs.append(proc)
++        return proc
++    yield spawn
++    for proc in procs:
++        proc.kill()
++        proc.wait()
++
++
++def _foreign_entry(proc, *, lease_id="foreign-lease", took_over_from=None, live="other-window") -> dict:
++    metadata = {"live_session_id": live}
++    if took_over_from:
++        metadata.update(took_over_from=list(took_over_from), took_over_at=1.0)
++    return {"lease_id": lease_id, "session_id": KEY, "surface": "desktop", "pid": proc.pid,
++            "process_start_time": active_sessions._process_start_time(proc.pid), "started_at": 1000.0,
++            "updated_at": 1000.0, "track_liveness": True, "metadata": metadata}
++
++
++@pytest.fixture
++def env(monkeypatch):
++    emitted: list[tuple] = []
++    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)) or True)
++    server._takeover_watch_stamps.clear()
++    sessions: list[dict] = []
++    yield types.SimpleNamespace(emitted=emitted, sessions=sessions)
++    for session in sessions:
++        server._release_active_session_slot(session)
++    server._sessions.pop(SID, None)
++    server_requests.reset_for_tests()
++
++
++def _own_session(env) -> tuple[dict, object]:
++    session = _session()
++    env.sessions.append(session)
++    server._sessions[SID] = session
++    assert server._ensure_active_session_slot(SID, session) is None
++    lease = session["active_session_lease"]
++    assert lease is not None and not lease.released
++    return session, lease
++
++
++def _foreign_takeover_of(lease, proc) -> None:
++    """What another process's take_over_active_session leaves behind: only ITS entry, naming ours."""
++    _write_entries([_foreign_entry(proc, lease_id="new-owner-lease", took_over_from=[lease.lease_id])])
++
++
++# ── (a) idle owned session ──────────────────────────────────────────────────────────────────────
++
++
++def test_watcher_revokes_an_idle_session_taken_over_by_another_process(env, sleeper):
++    session, lease = _own_session(env)
++    assert server._takeover_watch_pass() == 0  # nothing yet
++
++    _foreign_takeover_of(lease, sleeper())
++    assert server._takeover_watch_pass() == 1
++
++    assert lease.released is True
++    assert "active_session_lease" not in session
++    assert session["_lease_taken_over"] is True
++    errors = [p for e, s, p in env.emitted if e == "error" and s == SID]
++    assert errors == [{"message": "This chat was taken over by another Hermes window.",
++                       "error_surface": {"layer": "gateway", "code": "SESSION_NOT_OWNED", "retryable": False}}]
++    (entry,) = _entries()
++    assert entry["lease_id"] == "new-owner-lease"  # the new owner's entry is untouched
++    assert entry["metadata"]["handoff_acked"] == [lease.lease_id]
++
++    refusal = server._ensure_active_session_slot(SID, session)
++    assert getattr(refusal, "reason", None) == SESSION_NOT_OWNED
++
++    # A second pass is a no-op (nothing held any more).
++    assert server._takeover_watch_pass() == 0
++
++
++def test_watcher_skips_the_read_when_the_registry_did_not_change(env, sleeper, monkeypatch):
++    _session_obj, lease = _own_session(env)
++    assert server._takeover_watch_pass() == 0
++    reads = []
++    real = active_sessions.find_takeover_of
++    monkeypatch.setattr(active_sessions, "find_takeover_of", lambda *a, **k: reads.append(a) or real(*a, **k))
++    assert server._takeover_watch_pass() == 0
++    assert reads == []
++    _foreign_takeover_of(lease, sleeper())
++    assert server._takeover_watch_pass() == 1
++    assert len(reads) == 1
++
++
++def test_watcher_ignores_unrelated_registry_changes(env, sleeper):
++    session, lease = _own_session(env)
++    entries = _entries()
++    _write_entries([*entries, {**_foreign_entry(sleeper()), "session_id": "some-other-chat"}])
++    assert server._takeover_watch_pass() == 0
++    assert session["active_session_lease"] is lease and not lease.released
++    assert env.emitted == []
++
++
++# ── (b) running turn ────────────────────────────────────────────────────────────────────────────
++
++
++def test_watcher_interrupts_a_running_turn(env, sleeper):
++    session, lease = _own_session(env)
++    calls = []
++    session["agent"] = types.SimpleNamespace(hard_interrupt=lambda *a, **k: calls.append("hard_interrupt"))
++    session["running"] = True
++    _foreign_takeover_of(lease, sleeper())
++
++    assert server._takeover_watch_pass() == 1
++    assert calls == ["hard_interrupt"]
++    assert session["_turn_cancel_requested"] is True
++    assert session["running"] is False  # no live run thread: the interrupt settles it
++
++
++# ── (c) pending clarify ─────────────────────────────────────────────────────────────────────────
++
++
++def test_watcher_cancels_a_pending_clarify(env, sleeper):
++    _session_obj, lease = _own_session(env)
++    req = server_requests.ServerRequest(
++        SID, "clarify", {"questions": [{"qid": "q1", "question": "which one?"}]}, qids=["q1"])
++    server_requests._register(req)
++    assert server_requests.open_requests(SID)
++    # The agent thread parked on the answer, as the clarify tool does.
++    unblocked = threading.Event()
++    waiter = threading.Thread(target=lambda: req.event.wait(30) and unblocked.set())
++    waiter.start()
++    _foreign_takeover_of(lease, sleeper())
++
++    assert server._takeover_watch_pass() == 1
++    waiter.join(5)
++    assert unblocked.is_set()
++    assert req.result == {"answers": {}, "outcome": "cancelled"}
++    assert server_requests.open_requests(SID) == []
++
++
++# ── (d) session.take_over RPC ───────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture
++def rpc():
++    """Call the handler synchronously (the dispatcher would run it on the RPC pool) and return its response."""
++    handler = server._methods["session.take_over"]
++    return lambda: handler("t", {"session_id": SID})
++
++
++def _unowned_session(env) -> dict:
++    session = _session()
++    env.sessions.append(session)
++    server._sessions[SID] = session
++    return session
++
++
++def test_take_over_acknowledged_when_the_old_owner_acks(env, sleeper, rpc, monkeypatch):
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "10")
++    proc = sleeper()
++    _write_entries([_foreign_entry(proc)])
++    session = _unowned_session(env)
++    assert getattr(server._ensure_active_session_slot(SID, session), "reason", None) == SESSION_NOT_OWNED
++
++    # The old owner: acks as soon as it sees the takeover (what its watcher does).
++    def old_owner():
++        import time
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            if active_sessions.find_takeover_of("foreign-lease") is not None:
++                acknowledge_takeover("foreign-lease")
++                return
++            time.sleep(0.05)
++    t = threading.Thread(target=old_owner)
++    t.start()
++    resp = rpc()
++    t.join()
++
++    assert resp["result"]["status"] == "taken_over"
++    assert resp["result"]["acknowledged"] is True
++    assert resp["result"]["previous_owner"] == {"surface": "desktop", "pid": proc.pid, "started_at": 1000.0}
++    lease = session["active_session_lease"]
++    (entry,) = _entries()
++    assert entry["lease_id"] == lease.lease_id and entry["pid"] == os.getpid()
++    assert entry["metadata"]["took_over_from"] == ["foreign-lease"]
++    assert server._ensure_active_session_slot(SID, session) is None  # we own it now
++
++
++def test_take_over_not_acknowledged_after_the_timeout(env, sleeper, rpc, monkeypatch):
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "0.3")
++    _write_entries([_foreign_entry(sleeper())])
++    session = _unowned_session(env)
++    resp = rpc()
++    assert resp["result"]["status"] == "taken_over"
++    assert resp["result"]["acknowledged"] is False
++    assert session["active_session_lease"] is not None
++
++
++def test_take_over_reloads_history_from_the_store(env, sleeper, rpc, monkeypatch):
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "0")
++    _write_entries([_foreign_entry(sleeper())])
++    session = _unowned_session(env)
++    stored = [{"role": "user", "content": "hi", "_row_id": 1},
++              {"role": "assistant", "content": "written by the other window", "_row_id": 2}]
++    monkeypatch.setattr(server, "_load_durable_truncation_history", lambda s, **k: list(stored))
++    rpc()
++    assert [m["content"] for m in session["history"]] == ["hi", "written by the other window"]
++    assert session["history_version"] == 1
++
++
++def test_take_over_already_owner(env, rpc):
++    session, lease = _own_session(env)
++    resp = rpc()
++    assert resp["result"] == {"status": "already_owner", "previous_owner": None, "acknowledged": True}
++    assert session["active_session_lease"] is lease
++
++
++def test_take_over_refused_when_the_registry_is_unreadable(env, rpc):
++    _registry_path().parent.mkdir(parents=True, exist_ok=True)
++    _registry_path().write_text("{not json")
++    session = _unowned_session(env)
++    resp = rpc()
++    assert resp["error"]["code"] == 4090
++    assert resp["error"]["data"] == {"reason": "SESSION_COORDINATION_UNAVAILABLE"}
++    assert session.get("active_session_lease") is None
++    assert _registry_path().read_text() == "{not json"
++
++
++def test_take_over_unknown_session(env):
++    resp = server._methods["session.take_over"]("t", {"session_id": "nope"})
++    assert resp["error"]["code"] == 4001
++
++
++def test_take_over_is_a_declared_long_handler():
++    assert "session.take_over" in server._LONG_HANDLERS
++
++
++def test_same_process_sibling_is_revoked_by_the_takeover(env, rpc, monkeypatch):
++    """Another live runtime of the same chat in THIS process (a second window with a live client)."""
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "2")
++    sibling = _session()
++    env.sessions.append(sibling)
++    server._sessions["sibling-sid"] = sibling
++    try:
++        assert server._ensure_active_session_slot("sibling-sid", sibling) is None
++        old_lease = sibling["active_session_lease"]
++        monkeypatch.setattr(server, "_transport_is_dead", lambda t: False)  # the sibling still has a client
++        session = _unowned_session(env)
++        assert getattr(server._ensure_active_session_slot(SID, session), "reason", None) == SESSION_NOT_OWNED
++        resp = rpc()
++        assert resp["result"]["status"] == "taken_over" and resp["result"]["acknowledged"] is True
++        assert old_lease.released and sibling["_lease_taken_over"] is True
++        assert ("error", "sibling-sid") in [(e, s) for e, s, _ in env.emitted]
++    finally:
++        server._sessions.pop("sibling-sid", None)
++
++
++def test_take_over_with_take_over_active_session_contract(env, sleeper):
++    """Direct helper call mirrors what the RPC does for a foreign owner (sanity for the e2e)."""
++    _write_entries([_foreign_entry(sleeper())])
++    lease, removed, refusal = take_over_active_session(
++        session_id=KEY, surface="desktop", metadata={"live_session_id": SID}, track_liveness=True)
++    assert refusal is None and [e["lease_id"] for e in removed] == ["foreign-lease"]
++    lease.release()
+diff --git a/tests/tui_gateway/test_session_takeover_e2e.py b/tests/tui_gateway/test_session_takeover_e2e.py
+new file mode 100644
+index 0000000000..98fce434a7
+--- /dev/null
++++ b/tests/tui_gateway/test_session_takeover_e2e.py
+@@ -0,0 +1,161 @@
++"""End-to-end "Take over here" across TWO real gateway processes sharing one HERMES_HOME.
++
++Process A imports ``tui_gateway.server`` (revocation watcher running), claims the lease for a
++throwaway session X and idles like an open window. Process B imports its own ``tui_gateway.server``
++and calls the ``session.take_over`` handler for X. No model is ever called.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[2]
++KEY = "e2e-takeover-session"
++
++_COMMON = """
++import json, os, sys, threading, time
++from pathlib import Path
++from tui_gateway import server
++from hermes_cli.active_sessions import SESSION_NOT_OWNED
++
++def make_session():
++    return {"agent": None, "session_key": os.environ["KEY"], "history": [], "history_lock": threading.Lock(),
++            "history_version": 0, "running": False, "attached_images": [], "image_counter": 0, "cols": 80,
++            "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "source": "desktop"}
++
++def report(name, payload):
++    path = Path(os.environ["OUT_DIR"]) / name
++    path.with_suffix(".tmp").write_text(json.dumps(payload))
++    path.with_suffix(".tmp").rename(path)
++"""
++
++_OWNER_A = _COMMON + """
++sid = "window-a"
++session = make_session()
++server._sessions[sid] = session
++refusal = server._ensure_active_session_slot(sid, session)
++assert refusal is None, refusal
++lease = session["active_session_lease"]
++report("a_ready.json", {"pid": os.getpid(), "lease_id": lease.lease_id})
++deadline = time.monotonic() + 60
++while not session.get("_lease_taken_over") and time.monotonic() < deadline:
++    time.sleep(0.05)
++taken_at = time.monotonic()
++reclaim = server._ensure_active_session_slot(sid, session)
++report("a_after.json", {
++    "taken_over": bool(session.get("_lease_taken_over")),
++    "lease_released": lease.released,
++    "reclaim_reason": getattr(reclaim, "reason", None),
++    "reclaim_message": str(reclaim) if reclaim is not None else None,
++})
++Path(os.environ["OUT_DIR"], "a_done").touch()
++deadline = time.monotonic() + 60
++while not Path(os.environ["OUT_DIR"], "stop").exists() and time.monotonic() < deadline:
++    time.sleep(0.05)
++"""
++
++_TAKER_B = _COMMON + """
++sid = "window-b"
++session = make_session()
++server._sessions[sid] = session
++before = server._ensure_active_session_slot(sid, session)
++started = time.monotonic()
++resp = server._methods["session.take_over"]("rpc-1", {"session_id": sid})
++elapsed = time.monotonic() - started
++lease = session.get("active_session_lease")
++again = server._methods["session.take_over"]("rpc-2", {"session_id": sid})
++report("b_result.json", {
++    "pid": os.getpid(), "refused_before": getattr(before, "reason", None), "response": resp,
++    "elapsed_s": elapsed, "lease_id": getattr(lease, "lease_id", None), "second": again,
++})
++"""
++
++
++def _spawn(script: str, *, home: Path, out: Path, watcher: bool) -> subprocess.Popen[str]:
++    env = {k: v for k, v in os.environ.items() if not (k.endswith("_API_KEY") or k.endswith("_TOKEN"))}
++    env.update({
++        "HERMES_HOME": str(home), "OUT_DIR": str(out), "KEY": KEY,
++        "PYTHONPATH": os.pathsep.join(p for p in (str(REPO), env.get("PYTHONPATH", "")) if p),
++        "HERMES_SESSION_TAKEOVER_POLL_S": "0.2",
++    })
++    if watcher:
++        # The harness marker keeps the background watcher off in in-process tests; A is a real backend.
++        env.pop("HERMES_TEST_ISOLATION", None)
++    return subprocess.Popen([sys.executable, "-c", script], env=env, cwd=str(REPO),
++                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++
++
++def _wait_file(path: Path, proc: subprocess.Popen[str], timeout: float = 90.0) -> dict | None:
++    deadline = time.monotonic() + timeout
++    while not path.exists():
++        if proc.poll() is not None:
++            out, err = proc.communicate()
++            pytest.fail(f"{path.name}: process exited early rc={proc.returncode}\nstdout={out[-3000:]}\nstderr={err[-6000:]}")
++        if time.monotonic() >= deadline:
++            pytest.fail(f"timed out waiting for {path.name}")
++        time.sleep(0.05)
++    return json.loads(path.read_text()) if path.suffix == ".json" else None
++
++
++def test_take_over_between_two_real_gateway_processes(tmp_path):
++    home = tmp_path / "home"
++    home.mkdir()
++    out = tmp_path / "out"
++    out.mkdir()
++    a = _spawn(_OWNER_A, home=home, out=out, watcher=True)
++    b = None
++    try:
++        a_ready = _wait_file(out / "a_ready.json", a)
++        registry = json.loads((home / "runtime" / "active_sessions.json").read_text())["entries"]
++        assert [(e["session_id"], e["pid"]) for e in registry] == [(KEY, a_ready["pid"])]
++
++        b = _spawn(_TAKER_B, home=home, out=out, watcher=False)
++        b_result = _wait_file(out / "b_result.json", b)
++        a_after = _wait_file(out / "a_after.json", a)
++
++        print("\nA ready:", json.dumps(a_ready))
++        print("B result:", json.dumps(b_result, indent=1))
++        print("A after:", json.dumps(a_after))
++
++        assert b_result["refused_before"] == "SESSION_NOT_OWNED"
++        result = b_result["response"]["result"]
++        assert result["status"] == "taken_over"
++        assert result["acknowledged"] is True
++        assert result["previous_owner"]["pid"] == a_ready["pid"]
++        assert result["previous_owner"]["surface"] == "desktop"
++        assert b_result["elapsed_s"] < 5.0
++        assert b_result["second"]["result"]["status"] == "already_owner"
++
++        assert a_after == {"taken_over": True, "lease_released": True, "reclaim_reason": "SESSION_NOT_OWNED",
++                           "reclaim_message": a_after["reclaim_message"]}
++
++        registry = json.loads((home / "runtime" / "active_sessions.json").read_text())["entries"]
++        print("registry:", json.dumps(registry, indent=1))
++        assert len(registry) == 1
++        (entry,) = registry
++        assert entry["pid"] == b_result["pid"] and entry["lease_id"] == b_result["lease_id"]
++        assert entry["metadata"]["took_over_from"] == [a_ready["lease_id"]]
++        assert entry["metadata"]["handoff_acked"] == [a_ready["lease_id"]]
++
++        (out / "stop").touch()
++        a_stdout, _a_err = a.communicate(timeout=30)
++        frames = [json.loads(line) for line in a_stdout.splitlines() if line.startswith("{")]
++        errors = [f["params"] for f in frames if f.get("method") == "event" and f["params"].get("type") == "error"]
++        print("A error events:", json.dumps(errors))
++        assert any(e.get("session_id") == "window-a"
++                   and e["payload"]["message"] == "This chat was taken over by another Hermes window."
++                   and e["payload"]["error_surface"]["code"] == "SESSION_NOT_OWNED" for e in errors)
++    finally:
++        (out / "stop").touch()
++        for proc in (a, b):
++            if proc is not None and proc.poll() is None:
++                proc.kill()
++            if proc is not None:
++                proc.communicate()
+diff --git a/tui_gateway/contracts/events.py b/tui_gateway/contracts/events.py
+index b9b012e67b..2b6ff7fb32 100644
+--- a/tui_gateway/contracts/events.py
++++ b/tui_gateway/contracts/events.py
+@@ -90,9 +90,11 @@ event("free_tier.challenge", FreeTierChallengePayload,
+ 
+ 
+ class ErrorPayload(Payload):
+-    """Every ``_emit("error", …)`` site sets exactly ``message``."""
++    """Every ``_emit("error", …)`` site sets ``message``; ``error_surface`` rides when the gateway
++    already knows the machine code (the takeover watcher's ``SESSION_NOT_OWNED``)."""
+ 
+     message: str
++    error_surface: ErrorSurface | None = None
+ 
+ 
+ event("error", ErrorPayload, doc="A session-level failure outside a turn (agent init, model switch, compression, resume).")
+@@ -161,6 +163,9 @@ class ErrorSurface(Payload):
+     model_config = Payload.model_config | {"extra": "allow"}
+ 
+ 
++ErrorPayload.model_rebuild()  # its error_surface field names ErrorSurface, declared after it
++
++
+ class BillingBlock(Payload):
+     """``agent/billing_links.py::BillingBlock.to_dict`` (+ ``unverified`` from conversation_loop)."""
+ 
+diff --git a/tui_gateway/contracts/sessions.py b/tui_gateway/contracts/sessions.py
+index 9de8a849c7..b0f118dd28 100644
+--- a/tui_gateway/contracts/sessions.py
++++ b/tui_gateway/contracts/sessions.py
+@@ -620,6 +620,28 @@ method("session.interrupt", params=SessionInterruptParams, result=SessionInterru
+        doc="Stop the running turn (and streaming TTS); retires the crash-recovery marker.")
+ 
+ 
++class TakeOverStatus(WireEnum):
++    taken_over = "taken_over"
++    already_owner = "already_owner"
++
++
++class SessionPreviousOwner(Result):
++    surface: str
++    pid: int | None = None
++    started_at: float | None = None
++
++
++class SessionTakeOverResult(Result):
++    status: TakeOverStatus
++    previous_owner: SessionPreviousOwner | None = None
++    acknowledged: bool
++
++
++method("session.take_over", params=SessionParams, result=SessionTakeOverResult,
++       doc="Move this chat's active-session lease here from another Hermes window/process; the old owner "
++           "stops its turn and acknowledges (``acknowledged`` false when it did not within the timeout).")
++
++
+ class CorrectionStatus(WireEnum):
+     queued = "queued"
+     redirected = "redirected"
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index 6cedbcff1e..8f93439766 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -147,3 +147,5 @@ _correction_method("session.redirect", "redirect", "redirected",
+ def register(server) -> None:
+     """Publish this module's helpers onto ``server`` (rebound to its globals) and install handlers."""
+     bind_module(globals(), server, skip=("_",))
++    from . import methods_session_takeover  # cross-process "Take over here" + its revocation watcher
++    methods_session_takeover.register(server)
+diff --git a/tui_gateway/methods_session_takeover.py b/tui_gateway/methods_session_takeover.py
+new file mode 100644
+index 0000000000..1038d06b35
+--- /dev/null
++++ b/tui_gateway/methods_session_takeover.py
+@@ -0,0 +1,222 @@
++"""Cross-process session takeover: the ``session.take_over`` RPC and the revocation watcher.
++
++Per-session exclusivity (``hermes_cli/active_sessions.py``) refuses a chat whose lease another LIVE
++process holds — e.g. a second Desktop app whose backend runs on this machine. ``session.take_over`` is
++the explicit, user-initiated way past that wall: it rewrites the registry entry to this runtime
++(``take_over_active_session`` records ``took_over_from``) and waits briefly for the old owner to
++acknowledge. Every backend runs :func:`_takeover_watch_pass` on a daemon thread; when it finds one of
++its own leases displaced it stops that runtime's turn, withdraws its open questions, tells its client,
++and acknowledges. The displaced runtime's next submit re-claims and is refused ``SESSION_NOT_OWNED``.
++
++Bodies are rebound onto server.py's globals (``method_ctx.bind_module``), so they reference server.py
++globals bare (``_sessions``, ``_emit``, ``_interrupt_session_turn``, ...).
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import threading
++import time
++
++from tui_gateway._env import env_float
++
++from .method_ctx import HandlerRegistry, bind_module
++
++_registry = HandlerRegistry()
++method = _registry.method
++
++_TAKEOVER_MESSAGE = "This chat was taken over by another Hermes window."
++_TAKEOVER_ERROR_SURFACE = {"layer": "gateway", "code": "SESSION_NOT_OWNED", "retryable": False}
++_TAKEOVER_ACK_POLL_S = 0.25
++
++# Registry file stamp (inode, mtime_ns, size) per path at the last watcher read: an unchanged file
++# cannot hold a new takeover, so the 2 s poll costs one stat() per registry in the common case.
++_takeover_watch_stamps: dict = {}
++_takeover_watch_lock = threading.Lock()
++_takeover_watcher_state: dict = {"started": False}
++
++
++def _takeover_registry_stamp(path) -> tuple | None:
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return st.st_ino, st.st_mtime_ns, st.st_size
++
++
++def _takeover_held_leases() -> list:
++    """``(sid, session, lease)`` for every in-process session holding a real, unreleased lease."""
++    with _sessions_lock:
++        snapshot = [(sid, s, s.get("active_session_lease")) for sid, s in _sessions.items() if isinstance(s, dict)]
++    return [(sid, s, lease) for sid, s, lease in snapshot
++            if lease is not None and getattr(lease, "enabled", False) and not getattr(lease, "released", True)
++            and getattr(lease, "state_path", None) is not None]
++
++
++def _takeover_watch_pass() -> int:
++    """One revocation sweep; returns how many of this process's leases were found taken over."""
++    from hermes_cli.active_sessions import find_takeover_of
++
++    with _takeover_watch_lock:
++        held = _takeover_held_leases()
++        by_path: dict = {}
++        for item in held:
++            by_path.setdefault(str(item[2].state_path), []).append(item)
++        live_paths = set(by_path)
++        for stale in [p for p in _takeover_watch_stamps if p not in live_paths]:
++            _takeover_watch_stamps.pop(stale, None)
++        revoked = 0
++        for path, items in by_path.items():
++            stamp = _takeover_registry_stamp(path)
++            if stamp is not None and _takeover_watch_stamps.get(path) == stamp:
++                continue
++            _takeover_watch_stamps[path] = stamp
++            for sid, session, lease in items:
++                try:
++                    taker = find_takeover_of(lease.lease_id, state_path=path)
++                except Exception:
++                    logger.debug("takeover probe failed for %s", path, exc_info=True)
++                    continue
++                if taker is not None and _revoke_taken_over_lease(sid, session, lease, taker):
++                    revoked += 1
++        return revoked
++
++
++def _revoke_taken_over_lease(sid: str, session: dict, lease, taker: dict) -> bool:
++    """Stand this runtime down: its registry entry is already gone (never touch the new owner's)."""
++    from hermes_cli.active_sessions import acknowledge_takeover
++
++    with _sessions_lock:
++        if lease.released or session.get("active_session_lease") is not lease:
++            return False
++        lease.released = True
++        session.pop("active_session_lease", None)
++        session["_lease_taken_over"] = True  # finalize must not end the row the new owner is writing
++    logger.warning("Session %s (%s) was taken over by pid=%s surface=%s; stopping this runtime",
++                   sid, lease.session_id, taker.get("pid"), taker.get("surface"))
++    try:
++        _interrupt_session_turn(sid, session, request_id="lease-taken-over")
++    except Exception:
++        logger.exception("takeover interrupt failed sid=%s", sid)
++    with contextlib.suppress(Exception):
++        from tui_gateway import server_requests
++        server_requests.cancel(sid, reason="taken_over")  # unblock an agent parked on clarify/approval/sudo
++    with contextlib.suppress(Exception):
++        _emit("error", sid, {"message": _TAKEOVER_MESSAGE, "error_surface": dict(_TAKEOVER_ERROR_SURFACE)})
++    try:
++        acknowledge_takeover(lease.lease_id, state_path=lease.state_path)
++    except Exception:
++        logger.exception("takeover acknowledgement failed sid=%s", sid)
++    return True
++
++
++def _start_takeover_watcher() -> bool:
++    """Start the daemon revocation watcher once per process (``HERMES_SESSION_TAKEOVER_POLL_S``, default
++    2 s; <= 0 disables). Off under the test harness (``HERMES_TEST_ISOLATION``): tests drive
++    :func:`_takeover_watch_pass` directly and a background pass would race their assertions."""
++    from agent.memory_provider import spawn_context_thread
++
++    poll = env_float("HERMES_SESSION_TAKEOVER_POLL_S", 2.0)
++    if _takeover_watcher_state["started"] or poll <= 0 or os.environ.get("HERMES_TEST_ISOLATION"):
++        return False
++    _takeover_watcher_state["started"] = True
++
++    def _loop():
++        while True:
++            time.sleep(poll)
++            try:
++                _takeover_watch_pass()
++            except Exception:
++                logger.debug("session takeover watcher pass failed", exc_info=True)
++
++    spawn_context_thread(_loop, name="session-takeover-watch").start()
++    return True
++
++
++def _await_takeover_ack(lease, removed: list) -> bool:
++    """Wait (``HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S``, default 8 s) for every displaced owner to ack."""
++    from hermes_cli.active_sessions import takeover_acknowledged
++
++    if not removed:
++        return True
++    deadline = time.monotonic() + max(0.0, env_float("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", 8.0))
++    while True:
++        with contextlib.suppress(Exception):
++            if takeover_acknowledged(lease, removed):
++                return True
++        if time.monotonic() >= deadline:
++            return False
++        time.sleep(_TAKEOVER_ACK_POLL_S)
++
++
++def _reload_history_after_takeover(session: dict) -> bool:
++    """Re-read the transcript from state.db so the next turn sees the rows the old owner wrote."""
++    if session.get("running"):
++        return False
++    rows = _load_durable_truncation_history(session, repair_alternation=True)
++    if rows is None:
++        return False
++    history = canonicalize_replay_history(rows)
++    with session["history_lock"]:
++        if session.get("running"):
++            return False
++        session["history"] = history
++        session["history_version"] = int(session.get("history_version", 0)) + 1
++    return True
++
++
++def _takeover_previous_owner(entry: dict | None) -> dict | None:
++    if not entry:
++        return None
++    pid = entry.get("pid")
++    started = entry.get("started_at")
++    return {"surface": str(entry.get("surface") or "unknown"),
++            "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
++            "started_at": float(started) if isinstance(started, (int, float)) else None}
++
++
++@method("session.take_over")
++@_registry.profile_scoped
++def _(rid, params: dict) -> dict:
++    session, err = _sess_nowait(params, rid)
++    if err:
++        return err
++    sid = str(params.get("session_id") or "")
++    if session.get("active_session_lease") is not None:
++        return _ok(rid, {"status": "already_owner", "previous_owner": None, "acknowledged": True})
++    key = str(session.get("session_key") or "")
++    surface = _session_source(session)
++    if key and _take_over_detached_runtime_lease(sid, session, key):
++        _reload_history_after_takeover(session)
++        return _ok(rid, {"status": "taken_over", "acknowledged": True,
++                         "previous_owner": {"surface": surface, "pid": os.getpid(), "started_at": None}})
++    from hermes_cli.active_sessions import take_over_active_session
++    try:
++        lease, removed, refusal = take_over_active_session(
++            session_id=key, surface=surface, metadata=_lease_metadata(sid),
++            registry_home=session.get("profile_home"), config=_load_cfg(),
++            track_liveness=str(surface or "").strip().lower() == "desktop")
++    except Exception:  # health: allow BLE001 -- any registry/lock failure must fail CLOSED as a refusal, logged with traceback
++        logger.warning("session.take_over failed for %s", key, exc_info=True)
++        return _err(rid, 4090, _SESSION_OWNERSHIP_UNAVAILABLE, {"reason": "SESSION_COORDINATION_UNAVAILABLE"})
++    if refusal is not None:
++        reason = getattr(refusal, "reason", None)
++        return _err(rid, 4090, str(refusal), {"reason": reason} if reason else None)
++    _attach_lease(session, lease)
++    with contextlib.suppress(Exception):
++        _takeover_watch_pass()  # a displaced same-process sibling stands down now, not on the next tick
++    acknowledged = _await_takeover_ack(lease, removed)
++    try:
++        _reload_history_after_takeover(session)
++    except Exception:
++        logger.warning("session.take_over: history reload failed for %s", key, exc_info=True)
++    return _ok(rid, {"status": "taken_over", "acknowledged": acknowledged,
++                     "previous_owner": _takeover_previous_owner(removed[0] if removed else None)})
++
++
++def register(server) -> None:
++    """Publish this module's helpers onto ``server`` (rebound to its globals), install the handler, and
++    start the revocation watcher."""
++    bind_module(globals(), server, skip=("_",))
++    server._start_takeover_watcher()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 849d42bfda..f1987cb61f 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -193,7 +193,7 @@ _LONG_HANDLERS = frozenset({
+     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
+     "session.resume", "session.save", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
+     "onboarding.ensure_setup_profile", "onboarding.ensure_setup_session", "onboarding.reset_setup_profile",
+-    "session.start_chat",
++    "session.start_chat", "session.take_over",  # take_over waits for the old owner's ack
+     "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
+     "shared_metrics.set",  # consent reconcile waits on the metrics store's write lock
+ })
+-- 
+2.54.0 (Apple Git-157)
+

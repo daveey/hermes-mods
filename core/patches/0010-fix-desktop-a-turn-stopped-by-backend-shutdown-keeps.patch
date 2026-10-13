@@ -1,0 +1,111 @@
+From 91d62dbeae1b73fc902f41b63c4cd1e3493889a4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:12:57 -0700
+Subject: [PATCH] fix(desktop): a turn stopped by backend shutdown keeps its
+ crash marker so auto-continue resumes it [daveey]
+
+---
+ .../test_exit_keeps_turn_marker.py            | 58 +++++++++++++++++++
+ tui_gateway/session_auto_continue.py          |  5 +-
+ tui_gateway/session_reaper.py                 |  4 ++
+ 3 files changed, 66 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tui_gateway/test_exit_keeps_turn_marker.py
+
+diff --git a/tests/tui_gateway/test_exit_keeps_turn_marker.py b/tests/tui_gateway/test_exit_keeps_turn_marker.py
+new file mode 100644
+index 0000000000..7962ae3873
+--- /dev/null
++++ b/tests/tui_gateway/test_exit_keeps_turn_marker.py
+@@ -0,0 +1,58 @@
++"""A turn stopped by backend shutdown (SIGTERM/atexit) must keep its crash marker so desktop auto-continue
++resumes it on the next boot; a turn the user stopped must still retire it.
++
++Before this, ``_stop_turns_before_exit`` interrupted the turn cleanly, the turn's terminal frame ran
++``_retire_turn_marker``, and a backend restart (``hermes-sync``, update, respawn) looked like a user Stop:
++nothing auto-continued and the chat sat on "Operation interrupted: waiting for model response".
++"""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from tui_gateway import server
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++
++@pytest.fixture
++def running_session(tmp_path):
++    registered: list[str] = []
++
++    def _make(key: str) -> dict:
++        session = {"agent": None, "session_key": key, "running": True, "profile_home": str(tmp_path),
++                   "history_lock": threading.RLock()}
++        record_turn_start(tmp_path, key, "do the thing")
++        with server._sessions_lock:
++            server._sessions[key] = session
++        registered.append(key)
++        return session
++
++    yield _make
++    with server._sessions_lock:
++        for key in registered:
++            server._sessions.pop(key, None)
++
++
++def test_shutdown_interrupted_turn_keeps_marker(running_session, tmp_path):
++    session = running_session("sess-exit")
++    server._stop_turns_before_exit(budget_s=0)
++    # The interrupted turn now reaches its terminal frame, which retires the marker on a normal stop.
++    server._retire_turn_marker(session, "sess-exit")
++    marker = read_turn_marker(tmp_path, "sess-exit")
++    assert marker is not None and marker["prompt"] == "do the thing"
++
++
++def test_user_stopped_turn_still_retires_marker(running_session, tmp_path):
++    session = running_session("sess-user-stop")
++    server._retire_turn_marker(session, "sess-user-stop")
++    assert read_turn_marker(tmp_path, "sess-user-stop") is None
++
++
++def test_idle_session_not_flagged_at_exit(running_session, tmp_path):
++    session = running_session("sess-idle")
++    session["running"] = False
++    server._stop_turns_before_exit(budget_s=0)
++    server._retire_turn_marker(session, "sess-idle")
++    assert read_turn_marker(tmp_path, "sess-idle") is None
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 9615b5a927..b0378324af 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -40,7 +40,10 @@ def _session_home(session: dict) -> Path:
+ def _retire_turn_marker(session: dict, *keys: str) -> None:
+     """Drop the crash marker right before the terminal frame (not at turn-thread end: post-turn work outlives the
+     client's answer, and quitting in that window would leave a marker that re-runs a finished turn). Extra ``keys``
+-    cover a session_key that compression rotated mid-turn."""
++    cover a session_key that compression rotated mid-turn. A turn stopped by backend shutdown keeps its marker
++    (``_stop_turns_before_exit`` flags it) so the next boot auto-continues it like a crash."""
++    if session.get("_exit_keeps_turn_marker"):
++        return
+     home = _session_home(session)
+     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
+         if key:
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 6c6eb4c286..db37a516a2 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -127,6 +127,10 @@ def _stop_turns_before_exit(budget_s: float | None = None) -> None:
+         running = [(sid, s) for sid, s in _sessions.items() if s.get("running")]
+     threads = []
+     for sid, session in running:
++        # A backend exit is not a user Stop: keep the crash marker so auto-continue resumes this turn on the
++        # next boot (the interrupted turn's terminal frame would otherwise retire it).
++        with contextlib.suppress(Exception), session["history_lock"]:
++            session["_exit_keeps_turn_marker"] = True
+         with contextlib.suppress(Exception):
+             _interrupt_session_turn(sid, session)
+         if (t := session.get("_run_thread")) is not None and t is not threading.current_thread():
+-- 
+2.54.0 (Apple Git-157)
+

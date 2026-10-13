@@ -1,0 +1,174 @@
+From 09564ce1be205aa0926c1d0e89f9c90b6322f330 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:06:37 -0700
+Subject: [PATCH] fix(desktop): moving a session into a project doesn't switch
+ to it [daveey]
+
+---
+ apps/desktop/src/store/projects.test.ts | 62 ++++++++++++++++++++++++-
+ apps/desktop/src/store/projects.ts      | 37 ++++++++++++++-
+ 2 files changed, 97 insertions(+), 2 deletions(-)
+
+diff --git a/apps/desktop/src/store/projects.test.ts b/apps/desktop/src/store/projects.test.ts
+index b3d57712aa..87b7fd96f1 100644
+--- a/apps/desktop/src/store/projects.test.ts
++++ b/apps/desktop/src/store/projects.test.ts
+@@ -3,7 +3,7 @@ import { atom } from 'nanostores'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
+-import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
++import { $sidebarAgentsGrouped, $sidebarShowAllSessions, setSidebarAgentsGrouped } from '@/store/layout'
+ import { $activeGatewayProfile, $profiles, $profileScope, ALL_PROFILES, setShowAllProfiles } from '@/store/profile'
+ import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
+ import { deferred } from '@/test/deferred'
+@@ -22,6 +22,8 @@ import {
+   deleteProject,
+   enterProject,
+   fetchProjectSessions,
++  followActiveSessionCwd,
++  moveSessionToProject,
+   openProjectCreate,
+   pickProjectFolder,
+   pickProjectFolders,
+@@ -95,6 +97,11 @@ const getHermesConfig = vi.mocked(hermes.getHermesConfig)
+ const notifications = await import('@/store/notifications')
+ const notify = vi.mocked(notifications.notify)
+ 
++// RPC assertions below expect the capped preview_limit ("Show all sessions" off).
++beforeEach(() => {
++  $sidebarShowAllSessions.set(false)
++})
++
+ describe('project scope', () => {
+   beforeEach(() => {
+     window.localStorage.clear()
+@@ -1295,3 +1302,56 @@ describe('tombstone pruning', () => {
+     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+   })
+ })
++
++describe('moveSessionToProject keeps the sidebar scope', () => {
++  const tree: SidebarProjectTree[] = [
++    { id: 'p_src', label: 'Src', path: '/repos/src', repos: [], sessionCount: 1 },
++    { id: 'p_dest', label: 'Dest', path: '/repos/dest', repos: [], sessionCount: 0 }
++  ]
++
++  let moveHook: (() => Promise<void>) | null = null
++
++  beforeEach(() => {
++    vi.clearAllMocks()
++    setShowAllProfiles(false)
++    $activeGatewayProfile.set('default')
++    $projectTree.set(tree)
++    $projectScope.set('p_src')
++    moveHook = null
++    const request = vi.fn(async (method: string) => {
++      if (method === 'projects.tree') {
++        return { active_id: null, projects: tree, scoped_session_ids: [] }
++      }
++
++      if (method === 'projects.list') {
++        return { active_id: null, projects: [] }
++      }
++
++      if (method === 'session.workspace.move') {
++        await moveHook?.()
++
++        return { branch: null, cwd: '/repos/dest', git_repo_root: null }
++      }
++
++      return {}
++    })
++    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
++  })
++
++  it('control: a live agent cwd move still follows into the new project', async () => {
++    await followActiveSessionCwd('/repos/dest')
++    expect($projectScope.get()).toBe('p_dest')
++  })
++
++  it('does not enter the destination when session.info lands during the move RPC', async () => {
++    moveHook = () => followActiveSessionCwd('/repos/dest')
++    await moveSessionToProject('s1', 'p_dest')
++    expect($projectScope.get()).toBe('p_src')
++  })
++
++  it('does not enter the destination when session.info lands after the move RPC', async () => {
++    await moveSessionToProject('s1', 'p_dest')
++    await followActiveSessionCwd('/repos/dest')
++    expect($projectScope.get()).toBe('p_src')
++  })
++})
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index 4bbc5e3ade..9a70a5a465 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -271,7 +271,7 @@ export function projectNameForCwd(cwd: string): null | string {
+ export async function followActiveSessionCwd(cwd: string): Promise<void> {
+   const target = cwd.trim()
+ 
+-  if (!target) {
++  if (!target || consumeMoveFollowSuppression(target)) {
+     return
+   }
+ 
+@@ -783,6 +783,34 @@ interface WorkspaceMovePayload {
+   git_repo_root?: null | string
+ }
+ 
++// "Move to project" relocates the session's cwd, and the backend echoes that
++// as a session.info cwd change on the selected chat — which would otherwise
++// look like an agent-driven move and yank the sidebar into the destination.
++// A move is filing, not navigation: remember the destination briefly so the
++// follow for that cwd is skipped (local fix: sidebar-move-no-follow).
++const MOVE_FOLLOW_SUPPRESS_MS = 15_000
++const moveFollowSuppressed = new Map<string, number>()
++
++function suppressMoveFollow(cwd: string): void {
++  const target = cwd.trim()
++
++  if (target) {
++    moveFollowSuppressed.set(target, Date.now() + MOVE_FOLLOW_SUPPRESS_MS)
++  }
++}
++
++function consumeMoveFollowSuppression(cwd: string): boolean {
++  const until = moveFollowSuppressed.get(cwd)
++
++  if (until === undefined) {
++    return false
++  }
++
++  moveFollowSuppressed.delete(cwd)
++
++  return until >= Date.now()
++}
++
+ // Re-home a stored session into another project's root folder — the fix for a
+ // chat created in the wrong directory. The backend replaces cwd + git identity
+ // (so the tree's grouping follows) and re-anchors any live agent bound to the
+@@ -799,6 +827,8 @@ export async function moveSessionToProject(
+     throw new Error(translateNow('sidebar.projects.moveNoFolder'))
+   }
+ 
++  suppressMoveFollow(cwd)
++
+   const res = await gatewayRequest<WorkspaceMovePayload>('session.workspace.move', {
+     cwd,
+     session_key: sessionId,
+@@ -806,6 +836,11 @@ export async function moveSessionToProject(
+   })
+ 
+   const moved = res.cwd || cwd
++
++  if (moved !== cwd) {
++    // Backend normalized the path; the session.info echo carries that form.
++    suppressMoveFollow(moved)
++  }
+   setSessions(prev =>
+     prev.map(s =>
+       sessionMatchesStoredId(s, sessionId)
+-- 
+2.54.0 (Apple Git-157)
+

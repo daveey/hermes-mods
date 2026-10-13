@@ -1,0 +1,154 @@
+From 97571b43bbc430152e6f0c1c05962da8206cda74 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:36:02 -0700
+Subject: [PATCH] fix(serve): --stop leaves Hermes Desktop-owned backends
+ running [daveey]
+
+---
+ hermes_cli/dashboard_procs.py                 | 18 ++++++-
+ hermes_cli/main.py                            | 18 +++++--
+ .../test_dashboard_lifecycle_flags.py         | 50 +++++++++++++++++++
+ 3 files changed, 80 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/dashboard_procs.py b/hermes_cli/dashboard_procs.py
+index 77a516f542..9d33b23894 100644
+--- a/hermes_cli/dashboard_procs.py
++++ b/hermes_cli/dashboard_procs.py
+@@ -589,10 +589,12 @@ def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int,
+ def _kill_stale_dashboard_processes(
+     reason: str = "the running backend no longer matches the updated frontend", *,
+     restart_managed: bool = False, already_restarted_units: set[str] | None = None,
+-    scope_home: str | None = None,
++    scope_home: str | None = None, exclude_pids: set[int] | None = None,
+ ) -> dict[str, list]:
+     """Kill running ``hermes dashboard`` / ``hermes serve`` processes (update end, ``--stop``).
+ 
++    *exclude_pids* are never candidates (``--stop`` passes the Desktop-owned backends here).
++
+     With ``restart_managed`` (update only) systemd-owned PIDs get their unit restarted after the
+     kill (systemd treats our SIGTERM as a clean stop, so ``Restart=on-failure`` never fires) and
+     manual PIDs are respawned from captured argv. PIDs owned by *already_restarted_units* (no
+@@ -617,7 +619,7 @@ def _kill_stale_dashboard_processes(
+         _dash_unit = getattr(_dash, "_DASHBOARD_SYSTEMD_UNIT", "hermes-dashboard.service")
+         already_restarted_units = set(already_restarted_units or ()) | {
+             str(_dash_unit).removesuffix(".service")}
+-    exclude = _exclude_pids_from_env()
++    exclude = _exclude_pids_from_env() | set(exclude_pids or ())
+     if restart_managed:
+         # An SSH-owned backend belongs to an attached Desktop client; killing it strands that
+         # client's fixed SSH port-forward. Same ownership records as the reaper.
+@@ -901,6 +903,18 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
+     return owned
+ 
+ 
++def _desktop_owned_backend_pids(pids) -> set[int]:
++    """The subset of *pids* a running Hermes Desktop owns: spawned by it (``HERMES_DESKTOP=1`` in the
++    process environment, incl. pool backends), marked live via ``HERMES_DESKTOP_CHILD_PID``, or claimed by
++    a valid ``desktop-ssh/<id>/backend.lock.json`` (an SSH-attached Desktop). ``hermes serve --stop`` spares
++    these: killing one SIGTERMs the app's backend and interrupts every turn it is running."""
++    owned = (_lock_owned_serve_pids() | _exclude_pids_from_env()) & set(pids)
++    for pid in pids:
++        if pid not in owned and ((_pid_environ(pid) or {}).get("HERMES_DESKTOP") == "1"):
++            owned.add(pid)
++    return owned
++
++
+ def read_valid_backend_lock(lock_path: Path) -> dict | None:
+     """The validated body of one ``desktop-ssh/<ownershipId>/backend.lock.json``, or None when it is
+     missing, unreadable, oversized or does not match the writer's schema (never raises)."""
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index ff938bf627..261dce62d3 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2536,16 +2536,26 @@ def _dashboard_lifecycle_flags(args, token_file) -> None:
+         from hermes_constants import get_hermes_home
+ 
+         own_home = str(get_hermes_home())
+-        if not _find_stale_dashboard_pids(scope_home=own_home):
++        pids = _find_stale_dashboard_pids(scope_home=own_home)
++        if not pids:
+             print("No hermes dashboard processes running for this profile.")
+             sys.exit(0)
++        from hermes_cli import dashboard_procs as _procs
++
++        # Backends a running Hermes Desktop owns are its lifecycle, not --stop's: killing one SIGTERMs
++        # the app's backend and interrupts every turn in it (quit the app to stop them).
++        desktop = _procs._desktop_owned_backend_pids(pids)
++        if desktop:
++            print(f"Leaving {len(desktop)} Hermes Desktop backend(s) running (PID "
++                  f"{', '.join(map(str, sorted(desktop)))}); quit the app to stop them.")
++        if not [p for p in pids if p not in desktop]:
++            sys.exit(0)
+         # Reuse the same SIGTERM-grace-SIGKILL path used after `hermes update`;
+         # it prints outcomes itself. Exit 1 only if a pid was unkillable — judged
+         # from the kill result, not a re-scan: a launchd KeepAlive job respawns
+         # its backend on a fresh PID, which is not a failed stop.
+-        from hermes_cli.dashboard_procs import _kill_stale_dashboard_processes
+-
+-        result = _kill_stale_dashboard_processes(reason="requested via --stop", scope_home=own_home)
++        result = _procs._kill_stale_dashboard_processes(
++            reason="requested via --stop", scope_home=own_home, exclude_pids=desktop)
+         sys.exit(1 if result["failed"] else 0)
+ 
+ 
+diff --git a/tests/hermes_cli/test_dashboard_lifecycle_flags.py b/tests/hermes_cli/test_dashboard_lifecycle_flags.py
+index 99af7ca397..f8dac211de 100644
+--- a/tests/hermes_cli/test_dashboard_lifecycle_flags.py
++++ b/tests/hermes_cli/test_dashboard_lifecycle_flags.py
+@@ -191,3 +191,53 @@ class TestLifecycleFlagsTakePrecedence:
+              pytest.raises(SystemExit):
+             cmd_dashboard(_ns(stop=True))
+         assert called["start"] is False
++
++
++class TestDashboardStopSparesDesktop:
++    """``hermes serve --stop`` must not kill backends a running Hermes Desktop owns: an agent inside that
++    app running ``--stop`` to bounce a launchd serve SIGTERMed the app's own backend and every live turn."""
++
++    def test_stop_skips_desktop_owned_pids(self, capsys):
++        with patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[111, 222]), \
++             patch("hermes_cli.dashboard_procs._desktop_owned_backend_pids", return_value={111}), \
++             patch("hermes_cli.dashboard_procs._kill_stale_dashboard_processes",
++                   return_value={"matched": [222], "killed": [222], "failed": [], "unrecovered": []}) as kill, \
++             pytest.raises(SystemExit) as exc:
++            cmd_dashboard(_ns(stop=True))
++        assert exc.value.code == 0
++        assert 111 in kill.call_args.kwargs["exclude_pids"]
++        assert "Hermes Desktop" in capsys.readouterr().out
++
++    def test_stop_with_only_desktop_backends_kills_nothing(self, capsys):
++        with patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[111]), \
++             patch("hermes_cli.dashboard_procs._desktop_owned_backend_pids", return_value={111}), \
++             patch("hermes_cli.dashboard_procs._kill_stale_dashboard_processes") as kill, \
++             pytest.raises(SystemExit) as exc:
++            cmd_dashboard(_ns(stop=True))
++        kill.assert_not_called()
++        assert exc.value.code == 0
++        assert "Hermes Desktop" in capsys.readouterr().out
++
++
++def test_desktop_owned_backend_pids_classifies_by_env_and_lock(monkeypatch):
++    from hermes_cli import dashboard_procs as dp
++    envs = {1: {"HERMES_DESKTOP": "1"}, 2: {"HERMES_HOME": "/x"}, 3: None, 4: {}}
++    monkeypatch.setattr(dp, "_pid_environ", lambda pid: envs.get(pid))
++    monkeypatch.setattr(dp, "_lock_owned_serve_pids", lambda base_dir=None: {4})
++    monkeypatch.delenv("HERMES_DESKTOP_CHILD_PID", raising=False)
++    assert dp._desktop_owned_backend_pids([1, 2, 3, 4]) == {1, 4}
++
++
++def test_kill_stale_dashboard_processes_honours_exclude_pids(monkeypatch):
++    from hermes_cli import dashboard_procs as dp
++    from hermes_cli import main_dashboard as md
++    seen = {}
++
++    def fake_find(*, exclude_pids=None, scope_home=None):
++        seen["exclude"] = set(exclude_pids or ())
++        return []
++
++    monkeypatch.setattr(md, "_find_stale_dashboard_pids", fake_find)
++    monkeypatch.delenv("HERMES_DESKTOP_CHILD_PID", raising=False)
++    dp._kill_stale_dashboard_processes(reason="requested via --stop", exclude_pids={777})
++    assert 777 in seen["exclude"]
+-- 
+2.54.0 (Apple Git-157)
+

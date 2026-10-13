@@ -1,0 +1,328 @@
+From 926da3c8568e7d1708c5d6a14f3001822fbcbac8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 23:10:14 -0700
+Subject: [PATCH] feat(desktop): a hidden chat's agent keeps driving its own
+ Browser page [daveey]
+
+Switching chats parked the session's Browser tab (still mounted) but every
+preview.read/preview.act was declined as 'no Hermes Desktop window is showing
+this chat', stalling long browser tasks. The window holding the session's
+parked page now claims those two requests and acts only in that session's own
+off-screen tab - never a pin, never the page on screen. Tours and terminal
+reads keep the shown-session rule.
+---
+ .../app/chat/right-rail/preview-active-tab.ts |  41 ++++++-
+ .../src/app/chat/right-rail/preview-reader.ts |   4 +-
+ .../gateway-event/server-requests.test.ts     | 116 ++++++++++++++++++
+ .../gateway-event/server-requests.ts          |  38 +++++-
+ apps/desktop/src/store/preview.ts             |   8 ++
+ 5 files changed, 196 insertions(+), 11 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/right-rail/preview-active-tab.ts b/apps/desktop/src/app/chat/right-rail/preview-active-tab.ts
+index 79f64abb23..59c37703f0 100644
+--- a/apps/desktop/src/app/chat/right-rail/preview-active-tab.ts
++++ b/apps/desktop/src/app/chat/right-rail/preview-active-tab.ts
+@@ -12,9 +12,10 @@
+ import { findGroup } from '@/components/pane-shell/tree/model'
+ import { $activeTreeGroup, $hoveredTreeGroup, $layoutTree } from '@/components/pane-shell/tree/store'
+ import { $rightRailActiveTabId } from '@/store/layout'
+-import { type PreviewTab, previewTabsFor } from '@/store/preview'
++import { $visiblePreviewTabs, type PreviewTab, previewTabsFor, rememberedPreviewTabId } from '@/store/preview'
+ import { explicitOpenBlocksZone, PREVIEW_TILE_PREFIX } from '@/store/preview-explicit'
+-import type { PreviewOwner } from '@/store/preview-ownership'
++import { ownerIdentity, type PreviewOwner } from '@/store/preview-ownership'
++import { isBrowserWindow } from '@/store/windows'
+ 
+ function tabIdFromPreviewPane(paneId: string | undefined): null | string {
+   if (!paneId?.startsWith(`${PREVIEW_TILE_PREFIX}:`)) {
+@@ -69,8 +70,40 @@ export function resolveActivePreviewTab(tabs: readonly PreviewTab[] = previewTab
+   return tabs.find(tab => tab.id === $rightRailActiveTabId.get()) ?? tabs[0] ?? null
+ }
+ 
++/**
++ * The page a HIDDEN session's agent works in: one of that session's OWN tabs
++ * while none of them is on screen (the user switched chats; the guest stays
++ * mounted, parked and inert — see parked-panes.ts). Never a pinned tab: pins
++ * render in every session, so the user may be looking at one. Null when the
++ * owner's tabs are on screen (normal focus/hover resolution applies), when it
++ * owns no tab, or in a popped-out Browser window (it answers for its one tab).
++ * Prefers the tab the session last had in front, then its first web page.
++ */
++export function backgroundPreviewTabFor(owner: PreviewOwner | undefined): null | PreviewTab {
++  if (owner === undefined || isBrowserWindow()) {
++    return null
++  }
++
++  const own = previewTabsFor(owner).filter(tab => !tab.pinned)
++
++  if (own.length === 0) {
++    return null
++  }
++
++  const onScreen = new Set($visiblePreviewTabs.get().map(tab => tab.id))
++
++  if (own.some(tab => onScreen.has(tab.id))) {
++    return null
++  }
++
++  const remembered = rememberedPreviewTabId(ownerIdentity(owner).sessionId)
++
++  return own.find(tab => tab.id === remembered) ?? own.find(tab => tab.target.kind === 'url') ?? own[0] ?? null
++}
++
+ /** The active preview among the tabs `owner` (a stored id; null = a session
+- *  with none yet; omitted = the focused session) may see. */
++ *  with none yet; omitted = the focused session) may see. A hidden session
++ *  resolves to its own parked page (backgroundPreviewTabFor). */
+ export function activePreviewTabFor(owner?: PreviewOwner): null | PreviewTab {
+-  return resolveActivePreviewTab(previewTabsFor(owner))
++  return backgroundPreviewTabFor(owner) ?? resolveActivePreviewTab(previewTabsFor(owner))
+ }
+diff --git a/apps/desktop/src/app/chat/right-rail/preview-reader.ts b/apps/desktop/src/app/chat/right-rail/preview-reader.ts
+index ef867d69c2..3ec320cadb 100644
+--- a/apps/desktop/src/app/chat/right-rail/preview-reader.ts
++++ b/apps/desktop/src/app/chat/right-rail/preview-reader.ts
+@@ -16,7 +16,7 @@
+ import { type PreviewTab, previewTabsFor } from '@/store/preview'
+ import type { PreviewOwner } from '@/store/preview-ownership'
+ 
+-import { resolveActivePreviewTab } from './preview-active-tab'
++import { backgroundPreviewTabFor, resolveActivePreviewTab } from './preview-active-tab'
+ import { nudgeOverlay } from './preview-nudge'
+ 
+ export interface PreviewReadOptions {
+@@ -118,7 +118,7 @@ export async function readActivePreview(
+   sessionId?: PreviewOwner
+ ): Promise<null | PreviewReadResult> {
+   const tabs = previewTabsFor(sessionId)
+-  const tab = resolveActivePreviewTab(tabs)
++  const tab = backgroundPreviewTabFor(sessionId) ?? resolveActivePreviewTab(tabs)
+ 
+   if (!tab) {
+     return null
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+index 41367d7ead..4562f1cce2 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+@@ -543,6 +543,122 @@ describe('preview requests act for the session that asked (#73890)', () => {
+   })
+ })
+ 
++describe('a hidden session keeps driving its own parked Browser page', () => {
++  // The user switched from chat A to chat B mid-task. A's Browser tab left the
++  // layout tree but stays mounted (parked), so A's agent keeps working in it.
++  beforeEach(() => {
++    hasLivePreviewSurface.mockReturnValue(true)
++    closeRightRail()
++    publishSessionState('rt-a', createClientSessionState('stored-a'))
++    setActiveSessionId('rt-b')
++    setSelectedStoredSessionId('stored-b')
++  })
++
++  afterEach(() => {
++    dropSessionState('rt-a')
++    setActiveSessionId(null)
++    setSelectedStoredSessionId(null)
++    closeRightRail()
++    hasLivePreviewSurface.mockReturnValue(false)
++  })
++
++  const openOwn = (owner: string, host: string) => {
++    openPreview({ kind: 'url', label: host, source: `https://${host}`, url: `https://${host}` }, owner)
++
++    return $previewTabs.get().find(tab => tab.target.url === `https://${host}`)!
++  }
++
++  it("acts in the hidden session's own tab, never the page on screen", async () => {
++    const a = openOwn('stored-a', 'flow.example')
++    const b = openOwn('stored-b', 'b.example')
++    const backA = vi.fn()
++    const backB = vi.fn()
++
++    const unbind = [
++      registerPreviewNav(a.id, { back: backA, forward: () => {}, reload: () => {} }),
++      registerPreviewNav(b.id, { back: backB, forward: () => {}, reload: () => {} })
++    ]
++
++    try {
++      const { decline, respond } = deliver('preview.act', { action: 'back', session_id: 'rt-a' }, 'rt-b')
++
++      await vi.waitFor(() => expect(respond).toHaveBeenCalledTimes(1), { timeout: 30_000 })
++      expect(JSON.parse(respond.mock.calls[0][0].value)).toMatchObject({ acted: 'back', success: true })
++      expect(decline).not.toHaveBeenCalled()
++      expect(backA).toHaveBeenCalledTimes(1)
++      expect(backB).not.toHaveBeenCalled()
++    } finally {
++      unbind.forEach(stop => stop())
++    }
++  })
++
++  it("reads the hidden session's own page", async () => {
++    const a = openOwn('stored-a', 'flow.example')
++    openOwn('stored-b', 'b.example')
++
++    const unbind = registerPreviewPageReader(a.id, async () => ({
++      text: 'FLOW_PAGE_TEXT',
++      title: 'flow',
++      url: 'https://flow.example'
++    }))
++
++    try {
++      const { decline, respond } = deliver('preview.read', { session_id: 'rt-a' }, 'rt-b')
++
++      await vi.waitFor(() => expect(respond).toHaveBeenCalledTimes(1), { timeout: 30_000 })
++      expect(JSON.parse(respond.mock.calls[0][0].value)).toMatchObject({ text: 'FLOW_PAGE_TEXT' })
++      expect(decline).not.toHaveBeenCalled()
++    } finally {
++      unbind()
++    }
++  })
++
++  it('still declines when the hidden session only sees a pin (the user may be looking at it)', async () => {
++    const pin = openOwn('stored-a', 'pinned.example')
++    setPreviewTabPinned(pin.id, true)
++    const back = vi.fn()
++    const unbind = registerPreviewNav(pin.id, { back, forward: () => {}, reload: () => {} })
++
++    try {
++      const { decline, respond } = deliver('preview.act', { action: 'back', session_id: 'rt-a' }, 'rt-b')
++
++      await Promise.resolve()
++      expect(decline).toHaveBeenCalledTimes(1)
++      expect(respond).not.toHaveBeenCalled()
++      expect(back).not.toHaveBeenCalled()
++    } finally {
++      unbind()
++    }
++  })
++
++  it('still declines when this window holds no live page for the hidden session', async () => {
++    hasLivePreviewSurface.mockReturnValue(false)
++    openOwn('stored-a', 'flow.example')
++
++    const { decline, respond } = deliver('preview.act', { action: 'elements', session_id: 'rt-a' }, 'rt-b')
++
++    await Promise.resolve()
++    expect(decline).toHaveBeenCalledTimes(1)
++    expect(respond).not.toHaveBeenCalled()
++  })
++
++  it('keeps tours and terminal reads on the shown-session rule', async () => {
++    openOwn('stored-a', 'flow.example')
++
++    const requests = [
++      deliver('tour', { action: 'discover', session_id: 'rt-a', surface: 'preview' }, 'rt-b'),
++      deliver('terminal.read', { session_id: 'rt-a' }, 'rt-b')
++    ]
++
++    await Promise.resolve()
++
++    for (const { decline, respond } of requests) {
++      expect(decline).toHaveBeenCalledTimes(1)
++      expect(respond).not.toHaveBeenCalled()
++    }
++  })
++})
++
+ describe('tour request routing', () => {
+   afterEach(() => {
+     $toursEnabled.set(true)
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+index 9d0bf50621..da3943cda4 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+@@ -1,5 +1,6 @@
+ import { JSON_RPC_INTERNAL_ERROR } from '@hermes/shared'
+ 
++import { backgroundPreviewTabFor } from '@/app/chat/right-rail/preview-active-tab'
+ import {
+   hasLivePreviewSurface,
+   requestPopoutPreviewAct,
+@@ -115,6 +116,21 @@ const WINDOW_OWNED_REQUESTS = new Set(['preview.act', 'preview.read', 'terminal.
+  */
+ const declineNotShown = (request: ScopedServerRequest) => request.decline?.('This window is not showing the session.')
+ 
++/** Window-owned requests a window may answer for a session it does NOT show,
++ *  from that session's own parked Browser page. */
++const BACKGROUND_PREVIEW_REQUESTS = new Set(['preview.act', 'preview.read'])
++
++/** This window keeps a live, off-screen page owned by `sessionId`. */
++export function windowHoldsBackgroundPreview(sessionId: string): boolean {
++  if (!sessionId) {
++    return false
++  }
++
++  const owner = previewOwnerFor(sessionId)
++
++  return Boolean(backgroundPreviewTabFor(owner)) && hasLivePreviewSurface(owner)
++}
++
+ /**
+  * Whether a request's `session_id` names the same conversation as the pane's
+  * active session. The two sides are not always the same identity class: the
+@@ -547,8 +563,14 @@ const previewAct: Handler = ({ deps, isActiveSession, request, sessionId }) => {
+   // offer, don't hijack). Window ownership is settled by WINDOW_OWNED_REQUESTS
+   // before this runs, so a refusal here reaches the tool instead of stalling it.
+   const p = request.params
++  // The agent drives ITS session's page: with a tile focused, the primary's
++  // agent must not reach into the tile's tabs (#73890).
++  const owner = previewOwnerFor(sessionId)
+ 
+-  if (!isActiveSession) {
++  // A hidden session may drive its OWN parked page (never a pin, never what
++  // is on screen — backgroundPreviewTabFor), so a long browser task survives
++  // the user switching chats.
++  if (!isActiveSession && !backgroundPreviewTabFor(owner)) {
+     answerValue(request, {
+       error: 'The in-app browser only takes actions in the session the user is looking at.',
+       success: false
+@@ -557,10 +579,6 @@ const previewAct: Handler = ({ deps, isActiveSession, request, sessionId }) => {
+     return
+   }
+ 
+-  // The agent drives ITS session's page: with a tile focused, the primary's
+-  // agent must not reach into the tile's tabs (#73890).
+-  const owner = previewOwnerFor(sessionId)
+-
+   // The keystroke loop has to be able to stop when this request is withdrawn
+   // (tool timeout or turn interrupt). The local interrupted flag can flip
+   // before request.cancel arrives; poll it so Stop cuts the loop off too.
+@@ -746,6 +764,16 @@ export function handleServerRequest(
+     })
+ 
+     if (route === 'ignore') {
++      // A hidden session's own Browser page stays mounted (parked) in the
++      // window it was last shown in. That window claims the session's
++      // preview.read/preview.act so the agent keeps working while the user is
++      // in another chat; the handler only ever reaches that session's own tab.
++      if (BACKGROUND_PREVIEW_REQUESTS.has(request.method) && windowHoldsBackgroundPreview(sessionId)) {
++        handler({ deps, request, sessionId, isActiveSession: false })
++
++        return true
++      }
++
+       // Silence alone lets the owner win the fanout race (#113348:
+       // resolve_response keeps the FIRST response, so a fast empty or
+       // wrong-geometry answer from a non-claiming window could beat the
+diff --git a/apps/desktop/src/store/preview.ts b/apps/desktop/src/store/preview.ts
+index 22f8f53d80..e36aa5707e 100644
+--- a/apps/desktop/src/store/preview.ts
++++ b/apps/desktop/src/store/preview.ts
+@@ -511,6 +511,14 @@ export function preferredVisibleTabId(): RightRailTabId | null {
+   return isVisible(remembered) ? remembered! : (visible[0]?.id ?? null)
+ }
+ 
++/** The tab `sessionId` last had in front (memory-only; undefined = none seen).
++ *  Lets an agent acting for a HIDDEN session drive the page it left open. */
++export function rememberedPreviewTabId(sessionId: null | string | undefined): RightRailTabId | undefined {
++  const key = currentSessionId(sessionId)
++
++  return key ? activeTabBySession.get(key) : undefined
++}
++
+ /** A fresh draft has no session yet, so tabs opened there are ownerless (the
+  *  drawer of every draft shows them). Called where the draft's first send
+  *  assigns its stored id — beside the composer draft's own hand-over — so the
+-- 
+2.54.0 (Apple Git-157)
+

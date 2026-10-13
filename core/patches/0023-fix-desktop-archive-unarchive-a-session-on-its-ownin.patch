@@ -1,0 +1,173 @@
+From 8068f99c3f986361d431fdfb89d7640960241240 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 12:15:48 -0700
+Subject: [PATCH] fix(desktop): archive/unarchive a session on its owning
+ gateway [daveey]
+
+All-Gateways sidebar rows from another connection (connection_id set) were
+archived via the active backend, which 404'd ('Session not found'); the
+optimistic hide rolled back and the row reappeared. Route the PATCH with the
+row's connectionId, mirroring deleteSession's removedOwner.
+---
+ apps/desktop/src/api/sessions.test.ts         | 17 +++++++++
+ apps/desktop/src/api/sessions.ts              | 17 ++++++++-
+ .../hooks/use-session-actions/index.ts        | 12 +++++--
+ .../unarchive-session.test.tsx                | 36 +++++++++++++++++--
+ 4 files changed, 77 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/src/api/sessions.test.ts b/apps/desktop/src/api/sessions.test.ts
+index 424ac0558f..b815adda2c 100644
+--- a/apps/desktop/src/api/sessions.test.ts
++++ b/apps/desktop/src/api/sessions.test.ts
+@@ -152,6 +152,23 @@ describe('setSessionArchived profile scoping', () => {
+     })
+   })
+ 
++  it('routes an object owner to ITS connection (All-Gateways row on another gateway)', async () => {
++    // Regression: archiving a mac-mini row from the MacBook sidebar sent the
++    // PATCH to the active (local) backend, which 404'd; the row reappeared.
++    hermesApi.mockResolvedValue({ ok: true } as never)
++    vi.mocked(client.capabilityScoped).mockReturnValue({ profile: 'default', connectionId: 'mac-mini' })
++
++    await setSessionArchived('sess-remote', true, { connectionId: 'mac-mini', profile: 'default' })
++
++    expect(hermesApi.mock.calls[0][0]).toMatchObject({
++      connectionId: 'mac-mini',
++      method: 'PATCH',
++      path: '/api/sessions/sess-remote',
++      profile: 'default',
++      body: { archived: true, profile: 'default' }
++    })
++  })
++
+   it('omits the profile from the body only when there is no active profile at all', async () => {
+     hermesApi.mockResolvedValue({ ok: true } as never)
+ 
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index 8b759e957b..39995928d9 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -372,13 +372,28 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
+ 
+ // Mutations take the owning `profile` so Electron can route them to the correct
+ // remote backend or local profile scope. Omit for the current/default profile.
+-export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
++export function setSessionArchived(id: string, archived: boolean, profile?: ProfileScope): Promise<{ ok: boolean }> {
+   // Carry the owning profile IN THE PATCH BODY, mirroring renameSession — the
+   // backend reads its target DB from body.profile (_open_session_db_for_profile).
+   // Passing it only as request.profile (Electron routing) is not enough on a
+   // remote gateway with no remoteProfile alias: the archive lands on the wrong
+   // (default) state.db, no-ops on a missing row, and the archived/unarchived
+   // state silently fails to stick — the same class as the unscoped DELETE.
++  // An object owner also carries its CONNECTION: a row listed from another
++  // gateway (All Gateways sidebar) must be archived on that gateway, not on the
++  // active one — otherwise the PATCH 404s locally and the row reappears.
++  if (profile && typeof profile === 'object') {
++    const owner = sessionWriteProfile(profile.profile)
++
++    return hermesApi<{ ok: boolean }>({
++      ...sessionScoped(profile),
++      ...(owner ? { profile: owner } : {}),
++      path: `/api/sessions/${encodeURIComponent(id)}`,
++      method: 'PATCH',
++      body: { archived, ...(owner ? { profile: owner } : {}) }
++    })
++  }
++
+   const owner = sessionWriteProfile(profile)
+ 
+   return hermesApi<{ ok: boolean }>({
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 32f42ef42f..7635e7e27d 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -3369,7 +3369,12 @@ export function useSessionActions({
+       }
+ 
+       try {
+-        await setSessionArchived(storedSessionId, true, profile)
++        // Route to the row's OWN gateway (mirrors deleteSession's removedOwner):
++        // an All-Gateways row archived via the active connection 404s there.
++        const archiveOwner: SessionOwnerScope = archived?.connection_id
++          ? { connectionId: archived.connection_id, profile: archived.profile || 'default' }
++          : profile
++        await setSessionArchived(storedSessionId, true, archiveOwner)
+         // Archived rows never reach the sidebar, so their persisted unread can
+         // only rot. Dropped after the RPC so a failed archive keeps it.
+         forgetSessionUnread(archivedIds, profile)
+@@ -3418,7 +3423,10 @@ export function useSessionActions({
+       const profile = archived?.profile?.trim() || undefined
+ 
+       try {
+-        await setSessionArchived(storedSessionId, false, profile)
++        const restoreOwner: SessionOwnerScope = archived?.connection_id
++          ? { connectionId: archived.connection_id, profile: archived.profile || 'default' }
++          : profile
++        await setSessionArchived(storedSessionId, false, restoreOwner)
+ 
+         // Drop the archived-view row first so the view reflects the restore
+         // even when the session cannot be re-listed below (e.g. it belongs to
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/unarchive-session.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/unarchive-session.test.tsx
+index c3cb42b4b7..d703179a2b 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/unarchive-session.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/unarchive-session.test.tsx
+@@ -53,7 +53,7 @@ function archivedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
+   } as SessionInfo
+ }
+ 
+-type Handle = Pick<ReturnType<typeof useSessionActions>, 'unarchiveSession'>
++type Handle = Pick<ReturnType<typeof useSessionActions>, 'archiveSession' | 'unarchiveSession'>
+ 
+ function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
+   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+@@ -79,7 +79,7 @@ function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
+   })
+ 
+   useEffect(() => {
+-    onReady({ unarchiveSession: actions.unarchiveSession })
++    onReady({ archiveSession: actions.archiveSession, unarchiveSession: actions.unarchiveSession })
+   }, [actions, onReady])
+ 
+   return null
+@@ -132,6 +132,38 @@ describe('unarchiveSession', () => {
+     expect($sessions.get().map(session => session.id)).toEqual([])
+   })
+ 
++  it('restores a row from ANOTHER gateway on that gateway (connection-scoped owner)', async () => {
++    $archivedSessions.set([archivedSession({ connection_id: 'mac-mini', profile: 'default' } as Partial<SessionInfo>)])
++    vi.mocked(setSessionArchived).mockResolvedValue({ ok: true })
++
++    const handle = await mountHarness()
++
++    await act(() => handle.unarchiveSession('arch-1'))
++
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('arch-1', false, {
++      connectionId: 'mac-mini',
++      profile: 'default'
++    })
++  })
++
++  it('archives a row from ANOTHER gateway on that gateway, not the active one', async () => {
++    // Regression: an All-Gateways sidebar row (connection_id=mac-mini) was
++    // archived via the active local backend, which 404'd; the row came back.
++    setSessions([
++      archivedSession({ archived: false, connection_id: 'mac-mini', id: 'remote-1', profile: 'default' } as Partial<SessionInfo>)
++    ])
++    vi.mocked(setSessionArchived).mockResolvedValue({ ok: true })
++
++    const handle = await mountHarness()
++
++    await act(() => handle.archiveSession('remote-1'))
++
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('remote-1', true, {
++      connectionId: 'mac-mini',
++      profile: 'default'
++    })
++  })
++
+   it('passes the archived row profile to setSessionArchived', async () => {
+     $archivedSessions.set([archivedSession({ profile: 'sage' } as Partial<SessionInfo>)])
+     vi.mocked(setSessionArchived).mockResolvedValue({ ok: true })
+-- 
+2.54.0 (Apple Git-157)
+
