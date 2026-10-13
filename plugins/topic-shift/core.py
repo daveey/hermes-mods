@@ -94,12 +94,19 @@ def skip_reason(text: str, prior_user: list[str]) -> Optional[str]:
     return None
 
 
+def _before(messages: list[dict], text: str) -> list[dict]:
+    """Messages strictly before the last occurrence of the just-sent `text` (it, and any reply
+    already streaming after it, must not count as session context)."""
+    msgs = [m for m in messages if m.get("content")]
+    key = _norm(text)[:200]
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i]["role"] == "user" and _norm(msgs[i]["content"])[:200] == key:
+            return msgs[:i]
+    return msgs
+
+
 def _prior_user(info: dict, text: str) -> list[str]:
-    users = [_norm(m["content"]) for m in info.get("messages", []) if m["role"] == "user" and m["content"]]
-    # The just-sent message is usually already persisted: drop it.
-    if users and users[-1][:200] == _norm(text)[:200]:
-        users = users[:-1]
-    return users
+    return [_norm(m["content"]) for m in _before(info.get("messages", []), text) if m["role"] == "user"]
 
 
 def _parse_json(raw: str) -> dict:
@@ -108,11 +115,14 @@ def _parse_json(raw: str) -> dict:
 
 
 CLASSIFY_SYSTEM = (
-    "You decide whether a user's newest chat message starts a NEW, UNRELATED task compared with the "
-    "ongoing session, or continues/follows up on it. Follow-ups, refinements, bug reports about the same "
-    "work, 'also do X' on the same project, and questions about results are NOT new topics. A new topic "
-    "is a different goal that would be better handled in a fresh session (e.g. switching from debugging a "
-    "voice pipeline to filing taxes, or to an unrelated subsystem). Reply with ONLY JSON: "
+    "You decide whether a user's newest chat message starts a NEW task that would be better handled in a "
+    "fresh session, or continues the session's current work. CONTINUATION: follow-ups, refinements, "
+    "corrections, bug reports or questions about what was just built/discussed, and small additions that "
+    "only make sense on top of the current change. NEW TOPIC: a different goal, even inside the SAME "
+    "project/repo: a new feature, new capability, or different subsystem that needs its own design work "
+    "and does not depend on the recent work (e.g. the session fixed a login bug in an app; the new message "
+    "asks to add a recommendations feature to the same app). Sharing a project, repo, or a "
+    "keyword with the session is NOT enough to call it a continuation. Reply with ONLY JSON: "
     '{"new_topic": bool, "confidence": 0..1, "label": "<=6 word name of the NEW message topic", '
     '"reason": "<=15 words"}'
 )
@@ -126,7 +136,7 @@ def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = Non
     if (why := skip_reason(text, prior)):
         return {"shift": False, "skipped": why}
     recent = prior[-PRIOR_USER_WINDOW:]
-    last_asst = next((_norm(m["content"])[:600] for m in reversed(info["messages"])
+    last_asst = next((_norm(m["content"])[:600] for m in reversed(_before(info["messages"], text))
                       if m["role"] == "assistant" and m["content"]), "")
     user = (
         f"Session title: {info.get('title') or '(none)'}\n"
