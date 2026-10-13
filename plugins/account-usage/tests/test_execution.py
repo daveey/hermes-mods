@@ -144,6 +144,31 @@ class Execution(unittest.TestCase):
         a._interruptible_streaming_api_call.assert_not_called()
         manager._report_hook_failure.assert_not_called()
 
+    def test_disabled_integration_fails_closed_only_when_something_is_queued(self):
+        # Disabled = core drifted, so owner resolution may break. With nothing
+        # queued that must not reject every turn; with a queued intent it must.
+        from agent.account_usage_cache import _identity_id_for
+        from hermes_cli.middleware import _DownstreamExecutionError
+        integration = self.s.ExecutionIntegration(observe=lambda *args: None)
+        integration.disable()
+        self.addCleanup(self.s._install_failures.pop, integration.home, None)
+        next_call = Mock(return_value='sent')
+        def run():
+            with patch.dict(sys.modules, {'tui_gateway.server': self.server}), \
+                    patch.object(integration, 'calling_agent', return_value=self.agent), \
+                    patch.object(self.s, 'owner_scope', side_effect=RuntimeError('core drift')):
+                return integration.middleware(next_call=next_call, request='req', turn_id='turn')
+        self.assertEqual(run(), 'sent')
+        self.credentials([entry('B', source='manual').to_dict()])
+        # Intent queued while healthy, then core drifted.
+        self.s._install_failures.pop(integration.home, None)
+        self.s.SelectionService(self.home, server=self.server).put(
+            'runtime-A', provider='anthropic', account_id=_identity_id_for('anthropic', entry('B')), expected_revision=0)
+        integration.disable()
+        with self.assertRaises(_DownstreamExecutionError):
+            run()
+        self.assertEqual(next_call.call_count, 1)
+
     def test_install_refuses_in_memory_factory_drift_before_any_patch(self):
         from agent.client_lifecycle import ClientLifecycleMixin
         original = ClientLifecycleMixin._create_request_anthropic_client

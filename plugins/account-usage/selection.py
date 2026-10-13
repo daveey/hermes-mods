@@ -178,6 +178,13 @@ class PendingStore:
         with closing(self._connection()) as db, db:
             return self._read(db, key)
 
+    def has_pending(self, profile):
+        """Whether ANY chat in *profile* has a queued selection (no owner needed)."""
+        from contextlib import closing
+        with closing(self._connection()) as db, db:
+            return db.execute("SELECT 1 FROM selection WHERE profile=? AND state='pending' LIMIT 1",
+                              (profile,)).fetchone() is not None
+
     @staticmethod
     def _write(db, key, row):
         db.execute('INSERT OR REPLACE INTO selection VALUES (?,?,?,?,?,?,?)',
@@ -845,10 +852,20 @@ class ExecutionIntegration:
         if self.error:
             # No factories installed: never silently ignore a previously queued
             # intent. Unselected chats remain usable; cancel stays available.
+            # Disabled means core drifted, so owner_scope (which walks core
+            # session/registry internals) may itself fail. Only consult it when
+            # this profile has SOME queued intent; otherwise a resolution error
+            # would fail-closed every turn of every chat with nothing queued.
+            path = Path(self.home) / 'account_usage_selection.sqlite3'
+            try:
+                queued = path.exists() and PendingStore(path).has_pending(self.home)
+            except Exception:
+                queued = True
+            if not queued:
+                return next_call(request)
             try:
                 with owner_scope(profile_home=self.home, agent=agent) as owner:
-                    path = Path(self.home) / 'account_usage_selection.sqlite3'
-                    pending = path.exists() and PendingStore(path).read(owner.key)['state'] == 'pending'
+                    pending = PendingStore(path).read(owner.key)['state'] == 'pending'
             except Exception:
                 pending = True
             if pending:
