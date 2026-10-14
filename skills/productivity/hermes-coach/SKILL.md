@@ -55,6 +55,8 @@ A Bot profile on an always-on gateway owns the model work. Two crons: a no-agent
 `coach_mine.py --write-kpis` and prints the labeling queue plus numbered instructions with `--deliver bot-chat`.
 The Bot labels per `references/labeling.md`, writes `findings/` + `reports/`, then commits through a push helper.
 Put the KPI goals and the user's learning track in its SOUL.md so every report names the next drill.
+The cloud Bot can't read Mac paths: ship any doc that SOUL.md points at (e.g. the plan) into the profile's `work/`
+and reference it by that cloud path. Re-ship whenever the source changes.
 
 After changing a script: commit to hermes-mods (the Macs fast-forward through sync), then re-ship the changed files
 to the cloud profile's `scripts/` and its skill copy, compare byte counts, and rerun the feed on every host so all
