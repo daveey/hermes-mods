@@ -391,11 +391,6 @@ function Banner() {
               i
             )
           })
-        }),
-      j.skipped?.length > 0 &&
-        jsx('div', {
-          className: 'text-(--ui-text-tertiary)',
-          children: 'Left for you: ' + j.skipped.map(s => `${s.item}${s.reason ? ` (${s.reason})` : ''}`).join('; ')
         })
     ]
   })

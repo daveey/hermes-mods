@@ -131,8 +131,10 @@ assistant reply and the latest user messages. Ignore work that is already done.
 
 Rules:
 - One task per independent piece of work. Merge items that touch the same code/change. At most %d tasks.
-- Skip items that only the human can do or that need the human to decide first (purchases, choosing between
-  options, credentials, physical actions). List them under "skipped" with a reason.
+- Every follow-up item becomes a task; never drop or "leave" one for the human. Items that need the human (a
+  decision, credentials, a purchase, a physical action like re-plugging a device) are still tasks: the child
+  does all the agent-side work (diagnose, gather options, prepare the change, check current state), then asks
+  the human for exactly the one thing it needs, and verifies the result once they have done it.
 - Each child starts with NO access to this transcript, so its prompt must be self-contained: what the goal is,
   why, the environment (working dir, repo, branch, hosts, services), exact file paths, commands, IDs, URLs,
   decisions already made and constraints, what was already tried or is done, and a concrete done-when check.
@@ -142,8 +144,7 @@ Rules:
   not fit (long logs, earlier designs).
 
 Reply with ONLY JSON:
-{"tasks": [{"title": "<=7 words", "prompt": "...", "needs_parent": bool}],
- "skipped": [{"item": "...", "reason": "..."}]}""" % MAX_TASKS
+{"tasks": [{"title": "<=7 words", "prompt": "...", "needs_parent": bool}]}""" % MAX_TASKS
 
 
 def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None, auto: bool = False) -> dict:
@@ -175,9 +176,20 @@ def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None, auto: bool =
         tasks.append({"title": str(t.get("title") or "Follow-up").strip()[:80],
                       "prompt": str(t["prompt"]).strip(),
                       "needs_parent": bool(t.get("needs_parent"))})
-    skipped = [{"item": str(s.get("item") or "")[:200], "reason": str(s.get("reason") or "")[:200]}
-               for s in (out.get("skipped") or []) if isinstance(s, dict)]
-    return {"tasks": tasks, "skipped": skipped, "title": info.get("title") or "", "cwd": info.get("cwd") or "",
+    # Safety net: a model that still returns "skipped" items gets them promoted to tasks, never left behind.
+    for s in out.get("skipped") or []:
+        if len(tasks) >= MAX_TASKS:
+            break
+        item = str((s.get("item") if isinstance(s, dict) else s) or "").strip()
+        if not item:
+            continue
+        reason = str(s.get("reason") or "").strip() if isinstance(s, dict) else ""
+        tasks.append({"title": item[:80], "needs_parent": True,
+                      "prompt": f"{item}\n\n" + (f"Context: {reason}\n\n" if reason else "")
+                      + "Read the parent session for details. Do all the agent-side work (diagnose, check current "
+                        "state, prepare options or the change), then ask the human for exactly what only they can "
+                        "do or decide, and verify the result after they do it."})
+    return {"tasks": tasks, "skipped": [], "title": info.get("title") or "", "cwd": info.get("cwd") or "",
             "profile": info.get("profile_name") or "default", "reply_index": idx}
 
 

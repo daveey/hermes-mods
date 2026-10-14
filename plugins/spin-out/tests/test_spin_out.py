@@ -71,8 +71,11 @@ def test_plan_parses_tasks_and_context(tmp_path):
     db = make_db(tmp_path, compressed_parent=True)
     llm = FakeLLM("Here you go:\n" + PLAN)
     out = core.plan("s1", llm, db)
-    assert [t["title"] for t in out["tasks"]] == ["Fix sync job on mini", "Token refresh tests"]
-    assert out["skipped"][0]["item"] == "Buy Pro plan"
+    # human-dependent items are never left behind: a "skipped" entry is promoted to a task
+    assert [t["title"] for t in out["tasks"]] == ["Fix sync job on mini", "Token refresh tests", "Buy Pro plan"]
+    assert out["skipped"] == []
+    assert out["tasks"][2]["needs_parent"] and "needs your decision" in out["tasks"][2]["prompt"]
+    assert "skipped" not in llm.calls[0][0]["content"].split("Reply with ONLY JSON")[1]
     assert out["cwd"] == "/code/app" and out["profile"] == "default"
     sent = llm.calls[0][1]["content"]
     assert FINAL in sent                      # final reply kept whole

@@ -24,7 +24,9 @@ composer. For each follow-up you can:
 - `desktop-plugins/spin-out/plugin.js` watches `busyBySession` for the focused runtime flipping busy → idle,
   then calls `POST /api/plugins/spin-out/plan {auto: true}`. It also renders the banner.
 - `core.py`: reads the transcript (read-only `state.db`) and asks the aux model (task `spin_out`) to split the
-  follow-ups into independent, self-contained child prompts. `kanban_cards()` creates the cards through
+  follow-ups into independent, self-contained child prompts. Every follow-up becomes a launchable task, including
+  ones that need you (a decision, credentials, a physical action): that child does the agent-side work, asks you for
+  the one thing it needs, and verifies afterwards. Nothing is "left for you" outside the list. `kanban_cards()` creates the cards through
   `hermes_cli.kanban_db.create_task`.
 - `GET /ping` reports `api: 2`. Against an older backend (the plugin updated, but the backend not restarted yet), the
   desktop half skips the auto check and hides the Kanban button. Restart the backend (or the app) after updating.
