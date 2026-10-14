@@ -8,6 +8,7 @@
  *
  *   still_broken        3rd "still not working" turn -> Restart clean (new session with brief + repro + done-check)
  *   long_session        >250 msgs                    -> Spin out (hands over to the spin-out plugin's planner)
+ *                                                       or Compact (runs /compress in the session)
  *   screenshot_midturn  image sent while busy        -> Add a line (prefills the composer)
  *   move_to_board       10th subagent / >10 min job  -> Move to board (handoff card)
  *   hermes_bug          same Hermes bug in 2 sessions -> File it once (card on the hermes board)
@@ -163,10 +164,14 @@ async function launch(p, msg) {
   return created?.stored_session_id || null
 }
 
-async function act() {
+// Extra ghost buttons next to a rule's primary one (frontend-only; the backend still names one primary).
+const SECONDARY = { spin_out: { label: 'Compact', action: 'compact' } }
+
+async function act(override) {
   const p = panel
   if (!p || p.phase !== 'shown') return
-  const { action, data } = p.nudge
+  const { data } = p.nudge
+  const action = override || p.nudge.action
   patch({ phase: 'working', error: null })
   try {
     if (action === 'restart') {
@@ -182,6 +187,11 @@ async function act() {
       accept(p)
       setPanel(null) // spin-out's own panel takes over
       await window.__spinOut.spinOut()
+    } else if (action === 'compact') {
+      // The app's own /compress path (transcript swap, progress notice, stale-runtime recovery).
+      if (!host.composer?.submit?.(p.stored, '/compress')) throw new Error('no visible composer for this session')
+      accept(p)
+      setPanel(null)
     } else if (action === 'tip') {
       accept(p)
       if (data?.try) await host.composer?.setDraft?.(p.stored, data.try)
@@ -253,6 +263,7 @@ function Panel() {
         ]
       }),
       !done && jsx('button', { type: 'button', 'data-slot': 'coach-primary', className: PRIMARY, disabled: working, onClick: () => void act(), children: n.button }),
+      !done && SECONDARY[n.action] && jsx('button', { type: 'button', 'data-slot': 'coach-secondary', className: GHOST, disabled: working, onClick: () => void act(SECONDARY[n.action].action), children: SECONDARY[n.action].label }),
       done && p.board && jsx('button', { type: 'button', className: GHOST, onClick: () => host.navigate?.('/kanban'), children: 'Open board' }),
       jsx('button', { type: 'button', 'data-slot': 'coach-dismiss', className: GHOST, disabled: working, onClick: dismiss, children: done ? 'Close' : 'Dismiss' })
     ]
