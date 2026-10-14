@@ -12,13 +12,21 @@ _HERE = Path(__file__).resolve().parent
 
 
 def _load(name: str):
+    """Load a sibling module once; re-exec it when the file changed, so a plugin reload
+    (activate / discover_and_load(force=True)) picks up edits instead of the cached copy."""
     key = f"_coach_{name}"
+    path = _HERE / f"{name}.py"
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        mtime = None
     mod = sys.modules.get(key)
-    if mod is None:
-        spec = importlib.util.spec_from_file_location(key, _HERE / f"{name}.py")
+    if mod is None or getattr(mod, "_coach_mtime", None) != mtime:
+        spec = importlib.util.spec_from_file_location(key, path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[key] = mod
         spec.loader.exec_module(mod)
+        setattr(mod, "_coach_mtime", mtime)
     return mod
 
 

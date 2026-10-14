@@ -232,3 +232,16 @@ def test_still_broken_matcher():
           "make it not crash on empty input"]
     assert all(core.is_still_broken(t) for t in yes)
     assert not any(core.is_still_broken(t) for t in no)
+
+
+def test_plugin_reload_picks_up_edited_rules():
+    import os
+    path = ROOT / "agent_rules.py"
+    a = plugin._load("agent_rules")
+    assert plugin._load("agent_rules") is a  # unchanged file: cached
+    st = path.stat()
+    try:
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        assert plugin._load("agent_rules") is not a  # edited file: re-exec on reload
+    finally:
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
