@@ -192,10 +192,6 @@ async function act(override) {
       if (!host.composer?.submit?.(p.stored, '/compress')) throw new Error('no visible composer for this session')
       accept(p)
       setPanel(null)
-    } else if (action === 'tip') {
-      accept(p)
-      if (data?.try) await host.composer?.setDraft?.(p.stored, data.try)
-      setPanel(null)
     } else if (action === 'add_text') {
       accept(p)
       await host.composer?.setDraft?.(p.stored, 'About the screenshot: ')
