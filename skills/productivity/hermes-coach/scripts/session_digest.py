@@ -15,7 +15,7 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 2
+DIGEST_V = 3            # v3: dedupe compaction copies / queued placeholders (see transcript())
 MAX_TURNS = 60          # keep the first 10 and the last 50 user turns
 TURN_CHARS = 500
 LAST_REPLY_CHARS = 800
@@ -97,6 +97,8 @@ def clean_user(text: str) -> str:
         text = rx.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     text = re.sub(r"@image:`[^`]*`", "[screenshot]", text)
+    # Desktop stores "@image:`path`\n[screenshot]" for one attachment; don't count it twice.
+    text = re.sub(r"\[screenshot\](\s*\[screenshot\])+", "[screenshot]", text)
     text = re.sub(r"/Users/[^/\s]+/", "~/", text)
     return redact(re.sub(r"\n{3,}", "\n\n", text).strip())
 
@@ -119,6 +121,37 @@ def cols(con, table):
     return {r[1] for r in con.execute(f"pragma table_info({table})")}
 
 
+def transcript(con, sid, mcols):
+    """One row per real message, in order.
+
+    state.db is append-only across compaction: every compression pass re-inserts the live tail as new
+    rows (same message_uid) and flips the old copies to active=0, compacted=1. Queued prompts (typed
+    while a turn runs) also get a placeholder row (active=0, compacted=0, display_metadata
+    _queued_prompt) that is re-written on each pass; the real send lands later as its own row. Read
+    raw, one Desktop send shows up many times. Keep live + compacted history only (drop rewound and
+    queued placeholders), drop display-only `hidden` rows, and collapse copies by message_uid.
+    """
+    where, order = "session_id=?", "timestamp, id"
+    if "active" in mcols and "compacted" in mcols:
+        where += " and (active=1 or compacted=1)"
+    if "display_kind" in mcols:
+        where += " and coalesce(display_kind, '') <> 'hidden'"
+    uid = "message_uid" if "message_uid" in mcols else "NULL"
+    active = "active" if "active" in mcols else "1"
+    rows = con.execute(f"""select role, content, tool_name, tool_calls, timestamp, {uid} as uid, {active} as live
+                           from messages where {where} order by {order}""", (sid,)).fetchall()
+    # Prefer the live copy of a uid, else its first compacted copy; keep the first position seen.
+    best, order_keys = {}, []
+    for r in rows:
+        k = r["uid"] or (r["role"], r["timestamp"], r["content"], r["tool_calls"])
+        if k not in best:
+            order_keys.append(k)
+            best[k] = r
+        elif r["live"] and not best[k]["live"]:
+            best[k] = r
+    return [best[k] for k in order_keys]
+
+
 def digest_db(profile, db, host, since):
     con = sqlite3.connect(f"file:{db}", uri=True, timeout=30)
     con.execute("pragma query_only = 1")
@@ -133,7 +166,7 @@ def digest_db(profile, db, host, since):
                {opt('cwd')}, {opt('git_repo_root')}, {opt('git_branch')}, {opt('archived')},
                {opt('profile_name')}, {act} as activity
         from sessions where {act} >= ?""", (since,)).fetchall()
-    by_id = {r["id"]: r for r in rows}
+    mcols = cols(con, "messages")
 
     # Fold subagent sessions into their top-level ancestor.
     kids = collections.defaultdict(lambda: {"n": 0, "cost": 0.0, "msgs": 0, "tool_calls": 0})
@@ -153,8 +186,7 @@ def digest_db(profile, db, host, since):
         if r["parent_session_id"]:
             continue
         sid = r["id"]
-        msgs = con.execute("""select role, content, tool_name, tool_calls, timestamp from messages
-                              where session_id=? order by timestamp, id""", (sid,)).fetchall()
+        msgs = transcript(con, sid, mcols)
         users, tools, terr = [], collections.Counter(), collections.Counter()
         sig = collections.Counter()
         last_reply, n_real = "", 0
