@@ -199,6 +199,13 @@ async function act() {
       accept(p)
       host.notify({ kind: 'success', message: `Filed on the ${r.board} board: ${card.task_id}` })
       setPanel({ ...p, phase: 'done', note: `Filed as ${card.task_id} on the ${r.board} board`, board: true })
+    } else if (action === 'tip') {
+      // Instant: pre-fill the composer with the tip's "try" text (if any) and close.
+      accept(p)
+      setPanel(null)
+      if (data?.try) await host.composer?.setDraft?.(p.stored, data.try)
+    } else {
+      throw new Error(`unknown action: ${action}`)
     }
   } catch (err) {
     patch({ phase: 'shown', note: null, error: String(err?.message || err) })
