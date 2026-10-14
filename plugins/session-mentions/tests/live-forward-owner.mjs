@@ -3,8 +3,9 @@
 // Opens a NEW throwaway chat on that Desktop's backend (the lease a chat open in a window holds),
 // prints {"session_id": ...}, then waits up to 180s for exactly one user message containing
 // SM_MARKER — sent from ANOTHER Mac with cross_session — and reports whether it landed, with the
-// owner lease unchanged. Closes only the throwaway chat.
+// owner lease unchanged. Closes and deletes only the throwaway chat.
 import fs from 'node:fs/promises'
+import { hideThrowaway, deleteThrowaway } from './live-throwaway.mjs'
 const base = process.env.SM_LIVE_URL
 const marker = process.env.SM_MARKER
 if (!base || !/^http:\/\/127\.0\.0\.1:\d+$/.test(base) || !marker) throw Error('Set SM_LIVE_URL and SM_MARKER')
@@ -17,12 +18,13 @@ const pending = new Map(); let n = 0
 ws.onmessage = e => { const m = JSON.parse(e.data); const p = pending.get(m.id); if (p) { pending.delete(m.id); m.error ? p.reject(Error(JSON.stringify(m.error))) : p.resolve(m.result) } }
 const rpc = (method, params = {}) => new Promise((resolve, reject) => { const id = 'smfo-' + ++n; pending.set(id, { resolve, reject }); ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })) })
 const rest = async path => { const r = await fetch(base + path, { headers: { 'X-Hermes-Session-Token': token } }); if (!r.ok) throw Error('REST ' + r.status); return r.json() }
-let sid
+let sid, key
 try {
   const created = await rpc('session.create', { profile: 'default', source: 'desktop', title: 'Session Mentions forward live test', cwd: home + '/cache/scratch' })
   sid = created.session_id
-  const key = created.stored_session_id || created.session_key
+  key = created.stored_session_id || created.session_key
   await rpc('prompt.submit', { session_id: sid, text: 'Isolated transport test. Do not use tools. Reply exactly: READY', queued: true })
+  await hideThrowaway(base, token, key)
   const lease = async () => JSON.parse(await fs.readFile(home + '/runtime/active_sessions.json', 'utf8')).entries.find(e => e.session_id === key)
   const before = await lease()
   console.log(JSON.stringify({ session_id: key, owner_pid: before?.pid, surface: before?.surface }))
@@ -36,5 +38,6 @@ try {
   console.log(JSON.stringify({ landed, owner_unchanged: after?.pid === before?.pid && after?.lease_id === before?.lease_id }))
 } finally {
   if (sid) await rpc('session.close', { session_id: sid }).catch(() => undefined)
+  if (key) await deleteThrowaway(base, token, key).catch(e => console.error(String(e)))
   ws.close()
 }

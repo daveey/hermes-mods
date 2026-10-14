@@ -10,6 +10,7 @@
 // nothing while this Mac's Desktop courier is alive, and that courier delivers the message.
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
+import { hideThrowaway, deleteThrowaway } from './live-throwaway.mjs'
 const ownerUrl = process.env.SM_OWNER_URL
 const remoteUrl = process.env.SM_REMOTE_URL
 for (const u of [ownerUrl, remoteUrl]) if (!u || !/^http:\/\/127\.0\.0\.1:\d+$/.test(u)) throw Error('Set SM_OWNER_URL and SM_REMOTE_URL to explicit local backends')
@@ -29,19 +30,20 @@ async function backend(base) {
     if (!r.ok) throw Error(`REST ${r.status} ${path}`)
     return r.json()
   }
-  return { rpc, rest, close: () => ws.close() }
+  return { base, token, rpc, rest, close: () => ws.close() }
 }
 
 const owner = await backend(ownerUrl)
 const remote = await backend(remoteUrl)
 const out = {}
-let sid
+let sid, key
 let remoteLive
 try {
   const created = await owner.rpc('session.create', { profile: 'default', source: 'desktop', title: 'Session Mentions remote-drain live test', cwd: home + '/cache/scratch' })
   sid = created.session_id
-  const key = created.stored_session_id || created.session_key
+  key = created.stored_session_id || created.session_key
   await owner.rpc('prompt.submit', { session_id: sid, text: 'Isolated transport test. Do not use tools. Reply exactly: READY', queued: true })
+  await hideThrowaway(owner.base, owner.token, key)
   const lease = async () => JSON.parse(await fs.readFile(home + '/runtime/active_sessions.json', 'utf8')).entries.find(e => e.session_id === key)
   const before = await lease()
   assert.ok(before, 'throwaway chat has no owner lease')
@@ -95,5 +97,6 @@ try {
 } finally {
   if (sid) await owner.rpc('session.close', { session_id: sid }).catch(() => undefined)
   if (remoteLive) await remote.rpc('session.close', { session_id: remoteLive }).catch(() => undefined)
+  if (key) await deleteThrowaway(owner.base, owner.token, key).catch(e => console.error(String(e)))
   owner.close(); remote.close()
 }

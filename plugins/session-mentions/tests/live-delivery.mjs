@@ -2,6 +2,7 @@
 // SM_LIVE_URL=http://127.0.0.1:PORT node live-delivery.mjs
 import fs from 'node:fs/promises'
 import assert from 'node:assert/strict'
+import { hideThrowaway, deleteThrowaway } from './live-throwaway.mjs'
 const base=process.env.SM_LIVE_URL
 if(!base || !/^http:\/\/127\.0\.0\.1:\d+$/.test(base))throw Error('Set SM_LIVE_URL to an explicit local backend')
 const home=process.env.HOME+'/.hermes'
@@ -17,13 +18,15 @@ async function client(){
  return (method,params={})=>new Promise((resolve,reject)=>{const id='smtest-'+ ++count;const timer=setTimeout(()=>{pending.delete(id);reject(Error('RPC timeout: '+method))},60000);pending.set(id,{resolve,reject,timer});ws.send(JSON.stringify({jsonrpc:'2.0',id,method,params}))})
 }
 const evidence={}
+let sid,key,owner
 try{
- const owner=await client(),sender=await client()
+ owner=await client();const sender=await client()
  const created=await owner('session.create',{profile:'default',source:'desktop',title:'Session Mentions isolated delivery test',cwd:process.env.HOME+'/.hermes/cache/scratch'})
- const sid=created.session_id,key=created.stored_session_id||created.session_key
+ sid=created.session_id;key=created.stored_session_id||created.session_key
  assert.ok(sid&&key)
  evidence.session_id=key;evidence.live_session_id=sid
  await owner('prompt.submit',{session_id:sid,text:'This is an isolated transport test. Do not use tools. Reply exactly: SM-READY',queued:true})
+ await hideThrowaway(base,token,key)
  const lease=async()=>JSON.parse(await fs.readFile(home+'/runtime/active_sessions.json','utf8')).entries.find(e=>e.session_id===key)
  const before=await lease();assert.ok(before);evidence.owner_before=before
  globalThis.__smHost={state:{connectionId:{get:()=> 'local'},profile:{get:()=> 'default'}},request:sender,requestProfile:async()=>{throw Error('Wrong pooled backend chosen')}}
@@ -58,6 +61,9 @@ try{
  evidence.verified=true
  await fs.writeFile(new URL('live-evidence.json',import.meta.url),JSON.stringify(evidence,null,2))
  console.log(JSON.stringify(evidence,null,2))
- // Close only the throwaway runtime, after its turn has settled.
- await owner('session.close',{session_id:sid})
-}finally{for(const ws of sockets)ws.close()}
+}finally{
+ // Close the throwaway runtime, then delete its row — close alone leaves it in the sidebar.
+ if(sid&&owner)await owner('session.close',{session_id:sid}).catch(()=>undefined)
+ if(key)await deleteThrowaway(base,token,key).catch(e=>console.error(String(e)))
+ for(const ws of sockets)ws.close()
+}

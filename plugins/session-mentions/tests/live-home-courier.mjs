@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs/promises'
+import { hideThrowaway, deleteThrowaway } from './live-throwaway.mjs'
 const base = process.env.SM_LIVE_URL
 if (!base || !/^http:\/\/127\.0\.0\.1:\d+$/.test(base)) throw Error('Set SM_LIVE_URL to an explicit local backend')
 const rounds = Number(process.argv[2] || 4)
@@ -34,13 +35,14 @@ print(m.handle({"action": "send", "target": sys.argv[2], "message": sys.argv[3]}
 `, pluginDir, target, message], { encoding: 'utf8', timeout: 300_000 }).trim().split('\n').pop())
 
 const evidence = { started: new Date().toISOString(), rounds: [] }
-let sid
+let sid, key
 try {
   const created = await rpc('session.create', { profile: 'default', source: 'desktop', title: 'Session Mentions home-courier live test', cwd: home + '/cache/scratch' })
   sid = created.session_id
-  const key = created.stored_session_id || created.session_key
+  key = created.stored_session_id || created.session_key
   evidence.session_id = key
   await rpc('prompt.submit', { session_id: sid, text: 'Isolated transport test. Do not use tools. Reply exactly: READY', queued: true })
+  await hideThrowaway(base, token, key)
   const lease = async () => JSON.parse(await fs.readFile(home + '/runtime/active_sessions.json', 'utf8')).entries.find(e => e.session_id === key)
   const owner = await lease()
   assert.ok(owner, 'throwaway session has no owner lease')
@@ -66,5 +68,6 @@ try {
   if (process.env.SM_EVIDENCE) await fs.writeFile(process.env.SM_EVIDENCE, JSON.stringify(evidence, null, 2))
 } finally {
   if (sid) await rpc('session.close', { session_id: sid }).catch(() => undefined)
+  if (key) await deleteThrowaway(base, token, key).catch(e => console.error(String(e)))
   ws.close()
 }
