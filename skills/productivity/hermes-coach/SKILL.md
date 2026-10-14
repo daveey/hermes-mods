@@ -25,7 +25,8 @@ which finds anti-patterns and proposes improvements. Phase 1 of a measure → de
 | Script | Runs on | Does |
 |---|---|---|
 | `scripts/session_digest.py` | every host | `state.db` (+ `profiles/*/state.db`) → `<out>/<host>/<profile>/<id>.json`, rewritten only on change |
-| `scripts/coach_feed.py` | hosts that push | pull → digest → commit `<host>/` → push, to a private git repo |
+| `scripts/coach_feed.py` | hosts that push | pull → digest → commit `<host>/` → push, to a private git repo (`--exclude-profile` skips shared bots holding other people's chats) |
+| `scripts/coach_mine.py` | the coach | KPIs per host + overall (this window vs previous), top-N unlabeled sessions by waste score; `--write-kpis` appends `reports/kpis.jsonl` |
 
 The private repo layout is `<host>/<profile>/<session_id>.json`. Each host writes only its own subtree, so pushes never conflict.
 

@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--home", default=None)
     ap.add_argument("--since-days", default="45")
     ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--exclude-profile", action="append", default=[])
     a = ap.parse_args()
     repo = Path(a.repo_dir)
     status = {"host": a.host, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -35,6 +36,8 @@ def main():
            "--since-days", a.since_days]
     if a.home:
         cmd += ["--home", a.home]
+    for p in a.exclude_profile:
+        cmd += ["--exclude-profile", p]
     r = subprocess.run(cmd, capture_output=True, text=True)
     status["digest"] = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else r.stderr[-300:]
     git(repo, "add", "-A", a.host)

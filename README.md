@@ -75,6 +75,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [autonomous-ai-agents/claude-usage-diagnostics](skills/autonomous-ai-agents/claude-usage-diagnostics/) | Claude usage runs out or sessions stick on 429s. |
 | [devops/cloud-service-decommission](skills/devops/cloud-service-decommission/) | Shutting down a hosted service to stop billing. |
 | [hermes-disk-plugin-backends](skills/hermes-disk-plugin-backends/) | Adding Hermes disk-plugin REST backends. |
+| [productivity/hermes-coach](skills/productivity/hermes-coach/) | Mine every host's Hermes sessions into redacted per-session digests in a private git repo, compute usage KPIs, and queue the most wasteful sessions for a coach Bot to label (rubric in `references/labeling.md`). |
 | [productivity/ambitious-requests](skills/productivity/ambitious-requests/) | Make a request more ambitious: the Altitude / Depth / Range lenses (goes with the prompt-coach plugin). |
 | [productivity/quiet-mode](skills/productivity/quiet-mode/) | You want Hermes off the screen and speakers (goes with the quiet-mode plugin). |
 | [social-media/messaging-bridges](skills/social-media/messaging-bridges/) | WhatsApp/Signal bridges: QR-pair once, the session persists. |

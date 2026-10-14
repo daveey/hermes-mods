@@ -60,7 +60,7 @@ def redact(s: str) -> str:
 
 
 # User-role messages Hermes writes itself (not typed by the user): counted, not kept as turns.
-SYNTHETIC = re.compile(r"^\s*\[(IMPORTANT: Background process|Recent Summary|CONTEXT COMPACTION|Background task)", re.I)
+SYNTHETIC = re.compile(r"^\s*\[(IMPORTANT: Background process|Recent Summary|CONTEXT COMPACTION|Background task|Continuing toward your standing goal)", re.I)
 
 
 def flatten(content: str) -> str:
@@ -88,6 +88,7 @@ def clean_user(text: str) -> str:
     text = flatten(text)
     for rx in INJECTED:
         text = rx.sub("", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     text = re.sub(r"@image:`[^`]*`", "[screenshot]", text)
     text = re.sub(r"/Users/[^/\s]+/", "~/", text)
     return redact(re.sub(r"\n{3,}", "\n\n", text).strip())
@@ -157,7 +158,8 @@ def digest_db(profile, db, host, since):
                 if not text:
                     continue
                 if SYNTHETIC.match(text):
-                    sig["synthetic_" + ("bg_notify" if "Background" in text[:40] else "summary")] += 1
+                    sig["synthetic_" + ("bg_notify" if "Background" in text[:40] else
+                                        "goal_continue" if "standing goal" in text[:60] else "summary")] += 1
                     continue
                 for k, rx in SIGNALS.items():
                     if rx.search(text):
@@ -223,6 +225,8 @@ def main():
     ap.add_argument("--db", action="append", help="profile=path or path (repeatable)")
     ap.add_argument("--home", default=os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
     ap.add_argument("--since-days", type=float, default=45)
+    ap.add_argument("--exclude-profile", action="append", default=[],
+                    help="skip a discovered profile (e.g. a shared team bot holding other people's chats)")
     a = ap.parse_args()
 
     dbs = []
@@ -230,6 +234,7 @@ def main():
         prof, _, path = d.rpartition("=")
         dbs.append((prof or Path(path).parent.name, Path(path)))
     dbs = dbs or discover_dbs(Path(a.home).resolve())
+    dbs = [(p, d) for p, d in dbs if p not in a.exclude_profile]
     since = time.time() - a.since_days * 86400
     out = Path(a.out) / a.host
     written = unchanged = 0
