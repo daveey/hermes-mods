@@ -1,0 +1,139 @@
+From 80d40eb9093f508a0f9b9044422f4f620f3f2935 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:25:08 -0700
+Subject: [PATCH] =?UTF-8?q?feat(desktop):=20=E2=8C=98N=20returns=20to=20th?=
+ =?UTF-8?q?e=20pending=20new-session=20draft=20(text=20+=20attachments)=20?=
+ =?UTF-8?q?[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The new-session screen is a place: while its unsent draft holds text or
+attachments, New Chat keeps the current fresh draft key instead of rotating
+to an empty bucket. The key rotates once the draft is sent or emptied.
+Flushes the live editor first when already on the new-session screen so
+debounced keystrokes count.
+---
+ .../hooks/use-session-actions.test.tsx        | 25 ++++++++++++++++++-
+ .../hooks/use-session-actions/index.ts        | 19 +++++++++++---
+ apps/desktop/src/store/composer.ts            | 17 +++++++++++++
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index 4a1a3c066b..dfc6af10eb 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -23,7 +23,7 @@ import {
+ } from '@/hermes'
+ import { createClientSessionState } from '@/lib/chat-runtime'
+ import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+-import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
++import { clearSessionDraft, type ComposerAttachment, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+ import { $backgroundStatusBySession, type ComposerStatusItem } from '@/store/composer-status'
+ import {
+   activeGatewayConnectionId,
+@@ -6936,6 +6936,29 @@ describe('routed fresh chat keeps its exact owner across turns', () => {
+     await handle!.startFreshSessionDraft({ replaceRoute: true, rotateFreshDraftKey: false })
+     expect($freshDraftKey.get()).toBe(before)
+   })
++
++  it('returns to the pending new-session draft (text + attachments) instead of rotating it away', async () => {
++    let handle: HarnessHandle | null = null
++    const requestGateway = vi.fn(async () => ({}) as never)
++
++    render(<Harness onReady={h => (handle = h)} requestGateway={requestGateway} />)
++    await waitFor(() => expect(handle).not.toBeNull())
++
++    await handle!.startFreshSessionDraft()
++    const pendingKey = $freshDraftKey.get()
++    const image: ComposerAttachment = { id: 'img-1', kind: 'image', label: 'shot.png' }
++    stashSessionDraft(null, 'half-written prompt', [image])
++
++    await handle!.startFreshSessionDraft()
++    expect($freshDraftKey.get()).toBe(pendingKey)
++    expect(takeSessionDraft(null)).toEqual({ attachments: [image], text: 'half-written prompt' })
++
++    // Once the pending draft is emptied (sent / cleared), New Chat rotates again.
++    clearSessionDraft(null)
++    await handle!.startFreshSessionDraft()
++    expect($freshDraftKey.get()).not.toBe(pendingKey)
++    expect(takeSessionDraft(null)).toEqual({ attachments: [], text: '' })
++  })
+ })
+ 
+ describe('createBackendSessionForSend creatingSessionRef hold (#66057)', () => {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 6f2c284c0e..9a441639d3 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -35,7 +35,13 @@ import { purgeInFlightTurnJournals, recoverInFlightTurnJournal } from '@/lib/inf
+ import { latestSessionTodoSnapshot } from '@/lib/todos'
+ import { setSessionYolo } from '@/lib/yolo-session'
+ import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
+-import { announceGoneSessionDraft, announceNewSessionDraftKey, migrateSessionDraft } from '@/store/composer'
++import {
++  announceGoneSessionDraft,
++  announceNewSessionDraftKey,
++  migrateSessionDraft,
++  requestComposerDraftSync,
++  rotateFreshDraftKeyUnlessPending
++} from '@/store/composer'
+ import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+ import { resetSessionBackground } from '@/store/composer-status'
+ import { $connectionRequests } from '@/store/connection-request'
+@@ -81,7 +87,6 @@ import {
+   idsShareLineage,
+   type NewChatWorkspaceTarget,
+   resolveComposerSessionKey,
+-  rotateFreshDraftKey,
+   sessionPinId,
+   setActiveSessionId,
+   setActiveSessionStoredIdRotation,
+@@ -568,7 +573,15 @@ export function useSessionActions({
+         : undefined
+ 
+       if (draftOptions.rotateFreshDraftKey !== false) {
+-        rotateFreshDraftKey()
++        // Already on the new-session screen: push keystrokes still inside the
++        // persist debounce into the fresh bucket first, so the pending check
++        // below sees them instead of rotating them into an orphaned key.
++        if (!selectedStoredSessionIdRef.current && !activeSessionIdRef.current) {
++          requestComposerDraftSync('flush')
++        }
++
++        // Keep the unsent new-session draft (text + attachments) across ⌘N.
++        rotateFreshDraftKeyUnlessPending()
+       }
+ 
+       resetViewSync()
+diff --git a/apps/desktop/src/store/composer.ts b/apps/desktop/src/store/composer.ts
+index 8b1c7381b6..fb63dbc895 100644
+--- a/apps/desktop/src/store/composer.ts
++++ b/apps/desktop/src/store/composer.ts
+@@ -269,6 +269,23 @@ export const rotateFreshDraftKey = (): string => {
+   return key
+ }
+ 
++/** Whether the current fresh-chat lifecycle holds unsent text or attachments. */
++export const freshDraftHasContent = (): boolean => {
++  const draft = draftsBySession.get(freshDraftScope())
++
++  return Boolean(draft && (draft.text.trim() || draft.attachments.length > 0))
++}
++
++/**
++ * New Chat entry point: the new-session screen is a place, not a lifecycle.
++ * While the pending fresh draft still holds content (text or attachments),
++ * ⌘N returns to it instead of rotating to an empty bucket; the key only
++ * rotates once that draft was sent (re-homed onto its session) or emptied.
++ * Returns the fresh key now in effect.
++ */
++export const rotateFreshDraftKeyUnlessPending = (): string =>
++  freshDraftHasContent() ? freshDraftScope() : rotateFreshDraftKey()
++
+ // A draft key belongs to a fresh-chat lifecycle when it is the legacy shared
+ // bucket or one of its per-instance successors (`__new__:<uuid>`, #66662).
+ export const isFreshDraftScope = (key: string | null | undefined): boolean =>
+-- 
+2.54.0 (Apple Git-157)
+

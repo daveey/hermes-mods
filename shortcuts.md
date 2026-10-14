@@ -13,6 +13,7 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 | ⌘⇧A | Archive the selected (else open) session, then open the next one that needs you | core patches 0019, 0026 | same |
 | ⌘R | Send `resume` to the active chat (for a stalled turn) | core patch 0022 | same |
 | ⇧⌘R | Reload the window (⌘R used to do this) | core patch 0022 | same |
+| ⌘N | New session; returns to the unsent new-session draft (text + attachments) instead of an empty composer | core patch 0036 | [core/persistent-new-session-draft.md](core/persistent-new-session-draft.md) |
 | ⌘⇧N | Rename the session; the field is pre-filled with an AI short name | core patch 0020 | [core/ai-session-rename.md](core/ai-session-rename.md) |
 | ⌘⇧P | Move the selected session into a project (palette typeahead over every gateway's projects). A name that doesn't exist offers **Create project** with an empty `~/code/<slug>` | core patches 0018, 0030 | [core/project-palette.md](core/project-palette.md) |
 | ⇧⌘F | Spin out: turn the follow-up work at the end of a session into new sessions | plugin [spin-out](plugins/spin-out/) | `./install.sh` |
