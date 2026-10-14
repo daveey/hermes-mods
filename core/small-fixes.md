@@ -1,6 +1,6 @@
 # Small fixes
 
-Six small, self-contained patches to Hermes core. Each one applies on its own; none depends on another patch in
+Seven small, self-contained patches to Hermes core. Each one applies on its own; none depends on another patch in
 `patches/`. Paths below are relative to the hermes-agent repo root.
 
 | Patch | Area | Change |
@@ -11,6 +11,7 @@ Six small, self-contained patches to Hermes core. Each one applies on its own; n
 | [0005](patches/0005-fix-tui-gateway-host-sleep-doesn-t-count-as-turn-idl.patch) | TUI gateway | Host sleep doesn't count as turn idleness for the WS-orphan reaper |
 | [0006](patches/0006-fix-tui-gateway-live-compression-config-reload-leave.patch) | TUI gateway | Live compression config reload leaves context-engine plugins alone |
 | [0009](patches/0009-fix-plugins-desktop-only-packages-load-without-Pytho.patch) | Plugin loader | Desktop-only packages load without Python; `provides_middleware` is a known manifest field |
+| [0053](patches/0053-feat-desktop-tabs-show-their-full-title-when-the-str.patch) | Desktop | Tabs show their full title when the strip has room, and shrink when it doesn't |
 
 How to run tests (used by every section below):
 
@@ -361,9 +362,53 @@ builds its desktop bundle to a different path still fails.
 
 ---
 
+## 0053: tabs show their full title when the strip has room
+
+**Behavior.** Horizontal pane tabs (session tabs, zone headers) were capped at `max-w-48` (12rem) and didn't
+shrink (`shrink-0`), so a session title was clipped even on an empty strip, and a crowded strip scrolled instead
+of compacting. Now each tab sizes to its full label while the strip has room. When it doesn't, the tabs shrink,
+long labels first (flex-shrink is weighted by width), down to a floor of `min(label width, 8rem)`, so a short
+label never shrinks below its natural width. Closeable tabs keep their old 3.25rem floor (the label stays left of
+the hover ✕), so their floor is `clamp(3.25rem, label width, 8rem)`. Once every tab is at its floor, the strip
+scrolls as before. Vertical rails are unchanged.
+
+**Code.** `apps/desktop/src/components/ui/pane-tab.tsx`: the horizontal class loses its width cap and becomes
+shrinkable. `cn()` is tailwind-merge, so `shrink` overrides the base `shrink-0`. The `TAB_CLOSEABLE` (`min-w-13`)
+constant and its use are deleted:
+
+```ts
+const TAB_HORIZONTAL = 'h-full shrink not-first:border-l not-first:border-l-(--ui-stroke-quaternary)'
+```
+
+`apps/desktop/src/styles.css`, after the `[data-slot='pane-tab'][data-closeable]` rule. Tailwind has no utility for
+`calc-size()`, so the floors live here:
+
+```css
+[data-slot='pane-tab']:not([data-vertical]) {
+  min-width: calc-size(max-content, min(size, 8rem));
+}
+
+[data-slot='pane-tab'][data-closeable]:not([data-vertical]) {
+  min-width: calc-size(max-content, clamp(3.25rem, size, 8rem));
+}
+```
+
+**Tests.** No new unit test, because jsdom does no layout. The existing suites pass:
+`npx vitest run src/components/ui/pane-tab.test.tsx src/components/pane-shell/tree/renderer/tree-group.test.tsx`
+(18 tests). `tsc` and `eslint` are clean. The layout was checked in the app's own Electron 40 (Chrome 144) on
+900/400/150px strips: the long title gets its full 348px, then shrinks to 253px, then floors at 8rem. "New session"
+(98px), "Files" (49px) and a closeable "A" (3.25rem) hold their sizes. The production `vite build` CSS keeps both
+`calc-size()` rules verbatim.
+
+**Gotcha.** `calc-size()` needs Chromium 129+. On an older engine the declaration is dropped, so `min-width`
+falls back to `auto`, which here works out to roughly the label's longest word. Tabs still shrink, just less
+evenly. Don't put the floor back as a Tailwind `min-w-*` class: a fixed floor widens short tabs like "Files".
+
+---
+
 ## Applying
 
-All six are independent; none touches files changed by another, and none depends on any other patch in
+All seven are independent; none touches files changed by another, and none depends on any other patch in
 `core/patches/`. Verified on a scratch clone of current `upstream/main`: each patch passes
 `git apply --check -3` on its own, and all six `git am -3` cleanly in sequence. After applying, the three Python
 test files pass (22 tests), the two changed vitest files pass (13 tests), and desktop `tsc -p . --noEmit` is clean.
@@ -371,13 +416,13 @@ test files pass (22 tests), the two changed vitest files pass (13 tests), and de
 ```sh
 cd ~/.hermes/hermes-agent            # or your checkout
 git am -3 ~/code/hermes-mods/core/patches/0005-*.patch   # any subset, any order
-git am -3 ~/code/hermes-mods/core/patches/{0001,0002,0003,0005,0006,0009}-*.patch
+git am -3 ~/code/hermes-mods/core/patches/{0001,0002,0003,0005,0006,0009,0053}-*.patch
 ```
 
 After that:
 
 - The Python fixes (0005, 0006, 0009) take effect when the gateway or backend restarts.
-- The desktop fixes (0001–0003) need a rebuilt app: `hermes desktop --build-only --force-build`. On macOS, set
+- The desktop fixes (0001–0003, 0053) need a rebuilt app: `hermes desktop --build-only --force-build`. On macOS, set
   `APPLE_SIGNING_IDENTITY`, otherwise the build is ad-hoc signed.
-- None of the six changes the RPC contract, i18n locale files, or the keybind registry, so there's nothing to
+- None of the seven changes the RPC contract, i18n locale files, or the keybind registry, so there's nothing to
   regenerate.
