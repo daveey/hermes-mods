@@ -27,6 +27,26 @@ clones pass. A backtest over 37.6k past Hermes terminal calls blocks 43, and eve
 HEAD move or repack. Escape hatch for a change the user explicitly asked for: start the command with
 `COACH_ALLOW_LIVE=1`. Blocks are logged as `agent_block` in `log.jsonl`.
 
+### Reply check (`pre_verify`, before the turn ends)
+
+When the agent stops with its final message, `reply_check.py` looks at it once per turn. A regex prefilter
+finds candidates. The aux task `coach_reply` then judges them, given the user's ask, the turn's tool log and a
+private environment profile (`<HERMES_HOME>/coach/reply_profile.md`: which credential stores, hosts and browsers
+this user's agents can reach). A hit keeps the turn going with a nudge the user never sees.
+
+| Rule | Fires when | Nudge |
+|---|---|---|
+| `handoff` | the reply hands the user a step the agent could do itself (log in, click, run, paste...) | try it first with shell/ssh/browser/vault/token-broker; hand off only what needs hands or judgment, and say why |
+| `confirm` | the reply ends with "Want me to…?" about a reversible, in-scope step | proceed, verify, report; ask only before irreversible or external actions |
+| `unverified` (off by default) | "done/fixed" with no check on the user's real path | verify on the user's path or say what's unchecked |
+
+Measured on 360 real replies against hindsight labels (the labeler also saw the user's next message). At
+threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
+samples are small (n=120), so treat these numbers as early. `unverified` showed no usable signal.
+Settings: `COACH_REPLY_RULES` (comma list or `none`) and `COACH_REPLY_THRESHOLD`. Needs core
+`agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
+file edits. Nudges are logged as `reply_nudge` in `log.jsonl`.
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.

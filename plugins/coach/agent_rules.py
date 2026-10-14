@@ -344,7 +344,8 @@ class AgentCoach:
         s = self.sessions.get(sid)
         if s is None:
             s = self.sessions[sid] = {"turn": 0, "turn_tools": 0, "fails": {}, "recent": deque(maxlen=POLL_WINDOW),
-                                      "fired": set(), "pending": [], "bg": {}}
+                                      "fired": set(), "pending": [], "bg": {}, "ask": "",
+                                      "turn_log": deque(maxlen=60)}
         return s
 
     def _fire(self, s: dict, sid: str, rule: str, key: str, **fmt) -> None:
@@ -356,11 +357,19 @@ class AgentCoach:
         if self.signals:
             self.signals.log({"event": "agent_hint", "session_id": sid, "rule": rule})
 
-    def turn_start(self, sid: str) -> Optional[str]:
+    def turn_start(self, sid: str, user_message: Any = None) -> Optional[str]:
         s = self._s(sid)
         s["turn"] += 1
         s["turn_tools"] = 0
+        s["turn_log"].clear()
+        if isinstance(user_message, str) and user_message.strip():
+            s["ask"] = user_message[:2000]
         return self.take(sid)
+
+    def turn_context(self, sid: str) -> tuple[str, list[str]]:
+        """(latest user ask, this turn's tool log) for the reply check."""
+        s = self._s(sid)
+        return s["ask"], list(s["turn_log"])
 
     def take(self, sid: str) -> Optional[str]:
         s = self.sessions.get(sid)
@@ -378,6 +387,14 @@ class AgentCoach:
         s = self._s(sid)
         s["turn_tools"] += 1
         now = self.clock()
+        try:
+            arg = next((str(args[k]) for k in ("command", "code", "path", "url", "query", "goal", "name")
+                        if args.get(k)), json.dumps(args, default=str))
+        except Exception:
+            arg = ""
+        s["turn_log"].append(f"-> {tool}({arg[:140]})")
+        if failed(tool, result, status):
+            s["turn_log"].append(f"   <- ERROR {str(result)[:120]}")
 
         # repeat_failure
         key = command_key(tool, args)

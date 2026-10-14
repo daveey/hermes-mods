@@ -41,7 +41,7 @@ def build(store=None, checkout=None):
             if not session_id:
                 return None
             store.user_turn(session_id, user_message)
-            hint = coach.turn_start(session_id)
+            hint = coach.turn_start(session_id, user_message)
             return {"context": f"[coach] {hint}"} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
@@ -77,7 +77,29 @@ def build(store=None, checkout=None):
             pass
         return {"action": "block", "message": rules.block_message(what, coach.checkout)}
 
-    return coach, {"pre_tool_call": pre_tool_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
+    def pre_verify(session_id="", platform="", attempt=0, final_response="", changed_paths=None, **_):
+        """Check the agent's final answer before the turn ends; a hit keeps the turn going with a nudge.
+        At most one nudge per turn (attempt 0 only); fail-open on every error."""
+        try:
+            if attempt or not session_id or not final_response or platform in ("cron",):
+                return None
+            rc = _load("reply_check")
+            cfg = rc.settings()
+            if not cfg["rules"]:
+                return None
+            ask, log_lines = coach.turn_context(session_id)
+            hit = rc.check(final_response, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
+                           only=cfg["rules"], changed_paths=changed_paths)
+            if not hit:
+                return None
+            store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
+                       "p": hit["p"], "evidence": hit["evidence"]})
+            return {"action": "continue", "message": hit["nudge"]}
+        except Exception as exc:
+            log.debug("coach pre_verify: %s", exc)
+            return None
+
+    return coach, {"pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
                    "transform_tool_result": transform_tool_result}
 
 
