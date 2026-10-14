@@ -146,12 +146,16 @@ Reply with ONLY JSON:
  "skipped": [{"item": "...", "reason": "..."}]}""" % MAX_TASKS
 
 
-def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None) -> dict:
+def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None, auto: bool = False) -> dict:
+    """``auto=True`` (fired after every finished turn) skips the planner unless the last reply hints at follow-ups."""
     info = session_info(session_id, db_path)
     if not info:
         return {"tasks": [], "skipped": [], "error": "unknown session"}
-    if not any(m["role"] == "assistant" and (m.get("content") or "").strip() for m in info["messages"]):
+    idx, reply = last_reply(info)
+    if idx < 0:
         return {"tasks": [], "skipped": [], "error": "session has no assistant reply yet"}
+    if auto and not has_followups(reply):
+        return {"tasks": [], "skipped": [], "auto_skip": "no follow-up cues in the last reply", "reply_index": idx}
     files = touched_files(info["messages"])
     user = (
         f"Session title: {info.get('title') or '(none)'}\n"
@@ -174,7 +178,66 @@ def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None) -> dict:
     skipped = [{"item": str(s.get("item") or "")[:200], "reason": str(s.get("reason") or "")[:200]}
                for s in (out.get("skipped") or []) if isinstance(s, dict)]
     return {"tasks": tasks, "skipped": skipped, "title": info.get("title") or "", "cwd": info.get("cwd") or "",
-            "profile": info.get("profile_name") or "default"}
+            "profile": info.get("profile_name") or "default", "reply_index": idx}
+
+
+FOLLOWUP_CUES = re.compile(
+    r"(?i)\b(next steps?|follow[- ]ups?|still (open|owed|to do|todo|needed|pending|missing)|not (done|built|wired|tested) yet"
+    r"|remaining|left (to do|for you|open)|todo\b|pending|is owed|next is|next up|phase \d|want me to|shall i|should i"
+    r"|i can (also|then)|after that|later,? (i|we)|open (items|threads|questions)|not yet)\b")
+
+
+def last_reply(info: dict) -> tuple[int, str]:
+    """(index, text) of the final assistant message with content; (-1, '') when none."""
+    msgs = info.get("messages") or []
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        if m["role"] == "assistant" and (m.get("content") or "").strip():
+            return i, m["content"]
+    return -1, ""
+
+
+def has_followups(text: str) -> bool:
+    """Cheap pre-filter for the automatic check: only spend a planner call when the last reply hints at more work."""
+    return bool(FOLLOWUP_CUES.search(text or ""))
+
+
+def kanban_cards(tasks: list[dict], parent_id: str, profile: str, cwd: str = "", board: Optional[str] = None,
+                 kb=None) -> dict:
+    """Create one Kanban card per task (title + full child message as body) on ``board`` (None = active board).
+
+    Cards are assigned to ``profile``, linked to the parent session (``session_id``), and work in the parent's
+    directory when it still exists (``dir`` workspace), else the board default. ``idempotency_key`` makes a
+    second click return the same card instead of a duplicate. ``kb`` = (kanban_db, kanban_db_connect) for tests.
+    """
+    if kb is None:
+        from hermes_cli import kanban_db, kanban_db_connect  # type: ignore
+        kb = (kanban_db, kanban_db_connect)
+    db, connect = kb
+    try:
+        db.init_db(board=board)
+    except Exception:
+        pass
+    ws = {"workspace_kind": "dir", "workspace_path": cwd} if cwd and os.path.isdir(cwd) else {}
+    out, slug = [], board
+    con = connect.connect(board=board)
+    try:
+        try:
+            slug = board or db.get_current_board()
+        except Exception:
+            slug = board or "default"
+        for t in tasks:
+            title = str(t.get("title") or "Follow-up").strip()[:80]
+            try:
+                tid = db.create_task(con, title=title, body=t.get("message") or t.get("prompt") or "",
+                                     assignee=profile or "default", created_by="spin-out", session_id=parent_id,
+                                     idempotency_key=f"spin-out:{parent_id}:{title}", board=board, **ws)
+                out.append({"title": title, "task_id": tid})
+            except Exception as exc:
+                out.append({"title": title, "error": f"{type(exc).__name__}: {exc}"[:300]})
+    finally:
+        con.close()
+    return {"board": slug, "cards": out}
 
 
 def child_message(task: dict, parent_id: str, profile: str, parent_title: str) -> str:

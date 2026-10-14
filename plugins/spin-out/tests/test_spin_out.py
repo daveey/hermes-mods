@@ -107,3 +107,67 @@ def test_router_plan(tmp_path):
     r = TestClient(app).post("/plan", json={"session_id": "s1"}).json()
     assert len(r["tasks"]) == 2 and r["profile"] == "default"
     assert all("@session:default/s1" in t["message"] for t in r["tasks"])
+
+
+def test_auto_skips_without_cues_and_caches(tmp_path):
+    db = make_db(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute("insert into messages (session_id, role, content) values ('s1','assistant','All shipped and verified.')")
+    con.commit(); con.close()
+    llm = FakeLLM(PLAN)
+    out = core.plan("s1", llm, db, auto=True)
+    assert out["tasks"] == [] and "auto_skip" in out and llm.calls == []   # no model call
+    assert core.has_followups(FINAL)                                      # "Not done yet" is a cue
+    assert len(core.plan("s1", llm, db, auto=False)["tasks"]) == 2        # manual ⇧⌘F always plans
+
+
+def test_router_auto_cache(tmp_path):
+    llm = FakeLLM(PLAN)
+    app = FastAPI()
+    app.include_router(api.create_router(llm=llm, db_path=make_db(tmp_path)))
+    c = TestClient(app)
+    a = c.post("/plan", json={"session_id": "s1", "auto": True}).json()
+    b = c.post("/plan", json={"session_id": "s1", "auto": True}).json()
+    assert len(a["tasks"]) == 2 and b.get("cached") is True and len(llm.calls) == 1
+
+
+class FakeKanban:
+    def __init__(self):
+        self.created, self.keys = [], {}
+
+    def init_db(self, board=None):
+        pass
+
+    def get_current_board(self):
+        return "babybear"
+
+    def create_task(self, con, **kw):
+        key = kw["idempotency_key"]
+        if key not in self.keys:
+            self.keys[key] = f"t_{len(self.keys) + 1}"
+            self.created.append(kw)
+        return self.keys[key]
+
+    def connect(self, board=None):
+        return sqlite3.connect(":memory:")
+
+
+def test_kanban_cards(tmp_path):
+    kb = FakeKanban()
+    tasks = [{"title": "Fix sync job", "message": "Fix it @session:default/s1"}, {"title": "Tests", "message": "Add"}]
+    out = core.kanban_cards(tasks, "s1", "work", str(tmp_path), kb=(kb, kb))
+    assert out["board"] == "babybear" and [c["task_id"] for c in out["cards"]] == ["t_1", "t_2"]
+    kw = kb.created[0]
+    assert kw["assignee"] == "work" and kw["session_id"] == "s1" and kw["body"].startswith("Fix it")
+    assert kw["workspace_kind"] == "dir" and kw["workspace_path"] == str(tmp_path)
+    again = core.kanban_cards(tasks[:1], "s1", "work", "/no/such/dir", kb=(kb, kb))
+    assert again["cards"][0]["task_id"] == "t_1" and len(kb.created) == 2   # idempotent
+
+
+def test_router_kanban(tmp_path):
+    kb = FakeKanban()
+    app = FastAPI()
+    app.include_router(api.create_router(llm=FakeLLM(PLAN), db_path=make_db(tmp_path), kb=(kb, kb)))
+    r = TestClient(app).post("/kanban", json={"session_id": "s1", "profile": "default",
+                                              "tasks": [{"title": "A", "message": "do A"}, {"title": "B", "message": " "}]}).json()
+    assert [c["title"] for c in r["cards"]] == ["A"] and "workspace_kind" not in kb.created[0]

@@ -48,9 +48,34 @@ git clone git@github.com:<you>/hermes-coach-data ~/code/hermes-coach-data
 Schedule it every 30 min (launchd `StartInterval 1800` on macOS). Check `git log` in the data repo.
 A host with a non-default home passes `--home` (e.g. `~/.bb-hermes`). Profiles are discovered automatically.
 
+## Running the coach Bot
+
+A Bot profile on an always-on gateway owns the model work. Two crons: a no-agent feed for that host's own sessions
+(silent unless broken, `--deliver local`), and a daily no-agent prerun that pulls, digests, runs
+`coach_mine.py --write-kpis` and prints the labeling queue plus numbered instructions with `--deliver bot-chat`.
+The Bot labels per `references/labeling.md`, writes `findings/` + `reports/`, then commits through a push helper.
+Put the KPI goals and the user's learning track in its SOUL.md so every report names the next drill.
+
+After changing a script: commit to hermes-mods (the Macs fast-forward through sync), then re-ship the changed files
+to the cloud profile's `scripts/` and its skill copy, compare byte counts, and rerun the feed on every host so all
+digests share one version (`DIGEST_V`).
+
 ## Pitfalls
 
 - Verify redaction before the first push to a new repo: `gitleaks dir <repo>/<host>` must report no leaks.
+- Hermes writes many user-role messages itself: delegation results, cross-session messages, turn-cap notices,
+  `/goal` continuations, `[IMPORTANT: …]` notices, compression summaries, model-switch notes. Counted as user turns,
+  they inflated repeat-fix about 10× and the Hermes-meta share about 4×. Extend `SYNTHETIC` whenever a new
+  prefix appears (`grep -rhoE '"text": "\[[A-Z][A-Za-z: ]{4,40}' <host> | sort | uniq -c`), and normalize
+  per-session rates by real user turns, not by the kept turn sample.
+- Sanity-check a new KPI against the raw numbers before reporting it. Weight delegated work by spend: a count-based
+  Kanban share (sessions vs orchestrating chats) reads 68% when the cost-weighted one is 14%, because each card is a
+  session while one chat can hold 50 subagents.
+- Treat the coach's first report as a check of the pipeline itself: it audits the digests and finds metric bugs.
+  Fix those first, before acting on its usage findings.
+- Keyword signals (`hermes_meta` etc.) hit incidental mentions. Classify a session by title keywords or by the
+  signal's share of real turns, never by a raw count ≥ N.
+- Exclude shared team-bot profiles (`--exclude-profile`): they hold other people's conversations.
 - `[REDACTED]` inside ordinary prose usually means the `token|password …` rule caught a word. That rule requires
   a digit and ≥12 chars to keep false positives down.
 - User messages can be JSON lists of multimodal parts. `flatten()` keeps the text and turns images into `[screenshot]`.
