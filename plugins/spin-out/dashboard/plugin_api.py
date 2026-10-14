@@ -5,7 +5,11 @@ POST /plan {session_id, profile?, auto?} -> {tasks: [{title, prompt, needs_paren
   auto=true (sent after every finished turn) skips the model call unless the last reply hints at follow-ups,
   and reuses the previous plan while the session's last reply is unchanged.
 POST /kanban {session_id, profile?, cwd?, board?, tasks: [{title, message}]} -> {board, cards: [{title, task_id|error}]}
-  One Kanban card per task, assigned to the session's profile and linked to the parent session.
+  One Kanban card per task, assigned to the session's profile and linked to the parent session. Created cards are
+  recorded in the spun-out ledger.
+POST /spun {session_id, items: [{title, ref}]} -> {added}
+  Record follow-ups launched as child sessions (ref = "@session:<profile>/<child id>"). The parent's next turn gets a
+  one-time note (agent hook in ../__init__.py) so it stops offering them; later plans skip them.
 Read-only on state.db; at most one auxiliary-model call per /plan request.
 """
 import importlib.util
@@ -18,7 +22,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 
-API_VERSION = 2  # 2 = /plan auto + /kanban. The desktop half only uses those when ping reports >= 2.
+API_VERSION = 3  # 2 = /plan auto + /kanban; 3 = /spun ledger. The desktop half gates each on the ping version.
 
 
 def _core():
@@ -44,6 +48,16 @@ class CardTask(BaseModel):
     message: str = ""
 
 
+class SpunItem(BaseModel):
+    title: str
+    ref: str = ""
+
+
+class SpunBody(BaseModel):
+    session_id: str
+    items: list[SpunItem] = Field(default_factory=list)
+
+
 class KanbanBody(BaseModel):
     session_id: str
     profile: str = ""
@@ -52,7 +66,7 @@ class KanbanBody(BaseModel):
     tasks: list[CardTask] = Field(default_factory=list)
 
 
-def create_router(llm=None, db_path=None, kb=None):
+def create_router(llm=None, db_path=None, kb=None, ledger=None):
     router = APIRouter()
     cache: dict = {}  # session_id -> (reply_index, plan) for auto checks
     lock = threading.Lock()
@@ -71,7 +85,7 @@ def create_router(llm=None, db_path=None, kb=None):
                 hit = cache.get(body.session_id)
             if hit and hit[0] == idx:
                 return dict(hit[1], cached=True)
-        out = core.plan(body.session_id, llm or core.aux_llm, db_path, auto=body.auto)
+        out = core.plan(body.session_id, llm or core.aux_llm, db_path, auto=body.auto, ledger=ledger)
         profile = body.profile or out.get("profile") or "default"
         out["profile"] = profile
         for t in out.get("tasks", []):
@@ -87,7 +101,21 @@ def create_router(llm=None, db_path=None, kb=None):
         tasks = [t.model_dump() for t in body.tasks if t.message.strip()]
         if not tasks:
             return {"board": body.board, "cards": [], "error": "no tasks"}
-        return core.kanban_cards(tasks, body.session_id, body.profile or "default", body.cwd, body.board, kb=kb)
+        out = core.kanban_cards(tasks, body.session_id, body.profile or "default", body.cwd, body.board, kb=kb)
+        made = [{"title": c["title"], "ref": f"Kanban card {c['task_id']} on board {out.get('board') or 'default'}"}
+                for c in out.get("cards", []) if c.get("task_id")]
+        if made:
+            core.record_spun(body.session_id, made, ledger)
+            with lock:
+                cache.pop(body.session_id, None)
+        return out
+
+    @router.post("/spun")
+    def spun(body: SpunBody):
+        added = _core().record_spun(body.session_id, [i.model_dump() for i in body.items], ledger)
+        with lock:
+            cache.pop(body.session_id, None)  # the cached auto plan still lists what was just spun out
+        return {"added": added}
 
     return router
 

@@ -108,7 +108,7 @@ def test_router_plan(tmp_path):
     app = FastAPI()
     app.include_router(api.create_router(llm=FakeLLM(PLAN), db_path=make_db(tmp_path)))
     r = TestClient(app).post("/plan", json={"session_id": "s1"}).json()
-    assert len(r["tasks"]) == 2 and r["profile"] == "default"
+    assert len(r["tasks"]) == 3 and r["profile"] == "default"   # incl. the promoted "skipped" item
     assert all("@session:default/s1" in t["message"] for t in r["tasks"])
 
 
@@ -121,7 +121,7 @@ def test_auto_skips_without_cues_and_caches(tmp_path):
     out = core.plan("s1", llm, db, auto=True)
     assert out["tasks"] == [] and "auto_skip" in out and llm.calls == []   # no model call
     assert core.has_followups(FINAL)                                      # "Not done yet" is a cue
-    assert len(core.plan("s1", llm, db, auto=False)["tasks"]) == 2        # manual ⇧⌘F always plans
+    assert len(core.plan("s1", llm, db, auto=False)["tasks"]) == 3        # manual ⇧⌘F always plans
 
 
 def test_router_auto_cache(tmp_path):
@@ -131,7 +131,7 @@ def test_router_auto_cache(tmp_path):
     c = TestClient(app)
     a = c.post("/plan", json={"session_id": "s1", "auto": True}).json()
     b = c.post("/plan", json={"session_id": "s1", "auto": True}).json()
-    assert len(a["tasks"]) == 2 and b.get("cached") is True and len(llm.calls) == 1
+    assert len(a["tasks"]) == 3 and b.get("cached") is True and len(llm.calls) == 1
 
 
 class FakeKanban:
@@ -174,3 +174,47 @@ def test_router_kanban(tmp_path):
     r = TestClient(app).post("/kanban", json={"session_id": "s1", "profile": "default",
                                               "tasks": [{"title": "A", "message": "do A"}, {"title": "B", "message": " "}]}).json()
     assert [c["title"] for c in r["cards"]] == ["A"] and "workspace_kind" not in kb.created[0]
+
+
+def test_spun_ledger_note_once_and_planner_skips(tmp_path):
+    db, led = make_db(tmp_path, compressed_parent=True), tmp_path / "spun.json"
+    # recorded on the compressed ancestor: the live continuation still sees it
+    assert core.record_spun("s0", [{"title": "Fix sync job on mini", "ref": "@session:default/c1"}], led) == 1
+    assert core.record_spun("s0", [{"title": "Fix sync job on mini", "ref": "@session:default/c1"}], led) == 0
+    items = core.take_undelivered("s1", db, led)
+    note = core.spun_note(items)
+    assert "Fix sync job on mini → @session:default/c1" in note and "do not offer" in note
+    assert core.take_undelivered("s1", db, led) == []            # delivered once
+    llm = FakeLLM(PLAN)
+    out = core.plan("s1", llm, db, ledger=led)
+    assert "Fix sync job on mini" not in [t["title"] for t in out["tasks"]]
+    assert "ALREADY SPUN OUT" in llm.calls[0][1]["content"]
+
+
+def test_router_spun_and_kanban_record(tmp_path):
+    kb, led = FakeKanban(), tmp_path / "spun.json"
+    app = FastAPI()
+    app.include_router(api.create_router(llm=FakeLLM(PLAN), db_path=make_db(tmp_path), kb=(kb, kb), ledger=led))
+    c = TestClient(app)
+    assert c.get("/ping").json()["api"] == 3
+    assert c.post("/spun", json={"session_id": "s1", "items": [{"title": "A", "ref": "@session:default/c9"}]}).json() == {"added": 1}
+    c.post("/kanban", json={"session_id": "s1", "tasks": [{"title": "B", "message": "do B"}]})
+    refs = [r["ref"] for r in core.spun_items("s1", None, led)]
+    assert refs == ["@session:default/c9", "Kanban card t_1 on board babybear"]
+
+
+def test_agent_hook_injects_note(tmp_path, monkeypatch):
+    import sys as _sys
+    led = tmp_path / "spun.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "spin-out").mkdir()
+    plugin = load("so_plugin_test", ROOT / "__init__.py")
+    _sys.modules.pop("_spin_out_core", None)
+    hooks = {}
+    plugin.register(type("Ctx", (), {"register_hook": lambda self, n, f: hooks.setdefault(n, f)})())
+    c = plugin._core()
+    monkeypatch.setattr(c, "hermes_home", lambda: tmp_path)
+    c.record_spun("sX", [{"title": "A", "ref": "@session:default/c9"}])
+    assert hooks["pre_llm_call"](session_id="") is None
+    assert "@session:default/c9" in hooks["pre_llm_call"](session_id="sX")["context"]
+    assert hooks["pre_llm_call"](session_id="sX") is None

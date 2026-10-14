@@ -9,6 +9,14 @@ composer. For each follow-up you can:
   session's profile, linked to the parent session, and work in its directory. A second click returns the same cards
   (idempotency key), so there are no duplicates.
 
+## The parent is told what was spun out
+
+Every launched child and every created card is recorded per parent session in `<hermes_home>/spin-out/spun.json`
+(`POST /spun` from the desktop for sessions; `/kanban` records cards itself). On the parent's next turn the agent hook
+(`__init__.py`, `pre_llm_call`) adds a one-time note: these follow-ups are owned elsewhere (`@session:<profile>/<id>`
+or `Kanban card <id> on board <b>`), so don't offer or redo them. Later plans for that session (and its compressed
+continuations) skip them too. Each child's brief already ends with an `@session` pointer back to the parent.
+
 ## When it appears
 
 - **Automatically, when a turn finishes** in the focused session and its last reply mentions follow-up work
@@ -28,7 +36,7 @@ composer. For each follow-up you can:
   ones that need you (a decision, credentials, a physical action): that child does the agent-side work, asks you for
   the one thing it needs, and verifies afterwards. Nothing is "left for you" outside the list. `kanban_cards()` creates the cards through
   `hermes_cli.kanban_db.create_task`.
-- `GET /ping` reports `api: 2`. Against an older backend (the plugin updated, but the backend not restarted yet), the
+- `GET /ping` reports `api: 3` (2 = auto + `/kanban`, 3 = `/spun`). Against an older backend (the plugin updated, but the backend not restarted yet), the
   desktop half skips the auto check and hides the Kanban button. Restart the backend (or the app) after updating.
 
 ## Tests
@@ -36,5 +44,5 @@ composer. For each follow-up you can:
 ```bash
 cd plugins/spin-out
 uv run --with pytest --with fastapi --with httpx python -m pytest -q -p no:cacheprovider tests
-PATH=~/.nvm/versions/node/v20.20.2/bin:$PATH bash tests/desktop/run.sh   # desktop flow, mocked SDK
+PATH=$(ls -d ~/.nvm/versions/node/v2*/bin | tail -1):$PATH bash tests/desktop/run.sh   # desktop flow, mocked SDK
 ```

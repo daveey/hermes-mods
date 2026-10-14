@@ -8,7 +8,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 let fails = 0
 const ok = (cond, msg) => { console.log(`${cond ? 'ok' : 'FAIL'} - ${msg}`); if (!cond) fails++ }
 
-let api = 2, planReply = null
+let api = 3, planReply = null
 const rest = []
 const PLAN = { tasks: [{ title: 'Fix sync', message: 'Fix the sync job @session:default/S1', prompt: 'Fix' },
                        { title: 'Add tests', message: 'Add tests @session:default/S1', prompt: 'Add' }],
@@ -21,6 +21,7 @@ plugin.register({
     rest.push([path, opts.body])
     if (path === '/ping') return api >= 2 ? { ok: true, api } : { ok: true }
     if (path === '/plan') return planReply
+    if (path === '/spun') return { added: opts.body.items.length }
     if (path === '/kanban') return { board: 'babybear', cards: opts.body.tasks.map((t, i) => ({ title: t.title, task_id: `t_${i + 1}` })) }
     throw new Error('unexpected ' + path)
   }
@@ -83,7 +84,15 @@ await finishTurn()
 ok(plans().length === before, 'auto toggle off stops the check')
 regs['auto-toggle'].data.run()
 
-// 7. old backend (no api version): no auto check, no Kanban button on a manual run
+// 7. launching a child tells the parent (ledger) where it went
+SO.setJob(null)
+planReply = { ...PLAN, reply_index: 11 }
+await finishTurn()
+await SO.launchOne(0); await sleep(20)
+const sp = rest.find(r => r[0] === '/spun')
+ok(sp && sp[1].session_id === 'S1' && sp[1].items[0].title === 'Fix sync' && sp[1].items[0].ref === '@session:default/S9', '/spun records the child with an @session pointer')
+
+// 8. old backend (no api version): no auto check, no Kanban button on a manual run
 api = 1
 await SO.spinOut() // manual run re-probes
 await sleep(20)

@@ -10,6 +10,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -147,8 +149,10 @@ Reply with ONLY JSON:
 {"tasks": [{"title": "<=7 words", "prompt": "...", "needs_parent": bool}]}""" % MAX_TASKS
 
 
-def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None, auto: bool = False) -> dict:
-    """``auto=True`` (fired after every finished turn) skips the planner unless the last reply hints at follow-ups."""
+def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None, auto: bool = False,
+         ledger: Optional[Path] = None) -> dict:
+    """``auto=True`` (fired after every finished turn) skips the planner unless the last reply hints at follow-ups.
+    Follow-ups already spun out of this session (the ledger) are excluded."""
     info = session_info(session_id, db_path)
     if not info:
         return {"tasks": [], "skipped": [], "error": "unknown session"}
@@ -158,7 +162,11 @@ def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None, auto: bool =
     if auto and not has_followups(reply):
         return {"tasks": [], "skipped": [], "auto_skip": "no follow-up cues in the last reply", "reply_index": idx}
     files = touched_files(info["messages"])
+    spun = spun_items(session_id, db_path, ledger)
+    already = ("ALREADY SPUN OUT (owned by other sessions/cards; never return these or reworded copies):\n"
+               + "\n".join(f"- {r['title']}" for r in spun) + "\n\n") if spun else ""
     user = (
+        already +
         f"Session title: {info.get('title') or '(none)'}\n"
         f"Working dir: {info.get('cwd') or '(none)'}\n"
         f"Repo: {info.get('git_repo_root') or '(none)'}  branch: {info.get('git_branch') or '(none)'}\n"
@@ -189,6 +197,7 @@ def plan(session_id: str, llm: LLM, db_path: Optional[Path] = None, auto: bool =
                       + "Read the parent session for details. Do all the agent-side work (diagnose, check current "
                         "state, prepare options or the change), then ask the human for exactly what only they can "
                         "do or decide, and verify the result after they do it."})
+    tasks = drop_spun(tasks, spun)
     return {"tasks": tasks, "skipped": [], "title": info.get("title") or "", "cwd": info.get("cwd") or "",
             "profile": info.get("profile_name") or "default", "reply_index": idx}
 
@@ -263,6 +272,100 @@ def child_message(task: dict, parent_id: str, profile: str, parent_title: str) -
         tail = (f"Spun out of parent session {ref}{named}. The brief above should be enough; read the parent only "
                 "if you hit a gap.")
     return f"{task['prompt']}\n\n---\n{tail}"
+
+
+# ── spun-out ledger ─────────────────────────────────────────────────────
+# Every follow-up launched as a child session or put on Kanban is recorded per parent session in
+# <hermes_home>/spin-out/spun.json. The agent hook (`__init__.py`, pre_llm_call) tells the parent once, on its
+# next turn, that those items now live elsewhere (with a pointer), so it stops offering them; the planner skips them.
+_LEDGER_LOCK = threading.Lock()
+SPUN_KEEP = 40  # per parent
+
+
+def ledger_path() -> Path:
+    return hermes_home() / "spin-out" / "spun.json"
+
+
+def _load_ledger(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_ledger(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(tmp, path)
+
+
+def record_spun(parent_id: str, items: list[dict], path: Optional[Path] = None) -> int:
+    """Append ``items`` ({title, ref}) to ``parent_id``'s ledger as undelivered. Same title+ref is recorded once."""
+    path = path or ledger_path()
+    added = 0
+    with _LEDGER_LOCK:
+        data = _load_ledger(path)
+        rows = data.setdefault(parent_id, [])
+        have = {(r.get("title"), r.get("ref")) for r in rows}
+        for it in items:
+            title, ref = str(it.get("title") or "").strip()[:120], str(it.get("ref") or "").strip()
+            if not title or (title, ref) in have:
+                continue
+            rows.append({"title": title, "ref": ref, "at": int(time.time()), "delivered": False})
+            have.add((title, ref))
+            added += 1
+        data[parent_id] = rows[-SPUN_KEEP:]
+        if added:
+            _save_ledger(path, data)
+    return added
+
+
+def _lineage_ids(session_id: str, db_path: Optional[Path]) -> list[str]:
+    try:
+        con = _db(db_path)
+        try:
+            return _lineage(con, session_id) or [session_id]
+        finally:
+            con.close()
+    except Exception:
+        return [session_id]
+
+
+def spun_items(session_id: str, db_path: Optional[Path] = None, path: Optional[Path] = None) -> list[dict]:
+    """Everything spun out of this session or its compression ancestors."""
+    data = _load_ledger(path or ledger_path())
+    return [r for sid in _lineage_ids(session_id, db_path) for r in data.get(sid) or []]
+
+
+def take_undelivered(session_id: str, db_path: Optional[Path] = None, path: Optional[Path] = None) -> list[dict]:
+    """Undelivered items for this session (lineage-aware), marked delivered. The note rides that turn's user message,
+    whose exact bytes are replayed on later turns, so one delivery is enough."""
+    path = path or ledger_path()
+    ids = _lineage_ids(session_id, db_path)
+    out = []
+    with _LEDGER_LOCK:
+        data = _load_ledger(path)
+        for sid in ids:
+            for r in data.get(sid) or []:
+                if not r.get("delivered"):
+                    r["delivered"] = True
+                    out.append(r)
+        if out:
+            _save_ledger(path, data)
+    return out
+
+
+def spun_note(items: list[dict]) -> str:
+    lines = [f"- {r['title']}" + (f" → {r['ref']}" if r.get("ref") else "") for r in items]
+    return ("[spin-out] The user spun these follow-ups out of this session. They are owned elsewhere now: do not "
+            "offer, plan or redo them here; if they come up, point to where they live.\n" + "\n".join(lines))
+
+
+def drop_spun(tasks: list[dict], spun: list[dict]) -> list[dict]:
+    done = {str(r.get("title") or "").strip().lower() for r in spun}
+    return [t for t in tasks if str(t.get("title") or "").strip().lower() not in done]
 
 
 def aux_llm(messages: list, max_tokens: int) -> str:

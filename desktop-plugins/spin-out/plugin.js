@@ -230,6 +230,13 @@ const patchChild = (i, patch) => {
   setJob({ ...job, children, phase: allLaunched ? 'done' : job.phase })
 }
 
+// Tell the parent session (via the backend ledger + agent hook) what was spun out and where, so its next turn
+// stops offering it. Kanban cards are recorded server-side by /kanban. Best-effort; needs api >= 3.
+function recordSpun(parent, items) {
+  if (apiVersion < 3 || !items.length) return
+  ctxRef.rest('/spun', { method: 'POST', body: { session_id: parent, items }, timeoutMs: 15000 }).catch(err => log('record spun failed', err))
+}
+
 async function launchOne(i) {
   const j = job
   const c = j?.children?.[i]
@@ -248,6 +255,7 @@ async function launchOne(i) {
     }
     patchChild(i, { status: 'ok', stored })
     busReport('accepted')
+    recordSpun(j.parent, [{ title: c.title, ref: stored ? `@session:${profile}/${stored}` : '' }])
     return true
   } catch (err) {
     patchChild(i, { status: 'error', error: String(err?.message || err) })
