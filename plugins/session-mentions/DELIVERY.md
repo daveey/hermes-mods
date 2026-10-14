@@ -39,6 +39,9 @@ Fix:
   forwarded (`POST /enqueue`, poll `GET /status/<id>`), so that gateway's own Desktop delivers it through the owning
   socket. No home courier, an older backend, or a request unclaimed after 20s (withdrawn via `POST /cancel`) -> direct
   send as before. A lost enqueue ack only falls back once the request is provably absent.
+- A forwarded send refused over there falls back to the direct route: the chat may be open in THIS Desktop, whose own
+  backend on that gateway owns it. The courier ticks from a dedicated worker, because Chromium throttles an idle
+  hidden window's timers to ~1/min (the mini's heartbeat went stale and requests waited a minute).
 - Core's ownership refusal is reported as `status: "refused", delivered: false, retry_safe: true` (the turn was never
   admitted) instead of "unknown".
 
@@ -50,3 +53,14 @@ Tests: `uv run --with pytest python -m pytest -q -p no:cacheprovider tests/test_
 `node --test tests/` (courier.test.mjs). Live: `tests/live-remote-drain.mjs` (plays the other Mac's courier against
 the real SSH-isolated backend; before: claimed + refused, after: not claimed, home courier delivers) and
 `tests/live-home-courier.mjs` (N real tool sends into a throwaway chat owned by this Mac's Desktop).
+
+Live results (2026-10-13): `live-remote-drain.mjs` against the mini Desktop's SSH-isolated backend on the MacBook,
+before the fix: claimed by the remote drain, submit refused "This chat is open in another Hermes window", nothing
+landed; after restarting that backend: not claimed, the MacBook's home courier delivered it (`this-device`, queued,
+landed, owner lease unchanged). `live-home-courier.mjs 4`: 4/4 landed. Cross-gateway: a send from the MacBook into a
+throwaway chat owned by the mini's Desktop was forwarded (`forwarded: true`, streaming) and landed in 4s, owner lease
+unchanged (`live-forward-owner.mjs` on the mini).
+
+Limitation: a chat on this gateway that is open in ANOTHER Mac's Desktop (owned by that Desktop's SSH-isolated backend
+here) is still refused to the home courier; that is reported as `refused` (safe to retry) and the chat's "Take over
+here" applies.
