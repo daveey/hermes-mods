@@ -27,7 +27,7 @@ const MAX_RECENT = 15
 const COURIER_INTERVAL_MS = 3_000
 const UNSUPPORTED_BACKOFF_MS = 5 * 60_000
 const ERROR_BACKOFF_MS = 30_000
-const HOME_BEAT_MS = 5_000 // server treats the home courier as gone after 15s of silence
+const HOME_BEAT_MS = 5_000 // server treats the home courier as gone after 20s of silence
 const HOME_COURIER_ID = 'home-courier'
 const FORWARD_PICKUP_MS = 20_000
 const FORWARD_POLL_MS = 1_500
@@ -641,6 +641,22 @@ export async function courierTick() {
 
 // ── plugin ───────────────────────────────────────────────────────────────────
 
+/** setInterval on a dedicated worker; returns a stop function, or null when workers are unavailable. */
+export function workerTicker(fn, ms) {
+  try {
+    if (typeof Worker !== 'function' || typeof Blob !== 'function' || typeof URL?.createObjectURL !== 'function') return null
+    const url = URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${Number(ms) || 3000})`], { type: 'text/javascript' }))
+    const worker = new Worker(url)
+    worker.onmessage = () => fn()
+    return () => {
+      worker.terminate()
+      URL.revokeObjectURL(url)
+    }
+  } catch {
+    return null
+  }
+}
+
 export default {
   id: PLUGIN_ID,
   name: 'Session Mentions',
@@ -656,7 +672,13 @@ export default {
       const t = typeof ctx.setInterval === 'function' ? ctx.setInterval(fn, ms) : setInterval(fn, ms)
       timers.push(t)
     }
-    every(() => void courierTick(), COURIER_INTERVAL_MS)
+    // The courier must keep its cadence while the window is hidden and idle: Chromium then
+    // throttles main-thread timers to ~1/min, which starved the home heartbeat (other Macs'
+    // couriers took over again) and left requests waiting a minute. A dedicated worker's timer
+    // is not throttled that way, and its messages are not timers.
+    const stopWorker = typeof ctx.onDispose === 'function' ? workerTicker(() => void courierTick(), COURIER_INTERVAL_MS) : null
+    if (stopWorker) ctx.onDispose(stopWorker)
+    else every(() => void courierTick(), COURIER_INTERVAL_MS)
 
     let debounce = null
     const onChanged = () => {

@@ -23,7 +23,7 @@ from typing import Any
 
 STALE_SECONDS = 3600
 HOME_COURIER_ID = "home-courier"
-HOME_FRESH_SECONDS = 15.0  # the home Desktop beats every ~5s
+HOME_FRESH_SECONDS = 20.0  # the home Desktop beats every ~5s (from a worker, so hidden windows keep it)
 ACTIONS = ("list", "read", "send")
 
 

@@ -139,3 +139,21 @@ test("core's ownership refusal is reported as not delivered (safe to retry), not
   assert.equal(r.delivered, false)
   assert.equal(r.retry_safe, true)
 })
+
+test('courier ticks from a worker (hidden windows throttle main-thread timers to ~1/min)', async () => {
+  const m = await load({ state }, async () => ({}))
+  assert.equal(m.workerTicker(() => {}, 3000), null) // no Worker global: caller falls back to setInterval
+  let ticks = 0
+  let made = null
+  globalThis.Worker = class { constructor(url) { made = this; this.url = url } terminate() { this.dead = true } }
+  try {
+    const stop = m.workerTicker(() => ticks++, 3000)
+    assert.equal(typeof stop, 'function')
+    made.onmessage({ data: 0 })
+    assert.equal(ticks, 1)
+    stop()
+    assert.equal(made.dead, true)
+  } finally {
+    delete globalThis.Worker
+  }
+})

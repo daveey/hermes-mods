@@ -33,7 +33,7 @@ Desktop draining the MacBook).
 
 Fix:
 - Each Desktop's courier is the "home courier" of its own machine (`kind: local` connection): it heartbeats
-  `POST /result {id: "home-courier"}` every 5s and drains with `?home=1`. While that heartbeat is <15s old, any other
+  `POST /result {id: "home-courier"}` every 5s and drains with `?home=1`. While that heartbeat is <20s old, any other
   drain of that outbox returns nothing (`relay_files.claim_pending(home=False)`).
 - A send into ANOTHER gateway first asks it (`GET /ping` -> `home_courier`); if it has a live home courier the send is
   forwarded (`POST /enqueue`, poll `GET /status/<id>`), so that gateway's own Desktop delivers it through the owning
