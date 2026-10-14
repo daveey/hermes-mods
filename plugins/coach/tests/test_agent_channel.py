@@ -163,6 +163,35 @@ def test_live_checkout_in_tree_writes_still_fire(tmp_path):
     assert tlc("terminal", {"command": f"cd {tmp_path} && echo x > y.txt", "workdir": str(live)}, live) is None
 
 
+def test_live_checkout_ignores_quoted_and_heredoc_text(tmp_path):
+    tlc = rules.touches_live_checkout
+    live = (tmp_path / "hermes-agent")
+    live.mkdir()
+    live = live.resolve()
+    for cmd in (f"python - <<'EOF'\ncases={{'cd {live} && git checkout -- .':True}}\nEOF",
+                f"cat > /tmp/t.py <<EOF\ncd {live} && git commit -am x\necho x > {live}/a.py\nEOF\npython /tmp/t.py",
+                f"python -c \"print('cd {live} && git checkout -- .')\"",
+                f"echo 'cd {live} && git pull' > /tmp/notes.txt",
+                f"git commit -m 'stop touching {live} with git reset'"):
+        assert tlc("terminal", {"command": cmd}, live) is None, cmd
+
+
+def test_live_checkout_shell_scripts_and_home_var_still_fire(tmp_path, monkeypatch):
+    tlc = rules.touches_live_checkout
+    home = tmp_path.resolve()
+    monkeypatch.setenv("HOME", str(home))
+    live = home / ".hermes" / "hermes-agent"
+    live.mkdir(parents=True)
+    for cmd in ('cd "$HOME/.hermes/hermes-agent" && git checkout -- .',
+                "cd ${HOME}/.hermes/hermes-agent && echo x > run_agent.py",
+                "cd ~/.hermes/hermes-agent && git pull",
+                f"bash -c 'cd {live} && git pull'",
+                f"bash <<EOF\ncd {live}\ngit reset --hard\nEOF",
+                f"python - <<'EOF'\nprint(1)\nEOF\ncd {live} && git stash"):
+        assert tlc("terminal", {"command": cmd}, live) == str(live), cmd
+    assert tlc("terminal", {"command": 'cd "$HOME/.hermes/hermes-agent" && git status'}, live) is None
+
+
 # ── signals for the user channel ──
 def test_subagents_long_jobs_and_bug_signatures_are_recorded(tmp_path):
     clk = Clock()

@@ -132,6 +132,54 @@ def _inside(p: str, root: str) -> bool:
     return rp == root or rp.startswith(root + os.sep)
 
 
+HEREDOC_RE = re.compile(r"""<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1""")
+SHELL_RUNNER_RE = re.compile(r"""(?:^|[\s;&|(])(?:(?:ba|z|da)?sh|eval)(?:\s+-\w*c\w*)?\s*$""")
+QUOTED_RE = re.compile(r""""(?:[^"\\]|\\.)*"|'[^']*'""")
+HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME\b")
+
+
+def _strip_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies (they are stdin data, not commands), except when fed to a shell (`bash <<EOF`)."""
+    out, pos = [], 0
+    while True:
+        m = HEREDOC_RE.search(cmd, pos)
+        if not m:
+            out.append(cmd[pos:])
+            return "".join(out)
+        nl = cmd.find("\n", m.end())
+        if nl < 0:
+            out.append(cmd[pos:])
+            return "".join(out)
+        line_start = cmd.rfind("\n", 0, m.start()) + 1
+        feeds_shell = re.search(r"(?:^|[\s;&|(])(?:ba|z|da)?sh(?=\s|$)", cmd[line_start:m.start()]) is not None
+        end = re.compile(r"^\t*" + re.escape(m.group(2)) + r"[ \t]*$", re.M).search(cmd, nl + 1)
+        body_end = end.end() if end else len(cmd)
+        out.append(cmd[pos:nl + 1])
+        if feeds_shell:
+            out.append(cmd[nl + 1:body_end])
+        pos = body_end
+
+
+def _mask_quoted(cmd: str) -> str:
+    """Blank quoted strings that hold data (python -c code, echo text, commit messages).
+
+    A quoted single token (a path like "$HOME/.hermes/hermes-agent") is kept; so is the script of
+    `bash -c '...'` / `eval "..."`, which the shell really runs.
+    """
+    def repl(m: re.Match) -> str:
+        body = m.group(0)[1:-1]
+        if not re.search(r"\s", body) or SHELL_RUNNER_RE.search(cmd[:m.start()]):
+            return m.group(0)
+        return m.group(0)[0] + "_" + m.group(0)[-1]
+    return QUOTED_RE.sub(repl, cmd)
+
+
+def shell_code(cmd: str) -> str:
+    """The parts of a terminal command the shell executes: $HOME expanded, heredoc bodies and quoted data blanked."""
+    cmd = HOME_VAR_RE.sub(lambda _: str(Path.home()), cmd or "")
+    return _mask_quoted(_strip_heredocs(cmd))
+
+
 def redirect_writes_into(cmd: str, workdir: str, root: str) -> bool:
     """True when a shell output redirect in `cmd` writes a file inside `root`.
 
@@ -172,9 +220,9 @@ def touches_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Op
             rp = p
         return rp if rp == root or rp.startswith(root + os.sep) else None
     if tool == "terminal":
-        cmd = str(args.get("command") or "")
+        cmd = shell_code(str(args.get("command") or ""))
         wd = str(args.get("workdir") or "")
-        in_tree = root in cmd or home_form in cmd or (wd and str(Path(wd).expanduser()).startswith(root))
+        in_tree = root in cmd or home_form in cmd or bool(wd and _inside(wd, root))
         if in_tree and (GIT_MUTATE_RE.search(cmd) or FILE_MUTATE_RE.search(cmd)
                         or redirect_writes_into(cmd, wd, root)):
             return root
