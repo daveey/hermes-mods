@@ -27,6 +27,12 @@ const MAX_RECENT = 15
 const COURIER_INTERVAL_MS = 3_000
 const UNSUPPORTED_BACKOFF_MS = 5 * 60_000
 const ERROR_BACKOFF_MS = 30_000
+const HOME_BEAT_MS = 5_000 // server treats the home courier as gone after 15s of silence
+const HOME_COURIER_ID = 'home-courier'
+const FORWARD_PICKUP_MS = 20_000
+const FORWARD_POLL_MS = 1_500
+// Core's lease refusal (hermes_cli/active_sessions.py): the turn was never admitted.
+const OWNER_REFUSAL_RE = /open in another Hermes window|SESSION_NOT_OWNED|not owned by this runtime/i
 const HIDDEN_SOURCES = new Set(['cron', 'kanban', 'tool', 'oneshot', 'subagent'])
 
 // ── small utils ──────────────────────────────────────────────────────────────
@@ -326,6 +332,11 @@ export async function deliver(target, text, waitSeconds = 0) {
     try {
       sub = await request('prompt.submit', { session_id: live, text, queued: true }, 60_000)
     } catch (error) {
+      const msg = String(error?.message || error)
+      // A lease refusal happens before the turn is admitted: definitely not delivered.
+      if (OWNER_REFUSAL_RE.test(msg)) {
+        return { ok: false, delivered: false, status: 'refused', retry_safe: true, live_session_id: live, error: msg, note: 'Nothing was delivered: another Hermes backend holds that chat open. Safe to retry.' }
+      }
       // The server may have accepted the turn before the socket/response failed.
       // Never try another route or submit again on an uncertain acknowledgement.
       return { ok: false, delivered: null, status: 'unknown', retry_safe: false, live_session_id: live, error: String(error?.message || error), note: 'Delivery outcome unknown. Inspect the target transcript; do not resend automatically.' }
@@ -508,30 +519,101 @@ export async function performRequest(req, origin, conns) {
   }
 
   if (action === 'send') {
-    const sender = req.sender || {}
-    const senderRef = sender.session_id
-      ? sessionRef({ connectionId: origin, profile: sender.profile, sessionId: sender.session_id }, target.connectionId, conns)
-      : ''
-    const header = `[Message from another Hermes session${sender.title ? ` "${sender.title}"` : ''}${senderRef ? ` (${senderRef})` : ''}]`
-    const res = await deliver(target, `${header}\n\n${String(args.message || '')}`, Number(req.wait_for_reply) || 0)
+    let text = String(args.message || '')
+    if (!req.prewrapped) {
+      const sender = req.sender || {}
+      const senderRef = sender.session_id
+        ? sessionRef({ connectionId: origin, profile: sender.profile, sessionId: sender.session_id }, target.connectionId, conns)
+        : ''
+      const header = `[Message from another Hermes session${sender.title ? ` "${sender.title}"` : ''}${senderRef ? ` (${senderRef})` : ''}]`
+      text = `${header}\n\n${text}`
+    }
+    const wait = Number(req.wait_for_reply) || 0
+    // A gateway that runs its own Desktop holds its open chats on that Desktop's backend; this
+    // Desktop only reaches it through a separate serve process, which core refuses ("This chat
+    // is open in another Hermes window"). Hand the send to that gateway's own courier.
+    const home = conns.find(c => c.kind === 'local')
+    const forwarded = !req.forwarded && target.connectionId !== (home?.id || 'local') ? await forwardSend(target, text, wait) : null
+    const res = forwarded || (await deliver(target, text, wait))
     return { ...res, gateway: gw?.key || target.connectionId, ref: sessionRef(target, origin, conns) }
   }
 
   return { ok: false, error: `unknown action ${action}` }
 }
 
-async function courierTick() {
+const relay = (connectionId, path, opts) => api(connectionId, `/api/plugins/${PLUGIN_ID}${path}`, opts)
+
+/** Hand a send to the target gateway's own Desktop courier. Returns null when that gateway has
+ *  no live home courier (or predates forwarding) and nothing was queued there, so the caller
+ *  delivers directly. Never returns null once the forwarded request may have been claimed. */
+export async function forwardSend(target, text, waitSeconds = 0) {
+  const ping = await relay(target.connectionId, '/ping', { timeoutMs: 8_000 }).catch(() => null)
+  if (!ping?.forwarding || !ping?.home_courier) return null
+  const id = `fwd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const request = {
+    id,
+    action: 'send',
+    args: { target: `@session:${target.profile || 'default'}/${target.sessionId}`, message: text },
+    prewrapped: true,
+    forwarded: true,
+    wait_for_reply: waitSeconds,
+    ttl: 600
+  }
+  const status = () => relay(target.connectionId, `/status/${id}`, { timeoutMs: 10_000 }).catch(() => null)
+  const withdraw = async () => !!(await relay(target.connectionId, '/cancel', { method: 'POST', body: { id }, timeoutMs: 10_000 }).catch(() => null))?.ok
+  const unknown = error => ({ ok: false, delivered: null, status: 'unknown', retry_safe: false, forwarded: true, error, note: 'Delivery outcome unknown. Inspect the target transcript; do not resend automatically.' })
+
+  let enq = null
+  try {
+    enq = await relay(target.connectionId, '/enqueue', { method: 'POST', body: { request }, timeoutMs: 15_000 })
+  } catch {
+    // The POST may have landed. Only fall back once the request is provably not there.
+    const st = await status()
+    if (!st) return unknown('Lost the forwarding acknowledgement and could not check it')
+    if (st.state === 'unknown') return null
+    if (st.state === 'pending' && (await withdraw())) return null
+    enq = { ok: true }
+  }
+  if (!enq?.ok) return null
+
+  const started = Date.now()
+  const deadline = started + FORWARD_PICKUP_MS + 90_000 + Math.min(600, Math.max(0, waitSeconds)) * 1000
+  while (Date.now() < deadline) {
+    await sleep(FORWARD_POLL_MS)
+    const st = await status()
+    if (st?.state === 'done') return { ...(st.result || { ok: false, error: 'empty forwarded result' }), forwarded: true }
+    if (st?.state === 'pending' && Date.now() - started > FORWARD_PICKUP_MS && (await withdraw())) return null
+  }
+  return unknown(`The target gateway's Desktop did not finish the forwarded send in time`)
+}
+
+let lastHomeBeat = 0
+
+/** This Desktop's own machine. Its backend owns the chats open in this Desktop's windows. */
+const isHome = conn => conn?.kind === 'local'
+
+export async function courierTick() {
   if (courierBusy) return
   courierBusy = true
   try {
     const conns = await connections()
+    const home = conns.find(isHome)
+    if (home && Date.now() - lastHomeBeat >= HOME_BEAT_MS) {
+      // Tell this gateway its own courier is alive, so other Macs' Desktops (which reach it through
+      // a non-owning serve process) leave its outbox to us. Plain /result, so it also works on a
+      // backend that predates the home-courier gate.
+      lastHomeBeat = Date.now()
+      void relay(home.id, '/result', { method: 'POST', body: { id: HOME_COURIER_ID, result: { at: Date.now() / 1000 } }, timeoutMs: 10_000 }).catch(() => {
+        lastHomeBeat = 0
+      })
+    }
     await Promise.all(
       conns.map(async conn => {
         const st = courierState.get(conn.id)
         if (st && Date.now() < st.until) return
         let res
         try {
-          res = await api(conn.id, `/api/plugins/${PLUGIN_ID}/outbox`, { timeoutMs: 10_000 })
+          res = await relay(conn.id, `/outbox${isHome(conn) ? '?home=1' : ''}`, { timeoutMs: 10_000 })
         } catch (error) {
           const msg = String(error?.message || error)
           courierState.set(conn.id, { until: Date.now() + (/404|not found/i.test(msg) ? UNSUPPORTED_BACKOFF_MS : ERROR_BACKOFF_MS) })
@@ -565,6 +647,7 @@ export default {
   register(ctx) {
     rowCache.clear()
     courierState.clear()
+    lastHomeBeat = 0
     connCache = { at: 0, rows: [] }
     refreshStale()
 

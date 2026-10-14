@@ -11,10 +11,18 @@ import json
 import time
 import uuid
 
-from . import relay_files as rf
+if __package__:
+    from . import relay_files as rf
+else:  # pytest imports this hyphen-named plugin dir without a parent package
+    import importlib.util as _ilu
+    from pathlib import Path as _Path
+
+    _spec = _ilu.spec_from_file_location("_session_mentions_relay_files", _Path(__file__).with_name("relay_files.py"))
+    rf = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
+    _spec.loader.exec_module(rf)  # type: ignore[union-attr]
 
 TOOLSET = "session_mentions"
-PICKUP_TIMEOUT = 20.0  # Desktop drains every ~3s; no claim by then = Desktop not running
+PICKUP_TIMEOUT = 30.0  # Desktop drains every ~3s; no claim by then = Desktop not running
 MAX_REPLY_WAIT = 600
 
 SCHEMA = {
@@ -102,7 +110,7 @@ def handle(args: dict, session_id: str | None = None, **_kw) -> str:
     outbox = base / "outbox" / f"{rid}.json"
     result_path = base / "results" / f"{rid}.json"
     deadline_pickup = time.time() + PICKUP_TIMEOUT
-    deadline = time.time() + PICKUP_TIMEOUT + 90 + wait
+    deadline = time.time() + PICKUP_TIMEOUT + 120 + wait  # a forwarded send adds one hop
 
     while time.time() < deadline:
         if result_path.exists():

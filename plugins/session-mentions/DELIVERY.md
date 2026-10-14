@@ -22,3 +22,31 @@ This repairs use of the currently connected owning Desktop backend. It does NOT 
 Busy queue acknowledgements currently omit user_row_id, so wait_for_reply returns an explicit unavailable-correlation note for queued sends instead of claiming an old reply. Streaming submits with a returned row id support correlated waits.
 
 Desktop admission lint still flags the existing doubled-prefix MutationObserver's document.body reach; no new finding was introduced by the transport fix.
+
+## Home courier (fix: send fails when the target chat is open in a window)
+
+Root cause: every Desktop with this plugin drains the outbox of every gateway it is connected to. Another Mac's
+Desktop reaches this gateway through a separate SSH-isolated `serve` process, and core refuses a submit from there
+into a chat this Mac's Desktop holds open ("This chat is open in another Hermes window/terminal"). Whichever courier
+polled first won, so sends failed at random (state.db shows the failures with `gateway: "macbook"`, i.e. the mini's
+Desktop draining the MacBook).
+
+Fix:
+- Each Desktop's courier is the "home courier" of its own machine (`kind: local` connection): it heartbeats
+  `POST /result {id: "home-courier"}` every 5s and drains with `?home=1`. While that heartbeat is <15s old, any other
+  drain of that outbox returns nothing (`relay_files.claim_pending(home=False)`).
+- A send into ANOTHER gateway first asks it (`GET /ping` -> `home_courier`); if it has a live home courier the send is
+  forwarded (`POST /enqueue`, poll `GET /status/<id>`), so that gateway's own Desktop delivers it through the owning
+  socket. No home courier, an older backend, or a request unclaimed after 20s (withdrawn via `POST /cancel`) -> direct
+  send as before. A lost enqueue ack only falls back once the request is provably absent.
+- Core's ownership refusal is reported as `status: "refused", delivered: false, retry_safe: true` (the turn was never
+  admitted) instead of "unknown".
+
+Deploying: the Desktop half hot-reloads on save. The dashboard routes are mounted once per backend, so a backend keeps
+the old outbox until it restarts. The gate only needs the NEW code in the remote-facing (SSH-isolated) backends another
+Mac's Desktop spawned here; they are respawned on demand, so restart them when idle (no live `session_turn_leases`).
+
+Tests: `uv run --with pytest python -m pytest -q -p no:cacheprovider tests/test_relay_files.py` and
+`node --test tests/` (courier.test.mjs). Live: `tests/live-remote-drain.mjs` (plays the other Mac's courier against
+the real SSH-isolated backend; before: claimed + refused, after: not claimed, home courier delivers) and
+`tests/live-home-courier.mjs` (N real tool sends into a throwaway chat owned by this Mac's Desktop).
