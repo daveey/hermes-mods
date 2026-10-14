@@ -445,16 +445,21 @@ def tool_recent(state: State, args: dict, **_) -> str:
         if args.get("include_events"):
             out["events"] = state.store.events_since(since, c["id"])
         return _out(out)
-    summary = []
+    summary, quiet = [], []
+    quiet_pats = state.store.policy().get("quiet_channels") or []
     for s in state.store.activity_summary(since):
         info = state.channel_info(s["channel"])
         if info.get("private") and not (who["trusted"] or s["channel"] == who["channel"]):
+            continue
+        if core.matches(quiet_pats, s["channel"], info.get("name", "")):
+            quiet.append("#" + info.get("name", s["channel"]))
             continue
         summary.append({"channel": ("#" + info["name"]) if not info.get("is_im") else info["name"],
                         "id": s["channel"], "messages": s["n"], "people": s["people"],
                         "last": time.strftime("%a %H:%M", time.localtime(float(s["last_ts"])))})
     return _out({"since_hours": hours, "active_channels": summary,
-                 "hint": "call again with channel=… to read one"})
+                 "quiet_channels_skipped": quiet,
+                 "hint": "call again with channel=… to read one (quiet channels too)"})
 
 
 def _request_or_run(state: State, who: dict, ops: list[dict], reason: str) -> dict:

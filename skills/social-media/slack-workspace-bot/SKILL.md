@@ -60,7 +60,8 @@ asking you directly (and operator sessions outside Slack) skip approval.
 
 `<HERMES_HOME>/slack-workspace/policy.json` (the operator edits it, or the always-allow button does):
 `auto_join` (fnmatch names/ids, `"*"` = all public), `never_join`, `auto_methods`, `quiet_channels`
-(observed but never injected as context), `admins` (extra to `allow_admin_from`), `retention_days`.
+(alert/bot feeds: observed and readable by name, but never injected as context and left out of the
+`slack_recent` overview), `admins` (extra to `allow_admin_from`), `retention_days`.
 
 ## Pitfalls
 
