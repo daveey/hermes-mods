@@ -89,6 +89,9 @@ function onSent(text) {
       log('check', stored, busy ? '(after turn)' : '', res)
       lastCheck = { stored, text, res, busy, at: Date.now() }
       if (mine !== seq || !res?.shift) return
+      // Coach nudge bus: one panel at a time, session mutes and weekly demotion (fail-open without coach).
+      if (window.__coach && !window.__coach.claim(stored, ID)) return log('coach gate: not now', stored)
+      window.__coach?.report(stored, ID, 'shown')
       setFlag({
         stored,
         runtime: runtime || host.state.focusedSessionId.get(),
@@ -161,6 +164,7 @@ async function doNew() {
       await host.composer.setDraft('new', b.seeded)
       throw new Error('could not auto-send; message + brief left in the new composer')
     }
+    window.__coach?.report(f.stored, ID, 'accepted')
     setFlag(null)
   } catch (err) {
     patchFlag({ phase: 'shown', error: String(err?.message || err) })
@@ -183,6 +187,7 @@ async function doFork() {
       await host.composer.setDraft(child, f.text)
       throw new Error('could not auto-send; message left in the fork composer')
     }
+    window.__coach?.report(f.stored, ID, 'accepted')
     setFlag(null)
   } catch (err) {
     patchFlag({ phase: 'shown', error: String(err?.message || err) })
@@ -190,6 +195,7 @@ async function doFork() {
 }
 
 function sendHere() {
+  if (flag) window.__coach?.report(flag.stored, ID, 'dismissed')
   setFlag(null)
 }
 
@@ -197,6 +203,7 @@ function muteSession() {
   if (!flag) return
   muted.add(flag.stored)
   ctxRef?.storage?.set('muted', Array.from(muted).slice(-200))
+  window.__coach?.report(flag.stored, ID, 'dismissed')
   setFlag(null)
 }
 

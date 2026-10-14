@@ -203,7 +203,7 @@ def has_followups(text: str) -> bool:
 
 
 def kanban_cards(tasks: list[dict], parent_id: str, profile: str, cwd: str = "", board: Optional[str] = None,
-                 kb=None) -> dict:
+                 kb=None, created_by: str = "spin-out", key_prefix: str = "spin-out") -> dict:
     """Create one Kanban card per task (title + full child message as body) on ``board`` (None = active board).
 
     Cards are assigned to ``profile``, linked to the parent session (``session_id``), and work in the parent's
@@ -230,8 +230,9 @@ def kanban_cards(tasks: list[dict], parent_id: str, profile: str, cwd: str = "",
             title = str(t.get("title") or "Follow-up").strip()[:80]
             try:
                 tid = db.create_task(con, title=title, body=t.get("message") or t.get("prompt") or "",
-                                     assignee=profile or "default", created_by="spin-out", session_id=parent_id,
-                                     idempotency_key=f"spin-out:{parent_id}:{title}", board=board, **ws)
+                                     assignee=profile or "default", created_by=created_by, session_id=parent_id,
+                                     idempotency_key=t.get("key") or f"{key_prefix}:{parent_id}:{title}",
+                                     board=board, **ws)
                 out.append({"title": title, "task_id": tid})
             except Exception as exc:
                 out.append({"title": title, "error": f"{type(exc).__name__}: {exc}"[:300]})

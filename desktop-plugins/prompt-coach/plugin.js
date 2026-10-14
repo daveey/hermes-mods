@@ -55,7 +55,12 @@ async function waitFor(fn, timeoutMs = 8000, step = 120) {
 }
 
 const isBusy = runtime => !!(runtime && host.state.busyBySession.get()[runtime])
-const choice = (f, c) => ctxRef?.rest('/choice', { method: 'POST', body: { id: f.id, choice: c, edited: f.draft.trim() !== f.rewrite.trim() } }).catch(e => log('choice', e))
+// Coach nudge bus outcome for each choice (superseded by a new send = expired, which mutes nothing).
+const BUS = { new_session: 'accepted', replace: 'accepted', keep: 'dismissed', mute: 'dismissed', dismissed: 'expired' }
+const choice = (f, c) => {
+  if (f.stored) window.__coach?.report(f.stored, ID, BUS[c] || 'expired')
+  return ctxRef?.rest('/choice', { method: 'POST', body: { id: f.id, choice: c, edited: f.draft.trim() !== f.rewrite.trim() } }).catch(e => log('choice', e))
+}
 
 // ── detection (after send) ──────────────────────────────────────────────
 function onSent(text) {
@@ -77,6 +82,9 @@ function onSent(text) {
       log('check', stored, res)
       lastCheck = { stored, text, res, at: Date.now() }
       if (mine !== seq || !res?.coach) return
+      // Coach nudge bus: one panel at a time, session mutes and weekly demotion (fail-open without coach).
+      if (stored && window.__coach && !window.__coach.claim(stored, ID)) return log('coach gate: not now', stored)
+      if (stored) window.__coach?.report(stored, ID, 'shown')
       setFlag({
         id: res.id,
         stored,

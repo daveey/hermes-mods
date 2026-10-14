@@ -15,6 +15,8 @@ composer. For each follow-up you can:
   ("next steps", "still open", "not done yet", "want me to…"). A regex cue filter runs first, so most turns cost
   no model call. An unchanged reply reuses the cached plan, and a dismissed panel doesn't come back for the same reply.
   Palette: *Spin out: toggle automatic follow-up panel*.
+  The automatic panel goes through the [coach](../coach/) gate (`window.__coach.claim/report`): it waits while another
+  coaching panel is up, and a dismissal mutes it for the session.
 - **On demand** with ⇧⌘F (always plans). On first load the built-in session search moves to ⌥⌘F.
 
 ## How it works

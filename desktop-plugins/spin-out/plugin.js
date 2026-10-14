@@ -142,8 +142,18 @@ async function autoCheck(parent, profile) {
   }
   if (dismissed.get(parent) === plan.reply_index) return
   if (job?.parent === parent && job.replyIndex === plan.reply_index) return // already showing this plan
+  // Coach nudge bus: one panel at a time, session mutes and weekly demotion (fail-open without coach).
+  if (window.__coach && !window.__coach.claim(parent, ID)) return log('coach gate: not now', parent)
   log('auto plan', plan)
   showPlan(parent, profile, plan, true)
+  window.__coach?.report(parent, ID, 'shown')
+}
+
+// Report an automatic panel's outcome to the coach bus once (manual ⇧⌘F runs are not nudges).
+function busReport(event) {
+  if (!job?.auto || job.busReported) return
+  job.busReported = true
+  window.__coach?.report(job.parent, ID, event)
 }
 
 // A turn "finished" = the focused session's runtime flips busy → idle in busyBySession. Keyed by runtime id, so
@@ -168,6 +178,7 @@ function watchTurns(ctx) {
 }
 
 function dismiss() {
+  if (job && !job.children?.some(c => c.status !== 'idle')) busReport('dismissed')
   if (job && job.replyIndex != null) dismissed.set(job.parent, job.replyIndex)
   setJob(null)
 }
@@ -197,6 +208,7 @@ async function toKanban() {
     return
   }
   const cards = Array.isArray(res?.cards) ? res.cards : []
+  if (cards.some(c => c?.task_id)) busReport('accepted')
   let ok = 0
   idle.forEach((i, k) => {
     const card = cards[k]
@@ -235,6 +247,7 @@ async function launchOne(i) {
       return false
     }
     patchChild(i, { status: 'ok', stored })
+    busReport('accepted')
     return true
   } catch (err) {
     patchChild(i, { status: 'error', error: String(err?.message || err) })
