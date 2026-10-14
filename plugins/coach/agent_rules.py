@@ -43,7 +43,10 @@ SLEEP_RE = re.compile(r"\bsleep\s+(\d+(?:\.\d+)?)")
 LOOP_SLEEP_RE = re.compile(r"\b(while|until|for)\b[^\n]*?(;|\n|\bdo\b)[\s\S]*?\bsleep\s+\d", re.I)
 WATCH_RE = re.compile(r"(^|[;&|]\s*)watch\s+-n")
 GIT_MUTATE_RE = re.compile(r"\bgit\b[^;&|]*?\b(commit|pull|reset|checkout|switch|merge|rebase|stash|am|apply|cherry-pick)\b")
-FILE_MUTATE_RE = re.compile(r"(\bsed\s+-i\b|\bperl\s+-pi\b|>\s*\S|\bnpm\s+run\s+(pack|build)\b|\bhermes\s+desktop\b.*--build)")
+FILE_MUTATE_RE = re.compile(r"(\bsed\s+-i\b|\bperl\s+-pi\b|\bnpm\s+run\s+(pack|build)\b|\bhermes\s+desktop\b.*--build)")
+# Output redirects: `>`, `>>`, `>|`, `N>`, `&>`. The target group is either an fd dup (`&1`, `&2`, `&-`) or a path.
+REDIRECT_RE = re.compile(r"""(?<![-=<>])(?:&|\d*)>>?\|?\s*(&[\d-]*|"[^"]*"|'[^']*'|[^\s;&|()<>]+)""")
+CD_RE = re.compile(r"""(?:^|[;&|(]\s*)cd\s+("[^"]*"|'[^']*'|[^\s;&|()]+)""")
 HERMES_INFRA_TOOLS = {
     "cross_session", "delegate_task", "session_search", "memory", "skill_manage", "skill_view", "cronjob",
     "process_manage", "send_message", "todo", "clarify", "tool_search", "tool_describe", "tool_call",
@@ -121,6 +124,39 @@ def is_poll_loop(tool: str, args: dict) -> bool:
     return tool == "terminal" and bool(LOOP_SLEEP_RE.search(str(args.get("command") or "")))
 
 
+def _inside(p: str, root: str) -> bool:
+    try:
+        rp = str(Path(p).expanduser().resolve())
+    except Exception:
+        rp = p
+    return rp == root or rp.startswith(root + os.sep)
+
+
+def redirect_writes_into(cmd: str, workdir: str, root: str) -> bool:
+    """True when a shell output redirect in `cmd` writes a file inside `root`.
+
+    fd dups (`2>&1`, `>&2`) never count; path targets count only when they resolve into the tree.
+    Relative targets resolve against the last `cd` before the redirect, else `workdir`; with neither
+    the cwd is unknown, so they don't count.
+    """
+    for m in REDIRECT_RE.finditer(cmd):
+        target = m.group(1).strip("\"'")
+        if not target or target.startswith("&"):
+            continue
+        t = os.path.expanduser(target)
+        if not os.path.isabs(t):
+            cds = [c.group(1).strip("\"'") for c in CD_RE.finditer(cmd[:m.start()])]
+            base = os.path.expanduser(cds[-1]) if cds else (os.path.expanduser(workdir) if workdir else "")
+            if base and not os.path.isabs(base) and workdir:
+                base = os.path.join(os.path.expanduser(workdir), base)
+            if not base or not os.path.isabs(base):
+                continue
+            t = os.path.join(base, t)
+        if _inside(t, root):
+            return True
+    return False
+
+
 def touches_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Optional[str]:
     if not checkout:
         return None
@@ -139,7 +175,8 @@ def touches_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Op
         cmd = str(args.get("command") or "")
         wd = str(args.get("workdir") or "")
         in_tree = root in cmd or home_form in cmd or (wd and str(Path(wd).expanduser()).startswith(root))
-        if in_tree and (GIT_MUTATE_RE.search(cmd) or FILE_MUTATE_RE.search(cmd)):
+        if in_tree and (GIT_MUTATE_RE.search(cmd) or FILE_MUTATE_RE.search(cmd)
+                        or redirect_writes_into(cmd, wd, root)):
             return root
     return None
 

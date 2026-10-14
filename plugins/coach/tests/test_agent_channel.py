@@ -127,6 +127,42 @@ def test_live_checkout_edit_and_git_commit(tmp_path):
     assert "hermes-core-wt" in c2.take("s1")
 
 
+def test_live_checkout_ignores_read_only_redirects(tmp_path):
+    tlc = rules.touches_live_checkout
+    live = (tmp_path / "hermes-agent")
+    live.mkdir()
+    live = live.resolve()
+    scratch = tmp_path / "scratch"
+    for cmd in (f"cd {live} && grep -rn foo . 2>/dev/null | head",
+                f"cd {live} && git log --oneline -5 2>&1",
+                f"cd {live} && git status && echo ok >&2",
+                f"cd {live} && git diff > {scratch}/x.diff",
+                f"cd {live} && git diff >> {scratch}/x.diff 2>&1",
+                f"cd {live} && ls &>/dev/null",
+                f"cat {live}/run_agent.py > {scratch}/copy.py"):
+        assert tlc("terminal", {"command": cmd}, live) is None, cmd
+    # no cd and no workdir: relative redirect target has unknown cwd
+    assert tlc("terminal", {"command": f"grep x {live}/a.py > out.txt"}, live) is None
+
+
+def test_live_checkout_in_tree_writes_still_fire(tmp_path):
+    tlc = rules.touches_live_checkout
+    live = (tmp_path / "hermes-agent")
+    live.mkdir()
+    live = live.resolve()
+    for cmd in (f"cd {live} && echo x > run_agent.py",
+                f"cd {live} && echo x >> agent/notes.txt 2>/dev/null",
+                f"echo x > {live}/run_agent.py",
+                f"cd /tmp && echo x > {live}/a.py",
+                f"cd {live} && sed -i '' s/a/b/ run_agent.py",
+                f"cd {live} && git checkout -- run_agent.py",
+                f"cd {live} && git commit -am wip 2>&1"):
+        assert tlc("terminal", {"command": cmd}, live) == str(live), cmd
+    assert tlc("terminal", {"command": "echo x > run_agent.py", "workdir": str(live)}, live) == str(live)
+    assert tlc("terminal", {"command": "git diff > x.diff 2>&1", "workdir": str(live)}, live) == str(live)
+    assert tlc("terminal", {"command": f"cd {tmp_path} && echo x > y.txt", "workdir": str(live)}, live) is None
+
+
 # ── signals for the user channel ──
 def test_subagents_long_jobs_and_bug_signatures_are_recorded(tmp_path):
     clk = Clock()
