@@ -259,13 +259,9 @@ class AgentCoach:
             tasks = args.get("tasks")
             n = len(tasks) if isinstance(tasks, list) and tasks else 1
             self.signals.add_subagents(sid, n)
+        # Long job = it really ran (or was waited on) for 10+ min. A generous `timeout=` alone is not evidence:
+        # agents set 600 s caps on 5-second commands, which made every such call look like board work.
         if tool == "terminal":
-            try:
-                t = float(args.get("timeout") or 0)
-            except Exception:
-                t = 0
-            if not args.get("background") and t >= LONG_JOB_S:
-                self.signals.long_job(sid, f"foreground terminal with timeout {int(t)}s")
             if args.get("background"):
                 d = _as_dict(result) or {}
                 pid = str(d.get("session_id") or d.get("process_id") or d.get("pid") or "")

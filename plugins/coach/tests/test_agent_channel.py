@@ -141,8 +141,10 @@ def test_subagents_long_jobs_and_bug_signatures_are_recorded(tmp_path):
     clk.t += 601
     c.observe("s1", "process_manage", {"action": "wait", "session_id": "proc_1"}, "{}")
     assert "background job for 10 min" in st.session("s1")["long_job"]
-    c.observe("s2", "terminal", {"command": "make all", "timeout": 1800}, OK)
-    assert "timeout 1800" in st.session("s2")["long_job"]
+    c.observe("s2", "terminal", {"command": "make all", "timeout": 1800}, OK, duration_ms=3000)
+    assert not st.session("s2").get("long_job")  # a big timeout cap alone is not a long job
+    c.observe("s2", "terminal", {"command": "make all", "timeout": 1800}, OK, duration_ms=700_000)
+    assert "terminal ran 11 min" in st.session("s2")["long_job"]
     c.observe("s3", "cross_session", {"action": "send"}, json.dumps({"error": "chat is open in a window 42"}),
               status="error", error_message="chat is open in a window 42")
     c.observe("s3", "read_file", {"path": "/nope"}, json.dumps({"error": "not found"}), status="error",
