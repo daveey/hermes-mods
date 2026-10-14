@@ -46,6 +46,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 |---|---|---|
 | [account-usage](plugins/account-usage/) | [yes](desktop-plugins/account-usage/) | Status-bar chips for pooled Claude / ChatGPT accounts. Records which pooled credential served the latest call and highlights it. |
 | [anthropic-pool-status](plugins/anthropic-pool-status/) | — | Dashboard workaround: the Desktop Accounts card counts Anthropic OAuth logins in the credential pool. |
+| [compute-rentals](plugins/compute-rentals/) | [yes](desktop-plugins/compute-rentals/) | Read-only inventory of rented compute (Vast, RunPod, Modal, Prime Intellect, SF Compute, EC2, Slurm over ssh) in one panel, plus which session started each box. Private clusters plug in as extra provider files kept outside the repo. |
 | [fast-rate-limit-fallback](plugins/fast-rate-limit-fallback/) | — | On a long-reset rate limit, rotate pooled credentials first, then fall back to the next provider without sleeping through retries. |
 | [mcp-file-access](plugins/mcp-file-access/) | — | Ask (Once / Session / Always) before the Chrome DevTools MCP server reads or writes files outside its allowed folders. On approval, the file is routed through its temp folder, so no restart is needed. |
 | [oauth-keepalive](plugins/oauth-keepalive/) | — | Refreshes pooled OAuth tokens (Claude, ChatGPT/Codex) before they expire, including idle accounts. |
