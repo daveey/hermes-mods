@@ -127,6 +127,11 @@ def test_live_checkout_edit_and_git_commit(tmp_path):
     assert "hermes-core-wt" in c2.take("s1")
 
 
+def test_live_checkout_hint_ignores_merge_base(tmp_path):
+    live = (tmp_path / "hermes-agent"); live.mkdir(); live = live.resolve()
+    assert not rules.touches_live_checkout("terminal", {"command": f"cd {live} && git merge-base --is-ancestor abc HEAD"}, live)
+
+
 def test_live_checkout_ignores_read_only_redirects(tmp_path):
     tlc = rules.touches_live_checkout
     live = (tmp_path / "hermes-agent")
