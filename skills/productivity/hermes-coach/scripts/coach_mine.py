@@ -59,6 +59,10 @@ def kpis(ds):
     n = len(inter)
     if not n:
         return {"sessions": 0}
+    # Delegated work by spend: Kanban workers vs subagents spawned from chat sessions.
+    kan = sum(1 for d in ds if d.get("source") == "kanban")
+    kan_cost = sum(total_cost(d) for d in ds if d.get("source") == "kanban")
+    chat_sub_cost = sum((d.get("children") or {}).get("cost_usd") or 0 for d in inter)
     sizes = sorted(d["msgs"] for d in inter)
     sig = lambda d, k: (d.get("signals") or {}).get(k, 0)
     p90 = sizes[min(n - 1, int(round(0.9 * (n - 1))))]
@@ -75,6 +79,10 @@ def kpis(ds):
         "screenshot_sessions": sum(1 for d in inter if sig(d, "screenshot")),
         "tool_error_rate": round(sum(sum((d.get("tool_errors") or {}).values()) for d in inter)
                                  / max(1, sum(d.get("tool_calls") or 0 for d in inter)), 3),
+        "kanban_sessions": kan,
+        "kanban_share": round(kan_cost / (kan_cost + chat_sub_cost), 3) if kan_cost + chat_sub_cost else 0,
+        "chat_orchestration_sessions": sum(1 for d in inter if (d.get("children") or {}).get("n", 0) >= 15),
+        "kanban_creates_from_chat": sum((d.get("tools") or {}).get("kanban_create", 0) for d in inter),
         "subagents_per_session": round(sum((d.get("children") or {}).get("n", 0) for d in inter) / n, 2),
     }
 

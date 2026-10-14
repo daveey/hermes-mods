@@ -28,6 +28,9 @@ User side
 - `screenshot_only_report`: a bug reported only by screenshot, with no text on what is expected or wrong.
 - `re_explaining_context`: re-typing context that lives in another session or doc → `@session`, `@file`, a skill.
 - `manual_repetition`: the same check or chore asked for across sessions → cron / Bot routine / monitor.
+- `should_be_kanban`: long or parallel work orchestrated in chat: ≥15 subagents (`children.n`), status pings
+  ("how goes", "resume") while long jobs run, multi-phase sessions, or "check back later". Fix: board + cards (fan-out,
+  synthesizer, reviewer, `max_runtime_seconds`). Name the cards it should have been.
 - `permission_ping_pong`: user keeps answering "do it" / "yes" / "go". Usually agent-side (asks needlessly); label it agent-side then.
 
 Agent side
