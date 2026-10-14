@@ -1,0 +1,832 @@
+From 09583529d55733b7ac3060697e41ac51da89bd51 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:38:39 -0700
+Subject: [PATCH] fix(desktop): resume a session on its owning gateway, and
+ follow the owner on 4007 [daveey]
+
+With several registry gateways in one sidebar, a resume whose owner could not
+be proven at that instant fell through to the selected gateway. The owner
+record was fragile: a resume routed by a connection-tagged unified-list row
+never persisted an owner hint, so navigation opens (route change, session
+switcher, step keys) left nothing behind. Once the owning gateway's rows left
+the unified list (its pooled backend reconnecting; only pooled gateways are
+read), the next route re-resume probed only the selected gateway's store and
+sent session.resume there. Older backends then fabricated an empty session,
+so the chat opened empty and the selected gateway never moved.
+
+- persist the tagged row's owner as the hint when none is recorded
+- before dispatching an owner-less resume the selected store cannot find,
+  look the id up across connections (unified rows, hints, by-id probe of the
+  other registry connections) and resume there
+- on JSON-RPC 4007 from the dispatched gateway, follow the owner the same
+  way (pinning it as the only hint) instead of running not-found handling;
+  each connection is tried at most once per open
+- single-gateway installs never probe and behave as before
+---
+ ...use-session-actions.owner-gateway.test.tsx | 433 ++++++++++++++++++
+ .../hooks/use-session-actions.test.tsx        |   6 +-
+ .../hooks/use-session-actions/index.ts        |  97 +++-
+ .../hooks/use-session-actions/owner-follow.ts | 132 ++++++
+ .../hooks/use-session-actions/utils.ts        |  14 +-
+ 5 files changed, 674 insertions(+), 8 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions.owner-gateway.test.tsx
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.owner-gateway.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.owner-gateway.test.tsx
+new file mode 100644
+index 0000000000..7b53446a19
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.owner-gateway.test.tsx
+@@ -0,0 +1,433 @@
++/**
++ * A session that lives on another registry gateway resumes on its OWNING
++ * gateway, never the one the window happens to have selected — and a 4007
++ * "session not found" from the wrong gateway follows the owner instead of
++ * opening an empty chat.
++ *
++ * Observed live: with the Mac mini (local) gateway selected, opening MacBook
++ * sessions sent `session.resume` to the mini, which (before its own fix)
++ * fabricated an empty row — so the click painted an empty chat and the
++ * selected gateway never moved to the MacBook.
++ *
++ * Every gateway is mocked per connection and per RPC method, so a resume that
++ * lands on the wrong socket is observable rather than vacuously green.
++ */
++import { JsonRpcGatewayError } from '@hermes/shared'
++import { cleanup, render, waitFor } from '@testing-library/react'
++import type { MutableRefObject } from 'react'
++import { useEffect } from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { $activeConnectionId } from '@/store/connections'
++import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gateway'
++import { ensureGatewayAgent, ensureGatewayProfile } from '@/store/profile'
++import {
++  $messages,
++  $resumeFailedSessionId,
++  $selectedStoredSessionId,
++  _resetSessionOwnerHintsForTests,
++  getSessionOwnerHint,
++  setActiveSessionId,
++  setConnection,
++  setMessages,
++  setResumeFailedSessionId,
++  setSessions
++} from '@/store/session'
++import type { SessionProfileRoute } from '@/store/session-request-router'
++import { clearAllSessionStates } from '@/store/session-states'
++
++import type { ClientSessionState } from '../../types'
++
++import { useSessionActions } from './use-session-actions'
++
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  getAllSessionMessages: vi.fn(),
++  getLatestSessionMessages: vi.fn(),
++  getSession: vi.fn(),
++  listAllProfileSessions: vi.fn(),
++  setApiRequestProfile: vi.fn()
++}))
++
++vi.mock('@/store/profile', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  ensureGatewayAgent: vi.fn(),
++  ensureGatewayProfile: vi.fn()
++}))
++
++vi.mock('@/store/gateway', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  requestGatewayForAgent: vi.fn(),
++  requestGatewayForProfile: vi.fn(),
++  retainGatewayForAgent: vi.fn(async () => () => undefined)
++}))
++
++const MACBOOK = 'macbook'
++const MACBOOK_SESSION = '20261013_184022_b1a59f'
++const LOCAL_SESSION = '20261013_190000_aaaaaa'
++
++type GatewayHandler = (method: string, params: Record<string, unknown>) => unknown
++
++/** Per-connection, per-method gateway mocks. `local` is the window primary
++ *  (the ambient socket); every other id is a registry connection reached
++ *  through requestGatewayForAgent. */
++function mockGateways(handlers: Record<string, GatewayHandler>) {
++  const calls: { connection: string; method: string; params: Record<string, unknown> }[] = []
++
++  const dispatch = async (connection: string, method: string, params: Record<string, unknown> = {}) => {
++    calls.push({ connection, method, params })
++    const handler = handlers[connection]
++
++    if (!handler) {
++      throw new JsonRpcGatewayError(`no gateway for ${connection}`)
++    }
++
++    return handler(method, params)
++  }
++
++  const ambient = vi.fn(
++    async (method: string, params?: Record<string, unknown>) => await dispatch('local', method, params)
++  ) as unknown as <T>(method: string, params?: Record<string, unknown>) => Promise<T>
++
++  vi.mocked(requestGatewayForAgent).mockImplementation(async (connectionId, _profile, method, params) =>
++    dispatch(connectionId === null ? 'local' : connectionId, method, params ?? {})
++  )
++
++  // The legacy profile door (a bare profile owner) is the primary's pool.
++  vi.mocked(requestGatewayForProfile).mockImplementation(async (_profile, method, params) =>
++    dispatch('local', method, params ?? {})
++  )
++
++  const resumesOn = (connection: string) =>
++    calls.filter(call => call.connection === connection && call.method === 'session.resume')
++
++  // A warm re-open binds through session.activate; a cold one through
++  // session.resume. Either one on the wrong gateway is the misroute.
++  const opensOn = (connection: string) =>
++    calls.filter(
++      call => call.connection === connection && (call.method === 'session.resume' || call.method === 'session.activate')
++    )
++
++  return { ambient, calls, opensOn, resumesOn }
++}
++
++/** A gateway that owns `ids` and answers 4007 for anything else — the
++ *  post-fix backend contract for an id it never minted. */
++function owningGateway(owned: string[], runtimeId: string): GatewayHandler {
++  return (method, params) => {
++    if (method === 'session.resume') {
++      const id = String(params.session_id ?? '')
++
++      if (!owned.includes(id)) {
++        throw new JsonRpcGatewayError('session not found', { code: 4007 })
++      }
++
++      return {
++        info: {},
++        message_count: 2,
++        messages: [],
++        messages_omitted: true,
++        resumed: id,
++        session_id: runtimeId,
++        session_key: id
++      }
++    }
++
++    return {}
++  }
++}
++
++function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
++  return {
++    ended_at: null,
++    id: MACBOOK_SESSION,
++    input_tokens: 0,
++    is_active: false,
++    last_active: 1,
++    message_count: 2,
++    model: null,
++    output_tokens: 0,
++    preview: null,
++    source: 'desktop',
++    started_at: 1,
++    title: 'stored',
++    tool_call_count: 0,
++    ...overrides
++  }
++}
++
++const TRANSCRIPT = {
++  messages: [
++    { content: 'hello from the macbook', role: 'user', timestamp: 1 },
++    { content: 'hi', role: 'assistant', timestamp: 2 }
++  ]
++}
++
++function ResumeHarness({
++  onReady,
++  requestGateway
++}: {
++  onReady: (
++    resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
++  ) => void
++  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
++}) {
++  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
++  const stateMapRef = ref(new Map<string, ClientSessionState>())
++
++  const actions = useSessionActions({
++    activeSessionId: null,
++    activeSessionIdRef: ref<string | null>(null),
++    busyRef: ref(false),
++    creatingSessionRef: ref(false),
++    ensureSessionState: () => ({}) as ClientSessionState,
++    getRouteToken: () => 'token',
++    getRoutedStoredSessionId: () => null,
++    navigate: vi.fn() as never,
++    requestGateway,
++    resetViewSync: vi.fn(),
++    routedSessionId: null,
++    runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
++    selectedStoredSessionId: null,
++    selectedStoredSessionIdRef: ref<string | null>(null),
++    sessionStateByRuntimeIdRef: stateMapRef,
++    holdSessionTranscriptView: () => () => undefined,
++    syncSessionStateToView: vi.fn(),
++    updateSessionState: (sessionId, updater, storedSessionId) => {
++      const next = updater(stateMapRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null))
++      stateMapRef.current.set(sessionId, next)
++
++      return next
++    }
++  })
++
++  useEffect(() => {
++    onReady(actions.resumeSession)
++  }, [actions.resumeSession, onReady])
++
++  return null
++}
++
++async function mountResume(requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>) {
++  let resume: ((id: string, replaceRoute?: boolean, owner?: SessionProfileRoute) => Promise<unknown>) | null = null
++  render(<ResumeHarness onReady={r => (resume = r)} requestGateway={requestGateway} />)
++  await waitFor(() => expect(resume).not.toBeNull())
++
++  return resume!
++}
++
++describe('resume routes by the session owner, not the selected gateway', () => {
++  beforeEach(() => {
++    _resetSessionOwnerHintsForTests({ storage: true })
++    // The window has the local (Mac mini) gateway selected.
++    setConnection({ connectionId: 'local', mode: 'local', registryScoped: true } as never)
++
++    // Activating a gateway publishes its descriptor, which is what the
++    // connection switcher reads as the selected gateway.
++    vi.mocked(ensureGatewayAgent).mockImplementation(async connectionId => {
++      setConnection({ connectionId, mode: connectionId === 'local' ? 'local' : 'remote' } as never)
++    })
++    vi.mocked(ensureGatewayProfile).mockResolvedValue(undefined)
++    vi.mocked(getLatestSessionMessages).mockResolvedValue({ ...TRANSCRIPT, session_id: MACBOOK_SESSION } as never)
++    // The local backend never minted the MacBook id: by-id REST 404s there.
++    vi.mocked(getSession).mockRejectedValue(new Error('404: Session not found'))
++  })
++
++  afterEach(() => {
++    cleanup()
++    clearAllSessionStates()
++    setActiveSessionId(null)
++    setResumeFailedSessionId(null)
++    setMessages([])
++    setSessions([])
++    setConnection(null)
++    $connectionsRegistry.set(null)
++    _resetSessionOwnerHintsForTests({ storage: true })
++    vi.mocked(requestGatewayForAgent).mockReset()
++    vi.mocked(ensureGatewayAgent).mockReset()
++    vi.mocked(getSession).mockReset()
++    vi.mocked(getLatestSessionMessages).mockReset()
++  })
++
++  it('(a) opening a row tagged with a foreign connection resumes ONLY there and selects that gateway', async () => {
++    setSessions([storedSession({ connection_id: MACBOOK, profile: 'default' })])
++
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([MACBOOK_SESSION], 'rt-macbook')
++    })
++
++    const resume = await mountResume(gateways.ambient)
++    // The sidebar row click: the route resume carries no explicit owner when
++    // it was not an explicit request (navigation, ⌘⇧[ ], session switcher).
++    await resume(MACBOOK_SESSION, true)
++
++    expect(gateways.resumesOn('local')).toHaveLength(0)
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(1)
++    expect($activeConnectionId.get()).toBe(MACBOOK)
++    expect($selectedStoredSessionId.get()).toBe(MACBOOK_SESSION)
++  })
++
++  it('(a) a session reached by navigation keeps resuming on its owner after its row leaves the unified list', async () => {
++    // ⌘⇧[ ] / the session switcher / a route change open the row with no
++    // explicit owner. Later the MacBook's pooled backend reconnects and the
++    // unified list briefly carries none of its rows (only pooled gateways are
++    // read), while the selected (local) gateway re-opens and the route
++    // re-resumes the visible session.
++    setSessions([storedSession({ connection_id: MACBOOK, profile: 'default' })])
++
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([MACBOOK_SESSION], 'rt-macbook')
++    })
++
++    const resume = await mountResume(gateways.ambient)
++    await resume(MACBOOK_SESSION, true)
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(1)
++
++    // The user had the local gateway selected again by the time it reopened.
++    setConnection({ connectionId: 'local', mode: 'local', registryScoped: true } as never)
++    setSessions([])
++
++    const before = gateways.opensOn(MACBOOK).length
++    await resume(MACBOOK_SESSION, true)
++
++    expect(gateways.opensOn('local')).toHaveLength(0)
++    expect(gateways.opensOn(MACBOOK).length).toBeGreaterThan(before)
++    expect($activeConnectionId.get()).toBe(MACBOOK)
++  })
++
++  it('(b) restoring a stored id whose only owner record is a foreign hint never resumes locally', async () => {
++    // App start: the unified list has not spliced the MacBook rows yet (its
++    // pooled backend is still dialing), so only the persisted hint knows.
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([MACBOOK_SESSION], 'rt-macbook')
++    })
++
++    const resume = await mountResume(gateways.ambient)
++    const { setSessionOwnerHint } = await import('@/store/session')
++    setSessionOwnerHint(MACBOOK_SESSION, { connectionId: MACBOOK, profile: 'default' })
++
++    await resume(MACBOOK_SESSION, true)
++
++    expect(gateways.resumesOn('local')).toHaveLength(0)
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(1)
++    expect($activeConnectionId.get()).toBe(MACBOOK)
++  })
++
++  it('(b) a tagged row in the unified list routes the restore even after a stale local hint', async () => {
++    const { setSessionOwnerHint } = await import('@/store/session')
++    setSessionOwnerHint(MACBOOK_SESSION, { connectionId: 'local', profile: 'default' })
++    setSessions([storedSession({ connection_id: MACBOOK, profile: 'default' })])
++
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([MACBOOK_SESSION], 'rt-macbook')
++    })
++
++    const resume = await mountResume(gateways.ambient)
++    await resume(MACBOOK_SESSION, true)
++
++    expect(gateways.resumesOn('local')).toHaveLength(0)
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(1)
++    expect(getSessionOwnerHint(MACBOOK_SESSION)).toMatchObject({ connectionId: MACBOOK })
++  })
++
++  it('(c) a 4007 from the wrong gateway re-routes the resume to the owner in the unified list', async () => {
++    // The resume was dispatched with a stale explicit owner (`local`) — the
++    // shape a takeover/4001 recovery or an old persisted hint produces —
++    // while the unified list knows the MacBook owns the id.
++    setSessions([storedSession({ connection_id: MACBOOK, profile: 'default' })])
++
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([MACBOOK_SESSION], 'rt-macbook')
++    })
++
++    const resume = await mountResume(gateways.ambient)
++    await resume(MACBOOK_SESSION, true, { connectionId: 'local', profile: 'default' })
++
++    await waitFor(() => expect(gateways.resumesOn(MACBOOK)).toHaveLength(1))
++    expect($activeConnectionId.get()).toBe(MACBOOK)
++    expect(getSessionOwnerHint(MACBOOK_SESSION)).toMatchObject({ connectionId: MACBOOK })
++    // Not an empty chat and not a failure screen: the owner's transcript.
++    await waitFor(() => expect($messages.get().length).toBeGreaterThan(0))
++    expect($resumeFailedSessionId.get()).toBeNull()
++  })
++
++  it('(c) a 4007 for an id no connection owns keeps the existing not-found handling', async () => {
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([], 'rt-macbook')
++    })
++
++    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('404: Session not found'))
++
++    const resume = await mountResume(gateways.ambient)
++    await resume(MACBOOK_SESSION, true, { connectionId: 'local', profile: 'default' })
++
++    // Nothing to follow: the existing not-found handling owns the outcome,
++    // and the selected gateway is left where it was.
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(0)
++    expect(gateways.resumesOn('local')).toHaveLength(1)
++    expect($activeConnectionId.get()).toBe('local')
++    expect(getSessionOwnerHint(MACBOOK_SESSION)).toBeUndefined()
++  })
++
++  it('(b) restoring an unlisted id with no owner record finds its connection before dispatching', async () => {
++    // App start / reconnect re-resume: the MacBook rows are not in the unified
++    // list yet and no hint survived. The selected gateway's store does not have
++    // the id, so the owner is looked up across the registry — the resume must
++    // never be sent to the local gateway first.
++    $connectionsRegistry.set({
++      connections: [
++        { id: 'local', kind: 'local', label: 'This device' },
++        { id: MACBOOK, kind: 'ssh', label: 'macbook' }
++      ],
++      primary: 'local',
++      version: 2
++    } as never)
++    vi.mocked(getSession).mockImplementation(async (id, scope) => {
++      if (id === MACBOOK_SESSION && typeof scope === 'object' && scope?.connectionId === MACBOOK) {
++        return storedSession({ profile: 'default' })
++      }
++
++      throw new Error('404: Session not found')
++    })
++
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([MACBOOK_SESSION], 'rt-macbook')
++    })
++
++    const resume = await mountResume(gateways.ambient)
++    await resume(MACBOOK_SESSION, true)
++
++    expect(gateways.resumesOn('local')).toHaveLength(0)
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(1)
++    expect($activeConnectionId.get()).toBe(MACBOOK)
++    expect(getSessionOwnerHint(MACBOOK_SESSION)).toMatchObject({ connectionId: MACBOOK })
++  })
++
++  it('(d) control: a local session still resumes on the local gateway', async () => {
++    setSessions([storedSession({ id: LOCAL_SESSION, profile: 'default' })])
++    vi.mocked(getLatestSessionMessages).mockResolvedValue({ ...TRANSCRIPT, session_id: LOCAL_SESSION } as never)
++
++    const gateways = mockGateways({
++      local: owningGateway([LOCAL_SESSION], 'rt-local'),
++      [MACBOOK]: owningGateway([MACBOOK_SESSION], 'rt-macbook')
++    })
++
++    const resume = await mountResume(gateways.ambient)
++    await resume(LOCAL_SESSION, true)
++
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(0)
++    expect(gateways.calls.filter(call => call.method === 'session.resume')).toHaveLength(1)
++    expect(gateways.calls.find(call => call.method === 'session.resume')?.connection).toBe('local')
++    expect($activeConnectionId.get()).toBe('local')
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index dfc6af10eb..10641dbbf4 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -65,6 +65,7 @@ import {
+   $turnStartedAt,
+   _resetSessionOwnerHintsForTests,
+   getSessionOwnerHint,
++  getSessionOwnerHints,
+   knownSessionOwner,
+   ownerLookupSessionRows,
+   sessionMatchesStoredId,
+@@ -2723,7 +2724,10 @@ describe('resumeSession failure recovery', () => {
+ 
+     await runResume(requestGateway)
+ 
+-    expect(getSessionOwnerHint('stored-1')).toBeUndefined()
++    // The stale route is gone; what remains is the row's own owner, recorded
++    // so a later resume while the row is momentarily unlisted still routes
++    // to the connection that owns it.
++    expect(getSessionOwnerHints('stored-1')).toEqual([{ connectionId: 'ssh-vps', profile: 'default' }])
+   })
+ })
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 9a441639d3..6575928911 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -84,6 +84,7 @@ import {
+   $newChatWorkspaceTarget,
+   $sessions,
+   $yoloActive,
++  getSessionOwnerHints,
+   idsShareLineage,
+   type NewChatWorkspaceTarget,
+   resolveComposerSessionKey,
+@@ -170,6 +171,12 @@ import { branchCreateKey } from './branch-create-key'
+ import { sessionCreateOverrideParams, type SessionCreateOverrides, type SessionSeedMessage } from './create-overrides'
+ import { markSessionCreatedThisRun, sessionCreatedThisRun } from './created-this-run'
+ import { captureDisplayHydration } from './display-hydration'
++import {
++  dispatchedConnectionId,
++  findForeignSessionOwner,
++  isStoredSessionNotFound,
++  pinSessionOwner
++} from './owner-follow'
+ import { reconcilePersistedLiveTurn } from './persisted-live-turn'
+ import { provisionalTranscriptPaint, transcriptRestScope } from './provisional-transcript'
+ import { rememberedOwnerForResume } from './remembered-owner'
+@@ -374,6 +381,19 @@ export function useSessionActions({
+   const { t } = useI18n()
+   const copy = t.desktop
+   const resumeRequestRef = useRef(0)
++
++  // resumeSession follows a session to its owning gateway by re-entering
++  // itself; the ref breaks the useCallback self-reference.
++  const resumeSessionRef = useRef<
++    | ((
++        storedSessionId: string,
++        replaceRoute?: boolean,
++        capturedOwner?: SessionProfileRoute,
++        followedFrom?: readonly string[]
++      ) => Promise<void>)
++    | null
++  >(null)
++
+   const transcriptHydrationByRuntimeRef = useRef(new Map<string, symbol>())
+   const coldDisplayReadsRef = useRef(new Map<string, symbol>())
+   const branchCreateFlightsRef = useRef(new Map<string, Promise<SessionCreateResponse>>())
+@@ -1224,7 +1244,15 @@ export function useSessionActions({
+   }, [navigate, selectedStoredSessionId])
+ 
+   const resumeSession = useCallback(
+-    async (storedSessionId: string, replaceRoute = false, capturedOwner?: SessionProfileRoute) => {
++    async (
++      storedSessionId: string,
++      replaceRoute = false,
++      capturedOwner?: SessionProfileRoute,
++      // Connections this open already proved wrong (they answered 4007 or
++      // never had the id) while following the session to its owner. Bounds
++      // the follow: a connection is never retried within one open.
++      followedFrom: readonly string[] = []
++    ) => {
+       // Delete/archive tombstones the durable id before the route flips, and
+       // requestSessionResume already refuses to queue for a doomed id. This is
+       // the actuator-side half of the same rule: a resume that was queued
+@@ -1444,6 +1472,45 @@ export function useSessionActions({
+         setSessionOwnerHint(storedSessionId, sessionOwner)
+       }
+ 
++      // A connection-tagged row (the unified list's foreign-gateway rows) is
++      // the exact owner. Remember it too, so a later resume that runs while
++      // that row is momentarily absent — the owning gateway's pooled backend
++      // still dialing at boot or after its reconnect, when the unified list
++      // carries none of its rows — still routes there instead of falling
++      // through to the selected gateway, which never minted the id.
++      const taggedOwner = ownerRoute ? undefined : sessionOwnerRouteFromRow(storedForProfile)
++
++      if (taggedOwner && getSessionOwnerHints(storedSessionId).length === 0) {
++        setSessionOwnerHint(storedSessionId, taggedOwner)
++      }
++
++      // No exact owner and the selected gateway's store does not have the id:
++      // it lives on another connection (or nowhere). Look it up across every
++      // connection BEFORE dispatching, so the resume is never sent to a
++      // gateway that would answer 4007 — or, on older backends, fabricate an
++      // empty session for an id it never minted.
++      if (!ownerRoute && !storedForProfile) {
++        const foreignOwner = await findForeignSessionOwner(storedSessionId, [
++          ...followedFrom,
++          dispatchedConnectionId(sessionOwner)
++        ])
++
++        if (!isCurrentResume()) {
++          return
++        }
++
++        if (foreignOwner) {
++          pinSessionOwner(storedSessionId, foreignOwner)
++
++          await resumeSessionRef.current?.(storedSessionId, replaceRoute, foreignOwner, [
++            ...followedFrom,
++            dispatchedConnectionId(sessionOwner)
++          ])
++
++          return
++        }
++      }
++
+       const sessionRestScope = transcriptRestScope(ownerRoute, storedForProfile, ambientConnectionId)
+       provisional.paint(sessionRestScope)
+ 
+@@ -2484,6 +2551,27 @@ export function useSessionActions({
+           return
+         }
+ 
++        // 4007 from the gateway this resume was dispatched on: that gateway
++        // never minted the id, which proves the ROUTE wrong, not the session
++        // gone. If another connection owns it (the unified list, a hint, or a
++        // by-id probe), resume there — which also switches the selected
++        // gateway — instead of painting an empty chat or a not-found draft.
++        if (isStoredSessionNotFound(err)) {
++          const failedOn = dispatchedConnectionId(sessionOwner)
++          const foreignOwner = await findForeignSessionOwner(storedSessionId, [...followedFrom, failedOn])
++
++          if (!isCurrentResume()) {
++            return
++          }
++
++          if (foreignOwner) {
++            pinSessionOwner(storedSessionId, foreignOwner)
++            await resumeSessionRef.current?.(storedSessionId, replaceRoute, foreignOwner, [...followedFrom, failedOn])
++
++            return
++          }
++        }
++
+         // The gateway resume RPC failed. Try the REST transcript as a fallback
+         // so the window at least shows history. CRITICAL: this fallback must be
+         // wrapped in its own try — if it ALSO throws (wedged/unreachable backend,
+@@ -2667,6 +2755,11 @@ export function useSessionActions({
+     ]
+   )
+ 
++  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
++  useEffect(() => {
++    resumeSessionRef.current = resumeSession
++  }, [resumeSession])
++
+   // Shared fork: create a child session seeded with `branchMessages`, linked to
+   // `parentStoredId` so it nests under its parent, then open it as its own tab
+   // and switch to it — the parent chat stays put (mirrors openNewSessionTile).
+@@ -3393,6 +3486,7 @@ export function useSessionActions({
+         const archiveOwner: SessionOwnerScope = archived?.connection_id
+           ? { connectionId: archived.connection_id, profile: archived.profile || 'default' }
+           : profile
++
+         await setSessionArchived(storedSessionId, true, archiveOwner)
+         // Archived rows never reach the sidebar, so their persisted unread can
+         // only rot. Dropped after the RPC so a failed archive keeps it.
+@@ -3445,6 +3539,7 @@ export function useSessionActions({
+         const restoreOwner: SessionOwnerScope = archived?.connection_id
+           ? { connectionId: archived.connection_id, profile: archived.profile || 'default' }
+           : profile
++
+         await setSessionArchived(storedSessionId, false, restoreOwner)
+ 
+         // Drop the archived-view row first so the view reflects the restore
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
+new file mode 100644
+index 0000000000..218b6e9e12
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
+@@ -0,0 +1,132 @@
++import type { JsonRpcGatewayError } from '@hermes/shared'
++
++import { getSession } from '@/hermes'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import {
++  $connection,
++  forgetSessionOwnerHintsForSession,
++  getSessionOwnerHints,
++  ownerLookupSessionRows,
++  sessionMatchesStoredId,
++  setSessionOwnerHint
++} from '@/store/session'
++import {
++  isSessionOwnerRoute,
++  type SessionOwnerRoute,
++  sessionOwnerRouteFromRow,
++  type SessionOwnerScope
++} from '@/store/session-request-router'
++
++import { cachedSessionRowCandidates } from './utils'
++
++/**
++ * Following a session to the gateway that owns it [daveey].
++ *
++ * The sidebar unifies every connected gateway's sessions, so a stored id can be
++ * opened while the window has a DIFFERENT gateway selected. A resume dispatched
++ * on that ambient/stale route lands on a backend that never minted the id: it
++ * answers JSON-RPC 4007 ("session not found"). That answer is proof the route
++ * was wrong, not that the session is gone — so before the not-found handling
++ * runs, find the connection that does own the id and resume there.
++ */
++
++/** JSON-RPC 4007 — the gateway has no stored session by that id. */
++export const SESSION_NOT_FOUND_CODE = 4007
++
++/** True for a gateway's "no such stored session" answer to `session.resume`.
++ *  A bare 4001 (live runtime reaped) is a different signal and does not
++ *  qualify: the stored session exists there, only its runtime is gone. */
++export function isStoredSessionNotFound(error: unknown): boolean {
++  if (!error || typeof error !== 'object') {
++    return false
++  }
++
++  const code = (error as Partial<JsonRpcGatewayError>).code
++
++  if (typeof code === 'number') {
++    return code === SESSION_NOT_FOUND_CODE
++  }
++
++  return error instanceof Error && /\bsession not found\b/i.test(error.message)
++}
++
++/** The registry connection a session-scoped RPC with `owner` was dispatched
++ *  on. An exact route names it; anything else rode the selected (ambient)
++ *  connection, else the window primary. */
++export function dispatchedConnectionId(owner: SessionOwnerScope): string {
++  if (isSessionOwnerRoute(owner)) {
++    return owner.connectionId.trim()
++  }
++
++  return $connection.get()?.connectionId?.trim() || $connectionsRegistry.get()?.primary?.trim() || 'local'
++}
++
++function registryConnectionIds(): string[] {
++  return ($connectionsRegistry.get()?.connections ?? [])
++    .map(connection => connection.id?.trim() ?? '')
++    .filter(Boolean)
++}
++
++/**
++ * The owner of `storedSessionId` on a connection OTHER than `excluded`, from
++ * the unified session list (every connection's connection-tagged rows), then
++ * the persisted owner hints, then a read-only by-id probe of each remaining
++ * registry connection. Undefined when no other connection has it — or when
++ * there is no other connection at all (single-gateway installs never probe).
++ */
++export async function findForeignSessionOwner(
++  storedSessionId: string,
++  excluded: readonly string[]
++): Promise<SessionOwnerRoute | undefined> {
++  const id = storedSessionId.trim()
++  const skip = new Set(excluded.map(connection => connection.trim()).filter(Boolean))
++
++  if (!id) {
++    return undefined
++  }
++
++  const rows = [
++    ...cachedSessionRowCandidates(id),
++    ...ownerLookupSessionRows().filter(row => sessionMatchesStoredId(row, id))
++  ]
++
++  for (const row of rows) {
++    const route = sessionOwnerRouteFromRow(row)
++
++    if (route && !skip.has(route.connectionId)) {
++      return route
++    }
++  }
++
++  const hinted = getSessionOwnerHints(id).find(route => !skip.has(route.connectionId.trim()))
++
++  if (hinted) {
++    return hinted
++  }
++
++  const candidates = registryConnectionIds().filter(connectionId => !skip.has(connectionId))
++
++  if (candidates.length === 0 || registryConnectionIds().length < 2) {
++    return undefined
++  }
++
++  for (const connectionId of candidates) {
++    try {
++      const row = await getSession(id, { connectionId, profile: 'default' })
++
++      return { connectionId, profile: row?.profile?.trim() || 'default' }
++    } catch {
++      // Not on this connection (or it is unreachable); try the next.
++    }
++  }
++
++  return undefined
++}
++
++/** Record `route` as the session's ONLY owner: a 4007 just proved every other
++ *  remembered route wrong, and two hints for one id make the hint ambiguous
++ *  (getSessionOwnerHint answers undefined), which re-opens the ambient path. */
++export function pinSessionOwner(storedSessionId: string, route: SessionOwnerRoute): void {
++  forgetSessionOwnerHintsForSession(storedSessionId)
++  setSessionOwnerHint(storedSessionId, route)
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+index 1d79a4d796..f7e86d63b4 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+@@ -2116,17 +2116,19 @@ function projectTreeSessions(): SessionInfo[] {
+     ])
+ }
+ 
++/** Every cached row for a stored id, across every list that can hold one. */
++export function cachedSessionRowCandidates(storedSessionId: string): SessionInfo[] {
++  return [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get(), ...projectTreeSessions()].filter(
++    session => sessionMatchesStoredId(session, storedSessionId)
++  )
++}
++
+ // The best cached row for a stored id, across every list that can hold one.
+ // "Best" means self-describing: the same conversation can appear both as an
+ // ownerless legacy Recents copy and as a profile-stamped project-tree row, and
+ // picking the ownerless one throws away the only routing information we have.
+ export function cachedSessionRow(storedSessionId: string): SessionInfo | undefined {
+-  const candidates = [
+-    ...$sessions.get(),
+-    ...$cronSessions.get(),
+-    ...$messagingSessions.get(),
+-    ...projectTreeSessions()
+-  ].filter(session => sessionMatchesStoredId(session, storedSessionId))
++  const candidates = cachedSessionRowCandidates(storedSessionId)
+ 
+   return (
+     candidates.find(session => session.connection_id?.trim()) ??
+-- 
+2.55.0
+

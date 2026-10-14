@@ -1,0 +1,289 @@
+From 415e5caeb20b0ac07a84a81606e58936fc8bee99 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:34:34 -0700
+Subject: [PATCH] fix(gateway): session.resume only materializes keys this
+ backend minted [daveey]
+
+#96793 made session.resume create a sessions row for any unknown id that
+merely looked server-minted (YYYYMMDD_HHMMSS_hex6). Every gateway mints that
+shape, so with several gateways (Mac mini + MacBook) the desktop asking the
+mini to resume MacBook sessions got 13 fabricated empty rows instead of 4007,
+never fell back to the owning gateway, and opened empty runtime-less chats.
+
+session.create now records each minted stored key in the session's own
+state.db (new minted_session_keys table, 30-day prune; failures logged, never
+fatal), and _resume_locate only materializes a key that store recorded. A
+foreign key falls through to 4007 with no row written.
+---
+ hermes_state_common.py                        | 12 +++++
+ hermes_state_gateway.py                       | 25 +++++++++
+ .../hermes_state/test_minted_session_keys.py  | 32 +++++++++++
+ ..._session_resume_materializes_minted_key.py | 54 ++++++++++++++++++-
+ tui_gateway/methods_session.py                | 30 ++++++++++-
+ 5 files changed, 151 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_state/test_minted_session_keys.py
+
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 5a37d49eba..72ab679314 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -565,6 +565,18 @@ CREATE TABLE IF NOT EXISTS gateway_heartbeats (
+     host TEXT NOT NULL DEFAULT ''
+ );
+ 
++-- Stored session keys minted by THIS backend's ``session.create`` (which writes
++-- no sessions row until the first prompt). ``session.resume`` materializes a row
++-- for an unknown key only when it is recorded here: the key shape alone is not
++-- proof of ownership, since every gateway mints the same shape, and a foreign
++-- gateway's key must 4007 so the client routes the resume to its owner instead
++-- of opening an empty phantom row here. Rows older than 30 days are pruned on
++-- write (SessionDB.record_minted_session_key).
++CREATE TABLE IF NOT EXISTS minted_session_keys (
++    id TEXT PRIMARY KEY,
++    minted_at REAL NOT NULL
++);
++
+ CREATE TABLE IF NOT EXISTS compression_locks (
+     session_id TEXT PRIMARY KEY,
+     holder TEXT NOT NULL,
+diff --git a/hermes_state_gateway.py b/hermes_state_gateway.py
+index cdc69851d6..9fe3bde4c1 100644
+--- a/hermes_state_gateway.py
++++ b/hermes_state_gateway.py
+@@ -874,6 +874,31 @@ class SessionGatewayMixin:
+             return [str(r[0]) for r in cur.fetchall()]
+         return list(self._execute_write(_do) or [])
+ 
++    # Minted-key records outlive the restart window that strands an unprompted draft; 30 days bounds the table.
++    MINTED_SESSION_KEY_TTL_S = 30 * 86400
++
++    def record_minted_session_key(self, session_id: str) -> None:
++        """Record a stored session key minted by this backend's ``session.create`` (no sessions row yet).
++
++        ``session.resume`` only materializes a row for an unknown key recorded here, so another
++        gateway's key 4007s and the client routes to its owner. Idempotent; prunes stale records."""
++        if not session_id:
++            return
++        now = time.time()
++
++        def _do(conn):
++            conn.execute("INSERT OR IGNORE INTO minted_session_keys (id, minted_at) VALUES (?, ?)",
++                         (str(session_id), now))
++            conn.execute("DELETE FROM minted_session_keys WHERE minted_at < ?",
++                         (now - self.MINTED_SESSION_KEY_TTL_S,))
++        self._execute_write(_do)
++
++    def was_session_key_minted(self, session_id: str) -> bool:
++        """True iff ``record_minted_session_key`` recorded *session_id* in this store."""
++        if not session_id:
++            return False
++        return self._read_one("SELECT 1 FROM minted_session_keys WHERE id = ?", (str(session_id),)) is not None
++
+     def list_backend_heartbeats(self) -> list[dict[str, Any]]:
+         """Snapshot of every backend heartbeat (diagnostics/tests); fields mirror the table."""
+         rows = self._read_all(
+diff --git a/tests/hermes_state/test_minted_session_keys.py b/tests/hermes_state/test_minted_session_keys.py
+new file mode 100644
+index 0000000000..960e536813
+--- /dev/null
++++ b/tests/hermes_state/test_minted_session_keys.py
+@@ -0,0 +1,32 @@
++"""``minted_session_keys``: the store-local record ``session.resume`` checks before materializing a row."""
++
++from __future__ import annotations
++
++import time
++
++from hermes_state import SessionDB
++
++
++def test_record_and_lookup_is_idempotent(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        assert not db.was_session_key_minted("20261013_184022_b1a59f")
++        db.record_minted_session_key("20261013_184022_b1a59f")
++        db.record_minted_session_key("20261013_184022_b1a59f")
++        assert db.was_session_key_minted("20261013_184022_b1a59f")
++        assert not db.was_session_key_minted("")
++        assert db.get_session("20261013_184022_b1a59f") is None, "recording a key must not create a sessions row"
++    finally:
++        db.close()
++
++
++def test_record_prunes_records_older_than_ttl(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        stale = time.time() - db.MINTED_SESSION_KEY_TTL_S - 60
++        db._write_sql("INSERT INTO minted_session_keys (id, minted_at) VALUES (?, ?)", ("20260801_000000_aaaaaa", stale))
++        db.record_minted_session_key("20261013_184022_b1a59f")
++        assert not db.was_session_key_minted("20260801_000000_aaaaaa")
++        assert db.was_session_key_minted("20261013_184022_b1a59f")
++    finally:
++        db.close()
+diff --git a/tests/tui_gateway/test_session_resume_materializes_minted_key.py b/tests/tui_gateway/test_session_resume_materializes_minted_key.py
+index ccb7eb6bb6..c36e2c3c94 100644
+--- a/tests/tui_gateway/test_session_resume_materializes_minted_key.py
++++ b/tests/tui_gateway/test_session_resume_materializes_minted_key.py
+@@ -13,6 +13,12 @@ materialize the row and continue the normal empty resume instead of failing.
+ Abandoned drafts still leave no row — nothing is written until a client
+ explicitly resumes the exact key. Fail-closed: garbage, 8-hex runtime ids,
+ and titles still 4007, and lazy subagent watch windows are excluded.
++
++Multi-gateway rule: the key shape alone is not proof of ownership — every
++gateway mints the same shape. Only a key THIS backend's store recorded at
++``session.create`` (``minted_session_keys``) is materialized; a foreign
++gateway's key must 4007 so the client routes the resume to its owner instead
++of opening an empty, runtime-less phantom row here.
+ """
+ 
+ from __future__ import annotations
+@@ -58,8 +64,38 @@ def _assert_resumed_ok(resp, target):
+     assert resp["result"]["session_id"], "a live runtime must be registered"
+ 
+ 
++def _create_then_restart() -> str:
++    """``session.create`` on this backend, never prompted, then drop the live record
++    (what a backend restart does to the in-memory registry). Returns the stored key."""
++    created = server.handle_request({"id": "c", "method": "session.create", "params": {}})
++    assert "error" not in created, created
++    sid, key = created["result"]["session_id"], created["result"]["stored_session_id"]
++    with server._sessions_lock:
++        server._sessions.pop(sid, None)
++    return key
++
++
+ def test_resume_materializes_row_for_minted_key(real_db):
+-    """The core fix: a minted-but-never-persisted key resumes, row now exists."""
++    """The core fix: a key minted by THIS backend but never persisted resumes after a
++    restart with empty history, and the row now exists."""
++    key = _create_then_restart()
++    assert server._is_server_minted_key(key)
++    assert real_db.get_session(key) is None, "session.create must not write a sessions row"
++    assert real_db.was_session_key_minted(key)
++
++    resp = _resume(session_id=key)
++
++    _assert_resumed_ok(resp, key)
++    assert resp["result"]["message_count"] == 0
++    row = real_db.get_session(key)
++    assert row is not None, "resume must materialize the DB row"
++    assert row["source"] == "tui"
++    assert row["model"] == "test-model"
++
++
++def test_resume_materializes_recorded_key(real_db):
++    """A recorded minted key resumes; materialized row carries the launch profile."""
++    real_db.record_minted_session_key(MINTED_KEY)
+     resp = _resume(session_id=MINTED_KEY)
+ 
+     _assert_resumed_ok(resp, MINTED_KEY)
+@@ -88,6 +124,20 @@ def test_resume_existing_row_unaffected(real_db):
+     assert real_db.get_session(EXISTING_KEY)["message_count"] == 1
+ 
+ 
++def test_resume_foreign_gateway_key_4007_without_phantom_row(real_db):
++    """A well-formed server-style key this backend never minted (another gateway's
++    session) must 4007 — the client then routes to the owning gateway — and must NOT
++    leave a sessions row behind."""
++    foreign = "20261013_184022_b1a59f"
++    assert server._is_server_minted_key(foreign)
++
++    resp = _resume(session_id=foreign)
++
++    assert resp.get("error", {}).get("code") == 4007, resp
++    assert real_db.get_session(foreign) is None
++    assert len(real_db.list_sessions_rich(source="tui")) == 0
++
++
+ def test_resume_garbage_id_still_4007(real_db):
+     """Non-key garbage stays fail-closed: same error, no write."""
+     resp = _resume(session_id="not-a-session")
+@@ -107,6 +157,7 @@ def test_resume_8hex_runtime_id_still_4007(real_db):
+ 
+ def test_resume_lazy_watch_missing_key_still_4007(real_db):
+     """Lazy subagent watch windows must not mint phantom rows for dead children."""
++    real_db.record_minted_session_key(MINTED_KEY)  # isolate the lazy gate
+     resp = _resume(session_id=MINTED_KEY, lazy=True)
+ 
+     assert resp["error"]["code"] == 4007
+@@ -132,6 +183,7 @@ def test_resume_minted_key_claimed_by_other_profile_fails_closed(real_db):
+         "source": "desktop",
+     }
+     server._sessions["live-other-profile"] = record
++    real_db.record_minted_session_key(MINTED_KEY)  # isolate the live-claim gate
+     try:
+         resp = _resume(session_id=MINTED_KEY)
+         assert resp["error"]["code"] == 4007
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index d7da62716f..3cdb6921e3 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -466,6 +466,7 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) ->
+     # The same holds for a seeded session WITHOUT a parent (a client opening a chat with its first turns
+     # already written): the transcript exists only in memory, so a restart before the first prompt lost it
+     # and the post-create resume 404'd. Persist it up front too; only empty drafts stay lazy.
++    _record_minted_key(_sessions[sid], key)
+     if parent_session_id and history:
+         _seed_branch_row(_sessions[sid], key, parent_session_id, history, source, profile_home)
+     elif history:
+@@ -489,6 +490,18 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) ->
+                  "profile_name": _response_profile_name(profile)}})
+ 
+ 
++def _record_minted_key(session: dict, key: str) -> None:
++    """Record *key* as minted by this backend in the session's own store (the one a later
++    ``session.resume`` reads), so a restart before the first prompt can still materialize it
++    (#96793) while a foreign gateway's key 4007s. Never breaks ``session.create``."""
++    try:
++        with _session_db(session) as db:
++            if db is not None:
++                db.record_minted_session_key(key)
++    except Exception:
++        logger.warning("failed to record minted session key %s", key, exc_info=True)
++
++
+ @method("session.create")
+ def _(rid, params: dict) -> dict:
+     return _create_session(rid, params)
+@@ -777,6 +790,12 @@ def _resume_adopt_stranded(ctx: _Resume) -> None:
+ def _resume_materialize_minted(ctx: _Resume) -> None:
+     """Row for a minted-but-never-persisted key (#96793): adopt the id, not 4007.
+ 
++    Only for keys THIS backend's store recorded at ``session.create``
++    (``was_session_key_minted``). The key shape is not proof of ownership: with
++    several gateways (e.g. two Macs) every one mints the same shape, and a client
++    probing this backend for another gateway's key must get 4007 so it routes the
++    resume to the owner — materializing here fabricated empty, runtime-less rows.
++
+     ``session.create`` mints the stored key but intentionally writes no state.db row
+     until the first prompt (no "Untitled" litter). If the backend dies in that window,
+     the key exists client-side (pinned tile, stored id) but has no row anywhere — and
+@@ -803,6 +822,14 @@ def _resume_materialize_minted(ctx: _Resume) -> None:
+         logger.warning("failed to materialize session row for %s", ctx.target, exc_info=True)
+ 
+ 
++def _was_minted_here(ctx: _Resume) -> bool:
++    try:
++        return bool(ctx.db.was_session_key_minted(ctx.target))
++    except Exception:
++        logger.warning("minted-key lookup failed for %s; not materializing", ctx.target, exc_info=True)
++        return False
++
++
+ def _resume_locate(ctx: _Resume) -> dict | None:
+     """Resolve ``ctx.target`` to a stored row (``ctx.found``); a dict is an early response."""
+     ctx.found = ctx.db.get_session(ctx.target)
+@@ -822,8 +849,9 @@ def _resume_locate(ctx: _Resume) -> dict | None:
+         return _resume_live_unpersisted(ctx, live_sid, live)
+     if ctx.owns_db:
+         _resume_adopt_stranded(ctx)
++    # Materialize only a key this store minted: a foreign gateway's key must 4007 so the client routes to its owner.
+     if not ctx.found and not ctx.lazy and _is_server_minted_key(ctx.target) \
+-            and not _any_live_session_claims_key(ctx.target):
++            and not _any_live_session_claims_key(ctx.target) and _was_minted_here(ctx):
+         _resume_materialize_minted(ctx)
+     return None if ctx.found else _err(ctx.rid, 4007, "session not found")
+ 
+-- 
+2.55.0
+

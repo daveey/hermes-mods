@@ -25,7 +25,7 @@ probes `probeLocalBackend()` and then `selectConnection('local')`; the switch it
 `src/app/hooks/use-keybinds-new-session.test.tsx`, `src/store/connections.test.ts` (`selectThisDeviceForNewChat`).
 
 ## Applying
-Needs 0020 (it rebinds `session.rename`). `git am -3 core/patches/0040-*.patch`.
+Needs 0020 (it rebinds `session.rename`). `git am -3 core/patches/0042-*.patch`.
 
 ## Gotchas
 - Users with a single connection see no difference between ⌘N and ⌘⇧N.

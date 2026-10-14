@@ -8,14 +8,14 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 
 | Shortcut | Does | Source | How you get it |
 |---|---|---|---|
-| ⌘] / ⌘[ | Next / previous sidebar session that **needs you** (amber or unread dot); wraps. Falls back to the plain neighbour | core patch 0021 | [core/session-navigation-shortcuts.md](core/session-navigation-shortcuts.md) |
+| ⌘] / ⌘[ | Next / previous sidebar session with a **status stripe** (green = finished, red = blocked/stalled); wraps. No-op when none | core patches 0021, 0043 | [core/session-navigation-shortcuts.md](core/session-navigation-shortcuts.md) |
 | ⌘⇧] / ⌘⇧[ | Next / previous sidebar session, any state (upstream used these for profile next/prev) | core patch 0021 | same |
 | ⌘⇧A | Archive the selected (else open) session, then open the next one that needs you | core patches 0019, 0026 | same |
 | ⌘R | Send `resume` to the active chat (for a stalled turn) | core patch 0022 | same |
 | ⇧⌘R | Reload the window (⌘R used to do this) | core patch 0022 | same |
-| ⌘N | New session **on This device** (switches the gateway to local if another is selected); returns to the unsent new-session draft (text + attachments) instead of an empty composer | core patches 0036, 0040 | [core/persistent-new-session-draft.md](core/persistent-new-session-draft.md), [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
-| ⌘⇧N | New session on the currently selected gateway | core patch 0040 | [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
-| ⌘⇧E | Rename the session; the field is pre-filled with an AI short name | core patches 0020, 0040 | [core/ai-session-rename.md](core/ai-session-rename.md) |
+| ⌘N | New session **on This device** (switches the gateway to local if another is selected); returns to the unsent new-session draft (text + attachments) instead of an empty composer | core patches 0036, 0042 | [core/persistent-new-session-draft.md](core/persistent-new-session-draft.md), [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
+| ⌘⇧N | New session on the currently selected gateway | core patch 0042 | [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
+| ⌘⇧E | Rename the session; the field is pre-filled with an AI short name | core patches 0020, 0042 | [core/ai-session-rename.md](core/ai-session-rename.md) |
 | ⌘⇧P | Move the selected session into a project (palette typeahead over every gateway's projects). A name that doesn't exist offers **Create project** with an empty `~/code/<slug>` | core patches 0018, 0030 | [core/project-palette.md](core/project-palette.md) |
 | ⇧⌘F | Spin out: turn the follow-up work at the end of a session into new sessions | plugin [spin-out](plugins/spin-out/) | `./install.sh` |
 | ⌥⌘F | Session search (moved here from ⇧⌘F by spin-out) | plugin spin-out | `./install.sh` |

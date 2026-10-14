@@ -1,6 +1,6 @@
 # ⌘⇧E (formerly ⌘⇧N): rename a session with an AI-suggested short name
 
-Press **⌘⇧E** (`mod+shift+e`; ⌘⇧N until patch 0040, which gave ⌘⇧N to "new chat on the current gateway") in Hermes Desktop to open the "Rename session" dialog for the selected sidebar
+Press **⌘⇧E** (`mod+shift+e`; ⌘⇧N until patch 0042, which gave ⌘⇧N to "new chat on the current gateway") in Hermes Desktop to open the "Rename session" dialog for the selected sidebar
 session, or the focused chat if nothing is selected. While the dialog is open, the auxiliary title model reads the
 session's transcript. It then pre-fills the input with a short name of 2–4 lowercase words, such as
 `hermes shortcuts` or `vast gpu cleanup`, and selects the text. Press Enter to accept it, or type over it.

@@ -7,7 +7,7 @@ Desktop keybind registry, so you can rebind them in **Settings → Keybinds**. T
 | Patch | Shortcut | Action id | Does |
 |---|---|---|---|
 | [0019](patches/0019-feat-desktop-A-archives-the-selected-else-open-sessi.patch) | ⌘⇧A | `session.archive` | Archive the selected session, or the open chat if no row is selected |
-| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session that needs you. With none, the plain neighbour |
+| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red). With none, nothing happens |
 | [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌘R | `session.resume` | Send `resume` to the active chat as if you typed it |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⇧⌘R | *(Electron `forceReload`)* | Reload the window (always) |
@@ -25,8 +25,8 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
 - Upstream ships `session.archive` unbound. The fork binds it to `mod+shift+a` ("a" for archive).
 - Target: the clicked/selected sidebar row (`$selectedStoredSessionId`), else the chat that's open
   (`$focusedStoredSessionId`). With neither, it does nothing.
-- 0026: before archiving, it computes the next session with `nextSidebarSessionId(id, +1, needsYou)`, the
-  same lookup ⌘] uses. The lookup runs while the row is still in the sidebar, so its position is known.
+- 0026: before archiving, it computes the next session with `nextSidebarSessionId(id, +1, false, true)`, the
+  same lookup ⌘] uses (the last arg keeps the plain-neighbour fallback that ⌘] dropped in 0043). The lookup runs while the row is still in the sidebar, so its position is known.
   `archiveSession(id, { onDeselect })` then opens that session in place of upstream's
   `startFreshSessionDraft`. Archiving from the row menu (no `onDeselect`) still drops to a fresh draft.
 - An archived session that wasn't the open one leaves the view alone.
@@ -39,9 +39,13 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
   The list is virtualized, so it can't be read from the DOM; the section row model is the authority. A
   collapsed section contributes nothing. When no section is mounted (sidebar hidden, project view), it falls
   back to the recency list (`$sessions`).
-- **"Needs you"** = sidebar dot state `needs-input` (amber, blocking prompt) or `unread` (finished turn you
-  haven't seen). ⌘]/⌘[ skip everything else, and if no session needs you they move to the plain neighbour.
-  ⌘⇧]/⌘⇧[ don't filter.
+- **"Needs you"** (0043) = the row draws a status stripe ([sidebar-status-stripe.md](sidebar-status-stripe.md)):
+  green (finished turn, read or not) or red (blocked on a prompt, or stalled). Eligibility calls the same
+  `sessionStatusStripe(dotState, hasTurns)` the row uses, so ⌘]/⌘[ land exactly on striped rows. `hasTurns`
+  comes from the sections' published `turnIds` (rows with `message_count > 0`), else `$sessions`. With no
+  striped row they do nothing. (0021 used dot states `needs-input`/`unread` and fell back to the plain
+  neighbour; after 0039 kept the green stripe on read sessions, that filter often matched nothing and
+  ⌘[ landed on unstriped rows.) ⌘⇧]/⌘⇧[ don't filter.
 - **Wrapping:** stepping past either end wraps around. It starts from the selected row, else the open chat.
   With neither, or with a current session that isn't in the sidebar, ⌘] starts at the top and ⌘[ at the bottom.
   It never returns the current session, so it's a no-op when nothing else qualifies.
@@ -355,6 +359,7 @@ npx vitest run src/store/sidebar-visible-order.test.ts \
 | 0021 | 0019, 0020 (⌘⇧N rename: its `session.rename` lines are the hunk context in `actions.ts`, `use-keybinds.ts` and the i18n files) |
 | 0022 | 0021 (i18n and `use-keybinds.ts` context) |
 | 0026 | 0019 (`$focusedStoredSessionId` import), 0021 (`sidebar-visible-order.ts`). 0023 edits the same `archiveSession` function just below, so apply it first |
+| 0043 | 0021, 0026, 0038 (`sessionStatusStripe`), 0039 |
 
 Apply the whole series in numeric order from the hermes-agent repo root:
 
@@ -402,7 +407,7 @@ gateway RPC contract, so there's nothing to regenerate.
 
 - **⌘] does nothing:** no other session is visible. Check that the sections are expanded and the sidebar
   filter isn't hiding rows.
-- **⌘] skips a chat you expected:** its dot isn't amber or unread. Opening a chat marks it read.
+- **⌘] skips a chat you expected:** it has no green/red stripe (working, background, draft, or no messages).
 - **⌘R reloads the window:** `session.resume` is unbound or rebound, or the keybind shell wasn't mounted yet
   (`runBuiltinAction` returned false). Check Settings → Keybinds.
 - **⌘⇧] switches profiles:** the 0021 defaults change isn't in this build, or `profile.next` was rebound by hand.
