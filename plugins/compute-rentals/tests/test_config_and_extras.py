@@ -44,8 +44,43 @@ def test_aws_profile_env_is_the_default_profile(no_user_config, monkeypatch):
     assert load_config()['ec2']['profiles'] == ['team']
 
 
+def _block_module(monkeypatch, *names):
+    import builtins
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name.split('.')[0] in names:
+            raise ImportError(name)
+        return real(name, *a, **k)
+    monkeypatch.setattr(builtins, '__import__', fake)
+
+
+def test_ruamel_parses_yaml_without_pyyaml(tmp_path, monkeypatch):
+    # The Hermes runtime ships ruamel.yaml but not PyYAML.
+    pytest.importorskip('ruamel.yaml')
+    _block_module(monkeypatch, 'yaml')
+    path = tmp_path / 'cr.yaml'
+    path.write_text('ec2:\n  profiles: [prod, dev]\nslurm:\n  hosts: [a]\n  user: ops\n')
+    cfg = load_config(path)
+    assert cfg['ec2']['profiles'] == ['prod', 'dev']
+    assert cfg['slurm']['user'] == 'ops'
+    empty = tmp_path / 'empty.yaml'
+    empty.write_text('# nothing\n')
+    assert load_config(empty)['ec2']['profiles']
+
+
+def test_no_yaml_parser_gives_clear_error(tmp_path, monkeypatch):
+    _block_module(monkeypatch, 'yaml', 'ruamel')
+    path = tmp_path / 'cr.yaml'
+    path.write_text('ec2:\n  profiles: [prod]\n')
+    with pytest.raises(ValueError, match='no YAML parser'):
+        load_config(path)
+    path.write_text('{"ec2": {"profiles": ["prod"]}}')
+    assert load_config(path)['ec2']['profiles'] == ['prod']
+
+
 def test_env_path_override_merges_and_keeps_unknown_sections(tmp_path, monkeypatch):
-    pytest.importorskip('yaml')  # YAML syntax below; the worker runtime has only the JSON fallback
+    pytest.importorskip('yaml')  # YAML flow syntax below is parsed with PyYAML here
     path = tmp_path / 'cr.yaml'
     path.write_text(
         'extra_providers_dir: ~/my-providers\n'

@@ -40,12 +40,33 @@ def defaults():
     }
 
 
-def _parse(text):
+def _yaml_loader():
+    """Return a safe YAML load function, or None.
+
+    Hermes itself ships ruamel.yaml (not PyYAML), so try both; PyYAML first
+    because extra runtimes usually have it.
+    """
     try:
         import yaml
+        return yaml.safe_load
     except ImportError:
+        pass
+    try:
+        from ruamel.yaml import YAML
+    except ImportError:
+        return None
+    return YAML(typ='safe', pure=True).load
+
+
+def _parse(text, loader=None):
+    loader = loader or _yaml_loader()
+    if loader is not None:
+        return (loader(text) if text and text.strip() else None) or {}
+    try:
         return json.loads(text or '{}')
-    return yaml.safe_load(text) or {}
+    except json.JSONDecodeError as exc:
+        raise ValueError('compute-rentals config is not JSON and no YAML parser '
+                         '(PyYAML or ruamel.yaml) is installed: %s' % exc) from exc
 
 
 def _merge(base, override):

@@ -73,9 +73,9 @@ clusters out of this public repo.
 
 ## Python dependencies
 
-`modal` (for the Modal provider) and `pyyaml` (for the config file; without it the file must be
-JSON) aren't in the Hermes runtime. The broker worker runs from `.extra-runtime/` in this folder if
-it exists:
+`modal` (for the Modal provider) isn't in the Hermes runtime. The config file is parsed with PyYAML
+or, failing that, ruamel.yaml (which Hermes ships); with neither, it must be JSON. The broker
+worker runs from `.extra-runtime/` in this folder if it exists:
 
 ```bash
 cd ~/.hermes/plugins/compute-rentals
