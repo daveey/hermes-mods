@@ -17,6 +17,7 @@ and you work in Desktop.
 | 0011 | reopens the Desktop app that a headless update stopped for the bundle swap | `desktop.relaunch_after_rebuild` (`false`) |
 | 0012 | `hermes serve --stop` / `hermes dashboard --stop` skip Desktop-owned backends | none, always on |
 | 0016 | no "Switch to This device?" dialog when the local runtime is installed | none, always on |
+| 0066 | `hermes update` swaps in a desktop app you prebuilt from the new HEAD instead of packing it | env `HERMES_DESKTOP_PREBUILT_APP` (unset) |
 
 ## The fork workflow
 
@@ -381,3 +382,32 @@ pushes before calling `hermes update`. You lose the off-tree merge and the confl
 
 0016 is internal state of a core sidebar hook. The desktop plugin SDK (`KEYBINDS_AREA`, `PALETTE_AREA`, etc.)
 can add UI but can't remove an existing confirmation dialog, so it has to stay a core patch.
+
+
+## Prebuilt desktop app (0066)
+
+**Behavior.** With `HERMES_DESKTOP_PREBUILT_APP=<path to Hermes.app>` in its environment, `hermes update`'s desktop
+step installs that bundle instead of running `npm run build` + electron-builder, which takes a few minutes. That
+makes an update cheap to apply at the moment you choose, for example right after Desktop quits.
+
+**How it works.** `install_prebuilt_desktop_app` in `hermes_cli/main_desktop.py` checks the bundle against the
+same bar `_packaged_desktop_current_for_head` uses: the baked `install-stamp.json` commit is the new HEAD, the
+renderer is intact, node-pty is present, and the build receipt (`scripts/build/freshness.mjs`) matches this
+checkout's desktop inputs. It must also pass `codesign --verify --deep --strict` and must not downgrade the live
+app's signing team. It is then copied (`ditto`) into a staging dir and promoted with the existing stage-and-swap
+(`_swap_staged_desktop_app`). Any mismatch prints `Prebuilt desktop app not used (<reason>)` and the normal build
+runs. The prebuilt is copied, never moved, so a failed apply can retry with it.
+
+**Building one.** Use a detached worktree at the target commit with its **own** `npm ci`. A symlinked
+`node_modules` makes `prepare-packaging-tools.mjs` refuse `app-builder-lib` as "not the source's lock-pinned
+package". Then, in `apps/desktop`:
+`CSC_IDENTITY_AUTO_DISCOVERY=true npm run pack -- -c.directories.output=<dir>` (bundled Node on PATH). The receipt is
+content-hashed, so a bundle built in another checkout at the same commit is accepted.
+
+**Code / tests.** `hermes_cli/main_desktop.py` (`DESKTOP_PREBUILT_APP_ENV`, `_prebuilt_desktop_app_mismatch`,
+`install_prebuilt_desktop_app`), `hermes_cli/source_build.py::_build_desktop_product`. Tests are in
+`tests/hermes_cli/test_source_build.py` (`-k prebuilt`): a match swaps in with no npm call; a wrong commit, a failed
+signature, or no env var each builds.
+
+**Plugin?** No. The desktop build step has no plugin hook. The companion
+[core-update](../plugins/core-update/) plugin only shows the state.
