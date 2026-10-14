@@ -10,14 +10,14 @@ Desktop keybind registry, so you can rebind them in **Settings → Keybinds**. T
 | [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch), [0050](patches/0050-fix-desktop-and-stop-on-every-row-the-sidebar-paints.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red), skipping ⌘B-blocked (grey) ones. With none, nothing happens |
 | [0048](patches/0048-feat-desktop-B-marks-a-session-blocked-grey-stripe-s.patch) | ⌘B | `session.toggleBlocked` | Mark the selected (else open) session blocked: grey stripe, skipped by ⌘]/⌘[. Again to unblock. ⌘⇧]/⌘⇧[ skip it too (0049). Sidebar toggle moves to ⌥⌘B |
 | [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0049](patches/0049-fix-desktop-and-archive-next-fallback-skip-B-blocked.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state except ⌘B-blocked |
-| [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌘R | `session.resume` | Send `resume` to the active chat as if you typed it |
+| [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌥⌘R (⌘R until 0064) | `session.resume` | Send `resume` to the active chat as if you typed it |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⇧⌘R | *(Electron `forceReload`)* | Reload the window (always) |
 | [0026](patches/0026-feat-desktop-archive-hotkey-steps-to-the-next-sideba.patch) | ⌘⇧A | `session.archive` | After archiving the open chat, open the next session the same way ⌘] does, not a new draft |
 
 On Windows/Linux, ⌘ is Ctrl (`mod` in the registry).
 
 Typical triage loop: **⌘]** to the next chat waiting on you → read / answer → **⌘⇧A** when it's done (which
-lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose turn stalled.
+lands you on the next waiting chat) → repeat. Use **⌥⌘R** on a chat whose turn stalled.
 
 ## Behaviour
 
@@ -72,6 +72,9 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
 - **Moved binding:** upstream's sidebar toggle `view.toggleSidebar` moves from ⌘B to ⌥⌘B (`mod+alt+b`).
 
 ### ⌘R: resume; ⇧⌘R: reload (0022)
+
+> Since 0064, ⌘R is `app.reloadAll` (restart backend + reload; see [reload-backend-hotkey.md](reload-backend-hotkey.md))
+> and `session.resume` defaults to `mod+alt+r`. The ⌘R reroute described below is unchanged and is what 0064 uses.
 
 - `session.resume` (`mod+r`) calls `requestComposerSubmit('resume', { target: 'active' })`, which works like
   typing `resume` and pressing Enter. During a live turn it queues like any other submit. It works while the
