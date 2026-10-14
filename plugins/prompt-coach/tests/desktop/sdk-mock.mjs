@@ -7,10 +7,13 @@ export const state = {
 export const host = {
   state,
   notify: m => calls.push(['notify', m]),
+  newChat: p => { calls.push(['newChat', p]); state.focusedStoredSessionId.set(null); state.activeSessionId.set(null) },
   request: async (m, p) => { calls.push(['request', m, p]); if (m === 'session.interrupt') state.busyBySession.set({ R1: false }); return {} },
   composer: {
     submit: (target, text) => {
       calls.push(['submit', target, text.slice(0, 60)])
+      // Mirrors the app: an external submit to a busy session is queued, not run (slash commands too).
+      if (target !== 'new' && Object.values(state.busyBySession.get()).some(Boolean)) return true
       if (text === '/new') { state.focusedStoredSessionId.set(null); state.activeSessionId.set(null) }
       return true
     },

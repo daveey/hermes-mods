@@ -150,7 +150,10 @@ async function doNew() {
     await retireOld(f)
     const b = await briefP
     patchFlag({ step: 'Opening new session…' })
-    host.composer.submit(f.stored, '/new')
+    // Open the fresh chat directly: a '/new' submitted into a session that is still busy (the
+    // steered case keeps its turn running) is queued behind that turn instead of running.
+    if (typeof host.newChat === 'function') host.newChat(f.profile || null)
+    else host.composer.submit(f.stored, '/new')
     await waitFreshDraft()
     await sleep(300)
     const ok = await sendWhenReady('new', b.seeded)

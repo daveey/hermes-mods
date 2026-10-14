@@ -13,6 +13,7 @@ export const host = {
     busyBySession: signal({})
   },
   notify: n => calls.push(['notify', n]),
+  newChat: p => calls.push(['newChat', p]),
   request: async (m, p) => (calls.push(['request', m, p]), {}),
   composer: {
     submit: (target, text) => (calls.push(['submit', target, text]), true),

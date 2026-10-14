@@ -46,7 +46,8 @@ assert.match(html, /Keep here/)
 // 3) New session for a steered message never /undo-es the earlier turn.
 await ts.doNew()
 assert.ok(!calls.some(c => c[0] === 'submit' && c[2] === '/undo'), 'steered message must not /undo')
-assert.ok(calls.some(c => c[0] === 'submit' && c[2] === '/new'))
+assert.ok(calls.some(c => c[0] === 'newChat' && c[1] === 'default'), 'opens the new chat directly')
+assert.ok(!calls.some(c => c[0] === 'submit' && c[2] === '/new'), 'never routes /new into the (busy) original')
 assert.ok(calls.some(c => c[0] === 'submit' && c[2] === 'BRIEF+msg'))
 
 // 4) a busy wait is superseded by a later send (e.g. the queue drain re-sending it).

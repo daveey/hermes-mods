@@ -98,31 +98,41 @@ function onSent(text) {
 }
 
 // ── actions ─────────────────────────────────────────────────────────────
-async function sendWhenReady(target, text, timeoutMs = 8000) {
-  return !!(await waitFor(() => host.composer.submit(target, text), timeoutMs, 200))
+async function sendWhenReady(target, text, timeoutMs = 8000, step = 200) {
+  return !!(await waitFor(() => host.composer.submit(target, text), timeoutMs, step))
 }
+
+// Same text as core.seeded_message (kept in sync; core.skip_reason keys off the marker line).
+function seededMessage(f) {
+  const ref = f.stored ? `@session:${f.profile || 'default'}/${f.stored}` : 'another session'
+  const orig = (f.text || '').replace(/<memory-context>[\s\S]*?(<\/memory-context>|$)/g, '').replace(/\s+/g, ' ').trim().slice(0, 600)
+  return `${f.draft.trim()}\n\n---\n[prompt-coach] Rewritten from my request in ${ref}, which is still running separately. My original wording: "${orig}"`
+}
+
+const onFreshDraft = () => !host.state.focusedStoredSessionId.get() && !host.state.activeSessionId.get()
 
 async function doNewSession() {
   const f = flag
   if (!f || !f.draft.trim()) return
-  patchFlag({ phase: 'working', error: null, step: 'Opening new session…' })
+  // Close the panel immediately; the launch below needs no further input.
+  setFlag(null)
+  choice(f, 'new_session')
+  const seeded = seededMessage(f)
   try {
-    const { seeded } = await ctxRef.rest('/seed', {
-      method: 'POST',
-      body: { session_id: f.stored, profile: f.profile, rewrite: f.draft, original: f.text }
-    })
-    host.composer.submit(f.stored || 'new', '/new')
-    await waitFor(() => !host.state.focusedStoredSessionId.get() && !host.state.activeSessionId.get())
-    await sleep(300)
-    const ok = await sendWhenReady('new', seeded)
+    // Open the fresh chat directly. Submitting '/new' into the original composer does not
+    // work while its turn runs: an external slash-command submit to a busy session is
+    // QUEUED behind the turn, so the new session only opened once the turn finished.
+    if (typeof host.newChat === 'function') host.newChat(f.profile || null)
+    else host.composer.submit(f.stored || 'new', '/new')
+    if (!(await waitFor(onFreshDraft, 4000, 30))) throw new Error('new chat did not open')
+    const ok = await sendWhenReady('new', seeded, 5000, 50)
     if (!ok) {
       await host.composer.setDraft('new', seeded)
       throw new Error('could not auto-send; the rewrite is in the new composer')
     }
-    choice(f, 'new_session')
-    setFlag(null)
   } catch (err) {
-    patchFlag({ phase: 'shown', error: String(err?.message || err) })
+    log('new session', err)
+    host.notify({ kind: 'error', message: `Prompt Coach: ${String(err?.message || err)}` })
   }
 }
 

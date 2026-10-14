@@ -35,14 +35,20 @@ check('slash and queued sends skipped', rest.length === n && PC.flag?.id === 'c1
 // edit, then Run in new session
 PC.setFlag({ ...PC.flag, draft: PC.flag.draft + ' Target: zero crashes for 30 days.' })
 calls.length = 0
-await PC.doNewSession()
+state.busyBySession.set({ R1: true }) // original turn still running (the real-world case)
+const t0 = Date.now()
+const p = PC.doNewSession()
+check('panel closes immediately on click', PC.flag === null && html() === '')
+await p
+const ms = Date.now() - t0
 const subs = calls.filter(c => c[0] === 'submit')
-check('new session: /new then seeded send to "new"', subs[0][1] === 'S1' && subs[0][2] === '/new' && subs[1][1] === 'new' && subs[1][2].startsWith('Keep the app crash-free'))
+check('new session: newChat(profile) then seeded send to "new"', calls[0][0] === 'newChat' && calls[0][1] === 'default' && subs.length === 1 && subs[0][1] === 'new' && subs[0][2].startsWith('Keep the app crash-free'))
+check(`launch is fast while original is busy (${ms}ms)`, ms < 500)
+check('no /new routed into the busy original', !subs.some(s => s[2] === '/new'))
 check('no interrupt of the original turn', !calls.some(c => c[1] === 'session.interrupt'))
-const seed = rest.find(r => r[0] === '/seed')[1]
-check('seed carries edited draft + original', seed.rewrite.includes('zero crashes') && seed.original === d.text)
+check('no error notify', !calls.some(c => c[0] === 'notify'))
 check('choice logged new_session edited=true', JSON.stringify(rest.at(-1)) === JSON.stringify(['/choice', { id: 'c1', choice: 'new_session', edited: true }]))
-check('panel cleared', PC.flag === null && html() === '')
+state.busyBySession.set({ R1: false })
 
 // Replace path
 state.focusedStoredSessionId.set('S1'); state.activeSessionId.set('R1'); state.busyBySession.set({ R1: true })
