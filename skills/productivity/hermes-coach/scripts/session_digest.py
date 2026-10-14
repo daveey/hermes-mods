@@ -15,7 +15,7 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 1
+DIGEST_V = 2
 MAX_TURNS = 60          # keep the first 10 and the last 50 user turns
 TURN_CHARS = 500
 LAST_REPLY_CHARS = 800
@@ -60,12 +60,19 @@ def redact(s: str) -> str:
 
 
 # User-role messages Hermes writes itself (not typed by the user): counted, not kept as turns.
-SYNTHETIC = re.compile(r"^\s*\[(IMPORTANT: Background process|Recent Summary|CONTEXT COMPACTION|Background task|Continuing toward your standing goal)", re.I)
+SYNTHETIC = re.compile(
+    r"^\s*(\[(IMPORTANT:|STILL IN PROGRESS|Note: model was|Recent Summary|CONTEXT COMPACTION|Background task|Continuing toward your"
+    r" standing goal|ASYNC DELEGATION|Message from another Hermes session|From the [^\]]{0,80}session|System: )"
+    r"|You've reached the maximum number of tool-calling)", re.I)
+SYNTH_KIND = [("bg_notify", "Background"), ("goal_continue", "standing goal"), ("delegation", "ASYNC DELEGATION"),
+              ("cross_session", "session"), ("turn_cap", "maximum number of tool-calling"), ("system", "System:")]
 
 
 def flatten(content: str) -> str:
     """Multimodal content is stored as a JSON list of parts; keep the text, mark images."""
     c = content.lstrip()
+    if c.startswith("json:"):
+        c = c[5:].lstrip()
     if c.startswith("[{") or c.startswith('{"type"'):
         try:
             parts = json.loads(c)
@@ -150,7 +157,7 @@ def digest_db(profile, db, host, since):
                               where session_id=? order by timestamp, id""", (sid,)).fetchall()
         users, tools, terr = [], collections.Counter(), collections.Counter()
         sig = collections.Counter()
-        last_reply, call_names = "", {}
+        last_reply, n_real = "", 0
         for m in msgs:
             role, content = m["role"], m["content"] or ""
             if role == "user":
@@ -158,12 +165,13 @@ def digest_db(profile, db, host, since):
                 if not text:
                     continue
                 if SYNTHETIC.match(text):
-                    sig["synthetic_" + ("bg_notify" if "Background" in text[:40] else
-                                        "goal_continue" if "standing goal" in text[:60] else "summary")] += 1
+                    head = text[:80]
+                    sig["synthetic_" + next((k for k, w in SYNTH_KIND if w in head), "summary")] += 1
                     continue
                 for k, rx in SIGNALS.items():
                     if rx.search(text):
                         sig[k] += 1
+                n_real += 1
                 if users and users[-1]["text"] == trunc(text, TURN_CHARS):
                     continue  # the same turn persisted twice (retry / steer echo)
                 users.append({"t": round(m["timestamp"]), "text": trunc(text, TURN_CHARS)})
@@ -188,7 +196,7 @@ def digest_db(profile, db, host, since):
             "tokens": {"in": r["input_tokens"], "out": r["output_tokens"], "cache_read": r["cache_read_tokens"]},
             "cost_usd": round(r["cost"] or 0, 3),
             "children": {"n": k["n"], "cost_usd": round(k["cost"], 3), "msgs": k["msgs"], "tool_calls": k["tool_calls"]},
-            "user_turns_total": sum(1 for m in msgs if m["role"] == "user"),
+            "user_turns_total": n_real,
             "user_turns": users,
             "signals": dict(sig),
             "tools": dict(tools.most_common(25)),

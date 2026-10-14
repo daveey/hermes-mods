@@ -48,7 +48,7 @@ def is_meta(d):
     t = (d.get("title") or "").lower()
     if any(w in t for w in META_WORDS):
         return True
-    n = max(1, len(d.get("user_turns") or []))
+    n = max(1, d.get("user_turns_total") or len(d.get("user_turns") or []))
     return (d.get("signals") or {}).get("hermes_meta", 0) / n >= 0.3
 
 
