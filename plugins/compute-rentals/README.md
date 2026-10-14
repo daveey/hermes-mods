@@ -86,6 +86,7 @@ uv venv .extra-runtime --python 3.12 && uv pip install --python .extra-runtime/b
 
 ```bash
 cd ~/.hermes/plugins/compute-rentals
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q -p no:cacheprovider tests   # backend
-/opt/homebrew/bin/node --test tests/plugin.test.mjs                              # Desktop panel
+uv run --with pytest --with pyyaml --with fastapi --with httpx \
+  python -m pytest -q -p no:cacheprovider tests                                # backend
+node --test tests/plugin.test.mjs   # Desktop panel; needs Node >= 22 (jsdom uses require(esm))
 ```
