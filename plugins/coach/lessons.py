@@ -39,12 +39,30 @@ and the user's reply.
 Return ONLY JSON: {"p_correction": p, "durable": p, "rule": "...", "slug": "...", "scope": "..."}"""
 
 
+SKIP_RE = re.compile(
+    r"^\s*(?:/\S+.*|go|yes|y|yep|yeah|ok(?:ay)?|k|do it|done|thanks?|thank you|ty|sure|proceed|continue|resume|"
+    r"lgtm|ship it|sounds good|perfect|great|nice|cool|👍|\[image\]|\[screenshot\])\W*$", re.I)
+
+
 def prefilter(user_text: str) -> bool:
+    """Which user messages get judged. The keyword regex alone caught only 51% of corrections in the mined history
+    (they're phrased every which way: "do this yourself", "asana pat is in the secrets manager", "left frame didnt
+    change"), so every real message is judged except bare approvals/acks and slash commands. The judge runs off the
+    critical path (a background thread in __init__), so this costs tokens, not latency."""
+    t = (user_text or "").strip()
+    return bool(t) and not SKIP_RE.match(t[:200])
+
+
+def keyword_hit(user_text: str) -> bool:
     return bool(PREFILTER_RE.search((user_text or "")[:800]))
 
 
-def judge_prompt(prev_reply: str, user_text: str) -> str:
-    return f"AGENT'S PREVIOUS MESSAGE:\n{(prev_reply or '')[-2500:]}\n\nUSER'S REPLY:\n{(user_text or '')[:1500]}"
+def judge_prompt(prev_reply: str, user_text: str, known: Optional[list] = None) -> str:
+    k = ""
+    if known:
+        k = ("\n\nKNOWN RULES (if the correction restates one, REUSE its slug exactly):\n"
+             + "\n".join(f"- {c['slug']}: {c['rule'][:160]}" for c in known[:40]))
+    return f"AGENT'S PREVIOUS MESSAGE:\n{(prev_reply or '')[-2500:]}\n\nUSER'S REPLY:\n{(user_text or '')[:1500]}{k}"
 
 
 def parse(raw: str) -> Optional[dict]:
@@ -112,16 +130,24 @@ class LessonStore:
         self._write(d)
         return d[slug]
 
+    def known(self) -> list[dict]:
+        """Saved/promoted rules first, then the most-seen candidates (rejected excluded)."""
+        order = {"saved": 0, "promoted": 1, "candidate": 2}
+        return sorted((c for c in self._read().values() if c.get("status") in order),
+                      key=lambda c: (order[c["status"]], -len(c.get("sessions", []))))
+
     def by_status(self, status: str) -> list[dict]:
         return sorted((c for c in self._read().values() if c.get("status") == status),
                       key=lambda c: (-len(c.get("sessions", [])), -c.get("last", 0)))
 
 
 def assess(prev_reply: str, user_text: str, llm: Callable[[str, str], str], th_corr: float = 0.7,
-           th_durable: float = 0.7) -> Optional[dict]:
-    if not prev_reply or not prefilter(user_text):
+           th_durable: float = 0.7, wide: bool = False, known: Optional[list] = None) -> Optional[dict]:
+    """wide=True (the background caller) judges every non-ack message; wide=False keeps the keyword gate, so a
+    backend still running the old synchronous hook code doesn't pay judge latency on every turn."""
+    if not prev_reply or not (prefilter(user_text) if wide else keyword_hit(user_text)):
         return None
-    v = parse(llm(JUDGE_SYS, judge_prompt(prev_reply, user_text)))
+    v = parse(llm(JUDGE_SYS, judge_prompt(prev_reply, user_text, known)))
     if not v or v["p_correction"] < th_corr or v["durable"] < th_durable or not v["rule"] or not v["slug"]:
         return None
     return v

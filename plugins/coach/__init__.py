@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import threading
 import os
 import sys
 from pathlib import Path
@@ -43,12 +44,13 @@ def build(store=None, checkout=None):
                 return None
             store.user_turn(session_id, user_message)
             hint = coach.turn_start(session_id, user_message)
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(2) as ex:  # both judges are prefilter-gated; run them side by side
-                f_loop = ex.submit(_fix_loop, session_id, user_message)
-                f_lesson = ex.submit(_lesson, session_id, user_message)
-                loop_hint, lesson_hint = f_loop.result(), f_lesson.result()
-            hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", lesson_hint or "") if h)
+            # Lessons judge nearly every message, so it runs in the background; its hint rides the next tool result
+            # (or the next turn). The fix-loop judge is prefilter-gated and its hint matters before the first patch,
+            # so it stays inline.
+            prev = coach.loop_state(session_id).get("last_reply") or ""
+            threading.Thread(target=_lesson_bg, args=(session_id, user_message, prev), daemon=True).start()
+            loop_hint = _fix_loop(session_id, user_message)
+            hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "") if h)
             return {"context": hint} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
@@ -104,7 +106,12 @@ def build(store=None, checkout=None):
             log.debug("coach fix_loop: %s", exc)
             return None
 
-    def _lesson(session_id, user_message):
+    def _lesson_bg(session_id, user_message, prev):
+        h = _lesson(session_id, user_message, prev)
+        if h:
+            coach.queue_hint(session_id, h)
+
+    def _lesson(session_id, user_message, prev=None):
         """A correction that implies a standing rule -> candidate lesson (promoted on recurrence) + agent hint."""
         try:
             ls = _load("lessons")
@@ -112,11 +119,16 @@ def build(store=None, checkout=None):
                 return None
             if not isinstance(user_message, str):
                 return None
-            prev = coach.loop_state(session_id).get("last_reply") or ""
-            v = ls.assess(prev, user_message, ls.aux_judge)
+            if prev is None:
+                prev = coach.loop_state(session_id).get("last_reply") or ""
+            lstore = ls.LessonStore(store.root)
+            v = ls.assess(prev, user_message, ls.aux_judge, wide=True, known=lstore.known())
             if not v:
                 return None
-            c = ls.LessonStore(store.root).add(v, session_id, example=user_message)
+            c = lstore.add(v, session_id, example=user_message)
+            if c["status"] == "saved":  # already in memory: just remind, don't ask to save again
+                store.log({"event": "lesson", "session_id": session_id, "slug": v["slug"], "status": "saved"})
+                return ls.hint(v, promoted=False)
             promoted = c["status"] == "promoted"
             store.log({"event": "lesson", "session_id": session_id, "slug": v["slug"], "status": c["status"],
                        "sessions": len(c["sessions"])})

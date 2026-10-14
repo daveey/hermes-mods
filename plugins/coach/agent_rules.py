@@ -366,6 +366,10 @@ class AgentCoach:
             s["ask"] = user_message[:2000]
         return self.take(sid)
 
+    def queue_hint(self, sid: str, text: str) -> None:
+        """A hint from a background judge: delivered with the next tool result or the next turn's context."""
+        self._s(sid)["pending"].append(text[len("[coach] "):] if text.startswith("[coach] ") else text)
+
     def turn_end(self, sid: str, reply: str) -> None:
         """Remember the turn's final answer and tool log: the fix-loop judge reads them on the next user turn."""
         s = self._s(sid)

@@ -66,10 +66,14 @@ old GIF".
 
 ### Lessons from corrections (`lessons.py`)
 
-When the user corrects the agent (prefilter + aux task `coach_lessons`), the judge extracts a standing rule
-(`rule`, `slug`, `scope`), or nothing if it was a one-off. Each rule lands in
+Every real user message is judged by the aux task `coach_lessons`. Bare acks ("go", "do it", "ok"), slash
+commands and image-only sends are skipped. The judge runs in a background thread, so the turn never waits, and its
+hint arrives with the next tool result. A keyword gate caught only 51% of the 138 corrections in 700 mined
+exchanges. The skip list misses none of them and judges ~85% of messages. When a message is a correction, the judge
+extracts a standing rule (`rule`, `slug`, `scope`), or nothing if it was a one-off. It sees the known rules, so a
+restated rule reuses the existing slug instead of starting a new candidate. Each rule lands in
 `<HERMES_HOME>/coach/lessons.json` as a **candidate**. When its slug recurs in a 2nd session it is **promoted**.
-A rejected slug stays rejected. The agent gets the rule as a hint right away. Once a rule is promoted, the hint
+A rejected slug stays rejected. A `saved` rule (already in memory) only produces a reminder. The agent gets the rule as a hint right away. Once a rule is promoted, the hint
 also tells it to save the rule with the memory tool unless memory already has it. `COACH_LESSONS=0` turns this off.
 
 ## User channel (Desktop panel above the composer)
