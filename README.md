@@ -55,7 +55,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [slack-workspace](plugins/slack-workspace/) | — | For a team Slack bot: records traffic in every channel it's in and adds that channel's recent activity as context when it's @-mentioned. Tools to see recent activity, join channels in bulk and call any Slack API method. Joins, posts outside the current conversation and admin methods go to the bot's admins as one DM with approve-selected / always-allow / deny buttons. |
 | [session-mentions](plugins/session-mentions/) | [yes](desktop-plugins/session-mentions/) | `cross_session` tool: list, read and message sessions on any gateway connected to the Desktop app (local, Nous-hosted, remote). |
 | [spin-out](plugins/spin-out/) | [yes](desktop-plugins/spin-out/) | ⇧⌘F on a session: finds the follow-up work at its end and offers it as choices: click a task to launch it as a new session, or [All] for the rest. Each child gets a self-contained brief and an @session pointer to the parent. Moves the built-in session-search shortcut to ⌥⌘F. |
-| [topic-shift](plugins/topic-shift/) | [yes](desktop-plugins/topic-shift/) | After you send a message, detects a topic change and offers *New session* (with a carried-over brief and an @session link), *Fork* or *Send here*. |
+| [topic-shift](plugins/topic-shift/) | [yes](desktop-plugins/topic-shift/) | After you send a message (from a session's second message on; mid-turn sends are checked when the turn ends), detects a new task and offers *New session* (with a carried-over brief and an @session link), *Fork* or *Send here*. Set a model with `auxiliary.topic_shift.provider`/`.model` (a Sonnet-class model works well; it defaults to your main model). |
 
 ## Desktop-only plugins
 

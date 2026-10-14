@@ -64,15 +64,23 @@ def test_shift_detected_above_threshold(tmp_path):
     assert "resume" not in prompt.split("NEWEST")[0], "auto_continue rows are not user context"
 
 
-def test_low_confidence_is_not_a_shift(tmp_path):
+def test_threshold_on_p_new(tmp_path):
     db = make_db(tmp_path, PRIOR)
-    out = core.classify("s1", NEW, FakeLLM('{"new_topic": true, "confidence": 0.6}'), db)
-    assert out["shift"] is False
+    assert core.classify("s1", NEW, FakeLLM('{"p_new": 0.55}'), db)["shift"] is False
+    assert core.classify("s1", NEW, FakeLLM('{"p_new": 0.6, "label": "Tax"}'), db)["shift"] is True
+    assert core.classify("s1", NEW, FakeLLM('{"p_new": "junk"}'), db)["shift"] is False
+
+
+def test_legacy_reply_shape(tmp_path):
+    db = make_db(tmp_path, PRIOR)
+    assert core.classify("s1", NEW, FakeLLM('{"new_topic": true, "confidence": 0.8}'), db)["shift"] is True
+    out = core.classify("s1", NEW, FakeLLM('{"new_topic": false, "confidence": 0.9}'), db)
+    assert out["shift"] is False and abs(out["confidence"] - 0.1) < 1e-9
 
 
 def test_same_topic(tmp_path):
     db = make_db(tmp_path, PRIOR)
-    out = core.classify("s1", "ok now also tune the vad threshold", FakeLLM('{"new_topic": false, "confidence": 0.9}'), db)
+    out = core.classify("s1", "ok now also tune the vad threshold", FakeLLM('{"p_new": 0.1}'), db)
     assert out["shift"] is False
 
 
@@ -80,12 +88,19 @@ def test_skip_rules_make_no_llm_call(tmp_path):
     db = make_db(tmp_path, PRIOR)
     llm = FakeLLM("{}")
     assert core.classify("s1", "/undo", llm, db)["skipped"] == "slash"
-    assert core.classify("s1", "yes do it", llm, db)["skipped"] == "short"
+    assert core.classify("s1", "do it", llm, db)["skipped"] == "short"
     (tmp_path / "y").mkdir()
-    young = make_db(tmp_path / "y", PRIOR[:2])
+    young = make_db(tmp_path / "y", [])  # the session's first message is never checked
     assert core.classify("s1", NEW, llm, young)["skipped"] == "young_session"
     assert core.classify("nope", NEW, llm, db)["skipped"] == "unknown_session"
     assert llm.calls == []
+
+
+def test_second_message_and_three_words_are_checked(tmp_path):
+    db = make_db(tmp_path, PRIOR[:1])
+    llm = FakeLLM('{"p_new": 0.9, "label": "Seating map"}')
+    assert core.classify("s1", "kill seating map", llm, db)["shift"] is True
+    assert len(llm.calls) == 1
 
 
 def test_llm_failure_fails_open(tmp_path):

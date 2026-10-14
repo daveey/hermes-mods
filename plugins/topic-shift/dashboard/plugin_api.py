@@ -13,13 +13,16 @@ from pydantic import BaseModel
 
 
 def _core():
+    """core.py, reloaded when the file changes (edits apply without a backend restart)."""
     name = "_topic_shift_core"
     path = Path(__file__).resolve().parents[1] / "core.py"
+    mtime = path.stat().st_mtime
     mod = sys.modules.get(name)
-    if mod is None or getattr(mod, "__file__", None) != str(path):
+    if mod is None or getattr(mod, "__file__", None) != str(path) or getattr(mod, "_mtime", None) != mtime:
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        setattr(mod, "_mtime", mtime)
         sys.modules[name] = mod
     return mod
 

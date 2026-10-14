@@ -14,9 +14,9 @@ import sqlite3
 from pathlib import Path
 from typing import Callable, Optional
 
-MIN_WORDS = 4
-MIN_PRIOR_USER_MSGS = 3
-CONFIDENCE_THRESHOLD = 0.75
+MIN_WORDS = 3
+MIN_PRIOR_USER_MSGS = 1  # check from the session's second message on
+CONFIDENCE_THRESHOLD = 0.6  # on p_new, the probability the message starts a new task
 PRIOR_USER_WINDOW = 8
 BRIEF_MSG_WINDOW = 60
 
@@ -116,16 +116,29 @@ def _parse_json(raw: str) -> dict:
 
 CLASSIFY_SYSTEM = (
     "You decide whether a user's newest chat message starts a NEW task that would be better handled in a "
-    "fresh session, or continues the session's current work. CONTINUATION: follow-ups, refinements, "
-    "corrections, bug reports or questions about what was just built/discussed, and small additions that "
-    "only make sense on top of the current change. NEW TOPIC: a different goal, even inside the SAME "
-    "project/repo: a new feature, new capability, or different subsystem that needs its own design work "
-    "and does not depend on the recent work (e.g. the session fixed a login bug in an app; the new message "
-    "asks to add a recommendations feature to the same app). Sharing a project, repo, or a "
-    "keyword with the session is NOT enough to call it a continuation. Reply with ONLY JSON: "
-    '{"new_topic": bool, "confidence": 0..1, "label": "<=6 word name of the NEW message topic", '
+    "fresh session, or continues the session's current work. This user often switches tasks mid-session "
+    "without saying so, so judge the GOAL of the message, not its overlap in vocabulary.\n"
+    "CONTINUATION: approvals and answers to the assistant's questions ('do it', 'yes', '1 no 2 yes'), status "
+    "checks, follow-ups, refinements, corrections, bug reports about what was just built, and small additions "
+    "that only make sense on top of the current change.\n"
+    "NEW TASK: a different goal that needs its own investigation or design and does not depend on finishing the "
+    "recent work, EVEN on the same machine, project, repo or product. Examples: the session tuned a backup "
+    "script on a server and the user now asks why that server keeps running out of memory; the session deployed "
+    "a web app and the user now asks to change how a different service handles sign-in; the session fixed a "
+    "login bug and the user asks for a recommendations feature in the same app. Sharing a host, repo or keyword is NOT enough "
+    "to call it a continuation.\n"
+    "Reply with ONLY JSON: "
+    '{"p_new": <probability 0..1 that it is a NEW TASK>, "label": "<=6 word name of the NEWEST message\'s task", '
     '"reason": "<=15 words"}'
 )
+
+
+def _p_new(out: dict) -> float:
+    """p_new from the reply; also accepts the older {new_topic, confidence} shape."""
+    if out.get("p_new") is not None:
+        return float(out["p_new"])
+    conf = float(out.get("confidence") or 0)
+    return conf if out.get("new_topic") else 1 - conf if "new_topic" in out else 0.0
 
 
 def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = None) -> dict:
@@ -149,9 +162,11 @@ def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = Non
                                {"role": "user", "content": user}], 150))
     except Exception as exc:  # fail open: never block the user
         return {"shift": False, "skipped": f"llm_error: {type(exc).__name__}"}
-    conf = float(out.get("confidence") or 0)
-    shift = bool(out.get("new_topic")) and conf >= CONFIDENCE_THRESHOLD
-    return {"shift": shift, "confidence": conf, "label": str(out.get("label") or "")[:60],
+    try:
+        p = max(0.0, min(1.0, _p_new(out)))
+    except (TypeError, ValueError):
+        p = 0.0
+    return {"shift": p >= CONFIDENCE_THRESHOLD, "confidence": p, "label": str(out.get("label") or "")[:60],
             "reason": str(out.get("reason") or "")[:140], "title": info.get("title") or ""}
 
 
