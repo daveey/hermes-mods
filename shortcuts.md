@@ -18,6 +18,7 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 | ⌘⇧N | New session on the currently selected gateway | core patch 0042 | [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
 | ⌘⇧E | Rename the session; the field is pre-filled with an AI short name | core patches 0020, 0042 | [core/ai-session-rename.md](core/ai-session-rename.md) |
 | ⌘⇧P | Move the selected session into a project (palette typeahead over every gateway's projects). A name that doesn't exist offers **Create project** with an empty `~/code/<slug>` | core patches 0018, 0030 | [core/project-palette.md](core/project-palette.md) |
+| ⌘⇧K | Open the Kanban board (needs the Kanban desktop plugin enabled). **Moved:** composer "send next queued" goes to ⌘⌥K | core patch 0056 | [core/kanban-board-hotkey.md](core/kanban-board-hotkey.md) |
 | ⇧⌘F | Spin out: turn the follow-up work at the end of a session into new sessions | plugin [spin-out](plugins/spin-out/) | `./install.sh` |
 | ⌥⌘F | Session search (moved here from ⇧⌘F by spin-out) | plugin spin-out | `./install.sh` |
 | ⌘⇧B | Break the stalled tool call (`/break`) | community plugin intelligent-tool-break | `./install.sh --community` |

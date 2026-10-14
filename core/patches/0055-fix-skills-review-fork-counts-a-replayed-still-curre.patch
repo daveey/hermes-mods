@@ -1,0 +1,312 @@
+From 42f9e3087215d99865f705947d05523b36ebaf42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:33:30 -0700
+Subject: [PATCH] fix(skills): review fork counts a replayed, still-current
+ skill_view as a read [daveey]
+
+The background-review fork resumes the parent transcript. When the parent
+had loaded a skill (e.g. a 90 KB myapp-development SKILL.md) and the
+file is unchanged, the fork already holds the exact current content, yet
+read-before-write refused its first patch ('content has not been loaded in
+this review turn'), forcing a redundant re-view each review.
+
+Before the fork runs, seed the read marks from the history it replays:
+a full skill_view result is marked only when it is byte-identical to what
+skill_view serves now (same source path). Stale, pruned, stubbed or
+non-skill_view copies stay unmarked, so the guard still fires for them.
+---
+ agent/background_review.py                    |  13 ++-
+ .../test_background_review_memory_scope.py    |  31 +++++
+ tests/tools/test_skill_manager_tool.py        | 107 ++++++++++++++++++
+ tools/skill_manager_guards.py                 |  83 ++++++++++++++
+ 4 files changed, 231 insertions(+), 3 deletions(-)
+
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 25c80ccaf6..fc033f0904 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -1168,20 +1168,27 @@ def _run_review_fork(
+             + memory_phrase_deny + "." + deny_extra + " Do not retry {tool_name}."
+         ),
+     )
++    # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
++    review_history = _digest_history(messages_snapshot) if _routed else messages_snapshot
+     with suppress(Exception):
+-        from tools.skill_manager_guards import _reset_background_review_read_marks
++        from tools.skill_manager_guards import (
++            _reset_background_review_read_marks, seed_background_review_reads_from_history)
+ 
+         _reset_background_review_read_marks()
++        # A skill_view result the fork replays byte-identical to the file on disk IS a read of the
++        # current content; without this every review re-viewed the parent's loaded skill (or got
++        # refused patching it) just to satisfy read-before-write. Stale copies stay unmarked.
++        seed_background_review_reads_from_history(
++            review_history, session_id=getattr(agent, "session_id", None))
+     try:
+         if review_run is None or review_run.begin_request(st.review_agent):
+-            # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
+             st.review_agent.run_conversation(
+                 user_message=(
+                     prompt + "\n\nYou can only call " + memory_phrase_prompt +
+                     "management tools. Other tools will be denied "
+                     "at runtime — do not attempt them." + prompt_extra
+                 ),
+-                conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
++                conversation_history=review_history,
+             )
+     finally:
+         clear_thread_tool_whitelist()
+diff --git a/tests/agent/test_background_review_memory_scope.py b/tests/agent/test_background_review_memory_scope.py
+index 0b826f5733..e97e21f73a 100644
+--- a/tests/agent/test_background_review_memory_scope.py
++++ b/tests/agent/test_background_review_memory_scope.py
+@@ -114,6 +114,37 @@ class TestExplicitRefineOrigin:
+         assert fork._memory_write_origin == "background_review"
+         assert fork._review_attended is explicit
+ 
++    @pytest.mark.parametrize("routed", [False, True])
++    def test_fork_seeds_read_marks_from_the_history_it_replays(self, routed):
++        """Read-before-write: the fork seeds marks from exactly the history it will see (full
++        snapshot, or the digest when routed), after resetting and in its own context."""
++        seeded, replayed = [], []
++        snapshot = [{"role": "user", "content": "hi"}]
++
++        def fake_build(agent, task_cfg=None, *, max_iterations, write_origin="background_review"):
++            fork = SimpleNamespace(
++                _memory_enabled=True, _user_profile_enabled=False, _memory_write_origin=write_origin,
++                run_conversation=lambda **kw: replayed.append(kw["conversation_history"]),
++                _session_messages=[])
++            return fork, {}, routed
++
++        noop = lambda *a, **k: None
++        digest = [{"role": "user", "content": "digest"}]
++        with patch.object(bg, "build_cache_parity_fork", fake_build), \
++                patch.object(bg, "_digest_history", lambda m: digest), \
++                patch.object(bg, "_track_review_fork", noop), \
++                patch.object(bg, "_snapshot_review_usage", lambda a: {}), \
++                patch.object(bg, "_record_review_usage_to_parent", noop), \
++                patch.object(bg, "finish_background_review_run", noop), \
++                patch.object(bg, "_release_fork_clients", noop), \
++                patch("tools.skill_manager_guards.seed_background_review_reads_from_history",
++                      lambda history, session_id=None: seeded.append((history, session_id)) or 0):
++            bg._run_review_fork(SimpleNamespace(session_id="s1"), snapshot, "p", None, None,
++                                bg._ReviewForkState())
++        expected = digest if routed else snapshot
++        assert seeded == [(expected, "s1")]
++        assert replayed == [expected]
++
+ 
+ class TestConsolidationProposalSurfaces:
+     """The fork's own review summary is never published back, so a consolidation the delete
+diff --git a/tests/tools/test_skill_manager_tool.py b/tests/tools/test_skill_manager_tool.py
+index 254e197ead..4d6535c88d 100644
+--- a/tests/tools/test_skill_manager_tool.py
++++ b/tests/tools/test_skill_manager_tool.py
+@@ -1344,3 +1344,110 @@ class TestCuratorConsolidationDeleteGuard:
+             assert allowed["success"] is True, allowed
+ 
+         _reset_background_review_read_marks()
++
++    @staticmethod
++    def _replayed_view(call_id: str, view_json: str) -> list[dict]:
++        """The parent turn that loaded a skill, as the review fork replays it."""
++        return [
++            {"role": "assistant", "content": "", "tool_calls": [{
++                "id": call_id, "type": "function",
++                "function": {"name": "skill_view", "arguments": '{"name": "reviewed"}'}}]},
++            {"role": "tool", "tool_call_id": call_id, "content": view_json},
++        ]
++
++    def test_review_patch_allowed_when_replayed_view_is_current(self, tmp_path, monkeypatch):
++        """The parent loaded the skill and nothing changed since: the fork already holds the
++        exact current content, so its first patch must not be refused (coach bug: every review
++        of a session that loaded myapp-development was refused, then re-viewed 90 KB)."""
++        from tools.skills_tool import skill_view
++        from tools.skill_manager_guards import (
++            _reset_background_review_read_marks, seed_background_review_reads_from_history)
++
++        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
++            _create_curator_skill("reviewed", _skill_content("reviewed"))
++            history = self._replayed_view("call_1", skill_view("reviewed"))  # parent's view
++            _reset_background_review_read_marks()  # fork start
++
++            assert seed_background_review_reads_from_history(history) == 1
++            result = json.loads(skill_manage(
++                action="patch", name="reviewed",
++                old_string="Step 1: Do the thing.", new_string="Step 1: Do the thing safely."))
++            assert result["success"] is True, result
++
++        _reset_background_review_read_marks()
++
++    def test_review_patch_still_refused_when_replayed_view_is_stale(self, tmp_path, monkeypatch):
++        """Another session patched the skill after the parent loaded it: the fork's copy is
++        stale, so read-before-write must still refuse until it views the current file."""
++        from tools.skills_tool import skill_view
++        from tools.skill_manager_guards import (
++            _reset_background_review_read_marks, seed_background_review_reads_from_history)
++
++        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
++            _create_curator_skill("reviewed", _skill_content("reviewed"))
++            history = self._replayed_view("call_1", skill_view("reviewed"))
++            skill_md = tmp_path / ".hermes" / "skills" / "reviewed" / "SKILL.md"
++            skill_md.write_text(skill_md.read_text() + "Step 2: Added elsewhere.\n")
++            _reset_background_review_read_marks()
++
++            # Seeding compares via skill_view, whose own read-mark must not leak in.
++            assert seed_background_review_reads_from_history(history) == 0
++            blocked = json.loads(skill_manage(
++                action="patch", name="reviewed",
++                old_string="Step 1: Do the thing.", new_string="Step 1: Do the thing safely."))
++            assert blocked["success"] is False
++            assert blocked.get("_read_before_write_required") is True
++
++        _reset_background_review_read_marks()
++
++    def test_review_seeding_ignores_stubs_failures_and_other_tools(self, tmp_path, monkeypatch):
++        from tools.skill_manager_guards import (
++            _reset_background_review_read_marks, seed_background_review_reads_from_history)
++
++        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
++            _create_curator_skill("reviewed", _skill_content("reviewed"))
++            current = (tmp_path / ".hermes" / "skills" / "reviewed" / "SKILL.md").read_text()
++            stub = json.dumps({"success": True, "name": "reviewed", "dedup": True,
++                               "content_returned": False})
++            not_skill_view = json.dumps({"success": True, "name": "reviewed", "content": current})
++            history = (
++                self._replayed_view("c1", stub)
++                + self._replayed_view("c2", "[pruned: tool output summarised]")
++                + [{"role": "assistant", "content": "", "tool_calls": [{
++                    "id": "c3", "type": "function",
++                    "function": {"name": "read_file", "arguments": "{}"}}]},
++                   {"role": "tool", "tool_call_id": "c3", "content": not_skill_view}])
++            _reset_background_review_read_marks()
++
++            assert seed_background_review_reads_from_history(history) == 0
++            blocked = json.loads(skill_manage(
++                action="patch", name="reviewed",
++                old_string="Step 1: Do the thing.", new_string="Step 1: Do the thing safely."))
++            assert blocked.get("_read_before_write_required") is True
++
++        _reset_background_review_read_marks()
++
++    def test_review_seeding_supporting_file_marks_only_that_file(self, tmp_path, monkeypatch):
++        from tools.skills_tool import skill_view
++        from tools.skill_manager_guards import (
++            _reset_background_review_read_marks, seed_background_review_reads_from_history)
++
++        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
++            _create_curator_skill("reviewed", _skill_content("reviewed"))
++            ref = tmp_path / ".hermes" / "skills" / "reviewed" / "references"
++            ref.mkdir()
++            (ref / "workflow.md").write_text("old workflow\n", encoding="utf-8")
++            history = self._replayed_view("c1", skill_view("reviewed", "references/workflow.md"))
++            _reset_background_review_read_marks()
++
++            assert seed_background_review_reads_from_history(history) == 1
++            allowed = json.loads(skill_manage(
++                action="write_file", name="reviewed",
++                file_path="references/workflow.md", file_content="new workflow\n"))
++            assert allowed["success"] is True, allowed
++            blocked = json.loads(skill_manage(
++                action="patch", name="reviewed",
++                old_string="Step 1: Do the thing.", new_string="Step 1: Do the thing safely."))
++            assert blocked.get("_read_before_write_required") is True
++
++        _reset_background_review_read_marks()
+diff --git a/tools/skill_manager_guards.py b/tools/skill_manager_guards.py
+index 7b3c828338..407a11f6a9 100644
+--- a/tools/skill_manager_guards.py
++++ b/tools/skill_manager_guards.py
+@@ -73,6 +73,89 @@ def _reset_background_review_read_marks() -> None:
+     _background_review_read_paths.set(_BackgroundReviewReadMarks())
+ 
+ 
++def _transcript_skill_views(messages: list) -> list[tuple[str, Optional[str], str, Optional[str]]]:
++    """``(name, file_path, content, source_path)`` for every full skill_view result in ``messages``.
++
++    Dedup stubs (``content_returned: False``), failures and non-JSON (pruned/summarised) results
++    are skipped; the tool name comes from the assistant tool_call the result answers."""
++    import json
++
++    call_names: dict[str, str] = {}
++    views: list[tuple[str, Optional[str], str, Optional[str]]] = []
++    for msg in messages or []:
++        if not isinstance(msg, dict):
++            continue
++        for tc in msg.get("tool_calls") or []:
++            if isinstance(tc, dict) and tc.get("id"):
++                call_names[tc["id"]] = str((tc.get("function") or {}).get("name") or "")
++        if msg.get("role") != "tool" or not isinstance(content := msg.get("content"), str):
++            continue
++        tool = msg.get("tool_name") or msg.get("name") or call_names.get(msg.get("tool_call_id") or "")
++        if tool != "skill_view":
++            continue
++        try:
++            payload = json.loads(content)
++        except (TypeError, ValueError):
++            continue
++        if (isinstance(payload, dict) and payload.get("success") is True and payload.get("name")
++                and isinstance(payload.get("content"), str) and not payload.get("is_binary")):
++            views.append((str(payload["name"]), payload.get("file"), payload["content"],
++                          payload.get("_source_path")))
++    return views
++
++
++def seed_background_review_reads_from_history(messages: list, session_id: Optional[str] = None) -> int:
++    """Treat skill_view results the review fork replays verbatim as reads of the current file.
++
++    The fork resumes the parent's transcript, so a skill the parent loaded is already in the fork's
++    context. When that copy is byte-identical to what skill_view serves NOW, the fork holds the exact
++    current content, which is what the read-before-write guard demands; refusing its first patch only
++    forced a redundant re-view (a 90 KB SKILL.md reloaded per review). A stale, pruned or stubbed copy
++    does not match and stays unmarked, so the guard still fires for it. Call after
++    ``_reset_background_review_read_marks()`` in the context the fork's tool workers copy. Returns the
++    number of files marked."""
++    if (marks := _background_review_read_paths.get()) is None:
++        _background_review_read_paths.set(marks := _BackgroundReviewReadMarks())
++    seen: set[tuple[str, Optional[str]]] = set()
++    marked = 0
++    for name, file_path, content, source in reversed(_transcript_skill_views(messages)):
++        if (name, file_path) in seen:  # newest copy wins: an older one may predate a patch
++            continue
++        seen.add((name, file_path))
++        try:
++            current = _current_skill_view(name, file_path, session_id)
++        except Exception:
++            logger.debug("review read seeding failed for %s/%s", name, file_path, exc_info=True)
++            continue
++        if current is None or current[1] != content:
++            continue
++        resolved = _resolved_str(current[0])
++        # Same name but a different file (a shadowing copy appeared since): not a read of the target.
++        if source and _resolved_str(Path(source)) != resolved:
++            continue
++        marks.add(resolved)
++        marked += 1
++    return marked
++
++
++def _current_skill_view(name: str, file_path: Optional[str], session_id: Optional[str]):
++    """``(source path, content)`` skill_view would serve now, or None. Runs in a throwaway context
++    so skill_view's own read-mark side effect cannot leak into the fork's marks."""
++    import contextvars
++    import json
++
++    def _view():
++        _background_review_read_paths.set(_BackgroundReviewReadMarks())
++        from tools.skills_tool import skill_view
++        return skill_view(name, file_path=file_path, task_id=session_id)
++
++    payload = json.loads(contextvars.copy_context().run(_view))
++    if not (isinstance(payload, dict) and payload.get("success") is True and payload.get("_source_path")
++            and isinstance(payload.get("content"), str)):
++        return None
++    return Path(payload["_source_path"]), payload["content"]
++
++
+ def _resolved_roots(skill_path: Path):
+     """``(resolved skill_path, [(root, resolved_root), ...])`` over every resolvable skills root."""
+     from agent.skill_utils import get_all_skills_dirs
+-- 
+2.55.0
+
