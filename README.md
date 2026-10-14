@@ -50,6 +50,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [fast-rate-limit-fallback](plugins/fast-rate-limit-fallback/) | — | On a long-reset rate limit, rotate pooled credentials first, then fall back to the next provider without sleeping through retries. |
 | [mcp-file-access](plugins/mcp-file-access/) | — | Ask (Once / Session / Always) before the Chrome DevTools MCP server reads or writes files outside its allowed folders. On approval, the file is routed through its temp folder, so no restart is needed. |
 | [oauth-keepalive](plugins/oauth-keepalive/) | — | Refreshes pooled OAuth tokens (Claude, ChatGPT/Codex) before they expire, including idle accounts. |
+| [prompt-coach](plugins/prompt-coach/) | [yes](desktop-plugins/prompt-coach/) | After you send a task request, offers a more ambitious rewrite (Altitude / Depth / Range, after Felix Rieseberg) in a panel above the composer: *Run in new session* (the original keeps running), *Replace* or *Keep mine*. A cheap model screens; a stronger one rewrites. Logs choices for a weekly digest. |
 | [quiet-mode](plugins/quiet-mode/) | — | `/quiet` (`/movie`) blocks every Hermes session on the Mac from opening windows, driving the GUI or browser, changing lights or TVs, or making sound. |
 | [slack-workspace](plugins/slack-workspace/) | — | For a team Slack bot: records traffic in every channel it's in and adds that channel's recent activity as context when it's @-mentioned. Tools to see recent activity, join channels in bulk and call any Slack API method. Joins, posts outside the current conversation and admin methods go to the bot's admins as one DM with approve-selected / always-allow / deny buttons. |
 | [session-mentions](plugins/session-mentions/) | [yes](desktop-plugins/session-mentions/) | `cross_session` tool: list, read and message sessions on any gateway connected to the Desktop app (local, Nous-hosted, remote). |
@@ -73,6 +74,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [autonomous-ai-agents/claude-usage-diagnostics](skills/autonomous-ai-agents/claude-usage-diagnostics/) | Claude usage runs out or sessions stick on 429s. |
 | [devops/cloud-service-decommission](skills/devops/cloud-service-decommission/) | Shutting down a hosted service to stop billing. |
 | [hermes-disk-plugin-backends](skills/hermes-disk-plugin-backends/) | Adding Hermes disk-plugin REST backends. |
+| [productivity/ambitious-requests](skills/productivity/ambitious-requests/) | Make a request more ambitious: the Altitude / Depth / Range lenses (goes with the prompt-coach plugin). |
 | [productivity/quiet-mode](skills/productivity/quiet-mode/) | You want Hermes off the screen and speakers (goes with the quiet-mode plugin). |
 | [social-media/messaging-bridges](skills/social-media/messaging-bridges/) | WhatsApp/Signal bridges: QR-pair once, the session persists. |
 | [social-media/slack-workspace-bot](skills/social-media/slack-workspace-bot/) | Acting as a team Slack bot: use observed context, join channels, call the Slack API, handle approvals (goes with the slack-workspace plugin). |
