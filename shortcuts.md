@@ -13,8 +13,9 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 | ⌘⇧A | Archive the selected (else open) session, then open the next one that needs you | core patches 0019, 0026 | same |
 | ⌘R | Send `resume` to the active chat (for a stalled turn) | core patch 0022 | same |
 | ⇧⌘R | Reload the window (⌘R used to do this) | core patch 0022 | same |
-| ⌘N | New session; returns to the unsent new-session draft (text + attachments) instead of an empty composer | core patch 0036 | [core/persistent-new-session-draft.md](core/persistent-new-session-draft.md) |
-| ⌘⇧N | Rename the session; the field is pre-filled with an AI short name | core patch 0020 | [core/ai-session-rename.md](core/ai-session-rename.md) |
+| ⌘N | New session **on This device** (switches the gateway to local if another is selected); returns to the unsent new-session draft (text + attachments) instead of an empty composer | core patches 0036, 0040 | [core/persistent-new-session-draft.md](core/persistent-new-session-draft.md), [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
+| ⌘⇧N | New session on the currently selected gateway | core patch 0040 | [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
+| ⌘⇧E | Rename the session; the field is pre-filled with an AI short name | core patches 0020, 0040 | [core/ai-session-rename.md](core/ai-session-rename.md) |
 | ⌘⇧P | Move the selected session into a project (palette typeahead over every gateway's projects). A name that doesn't exist offers **Create project** with an empty `~/code/<slug>` | core patches 0018, 0030 | [core/project-palette.md](core/project-palette.md) |
 | ⇧⌘F | Spin out: turn the follow-up work at the end of a session into new sessions | plugin [spin-out](plugins/spin-out/) | `./install.sh` |
 | ⌥⌘F | Session search (moved here from ⇧⌘F by spin-out) | plugin spin-out | `./install.sh` |
@@ -22,7 +23,7 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 
 The day-to-day loop they're built for: **⌘]** to the next chat waiting on you → answer it →
 **⌘⇧A** when it's done (lands on the next waiting chat) → repeat. **⌘R** nudges a stalled turn,
-**⌘⇧P** files a chat into a project, **⌘⇧N** gives it a real name.
+**⌘⇧P** files a chat into a project, **⌘⇧E** gives it a real name.
 
 ## Adding them to your Hermes (for agents)
 
@@ -36,7 +37,7 @@ half needs a gateway or Desktop-backend restart.
 
 ### 2. Core shortcuts: patch Hermes, or rewrite as a plugin
 
-⌘] ⌘[ ⌘⇧] ⌘⇧[ ⌘⇧A ⌘R ⌘⇧N ⌘⇧P are changes to Hermes's own source (`apps/desktop/src`). You have three ways:
+⌘] ⌘[ ⌘⇧] ⌘⇧[ ⌘⇧A ⌘R ⌘N ⌘⇧N ⌘⇧E ⌘⇧P are changes to Hermes's own source (`apps/desktop/src`). You have three ways:
 
 **a. Apply the patches to a fork (recommended if you'll keep more than one core change).**
 
@@ -80,7 +81,7 @@ contribution. Roughly:
 | ⌘R resume | Yes, on a different chord: `host.composer.submit(sessionId, 'resume')`. A plugin **can't take ⌘R itself**, because Electron's main process eats ⌘R as "reload" before the renderer sees it. The core patch reroutes that accelerator. |
 | ⌘] / ⌘[ | Partly. `host.state` exposes the busy/awaiting atoms, but not the sidebar's drawn order or the unread state. A plugin version would step in recency order (`host.listPersistedSessions`) and use `host.openSession(id)`. |
 | ⌘⇧A | Likely: `host.request('session.archive', …)` (a backend method in `tui_gateway/methods_session.py`), then `host.openSession(next)`. Check the params there first. |
-| ⌘⇧N | Needs the backend `session.title.suggest` RPC from patch 0020, which you could port into an agent plugin. The rename dialog has to be built in the plugin. |
+| ⌘⇧E | Needs the backend `session.title.suggest` RPC from patch 0020, which you could port into an agent plugin. The rename dialog has to be built in the plugin. |
 | ⌘⇧P | Possible through `PALETTE_AREA` + `host.request('session.workspace.move', …)`. The cross-gateway project list is core (0024). |
 
 If a built-in already owns the chord you want, pick another one, or unbind the built-in in

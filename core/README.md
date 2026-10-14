@@ -16,10 +16,11 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | Doc | Patches | What you get |
 |---|---|---|
 | [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 | ⌘]/⌘[ next/prev session that needs you, ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume, ⇧⌘R reload |
-| [ai-session-rename.md](ai-session-rename.md) | 0020 0032 | ⌘⇧N rename, pre-filled with an AI short name (`session.title.suggest` RPC) |
+| [ai-session-rename.md](ai-session-rename.md) | 0020 0032 0040 | ⌘⇧E rename (was ⌘⇧N until 0040), pre-filled with an AI short name (`session.title.suggest` RPC) |
 | [project-palette.md](project-palette.md) | 0004 0018 0030 | ⌘⇧P moves a session to a project by typeahead; a new name offers "Create project" with an empty `~/code/<slug>` |
 | [multi-gateway-projects.md](multi-gateway-projects.md) | 0023 0024 0025 0028 0029 0031 | Sidebar shows every connected gateway's projects (colored, with show/hide toggles); move a session into any gateway's project; archive on the owning gateway |
 | [sidebar-status-stripe.md](sidebar-status-stripe.md) | 0038 0039 | Sidebar row stripe shows status (green = done, waiting on you; red = stuck); the owning gateway is a laptop / Mac mini / cloud glyph after the age |
+| [new-chat-gateway-hotkeys.md](new-chat-gateway-hotkeys.md) | 0040 | ⌘N starts the new chat on This device (switches the gateway to local); ⌘⇧N keeps the selected gateway |
 | [persistent-new-session-draft.md](persistent-new-session-draft.md) | 0036 | ⌘N returns to the unsent new-session draft (text + attachments) instead of an empty composer |
 | [session-takeover.md](session-takeover.md) | 0013 0014 0015 | "Take over here" for a chat that's live in another Hermes window; a hidden chat's agent keeps its Browser page |
 | [auto-continue-resume.md](auto-continue-resume.md) | 0008 0010 | `desktop.auto_continue.resume_on_startup`: interrupted sessions resume when the backend boots, including turns cut off by a backend shutdown |
