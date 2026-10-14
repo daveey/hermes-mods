@@ -18,6 +18,7 @@ State: ``<HERMES_HOME>/slack-workspace/{observed.sqlite,policy.json}``.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -134,9 +135,12 @@ class State:
 
     def render_text(self, text: str) -> str:
         text = re.sub(r"<@([UW][A-Z0-9]+)(\|[^>]*)?>", lambda m: "@" + self.user_name(m.group(1)), text or "")
-        text = re.sub(r"<#([CG][A-Z0-9]+)\|([^>]*)>", r"#\2", text)
+        text = re.sub(r"<#([CG][A-Z0-9]+)\|([^>]+)>", r"#\2", text)
+        text = re.sub(r"<#([CG][A-Z0-9]+)\|?>", lambda m: "#" + self.channel_info(m.group(1)).get("name", m.group(1)),
+                      text)
+        text = re.sub(r"<!(here|channel|everyone)>", r"@\1", text)
         text = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2 (\1)", text)
-        return text
+        return html.unescape(text)
 
     def public_channels(self, max_age: float = 600) -> list[dict]:
         with self._lock:
