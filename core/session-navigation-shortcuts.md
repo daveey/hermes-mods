@@ -7,7 +7,7 @@ Desktop keybind registry, so you can rebind them in **Settings → Keybinds**. T
 | Patch | Shortcut | Action id | Does |
 |---|---|---|---|
 | [0019](patches/0019-feat-desktop-A-archives-the-selected-else-open-sessi.patch) | ⌘⇧A | `session.archive` | Archive the selected session, or the open chat if no row is selected |
-| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red), skipping ⌘B-blocked (grey) ones. With none, nothing happens |
+| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch), [0050](patches/0050-fix-desktop-and-stop-on-every-row-the-sidebar-paints.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red), skipping ⌘B-blocked (grey) ones. With none, nothing happens |
 | [0048](patches/0048-feat-desktop-B-marks-a-session-blocked-grey-stripe-s.patch) | ⌘B | `session.toggleBlocked` | Mark the selected (else open) session blocked: grey stripe, skipped by ⌘]/⌘[. Again to unblock. ⌘⇧]/⌘⇧[ skip it too (0049). Sidebar toggle moves to ⌥⌘B |
 | [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0049](patches/0049-fix-desktop-and-archive-next-fallback-skip-B-blocked.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state except ⌘B-blocked |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌘R | `session.resume` | Send `resume` to the active chat as if you typed it |
@@ -42,7 +42,10 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
   back to the recency list (`$sessions`).
 - **"Needs you"** (0043) = the row draws a status stripe ([sidebar-status-stripe.md](sidebar-status-stripe.md)):
   green (finished turn, read or not) or red (blocked on a prompt, or stalled). Eligibility calls the same
-  `sessionStatusStripe(dotState, hasTurns)` the row uses, so ⌘]/⌘[ land exactly on striped rows. `hasTurns`
+  `sessionStatusStripe(dotState, hasTurns)` the row uses, so ⌘]/⌘[ land exactly on striped rows. Since 0050 a
+  drawn row publishes its painted stripe (`data-sidebar-stripe`) and that wins: the projects overview draws lane
+  rows the flat row model doesn't carry, so green rows there had no `hasTurns` and were skipped (⌘] bounced
+  between two rows). For undrawn (virtualized off-screen) rows, `hasTurns`
   comes from the sections' published `turnIds` (rows with `message_count > 0`), else `$sessions`. With no
   striped row they do nothing. (0021 used dot states `needs-input`/`unread` and fell back to the plain
   neighbour; after 0039 kept the green stripe on read sessions, that filter often matched nothing and
@@ -376,6 +379,7 @@ npx vitest run src/store/sidebar-visible-order.test.ts \
 | 0022 | 0021 (i18n and `use-keybinds.ts` context) |
 | 0026 | 0019 (`$focusedStoredSessionId` import), 0021 (`sidebar-visible-order.ts`). 0023 edits the same `archiveSession` function just below, so apply it first |
 | 0043 | 0021, 0026, 0038 (`sessionStatusStripe`), 0039 |
+| 0050 | 0043, 0048 |
 
 Apply the whole series in numeric order from the hermes-agent repo root:
 
