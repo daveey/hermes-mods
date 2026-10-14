@@ -157,3 +157,25 @@ test('courier ticks from a worker (hidden windows throttle main-thread timers to
     delete globalThis.Worker
   }
 })
+
+test('a forwarded send refused over there (chat open in THIS Desktop) falls back to the direct, owning route', async () => {
+  let direct = 0
+  const m = await load(
+    {
+      state,
+      connections: async () => conns,
+      profileRoutes: async () => [{ connectionId: 'macbook', profile: 'default', targetProfile: 'default' }],
+      requestProfile: async (_r, method) => (method === 'session.resume' ? { session_id: 'live' } : (direct++, { status: 'streaming', user_row_id: 3 }))
+    },
+    async req => {
+      if (req.path.endsWith('/ping')) return { ok: true, home_courier: true, forwarding: true }
+      if (req.path.endsWith('/enqueue')) return { ok: true }
+      if (req.path.includes('/status/')) return { state: 'done', result: { ok: false, delivered: false, status: 'refused', retry_safe: true } }
+      throw Error(`unexpected ${req.path}`)
+    }
+  )
+  const res = await m.performRequest({ action: 'send', args: { target: '@session:default@macbook/x', message: 'hi' } }, 'local', conns)
+  assert.equal(direct, 1)
+  assert.equal(res.ok, true)
+  assert.equal(res.status, 'streaming')
+})

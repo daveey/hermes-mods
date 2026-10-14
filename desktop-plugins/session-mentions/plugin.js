@@ -533,7 +533,10 @@ export async function performRequest(req, origin, conns) {
     // Desktop only reaches it through a separate serve process, which core refuses ("This chat
     // is open in another Hermes window"). Hand the send to that gateway's own courier.
     const home = conns.find(c => c.kind === 'local')
-    const forwarded = !req.forwarded && target.connectionId !== (home?.id || 'local') ? await forwardSend(target, text, wait) : null
+    let forwarded = !req.forwarded && target.connectionId !== (home?.id || 'local') ? await forwardSend(target, text, wait) : null
+    // Refused there = never admitted, and the chat may be open in THIS Desktop (its backend on
+    // that gateway owns it): the direct route is then the owning one.
+    if (forwarded?.status === 'refused') forwarded = null
     const res = forwarded || (await deliver(target, text, wait))
     return { ...res, gateway: gw?.key || target.connectionId, ref: sessionRef(target, origin, conns) }
   }
