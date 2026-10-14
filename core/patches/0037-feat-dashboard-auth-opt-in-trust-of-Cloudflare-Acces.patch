@@ -1,0 +1,303 @@
+From 94280676d7f9337611fb6af2b2fd2c0a7af8238e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:31:25 -0700
+Subject: [PATCH] feat(dashboard-auth): opt-in trust of Cloudflare Access login
+ as a dashboard session [daveey]
+
+When HERMES_DASHBOARD_CF_ACCESS_{TEAM_DOMAIN,AUD,EMAILS} are all set, a request whose
+Cf-Access-Jwt-Assertion verifies (RS256, team certs, pinned iss/aud) and whose email is on
+the allowlist is treated as logged in, so a dashboard behind Access doesn't ask for a second
+login. Service tokens (no email) and everything else fall through to the normal gate.
+/login bounces back to next when such a session is present. Off unless configured.
+---
+ hermes_cli/dashboard_auth/cf_access.py        | 115 +++++++++++++++++
+ hermes_cli/dashboard_auth/middleware.py       |  19 ++-
+ .../test_dashboard_auth_cf_access.py          | 117 ++++++++++++++++++
+ 3 files changed, 250 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/dashboard_auth/cf_access.py
+ create mode 100644 tests/hermes_cli/test_dashboard_auth_cf_access.py
+
+diff --git a/hermes_cli/dashboard_auth/cf_access.py b/hermes_cli/dashboard_auth/cf_access.py
+new file mode 100644
+index 0000000000..7ec014948d
+--- /dev/null
++++ b/hermes_cli/dashboard_auth/cf_access.py
+@@ -0,0 +1,115 @@
++"""Trust a Cloudflare Access login as a dashboard session (opt-in, off by default).
++
++When the dashboard sits behind a Cloudflare Access application, every proxied request carries a
++signed ``Cf-Access-Jwt-Assertion`` header. If the operator configures the team domain, the
++application's AUD tag(s) and an email allowlist, a request whose JWT verifies (RS256 against the
++team's ``/cdn-cgi/access/certs``, pinned ``iss`` + ``aud``) and whose ``email`` claim is allowed is
++treated as an authenticated session, so the user isn't asked to log in a second time.
++
++Fails closed: any missing setting disables it; a JWT without an ``email`` claim (an Access
++*service token*) is ignored, so machine clients keep using the normal provider login; an
++unreachable certs endpoint or a bad token just falls through to the normal gate (never 503).
++
++Settings (environment, per host):
++  HERMES_DASHBOARD_CF_ACCESS_TEAM_DOMAIN  e.g. ``myteam.cloudflareaccess.com``
++  HERMES_DASHBOARD_CF_ACCESS_AUD          comma-separated Access application AUD tag(s)
++  HERMES_DASHBOARD_CF_ACCESS_EMAILS       comma-separated allowed emails (case-insensitive)
++"""
++from __future__ import annotations
++
++import logging
++import os
++import threading
++from dataclasses import dataclass
++from typing import Any, Mapping, Optional
++
++from fastapi import Request
++
++from hermes_cli.dashboard_auth.base import Session
++
++_log = logging.getLogger(__name__)
++
++HEADER = "cf-access-jwt-assertion"
++PROVIDER_NAME = "cloudflare_access"
++JWKS_CACHE_SECONDS = 3600
++LEEWAY_SECONDS = 60
++
++
++@dataclass(frozen=True)
++class CfAccessConfig:
++    team_domain: str
++    audiences: tuple[str, ...]
++    emails: frozenset[str]
++
++    @property
++    def issuer(self) -> str:
++        return f"https://{self.team_domain}"
++
++    @property
++    def certs_url(self) -> str:
++        return f"https://{self.team_domain}/cdn-cgi/access/certs"
++
++
++def _split(value: str) -> list[str]:
++    return [v.strip() for v in value.split(",") if v.strip()]
++
++
++def load_config(env: Optional[Mapping[str, str]] = None) -> Optional[CfAccessConfig]:
++    """The configured trust, or ``None`` (disabled) unless all three settings are present."""
++    src: Mapping[str, str] = os.environ if env is None else env
++    team = src.get("HERMES_DASHBOARD_CF_ACCESS_TEAM_DOMAIN", "").strip().lower()
++    team = team.removeprefix("https://").rstrip("/")
++    auds = tuple(_split(src.get("HERMES_DASHBOARD_CF_ACCESS_AUD", "")))
++    emails = frozenset(e.lower() for e in _split(src.get("HERMES_DASHBOARD_CF_ACCESS_EMAILS", "")))
++    if not (team and auds and emails):
++        return None
++    return CfAccessConfig(team_domain=team, audiences=auds, emails=emails)
++
++
++_jwks_lock = threading.Lock()
++_jwks_clients: dict[str, Any] = {}
++
++
++def _jwks_client(url: str) -> Any:
++    with _jwks_lock:
++        client = _jwks_clients.get(url)
++        if client is None:
++            from jwt import PyJWKClient
++
++            client = PyJWKClient(
++                url, cache_keys=True, lifespan=JWKS_CACHE_SECONDS,
++                headers={"Accept": "application/json", "User-Agent": "HermesAgent/1.0"})
++            _jwks_clients[url] = client
++        return client
++
++
++def verify_assertion(token: str, cfg: CfAccessConfig) -> Optional[Session]:
++    """Session for a valid, allowed Access JWT; ``None`` for anything else. Never raises."""
++    import jwt
++
++    try:
++        key = _jwks_client(cfg.certs_url).get_signing_key_from_jwt(token)
++        claims = jwt.decode(
++            token, key.key, algorithms=["RS256"], audience=list(cfg.audiences), issuer=cfg.issuer,
++            leeway=LEEWAY_SECONDS, options={"require": ["exp", "iat", "aud", "iss", "sub"]})
++    except Exception as exc:  # bad/expired/foreign token or certs unreachable: normal login applies
++        _log.info("dashboard-auth: Cloudflare Access assertion not accepted: %s", exc)
++        return None
++    email = str(claims.get("email") or "").strip().lower()
++    if not email or email not in cfg.emails:
++        # Service tokens carry no email; other identities aren't on the allowlist.
++        return None
++    return Session(
++        user_id=str(claims["sub"]), email=email, display_name=email, org_id="",
++        provider=PROVIDER_NAME, expires_at=int(claims["exp"]), access_token="", refresh_token="")
++
++
++def session_from_request(request: Request) -> Optional[Session]:
++    """Verified Session from the request's Access header when the trust is configured."""
++    token = request.headers.get(HEADER, "").strip()
++    if not token:
++        return None
++    cfg = load_config()
++    if cfg is None:
++        return None
++    return verify_assertion(token, cfg)
+diff --git a/hermes_cli/dashboard_auth/middleware.py b/hermes_cli/dashboard_auth/middleware.py
+index ea9b03801e..66c571fe8b 100644
+--- a/hermes_cli/dashboard_auth/middleware.py
++++ b/hermes_cli/dashboard_auth/middleware.py
+@@ -20,6 +20,8 @@ from starlette.concurrency import run_in_threadpool
+ from hermes_cli.dashboard_auth import list_session_providers
+ from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+ from hermes_cli.dashboard_auth.base import ProviderError
++from hermes_cli.dashboard_auth.cf_access import HEADER as CF_ACCESS_HEADER
++from hermes_cli.dashboard_auth.cf_access import session_from_request as cf_access_session
+ from hermes_cli.dashboard_auth.cookies import (
+     clear_session_cookies, clear_sso_attempt_cookie, detect_https, read_session_cookies,
+     read_session_provider, read_sso_attempt_cookie, set_session_cookies,
+@@ -164,7 +166,22 @@ async def gated_auth_middleware(
+         return await call_next(request)
+     # Already authenticated by the token-auth seam (service caller on a registered token
+     # route): not a cookie session, must not bounce to /login.
+-    if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
++    if getattr(request.state, "token_authenticated", False):
++        return await call_next(request)
++    path = request.url.path
++    # Opt-in Cloudflare Access trust: a verified, allowlisted Access login IS the session, so
++    # the user isn't asked to log in twice. ``/login`` is checked too so a stray bounce there
++    # goes straight back to the app instead of rendering the form.
++    if (path == "/login" or not _path_is_public(path)) and request.headers.get(CF_ACCESS_HEADER):
++        cf_session = await run_in_threadpool(cf_access_session, request)
++        if cf_session is not None:
++            if path == "/login":
++                nxt = request.query_params.get("next", "")
++                target = nxt if nxt and is_safe_next_path(nxt) else f"{prefix_from_request(request)}/"
++                return RedirectResponse(url=target, status_code=302)
++            request.state.session = cf_session
++            return await call_next(request)
++    if _path_is_public(path):
+         return await call_next(request)
+     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
+     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
+diff --git a/tests/hermes_cli/test_dashboard_auth_cf_access.py b/tests/hermes_cli/test_dashboard_auth_cf_access.py
+new file mode 100644
+index 0000000000..b76367adaf
+--- /dev/null
++++ b/tests/hermes_cli/test_dashboard_auth_cf_access.py
+@@ -0,0 +1,117 @@
++"""Opt-in Cloudflare Access trust in the dashboard gate (``dashboard_auth.cf_access``)."""
++from __future__ import annotations
++
++import time
++
++import jwt
++import pytest
++from cryptography.hazmat.primitives.asymmetric import rsa
++from fastapi.testclient import TestClient
++
++from hermes_cli import web_server
++from hermes_cli.dashboard_auth import cf_access, clear_providers, register_provider
++from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
++
++TEAM = "team.cloudflareaccess.com"
++AUD = "aud-mini"
++EMAIL = "me@example.com"
++
++_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++_OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++
++
++class _StubJwks:
++    def get_signing_key_from_jwt(self, token):
++        class _K:
++            key = _KEY.public_key()
++        return _K()
++
++
++def _token(*, key=_KEY, aud=AUD, iss=f"https://{TEAM}", email=EMAIL, exp_in=600):
++    now = int(time.time())
++    claims = {"aud": [aud], "iss": iss, "sub": "user-1", "iat": now, "exp": now + exp_in}
++    if email is not None:
++        claims["email"] = email
++    return jwt.encode(claims, key, algorithm="RS256", headers={"kid": "k1"})
++
++
++@pytest.fixture
++def gated(monkeypatch):
++    clear_providers()
++    register_provider(StubAuthProvider())
++    monkeypatch.setattr(cf_access, "_jwks_client", lambda url: _StubJwks())
++    monkeypatch.setenv("HERMES_DASHBOARD_CF_ACCESS_TEAM_DOMAIN", TEAM)
++    monkeypatch.setenv("HERMES_DASHBOARD_CF_ACCESS_AUD", f"other-aud, {AUD}")
++    monkeypatch.setenv("HERMES_DASHBOARD_CF_ACCESS_EMAILS", "Me@Example.com")
++    saved = {k: getattr(web_server.app.state, k, None) for k in ("bound_host", "bound_port", "auth_required")}
++    web_server.app.state.bound_host = "fly-app.fly.dev"
++    web_server.app.state.bound_port = 443
++    web_server.app.state.auth_required = True
++    yield TestClient(web_server.app, base_url="https://fly-app.fly.dev")
++    clear_providers()
++    for k, v in saved.items():
++        setattr(web_server.app.state, k, v)
++
++
++def _me(client, token=None):
++    headers = {cf_access.HEADER: token} if token else {}
++    return client.get("/api/auth/me", headers=headers)
++
++
++def test_valid_allowlisted_access_jwt_is_a_session(gated):
++    r = _me(gated, _token())
++    assert r.status_code == 200
++    assert r.json()["email"] == EMAIL
++    assert r.json()["provider"] == "cloudflare_access"
++
++
++def test_ws_ticket_works_with_access_session(gated):
++    r = gated.post("/api/auth/ws-ticket", headers={cf_access.HEADER: _token()})
++    assert r.status_code == 200 and r.json()["ticket"]
++
++
++@pytest.mark.parametrize("kwargs", [
++    {"aud": "some-other-app"},
++    {"iss": "https://evil.cloudflareaccess.com"},
++    {"email": "someone@else.com"},
++    {"email": None},  # Access service token: no email claim -> normal login (Redde)
++    {"key": _OTHER_KEY},
++    {"exp_in": -3600},
++])
++def test_rejected_assertions_fall_through_to_normal_gate(gated, kwargs):
++    r = _me(gated, _token(**kwargs))
++    assert r.status_code == 401
++    assert r.json()["error"] == "unauthenticated"
++
++
++def test_disabled_without_full_config(gated, monkeypatch):
++    monkeypatch.delenv("HERMES_DASHBOARD_CF_ACCESS_EMAILS")
++    assert _me(gated, _token()).status_code == 401
++
++
++def test_no_header_still_requires_login(gated):
++    assert _me(gated).status_code == 401
++
++
++def test_login_page_bounces_back_when_access_session_valid(gated):
++    r = gated.get("/login", params={"next": "/sessions?x=1"}, headers={cf_access.HEADER: _token()},
++                  follow_redirects=False)
++    assert r.status_code == 302 and r.headers["location"] == "/sessions?x=1"
++    r = gated.get("/login", params={"next": "//evil.com"}, headers={cf_access.HEADER: _token()},
++                  follow_redirects=False)
++    assert r.status_code == 302 and r.headers["location"] == "/"
++
++
++def test_login_page_renders_without_access_session(gated):
++    r = gated.get("/login", headers={cf_access.HEADER: _token(email="x@y.z")})
++    assert r.status_code == 200
++
++
++def test_load_config_requires_all_settings():
++    assert cf_access.load_config({}) is None
++    cfg = cf_access.load_config({
++        "HERMES_DASHBOARD_CF_ACCESS_TEAM_DOMAIN": "https://Team.cloudflareaccess.com/",
++        "HERMES_DASHBOARD_CF_ACCESS_AUD": "a,b",
++        "HERMES_DASHBOARD_CF_ACCESS_EMAILS": "A@B.c"})
++    assert cfg and cfg.team_domain == "team.cloudflareaccess.com"
++    assert cfg.audiences == ("a", "b") and cfg.emails == frozenset({"a@b.c"})
+-- 
+2.50.1 (Apple Git-155)
+

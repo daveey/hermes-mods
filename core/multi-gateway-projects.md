@@ -45,7 +45,8 @@ Terms:
   - Every remote row is stamped with its `connection_id`, so clicking it resumes on the right
     gateway.
   - Remote session ids are added to the scoped (live) set.
-- Every session row gets a 3 px stripe on its left edge in its gateway's color
+- (Superseded by `0038`, [sidebar-status-stripe.md](sidebar-status-stripe.md): the row stripe now shows
+  status and the gateway is a device glyph.) Every session row gets a 3 px stripe on its left edge in its gateway's color
   (`data-slot="session-gateway-stripe"`). Stripes only appear when the registry has more than one
   connection.
 - Default colors: `kind: 'local'` gets no color. Each remote takes the next slot of an 8-color
