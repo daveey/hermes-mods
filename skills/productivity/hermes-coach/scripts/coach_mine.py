@@ -151,6 +151,19 @@ def _names(v):
     return [v] if isinstance(v, str) else list(v or [])
 
 
+def linked_worktree(d):
+    """True when the digest's cwd is inside a linked git worktree: `repo` is the git common root
+    (session_digest records git_repo_root), and cwd sits outside it (~/code/babybear-x for repo
+    ~/code/babybear) or under its .worktrees/ (hermes -w) or .git/worktrees/ dirs."""
+    c, r = (d.get("cwd") or "").rstrip("/"), (d.get("repo") or "").rstrip("/")
+    if not c or not r or c == r:
+        return False
+    if not c.startswith(r + "/"):
+        return True
+    rest = c[len(r) + 1:]
+    return rest.startswith(".worktrees/") or rest.startswith(".git/worktrees/")
+
+
 def adoption_test(t, ds, now):
     """(count, need, evidence) for one adopted-test mapping over the digests."""
     days = float(t.get("days", 14))
@@ -169,6 +182,8 @@ def adoption_test(t, ds, now):
         if t.get("profile") and not re.search(t["profile"], d.get("profile") or ""):
             continue
         if t.get("cwd") and not re.search(t["cwd"], d.get("cwd") or ""):
+            continue
+        if t.get("linked_worktree") and not linked_worktree(d):
             continue
         if t.get("match") and not re.search(t["match"], " ".join(str(d.get(k) or "") for k in ("repo", "cwd", "title"))):
             continue

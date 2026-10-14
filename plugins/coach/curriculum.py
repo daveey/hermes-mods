@@ -342,7 +342,11 @@ class Spacing:
             r["next_at"] = now + ACCEPT_GAP_S
         elif choice == "expired":  # never really seen: free it again (the session key still blocks a repeat there)
             r["next_at"] = now
-            d["shows"] = d.get("shows", [])[:-1]
+            # drop this tip's own show from the daily count, not whichever tip showed last
+            last, shows = r.get("last_shown"), list(d.get("shows", []))
+            if last in shows:
+                shows.remove(last)
+            d["shows"] = shows
         else:
             return
         r["last_choice"] = choice
@@ -362,19 +366,21 @@ class Spacing:
 
 def candidates(entries: list[dict], sig: dict, facts: Facts, msgs: int, recent_text: set, spacing: Spacing,
                adopted: set) -> list[dict]:
-    """At most one tip for this session now: first entry (curriculum order) whose trigger holds and that is due."""
+    """Due tips whose trigger holds, in curriculum order. The bus gate shows at most one: if it rejects
+    the first (e.g. tip:X muted in this session), the next one gets its chance in the same check."""
     st = spacing.read()
     spacing.retire(adopted & {e["id"] for e in entries})
     if spacing.shown_today(st) >= DAILY_MAX:
         return []
+    out = []
     for e in entries:
         if not runnable(e) or e["id"] in adopted or not spacing.ready(e["id"], st):
             continue
         fmt = trigger_holds(e, sig, facts, msgs, recent_text)
         if fmt is None:
             continue
-        return [{"rule": f"tip:{e['id']}", "key": f"tip:{e['id']}", "fmt": fmt, "entry": e}]
-    return []
+        out.append({"rule": f"tip:{e['id']}", "key": f"tip:{e['id']}", "fmt": fmt, "entry": e})
+    return out
 
 
 class _Fmt(dict):

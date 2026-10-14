@@ -269,10 +269,29 @@ def test_expired_tip_frees_spacing_and_stats_count_tips(tmp_path, monkeypatch):
     assert core.stats(store)["rules"]["tip:cron_whenever"]["shown"] == 1
 
 
+def test_expired_drops_only_its_own_show_from_daily_count(tmp_path):
+    clock = Clock()
+    sp = cur.Spacing(tmp_path, clock)
+    sp.on_shown("a")
+    clock.t += 60
+    sp.on_shown("b")
+    sp.on_choice("a", "expired")  # a's show goes; b's (the latest) stays
+    assert sp.read()["shows"] == [NOW + 60]
+
+
+def test_muted_first_tip_lets_next_due_tip_through(tmp_path, monkeypatch):
+    store = mk(tmp_path, monkeypatch=monkeypatch)
+    store._update("s1", lambda x: x.setdefault("muted", []).append("tip:cron_whenever"))
+    turn(store, "s1", "every day, and keep the follow-ups for later")
+    n = st(store, "s1", make_db(tmp_path))["nudge"]
+    assert n and n["rule"] == "tip:kanban_l1_boards", n
+
+
 # ── miner: adoption tests over digests ───────────────────────────────────
 
-def dg(i, src="desktop", features=None, signals=None, tools=None, profile="default", cwd="~/code/app", msgs=50, age=1):
-    return {"host": "h", "profile": profile, "id": f"d{i}", "source": src, "cwd": cwd, "repo": cwd, "title": "t",
+def dg(i, src="desktop", features=None, signals=None, tools=None, profile="default", cwd="~/code/app", msgs=50, age=1,
+       repo=None):
+    return {"host": "h", "profile": profile, "id": f"d{i}", "source": src, "cwd": cwd, "repo": repo or cwd, "title": "t",
             "msgs": msgs, "user_turns_total": 3, "started_at": NOW - age * 86400, "last_activity_at": NOW - age * 86400,
             "features": features or {}, "signals": signals or {}, "tools": tools or {}}
 
@@ -289,7 +308,7 @@ def test_miner_evaluates_events_sessions_sources_any_and_window():
     r = mine.adoption([es["kanban_max_runtime"]], ds, now=NOW)["kanban_max_runtime"]
     assert r["adopted"] and r["evidence"][0].startswith("h/default/")
     # any-of: worktree sessions by cwd OR worktree cards
-    wt = [dg(6, cwd="~/code/app/.worktrees/a"), dg(7, cwd="~/code/app/.worktrees/b")]
+    wt = [dg(6, cwd="~/code/app/.worktrees/a", repo="~/code/app"), dg(7, cwd="~/code/app/.worktrees/b", repo="~/code/app")]
     assert mine.adoption([es["worktree_parallel"]], wt, now=NOW)["worktree_parallel"]["adopted"]
     wt = [dg(8, features={"kanban_create:worktree": 2})]
     assert mine.adoption([es["worktree_parallel"]], wt, now=NOW)["worktree_parallel"]["adopted"]
@@ -297,6 +316,33 @@ def test_miner_evaluates_events_sessions_sources_any_and_window():
     bots = [dg(10 + i, profile="babybear-dev") for i in range(3)]
     assert mine.adoption([es["project_bot"]], bots, now=NOW)["project_bot"]["adopted"]
     assert not mine.adoption([es["project_bot"]], [dg(20 + i) for i in range(5)], now=NOW)["project_bot"]["adopted"]
+
+
+def test_miner_counts_sibling_linked_worktree_sessions(tmp_path):
+    """The user's real habit: `git worktree add ../babybear-x`, so cwd=~/code/babybear-x, repo (git common
+    root)=~/code/babybear. Subdirectories of the main checkout are not worktrees; machine sessions don't count."""
+    ov = tmp_path / "ov.yaml"
+    ov.write_text("- id: babybear_worktrees\n  adopted:\n    any:\n      - {unit: sessions, min: 2, linked_worktree: true,"
+                  " match: babybear, sources: interactive}\n")  # same shape as the private overlay entry
+    es = {e["id"]: e for e in mine.load_curriculum([ROOT / "curriculum.yaml", ov])}
+    assert mine.linked_worktree({"cwd": "~/code/babybear-logship", "repo": "~/code/babybear"})
+    assert mine.linked_worktree({"cwd": "~/code/app/.worktrees/a", "repo": "~/code/app"})
+    assert not mine.linked_worktree({"cwd": "~/code/babybear/app", "repo": "~/code/babybear"})
+    assert not mine.linked_worktree({"cwd": "~/code/babybear", "repo": "~/code/babybear"})
+    assert not mine.linked_worktree({"cwd": "~/code/x", "repo": None})
+    sub = [dg(1, cwd="~/code/babybear/app", repo="~/code/babybear"), dg(2, cwd="~/code/babybear", repo="~/code/babybear"),
+           dg(3, src="cron", cwd="~/code/babybear-a", repo="~/code/babybear")]
+    for tip in ("worktree_parallel", "babybear_worktrees"):
+        assert not mine.adoption([es[tip]], sub, now=NOW)[tip]["adopted"]
+    wt = sub + [dg(4, cwd="~/code/babybear-logship", repo="~/code/babybear"),
+                dg(5, cwd="~/code/babybear-ear-faces", repo="~/code/babybear")]
+    for tip in ("worktree_parallel", "babybear_worktrees"):
+        r = mine.adoption([es[tip]], wt, now=NOW)[tip]
+        assert r["adopted"] and set(r["evidence"]) == {"h/default/d4", "h/default/d5"}, (tip, r)
+    # a sibling worktree of another repo does not satisfy the Baby Bear entry
+    other = [dg(6, cwd="~/code/app-x", repo="~/code/app"), dg(7, cwd="~/code/app-y", repo="~/code/app")]
+    assert mine.adoption([es["worktree_parallel"]], other, now=NOW)["worktree_parallel"]["adopted"]
+    assert not mine.adoption([es["babybear_worktrees"]], other, now=NOW)["babybear_worktrees"]["adopted"]
 
 
 def test_miner_adoption_is_sticky_and_prose_entries_are_unchecked(tmp_path):

@@ -48,7 +48,7 @@ adds entries or overrides them by `id` (`enabled: false` drops one). The file he
 | `kanban_max_runtime` | a job over 10 min in chat | `kanban_create` with `max_runtime_seconds` in 3 sessions |
 | `todo_checklist` | a turn with 3+ list items, and no todo use yet | todo used in 3 sessions |
 | `cron_whenever` | "every day / whenever / each time" | a cron job created in 3 sessions |
-| `worktree_parallel` | a 2nd live session in the same repo | 2 sessions in a `.worktrees/` checkout, or 2 worktree cards |
+| `worktree_parallel` | a 2nd live session in the same repo | 2 sessions in a linked git worktree (sibling `../repo-x` or `.worktrees/`), or 2 worktree cards |
 | `session_mention` | "as we discussed / in the other session" | `@session:` typed in 3 sessions |
 | `kanban_l1_boards` | "follow-ups / next steps / backlog" | 5 cards created from your own chats |
 | `kanban_l2_fanout` | 5 subagents, or 3 `delegate_task` calls | 3 cards with `parents`, or one `kanban swarm` |
