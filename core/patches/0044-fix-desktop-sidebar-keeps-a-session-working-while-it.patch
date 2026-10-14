@@ -1,0 +1,402 @@
+From 1597e882c43d36ddfeef5f9392ee6ec901095f60 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:11:05 -0700
+Subject: [PATCH] fix(desktop): sidebar keeps a session 'working' while its
+ kanban tasks run [daveey]
+
+A turn that hands work to kanban_create ends at once, so the sidebar painted
+the session done (green stripe) while its kanban workers ran for hours.
+Session-list endpoints now stamp kanban_active (queued/running tasks created
+by the row's lineage, read from every board, 3s cache) and the dot state
+claims 'background' for those rows, like async delegation.
+---
+ .../src/store/session-dot-state.test.ts       |  41 +++++++
+ apps/desktop/src/store/session-dot-state.ts   |  25 +++-
+ apps/desktop/src/types/hermes.ts              |   6 +
+ hermes_cli/kanban_session_activity.py         | 116 ++++++++++++++++++
+ hermes_cli/web_routers/profiles.py            |   4 +-
+ hermes_cli/web_routers/sessions.py            |   2 +
+ .../test_kanban_session_activity.py           |  71 +++++++++++
+ 7 files changed, 263 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity.py
+ create mode 100644 tests/hermes_cli/test_kanban_session_activity.py
+
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index d3be36451c..2c8919dd9b 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -15,6 +15,7 @@ import {
+ } from './session'
+ import {
+   $delegatingSessionIds,
++  $kanbanBusySessionIds,
+   $sessionDotStateById,
+   $unreadSessionCount,
+   hasLiveTurn,
+@@ -261,3 +262,43 @@ describe('$unreadSessionCount (titlebar badge)', () => {
+     expect($sessionDotStateById.get()['cron-1']).not.toBe('unread')
+   })
+ })
++
++describe('kanban work in flight ($kanbanBusySessionIds)', () => {
++  beforeEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++    $unreadWriteGuard.set(new Map())
++  })
++
++  afterEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++  })
++
++  it('reads a finished turn with running kanban tasks as background, not done', () => {
++    setSessions([storedRow('s1', { kanban_active: 2, unread: true }), storedRow('s2')])
++
++    expect($kanbanBusySessionIds.get()).toEqual(['s1'])
++    expect($sessionDotStateById.get()['s1']).toBe('background')
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBeNull()
++    // Control: a plain finished session still gets its green stripe.
++    expect(sessionStatusStripe($sessionDotStateById.get()['s2'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('goes back to done once the tasks finish', () => {
++    setSessions([storedRow('s1', { kanban_active: 1 })])
++    setSessions([storedRow('s1', { kanban_active: 0 })])
++
++    expect($kanbanBusySessionIds.get()).toEqual([])
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('yields to a live turn', () => {
++    setSessions([storedRow('s1', { kanban_active: 1 })])
++    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
++
++    expect($sessionDotStateById.get()['s1']).toBe('working')
++  })
++})
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 083f11c91f..b490758c99 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -67,6 +67,26 @@ export const $delegatingSessionIds = computed(
+   }
+ )
+ 
++// [daveey] Sessions whose kanban tasks are still queued or running. Same story
++// as async delegation, but the work lives in kanban worker processes for hours:
++// `kanban_create` returns at once, the creating turn ends, and the sidebar read
++// the session as done (green stripe) while its workers were still going. The
++// backend stamps `kanban_active` on every list row (summed over the lineage).
++let kanbanBusyIds: readonly string[] = []
++export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions], (sessions, messaging) => {
++  const ids: string[] = []
++
++  for (const rows of [sessions, messaging]) {
++    for (const row of rows) {
++      if ((row.kanban_active ?? 0) > 0) {
++        ids.push(row.id)
++      }
++    }
++  }
++
++  return (kanbanBusyIds = stableArray(kanbanBusyIds, ids))
++})
++
+ export type SessionDotState = 'background' | 'draft' | 'idle' | 'needs-input' | 'stalled' | 'unread' | 'working'
+ 
+ /** The sidebar row's arc. A quiet turn is still authoritatively running, so
+@@ -120,12 +140,13 @@ export const $sessionDotStateById = computed(
+     $stalledSessionIds,
+     $backgroundRunningSessionIds,
+     $delegatingSessionIds,
++    $kanbanBusySessionIds,
+     $unreadFinishedSessionIds,
+     $draftSessionIds,
+     $sessions,
+     $unreadWriteGuard
+   ],
+-  (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
++  (attention, working, stalled, background, delegating, kanbanBusy, unread, draft, sessions, unreadWriteGuard) => {
+     const next: Record<string, SessionDotState> = {}
+ 
+     const claim = (ids: readonly string[], state: SessionDotState) => {
+@@ -177,6 +198,8 @@ export const $sessionDotStateById = computed(
+     // claim as background processes — and it yields to `working` below the
+     // moment the parent turn itself is live (synchronous orchestrator children).
+     claim(delegating, 'background')
++    // Kanban tasks it created are still queued or running: same claim.
++    claim(kanbanBusy, 'background')
+     claim(working, 'working')
+ 
+     // Stalled REFINES working rather than rivalling it — the turn is still
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 6b2b7d73df..d642c865ac 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -633,6 +633,12 @@ export interface SessionInfo {
+    *  explicitly marked unread or a response arrived after it was last read.
+    *  Undefined against a backend predating the flag; treat as read. */
+   unread?: boolean
++  /** [daveey] Kanban tasks this conversation created (`kanban_create`) that
++   *  are still queued or running, summed over its compression lineage. The
++   *  turn that created them has ended, but the session's work goes on in the
++   *  workers, so the sidebar paints it like a background job, not "done".
++   *  Absent when zero or against a backend predating the field. */
++  kanban_active?: number
+   preview: null | string
+   source: null | string
+   started_at: number
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+new file mode 100644
+index 0000000000..cb15d7c634
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity.py
+@@ -0,0 +1,116 @@
++"""Which sessions still have kanban work in flight.
++
++A session that hands work to ``kanban_create`` ends its own turn right away,
++while the tasks it created keep running for hours in worker processes. The
++sidebar painted such a session as "done" (green stripe) although its work was
++still going on. Every kanban task records the session that created it
++(``tasks.session_id``), so session-list endpoints stamp each row with how many
++of its tasks are still pending or running (``kanban_active``); the desktop
++treats a non-zero count like a running background job. [daveey]
++
++Read-only and cheap: one indexed GROUP BY per board database, cached for a few
++seconds because the sidebar polls.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any, Iterable
++
++_log = logging.getLogger(__name__)
++
++# Statuses that mean "work is still queued or running". ``blocked``/``review``
++# wait on a human and ``done``/``archived`` are finished, so neither keeps the
++# creating session busy.
++ACTIVE_STATUSES = ("todo", "ready", "running", "scheduled")
++
++_CACHE_TTL_S = 3.0
++_cache_lock = threading.Lock()
++_cache: tuple[float, dict[str, int]] | None = None
++
++
++def _board_db_paths() -> list[Path]:
++    from hermes_cli import kanban_db
++
++    paths: list[Path] = []
++    root = kanban_db.kanban_home()
++    default = root / "kanban.db"
++    if default.exists():
++        paths.append(default)
++    try:
++        boards = kanban_db.boards_root()
++        if boards.is_dir():
++            paths.extend(p for p in sorted(boards.glob("*/kanban.db")) if p.is_file())
++    except OSError:
++        pass
++    return paths
++
++
++def _read_counts(path: Path) -> dict[str, int]:
++    placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++    try:
++        rows = conn.execute(
++            f"SELECT session_id, COUNT(*) FROM tasks WHERE session_id IS NOT NULL "
++            f"AND session_id != '' AND status IN ({placeholders}) GROUP BY session_id",
++            ACTIVE_STATUSES,
++        ).fetchall()
++    finally:
++        conn.close()
++    return {str(sid): int(n) for sid, n in rows}
++
++
++def active_task_counts() -> dict[str, int]:
++    """``{session_id: active task count}`` across every kanban board."""
++    global _cache
++    now = time.monotonic()
++    with _cache_lock:
++        if _cache is not None and now < _cache[0]:
++            return _cache[1]
++    counts: dict[str, int] = {}
++    for path in _board_db_paths():
++        try:
++            for sid, n in _read_counts(path).items():
++                counts[sid] = counts.get(sid, 0) + n
++        except sqlite3.Error as exc:  # an old schema without session_id, a locked file
++            _log.debug("kanban activity read failed for %s: %s", path, exc)
++    with _cache_lock:
++        _cache = (now + _CACHE_TTL_S, counts)
++    return counts
++
++
++def _row_ids(row: dict[str, Any]) -> Iterable[str]:
++    seen: set[str] = set()
++    for sid in (row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())):
++        if sid and sid not in seen:
++            seen.add(sid)
++            yield sid
++
++
++def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Stamp ``kanban_active`` on each session row (summed over its whole
++    compression lineage). Never raises: the list must render without it."""
++    if not rows:
++        return rows
++    try:
++        counts = active_task_counts()
++    except Exception:
++        _log.debug("kanban activity unavailable", exc_info=True)
++        return rows
++    for row in rows:
++        n = sum(counts.get(sid, 0) for sid in _row_ids(row))
++        if n:
++            row["kanban_active"] = n
++        else:
++            row.pop("kanban_active", None)
++    return rows
++
++
++def _reset_cache_for_tests() -> None:
++    global _cache
++    with _cache_lock:
++        _cache = None
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index fcd4c87aea..e757748bbc 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -35,6 +35,7 @@ from hermes_cli.profiles import ProfileIdentitySettlementPending
+ from hermes_cli.web_server_config import (
+     _apply_main_model_assignment, _normalize_main_model_assignment, _validated_main_model_selection,
+ )
++from hermes_cli.kanban_session_activity import annotate_kanban_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+ from hermes_cli.web_server_profiles import (
+@@ -506,6 +507,7 @@ def get_profiles_sessions(
+     window = _pinned_window(merged, offset, limit)
+     if not full:
+         _strip_session_list_rows(window)
++    annotate_kanban_activity(window)
+     return {"sessions": window, "total": sum(totals.values()), "profile_totals": totals,
+             "limit": limit, "offset": offset, "errors": errors,
+             "storage": _corrupt_profile_stores(targets)}
+@@ -609,7 +611,7 @@ def get_profiles_sessions_sidebar(
+         rows[key].sort(key=_recency, reverse=True)
+         win = _pinned_window(rows[key], 0, cap[key])
+         _strip_session_list_rows(win)
+-        return win
++        return annotate_kanban_activity(win)
+ 
+     storage = _corrupt_profile_stores(scanned)
+     retryable = _retryable_profile_errors(errors, scanned)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 243039f55e..6af48b827a 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
+ 
+ from hermes_cli.session_listing import subagent_listing_scope
+ from hermes_cli.web_deps import late
++from hermes_cli.kanban_session_activity import annotate_kanban_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
+ from hermes_cli.web_models import (
+@@ -233,6 +234,7 @@ def get_sessions(
+                 s["pinned"] = bool(s.get("pinned"))
+             if not full:
+                 _strip_session_list_rows(sessions)
++            annotate_kanban_activity(sessions)
+             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
+             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
+             storage = {row_profile: STORAGE_CORRUPT} if storage_state(db.db_path) == STORAGE_CORRUPT else {}
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+new file mode 100644
+index 0000000000..703986890a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -0,0 +1,71 @@
++"""kanban_active stamping on session-list rows (sidebar 'still working' state)."""
++
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_session_activity as ksa
++
++
++def _make_board(path: Path, rows: list[tuple[str, str, str | None]]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)")
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
++    conn.commit()
++    conn.close()
++
++
++@pytest.fixture
++def kanban_root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    ksa._reset_cache_for_tests()
++    yield tmp_path
++    ksa._reset_cache_for_tests()
++
++
++def test_counts_only_pending_and_running_tasks_across_boards(kanban_root):
++    _make_board(kanban_root / "kanban.db", [
++        ("t1", "running", "s_parent"),
++        ("t2", "todo", "s_parent"),
++        ("t3", "done", "s_parent"),
++        ("t4", "blocked", "s_blocked"),
++        ("t5", "ready", None),
++        ("t6", "archived", "s_done"),
++    ])
++    _make_board(kanban_root / "kanban" / "boards" / "other" / "kanban.db", [
++        ("t7", "scheduled", "s_parent"),
++        ("t8", "running", "s_other"),
++    ])
++
++    assert ksa.active_task_counts() == {"s_parent": 3, "s_other": 1}
++
++
++def test_annotates_rows_by_whole_compression_lineage(kanban_root):
++    _make_board(kanban_root / "kanban.db", [
++        ("t1", "running", "s_root"),  # created before compression rotated the id
++        ("t2", "done", "s_idle"),
++    ])
++    rows = [
++        {"id": "s_tip", "_lineage_root_id": "s_root", "_lineage_ids": ["s_root", "s_tip"]},
++        {"id": "s_idle", "kanban_active": 2},  # stale stamp from a reused dict is cleared
++        {"id": "s_none"},
++    ]
++
++    ksa.annotate_kanban_activity(rows)
++
++    assert rows[0]["kanban_active"] == 1
++    assert "kanban_active" not in rows[1]
++    assert "kanban_active" not in rows[2]
++
++
++def test_missing_or_old_board_never_breaks_the_list(kanban_root):
++    old = kanban_root / "kanban.db"
++    conn = sqlite3.connect(old)
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")  # pre-session_id schema
++    conn.commit()
++    conn.close()
++    rows = [{"id": "s1"}]
++
++    assert ksa.annotate_kanban_activity(rows) == [{"id": "s1"}]
+-- 
+2.55.0
+

@@ -1,0 +1,724 @@
+From e0cd688c40b9e8ce253792d264e509c03d9dd2bf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:00:56 -0700
+Subject: [PATCH] fix(desktop): session-scoped RPCs route to the owning gateway
+ and follow it on not-found [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With several registry gateways, a stale owner record (a `local` hint minted
+while the selected gateway fabricated rows for foreign ids, or a tile route
+saved before the owner was known) outranks the MacBook-tagged row in the
+unified list. Every session-scoped RPC then went to the wrong backend:
+the mini's gui.log shows slash.exec / session.activate / process.list /
+session.control.read rejected "not in memory" (4001) every 5s.
+
+The shared router (requestForSessionProfile — the window dispatcher, the
+store pollers via requestForOwnedSession, tile actions) now takes a
+follower registered by owner-follow:
+
+- pre-dispatch: a connection-tagged unified-list row naming another
+  registered gateway, or an owner already proven by a follow, overrides the
+  stale route
+- on 4007 (stored id unknown there) look the owner up (rows, hints, by-id
+  probe); on 4001 only rows/hints (a reaped runtime on its real owner
+  answers 4001 too). Retry ONCE there; on success pin the hint, repoint the
+  tile and memo the correction so the wrong gateway is not polled again
+- a miss or failed retry is negative-cached for 60s per session/gateway,
+  lookups are deduped, so a gone session costs one request per tick
+- session.resume is excluded (its callers rebind to the owner themselves);
+  fewer than two registry connections makes the follower inert
+---
+ ...ession-rpc-dispatcher.owner-follow.test.ts | 280 ++++++++++++++++++
+ .../src/app/contrib/session-rpc-dispatcher.ts |   5 +
+ .../hooks/use-session-actions/owner-follow.ts | 224 +++++++++++++-
+ .../src/store/session-request-router.ts       |  88 +++++-
+ 4 files changed, 593 insertions(+), 4 deletions(-)
+ create mode 100644 apps/desktop/src/app/contrib/session-rpc-dispatcher.owner-follow.test.ts
+
+diff --git a/apps/desktop/src/app/contrib/session-rpc-dispatcher.owner-follow.test.ts b/apps/desktop/src/app/contrib/session-rpc-dispatcher.owner-follow.test.ts
+new file mode 100644
+index 0000000000..68b9299146
+--- /dev/null
++++ b/apps/desktop/src/app/contrib/session-rpc-dispatcher.owner-follow.test.ts
+@@ -0,0 +1,280 @@
++/**
++ * Session-scoped RPCs (process.list, slash.exec, session.control.read,
++ * session.activate, …) reach the gateway that OWNS the session, and a
++ * not-found answer from a gateway that never held it follows the owner once
++ * instead of polling the wrong backend forever.
++ *
++ * Observed live (Mac mini gui.log): with the mini (local) selected, MacBook
++ * sessions' slash.exec / session.activate / process.list /
++ * session.control.read hit the mini every 5s and were rejected "not in
++ * memory" (4001), while a stale `local` owner record (hint / tile route)
++ * outranked the MacBook-tagged row in the unified list.
++ *
++ * Every gateway is mocked per connection and per method, so an RPC that lands
++ * on the wrong socket is observable rather than vacuously green.
++ */
++import { JsonRpcGatewayError } from '@hermes/shared'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const gatewayMocks = vi.hoisted(() => ({
++  requestGatewayForAgent: vi.fn(),
++  requestGatewayForProfile: vi.fn()
++}))
++
++vi.mock('@/store/gateway', async importActual => ({
++  ...(await importActual<Record<string, unknown>>()),
++  requestGatewayForAgent: gatewayMocks.requestGatewayForAgent,
++  requestGatewayForProfile: gatewayMocks.requestGatewayForProfile,
++  retainGatewayForSessionTurn: vi.fn(async () => () => undefined)
++}))
++
++vi.mock('@/hermes', async importActual => ({
++  ...(await importActual<Record<string, unknown>>()),
++  getSession: vi.fn()
++}))
++
++const { getSession } = await import('@/hermes')
++const { createSessionRpcDispatcher } = await import('./session-rpc-dispatcher')
++const { $connectionsRegistry } = await import('@/store/connection-registry-state')
++const { $profiles } = await import('@/store/profile')
++
++const { _resetSessionOwnerHintsForTests, getSessionOwnerHint, setConnection, setSessionOwnerHint, setSessions } =
++  await import('@/store/session')
++
++const { $sessionTiles, clearAllSessionStates, requestForOwnedSession, sessionTileOwnerRoute } =
++  await import('@/store/session-states')
++
++const { _resetSessionOwnerFollowForTests } = await import('@/app/session/hooks/use-session-actions/owner-follow')
++const { makeSessionInfo } = await import('@/test/session-info')
++
++const MACBOOK = 'macbook'
++const MACBOOK_SESSION = '20261013_184022_b1a59f'
++const LOCAL_SESSION = '20261013_190000_aaaaaa'
++
++type Call = { connection: string; method: string; params: Record<string, unknown> }
++
++/** A gateway holding `stored` (and their runtime ids). Anything else answers
++ *  4007 when addressed by a stored-shaped id, 4001 by a runtime id — the
++ *  backend contract (`_sess_nowait` / `_resume_locate`). */
++function gateway(held: Record<string, string>) {
++  const runtimes = new Set(Object.values(held))
++
++  return (method: string, params: Record<string, unknown>) => {
++    const id = String(params.session_id ?? '')
++
++    if (id && !(id in held) && !runtimes.has(id)) {
++      throw /^\d{8}_\d{6}_/.test(id)
++        ? new JsonRpcGatewayError('session not found', { code: 4007 })
++        : new JsonRpcGatewayError('session not found', { code: 4001 })
++    }
++
++    return { method, ok: true }
++  }
++}
++
++function mockGateways(handlers: Record<string, (method: string, params: Record<string, unknown>) => unknown>) {
++  const calls: Call[] = []
++
++  const dispatch = async (connection: string, method: string, params: Record<string, unknown> = {}) => {
++    calls.push({ connection, method, params })
++
++    return handlers[connection](method, params)
++  }
++
++  gatewayMocks.requestGatewayForAgent.mockImplementation(async (connectionId, _profile, method, params) =>
++    dispatch(connectionId ?? 'local', method, params ?? {})
++  )
++  // The legacy profile door (a bare profile owner) is the primary's pool.
++  gatewayMocks.requestGatewayForProfile.mockImplementation(async (_profile, method, params) =>
++    dispatch('local', method, params ?? {})
++  )
++
++  const ambient = vi.fn(async (method: string, params?: Record<string, unknown>) =>
++    dispatch('local', method, params ?? {})
++  )
++
++  return {
++    ambient,
++    calls,
++    on: (connection: string) => calls.filter(call => call.connection === connection)
++  }
++}
++
++function dispatcher(ambient: ReturnType<typeof vi.fn>, bindings: [string, string][] = []) {
++  return createSessionRpcDispatcher({
++    ambientRequest: ambient as never,
++    runtimeIdByStoredSessionIdRef: { current: new Map(bindings) },
++    selectedStoredSessionIdRef: { current: null },
++    sessionStateByRuntimeIdRef: { current: new Map() }
++  })
++}
++
++const handlers = () => ({
++  local: gateway({ [LOCAL_SESSION]: 'rt-local' }),
++  [MACBOOK]: gateway({ [MACBOOK_SESSION]: 'rt-mb' })
++})
++
++beforeEach(() => {
++  _resetSessionOwnerFollowForTests()
++  _resetSessionOwnerHintsForTests({ storage: true })
++  $profiles.set([{ name: 'default' }] as never)
++  $connectionsRegistry.set({
++    connections: [
++      { id: 'local', kind: 'local', label: 'This device' },
++      { id: MACBOOK, kind: 'ssh', label: 'macbook' }
++    ],
++    primary: 'local',
++    version: 2
++  } as never)
++  // The window has the local (Mac mini) gateway selected.
++  setConnection({ connectionId: 'local', mode: 'local', registryScoped: true } as never)
++  vi.mocked(getSession).mockRejectedValue(new Error('404: Session not found'))
++})
++
++afterEach(() => {
++  _resetSessionOwnerFollowForTests()
++  $connectionsRegistry.set(null)
++  setConnection(null)
++  setSessions([])
++  $sessionTiles.set([])
++  $profiles.set([])
++  clearAllSessionStates()
++  _resetSessionOwnerHintsForTests({ storage: true })
++  vi.mocked(getSession).mockReset()
++  gatewayMocks.requestGatewayForAgent.mockReset()
++  gatewayMocks.requestGatewayForProfile.mockReset()
++})
++
++describe('(b) session-scoped RPCs go only to the owning gateway', () => {
++  it('slash.exec / process.list for a MacBook session with a stale local hint never touch local', async () => {
++    // The unified list knows the MacBook owns the id; an older build left a
++    // `local` owner hint behind (fabricated-row era), which outranks the row.
++    setSessions([makeSessionInfo({ connection_id: MACBOOK, id: MACBOOK_SESSION, profile: 'default' })])
++    setSessionOwnerHint(MACBOOK_SESSION, { connectionId: 'local', profile: 'default' })
++
++    const gateways = mockGateways(handlers())
++    const request = dispatcher(gateways.ambient, [[MACBOOK_SESSION, 'rt-mb']])
++
++    await request('slash.exec', { command: '/goal status', session_id: 'rt-mb' })
++    await request('process.list', { session_id: 'rt-mb' })
++    await request('session.control.read', { session_id: 'rt-mb' })
++
++    expect(gateways.on('local')).toHaveLength(0)
++    expect(gateways.on(MACBOOK).map(call => call.method)).toEqual([
++      'slash.exec',
++      'process.list',
++      'session.control.read'
++    ])
++  })
++
++  it('the store poller path (requestForOwnedSession) ignores a stale local tile route too', async () => {
++    setSessions([makeSessionInfo({ connection_id: MACBOOK, id: MACBOOK_SESSION, profile: 'default' })])
++    $sessionTiles.set([
++      { ownerRoute: { connectionId: 'local', profile: 'default' }, runtimeId: 'rt-mb', storedSessionId: MACBOOK_SESSION }
++    ] as never)
++
++    const gateways = mockGateways(handlers())
++
++    await requestForOwnedSession('rt-mb', gateways.ambient as never, 'process.list', { session_id: 'rt-mb' })
++
++    expect(gateways.on('local')).toHaveLength(0)
++    expect(gateways.on(MACBOOK)).toHaveLength(1)
++  })
++})
++
++describe('(c) a not-found from the wrong gateway follows the owner once', () => {
++  it('4007: resolves the owner by probe, retries there once, never repeats on the wrong gateway', async () => {
++    // No tagged row (the MacBook's pooled backend is still dialing) and a stale
++    // local hint: only a by-id probe can find the owner.
++    setSessionOwnerHint(MACBOOK_SESSION, { connectionId: 'local', profile: 'default' })
++    vi.mocked(getSession).mockImplementation(async (id, scope) => {
++      if (id === MACBOOK_SESSION && typeof scope === 'object' && scope?.connectionId === MACBOOK) {
++        return makeSessionInfo({ id: MACBOOK_SESSION, profile: 'default' })
++      }
++
++      throw new Error('404: Session not found')
++    })
++
++    const gateways = mockGateways(handlers())
++    const request = dispatcher(gateways.ambient)
++
++    await expect(request('session.activate', { session_id: MACBOOK_SESSION })).resolves.toMatchObject({ ok: true })
++    await request('session.control.read', { session_id: MACBOOK_SESSION })
++    await request('slash.exec', { command: '/goal status', session_id: MACBOOK_SESSION })
++
++    expect(gateways.on('local')).toHaveLength(1)
++    expect(gateways.on(MACBOOK).map(call => call.method)).toEqual([
++      'session.activate',
++      'session.control.read',
++      'slash.exec'
++    ])
++    expect(getSessionOwnerHint(MACBOOK_SESSION)).toMatchObject({ connectionId: MACBOOK })
++  })
++
++  it('4001 on a stale tile route: follows the remembered owner, repoints the tile, stops polling local', async () => {
++    // The tile was saved with `local`; the MacBook hint is the only other
++    // record. A runtime-id RPC answers 4001 ("not in memory") on local.
++    $sessionTiles.set([
++      { ownerRoute: { connectionId: 'local', profile: 'default' }, runtimeId: 'rt-mb', storedSessionId: MACBOOK_SESSION }
++    ] as never)
++    setSessionOwnerHint(MACBOOK_SESSION, { connectionId: MACBOOK, profile: 'default' })
++
++    const gateways = mockGateways(handlers())
++    const request = dispatcher(gateways.ambient)
++
++    for (let tick = 0; tick < 3; tick += 1) {
++      await request('process.list', { session_id: 'rt-mb' })
++    }
++
++    expect(gateways.on('local')).toHaveLength(1)
++    expect(gateways.on(MACBOOK)).toHaveLength(3)
++    expect(sessionTileOwnerRoute(MACBOOK_SESSION)).toMatchObject({ connectionId: MACBOOK })
++  })
++
++  it('no owner anywhere: one failed request per call, the probe runs once, no retry storm', async () => {
++    setSessionOwnerHint(MACBOOK_SESSION, { connectionId: 'local', profile: 'default' })
++
++    const gateways = mockGateways({ local: gateway({}), [MACBOOK]: gateway({}) })
++    const request = dispatcher(gateways.ambient)
++
++    for (let tick = 0; tick < 3; tick += 1) {
++      await expect(request('session.control.read', { session_id: MACBOOK_SESSION })).rejects.toMatchObject({
++        code: 4007
++      })
++    }
++
++    expect(gateways.on('local')).toHaveLength(3)
++    expect(gateways.on(MACBOOK)).toHaveLength(0)
++    expect(vi.mocked(getSession)).toHaveBeenCalledTimes(1)
++  })
++})
++
++describe('(e) control: local sessions stay local', () => {
++  it('a local session routes only to local and never probes another gateway', async () => {
++    setSessions([makeSessionInfo({ id: LOCAL_SESSION, profile: 'default' })])
++    setSessionOwnerHint(LOCAL_SESSION, { connectionId: 'local', profile: 'default' })
++
++    const gateways = mockGateways(handlers())
++    const request = dispatcher(gateways.ambient, [[LOCAL_SESSION, 'rt-local']])
++
++    await request('process.list', { session_id: 'rt-local' })
++    await request('slash.exec', { command: '/goal status', session_id: 'rt-local' })
++
++    expect(gateways.on(MACBOOK)).toHaveLength(0)
++    expect(gateways.on('local')).toHaveLength(2)
++    expect(vi.mocked(getSession)).not.toHaveBeenCalled()
++  })
++
++  it('a genuinely reaped local runtime (4001) surfaces as before, with no request to another gateway', async () => {
++    setSessions([makeSessionInfo({ id: LOCAL_SESSION, profile: 'default' })])
++    setSessionOwnerHint(LOCAL_SESSION, { connectionId: 'local', profile: 'default' })
++
++    const gateways = mockGateways(handlers())
++    const request = dispatcher(gateways.ambient, [[LOCAL_SESSION, 'rt-dead']])
++
++    await expect(request('process.list', { session_id: 'rt-dead' })).rejects.toMatchObject({ code: 4001 })
++
++    expect(gateways.on(MACBOOK)).toHaveLength(0)
++    expect(vi.mocked(getSession)).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/app/contrib/session-rpc-dispatcher.ts b/apps/desktop/src/app/contrib/session-rpc-dispatcher.ts
+index ec94658adb..35c906a633 100644
+--- a/apps/desktop/src/app/contrib/session-rpc-dispatcher.ts
++++ b/apps/desktop/src/app/contrib/session-rpc-dispatcher.ts
+@@ -33,6 +33,7 @@
+  */
+ import type { MutableRefObject } from 'react'
+ 
++import { noteRpcStoredSessionId } from '@/app/session/hooks/use-session-actions/owner-follow'
+ import { resolveSessionOwner } from '@/app/session/hooks/use-session-actions/utils'
+ import type { ClientSessionState } from '@/app/types'
+ import { isSessionGoneForBackgroundPolling } from '@/store/runtime-gone'
+@@ -107,6 +108,10 @@ export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): Ambi
+     // backend "session not found" on a backend that never held the runtime.
+     assertSessionOwnerResolved(owner, { method, sessionId: paramSessionId ? routingSessionId : null })
+ 
++    // A misroute is followed by the stored id (the owner records key on it);
++    // the shared router only sees the runtime id in params.
++    noteRpcStoredSessionId(paramSessionId, routingSessionId)
++
+     try {
+       return await requestForSessionProfile<T>(owner, ambientRequest, method, params ?? {}, timeoutMs, signal)
+     } catch (error) {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
+index 218b6e9e12..06347b4389 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
+@@ -12,10 +12,13 @@ import {
+ } from '@/store/session'
+ import {
+   isSessionOwnerRoute,
++  type SessionOwnerFollower,
+   type SessionOwnerRoute,
+   sessionOwnerRouteFromRow,
+-  type SessionOwnerScope
++  type SessionOwnerScope,
++  setSessionOwnerFollower
+ } from '@/store/session-request-router'
++import { $sessionTiles, patchSessionTile, storedSessionIdForRuntimeId } from '@/store/session-states'
+ 
+ import { cachedSessionRowCandidates } from './utils'
+ 
+@@ -33,6 +36,9 @@ import { cachedSessionRowCandidates } from './utils'
+ /** JSON-RPC 4007 — the gateway has no stored session by that id. */
+ export const SESSION_NOT_FOUND_CODE = 4007
+ 
++/** JSON-RPC 4001 — the gateway holds no live runtime by that id ("not in memory"). */
++export const SESSION_NOT_IN_MEMORY_CODE = 4001
++
+ /** True for a gateway's "no such stored session" answer to `session.resume`.
+  *  A bare 4001 (live runtime reaped) is a different signal and does not
+  *  qualify: the stored session exists there, only its runtime is gone. */
+@@ -76,7 +82,8 @@ function registryConnectionIds(): string[] {
+  */
+ export async function findForeignSessionOwner(
+   storedSessionId: string,
+-  excluded: readonly string[]
++  excluded: readonly string[],
++  { probe = true }: { probe?: boolean } = {}
+ ): Promise<SessionOwnerRoute | undefined> {
+   const id = storedSessionId.trim()
+   const skip = new Set(excluded.map(connection => connection.trim()).filter(Boolean))
+@@ -106,7 +113,7 @@ export async function findForeignSessionOwner(
+ 
+   const candidates = registryConnectionIds().filter(connectionId => !skip.has(connectionId))
+ 
+-  if (candidates.length === 0 || registryConnectionIds().length < 2) {
++  if (!probe || candidates.length === 0 || registryConnectionIds().length < 2) {
+     return undefined
+   }
+ 
+@@ -130,3 +137,214 @@ export function pinSessionOwner(storedSessionId: string, route: SessionOwnerRout
+   forgetSessionOwnerHintsForSession(storedSessionId)
+   setSessionOwnerHint(storedSessionId, route)
+ }
++
++/** Pin `route` as the session's owner on its open tile too: a tile's saved
++ *  route outranks the hint in every owner ladder, so a stale one would keep
++ *  sending the session's RPCs (and the next tile resume) to the wrong gateway. */
++export function repointSessionTileOwner(storedSessionId: string, route: SessionOwnerRoute): void {
++  const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
++
++  if (tile?.ownerRoute && tile.ownerRoute.connectionId.trim() !== route.connectionId.trim()) {
++    patchSessionTile(storedSessionId, { ownerRoute: route })
++  }
++}
++
++// ── Session-scoped RPC follower ─────────────────────────────────────────────
++// Registered with the shared session-RPC router (requestForSessionProfile), so
++// every session-scoped caller — the window dispatcher, the store pollers
++// (process.list, session.control.read, approval.*), tile actions — routes by
++// the owner and recovers from a misroute the same way. Inert with fewer than
++// two registry connections, so single-gateway installs behave as before.
++
++/** How long a session/gateway pair with no other owner is left alone after a
++ *  lookup missed (or the retry failed), so a 5s poller against a session that
++ *  really is gone costs one request per tick and no probes. */
++const NO_FOREIGN_OWNER_TTL_MS = 60_000
++const FOLLOW_MEMO_LIMIT = 256
++
++/** Proven corrections: session id (param or stored) → the gateway that
++ *  answered not-found and the owner that answered instead. */
++const followedOwners = new Map<string, { from: string; to: SessionOwnerRoute }>()
++const noForeignOwnerUntil = new Map<string, number>()
++const ownerLookups = new Map<string, Promise<SessionOwnerRoute | undefined>>()
++
++const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now())
++
++function rememberBounded<V>(map: Map<string, V>, key: string, value: V): void {
++  map.delete(key)
++  map.set(key, value)
++
++  if (map.size > FOLLOW_MEMO_LIMIT) {
++    const oldest = map.keys().next().value
++
++    if (oldest !== undefined) {
++      map.delete(oldest)
++    }
++  }
++}
++
++function multiGateway(): boolean {
++  return registryConnectionIds().length >= 2
++}
++
++/** The connection an RPC with `owner` really goes to: an exact route names it;
++ *  a bare profile takes the primary's profile door; no owner rides ambient. */
++export function routedConnectionId(owner: SessionOwnerScope): string {
++  if (isSessionOwnerRoute(owner)) {
++    return owner.connectionId.trim()
++  }
++
++  if (owner && String(owner).trim()) {
++    return $connectionsRegistry.get()?.primary?.trim() || 'local'
++  }
++
++  return dispatchedConnectionId(owner)
++}
++
++/** Runtime → stored ids a caller already translated through ladders the
++ *  store cannot see (the window dispatcher's wiring-cache bindings). */
++const translatedRuntimeIds = new Map<string, string>()
++
++/** Record the stored id a session-scoped RPC's runtime id belongs to, so a
++ *  misroute can be followed by the durable id the owner records key on. */
++export function noteRpcStoredSessionId(runtimeId: null | string | undefined, storedSessionId: null | string): void {
++  const runtime = runtimeId?.trim()
++  const stored = storedSessionId?.trim()
++
++  if (runtime && stored && runtime !== stored) {
++    rememberBounded(translatedRuntimeIds, runtime, stored)
++  }
++}
++
++function rpcSessionIds(params: Record<string, unknown>): { paramId: string; storedId: string } {
++  const paramId = typeof params.session_id === 'string' ? params.session_id.trim() : ''
++
++  const storedId =
++    (paramId && (storedSessionIdForRuntimeId(paramId) ?? translatedRuntimeIds.get(paramId))) || paramId
++
++  return { paramId, storedId }
++}
++
++/** The owner a connection-tagged row in the unified list names, when it is a
++ *  registered connection other than `from`. */
++function taggedForeignOwner(storedSessionId: string, from: string): SessionOwnerRoute | undefined {
++  const registered = new Set(registryConnectionIds())
++
++  const rows = [
++    ...cachedSessionRowCandidates(storedSessionId),
++    ...ownerLookupSessionRows().filter(row => sessionMatchesStoredId(row, storedSessionId))
++  ]
++
++  for (const row of rows) {
++    const route = sessionOwnerRouteFromRow(row)
++
++    if (route) {
++      return route.connectionId !== from && registered.has(route.connectionId) ? route : undefined
++    }
++  }
++
++  return undefined
++}
++
++function notFoundCode(error: unknown): number | undefined {
++  const code = error && typeof error === 'object' ? (error as Partial<JsonRpcGatewayError>).code : undefined
++
++  if (code === SESSION_NOT_FOUND_CODE || code === SESSION_NOT_IN_MEMORY_CODE) {
++    return code
++  }
++
++  return undefined
++}
++
++export const sessionRpcOwnerFollower: SessionOwnerFollower = {
++  redirect(owner, _method, params) {
++    if (!multiGateway()) {
++      return undefined
++    }
++
++    const { paramId, storedId } = rpcSessionIds(params)
++    const from = routedConnectionId(owner)
++    const followed = followedOwners.get(paramId) ?? followedOwners.get(storedId)
++
++    if (followed && followed.from === from) {
++      return followed.to
++    }
++
++    // The unified list's connection tag is the owning gateway's own claim; a
++    // hint or tile route naming another gateway is a leftover (older builds
++    // minted `local` for ids the selected gateway fabricated rows for).
++    return storedId ? taggedForeignOwner(storedId, from) : undefined
++  },
++
++  async follow(owner, _method, params, error) {
++    const code = notFoundCode(error)
++
++    if (code === undefined || !multiGateway()) {
++      return undefined
++    }
++
++    const { storedId } = rpcSessionIds(params)
++    const from = routedConnectionId(owner)
++    const key = `${storedId}|${from}`
++
++    if (!storedId || (noForeignOwnerUntil.get(key) ?? 0) > now()) {
++      return undefined
++    }
++
++    let lookup = ownerLookups.get(key)
++
++    if (!lookup) {
++      // 4007 (no stored session there) earns the by-id probe of the other
++      // gateways; 4001 (runtime not in memory) is also what a reaped runtime on
++      // its real owner answers, so only the cheap local records (unified list,
++      // hints) may name another owner — never a probe per poll tick.
++      lookup = findForeignSessionOwner(storedId, [from], { probe: code === SESSION_NOT_FOUND_CODE }).finally(() =>
++        ownerLookups.delete(key)
++      )
++      ownerLookups.set(key, lookup)
++    }
++
++    const route = await lookup
++
++    if (!route) {
++      rememberBounded(noForeignOwnerUntil, key, now() + NO_FOREIGN_OWNER_TTL_MS)
++    }
++
++    return route
++  },
++
++  confirm(owner, route, _method, params) {
++    const { paramId, storedId } = rpcSessionIds(params)
++    const from = routedConnectionId(owner)
++
++    for (const id of new Set([paramId, storedId])) {
++      if (id) {
++        rememberBounded(followedOwners, id, { from, to: route })
++      }
++    }
++
++    if (storedId) {
++      noForeignOwnerUntil.delete(`${storedId}|${from}`)
++      pinSessionOwner(storedId, route)
++      repointSessionTileOwner(storedId, route)
++    }
++  },
++
++  reject(owner, _route, _method, params) {
++    const { storedId } = rpcSessionIds(params)
++
++    if (storedId) {
++      rememberBounded(noForeignOwnerUntil, `${storedId}|${routedConnectionId(owner)}`, now() + NO_FOREIGN_OWNER_TTL_MS)
++    }
++  }
++}
++
++setSessionOwnerFollower(sessionRpcOwnerFollower)
++
++/** Test seam: drop every follow memo. */
++export function _resetSessionOwnerFollowForTests(): void {
++  followedOwners.clear()
++  noForeignOwnerUntil.clear()
++  translatedRuntimeIds.clear()
++  ownerLookups.clear()
++}
+diff --git a/apps/desktop/src/store/session-request-router.ts b/apps/desktop/src/store/session-request-router.ts
+index f41c4b8633..0711f224e6 100644
+--- a/apps/desktop/src/store/session-request-router.ts
++++ b/apps/desktop/src/store/session-request-router.ts
+@@ -179,11 +179,52 @@ export function sessionRpcNeedsProfileRoute(ownerProfile: SessionOwnerScope | un
+   return ownerProfile != null && Boolean(String(ownerProfile).trim())
+ }
+ 
++// ── Following a session to its owning gateway [daveey] ──────────────────────
++// With several registry gateways in one window, an owner record can name the
++// wrong gateway (a stale hint or tile route from before the session's owner was
++// known). That gateway answers the RPC "session not found" — 4007 for a stored
++// id, 4001 ("not in memory") for a runtime id — and background pollers then hit
++// it every few seconds. The follower (registered by the session layer, which
++// owns the unified list, the hints and the registry probe) corrects the route
++// before dispatch when the unified list proves another owner, and after such a
++// not-found answer resolves the owner and retries ONCE there. session.resume is
++// never followed here: its callers rebind the runtime to the owner themselves.
++
++type SessionRpcParams = Record<string, unknown>
++
++export interface SessionOwnerFollower {
++  /** Sync, pre-dispatch: a proven better owner than `owner`, else undefined. */
++  redirect: (owner: SessionOwnerScope, method: string, params: SessionRpcParams) => SessionOwnerRoute | undefined
++  /** After `owner` failed with `error`: the one owner to retry on, else undefined. */
++  follow: (
++    owner: SessionOwnerScope,
++    method: string,
++    params: SessionRpcParams,
++    error: unknown
++  ) => Promise<SessionOwnerRoute | undefined>
++  /** The retry on `route` answered: record it so the wrong owner is not tried again. */
++  confirm: (owner: SessionOwnerScope, route: SessionOwnerRoute, method: string, params: SessionRpcParams) => void
++  /** The retry on `route` failed too: stop following for this session/owner pair. */
++  reject: (owner: SessionOwnerScope, route: SessionOwnerRoute, method: string, params: SessionRpcParams) => void
++}
++
++let sessionOwnerFollower: SessionOwnerFollower | null = null
++
++export function setSessionOwnerFollower(next: SessionOwnerFollower | null): void {
++  sessionOwnerFollower = next
++}
++
++function followableSessionRpc(method: string, params: SessionRpcParams): boolean {
++  return method !== 'session.resume' && typeof params.session_id === 'string' && Boolean(params.session_id.trim())
++}
++
+ /**
+  * Dispatch a session-scoped RPC on the socket that owns `ownerProfile`,
+  * falling back to the ambient dispatcher when the active gateway already
+  * serves that profile (keeps the primary's reauth-aware reconnect path).
+- * The route is decided at CALL time, not at swap time.
++ * The route is decided at CALL time, not at swap time. With a follower
++ * registered (multi-gateway), the route is corrected / followed once — see
++ * SessionOwnerFollower.
+  */
+ export function requestForSessionProfile<T>(
+   ownerProfile: SessionOwnerScope | undefined,
+@@ -197,6 +238,51 @@ export function requestForSessionProfile<T>(
+   params: Record<string, unknown> = {},
+   timeoutMs?: number,
+   signal?: AbortSignal
++): Promise<T> {
++  const follower = sessionOwnerFollower
++
++  if (!follower || !followableSessionRpc(method, params)) {
++    return dispatchForSessionOwner<T>(ownerProfile, ambientRequest, method, params, timeoutMs, signal)
++  }
++
++  const owner: SessionOwnerScope = follower.redirect(ownerProfile, method, params) ?? ownerProfile
++
++  return dispatchForSessionOwner<T>(owner, ambientRequest, method, params, timeoutMs, signal).catch(
++    async (error: unknown) => {
++      const route = signal?.aborted ? undefined : await follower.follow(owner, method, params, error)
++
++      if (!route) {
++        throw error
++      }
++
++      try {
++        const result = await dispatchForSessionOwner<T>(route, ambientRequest, method, params, timeoutMs, signal)
++        follower.confirm(owner, route, method, params)
++
++        return result
++      } catch {
++        follower.reject(owner, route, method, params)
++
++        // The caller's error handling (gone-latch, not-found recovery) keys on
++        // the answer from the route it chose.
++        throw error
++      }
++    }
++  )
++}
++
++function dispatchForSessionOwner<T>(
++  ownerProfile: SessionOwnerScope | undefined,
++  ambientRequest: <R>(
++    method: string,
++    params?: Record<string, unknown>,
++    timeoutMs?: number,
++    signal?: AbortSignal
++  ) => Promise<R>,
++  method: string,
++  params: Record<string, unknown> = {},
++  timeoutMs?: number,
++  signal?: AbortSignal
+ ): Promise<T> {
+   if (isRoute(ownerProfile)) {
+     const connectionId = ownerProfile.connectionId.trim()
+-- 
+2.55.0
+

@@ -1,0 +1,315 @@
+From a7f0d415b910f028d54018c7cc992e1deda3c098 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:01:05 -0700
+Subject: [PATCH] fix(desktop): a session tile resumes on its owning gateway
+ when its saved owner 4007s [daveey]
+
+resumeTile trusted the tile's saved owner route first and, when that
+gateway answered 4007 (it never minted the id), fell through to the
+read-only transcript fallback using the wrong gateway's empty prefetch.
+Follow the owner like resumeSession does: on 4007 look it up (unified
+list, hints, by-id probe of the other registry gateways), retry the resume
+there once, pin the hint, repoint the tile route and re-read the
+transcript from the owner.
+---
+ ...session-tile-delegate.owner-follow.test.ts | 188 ++++++++++++++++++
+ .../hooks/use-session-tile-delegate.ts        |  61 +++++-
+ 2 files changed, 239 insertions(+), 10 deletions(-)
+ create mode 100644 apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.owner-follow.test.ts
+
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.owner-follow.test.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.owner-follow.test.ts
+new file mode 100644
+index 0000000000..e3c8c42749
+--- /dev/null
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.owner-follow.test.ts
+@@ -0,0 +1,188 @@
++/**
++ * A tile whose SAVED owner is the wrong gateway (it answers 4007 for the id)
++ * follows the session to its owner — the unified list shows it on the
++ * MacBook — instead of opening an empty or read-only tile.
++ */
++import { JsonRpcGatewayError } from '@hermes/shared'
++import { renderHook } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type * as HermesModule from '@/hermes'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import {
++  _resetSessionOwnerHintsForTests,
++  getSessionOwnerHint,
++  setConnection,
++  setSessionOwnerHint,
++  setSessions
++} from '@/store/session'
++import { $sessionTiles, sessionTileDelegate, sessionTileOwnerRoute } from '@/store/session-states'
++import { makeSessionInfo } from '@/test/session-info'
++
++import { _resetSessionOwnerFollowForTests } from '../../session/hooks/use-session-actions/owner-follow'
++
++import { useSessionTileDelegate } from './use-session-tile-delegate'
++
++vi.mock('@/hermes', async importActual => ({
++  ...(await importActual<typeof HermesModule>()),
++  fetchStoredTranscriptAcrossBackends: vi.fn(async () => null),
++  getLatestSessionMessages: vi.fn(),
++  getSession: vi.fn()
++}))
++vi.mock('@/store/gateway', async importActual => ({
++  ...(await importActual<Record<string, unknown>>()),
++  requestGatewayForAgent: vi.fn(),
++  requestGatewayForProfile: vi.fn()
++}))
++
++const { getLatestSessionMessages, getSession } = await import('@/hermes')
++const { requestGatewayForAgent, requestGatewayForProfile } = await import('@/store/gateway')
++
++const MACBOOK = 'macbook'
++const MACBOOK_SESSION = '20261013_184022_b1a59f'
++
++const TRANSCRIPT = [
++  { content: 'hello from the macbook', role: 'user', timestamp: 1 },
++  { content: 'hi', role: 'assistant', timestamp: 2 }
++]
++
++function mockGateways() {
++  const calls: { connection: string; method: string }[] = []
++
++  const dispatch = async (connection: string, method: string, params: Record<string, unknown>) => {
++    calls.push({ connection, method })
++
++    if (method === 'session.resume') {
++      if (connection !== MACBOOK || params.session_id !== MACBOOK_SESSION) {
++        throw new JsonRpcGatewayError('session not found', { code: 4007 })
++      }
++
++      return { info: {}, messages: [], messages_omitted: true, session_id: 'rt-mb', session_key: MACBOOK_SESSION }
++    }
++
++    return {}
++  }
++
++  vi.mocked(requestGatewayForAgent).mockImplementation(async (connectionId, _profile, method, params) =>
++    dispatch(connectionId ?? 'local', method, params ?? {})
++  )
++  vi.mocked(requestGatewayForProfile).mockImplementation(async (_profile, method, params) =>
++    dispatch('local', method, params ?? {})
++  )
++
++  const ambient = vi.fn(async (method: string, params?: Record<string, unknown>) =>
++    dispatch('local', method, params ?? {})
++  )
++
++  return { ambient, resumesOn: (c: string) => calls.filter(x => x.connection === c && x.method === 'session.resume') }
++}
++
++describe('tile resume follows the owning gateway on 4007', () => {
++  beforeEach(() => {
++    _resetSessionOwnerFollowForTests()
++    _resetSessionOwnerHintsForTests({ storage: true })
++    $connectionsRegistry.set({
++      connections: [
++        { id: 'local', kind: 'local', label: 'This device' },
++        { id: MACBOOK, kind: 'ssh', label: 'macbook' }
++      ],
++      primary: 'local',
++      version: 2
++    } as never)
++    setConnection({ connectionId: 'local', mode: 'local', registryScoped: true } as never)
++    vi.mocked(getSession).mockRejectedValue(new Error('404: Session not found'))
++    // Only the owner serves the transcript.
++    vi.mocked(getLatestSessionMessages).mockImplementation(async (_id, scope) =>
++      typeof scope === 'object' && scope?.connectionId === MACBOOK
++        ? ({ messages: TRANSCRIPT, session_id: MACBOOK_SESSION } as never)
++        : Promise.reject(new Error('404: Session not found'))
++    )
++  })
++
++  afterEach(() => {
++    _resetSessionOwnerFollowForTests()
++    $connectionsRegistry.set(null)
++    setConnection(null)
++    setSessions([])
++    $sessionTiles.set([])
++    _resetSessionOwnerHintsForTests({ storage: true })
++    vi.mocked(requestGatewayForAgent).mockReset()
++    vi.mocked(requestGatewayForProfile).mockReset()
++    vi.mocked(getLatestSessionMessages).mockReset()
++    vi.mocked(getSession).mockReset()
++  })
++
++  it('(a) saved owner 4007s while the unified list shows the id on the MacBook: retried there, not empty', async () => {
++    $sessionTiles.set([
++      { ownerRoute: { connectionId: 'local', profile: 'default' }, storedSessionId: MACBOOK_SESSION }
++    ] as never)
++    setSessions([makeSessionInfo({ connection_id: MACBOOK, id: MACBOOK_SESSION, profile: 'default' })])
++
++    const gateways = mockGateways()
++    const states = new Map<string, ReturnType<typeof createClientSessionState>>()
++
++    const updateSessionState = vi.fn(
++      (id: string, updater: (s: ReturnType<typeof createClientSessionState>) => unknown, stored?: string) => {
++        const next = updater(states.get(id) ?? createClientSessionState(stored ?? null)) as ReturnType<
++          typeof createClientSessionState
++        >
++
++        states.set(id, next)
++
++        return next
++      }
++    )
++
++    renderHook(() =>
++      useSessionTileDelegate({
++        archiveSession: vi.fn(async () => undefined),
++        branchLoadedSession: vi.fn(async () => false) as never,
++        branchStoredSession: vi.fn(async () => undefined),
++        executeSlashCommand: vi.fn(async () => undefined) as never,
++        removeSession: vi.fn(async () => undefined),
++        requestGateway: gateways.ambient as never,
++        runtimeIdByStoredSessionIdRef: { current: new Map() } as never,
++        sessionStateByRuntimeIdRef: { current: new Map() } as never,
++        updateSessionState: updateSessionState as never
++      })
++    )
++
++    const runtimeId = await sessionTileDelegate()!.resumeTile(MACBOOK_SESSION)
++
++    expect(runtimeId).toBe('rt-mb')
++    expect(gateways.resumesOn('local')).toHaveLength(1)
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(1)
++    expect(states.get('rt-mb')?.messages.length).toBeGreaterThan(0)
++    // The tile and the hint now name the owner, so the next resume goes there first.
++    expect(sessionTileOwnerRoute(MACBOOK_SESSION)).toMatchObject({ connectionId: MACBOOK })
++    expect(getSessionOwnerHint(MACBOOK_SESSION)).toMatchObject({ connectionId: MACBOOK })
++  })
++
++  it('control: a tile whose saved owner holds the session resumes there once', async () => {
++    $sessionTiles.set([
++      { ownerRoute: { connectionId: MACBOOK, profile: 'default' }, storedSessionId: MACBOOK_SESSION }
++    ] as never)
++    setSessionOwnerHint(MACBOOK_SESSION, { connectionId: MACBOOK, profile: 'default' })
++
++    const gateways = mockGateways()
++
++    renderHook(() =>
++      useSessionTileDelegate({
++        archiveSession: vi.fn(async () => undefined),
++        branchLoadedSession: vi.fn(async () => false) as never,
++        branchStoredSession: vi.fn(async () => undefined),
++        executeSlashCommand: vi.fn(async () => undefined) as never,
++        removeSession: vi.fn(async () => undefined),
++        requestGateway: gateways.ambient as never,
++        runtimeIdByStoredSessionIdRef: { current: new Map() } as never,
++        sessionStateByRuntimeIdRef: { current: new Map() } as never,
++        updateSessionState: vi.fn() as never
++      })
++    )
++
++    await expect(sessionTileDelegate()!.resumeTile(MACBOOK_SESSION)).resolves.toBe('rt-mb')
++    expect(gateways.resumesOn('local')).toHaveLength(0)
++    expect(gateways.resumesOn(MACBOOK)).toHaveLength(1)
++  })
++})
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+index 16bde26d84..dd19021aba 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+@@ -26,6 +26,7 @@ import {
+ import { knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
+ import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
+ import {
++  isSessionOwnerRoute,
+   profileScopeForSessionOwner,
+   requestForSessionProfile,
+   type SessionOwnerScope
+@@ -43,6 +44,13 @@ import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
+ import { singleFlightSessionResume } from '../../session/hooks/use-prompt-actions/single-flight-resume'
+ import { markSessionRecentlyInterrupted, withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
+ import type { useSessionActions } from '../../session/hooks/use-session-actions'
++import {
++  findForeignSessionOwner,
++  isStoredSessionNotFound,
++  pinSessionOwner,
++  repointSessionTileOwner,
++  routedConnectionId
++} from '../../session/hooks/use-session-actions/owner-follow'
+ import {
+   chatMessageArraysEquivalent,
+   preserveLocalPendingTurnMessages,
+@@ -367,14 +375,16 @@ export function useSessionTileDelegate({
+         // reading messages) without a profile lets the gateway fall back to the
+         // launch-profile DB and fork the conversation into the wrong profile —
+         // the same cross-profile bleed the recovery resumes had (#67603).
+-        const owner = await ownerForStoredSession(storedSessionId)
++        let owner = await ownerForStoredSession(storedSessionId)
++
++        const restScopeFor = (scope: SessionOwnerScope) =>
++          isSessionOwnerRoute(scope)
++            ? { connectionId: scope.connectionId, profile: scope.targetProfile || scope.profile }
++            : scope
+ 
+-        const restScope =
+-          owner && typeof owner === 'object'
+-            ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
+-            : owner
++        const restScope = restScopeFor(owner)
+ 
+-        const prefetchPromise = getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
++        let prefetchPromise = getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
+ 
+         if (existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
+           const prefetch = await prefetchPromise
+@@ -416,14 +426,45 @@ export function useSessionTileDelegate({
+           () => {
+             assertSessionOwnerResolved(owner, { method: 'session.resume', sessionId: storedSessionId })
+ 
+-            return singleFlightSessionResume(storedSessionId, () =>
+-              requestForSessionProfile<SessionResumeResult>(owner, requestGateway, 'session.resume', {
++            const resumeOn = (scope: SessionOwnerScope) =>
++              requestForSessionProfile<SessionResumeResult>(scope, requestGateway, 'session.resume', {
+                 session_id: storedSessionId,
+                 cols: 96,
+                 omit_messages: true,
+-                ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
++                ...(scope ? { profile: typeof scope === 'string' ? scope : scope.profile } : {})
+               })
+-            )
++
++            return singleFlightSessionResume(storedSessionId, async () => {
++              try {
++                return await resumeOn(owner)
++              } catch (error) {
++                // 4007: the tile's saved owner never minted this id — the route
++                // is wrong, not the session gone. Follow it to the gateway that
++                // owns it (unified list, hints, by-id probe), once, and repoint
++                // the tile so the next resume and its RPCs go there first.
++                if (!isStoredSessionNotFound(error)) {
++                  throw error
++                }
++
++                const foreignOwner = await findForeignSessionOwner(storedSessionId, [routedConnectionId(owner)])
++
++                if (!foreignOwner) {
++                  throw error
++                }
++
++                const resumed = await resumeOn(foreignOwner)
++
++                owner = foreignOwner
++                pinSessionOwner(storedSessionId, foreignOwner)
++                repointSessionTileOwner(storedSessionId, foreignOwner)
++                // The first prefetch read the wrong gateway's store.
++                prefetchPromise = getLatestSessionMessages(storedSessionId, restScopeFor(foreignOwner)).catch(
++                  () => null
++                )
++
++                return resumed
++              }
++            })
+           },
+           async () => {
+             const stored = (await prefetchPromise) ?? (await fetchStoredTranscriptAcrossBackends(storedSessionId))
+-- 
+2.55.0
+

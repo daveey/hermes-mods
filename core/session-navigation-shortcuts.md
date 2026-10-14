@@ -7,7 +7,8 @@ Desktop keybind registry, so you can rebind them in **Settings → Keybinds**. T
 | Patch | Shortcut | Action id | Does |
 |---|---|---|---|
 | [0019](patches/0019-feat-desktop-A-archives-the-selected-else-open-sessi.patch) | ⌘⇧A | `session.archive` | Archive the selected session, or the open chat if no row is selected |
-| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red). With none, nothing happens |
+| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red), skipping ⌘B-blocked (grey) ones. With none, nothing happens |
+| [0048](patches/0048-feat-desktop-B-marks-a-session-blocked-grey-stripe-s.patch) | ⌘B | `session.toggleBlocked` | Mark the selected (else open) session blocked: grey stripe, skipped by ⌘]/⌘[. Again to unblock. Sidebar toggle moves to ⌥⌘B |
 | [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌘R | `session.resume` | Send `resume` to the active chat as if you typed it |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⇧⌘R | *(Electron `forceReload`)* | Reload the window (always) |
@@ -51,6 +52,20 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
   It never returns the current session, so it's a no-op when nothing else qualifies.
 - **Moved binding:** upstream binds ⌘⇧]/⌘⇧[ to `profile.next`/`profile.prev`. The fork unbinds those, so
   rebind them if you step profiles from the keyboard.
+
+### ⌘B: mark blocked (0048)
+
+- `session.toggleBlocked` (`mod+b`) flips a per-session flag on the selected row, else the open chat
+  (`store/session-blocked.ts`). The flag is a manual park: “waiting on something outside this chat”. Only ⌘B
+  clears it; a finishing turn doesn't.
+- Stored as a string array in localStorage (`hermes.desktop.blockedSessionIds`), so it is per window profile,
+  not synced across devices. Membership is checked across the compression lineage (`lineageAliases`), and
+  unblocking removes every alias.
+- The row's stripe becomes `blocked` (grey, `bg-zinc-400` / dark `bg-zinc-500`), overriding green/red/none:
+  `sessionStatusStripe(state, hasTurns, userBlocked)`.
+- `sessionHasStatusStripe` returns false for blocked sessions, so ⌘]/⌘[ (and ⌘⇧A's archive → next) skip
+  them. ⌘⇧]/⌘⇧[ still step onto them.
+- **Moved binding:** upstream's sidebar toggle `view.toggleSidebar` moves from ⌘B to ⌥⌘B (`mod+alt+b`).
 
 ### ⌘R: resume; ⇧⌘R: reload (0022)
 
