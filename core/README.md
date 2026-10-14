@@ -15,7 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
-| [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 0049 0050 | ⌘]/⌘[ next/prev session with a green/red status stripe, ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌥⌘R resume (⌘R until 0064), ⇧⌘R reload |
+| [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 0049 0050 | ⌘]/⌘[ next/prev session with a green/red status stripe, ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume (⌥⌘R in 0064–0070), ⌥⇧⌘R window reload |
 | [ai-session-rename.md](ai-session-rename.md) | 0020 0032 0042 | ⌘⇧E rename (was ⌘⇧N until 0042), pre-filled with an AI short name (`session.title.suggest` RPC) |
 | [project-palette.md](project-palette.md) | 0004 0018 0030 | ⌘⇧P moves a session to a project by typeahead; a new name offers "Create project" with an empty `~/code/<slug>` |
 | [multi-gateway-projects.md](multi-gateway-projects.md) | 0023 0024 0025 0028 0029 0031 0054 | Sidebar shows every connected gateway's projects (colored, with show/hide toggles); move a session into any gateway's project; archive on the owning gateway; `@session` ref clicks open on the owning gateway |
@@ -28,7 +28,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [macos-signed-python.md](macos-signed-python.md) | 0017 0027 | macOS: run Hermes from a Developer-ID-signed Python.app, so Full Disk Access, Accessibility and other permission grants survive Python upgrades |
 | [kanban-board-hotkey.md](kanban-board-hotkey.md) | 0056 | ⌘⇧K opens the Kanban board; composer send-queued moves to ⌘⌥K |
 | [kanban-drop-attachments.md](kanban-drop-attachments.md) | 0057 | Drag files from Finder onto a Kanban task card or open task dialog to attach them |
-| [reload-backend-hotkey.md](reload-backend-hotkey.md) | 0064 | ⌘R restarts the backend and reloads the window, so core/plugin edits land without quitting the app; resume moves to ⌥⌘R |
+| [reload-backend-hotkey.md](reload-backend-hotkey.md) | 0064 0071 | ⇧⌘R restarts the backend and reloads the window, so core/plugin edits land without quitting the app; ⌘R is resume; forceReload on ⌥⇧⌘R |
 | [kanban-toast-status-icon.md](kanban-toast-status-icon.md) | 0062 | Kanban task popups lead with a green check (done), yellow ? (blocked) or red X (triage / failed) |
 | [small-fixes.md](small-fixes.md) | 0001 0002 0003 0005 0006 0009 0053 | Completion sound "Off", sidebar chevron, no session preview cap, sleep isn't idleness, compression reload spares context engines, desktop-only plugin packages, full-width tab titles |
 

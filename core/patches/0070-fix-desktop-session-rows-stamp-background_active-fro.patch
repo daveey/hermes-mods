@@ -1,0 +1,460 @@
+From 2cc8f4f80cdb474893dce9f9f63371b063bf37cb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:48:57 -0700
+Subject: [PATCH] fix(desktop): session rows stamp background_active from live
+ registered processes; sidebar keeps them off green [daveey]
+
+---
+ .../src/store/session-dot-state.test.ts       |  41 +++++
+ apps/desktop/src/store/session-dot-state.ts   |  25 +++
+ apps/desktop/src/types/hermes.ts              |   6 +
+ hermes_cli/process_session_activity.py        | 160 ++++++++++++++++++
+ hermes_cli/web_routers/profiles.py            |   4 +-
+ hermes_cli/web_routers/sessions.py            |   2 +
+ .../test_process_session_activity.py          |  85 ++++++++++
+ 7 files changed, 322 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/process_session_activity.py
+ create mode 100644 tests/hermes_cli/test_process_session_activity.py
+
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 5edd9ab079..8a15c6a0d4 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -14,6 +14,7 @@ import {
+   setSessions
+ } from './session'
+ import {
++  $backgroundActiveSessionIds,
+   $delegatingSessionIds,
+   $goalActiveSessionIds,
+   $kanbanBusySessionIds,
+@@ -310,6 +311,46 @@ describe('kanban work in flight ($kanbanBusySessionIds)', () => {
+   })
+ })
+ 
++describe('backend-registered background process ($backgroundActiveSessionIds)', () => {
++  beforeEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++    $unreadWriteGuard.set(new Map())
++  })
++
++  afterEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++  })
++
++  it('reads a finished turn with a live background process as background, not done', () => {
++    setSessions([storedRow('s1', { background_active: 1, unread: true }), storedRow('s2')])
++
++    expect($backgroundActiveSessionIds.get()).toEqual(['s1'])
++    expect($sessionDotStateById.get()['s1']).toBe('background')
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBeNull()
++    // Control: a plain finished session still gets its green stripe.
++    expect(sessionStatusStripe($sessionDotStateById.get()['s2'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('goes back to done once the process exits', () => {
++    setSessions([storedRow('s1', { background_active: 1 })])
++    setSessions([storedRow('s1')])
++
++    expect($backgroundActiveSessionIds.get()).toEqual([])
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('yields to a live turn', () => {
++    setSessions([storedRow('s1', { background_active: 2 })])
++    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
++
++    expect($sessionDotStateById.get()['s1']).toBe('working')
++  })
++})
++
+ describe('standing goal in flight ($goalActiveSessionIds)', () => {
+   beforeEach(() => {
+     clearAllSessionStates()
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 6945a1a741..d9f5cde691 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -87,6 +87,27 @@ export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions], (
+   return (kanbanBusyIds = stableArray(kanbanBusyIds, ids))
+ })
+ 
++// [daveey] Sessions owning a live background process, per the backend. The
++// renderer's own $backgroundRunningSessionIds only knows sessions it polled
++// after one of their tool events streamed into this window, so a turn the
++// backend resumed after a restart (or a process another Hermes process
++// registered) left the row green while e.g. `gh pr checks --watch` still ran.
++// The backend stamps `background_active` (live pids, over the lineage).
++let backgroundActiveIds: readonly string[] = []
++export const $backgroundActiveSessionIds = computed([$sessions, $messagingSessions], (sessions, messaging) => {
++  const ids: string[] = []
++
++  for (const rows of [sessions, messaging]) {
++    for (const row of rows) {
++      if ((row.background_active ?? 0) > 0) {
++        ids.push(row.id)
++      }
++    }
++  }
++
++  return (backgroundActiveIds = stableArray(backgroundActiveIds, ids))
++})
++
+ // [daveey] Sessions with a standing `/goal` still active. Between goal turns —
+ // especially while the judge has parked it on a `wait` timer — no turn is live,
+ // so the sidebar read the session as done (green stripe) although the goal loop
+@@ -166,6 +187,7 @@ export const $sessionDotStateById = computed(
+     $workingSessionIds,
+     $stalledSessionIds,
+     $backgroundRunningSessionIds,
++    $backgroundActiveSessionIds,
+     $delegatingSessionIds,
+     $kanbanBusySessionIds,
+     $goalActiveSessionIds,
+@@ -179,6 +201,7 @@ export const $sessionDotStateById = computed(
+     working,
+     stalled,
+     background,
++    backgroundActive,
+     delegating,
+     kanbanBusy,
+     goalActive,
+@@ -233,6 +256,8 @@ export const $sessionDotStateById = computed(
+     claim(persistedUnread, 'unread')
+ 
+     claim(background, 'background')
++    // Same claim from the backend's process registry (survives restarts).
++    claim(backgroundActive, 'background')
+     // Async delegation: the parent turn has ended but its subagents are still
+     // running, so the session's work continues in child sessions. Same visual
+     // claim as background processes — and it yields to `working` below the
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index e0e3bf50af..e939c29e9b 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -648,6 +648,12 @@ export interface SessionInfo {
+    *  goal loop resumes it unasked, so the sidebar paints it like a background
+    *  job, not "done". Absent otherwise or against an older backend. */
+   goal_active?: boolean
++  /** [daveey] Live background processes (terminal background=true) this
++   *  conversation owns, per the backend's process registry and the shared
++   *  processes.json, summed over its compression lineage. Keeps the sidebar
++   *  row off "done" even when this window never polled the session. Absent
++   *  when zero or against an older backend. */
++  background_active?: number
+   preview: null | string
+   source: null | string
+   started_at: number
+diff --git a/hermes_cli/process_session_activity.py b/hermes_cli/process_session_activity.py
+new file mode 100644
+index 0000000000..2b1aa2d48f
+--- /dev/null
++++ b/hermes_cli/process_session_activity.py
+@@ -0,0 +1,160 @@
++"""Which sessions still own a running background process.
++
++The sidebar paints a session green ("done") unless something it owns is still
++working. The renderer only learned about background processes by polling a
++session after one of its tool events streamed into the window, so a turn the
++backend resumed after a restart, or a process registered by another Hermes
++process, left the row green while ``gh pr checks --watch`` was still running.
++Session-list endpoints now stamp each row with how many live background
++processes its lineage owns (``background_active``). [daveey]
++
++Sources: this process's registry (``tools.process_registry``) plus every
++profile's ``processes.json`` checkpoint (shared by the Desktop backend, the
++messaging gateway, CLI runs and kanban workers). Only processes whose host pid
++is alive (and still the process that was spawned) count. Cached for a few
++seconds because the sidebar polls.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import threading
++import time
++from pathlib import Path
++from typing import Any, Iterable
++
++_log = logging.getLogger(__name__)
++
++_CACHE_TTL_S = 3.0
++_cache_lock = threading.Lock()
++_cache: tuple[float, dict[str, frozenset[str]]] | None = None
++
++_SESSION_PREFIX = "session:"
++
++
++def _owner_ids(item: dict[str, Any]) -> set[str]:
++    """Session ids a process entry belongs to: its session key, the spawning
++    conversation, and a ``session:<id>`` task/owner id."""
++    ids: set[str] = set()
++    for key in ("session_key", "parent_session_id", "owner_task_id", "task_id"):
++        value = str(item.get(key) or "").strip()
++        if value.startswith(_SESSION_PREFIX):
++            value = value[len(_SESSION_PREFIX):]
++        elif key in ("owner_task_id", "task_id") and value in ("", "default"):
++            continue
++        if value:
++            ids.add(value)
++    return ids
++
++
++def _checkpoint_paths() -> list[Path]:
++    paths: list[Path] = []
++    try:
++        from hermes_constants import get_hermes_home
++
++        home = Path(get_hermes_home())
++        paths.append(home / "processes.json")
++        profiles = home / "profiles"
++        if profiles.is_dir():
++            paths.extend(sorted(profiles.glob("*/processes.json")))
++    except Exception:
++        _log.debug("process checkpoint paths unavailable", exc_info=True)
++    try:
++        from tools.process_registry import _checkpoint_path
++
++        current = _checkpoint_path()
++        if current not in paths:
++            paths.append(current)
++    except Exception:
++        pass
++    return [p for p in paths if p.is_file()]
++
++
++def _live(pid: Any, start: Any) -> bool:
++    from tools.process_registry import ProcessRegistry
++
++    return isinstance(pid, int) and pid > 0 and ProcessRegistry._host_pid_is_ours(pid, start)
++
++
++def _collect() -> dict[str, frozenset[str]]:
++    pairs: set[tuple[str, str]] = set()
++    try:
++        from tools.process_registry import process_registry
++
++        with process_registry._lock:
++            running = [s for s in process_registry._running.values() if not s.exited]
++        for s in running:
++            if s.pid_scope == "host" and not _live(s.pid, s.host_start_time):
++                continue
++            item = {"session_key": s.session_key, "parent_session_id": s.parent_session_id,
++                    "owner_task_id": s.owner_task_id, "task_id": s.task_id}
++            pairs.update((sid, s.id) for sid in _owner_ids(item))
++    except Exception:
++        _log.debug("in-process registry unavailable", exc_info=True)
++    for path in _checkpoint_paths():
++        try:
++            entries = json.loads(path.read_text(encoding="utf-8-sig"))
++        except Exception:
++            continue
++        for item in entries if isinstance(entries, list) else ():
++            if not isinstance(item, dict) or item.get("pid_scope", "host") != "host":
++                continue
++            if not _live(item.get("pid"), item.get("host_start_time")):
++                continue
++            proc_id = str(item.get("session_id") or item.get("pid"))
++            pairs.update((sid, proc_id) for sid in _owner_ids(item))
++    owned: dict[str, set[str]] = {}
++    for sid, proc in pairs:
++        owned.setdefault(sid, set()).add(proc)
++    return {sid: frozenset(procs) for sid, procs in owned.items()}
++
++
++def _owned_processes() -> dict[str, frozenset[str]]:
++    global _cache
++    now = time.monotonic()
++    with _cache_lock:
++        if _cache is not None and now < _cache[0]:
++            return _cache[1]
++    owned = _collect()
++    with _cache_lock:
++        _cache = (now + _CACHE_TTL_S, owned)
++    return owned
++
++
++def background_process_counts() -> dict[str, int]:
++    """``{session_id: live background process count}``, cached briefly."""
++    return {sid: len(procs) for sid, procs in _owned_processes().items()}
++
++
++def _row_ids(row: dict[str, Any]) -> Iterable[str]:
++    seen: set[str] = set()
++    for sid in (row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())):
++        if sid and sid not in seen:
++            seen.add(sid)
++            yield sid
++
++
++def annotate_background_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Stamp ``background_active`` on each session row (summed over its
++    compression lineage; a process counts once per row). Never raises."""
++    if not rows:
++        return rows
++    try:
++        owned = _owned_processes()
++    except Exception:
++        _log.debug("background activity unavailable", exc_info=True)
++        return rows
++    for row in rows:
++        n = len(set().union(*(owned.get(sid, ()) for sid in _row_ids(row))))
++        if n:
++            row["background_active"] = n
++        else:
++            row.pop("background_active", None)
++    return rows
++
++
++def _reset_cache_for_tests() -> None:
++    global _cache
++    with _cache_lock:
++        _cache = None
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index ec7b01edb5..58b72785b5 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -37,6 +37,7 @@ from hermes_cli.web_server_config import (
+ )
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
++from hermes_cli.process_session_activity import annotate_background_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+ from hermes_cli.web_server_profiles import (
+@@ -510,6 +511,7 @@ def get_profiles_sessions(
+         _strip_session_list_rows(window)
+     annotate_kanban_activity(window)
+     annotate_goal_activity(window)
++    annotate_background_activity(window)
+     return {"sessions": window, "total": sum(totals.values()), "profile_totals": totals,
+             "limit": limit, "offset": offset, "errors": errors,
+             "storage": _corrupt_profile_stores(targets)}
+@@ -613,7 +615,7 @@ def get_profiles_sessions_sidebar(
+         rows[key].sort(key=_recency, reverse=True)
+         win = _pinned_window(rows[key], 0, cap[key])
+         _strip_session_list_rows(win)
+-        return annotate_goal_activity(annotate_kanban_activity(win))
++        return annotate_background_activity(annotate_goal_activity(annotate_kanban_activity(win)))
+ 
+     storage = _corrupt_profile_stores(scanned)
+     retryable = _retryable_profile_errors(errors, scanned)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index d7b4568a34..d8702e7659 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -22,6 +22,7 @@ from hermes_cli.session_listing import subagent_listing_scope
+ from hermes_cli.web_deps import late
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
++from hermes_cli.process_session_activity import annotate_background_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
+ from hermes_cli.web_models import (
+@@ -237,6 +238,7 @@ def get_sessions(
+                 _strip_session_list_rows(sessions)
+             annotate_kanban_activity(sessions)
+             annotate_goal_activity(sessions)
++            annotate_background_activity(sessions)
+             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
+             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
+             storage = {row_profile: STORAGE_CORRUPT} if storage_state(db.db_path) == STORAGE_CORRUPT else {}
+diff --git a/tests/hermes_cli/test_process_session_activity.py b/tests/hermes_cli/test_process_session_activity.py
+new file mode 100644
+index 0000000000..2b2f5225e3
+--- /dev/null
++++ b/tests/hermes_cli/test_process_session_activity.py
+@@ -0,0 +1,85 @@
++"""background_active stamping on session-list rows (sidebar 'still working' state). [daveey]"""
++
++import json
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_cli import process_session_activity as psa
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    import tools.process_registry as pr
++
++    monkeypatch.setattr(pr, "process_registry", ProcessRegistry())
++    psa._reset_cache_for_tests()
++    yield tmp_path
++    psa._reset_cache_for_tests()
++
++
++@pytest.fixture
++def sleeper():
++    procs = []
++
++    def spawn():
++        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++        procs.append(proc)
++        return proc
++
++    yield spawn
++    for proc in procs:
++        proc.kill()
++        proc.wait()
++
++
++def _entry(sid, pid, **owner):
++    return {"session_id": sid, "pid": pid, "pid_scope": "host",
++            "host_start_time": ProcessRegistry._safe_host_start_time(pid), "task_id": "default", **owner}
++
++
++def test_checkpoint_process_marks_owning_session_busy(home, sleeper):
++    """The 20261014_161613_1af8dd case: ``gh pr checks --watch`` registered in
++    processes.json under the session, the renderer never polled it."""
++    live = sleeper()
++    dead = subprocess.Popen([sys.executable, "-c", "pass"])
++    dead.wait()
++    (home / "processes.json").write_text(json.dumps([
++        _entry("proc_114c3e5a186f", live.pid, session_key="s_watch", owner_task_id="s_watch"),
++        _entry("proc_dead", dead.pid, session_key="s_dead"),
++    ]))
++    rows = [{"id": "s_watch"}, {"id": "s_dead", "background_active": 1}, {"id": "s_idle"}]
++
++    psa.annotate_background_activity(rows)
++
++    assert rows[0]["background_active"] == 1
++    assert "background_active" not in rows[1]  # pid gone: not working; stale stamp cleared
++    assert "background_active" not in rows[2]
++
++
++def test_lineage_and_session_task_ids_count_each_process_once(home, sleeper):
++    live = sleeper()
++    (home / "processes.json").write_text(json.dumps([
++        _entry("proc_a", live.pid, session_key="s_root", parent_session_id="s_tip"),
++        _entry("proc_b", sleeper().pid, task_id="session:s_root"),
++    ]))
++    rows = [{"id": "s_tip", "_lineage_root_id": "s_root", "_lineage_ids": ["s_root", "s_tip"]}]
++
++    psa.annotate_background_activity(rows)
++
++    assert rows[0]["background_active"] == 2
++
++
++def test_in_process_registry_counts(home, sleeper):
++    import tools.process_registry as pr
++
++    live = sleeper()
++    pr.process_registry._running["proc_mem"] = ProcessSession(
++        id="proc_mem", command="x", task_id="default", session_key="s_mem", pid=live.pid,
++        host_start_time=ProcessRegistry._safe_host_start_time(live.pid), started_at=time.time())
++
++    assert psa.background_process_counts() == {"s_mem": 1}
+-- 
+2.55.0
+

@@ -12,8 +12,9 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 | ⌘B | Mark the selected/open session **blocked** (grey stripe, skipped by ⌘]/⌘[ and ⌘⇧]/⌘⇧[); again to unblock. Sidebar toggle moves to ⌥⌘B | core patches 0048, 0049 | same |
 | ⌘⇧] / ⌘⇧[ | Next / previous sidebar session, any state except ⌘B-blocked (upstream used these for profile next/prev) | core patches 0021, 0049 | same |
 | ⌘⇧A | Archive the selected (else open) session, then open the next one that needs you | core patches 0019, 0026 | same |
-| ⌘R | Restart the backend, then reload the window (picks up core/plugin edits) | core patch 0064 | same |
-| ⌥⌘R | Send `resume` to the active chat (for a stalled turn; was ⌘R until 0064) | core patches 0022, 0064 | same |
+| ⌘R | Send `resume` to the active chat (for a stalled turn) | core patches 0022, 0071 | same |
+| ⇧⌘R | Restart the backend, then reload the window (picks up core/plugin edits) | core patches 0064, 0071 | same |
+| ⌥⇧⌘R | Reload the window only (Electron `forceReload`; was ⇧⌘R) | core patch 0071 | same |
 | ⇧⌘R | Reload the window only | core patch 0022 | same |
 | ⌘N | New session **on This device** (switches the gateway to local if another is selected); returns to the unsent new-session draft (text + attachments) instead of an empty composer | core patches 0036, 0042 | [core/persistent-new-session-draft.md](core/persistent-new-session-draft.md), [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
 | ⌘⇧N | New session on the currently selected gateway | core patch 0042 | [core/new-chat-gateway-hotkeys.md](core/new-chat-gateway-hotkeys.md) |
@@ -25,7 +26,7 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 | ⌘⇧B | Break the stalled tool call (`/break`) | community plugin intelligent-tool-break | `./install.sh --community` |
 
 The day-to-day loop they're built for: **⌘]** to the next chat waiting on you → answer it →
-**⌘⇧A** when it's done (lands on the next waiting chat) → repeat. **⌥⌘R** nudges a stalled turn,
+**⌘⇧A** when it's done (lands on the next waiting chat) → repeat. **⌘R** nudges a stalled turn,
 **⌘⇧P** files a chat into a project, **⌘⇧E** gives it a real name.
 
 ## Adding them to your Hermes (for agents)
@@ -40,7 +41,7 @@ half needs a gateway or Desktop-backend restart.
 
 ### 2. Core shortcuts: patch Hermes, or rewrite as a plugin
 
-⌘] ⌘[ ⌘B ⌘⇧] ⌘⇧[ ⌘⇧A ⌘R ⌥⌘R ⌘N ⌘⇧N ⌘⇧E ⌘⇧P are changes to Hermes's own source (`apps/desktop/src`). You have three ways:
+⌘] ⌘[ ⌘B ⌘⇧] ⌘⇧[ ⌘⇧A ⌘R ⇧⌘R ⌘N ⌘⇧N ⌘⇧E ⌘⇧P are changes to Hermes's own source (`apps/desktop/src`). You have three ways:
 
 **a. Apply the patches to a fork (recommended if you'll keep more than one core change).**
 
@@ -81,7 +82,7 @@ contribution. Roughly:
 
 | Shortcut | As a plugin? |
 |---|---|
-| ⌥⌘R resume | Yes, on any chord: `host.composer.submit(sessionId, 'resume')`. A plugin **can't take ⌘R itself**, because Electron's main process eats ⌘R as "reload" before the renderer sees it. The core patch reroutes that accelerator. |
+| ⌘R resume | Yes, on any other chord: `host.composer.submit(sessionId, 'resume')`. A plugin **can't take ⌘R itself**, because Electron's main process eats ⌘R as "reload" before the renderer sees it. The core patch reroutes that accelerator. |
 | ⌘] / ⌘[ | Partly. `host.state` exposes the busy/awaiting atoms, but not the sidebar's drawn order or the unread state. A plugin version would step in recency order (`host.listPersistedSessions`) and use `host.openSession(id)`. |
 | ⌘⇧A | Likely: `host.request('session.archive', …)` (a backend method in `tui_gateway/methods_session.py`), then `host.openSession(next)`. Check the params there first. |
 | ⌘⇧E | Needs the backend `session.title.suggest` RPC from patch 0020, which you could port into an agent plugin. The rename dialog has to be built in the plugin. |
