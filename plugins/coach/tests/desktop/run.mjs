@@ -151,5 +151,26 @@ await finishTurn()
 ok(n('/state').length === s1 && crest.length > origRest, 'toggle off: no checks')
 cregs.toggle.data.run()
 
+// 11. curriculum tips: Try it prefills the drill and accepts; Got it just accepts; Dismiss is a per-tip dismissal
+planReply = { ...planReply, tasks: [] } // clear the auto spin-out banner left by step 10
+SO.dismiss()
+stateReply = N('tip:cron_whenever', 'Try it', 'tip', { tip: 'cron_whenever', try: 'Turn this into a scheduled cron job' })
+await finishTurn()
+h = panel()
+ok(h.includes('data-rule="tip:cron_whenever"') && h.includes('Try it') && (h.match(/<button/g) || []).length === 2, 'tip panel: Try it + Dismiss')
+await C.act()
+ok(calls.some(c => c[0] === 'setDraft' && c[1] === 'S1' && /scheduled cron job/.test(c[2])) && panel() === '', 'Try it prefills the drill, panel closes')
+ok(events().at(-1) === 'tip:cron_whenever:accepted', 'Try it -> accepted')
+stateReply = N('tip:todo_checklist', 'Got it', 'tip', { tip: 'todo_checklist', try: null })
+const drafts = calls.filter(c => c[0] === 'setDraft').length
+await finishTurn()
+await C.act()
+ok(events().at(-1) === 'tip:todo_checklist:accepted' && calls.filter(c => c[0] === 'setDraft').length === drafts, 'Got it -> accepted, composer untouched')
+stateReply = N('tip:project_bot', 'Try it', 'tip', { tip: 'project_bot', try: 'x' })
+await finishTurn()
+C.dismiss()
+ok(events().at(-1) === 'tip:project_bot:dismissed' && C.claim('S1', 'tip:project_bot') === false, 'tip dismissed -> logged per tip, muted in the session')
+stateReply = EMPTY
+
 console.log(fails ? `# fail ${fails}` : '# pass')
 process.exit(fails ? 1 : 0)

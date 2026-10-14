@@ -15,7 +15,7 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 3            # v3: dedupe compaction copies / queued placeholders (see transcript())
+DIGEST_V = 4            # v4: `features` (content-free feature-use counts for curriculum adoption checks)
 MAX_TURNS = 60          # keep the first 10 and the last 50 user turns
 TURN_CHARS = 500
 LAST_REPLY_CHARS = 800
@@ -50,6 +50,74 @@ SIGNALS = {
     "hermes_meta": re.compile(r"(?i)\bhermes\b"),
     "frustration": re.compile(r"(?i)\b(wtf|why (is|isn'?t|does|doesn'?t|did)|ugh|come on|seriously)\b"),
 }
+# Feature use read from tool-call args (counts only; no argument text leaves the host). The curriculum's
+# "adopted" tests (plugins/coach/curriculum.yaml, evaluated by coach_mine.py --write-adoption) key off these names.
+# `hermes` as a command word (not a ~/.hermes path), then its options up to the subcommand.
+HERMES_CMD = r"(?<![\w./-])hermes\s+(?:[^\s;&|]+\s+)*?"
+CMD_FEATURES = [
+    ("kanban_board_create", re.compile(r"\bkanban\s+boards\s+(create|new)\b")),
+    ("kanban_cli_create", re.compile(HERMES_CMD + r"kanban\s+create\b")),
+    ("kanban_swarm", re.compile(r"\bkanban\s+swarm\b")),
+    ("kanban_specify", re.compile(r"\bkanban\s+specify\b")),
+    ("kanban_decompose", re.compile(r"\bkanban\s+decompose\b")),
+    ("kanban_notify", re.compile(r"\bkanban\s+notify-subscribe\b")),
+    ("kanban_tail", re.compile(r"\bkanban\s+(tail|watch)\b")),
+    ("kanban_request_review", re.compile(r"\bkanban\s+request-review\b")),
+    ("kanban_request_changes", re.compile(r"\bkanban\s+(request-changes|reopen-review)\b")),
+    ("profile_create", re.compile(HERMES_CMD + r"profile\s+create\b")),
+    ("cron_create", re.compile(HERMES_CMD + r"cron\s+create\b")),
+    ("git_worktree", re.compile(r"\bgit\s+worktree\s+add\b")),
+    ("hermes_worktree", re.compile(HERMES_CMD + r"(-w|--worktree)(?=\s|$)")),
+]
+
+
+def _args(raw):
+    if isinstance(raw, dict):
+        return raw
+    try:
+        d = json.loads(raw or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def call_features(name, args):
+    """Feature names one tool call counts toward (a tool_call wrapper is unwrapped by the caller)."""
+    out = []
+    if name == "kanban_create":
+        out.append("kanban_create")
+        if args.get("max_runtime_seconds"):
+            out.append("kanban_create:max_runtime")
+        if args.get("parents"):
+            out.append("kanban_create:parents")
+        if args.get("workspace_kind") == "worktree":
+            out.append("kanban_create:worktree")
+        if args.get("goal_mode"):
+            out.append("kanban_create:goal_mode")
+        if args.get("triage"):
+            out.append("kanban_create:triage")
+        if args.get("skills"):
+            out.append("kanban_create:skills")
+        if str(args.get("assignee") or "default") not in ("default", ""):
+            out.append("kanban_create:specialist")
+    elif name in ("todo", "todo_list", "todo_write"):
+        out.append("todo")
+    elif name in ("cronjob", "cronjob_manage", "cron"):
+        if str(args.get("action") or "create") in ("create", "add"):
+            out.append("cron_create")
+    elif name in ("cross_session", "kanban_request_review", "kanban_request_changes"):
+        out.append(name)
+    elif name == "terminal":
+        cmd = str(args.get("command") or "")
+        out += [k for k, rx in CMD_FEATURES if rx.search(cmd)]
+        if "kanban_cli_create" in out:  # the CLI spelling of the same card options
+            for flag, k in (("--max-runtime", "max_runtime"), ("--parent", "parents"), ("--goal", "goal_mode"),
+                            ("--triage", "triage"), ("--skill", "skills")):
+                if re.search(re.escape(flag) + r"\b", cmd):
+                    out.append(f"kanban_create:{k}")
+    return out
+
+
 TOOL_ERR = re.compile(r'"exit_code":\s*[1-9]|"success":\s*false|"error":\s*"[^"]|^Error\b|Traceback \(most recent', re.M)
 
 
@@ -189,6 +257,7 @@ def digest_db(profile, db, host, since):
         msgs = transcript(con, sid, mcols)
         users, tools, terr = [], collections.Counter(), collections.Counter()
         sig = collections.Counter()
+        feats = collections.Counter()
         last_reply, n_real = "", 0
         for m in msgs:
             role, content = m["role"], m["content"] or ""
@@ -210,8 +279,10 @@ def digest_db(profile, db, host, since):
             elif role == "assistant":
                 if content.strip():
                     last_reply = content
-                for tc in _tool_calls(m["tool_calls"]):
-                    tools[tc] += 1
+                for tc, targs, inner in _tool_calls(m["tool_calls"], with_args=True):
+                    if not inner:
+                        tools[tc] += 1
+                    feats.update(call_features(tc, targs))
             elif role == "tool":
                 if m["tool_name"] and TOOL_ERR.search(content[:4000]):
                     terr[m["tool_name"]] += 1
@@ -233,12 +304,16 @@ def digest_db(profile, db, host, since):
             "signals": dict(sig),
             "tools": dict(tools.most_common(25)),
             "tool_errors": dict(terr.most_common(15)),
+            "features": dict(sorted(feats.items())),
             "last_reply": trunc(redact(_home_rel(last_reply) or ""), LAST_REPLY_CHARS),
         }
     con.close()
 
 
-def _tool_calls(raw):
+def _tool_calls(raw, with_args=False):
+    """Tool names in an assistant message. with_args: (name, args, inner) triples, where deferred tools invoked
+    through the `tool_call` wrapper also yield each inner call (inner=True), so `todo_list` via tool_call counts
+    as todo use without inflating the tool counts."""
     if not raw:
         return []
     try:
@@ -249,8 +324,17 @@ def _tool_calls(raw):
     for c in calls if isinstance(calls, list) else []:
         fn = (c.get("function") or {}) if isinstance(c, dict) else {}
         name = fn.get("name") or (c.get("name") if isinstance(c, dict) else None)
-        if name:
+        if not name:
+            continue
+        if not with_args:
             out.append(name)
+            continue
+        args = _args(fn.get("arguments") if fn else c.get("arguments"))
+        out.append((name, args, False))
+        if name == "tool_call":
+            for inner in args.get("calls") or []:
+                if isinstance(inner, dict) and inner.get("name"):
+                    out.append((inner["name"], _args(inner.get("arguments")), True))
     return out
 
 

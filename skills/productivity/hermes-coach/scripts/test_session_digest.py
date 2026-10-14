@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stdlib tests for session_digest.py:  python3 test_session_digest.py"""
-import sqlite3, sys, tempfile, time, unittest
+import json, sqlite3, sys, tempfile, time, unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -68,6 +68,39 @@ class DigestDedupe(unittest.TestCase):
             con.commit(); con.close()
             (dg,) = list(sd.digest_db("default", db, "test", 0))
         self.assertEqual([u["text"] for u in dg["user_turns"]], ["hi"])
+
+
+class DigestFeatures(unittest.TestCase):
+    def test_feature_counts_from_tool_args_and_tool_call_wrapper(self):
+        t = time.time() - 100
+        call = lambda name, args: {"type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+        calls = [
+            call("kanban_create", {"title": "x", "assignee": "reviewer", "parents": ["t_1"], "max_runtime_seconds": 3600,
+                                   "workspace_kind": "worktree", "goal_mode": True}),
+            call("kanban_create", {"title": "y", "assignee": "default", "triage": True}),
+            call("terminal", {"command": "hermes kanban boards create babybear && git worktree add ../wt"}),
+            call("terminal", {"command": "grep -w foo ~/.hermes/config.yaml"}),
+            call("tool_call", {"calls": [{"name": "todo_list", "arguments": {"todos": []}},
+                                         {"name": "cronjob_manage", "arguments": {"action": "create"}}]}),
+        ]
+        rows = [("user", "go", t, 1, 0, None, None, "u1"),
+                ("assistant", "", t + 1, 1, 0, None, None, "a1")]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            con = sqlite3.connect(db)
+            con.execute("update messages set tool_calls=? where message_uid='a1'", (json.dumps(calls),))
+            con.commit(); con.close()
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        f = dg["features"]
+        self.assertEqual(f["kanban_create"], 2)
+        for k in ("max_runtime", "parents", "worktree", "goal_mode", "specialist", "triage"):
+            self.assertEqual(f[f"kanban_create:{k}"], 1, k)
+        self.assertEqual((f["kanban_board_create"], f["git_worktree"], f["todo"], f["cron_create"]), (1, 1, 1, 1))
+        self.assertNotIn("hermes_worktree", f)  # `grep -w` on a ~/.hermes path is not `hermes -w`
+        self.assertEqual(dg["tools"].get("tool_call"), 1)  # inner calls feed features, not tool counts
+        self.assertNotIn("todo_list", dg["tools"])
+        self.assertEqual(dg["digest_v"], sd.DIGEST_V)
 
 
 if __name__ == "__main__":

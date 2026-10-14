@@ -11,6 +11,8 @@
  *   screenshot_midturn  image sent while busy        -> Add a line (prefills the composer)
  *   move_to_board       10th subagent / >10 min job  -> Move to board (handoff card)
  *   hermes_bug          same Hermes bug in 2 sessions -> File it once (card on the hermes board)
+ *   tip:<id>            a curriculum trigger fired     -> Try it (prefills the drill) / Got it  (lowest priority;
+ *                       spaced repetition + retirement on adoption are decided server side, plugins/coach/curriculum.py)
  *
  * When it checks: after a turn finishes in the focused session (busy -> idle), every 60 s while that turn runs, and
  * on a screenshot send. It never shows while another bus panel (spin-out, topic-shift, prompt-coach) is up for the
@@ -180,6 +182,10 @@ async function act() {
       accept(p)
       setPanel(null) // spin-out's own panel takes over
       await window.__spinOut.spinOut()
+    } else if (action === 'tip') {
+      accept(p)
+      if (data?.try) await host.composer?.setDraft?.(p.stored, data.try)
+      setPanel(null)
     } else if (action === 'add_text') {
       accept(p)
       await host.composer?.setDraft?.(p.stored, 'About the screenshot: ')

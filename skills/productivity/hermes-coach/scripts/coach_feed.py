@@ -6,6 +6,8 @@
 Runs session_digest.py into <repo-dir>, then commits and pushes only when a digest changed.
 Pull uses rebase + autostash; each host writes only its own <host>/ subtree, so hosts never conflict.
 Meant for launchd/cron every ~30 min. Prints one JSON status line.
+Also copies this host's private curriculum overlay (<home>/coach/curriculum.yaml, if any) to
+<repo-dir>/curriculum/<host>.yaml, so the miner on the coach Bot can check its adoption tests.
 """
 import argparse, json, os, subprocess, sys, time
 from pathlib import Path
@@ -40,7 +42,14 @@ def main():
         cmd += ["--exclude-profile", p]
     r = subprocess.run(cmd, capture_output=True, text=True)
     status["digest"] = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else r.stderr[-300:]
+    home = Path(a.home or os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    overlay, copy = home / "coach" / "curriculum.yaml", repo / "curriculum" / f"{a.host}.yaml"
+    if overlay.exists() and (not copy.exists() or copy.read_bytes() != overlay.read_bytes()):
+        copy.parent.mkdir(exist_ok=True)
+        copy.write_bytes(overlay.read_bytes())
     git(repo, "add", "-A", a.host)
+    if copy.exists():
+        git(repo, "add", str(copy.relative_to(repo)))
     if git(repo, "diff", "--cached", "--quiet", check=False).returncode == 0:
         status["commit"] = None
     else:

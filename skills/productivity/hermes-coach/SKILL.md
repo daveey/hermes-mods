@@ -26,7 +26,7 @@ which finds anti-patterns and proposes improvements. Phase 1 of a measure → de
 |---|---|---|
 | `scripts/session_digest.py` | every host | `state.db` (+ `profiles/*/state.db`) → `<out>/<host>/<profile>/<id>.json`, rewritten only on change |
 | `scripts/coach_feed.py` | hosts that push | pull → digest → commit `<host>/` → push, to a private git repo (`--exclude-profile` skips shared bots holding other people's chats) |
-| `scripts/coach_mine.py` | the coach | KPIs per host + overall (this window vs previous), top-N unlabeled sessions by waste score; `--write-kpis` writes today's row of `reports/kpis.jsonl` (a rerun replaces it) |
+| `scripts/coach_mine.py` | the coach | KPIs per host + overall (this window vs previous), top-N unlabeled sessions by waste score; `--write-kpis` writes today's row of `reports/kpis.jsonl` (a rerun replaces it); `--write-adoption` evaluates the coach plugin's curriculum `adopted` tests (public file + `curriculum/*.yaml` overlays) into sticky `reports/adoption.json` (needs PyYAML or ruamel.yaml) |
 | `scripts/coach_weekly.py` | the coach | weekly context: the 6 plan KPIs (latest `kpis.jsonl` row vs the row a week earlier, gaps recomputed from digests), top findings by est. waste, `--check key=value@UTC#signal` before/after verdicts (keep / raise / revert), proposal state + rejected list |
 | `scripts/coach_proposals.py` | both | `add` parses ```` ```coach-proposal ```` JSON blocks from a report into the append-only `reports/proposals.jsonl` (drops anything matching a rejected fingerprint); `list`, `rejected`, `mark` |
 
@@ -34,7 +34,8 @@ The private repo layout is `<host>/<profile>/<session_id>.json`. Each host write
 
 Digest = session stats (msgs counted from `messages`, since `sessions.message_count` goes stale), cost,
 subagent children folded into the root, user turns (first 10 + last 50, ≤500 chars), tool counts, tool-error
-counts, pattern signals, and the last reply (≤800 chars). Removed: injected blocks (`<memory-context>`,
+counts, pattern signals, `features` (content-free feature-use counts from tool-call args: kanban_create options,
+todo, cron/profile/board creation, worktrees; v4), and the last reply (≤800 chars). Removed: injected blocks (`<memory-context>`,
 system notes, pasted content), Hermes-written user-role messages (background-process notices, compression
 summaries, which are counted as `synthetic_*` signals), base64 image parts, and secrets (provider keys, GitHub/Slack
 tokens, JWTs, private keys, `token=…` values with digits, long opaque blobs). Home paths become `~/`.
@@ -84,6 +85,9 @@ digests share one version (`DIGEST_V`).
   Fix those first, before acting on its usage findings.
 - Keyword signals (`hermes_meta` etc.) hit incidental mentions. Classify a session by title keywords or by the
   signal's share of real turns, never by a raw count ≥ N.
+- A new curriculum `adopted` test that needs a fact the digest lacks: add a counter to `call_features()` /
+  `CMD_FEATURES` in `session_digest.py` (names only, never argument text), bump `DIGEST_V`, re-ship, rerun every feed.
+  Sanity-check new adoption counts against real sessions before trusting them (agent-run commands count too).
 - Exclude shared team-bot profiles (`--exclude-profile`): they hold other people's conversations.
 - `[REDACTED]` inside ordinary prose usually means the `token|password …` rule caught a word. That rule requires
   a digit and ≥12 chars to keep false positives down.

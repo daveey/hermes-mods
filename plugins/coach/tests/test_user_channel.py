@@ -5,6 +5,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -20,6 +21,12 @@ def load(name, path):
 
 
 core = load("coach_core_test_u", ROOT / "core.py")
+
+
+@pytest.fixture(autouse=True)
+def _no_tips(monkeypatch):
+    """These tests cover the bus rules; curriculum tips have their own suite (test_curriculum.py)."""
+    monkeypatch.setenv("COACH_TIPS", "0")
 api = load("coach_api_test", ROOT / "dashboard" / "plugin_api.py")
 
 

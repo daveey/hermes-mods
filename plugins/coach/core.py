@@ -4,6 +4,8 @@ Everything lives under <HERMES_HOME>/coach/:
   sessions/<id>.json   per-session signals + limiter state (turns, still-broken hits, subagents, long job, shown)
   bugs.jsonl           Hermes-bug signatures seen by the agent channel (ts, session, sig, sample)
   log.jsonl            every shown nudge, every choice, every digest-only suppression, every agent hint (KPI 4)
+  curriculum.yaml      private curriculum overlay (merged over the public plugins/coach/curriculum.yaml)
+  curriculum_state.json  spaced-repetition state of the feature tips (curriculum.py)
 
 state.db is read-only here. LLM calls are injected (`llm(messages, max_tokens) -> str`) so tests can fake them;
 production uses the auxiliary client, task "coach" (`auxiliary.coach.*`).
@@ -67,6 +69,21 @@ STILL_BROKEN_RE = re.compile(
 # Hermes-written user-role messages: "[IMPORTANT: ...", "[System note: ...", "[ASYNC DELEGATION ...", turn-cap notices.
 SYNTHETIC_RE = re.compile(r"^\s*(\[[A-Z][A-Za-z -]{2,40}(:|\]| —)|You've reached the maximum number of tool-calling)")
 OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
+
+
+def curriculum_mod():
+    """Sibling curriculum.py, re-executed when the file changes (same reload rule as __init__._load)."""
+    name = "_coach_curriculum"
+    path = Path(__file__).resolve().parent / "curriculum.py"
+    mtime = path.stat().st_mtime_ns
+    mod = sys.modules.get(name)
+    if mod is None or getattr(mod, "_coach_mtime", None) != mtime:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        mod._coach_mtime = mtime
+    return mod
 
 
 def hermes_home() -> Path:
@@ -154,13 +171,33 @@ class Store:
         return out
 
     # ── signals written by the agent channel ──
+    def curriculum(self) -> list:
+        try:
+            cur = curriculum_mod()
+            return cur.load(self.root / "curriculum.yaml")
+        except Exception:
+            return []
+
     def user_turn(self, sid: str, text) -> dict:
         broken = is_still_broken(text)
+        t = flatten(text)
+        m = OOB_RE.match(t)
+        t = m.group(1) if m else t
+        hits = []
+        if t.strip() and not SYNTHETIC_RE.match(t):
+            try:
+                hits = curriculum_mod().text_hits(self.curriculum(), t)
+            except Exception:
+                hits = []
 
         def fn(s):
             s["turns"] = s.get("turns", 0) + 1
             if broken:
                 s["still_broken"] = s.get("still_broken", 0) + 1
+            if hits:
+                th = s.setdefault("tip_text", {})
+                for h in hits:
+                    th[h] = s["turns"]
         return self._update(sid, fn)
 
     def add_subagents(self, sid: str, n: int) -> None:
@@ -250,6 +287,11 @@ class Store:
             return {"ok": False, "error": "event must be shown|accepted|dismissed|expired"}
         if event == "dismissed":
             self._update(sid, lambda x: x.setdefault("muted", []).append(rule) if rule not in x.get("muted", []) else None)
+        if rule.startswith("tip:"):
+            try:
+                curriculum_mod().Spacing(self.root, self.clock).on_choice(rule[4:], event)
+            except Exception:
+                pass
         self.log({"event": "choice", "session_id": sid, "rule": rule, "id": nudge_id, "choice": event, **(extra or {})})
         return {"ok": True}
 
@@ -306,13 +348,31 @@ def session_counts(sid: str, db_path: Optional[Path] = None) -> dict:
 # ── user-channel rules ────────────────────────────────────────────────────
 
 def _merged(store: Store, ids: list[str]) -> dict:
-    out = {"turns": 0, "still_broken": 0, "subagents": 0, "long_job": None}
+    out = {"turns": 0, "still_broken": 0, "subagents": 0, "long_job": None, "tip_text": set()}
     for i in ids:
         s = store.session(i)
         for k in ("turns", "still_broken", "subagents"):
             out[k] += int(s.get(k) or 0)
         out["long_job"] = out["long_job"] or s.get("long_job")
+    last = store.session(ids[-1]) if ids else {}
+    cur = curriculum_mod()
+    out["tip_text"] = {t for t, turn in (last.get("tip_text") or {}).items()
+                       if int(last.get("turns") or 0) - int(turn) < cur.TEXT_TURNS}
     return out
+
+
+def tip_candidates(store: Store, sid: str, counts: dict, sig: dict, db_path: Optional[Path] = None) -> list[dict]:
+    """Curriculum tips (lowest priority on the bus): spaced, retired once adopted, at most one per check.
+    COACH_TIPS=0 turns them off (the bus rules keep working)."""
+    if os.environ.get("COACH_TIPS", "1").lower() in ("0", "off", "false", "no"):
+        return []
+    try:
+        cur = curriculum_mod()
+        facts = cur.Facts(counts["ids"], db_path or hermes_home() / "state.db", store.clock)
+        return cur.candidates(store.curriculum(), sig, facts, counts["msgs"], sig["tip_text"],
+                              cur.Spacing(store.root, store.clock), cur.adopted_ids())
+    except Exception:
+        return []
 
 
 def bug_hits(store: Store, sid_ids: list[str]) -> Optional[dict]:
@@ -331,7 +391,7 @@ def bug_hits(store: Store, sid_ids: list[str]) -> Optional[dict]:
     return None
 
 
-def candidates(store: Store, sid: str, counts: dict) -> list[dict]:
+def candidates(store: Store, sid: str, counts: dict, db_path: Optional[Path] = None) -> list[dict]:
     """User-channel rules that currently apply to the session, most urgent first (before the gate)."""
     sig = _merged(store, counts["ids"])
     out = []
@@ -351,10 +411,14 @@ def candidates(store: Store, sid: str, counts: dict) -> list[dict]:
     if counts["msgs"] > LONG_SESSION_MSGS:
         band = counts["msgs"] // LONG_SESSION_MSGS
         out.append({"rule": "long_session", "key": f"long_session:{band}", "fmt": {"msgs": counts["msgs"]}, "data": {}})
+    out += tip_candidates(store, sid, counts, sig, db_path)
     return out
 
 
-def nudge(rule: str, key: str, fmt: dict, data: Optional[dict] = None) -> dict:
+def nudge(rule: str, key: str, fmt: dict, data: Optional[dict] = None, entry: Optional[dict] = None) -> dict:
+    if entry is not None:
+        t = curriculum_mod().tip_nudge({"entry": entry, "fmt": fmt})
+        return {"id": uuid.uuid4().hex[:12], "rule": rule, "key": key, **t}
     title, text, button, action = USER_RULES[rule]
     return {"id": uuid.uuid4().hex[:12], "rule": rule, "key": key, "title": title.format(**fmt),
             "text": text.format(**fmt), "button": button, "action": action, "data": data or {}}
@@ -370,11 +434,13 @@ def state(store: Store, sid: str, db_path: Optional[Path] = None, offer: Optiona
     if offer:
         cands = [{"rule": offer, "key": f"{offer}:{turn}", "fmt": {}, "data": {}}] if offer in USER_RULES else []
     else:
-        cands = candidates(store, sid, counts)
+        cands = candidates(store, sid, counts, db_path)
     for c in cands:
         ok, why = store.gate(sid, c["rule"], c["key"], turn, demoted)
         if ok:
-            shown = nudge(c["rule"], c["key"], c["fmt"], c["data"])
+            shown = nudge(c["rule"], c["key"], c["fmt"], c.get("data"), c.get("entry"))
+            if c.get("entry") is not None:
+                curriculum_mod().Spacing(store.root, store.clock).on_shown(c["entry"]["id"])
             store.log({"event": "shown", "session_id": sid, "rule": c["rule"], "key": c["key"], "id": shown["id"],
                        "turn": turn, "msgs": counts["msgs"]})
             break
