@@ -15,7 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
-| [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 | ⌘]/⌘[ next/prev session with a green/red status stripe, ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume, ⇧⌘R reload |
+| [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 0049 | ⌘]/⌘[ next/prev session with a green/red status stripe, ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume, ⇧⌘R reload |
 | [ai-session-rename.md](ai-session-rename.md) | 0020 0032 0042 | ⌘⇧E rename (was ⌘⇧N until 0042), pre-filled with an AI short name (`session.title.suggest` RPC) |
 | [project-palette.md](project-palette.md) | 0004 0018 0030 | ⌘⇧P moves a session to a project by typeahead; a new name offers "Create project" with an empty `~/code/<slug>` |
 | [multi-gateway-projects.md](multi-gateway-projects.md) | 0023 0024 0025 0028 0029 0031 | Sidebar shows every connected gateway's projects (colored, with show/hide toggles); move a session into any gateway's project; archive on the owning gateway |

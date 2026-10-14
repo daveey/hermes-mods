@@ -11,7 +11,7 @@ Patches: `0038`, `0039` in `core/patches/`. Touches `apps/desktop` only. Replace
   - **red**: not finished and needs help (dot state `needs-input`, i.e. blocked on a clarify/approval
     prompt, or `stalled`, i.e. a live turn that has gone quiet).
   - **grey**: you parked it with ⌘B (`0048`, [session-navigation-shortcuts.md](session-navigation-shortcuts.md)).
-    Overrides every other colour; ⌘]/⌘[ skip it. ⌘B again clears it.
+    Overrides every other colour; ⌘]/⌘[ and ⌘⇧]/⌘⇧[ skip it. ⌘B again clears it.
   - **none**: working, background/delegating, draft, archived, or a session with no turn yet.
 - The owning gateway becomes a small device glyph right after the row's age: laptop, Mac mini or cloud
   (a generic monitor when nothing matches). Shown only when the registry has more than one connection.

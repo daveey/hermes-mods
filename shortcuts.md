@@ -9,8 +9,8 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 | Shortcut | Does | Source | How you get it |
 |---|---|---|---|
 | ⌘] / ⌘[ | Next / previous sidebar session with a **status stripe** (green = finished, red = needs input/stalled); skips ⌘B-blocked (grey) rows; wraps. No-op when none | core patches 0021, 0043, 0048 | [core/session-navigation-shortcuts.md](core/session-navigation-shortcuts.md) |
-| ⌘B | Mark the selected/open session **blocked** (grey stripe, skipped by ⌘]/⌘[); again to unblock. Sidebar toggle moves to ⌥⌘B | core patch 0048 | same |
-| ⌘⇧] / ⌘⇧[ | Next / previous sidebar session, any state (upstream used these for profile next/prev) | core patch 0021 | same |
+| ⌘B | Mark the selected/open session **blocked** (grey stripe, skipped by ⌘]/⌘[ and ⌘⇧]/⌘⇧[); again to unblock. Sidebar toggle moves to ⌥⌘B | core patches 0048, 0049 | same |
+| ⌘⇧] / ⌘⇧[ | Next / previous sidebar session, any state except ⌘B-blocked (upstream used these for profile next/prev) | core patches 0021, 0049 | same |
 | ⌘⇧A | Archive the selected (else open) session, then open the next one that needs you | core patches 0019, 0026 | same |
 | ⌘R | Send `resume` to the active chat (for a stalled turn) | core patch 0022 | same |
 | ⇧⌘R | Reload the window (⌘R used to do this) | core patch 0022 | same |

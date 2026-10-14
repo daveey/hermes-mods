@@ -8,8 +8,8 @@ Desktop keybind registry, so you can rebind them in **Settings → Keybinds**. T
 |---|---|---|---|
 | [0019](patches/0019-feat-desktop-A-archives-the-selected-else-open-sessi.patch) | ⌘⇧A | `session.archive` | Archive the selected session, or the open chat if no row is selected |
 | [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red), skipping ⌘B-blocked (grey) ones. With none, nothing happens |
-| [0048](patches/0048-feat-desktop-B-marks-a-session-blocked-grey-stripe-s.patch) | ⌘B | `session.toggleBlocked` | Mark the selected (else open) session blocked: grey stripe, skipped by ⌘]/⌘[. Again to unblock. Sidebar toggle moves to ⌥⌘B |
-| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state |
+| [0048](patches/0048-feat-desktop-B-marks-a-session-blocked-grey-stripe-s.patch) | ⌘B | `session.toggleBlocked` | Mark the selected (else open) session blocked: grey stripe, skipped by ⌘]/⌘[. Again to unblock. ⌘⇧]/⌘⇧[ skip it too (0049). Sidebar toggle moves to ⌥⌘B |
+| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0049](patches/0049-fix-desktop-and-archive-next-fallback-skip-B-blocked.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state except ⌘B-blocked |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌘R | `session.resume` | Send `resume` to the active chat as if you typed it |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⇧⌘R | *(Electron `forceReload`)* | Reload the window (always) |
 | [0026](patches/0026-feat-desktop-archive-hotkey-steps-to-the-next-sideba.patch) | ⌘⇧A | `session.archive` | After archiving the open chat, open the next session the same way ⌘] does, not a new draft |
@@ -53,7 +53,7 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
 - **Moved binding:** upstream binds ⌘⇧]/⌘⇧[ to `profile.next`/`profile.prev`. The fork unbinds those, so
   rebind them if you step profiles from the keyboard.
 
-### ⌘B: mark blocked (0048)
+### ⌘B: mark blocked (0048, 0049)
 
 - `session.toggleBlocked` (`mod+b`) flips a per-session flag on the selected row, else the open chat
   (`store/session-blocked.ts`). The flag is a manual park: “waiting on something outside this chat”. Only ⌘B
@@ -63,8 +63,9 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
   unblocking removes every alias.
 - The row's stripe becomes `blocked` (grey, `bg-zinc-400` / dark `bg-zinc-500`), overriding green/red/none:
   `sessionStatusStripe(state, hasTurns, userBlocked)`.
-- `sessionHasStatusStripe` returns false for blocked sessions, so ⌘]/⌘[ (and ⌘⇧A's archive → next) skip
-  them. ⌘⇧]/⌘⇧[ still step onto them.
+- `sessionHasStatusStripe` returns false for blocked sessions, so ⌘]/⌘[ skip them. Since 0049
+  `nextSidebarSessionId` passes a not-blocked filter to the ⇧ variant and the archive → next fallback too, so
+  no stepping shortcut lands on a blocked session.
 - **Moved binding:** upstream's sidebar toggle `view.toggleSidebar` moves from ⌘B to ⌥⌘B (`mod+alt+b`).
 
 ### ⌘R: resume; ⇧⌘R: reload (0022)
