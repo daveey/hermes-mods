@@ -62,7 +62,22 @@ def build(store=None, checkout=None):
             log.debug("coach transform_tool_result: %s", exc)
             return None
 
-    return coach, {"pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
+    def pre_tool_call(tool_name="", args=None, **_):
+        try:
+            what = rules.blocks_live_checkout(tool_name, args if isinstance(args, dict) else {}, coach.checkout)
+        except Exception as exc:
+            log.debug("coach pre_tool_call: %s", exc)
+            return None
+        if not what:
+            return None
+        log.info("coach blocked live-checkout change: %s", what)
+        try:
+            store.log({"event": "agent_block", "rule": "live_checkout", "what": what})
+        except Exception:
+            pass
+        return {"action": "block", "message": rules.block_message(what, coach.checkout)}
+
+    return coach, {"pre_tool_call": pre_tool_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
                    "transform_tool_result": transform_tool_result}
 
 

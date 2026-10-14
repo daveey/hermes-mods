@@ -229,6 +229,74 @@ def touches_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Op
     return None
 
 
+GIT_HEAD_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)[^;&|\n]*?\s"
+                         r"(commit|pull|reset|checkout|switch|merge|rebase|am|cherry-pick|revert)(?![-\w])")
+PACK_RE = re.compile(r"(\bnpm\s+run\s+pack\b|\bhermes\s+desktop\b[^;&|\n]*--build)")
+UPDATE_RE = re.compile(r"(?:^|[;&|(]\s*|\s)hermes\s+update\b")
+ALLOW_LIVE_RE = re.compile(r"\bCOACH_ALLOW_LIVE=1\b")
+
+
+def _target_dir(cmd: str, pos: int, explicit: str, workdir: str) -> Optional[str]:
+    """Directory a command at `pos` runs in: `git -C X`, else the last `cd` before it, else workdir.
+    None when it can't be known (a `cd $VAR` we can't expand)."""
+    def norm(d: str, base: str) -> Optional[str]:
+        d = d.strip("\"'")
+        if "$" in d or "`" in d:
+            return None
+        d = os.path.expanduser(d)
+        if not os.path.isabs(d):
+            if not base:
+                return None
+            d = os.path.join(base, d)
+        return os.path.normpath(d)
+    base = os.path.expanduser(workdir) if workdir else ""
+    for c in CD_RE.finditer(cmd[:pos]):
+        nb = norm(c.group(1), base)
+        base = nb if nb else ""
+    if explicit:
+        return norm(explicit, base)
+    return base or None
+
+
+def blocks_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Optional[str]:
+    """The live-checkout change that must be refused BEFORE it runs: anything that moves HEAD (every running
+    backend then reports code skew and the Desktop restarts, killing in-flight turns in every chat) or
+    repacks the running Hermes.app. Plain file edits stay a post-hoc hint. `COACH_ALLOW_LIVE=1` in the
+    command is the escape hatch for a change the user explicitly asked to make in the live tree."""
+    if not checkout or tool != "terminal":
+        return None
+    raw = str(args.get("command") or "")
+    if ALLOW_LIVE_RE.search(raw):
+        return None
+    root = str(checkout)
+    cmd = shell_code(raw)
+    wd = str(args.get("workdir") or "")
+    if any(not re.match(r"[^;&|\n]*--help", cmd[m.end():]) for m in UPDATE_RE.finditer(cmd)):
+        return "`hermes update`"
+    for m in GIT_HEAD_RE.finditer(cmd):
+        if m.group(2) == "checkout" and re.match(r"[^;&|\n]*\s--(\s|$)", cmd[m.end():]):
+            continue  # `git checkout -- <file>` discards live edits (what the post-hoc hint asks for); HEAD stays
+        explicit = re.sub(r"^\s*-C\s+", "", m.group(1) or "")
+        d = _target_dir(cmd, m.start(), explicit, wd)
+        if d and _inside(d, root):
+            return f"`git {m.group(2)}`"
+    for m in PACK_RE.finditer(cmd):
+        d = _target_dir(cmd, m.start(), "", wd)
+        if d and _inside(d, root):
+            return f"`{m.group(1).strip()}`"
+    return None
+
+
+def block_message(what: str, checkout: Path) -> str:
+    path = str(checkout).replace(str(Path.home()), "~", 1)
+    return (f"COACH LIVE-CHECKOUT GUARD: blocked {what} in {path}, the checkout every running Hermes backend executes. "
+            "Moving its HEAD or repacking the app makes Desktop restart and kills in-flight turns in every chat "
+            "(measured: ~10 Desktop quits on 2026-10-13, mostly from live-tree commits). Do core work in a worktree: "
+            "`~/.hermes/bin/hermes-core-wt new <slug>` -> edit/test/commit there -> `hermes-core-wt ship <slug>`; "
+            "hermes-sync deploys it when Desktop is idle. Only if the user explicitly asked for this exact change in "
+            "the live tree, rerun with `COACH_ALLOW_LIVE=1` at the start of the command.")
+
+
 def bug_signature(tool: str, result: Any, status: Optional[str], error_type: Optional[str],
                   error_message: Optional[str]) -> Optional[str]:
     """A normalized signature when this failure looks like a Hermes bug (not the agent's own mistake)."""

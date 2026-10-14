@@ -17,6 +17,16 @@ pending at the end of a turn rides the next turn's `pre_llm_call` context. Each 
 
 The live checkout is the tree that `hermes_cli` is imported from. Override it with `COACH_LIVE_CHECKOUT`.
 
+**Live-checkout guard (`pre_tool_call`, blocks before running).** A terminal command that would move the live
+checkout's HEAD (`git commit/pull/reset/checkout/switch/merge/rebase/am/cherry-pick/revert`, attributed per
+command through `git -C` or the last `cd`), repack the running app (`npm run pack`, `hermes desktop --build`) or run
+`hermes update` is refused, and the message points at `hermes-core-wt`. Why: each HEAD move makes every backend
+report code skew, Desktop restarts, and in-flight turns die in every chat. On 2026-10-13 the MacBook Desktop quit
+about 10 times this way. `git checkout -- <file>` (discarding live edits), read-only git, worktrees and scratch
+clones pass. A backtest over 37.6k past Hermes terminal calls blocks 43, and every sampled one was a real live-tree
+HEAD move or repack. Escape hatch for a change the user explicitly asked for: start the command with
+`COACH_ALLOW_LIVE=1`. Blocks are logged as `agent_block` in `log.jsonl`.
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.

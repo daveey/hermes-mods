@@ -274,3 +274,55 @@ def test_plugin_reload_picks_up_edited_rules():
         assert plugin._load("agent_rules") is not a  # edited file: re-exec on reload
     finally:
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+# ── live_checkout block (pre_tool_call) ──
+def test_live_checkout_blocks_head_moves_and_repacks(tmp_path):
+    blk = rules.blocks_live_checkout
+    live = (tmp_path / "hermes-agent")
+    (live / "apps" / "desktop").mkdir(parents=True)
+    live = live.resolve()
+    for cmd in (f"cd {live} && git commit -am wip",
+                f"git -C {live} merge fix/x",
+                f"cd {live} && git pull --ff-only",
+                f"cd {live} && git cherry-pick abc123",
+                f"cd {live}/apps/desktop && npm run pack",
+                "hermes update --yes"):
+        assert blk("terminal", {"command": cmd}, live), cmd
+    assert blk("terminal", {"command": "git commit -m x", "workdir": str(live)}, live)
+
+
+def test_live_checkout_block_allows_reads_worktrees_and_escape(tmp_path):
+    blk = rules.blocks_live_checkout
+    live = (tmp_path / "hermes-agent")
+    live.mkdir()
+    live = live.resolve()
+    wt = tmp_path / "_wt" / "slug"
+    for cmd in (f"cd {live} && git status && git log -3",
+                f"cd {live} && git diff > /tmp/x.diff",
+                f"cd {wt} && git commit -am wip",
+                f"cd {live} && echo 'git commit is blocked here' ",
+                f"cd {live} && cat <<'EOF'\ngit commit -am x\nEOF",
+                f"COACH_ALLOW_LIVE=1 git -C {live} pull --ff-only",
+                "echo hermes updates are deferred",
+                "hermes update --help | head",
+                f"cd {live} && git checkout -- hermes_cli/x.py && git status",
+                f"cd {live} && git merge-base --is-ancestor abc HEAD && git log -1",
+                f"cd {tmp_path}/scratch/pp && U=$(git -C {live} rev-parse upstream/main); git checkout -q -f $U",
+                f"cd {live} && WT={tmp_path}/wt && git worktree add -q --detach $WT upstream/main && cd $WT && git am x.patch"):
+        assert not blk("terminal", {"command": cmd}, live), cmd
+    assert not blk("write_file", {"path": str(live / "x.py")}, live)  # edits stay a post-hoc hint
+
+
+def test_pre_tool_call_hook_returns_block(tmp_path):
+    import importlib.util, sys
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("coach_pkg_init", Path(__file__).resolve().parents[1] / "__init__.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    core = mod._load("core")
+    live = (tmp_path / "hermes-agent"); live.mkdir(); live = live.resolve()
+    store = core.Store(root=tmp_path / "coach")
+    _, hooks = mod.build(store=store, checkout=live)
+    out = hooks["pre_tool_call"](tool_name="terminal", args={"command": f"cd {live} && git commit -am x"})
+    assert out and out["action"] == "block" and "hermes-core-wt" in out["message"]
+    assert hooks["pre_tool_call"](tool_name="terminal", args={"command": f"cd {live} && git status"}) is None
