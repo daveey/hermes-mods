@@ -64,6 +64,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | Plugin | What it does |
 |---|---|
 | [hide-date-dividers](desktop-plugins/hide-date-dividers/) | Removes the "Earlier today / Yesterday / Last week" separators from the session sidebar. |
+| [screenshot-mention](desktop-plugins/screenshot-mention/) | Type `@ss` in the composer to attach your latest screenshot (`@ss3` = latest 3) as an image chip, no dragging. When you send, the originals go to the Trash; Hermes keeps its own copy. |
 | [session-transfer](desktop-plugins/session-transfer/) | Copy or move sessions between gateways (this device ⇄ Nous-hosted or remote, or any two connections). |
 
 ## Skills
