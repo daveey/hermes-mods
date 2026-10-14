@@ -1,0 +1,628 @@
+"""slack-workspace — give a Hermes Slack bot workspace awareness and safe use of its scopes.
+
+* Observes every Events API payload the bot receives (Socket Mode middleware) into a per-profile
+  SQLite store, including messages it was not @-mentioned in.
+* ``pre_llm_call``: on a Slack turn in a channel, injects what was said in that channel since this
+  session last looked (the adapter already supplies the current thread).
+* Tools (toolset ``slack_workspace``): ``slack_recent``, ``slack_join``, ``slack_api``,
+  ``slack_request``. Methods are tiered read / act / admin. Reads of private conversations only from
+  inside them (or by an admin); acts outside the current conversation and admin methods need an
+  admin, or an approval request that DMs the admins one message with checkboxes and
+  Approve selected / Approve all + always allow / Deny buttons.
+
+Admins = ``platforms.slack.extra.allow_admin_from`` (plus ``admins`` in policy.json). Turns from
+non-Slack surfaces (desktop, CLI, cron) are the operator and are trusted.
+State: ``<HERMES_HOME>/slack-workspace/{observed.sqlite,policy.json}``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import threading
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+if __package__:
+    from . import core
+else:  # imported outside a package (e.g. pytest collecting this dir)
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("slack_workspace_core", Path(__file__).with_name("core.py"))
+    core = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
+    _spec.loader.exec_module(core)  # type: ignore[union-attr]
+
+logger = logging.getLogger(__name__)
+
+TOOLSET = "slack_workspace"
+MAX_RESULT_CHARS = 14000
+CONTEXT_MAX_CHARS = 6000
+CONTEXT_FIRST_LOOKBACK_S = 3 * 86400
+
+
+def _session(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_SESSION_" + name, "") or ""
+    except Exception:
+        return ""
+
+
+class State:
+    def __init__(self, root: Path):
+        self.store = core.Store(root)
+        self.adapter: Any = None
+        self.native: Any = None
+        self._chan_list: tuple[float, list] = (0.0, [])
+        self._lock = threading.Lock()
+
+    # ---- identity / auth ---------------------------------------------------------------------
+    def token(self, team: str = "") -> str:
+        a = self.adapter
+        if a is None:
+            raise RuntimeError("Slack is not connected in this profile yet")
+        clients = getattr(a, "_team_clients", None) or {}
+        client = clients.get(team) if team else None
+        if client is None and clients:
+            client = next(iter(clients.values()))
+        if client is None and self.native is not None:
+            client = getattr(self.native, "client", None)
+        tok = getattr(client, "token", None)
+        if not tok:
+            raise RuntimeError("no Slack bot token available on the adapter")
+        return tok
+
+    def api(self, method: str, params: Optional[dict] = None) -> dict:
+        return core.call(self.token(_session("SCOPE_ID")), method, params)
+
+    def bot_user_id(self) -> str:
+        return str(getattr(self.adapter, "_bot_user_id", "") or "")
+
+    def admins(self) -> set[str]:
+        out: set[str] = set()
+        extra = getattr(getattr(self.adapter, "config", None), "extra", None) or {}
+        for key in ("allow_admin_from", "group_allow_admin_from"):
+            v = extra.get(key) or []
+            out |= set(v.split(",") if isinstance(v, str) else v)
+        out |= set(self.store.policy().get("admins") or [])
+        return {x.strip() for x in out if x and x.strip()}
+
+    # ---- requester context ---------------------------------------------------------------------
+    def requester(self) -> dict:
+        platform = _session("PLATFORM")
+        user = _session("USER_ID")
+        on_slack = platform == "slack"
+        return {"platform": platform, "user": user, "channel": _session("CHAT_ID") if on_slack else "",
+                "thread": _session("THREAD_ID") if on_slack else "",
+                "trusted": (not on_slack) or user in self.admins()}
+
+    # ---- names -----------------------------------------------------------------------------------
+    def channel_info(self, cid: str) -> dict:
+        hit = self.store.cached(cid)
+        if hit:
+            return {"id": cid, "name": hit["name"], "private": bool(hit["private"]),
+                    **json.loads(hit["extra"] or "{}")}
+        try:
+            c = self.api("conversations.info", {"channel": cid})["channel"]
+        except core.SlackError:
+            return {"id": cid, "name": cid, "private": cid[:1] in ("D", "G"), "unknown": True}
+        private = bool(c.get("is_private") or c.get("is_im") or c.get("is_mpim"))
+        name = c.get("name") or (("dm:" + c.get("user", "")) if c.get("is_im") else cid)
+        extra = {"is_im": bool(c.get("is_im")), "is_mpim": bool(c.get("is_mpim")),
+                 "ext_shared": bool(c.get("is_ext_shared"))}
+        self.store.cache_name(cid, name, "channel", private, extra)
+        return {"id": cid, "name": name, "private": private, **extra}
+
+    def user_name(self, uid: str) -> str:
+        if not uid:
+            return "?"
+        hit = self.store.cached(uid)
+        if hit:
+            return hit["name"]
+        try:
+            u = self.api("users.info", {"user": uid})["user"]
+            p = u.get("profile") or {}
+            name = p.get("display_name") or u.get("real_name") or u.get("name") or uid
+            self.store.cache_name(uid, name, "user", False,
+                                  {"bot": bool(u.get("is_bot")), "team": u.get("team_id"),
+                                   "guest": bool(u.get("is_restricted") or u.get("is_ultra_restricted"))})
+            return name
+        except core.SlackError:
+            return uid
+
+    def render_text(self, text: str) -> str:
+        text = re.sub(r"<@([UW][A-Z0-9]+)(\|[^>]*)?>", lambda m: "@" + self.user_name(m.group(1)), text or "")
+        text = re.sub(r"<#([CG][A-Z0-9]+)\|([^>]*)>", r"#\2", text)
+        text = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2 (\1)", text)
+        return text
+
+    def public_channels(self, max_age: float = 600) -> list[dict]:
+        with self._lock:
+            at, chans = self._chan_list
+            if chans and time.time() - at < max_age:
+                return chans
+        out, cursor = [], None
+        while True:
+            d = self.api("conversations.list", {"types": "public_channel", "exclude_archived": "true",
+                                                "limit": 1000, "cursor": cursor})
+            out += d.get("channels", [])
+            cursor = (d.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        for c in out:
+            self.store.cache_name(c["id"], c["name"], "channel", False, {})
+        with self._lock:
+            self._chan_list = (time.time(), out)
+        return out
+
+    def can_read(self, cid: str, who: dict) -> tuple[bool, str]:
+        if not cid or who["trusted"] or cid == who["channel"]:
+            return True, ""
+        info = self.channel_info(cid)
+        if info.get("private"):
+            return False, ("that is a private conversation; its content can only be read from inside it "
+                           "or by an admin")
+        return True, ""
+
+
+STATE: dict[str, State] = {}
+
+
+# =================================================================================================
+# Observation
+# =================================================================================================
+
+def _make_factory(state: State):
+    def slack_workspace_wire(native, adapter):
+        state.native, state.adapter = native, adapter
+
+        async def _observe(body, next):  # noqa: A002 - slack_bolt injects by name
+            try:
+                if isinstance(body, dict) and body.get("type") == "event_callback":
+                    ev = body.get("event") or {}
+                    await asyncio.to_thread(state.store.record_event, ev, body.get("team_id") or "")
+            except Exception as exc:  # never break dispatch
+                logger.debug("slack-workspace observe failed: %s", exc)
+            await next()
+
+        native.use(_observe)
+        try:
+            state.store.prune()
+        except Exception:
+            pass
+        logger.info("slack-workspace: observing Slack events for this profile")
+    return slack_workspace_wire
+
+
+# =================================================================================================
+# Context injection
+# =================================================================================================
+
+def _fmt_lines(state: State, rows: list[dict], cur_thread: str = "") -> list[str]:
+    lines = []
+    bot = state.bot_user_id()
+    for r in rows:
+        who = "you" if bot and r["user"] == bot else (state.user_name(r["user"]) if r["user"]
+                                                      else (r["bot"] or "bot"))
+        t = time.strftime("%a %H:%M", time.localtime(float(r["ts"])))
+        where = ""
+        if r["thread_ts"] and r["thread_ts"] != r["ts"]:
+            where = " (thread reply)" if r["thread_ts"] != cur_thread else " (this thread)"
+        elif r.get("reply_count"):
+            where = f" ({r['reply_count']} replies)"
+        text = state.render_text(r["text"]).replace("\n", " ⏎ ")
+        if len(text) > 500:
+            text = text[:500] + "…"
+        lines.append(f"[{t}] {who}{where}: {text}")
+    return lines
+
+
+def _make_context_hook(state: State):
+    def pre_llm_call(**kw):
+        if (kw.get("platform") or "") != "slack":
+            return None
+        cid, thread, msg = _session("CHAT_ID"), _session("THREAD_ID"), _session("MESSAGE_ID")
+        if not cid or cid.startswith("D"):
+            return None
+        try:
+            info = state.channel_info(cid)
+            if core.matches(state.store.policy().get("quiet_channels") or [], cid, info.get("name", "")):
+                return None
+            key = f"{kw.get('session_id')}:{cid}"
+            wm = state.store.watermark(key)
+            since = float(wm) if wm else time.time() - CONTEXT_FIRST_LOOKBACK_S
+            rows = state.store.recent(cid, since, limit=60, exclude_ts={msg} if msg else ())
+            if thread:  # the adapter already injects the current thread
+                rows = [r for r in rows if (r["thread_ts"] or r["ts"]) != thread]
+            newest = max([r["ts"] for r in rows] + ([msg] if msg else []) + ([wm] if wm else []),
+                         key=float, default=None)
+            if newest:
+                state.store.set_watermark(key, newest)
+            if not rows:
+                return None
+            lines = _fmt_lines(state, rows, thread)
+            while lines and sum(len(x) + 1 for x in lines) > CONTEXT_MAX_CHARS:
+                lines.pop(0)
+            head = ("Recent activity in #%s you observed (not addressed to you; for context only, "
+                    "do not reply to it unless asked)%s:" % (
+                        info.get("name", cid), "" if wm else " — last 3 days"))
+            return {"context": head + "\n" + "\n".join(lines)}
+        except Exception as exc:
+            logger.debug("slack-workspace context failed: %s", exc)
+            return None
+    return pre_llm_call
+
+
+# =================================================================================================
+# Approvals
+# =================================================================================================
+
+def _approval_blocks(state: State, req: dict) -> list[dict]:
+    who = req["requester"]
+    origin = req.get("origin") or {}
+    where = f" in <#{origin['channel']}>" if origin.get("channel") else ""
+    joins = all(op["method"] == "conversations.join" for op in req["ops"])
+    blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": (
+        f"*{'<@' + who + '>' if who else 'The agent'}* asked me{where} to do {len(req['ops'])} thing(s)"
+        f" that need your OK.\n>{(req.get('reason') or '(no reason given)')[:600]}")}}]
+    ops = req["ops"]
+    for start in range(0, len(ops), 10):
+        chunk = ops[start:start + 10]
+        options = [{"text": {"type": "mrkdwn", "text": core.op_label(op)[:150]}, "value": str(start + i)}
+                   for i, op in enumerate(chunk)]
+        blocks.append({"type": "actions", "block_id": f"sw_pick_{start}", "elements": [{
+            "type": "checkboxes", "action_id": f"sw_pick_{start}", "options": options,
+            "initial_options": options}]})
+    always = ("Approve all + auto-approve future joins" if joins
+              else "Approve all + always allow these methods")
+    blocks.append({"type": "actions", "block_id": "sw_buttons", "elements": [
+        {"type": "button", "action_id": "sw_approve", "style": "primary", "value": req["id"],
+         "text": {"type": "plain_text", "text": "Approve selected"}},
+        {"type": "button", "action_id": "sw_always", "value": req["id"],
+         "text": {"type": "plain_text", "text": always}},
+        {"type": "button", "action_id": "sw_deny", "style": "danger", "value": req["id"],
+         "text": {"type": "plain_text", "text": "Deny"}}]})
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"request `{req['id']}`"}]})
+    return blocks
+
+
+def _send_request(state: State, req: dict) -> list[str]:
+    sent = []
+    blocks = _approval_blocks(state, req)
+    for admin in sorted(state.admins()):
+        try:
+            dm = state.api("conversations.open", {"users": admin})["channel"]["id"]
+            m = state.api("chat.postMessage", {"channel": dm, "blocks": blocks,
+                                               "text": f"Approval needed: request {req['id']}"})
+            req["dm"].append([dm, m["ts"]])
+            sent.append(admin)
+        except core.SlackError as exc:
+            logger.warning("slack-workspace: could not DM admin %s: %s", admin, exc)
+    state.store.save_request(req)
+    return sent
+
+
+def _execute(state: State, op: dict) -> dict:
+    try:
+        out = state.api(op["method"], op["params"])
+        return {"op": core.op_label(op), "ok": True,
+                "result": {k: out[k] for k in ("channel", "ts") if k in out and not isinstance(out[k], dict)}}
+    except core.SlackError as exc:
+        return {"op": core.op_label(op), "ok": False, "error": exc.error}
+
+
+def _resolve(state: State, rid: str, admin: str, decision: str, picked: Optional[set[int]]) -> Optional[dict]:
+    req = state.store.request(rid)
+    if not req or req["status"] != "pending":
+        return req
+    ops = req["ops"]
+    if decision == "deny":
+        req["status"] = "denied"
+    else:
+        idx = set(range(len(ops))) if (decision == "always" or picked is None) else picked
+        req["results"] = [_execute(state, ops[i]) for i in sorted(idx) if 0 <= i < len(ops)]
+        req["status"] = "approved"
+        if decision == "always":
+            joins = [op for op in ops if op["method"] == "conversations.join"]
+            others = sorted({op["method"] for op in ops if op["method"] != "conversations.join"})
+            state.store.update_policy(**({"auto_join": ["*"]} if joins else {}),
+                                      **({"auto_methods": others} if others else {}))
+    req["decided_by"], req["decided_at"] = admin, time.time()
+    state.store.save_request(req)
+    # Update every admin's copy of the request.
+    if req["status"] == "denied":
+        summary = f"Denied by <@{admin}>."
+    else:
+        ok = [r["op"] for r in req["results"] if r["ok"]]
+        bad = [f"{r['op']} ({r['error']})" for r in req["results"] if not r["ok"]]
+        summary = f"Approved by <@{admin}>" + (" (and set to always allow)" if decision == "always" else "") + "."
+        if ok:
+            summary += "\n✅ " + "\n✅ ".join(ok)
+        if bad:
+            summary += "\n⚠️ " + "\n⚠️ ".join(bad)
+    for dm, ts in req.get("dm") or []:
+        try:
+            state.api("chat.update", {"channel": dm, "ts": ts, "text": summary, "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"Request `{rid}`: {summary}"[:2900]}}]})
+        except core.SlackError:
+            pass
+    origin = req.get("origin") or {}
+    if origin.get("channel") and req.get("requester") != admin:
+        try:
+            state.api("chat.postMessage", {"channel": origin["channel"],
+                                           "thread_ts": origin.get("thread") or None,
+                                           "text": f"<@{req['requester']}> request `{rid}`: {summary}"[:3000]})
+        except core.SlackError:
+            pass
+    return req
+
+
+def _picked(body: dict) -> Optional[set[int]]:
+    values = ((body.get("state") or {}).get("values") or {})
+    found, picked = False, set()
+    for block in values.values():
+        for aid, v in block.items():
+            if aid.startswith("sw_pick_") and v.get("type") == "checkboxes":
+                found = True
+                picked |= {int(o["value"]) for o in v.get("selected_options") or []}
+    return picked if found else None
+
+
+def _make_action_handler(state: State, decision: str):
+    async def handler(ack, body, action):
+        await ack()
+        admin = ((body or {}).get("user") or {}).get("id", "")
+        if admin not in state.admins():
+            ch = ((body or {}).get("container") or {}).get("channel_id")
+            if ch:
+                await asyncio.to_thread(state.api, "chat.postEphemeral", {
+                    "channel": ch, "user": admin, "text": "Only this bot's admins can decide requests."})
+            return
+        await asyncio.to_thread(_resolve, state, (action or {}).get("value", ""), admin, decision,
+                                _picked(body or {}))
+    return handler
+
+
+async def _ack_only(ack, body, action):
+    await ack()
+
+
+# =================================================================================================
+# Tools
+# =================================================================================================
+
+def _out(obj: Any) -> str:
+    s = json.dumps(obj, ensure_ascii=False, default=str)
+    if len(s) > MAX_RESULT_CHARS:
+        s = s[:MAX_RESULT_CHARS] + f'… [truncated {len(s) - MAX_RESULT_CHARS} chars; narrow the query]'
+    return s
+
+
+def _resolve_channel(state: State, ref: str) -> Optional[dict]:
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    m = re.match(r"<#([CG][A-Z0-9]+)(\|[^>]*)?>", ref)
+    if m:
+        ref = m.group(1)
+    name = ref.lstrip("#").lower()
+    for c in state.public_channels():
+        if c["id"] == ref or c["name"] == name:
+            return c
+    if re.fullmatch(r"[CGD][A-Z0-9]{6,}", ref):
+        info = state.channel_info(ref)
+        if info.get("unknown"):
+            return None
+        return {"id": ref, "name": info.get("name"), "is_private": info.get("private"),
+                "is_member": None}
+    return None
+
+
+def tool_recent(state: State, args: dict, **_) -> str:
+    who = state.requester()
+    hours = float(args.get("hours") or 24)
+    since = time.time() - hours * 3600
+    ref = args.get("channel")
+    if ref:
+        c = _resolve_channel(state, ref)
+        if not c:
+            return _out({"error": f"unknown channel {ref!r}"})
+        ok, why = state.can_read(c["id"], who)
+        if not ok:
+            return _out({"error": why})
+        rows = state.store.recent(c["id"], since, limit=int(args.get("limit") or 150))
+        if args.get("thread_ts"):
+            rows = [r for r in rows if (r["thread_ts"] or r["ts"]) == args["thread_ts"]]
+        out = {"channel": f"#{c.get('name')}", "id": c["id"], "messages": _fmt_lines(state, rows),
+               "note": "only messages since the bot joined / since observation started are stored; "
+                       "use slack_api conversations.history for older"}
+        if args.get("include_events"):
+            out["events"] = state.store.events_since(since, c["id"])
+        return _out(out)
+    summary = []
+    for s in state.store.activity_summary(since):
+        info = state.channel_info(s["channel"])
+        if info.get("private") and not (who["trusted"] or s["channel"] == who["channel"]):
+            continue
+        summary.append({"channel": ("#" + info["name"]) if not info.get("is_im") else info["name"],
+                        "id": s["channel"], "messages": s["n"], "people": s["people"],
+                        "last": time.strftime("%a %H:%M", time.localtime(float(s["last_ts"])))})
+    return _out({"since_hours": hours, "active_channels": summary,
+                 "hint": "call again with channel=… to read one"})
+
+
+def _request_or_run(state: State, who: dict, ops: list[dict], reason: str) -> dict:
+    req = state.store.new_request(requester=who["user"], origin={"channel": who["channel"],
+                                                                 "thread": who["thread"]},
+                                  ops=ops, reason=reason)
+    sent = _send_request(state, req)
+    if not sent:
+        return {"status": "blocked", "error": "needs admin approval but no admin could be DMed",
+                "request_id": req["id"]}
+    return {"status": "pending_approval", "request_id": req["id"],
+            "waiting_on": [f"<@{a}>" for a in sent],
+            "note": "The admins got one DM with approve/deny buttons; the requester is told in this "
+                    "thread when it's decided. Check with slack_request."}
+
+
+def tool_join(state: State, args: dict, **_) -> str:
+    who = state.requester()
+    pol = state.store.policy()
+    refs = args.get("channels") or []
+    if isinstance(refs, str):
+        refs = [x for x in re.split(r"[\s,]+", refs) if x]
+    if refs == ["*"] or args.get("all_public"):
+        refs = [c["id"] for c in state.public_channels() if not c.get("is_member")]
+    joined, already, pending_ops, problems = [], [], [], []
+    for ref in refs:
+        c = _resolve_channel(state, ref)
+        if not c:
+            problems.append({"channel": ref, "error": "not found among public channels — if it is private, "
+                                                      "a member has to /invite the bot"})
+            continue
+        name = c.get("name") or c["id"]
+        if c.get("is_member"):
+            already.append("#" + name)
+            continue
+        if c.get("is_private"):
+            problems.append({"channel": "#" + name, "error": "private: a member must /invite the bot"})
+            continue
+        if core.matches(pol.get("never_join") or [], c["id"], name):
+            problems.append({"channel": "#" + name, "error": "on the never_join list"})
+            continue
+        op = {"method": "conversations.join", "params": {"channel": c["id"]}, "name": name}
+        if who["trusted"] or core.matches(pol.get("auto_join") or [], c["id"], name):
+            r = _execute(state, op)
+            (joined.append("#" + name) if r["ok"] else problems.append({"channel": "#" + name,
+                                                                        "error": r.get("error")}))
+        else:
+            pending_ops.append(op)
+    if joined:
+        with state._lock:
+            state._chan_list = (0.0, [])
+    out: dict = {"joined": joined, "already_member": already, "problems": problems}
+    if pending_ops:
+        out["approval"] = _request_or_run(state, who, pending_ops, args.get("reason") or "")
+    return _out(out)
+
+
+def tool_api(state: State, args: dict, **_) -> str:
+    who = state.requester()
+    method = (args.get("method") or "").strip()
+    params = args.get("params") or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except ValueError:
+            return _out({"error": "params must be a JSON object"})
+    if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.]+", method):
+        return _out({"error": "method must look like conversations.history"})
+    if method == "conversations.join":
+        return tool_join(state, {"channels": [core.target_channel(params)], "reason": args.get("reason")})
+    tier = core.method_tier(method)
+    ch = core.target_channel(params)
+    pol = state.store.policy()
+    if tier == core.READ:
+        ok, why = state.can_read(ch, who)
+        if not ok:
+            return _out({"error": why})
+        allowed = True
+    elif tier == core.ACT:
+        allowed = (who["trusted"] or (ch and ch == who["channel"])
+                   or (not ch and method in core.ACT_ANYWHERE) or method in (pol.get("auto_methods") or []))
+    else:
+        allowed = who["trusted"] or method in (pol.get("auto_methods") or [])
+    if not allowed:
+        op = {"method": method, "params": params}
+        return _out({"tier": tier, **_request_or_run(state, who, [op], args.get("reason") or "")})
+    try:
+        out = state.api(method, params)
+    except core.SlackError as exc:
+        hint = ""
+        if exc.error in ("missing_scope",):
+            hint = f" (needs scope {exc.data.get('needed')}; ask an admin to add it and reinstall the app)"
+        elif exc.error == "not_in_channel":
+            hint = " (join it first with slack_join, or ask a member to /invite the bot if it's private)"
+        return _out({"error": exc.error + hint})
+    if not (out.get("response_metadata") or {}).get("next_cursor"):
+        out.pop("response_metadata", None)
+    return _out({"tier": tier, **out})
+
+
+def tool_request(state: State, args: dict, **_) -> str:
+    rid = (args.get("request_id") or "").strip()
+    if rid:
+        req = state.store.request(rid)
+        if not req:
+            return _out({"error": "no such request"})
+        return _out({k: req.get(k) for k in ("id", "status", "reason", "results", "decided_by")}
+                    | {"ops": [core.op_label(o) for o in req["ops"]]})
+    pol = state.store.policy()
+    return _out({"policy": {k: pol.get(k) for k in ("auto_join", "never_join", "auto_methods",
+                                                    "quiet_channels")},
+                 "admins": sorted(state.admins())})
+
+
+SCHEMAS = {
+    "slack_recent": ("Read what has been happening in Slack channels the bot is in, from the bot's own "
+                     "observation log (includes messages that did not mention it). No channel → list of "
+                     "active channels with counts. With channel → the messages.", {
+        "channel": {"type": "string", "description": "#name, name, <#C…>, or channel id"},
+        "hours": {"type": "number", "description": "lookback window, default 24"},
+        "thread_ts": {"type": "string", "description": "only this thread"},
+        "limit": {"type": "integer"},
+        "include_events": {"type": "boolean", "description": "joins/leaves/reactions/pins too"}}, []),
+    "slack_join": ("Join public Slack channels (bulk). Channels matching the standing policy (or asked for by "
+                   "an admin) are joined now; the rest go to the admins as ONE approval DM. Private channels "
+                   "need a member to /invite the bot.", {
+        "channels": {"type": "array", "items": {"type": "string"},
+                     "description": "names or ids; [\"*\"] = every public channel not joined yet"},
+        "reason": {"type": "string", "description": "why — shown to the admins"}}, ["channels"]),
+    "slack_api": ("Call any Slack Web API method with the bot token (e.g. conversations.history, "
+                  "conversations.replies, users.info, search.messages, assistant.search.context, "
+                  "reactions.add, pins.add, bookmarks.add, canvases.create, conversations.setTopic). Reads "
+                  "are free except other private conversations; posting/reacting is free in the current "
+                  "conversation; anything else or admin-type methods (topic/rename/archive/invite/kick/"
+                  "usergroups/profile) needs an admin's approval, requested automatically.", {
+        "method": {"type": "string"},
+        "params": {"type": "object", "description": "method arguments as JSON"},
+        "reason": {"type": "string", "description": "why — shown to the admins if approval is needed"}},
+        ["method"]),
+    "slack_request": ("Check an approval request by id, or (no id) show the standing policy and admins.", {
+        "request_id": {"type": "string"}}, []),
+}
+HANDLERS = {"slack_recent": tool_recent, "slack_join": tool_join, "slack_api": tool_api,
+            "slack_request": tool_request}
+
+
+def register(ctx):
+    try:
+        from hermes_constants import get_hermes_home
+        root = Path(get_hermes_home()) / "slack-workspace"
+    except Exception:
+        root = Path.home() / ".hermes" / "slack-workspace"
+    state = STATE.setdefault(str(root), State(root))
+
+    ctx.register_platform_handler("slack", _make_factory(state))
+    ctx.register_hook("pre_llm_call", _make_context_hook(state))
+    ctx.register_slack_action_handler("sw_approve", _make_action_handler(state, "approve"))
+    ctx.register_slack_action_handler("sw_always", _make_action_handler(state, "always"))
+    ctx.register_slack_action_handler("sw_deny", _make_action_handler(state, "deny"))
+    ctx.register_slack_action_handler(re.compile(r"^sw_pick_\d+$"), _ack_only)
+
+    for name, (desc, props, required) in SCHEMAS.items():
+        fn = HANDLERS[name]
+
+        def handler(args, _fn=fn, **kw):
+            try:
+                return _fn(state, dict(args or {}), **kw)
+            except Exception as exc:
+                logger.warning("slack-workspace %s failed: %s", _fn.__name__, exc, exc_info=True)
+                return _out({"error": str(exc)})
+
+        schema = {"name": name, "description": desc, "parameters": {
+            "type": "object", "properties": props, "required": required}}
+        ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler, description=desc,
+                          check_fn=lambda: state.adapter is not None)

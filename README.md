@@ -51,6 +51,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [mcp-file-access](plugins/mcp-file-access/) | — | Ask (Once / Session / Always) before the Chrome DevTools MCP server reads or writes files outside its allowed folders. On approval, the file is routed through its temp folder, so no restart is needed. |
 | [oauth-keepalive](plugins/oauth-keepalive/) | — | Refreshes pooled OAuth tokens (Claude, ChatGPT/Codex) before they expire, including idle accounts. |
 | [quiet-mode](plugins/quiet-mode/) | — | `/quiet` (`/movie`) blocks every Hermes session on the Mac from opening windows, driving the GUI or browser, changing lights or TVs, or making sound. |
+| [slack-workspace](plugins/slack-workspace/) | — | For a team Slack bot: records traffic in every channel it's in and adds that channel's recent activity as context when it's @-mentioned. Tools to see recent activity, join channels in bulk and call any Slack API method. Joins, posts outside the current conversation and admin methods go to the bot's admins as one DM with approve-selected / always-allow / deny buttons. |
 | [session-mentions](plugins/session-mentions/) | [yes](desktop-plugins/session-mentions/) | `cross_session` tool: list, read and message sessions on any gateway connected to the Desktop app (local, Nous-hosted, remote). |
 | [spin-out](plugins/spin-out/) | [yes](desktop-plugins/spin-out/) | ⇧⌘F on a session: finds the follow-up work at its end and offers it as choices: click a task to launch it as a new session, or [All] for the rest. Each child gets a self-contained brief and an @session pointer to the parent. Moves the built-in session-search shortcut to ⌥⌘F. |
 | [topic-shift](plugins/topic-shift/) | [yes](desktop-plugins/topic-shift/) | After you send a message, detects a topic change and offers *New session* (with a carried-over brief and an @session link), *Fork* or *Send here*. |
@@ -74,6 +75,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [hermes-disk-plugin-backends](skills/hermes-disk-plugin-backends/) | Adding Hermes disk-plugin REST backends. |
 | [productivity/quiet-mode](skills/productivity/quiet-mode/) | You want Hermes off the screen and speakers (goes with the quiet-mode plugin). |
 | [social-media/messaging-bridges](skills/social-media/messaging-bridges/) | WhatsApp/Signal bridges: QR-pair once, the session persists. |
+| [social-media/slack-workspace-bot](skills/social-media/slack-workspace-bot/) | Acting as a team Slack bot: use observed context, join channels, call the Slack API, handle approvals (goes with the slack-workspace plugin). |
 | [software-development/repo-security-audit](skills/software-development/repo-security-audit/) | Auditing a repo for security flaws and fixing them. |
 
 ## Contributing / my own workflow
