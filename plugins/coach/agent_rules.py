@@ -345,7 +345,7 @@ class AgentCoach:
         if s is None:
             s = self.sessions[sid] = {"turn": 0, "turn_tools": 0, "fails": {}, "recent": deque(maxlen=POLL_WINDOW),
                                       "fired": set(), "pending": [], "bg": {}, "ask": "",
-                                      "turn_log": deque(maxlen=60)}
+                                      "turn_log": deque(maxlen=60), "loop": {"fails": []}}
         return s
 
     def _fire(self, s: dict, sid: str, rule: str, key: str, **fmt) -> None:
@@ -365,6 +365,18 @@ class AgentCoach:
         if isinstance(user_message, str) and user_message.strip():
             s["ask"] = user_message[:2000]
         return self.take(sid)
+
+    def turn_end(self, sid: str, reply: str) -> None:
+        """Remember the turn's final answer and tool log: the fix-loop judge reads them on the next user turn."""
+        s = self._s(sid)
+        s["loop"]["last_reply"] = reply[-4000:]
+        s["loop"]["last_log"] = list(s["turn_log"])[-25:]
+
+    def loop_state(self, sid: str) -> dict:
+        return self._s(sid)["loop"]
+
+    def turn_number(self, sid: str) -> int:
+        return self._s(sid)["turn"]
 
     def turn_context(self, sid: str) -> tuple[str, list[str]]:
         """(latest user ask, this turn's tool log) for the reply check."""

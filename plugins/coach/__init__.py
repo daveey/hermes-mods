@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -42,7 +43,13 @@ def build(store=None, checkout=None):
                 return None
             store.user_turn(session_id, user_message)
             hint = coach.turn_start(session_id, user_message)
-            return {"context": f"[coach] {hint}"} if hint else None
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(2) as ex:  # both judges are prefilter-gated; run them side by side
+                f_loop = ex.submit(_fix_loop, session_id, user_message)
+                f_lesson = ex.submit(_lesson, session_id, user_message)
+                loop_hint, lesson_hint = f_loop.result(), f_lesson.result()
+            hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", lesson_hint or "") if h)
+            return {"context": hint} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
             return None
@@ -77,6 +84,54 @@ def build(store=None, checkout=None):
             pass
         return {"action": "block", "message": rules.block_message(what, coach.checkout)}
 
+    def _fix_loop(session_id, user_message):
+        """Judge whether this user message reports that the agent's last fix failed (once per turn, sync,
+        prefilter-gated, short timeout). Fail-open."""
+        try:
+            fl = _load("fix_loop")
+            cfg = fl.settings()
+            if not cfg["on"] or not isinstance(user_message, str):
+                return None
+            st = coach.loop_state(session_id)
+            hit = fl.assess(st, coach.turn_number(session_id), user_message, fl.aux_judge, threshold=cfg["threshold"])
+            if not hit:
+                return None
+            store.log({"event": "agent_hint", "session_id": session_id, "rule": "fix_loop", "n": hit["n"],
+                       "p": hit["p"], "issue": hit["issue"]})
+            store.confirmed_fail(session_id)
+            return hit["hint"]
+        except Exception as exc:
+            log.debug("coach fix_loop: %s", exc)
+            return None
+
+    def _lesson(session_id, user_message):
+        """A correction that implies a standing rule -> candidate lesson (promoted on recurrence) + agent hint."""
+        try:
+            ls = _load("lessons")
+            if os.environ.get("COACH_LESSONS", "1").strip().lower() in ("0", "off", "false", "no"):
+                return None
+            if not isinstance(user_message, str):
+                return None
+            prev = coach.loop_state(session_id).get("last_reply") or ""
+            v = ls.assess(prev, user_message, ls.aux_judge)
+            if not v:
+                return None
+            c = ls.LessonStore(store.root).add(v, session_id, example=user_message)
+            promoted = c["status"] == "promoted"
+            store.log({"event": "lesson", "session_id": session_id, "slug": v["slug"], "status": c["status"],
+                       "sessions": len(c["sessions"])})
+            return ls.hint(v, promoted)
+        except Exception as exc:
+            log.debug("coach lessons: %s", exc)
+            return None
+
+    def post_llm_call(session_id="", assistant_response=None, **_):
+        try:
+            if session_id and isinstance(assistant_response, str) and assistant_response.strip():
+                coach.turn_end(session_id, assistant_response)
+        except Exception as exc:
+            log.debug("coach post_llm_call: %s", exc)
+
     def pre_verify(session_id="", platform="", attempt=0, final_response="", changed_paths=None, **_):
         """Check the agent's final answer before the turn ends; a hit keeps the turn going with a nudge.
         At most one nudge per turn (attempt 0 only); fail-open on every error."""
@@ -99,7 +154,7 @@ def build(store=None, checkout=None):
             log.debug("coach pre_verify: %s", exc)
             return None
 
-    return coach, {"pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
+    return coach, {"pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
                    "transform_tool_result": transform_tool_result}
 
 

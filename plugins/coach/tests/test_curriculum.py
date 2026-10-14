@@ -130,6 +130,7 @@ def test_text_trigger_expires_after_two_turns(tmp_path, monkeypatch):
 
 
 def test_tip_ranks_below_bus_rules(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_FIXLOOP", "0")  # regex still_broken path
     store = mk(tmp_path, monkeypatch=monkeypatch)
     db = make_db(tmp_path)
     for _ in range(3):

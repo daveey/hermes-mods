@@ -35,6 +35,11 @@ DEMOTE_DISMISSALS = 3     # this many dismissals of a rule in DEMOTE_WINDOW_S ->
 DEMOTE_WINDOW_S = 7 * 86400
 BUG_WINDOW_S = 7 * 86400
 STILL_BROKEN_N = 3
+CONFIRMED_FAIL_N = 2
+
+
+def fixloop_on() -> bool:
+    return os.environ.get("COACH_FIXLOOP", "1").strip().lower() not in ("0", "off", "false", "no")
 SUBAGENTS_N = 10
 LONG_SESSION_MSGS = 250
 
@@ -177,6 +182,13 @@ class Store:
             return cur.load(self.root / "curriculum.yaml")
         except Exception:
             return []
+
+    def confirmed_fail(self, sid: str) -> None:
+        """A judge-confirmed failed fix (fix_loop). The user-channel `still_broken` rule counts these once any exist,
+        because the regex alone had precision ~0.15 on labeled history."""
+        def fn(s):
+            s["confirmed_fail"] = s.get("confirmed_fail", 0) + 1
+        self._update(sid, fn)
 
     def user_turn(self, sid: str, text) -> dict:
         broken = is_still_broken(text)
@@ -348,10 +360,10 @@ def session_counts(sid: str, db_path: Optional[Path] = None) -> dict:
 # ── user-channel rules ────────────────────────────────────────────────────
 
 def _merged(store: Store, ids: list[str]) -> dict:
-    out = {"turns": 0, "still_broken": 0, "subagents": 0, "long_job": None, "tip_text": set()}
+    out = {"turns": 0, "still_broken": 0, "confirmed_fail": 0, "subagents": 0, "long_job": None, "tip_text": set()}
     for i in ids:
         s = store.session(i)
-        for k in ("turns", "still_broken", "subagents"):
+        for k in ("turns", "still_broken", "confirmed_fail", "subagents"):
             out[k] += int(s.get(k) or 0)
         out["long_job"] = out["long_job"] or s.get("long_job")
     last = store.session(ids[-1]) if ids else {}
@@ -400,9 +412,12 @@ def candidates(store: Store, sid: str, counts: dict, db_path: Optional[Path] = N
         h = hashlib.sha1(bug["sig"].encode()).hexdigest()[:10]
         out.append({"rule": "hermes_bug", "key": f"hermes_bug:{h}", "fmt": {"sig": bug["sig"][:90], "n": bug["n"]},
                     "data": bug})
-    if sig["still_broken"] >= STILL_BROKEN_N:
-        level = sig["still_broken"] // STILL_BROKEN_N
-        out.append({"rule": "still_broken", "key": f"still_broken:{level}", "fmt": {}, "data": {"n": sig["still_broken"]}})
+    # With the fix_loop judge on, count judge-confirmed failed fixes (2 = Anthropic's "two failed corrections");
+    # otherwise fall back to the regex count at 3.
+    n_fail, need = ((sig["confirmed_fail"], CONFIRMED_FAIL_N) if fixloop_on() else (sig["still_broken"], STILL_BROKEN_N))
+    if n_fail >= need:
+        level = n_fail // need
+        out.append({"rule": "still_broken", "key": f"still_broken:{level}", "fmt": {}, "data": {"n": n_fail}})
     if sig["subagents"] >= SUBAGENTS_N or sig["long_job"]:
         why = (f"{sig['subagents']} subagents in this chat" if sig["subagents"] >= SUBAGENTS_N
                else f"A long job is running in chat ({sig['long_job']})")

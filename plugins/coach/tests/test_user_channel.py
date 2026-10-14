@@ -104,7 +104,8 @@ def log(tmp_path):
     return [json.loads(x) for x in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
 
 
-def test_still_broken_third_turn_offers_restart_clean(tmp_path):
+def test_still_broken_third_turn_offers_restart_clean(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_FIXLOOP", "0")  # regex fallback: 3 still-broken turns
     c, kb, llm, st = client(tmp_path, make_db(tmp_path))
     st.user_turn("s1", "still not working")
     st.user_turn("s1", "same error")
@@ -116,6 +117,18 @@ def test_still_broken_third_turn_offers_restart_clean(tmp_path):
     r = post(c, "/restart", session_id="s1")
     assert r["title"] == "Fix login" and "@session:default/s1" in r["message"] and "## Done when" in r["message"]
     assert "MODE: RESTART" in llm.calls[0][0]["content"].upper()
+
+
+def test_still_broken_uses_confirmed_failures_when_judge_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_FIXLOOP", "1")
+    c, kb, llm, st = client(tmp_path, make_db(tmp_path))
+    for t in ("still not working", "same error", "nope, didn't work"):
+        st.user_turn("s1", t)  # regex hits alone no longer count
+    assert post(c, "/state", session_id="s1")["nudge"] is None
+    st.confirmed_fail("s1")
+    assert post(c, "/state", session_id="s1")["nudge"] is None
+    st.confirmed_fail("s1")
+    assert post(c, "/state", session_id="s1")["nudge"]["rule"] == "still_broken"
 
 
 def test_long_session_over_250_msgs_offers_spin_out_across_compression(tmp_path):

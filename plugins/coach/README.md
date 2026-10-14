@@ -47,6 +47,31 @@ Settings: `COACH_REPLY_RULES` (comma list or `none`) and `COACH_REPLY_THRESHOLD`
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`.
 
+### Fix loops across turns (`pre_llm_call` + `post_llm_call`)
+
+`post_llm_call` remembers each turn's final answer and tool log. On the next user message, `fix_loop.py`
+prefilters it (still / again / I don't see it / a bare screenshot ...), and the aux task `coach_fixloop` judges
+whether the user is reporting that the agent's claimed fix failed. Confirmed failures count within 8 user turns:
+
+- 1st: hint to reproduce on the user's actual path, root-cause, and verify it the way the user will see it.
+- 2nd and later: hint to stop patching, list what was tried plus hypotheses, check the distinguishing evidence,
+  consider a read-only second opinion or a clean-restart brief.
+
+The user-channel `still_broken` panel now counts these judge-confirmed failures (2 = Anthropic's "after two
+failed corrections") in place of 3 regex hits. Set `COACH_FIXLOOP=0` to go back to the regex.
+Backtest on 313 real (reply → user) pairs against hindsight labels (the labeler also saw the next turn), at
+0.8: precision 0.84, recall 0.35. The old regex scored 0.47 / 0.15. Held-out fired only 3 times, so its 0.33
+says little; most of the disagreements were cases the hindsight labeler excused, like "it turned out to be the
+old GIF".
+
+### Lessons from corrections (`lessons.py`)
+
+When the user corrects the agent (prefilter + aux task `coach_lessons`), the judge extracts a standing rule
+(`rule`, `slug`, `scope`), or nothing if it was a one-off. Each rule lands in
+`<HERMES_HOME>/coach/lessons.json` as a **candidate**. When its slug recurs in a 2nd session it is **promoted**.
+A rejected slug stays rejected. The agent gets the rule as a hint right away. Once a rule is promoted, the hint
+also tells it to save the rule with the memory tool unless memory already has it. `COACH_LESSONS=0` turns this off.
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.
