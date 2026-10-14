@@ -131,9 +131,14 @@ def main():
                    ("sessions", "cost_usd", "msgs_p90", "repeat_fix_rate", "hermes_meta_cost_share") if x in k))
     if a.write_kpis:
         (data / "reports").mkdir(exist_ok=True)
-        with open(data / "reports" / "kpis.jsonl", "a") as f:
-            f.write(json.dumps({"date": time.strftime("%Y-%m-%d"), "days": a.days, "overall": overall,
-                                "by_host": {h: kpis(v) for h, v in by_host.items()}}) + "\n")
+        # One row per day: a rerun on the same day replaces that day's row.
+        kf = data / "reports" / "kpis.jsonl"
+        today = time.strftime("%Y-%m-%d")
+        rows = [l for l in (kf.read_text().splitlines() if kf.exists() else [])
+                if l.strip() and not l.startswith('{"date": "%s"' % today)]
+        rows.append(json.dumps({"date": today, "days": a.days, "overall": overall,
+                                "by_host": {h: kpis(v) for h, v in by_host.items()}}))
+        kf.write_text("\n".join(rows) + "\n")
 
     done = labeled_ids(data)
     queue = sorted((d for d in cur if d["id"] not in done and d.get("user_turns")

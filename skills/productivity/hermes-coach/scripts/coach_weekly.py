@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Weekly coach digest context (stdlib only): KPI deltas, top findings, config-change checks, proposal state.
+
+    coach_weekly.py --data DIR [--days 7] [--check "agent.max_turns=150@2026-10-14T05:39Z#synthetic_turn_cap"]
+
+Prints a Markdown block the coach Bot turns into reports/weekly-<date>.md:
+  1. The 6 plan KPIs (+ secondary ones): latest reports/kpis.jsonl row vs the row closest to --days earlier.
+     Keys missing from older rows (e.g. kanban_share, added later) are recomputed from the digests for that window.
+     KPI 4 (coaching precision) = applied / (applied + rejected) proposals; KPI 5 (adoption) = sessions using
+     each feature a curriculum proposal taught, since it was applied.
+  2. Top findings of the window from findings/*.jsonl, ranked by estimated waste, as `host/profile/id — title`.
+  3. Each --check: before/after comparison for a config change at a timestamp (sessions fully before vs started
+     after, equal-length windows), with a keep / raise / revert recommendation.
+  4. Pending and rejected proposals (the Bot must not re-propose rejected ones).
+"""
+import argparse, collections, glob, json, statistics, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import coach_mine  # noqa: E402
+import coach_proposals  # noqa: E402
+
+PLAN_KPIS = [  # (n, key, label, goal, better)
+    (1, "repeat_fix_rate", "Repeat-fix rate", "halve", "down"),
+    (2, "msgs_p90", "p90 session size (msgs)", "<200", "down"),
+    (3, "hermes_meta_cost_share", "Hermes-meta share of spend", "<0.15", "down"),
+    (4, "coaching_precision", "Coaching precision (proposals accepted)", ">=0.40", "up"),
+    (5, "feature_adoption", "Feature adoption (taught features used >=3x in 2 wk)", "all taught", "up"),
+    (6, "kanban_share", "Kanban share of delegated spend", ">0.50", "up"),
+]
+SECONDARY = ["sessions", "cost_usd", "msgs_p50", "over_300_msgs", "stuck_rate", "tool_error_rate",
+             "chat_orchestration_sessions", "kanban_creates_from_chat", "subagents_per_session"]
+
+
+def parse_ts(s):
+    s = s.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def act(d):
+    return d.get("last_activity_at") or d.get("started_at") or 0
+
+
+def kpi_rows(data):
+    f = data / "reports" / "kpis.jsonl"
+    rows = []
+    if f.exists():
+        for line in f.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    return rows
+
+
+def window_kpis(ds, lo, hi):
+    return coach_mine.kpis([d for d in ds if lo <= act(d) < hi])
+
+
+def proposal_kpis(data, ds, now):
+    st = coach_proposals.state(data).values()
+    acc = sum(1 for p in st if p.get("status") == "applied")
+    rej = sum(1 for p in st if p.get("status") == "rejected")
+    precision = round(acc / (acc + rej), 3) if acc + rej else None
+    adoption, detail = None, []
+    taught = [p for p in st if p.get("status") == "applied" and p.get("kind") == "curriculum" and p.get("feature")]
+    if taught:
+        ok = 0
+        for p in taught:
+            t0 = parse_ts(p["at"])
+            uses = sum((d.get("tools") or {}).get(p["feature"], 0) for d in ds if t0 <= act(d) < t0 + 14 * 86400)
+            ok += uses >= 3
+            detail.append(f"{p['feature']}: {uses} uses since {p['at'][:10]}")
+        adoption = round(ok / len(taught), 3)
+    return {"coaching_precision": precision, "feature_adoption": adoption}, (acc, rej), detail
+
+
+def fmt(v):
+    if v is None:
+        return "n/a"
+    if isinstance(v, float):
+        return f"{v:.3f}".rstrip("0").rstrip(".") if abs(v) < 10 else f"{v:,.1f}"
+    return str(v)
+
+
+def delta(cur, prev, better):
+    if not isinstance(cur, (int, float)) or not isinstance(prev, (int, float)):
+        return "–"
+    d = cur - prev
+    if abs(d) < 1e-9:
+        return "0 (flat)"
+    good = (d < 0) == (better == "down")
+    pct = f" ({d / prev:+.0%})" if prev else ""
+    return f"{d:+.3g}{pct} {'better' if good else 'worse'}"
+
+
+def section_kpis(data, ds, now, days):
+    rows = kpi_rows(data)
+    cur_row = rows[-1] if rows else None
+    target = now - days * 86400
+    base_row = None
+    if rows:
+        older = [r for r in rows if parse_ts(r["date"]) <= target + 43200]
+        base_row = older[-1] if older else None
+    cur = dict(cur_row["overall"]) if cur_row else window_kpis(ds, now - days * 86400, now + 1)
+    cur_src = f"kpis.jsonl {cur_row['date']}" if cur_row else "computed now"
+    if base_row:
+        prev, prev_src = dict(base_row["overall"]), f"kpis.jsonl {base_row['date']}"
+    else:
+        prev, prev_src = {}, "no row ≥7 days old yet"
+    live_cur = window_kpis(ds, now - days * 86400, now + 1)
+    live_prev = window_kpis(ds, now - 2 * days * 86400, now - days * 86400)
+    filled = []
+    for k, v in live_cur.items():
+        if k not in cur:
+            cur[k] = v
+            filled.append(f"{k} (this window)")
+    for k, v in live_prev.items():
+        if k not in prev and (base_row or live_prev.get("sessions", 0) >= 10):
+            prev[k] = v
+            if base_row:
+                filled.append(f"{k} (baseline)")
+    if not base_row and live_prev.get("sessions", 0) < 10:
+        prev = {}  # too little history for a baseline (e.g. the digests start inside the previous window)
+        prev_src = f"none: only {live_prev.get('sessions', 0)} sessions {days:g}–{2 * days:g} days ago"
+    elif not base_row:
+        prev_src = f"recomputed from digests, {days:g}–{2 * days:g} days ago ({live_prev.get('sessions', 0)} sessions)"
+    pk, (acc, rej), adoption_detail = proposal_kpis(data, ds, now)
+    cur.update(pk)
+    out = [f"## KPI deltas (current: {cur_src}; baseline: {prev_src})", "",
+           "| # | KPI | now | baseline | delta | goal |", "|---|---|---|---|---|---|"]
+    for n, k, label, goal, better in PLAN_KPIS:
+        out.append(f"| {n} | {label} (`{k}`) | {fmt(cur.get(k))} | {fmt(prev.get(k))} | "
+                   f"{delta(cur.get(k), prev.get(k), better)} | {goal} |")
+    out += ["", "Secondary: " + ", ".join(f"{k} {fmt(cur.get(k))} (was {fmt(prev.get(k))})" for k in SECONDARY), ""]
+    out.append(f"KPI 4 basis: {acc} applied, {rej} rejected proposals"
+               + (" (no decisions yet)" if not acc + rej else "")
+               + ". The Phase 2 nudge log is not built yet, so proposal acceptance stands in.")
+    out.append("KPI 5 basis: " + ("; ".join(adoption_detail) if adoption_detail else
+                                  "no applied curriculum proposal with a `feature` yet (Phase 3 not built)."))
+    if filled:
+        out.append("Filled from digests (missing in kpis.jsonl): " + ", ".join(filled) + ".")
+    return out
+
+
+def section_findings(data, ds, now, days, top):
+    by_id = {d["id"]: d for d in ds}
+    rows = []
+    for f in sorted(glob.glob(str(data / "findings" / "*.jsonl"))):
+        day = Path(f).stem
+        try:
+            if parse_ts(day + "T00:00:00Z") < now - (days + 1) * 86400:
+                continue
+        except Exception:
+            continue
+        for line in open(f):
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("pattern") in (None, "none"):
+                continue
+            rows.append(r)
+    pats = collections.defaultdict(list)
+    for r in rows:
+        pats[r["pattern"]].append(r)
+    ranked = sorted(pats.items(), key=lambda kv: -sum(float(x.get("waste_usd_est") or 0) for x in kv[1]))
+    out = [f"## Findings this window ({len(rows)} findings, {len(pats)} patterns), ranked by est. waste", ""]
+    for pat, rs in ranked[:top]:
+        w = sum(float(x.get("waste_usd_est") or 0) for x in rs)
+        out.append(f"### {pat} — ~${w:.0f} est., {len(rs)} findings")
+        for r in sorted(rs, key=lambda x: -float(x.get("waste_usd_est") or 0))[:4]:
+            d = by_id.get(r["session_id"], {})
+            host, prof = r.get("host") or d.get("host", "?"), r.get("profile") or d.get("profile", "?")
+            title = r.get("title") or d.get("title") or "(untitled)"
+            out.append(f"- {host}/{prof}/{r['session_id']} — {title}: {r.get('evidence', '')[:300]}"
+                       f" → fix ({r.get('fix_kind', '?')}): {r.get('fix', '')[:200]}")
+        out.append("")
+    if len(ranked) > top:
+        out.append("Other patterns: " + ", ".join(f"{p} ({len(rs)})" for p, rs in ranked[top:]))
+    if not rows:
+        out.append("No findings in this window.")
+    return out
+
+
+def check_change(ds, spec, now):
+    """spec = key=value@ISO-UTC[#signal]. Sessions fully before vs started after, equal windows."""
+    head, _, rest = spec.partition("@")
+    when, _, signal = rest.partition("#")
+    signal = signal or "synthetic_turn_cap"
+    t = parse_ts(when)
+    span = now - t  # after: everything since the change; before: the 7 days up to it (rates, not totals, compare)
+    before = [d for d in ds if t - 7 * 86400 <= (d.get("started_at") or 0) and act(d) < t and d.get("msgs")]
+    after = [d for d in ds if (d.get("started_at") or 0) >= t and d.get("msgs")]
+
+    def stats(xs):
+        n = len(xs)
+        if not n:
+            return {"n": 0}
+        costs = [coach_mine.total_cost(d) for d in xs]
+        hits = [(d.get("signals") or {}).get(signal, 0) for d in xs]
+        sizes = sorted(d["msgs"] for d in xs)
+        return {"n": n, "hits": sum(hits), "hits_per_session": round(sum(hits) / n, 3),
+                "sessions_hit": sum(1 for h in hits if h), "share_hit": round(sum(1 for h in hits if h) / n, 3),
+                "cost_mean": round(statistics.mean(costs), 2), "cost_median": round(statistics.median(costs), 2),
+                "msgs_p90": sizes[min(n - 1, int(round(0.9 * (n - 1))))]}
+
+    b, a = stats(before), stats(after)
+    hours = span / 3600
+    if a["n"] < 15 or hours < 72:
+        rec = (f"KEEP (provisional): only {a['n']} sessions / {hours:.0f} h since the change; need ≥15 sessions "
+               "and ≥3 days to judge. Re-check next week.")
+    else:
+        hit_drop = 1 - (a["hits_per_session"] / b["hits_per_session"]) if b.get("hits_per_session") else 0
+        cost_rise = a["cost_mean"] / b["cost_mean"] - 1 if b.get("cost_mean") else 0
+        if cost_rise > 0.25 and hit_drop < 0.3:
+            rec = f"REVERT: cost/session up {cost_rise:+.0%} while cap hits/session only fell {hit_drop:.0%}."
+        elif a["share_hit"] > 0.05 and cost_rise <= 0.25:
+            rec = (f"RAISE: {a['share_hit']:.0%} of sessions still hit the cap (cost/session {cost_rise:+.0%}); "
+                   "try the next step up.")
+        else:
+            rec = f"KEEP: cap hits/session {-hit_drop:+.0%}, cost/session {cost_rise:+.0%}."
+    out = [f"### Check: `{head}` since {datetime.fromtimestamp(t, timezone.utc):%Y-%m-%d %H:%M} UTC (signal `{signal}`)",
+           f"Windows: 7 days before (sessions that ended before the change) vs {hours:.0f} h after "
+           "(sessions started after it; sessions spanning the change are left out). All sources.", "",
+           "| | sessions | cap hits | hits/session | sessions hitting | cost/session mean | median | msgs p90 |",
+           "|---|---|---|---|---|---|---|---|"]
+    for name, s in (("before", b), ("after", a)):
+        out.append(f"| {name} | {s['n']} | {s.get('hits', '–')} | {s.get('hits_per_session', '–')} | "
+                   f"{s.get('sessions_hit', '–')} ({fmt(s.get('share_hit'))}) | ${s.get('cost_mean', '–')} | "
+                   f"${s.get('cost_median', '–')} | {s.get('msgs_p90', '–')} |")
+    out += ["", f"Recommendation: {rec}"]
+    return out
+
+
+def section_proposals(data):
+    st = list(coach_proposals.state(data).values())
+    pend = [p for p in st if p.get("status") == "pending"]
+    rej = [p for p in st if p.get("status") == "rejected"]
+    app = [p for p in st if p.get("status") == "applied"]
+    out = ["## Proposal state", "", f"Pending ({len(pend)}):"]
+    out += [f"- {p['id']} {p['kind']} {p['target']}: {p.get('title', '')}" for p in pend] or ["- none"]
+    out += ["", f"Applied ({len(app)}):"]
+    out += [f"- {p['id']} {p['kind']} {p['target']} ({p.get('at', '')[:10]})" for p in app] or ["- none"]
+    out += ["", f"REJECTED — never propose these again ({len(rej)}):"]
+    out += [f"- {p['kind']} {p['target']}: {json.dumps(p['change'], ensure_ascii=False)[:160]}"
+            f"{' — ' + p['note'] if p.get('note') else ''}" for p in rej] or ["- none"]
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--days", type=float, default=7)
+    ap.add_argument("--top", type=int, default=3)
+    ap.add_argument("--check", action="append", default=[],
+                    help="key=value@ISO-UTC[#signal], e.g. agent.max_turns=150@2026-10-14T05:39Z#synthetic_turn_cap")
+    a = ap.parse_args()
+    data = Path(a.data)
+    ds = coach_mine.load(data)
+    now = time.time()
+    out = [f"# Weekly coach context — {time.strftime('%Y-%m-%d', time.gmtime(now))} (last {a.days:g} days)",
+           f"Digests: {len(ds)} across hosts {sorted({d['host'] for d in ds})}.", ""]
+    out += section_kpis(data, ds, now, a.days) + [""]
+    out += section_findings(data, ds, now, a.days, a.top) + [""]
+    if a.check:
+        out += ["## Config-change checks", ""]
+        for c in a.check:
+            out += check_change(ds, c, now) + [""]
+    ideas = [p for p in (data / "ideas.md", data / "reports" / "ideas.md") if p.exists()]
+    out.append(f"## Phase 4 ideas: {ideas[0].relative_to(data)}" if ideas else
+               "## Phase 4 ideas: none yet (no ideas.md in the data repo).")
+    out.append("")
+    out += section_proposals(data)
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()
