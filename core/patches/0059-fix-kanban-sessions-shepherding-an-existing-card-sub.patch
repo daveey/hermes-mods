@@ -1,0 +1,246 @@
+From 6266021c94654d48dd961f39d1bb91de83c4c1c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:46:53 -0700
+Subject: [PATCH] fix(kanban): sessions shepherding an existing card subscribe
+ to it and stay busy in the sidebar [daveey]
+
+A chat asked to see someone else's card through (comment/unblock/link) had no
+subscription, so it never woke when the card finished and its sidebar row
+painted green 'done' while the card still ran. kanban.auto_subscribe_on_touch
+(default off) subscribes it like kanban_create; kanban_active now also counts
+tasks a tui session is subscribed to.
+---
+ hermes_cli/config_defaults.py                 |  4 ++
+ hermes_cli/kanban_session_activity.py         | 31 ++++++++---
+ .../test_kanban_session_activity.py           | 24 +++++++++
+ tests/tools/test_kanban_tools.py              | 51 +++++++++++++++++++
+ tools/kanban_tools.py                         | 29 ++++++++---
+ 5 files changed, 127 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index e02c23fa0a..6ce9ebb302 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1891,6 +1891,10 @@ DEFAULT_CONFIG = {
+         # kanban_create is called from a session with a persistent delivery channel. Disable for
+         # profiles that prefer explicit kanban_notify-subscribe calls per task.
+         "auto_subscribe_on_create": True,
++        # Also subscribe a chat session that comments on, unblocks or links an EXISTING card
++        # (it is shepherding that card): it wakes on completion/block and its sidebar row stays
++        # busy until the card lands. Off upstream; dispatcher workers never subscribe. [daveey]
++        "auto_subscribe_on_touch": False,
+         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
+         # not own notification subscriptions to avoid an idle five-second board probe.
+         "notify_in_gateway": True,
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index cb15d7c634..e728e29a8e 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -51,17 +51,36 @@ def _board_db_paths() -> list[Path]:
+ 
+ 
+ def _read_counts(path: Path) -> dict[str, int]:
++    """Active tasks per session: tasks the session created, plus tasks it is a
++    ``tui`` notify subscriber of (a session asked to shepherd someone else's
++    card subscribes to it, and is just as "still working" until it lands).
++    Each (session, task) pair counts once."""
+     placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+     try:
+-        rows = conn.execute(
+-            f"SELECT session_id, COUNT(*) FROM tasks WHERE session_id IS NOT NULL "
+-            f"AND session_id != '' AND status IN ({placeholders}) GROUP BY session_id",
+-            ACTIVE_STATUSES,
+-        ).fetchall()
++        pairs: set[tuple[str, str]] = {
++            (str(sid), str(tid)) for sid, tid in conn.execute(
++                f"SELECT session_id, id FROM tasks WHERE session_id IS NOT NULL "
++                f"AND session_id != '' AND status IN ({placeholders})",
++                ACTIVE_STATUSES,
++            )
++        }
++        try:
++            pairs.update(
++                (str(sid), str(tid)) for sid, tid in conn.execute(
++                    f"SELECT s.chat_id, t.id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++                    f"WHERE s.platform = 'tui' AND s.chat_id != '' AND t.status IN ({placeholders})",
++                    ACTIVE_STATUSES,
++                )
++            )
++        except sqlite3.Error:  # board predates notify subscriptions
++            pass
+     finally:
+         conn.close()
+-    return {str(sid): int(n) for sid, n in rows}
++    counts: dict[str, int] = {}
++    for sid, _tid in pairs:
++        counts[sid] = counts.get(sid, 0) + 1
++    return counts
+ 
+ 
+ def active_task_counts() -> dict[str, int]:
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 703986890a..72d86dcd2a 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -69,3 +69,27 @@ def test_missing_or_old_board_never_breaks_the_list(kanban_root):
+     rows = [{"id": "s1"}]
+ 
+     assert ksa.annotate_kanban_activity(rows) == [{"id": "s1"}]
++
++
++def test_counts_tasks_a_session_subscribed_to_but_did_not_create(kanban_root):
++    """A session asked to shepherd someone else's card subscribes to it (tui notify
++    sub); it must stay busy until the card lands, not paint "done". [daveey]"""
++    path = kanban_root / "kanban.db"
++    _make_board(path, [
++        ("t1", "running", "s_creator"),
++        ("t2", "done", "s_creator"),
++        ("t3", "ready", None),
++    ])
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT)")
++    conn.executemany("INSERT INTO kanban_notify_subs VALUES (?, ?, ?)", [
++        ("t1", "tui", "s_creator"),    # creator's own auto-sub: counted once, not twice
++        ("t1", "tui", "s_watcher"),
++        ("t3", "tui", "s_watcher"),
++        ("t2", "tui", "s_late"),       # finished card keeps nobody busy
++        ("t1", "telegram", "chat-9"),  # gateway chats are not sidebar sessions
++    ])
++    conn.commit()
++    conn.close()
++
++    assert ksa.active_task_counts() == {"s_creator": 1, "s_watcher": 2}
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 2d5a50f584..7885daf5db 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -1483,3 +1483,54 @@ class TestDefaultTaskId:
+         assert kt._default_task_id("") == worker_env
+         assert kt._default_task_id("   ") == worker_env
+         assert kt._default_task_id(None) == worker_env
++
++
++def _orchestrator_tui(monkeypatch, tmp_path, *, touch_gate: bool):
++    """Chat-session caller (no dispatcher task) with a TUI session key."""
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    for k in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(k, raising=False)
++    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-shepherd")
++    (tmp_path / ".hermes" / "config.yaml").write_text(
++        f"kanban:\n  auto_subscribe_on_touch: {'true' if touch_gate else 'false'}\n")
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kt, "_live_tui_session_key", lambda key, profile: key)
++
++
++def test_comment_on_existing_card_subscribes_shepherding_session(monkeypatch, worker_env, tmp_path):
++    """[daveey] A session told to "make sure t_x finishes" comments on a card it did not
++    create; it must be subscribed so it wakes on completion and its row stays busy."""
++    from tools import kanban_tools as kt
++    _orchestrator_tui(monkeypatch, tmp_path, touch_gate=True)
++
++    d = json.loads(kt._handle_comment({"task_id": worker_env, "body": "watching this"}))
++
++    assert d["ok"] is True and d.get("subscribed") is True, d
++    subs = _list_subs_for_task(worker_env)
++    assert [(s["platform"], s["chat_id"]) for s in subs] == [("tui", "tui-shepherd")]
++    # Commenting again does not duplicate the subscription.
++    kt._handle_comment({"task_id": worker_env, "body": "still watching"})
++    assert len(_list_subs_for_task(worker_env)) == 1
++
++
++def test_comment_does_not_subscribe_when_touch_gate_off(monkeypatch, worker_env, tmp_path):
++    from tools import kanban_tools as kt
++    _orchestrator_tui(monkeypatch, tmp_path, touch_gate=False)
++
++    d = json.loads(kt._handle_comment({"task_id": worker_env, "body": "fyi"}))
++
++    assert d["ok"] is True and "subscribed" not in d
++    assert _list_subs_for_task(worker_env) == []
++
++
++def test_worker_comment_never_subscribes(monkeypatch, worker_env, tmp_path):
++    """Dispatcher workers (HERMES_KANBAN_TASK set) comment as a handoff channel; no sub."""
++    from tools import kanban_tools as kt
++    _orchestrator_tui(monkeypatch, tmp_path, touch_gate=True)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_env)
++
++    d = json.loads(kt._handle_comment({"task_id": worker_env, "body": "progress"}))
++
++    assert d["ok"] is True and "subscribed" not in d
++    assert _list_subs_for_task(worker_env) == []
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index c8b64c095c..b5abb9ed64 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -970,7 +970,8 @@ def _handle_comment(args: dict, **kw) -> str:
+     author = _persisted_identity()
+     with _board(args.get("board")) as (kb, conn):
+         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+-        return _ok(task_id=tid, comment_id=cid)
++        subscribed = _maybe_subscribe_on_touch(conn, str(tid))
++        return _ok(task_id=tid, comment_id=cid, **({"subscribed": True} if subscribed else {}))
+ 
+ 
+ def _store_attachment(board, tid, filename, data, content_type) -> str:
+@@ -1226,13 +1227,14 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
+         delivery_metadata=delivery_metadata or None)
+ 
+ 
+-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
++def _maybe_auto_subscribe(conn: Any, task_id: str, *, gate: str = "auto_subscribe_on_create",
++                          gate_default: bool = True) -> bool:
+     """Subscribe the calling session to completion/block events; True iff a row was
+     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
+-    ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
+-    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create."""
++    ``kanban_notify-subscribe``). Gated by ``kanban.<gate>`` (``auto_subscribe_on_create``,
++    default True). Failures are logged and swallowed: bookkeeping must never fail the tool."""
+     try:
+-        if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
++        if not cfg_get(load_config(), "kanban", gate, default=gate_default):
+             return False
+     except Exception:
+         pass  # unreadable config keeps the user-friendly default (True)
+@@ -1257,6 +1259,18 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+         return False
+ 
+ 
++def _maybe_subscribe_on_touch(conn: Any, task_id: str) -> bool:
++    """A chat session that comments on, unblocks or links an existing card is
++    shepherding it, so subscribe it like ``kanban_create`` does: it then wakes when
++    the card completes or blocks, and the sidebar shows it busy (``kanban_active``)
++    instead of "done" while the card still runs. Dispatcher workers
++    (``HERMES_KANBAN_TASK`` set) never subscribe this way. Gated by
++    ``kanban.auto_subscribe_on_touch`` (default False). [daveey]"""
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return False
++    return _maybe_auto_subscribe(conn, task_id, gate="auto_subscribe_on_touch", gate_default=False)
++
++
+ @_kanban_handler("kanban_unblock")
+ def _handle_unblock(args: dict, **kw) -> str:
+     """Transition a blocked task to ready, or todo while parents remain open."""
+@@ -1268,7 +1282,9 @@ def _handle_unblock(args: dict, **kw) -> str:
+     _enforce_worker_task_ownership(tid)
+     with _board(args.get("board")) as (kb, conn):
+         _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
+-        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
++        subscribed = _maybe_subscribe_on_touch(conn, tid)
++        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)),
++                   **({"subscribed": True} if subscribed else {}))
+ 
+ 
+ @_kanban_handler("kanban_link")
+@@ -1284,6 +1300,7 @@ def _handle_link(args: dict, **kw) -> str:
+         gated = kb.link_tasks(
+             conn, parent_id=parent_id, child_id=child_id,
+             expected_child_run_id=_worker_run_id(str(child_id)))
++        _maybe_subscribe_on_touch(conn, str(child_id))
+         return _ok(parent_id=parent_id, child_id=child_id, gated=gated,
+                    **({"gated_by": parent_id} if gated else {}))
+ 
+-- 
+2.55.0
+
