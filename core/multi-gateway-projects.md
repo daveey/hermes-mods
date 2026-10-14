@@ -1,6 +1,6 @@
 # Multi-gateway projects (Desktop)
 
-Patches: `0023`, `0024`, `0025`, `0028`, `0029` in `core/patches/`. All touch `apps/desktop` only.
+Patches: `0023`, `0024`, `0025`, `0028`, `0029`, `0054` in `core/patches/`. All touch `apps/desktop` only.
 
 If the connections registry has more than one gateway (for example a laptop plus a `mac-mini`),
 the Desktop sidebar already lists sessions from all of them. Upstream, though, the actions on
@@ -16,6 +16,7 @@ rows are colored by gateway, and each action runs on the gateway that owns the s
 | 0025 | feat | Move a session into any gateway's project; the project is created on the session's gateway |
 | 0028 | fix | Cross-gateway move creates an empty project folder instead of cloning (amends 0025) |
 | 0029 | fix | A gateway-qualified `@session` ref is never parsed as a profile name |
+| 0054 | fix | Clicking a `@session` ref opens it on the gateway that owns the session, not the active one |
 
 Terms:
 - **owning gateway**: the registry connection a session row came from (`session.connection_id`).
@@ -126,6 +127,23 @@ four places:
   contains `@`.
 - **Tile routes.** Persisted tile owner routes that contain `@` are dropped on hydrate and
   resolved again. Valid routes are kept.
+
+### 0054: a `@session` ref opens on its owning gateway
+Clicking `@session:default/<id>` in a transcript opened the bare id as a tab on the **active**
+gateway. With a cloud gateway selected, a local session's tab probed only that backend, found
+nothing, and stayed blank. `openSessionRef` now resolves the owner before opening, in this order:
+1. the ref's gateway qualifier (`<profile>@<gateway>/<id>`), matched to a registry connection by id
+   or slugged label;
+2. the unified-list row for the id: its `connection_id`, or the registry `primary` when the row is
+   untagged (only the primary's own rows are left untagged);
+3. the remembered owner hint for the id;
+4. for an unqualified ref, the gateway of the tile chat that shows the link.
+
+If nothing resolves, it falls back to the old ambient open. `openSession('tab')` passes the
+resolved `ownerRoute` to `openSessionTile`, so the tile resolves and resumes on that backend.
+The `SessionView` context moved to the store-free `app/chat/session-view-context.ts`. Transcript
+chips can then read their enclosing chat without importing the session store graph, which broke
+other tests' `vi.mock('@/store/session-states')`.
 
 ## How it works
 
@@ -387,6 +405,7 @@ New or changed vitest files, all under `apps/desktop/src/`:
 | 0024 | `store/gateway-project-merge.test.ts`, `store/gateway-visibility.test.ts` (new) |
 | 0025/0028 | `store/projects-cross-gateway-move.test.ts` (see below) |
 | 0029 | `lib/session-refs.test.ts`, `store/session-owner-hint-qualified.test.ts` (new) |
+| 0054 | `app/chat/session-ref-owner.test.ts` (new), `app/open-session.test.ts` |
 
 `projects-cross-gateway-move.test.ts` is new in 0025. 0028 replaces its clone cases. It covers:
 - a local control case;
@@ -415,7 +434,7 @@ files pass (63 tests). `overlay-completeness.test.ts` passes once 0031 is applie
 Order: `0023 → 0024 → 0025 → 0028 → 0029`, then `0031` (translations for 0024's labels).
 - 0028 rewrites code that 0025 added.
 - 0025 needs 0024 (`remoteTrees`, `ownerGatewayId`, `isRemoteProjectId`).
-- 0023 and 0029 can each be applied on their own.
+- 0023 and 0029 can each be applied on their own. 0054 needs 0029 (`parseSessionRefValue` returns `gateway`).
 
 Textual dependencies on earlier patches (checked against `upstream/main`):
 - **0004** (moving a session into a project doesn't switch to it). Without it, 0024 conflicts in
