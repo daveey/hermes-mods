@@ -1,0 +1,425 @@
+From 0c6d155acbe8dc4af25b216e281a665de5541da4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:22:30 -0700
+Subject: [PATCH] fix(desktop): sidebar no longer paints a session green while
+ its /goal is still active [daveey]
+
+Between goal turns (and while the judge parks it on a wait timer) no turn
+is live, so the row read as done although the goal loop resumes it unasked.
+Session-list endpoints now stamp goal_active (state_meta goal:<id> with
+status=active, over the lineage, across profiles) and the dot state claims
+it as background, same as kanban_active.
+---
+ .../src/store/session-dot-state.test.ts       |  41 ++++++
+ apps/desktop/src/store/session-dot-state.ts   |  37 ++++-
+ apps/desktop/src/types/hermes.ts              |   5 +
+ hermes_cli/goal_session_activity.py           | 133 ++++++++++++++++++
+ hermes_cli/web_routers/profiles.py            |   4 +-
+ hermes_cli/web_routers/sessions.py            |   2 +
+ .../hermes_cli/test_goal_session_activity.py  |  66 +++++++++
+ 7 files changed, 286 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/goal_session_activity.py
+ create mode 100644 tests/hermes_cli/test_goal_session_activity.py
+
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 6b7dc1304f..5edd9ab079 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -15,6 +15,7 @@ import {
+ } from './session'
+ import {
+   $delegatingSessionIds,
++  $goalActiveSessionIds,
+   $kanbanBusySessionIds,
+   $sessionDotStateById,
+   $unreadSessionCount,
+@@ -308,3 +309,43 @@ describe('kanban work in flight ($kanbanBusySessionIds)', () => {
+     expect($sessionDotStateById.get()['s1']).toBe('working')
+   })
+ })
++
++describe('standing goal in flight ($goalActiveSessionIds)', () => {
++  beforeEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++    $unreadWriteGuard.set(new Map())
++  })
++
++  afterEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++  })
++
++  it('reads a finished turn with an active goal as background, not done', () => {
++    setSessions([storedRow('s1', { goal_active: true, unread: true }), storedRow('s2')])
++
++    expect($goalActiveSessionIds.get()).toEqual(['s1'])
++    expect($sessionDotStateById.get()['s1']).toBe('background')
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBeNull()
++    // Control: a plain finished session still gets its green stripe.
++    expect(sessionStatusStripe($sessionDotStateById.get()['s2'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('goes back to done once the goal ends', () => {
++    setSessions([storedRow('s1', { goal_active: true })])
++    setSessions([storedRow('s1')])
++
++    expect($goalActiveSessionIds.get()).toEqual([])
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('yields to a live turn', () => {
++    setSessions([storedRow('s1', { goal_active: true })])
++    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
++
++    expect($sessionDotStateById.get()['s1']).toBe('working')
++  })
++})
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 38aafdc0c6..6945a1a741 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -87,6 +87,26 @@ export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions], (
+   return (kanbanBusyIds = stableArray(kanbanBusyIds, ids))
+ })
+ 
++// [daveey] Sessions with a standing `/goal` still active. Between goal turns —
++// especially while the judge has parked it on a `wait` timer — no turn is live,
++// so the sidebar read the session as done (green stripe) although the goal loop
++// will resume it on its own. The backend stamps `goal_active` on every list row
++// (over the lineage); paused/done goals don't count.
++let goalActiveIds: readonly string[] = []
++export const $goalActiveSessionIds = computed([$sessions, $messagingSessions], (sessions, messaging) => {
++  const ids: string[] = []
++
++  for (const rows of [sessions, messaging]) {
++    for (const row of rows) {
++      if (row.goal_active === true) {
++        ids.push(row.id)
++      }
++    }
++  }
++
++  return (goalActiveIds = stableArray(goalActiveIds, ids))
++})
++
+ export type SessionDotState = 'background' | 'draft' | 'idle' | 'needs-input' | 'stalled' | 'unread' | 'working'
+ 
+ /** The sidebar row's arc. A quiet turn is still authoritatively running, so
+@@ -148,12 +168,25 @@ export const $sessionDotStateById = computed(
+     $backgroundRunningSessionIds,
+     $delegatingSessionIds,
+     $kanbanBusySessionIds,
++    $goalActiveSessionIds,
+     $unreadFinishedSessionIds,
+     $draftSessionIds,
+     $sessions,
+     $unreadWriteGuard
+   ],
+-  (attention, working, stalled, background, delegating, kanbanBusy, unread, draft, sessions, unreadWriteGuard) => {
++  (
++    attention,
++    working,
++    stalled,
++    background,
++    delegating,
++    kanbanBusy,
++    goalActive,
++    unread,
++    draft,
++    sessions,
++    unreadWriteGuard
++  ) => {
+     const next: Record<string, SessionDotState> = {}
+ 
+     const claim = (ids: readonly string[], state: SessionDotState) => {
+@@ -207,6 +240,8 @@ export const $sessionDotStateById = computed(
+     claim(delegating, 'background')
+     // Kanban tasks it created are still queued or running: same claim.
+     claim(kanbanBusy, 'background')
++    // A standing goal will start its next turn by itself: same claim.
++    claim(goalActive, 'background')
+     claim(working, 'working')
+ 
+     // Stalled REFINES working rather than rivalling it — the turn is still
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index d642c865ac..7fc1ba155a 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -639,6 +639,11 @@ export interface SessionInfo {
+    *  workers, so the sidebar paints it like a background job, not "done".
+    *  Absent when zero or against a backend predating the field. */
+   kanban_active?: number
++  /** [daveey] True while this conversation's standing `/goal` is still
++   *  active (running between turns or parked on a judge `wait` timer). The
++   *  goal loop resumes it unasked, so the sidebar paints it like a background
++   *  job, not "done". Absent otherwise or against an older backend. */
++  goal_active?: boolean
+   preview: null | string
+   source: null | string
+   started_at: number
+diff --git a/hermes_cli/goal_session_activity.py b/hermes_cli/goal_session_activity.py
+new file mode 100644
+index 0000000000..c0fb927285
+--- /dev/null
++++ b/hermes_cli/goal_session_activity.py
+@@ -0,0 +1,133 @@
++"""Which sessions still have a standing goal in flight.
++
++A ``/goal`` session ends each turn normally, then the goal loop judges it and
++either kicks the next turn or parks it (``verdict=wait``) until a timer fires.
++Between turns the sidebar painted such a session as "done" (green stripe)
++although the goal would resume on its own. The goal lives in the session's
++``state_meta`` row (``goal:<session_id>``, see ``hermes_cli.goals``), so
++session-list endpoints stamp each row whose goal is still ``active``
++(``goal_active``); the desktop treats it like a running background job.
++Paused, done and cleared goals don't count: nothing resumes them unasked.
++[daveey]
++
++Read-only and cheap: one primary-key range scan of ``state_meta`` per profile
++database, cached for a couple of seconds because the sidebar polls.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any, Iterable
++
++_log = logging.getLogger(__name__)
++
++_KEY_PREFIX = "goal:"
++_CACHE_TTL_S = 2.0
++_cache_lock = threading.Lock()
++_cache: tuple[float, frozenset[str]] | None = None
++
++
++def _state_db_paths() -> list[Path]:
++    from hermes_constants import get_default_hermes_root, get_hermes_home
++
++    paths: list[Path] = []
++    seen: set[str] = set()
++
++    def add(p: Path) -> None:
++        key = str(p.resolve()) if p.exists() else ""
++        if key and key not in seen:
++            seen.add(key)
++            paths.append(p)
++
++    roots = [get_hermes_home()]
++    try:
++        roots.append(get_default_hermes_root())
++    except Exception:  # pragma: no cover - defensive
++        pass
++    for root in roots:
++        add(Path(root) / "state.db")
++        prof = Path(root) / "profiles"
++        try:
++            if prof.is_dir():
++                for p in sorted(prof.glob("*/state.db")):
++                    add(p)
++        except OSError:
++            pass
++    return paths
++
++
++def _read_active(path: Path) -> set[str]:
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++    try:
++        # Range scan on the PRIMARY KEY (LIKE can't use it under NOCASE rules).
++        rows = conn.execute(
++            "SELECT key, value FROM state_meta WHERE key >= ? AND key < ?",
++            (_KEY_PREFIX, _KEY_PREFIX[:-1] + chr(ord(_KEY_PREFIX[-1]) + 1)),
++        ).fetchall()
++    finally:
++        conn.close()
++    out: set[str] = set()
++    for key, raw in rows:
++        try:
++            data = json.loads(raw or "")
++        except (TypeError, ValueError):
++            continue
++        if isinstance(data, dict) and data.get("status") == "active" and str(data.get("goal") or "").strip():
++            out.add(str(key)[len(_KEY_PREFIX):])
++    return out
++
++
++def active_goal_sessions() -> frozenset[str]:
++    """Session ids (across every profile) whose standing goal is still active."""
++    global _cache
++    now = time.monotonic()
++    with _cache_lock:
++        if _cache is not None and now < _cache[0]:
++            return _cache[1]
++    ids: set[str] = set()
++    for path in _state_db_paths():
++        try:
++            ids |= _read_active(path)
++        except sqlite3.Error as exc:  # no state_meta yet, a locked file
++            _log.debug("goal activity read failed for %s: %s", path, exc)
++    result = frozenset(ids)
++    with _cache_lock:
++        _cache = (now + _CACHE_TTL_S, result)
++    return result
++
++
++def _row_ids(row: dict[str, Any]) -> Iterable[str]:
++    seen: set[str] = set()
++    for sid in (row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())):
++        if sid and sid not in seen:
++            seen.add(sid)
++            yield sid
++
++
++def annotate_goal_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Stamp ``goal_active: True`` on rows whose lineage carries an active goal.
++    Never raises: the list must render without it."""
++    if not rows:
++        return rows
++    try:
++        active = active_goal_sessions()
++    except Exception:
++        _log.debug("goal activity unavailable", exc_info=True)
++        return rows
++    for row in rows:
++        if active and any(sid in active for sid in _row_ids(row)):
++            row["goal_active"] = True
++        else:
++            row.pop("goal_active", None)
++    return rows
++
++
++def _reset_cache_for_tests() -> None:
++    global _cache
++    with _cache_lock:
++        _cache = None
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index e757748bbc..ec7b01edb5 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -36,6 +36,7 @@ from hermes_cli.web_server_config import (
+     _apply_main_model_assignment, _normalize_main_model_assignment, _validated_main_model_selection,
+ )
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity
++from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+ from hermes_cli.web_server_profiles import (
+@@ -508,6 +509,7 @@ def get_profiles_sessions(
+     if not full:
+         _strip_session_list_rows(window)
+     annotate_kanban_activity(window)
++    annotate_goal_activity(window)
+     return {"sessions": window, "total": sum(totals.values()), "profile_totals": totals,
+             "limit": limit, "offset": offset, "errors": errors,
+             "storage": _corrupt_profile_stores(targets)}
+@@ -611,7 +613,7 @@ def get_profiles_sessions_sidebar(
+         rows[key].sort(key=_recency, reverse=True)
+         win = _pinned_window(rows[key], 0, cap[key])
+         _strip_session_list_rows(win)
+-        return annotate_kanban_activity(win)
++        return annotate_goal_activity(annotate_kanban_activity(win))
+ 
+     storage = _corrupt_profile_stores(scanned)
+     retryable = _retryable_profile_errors(errors, scanned)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 6af48b827a..d7b4568a34 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
+ from hermes_cli.session_listing import subagent_listing_scope
+ from hermes_cli.web_deps import late
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity
++from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
+ from hermes_cli.web_models import (
+@@ -235,6 +236,7 @@ def get_sessions(
+             if not full:
+                 _strip_session_list_rows(sessions)
+             annotate_kanban_activity(sessions)
++            annotate_goal_activity(sessions)
+             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
+             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
+             storage = {row_profile: STORAGE_CORRUPT} if storage_state(db.db_path) == STORAGE_CORRUPT else {}
+diff --git a/tests/hermes_cli/test_goal_session_activity.py b/tests/hermes_cli/test_goal_session_activity.py
+new file mode 100644
+index 0000000000..2b8e55f1fc
+--- /dev/null
++++ b/tests/hermes_cli/test_goal_session_activity.py
+@@ -0,0 +1,66 @@
++"""goal_active stamping on session-list rows (sidebar 'still working' state)."""
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import goal_session_activity as gsa
++
++
++def _make_state_db(path: Path, goals: dict[str, dict | str]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
++    conn.executemany(
++        "INSERT INTO state_meta VALUES (?, ?)",
++        [(f"goal:{sid}", v if isinstance(v, str) else json.dumps(v)) for sid, v in goals.items()]
++        + [("generation", "x"), ("goalpost", "{}")],
++    )
++    conn.commit()
++    conn.close()
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    gsa._reset_cache_for_tests()
++    yield tmp_path
++    gsa._reset_cache_for_tests()
++
++
++def test_only_active_goals_count_across_profiles(home):
++    _make_state_db(home / "state.db", {
++        "s_active": {"goal": "climb the ladder", "status": "active", "last_verdict": "wait"},
++        "s_paused": {"goal": "x", "status": "paused"},
++        "s_done": {"goal": "x", "status": "done"},
++        "s_blank": {"goal": "", "status": "active"},
++        "s_junk": "not json",
++    })
++    _make_state_db(home / "profiles" / "work" / "state.db", {
++        "s_prof": {"goal": "ship it", "status": "active"},
++    })
++
++    assert gsa.active_goal_sessions() == {"s_active", "s_prof"}
++
++
++def test_annotates_rows_by_lineage_and_clears_stale_stamps(home):
++    _make_state_db(home / "state.db", {"s_root": {"goal": "g", "status": "active"}})
++    rows = [
++        {"id": "s_tip", "_lineage_root_id": "s_root", "_lineage_ids": ["s_root", "s_tip"]},
++        {"id": "s_idle", "goal_active": True},  # finished goal: stale stamp is cleared
++        {"id": "s_none"},
++    ]
++
++    gsa.annotate_goal_activity(rows)
++
++    assert rows[0]["goal_active"] is True
++    assert "goal_active" not in rows[1]
++    assert "goal_active" not in rows[2]
++
++
++def test_missing_or_schemaless_db_is_harmless(home):
++    sqlite3.connect(home / "state.db").close()  # no state_meta table
++    rows = [{"id": "s1"}]
++    assert gsa.annotate_goal_activity(rows) == [{"id": "s1"}]
+-- 
+2.55.0
+

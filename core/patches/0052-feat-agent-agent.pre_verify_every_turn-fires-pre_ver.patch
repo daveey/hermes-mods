@@ -1,0 +1,133 @@
+From 4c93d9c6327d92efa2ef1242ba627515c8d51091 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:49:50 -0700
+Subject: [PATCH] feat(agent): agent.pre_verify_every_turn fires pre_verify on
+ text stops without edits [daveey]
+
+---
+ agent/turn_stop_gates.py         |  9 ++++---
+ agent/verify_hooks.py            |  9 ++++++-
+ hermes_cli/config_defaults.py    |  3 +++
+ tests/agent/test_verify_hooks.py | 46 ++++++++++++++++++++++++++++++++
+ 4 files changed, 62 insertions(+), 5 deletions(-)
+
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index 9580c635d4..a762ca3237 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -50,15 +50,16 @@ def _verify_on_stop_nudge(agent) -> Optional[str]:
+ 
+ 
+ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
+-    """After code edits a registered ``pre_verify`` hook may keep the agent going one
+-    more turn; no default continuation cost."""
++    """After code edits (or on every text stop with ``agent.pre_verify_every_turn``) a registered
++    ``pre_verify`` hook may keep the agent going one more turn; no default continuation cost."""
+     _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
+     try:
+-        from agent.verify_hooks import max_verify_nudges
++        from agent.verify_hooks import max_verify_nudges, pre_verify_every_turn
+         from hermes_cli.lifecycle import has_hook
+         from hermes_cli.plugins import get_pre_verify_continue_message
+ 
+-        if _edited and has_hook("pre_verify") and attempt < max_verify_nudges():
++        if (has_hook("pre_verify") and attempt < max_verify_nudges()
++                and (_edited or pre_verify_every_turn())):
+             # Posture is fixed for the session — resolve once + cache.
+             coding = getattr(agent, "_resolved_is_coding", None)
+             if coding is None:
+diff --git a/agent/verify_hooks.py b/agent/verify_hooks.py
+index 7b554bcb5b..928355ca47 100644
+--- a/agent/verify_hooks.py
++++ b/agent/verify_hooks.py
+@@ -41,6 +41,12 @@ def coding_verify_guidance(config: Optional[dict[str, Any]] = None) -> Optional[
+     return CODING_VERIFY_GUIDANCE
+ 
+ 
++def pre_verify_every_turn(config: Optional[dict[str, Any]] = None) -> bool:
++    """``agent.pre_verify_every_turn``: also fire ``pre_verify`` on turns with no file edits (with
++    ``changed_paths=[]``), so plugins can check any final answer. Default off (upstream behavior)."""
++    return is_truthy_value(_agent_cfg(config).get("pre_verify_every_turn", False), default=False)
++
++
+ def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+     if config is None:
+         try:
+@@ -53,4 +59,5 @@ def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+     return agent_cfg if isinstance(agent_cfg, dict) else {}
+ 
+ 
+-__all__ = ["CODING_VERIFY_GUIDANCE", "DEFAULT_MAX_VERIFY_NUDGES", "coding_verify_guidance", "max_verify_nudges"]
++__all__ = ["CODING_VERIFY_GUIDANCE", "DEFAULT_MAX_VERIFY_NUDGES", "coding_verify_guidance", "max_verify_nudges",
++           "pre_verify_every_turn"]
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index e227692a8d..e02c23fa0a 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -213,6 +213,9 @@ DEFAULT_CONFIG = {
+         "verify_guidance": True,
+         # Max consecutive `pre_verify` "continue" nudges per turn (hooks can't trap the loop).
+         "max_verify_nudges": 3,
++        # Also fire `pre_verify` on turns without file edits (changed_paths=[]), so a plugin can check
++        # any final answer (e.g. a hand-off or an unverified "done"). False = upstream: edits only.
++        "pre_verify_every_turn": False,
+         # Verification closure: after code edits in a workspace, refuse a final answer until fresh
+         # verification evidence exists or the agent explains why it can't check (bounded loop,
+         # passive ledger). False (default) because the nudges proved more noise than signal; true =
+diff --git a/tests/agent/test_verify_hooks.py b/tests/agent/test_verify_hooks.py
+index 8922a93108..1d6438f022 100644
+--- a/tests/agent/test_verify_hooks.py
++++ b/tests/agent/test_verify_hooks.py
+@@ -51,3 +51,49 @@ class TestCodingVerifyGuidance:
+     def test_opt_out_via_config(self):
+         off = {"agent": {"verify_guidance": False}}
+         assert verify_hooks.coding_verify_guidance(off) is None
++
++
++class TestPreVerifyEveryTurn:
++    def test_off_by_default(self):
++        assert verify_hooks.pre_verify_every_turn({}) is False
++        assert verify_hooks.pre_verify_every_turn({"agent": {}}) is False
++
++    def test_opt_in(self):
++        assert verify_hooks.pre_verify_every_turn({"agent": {"pre_verify_every_turn": True}}) is True
++        assert verify_hooks.pre_verify_every_turn({"agent": {"pre_verify_every_turn": "yes"}}) is True
++
++
++class TestPreVerifyGateWithoutEdits:
++    """turn_stop_gates._pre_verify_nudge: no edits -> hook only consulted when opted in."""
++
++    def _run(self, monkeypatch, every_turn, edited):
++        from types import SimpleNamespace
++        from agent import turn_stop_gates
++        from hermes_cli import lifecycle
++        from hermes_cli import plugins
++
++        calls = []
++        monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "pre_verify")
++        monkeypatch.setattr(verify_hooks, "pre_verify_every_turn", lambda config=None: every_turn)
++        monkeypatch.setattr(verify_hooks, "max_verify_nudges", lambda config=None: 3)
++
++        def fake(**kw):
++            calls.append(kw)
++            return "keep going"
++
++        monkeypatch.setattr(plugins, "get_pre_verify_continue_message", fake)
++        agent = SimpleNamespace(_turn_file_mutation_paths=set(edited), session_id="s", platform="cli",
++                                model="m", _resolved_is_coding=False)
++        return turn_stop_gates._pre_verify_nudge(agent, "Done.", 0), calls
++
++    def test_no_edits_default_skips_hook(self, monkeypatch):
++        msg, calls = self._run(monkeypatch, every_turn=False, edited=[])
++        assert msg is None and calls == []
++
++    def test_no_edits_opted_in_calls_hook_with_empty_paths(self, monkeypatch):
++        msg, calls = self._run(monkeypatch, every_turn=True, edited=[])
++        assert msg == "keep going" and calls[0]["changed_paths"] == []
++
++    def test_edits_still_call_hook_when_off(self, monkeypatch):
++        msg, calls = self._run(monkeypatch, every_turn=False, edited=["a.py"])
++        assert msg == "keep going" and calls[0]["changed_paths"] == ["a.py"]
+-- 
+2.55.0
+
