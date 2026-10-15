@@ -78,14 +78,45 @@ def _err(msg: str) -> str:
     return json.dumps({"ok": False, "error": msg})
 
 
+# Models reach this tool through deferred `tool_call` without loading its schema, and guess the
+# argument names — `session` for `target` in every logged failure. Accept the common guesses.
+TARGET_ALIASES = ("session", "session_id", "sessionId", "session_ref", "session_link", "link", "ref", "id", "to")
+MESSAGE_ALIASES = ("text", "content", "body", "prompt")
+
+
+def _first(args: dict, keys) -> object:
+    for k in keys:
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def normalize_args(args: dict | None) -> dict:
+    args = dict(args or {})
+    if not str(args.get("target") or "").strip():
+        alias = _first(args, TARGET_ALIASES)
+        if alias is not None:
+            args["target"] = alias
+    if not str(args.get("message") or "").strip():
+        alias = _first(args, MESSAGE_ALIASES)
+        if alias is not None:
+            args["message"] = alias
+    return args
+
+
 def handle(args: dict, session_id: str | None = None, **_kw) -> str:
+    args = normalize_args(args)
     action = str(args.get("action") or "").strip()
     if action not in ("list", "read", "send"):
         return _err("action must be list, read, or send")
     if action in ("read", "send") and not str(args.get("target") or "").strip():
-        return _err("target is required for read/send")
+        got = sorted(k for k in args if k != "action")
+        return _err("target is required for read/send — pass the session link as `target` "
+                    "(e.g. target=\"@session:default/20260101_000000_abc123\"); got keys: "
+                    + (", ".join(got) or "none"))
     if action == "send" and not str(args.get("message") or "").strip():
-        return _err("message is required for send")
+        return _err("message is required for send — pass the text as `message`")
 
     wait = 0
     if action == "send":
