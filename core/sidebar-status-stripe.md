@@ -1,7 +1,7 @@
 # Sidebar status stripe + gateway device glyph (Desktop)
 
-Patches: `0038`, `0039`, `0044`, `0051`, `0063` in `core/patches/`. `0038`/`0039` touch `apps/desktop` only;
-`0044`, `0051` and `0063` also add backend fields to the session-list endpoints. Replaces the per-gateway
+Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
+only; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints. Replaces the per-gateway
 row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `0038`: stripe shows session status (green/red); gateway becomes a device glyph after the age.
@@ -9,6 +9,7 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `0044`: a session whose kanban tasks are still queued or running stays "working" (no green).
 - `0051`: a session whose `/goal` is still active stays "working" (no green).
 - `0063`: the row shows open and blocked kanban task counts after the age.
+- `0070`: a session that owns a live background process (per the backend) stays "working" (no green).
 
 ## Behavior
 
@@ -27,8 +28,12 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
     tasks don't count.
   - its standing `/goal` is still `active` (`0051`): between goal turns, or parked on a judge `wait` timer.
     Paused, done and cleared goals don't count.
+  - it owns a background process (`terminal` with `background=true`) whose PID is still alive, as the backend
+    sees it (`0070`). The renderer already showed `background` for processes it had polled itself, but only for
+    sessions whose tool events streamed into this window. A turn the backend resumed after a restart, or a
+    process registered by another Hermes process, left the row green while e.g. `gh pr checks --watch` still ran.
 
-  Both count over the session's whole compression lineage. Once the work ends the row goes back to green.
+  All three count over the session's whole compression lineage. Once the work ends the row goes back to green.
   A live turn still wins: the row reads `working`.
 - The row shows kanban task counts right after the age and before the gateway glyph (`0063`): open
   (queued/running) with a project glyph, blocked with an amber `?`. A side that is zero is hidden; with no
@@ -54,10 +59,24 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   counts when its JSON has `status == "active"` and a non-blank `goal`. Cached 2 s.
   `annotate_goal_activity(rows)` stamps `goal_active: true` by lineage, clears stale stamps, never raises,
   and runs on the same three endpoints right after the kanban stamp.
-- Desktop side: `SessionInfo` (`types/hermes.ts`) gains `kanban_active?`, `goal_active?` and
-  `kanban_blocked?`. `$kanbanBusySessionIds` and `$goalActiveSessionIds` collect ids from `$sessions` and
-  `$messagingSessions`. `$sessionDotStateById` claims both as `background`, after `delegating` and before
-  `working`, so a live turn overrides them.
+- Background processes (`0070`): `hermes_cli/process_session_activity.py` collects live processes from this
+  process's `tools.process_registry.process_registry` (`_running`, not exited) and from every `processes.json`
+  it can find: the Hermes home, each `profiles/*/processes.json`, and the registry's own `_checkpoint_path()`.
+  Only host-scoped entries whose PID passes `ProcessRegistry._host_pid_is_ours(pid, host_start_time)` count; an
+  in-memory session with a non-host `pid_scope` counts without a PID check. `_owner_ids(item)` maps an entry to
+  sessions via `session_key`, `parent_session_id`, `owner_task_id` and `task_id` (a `session:` prefix is stripped;
+  an empty or `default` task id is ignored). Results are cached for 3 s (`_CACHE_TTL_S`).
+  `annotate_background_activity(rows)` stamps `background_active` with the number of distinct processes owned by
+  the row's `id`, `_lineage_root_id` and `_lineage_ids` (a process counts once per row), clears a stale stamp when
+  the count is zero, and never raises. It runs on the same three endpoints right after the goal stamp.
+  `background_process_counts()` returns the per-session counts.
+- Desktop side: `SessionInfo` (`types/hermes.ts`) gains `kanban_active?`, `goal_active?`,
+  `kanban_blocked?` and `background_active?` (a number). `$kanbanBusySessionIds`, `$goalActiveSessionIds` and
+  `$backgroundActiveSessionIds` (rows with `background_active > 0`) collect ids from `$sessions` and
+  `$messagingSessions`. `$sessionDotStateById` claims all three as `background` before `working`, so a live turn
+  overrides them. `$backgroundActiveSessionIds` is claimed right after the renderer's own
+  `$backgroundRunningSessionIds`; kanban and goal come after `delegating`. The stripe needs no change: `background`
+  already maps to no stripe in `sessionStatusStripe`.
 - Blocked counts (`0063`): `_read_counts(path, statuses)` now takes the status set; `_all_counts()` reads
   `ACTIVE_STATUSES` and `BLOCKED_STATUSES = ("blocked",)` into two maps under one cache entry.
   `active_task_counts()` and the new `blocked_task_counts()` return each. `annotate_kanban_activity` stamps
@@ -78,7 +97,8 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `store/session-dot-state.test.ts`: `sessionStatusStripe`; "kanban work in flight
   (`$kanbanBusySessionIds`)" and "standing goal in flight (`$goalActiveSessionIds`)" (background not done,
-  back to done when the work ends, yields to a live turn).
+  back to done when the work ends, yields to a live turn), and the same three cases in "backend-registered
+  background process (`$backgroundActiveSessionIds`)" (`0070`).
 - `app/chat/sidebar/gateway-device-icon.test.ts`.
 - `app/chat/sidebar/session-row.test.tsx`: "SidebarSessionRow kanban counts" (counts follow the age,
   zero side hidden, nothing when idle).
@@ -87,6 +107,9 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   `test_stamps_blocked_count_separately_from_active`.
 - `tests/hermes_cli/test_goal_session_activity.py`: only active goals count across profiles, lineage
   stamping, missing `state_meta` is harmless.
+- `tests/hermes_cli/test_process_session_activity.py` (`0070`): a live process in `processes.json` stamps its
+  session while a dead PID clears a stale stamp; lineage ids and a `session:<id>` task id count each process
+  once; the in-process registry counts.
 
 ## Applying
 
@@ -94,7 +117,10 @@ Apply after `0024`. Name your gateways so the regexes match (e.g. a connection l
 an ssh host containing `mini`). Apply `0044` before `0051` and `0063`: both edit code it adds in
 `kanban_session_activity.py`, `session-dot-state.ts` and `types/hermes.ts`. `0063` also edits the
 subscriber-counting part of `_read_counts` and sits after a test, both added by `0059` (sessions that
-shepherd a kanban card subscribe to it; not covered here), so apply `0059` first.
+shepherd a kanban card subscribe to it; not covered here), so apply `0059` first. Apply `0070` after `0051`:
+its hunks sit next to the goal code in `session-dot-state.ts`, `types/hermes.ts` and both routers. `0070` reads
+`processes.json`, so it works best with `0069` ([process-readoption.md](process-readoption.md)), which stops
+Hermes processes from erasing each other's entries there; it does not need `0069` to apply.
 
 ## Gotchas
 
@@ -105,4 +131,8 @@ shepherd a kanban card subscribe to it; not covered here), so apply `0059` first
 - Tasks count for the session that created them (and, after `0059`, tui sessions subscribed to them). A
   board db with an older schema (no `session_id`) is skipped with a debug log.
 - A session with only blocked tasks shows the amber count but still goes green: blocked work waits on you.
+- Any live background process keeps the row off green, including a long-lived server or watcher you meant to
+  leave running. Kill it (or let it exit) and the row goes green within the poll interval plus the 3 s cache.
+- Background ownership is only as good as `processes.json`: without `0069`, a process missing from the file
+  and not in this backend's registry leaves the row green.
 - The `kanbanTasks` tooltip is untranslated outside English.

@@ -2,6 +2,9 @@
 
 Patches:
 
+- `patches/0069-fix-process-shared-processes.json-keeps-other-proces.patch`: backend. Every Hermes process on the
+  host writes the same `processes.json`. A write now keeps other processes' entries whose child is still alive,
+  stamps each entry with the process that wrote it, and recovery adopts only orphans (writer gone).
 - `patches/0072-fix-process-Desktop-backend-re-adopts-its-chats-orph.patch`: backend. On startup the Desktop backend
   re-adopts background jobs its chats left running, watches their PIDs, and wakes the chat when one exits. The
   messaging gateway now adopts only its own jobs, so its shutdown never kills a Desktop chat's job.
@@ -20,6 +23,9 @@ finished, the chat never heard about it and just sat there looking done. With th
 the job up again. When it exits, the chat gets a completion turn that says the job "exited (status unknown —
 re-adopted after restart)", even if you haven't opened that chat since the restart.
 
+Before 0069 the job often wasn't even in `processes.json` by then: each process overwrote the file with only its
+own jobs, so a kanban worker or CLI run spawning anything erased the Desktop chat's entry.
+
 ## Behavior
 
 - **Who adopts what.** Every Hermes process on a host shares one `processes.json`. An entry belongs to:
@@ -27,8 +33,15 @@ re-adopted after restart)", even if you haven't opened that chat since the resta
     `watcher_platform`;
   - the **Desktop/TUI backend** when its `session_key` is a bare state.db session id;
   - nobody in particular when it has no `session_key` (legacy). The gateway adopts those, as before.
-- **Only orphans are adopted.** An entry whose writer process is still alive is left alone (that rule comes from
-  0069, which these patches build on).
+- **The shared file keeps everyone's live jobs** (0069). Each process still writes only its own running jobs, but
+  it merges in the other entries already in the file whose child PID is still running (start time checked, so a
+  recycled PID doesn't count). Other processes' entries whose child has exited are dropped, as are this process's
+  own finished jobs. A Desktop chat's job therefore stays in the file while kanban workers, CLI runs and the
+  gateway come and go, and it is still there when the Desktop backend restarts.
+- **Only orphans are adopted** (0069). Each entry records its writer (`writer_pid`, `writer_start_time`). Recovery
+  skips an entry whose writer process is still alive, so two live processes never both own one child and one's
+  shutdown can't kill the other's job. The skipped entry stays in the file for its owner. An entry with no
+  `writer_pid` (written before 0069) counts as orphaned.
 - **Only the Desktop-owned backend adopts chat jobs** (0077). A launchd `hermes dashboard` runs the same
   `web_server` lifespan but hosts no chats, so it skips adoption.
 - **The gateway's shutdown `kill_all` no longer kills a Desktop chat's job**, because the gateway never adopted it.
@@ -71,6 +84,16 @@ re-adopted after restart)", even if you haven't opened that chat since the resta
   - 0073 adds `start_checkpoint_keeper`, a `process-checkpoint-keeper` thread that calls `reassert_checkpoint` every
     30 s (`CHECKPOINT_KEEPER_SECONDS`).
 - **`tools/process_registry_checkpoint.py`**:
+  - 0069: `_write_checkpoint` now takes `_checkpoint_file_lock()` (an `fcntl.flock` on `processes.json.lock`; a no-op
+    without `fcntl`, i.e. on Windows) and calls `_write_checkpoint_locked`. That builds this registry's entries as
+    before, adds `_writer_identity()` (`writer_pid` = `os.getpid()`, `writer_start_time`) to each, then appends
+    `_foreign_live_entries(own_ids)`: entries from the current file that are host-scoped, not one of this registry's
+    running or finished ids, and whose `_detached_host_fate(pid, host_start_time)` is `running`. It writes with
+    `atomic_json_write`.
+  - 0069: `_writer_alive(entry)` is true for this process's own pid, otherwise `_host_pid_is_ours(writer_pid,
+    writer_start_time)`. A missing or non-positive `writer_pid` returns false. `recover_from_checkpoint` skips an
+    entry when `writer_pid != os.getpid()` and `_writer_alive(entry)`. Its closing `_write_checkpoint` keeps those
+    skipped entries through the foreign-entry merge.
   - `recover_from_checkpoint(owner=None)` now runs the whole read-decide-write under `_checkpoint_file_lock()`
     (`_recover_from_checkpoint_locked`), so two backends starting together adopt an orphan once. The adopter writes
     itself as writer, so a later backend sees a live writer and skips.
@@ -108,6 +131,11 @@ re-adopted after restart)", even if you haven't opened that chat since the resta
 
 New files:
 
+- `tests/tools/test_process_checkpoint_shared_file.py` (0069). Real sleeper processes and a temporary checkpoint
+  (`CHECKPOINT_PATH` patched). Covers: a write keeps another live writer's live child; it keeps a live child whose
+  writer is dead (the Desktop restart case); it drops a foreign entry whose child exited; it drops this registry's
+  own finished job; entries carry `writer_pid`; recovery skips a child whose writer is alive and leaves its entry in
+  the file; recovery adopts the orphan of a dead writer as a detached session.
 - `tests/tools/test_process_orphan_readopt_tui.py` (0072, 0073, 0076). Uses real child processes and a temporary
   checkpoint. Covers:
   - owner classification; TUI recovery adopts only bare-id entries; gateway recovery leaves them alone;
@@ -136,18 +164,18 @@ New files:
 Run with the repo runner:
 
 ```bash
-scripts/run_tests.sh tests/tools/test_process_orphan_readopt_tui.py \
-  tests/tui_gateway/test_readopted_completion_parking.py tests/tools/test_background_checkpoint_flags.py
+scripts/run_tests.sh tests/tools/test_process_checkpoint_shared_file.py \
+  tests/tools/test_process_orphan_readopt_tui.py tests/tui_gateway/test_readopted_completion_parking.py tests/tools/test_background_checkpoint_flags.py
 ```
 
 I did not re-run these for this doc.
 
 ## Applying
 
-Apply in order: 0072, 0073, 0076, 0077, 0085.
+Apply in order: 0069, 0072, 0073, 0076, 0077, 0085.
 
-- They need 0069 first. It adds the shared-file checkpoint pieces these patches call: `writer_pid` in entries,
-  `_writer_alive`, `_checkpoint_file_lock` and `_write_checkpoint_locked`.
+- 0069 stands alone (two files: `tools/process_registry_checkpoint.py` and its new test). The later patches call
+  what it adds: `writer_pid` in entries, `_writer_alive`, `_checkpoint_file_lock` and `_write_checkpoint_locked`.
 - 0076 is tests only, and its new tests fail until 0077 is applied. Apply both or neither.
 - 0077's `web_server.py` hunk uses `is_desktop_owned_backend` and `tui_gateway.server`, which the live file already
   imports. The patch does not add those imports.
@@ -167,8 +195,16 @@ Apply in order: 0072, 0073, 0076, 0077, 0085.
   loses them.
 - The wake searches profiles by name because a checkpoint entry does not record its profile. A session id present
   in two profiles' stores resumes in the first one found (launch profile first, then alphabetical).
-- Old Hermes processes (pre-0069 code) can still overwrite the file. 0073 repairs that within 30 s, but a restart
+- Every Hermes process on the host has to run 0069 code for the merge to hold. A process still on old code
+  overwrites the file with only its own entries. 0073 repairs that within 30 s, but a restart
   inside that window loses the job.
+- An entry with no `writer_pid` (written by pre-0069 code) is treated as orphaned, so right after the update the
+  first backend to recover may adopt a job that an old, still-running process also supervises.
+- The orphan check needs the writer's PID to still name the writer. Without a recorded `writer_start_time`, a
+  recycled writer PID looks alive and its jobs are never adopted. 0069 always records the start time when it can
+  read it.
+- The file lock is advisory and best-effort: if `flock` fails the write goes ahead unlocked, and on Windows there
+  is no lock at all.
 
 ## Plugin?
 
