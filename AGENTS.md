@@ -39,6 +39,10 @@ the private repo `daveey/hermes` (`~/code/hermes`, branch `state`).
    Update the tables in `README.md`.
 6. Other machines pick it up on their next `hermes-sync` pass (≤10 min).
 
+- Core patches (`core/patches/NNNN-*.patch`) ship with their feature doc in the same commit: a new or extended
+  `core/<feature>.md` and the patch number in its `core/README.md` row. The pre-commit hook
+  (`core/check_coverage.py`) refuses a commit that leaves any patch without a row.
+
 ## Never
 
 - Commit secrets, tokens, `auth.json`/`.env` content, or anything matched by the private denylist.
