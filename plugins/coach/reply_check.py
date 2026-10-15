@@ -1,9 +1,13 @@
 """reply_check: look at the agent's final answer for a turn BEFORE the turn ends (pre_verify hook).
 
-Three anti-patterns, measured in the user's own history (coach gap report 2026-10-14):
+Four anti-patterns, measured in the user's own history (coach gap report 2026-10-14):
 - handoff:     the agent hands the user a step it could plausibly do itself (click/log in/run/paste...).
 - confirm:     the agent ends by asking permission for a reversible next step ("Want me to ...?").
 - unverified:  the agent claims done/fixed/working without checking on the user's real path.
+- unwatched:   the agent promises to continue once outside work finishes ("I'll write the report when the
+               runs finish") but nothing will wake the session: no background process, kanban card, goal or
+               subagent. The turn ends, the sidebar paints the row done, and the promise is never kept.
+               A deterministic wake-source check runs first, so the judge only sees promises with no waker.
 
 Layer 1 (here, zero latency) are cheap regex prefilters; Layer 2 is an LLM judge (aux task
 `coach_reply`) that sees the user's ask, the turn's tool log and the reply. Only a judge verdict
@@ -30,12 +34,20 @@ CONFIRM_RE = re.compile(
     r"(?:ready|happy) (?:for me )?to (?:proceed|go|ship|merge|push|apply)|say (?:the word|go|yes)|"
     r"(?:let me know|tell me) if you(?:'d)? (?:want|like) me to)\b[^?\n]{0,200}\?\s*$"
     r"|\b(?:want me to|should i|shall i)\b[^?\n]{0,200}\?)", re.I | re.M)
+_FINISH = (r"(?:finish(?:es|ed)?|complete[sd]?|land(?:s|ed)?|(?:is|are) done|come[s]? back|end[s]?|pass(?:es)?|"
+           r"go(?:es)? green)")
+WAIT_RE = re.compile(
+    r"(\b(?:once|when|after|as soon as)\b[^.\n]{0,90}\b" + _FINISH + r"\b[^\n]{0,160}?\b(?:I'll|I will|I'm going to)\b"
+    r"|\b(?:I'll|I will)\b[^.\n]{0,160}\b(?:once|when|after|as soon as)\b[^.\n]{0,90}\b" + _FINISH + r"\b"
+    r"|\bI'll (?:check back|check in again|follow up|report back|pick (?:this|it) (?:back )?up)\b"
+    r"|\b(?:waiting|wait) (?:on|for) (?:the |its |their |those |these )?(?:\w+ ){0,3}(?:runs?|jobs?|training|"
+    r"experiments?|evals?|builds?|CI|sweeps?|deploys?|tests?|soaks?|workers?)\b)", re.I)
 DONE_RE = re.compile(
     r"\b(done|fixed|works now|is working|now works|verified|deployed|shipped|is live|it'?s live|resolved|"
     r"all set|should (?:now )?(?:work|be fixed|be working)|ready to use|in place|complete[d]?)\b", re.I)
 
-RULES = ("handoff", "confirm", "unverified")
-DEFAULT_RULES = ("handoff", "confirm")
+RULES = ("handoff", "confirm", "unverified", "unwatched")
+DEFAULT_RULES = ("handoff", "confirm", "unwatched")
 
 
 def prefilter(reply: str) -> list[str]:
@@ -49,7 +61,91 @@ def prefilter(reply: str) -> list[str]:
         out.append("confirm")
     if DONE_RE.search(r[:600]) or DONE_RE.search(tail):
         out.append("unverified")
+    if WAIT_RE.search(r[-1200:]):
+        out.append("unwatched")
     return out
+
+
+# Tools that, called this turn, leave something that will wake the session later.
+WAKE_TOOLS = ("delegate_task", "kanban_create", "kanban_schedule", "cronjob")
+
+
+def _lineage(session_id: str, depth: int = 12) -> list[str]:
+    """session_id plus its compression ancestors (compression rotates ids; a watcher started before a
+    rotation is keyed by the old id)."""
+    ids = [session_id]
+    try:
+        import sqlite3
+        db = sqlite3.connect(f"file:{_hermes_home() / 'state.db'}?mode=ro", uri=True, timeout=1)
+        try:
+            cur = session_id
+            for _ in range(depth):
+                row = db.execute("select parent_session_id from sessions where id=?", (cur,)).fetchone()
+                if not row or not row[0] or row[0] in ids:
+                    break
+                cur = row[0]
+                ids.append(cur)
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return ids
+
+
+def _running_processes(ids: set) -> list[str]:
+    """Background processes still running for this session: the in-process registry (authoritative inside the
+    backend that owns the turn) plus live pids in processes.json (another backend, or a recovered checkpoint)."""
+    out: list[str] = []
+    try:
+        from tools.process_registry import process_registry as reg  # type: ignore
+        with reg._lock:
+            live = list(reg._running.values())
+        out += [s.id for s in live if not s.exited and ({s.session_key, s.owner_task_id} & ids)]
+    except Exception:
+        pass
+    try:
+        rows = json.loads((_hermes_home() / "processes.json").read_text())
+        rows = rows if isinstance(rows, list) else rows.get("processes", [])
+    except Exception:
+        rows = []
+    for r in rows:
+        if not isinstance(r, dict) or not ({r.get("session_key"), r.get("owner_task_id")} & ids) or not r.get("pid"):
+            continue
+        pid_name = str(r.get("session_id") or r["pid"])
+        if pid_name in out:
+            continue
+        try:
+            os.kill(int(r["pid"]), 0)
+            out.append(pid_name)
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def wake_sources(session_id: str, tool_log: Optional[list] = None) -> list[str]:
+    """What will wake this session after the turn ends. Empty = nothing; a promise to continue later is orphaned.
+    Fail-open the other way: any lookup error just means that source isn't counted."""
+    found: list[str] = []
+    log = "\n".join(tool_log or [])
+    found += [f"tool:{t}" for t in WAKE_TOOLS if t in log]
+    ids = set(_lineage(session_id)) if session_id else set()
+    if not ids:
+        return found
+    found += [f"process:{p}" for p in _running_processes(ids)]
+    try:
+        from hermes_cli.kanban_session_activity import active_task_counts  # type: ignore
+        counts = active_task_counts()
+        if any(counts.get(i) for i in ids):
+            found.append("kanban")
+    except Exception:
+        pass
+    try:
+        from hermes_cli.goal_session_activity import active_goal_sessions  # type: ignore
+        if ids & set(active_goal_sessions()):
+            found.append("goal")
+    except Exception:
+        pass
+    return found
 
 
 JUDGE_SYS = """You review an AI agent's final message for a turn, right before the turn ends, for a power user who wants
@@ -70,10 +166,16 @@ probabilities (0-1):
   that exercises the user's actual path (running the real command/app/URL/test the user cares about and seeing the
   right result). Building, type-checking, or testing something adjacent does not count. Saying explicitly that it
   is unverified or what remains unchecked is NOT an unverified claim (score low).
+- unwatched: the message says the AGENT will act later, after some outside work finishes (runs, jobs, CI, builds,
+  deploys, other agents): "I'll write the report once the runs finish", "waiting on the eval". A deterministic check
+  already confirmed nothing is armed to wake this session afterwards (no background watcher, kanban card, goal or
+  subagent). Score high when the agent's own follow-up depends on that outside work. Score low when the next step is
+  the USER's (they will test, decide, or reply), when the agent says plainly that it is stopping and the user should
+  ping it, or when the outside work's result needs no further action from the agent.
 
 Calibrate: 0.8+ means you'd bet the user will push back ("do it yourself" / "just do it" / "you have access").
 
-Return ONLY JSON: {"handoff": p, "confirm": p, "unverified": p, "evidence": "<=25 words citing the message/tool log"}"""
+Return ONLY JSON: {"handoff": p, "confirm": p, "unverified": p, "unwatched": p, "evidence": "<=25 words citing the message/tool log"}"""
 
 
 def _hermes_home():
@@ -130,6 +232,13 @@ NUDGES = {
     "unverified": ("[coach] Your message says it's done/fixed, but this turn has no check on the user's actual path "
                    "({evidence}). Verify it the way the user will experience it (same command/app/URL/viewport/device) "
                    "and cite the evidence, or state plainly what is still unverified."),
+    "unwatched": ("[coach] Your message promises to continue after outside work finishes ({evidence}), but nothing "
+                  "will wake this session: no background process, kanban card, goal or subagent is attached, so "
+                  "the turn ends, the sidebar shows it as done, and the follow-up never happens. Before ending, arm "
+                  "a wake source: one `terminal(background=true, notify=true)` watcher that polls the real "
+                  "completion signal (result files, job/CI status) with a sensible interval and a time cap, then "
+                  "exits with a short summary. Use a kanban card instead for multi-hour work. If you are actually "
+                  "handing the follow-up to the user, say so plainly instead of promising it."),
 }
 
 
@@ -159,9 +268,18 @@ def aux_judge(system: str, prompt: str) -> str:
 
 def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
           threshold: float = 0.8, only: Optional[list[str]] = None,
-          changed_paths: Optional[list] = None) -> Optional[dict]:
-    """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None."""
+          changed_paths: Optional[list] = None,
+          wake: Optional[Callable[[], list]] = None) -> Optional[dict]:
+    """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `wake()` lists the session's wake sources; any source drops the `unwatched` candidate before the judge runs
+    (no wake callable = can't tell, so `unwatched` is skipped)."""
     cands = [r for r in prefilter(reply) if not only or r in only]
+    if "unwatched" in cands:
+        try:
+            if wake is None or wake():
+                cands.remove("unwatched")
+        except Exception:
+            cands.remove("unwatched")
     if not cands:
         return None
     v = parse_verdict(llm(judge_system(), judge_prompt(user_ask, tool_log, reply)))

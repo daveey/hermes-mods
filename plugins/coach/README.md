@@ -38,11 +38,13 @@ this user's agents can reach). A hit keeps the turn going with a nudge the user 
 |---|---|---|
 | `handoff` | the reply hands the user a step the agent could do itself (log in, click, run, paste...) | try it first with shell/ssh/browser/vault/token-broker; hand off only what needs hands or judgment, and say why |
 | `confirm` | the reply ends with "Want me to…?" about a reversible, in-scope step | proceed, verify, report; ask only before irreversible or external actions |
+| `unwatched` | the reply promises to continue after outside work finishes ("I'll write the report once the runs finish", "waiting on CI") and `wake_sources()` finds nothing armed: no live background process for the session or its compression ancestors, no open kanban card, no active goal, and no delegate/kanban/cron call this turn. A row like this gets painted done and its follow-up never runs | arm one `terminal(background=true, notify=true)` watcher on the real completion signal with a time cap (a kanban card for multi-hour work), or say plainly that the user owns the follow-up |
 | `unverified` (off by default) | "done/fixed" with no check on the user's real path | verify on the user's path or say what's unchecked |
 
 Measured on 360 real replies against hindsight labels (the labeler also saw the user's next message). At
 threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
 samples are small (n=120), so treat these numbers as early. `unverified` showed no usable signal.
+`unwatched` checks wake sources deterministically before the judge runs, so a reply with a live watcher costs no LLM call. Of 3,260 recent Desktop replies, 299 matched the prefilter. On three real cases the judge scored the orphaned "once the runs finish, I'll…" reply 0.85 and scored the user-owned next step and the reply that armed a watcher below threshold. Watchers die when their backend restarts, so a promise made before a restart can become orphaned later; the rule only catches this at turn end.
 Settings: `COACH_REPLY_RULES` (comma list or `none`) and `COACH_REPLY_THRESHOLD`. Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`.

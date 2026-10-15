@@ -156,7 +156,8 @@ def build(store=None, checkout=None):
                 return None
             ask, log_lines = coach.turn_context(session_id)
             hit = rc.check(final_response, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
-                           only=cfg["rules"], changed_paths=changed_paths)
+                           only=cfg["rules"], changed_paths=changed_paths,
+                           wake=lambda: rc.wake_sources(session_id, log_lines))
             if not hit:
                 return None
             store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],

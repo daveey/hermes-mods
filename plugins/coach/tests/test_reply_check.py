@@ -85,4 +85,43 @@ def test_pre_verify_hook_nudges_once_per_turn(tmp_path, monkeypatch):
 def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
     monkeypatch.delenv("COACH_REPLY_THRESHOLD", raising=False)
-    assert rc.settings() == {"rules": ["handoff", "confirm"], "threshold": 0.7}
+    assert rc.settings() == {"rules": ["handoff", "confirm", "unwatched"], "threshold": 0.7}
+
+
+ORPHAN = ("Everything is running.\n\nOnce the last runs finish, around 03:30 UTC, I'll build the tables from the "
+          "result files, write the report and merge the PR.")
+
+
+def test_prefilter_unwatched_promises():
+    assert "unwatched" in rc.prefilter(ORPHAN)
+    assert "unwatched" in rc.prefilter("Smoke test is green. I'll launch the sweep as soon as CI passes.")
+    assert "unwatched" in rc.prefilter("Nothing else to do here; waiting on the eval runs.")
+    assert "unwatched" not in rc.prefilter("The runs finished and the tables are below.")
+
+
+def test_unwatched_needs_no_wake_source_before_the_judge_runs():
+    verdict = {"handoff": 0, "confirm": 0, "unverified": 0, "unwatched": 0.9, "evidence": "promises tables at 03:30"}
+    llm, calls = _judge(verdict)
+    assert rc.check(ORPHAN, "run it", [], llm, wake=lambda: ["process:proc_1"]) is None and calls == []
+    assert rc.check(ORPHAN, "run it", [], llm) is None and calls == []  # can't tell -> skip
+    assert rc.check(ORPHAN, "run it", [], llm, wake=lambda: 1 / 0) is None and calls == []  # lookup error -> skip
+    hit = rc.check(ORPHAN, "run it", [], llm, wake=lambda: [])
+    assert hit["rule"] == "unwatched" and "background=true, notify=true" in hit["nudge"] and len(calls) == 1
+    low, _ = _judge({**verdict, "unwatched": 0.3})
+    assert rc.check(ORPHAN, "run it", [], low, wake=lambda: []) is None
+
+
+def test_wake_sources_tool_log_and_live_process(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(rc, "_hermes_home", lambda: tmp_path)
+    assert rc.wake_sources("s1", ["-> terminal(ls)"]) == []
+    assert rc.wake_sources("s1", ["-> delegate_task(train it)"]) == ["tool:delegate_task"]
+    (tmp_path / "processes.json").write_text(json.dumps([
+        {"session_id": "proc_live", "session_key": "s1", "pid": os.getpid()},
+        {"session_id": "proc_other", "session_key": "s2", "pid": os.getpid()},
+        {"session_id": "proc_dead", "session_key": "s1", "pid": 2 ** 22 + 12345}]))
+    import sys
+    monkeypatch.setitem(sys.modules, "tools.process_registry", None)  # force the processes.json fallback
+    assert rc.wake_sources("s1", []) == ["process:proc_live"]
+    assert rc.wake_sources("s3", []) == []
