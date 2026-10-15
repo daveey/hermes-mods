@@ -1,7 +1,8 @@
 # Sidebar status stripe + gateway device glyph (Desktop)
 
-Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
-only, as does `0089`; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints. Replaces the per-gateway
+Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
+only, as does `0089`; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints; `0091`
+is backend-only (`tui_gateway/server.py`). Replaces the per-gateway
 row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `0038`: stripe shows session status (green/red); gateway becomes a device glyph after the age.
@@ -11,6 +12,8 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `0063`: the row shows open and blocked kanban task counts after the age.
 - `0070`: a session that owns a live background process (per the backend) stays "working" (no green).
 - `0089`: the travelling arc border marks the selected row, not every working row.
+- `0091`: a turn running longer than 5 min no longer paints red while its tools are still active.
+- Red for blocked kanban cards is `0092`, documented in [kanban-session-links.md](kanban-session-links.md).
 
 ## Behavior
 
@@ -21,7 +24,11 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   - **green**: the agent finished its turn and is waiting on you: dot state `unread`, or `idle` with at
     least one message. It stays after you open the row (`0039`; in `0038` it was unread-only).
   - **red**: not finished and needs help (dot state `needs-input`, i.e. blocked on a clarify/approval
-    prompt, or `stalled`, i.e. a live turn that has gone quiet).
+    prompt, or `stalled`, i.e. a live turn that has gone quiet). Since `0092` also when kanban cards it created or
+    shepherds are `blocked` and no turn is working ([kanban-session-links.md](kanban-session-links.md)).
+  - A live turn counts as quiet only when the agent itself has gone quiet (`0091`). Before, the live list's
+    `last_active` was the turn's start time, so every turn longer than 5 min painted red while its tools ran, and
+    opening the session cleared it (streamed events refreshed the clock), which looked like an instant resume.
   - **grey**: you parked it with ⌘B (`0048`, [session-navigation-shortcuts.md](session-navigation-shortcuts.md)).
     Overrides every other colour; ⌘]/⌘[ and ⌘⇧]/⌘⇧[ skip it. ⌘B again clears it.
   - **none**: working, background/delegating, draft, archived, or a session with no turn yet.
@@ -97,6 +104,14 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   the new i18n string `sidebar.row.kanbanTasks(open, blocked)` (English only; other locales are listed in
   `overlay-gaps.json`).
 
+- Live-list activity clock (`0091`): `session.active_list` builds each row with `_session_live_item`, whose
+  `last_active` now comes from `_session_live_last_active(session, now)` in `tui_gateway/server.py`.
+  `session["last_active"]` is stamped only at turn start/end; for a `running` session the helper takes the max of
+  that stamp, the agent's `_last_activity_ts` (API waits, stream tokens, tool heartbeats) and, for an isolated
+  compute-host turn (`_compute_host_turn_id` set), `now` minus the age of `_compute_host_activity_ns`
+  (a `perf_counter_ns` stamp), capped at `now`. Idle sessions keep their stored stamp. Desktop's
+  `rehydrateLiveSessionStatuses` is unchanged: it still marks a working row `stalled` once `last_active` is 5+ min old.
+
 ## Tests
 
 - `store/session-dot-state.test.ts`: `sessionStatusStripe`; "kanban work in flight
@@ -110,6 +125,10 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `tests/hermes_cli/test_kanban_session_activity.py`: only pending/running count across boards, lineage
   stamping and stale-stamp clearing, old schema never breaks the list,
   `test_stamps_blocked_count_separately_from_active`.
+- `tests/tui_gateway/test_tui_gateway_server.py` (`0091`):
+  `test_session_active_list_last_active_follows_running_turn_activity` (running turn follows the agent clock, an
+  isolated turn follows its ns stamp, an idle row keeps its stored stamp, a really quiet running turn stays old,
+  nothing is in the future).
 - `tests/hermes_cli/test_goal_session_activity.py`: only active goals count across profiles, lineage
   stamping, missing `state_meta` is harmless.
 - `tests/hermes_cli/test_process_session_activity.py` (`0070`): a live process in `processes.json` stamps its
@@ -126,7 +145,8 @@ shepherd a kanban card subscribe to it; not covered here), so apply `0059` first
 its hunks sit next to the goal code in `session-dot-state.ts`, `types/hermes.ts` and both routers. `0070` reads
 `processes.json`, so it works best with `0069` ([process-readoption.md](process-readoption.md)), which stops
 Hermes processes from erasing each other's entries there; it does not need `0069` to apply. `0089` is a two-file change to `session-row.tsx` and its test and applies on
-its own; it drops the row's use of `showsRunningArc` but leaves that helper in `session-dot-state.ts`.
+its own; it drops the row's use of `showsRunningArc` but leaves that helper in `session-dot-state.ts`. `0091` applies
+on its own (one helper in `tui_gateway/server.py` plus a test) and needs no Desktop change.
 
 ## Gotchas
 
@@ -138,7 +158,10 @@ its own; it drops the row's use of `showsRunningArc` but leaves that helper in `
   2–3 s backend cache.
 - Tasks count for the session that created them (and, after `0059`, tui sessions subscribed to them). A
   board db with an older schema (no `session_id`) is skipped with a debug log.
-- A session with only blocked tasks shows the amber count but still goes green: blocked work waits on you.
+- A session with only blocked tasks shows the amber count and, since `0092`, the red stripe (it can't finish until
+  someone unblocks them). Before `0092` it went green.
+- `0091` only helps when the agent stamps `_last_activity_ts`. A tool that blocks for 5+ min without heartbeats
+  still reads as stalled; that is the signal working as intended.
 - Any live background process keeps the row off green, including a long-lived server or watcher you meant to
   leave running. Kill it (or let it exit) and the row goes green within the poll interval plus the 3 s cache.
 - Background ownership is only as good as `processes.json`: without `0069`, a process missing from the file

@@ -9,12 +9,17 @@ Patches:
   the calling chat's session (`HERMES_SESSION_ID`) on the new card.
 - `patches/0068-fix-kanban-CLI-create-in-an-agent-terminal-stamps-HE.patch`: CLI. In a Desktop/TUI agent terminal,
   `hermes kanban create` prefers `HERMES_SESSION_KEY` and also adds the `tui` completion subscription.
+- `patches/0092-fix-desktop-red-stripe-on-a-session-whose-kanban-car.patch`: Desktop. A session whose kanban cards
+  are `blocked` gets the red (stuck) sidebar stripe instead of green.
+- `patches/0093-feat-kanban-GET-api-session-kanban-tasks-lists-the-c.patch`: backend. `GET
+  /api/session-kanban-tasks?ids=…` lists the cards behind a sidebar row's kanban counts.
 
 What you see: a chat that starts or babysits Kanban cards stays tied to them. Ask a chat to "make sure t_x finishes"
 and, with the config flag on, it wakes when the card completes or blocks. Its sidebar row stays busy until the card
 lands instead of painting green "done" while the card still runs. Cards an agent creates by shelling out to
 `hermes kanban create` (terminal or execute_code) now show in that chat's Tasks view, the same as cards made with
-the `kanban_create` tool. Before, the chat said "N cards running" while its Tasks view was empty.
+the `kanban_create` tool. Before, the chat said "N cards running" while its Tasks view was empty. A chat whose cards
+are blocked on a human shows red in the sidebar, and the open chat's task strip lists exactly the cards its badge counts.
 
 ## Behavior
 
@@ -40,6 +45,17 @@ the `kanban_create` tool. Before, the chat said "N cards running" while its Task
 - **Idempotency hits are left alone (0068).** If `--idempotency-key` matches an existing non-archived card, the CLI
   returns it without re-stamping or re-subscribing.
 
+- **Blocked cards paint red (0092).** If any card the session created or shepherds (its `kanban_blocked` count, from
+  0063) is `blocked`, the sidebar stripe is red (`stuck`) unless a turn is actively `working`. A ⌘B user block
+  (grey) still wins. ⌘]/⌘[ stepping uses the same rule, so it lands on these rows.
+- **Session task list (0093).** `GET /api/session-kanban-tasks?ids=a,b,c` takes one compression lineage's session
+  ids (max 50, query max 4000 chars) and returns `{"tasks": [...]}`: every `todo`/`ready`/`running`/`scheduled`,
+  `blocked` or `review` card on every board that those ids created or are `tui` subscribers of. Each task has `id`,
+  `title`, `status`, `assignee`, `session_id`, `created_at`, `started_at`, `current_run_started_at`, `board` (slug,
+  `default` for the root board) and `via` (`created` or `subscribed`; created wins). Missing `ids` is a 422.
+  The consumer is the `desktop-plugins/session-tasks` plugin in this repo, which falls back to scanning the
+  current board on backends without the route.
+
 ## How it works
 
 - 0059, `tools/kanban_tools.py`: `_maybe_auto_subscribe` takes `gate` and `gate_default` keyword arguments, so the
@@ -61,6 +77,20 @@ the `kanban_create` tool. Before, the chat said "N cards running" while its Task
   the same `idempotency_key`. After the create, if there is a session key and no idempotency hit, it calls
   `_maybe_auto_subscribe(conn, task_id)`, so `kanban.auto_subscribe_on_create` gates it too.
 
+- 0092, `apps/desktop/src/store/session-dot-state.ts`: `sessionStatusStripe(state, hasTurns, userBlocked, kanbanBlocked = 0)`
+  returns `stuck` when `kanbanBlocked > 0 && state !== 'working'` (after the user-blocked check).
+  `sidebar/session-row.tsx` passes the row's `kanbanBlocked`; `sessionHasStatusStripe` in
+  `store/sidebar-visible-order.ts` passes `session.kanban_blocked`, keeping stripe and stepping on one predicate.
+- 0093, `hermes_cli/kanban_session_activity.py`: `LISTED_STATUSES = ACTIVE_STATUSES + BLOCKED_STATUSES + ("review",)`.
+  `session_tasks(session_ids, statuses=LISTED_STATUSES)` dedupes the ids and calls `_read_session_tasks` on each
+  `_board_db_paths()` db (read-only, 0.5 s timeout; a board that raises `sqlite3.Error` is skipped with a debug
+  log). That runs the same two queries `_read_counts` counts: `tasks.session_id IN ids`, then
+  `kanban_notify_subs` with `platform = 'tui'` and `chat_id IN ids` joined to `tasks`. Columns missing from an old
+  schema come back `NULL`; `current_run_started_at` is read from `task_runs` via `current_run_id` when both exist.
+  `_board_slug(path)` names the board. Results are not cached.
+- 0093, `hermes_cli/web_routers/sessions.py`: `get_session_kanban_tasks` on `list_router` splits `ids`, keeps the
+  first 50 and returns `session_kanban_tasks(wanted)`.
+
 ## Tests
 
 - `tests/tools/test_kanban_tools.py` (0059): `test_comment_on_existing_card_subscribes_shepherding_session` (one
@@ -74,6 +104,16 @@ the `kanban_create` tool. Before, the chat said "N cards running" while its Task
   `test_cli_create_without_session_env_is_unstamped`, `test_cli_create_in_worker_does_not_stamp_worker_session`,
   `test_cli_create_with_session_key_stamps_and_subscribes`, `test_cli_create_without_session_key_adds_no_subscription`,
   `test_cli_create_idempotency_hit_does_not_restamp`.
+
+- `apps/desktop/src/store/session-dot-state.test.ts` (0092): "paints stuck (red) when kanban cards the session
+  created are blocked, unless a turn is working" (also: user block wins, zero blocked stays done).
+- `apps/desktop/src/app/chat/sidebar/session-row.test.tsx` (0092): "paints the red (stuck) stripe while a kanban
+  card it created is blocked".
+- `tests/hermes_cli/test_kanban_session_activity.py` (0093):
+  `test_session_tasks_lists_created_and_shepherded_cards_the_sidebar_counts` (created and `tui`-shepherded cards
+  across two boards, done and non-`tui` rows excluded, matches the badge counts),
+  `test_session_tasks_empty_ids_and_old_schema`, `test_session_kanban_tasks_endpoint` (filters by id, 422 without
+  `ids`).
 
 ## Applying
 
@@ -89,6 +129,12 @@ the `kanban_create` tool. Before, the chat said "N cards running" while its Task
     auto_subscribe_on_touch: true
   ```
 
+- 0092 needs 0063 (the `kanban_blocked` field and `sessionStatusStripe`'s stripe from
+  [sidebar-status-stripe.md](sidebar-status-stripe.md)) and the ⌘B user-block argument from 0048.
+- 0093 needs 0044 and 0063 (`ACTIVE_STATUSES`, `BLOCKED_STATUSES`, `_board_db_paths`) and inserts its route next
+  to the import 0044 added in `web_routers/sessions.py`. Its subscriber query matches 0059's counting; without
+  0059 the counts and the list disagree on shepherded cards.
+
 ## Gotchas
 
 - `auto_subscribe_on_touch` is off by default, so 0059's subscribe-on-touch does nothing until you enable it. The
@@ -102,7 +148,14 @@ the `kanban_create` tool. Before, the chat said "N cards running" while its Task
 - The idempotency check is a separate query before `create_task`. It isn't atomic with the create, which only matters
   if two creates with the same key race.
 
+- After 0092 a session goes red for blocked cards even when its own turn finished fine; unblock (or archive) the
+  card to clear it. A `review` card does not turn it red, but 0093 lists it.
+- 0093 lists `review` cards that the sidebar badge does not count, so the strip can show more cards than the badge.
+- The endpoint reads only this backend's boards. The desktop plugin asks the active connection, so cards on another
+  gateway's boards don't show.
+
 ## Plugin?
 
-No. The subscribe calls live inside the Kanban tool handlers and `hermes kanban create`, and the sidebar count is in
+Partly. 0093's consumer is the `desktop-plugins/session-tasks` plugin in this repo; the route itself must be
+in core, since it reads the session-list module. Otherwise no. The subscribe calls live inside the Kanban tool handlers and `hermes kanban create`, and the sidebar count is in
 the session-list code. None of these have plugin hooks.

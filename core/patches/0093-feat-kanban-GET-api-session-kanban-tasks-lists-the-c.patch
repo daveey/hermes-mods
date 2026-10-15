@@ -1,0 +1,200 @@
+From 629327cfebcb5f5c1d3fc0d5298deeb4034f106f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:34:03 -0700
+Subject: [PATCH] feat(kanban): GET /api/session-kanban-tasks lists the cards
+ behind a sidebar row's kanban counts [daveey]
+
+Created + tui-shepherded open/blocked/review cards across every board for a
+session lineage, so the desktop session-tasks strip shows the same cards the
+sidebar badge counts (it scanned only the current board and missed shepherded
+cards) without fetching the whole board.
+---
+ hermes_cli/kanban_session_activity.py         | 60 ++++++++++++++++
+ hermes_cli/web_routers/sessions.py            | 12 +++-
+ .../test_kanban_session_activity.py           | 72 +++++++++++++++++++
+ 3 files changed, 143 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index ccf4e8006b..c71ffa304c 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -117,6 +117,66 @@ def blocked_task_counts() -> dict[str, int]:
+     return _all_counts()[1]
+ 
+ 
++# What a session's task strip lists: the sidebar's open + blocked sets, plus
++# ``review`` (also waiting on a human). [daveey]
++LISTED_STATUSES = ACTIVE_STATUSES + BLOCKED_STATUSES + ("review",)
++_TASK_FIELDS = ("id", "title", "status", "assignee", "session_id", "created_at", "started_at")
++
++
++def _board_slug(path: Path) -> str:
++    return path.parent.name if path.parent.parent.name == "boards" else "default"
++
++
++def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
++    """Tasks on one board that any of ``ids`` created or is a ``tui`` subscriber
++    of, in ``statuses`` — the same pairs ``_read_counts`` counts."""
++    sid_ph = ",".join("?" for _ in ids)
++    st_ph = ",".join("?" for _ in statuses)
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++    conn.row_factory = sqlite3.Row
++    try:
++        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++        select = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in _TASK_FIELDS)
++        run_start = "NULL"
++        if "current_run_id" in cols and conn.execute(
++                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone():
++            run_start = "(SELECT r.started_at FROM task_runs r WHERE r.id = t.current_run_id)"
++        found: dict[str, dict[str, Any]] = {}
++        for row in conn.execute(
++                f"SELECT {select}, {run_start} AS current_run_started_at FROM tasks t "
++                f"WHERE t.session_id IN ({sid_ph}) AND t.status IN ({st_ph})", (*ids, *statuses)):
++            found[row["id"]] = {**dict(row), "via": "created"}
++        try:
++            for row in conn.execute(
++                    f"SELECT {select}, {run_start} AS current_run_started_at FROM kanban_notify_subs s "
++                    f"JOIN tasks t ON t.id = s.task_id WHERE s.platform = 'tui' "
++                    f"AND s.chat_id IN ({sid_ph}) AND t.status IN ({st_ph})", (*ids, *statuses)):
++                found.setdefault(row["id"], {**dict(row), "via": "subscribed"})
++        except sqlite3.Error:  # board predates notify subscriptions
++            pass
++    finally:
++        conn.close()
++    board = _board_slug(path)
++    return [{**t, "board": board} for t in found.values()]
++
++
++def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES) -> list[dict[str, Any]]:
++    """Every open/blocked/review task across all boards that the given session
++    ids (one compression lineage) created or shepherd — exactly the cards the
++    sidebar row's ``kanban_active``/``kanban_blocked`` counts cover. Never
++    raises on a bad board; skips it."""
++    ids = [s for s in dict.fromkeys(str(s) for s in session_ids if s)]
++    if not ids:
++        return []
++    out: list[dict[str, Any]] = []
++    for path in _board_db_paths():
++        try:
++            out.extend(_read_session_tasks(path, ids, statuses))
++        except sqlite3.Error as exc:
++            _log.debug("kanban session tasks read failed for %s: %s", path, exc)
++    return out
++
++
+ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
+     seen: set[str] = set()
+     for sid in (row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())):
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index d8702e7659..feaf177a7c 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
+ 
+ from hermes_cli.session_listing import subagent_listing_scope
+ from hermes_cli.web_deps import late
+-from hermes_cli.kanban_session_activity import annotate_kanban_activity
++from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+@@ -175,6 +175,16 @@ def _resolve_session_id(db, session_id: str) -> Optional[str]:
+             raise
+ 
+ 
++@list_router.get("/api/session-kanban-tasks")
++def get_session_kanban_tasks(ids: str = Query(..., max_length=4000)):
++    """Open, blocked and review kanban cards that any of the comma-separated
++    session ``ids`` (one compression lineage) created or shepherds, across every
++    board — the cards behind the sidebar row's kanban counts. Lets the desktop
++    list them for the open chat without loading the whole board. [daveey]"""
++    wanted = [s.strip() for s in ids.split(",") if s.strip()][:50]
++    return {"tasks": session_kanban_tasks(wanted)}
++
++
+ # ``le=100`` on limit: an unbounded limit lets one request drag every session
+ # row (plus correlated-subquery preview work) out of SQLite in a single hit.
+ @list_router.get("/api/sessions")
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 7bd555e464..3797ad401a 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -112,3 +112,75 @@ def test_stamps_blocked_count_separately_from_active(kanban_root):
+     assert "kanban_active" not in rows[1] and rows[1]["kanban_blocked"] == 1
+     assert "kanban_blocked" not in rows[2]
+     assert ksa.blocked_task_counts() == {"s1": 2, "s_only_blocked": 1}
++
++
++def _make_full_board(path: Path, tasks: list[tuple], subs: list[tuple[str, str, str]] = ()) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.execute(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL, assignee TEXT, "
++        "session_id TEXT, created_at INTEGER, started_at INTEGER, current_run_id INTEGER)")
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, started_at INTEGER)")
++    conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT)")
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)", tasks)
++    conn.executemany("INSERT INTO task_runs VALUES (?, ?, ?)", [(t[7], t[0], 500) for t in tasks if t[7]])
++    conn.executemany("INSERT INTO kanban_notify_subs VALUES (?, ?, ?)", subs)
++    conn.commit()
++    conn.close()
++
++
++def test_session_tasks_lists_created_and_shepherded_cards_the_sidebar_counts(kanban_root):
++    _make_full_board(kanban_root / "kanban.db", [
++        ("t_run", "Run", "running", "default", "s_me", 100, 200, 7),
++        ("t_done", "Done", "done", "default", "s_me", 100, 200, None),
++        ("t_other", "Theirs", "blocked", "default", "s_them", 100, None, None),
++        ("t_unrel", "Unrelated", "running", "default", "s_them", 100, None, None),
++    ], subs=[
++        ("t_other", "tui", "s_me"),   # shepherded card created by another chat
++        ("t_done", "tui", "s_me"),    # finished: not listed
++        ("t_unrel", "slack", "s_me"),  # non-tui subscription: not a chat shepherding it
++    ])
++    _make_full_board(kanban_root / "kanban" / "boards" / "bb" / "kanban.db", [
++        ("t_root", "Before compression", "todo", "bob", "s_root", 100, None, None),
++    ])
++
++    got = {t["id"]: t for t in ksa.session_tasks(["s_me", "s_root"])}
++
++    assert set(got) == {"t_run", "t_other", "t_root"}
++    assert got["t_run"]["via"] == "created" and got["t_run"]["current_run_started_at"] == 500
++    assert got["t_run"]["board"] == "default" and got["t_run"]["title"] == "Run"
++    assert got["t_other"]["via"] == "subscribed" and got["t_other"]["status"] == "blocked"
++    assert got["t_root"]["board"] == "bb"
++    # Same cards the sidebar badge counts (open + blocked).
++    ksa._reset_cache_for_tests()
++    active, blocked = ksa.active_task_counts(), ksa.blocked_task_counts()
++    assert active.get("s_me", 0) + active.get("s_root", 0) == 2
++    assert blocked.get("s_me") == 1
++
++
++def test_session_tasks_empty_ids_and_old_schema(kanban_root):
++    _make_board(kanban_root / "kanban.db", [("t1", "running", "s_a")])  # no title/subs columns
++    assert ksa.session_tasks([]) == []
++    rows = ksa.session_tasks(["s_a"])
++    assert [(r["id"], r["title"], r["via"]) for r in rows] == [("t1", None, "created")]
++
++
++def test_session_kanban_tasks_endpoint(kanban_root, _isolate_hermes_home):
++    try:
++        from starlette.testclient import TestClient
++    except ImportError:
++        pytest.skip("fastapi/starlette not installed")
++    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
++
++    _make_full_board(kanban_root / "kanban.db", [
++        ("t_run", "Run", "running", "default", "s_me", 100, 200, None),
++        ("t_x", "Theirs", "running", "default", "s_them", 100, 200, None),
++    ])
++    client = TestClient(app)
++    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
++
++    res = client.get("/api/session-kanban-tasks", params={"ids": "s_me, s_root"})
++
++    assert res.status_code == 200
++    assert [t["id"] for t in res.json()["tasks"]] == ["t_run"]
++    assert client.get("/api/session-kanban-tasks").status_code == 422
+-- 
+2.55.0
+
