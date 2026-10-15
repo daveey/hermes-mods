@@ -49,3 +49,17 @@ test('elapsed formats', () => {
   assert.equal(m.elapsed(now / 1000 - 3700, now), '1h01')
   assert.equal(m.elapsed(0, now), '')
 })
+
+test('sessionTaskChips: every listed status, shepherded cards marked, running first, deduped', () => {
+  const chips = m.sessionTaskChips([
+    { id: 't_b', title: 'theirs', status: 'blocked', via: 'subscribed', board: 'default' },
+    { id: 't_q', title: 'queued', status: 'todo', via: 'created', board: 'bb' },
+    { id: 't_r', title: 'mine', status: 'running', via: 'created', current_run_started_at: 100 },
+    { id: 't_r', title: 'mine (dup from another board)', status: 'running' },
+    { id: 't_d', title: 'finished', status: 'done' }
+  ])
+  assert.deepEqual(chips.map(c => `${c.id}:${c.state}`), ['t_r:running', 't_b:blocked', 't_q:todo'])
+  assert.match(chips[1].title, /shepherding/)
+  assert.match(chips[2].title, /board bb/)
+  assert.equal(chips[0].since, 100)
+})

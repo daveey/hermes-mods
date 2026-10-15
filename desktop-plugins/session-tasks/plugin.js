@@ -4,8 +4,11 @@
  *
  *   ⟳ bg   background processes   (gateway RPC `process.list`, status != exited)
  *   ⟳ sub  delegate_task subagents (gateway RPC `subagent.list`, non-terminal status)
- *   ⟳ t_…  kanban tasks this session created (`/api/plugins/kanban/board`,
- *          task.session_id ∈ the session's lineage) in running / ready / blocked / review
+ *   ⟳ t_…  kanban tasks this session created or shepherds (tui subscription),
+ *          across every board, in todo / ready / running / scheduled / blocked / review
+ *          — the same cards the sidebar row's kanban counts cover
+ *          (`/api/session-kanban-tasks?ids=<lineage>`; older backends: a scan of the
+ *          current `/api/plugins/kanban/board` for cards the lineage created)
  *
  * Hidden when nothing is running. Polls every 5 s while the window is visible.
  * Clicking a kanban chip opens the Task Mentions popup when that plugin is
@@ -20,12 +23,14 @@ const POLL_MS = 5_000
 const KANBAN_POLL_MS = 10_000
 const LINEAGE_TTL_MS = 5 * 60_000
 const MAX_LABEL = 38
-const KANBAN_ACTIVE = new Set(['running', 'ready', 'blocked', 'review'])
+const KANBAN_ACTIVE = new Set(['todo', 'ready', 'running', 'scheduled', 'blocked', 'review'])
 const SUBAGENT_DONE = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'timeout', 'error'])
 
 const STATE_COLOR = {
   running: 'var(--accent, #3b82f6)',
   ready: '#8b949e',
+  todo: '#8b949e',
+  scheduled: '#8b949e',
   blocked: '#f85149',
   review: '#db61a2'
 }
@@ -74,6 +79,37 @@ export function subagentChips(subagents) {
     })
 }
 
+const KANBAN_RANK = { running: 0, blocked: 1, review: 2, ready: 3, scheduled: 4, todo: 5 }
+
+function taskChip(t, status) {
+  const watching = t.via === 'subscribed'
+  return {
+    key: `kb:${t.id}`,
+    kind: 'kanban',
+    id: str(t.id),
+    state: status,
+    label: str(t.title) || t.id,
+    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}\n${str(t.title)}`,
+    since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
+  }
+}
+
+const byRank = chips => chips.sort((a, b) => (KANBAN_RANK[a.state] ?? 9) - (KANBAN_RANK[b.state] ?? 9))
+
+/** `/api/session-kanban-tasks` rows (already filtered to the lineage by the backend). */
+export function sessionTaskChips(tasks) {
+  const seen = new Set()
+  const out = []
+  for (const t of Array.isArray(tasks) ? tasks : []) {
+    const status = str(t?.status)
+    if (!t?.id || !KANBAN_ACTIVE.has(status) || seen.has(t.id)) continue
+    seen.add(t.id)
+    out.push(taskChip(t, status))
+  }
+  return byRank(out)
+}
+
+/** Fallback for backends without that route: scan the current board. */
 export function kanbanChips(board, sessionIds) {
   const ids = sessionIds instanceof Set ? sessionIds : new Set(sessionIds || [])
   const out = []
@@ -81,19 +117,10 @@ export function kanbanChips(board, sessionIds) {
     for (const t of col?.tasks || []) {
       const status = str(t?.status || col?.name)
       if (!KANBAN_ACTIVE.has(status) || !ids.has(str(t?.session_id))) continue
-      out.push({
-        key: `kb:${t.id}`,
-        kind: 'kanban',
-        id: str(t.id),
-        state: status,
-        label: str(t.title) || t.id,
-        title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}\n${str(t.title)}`,
-        since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
-      })
+      out.push(taskChip(t, status))
     }
   }
-  const rank = { running: 0, blocked: 1, review: 2, ready: 3 }
-  return out.sort((a, b) => (rank[a.state] ?? 9) - (rank[b.state] ?? 9))
+  return byRank(out)
 }
 
 // ── data ────────────────────────────────────────────────────────────────────
@@ -151,11 +178,27 @@ let timer = null
 let lastKanbanAt = 0
 let kanbanCache = []
 let running = false
+let rerun = false
 
 const emit = () => subs.forEach(fn => fn(snapshot))
 
+async function loadKanban(ids) {
+  const list = await safe(
+    () => api(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
+    null
+  )
+  if (list && Array.isArray(list.tasks)) return sessionTaskChips(list.tasks)
+  const board = await safe(() => api('/api/plugins/kanban/board'), null)
+  return board ? kanbanChips(board, ids) : null
+}
+
 async function refresh() {
-  if (running) return
+  // A focus change during an in-flight round must not be dropped (that left the
+  // strip empty for a whole poll interval after opening a chat): run again after.
+  if (running) {
+    rerun = true
+    return
+  }
   if (typeof document !== 'undefined' && document.hidden) return
   running = true
   try {
@@ -173,8 +216,9 @@ async function refresh() {
     if (stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)) {
       lastKanbanAt = Date.now()
       const ids = await lineageIds(stored)
-      const board = await safe(() => api('/api/plugins/kanban/board'), null)
-      if (board) kanbanCache = kanbanChips(board, ids)
+      const chips = await loadKanban(ids)
+      if (chips) kanbanCache = chips
+      else if (!sameSession) kanbanCache = [] // never show the previous chat's cards
     } else if (!stored) {
       kanbanCache = []
     }
@@ -190,6 +234,10 @@ async function refresh() {
     log('refresh failed', e)
   } finally {
     running = false
+    if (rerun) {
+      rerun = false
+      void refresh()
+    }
   }
 }
 
