@@ -10,8 +10,10 @@
  * CSS Custom Highlight API (`::highlight(task-mention)`, Ranges over existing text
  * nodes) and hit-tested with `caretPositionFromPoint`. Popups live in a body-level host.
  *
- * Data: the kanban plugin's REST router (`/api/plugins/kanban/tasks/<id>`) on the active
- * gateway; an id missing from the current board is looked up on every other board.
+ * Data: the kanban plugin's REST router (`/api/plugins/kanban/tasks/<id>`). A ref written as
+ * `@task:<board>@<gateway>/<id>` (session-mentions typeahead) is read on that gateway; any other
+ * id is tried on the active gateway first, then on every other connected gateway. Within a
+ * gateway an id missing from the named/current board is looked up on every other board.
  */
 
 import { host as sdkHost } from '@hermes/plugin-sdk'
@@ -74,9 +76,11 @@ const truncate = (s, n) => {
 // ── data ─────────────────────────────────────────────────────────────────────
 
 const enc = encodeURIComponent
-const cache = new Map() // id -> {at, data, board, error}
+const cache = new Map() // id -> {at, data, board, conn, error}
 const inflight = new Map()
 const boardOf = new Map() // id -> board slug where it was found
+const connOf = new Map() // id -> connection id where it was found
+const hintOf = new Map() // id -> {gateway, board} from an `@task:<board>@<gateway>/` prefix
 let hostRef = null
 
 function activeConnection() {
@@ -87,40 +91,100 @@ function activeConnection() {
   }
 }
 
-function api(path) {
+export const slug = text =>
+  String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+let connCache = { at: 0, rows: [] }
+async function connections() {
+  if (Date.now() - connCache.at < 60_000 && connCache.rows.length) return connCache.rows
+  let rows = []
+  try {
+    rows = typeof hostRef?.connections === 'function' ? await hostRef.connections() : []
+  } catch {
+    /* optional */
+  }
+  const list = (Array.isArray(rows) ? rows : []).filter(r => r && r.id).map(r => ({ id: String(r.id), label: String(r.label || r.name || r.id) }))
+  connCache = { at: Date.now(), rows: list.length ? list : [{ id: activeConnection(), label: 'This device' }] }
+  return connCache.rows
+}
+
+/** Connection id for a gateway name as written in a ref (slugged label or id). */
+export function findConnection(conns, name) {
+  const n = String(name || '').trim().toLowerCase()
+  if (!n) return null
+  return conns.find(c => c.id.toLowerCase() === n || slug(c.label) === slug(n))?.id || null
+}
+
+/** `@task:<board>[@<gateway>]/` immediately before an id: {board, gateway} or null. */
+export function refQualifier(before) {
+  const m = /@task:[`"']?([\w.-]*)(?:@([\w.-]+))?\/$/.exec(String(before || '').slice(-120))
+  return m ? { board: m[1] || '', gateway: m[2] || '' } : null
+}
+
+function api(path, connectionId = activeConnection()) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
-  return bridge({ path, connectionId: activeConnection(), timeoutMs: 15_000 })
+  return bridge({ path, connectionId, timeoutMs: 15_000 })
 }
 
 const is404 = e => /\b404\b|not found/i.test(String(e?.message || e))
 
-async function loadTask(id) {
-  const tryBoard = board => api(`/api/plugins/kanban/tasks/${enc(id)}${board ? `?board=${enc(board)}` : ''}`)
-  const known = boardOf.get(id)
-  try {
-    return { data: await tryBoard(known), board: known || '' }
-  } catch (e) {
-    if (!is404(e)) throw e
+/** {data, board} from one gateway, or null when no board there has the id. */
+async function loadTaskOn(id, conn, preferBoard) {
+  const tryBoard = board => api(`/api/plugins/kanban/tasks/${enc(id)}${board ? `?board=${enc(board)}` : ''}`, conn)
+  const tried = new Set()
+  for (const b of [preferBoard, undefined]) {
+    if (tried.has(b || '')) continue
+    tried.add(b || '')
+    try {
+      return { data: await tryBoard(b), board: b || '' }
+    } catch (e) {
+      if (!is404(e)) throw e
+    }
   }
   let boards = []
   try {
-    const res = await api('/api/plugins/kanban/boards')
+    const res = await api('/api/plugins/kanban/boards', conn)
     boards = (Array.isArray(res) ? res : res?.boards || []).map(b => (typeof b === 'string' ? b : b?.slug)).filter(Boolean)
   } catch {
     /* older backend: single board */
   }
   for (const b of boards) {
-    if (b === known) continue
+    if (tried.has(b)) continue
     try {
-      const data = await tryBoard(b)
-      boardOf.set(id, b)
-      return { data, board: b }
+      return { data: await tryBoard(b), board: b }
     } catch (e) {
       if (!is404(e)) throw e
     }
   }
-  throw new Error(`task ${id} not found on any board`)
+  return null
+}
+
+async function loadTask(id) {
+  const conns = await connections()
+  const active = activeConnection()
+  const hint = hintOf.get(id)
+  const named = hint?.gateway ? findConnection(conns, hint.gateway) : null
+  if (hint?.gateway && !named) throw new Error(`gateway "${hint.gateway}" is not connected`)
+  const order = named ? [named] : [...new Set([connOf.get(id), active, ...conns.map(c => c.id)].filter(Boolean))]
+  let lastError = null
+  for (const conn of order) {
+    try {
+      const hit = await loadTaskOn(id, conn, boardOf.get(id) || hint?.board)
+      if (hit) {
+        boardOf.set(id, hit.board)
+        connOf.set(id, conn)
+        return { ...hit, conn, gateway: conns.find(c => c.id === conn)?.label || conn }
+      }
+    } catch (e) {
+      lastError = e
+    }
+  }
+  if (lastError && order.length === 1) throw lastError
+  throw new Error(`task ${id} not found on ${named ? hint.gateway : 'any connected gateway'}`)
 }
 
 export function getTask(id, force = false) {
@@ -128,8 +192,8 @@ export function getTask(id, force = false) {
   if (!force && hit && Date.now() - hit.at < CACHE_MS) return Promise.resolve(hit)
   if (inflight.has(id)) return inflight.get(id)
   const p = loadTask(id)
-    .then(({ data, board }) => {
-      const entry = { at: Date.now(), data, board }
+    .then(({ data, board, conn, gateway }) => {
+      const entry = { at: Date.now(), data, board, conn, gateway }
       cache.set(id, entry)
       return entry
     })
@@ -280,6 +344,8 @@ function idAtPoint(x, y) {
   if (!node || node.nodeType !== 3) return null
   for (const m of findTaskIds(node.data)) {
     if (offset < m.start || offset > m.end) continue
+    const q = refQualifier(node.data.slice(0, m.start))
+    if (q && (q.gateway || q.board)) hintOf.set(m.id, q)
     // The caret snaps to the nearest character even past the end of a line: require the
     // pointer to be inside the id's own boxes.
     const r = document.createRange()
@@ -324,7 +390,7 @@ function createUI(host) {
     const t = entry.data.task || {}
     const a = t.age || {}
     return [
-      h('div', { class: 'tm-row' }, pill(t.status), h('span', { class: 'tm-mono tm-muted' }, t.id), entry.board ? h('span', { class: 'tm-muted' }, `· ${entry.board}`) : null),
+      h('div', { class: 'tm-row' }, pill(t.status), h('span', { class: 'tm-mono tm-muted' }, t.id), entry.board ? h('span', { class: 'tm-muted' }, `· ${entry.board}`) : null, entry.conn && entry.conn !== activeConnection() ? h('span', { class: 'tm-muted' }, `· ${entry.gateway}`) : null),
       h('div', { class: 'tm-title' }, t.title || '(untitled)'),
       h(
         'div',
@@ -374,6 +440,8 @@ function createUI(host) {
   const renderModal = (id, entry) => {
     const open = next => {
       if (next === modalId) return
+      // Linked tasks live on the same gateway as this one: look there first.
+      if (entry?.conn && !connOf.has(next)) connOf.set(next, entry.conn)
       history.push(modalId)
       void openModal(next, false)
     }
@@ -388,6 +456,7 @@ function createUI(host) {
     const d = entry.data
     const t = d.task || {}
     const a = t.age || {}
+    const remote = !!entry.conn && entry.conn !== activeConnection()
     const meta = h(
       'div',
       { class: 'tm-row tm-muted' },
@@ -502,10 +571,11 @@ function createUI(host) {
     const foot = h(
       'div',
       { class: 'tm-foot' },
-      t.session_id && typeof host.openSession === 'function'
+      // Worker session + board live on the task's gateway; both buttons open the ACTIVE one.
+      !remote && t.session_id && typeof host.openSession === 'function'
         ? h('button', { class: 'tm-btn tm-primary', onclick: () => (closeModal(), void host.openSession(t.session_id).catch(e => host.notifyError?.(e, 'Could not open worker session'))) }, 'Open worker session')
         : null,
-      typeof host.navigate === 'function' ? h('button', { class: 'tm-btn', onclick: () => (closeModal(), host.navigate('/kanban')) }, 'Open board') : null,
+      !remote && typeof host.navigate === 'function' ? h('button', { class: 'tm-btn', onclick: () => (closeModal(), host.navigate('/kanban')) }, 'Open board') : null,
       h('button', { class: 'tm-btn', onclick: e => copy(t.id, e.currentTarget) }, 'Copy id'),
       h('button', { class: 'tm-btn', onclick: () => void openModal(id, false, true) }, 'Refresh'),
       history.length ? h('button', { class: 'tm-btn', onclick: () => void openModal(history.pop(), false) }, '← Back') : null
@@ -517,7 +587,7 @@ function createUI(host) {
       h(
         'div',
         { class: 'tm-head' },
-        h('div', { class: 'tm-row' }, pill(t.status), h('span', { class: 'tm-mono tm-muted' }, t.id), entry.board ? h('span', { class: 'tm-muted' }, `· board ${entry.board}`) : null, h('button', { class: 'tm-x', title: 'Close (Esc)', onclick: closeModal }, '×')),
+        h('div', { class: 'tm-row' }, pill(t.status), h('span', { class: 'tm-mono tm-muted' }, t.id), entry.board ? h('span', { class: 'tm-muted' }, `· board ${entry.board}`) : null, remote ? h('span', { class: 'tm-muted' }, `· on ${entry.gateway}`) : null, h('button', { class: 'tm-x', title: 'Close (Esc)', onclick: closeModal }, '×')),
         h('h2', null, t.title || '(untitled)'),
         meta
       ),
@@ -582,6 +652,9 @@ function registerWith(ctx, host) {
   hostRef = host
   cache.clear()
   boardOf.clear()
+  connOf.clear()
+  hintOf.clear()
+  connCache = { at: 0, rows: [] }
   const ui = createUI(host)
   const hasHighlights = typeof CSS !== 'undefined' && CSS.highlights && typeof Highlight === 'function'
 

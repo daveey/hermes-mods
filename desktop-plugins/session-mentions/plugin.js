@@ -14,6 +14,11 @@
  *    gateway that has the agent plugin (GET /api/plugins/session-mentions/outbox), performs
  *    list/read/send on the target gateway's own connection, posts the result back.
  *
+ * 5. Kanban tasks. `@task:` / `@<title words>` / `@t_1a2b` complete tasks from every board on
+ *    every gateway, inserting `@task:<board>/<id>` (this gateway) or
+ *    `@task:<board>@<gateway>/<id>`. The courier also serves the agent's `cross_task` tool
+ *    (task_list / task_read / task_comment over each gateway's kanban REST router).
+ *
  * Also repairs the core composer's doubled `@session:` prefix (core's @ popover only splits
  * kind from value for file|folder|url|image|tool|git).
  */
@@ -368,6 +373,319 @@ export async function deliver(target, text, waitSeconds = 0) {
   }
 }
 
+// ── kanban tasks on every gateway ────────────────────────────────────────────
+
+const TASK_STALE_MS = 60_000
+const MAX_TASK_MATCHES = 4 // plain `@query`: tasks share the popover with sessions
+const MAX_TASK_SCOPED = 12 // `@task:query`
+const LIVE_TASK_STATUSES = new Set(['running', 'ready', 'blocked', 'review', 'triage', 'todo', 'scheduled'])
+
+/** `@task:<board>/<id>` relative to `relativeTo`; `@task:<board>@<gateway>/<id>` elsewhere. */
+export function taskRef({ connectionId, board, taskId }, relativeTo, conns) {
+  const b = String(board || '').split('@')[0].trim() || 'default'
+  if (!connectionId || connectionId === relativeTo) return `@task:${b}/${taskId}`
+  const gw = conns.find(c => c.id === connectionId)
+  return `@task:${b}@${gw ? gw.key : connectionId}/${taskId}`
+}
+
+/** Parse `@task:<board>[@<gateway>]/<id>`, `<gateway>:<id>` or a bare id. Unqualified refs
+ *  belong to `origin`; `board` is undefined when the ref doesn't name one. `anyGateway` is set
+ *  for a bare id, which may live on any gateway. */
+export function parseTaskRef(raw, origin, conns) {
+  const unfence = s => s.trim().replace(/^[`"']|[`"']$/g, '').trim()
+  const text = unfence(unfence(String(raw || '')).replace(/^@task:/, ''))
+  if (!text) return { error: 'empty task reference' }
+  let gateway = null
+  let board
+  let taskId
+  const slash = text.lastIndexOf('/')
+  if (slash !== -1) {
+    let head = text.slice(0, slash)
+    taskId = text.slice(slash + 1).trim()
+    const at = head.indexOf('@')
+    if (at !== -1) {
+      gateway = head.slice(head.lastIndexOf('@') + 1)
+      head = head.slice(0, at)
+    }
+    board = head || undefined
+  } else {
+    const colon = text.indexOf(':')
+    if (colon !== -1) {
+      gateway = text.slice(0, colon)
+      taskId = text.slice(colon + 1).trim()
+    } else {
+      taskId = text
+    }
+  }
+  if (!taskId) return { error: `no task id in "${raw}"` }
+  if (!/^t_[0-9a-z]+$/i.test(taskId)) return { error: `"${taskId}" is not a kanban task id (t_…)` }
+  let connectionId = origin
+  if (gateway) {
+    const gw = findGateway(conns, gateway)
+    if (!gw) return { error: `unknown gateway "${gateway}" — connected: ${conns.map(c => c.key).join(', ')}` }
+    connectionId = gw.id
+  }
+  return { connectionId, board, taskId, anyGateway: !gateway && !board }
+}
+
+const taskActivity = t => Number(t.completed_at || t.started_at || t.created_at || 0)
+
+/** Slim board rows to what typeahead/list need (a busy board is ~1 MB). */
+export function slimTasks(board, columns, conn) {
+  const out = []
+  for (const col of Array.isArray(columns) ? columns : []) {
+    for (const t of Array.isArray(col?.tasks) ? col.tasks : []) {
+      if (!t?.id || t.status === 'archived') continue
+      out.push({
+        id: t.id,
+        title: t.title || '',
+        status: t.status || col.name || '',
+        assignee: t.assignee || '',
+        priority: t.priority || 0,
+        created_at: t.created_at || 0,
+        started_at: t.started_at || 0,
+        completed_at: t.completed_at || 0,
+        board,
+        _conn: conn.id,
+        _gwLabel: conn.label,
+        _gwKey: conn.key || conn.id
+      })
+    }
+  }
+  return out
+}
+
+const taskCache = new Map() // connectionId -> {at, rows}
+const taskInflight = new Map()
+const taskErrors = new Map()
+
+function fetchTasks(conn, force = false) {
+  const cached = taskCache.get(conn.id)
+  if (!force && cached && Date.now() - cached.at < TASK_STALE_MS) return Promise.resolve(cached.rows)
+  if (taskInflight.has(conn.id)) return taskInflight.get(conn.id)
+  const p = (async () => {
+    const res = await api(conn.id, '/api/plugins/kanban/boards', { timeoutMs: 15_000 })
+    const boards = (Array.isArray(res?.boards) ? res.boards : []).filter(b => b?.slug && (b.total == null || b.total > 0))
+    const lists = await Promise.all(
+      boards.map(b =>
+        api(conn.id, `/api/plugins/kanban/board?board=${enc(b.slug)}`, { timeoutMs: 20_000 })
+          .then(board => slimTasks(b.slug, board?.columns, conn))
+          .catch(() => [])
+      )
+    )
+    return lists.flat()
+  })()
+    .then(rows => {
+      taskCache.set(conn.id, { at: Date.now(), rows })
+      taskErrors.delete(conn.id)
+      return rows
+    })
+    .catch(error => {
+      taskErrors.set(conn.id, String(error?.message || error).slice(0, 300))
+      const old = taskCache.get(conn.id)
+      taskCache.set(conn.id, { at: Date.now() - TASK_STALE_MS + 15_000, rows: old?.rows || [] })
+      return old?.rows || []
+    })
+    .finally(() => taskInflight.delete(conn.id))
+  taskInflight.set(conn.id, p)
+  return p
+}
+
+async function allTasks(force = false) {
+  const conns = await connections(force)
+  return (await Promise.all(conns.map(c => fetchTasks(c, force)))).flat()
+}
+
+function cachedTasks() {
+  const out = []
+  for (const { rows } of taskCache.values()) out.push(...rows)
+  return out
+}
+
+function refreshStaleTasks() {
+  void connections().then(conns => conns.forEach(c => void fetchTasks(c)))
+}
+
+/** Title-first match score for a task row; `loose` also matches assignee, board, status, gateway. */
+export function taskScore(row, query, { loose = false } = {}) {
+  const q = String(query || '').trim()
+  if (/^t_[0-9a-f]*$/i.test(q)) return String(row.id).toLowerCase().startsWith(q.toLowerCase()) ? 10 : 0
+  return score({ title: row.title, preview: loose ? `${row.assignee} ${row.board} ${row.status}` : '', _gwLabel: loose ? row._gwLabel : '', id: row.id }, q)
+}
+
+export function taskItems(rows, rawQuery, { active = 'local', conns = [], now = Date.now() } = {}) {
+  const query = String(rawQuery || '')
+  const lower = query.toLowerCase()
+  const items = []
+  if (lower.length >= 2 && 'task'.startsWith(lower)) {
+    items.push({ insert: '@task:', display: '@task:', meta: 'Mention a kanban task (any gateway)', icon: 'simple' })
+  }
+  const scoped = lower.startsWith('task:')
+  const q = (scoped ? query.slice('task:'.length) : query).trim()
+  const idQuery = /^t_[0-9a-f]*$/i.test(q)
+  if (!scoped && !idQuery && q.length < 3) return items
+
+  const live = t => (LIVE_TASK_STATUSES.has(t.status) ? 1 : 0)
+  const recency = (a, b) => live(b) - live(a) || taskActivity(b) - taskActivity(a)
+  const picked = !q
+    ? [...rows].sort(recency).slice(0, MAX_TASK_SCOPED)
+    : rows
+        .map(row => ({ row, s: taskScore(row, q, { loose: scoped }) }))
+        .filter(x => x.s > 0)
+        .sort((a, b) => b.s - a.s || recency(a.row, b.row))
+        .slice(0, scoped || idQuery ? MAX_TASK_SCOPED : MAX_TASK_MATCHES)
+        .map(x => x.row)
+
+  const multi = new Set(rows.map(r => r._conn)).size > 1 || conns.length > 1
+  for (const row of picked) {
+    const bits = [`Task · ${row.status}`]
+    if (multi) bits.push(row._conn === active ? `${row._gwLabel} (this gateway)` : row._gwLabel)
+    if (row.board && row.board !== 'default') bits.push(`board ${row.board}`)
+    if (row.assignee) bits.push(`@${row.assignee}`)
+    bits.push(ago(taskActivity(row), now))
+    items.push({
+      insert: taskRef({ connectionId: row._conn, board: row.board, taskId: row.id }, active, conns),
+      display: `${row.title || '(untitled)'} · ${row.id}`,
+      meta: bits.filter(Boolean).join(' · '),
+      icon: 'simple'
+    })
+  }
+  return items
+}
+
+const clip = (s, n) => {
+  const t = String(s ?? '')
+  return t.length > n ? `${t.slice(0, n)}…[truncated]` : t
+}
+
+/** GET a task on its gateway: the named board first, then every other board there. */
+async function fetchTask(connectionId, taskId, board) {
+  const is404 = e => /\b404\b|not found/i.test(String(e?.message || e))
+  const one = b => api(connectionId, `/api/plugins/kanban/tasks/${enc(taskId)}${b ? `?board=${enc(b)}` : ''}`, { timeoutMs: 15_000 })
+  const tried = new Set()
+  for (const b of [board, undefined]) {
+    if (tried.has(b || '')) continue
+    tried.add(b || '')
+    try {
+      return { data: await one(b), board: b || '' }
+    } catch (e) {
+      if (!is404(e)) throw e
+    }
+  }
+  const res = await api(connectionId, '/api/plugins/kanban/boards', { timeoutMs: 15_000 }).catch(() => null)
+  for (const b of (res?.boards || []).map(x => x?.slug).filter(Boolean)) {
+    if (tried.has(b)) continue
+    try {
+      return { data: await one(b), board: b }
+    } catch (e) {
+      if (!is404(e)) throw e
+    }
+  }
+  return null
+}
+
+export function summarizeTask(data, limit = 10) {
+  const t = data?.task || {}
+  return {
+    id: t.id,
+    title: t.title,
+    status: t.status,
+    assignee: t.assignee || null,
+    priority: t.priority,
+    created_by: t.created_by || null,
+    created_at: t.created_at ? new Date(t.created_at * 1000).toISOString() : null,
+    started_at: t.started_at ? new Date(t.started_at * 1000).toISOString() : null,
+    completed_at: t.completed_at ? new Date(t.completed_at * 1000).toISOString() : null,
+    block_kind: t.block_kind || null,
+    last_failure_error: t.last_failure_error ? clip(t.last_failure_error, 1500) : null,
+    session_id: t.session_id || null,
+    workspace: t.workspace_path || null,
+    body: clip(t.body, 6000),
+    latest_summary: clip(t.latest_summary || t.result, 4000),
+    parents: data?.links?.parents || [],
+    children: data?.links?.children || [],
+    link_tasks: (data?.link_tasks || []).map(x => ({ id: x.id, title: x.title, status: x.status })),
+    runs: (data?.runs || []).slice(-5).map(r => ({ id: r.id, profile: r.profile, outcome: r.outcome || r.status, summary: clip(r.summary || r.error, 800) })),
+    comments: (data?.comments || []).slice(-limit).map(c => ({ author: c.author, at: c.created_at ? new Date(c.created_at * 1000).toISOString() : null, body: clip(c.body, 2000) })),
+    events: (data?.events || []).filter(e => e.kind !== 'heartbeat').slice(-limit).map(e => ({ kind: e.kind, at: e.created_at ? new Date(e.created_at * 1000).toISOString() : null }))
+  }
+}
+
+/** Resolve a task ref to {target, found:{data, board}}; a bare id is searched on every gateway
+ *  (origin first). */
+async function resolveTask(rawTarget, origin, conns) {
+  const target = parseTaskRef(rawTarget, origin, conns)
+  if (target.error) return { error: target.error }
+  const order = target.anyGateway ? [origin, ...conns.map(c => c.id).filter(id => id !== origin)] : [target.connectionId]
+  for (const connectionId of order) {
+    const found = await fetchTask(connectionId, target.taskId, target.board).catch(() => null)
+    if (found) return { target: { ...target, connectionId, board: found.board || target.board }, found }
+  }
+  return { error: `task ${target.taskId} not found${target.anyGateway ? ' on any connected gateway' : ` on ${conns.find(c => c.id === target.connectionId)?.key || target.connectionId}`}` }
+}
+
+async function performTaskRequest(req, origin, conns) {
+  const args = req?.args || {}
+  const action = req.action
+
+  if (action === 'task_list') {
+    let rows = await allTasks(true)
+    if (args.gateway) {
+      const gw = findGateway(conns, args.gateway)
+      if (!gw) return { ok: false, error: `unknown gateway "${args.gateway}" — connected: ${conns.map(c => c.key).join(', ')}` }
+      rows = rows.filter(r => r._conn === gw.id)
+    }
+    if (args.status) {
+      const want = new Set(String(args.status).toLowerCase().split(/[\s,|]+/).filter(Boolean))
+      rows = rows.filter(r => want.has(String(r.status).toLowerCase()))
+    }
+    const limit = Math.max(1, Math.min(100, Number(args.limit) || 20))
+    const recency = (a, b) => taskActivity(b) - taskActivity(a)
+    const picked = args.query
+      ? rows.map(r => ({ r, s: taskScore(r, args.query, { loose: true }) })).filter(x => x.s > 0).sort((a, b) => b.s - a.s || recency(a.r, b.r)).map(x => x.r)
+      : [...rows].sort(recency)
+    return {
+      ok: true,
+      gateways: conns.map(c => ({ name: c.key, label: c.label, id: c.id, this_gateway: c.id === origin, ...(taskErrors.has(c.id) ? { error: taskErrors.get(c.id) } : {}) })),
+      tasks: picked.slice(0, limit).map(r => ({
+        ref: taskRef({ connectionId: r._conn, board: r.board, taskId: r.id }, origin, conns),
+        id: r.id,
+        title: r.title,
+        status: r.status,
+        assignee: r.assignee || null,
+        gateway: r._gwKey,
+        board: r.board,
+        last_activity: taskActivity(r) ? new Date(taskActivity(r) * 1000).toISOString() : null
+      }))
+    }
+  }
+
+  const { target, found, error } = await resolveTask(args.target, origin, conns)
+  if (error) return { ok: false, error }
+  const gw = conns.find(c => c.id === target.connectionId)
+  const ref = taskRef(target, origin, conns)
+
+  if (action === 'task_read') {
+    return { ok: true, gateway: gw?.key || target.connectionId, board: target.board || 'default', ref, task: summarizeTask(found.data, Number(args.limit) || 10) }
+  }
+
+  if (action === 'task_comment') {
+    const body = String(args.message || '').trim()
+    if (!body) return { ok: false, error: 'message is required for comment' }
+    const sender = req.sender || {}
+    const author = String(sender.title || sender.session_id || 'cross-gateway agent').slice(0, 80)
+    await api(target.connectionId, `/api/plugins/kanban/tasks/${enc(target.taskId)}/comments${target.board ? `?board=${enc(target.board)}` : ''}`, {
+      method: 'POST',
+      body: { body, author },
+      timeoutMs: 15_000
+    })
+    taskCache.delete(target.connectionId)
+    return { ok: true, commented: true, gateway: gw?.key || target.connectionId, ref }
+  }
+
+  return { ok: false, error: `unknown action ${action}` }
+}
+
 // ── typeahead ────────────────────────────────────────────────────────────────
 
 function focusedIds() {
@@ -481,6 +799,8 @@ let courierBusy = false
 export async function performRequest(req, origin, conns) {
   const args = req?.args || {}
   const action = req?.action
+
+  if (String(action || '').startsWith('task_')) return performTaskRequest(req, origin, conns)
 
   if (action === 'list') {
     let rows = await allRows(true)
@@ -665,10 +985,12 @@ export default {
   name: 'Session Mentions',
   register(ctx) {
     rowCache.clear()
+    taskCache.clear()
     courierState.clear()
     lastHomeBeat = 0
     connCache = { at: 0, rows: [] }
     refreshStale()
+    refreshStaleTasks()
 
     const timers = []
     const every = (fn, ms) => {
@@ -741,6 +1063,18 @@ export default {
           refreshStale()
           const conns = connCache.rows
           return sessionItems(cachedRows(), query, { active: activeConnectionId(conns), conns, exclude: focusedIds() })
+        }
+      }
+    })
+
+    ctx.register({
+      id: 'task-mention-completions',
+      area: COMPOSER_AREAS.atCompletions,
+      data: {
+        provide: query => {
+          refreshStaleTasks()
+          const conns = connCache.rows
+          return taskItems(cachedTasks(), query, { active: activeConnectionId(conns), conns })
         }
       }
     })
