@@ -1,0 +1,540 @@
+From ea7140cb68fc3b108daf06cde7c433f8103083bc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 15:19:24 -0700
+Subject: [PATCH] feat(desktop): periodic loop glyph for sessions that own a
+ live cron job [daveey]
+
+A session that set up a recurring cron job finished its turn and the sidebar
+painted it green (done), although its work goes on periodically. Cron jobs now
+record the creating session (owner_session_id: the tool's session id, or the
+HERMES_SESSION_ID a 'hermes cron create' subprocess inherits); session-list
+endpoints stamp cron_active over the lineage for enabled, scheduled jobs; the
+row shows a tiny grey loop glyph in place of the stripe and is treated like a
+parked (blocked) row: Cmd-]/Cmd-[ skip it. Only a real prompt (needs-input) beats it.
+---
+ .../src/app/chat/sidebar/session-row.tsx      |  22 ++-
+ .../src/store/session-dot-state.test.ts       |  10 ++
+ apps/desktop/src/store/session-dot-state.ts   |  12 +-
+ .../src/store/sidebar-visible-order.ts        |  19 ++-
+ apps/desktop/src/types/hermes.ts              |   5 +
+ cron/jobs.py                                  |   5 +-
+ hermes_cli/cron_session_activity.py           | 142 ++++++++++++++++++
+ hermes_cli/web_routers/profiles.py            |   4 +-
+ hermes_cli/web_routers/sessions.py            |   2 +
+ .../hermes_cli/test_cron_session_activity.py  |  64 ++++++++
+ tests/tools/test_cronjob_tools.py             |  13 ++
+ tools/cronjob_tools.py                        |  16 ++
+ 12 files changed, 302 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/cron_session_activity.py
+ create mode 100644 tests/hermes_cli/test_cron_session_activity.py
+
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index 88badb289c..36737f0289 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -326,7 +326,13 @@ function SidebarSessionRowImpl({
+ 
+   const statusStripe = session.archived
+     ? null
+-    : sessionStatusStripe(dotState, session.message_count > 0, userBlocked, kanbanBlocked)
++    : sessionStatusStripe(
++        dotState,
++        session.message_count > 0,
++        userBlocked,
++        kanbanBlocked,
++        session.cron_active === true
++      )
+ 
+   // Card header line: the workspace this belongs to — the project when it
+   // resolves (same function the session color reads, so name and tint agree;
+@@ -503,7 +509,19 @@ function SidebarSessionRowImpl({
+             not a working one: with several sessions busy the arcs drowned out
+             the current task. Working state stays on the status dot [daveey]. */}
+         {isSelected && <span aria-hidden="true" className="arc-border arc-row" />}
+-        {statusStripe && (
++        {/* [daveey] A session that owns a live cron job: a tiny grey loop
++            glyph in the stripe's place — it recurs, so it is never "done". */}
++        {statusStripe === 'periodic' && (
++          <span
++            aria-hidden="true"
++            className="pointer-events-none absolute top-1/2 -left-0.5 flex -translate-y-1/2 text-zinc-400 dark:text-zinc-500"
++            data-slot="session-status-stripe"
++            data-status-stripe={statusStripe}
++          >
++            <Codicon name="sync" size="0.5625rem" />
++          </span>
++        )}
++        {statusStripe && statusStripe !== 'periodic' && (
+           <span
+             aria-hidden="true"
+             className={cn(
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 80727a9dbc..cf554462f6 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -80,6 +80,16 @@ describe('sessionStatusStripe', () => {
+     expect(sessionStatusStripe('idle', true, true, 1)).toBe('blocked')
+     expect(sessionStatusStripe('idle', true, false, 0)).toBe('done')
+   })
++
++  it('paints periodic (grey loop) for a session owning a live cron job, unless a prompt waits', () => {
++    for (const state of ['idle', 'unread', 'working', 'background', 'stalled'] as const) {
++      expect(sessionStatusStripe(state, true, false, 0, true)).toBe('periodic')
++    }
++
++    expect(sessionStatusStripe('idle', true, false, 3, true)).toBe('periodic')
++    expect(sessionStatusStripe('needs-input', true, false, 0, true)).toBe('stuck')
++    expect(sessionStatusStripe('idle', true, true, 0, true)).toBe('blocked')
++  })
+ })
+ 
+ describe('hasLiveTurn', () => {
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 3141db7c87..1000161755 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -142,17 +142,23 @@ export const showsRunningArc = (state: SessionDotState): boolean => state === 's
+  *  it with ⌘B, which wins over everything. Working, background and drafts (no
+  *  turn yet) get none — except that a session with kanban cards it created
+  *  sitting `blocked` (waiting on a human) is `stuck` too unless a turn is
+- *  actively working: it can't finish until someone unblocks them. */
+-export type SessionStatusStripe = 'blocked' | 'done' | 'stuck'
++ *  actively working: it can't finish until someone unblocks them.
++ *  `periodic` (loop glyph, grey) when the session owns a live cron job: its
++ *  work recurs on its own, so it is never "done" — it counts as parked like
++ *  `blocked` (⌘] / ⌘[ skip it); only a real prompt (needs-input) beats it. */
++export type SessionStatusStripe = 'blocked' | 'done' | 'periodic' | 'stuck'
+ 
+ export const sessionStatusStripe = (
+   state: SessionDotState,
+   hasTurns: boolean,
+   userBlocked = false,
+-  kanbanBlocked = 0
++  kanbanBlocked = 0,
++  periodic = false
+ ): null | SessionStatusStripe =>
+   userBlocked
+     ? 'blocked'
++    : periodic && state !== 'needs-input'
++    ? 'periodic'
+     : state === 'needs-input' || state === 'stalled' || (kanbanBlocked > 0 && state !== 'working')
+     ? 'stuck'
+     : state === 'unread' || (state === 'idle' && hasTurns)
+diff --git a/apps/desktop/src/store/sidebar-visible-order.ts b/apps/desktop/src/store/sidebar-visible-order.ts
+index f73a85dd39..2b84b420c5 100644
+--- a/apps/desktop/src/store/sidebar-visible-order.ts
++++ b/apps/desktop/src/store/sidebar-visible-order.ts
+@@ -81,6 +81,10 @@ export function sidebarSessionOrder(): string[] {
+  *  waiting on you) or red (needs input / stalled). ⌘] / ⌘[ step only to
+  *  these, so they land exactly where the sidebar shows a coloured bar. A
+  *  session the user parked with ⌘B (grey stripe) is skipped. */
++// Only green / red stripes are stops; grey (parked) and the periodic loop
++// glyph are skipped like a parked session.
++const sessionHasStepStripe = (stripe: null | string | undefined): boolean => stripe === 'done' || stripe === 'stuck'
++
+ export function sessionHasStatusStripe(id: string): boolean {
+   if (isSessionBlocked(id)) {
+     return false
+@@ -93,9 +97,7 @@ export function sessionHasStatusStripe(id: string): boolean {
+   const row = document.querySelector<HTMLElement>(`[data-sidebar-session-id="${CSS.escape(id)}"]`)
+ 
+   if (row) {
+-    const stripe = row.dataset.sidebarStripe
+-
+-    return stripe === 'done' || stripe === 'stuck'
++    return sessionHasStepStripe(row.dataset.sidebarStripe)
+   }
+ 
+   // Not drawn (virtualized off-screen row): derive it from the row model.
+@@ -116,8 +118,15 @@ export function sessionHasStatusStripe(id: string): boolean {
+   }
+ 
+   return (
+-    sessionStatusStripe($sessionDotStateById.get()[id] ?? 'idle', hasTurns, false, session?.kanban_blocked ?? 0) !==
+-    null
++    sessionHasStepStripe(
++      sessionStatusStripe(
++        $sessionDotStateById.get()[id] ?? 'idle',
++        hasTurns,
++        false,
++        session?.kanban_blocked ?? 0,
++        session?.cron_active === true
++      )
++    )
+   )
+ }
+ 
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index e939c29e9b..f36be0b82b 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -648,6 +648,11 @@ export interface SessionInfo {
+    *  goal loop resumes it unasked, so the sidebar paints it like a background
+    *  job, not "done". Absent otherwise or against an older backend. */
+   goal_active?: boolean
++  /** [daveey] True while this conversation (over its lineage) owns an enabled,
++   *  scheduled cron job: it does its work periodically, so the sidebar shows a
++   *  loop glyph and treats the row like a parked (grey) one instead of "done".
++   *  Absent otherwise or against an older backend. */
++  cron_active?: boolean
+   /** [daveey] Live background processes (terminal background=true) this
+    *  conversation owns, per the backend's process registry and the shared
+    *  processes.json, summed over its compression lineage. Keeps the sidebar
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 7d16596518..44aff815fa 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -1836,6 +1836,7 @@ def create_job(
+     paused_reason: Optional[str] = None,
+     pinned: bool = False,
+     interpreter: Optional[str] = None,
++    owner_session_id: Optional[str] = None,
+ ) -> dict[str, Any]:
+     """Create a new cron job and return the stored record.
+ 
+@@ -1846,7 +1847,8 @@ def create_job(
+     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
+     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
+     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
+-    (a venv can be rebuilt or moved after creation)."""
++    (a venv can be rebuilt or moved after creation). owner_session_id: the session that created
++    the job (persisted only when set); the desktop sidebar marks that session periodic. [daveey]"""
+     if not isinstance(paused, bool):
+         raise ValueError("paused must be a boolean.")
+     if paused_reason is not None and not isinstance(paused_reason, str):
+@@ -1934,6 +1936,7 @@ def create_job(
+     for key, value in (
+         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
+         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
++        ("owner_session_id", (owner_session_id or "").strip() or None),
+     ):
+         if value is not None:
+             job[key] = value
+diff --git a/hermes_cli/cron_session_activity.py b/hermes_cli/cron_session_activity.py
+new file mode 100644
+index 0000000000..71e709d7fc
+--- /dev/null
++++ b/hermes_cli/cron_session_activity.py
+@@ -0,0 +1,142 @@
++"""Which sessions own a live recurring cron job.
++
++A session that sets up a cron job ("check X every 10 minutes") finishes its turn
++and the sidebar painted it "done" (green stripe), although the work goes on
++periodically without it. Jobs created from a session record it as
++``owner_session_id`` (``cron.jobs.create_job``); session-list endpoints stamp
++each row whose lineage owns an enabled, scheduled job (``cron_active``). The
++desktop shows a loop glyph there and treats the row like a parked (grey) one.
++Paused, disabled and finished jobs don't count. [daveey]
++
++Read-only and cheap: one ``jobs.json`` read per profile, re-read only when the
++file changes, plus a short TTL because the sidebar polls.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import threading
++import time
++from pathlib import Path
++from typing import Any, Iterable
++
++_log = logging.getLogger(__name__)
++
++_CACHE_TTL_S = 2.0
++_cache_lock = threading.Lock()
++_cache: tuple[float, frozenset[str]] | None = None
++_file_cache: dict[str, tuple[tuple[int, int], frozenset[str]]] = {}
++
++
++def _jobs_paths() -> list[Path]:
++    from hermes_constants import get_default_hermes_root, get_hermes_home
++
++    paths: list[Path] = []
++    seen: set[str] = set()
++    roots = [get_hermes_home()]
++    try:
++        roots.append(get_default_hermes_root())
++    except Exception:  # pragma: no cover - defensive
++        pass
++    candidates: list[Path] = []
++    for root in roots:
++        candidates.append(Path(root) / "cron" / "jobs.json")
++        prof = Path(root) / "profiles"
++        try:
++            if prof.is_dir():
++                candidates.extend(sorted(prof.glob("*/cron/jobs.json")))
++        except OSError:
++            pass
++    for p in candidates:
++        try:
++            key = str(p.resolve()) if p.exists() else ""
++        except OSError:
++            key = ""
++        if key and key not in seen:
++            seen.add(key)
++            paths.append(p)
++    return paths
++
++
++def _job_is_live(job: dict[str, Any]) -> bool:
++    if not job.get("enabled", True):
++        return False
++    if str(job.get("state") or "scheduled") in ("paused", "completed", "disabled"):
++        return False
++    return bool(job.get("next_run_at"))
++
++
++def owners_from_jobs(jobs: Iterable[Any]) -> set[str]:
++    out: set[str] = set()
++    for job in jobs:
++        if isinstance(job, dict) and _job_is_live(job):
++            owner = str(job.get("owner_session_id") or "").strip()
++            if owner:
++                out.add(owner)
++    return out
++
++
++def _read_owners(path: Path) -> frozenset[str]:
++    st = path.stat()
++    stamp = (st.st_mtime_ns, st.st_size)
++    hit = _file_cache.get(str(path))
++    if hit and hit[0] == stamp:
++        return hit[1]
++    data = json.loads(path.read_text(encoding="utf-8") or "[]")
++    jobs = data.get("jobs", []) if isinstance(data, dict) else data
++    owners = frozenset(owners_from_jobs(jobs if isinstance(jobs, list) else []))
++    _file_cache[str(path)] = (stamp, owners)
++    return owners
++
++
++def cron_owner_sessions() -> frozenset[str]:
++    """Session ids (across every profile) that own a live scheduled cron job."""
++    global _cache
++    now = time.monotonic()
++    with _cache_lock:
++        if _cache is not None and now < _cache[0]:
++            return _cache[1]
++    ids: set[str] = set()
++    for path in _jobs_paths():
++        try:
++            ids |= _read_owners(path)
++        except (OSError, ValueError) as exc:
++            _log.debug("cron activity read failed for %s: %s", path, exc)
++    result = frozenset(ids)
++    with _cache_lock:
++        _cache = (now + _CACHE_TTL_S, result)
++    return result
++
++
++def _row_ids(row: dict[str, Any]) -> Iterable[str]:
++    seen: set[str] = set()
++    for sid in (row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())):
++        if sid and sid not in seen:
++            seen.add(sid)
++            yield sid
++
++
++def annotate_cron_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Stamp ``cron_active: True`` on rows whose lineage owns a live cron job.
++    Never raises: the list must render without it."""
++    if not rows:
++        return rows
++    try:
++        owners = cron_owner_sessions()
++    except Exception:
++        _log.debug("cron activity unavailable", exc_info=True)
++        return rows
++    for row in rows:
++        if owners and any(sid in owners for sid in _row_ids(row)):
++            row["cron_active"] = True
++        else:
++            row.pop("cron_active", None)
++    return rows
++
++
++def _reset_cache_for_tests() -> None:
++    global _cache
++    with _cache_lock:
++        _cache = None
++        _file_cache.clear()
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 58b72785b5..dea7d382bb 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -36,6 +36,7 @@ from hermes_cli.web_server_config import (
+     _apply_main_model_assignment, _normalize_main_model_assignment, _validated_main_model_selection,
+ )
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity
++from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+@@ -511,6 +512,7 @@ def get_profiles_sessions(
+         _strip_session_list_rows(window)
+     annotate_kanban_activity(window)
+     annotate_goal_activity(window)
++    annotate_cron_activity(window)
+     annotate_background_activity(window)
+     return {"sessions": window, "total": sum(totals.values()), "profile_totals": totals,
+             "limit": limit, "offset": offset, "errors": errors,
+@@ -615,7 +617,7 @@ def get_profiles_sessions_sidebar(
+         rows[key].sort(key=_recency, reverse=True)
+         win = _pinned_window(rows[key], 0, cap[key])
+         _strip_session_list_rows(win)
+-        return annotate_background_activity(annotate_goal_activity(annotate_kanban_activity(win)))
++        return annotate_background_activity(annotate_cron_activity(annotate_goal_activity(annotate_kanban_activity(win))))
+ 
+     storage = _corrupt_profile_stores(scanned)
+     retryable = _retryable_profile_errors(errors, scanned)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index feaf177a7c..701f3f0c50 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
+ from hermes_cli.session_listing import subagent_listing_scope
+ from hermes_cli.web_deps import late
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
++from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+@@ -248,6 +249,7 @@ def get_sessions(
+                 _strip_session_list_rows(sessions)
+             annotate_kanban_activity(sessions)
+             annotate_goal_activity(sessions)
++            annotate_cron_activity(sessions)
+             annotate_background_activity(sessions)
+             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
+             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
+diff --git a/tests/hermes_cli/test_cron_session_activity.py b/tests/hermes_cli/test_cron_session_activity.py
+new file mode 100644
+index 0000000000..fa1a6f2133
+--- /dev/null
++++ b/tests/hermes_cli/test_cron_session_activity.py
+@@ -0,0 +1,64 @@
++"""cron_active stamping on session-list rows (sidebar periodic state). [daveey]"""
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import cron_session_activity as csa
++
++
++def _write_jobs(path: Path, jobs: list[dict]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({"jobs": jobs}))
++
++
++def _job(owner, **kw):
++    base = {"id": owner or "x", "enabled": True, "state": "scheduled", "next_run_at": "2026-01-01T00:00:00",
++            "owner_session_id": owner}
++    base.update(kw)
++    return base
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    csa._reset_cache_for_tests()
++    yield tmp_path
++    csa._reset_cache_for_tests()
++
++
++def test_only_live_owned_jobs_count_across_profiles(home):
++    _write_jobs(home / "cron" / "jobs.json", [
++        _job("s_live"),
++        _job("s_paused", state="paused"),
++        _job("s_disabled", enabled=False),
++        _job("s_done", state="completed", next_run_at=None),
++        _job(None),
++        {"id": "legacy", "enabled": True, "next_run_at": "x"},  # predates owner_session_id
++    ])
++    _write_jobs(home / "profiles" / "work" / "cron" / "jobs.json", [_job("s_prof")])
++
++    assert csa.cron_owner_sessions() == {"s_live", "s_prof"}
++
++
++def test_annotates_rows_by_lineage_and_clears_stale_stamps(home):
++    _write_jobs(home / "cron" / "jobs.json", [_job("s_root")])
++    rows = [
++        {"id": "s_tip", "_lineage_root_id": "s_root", "_lineage_ids": ["s_root", "s_tip"]},
++        {"id": "s_old", "cron_active": True},  # job removed since: stale stamp is cleared
++        {"id": "s_none"},
++    ]
++
++    csa.annotate_cron_activity(rows)
++
++    assert rows[0]["cron_active"] is True
++    assert "cron_active" not in rows[1]
++    assert "cron_active" not in rows[2]
++
++
++def test_missing_or_corrupt_jobs_file_never_raises(home):
++    (home / "cron").mkdir()
++    (home / "cron" / "jobs.json").write_text("{not json")
++    rows = [{"id": "s1"}]
++    assert csa.annotate_cron_activity(rows) == [{"id": "s1"}]
+diff --git a/tests/tools/test_cronjob_tools.py b/tests/tools/test_cronjob_tools.py
+index eefb67e804..6802beec40 100644
+--- a/tests/tools/test_cronjob_tools.py
++++ b/tests/tools/test_cronjob_tools.py
+@@ -242,6 +242,19 @@ class TestUnifiedCronjobTool:
+         assert listing["jobs"][0]["name"] == "Server Check"
+         assert listing["jobs"][0]["state"] == "scheduled"
+ 
++    def test_create_records_owner_session(self, monkeypatch):
++        # [daveey] The creating session is stored so the sidebar can mark it periodic: the tool's
++        # own session id wins, else the HERMES_SESSION_ID a `hermes cron create` subprocess inherits.
++        from cron.jobs import load_jobs
++        monkeypatch.setenv("HERMES_SESSION_ID", "s_env")
++        json.loads(cronjob(action="create", prompt="a", schedule="every 1h", session_id="s_tool"))
++        json.loads(cronjob(action="create", prompt="b", schedule="every 1h"))
++        monkeypatch.delenv("HERMES_SESSION_ID")
++        json.loads(cronjob(action="create", prompt="c", schedule="every 1h"))
++        owners = {j["prompt"]: j.get("owner_session_id") for j in load_jobs()}
++        assert owners == {"a": "s_tool", "b": "s_env", "c": None}
++        assert "owner_session_id" not in next(j for j in load_jobs() if j["prompt"] == "c")
++
+     def test_create_with_natural_weekday_schedule(self):
+         # The documented "every monday 9am" form must create a real cron job
+         # through the tool path, not error out (issue: parser rejected it).
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index 625b7d970b..fcf41ec19f 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -489,6 +489,19 @@ def _reap_stale_executions(job_name: str) -> None:
+         logger.debug("Stale execution reclaim failed: %s", _reap_exc)
+ 
+ 
++def _owner_session_id(session_id: Optional[str]) -> Optional[str]:
++    """[daveey] The session creating a job: the tool's own session id, else the session env a
++    terminal subprocess (``hermes cron create``) inherits."""
++    if session_id:
++        return str(session_id)
++    try:
++        from gateway.session_context import get_session_env
++        return get_session_env("HERMES_SESSION_ID", "") or None
++    except Exception:
++        import os
++        return os.environ.get("HERMES_SESSION_ID") or None
++
++
+ def _background_session_key(session_id: Optional[str]) -> str:
+     """Routing key for a detached completion, captured on THIS thread (contextvars don't
+     cross the pool). Empty string = no durable consumer."""
+@@ -698,6 +711,9 @@ def _action_create(a: dict[str, Any]) -> str:
+             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
+             pinned=bool(a["pinned"]),
+             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
++            # [daveey] The creating session (agent tool call, or `hermes cron create` run from an
++            # agent's terminal, which inherits HERMES_SESSION_ID): the sidebar marks it periodic.
++            owner_session_id=_owner_session_id(a["session_id"]),
+             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
+                if a["paused"] is not False or a["paused_reason"] is not None else {}))
+     except CronSchedulerRegistrationError as exc:
+-- 
+2.55.0
+

@@ -1,0 +1,152 @@
+From b2251b137542d0ebf7c3e99ec81e144eb056b542 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:51:16 -0700
+Subject: [PATCH] fix(tui-gateway): don't reap a detached session that owns a
+ running background job [daveey]
+
+Closing the session runs AIAgent.close(), which SIGTERMs the agent's
+non-persisted background jobs with output consumed. A notify_on_complete
+watcher the chat promised to wake on died silently and the row painted
+done. The WS-orphan, TTL and LRU-cap reapers now keep such a session
+until the job exits (memory-trim quiescence is unchanged).
+---
+ .../test_detached_loop_keepalive.py           | 62 +++++++++++++++++++
+ tui_gateway/session_lifecycle.py              |  8 ++-
+ tui_gateway/session_reaper.py                 | 29 ++++++++-
+ 3 files changed, 94 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_detached_loop_keepalive.py b/tests/tui_gateway/test_detached_loop_keepalive.py
+index 1ddc64e62f..576daa3427 100644
+--- a/tests/tui_gateway/test_detached_loop_keepalive.py
++++ b/tests/tui_gateway/test_detached_loop_keepalive.py
+@@ -189,3 +189,65 @@ def test_gateway_owned_heartbeat_does_not_pin_detached_session(server, detached,
+     _fire_orphan_reap(server, sid)
+ 
+     assert sid not in server._sessions and popped == [session]
++
++
++class _Agent:
++    def __init__(self, *owners):
++        self._process_owner_task_ids = set(owners)
++
++
++def _fake_running(monkeypatch, owners_running: set[str]):
++    from tools.process_registry import process_registry
++
++    monkeypatch.setattr(process_registry, "running_owned_by",
++                        lambda owner: [object()] if owner in owners_running else [])
++
++
++def test_orphan_reap_keeps_detached_session_with_running_background_job(server, detached, monkeypatch):
++    """A notify_on_complete watcher dies with the agent on close (agent_close SIGTERM, output consumed), so the
++    chat that promised to wake on it would stay green forever. The reaper must keep its session until the job ends."""
++    sid, session, popped = detached
++    session["agent"] = _Agent("turn-owner-id")
++    _fake_running(monkeypatch, {"turn-owner-id"})
++
++    _fire_orphan_reap(server, sid)
++
++    assert server._sessions.get(sid) is session and not popped
++    assert server._pending_ws_reaps[sid] is _Timer.created[-1]
++
++
++def test_orphan_reap_collects_session_once_background_job_exits(server, detached, monkeypatch):
++    sid, session, popped = detached
++    session["agent"] = _Agent("turn-owner-id")
++    _fake_running(monkeypatch, set())
++
++    _fire_orphan_reap(server, sid)
++
++    assert sid not in server._sessions and popped == [session]
++
++
++def test_ttl_and_cap_reapers_spare_session_with_running_background_job(server, detached, monkeypatch):
++    sid, session, _ = detached
++    monkeypatch.setattr(server, "_SESSION_TTL_S", 1)
++    now = time.time()
++    _fake_running(monkeypatch, set())
++    assert server._session_is_evictable(sid, session, now)
++
++    _fake_running(monkeypatch, {session["session_key"]})  # owned by the session key, no agent built yet
++
++    assert not server._session_is_evictable(sid, session, now)
++    assert not server._session_is_reapable(sid, session)
++    assert server._session_is_lru_evictable(sid, session)  # does not block a memory trim
++
++
++def test_lru_cap_skips_session_with_running_background_job(server, detached, monkeypatch):
++    sid, session, popped = detached
++    monkeypatch.setattr(server, "_max_live_sessions", lambda: 1)
++    other = dict(session, session_key="other-idle", last_active=1.0)
++    server._sessions["sid-other"] = other
++    _fake_running(monkeypatch, {session["session_key"]})
++
++    server._enforce_session_cap()
++
++    assert server._sessions.get(sid) is session
++    assert "sid-other" not in server._sessions and popped == [other]
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 19fc4f77cb..6b7f0f6ac6 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -944,9 +944,11 @@ def _schedule_ws_orphan_reap(
+             if _session_has_active_delegations(sid, current) or (
+                     not current.get("running")
+                     and not current.get("_client_gone_interrupt_requested")
+-                    and _session_owns_live_wakeup_schedule(current)):
+-                # Live background work, or an active /loop or /heartbeat only this process's poller can fire. A
+-                # settled client-gone interrupt wins over the schedule: its latches block every tick and reattach.
++                    and (_session_owns_live_wakeup_schedule(current)
++                         or _session_owns_running_process(current))):
++                # Live background work, an active /loop or /heartbeat only this process's poller can fire, or a
++                # running background job that closing the agent would kill. A settled client-gone interrupt wins
++                # over these: its latches block every tick and reattach.
+                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+             elif not current.get("running"):
+                 session = _pop_session_by_id(sid)
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index db37a516a2..26cd258418 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -243,11 +243,36 @@ def _sessions_quiescent(exclude: str | None = None) -> bool:
+     return all(_session_is_lru_evictable(sid, s) for sid, s in others)
+ 
+ 
++def _session_owns_running_process(session: dict) -> bool:
++    """True while a ``terminal(background=true)`` job this session's agent spawned is still running.
++
++    Closing the session runs ``AIAgent.close()``, which SIGTERMs every non-persisted job the agent owns and
++    consumes its output, so a ``notify_on_complete`` watcher the chat promised to wake on dies silently
++    and the row paints done. Bounded by the job's own lifetime. Fail-open to False: an unreadable registry
++    must not make a session unreapable."""
++    agent = session.get("agent")
++    owners = {str(o) for o in (getattr(agent, "_process_owner_task_ids", None) or ()) if o}
++    if key := str(session.get("session_key") or ""):
++        owners.add(key)
++    if not owners:
++        return False
++    try:
++        from tools.process_registry import process_registry
++        return any(process_registry.running_owned_by(owner) for owner in owners)
++    except Exception:
++        logger.debug("running-process check failed for %s", session.get("session_key"), exc_info=True)
++        return False
++
++
+ def _session_is_reapable(sid: str, session: dict) -> bool:
+     """Reaper eligibility: the LRU exemptions, and not the sole driver of an active /loop or /heartbeat
+     (closing the session stops the notification poller that fires it, freezing the schedule until a client
+-    reattaches). Kept out of ``_sessions_quiescent``: an idle looping session does not block a memory trim."""
+-    return _session_is_lru_evictable(sid, session) and not _session_owns_live_wakeup_schedule(session)
++    reattaches), and not the owner of a running background job (closing would kill it — see
++    ``_session_owns_running_process``). Kept out of ``_sessions_quiescent``: an idle session with a schedule
++    or a background job does not block a memory trim."""
++    return (_session_is_lru_evictable(sid, session)
++            and not _session_owns_live_wakeup_schedule(session)
++            and not _session_owns_running_process(session))
+ 
+ 
+ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
+-- 
+2.55.0
+

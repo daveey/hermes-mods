@@ -1,8 +1,9 @@
 # Sidebar status stripe + gateway device glyph (Desktop)
 
-Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
+Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091`, `0094`, `0095` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
 only, as does `0089`; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints; `0091`
-is backend-only (`tui_gateway/server.py`). Replaces the per-gateway
+is backend-only (`tui_gateway/server.py`), as is `0094` (`tui_gateway/session_reaper.py`); `0095` touches cron, the
+session-list endpoints and `apps/desktop`. Replaces the per-gateway
 row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `0038`: stripe shows session status (green/red); gateway becomes a device glyph after the age.
@@ -13,6 +14,8 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `0070`: a session that owns a live background process (per the backend) stays "working" (no green).
 - `0089`: the travelling arc border marks the selected row, not every working row.
 - `0091`: a turn running longer than 5 min no longer paints red while its tools are still active.
+- `0094`: the backend no longer reaps a detached session that owns a running background job.
+- `0095`: a session that owns a live cron job shows a grey loop glyph instead of the stripe (never green).
 - Red for blocked kanban cards is `0092`, documented in [kanban-session-links.md](kanban-session-links.md).
 
 ## Behavior
@@ -31,6 +34,10 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
     opening the session cleared it (streamed events refreshed the clock), which looked like an instant resume.
   - **grey**: you parked it with ⌘B (`0048`, [session-navigation-shortcuts.md](session-navigation-shortcuts.md)).
     Overrides every other colour; ⌘]/⌘[ and ⌘⇧]/⌘⇧[ skip it. ⌘B again clears it.
+  - **loop glyph (grey)**: the session owns an enabled, scheduled cron job (`0095`), e.g. it set up "check X every
+    10 minutes". Its work recurs on its own, so it is never "done". A tiny grey `sync` codicon replaces the stripe
+    and the row is treated like a parked one: ⌘]/⌘[ skip it. ⌘B (grey bar) and a real prompt (`needs-input`,
+    red) beat it; a live turn does not. Paused, disabled or finished jobs don't count.
   - **none**: working, background/delegating, draft, archived, or a session with no turn yet.
 - A finished turn does not go green while the session's work still runs elsewhere. Its dot reads
   `background` (no stripe) when:
@@ -104,6 +111,20 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   the new i18n string `sidebar.row.kanbanTasks(open, blocked)` (English only; other locales are listed in
   `overlay-gaps.json`).
 
+- Detached-session keepalive (`0094`): closing a session runs `AIAgent.close()`, which SIGTERMs its
+  non-persisted background jobs. A `notify_on_complete` watcher the chat promised to wake on died silently and the
+  row went green. The WS-orphan, TTL and LRU-cap reapers (`tui_gateway/session_reaper.py`,
+  `session_lifecycle.py`) now keep such a session until the job exits; memory-trim quiescence is unchanged.
+- Periodic (`0095`): `cron.jobs.create_job(owner_session_id=...)` persists the creating session (only when set).
+  The `cronjob` tool passes `_owner_session_id(session_id)`: its own session id, else `HERMES_SESSION_ID` via
+  `get_session_env`, which a `hermes cron create` run from an agent's terminal inherits.
+  `hermes_cli/cron_session_activity.py` reads every `cron/jobs.json` (Hermes home, default root,
+  `profiles/*/cron/jobs.json`), re-reading a file only when its mtime/size changes, plus a 2 s TTL. A job counts when
+  `enabled`, `state` not paused/completed/disabled, and `next_run_at` set. `annotate_cron_activity(rows)` stamps
+  `cron_active: true` by lineage on the same three endpoints, clears stale stamps and never raises. Desktop:
+  `SessionInfo.cron_active?`; `sessionStatusStripe(state, hasTurns, userBlocked, kanbanBlocked, periodic)` returns
+  `'periodic'` after `blocked` and before everything except `needs-input`; `session-row.tsx` renders the glyph with
+  `data-status-stripe="periodic"`; `sessionHasStatusStripe` steps only to `done`/`stuck`.
 - Live-list activity clock (`0091`): `session.active_list` builds each row with `_session_live_item`, whose
   `last_active` now comes from `_session_live_last_active(session, now)` in `tui_gateway/server.py`.
   `session["last_active"]` is stamped only at turn start/end; for a `running` session the helper takes the max of
@@ -129,6 +150,10 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   `test_session_active_list_last_active_follows_running_turn_activity` (running turn follows the agent clock, an
   isolated turn follows its ns stamp, an idle row keeps its stored stamp, a really quiet running turn stays old,
   nothing is in the future).
+- `tests/tui_gateway/test_detached_loop_keepalive.py` (`0094`).
+- `0095`: `store/session-dot-state.test.ts` "paints periodic (grey loop) ..."; `tests/hermes_cli/test_cron_session_activity.py`
+  (only live owned jobs count across profiles, lineage stamping, corrupt file harmless);
+  `tests/tools/test_cronjob_tools.py::TestUnifiedCronjobTool::test_create_records_owner_session`.
 - `tests/hermes_cli/test_goal_session_activity.py`: only active goals count across profiles, lineage
   stamping, missing `state_meta` is harmless.
 - `tests/hermes_cli/test_process_session_activity.py` (`0070`): a live process in `processes.json` stamps its
@@ -147,8 +172,13 @@ its hunks sit next to the goal code in `session-dot-state.ts`, `types/hermes.ts`
 Hermes processes from erasing each other's entries there; it does not need `0069` to apply. `0089` is a two-file change to `session-row.tsx` and its test and applies on
 its own; it drops the row's use of `showsRunningArc` but leaves that helper in `session-dot-state.ts`. `0091` applies
 on its own (one helper in `tui_gateway/server.py` plus a test) and needs no Desktop change.
+ `0094` applies on its own. Apply `0095` after `0092`
+(it extends `sessionStatusStripe`'s `kanbanBlocked` signature) and after `0051`/`0070` (adjacent router lines).
 
 ## Gotchas
+
+- `0095` only knows jobs created after it landed: older jobs have no `owner_session_id`. Set it by hand in
+  `cron/jobs.json` to mark an existing session periodic.
 
 - After `0089`, a running row looks the same as an idle one except for its status dot. If you want the arc on
   working rows back, revert `0089` alone.
