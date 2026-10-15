@@ -240,13 +240,41 @@ export function dedupeRows(rows) {
   return out
 }
 
+const SESSION_PAGE = 500 // the endpoint's max page size
+const MAX_SESSION_ROWS = 5_000
+
+/** Every user-facing session, not just the most recent page. Hidden sources (kanban workers,
+ *  oneshots, …) are excluded SERVER-side: they were ~93% of each page, so a 300-row page held
+ *  only ~20 real chats and a week-old one could not be @-mentioned at all. */
+export async function fetchAllSessionPages(connectionId, request = api) {
+  const out = []
+  const exclude = [...HIDDEN_SOURCES].join(',')
+  for (let offset = 0; offset < MAX_SESSION_ROWS; offset += SESSION_PAGE) {
+    let res
+    try {
+      res = await request(
+        connectionId,
+        `/api/profiles/sessions?limit=${SESSION_PAGE}&offset=${offset}&order=recent&profile=all&min_messages=1&archived=exclude&exclude_sources=${exclude}`
+      )
+    } catch (error) {
+      if (!out.length) throw error
+      break // keep the pages we have; the next refresh retries
+    }
+    const page = Array.isArray(res?.sessions) ? res.sessions : []
+    out.push(...page)
+    const total = Number(res?.total)
+    if (page.length < SESSION_PAGE || (Number.isFinite(total) && offset + page.length >= total)) break
+  }
+  return out
+}
+
 function fetchRows(conn, force = false) {
   const cached = rowCache.get(conn.id)
   if (!force && cached && Date.now() - cached.at < STALE_MS) return Promise.resolve(cached.rows)
   if (rowInflight.has(conn.id)) return rowInflight.get(conn.id)
-  const p = api(conn.id, '/api/profiles/sessions?limit=300&offset=0&order=recent&profile=all&min_messages=1&archived=exclude&exclude_sources=cron')
-    .then(res => {
-      const rows = tagRows(res?.sessions, conn, connCache.rows)
+  const p = fetchAllSessionPages(conn.id)
+    .then(sessions => {
+      const rows = tagRows(sessions, conn, connCache.rows)
       rowCache.set(conn.id, { at: Date.now(), rows })
       rowErrors.delete(conn.id)
       return rows
