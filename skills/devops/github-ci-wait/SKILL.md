@@ -56,3 +56,17 @@ How to run it from an agent:
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
   maps to) takes precedence; check the repo's AGENTS.md first.
 - Tests: `python3 -B -m unittest discover -s tests` from this skill's dir.
+
+## Rescuing a session already stuck on a hand-rolled watcher
+
+Read its last background command (`ps -axo pid,etime,command | grep 'gh run'`). If it follows the newest run or one
+run id, check the commit with `--once`. When it has already shipped, kill the watcher. A `zsh -lic` loop ignores
+SIGTERM, so use `pkill -P <pid>; kill -9 <pid>` and confirm with `ps -p`. Then send the session the facts: which run
+or tag contains its commit, and what to do next. Also tell it to use this script next time.
+
+## Adding helper scripts to a repo
+
+Before choosing a directory for a new tool, read the CI workflows' `on.push.paths` and any plan step's path rules. A
+script under a shared or product directory (e.g. `shared/`, `lib/`) can trigger a full rebuild and release of every
+product on push. Put agent tooling where no release workflow watches (often `tools/`), and confirm by checking that
+no new run started after the push.
