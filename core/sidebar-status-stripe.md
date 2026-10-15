@@ -1,7 +1,7 @@
 # Sidebar status stripe + gateway device glyph (Desktop)
 
-Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
-only; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints. Replaces the per-gateway
+Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
+only, as does `0089`; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints. Replaces the per-gateway
 row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `0038`: stripe shows session status (green/red); gateway becomes a device glyph after the age.
@@ -10,9 +10,13 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `0051`: a session whose `/goal` is still active stays "working" (no green).
 - `0063`: the row shows open and blocked kanban task counts after the age.
 - `0070`: a session that owns a live background process (per the backend) stays "working" (no green).
+- `0089`: the travelling arc border marks the selected row, not every working row.
 
 ## Behavior
 
+- The travelling arc border (`.arc-row`) paints only on the **selected** row, the session the pane shows,
+  whether it is idle or working (`0089`). Upstream painted it on every running row, so with several sessions
+  busy the current one got lost. Working state is still shown by the status dot.
 - The 3 px stripe on a session row's left edge shows the session's **status**, not its gateway:
   - **green**: the agent finished its turn and is waiting on you: dot state `unread`, or `idle` with at
     least one message. It stays after you open the row (`0039`; in `0038` it was unread-only).
@@ -100,7 +104,8 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   back to done when the work ends, yields to a live turn), and the same three cases in "backend-registered
   background process (`$backgroundActiveSessionIds`)" (`0070`).
 - `app/chat/sidebar/gateway-device-icon.test.ts`.
-- `app/chat/sidebar/session-row.test.tsx`: "SidebarSessionRow kanban counts" (counts follow the age,
+- `app/chat/sidebar/session-row.test.tsx`: "SidebarSessionRow selection arc" (no arc on an unselected settled
+  or running row; arc on the selected row, idle or not) (`0089`), and "SidebarSessionRow kanban counts" (counts follow the age,
   zero side hidden, nothing when idle).
 - `tests/hermes_cli/test_kanban_session_activity.py`: only pending/running count across boards, lineage
   stamping and stale-stamp clearing, old schema never breaks the list,
@@ -120,10 +125,13 @@ subscriber-counting part of `_read_counts` and sits after a test, both added by 
 shepherd a kanban card subscribe to it; not covered here), so apply `0059` first. Apply `0070` after `0051`:
 its hunks sit next to the goal code in `session-dot-state.ts`, `types/hermes.ts` and both routers. `0070` reads
 `processes.json`, so it works best with `0069` ([process-readoption.md](process-readoption.md)), which stops
-Hermes processes from erasing each other's entries there; it does not need `0069` to apply.
+Hermes processes from erasing each other's entries there; it does not need `0069` to apply. `0089` is a two-file change to `session-row.tsx` and its test and applies on
+its own; it drops the row's use of `showsRunningArc` but leaves that helper in `session-dot-state.ts`.
 
 ## Gotchas
 
+- After `0089`, a running row looks the same as an idle one except for its status dot. If you want the arc on
+  working rows back, revert `0089` alone.
 - Gateway colors (filter menu) still exist and still color project headers, but no longer paint rows.
 - An unmatched local hostname shows the monitor glyph; rename the host or extend the regexes.
 - Kanban and goal state come from the session-list poll, so the row can lag by the poll interval plus the
