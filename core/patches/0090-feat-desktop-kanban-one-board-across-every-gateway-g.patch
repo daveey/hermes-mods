@@ -1,0 +1,1452 @@
+From 273feb8964361226ea89866593baf11c1257c23b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 12:48:05 -0700
+Subject: [PATCH] feat(desktop/kanban): one board across every gateway, gateway
+ filter + device glyph on cards [daveey]
+
+The Kanban page now reads the selected board from EVERY registered gateway
+(local, ssh, cloud) and merges the columns; each card is tagged with its
+owning gateway and shows the sidebar session row's device glyph (laptop /
+Mac mini / cloud). Writes (move, edit, comment, reassign, reclaim, delete,
+attachments, estimate, bulk) are routed back to the owning gateway and
+board; bulk ops split per gateway; the dispatcher nudge follows the write.
+New tasks go to the gateway filter's pick, else the active gateway.
+
+- Filter menu: All gateways / one gateway (persisted), with an outage mark.
+- Board switcher: union of boards across gateways, totals summed, glyphs
+  for the gateways carrying each board; management actions only when the
+  active gateway has the board.
+- Remote reads have a hard 6s deadline (the bridge timeout does not cover a
+  pending OAuth login) and a 60s cool-down; failures show as a header chip.
+- Remote gateways have no events socket here: the board polls every 15s
+  when more than one gateway is registered.
+- SDK: PluginRestOptions.connectionId, host.state.gateways, GatewayDeviceIcon.
+
+Single-gateway setups take the old code path unchanged.
+---
+ apps/desktop/src/api/plugins.ts               |   7 +-
+ .../src/plugins/kanban/api.gateways.test.ts   | 316 ++++++++++++
+ apps/desktop/src/plugins/kanban/api.ts        | 488 ++++++++++++++++--
+ .../src/plugins/kanban/board-switcher.tsx     |  16 +-
+ apps/desktop/src/plugins/kanban/board.tsx     | 146 ++++--
+ apps/desktop/src/plugins/kanban/i18n.ts       |  16 +
+ apps/desktop/src/plugins/kanban/types.ts      |   9 +
+ apps/desktop/src/sdk/index.ts                 |  21 +
+ 8 files changed, 945 insertions(+), 74 deletions(-)
+ create mode 100644 apps/desktop/src/plugins/kanban/api.gateways.test.ts
+
+diff --git a/apps/desktop/src/api/plugins.ts b/apps/desktop/src/api/plugins.ts
+index d22d5e9d4e..ec51071303 100644
+--- a/apps/desktop/src/api/plugins.ts
++++ b/apps/desktop/src/api/plugins.ts
+@@ -47,6 +47,11 @@ export interface PluginRestOptions {
+   /** Single-file multipart upload (see HermesApiRequest.upload). */
+   upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
+   timeoutMs?: number
++  /** [daveey] Send this call to ONE registry connection (its id) instead of
++   *  the active gateway — for plugins that read every gateway at once (the
++   *  Kanban board). The ambient profile is NOT carried: a profile name belongs
++   *  to its own gateway, so the target's default profile answers. */
++  connectionId?: string
+ }
+ 
+ // Normalize `path` to a leading-slash suffix relative to `/api/plugins/<id>`.
+@@ -82,7 +87,7 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
+     body: opts.body,
+     upload: opts.upload,
+     timeoutMs: opts.timeoutMs,
+-    ...profileScoped()
++    ...(opts.connectionId ? { connectionId: opts.connectionId } : profileScoped())
+   })
+ }
+ 
+diff --git a/apps/desktop/src/plugins/kanban/api.gateways.test.ts b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+new file mode 100644
+index 0000000000..b5eaa7d73a
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+@@ -0,0 +1,316 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] One board across every registered gateway: reads fan out and merge,
++// writes route back to the task's owning gateway. See the gateways section of
++// ./api.ts.
++
++const routed = vi.hoisted(() => ({ id: null as null | string }))
++
++vi.mock('@/hermes', () => ({ setApiRequestProfile: vi.fn() }))
++vi.mock('@/store/gateway', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  activeGatewayConnectionId: () => routed.id
++}))
++
++const api = await import('./api')
++const { $connectionsRegistry } = await import('@/store/connection-registry-state')
++const { queryClient } = await import('@/lib/query-client')
++
++const {
++  $boardSlug,
++  bindApi,
++  bulkTasks,
++  createTask,
++  fetchBoard,
++  fetchBoards,
++  mergeBoardLists,
++  mergeBoards,
++  patchTask,
++  resetGatewayCooldowns
++} = api
++
++type Call = { opts?: { connectionId?: string; method?: string; body?: unknown }; path: string }
++
++const task = (id: string, extra: Record<string, unknown> = {}) => ({ id, status: 'ready', title: id, ...extra })
++
++const board = (columns: Record<string, ReturnType<typeof task>[]>, extra: Record<string, unknown> = {}) => ({
++  assignees: [],
++  columns: Object.entries(columns).map(([name, tasks]) => ({ name, tasks })),
++  latest_event_id: 0,
++  now: 0,
++  tenants: [],
++  ...extra
++})
++
++const storage = { get: <T>(_key: string, fallback: T) => fallback, remove: vi.fn(), set: vi.fn() }
++
++function registry(...ids: string[]) {
++  $connectionsRegistry.set({
++    connections: ids.map(id => ({ id, kind: id === 'local' ? 'local' : 'ssh', label: id.toUpperCase() })),
++    primary: 'local'
++  } as never)
++}
++
++let calls: Call[] = []
++let dispose: () => void = () => undefined
++
++async function bind(respond: (call: Call) => unknown) {
++  const socket = vi.fn(() => vi.fn())
++  calls = []
++  dispose = bindApi(
++    (async (path: string, opts?: Call['opts']) => {
++      const call = { opts, path }
++      calls.push(call)
++      const out = respond(call)
++
++      if (out instanceof Error) {
++        throw out
++      }
++
++      return out
++    }) as never,
++    storage,
++    socket
++  )
++  // bindApi's own events-socket snapshot read is not what these tests assert.
++  await vi.waitFor(() => expect(socket).toHaveBeenCalled())
++  calls = []
++}
++
++beforeEach(() => {
++  routed.id = 'local'
++})
++
++afterEach(() => {
++  dispose()
++  $connectionsRegistry.set(null)
++  $boardSlug.set('')
++  resetGatewayCooldowns()
++  queryClient.clear()
++  vi.useRealTimers()
++})
++
++describe('mergeBoards', () => {
++  it('tags every card with its gateway and keeps the dispatch order across gateways', () => {
++    const merged = mergeBoards([
++      {
++        board: board(
++          { ready: [task('a', { created_at: 5, priority: 0 })], done: [task('d1', { completed_at: 10 })] },
++          { assignees: ['x'], latest_event_id: 42, now: 100 }
++        ),
++        gateway: 'local'
++      },
++      {
++        board: board(
++          {
++            ready: [task('b', { created_at: 9, priority: 2 }), task('c', { created_at: 1, priority: 0 })],
++            done: [task('d2', { completed_at: 20 })]
++          },
++          { assignees: ['y', 'x'], latest_event_id: 7 }
++        ),
++        gateway: 'mini'
++      }
++    ])
++
++    const ready = merged.columns.find(col => col.name === 'ready')!.tasks
++    expect(ready.map(t => [t.id, t.gateway])).toEqual([
++      ['b', 'mini'],
++      ['c', 'mini'],
++      ['a', 'local']
++    ])
++    expect(merged.columns.find(col => col.name === 'done')!.tasks.map(t => t.id)).toEqual(['d2', 'd1'])
++    expect(merged.assignees).toEqual(['x', 'y'])
++    // The routed (first) gateway's cursor drives the events socket.
++    expect(merged.latest_event_id).toBe(42)
++    expect(merged.gateway_errors).toBeUndefined()
++  })
++
++  it('skips a gateway without the board silently and reports other failures', () => {
++    const merged = mergeBoards([
++      { board: board({ ready: [task('a')] }), gateway: 'local' },
++      { error: new Error('404: {"detail":"board \'ops\' does not exist"}'), gateway: 'mini' },
++      { error: new Error('timed out'), gateway: 'cloud' }
++    ])
++
++    expect(merged.columns[0].tasks.map(t => t.id)).toEqual(['a'])
++    expect(merged.gateway_errors).toEqual({ cloud: 'timed out' })
++  })
++
++  it('throws only when no gateway answered', () => {
++    expect(() =>
++      mergeBoards([
++        { error: new Error('down'), gateway: 'local' },
++        { error: new Error('404: nope'), gateway: 'mini' }
++      ])
++    ).toThrow('down')
++  })
++})
++
++describe('mergeBoardLists', () => {
++  it('unions boards by slug, sums totals and records which gateways carry each', () => {
++    const merged = mergeBoardLists([
++      { boards: { boards: [{ slug: 'default', total: 2 }], current: 'default' }, gateway: 'local' },
++      {
++        boards: {
++          boards: [
++            { slug: 'default', total: 3 },
++            { slug: 'ops', total: 1 }
++          ],
++          current: 'ops'
++        },
++        gateway: 'mini'
++      },
++      { boards: null, gateway: 'cloud' }
++    ])
++
++    expect(merged.current).toBe('default')
++    expect(merged.boards).toEqual([
++      { gateways: ['local', 'mini'], is_current: true, slug: 'default', total: 5 },
++      { gateways: ['mini'], is_current: false, slug: 'ops', total: 1 }
++    ])
++  })
++})
++
++describe('gateway routing', () => {
++  it('keeps the single-gateway path byte-identical', async () => {
++    registry('local')
++    await bind(() => board({ ready: [task('a')] }))
++
++    const result = await fetchBoard(false)
++
++    expect(calls.filter(c => c.path.startsWith('/board'))).toEqual([{ opts: undefined, path: '/board' }])
++    expect(result.columns[0].tasks[0].gateway).toBeUndefined()
++  })
++
++  it('reads every gateway and routes each write to the owner', async () => {
++    registry('local', 'mini')
++    await bind(call => {
++      if (call.path.startsWith('/board?')) {
++        return call.opts?.connectionId === 'mini'
++          ? board({ ready: [task('remote1'), task('remote2')] })
++          : board({ ready: [task('local1')] })
++      }
++
++      if (call.path.startsWith('/tasks/bulk')) {
++        return { results: (call.opts?.body as { ids: string[] }).ids.map(id => ({ id, ok: true })) }
++      }
++
++      if (call.path.startsWith('/tasks?')) {
++        return { task: { id: 'fresh', status: 'ready' } }
++      }
++
++      return {}
++    })
++    // After bind: it hydrates the slug from (empty) storage.
++    $boardSlug.set('ops')
++    await vi.waitFor(() => expect(calls.length).toBeGreaterThan(0))
++    calls = []
++
++    const merged = await fetchBoard(false)
++    const reads = calls.filter(c => c.path.startsWith('/board?'))
++
++    expect(reads.map(c => [c.path, c.opts?.connectionId])).toEqual([
++      ['/board?board=ops', undefined],
++      ['/board?board=ops', 'mini']
++    ])
++    expect(merged.columns[0].tasks.map(t => [t.id, t.gateway])).toEqual([
++      ['local1', 'local'],
++      ['remote1', 'mini'],
++      ['remote2', 'mini']
++    ])
++
++    calls = []
++    await patchTask('remote1', { status: 'todo' })
++    await patchTask('local1', { status: 'todo' })
++    expect(calls.map(c => [c.path, c.opts?.method, c.opts?.connectionId])).toEqual([
++      ['/tasks/remote1?board=ops', 'PATCH', 'mini'],
++      ['/tasks/local1?board=ops', 'PATCH', undefined]
++    ])
++
++    calls = []
++    const bulk = await bulkTasks(['local1', 'remote1', 'remote2'], { status: 'done' })
++    expect(bulk.results.map(r => r.id).sort()).toEqual(['local1', 'remote1', 'remote2'])
++    expect(calls.map(c => [c.path, c.opts?.connectionId, (c.opts?.body as { ids: string[] }).ids])).toEqual(
++      expect.arrayContaining([
++        ['/tasks/bulk?board=ops', 'mini', ['remote1', 'remote2']],
++        ['/tasks/bulk?board=ops', undefined, ['local1']]
++      ])
++    )
++    expect(calls).toHaveLength(2)
++
++    // A task created on another gateway routes its follow-up writes there
++    // before any board read has seen it.
++    calls = []
++    await createTask({ title: 'x' }, 'mini')
++    await patchTask('fresh', { status: 'triage' })
++    expect(calls.map(c => [c.path, c.opts?.connectionId])).toEqual([
++      ['/tasks?board=ops', 'mini'],
++      ['/tasks/fresh?board=ops', 'mini']
++    ])
++  })
++
++  it("resolves the '' board alias against the routed gateway for every gateway", async () => {
++    registry('local', 'mini')
++    await bind(call => {
++      if (call.path === '/boards') {
++        return { boards: [{ slug: 'work' }], current: 'work' }
++      }
++
++      return board({ ready: [] })
++    })
++
++    await fetchBoard(false)
++
++    expect(calls.filter(c => c.path.startsWith('/board')).map(c => [c.path, c.opts?.connectionId])).toContainEqual([
++      '/board?board=work',
++      'mini'
++    ])
++    // The routed gateway keeps its unscoped read.
++    expect(calls.filter(c => c.path.startsWith('/board')).map(c => [c.path, c.opts?.connectionId])).toContainEqual([
++      '/board',
++      undefined
++    ])
++  })
++
++  it('does not let a hung gateway stall the board, and cools it down', async () => {
++    registry('local', 'cloud')
++    await bind(call =>
++      call.opts?.connectionId === 'cloud'
++        ? new Promise(() => undefined) // e.g. an OAuth login nobody completes
++        : call.path === '/boards'
++          ? { boards: [], current: 'default' }
++          : board({ ready: [task('a')] })
++    )
++
++    vi.useFakeTimers()
++    const pending = fetchBoard(false)
++    await vi.advanceTimersByTimeAsync(6_000)
++    const merged = await pending
++
++    expect(merged.columns[0].tasks.map(t => t.id)).toEqual(['a'])
++    expect(merged.gateway_errors).toEqual({ cloud: 'no answer in 6s' })
++
++    // The next poll skips the cooled-down gateway instead of waiting again.
++    calls = []
++    const again = await fetchBoard(false)
++    expect(again.gateway_errors).toEqual({ cloud: 'no answer in 6s' })
++    expect(calls.some(c => c.opts?.connectionId === 'cloud')).toBe(false)
++  })
++
++  it('lists the union of boards from every gateway', async () => {
++    registry('local', 'mini')
++    await bind(call =>
++      call.opts?.connectionId === 'mini'
++        ? { boards: [{ slug: 'ops', total: 4 }], current: 'ops' }
++        : { boards: [{ slug: 'default', total: 1 }], current: 'default' }
++    )
++
++    const boards = await fetchBoards()
++
++    expect(boards.current).toBe('default')
++    expect(boards.boards.map(meta => [meta.slug, meta.gateways])).toEqual([
++      ['default', ['local']],
++      ['ops', ['mini']]
++    ])
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index fdab9c7895..fdfe5b0662 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -35,6 +35,7 @@ import type {
+   BoardMeta,
+   BoardsResponse,
+   KanbanBoard,
++  KanbanColumn,
+   KanbanProfile,
+   KanbanProject,
+   KanbanTask,
+@@ -70,6 +71,7 @@ const LOCAL_SCOPE = 'local'
+ const KANBAN_KEY_ROOT = ['kanban'] as const
+ 
+ const BOARD_SLUG_KEY = 'boardSlug'
++const GATEWAY_FILTER_KEY = 'gatewayFilter'
+ const INTRO_KEY = 'introDismissed'
+ const LANES_KEY = 'lanesByProfile'
+ const COLLAPSED_KEY = 'collapsedLanes'
+@@ -225,6 +227,7 @@ export function bindApi(
+   persist($introDismissed, INTRO_KEY, false)
+   persist($lanesByProfile, LANES_KEY, false)
+   persist($collapsedLanes, COLLAPSED_KEY, {})
++  persist($gatewayFilter, GATEWAY_FILTER_KEY, '')
+ 
+   eventCursorByBoard.clear()
+ 
+@@ -268,7 +271,10 @@ export function bindApi(
+       // with no since — the server starts at the tail rather than replaying.
+       void queryClient
+         .fetchQuery({
+-          queryFn: () => r<KanbanBoard>(boardSnapshotPath(slug)),
++          // [daveey] The same (merged, gateway-tagged) fetch the page runs —
++          // a raw single-gateway snapshot under this key would briefly drop
++          // every other gateway's cards.
++          queryFn: () => (slug === $boardSlug.get() ? fetchBoard(false) : r<KanbanBoard>(boardSnapshotPath(slug))),
+           queryKey: boardKey(scope, slug, false)
+         })
+         .then(board => {
+@@ -383,25 +389,338 @@ export const profilesKey = (scope: string) => ['kanban', 'profiles', scope] as c
+ export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
+ export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', scope] as const
+ 
++// ── gateways [daveey] ────────────────────────────────────────────────────────
++//
++// One board across EVERY registered gateway: the board read fans out to each
++// connection's own kanban API and merges the columns, tagging every card with
++// its owner. Each gateway keeps its own kanban.db and dispatcher — nothing is
++// replicated — so every write about a task is routed back to the gateway that
++// owns it (`taskOwners`, filled by each merged read). With one gateway (or a
++// Desktop without the registry) every path below is the old single-gateway
++// call, byte for byte.
++
++/** Gateway filter: '' = every gateway, else one registry connection id. Persisted. */
++export const $gatewayFilter = atom<string>('')
++
++/** Remote gateways get a shorter leash than the active one: a dead ssh tunnel
++ *  or a cloud gateway waiting on an OAuth login must not hold the whole board
++ *  hostage. The bridge's own `timeoutMs` does not cover a pending login, so
++ *  the deadline is enforced here too. */
++const REMOTE_BOARD_TIMEOUT_MS = 6_000
++
++/** After a remote gateway fails, skip it for this long (its error stays on
++ *  the board) instead of making every poll wait out the deadline again. */
++const REMOTE_COOLDOWN_MS = 60_000
++
++const gatewayCooldown = new Map<string, { message: string; until: number }>()
++
++/** Test seam: forget remembered gateway failures. */
++export function resetGatewayCooldowns(): void {
++  gatewayCooldown.clear()
++}
++
++/** One read from a remote gateway: hard deadline, failures cooled down. */
++function remoteRead<T>(gateway: string, path: string): Promise<T> {
++  const cooling = gatewayCooldown.get(gateway)
++
++  if (cooling && cooling.until > Date.now()) {
++    return Promise.reject(new Error(cooling.message))
++  }
++
++  return new Promise<T>((resolve, reject) => {
++    const fail = (err: unknown) => {
++      clearTimeout(timer)
++
++      // A missing board is an answer, not an outage.
++      if (!isMissingBoard(err)) {
++        gatewayCooldown.set(gateway, {
++          message: err instanceof Error ? err.message : String(err),
++          until: Date.now() + REMOTE_COOLDOWN_MS
++        })
++      }
++
++      reject(err)
++    }
++
++    const timer = setTimeout(
++      () => fail(new Error(`no answer in ${REMOTE_BOARD_TIMEOUT_MS / 1000}s`)),
++      REMOTE_BOARD_TIMEOUT_MS
++    )
++
++    call<T>(path, { ...via(gateway), timeoutMs: REMOTE_BOARD_TIMEOUT_MS }).then(value => {
++      clearTimeout(timer)
++      gatewayCooldown.delete(gateway)
++      resolve(value)
++    }, fail)
++  })
++}
++
++interface TaskOwner {
++  gateway: string
++  board: string
++}
++
++const taskOwners = new Map<string, TaskOwner>()
++
++/** Registry ids of every gateway, the routed (active) one first. A single
++ *  gateway, or a legacy profile-only Desktop, yields just the routed scope. */
++export function boardGateways(): string[] {
++  const active = routedScope()
++  // Optional chain: a host SDK older than the gateways atom reads as one gateway.
++  const ids = (host.state.gateways?.get() ?? []).map(gateway => gateway.id)
++
++  if (ids.length < 2) {
++    return [active]
++  }
++
++  return [active, ...ids.filter(id => id !== active)]
++}
++
++export const multiGateway = (): boolean => boardGateways().length > 1
++
++/** REST options that send a call to `gateway` — none for the routed one, so
++ *  its calls keep the ambient profile exactly as before. */
++function via(gateway: string | undefined): PluginRestOptions {
++  return gateway && gateway !== routedScope() ? { connectionId: gateway } : {}
++}
++
++/** Owning gateway of a task (the routed one when unknown — e.g. a task id
++ *  typed before the board loaded, or a single-gateway setup). */
++export function taskGateway(id: string): string {
++  return taskOwners.get(id)?.gateway ?? routedScope()
++}
++
++function withSlug(path: string, slug: string, params: Record<string, string> = {}): string {
++  const search = new URLSearchParams(params)
++
++  if (slug) {
++    search.set('board', slug)
++  }
++
++  const qs = search.toString()
++
++  return qs ? `${path}?${qs}` : path
++}
++
++/** `withBoard` for a task: its own board slug on its own gateway. */
++function forTask(id: string, path: string, params: Record<string, string> = {}): [string, PluginRestOptions] {
++  const owner = taskOwners.get(id)
++
++  return owner && owner.gateway !== routedScope()
++    ? [withSlug(path, owner.board, params), via(owner.gateway)]
++    : [withBoard(path, params), {}]
++}
++
++/** The selected slug, with the '' (server-current) alias resolved against the
++ *  ROUTED gateway — remote gateways must show that same board, not their own
++ *  current one. */
++async function resolvedSlug(): Promise<string> {
++  const slug = $boardSlug.get()
++
++  if (slug) {
++    return slug
++  }
++
++  try {
++    const boards = await call<BoardsResponse>('/boards')
++
++    return typeof boards.current === 'string' ? boards.current : ''
++  } catch {
++    return ''
++  }
++}
++
++const isMissingBoard = (err: unknown): boolean => {
++  const message = err instanceof Error ? err.message : String(err)
++
++  return /^\s*404\b/.test(message) || /does not exist|is archived/.test(message)
++}
++
++export interface GatewayBoardPart {
++  gateway: string
++  board?: KanbanBoard
++  error?: unknown
++}
++
++const TERMINAL_ORDER = new Set(['done', 'archived'])
++
++/** Merge per-gateway boards into one: columns in first-seen order, every task
++ *  tagged with its `gateway`, queue lanes re-sorted by the backend's dispatch
++ *  key (priority DESC, created_at ASC) and history lanes newest-first. The
++ *  FIRST part is the routed gateway: its `latest_event_id`/`now` drive the
++ *  events socket. A gateway that lacks the board contributes nothing; any
++ *  other failure is reported in `gateway_errors`. Throws only when no
++ *  gateway answered. */
++export function mergeBoards(parts: GatewayBoardPart[]): KanbanBoard {
++  const answered = parts.filter(part => part.board)
++
++  if (answered.length === 0) {
++    const failed = parts.find(part => part.error && !isMissingBoard(part.error)) ?? parts[0]
++
++    throw failed?.error ?? new Error('kanban board unavailable')
++  }
++
++  const columns = new Map<string, KanbanColumn>()
++  const tenants = new Set<string>()
++  const assignees = new Set<string>()
++  const gatewayErrors: Record<string, string> = {}
++
++  for (const part of parts) {
++    if (!part.board) {
++      if (part.error && !isMissingBoard(part.error)) {
++        gatewayErrors[part.gateway] = part.error instanceof Error ? part.error.message : String(part.error)
++      }
++
++      continue
++    }
++
++    for (const col of part.board.columns ?? []) {
++      const merged = columns.get(col.name) ?? { name: col.name, tasks: [] }
++      merged.tasks.push(...col.tasks.map(task => ({ ...task, gateway: part.gateway })))
++      columns.set(col.name, merged)
++    }
++
++    part.board.tenants?.forEach(name => tenants.add(name))
++    part.board.assignees?.forEach(name => assignees.add(name))
++  }
++
++  if (answered.length > 1) {
++    for (const col of columns.values()) {
++      if (TERMINAL_ORDER.has(col.name)) {
++        col.tasks.sort(
++          (a, b) =>
++            Number(a.completed_at == null) - Number(b.completed_at == null) ||
++            (b.completed_at ?? 0) - (a.completed_at ?? 0) ||
++            (b.created_at ?? 0) - (a.created_at ?? 0)
++        )
++      } else {
++        col.tasks.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || (a.created_at ?? 0) - (b.created_at ?? 0))
++      }
++    }
++  }
++
++  const primary = parts[0]?.board
++
++  return {
++    assignees: [...assignees].sort(),
++    columns: [...columns.values()],
++    gateway_errors: Object.keys(gatewayErrors).length ? gatewayErrors : undefined,
++    latest_event_id: primary?.latest_event_id ?? 0,
++    now: primary?.now ?? answered[0].board!.now,
++    tenants: [...tenants].sort()
++  }
++}
++
++function rememberOwners(board: KanbanBoard, slug: string): KanbanBoard {
++  for (const col of board.columns) {
++    for (const task of col.tasks) {
++      if (task.gateway) {
++        taskOwners.set(task.id, { board: slug, gateway: task.gateway })
++      }
++    }
++  }
++
++  return board
++}
++
+ // ── reads ─────────────────────────────────────────────────────────────────────
+ 
+-export const fetchBoard = (archived: boolean) =>
+-  call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
++export async function fetchBoard(archived: boolean): Promise<KanbanBoard> {
++  const params: Record<string, string> = archived ? { include_archived: 'true' } : {}
++  const gateways = boardGateways()
++
++  if (gateways.length < 2) {
++    return call<KanbanBoard>(withBoard('/board', params))
++  }
++
++  const slug = await resolvedSlug()
++
++  const settled = await Promise.allSettled(
++    gateways.map((gateway, index) =>
++      index === 0
++        ? call<KanbanBoard>(withBoard('/board', params))
++        : remoteRead<KanbanBoard>(gateway, withSlug('/board', slug, params))
++    )
++  )
++
++  const board = mergeBoards(
++    settled.map((result, index) => ({
++      gateway: gateways[index],
++      ...(result.status === 'fulfilled' ? { board: result.value } : { error: result.reason })
++    }))
++  )
++
++  return rememberOwners(board, slug)
++}
+ 
+ export const fetchTask = async (id: string) => {
+   const downloadAttachment = captureGatewayFileDownload()
+-  const detail = await call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
++  const detail = await call<KanbanTaskDetail>(...forTask(id, `/tasks/${id}`))
+ 
+   return { ...detail, downloadAttachment }
+ }
+ 
+ /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
+-export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
++export const fetchLog = (id: string) => call<WorkerLog>(...forTask(id, `/tasks/${id}/log`, { tail: '16384' }))
++
++/** Every gateway's boards as one list: union by slug, card totals summed,
++ *  `current` = the routed gateway's. A remote-only board is listed too, so
++ *  picking it shows its cards. */
++export async function fetchBoards(): Promise<BoardsResponse> {
++  const gateways = boardGateways()
++
++  if (gateways.length < 2) {
++    return call<BoardsResponse>('/boards')
++  }
++
++  const settled = await Promise.allSettled(
++    gateways.map((gateway, index) =>
++      index === 0 ? call<BoardsResponse>('/boards') : remoteRead<BoardsResponse>(gateway, '/boards')
++    )
++  )
++
++  const primary = settled[0]
++
++  if (primary.status === 'rejected' && settled.every(result => result.status === 'rejected')) {
++    throw primary.reason
++  }
++
++  return mergeBoardLists(
++    settled.map((result, index) => ({
++      gateway: gateways[index],
++      boards: result.status === 'fulfilled' ? result.value : null
++    }))
++  )
++}
++
++export function mergeBoardLists(parts: Array<{ gateway: string; boards: BoardsResponse | null }>): BoardsResponse {
++  const bySlug = new Map<string, BoardMeta>()
++  const current = parts[0]?.boards?.current ?? parts.find(part => part.boards)?.boards?.current ?? 'default'
++
++  for (const part of parts) {
++    for (const meta of part.boards?.boards ?? []) {
++      const seen = bySlug.get(meta.slug)
++
++      if (!seen) {
++        bySlug.set(meta.slug, { ...meta, gateways: [part.gateway], is_current: meta.slug === current })
++
++        continue
++      }
++
++      seen.total = (seen.total ?? 0) + (meta.total ?? 0)
++      seen.gateways = [...(seen.gateways ?? []), part.gateway]
++    }
++  }
+ 
+-export const fetchBoards = () => call<BoardsResponse>('/boards')
++  return { boards: [...bySlug.values()], current }
++}
+ 
++/** The assignee roster of `gateway` (default: the routed one) — profiles are
++ *  per gateway, so a create aimed at another gateway lists ITS profiles. */
+ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profiles')
+ 
++export const fetchGatewayProfiles = (gateway: string) => remoteRead<{ profiles: KanbanProfile[] }>(gateway, '/profiles')
++
+ /** First-class Hermes projects, for scoping a board's default workspace. */
+ export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')
+ 
+@@ -413,59 +732,142 @@ export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestrat
+ // change takes effect NOW instead of on the next 60s tick — create a ready
+ // task and the worker spawns immediately, no manual "nudge" ritual. The tick
+ // is lock-guarded and ~1ms when there's nothing to do, so over-nudging is
+-// free; failures are non-events (the periodic tick still exists).
+-let nudgeTimer: null | ReturnType<typeof setTimeout> = null
++// free; failures are non-events (the periodic tick still exists). [daveey]
++// The nudge goes to the gateway the write landed on — one timer per gateway.
++const nudgeTimers = new Map<string, ReturnType<typeof setTimeout>>()
++
++function autoNudge(gateway: string = routedScope()): void {
++  const pending = nudgeTimers.get(gateway)
+ 
+-function autoNudge(): void {
+-  if (nudgeTimer != null) {
+-    clearTimeout(nudgeTimer)
++  if (pending != null) {
++    clearTimeout(pending)
+   }
+ 
+-  nudgeTimer = setTimeout(() => {
+-    nudgeTimer = null
+-    nudgeDispatcher().catch(() => undefined)
+-  }, 400)
++  nudgeTimers.set(
++    gateway,
++    setTimeout(() => {
++      nudgeTimers.delete(gateway)
++      nudgeDispatcher(gateway).catch(() => undefined)
++    }, 400)
++  )
+ }
+ 
+-/** Resolve the write, then kick the dispatcher. Rejections pass through. */
+-function nudged<T>(write: Promise<T>): Promise<T> {
++/** Resolve the write, then kick the owning gateway's dispatcher. Rejections pass through. */
++function nudged<T>(write: Promise<T>, gateway?: string): Promise<T> {
+   return write.then(value => {
+-    autoNudge()
++    autoNudge(gateway)
+ 
+     return value
+   })
+ }
+ 
+-export const patchTask = (id: string, patch: Record<string, unknown>) =>
+-  nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
++export const patchTask = (id: string, patch: Record<string, unknown>) => {
++  const [path, opts] = forTask(id, `/tasks/${id}`)
++
++  return nudged(call(path, { ...opts, method: 'PATCH', body: patch }), taskGateway(id))
++}
++
++/** Create on `gateway` (default: the routed one). The board slug is the
++ *  selected one, resolved — a remote gateway must not fall back to its own
++ *  current board. */
++export const createTask = async (body: Record<string, unknown>, gateway?: string) => {
++  if (!gateway || gateway === routedScope()) {
++    return nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
++  }
+ 
+-export const createTask = (body: Record<string, unknown>) =>
+-  nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
++  const slug = await resolvedSlug()
++
++  const created = await nudged(
++    call<{ task: KanbanTask | null; warning?: string }>(withSlug('/tasks', slug), {
++      ...via(gateway),
++      method: 'POST',
++      body
++    }),
++    gateway
++  )
++
++  // Route the follow-up writes (the dialog's lane move) before any board read
++  // has seen the new card.
++  if (created.task?.id) {
++    taskOwners.set(created.task.id, { board: slug, gateway })
++  }
++
++  return created
++}
+ 
+ // Deleting can unblock dependants (a gone parent no longer gates), so it
+ // nudges too.
+-export const deleteTask = (id: string) => nudged(call(withBoard(`/tasks/${id}`), { method: 'DELETE' }))
++export const deleteTask = (id: string) => {
++  const [path, opts] = forTask(id, `/tasks/${id}`)
++
++  return nudged(call(path, { ...opts, method: 'DELETE' }), taskGateway(id))
++}
++
++type BulkResult = { results: Array<{ id: string; ok: boolean; error?: string }> }
+ 
+ /** One patch, many ids — independent per-id application; returns per-id
+- *  outcomes so the UI can toast partial failures. */
+-export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
+-  nudged(
+-    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(withBoard('/tasks/bulk'), {
+-      method: 'POST',
+-      body: { ids, ...patch }
++ *  outcomes so the UI can toast partial failures. [daveey] Split per owning
++ *  gateway (and board); a whole gateway failing reports each of its ids. */
++export async function bulkTasks(ids: string[], patch: Record<string, unknown>): Promise<BulkResult> {
++  const groups = new Map<string, string[]>()
++
++  for (const id of ids) {
++    const owner = taskOwners.get(id)
++    const key = owner && owner.gateway !== routedScope() ? `${owner.gateway}\0${owner.board}` : ''
++    groups.set(key, [...(groups.get(key) ?? []), id])
++  }
++
++  const outcomes = await Promise.all(
++    [...groups.entries()].map(async ([key, group]) => {
++      const [gateway, board] = key ? key.split('\0') : [routedScope(), '']
++      const path = key ? withSlug('/tasks/bulk', board) : withBoard('/tasks/bulk')
++
++      try {
++        return await nudged(
++          call<BulkResult>(path, { ...(key ? via(gateway) : {}), method: 'POST', body: { ids: group, ...patch } }),
++          gateway
++        )
++      } catch (err) {
++        if (groups.size === 1) {
++          throw err
++        }
++
++        const error = err instanceof Error ? err.message : String(err)
++
++        return { results: group.map(id => ({ error, id, ok: false })) }
++      }
+     })
+   )
+ 
+-export const addComment = (id: string, body: string) =>
+-  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
++  return { results: outcomes.flatMap(outcome => outcome.results) }
++}
++
++export const addComment = (id: string, body: string) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/comments`)
++
++  return call(path, { ...opts, method: 'POST', body: { author: 'desktop', body } })
++}
++
++export const reassignTask = (id: string, profile: string) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/reassign`)
+ 
+-export const reassignTask = (id: string, profile: string) =>
+-  nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
++  return nudged(call(path, { ...opts, method: 'POST', body: { profile, reclaim_first: true } }), taskGateway(id))
++}
+ 
+-export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
++export const reclaimTask = (id: string) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/reclaim`)
++
++  return nudged(call(path, { ...opts, method: 'POST', body: {} }), taskGateway(id))
++}
+ 
+-export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
+-  call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
++export const uploadAttachment = (
++  id: string,
++  upload: { filename: string; contentType?: string; bytes: ArrayBuffer }
++) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/attachments`)
++
++  return call(path, { ...opts, method: 'POST', upload })
++}
+ 
+ export const createBoard = (slug: string, name: string, projectId?: string) =>
+   call<{ board: { slug: string } }>('/boards', {
+@@ -475,8 +877,11 @@ export const createBoard = (slug: string, name: string, projectId?: string) =>
+ 
+ /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a
+  *  model call — gate behind an explicit user action + disclaimer. */
+-export const estimateTask = (id: string) =>
+-  call<TaskEstimate>(withBoard(`/tasks/${id}/estimate`), { method: 'POST', body: {} })
++export const estimateTask = (id: string) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/estimate`)
++
++  return call<TaskEstimate>(path, { ...opts, method: 'POST', body: {} })
++}
+ 
+ /** Estimate from typed title/body before a task exists (create dialog). */
+ export const estimateNew = (title: string, body: string) =>
+@@ -503,7 +908,12 @@ export const exportBoard = (slug: string, output: string) =>
+ export const importBoard = (archive: string) =>
+   call<BoardImportResult>('/boards/import', { method: 'POST', body: { archive } })
+ 
+-export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
++export const nudgeDispatcher = (gateway?: string) =>
++  !gateway || gateway === routedScope()
++    ? call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
++    : resolvedSlug().then(slug =>
++        call<{ spawned?: unknown[] }>(withSlug('/dispatch', slug), { ...via(gateway), method: 'POST', body: {} })
++      )
+ 
+ export const saveOrchestration = (patch: Record<string, unknown>) =>
+   call<OrchestrationSettings>('/orchestration', { method: 'PUT', body: patch })
+diff --git a/apps/desktop/src/plugins/kanban/board-switcher.tsx b/apps/desktop/src/plugins/kanban/board-switcher.tsx
+index fa77ef89a1..c98b36a935 100644
+--- a/apps/desktop/src/plugins/kanban/board-switcher.tsx
++++ b/apps/desktop/src/plugins/kanban/board-switcher.tsx
+@@ -19,6 +19,7 @@ import {
+   DropdownMenuItem,
+   DropdownMenuSeparator,
+   DropdownMenuTrigger,
++  GatewayDeviceIcon,
+   host,
+   Input,
+   isSubmitEnter,
+@@ -336,8 +337,11 @@ export function BoardSwitcher() {
+   }
+ 
+   const currentSlug = slug || boards.current
+-  const current = boards.boards.find(meta => meta.slug === currentSlug)
+-  const label = current?.name || current?.slug || k.board
++  const listed = boards.boards.find(meta => meta.slug === currentSlug)
++  // [daveey] The list spans every gateway; rename / settings / export / delete
++  // act on the ACTIVE gateway's copy, so offer them only when it has one.
++  const current = listed && (!listed.gateways || listed.gateways.includes(scope)) ? listed : undefined
++  const label = listed?.name || listed?.slug || k.board
+ 
+   return (
+     <>
+@@ -353,8 +357,8 @@ export function BoardSwitcher() {
+               <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="project" size="0.8125rem" />
+               <span className="shrink-0 text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{k.board}</span>
+               <span className="min-w-0 flex-1 truncate text-[0.75rem] font-medium leading-none">{label}</span>
+-              {typeof current?.total === 'number' && (
+-                <span className="text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{current.total}</span>
++              {typeof listed?.total === 'number' && (
++                <span className="text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{listed.total}</span>
+               )}
+               <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="chevron-down" size="0.8125rem" />
+             </Button>
+@@ -370,6 +374,10 @@ export function BoardSwitcher() {
+               {typeof meta.total === 'number' && (
+                 <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{meta.total}</span>
+               )}
++              {/* [daveey] Which gateways carry this board (merged list only). */}
++              {meta.gateways?.map(id => (
++                <GatewayDeviceIcon gatewayId={id} key={id} />
++              ))}
+               {meta.slug === currentSlug && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+             </DropdownMenuItem>
+           ))}
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index c15c87688d..18f0ffeecf 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -31,6 +31,7 @@ import {
+   DropdownMenuTrigger,
+   ErrorState,
+   formatModifierToken,
++  GatewayDeviceIcon,
+   host,
+   Input,
+   isSubmitEnter,
+@@ -64,6 +65,7 @@ import {
+ import {
+   $boardSlug,
+   $collapsedLanes,
++  $gatewayFilter,
+   $introDismissed,
+   $lanesByProfile,
+   boardKey,
+@@ -75,7 +77,9 @@ import {
+   estimateNew,
+   fetchBoard,
+   fetchBoards,
++  fetchGatewayProfiles,
+   fetchProfiles,
++  multiGateway,
+   patchTask,
+   profilesKey,
+   taskKey,
+@@ -244,6 +248,8 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+           <span className="text-(--ui-text-quaternary)">{created}</span>
+         ) : null}
+         <span className="min-w-0 truncate font-mono text-(--ui-text-quaternary)">{shortId(task.id)}</span>
++        {/* [daveey] Which gateway owns the card — the sidebar session row's glyph. */}
++        {task.gateway && <GatewayDeviceIcon gatewayId={task.gateway} />}
+       </div>
+     </div>
+   )
+@@ -321,11 +327,7 @@ function Card({
+           {fileOver && (
+             <span className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-md border border-dashed border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--ui-bg-elevated)_82%,transparent)] text-[0.75rem] font-medium text-foreground">
+               <span className="inline-flex items-center gap-1.5">
+-                <Codicon
+-                  name={attach.isPending ? 'sync' : 'cloud-upload'}
+-                  size="0.85rem"
+-                  spinning={attach.isPending}
+-                />
++                <Codicon name={attach.isPending ? 'sync' : 'cloud-upload'} size="0.85rem" spinning={attach.isPending} />
+                 {k.dropToAttach}
+               </span>
+             </span>
+@@ -589,22 +591,36 @@ function Field({ children, label }: { children: ReactNode; label: string }) {
+ }
+ 
+ function NewTaskDialog({
++  gateway,
+   onClose,
+   parents,
+   target
+ }: {
++  /** [daveey] Gateway the task is created on (registry id). */
++  gateway: string
+   onClose: () => void
+-  parents: Array<{ id: string; title: string }>
++  parents: Array<{ gateway?: string; id: string; title: string }>
+   target: null | string
+ }) {
+   const k = useKanban()
+   const qc = useQueryClient()
+   const scope = useKanbanScope()
+-  const { data: roster } = useQuery({ queryKey: profilesKey(scope), queryFn: fetchProfiles, staleTime: 60_000 })
++  // [daveey] Another gateway has its own profiles and orchestration defaults.
++  const remote = gateway !== scope
++  const gatewayLabel = useValue(host.state.gateways).find(entry => entry.id === gateway)?.label ?? gateway
++
++  const { data: roster } = useQuery({
++    queryKey: remote ? [...profilesKey(scope), gateway] : profilesKey(scope),
++    queryFn: () => (remote ? fetchGatewayProfiles(gateway) : fetchProfiles()),
++    staleTime: 60_000
++  })
++
+   // Title-only creates must RUN: "auto" resolves to the orchestration default
+   // (ultimately the active profile), applied at create time. Never silently
+   // unassigned — parking a card is the explicit choice, not the default.
+-  const resolvedDefault = useOrchestration()?.resolved_default_assignee || 'default'
++  const localDefault = useOrchestration()?.resolved_default_assignee || 'default'
++  const resolvedDefault = remote ? 'default' : localDefault
++  const parentChoices = parents.filter(entry => !entry.gateway || entry.gateway === gateway)
+ 
+   // Board-level workspace default: a task inherits the current board's
+   // configured project dir (scratch when unset, worktree in a git repo, else
+@@ -686,20 +702,23 @@ function NewTaskDialog({
+ 
+       // create() derives status (triage flag → 'triage', else 'ready'); move to
+       // the requested column when they differ, so a per-column add lands right.
+-      const { task, warning } = await createTask({
+-        assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
+-        body: bodyText.trim() || undefined,
+-        goal_mode: goalMode,
+-        parents: parent ? [parent] : undefined,
+-        priority: Number(priority) || 0,
+-        skills: skillList.length ? skillList : undefined,
+-        title: trimmed,
+-        triage: isTriage,
+-        workspace_kind: workspaceKind,
+-        ...overrideCreateFields(modelOverride),
+-        // Empty → backend inherits the board's default project dir.
+-        workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
+-      })
++      const { task, warning } = await createTask(
++        {
++          assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
++          body: bodyText.trim() || undefined,
++          goal_mode: goalMode,
++          parents: parent ? [parent] : undefined,
++          priority: Number(priority) || 0,
++          skills: skillList.length ? skillList : undefined,
++          title: trimmed,
++          triage: isTriage,
++          workspace_kind: workspaceKind,
++          ...overrideCreateFields(modelOverride),
++          // Empty → backend inherits the board's default project dir.
++          workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
++        },
++        gateway
++      )
+ 
+       if (task && task.status !== target) {
+         await patchTask(task.id, { status: target })
+@@ -732,6 +751,17 @@ function NewTaskDialog({
+       <DialogContent className="w-[min(42rem,94vw)] max-w-none overflow-visible">
+         <DialogHeader>
+           <DialogTitle>{target ? k.newTaskIn(columnLabel(k, target)) : k.newTask}</DialogTitle>
++          {multiGateway() && (
++            // [daveey] Where the card will live (and run): the gateway filter's
++            // pick, else the active gateway.
++            <span
++              className="inline-flex items-center gap-1 text-[0.6875rem] text-(--ui-text-tertiary)"
++              data-slot="kanban-create-gateway"
++            >
++              <GatewayDeviceIcon gatewayId={gateway} />
++              {k.createOn(gatewayLabel)}
++            </span>
++          )}
+         </DialogHeader>
+         <div className="flex max-h-[min(72vh,44rem)] flex-col gap-3 overflow-y-auto pr-0.5">
+           <Input
+@@ -815,7 +845,7 @@ function NewTaskDialog({
+             <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.modelHint}</span>
+           </Field>
+ 
+-          {parents.length > 0 && (
++          {parentChoices.length > 0 && (
+             <Field label={k.parent}>
+               <Select onValueChange={v => setParent(v === NO_PARENT ? '' : v)} value={parent || NO_PARENT}>
+                 <SelectTrigger>
+@@ -823,7 +853,7 @@ function NewTaskDialog({
+                 </SelectTrigger>
+                 <SelectContent>
+                   <SelectItem value={NO_PARENT}>{k.noParent}</SelectItem>
+-                  {parents.map(option => (
++                  {parentChoices.map(option => (
+                     <SelectItem key={option.id} value={option.id}>
+                       {option.title || option.id}
+                     </SelectItem>
+@@ -939,7 +969,9 @@ function FilterMenu({
+   tenant: string
+ }) {
+   const k = useKanban()
+-  const active = Boolean(assignee || tenant || archived)
++  const gatewayFilter = useValue($gatewayFilter)
++  const gateways = useValue(host.state.gateways)
++  const active = Boolean(assignee || tenant || archived || gatewayFilter)
+   const lanesByProfile = useValue($lanesByProfile)
+ 
+   const check = (on: boolean) => (on ? <Codicon className="ml-auto" name="check" size="0.8rem" /> : null)
+@@ -957,6 +989,26 @@ function FilterMenu({
+         </Button>
+       </DropdownMenuTrigger>
+       <DropdownMenuContent align="start">
++        {gateways.length > 1 && (
++          // [daveey] One board spans every gateway; narrow it to one machine.
++          <>
++            <DropdownMenuItem onSelect={() => $gatewayFilter.set('')}>
++              {k.allGateways}
++              {check(!gatewayFilter)}
++            </DropdownMenuItem>
++            {gateways.map(gateway => (
++              <DropdownMenuItem key={gateway.id} onSelect={() => $gatewayFilter.set(gateway.id)}>
++                <GatewayDeviceIcon gatewayId={gateway.id} />
++                {gateway.label}
++                {board.gateway_errors?.[gateway.id] && (
++                  <Codicon className="text-amber-500" name="warning" size="0.75rem" />
++                )}
++                {check(gatewayFilter === gateway.id)}
++              </DropdownMenuItem>
++            ))}
++            <DropdownMenuSeparator />
++          </>
++        )}
+         <DropdownMenuItem onSelect={() => onAssignee('')}>
+           {k.allProfiles}
+           {check(!assignee)}
+@@ -1144,12 +1196,21 @@ export function KanbanBoardPage() {
+ 
+   // Live updates ride the events socket (bindApi); this interval is only the
+   // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
++  // [daveey] Other gateways have no socket here — poll them faster.
++  const gateways = useValue(host.state.gateways)
++  const spansGateways = gateways.length > 1
++
+   const { data: board, error } = useQuery({
+     queryFn: () => fetchBoard(archived),
+     queryKey: boardKey(scope, slug, archived),
+-    refetchInterval: 60_000
++    refetchInterval: spansGateways ? 15_000 : 60_000
+   })
+ 
++  // A filter naming a gateway that left the registry shows everything.
++  const pickedGateway = useValue($gatewayFilter)
++  const gatewayFilter = gateways.some(gateway => gateway.id === pickedGateway) ? pickedGateway : ''
++  const createGateway = gatewayFilter || scope
++
+   const [openId, setOpenId] = useState<null | string>(null)
+   const [addStatus, setAddStatus] = useState<null | string>(null)
+   const [settingsOpen, setSettingsOpen] = useState(false)
+@@ -1237,7 +1298,10 @@ export function KanbanBoardPage() {
+   const columnNames = board?.columns.map(col => col.name) ?? []
+ 
+   const parentOptions = useMemo(
+-    () => board?.columns.flatMap(col => col.tasks).map(task => ({ id: task.id, title: task.title })) ?? [],
++    () =>
++      board?.columns
++        .flatMap(col => col.tasks)
++        .map(task => ({ gateway: task.gateway, id: task.id, title: task.title })) ?? [],
+     [board]
+   )
+ 
+@@ -1252,10 +1316,11 @@ export function KanbanBoardPage() {
+     const keep = (task: KanbanTask) =>
+       (!q || `${task.title} ${task.body ?? ''} ${task.id}`.toLowerCase().includes(q)) &&
+       (!tenant || task.tenant === tenant) &&
+-      (!assignee || task.assignee === assignee)
++      (!assignee || task.assignee === assignee) &&
++      (!gatewayFilter || (task.gateway ?? scope) === gatewayFilter)
+ 
+     return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(keep) })) }
+-  }, [board, search, tenant, assignee])
++  }, [board, search, tenant, assignee, gatewayFilter, scope])
+ 
+   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
+ 
+@@ -1418,6 +1483,22 @@ export function KanbanBoardPage() {
+           />
+         )}
+         <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
++        {board?.gateway_errors && (
++          // [daveey] A gateway that didn't answer: its cards are missing, say so.
++          <Tip
++            label={Object.entries(board.gateway_errors)
++              .map(([id, message]) => k.gatewayUnreachable(gateways.find(g => g.id === id)?.label ?? id, message))
++              .join('\n')}
++          >
++            <span
++              className="inline-flex cursor-help items-center gap-1 text-[0.6875rem] text-amber-500"
++              data-slot="kanban-gateway-errors"
++            >
++              <Codicon name="warning" size="0.75rem" />
++              {Object.keys(board.gateway_errors).length}
++            </span>
++          </Tip>
++        )}
+         <div className="ml-auto flex items-center gap-1">
+           <Tip label={k.orchestrationSettings}>
+             <Button
+@@ -1498,7 +1579,12 @@ export function KanbanBoardPage() {
+         />
+       )}
+ 
+-      <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
++      <NewTaskDialog
++        gateway={createGateway}
++        onClose={() => setAddStatus(null)}
++        parents={parentOptions}
++        target={addStatus}
++      />
+       <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
+     </div>
+   )
+diff --git a/apps/desktop/src/plugins/kanban/i18n.ts b/apps/desktop/src/plugins/kanban/i18n.ts
+index 131ce29ba4..3be82efa43 100644
+--- a/apps/desktop/src/plugins/kanban/i18n.ts
++++ b/apps/desktop/src/plugins/kanban/i18n.ts
+@@ -47,6 +47,10 @@ type KanbanMessages = {
+   unassigned: string
+   filters: string
+   allProfiles: string
++  /** [daveey] Gateway filter + create target (board spans every gateway). */
++  allGateways: string
++  createOn: (gateway: string) => string
++  gatewayUnreachable: (gateway: string, error: string) => string
+   allTenants: string
+   showArchived: string
+   groupRunning: string
+@@ -275,6 +279,9 @@ export const en: KanbanMessages = {
+   unassigned: 'unassigned',
+   filters: 'Filters',
+   allProfiles: 'All profiles',
++  allGateways: 'All gateways',
++  createOn: gateway => `On ${gateway}`,
++  gatewayUnreachable: (gateway, error) => `${gateway} didn't answer, so its cards are missing: ${error}`,
+   allTenants: 'All tenants',
+   showArchived: 'Show archived',
+   groupRunning: 'Group Running by profile',
+@@ -505,6 +512,9 @@ const ja: KanbanMessages = {
+   unassigned: '未割り当て',
+   filters: 'フィルタ',
+   allProfiles: 'すべてのプロフィール',
++  allGateways: 'すべてのゲートウェイ',
++  createOn: gateway => `${gateway} に作成`,
++  gatewayUnreachable: (gateway, error) => `${gateway} が応答しないため、そのカードは表示されていません: ${error}`,
+   allTenants: 'すべてのテナント',
+   showArchived: 'アーカイブを表示',
+   groupRunning: '実行中をプロフィールでグループ化',
+@@ -733,6 +743,9 @@ const zh: KanbanMessages = {
+   unassigned: '未分配',
+   filters: '筛选',
+   allProfiles: '所有配置档',
++  allGateways: '所有网关',
++  createOn: gateway => `创建于 ${gateway}`,
++  gatewayUnreachable: (gateway, error) => `${gateway} 未响应，其卡片未显示：${error}`,
+   allTenants: '所有租户',
+   showArchived: '显示已归档',
+   groupRunning: '按配置档分组运行中',
+@@ -959,6 +972,9 @@ const zhHant: KanbanMessages = {
+   unassigned: '未指派',
+   filters: '篩選',
+   allProfiles: '所有設定檔',
++  allGateways: '所有閘道',
++  createOn: gateway => `建立於 ${gateway}`,
++  gatewayUnreachable: (gateway, error) => `${gateway} 未回應，其卡片未顯示：${error}`,
+   allTenants: '所有租戶',
+   showArchived: '顯示已封存',
+   groupRunning: '依設定檔分組執行中',
+diff --git a/apps/desktop/src/plugins/kanban/types.ts b/apps/desktop/src/plugins/kanban/types.ts
+index 0b8735d4b5..3480e00b30 100644
+--- a/apps/desktop/src/plugins/kanban/types.ts
++++ b/apps/desktop/src/plugins/kanban/types.ts
+@@ -34,6 +34,11 @@ export interface KanbanTask {
+   /** Unblock-loop counter — how many times this task re-blocked for the same
+    *  reason after a human unblock. 0/absent on legacy payloads. */
+   block_recurrences?: number
++  /** Done-lane sort key (the backend orders history newest-completed-first). */
++  completed_at?: null | number
++  /** [daveey] Registry connection id of the gateway that owns this card —
++   *  stamped client-side by the merged board read (api.ts `mergeBoards`). */
++  gateway?: string
+ }
+ 
+ export interface KanbanColumn {
+@@ -47,6 +52,8 @@ export interface KanbanBoard {
+   assignees: string[]
+   latest_event_id: number
+   now: number
++  /** [daveey] Gateways that failed to answer the merged read (id → message). */
++  gateway_errors?: Record<string, string>
+ }
+ 
+ /** A structured recovery action attached to a diagnostic. */
+@@ -162,6 +169,8 @@ export interface BoardMeta {
+   /** First-class Project the board is scoped to (id) + resolved name. */
+   project_id?: null | string
+   project_name?: null | string
++  /** [daveey] Registry ids of the gateways that have this board (merged list). */
++  gateways?: string[]
+ }
+ 
+ /** POST /boards/{slug}/export — the archive the backend wrote. */
+diff --git a/apps/desktop/src/sdk/index.ts b/apps/desktop/src/sdk/index.ts
+index 127b15fa6d..dd9159d58f 100644
+--- a/apps/desktop/src/sdk/index.ts
++++ b/apps/desktop/src/sdk/index.ts
+@@ -49,6 +49,7 @@ import type { WorkspaceMode } from '@/contrib/types'
+ import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
+ import { traceIdentityChange } from '@/lib/identity-trace'
+ import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import {
+   $gateway,
+   activeGatewayConnectionId,
+@@ -348,6 +349,19 @@ if (typeof window !== 'undefined') {
+  *  state — the same readout the core statusbar's context chip paints. */
+ const $focusedUsage = computed($focusedSessionState, state => state?.usage ?? null)
+ 
++/** [daveey] Every registered gateway (id, kind, label), registry order. Token
++ *  bytes and ssh details never cross into plugins. Empty on legacy
++ *  profile-only Desktop builds. */
++export interface PluginGateway {
++  id: string
++  kind: string
++  label: string
++}
++
++const $gateways = computed($connectionsRegistry, (registry): PluginGateway[] =>
++  (registry?.connections ?? []).map(({ id, kind, label }) => ({ id, kind, label }))
++)
++
+ const $activeConnectionId = computed($connection, connection => {
+   if (!connection) {
+     return null
+@@ -708,6 +722,9 @@ export const host = {
+     focusedUsage: readonlyAtom<null | UsageStats>($focusedUsage),
+     /** Gateway socket state: 'idle' | 'connecting' | 'open' | …. Not turn-busy. */
+     gateway: readonlyAtom<string>($gatewayState),
++    /** [daveey] Every registered gateway — read them all with
++     *  `ctx.rest(path, { connectionId })`. */
++    gateways: readonlyAtom<PluginGateway[]>($gateways),
+     /** Current main model slug. */
+     model: readonlyAtom<string>($currentModel),
+     /** Profile the live gateway is routed to. */
+@@ -1702,6 +1719,10 @@ export { SidebarRowLead } from '@/app/chat/sidebar/chrome'
+  *  switcher, the fleet profile rail and any plugin rail listing gateways share
+  *  it, so a connection looks the same wherever it is named. */
+ export { ConnectionGlyph } from '@/app/chat/sidebar/connection-glyph'
++/** [daveey] The sidebar session row's "which machine" glyph (laptop / Mac
++ *  mini / cloud) for a registry connection id. Renders nothing with fewer
++ *  than two gateways, so single-gateway users see no change. */
++export { GatewayDeviceIcon } from '@/app/chat/sidebar/gateway-device-icon'
+ export { SIDEBAR_ROW_LEAD, SIDEBAR_TRUNCATED_LEADING } from '@/app/chat/sidebar/row-geometry'
+ export { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
+ /** Page-owned header control (the kanban board switcher): projected into the
+-- 
+2.54.0 (Apple Git-157)
+
