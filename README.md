@@ -68,6 +68,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [screenshot-mention](desktop-plugins/screenshot-mention/) | Type `@ss` in the composer to attach your latest screenshot (`@ss3` = latest 3) as an image chip, no dragging. When you send, the originals go to the Trash; Hermes keeps its own copy. |
 | [session-transfer](desktop-plugins/session-transfer/) | Copy or move sessions between gateways (this device ⇄ Nous-hosted or remote, or any two connections). |
 | [task-mentions](desktop-plugins/task-mentions/) | Kanban task ids (`t_1a2b3c4d`) in any chat become live: hover for a preview card (title, status, assignee, age, latest summary), click for a popup with description, summary, parents/children, runs, comments and events, plus buttons to open the worker session or the board. Looks up every board; leaves the chat DOM untouched (CSS Highlight API). |
+| [session-tasks](desktop-plugins/session-tasks/) | A right-aligned strip of chips just above the composer input, one per thing the focused session is running: background processes, delegate_task subagents, and Kanban tasks it created (running/ready/blocked/review, matched across the session's compression lineage). Pulsing dot + elapsed time; hover for the full command/goal; click a Kanban chip for the Task Mentions popup. Hidden when idle; polls every 5 s while visible. Tests: `node --test desktop-plugins/session-tasks/test/projections.test.mjs`. |
 
 ## Skills
 
