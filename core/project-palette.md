@@ -4,14 +4,17 @@ Press **⌘⇧P** (Ctrl+Shift+P off macOS) with a session selected and the comma
 typeahead over your projects. Pick one and the session is re-homed into that project's folder. The
 sidebar stays where it was; it does not jump into the destination project. If the typed name matches no
 project, the palette offers **Create project "…"**. That creates an empty `~/code/<slug>` folder and
-project on the session's own gateway, then moves the session there. All changes are in the desktop app
-(`apps/desktop/src/`). No backend or RPC-contract changes.
+project on the session's own gateway, then moves the session there. You can also do it from plain **⌘P**:
+type a project name and the results include **Move to project: <name>** for the current chat, next to the
+usual go-to-project row. All changes are in the desktop app (`apps/desktop/src/`). No backend or
+RPC-contract changes.
 
 | Patch | What it does |
 |---|---|
 | [`0004`](patches/0004-fix-desktop-moving-a-session-into-a-project-doesn-t-.patch) | Moving a session into a project no longer switches the sidebar to that project. |
 | [`0018`](patches/0018-feat-desktop-P-moves-the-selected-session-to-a-proje.patch) | ⌘⇧P opens a command-palette page that moves the selected session to a project. |
 | [`0030`](patches/0030-feat-desktop-P-offers-Create-project-for-a-typed-nam.patch) | When the typed name matches no project, the page offers **Create project "…"**. |
+| [`0061`](patches/0061-feat-palette-P-lists-Move-to-project-name-for-the-cu.patch) | Typing in the root ⌘P palette lists **Move to project: <name>** rows for the current chat. |
 
 ## Behavior
 
@@ -42,6 +45,21 @@ project on the session's own gateway, then moves the session there. All changes 
   4. Move the session into that folder (`session.workspace.move`).
 - **Esc / Back** on this page closes the palette (`STANDALONE_PAGES`). It does not go back to the root
   command list. Closing the palette clears `$moveToProjectTarget`.
+- **⌘P move rows (0061):** in the root palette (not the ⌘⇧P page), typed search adds a group headed
+  `sidebar.projects.moveToProject` ("Move to project"). It acts on the current chat: `$selectedStoredSessionId`,
+  else `$focusedStoredSessionId`, the same order as the ⌘⇧P handler. With neither, no group is added.
+  - One row per `moveToProjectTargets(projectTree, liveSessions, currentSessionId)` result, labelled
+    `Move to project: <label>`, id `move-current-to-project-<node.id>`. Keywords are `move`, `assign`,
+    `project`, the label and the path. Picking it calls `moveSessionToProject(currentSessionId, node.id,
+    profile)` with the same success and error toasts as the ⌘⇧P page. The view does not move (`goToProject`
+    is not called).
+  - The project the chat already lives in and the Home bucket are left out, as on the ⌘⇧P page.
+  - One more row, `move-current-to-project-picker`, labelled with the ⌘⇧P action name ("Move current session
+    to project…"), opens the ⌘⇧P page for the chat (`$moveToProjectTarget.set(...)`, `setPage('move-to-project')`,
+    search cleared). It has `keepOpen: true`.
+  - The rows live in `searchGroups`, which is empty until you type. The palette scores rows itself
+    (`scoreItem`, every typed word must be in the label or keywords), so typing `fabric` shows
+    `Move to project: fabric` and typing `move` or `project` shows every target.
 - **Sidebar does not follow (0004):** a move updates the session's cwd. That update normally makes the
   sidebar switch to the destination project. For moves, it is suppressed once per destination cwd, for
   up to 15 s. cwd changes made by the agent still follow as before.
@@ -79,6 +97,10 @@ use-keybinds.ts 'session.moveToProject'
 app/command-palette/index.tsx movePage (useMemo on liveSessions, moveTarget, projectTree, search, t)
   ├─ group 1: moveToProjectTargets(...)  → moveSessionToProject(...)
   └─ group 2 (0030): typedIsNew          → createProjectAndMoveSession(...)
+app/command-palette/index.tsx searchGroups (0061, root ⌘P, only when search is non-empty)
+  ├─ currentSessionId = $selectedStoredSessionId || $focusedStoredSessionId
+  ├─ move-current-to-project-picker     → $moveToProjectTarget.set(...) + setPage('move-to-project')
+  └─ moveToProjectTargets(...)          → moveSessionToProject(...)
 store/projects.ts
   moveSessionToProject / createProjectAndMoveSession
     └─ moveSessionToCwd(target, sessionId, cwd)          (0030 factors this out)
@@ -213,6 +235,43 @@ if (page && STANDALONE_PAGES.has(page)) {
 // page map: 'move-to-project': movePage   (and add movePage to that useMemo's deps)
 ```
 
+### `apps/desktop/src/app/command-palette/index.tsx`: root ⌘P rows (0061)
+
+```tsx
+const selectedStoredSessionId = useStore($selectedStoredSessionId)
+const focusedStoredSessionId = useStore($focusedStoredSessionId)
+const currentSessionId = selectedStoredSessionId || focusedStoredSessionId || null
+
+// in searchGroups (returns [] when search is blank), first push:
+if (currentSessionId) {
+  const session = liveSessions.find(s => sessionMatchesStoredId(s, currentSessionId))
+  const p = t.sidebar.projects
+  const targets = moveToProjectTargets(projectTree, liveSessions, currentSessionId)
+  const profile = session?.profile || undefined
+  result.push({
+    heading: p.moveToProject,
+    items: [
+      { action: 'session.moveToProject', icon: codiconIcon('folder-library'), id: 'move-current-to-project-picker',
+        keywords: ['move', 'assign', 'project', 'session'], label: t.keybinds.actions['session.moveToProject'],
+        keepOpen: true,
+        run: () => { $moveToProjectTarget.set({ profile, sessionId: currentSessionId }); setPage('move-to-project'); setSearch('') } },
+      ...targets.map(node => ({
+        icon: codiconIcon(node.icon || 'folder-library'),
+        id: `move-current-to-project-${node.id}`,
+        keywords: ['move', 'assign', 'project', node.label, ...(node.path ? [node.path] : [])],
+        label: `${p.moveToProject}: ${node.label}`,
+        run: () => {
+          moveSessionToProject(currentSessionId, node.id, profile)
+            .then(() => notify({ durationMs: 2_000, kind: 'success', message: p.movedTo(node.label) }))
+            .catch(err => notifyError(err, p.moveFailed))
+        }
+      }))
+    ]
+  })
+}
+// searchGroups deps gain currentSessionId, liveSessions, projectTree
+```
+
 ### `apps/desktop/src/store/projects.ts`: follow suppression (0004)
 
 ```ts
@@ -328,6 +387,7 @@ and the rest is single-quoted.
 |---|---|---|
 | `src/store/projects.test.ts` | 0004 | `moveSessionToProject keeps the sidebar scope`: a control test (a live `followActiveSessionCwd` still enters the project), plus no follow when `session.info` arrives during the move RPC or after it. 0004 also sets `$sidebarShowAllSessions` to `false` in a top-level `beforeEach` so existing RPC assertions keep the capped `preview_limit`. |
 | `src/store/projects.test.ts` | 0018 | `moveToProjectTargets` leaves out the owner and Home, and lists all foldered projects for a session outside any project. |
+| `src/app/command-palette/move-to-project.test.tsx` (new) | 0061 | Renders `CommandPalette` with projects `fabric` and `other` and chat `chat-1` in `other`. Typing `fabric` shows a row with text `Move to project: fabric` next to the plain go-to-project row; clicking it calls `moveSessionToProject('chat-1', '/repos/fabric', 'default')` and not `goToProject`. Typing `other` shows no move row for the chat's own project. With no selected session there are no move rows. |
 | `src/store/projects-cross-gateway-move.test.ts` | 0030 | `createProjectAndMoveSession`: call order `projects.list` → `shell.exec` (`mkdir -p "$HOME"/'code/my-thing'`) → `projects.create` → `session.workspace.move`; reuse of a same-named project (no `shell.exec`/`create`); slug cases. The file comes from 0025. |
 
 Run from `apps/desktop` (vitest config in `vitest.config.ts`; `npm test` = `vitest run`):
@@ -335,7 +395,7 @@ Run from `apps/desktop` (vitest config in `vitest.config.ts`; `npm test` = `vite
 ```sh
 cd apps/desktop
 npx vitest run src/store/projects.test.ts src/store/projects-cross-gateway-move.test.ts \
-  src/app/chat/sidebar/session-actions-menu.test.tsx
+  src/app/chat/sidebar/session-actions-menu.test.tsx src/app/command-palette/move-to-project.test.tsx
 npx vitest run src/i18n src/lib/keybinds   # overlay-gaps + keybind registry checks
 npx tsc -p . --noEmit
 ```
@@ -354,6 +414,7 @@ Order and dependencies (checked with `git am -3` on a clean `upstream/main` chec
 | 0004 | nothing | |
 | 0018 | 0004 | Textual: it does not apply without 0004. |
 | 0030 | 0025 and 0028 | It edits code those patches add: `moveTargetGateway`, `moveTargetRequest`, `MoveTarget`, `ShellResult`, `shellPath`, `labelKey`, `ensureProjectRootOn`, `projects-cross-gateway-move.test.ts`. 0028 is needed because the hunk context is its `mkdir -p` version of `ensureProjectRootOn`. Without them, `git am` fails. |
+| 0061 | 0018 | It uses `moveToProjectTargets`, `moveSessionToProject`, `$moveToProjectTarget`, the `move-to-project` page and the `session.moveToProject` label. It only touches `command-palette/index.tsx`, so it doesn't need 0030. |
 | 0025 | 0024 at runtime | 0025 applies on top of 0004 + 0018 without 0024, but its code calls `ownerGatewayId` / `isRemoteProjectId` from 0024. Without 0024, the projects tests fail with `ReferenceError`. |
 
 Minimal sets:
@@ -404,6 +465,12 @@ To re-implement against a newer upstream without 0024/0025/0028:
 - **`shell.exec` safety gate.** `shell.exec` runs commands through `tools.approval_detection`. A plain
   `mkdir -p` passes. If that module can't be imported on the target gateway, the create fails with
   `5001 shell.exec unavailable`. The command times out after 30 s.
+- **⌘P move rows need a typed match.** The picker row (`move-current-to-project-picker`) only shows when the
+  typed words match its label or keywords (`move`, `assign`, `project`, `session`). A brand-new project name
+  matches no ⌘P move row, so ⌘P can't create a project directly. Use ⌘⇧P, or type `move` in ⌘P and pick the
+  picker row, which opens the ⌘⇧P page with an empty search.
+- **⌘P acts on the selected chat first.** `currentSessionId` prefers `$selectedStoredSessionId` over the focused
+  tile/tab, like the ⌘⇧P handler. With a tab focused on top of another chat, the rows move the main chat.
 - **Folderless projects can't be targets.** They are filtered out of the list. The row menu shows
   `moveNoFolder` for them.
 - **Suppression is keyed by exact cwd string.** If the backend's echoed cwd differs from both the
@@ -434,5 +501,8 @@ What it can't do:
   exported to plugins. The SDK does have `requestProfile` / `profileRoutes`, which might be enough for
   remote targets; that hasn't been tried.
 
-Verdict: 0004 must stay a core patch. 0018 and 0030 could be rebuilt as a plugin with its own picker UI,
+- **No search-dependent root rows.** 0061's rows depend on the current chat and the project tree. A
+  `PALETTE_AREA` row is static, so a plugin could add one "Move to project…" row but not one per project.
+
+Verdict: 0004 must stay a core patch. 0018, 0030 and 0061 could be rebuilt as a plugin with its own picker UI,
 but it would lose the built-in palette UX and wouldn't share code with the row menu's "Move to project".

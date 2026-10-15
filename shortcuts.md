@@ -8,7 +8,7 @@ All of them show up in **Settings → Keybinds** and can be rebound there.
 
 | Shortcut | Does | Source | How you get it |
 |---|---|---|---|
-| ⌘] / ⌘[ | Next / previous sidebar session with a **status stripe** (green = finished, red = needs input/stalled); skips ⌘B-blocked (grey) rows; wraps. No-op when none | core patches 0021, 0043, 0048 | [core/session-navigation-shortcuts.md](core/session-navigation-shortcuts.md) |
+| ⌘] / ⌘[ | Next / previous sidebar session with a **status stripe** (green = finished, red = needs input/stalled); skips ⌘B-blocked (grey) rows; wraps; starts from the focused tab, else the main chat. No-op when none | core patches 0021, 0043, 0048, 0065 | [core/session-navigation-shortcuts.md](core/session-navigation-shortcuts.md) |
 | ⌘B | Mark the selected/open session **blocked** (grey stripe, skipped by ⌘]/⌘[ and ⌘⇧]/⌘⇧[); again to unblock. Sidebar toggle moves to ⌥⌘B | core patches 0048, 0049 | same |
 | ⌘⇧] / ⌘⇧[ | Next / previous sidebar session, any state except ⌘B-blocked (upstream used these for profile next/prev) | core patches 0021, 0049 | same |
 | ⌘⇧A | Archive the selected (else open) session, then open the next one that needs you | core patches 0019, 0026 | same |

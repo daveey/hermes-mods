@@ -9,12 +9,15 @@ Patches:
   somewhere else" error card gets a **Take over here** button.
 - `patches/0015-feat-desktop-a-hidden-chat-s-agent-keeps-driving-its.patch`: desktop. When you switch away from a
   chat, its agent can still read and act in that chat's own parked Browser tab.
+- `patches/0060-feat-sessions-say-which-machine-holds-a-chat-that-is.patch`: backend + desktop. Leases record the
+  machine that holds the chat, and the refusal, the takeover error and the error card name it.
 
 What you see: you open a chat that another Hermes window is holding. Stock Hermes refuses every send with
 `SESSION_NOT_OWNED`, for example when a second Desktop app's backend on the same machine has it open. With these
 patches the error card shows **Take over here** before **Start new session**. Click it and this window gets the chat:
 the other window stops its turn and shows "This chat was taken over by another Hermes window.", the transcript reloads
-from disk, and your refused prompt is sent again. Separately (0015), a long browser task keeps running after you
+from disk, and your refused prompt is sent again. With 0060 the card also says where the chat is open, for example
+"This chat is open in Hermes desktop on <machine> (opened 4m ago)", so you know which computer to walk to. Separately (0015), a long browser task keeps running after you
 switch to a different chat. Before, the agent's `preview.read`/`preview.act` calls were declined as soon as its chat
 was off screen.
 
@@ -26,7 +29,9 @@ was off screen.
   `{ retry: false, startNewSession: true, takeOver: true }`, so Retry stays hidden.
 - **Button order:** Choose model, then **Take over here**, then Start new session, and so on.
 - **Card body text** for `SESSION_NOT_OWNED` (en): "This chat is open in another Hermes window or terminal. Take it
-  over here, or start a new chat."
+  over here, or start a new chat." When the refusal names a machine (0060), the body is instead "This chat is open
+  in Hermes <surface> on <host> (opened <age> ago). Use it there, take it over here, or start a new chat." The
+  `(opened … ago)` part is left out when there is no age.
 - **Click flow:**
   1. `session.take_over({session_id: <runtime id>})`, routed to the owning profile.
   2. If the result has `acknowledged: false`, a warning toast says "The other window didn't confirm; it may still be
@@ -40,7 +45,8 @@ was off screen.
   - Open clarify, approval and sudo prompts are cancelled with outcome `cancelled`, so the agent thread unblocks.
   - It gets an `error` event: `{message: "This chat was taken over by another Hermes window.", error_surface:
     {layer: "gateway", code: "SESSION_NOT_OWNED", retryable: false}}`. Its card therefore offers Take over here too,
-    which lets you take the chat back.
+    which lets you take the chat back. Since 0060 the message has a second line naming the taker,
+    `Details: session <key> opened by <surface> on <host> <age> ago.`, so the displaced card says where the chat went.
   - Its next submit is refused with `SESSION_NOT_OWNED`.
 - **RPC results:**
   - `{status: "already_owner", previous_owner: null, acknowledged: true}` when this runtime already holds the lease.
@@ -58,6 +64,19 @@ was off screen.
   |-----------------------------------------|---------|--------------------------------------------------------------------------|
   | `HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S` | `8`     | How long `session.take_over` waits for the old owner's ack.              |
   | `HERMES_SESSION_TAKEOVER_POLL_S`        | `2`     | Watcher poll period. `<= 0` disables the watcher. It is also off when `HERMES_TEST_ISOLATION` is set. |
+
+### Which machine holds it (0060)
+
+- Every lease entry gets a `host` field: the machine a person would walk to in order to use that chat window.
+  - A backend the Desktop launched over SSH gets `HERMES_DESKTOP_CLIENT_HOST=<this Mac's hostname>` in its
+    environment, so its leases name the Mac, not the remote machine.
+  - Otherwise it is this machine's `socket.gethostname()`.
+  - A trailing `.local` is stripped (`my-mac.local` → `my-mac`).
+- The shared `Details:` line now reads `Details: session <id> opened by <surface> on <host> <age> ago.` Both
+  `on <host>` and `<age> ago` are optional. An entry without a host keeps the old shape.
+- The desktop parses that line into `ErrorSurface.owner = {surface, host?, age?}`. Only when `host` is present does
+  the card switch to the "open in Hermes <surface> on <host>" body. Without it (an older backend) the generic body
+  stays.
 
 ### Hidden chat keeps its Browser page (0015)
 
@@ -159,6 +178,32 @@ from a client-less sibling runtime in the **same process**. Nothing in stock ups
   - the Retry, limit-reset and scheduled-retry buttons move into a `RetryActions` component, which keeps
     `ErrorRecoveryActions` under its complexity cap
 
+### 0060 machine name
+
+- `hermes_cli/active_sessions.py`:
+  - `DESKTOP_CLIENT_HOST_ENV = "HERMES_DESKTOP_CLIENT_HOST"`, `_short_host(name)` and `owner_host()`.
+  - `_lease_entry` writes `"host": owner_host()`. `_read_entries` validates `host` as an optional string, like
+    `surface`.
+  - `session_owner_details(session_id, entry)` (stock) adds ` on <host>` when the entry has one.
+- `tui_gateway/methods_session_takeover.py`: `_revoke_taken_over_lease` emits
+  `f"{_TAKEOVER_MESSAGE}\n{session_owner_details(lease.session_id, taker)}"`. `taker` is the new owner's entry, so the
+  line names the window that took the chat.
+- `apps/desktop/electron/remote-lifecycle.ts`: `buildSpawnCommand` adds `HERMES_DESKTOP_CLIENT_HOST` via
+  `desktopClientHostEnv(opts.clientHost ?? os.hostname())`. The value goes into the remote shell command unquoted,
+  so it is cut to `[A-Za-z0-9._-]`, at most 64 characters, and dropped when empty.
+- `apps/desktop/src/lib/error-surface.ts`: new `SessionOwner`, `ErrorSurface.owner`, `parseSessionOwner(text)`
+  (regex `SESSION_OWNER_DETAILS_RE`, kept in step with `session_owner_details`) and
+  `sessionNotOwnedSurface(text, base?)`, which returns the `SESSION_NOT_OWNED` surface plus `owner` when the text
+  has a Details line.
+- `.../gateway-event/status.ts`: `gatewayErrorSurface` (from 0014) runs a sent `SESSION_NOT_OWNED` surface, and the
+  text-sniffed fallback, through `sessionNotOwnedSurface`. `.../use-prompt-actions/submit.ts` does the same for a
+  refused submit.
+- `apps/desktop/src/lib/error-surface-copy.ts`: `errorCardText` returns
+  `thread.errorSessionOwnedElsewhere(owner.surface, owner.host, owner.age ?? '')` as the body when
+  `SESSION_NOT_OWNED` has `owner.host`. The title stays "This chat is open somewhere else".
+- i18n: `assistant.thread.errorSessionOwnedElsewhere(surface, host, age)` is typed in `types.ts` and translated in
+  `en`, `de`, `es`, `fr`, `ja`, `zh`, `ar_assistant`, `zh-hant_assistant`. `ru` is listed in `overlay-gaps.json`.
+
 ### 0015 desktop
 
 - `apps/desktop/src/store/preview.ts`: `rememberedPreviewTabId(sessionId)` reads `activeTabBySession`.
@@ -241,7 +286,8 @@ def _revoke_taken_over_lease(sid, session, lease, taker) -> bool:
         session["_lease_taken_over"] = True   # finalize must not end the row the new owner writes
     _interrupt_session_turn(sid, session, request_id="lease-taken-over")
     server_requests.cancel(sid, reason="taken_over")       # unblock clarify/approval/sudo
-    _emit("error", sid, {"message": _TAKEOVER_MESSAGE, "error_surface": dict(_TAKEOVER_ERROR_SURFACE)})
+    message = f"{_TAKEOVER_MESSAGE}\n{session_owner_details(lease.session_id, taker)}"   # 0060
+    _emit("error", sid, {"message": message, "error_surface": dict(_TAKEOVER_ERROR_SURFACE)})
     acknowledge_takeover(lease.lease_id, state_path=lease.state_path)
     return True
 
@@ -382,6 +428,43 @@ if (BACKGROUND_PREVIEW_REQUESTS.has(request.method) && windowHoldsBackgroundPrev
 if (!isActiveSession && !backgroundPreviewTabFor(owner)) { answerValue(request, { error: '...', success: false }); return }
 ```
 
+`hermes_cli/active_sessions.py` (0060):
+
+```python
+DESKTOP_CLIENT_HOST_ENV = "HERMES_DESKTOP_CLIENT_HOST"
+
+def owner_host() -> str:
+    client = os.environ.get(DESKTOP_CLIENT_HOST_ENV, "")
+    if client.strip():
+        return _short_host(client)
+    with suppress(OSError):
+        return _short_host(socket.gethostname())
+    return ""
+
+def session_owner_details(session_id: str, entry: dict[str, Any]) -> str:
+    surface = str(entry.get("surface") or "another surface")
+    host = str(entry.get("host") or "").strip()
+    where = f" on {host}" if host else ""
+    started = _optional_float(entry.get("started_at"))
+    age = f" {format_age(time.time() - started)} ago" if started else ""
+    return f"Details: session {session_id} opened by {surface}{where}{age}."
+```
+
+`apps/desktop/src/lib/error-surface.ts` (0060):
+
+```ts
+// hermes_cli/active_sessions.py session_owner_details(): keep the two in step.
+const SESSION_OWNER_DETAILS_RE = /Details: session \S+ opened by (.+?)(?: on (\S+?))?(?: (\d+h(?:\d+m)?|\d+m) ago)?\.\s*$/m
+
+export function sessionNotOwnedSurface(text: string | null | undefined, base?: ErrorSurface | null): ErrorSurface {
+  const owner = parseSessionOwner(text)
+  return {
+    ...(base ?? { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false }),
+    ...(owner ? { owner } : {})
+  }
+}
+```
+
 i18n (0014) adds the keys `assistant.thread.errorTakeOver`, `errorTakeOverUnconfirmed` and `errorTakeOverFailed`:
 
 - `types.ts`: type declarations.
@@ -407,6 +490,12 @@ scripts/run_tests.sh tests/hermes_cli/test_active_session_takeover.py \
   session, `_LONG_HANDLERS`, same-process sibling).
 - `test_session_takeover_e2e.py`: two real gateway processes sharing one `HERMES_HOME`. No model calls.
 - `contracts/test_generated.py` (stock): fails if the generated TS/OpenRPC files are stale.
+- 0060 adds to `tests/hermes_cli/test_active_sessions.py`: `test_owner_refusal_names_the_holding_machine` (with
+  `HERMES_DESKTOP_CLIENT_HOST` set, the lease's `host` is the short client name and the Details line says
+  `opened by desktop on <host> … ago.`), `test_owner_host_defaults_to_this_machine` and
+  `test_owner_details_without_host_keeps_old_shape`. It also updates `test_session_takeover.py` and
+  `test_session_takeover_e2e.py`: the displaced window's message is now the takeover sentence plus a
+  `Details: session … opened by desktop` line.
 
 Desktop, from `apps/desktop` (vitest):
 
@@ -415,9 +504,20 @@ npx vitest run src/lib/error-surface.test.ts \
   src/components/assistant-ui/thread/assistant-message.test.tsx \
   src/app/session/hooks/use-message-stream/gateway-event/status.test.ts \
   src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts \
-  src/i18n/overlay-completeness.test.ts
+  src/i18n/overlay-completeness.test.ts \
+  src/lib/error-surface-copy.test.ts
 node scripts/i18n-keys.mjs --check
+npx vitest run --project electron electron/remote-lifecycle.test.ts   # 0060
 ```
+
+0060's desktop tests:
+
+- `error-surface-copy.test.ts`: a Details line with a host gives `owner = {age: '4m', host, surface: 'desktop'}` and a
+  body containing `Hermes desktop on <host> (opened 4m ago)`. A line without a host keeps the generic body; text
+  without a Details line has no `owner`.
+- `status.test.ts`: a takeover `error` event with a Details line reaches `failAssistantMessage` with `owner` set.
+- `remote-lifecycle.test.ts`: `buildSpawnCommand` puts `HERMES_DESKTOP_CLIENT_HOST=<host>` after
+  `HERMES_DESKTOP=1`, strips shell metacharacters from a hostile name, and omits the variable for an empty one.
 
 Verified on upstream/main (`e06df9c2ea`) with 0001–0015 applied and 0013 resolved as described below:
 
@@ -471,7 +571,9 @@ Dependencies:
 - 0014 needs 0013. It imports `SessionTakeOverResult` from `@hermes/shared` and calls `session.take_over`, so it
   applies alone but fails typecheck and the runtime without 0013.
 - 0015 is independent: desktop only, applies with `-3` on bare upstream.
-- None of the three depends on 0001–0012. They were only tested in sequence after them.
+- 0060 needs 0013 (it edits `_revoke_taken_over_lease` in `methods_session_takeover.py` and its tests) and 0014
+  (`gatewayErrorSurface` in `status.ts`). `session_owner_details` and the `notOwned` branch in `submit.ts` are stock.
+- None of 0013–0015 depends on 0001–0012. They were only tested in sequence after them.
 
 After applying, rebuild the desktop app (0014/0015) and restart the backend (0013). Every backend that might be
 displaced needs 0013 too, because the old owner's watcher is what stops its turn and acks. See Gotchas.
@@ -507,6 +609,15 @@ displaced needs 0013 too, because the old owner's watcher is what stops its turn
     writes it)
 - **Rebuild the desktop app** after 0014/0015: `hermes desktop --build-only --force-build`. On macOS, set
   `APPLE_SIGNING_IDENTITY` or the app is ad-hoc signed.
+- **Keep the Details line and the regex in step (0060).** The desktop reads the machine name by parsing the text
+  `session_owner_details` builds. If you change that format, update `SESSION_OWNER_DETAILS_RE` too, or the card
+  quietly falls back to the generic body.
+- **Which name you see (0060).** A backend the Desktop launched over SSH names the Mac only if that Desktop has
+  0060, because the Mac passes `HERMES_DESKTOP_CLIENT_HOST` at spawn time. A backend spawned earlier, or by an
+  older Desktop, records the remote machine's own hostname. Leases written before 0060 have no `host`, so their
+  refusals keep the old wording.
+- **Hostnames are written to the registry (0060).** Each lease now stores `host` in
+  `runtime/active_sessions.json`. A registry with a non-string `host` is treated like any other malformed entry.
 - **0015 depends on parked panes.** It relies on stock pane-lifecycle "parked" panes, which keep the webview mounted
   while off screen. If upstream ever unmounts hidden Browser tabs, `hasLivePreviewSurface` returns false and requests
   are declined again (safe, but the feature goes away).
@@ -524,5 +635,7 @@ Mostly no.
 - **0014** could in principle be a palette/keybind command in a desktop plugin that calls `session.take_over` and then
   resends. But the plugin SDK has no contribution point on the in-thread error card, and no access to
   `aui.message().reload()`, so the one-click recovery needs core.
+- **0060** changes the lease format and the backend spawn command, both core. The card wording could not be
+  changed from a plugin either: the SDK has no hook on the in-thread error card.
 - **0015** changes how core routes server requests (`handleServerRequest`, `previewAct`). The plugin SDK has no hook
   there.

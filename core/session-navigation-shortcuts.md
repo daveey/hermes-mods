@@ -7,9 +7,9 @@ Desktop keybind registry, so you can rebind them in **Settings → Keybinds**. T
 | Patch | Shortcut | Action id | Does |
 |---|---|---|---|
 | [0019](patches/0019-feat-desktop-A-archives-the-selected-else-open-sessi.patch) | ⌘⇧A | `session.archive` | Archive the selected session, or the open chat if no row is selected |
-| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch), [0050](patches/0050-fix-desktop-and-stop-on-every-row-the-sidebar-paints.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red), skipping ⌘B-blocked (grey) ones. With none, nothing happens |
+| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0043](patches/0043-fix-desktop-step-only-to-sessions-with-a-status-stri.patch), [0050](patches/0050-fix-desktop-and-stop-on-every-row-the-sidebar-paints.patch), [0065](patches/0065-fix-desktop-step-from-the-focused-tab-not-the-main-c.patch) | ⌘] / ⌘[ | `session.nextNeedsYou` / `session.prevNeedsYou` | Next / previous sidebar session with a status stripe (green or red), skipping ⌘B-blocked (grey) ones. With none, nothing happens |
 | [0048](patches/0048-feat-desktop-B-marks-a-session-blocked-grey-stripe-s.patch) | ⌘B | `session.toggleBlocked` | Mark the selected (else open) session blocked: grey stripe, skipped by ⌘]/⌘[. Again to unblock. ⌘⇧]/⌘⇧[ skip it too (0049). Sidebar toggle moves to ⌥⌘B |
-| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0049](patches/0049-fix-desktop-and-archive-next-fallback-skip-B-blocked.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state except ⌘B-blocked |
+| [0021](patches/0021-feat-desktop-step-to-the-next-prev-sidebar-session-t.patch), [0049](patches/0049-fix-desktop-and-archive-next-fallback-skip-B-blocked.patch), [0065](patches/0065-fix-desktop-step-from-the-focused-tab-not-the-main-c.patch) | ⌘⇧] / ⌘⇧[ | `session.nextSession` / `session.prevSession` | Next / previous sidebar session, any state except ⌘B-blocked |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌘R (⌥⌘R in 0064–0070) | `session.resume` | Send `resume` to the active chat as if you typed it |
 | [0022](patches/0022-feat-desktop-R-sends-resume-to-the-active-chat-R-rel.patch) | ⌥⇧⌘R (⇧⌘R until 0071) | *(Electron `forceReload`)* | Reload the window (always) |
 | [0026](patches/0026-feat-desktop-archive-hotkey-steps-to-the-next-sideba.patch) | ⌘⇧A | `session.archive` | After archiving the open chat, open the next session the same way ⌘] does, not a new draft |
@@ -32,7 +32,7 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
   `startFreshSessionDraft`. Archiving from the row menu (no `onDeselect`) still drops to a fresh draft.
 - An archived session that wasn't the open one leaves the view alone.
 
-### ⌘] / ⌘[ and ⌘⇧] / ⌘⇧[: step through sessions (0021)
+### ⌘] / ⌘[ and ⌘⇧] / ⌘⇧[: step through sessions (0021, 0065)
 
 - **Order** is the sidebar as drawn, top to bottom: pinned, then recents, including branches. Each rendered
   `SidebarSessionsSection` publishes its visible row ids and a hidden anchor `<span data-sidebar-order-anchor>`
@@ -50,16 +50,18 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
   striped row they do nothing. (0021 used dot states `needs-input`/`unread` and fell back to the plain
   neighbour; after 0039 kept the green stripe on read sessions, that filter often matched nothing and
   ⌘[ landed on unstriped rows.) ⌘⇧]/⌘⇧[ don't filter.
-- **Wrapping:** stepping past either end wraps around. It starts from the selected row, else the open chat.
-  With neither, or with a current session that isn't in the sidebar, ⌘] starts at the top and ⌘[ at the bottom.
+- **Starting point** (0065): the session on screen. That is the focused tile or tab if one has focus, else
+  the main chat (`$focusedStoredSessionId`, which falls back to `$selectedStoredSessionId`). Before 0065 the
+  main chat won, so with a tab open on top, ⌘]/⌘[ stepped from the chat behind it.
+- **Wrapping:** stepping past either end wraps around. With no current session, or with a current session that isn't in the sidebar, ⌘] starts at the top and ⌘[ at the bottom.
   It never returns the current session, so it's a no-op when nothing else qualifies.
 - **Moved binding:** upstream binds ⌘⇧]/⌘⇧[ to `profile.next`/`profile.prev`. The fork unbinds those, so
   rebind them if you step profiles from the keyboard.
 
 ### ⌘B: mark blocked (0048, 0049)
 
-- `session.toggleBlocked` (`mod+b`) flips a per-session flag on the selected row, else the open chat
-  (`store/session-blocked.ts`). The flag is a manual park: “waiting on something outside this chat”. Only ⌘B
+- `session.toggleBlocked` (`mod+b`) flips a per-session flag on the session `currentSessionForStep()` returns
+  (`store/session-blocked.ts`): since 0065 the focused tile/tab, else the main chat. The flag is a manual park: “waiting on something outside this chat”. Only ⌘B
   clears it; a finishing turn doesn't.
 - Stored as a string array in localStorage (`hermes.desktop.blockedSessionIds`), so it is per window profile,
   not synced across devices. Membership is checked across the compression lineage (`lineageAliases`), and
@@ -115,7 +117,8 @@ changes. Flow:
 | File | Patches |
 |---|---|
 | `apps/desktop/src/lib/keybinds/actions.ts` (defaults) | 0019, 0021, 0022 |
-| `apps/desktop/src/app/hooks/use-keybinds.ts` (handlers) | 0021, 0022 |
+| `apps/desktop/src/app/hooks/use-keybinds.ts` (handlers) | 0021, 0022, 0065 |
+| `apps/desktop/src/app/hooks/use-keybinds-step-focused-tile.test.tsx` (new) | 0065 |
 | `apps/desktop/src/store/sidebar-visible-order.ts` (+ test) (new: order registry, `stepSessionId`, `nextSidebarSessionId`) | 0021 |
 | `apps/desktop/src/app/chat/sidebar/sessions-section.tsx` (publishes section order) | 0021 |
 | `apps/desktop/src/app/contrib/wiring.tsx` (`archiveSelectedSession`) | 0019, 0026 |
@@ -262,13 +265,16 @@ useEffect(() => () => unpublishSidebarSection(orderKey), [orderKey])
 <span aria-hidden className="hidden" data-sidebar-order-anchor="" ref={orderAnchorRef} />
 ```
 
-### `apps/desktop/src/app/hooks/use-keybinds.ts` (0021, 0022)
+### `apps/desktop/src/app/hooks/use-keybinds.ts` (0021, 0022, 0065)
 
 ```ts
 import { nextSidebarSessionId } from '@/store/sidebar-visible-order'
 import { requestComposerSubmit /* , … */ } from '../chat/composer/focus'
 
-const currentSessionForStep = () => $selectedStoredSessionId.get() || $focusedStoredSessionId.get()
+// 0065: the session on screen. $focusedStoredSessionId is the focused tile/tab's
+// session, else $selectedStoredSessionId. (0021 had `$selectedStoredSessionId.get() ||
+// $focusedStoredSessionId.get()`, which stepped from the main chat behind an open tab.)
+const currentSessionForStep = () => $focusedStoredSessionId.get()
 
 // in the handler map (goToSession already exists upstream: id → openSession(id, navigate))
 'session.nextNeedsYou': () => goToSession(nextSidebarSessionId(currentSessionForStep(), 1, false)),
@@ -362,7 +368,8 @@ recorded as gaps in `i18n/overlay-gaps.json`, and the keys are added to `locales
 cd apps/desktop
 npx vitest run src/store/sidebar-visible-order.test.ts \
   src/lib/keybinds/actions.test.ts \
-  src/app/session/hooks/use-session-actions.test.tsx
+  src/app/session/hooks/use-session-actions.test.tsx \
+  src/app/hooks/use-keybinds-step-focused-tile.test.tsx
 ```
 
 - `sidebar-visible-order.test.ts`: wrapping, skipping ineligible sessions, null when nothing qualifies,
@@ -372,6 +379,10 @@ npx vitest run src/store/sidebar-visible-order.test.ts \
   the composer), and nothing claims `mod+shift+r`.
 - `use-session-actions.test.tsx`: archiving the open session calls `onDeselect` without navigating. Without
   it, the session still drops to a fresh draft.
+- `use-keybinds-step-focused-tile.test.tsx` (0065): renders `useKeybinds` with a mocked
+  `$focusedStoredSessionId` and `nextSidebarSessionId`. With the main session `main-session` and a focused tile
+  `tile-session`, ⌘] and ⌘[ call `nextSidebarSessionId('tile-session', ±1, false)`. With main focused, they
+  step from `main-session`.
 
 ## Applying
 
@@ -383,6 +394,7 @@ npx vitest run src/store/sidebar-visible-order.test.ts \
 | 0026 | 0019 (`$focusedStoredSessionId` import), 0021 (`sidebar-visible-order.ts`). 0023 edits the same `archiveSession` function just below, so apply it first |
 | 0043 | 0021, 0026, 0038 (`sessionStatusStripe`), 0039 |
 | 0050 | 0043, 0048 |
+| 0065 | 0021 (rewrites its `currentSessionForStep`). Its hunk context includes the `toggleSessionBlocked` import (0048) and the `reloadAppAndBackend` import (0064), so apply it after those |
 
 Apply the whole series in numeric order from the hermes-agent repo root:
 
@@ -422,6 +434,10 @@ gateway RPC contract, so there's nothing to regenerate.
   through the SDK.
 - **Stale comment:** after 0019, the upstream comment above `session.archive` still says it "ships unbound". The
   code is right; the comment isn't.
+- **⌘B follows the focused tab too; ⌘⇧A doesn't.** ⌘B's handler (0048) also calls `currentSessionForStep`,
+  so since 0065 it blocks the focused tile/tab's session. ⌘⇧A (`archiveSelectedSession` in `wiring.tsx`) still
+  picks `$selectedStoredSessionId` first, so with a tab focused it archives the main chat. The 0065 test
+  covers only ⌘]/⌘[.
 - **Updating:** these are local commits on your checkout, so re-apply or rebase them whenever you pull
   upstream. Upstream changes `actions.ts` and the i18n files often, so their hunk context is the likeliest to
   conflict.
