@@ -33,6 +33,8 @@ BLOCK_TOOLS = {
     "focus_pane", "apply_layout", "close_terminal", "desktop_project",
     # audio
     "text_to_speech",
+    # opens a terminal window on screen
+    "run_in_user_terminal",
     # browser: config uses a local, real-profile (visible) Chrome
     "browser_exec", "browser_cdp", "browser_dialog", "browser_vault_fill", "browser_vault_enter_code",
     "browser_vault_save_login", "browser_vault_unlock",
