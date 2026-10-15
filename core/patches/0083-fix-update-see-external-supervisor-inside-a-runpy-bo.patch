@@ -1,0 +1,204 @@
+From 07b4bd40da0d75f02e1f47afc5c89a567f932505 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 08:53:38 -0700
+Subject: [PATCH] fix(update): see --external-supervisor inside a
+ runpy-bootstrapped gateway argv [daveey]
+
+_capture_gateway_argv validated the argv with a plain ' '.join, so the
+Hermes Python.app runpy bootstrap (spaced interpreter path, flag inside
+the -c source element) came back None; the update then armed a detached
+'gateway run --replace' that raced launchd's own respawn and left the
+mini gateway running outside launchd. Validate via argv_to_command_line,
+and read the flag through argv_declares_external_supervisor (unwraps the
+inline bootstrap) in the update restart planner, the posix pause and
+gateway_declares_external_supervisor.
+---
+ hermes_cli/gateway.py                         | 30 ++++++-
+ hermes_cli/gateway_supervised_restart.py      |  4 +-
+ hermes_cli/update_cmd_posix_pause.py          |  4 +-
+ .../test_update_runpy_external_supervisor.py  | 82 +++++++++++++++++++
+ 4 files changed, 113 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_runpy_external_supervisor.py
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index e785e27e58..c6353c8824 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -962,14 +962,38 @@ def _capture_gateway_argv(pid: int) -> list[str] | None:
+         return None
+     # Never respawn an unrelated process the scan happened to report.
+     try:
+-        from gateway.status import looks_like_gateway_command_line
+-        if not looks_like_gateway_command_line(" ".join(argv)):
++        from gateway.status import argv_to_command_line, looks_like_gateway_command_line
++        # [daveey] argv_to_command_line, not " ".join: a space-joined ``Hermes Python.app`` runpy
++        # bootstrap fails the matcher, so the gateway's argv came back None and update never saw
++        # its ``--external-supervisor`` marker.
++        if not looks_like_gateway_command_line(argv_to_command_line(argv)):
+             return None
+     except Exception:
+         pass
+     return argv
+ 
+ 
++def argv_declares_external_supervisor(argv: list[str] | None) -> bool:
++    """[daveey] True when a gateway argv carries ``--external-supervisor``, including inside a Hermes
++    inline bootstrap (``python -I -c "…; sys.argv = [… 'gateway', 'run', '--external-supervisor']; runpy…"``),
++    where the flag is part of the ``-c`` source token rather than its own argv element."""
++    if not argv:
++        return False
++    if "--external-supervisor" in argv:
++        return True
++    try:
++        from gateway.status_inline_source import command_line_runs_inline_source, inline_bootstrap_argv
++        cased = [str(t) for t in argv]
++        if not command_line_runs_inline_source(cased):
++            return False
++        # The source arrives as ONE argv element here; the parser expects it split on spaces. The
++        # interpreter path (argv[0], may contain spaces) stays one token.
++        effective = inline_bootstrap_argv([cased[0], *(tok for part in cased[1:] for tok in part.split(" ") if tok)])
++    except Exception:
++        return False
++    return bool(effective) and "--external-supervisor" in effective
++
++
+ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | None:
+     """Choose who relaunches a profile gateway after ``hermes update``: ``--external-supervisor`` gateways
+     exit back to their manager (a detached watcher would race its replacement); otherwise arm the
+@@ -983,7 +1007,7 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
+     disk. ``argv`` is already captured above, so the fallback costs nothing extra.
+     """
+     argv = _capture_gateway_argv(pid)
+-    if argv and "--external-supervisor" in argv:
++    if argv_declares_external_supervisor(argv):
+         return "external-supervisor"
+     if launch_detached_profile_gateway_restart(profile, pid):
+         return "detached"
+diff --git a/hermes_cli/gateway_supervised_restart.py b/hermes_cli/gateway_supervised_restart.py
+index 20062688df..d2eb03961e 100644
+--- a/hermes_cli/gateway_supervised_restart.py
++++ b/hermes_cli/gateway_supervised_restart.py
+@@ -34,7 +34,7 @@ def gateway_declares_external_supervisor(pid: int, home: Path | None = None) ->
+         return False
+     from gateway.control_socket import identify_gateway
+     from gateway.status import _get_process_hermes_home, read_runtime_status
+-    from hermes_cli.gateway import _capture_gateway_argv
++    from hermes_cli.gateway import _capture_gateway_argv, argv_declares_external_supervisor
+ 
+     home = home or _get_process_hermes_home()
+     identity = identify_gateway(home) or {}
+@@ -44,7 +44,7 @@ def gateway_declares_external_supervisor(pid: int, home: Path | None = None) ->
+     if argv is None:
+         record = read_runtime_status(home / "gateway_state.json") or {}
+         argv = record.get("argv") if record.get("pid") == pid else None
+-    return bool(argv) and "--external-supervisor" in argv
++    return argv_declares_external_supervisor(argv)
+ 
+ 
+ def _wait_for_supervised_gateway_replacement(
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 0f71d8b8a2..a9c2c66f44 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -182,8 +182,8 @@ def _home_of(pid: int) -> str | None:
+ def _supervisor_markers(pid: int) -> str | None:
+     """Why *pid* answers to a supervisor other than a hermes unit/job (it would respawn it on old
+     code), or ``None``."""
+-    from hermes_cli.gateway import _capture_gateway_argv
+-    if "--external-supervisor" in (_capture_gateway_argv(pid) or []):
++    from hermes_cli.gateway import _capture_gateway_argv, argv_declares_external_supervisor
++    if argv_declares_external_supervisor(_capture_gateway_argv(pid)):
+         return "--external-supervisor"
+     try:
+         import psutil  # type: ignore
+diff --git a/tests/hermes_cli/test_update_runpy_external_supervisor.py b/tests/hermes_cli/test_update_runpy_external_supervisor.py
+new file mode 100644
+index 0000000000..1c6c79dd42
+--- /dev/null
++++ b/tests/hermes_cli/test_update_runpy_external_supervisor.py
+@@ -0,0 +1,82 @@
++"""``hermes update`` must hand a Hermes-Python.app runpy-bootstrapped ``--external-supervisor`` gateway
++back to its supervisor, not arm a detached ``--replace`` relaunch that races the supervisor's respawn.
++
++Live argv of the mini's launchd gateway (``com.daveey.myapp.hermes``): the flag lives INSIDE the
++``-c`` source element, and the interpreter path contains a space. ``_capture_gateway_argv`` joined it
++with plain spaces, the matcher rejected it, argv came back None, and the update armed a watcher: two
++``gateway.start`` lines, the launchd child exited, and the survivor ran outside launchd.
++"""
++
++import types
++
++import pytest
++
++from hermes_cli import gateway
++from hermes_cli import gateway_supervised_restart as gsr
++
++_PY = "/Users/me/Applications/Hermes Python.app/Contents/MacOS/python3.14"
++_HERMES = "/Users/me/code/hermes-agent/.venv/bin/hermes"
++
++
++def _runpy_argv(*gateway_args: str) -> list[str]:
++    argv_list = ", ".join(repr(a) for a in (_HERMES, "gateway", "run", *gateway_args))
++    src = (
++        "import sys, runpy; sys.path.insert(0, '/Users/me/code/hermes-agent'); "
++        f"sys.argv = [{argv_list}]; runpy.run_path({_HERMES!r}, run_name='__main__')"
++    )
++    return [_PY, "-I", "-c", src]
++
++
++SUPERVISED = _runpy_argv("--external-supervisor")
++UNSUPERVISED = _runpy_argv()
++
++
++def _fake_psutil(monkeypatch, argv):
++    fake = types.SimpleNamespace(Process=lambda pid: types.SimpleNamespace(cmdline=lambda: list(argv)))
++    monkeypatch.setitem(__import__("sys").modules, "psutil", fake)
++
++
++def test_capture_gateway_argv_accepts_runpy_bootstrap_under_spaced_interpreter(monkeypatch):
++    _fake_psutil(monkeypatch, SUPERVISED)
++    assert gateway._capture_gateway_argv(4242) == SUPERVISED
++
++
++@pytest.mark.parametrize(
++    ("argv", "expected"),
++    [
++        (SUPERVISED, True),
++        (UNSUPERVISED, False),
++        (["python", "-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"], True),
++        (None, False),
++        # #107002 control: an arbitrary -c program merely carrying the flag is not a declaration.
++        ([_PY, "-c", "import subprocess, sys; subprocess.run(sys.argv[1:])", "x --external-supervisor"], False),
++    ],
++)
++def test_argv_declares_external_supervisor(argv, expected):
++    assert gateway.argv_declares_external_supervisor(argv) is expected
++
++
++def test_update_hands_runpy_external_supervisor_gateway_back_without_watcher(monkeypatch):
++    _fake_psutil(monkeypatch, SUPERVISED)
++    monkeypatch.setattr(
++        gateway, "launch_detached_profile_gateway_restart", lambda *_a: pytest.fail("watcher must not be armed")
++    )
++    monkeypatch.setattr(
++        gateway, "launch_detached_gateway_restart_by_cmdline", lambda *_a: pytest.fail("watcher must not be armed")
++    )
++    assert gateway._prepare_profile_gateway_update_restart("default", 4242) == "external-supervisor"
++
++
++def test_update_still_arms_watcher_for_unsupervised_runpy_gateway(monkeypatch):
++    """Control: without the flag the same bootstrap form keeps the detached relaunch."""
++    _fake_psutil(monkeypatch, UNSUPERVISED)
++    armed = []
++    monkeypatch.setattr(gateway, "launch_detached_profile_gateway_restart", lambda *a: armed.append(a) or True)
++    assert gateway._prepare_profile_gateway_update_restart("default", 4242) == "detached"
++    assert armed
++
++
++def test_declares_external_supervisor_reads_runpy_argv_when_identify_is_silent(monkeypatch, tmp_path):
++    _fake_psutil(monkeypatch, SUPERVISED)
++    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda _home: None)
++    assert gsr.gateway_declares_external_supervisor(4242, home=tmp_path) is True
+-- 
+2.55.0
+

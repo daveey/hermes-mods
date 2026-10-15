@@ -1,0 +1,854 @@
+From b7d6bf9aa0b7090114a9a8e2c57d6e67aadf3ef3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:03:09 -0700
+Subject: [PATCH] fix(process): Desktop backend re-adopts its chats' orphaned
+ background jobs after a restart and wakes the chat when they exit [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- recover_from_checkpoint(owner=): 'gateway' adopts messaging keys + legacy keyless
+  entries, 'tui' adopts bare state.db session ids; the read-decide-write runs under the
+  checkpoint file lock so concurrent backends adopt an orphan once.
+- Desktop serve startup (web_server lifespan) runs recover_tui_orphaned_processes off-thread
+  and starts a 30s detached-pid sweep that ends when nothing is left to watch.
+- A re-adopted notify_on_complete job's exit (or one that died while no backend ran)
+  queues a completion 'exited (status unknown — re-adopted after restart)' on its
+  session_key; if that chat is not open the TUI poller parks it and the owner's poller
+  takes it every 2s.
+- Messaging gateway recovers with owner='gateway', so its shutdown kill_all never kills a
+  Desktop chat's job it never spawned.
+---
+ gateway/run_startup.py                        |   7 +-
+ hermes_cli/web_server.py                      |   9 +
+ .../tools/test_process_orphan_readopt_tui.py  | 249 ++++++++++++++++++
+ .../test_readopted_completion_parking.py      |  79 ++++++
+ tools/process_registry.py                     |  11 +-
+ tools/process_registry_checkpoint.py          |  48 +++-
+ tools/process_registry_notifications.py       |   9 +-
+ tools/process_registry_readopt.py             | 186 +++++++++++++
+ tui_gateway/session_notifications.py          |  28 +-
+ 9 files changed, 608 insertions(+), 18 deletions(-)
+ create mode 100644 tests/tools/test_process_orphan_readopt_tui.py
+ create mode 100644 tests/tui_gateway/test_readopted_completion_parking.py
+ create mode 100644 tools/process_registry_readopt.py
+
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index 071330e0ab..fe538ef1a3 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -1131,7 +1131,8 @@ class GatewayStartupMixin:
+                 continue
+             try:
+                 with _profile_runtime_scope(Path(profile_home), {}):
+-                    recovered += process_registry.recover_from_checkpoint()
++                    # Desktop/TUI chats' jobs belong to the Desktop backend, which re-adopts them itself. [daveey]
++                    recovered += process_registry.recover_from_checkpoint(owner="gateway")
+             except Exception:
+                 logger.warning("Process checkpoint recovery for profile %r failed", profile_name, exc_info=True)
+         return recovered
+@@ -1150,7 +1151,9 @@ class GatewayStartupMixin:
+         # served profile's file under its scope or those processes are never re-adopted.
+         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
+             from tools.process_registry import process_registry
+-            recovered = process_registry.recover_from_checkpoint()
++            # owner="gateway": leave Desktop/TUI chats' orphans to the Desktop backend, so this gateway's
++            # shutdown kill_all can never kill a job it does not own. [daveey]
++            recovered = process_registry.recover_from_checkpoint(owner="gateway")
+             recovered += self._recover_secondary_process_checkpoints(process_registry)
+             if recovered:
+                 logger.info("Recovered %s background process(es) from previous run", recovered)
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index f8b5089234..12368466b3 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -252,6 +252,15 @@ async def _lifespan(app: FastAPI):
+     except Exception:
+         _log.warning("startup resume sweep did not start", exc_info=True)
+ 
++    # Re-adopt background jobs a previous backend's chats left running (orphans of a Desktop
++    # restart) and wake each chat when its job exits (tools/process_registry_readopt.py). [daveey]
++    try:
++        from tools.process_registry_readopt import start_tui_orphan_recovery
++
++        start_tui_orphan_recovery()
++    except Exception:
++        _log.warning("background process re-adoption did not start", exc_info=True)
++
+     # Desktop-spawned backends fire cron jobs themselves, since the app has no
+     # gateway running the scheduler. Server `hermes dashboard` is unaffected —
+     # it relies on its own gateway.
+diff --git a/tests/tools/test_process_orphan_readopt_tui.py b/tests/tools/test_process_orphan_readopt_tui.py
+new file mode 100644
+index 0000000000..6d081dc3d9
+--- /dev/null
++++ b/tests/tools/test_process_orphan_readopt_tui.py
+@@ -0,0 +1,249 @@
++"""Desktop/TUI backend re-adopts its orphaned background jobs after a restart. [daveey]
++
++A Desktop chat's ``notify_on_complete`` job outlives a Desktop restart (the
++backend that spawned it is gone). The new backend must adopt it again, watch its
++PID, and wake the chat when it exits, with an honest "status unknown" since no
++pipe is left to collect the exit code. The messaging gateway must neither adopt
++it nor kill it on shutdown.
++"""
++
++import json
++import subprocess
++import sys
++import time
++from unittest.mock import patch
++
++import pytest
++
++from tools.process_registry import ProcessRegistry
++from tools.process_registry_notifications import format_process_notification, process_completion_display_text
++from tools.process_registry_readopt import (
++    UNKNOWN_EXIT_STATUS, checkpoint_entry_owner, recover_tui_orphaned_processes,
++)
++
++TUI_KEY = "20261014_152627_e39461"
++GW_KEY = "agent:main:telegram:dm:42"
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _entry(sid: str, pid: int, key: str, *, notify=True, platform="") -> dict:
++    return {
++        "session_id": sid, "command": "bash watch_onit.sh", "pid": pid, "pid_scope": "host",
++        "host_start_time": ProcessRegistry._safe_host_start_time(pid), "started_at": time.time(),
++        "task_id": "default", "owner_task_id": key, "session_key": key, "notify_on_complete": notify,
++        "watcher_platform": platform, "writer_pid": _dead_pid(), "writer_start_time": None,
++    }
++
++
++@pytest.fixture()
++def procs():
++    started: list[subprocess.Popen] = []
++
++    def spawn() -> subprocess.Popen:
++        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL)
++        started.append(proc)
++        return proc
++
++    yield spawn
++    for proc in started:
++        proc.kill()
++        proc.wait()
++
++
++@pytest.fixture()
++def checkpoint(tmp_path):
++    path = tmp_path / "processes.json"
++    with patch("tools.process_registry.CHECKPOINT_PATH", path):
++        yield path
++
++
++def _drain(registry: ProcessRegistry) -> list[dict]:
++    out = []
++    while not registry.completion_queue.empty():
++        out.append(registry.completion_queue.get_nowait())
++    return out
++
++
++def _kill(proc: subprocess.Popen) -> None:
++    proc.kill()
++    proc.wait()
++
++
++def test_entry_owner_classification():
++    assert checkpoint_entry_owner({"session_key": TUI_KEY}) == "tui"
++    assert checkpoint_entry_owner({"session_key": GW_KEY}) == "gateway"
++    assert checkpoint_entry_owner({"session_key": TUI_KEY, "watcher_platform": "slack"}) == "gateway"
++    assert checkpoint_entry_owner({"session_key": ""}) == ""
++
++
++def test_tui_recovery_adopts_only_desktop_orphans(checkpoint, procs):
++    checkpoint.write_text(json.dumps([
++        _entry("proc_tui", procs().pid, TUI_KEY),
++        _entry("proc_gw", procs().pid, GW_KEY),
++        _entry("proc_keyless", procs().pid, ""),
++    ]))
++    registry = ProcessRegistry()
++    assert registry.recover_from_checkpoint(owner="tui") == 1
++    assert set(registry._running) == {"proc_tui"}
++    # The other kinds stay in the shared file for their own owner.
++    assert {e["session_id"] for e in json.loads(checkpoint.read_text())} == {"proc_tui", "proc_gw", "proc_keyless"}
++
++
++def test_gateway_recovery_leaves_desktop_orphans_alone(checkpoint, procs):
++    checkpoint.write_text(json.dumps([
++        _entry("proc_tui", procs().pid, TUI_KEY),
++        _entry("proc_gw", procs().pid, GW_KEY),
++        _entry("proc_keyless", procs().pid, ""),
++    ]))
++    registry = ProcessRegistry()
++    assert registry.recover_from_checkpoint(owner="gateway") == 2
++    assert set(registry._running) == {"proc_gw", "proc_keyless"}
++
++
++def test_gateway_shutdown_kill_all_spares_desktop_orphan(checkpoint, procs):
++    """Item 3: the gateway never adopts a Desktop chat's job, so its shutdown sweep cannot kill it."""
++    desktop_child = procs()
++    checkpoint.write_text(json.dumps([_entry("proc_tui", desktop_child.pid, TUI_KEY)]))
++    registry = ProcessRegistry()
++    registry.recover_from_checkpoint(owner="gateway")
++    registry.kill_all(source="gateway_shutdown")
++    time.sleep(0.2)
++    assert desktop_child.poll() is None, "the Desktop chat's job survived the gateway shutdown"
++
++
++def test_readopted_notify_job_exit_queues_status_unknown(checkpoint, procs):
++    child = procs()
++    checkpoint.write_text(json.dumps([_entry("proc_4fa0a87e0e10", child.pid, TUI_KEY)]))
++    registry = ProcessRegistry()
++    assert registry.recover_from_checkpoint(owner="tui") == 1
++    assert registry.sweep_detached_once() == 1
++    assert _drain(registry) == []
++
++    _kill(child)
++    assert registry.sweep_detached_once() == 0
++    (event,) = _drain(registry)
++    assert event["type"] == "completion"
++    assert event["session_key"] == TUI_KEY
++    assert event["session_id"] == "proc_4fa0a87e0e10"
++    assert event["exit_code"] is None
++    text = format_process_notification(event)
++    assert UNKNOWN_EXIT_STATUS in text
++    assert "exit code ?" in text
++    assert "status unknown" in process_completion_display_text([event]).lower()
++    # Swept once: a second sweep (or any refresh) does not re-notify.
++    registry.sweep_detached_once()
++    assert registry.list_sessions() == []
++    assert _drain(registry) == []
++
++
++def test_readopted_job_without_notify_exits_silently(checkpoint, procs):
++    child = procs()
++    checkpoint.write_text(json.dumps([_entry("proc_quiet", child.pid, TUI_KEY, notify=False)]))
++    registry = ProcessRegistry()
++    registry.recover_from_checkpoint(owner="tui")
++    _kill(child)
++    registry.sweep_detached_once()
++    assert _drain(registry) == []
++
++
++def test_gateway_recovered_job_keeps_existing_silent_prune(checkpoint, procs):
++    """The gateway has its own watcher delivery; the unknown-exit completion is TUI-only."""
++    child = procs()
++    checkpoint.write_text(json.dumps([_entry("proc_gw", child.pid, GW_KEY)]))
++    registry = ProcessRegistry()
++    registry.recover_from_checkpoint(owner="gateway")
++    _kill(child)
++    registry.sweep_detached_once()
++    assert _drain(registry) == []
++
++
++def test_orphan_that_died_while_backend_was_down_still_notifies(checkpoint):
++    checkpoint.write_text(json.dumps([_entry("proc_died", _dead_pid(), TUI_KEY)]))
++    registry = ProcessRegistry()
++    assert registry.recover_from_checkpoint(owner="tui") == 0
++    (event,) = _drain(registry)
++    assert event["session_id"] == "proc_died" and event["completion_reason"] == "unknown"
++    assert json.loads(checkpoint.read_text()) == []
++
++
++def test_startup_helper_adopts_and_sweeps_until_exit(checkpoint, procs):
++    child = procs()
++    checkpoint.write_text(json.dumps([_entry("proc_sweep", child.pid, TUI_KEY)]))
++    registry = ProcessRegistry()
++    assert recover_tui_orphaned_processes(registry, sweep_interval=0.05) == 1
++    _kill(child)
++    deadline = time.monotonic() + 5
++    events: list = []
++    while not events and time.monotonic() < deadline:
++        time.sleep(0.05)
++        events = _drain(registry)
++    assert [e["session_id"] for e in events] == ["proc_sweep"]
++    deadline = time.monotonic() + 2
++    while registry._detached_sweep_thread is not None and time.monotonic() < deadline:
++        time.sleep(0.05)
++    assert registry._detached_sweep_thread is None, "the sweep thread ends once nothing is left to watch"
++
++
++def test_adopter_stamps_itself_as_writer_so_a_second_backend_skips(checkpoint, procs):
++    """Recovery writes under the file lock it read under, so the next backend sees a live writer."""
++    import os
++
++    checkpoint.write_text(json.dumps([_entry("proc_once", procs().pid, TUI_KEY)]))
++    assert ProcessRegistry().recover_from_checkpoint(owner="tui") == 1
++    (entry,) = json.loads(checkpoint.read_text())
++    assert entry["writer_pid"] == os.getpid()
++
++
++def test_concurrent_backends_adopt_an_orphan_once(checkpoint, procs, tmp_path):
++    child = procs()
++    checkpoint.write_text(json.dumps([_entry("proc_once", child.pid, TUI_KEY)]))
++    script = tmp_path / "adopt.py"
++    script.write_text(
++        "import sys, time\n"
++        "from unittest.mock import patch\n"
++        "from tools.process_registry import ProcessRegistry\n"
++        f"with patch('tools.process_registry.CHECKPOINT_PATH', __import__('pathlib').Path({str(checkpoint)!r})):\n"
++        "    print(ProcessRegistry().recover_from_checkpoint(owner='tui'), flush=True)\n"
++        "    time.sleep(10)\n")  # stay alive: a live writer is what makes the sibling skip
++    import os
++    runs = [subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True,
++                             cwd=os.getcwd(), env=os.environ.copy()) for _ in range(4)]
++    counts = [int(run.communicate(timeout=60)[0].strip().splitlines()[-1]) for run in runs]
++    assert sorted(counts) == [0, 0, 0, 1]
++
++
++def test_parked_events_are_taken_only_by_their_owner():
++    registry = ProcessRegistry()
++    mine, theirs = {"session_key": "a"}, {"session_key": "b"}
++    registry.park_unowned_event(mine)
++    registry.park_unowned_event(theirs)
++    assert registry.take_parked_events(lambda e: e["session_key"] == "a") == [mine]
++    assert registry.take_parked_events(lambda e: e["session_key"] == "a") == []
++    assert registry.take_parked_events(lambda e: True) == [theirs]
++
++
++def test_start_tui_orphan_recovery_runs_off_thread(checkpoint, procs):
++    from tools.process_registry_readopt import start_tui_orphan_recovery
++
++    checkpoint.write_text(json.dumps([_entry("proc_bg", procs().pid, TUI_KEY)]))
++    registry = ProcessRegistry()
++    start_tui_orphan_recovery(registry).join(10)
++    assert set(registry._running) == {"proc_bg"}
++
++
++def test_messaging_gateway_and_desktop_backend_recover_with_their_owner_filter():
++    """Both startup paths name their owner, so neither adopts (or later kill_all's) the other's jobs."""
++    import inspect
++
++    from gateway import run_startup
++    from hermes_cli import web_server
++
++    gw = inspect.getsource(run_startup)
++    assert "recover_from_checkpoint()" not in gw
++    assert gw.count('recover_from_checkpoint(owner="gateway")') == 2
++    assert "start_tui_orphan_recovery()" in inspect.getsource(web_server)
+diff --git a/tests/tui_gateway/test_readopted_completion_parking.py b/tests/tui_gateway/test_readopted_completion_parking.py
+new file mode 100644
+index 0000000000..f89be7d37b
+--- /dev/null
++++ b/tests/tui_gateway/test_readopted_completion_parking.py
+@@ -0,0 +1,79 @@
++"""A re-adopted orphan's exit reaches its chat even when the chat is not open yet. [daveey]
++
++After a Desktop restart the new backend re-adopts a chat's ``notify_on_complete`` job
++(tools/process_registry_readopt.py). Its exit completion is addressed to that chat's
++session_key, but the first poller to dequeue it usually belongs to another chat.
++Unowned addressed events are normally dropped; a re-adopted completion is parked
++instead, and the owning chat's poller takes it once that chat is open.
++"""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from tools.process_registry import ProcessRegistry
++from tui_gateway import server
++
++KEY = "20261014_152627_e39461"
++EVENT = {"type": "completion", "session_id": "proc_4fa0a87e0e10", "session_key": KEY, "command": "bash x.sh",
++         "exit_code": None, "completion_reason": "unknown", "park_if_unowned": True}
++
++
++@pytest.fixture
++def owners(monkeypatch):
++    owned: set[str] = set()
++    monkeypatch.setattr(server, "_notification_event_belongs_elsewhere", lambda sid, session, evt: False)
++    monkeypatch.setattr(server, "_session_owns_notification_event",
++                        lambda sid, session, evt: sid in owned and evt.get("session_key") == KEY)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    return owned
++
++
++def _session() -> dict:
++    return {"history_lock": threading.RLock(), "running": False, "history": [], "agent": None, "profile_home": None}
++
++
++def test_unowned_readopted_completion_is_parked_not_dropped(owners):
++    registry = ProcessRegistry()
++    completions: list = []
++    assert server._notif_handle_event("other", _session(), dict(EVENT), set(), registry, lambda e: "t", None,
++                                      completions) is True
++    assert completions == []
++    assert registry.completion_queue.empty()
++    assert [e["session_id"] for e in registry.take_parked_events(lambda e: True)] == ["proc_4fa0a87e0e10"]
++
++
++def test_ordinary_unowned_completion_is_still_dropped(owners):
++    registry = ProcessRegistry()
++    evt = {k: v for k, v in EVENT.items() if k != "park_if_unowned"}
++    server._notif_handle_event("other", _session(), evt, set(), registry, lambda e: "t", None, [])
++    assert registry.take_parked_events(lambda e: True) == []
++
++
++def test_owner_poller_takes_the_parked_completion(owners):
++    registry = ProcessRegistry()
++    registry.park_unowned_event(dict(EVENT))
++    handled: list = []
++    handle = lambda events, deferred: handled.extend(events)
++
++    assert server._notif_take_parked("other", _session(), registry, handle) == 0
++    assert handled == []
++
++    owners.add("owner")
++    assert server._notif_take_parked("owner", _session(), registry, handle) == 1
++    assert [e["session_key"] for e in handled] == [KEY]
++    assert server._notif_take_parked("owner", _session(), registry, handle) == 0, "taken once"
++
++
++def test_owner_handles_parked_completion_as_a_turn(owners, monkeypatch):
++    """End to end through the real handler: the owner batches it into a completion turn."""
++    registry = ProcessRegistry()
++    registry.park_unowned_event(dict(EVENT))
++    owners.add("owner")
++    completions: list = []
++    handle = lambda events, deferred: [server._notif_handle_event(
++        "owner", _session(), e, set(), registry, lambda evt: "wake", deferred, completions) for e in events]
++    server._notif_take_parked("owner", _session(), registry, handle)
++    assert [(e["session_id"], text) for e, text in completions] == [("proc_4fa0a87e0e10", "wake")]
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 017df6a950..9e836f1d62 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -34,6 +34,7 @@ from hermes_cli.config import get_hermes_home
+ 
+ from tools.process_registry_notifications import format_process_notification, is_child_process_notification, should_surface_notification
+ from tools.process_registry_checkpoint import ProcessCheckpointMixin
++from tools.process_registry_readopt import ProcessReadoptMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+ from tools.process_registry_env_log import log_delta_command
+@@ -555,7 +556,7 @@ class ProcessSession:
+     exited: bool = False
+     exited_at: float = 0.0                      # time.time() of the FIRST move to finished (0 = unknown)
+     exit_code: Optional[int] = None             # None while running
+-    completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
++    completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited|unknown
+     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
+     max_output_chars: int = MAX_OUTPUT_CHARS
+@@ -607,6 +608,8 @@ class ProcessSession:
+     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
+     _reader_selectable: bool = field(default=False, repr=False)
+     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
++    # Re-adopted by a Desktop/TUI backend: queue a status-unknown completion when the PID goes. [daveey]
++    _report_lost_exit: bool = field(default=False, repr=False)
+ 
+     def __post_init__(self):
+         # A session built without an explicit owner is owned by its own task, so ownership checks compare
+@@ -698,7 +701,7 @@ def _is_wsl_launcher_command(command: str) -> bool:
+     return False
+ 
+ 
+-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
++class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessReadoptMixin):
+     """In-memory registry of running and finished background processes.
+     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
+     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
+@@ -1063,12 +1066,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
+         with session._lock:
+             session.exited = True
+         with self._lock:
+-            self._running.pop(session.id, None)
++            was_running = self._running.pop(session.id, None) is not None
+             if session.systemd_unit:
+                 self._finished[session.id] = session
+             else:
+                 self._finished.pop(session.id, None)
+         self._write_checkpoint()
++        if was_running and session._report_lost_exit and session.notify_on_complete:
++            self._queue_unknown_exit(session)
+         session._completion_event.set()
+         return session if session.systemd_unit else None
+ 
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index e272d35724..32c577ec6a 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -128,13 +128,28 @@ class ProcessCheckpointMixin:
+         from utils import atomic_json_write
+         atomic_json_write(_checkpoint_path(), entries)
+ 
+-    def recover_from_checkpoint(self) -> int:
+-        """On gateway startup, probe PIDs from the checkpoint file; returns how many
+-        were recovered as detached sessions."""
++    def recover_from_checkpoint(self, owner: Optional[str] = None) -> int:
++        """On startup, probe PIDs from the checkpoint file; returns how many were
++        recovered as detached sessions.
++
++        ``owner`` limits adoption to one kind of entry (see
++        ``tools.process_registry_readopt``): ``"gateway"`` (messaging session keys and
++        legacy keyless entries) or ``"tui"`` (Desktop/TUI session ids). ``None`` adopts
++        every orphan. The whole read-decide-write runs under the checkpoint file lock,
++        so two backends starting together adopt an orphan once. [daveey]"""
++        try:
++            with self._checkpoint_file_lock():
++                return self._recover_from_checkpoint_locked(owner)
++        except Exception as e:
++            logger.warning("Process checkpoint recovery failed: %s", e, exc_info=True)
++            return 0
++
++    def _recover_from_checkpoint_locked(self, owner: Optional[str]) -> int:
+         from tools.process_registry import (
+             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
+             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
+         )
++        from tools.process_registry_readopt import OWNER_TUI, owner_accepts
+ 
+         checkpoint_path = _checkpoint_path()
+         if not checkpoint_path.exists():
+@@ -160,6 +175,8 @@ class ProcessCheckpointMixin:
+             # kill it. Only orphans (writer gone) are recovered. [daveey]
+             if entry.get("writer_pid") != os.getpid() and self._writer_alive(entry):
+                 continue
++            if not owner_accepts(owner, entry):
++                continue
+             if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
+                 logger.info(
+                     "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
+@@ -179,6 +196,9 @@ class ProcessCheckpointMixin:
+                     entry.get("session_id", "?"), pid)
+                 continue
+             if fate != "running":
++                if owner == OWNER_TUI and entry.get("notify_on_complete"):
++                    # Exited while no backend watched it: the chat still gets its wake.
++                    self._queue_unknown_exit(self._session_from_entry(entry))
+                 systemd_unit = entry.get("systemd_unit", "")
+                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
+                     logger.warning(
+@@ -187,13 +207,10 @@ class ProcessCheckpointMixin:
+                         systemd_unit, pid)
+                     unresolved_scope_entries.append(entry)
+                 continue
+-            fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+-            fields.update(
+-                command=entry.get("command", "unknown"),
+-                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+-                started_at=entry.get("started_at", time.time()))
+             # detached: can't read output, but can report status + kill
+-            session = ProcessSession(id=entry["session_id"], detached=True, **fields)
++            session = self._session_from_entry(entry)
++            # A TUI backend reports the eventual exit (status unknown) to the owning chat.
++            session._report_lost_exit = owner == OWNER_TUI
+             with self._lock:
+                 self._running[session.id] = session
+             recovered += 1
+@@ -208,5 +225,16 @@ class ProcessCheckpointMixin:
+                     "notify_on_complete": session.notify_on_complete,
+                     "parent_session_id": session.parent_session_id,
+                 })
+-        self._write_checkpoint(extra_entries=unresolved_scope_entries)
++        self._write_checkpoint_locked(extra_entries=unresolved_scope_entries)
+         return recovered
++
++    @staticmethod
++    def _session_from_entry(entry: dict[str, Any]):
++        from tools.process_registry import ProcessSession, _CHECKPOINT_DEFAULTS, _CHECKPOINT_FIELDS
++
++        fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
++        fields.update(
++            command=entry.get("command", "unknown"),
++            owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
++            started_at=entry.get("started_at", time.time()))
++        return ProcessSession(id=entry["session_id"], detached=True, **fields)
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index 757febc1ce..6ba9a03470 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -8,7 +8,10 @@ from dataclasses import dataclass
+ from contextlib import suppress
+ 
+ _DONE = ("completed", "success")
+-_REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
++_REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start",
++                  # A re-adopted orphan (no pipe after a restart) exited; its status was never collected. [daveey]
++                  "unknown": "exited (status unknown — re-adopted after restart)"}
++_REASON_OUTCOME = {"lost": "Lost", "failed_start": "Failed to Start", "unknown": "Exited (status unknown)"}
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -358,7 +361,7 @@ def process_completion_display_text(events: list) -> str:
+     if reason == "killed":
+         outcome = "Terminated"
+     elif reason in _REASON_STATUS:
+-        outcome = "Lost" if reason == "lost" else "Failed to Start"
++        outcome = _REASON_OUTCOME[reason]
+     else:
+         outcome = "Finished" if exit_code == 0 else "Failed"
+     cmd = _short_command(evt.get("command"))
+@@ -453,6 +456,8 @@ def format_process_notification(evt: dict) -> str | None:
+             f"{attribution}Command: {_cmd}\nMatched output:\n{evt.get('output', '')}"
+             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
+     _exit = evt.get("exit_code", "?")
++    if _exit is None:
++        _exit = "?"
+     _out = evt.get("output", "")
+     _signal = ", SIGTERM" if _exit in {-15, 143, "-15", "143"} else ""
+     # A subagent-owned process's full output belongs in the child's transcript, not as
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+new file mode 100644
+index 0000000000..80fb662b9f
+--- /dev/null
++++ b/tools/process_registry_readopt.py
+@@ -0,0 +1,186 @@
++"""Re-adoption of orphaned background processes by the Desktop/TUI backend. [daveey]
++
++Every Hermes process on a host writes the same ``processes.json``. When a Desktop
++backend restarts, the background jobs its chats started live on as orphans (the
++writer pid is gone). Only the messaging gateway used to call
++``recover_from_checkpoint``, so nothing supervised a Desktop chat's
++``notify_on_complete`` job again and its exit never reached the chat.
++
++Ownership is read from the entry's routing fields: a messaging-gateway session key
++is ``<ns>:<platform>:...`` (always has a colon) or the entry carries a watcher
++platform. A Desktop/TUI/CLI session key is a bare state.db session id. The
++messaging gateway adopts only its own (and legacy keyless) entries, and the TUI
++backend adopts only bare-id entries, so the two never fight over one child and the
++gateway's shutdown ``kill_all`` cannot kill a Desktop chat's job.
++
++A re-adopted process has no pipe, so its exit status is never collected. When the
++PID disappears, a ``completion`` with ``completion_reason="unknown"`` is queued
++for the owning session ("exited (status unknown — re-adopted after restart)").
++If that chat is not open in this backend, the poller parks the event instead of
++dropping it, and the chat's own poller picks it up once the chat is resumed.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger("tools.process_registry")
++
++OWNER_GATEWAY = "gateway"
++OWNER_TUI = "tui"
++UNKNOWN_EXIT_REASON = "unknown"
++UNKNOWN_EXIT_STATUS = "exited (status unknown — re-adopted after restart)"
++DETACHED_SWEEP_SECONDS = 30.0
++_MAX_PARKED_EVENTS = 256
++
++
++def checkpoint_entry_owner(entry: dict[str, Any]) -> str:
++    """``gateway``, ``tui`` or ``""`` (no session key: legacy/unknown) for a checkpoint entry."""
++    key = str(entry.get("session_key") or "")
++    if entry.get("watcher_platform") or ":" in key:
++        return OWNER_GATEWAY
++    return OWNER_TUI if key else ""
++
++
++def owner_accepts(owner: Optional[str], entry: dict[str, Any]) -> bool:
++    """Whether a recovering process of kind *owner* may adopt *entry* (None = adopt any)."""
++    if owner is None:
++        return True
++    kind = checkpoint_entry_owner(entry)
++    if owner == OWNER_GATEWAY:
++        return kind in (OWNER_GATEWAY, "")
++    return kind == owner
++
++
++class ProcessReadoptMixin:
++    """Detached-PID sweep, unknown-exit completions and the parked-event box."""
++
++    # Supplied by ProcessRegistry.
++    _lock: Any
++    _running: dict
++    completion_queue: Any
++    _refresh_detached_session: Callable[[Any], Any]
++
++    _detached_sweep_thread: Optional[threading.Thread] = None
++    _parked_events: Optional[list] = None
++
++    # ----- unknown-exit completion -----
++
++    def _unknown_exit_event(self, session) -> dict[str, Any]:
++        return {
++            "type": "completion",
++            "session_id": session.id,
++            "session_key": session.session_key,
++            "task_id": session.task_id,
++            "owner_task_id": session.owner_task_id,
++            "command": session.command,
++            "exit_code": None,
++            "completion_reason": UNKNOWN_EXIT_REASON,
++            "termination_source": "readopted_after_restart",
++            "output": "",
++            "started_at": session.started_at,
++            # The chat may not be open in this backend yet: park instead of dropping.
++            "park_if_unowned": True,
++        }
++
++    def _queue_unknown_exit(self, session) -> None:
++        from tools.process_registry import _redact_process_result
++        event = self._unknown_exit_event(session)
++        _redact_process_result(event)
++        self.completion_queue.put(event)
++        logger.info("Re-adopted process %s (pid=%s) exited; status unknown — notifying %s",
++                    session.id, session.pid, session.session_key)
++
++    # ----- parked events (owner chat not open in this backend) -----
++
++    def park_unowned_event(self, event: dict[str, Any]) -> None:
++        with self._lock:
++            if self._parked_events is None:
++                self._parked_events = []
++            self._parked_events.append(event)
++            del self._parked_events[:-_MAX_PARKED_EVENTS]
++
++    def take_parked_events(self, owns: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
++        """Remove and return the parked events *owns* claims. ``owns`` runs outside the lock."""
++        with self._lock:
++            parked = list(self._parked_events or ())
++        if not parked:
++            return []
++        taken = [evt for evt in parked if _safe_owns(owns, evt)]
++        if taken:
++            with self._lock:
++                ids = {id(evt) for evt in taken}
++                self._parked_events = [evt for evt in (self._parked_events or ()) if id(evt) not in ids]
++        return taken
++
++    # ----- detached-PID sweep -----
++
++    def sweep_detached_once(self) -> int:
++        """Refresh every running detached host session; returns how many are still running."""
++        with self._lock:
++            sessions = [s for s in self._running.values() if s.detached and s.pid_scope == "host"]
++        alive = 0
++        for session in sessions:
++            try:
++                refreshed = self._refresh_detached_session(session)
++            except Exception:
++                logger.debug("Detached sweep failed for %s", session.id, exc_info=True)
++                continue
++            alive += bool(refreshed is not None and not refreshed.exited)
++        return alive
++
++    def start_detached_sweep(self, interval: float = DETACHED_SWEEP_SECONDS) -> bool:
++        """Start the low-rate sweep thread (idempotent). It ends once no detached session is left."""
++        with self._lock:
++            thread = self._detached_sweep_thread
++            if thread is not None and thread.is_alive():
++                return False
++            thread = threading.Thread(target=self._detached_sweep_loop, args=(interval,),
++                                      name="process-detached-sweep", daemon=True)
++            self._detached_sweep_thread = thread
++        thread.start()
++        return True
++
++    def _detached_sweep_loop(self, interval: float) -> None:
++        while True:
++            time.sleep(interval)
++            if not self.sweep_detached_once():
++                with self._lock:
++                    if not any(s.detached and not s.exited for s in self._running.values()):
++                        self._detached_sweep_thread = None
++                        return
++
++
++def _safe_owns(owns: Callable[[dict[str, Any]], bool], evt: dict[str, Any]) -> bool:
++    try:
++        return bool(owns(evt))
++    except Exception:
++        return False
++
++
++def recover_tui_orphaned_processes(registry=None, *, sweep_interval: float = DETACHED_SWEEP_SECONDS) -> int:
++    """Desktop/TUI backend startup: adopt this host's orphaned Desktop-chat processes and
++    supervise them until they exit. Never raises."""
++    if registry is None:
++        from tools.process_registry import process_registry as registry
++    try:
++        recovered = registry.recover_from_checkpoint(owner=OWNER_TUI)
++    except Exception:
++        logger.warning("TUI process checkpoint recovery failed", exc_info=True)
++        return 0
++    if recovered:
++        logger.info("Re-adopted %d orphaned background process(es) after restart", recovered)
++        registry.start_detached_sweep(sweep_interval)
++    return recovered
++
++
++def start_tui_orphan_recovery(registry=None) -> threading.Thread:
++    """Run :func:`recover_tui_orphaned_processes` off the startup path (it probes PIDs and
++    takes the checkpoint file lock)."""
++    thread = threading.Thread(target=recover_tui_orphaned_processes, args=(registry,),
++                              name="process-orphan-readopt", daemon=True)
++    thread.start()
++    return thread
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 6fea2d4bcb..d05c193a85 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -541,6 +541,11 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
+         return True
+     if not owned and _notification_event_requires_owner(evt) and not _session_owns_notification_event(sid, session, evt):
+         origin, key = str(evt.get("origin_ui_session_id") or ""), str(evt.get("session_key") or "")
++        if evt.get("park_if_unowned") and hasattr(registry, "park_unowned_event"):
++            # A re-adopted orphan's exit: its chat may simply not be open in this backend yet. Park it
++            # for that chat's own poller (take_parked_events) instead of dropping it. [daveey]
++            registry.park_unowned_event(evt)
++            return True
+         if deferred is None:
+             # A durable replay stays pending: hand it back so the orphan sweep re-offers it once its owner
+             # is live (#97202), and keep that retry out of WARNING.
+@@ -729,6 +734,24 @@ def _poll_bot_live_delivery_guarded(sid: str, session: dict, now: float) -> None
+     session["_bot_poll_warn_suppressed"] = 0
+ 
+ 
++_PARKED_POLL_SECONDS = 2.0
++
++
++def _notif_take_parked(sid, session, registry, handle) -> int:
++    """Deliver the parked events (re-adopted orphans' exits whose chat was not open) this session owns. [daveey]"""
++    take = getattr(registry, "take_parked_events", None)
++    if take is None:
++        return 0
++    try:
++        events = take(lambda evt: _session_owns_notification_event(sid, session, evt))
++        if events:
++            handle(events, None)
++        return len(events)
++    except Exception as exc:
++        _notif_log_failure("parked notification dispatch failed", exc)
++        return 0
++
++
+ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
+     with _session_profile_runtime_scope(session):
+         _notification_poller_scoped_loop(stop_event, sid, session)
+@@ -751,7 +774,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+     emitted = session.setdefault("_notification_emitted", set())
+     handle = lambda events, deferred: _notif_handle_ready(
+         sid, session, events, emitted, process_registry, format_process_notification, deferred)
+-    last_kanban_poll = last_loop_poll = last_bot_poll = 0.0
++    last_kanban_poll = last_loop_poll = last_bot_poll = last_parked_poll = 0.0
+     while not stop_event.is_set() and not session.get("_finalized"):
+         now = time.monotonic()
+         # Completions whose owner process died after this one started (#97202); throttled per profile home.
+@@ -771,6 +794,9 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
+             last_kanban_poll = now
+             _notif_poll_kanban(sid, session)
++        if now - last_parked_poll >= _PARKED_POLL_SECONDS:
++            last_parked_poll = now
++            _notif_take_parked(sid, session, process_registry, handle)
+         try:
+             evt = queue.get(timeout=0.5)
+         except Exception:
+-- 
+2.55.0
+

@@ -1,0 +1,208 @@
+From d57d1dd95c49a834ac59de44d08ca8bf3bbbf04a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 12:06:11 -0700
+Subject: [PATCH] fix(agent): renew a lapsed turn lease by compare-and-swap
+ instead of killing the turn on wake [daveey]
+
+Every 'Session turn lease refresh stayed locked through its lifetime' in the
+MacBook logs (36 across 2026-10-14/15) lined up with a wake from clamshell or
+maintenance sleep longer than the 300s TTL. There were no 'hit a SQLite lock'
+retries before any of them. The periodic scheduler waits on the monotonic
+clock, which stops during sleep, but the row's wall-clock expiry keeps
+running, so the first tick after wake found no patience left and
+hard-interrupted every live turn, even though nobody else had claimed the
+session.
+
+A tick that arrives after the authority lapsed now tries the holder-qualified
+renewal, which is a compare-and-swap serialised with acquisition. If the row
+still names this holder, the turn keeps running. If a successor reclaimed the
+row, or claimed and released it, the renewal misses and the turn stops as
+before. A lock error on a lapsed row is retried on the next tick. Lock
+contention while the lease is still valid keeps upstream's stop-before-expiry
+rule.
+---
+ agent/turn_facade_lease.py            | 59 ++++++++++++++++-
+ tests/agent/test_turn_facade_lease.py | 93 +++++++++++++++++++++++++++
+ 2 files changed, 151 insertions(+), 1 deletion(-)
+
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index ad7f31cdaf..4c32148cdc 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -196,6 +196,63 @@ class DurableTurnLease:
+         self._interrupt_turn("Session turn lease could not be refreshed; stopping to protect the transcript.")
+         return False
+ 
++    def _renew_after_lapse(self, started: float):
++        """[daveey] The tick ran only after the row's expiry had passed, so this process was not
++        running for longer than the lease TTL. In practice that is macOS sleep: the scheduler waits
++        on the monotonic clock, which stops during sleep, while the row's wall-clock expiry keeps
++        running. Every logged "stayed locked through its lifetime" lined up with a wake from
++        clamshell or maintenance sleep. Killing the turn on wake throws away work that nobody else
++        claimed.
++
++        Expiry only makes the row reclaimable. The holder-qualified UPDATE is a compare-and-swap,
++        serialised with acquisition by BEGIN IMMEDIATE. If a successor reclaimed the row (or claimed
++        and released it), the holder no longer matches and the renewal misses, so the lease is
++        really lost and the turn stops. Otherwise this turn still owns the session and keeps
++        running. The transcript-write fence (``hermes_state_messages``) already renews a lapsed row
++        that still names its holder; this brings the refresher into line with it. A lock error here
++        is a missed tick, retried next interval: the row is already reclaimable, so stopping would
++        not protect anything, and holder fencing still refuses the transcript writes of a turn
++        whose row a successor takes."""
++        session_id = self._current_session_id()
++        lapsed_s = max(0.0, started - self._authority_deadline)
++        try:
++            renewed = self.db.refresh_session_turn_lease(
++                session_id, self.holder, ttl_seconds=LEASE_TTL_SECONDS, patience_s=_REFRESH_WRITE_PATIENCE_S,
++            )
++        except Exception as exc:
++            if self.stop.is_set():
++                return False
++            from hermes_state_errors import is_sqlite_lock_error
++
++            if is_sqlite_lock_error(exc):
++                if started < self._authority_deadline:
++                    # Not lapsed yet (a tick inside the expiry margin): same rule as a locked
++                    # renewal near expiry, stop before the row becomes reclaimable.
++                    return self._stop_on_exhausted_authority()
++                logger.warning(
++                    "Session turn lease lapsed %.0fs ago and its renewal hit a SQLite lock; will retry: %s",
++                    lapsed_s, session_id,
++                )
++                return None
++            logger.warning("Failed to renew lapsed session turn lease: %s", session_id, exc_info=True)
++            self._interrupt_turn("Session turn lease could not be refreshed; stopping to protect the transcript.")
++            return False
++        if renewed:
++            self._authority_deadline = started + LEASE_TTL_SECONDS
++            logger.warning(
++                "Session turn lease renewed %.0fs after it lapsed (process suspended or starved; "
++                "no other owner claimed the session): %s", lapsed_s, session_id,
++            )
++            return None
++        if self.stop.is_set():
++            return False
++        logger.error(
++            "Lost session turn lease while turn is active (another owner claimed it during a %.0fs lapse): %s",
++            lapsed_s, session_id,
++        )
++        self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
++        return False
++
+     def refresh_tick(self):
+         """One periodic renewal (every ``refresh_interval`` via the shared scheduler). A real
+         miss (rowcount 0) or a non-lock error interrupts the turn. A SQLite lock is a missed
+@@ -218,7 +275,7 @@ class DurableTurnLease:
+         # margin covers one BEGIN IMMEDIATE that blocks in SQLite's busy handler past the patience.
+         patience = self._authority_deadline - _REFRESH_EXPIRY_MARGIN_S - started
+         if patience <= 0:
+-            return self._stop_on_exhausted_authority()
++            return self._renew_after_lapse(started)
+         try:
+             if self.db.refresh_session_turn_lease(
+                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
+diff --git a/tests/agent/test_turn_facade_lease.py b/tests/agent/test_turn_facade_lease.py
+index 5ce136570e..1aa88cc64e 100644
+--- a/tests/agent/test_turn_facade_lease.py
++++ b/tests/agent/test_turn_facade_lease.py
+@@ -246,3 +246,96 @@ def test_interrupt_turn_only_while_active():
+     assert calls == ["lost"] and lease.interrupt_message == "lost"
+     lease.deactivate_after_liveness_abort()
+     assert lease.stop.is_set() and lease.is_turn_active() is False
++
++
++def _real_lease(tmp_path, monkeypatch):
++    import hermes_state
++    import hermes_state_compression
++    from agent import turn_facade_lease
++
++    clock = _MovingClock(1000.0)
++    fake_time = SimpleNamespace(time=clock.time, monotonic=time.monotonic, sleep=time.sleep)
++    monkeypatch.setattr(turn_facade_lease, "time", fake_time)
++    monkeypatch.setattr(hermes_state_compression, "time", fake_time)
++    db = hermes_state.SessionDB(tmp_path / "state.db")
++    db.create_session("s1", source="test")
++    assert db.try_acquire_session_turn_lease("s1", "h")
++    events = []
++    agent = SimpleNamespace(session_id="s1", interrupt=lambda msg, **kw: events.append(msg))
++    lease = DurableTurnLease(agent, db, "s1", "h", expires_at=db.session_turn_lease_expires_at("s1", "h"))
++    lease.turn_active = True
++    return db, clock, lease, events
++
++
++def test_refresh_stalled_past_the_lease_lifetime_keeps_an_unclaimed_turn(tmp_path, monkeypatch):
++    """[daveey] A refresher that cannot run for longer than the TTL (macOS sleep stops the
++    monotonic scheduler while the row's wall-clock expiry keeps running) must not cost the turn its
++    lease when no other owner claimed the session. Before the fix the first tick after wake saw no
++    patience left and hard-interrupted the turn ("stayed locked through its lifetime")."""
++    db, clock, lease, events = _real_lease(tmp_path, monkeypatch)
++    try:
++        # The machine slept 418s (the 10:31:54 -> 10:38:52 clamshell sleep in the incident logs).
++        clock.set(lease._authority_deadline + 418.0)
++        assert lease.refresh_tick() is None, "the refresher must keep running"
++        assert events == [] and lease.interrupt_message is None and not lease.stop.is_set()
++        renewed = db.session_turn_lease_expires_at("s1", "h")
++        assert renewed is not None and renewed > clock.time() + LEASE_TTL_SECONDS - 5
++        assert lease._authority_deadline <= renewed
++        # The renewed row fences a successor out again.
++        assert not db.try_acquire_session_turn_lease("s1", "successor")
++        # And the next ordinary tick renews normally.
++        clock.set(clock.time() + 60.0)
++        assert lease.refresh_tick() is None and events == []
++    finally:
++        db.close()
++
++
++def test_refresh_after_a_lapse_stops_the_turn_when_a_successor_claimed_it(tmp_path, monkeypatch):
++    """Control: during the lapse another process really took the session. The holder-qualified
++    renewal is a compare-and-swap, so it misses and the turn stops; the successor keeps its row."""
++    db, clock, lease, events = _real_lease(tmp_path, monkeypatch)
++    try:
++        clock.set(lease._authority_deadline + 30.0)
++        assert db.try_acquire_session_turn_lease("s1", "successor")  # expired row reclaimed
++        assert lease.refresh_tick() is False
++        assert events == ["Session turn lease lost; stopping to protect the transcript."]
++        assert db.session_turn_lease_expires_at("s1", "successor") is not None
++        assert db.session_turn_lease_expires_at("s1", "h") is None
++    finally:
++        db.close()
++
++
++def test_refresh_after_a_lapse_stops_when_a_successor_came_and_went(tmp_path, monkeypatch):
++    """Control: a successor claimed, ran and released while this turn was suspended. The row is
++    gone, so the renewal must not resurrect it."""
++    db, clock, lease, events = _real_lease(tmp_path, monkeypatch)
++    try:
++        clock.set(lease._authority_deadline + 30.0)
++        assert db.try_acquire_session_turn_lease("s1", "successor")
++        db.release_session_turn_lease("s1", "successor")
++        assert lease.refresh_tick() is False
++        assert events == ["Session turn lease lost; stopping to protect the transcript."]
++        assert db.session_turn_lease_expires_at("s1", "h") is None
++    finally:
++        db.close()
++
++
++def test_refresh_after_a_lapse_retries_a_locked_renewal(tmp_path, monkeypatch):
++    """A wake can find state.db busy (every session renews at once). A lapsed row is already
++    reclaimable, so a lock is a missed tick, not a reason to kill the turn; the next tick's
++    compare-and-swap decides."""
++    db, clock, lease, events = _real_lease(tmp_path, monkeypatch)
++    try:
++        clock.set(lease._authority_deadline + 30.0)
++
++        def locked(*a, **k):
++            raise sqlite3.OperationalError("database is locked")
++
++        real_refresh = db.refresh_session_turn_lease
++        monkeypatch.setattr(db, "refresh_session_turn_lease", locked)
++        assert lease.refresh_tick() is None and events == []
++        monkeypatch.setattr(db, "refresh_session_turn_lease", real_refresh)
++        assert lease.refresh_tick() is None and events == []
++        assert db.session_turn_lease_expires_at("s1", "h") > clock.time()
++    finally:
++        db.close()
+-- 
+2.55.0
+

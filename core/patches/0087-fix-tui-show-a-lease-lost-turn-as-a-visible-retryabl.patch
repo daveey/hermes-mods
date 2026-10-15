@@ -1,0 +1,299 @@
+From cb2e9660d1c6585f2bf666743eed426714dd98aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 12:12:25 -0700
+Subject: [PATCH] fix(tui): show a lease-lost turn as a visible, retryable
+ failure instead of a silent cancel [daveey]
+
+A turn stopped by session_turn_lease_lost reached Desktop as status=interrupted
+with empty text, the same shape as a user pressing Stop. Desktop rendered
+nothing, the row went idle, and the log said error_retained=False with
+response_len=0. To the user the agent had simply stopped mid-work.
+
+The turn finalizer now stamps result.interrupt_issuer, the system producer's
+slug, or nothing for a human stop. The TUI gateway turns a lease-lost interrupt
+into a failed result with failure_reason=session_turn_lease_lost, retryable, on
+the gateway layer. The transcript shows the error card ('Hermes stopped this
+turn because it lost ownership of the session ... Send /retry'), the inflight
+snapshot is retained for resume, and any text already streamed is kept as a
+partial. Human stops are unchanged.
+---
+ agent/error_surface.py                        |   1 +
+ agent/turn_finalizer.py                       |   6 +
+ tests/agent/test_run_agent.py                 |  40 ++++++
+ .../test_lease_lost_turn_visible.py           | 121 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  26 ++++
+ tui_gateway/user_messages.py                  |   3 +
+ 6 files changed, 197 insertions(+)
+ create mode 100644 tests/tui_gateway/test_lease_lost_turn_visible.py
+
+diff --git a/agent/error_surface.py b/agent/error_surface.py
+index ff977fa852..4ac7f73acc 100644
+--- a/agent/error_surface.py
++++ b/agent/error_surface.py
+@@ -37,6 +37,7 @@ LAYER_DISK = "disk"
+ _REASON_TO_LAYER = {
+     "auth": LAYER_AUTH, "auth_permanent": LAYER_AUTH, "billing": LAYER_BILLING, "billing_unverified": LAYER_BILLING,
+     "loop_error": LAYER_GATEWAY, "interpreter_shutdown": LAYER_GATEWAY, "session_busy": LAYER_GATEWAY,
++    "session_turn_lease_lost": LAYER_GATEWAY,  # [daveey] tui_gateway/prompt_turn._surface_system_interrupt
+     "truncated": LAYER_PROVIDER, "empty_response": LAYER_PROVIDER, "invalid_response": LAYER_PROVIDER,
+     "context_overflow": LAYER_PROVIDER,  # a bigger-window model IS the fix, so Switch provider applies
+ }
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index 9fd39ec52d..ecb60b7175 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -751,6 +751,12 @@ def finalize_turn(
+     agent._reused_response_text = None
+     if interrupted and agent._interrupt_message:
+         result["interrupt_message"] = agent._interrupt_message
++    if interrupted:
++        # [daveey] Which system producer stopped the turn (None for a human stop), so clients can
++        # tell "you pressed Stop" from "Hermes stopped this" (tui_gateway/prompt_turn surfaces it).
++        from agent.interrupt_control import interrupt_issuer as _interrupt_issuer
++        if _issuer_slug := _interrupt_issuer(agent):
++            result["interrupt_issuer"] = _issuer_slug
+     agent.clear_interrupt()
+     agent._stream_callback = None  # don't leak into future calls
+ 
+diff --git a/tests/agent/test_run_agent.py b/tests/agent/test_run_agent.py
+index 63bc8d1172..19caa6fbce 100644
+--- a/tests/agent/test_run_agent.py
++++ b/tests/agent/test_run_agent.py
+@@ -2547,9 +2547,49 @@ class TestHandleMaxIterations:
+         assert result["interrupt_message"] == "follow-up message"
+         assert result["turn_exit_reason"].startswith("interrupted_during_api_call")
+         assert result["final_response"].startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
++        # A new user message is a human stop: no system issuer is stamped.
++        assert "interrupt_issuer" not in result
+         assert "couldn't produce a summary" not in result["final_response"]
+         assert all(m.get("content") != MAX_ITERATIONS_SUMMARY_REQUEST for m in result["messages"])
+ 
++
++    def test_lease_lost_interrupt_stamps_its_system_issuer(self, agent, monkeypatch):
++        """[daveey] A lease-lost stop carries ``interrupt_issuer`` so the TUI gateway can show the
++        user why the turn ended instead of a silent cancel (tui_gateway/prompt_turn)."""
++        agent._cached_system_prompt = "You are helpful."
++        agent._use_prompt_caching = False
++        agent.compression_enabled = False
++        agent.save_trajectories = False
++        release = threading.Event()
++
++        def provider(*args, **kwargs):
++            agent.interrupt(
++                "Session turn lease lost; stopping to protect the transcript.",
++                hard_cancel=True, tool_reason="session turn lease lost",
++            )
++            release.wait(10)
++            raise OSError("fixture request stopped")
++
++        request_client = MagicMock()
++        request_client.chat.completions.create.side_effect = provider
++        agent.client.chat.completions.create.side_effect = provider
++        monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: request_client)
++        monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **kw: release.set())
++        monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
++        try:
++            with (
++                patch.object(agent, "_persist_session"),
++                patch.object(agent, "_save_trajectory"),
++                patch.object(agent, "_cleanup_task_resources"),
++            ):
++                result = agent.run_conversation("do the work")
++        finally:
++            release.set()
++
++        assert result["interrupted"] is True
++        assert result["interrupt_issuer"] == "session_turn_lease_lost"
++        assert result["interrupt_message"].startswith("Session turn lease lost")
++        assert result["turn_exit_reason"] == "interrupted_during_api_call(session_turn_lease_lost)"
+     def test_summary_notice_uses_safe_print(self, agent):
+         agent._print_fn = lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("closed"))
+         agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+diff --git a/tests/tui_gateway/test_lease_lost_turn_visible.py b/tests/tui_gateway/test_lease_lost_turn_visible.py
+new file mode 100644
+index 0000000000..e238154163
+--- /dev/null
++++ b/tests/tui_gateway/test_lease_lost_turn_visible.py
+@@ -0,0 +1,121 @@
++"""[daveey] A turn the system stopped because it lost its session lease must be visible.
++
++Before this, a ``session_turn_lease_lost`` interrupt reached Desktop as ``status=interrupted`` with
++empty text. That is the shape of a user pressing Stop, so the transcript showed nothing and the
++session row went idle. The user only saw the agent stop mid-work. The gateway now turns that
++interrupt into a retryable failure: the error card in the transcript, a retained inflight snapshot,
++and ``status=error error_retained=True`` in the turn bookend. A human stop keeps today's silent
++cancel.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import types
++
++import pytest
++
++from tui_gateway import server
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++def _session(agent):
++    return {
++        "agent": agent, "session_key": "gw-session-key", "history": [], "history_lock": threading.Lock(),
++        "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
++        "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++    }
++
++
++@pytest.fixture()
++def emitted(monkeypatch, tmp_path):
++    frames = []
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None, *a, **k: frames.append((event, payload)))
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    return frames
++
++
++def _run(result):
++    agent = types.SimpleNamespace(
++        session_id="agent-sid-1", run_conversation=lambda *a, **k: result, clear_interrupt=lambda: None)
++    session = _session(agent)
++    server._run_prompt_submit("rid", "ui-sid", session, "go")
++    return session
++
++
++def _complete(frames):
++    payloads = [p for event, p in frames if event == "message.complete"]
++    assert len(payloads) == 1
++    return payloads[0]
++
++
++def _finished(caplog):
++    return [r.getMessage() for r in caplog.records if "tui turn finished" in r.getMessage()][-1]
++
++
++LEASE_MESSAGE = "Session turn lease could not be refreshed; stopping to protect the transcript."
++
++
++def test_lease_lost_interrupt_renders_a_visible_retryable_failure(emitted, caplog):
++    with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
++        session = _run({
++            "final_response": "", "messages": [], "interrupted": True, "completed": False,
++            "interrupt_issuer": "session_turn_lease_lost", "interrupt_message": LEASE_MESSAGE,
++        })
++    payload = _complete(emitted)
++    assert payload["status"] == "error"
++    assert payload["recoverable"] is True
++    assert "lost ownership of the session" in payload["text"]
++    assert LEASE_MESSAGE in payload["text"]
++    assert payload["error"] == LEASE_MESSAGE
++    assert payload["error_surface"]["code"] == "session_turn_lease_lost"
++    assert payload["error_surface"]["retryable"] is True
++    assert payload["error_surface"]["layer"] == "gateway"
++    # Retained for resume: a reload/reconnect still shows the failure.
++    assert session["inflight_turn"] is not None
++    msg = _finished(caplog)
++    assert "status=error" in msg and "error_retained=True" in msg
++
++
++def test_lease_lost_keeps_text_already_produced_as_a_partial(emitted):
++    _run({
++        "final_response": "Half of the answer", "messages": [], "interrupted": True,
++        "interrupt_issuer": "session_turn_lease_lost", "interrupt_message": LEASE_MESSAGE,
++    })
++    payload = _complete(emitted)
++    assert payload["status"] == "error"
++    assert payload["partial"] is True
++    assert payload["text"] == "Half of the answer"
++
++
++def test_a_human_stop_stays_a_silent_cancel(emitted, caplog):
++    """Control: no system issuer, so nothing changes for Stop / a new message."""
++    with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
++        _run({"final_response": "", "messages": [], "interrupted": True, "interrupt_message": "next msg"})
++    payload = _complete(emitted)
++    assert payload["status"] == "interrupted"
++    assert payload["text"] == ""
++    assert "error" not in payload
++    assert "status=interrupted" in _finished(caplog)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 0cc90dee8a..d99a18f208 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -313,6 +313,31 @@ def _result_status(result: dict) -> str:
+         else "error" if result.get("error") else "complete")
+ 
+ 
++# [daveey] System interrupts that must reach the user as a visible, retryable failure rather than a
++# silent "cancelled" turn: issuer slug (agent.interrupt_control.interrupt_issuer) -> failure_reason.
++_SURFACED_SYSTEM_INTERRUPTS = {"session_turn_lease_lost": "session_turn_lease_lost"}
++
++
++def _surface_system_interrupt(result: Any) -> None:
++    """Turn a lease-lost interrupt into a failed result, in place. Desktop renders an
++    ``interrupted`` turn with no text as nothing at all, so the user saw the agent simply stop. As a
++    failure, the turn gets the error card in the transcript, a retained inflight snapshot for
++    resume, and the row's error state. Text already produced is kept as a partial."""
++    if not isinstance(result, dict) or not result.get("interrupted") or result.get("error"):
++        return
++    reason = _SURFACED_SYSTEM_INTERRUPTS.get(str(result.get("interrupt_issuer") or ""))
++    if reason is None:
++        return
++    result["interrupted"] = False
++    result["failed"] = True
++    result["error"] = str(result.get("interrupt_message") or "Session turn lease lost.")
++    result["failure_reason"] = reason
++    result["failure_retryable"] = True
++    final_text = result.get("final_response")
++    if isinstance(final_text, str) and final_text.strip():
++        result["partial"] = True
++
++
+ def _turn_outcome(result: Any, error_surface: dict | None = None) -> tuple[Any, str, str | None]:
+     """Reduce a run_conversation result to ``(raw_text, status, last_reasoning)``."""
+     if not isinstance(result, dict):
+@@ -930,6 +955,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
+     """``(payload, raw, status)`` for message.complete; retains/clears the inflight turn and
+     settles the hosted-room terminal receipt."""
+     result, agent = st.result, st.agent
++    _surface_system_interrupt(result)
+     # Advisory {layer, code, retryable} descriptor; computed before the retain so resume
+     # replay carries the same one, and before the text so the fallback copy can use it.
+     _error_surface = None
+diff --git a/tui_gateway/user_messages.py b/tui_gateway/user_messages.py
+index 6e73065e99..09a7fb3482 100644
+--- a/tui_gateway/user_messages.py
++++ b/tui_gateway/user_messages.py
+@@ -33,6 +33,9 @@ _TURN_ERROR_CODE_COPY: dict[str, tuple[str, str]] = {
+     "format_error": ("The model provider rejected the request format", "Try /retry; if it persists, switch with /model."),
+     "ssl_cert_verification": ("The connection to the model provider could not be verified (TLS)",
+                               "Check the endpoint's certificate, then /retry."),
++    # [daveey] Not a provider verdict: the turn's session lease was lost (another owner claimed it).
++    "session_turn_lease_lost": ("Hermes stopped this turn because it lost ownership of the session",
++                                "Send /retry to run it again."),
+ }
+ 
+ _TURN_ERROR_LAYER_COPY: dict[str, tuple[str, str]] = {
+-- 
+2.55.0
+

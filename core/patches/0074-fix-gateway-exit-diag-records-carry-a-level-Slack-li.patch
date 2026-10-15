@@ -1,0 +1,403 @@
+From 687f63c0e90fb8b9b5dcc2702bc7ad68201f2807 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 19:08:27 -0700
+Subject: [PATCH] fix(gateway): exit-diag records carry a level; Slack list
+ failures log one line; closed-ws keepalive no longer logs a loop error
+
+- gateway-exit-diag.log: every record carries level (info for start/clean exit/SystemExit 0|75,
+  error for crashes and non-zero exits). A supervised restart (exit 75) was graded an error by
+  keyword-based log shippers on every hermes update. _make_exit_diag moves to
+  hermes_cli/gateway_exit_diag.py.
+- channel_directory: SlackApiError's two-line str() split one warning into two log records; the
+  second ('The server responded with: {...invalid_auth}') was shipped as an error.
+- tui_gateway.loop_noise: websockets' legacy keepalive awaits asyncio.shield(pong_waiter); on close
+  the keepalive is cancelled and abort_pings fails the waiter, which asyncio logs as
+  'ConnectionClosedOK exception in shielded future' at ERROR on every SSH-tunnel Desktop disconnect.
+  Collapsed to a debug line, gated on the shield message + ConnectionClosed.
+
+Burndown: hermes-gateway-mini
+Fingerprints: 2cba464bd093 cc6bfc982678 6d8fbc34332b c1676bd05722 9433ad9fc697 08091931d56b
+Fixes BB-59 BB-69 BB-76 BB-70 BB-71 BB-75
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/channel_directory.py                  |  5 +-
+ hermes_cli/gateway.py                         | 28 +------
+ hermes_cli/gateway_exit_diag.py               | 48 ++++++++++++
+ .../test_channel_directory_slack_errors.py    | 43 +++++++++++
+ tests/hermes_cli/test_gateway_exit_diag.py    | 56 ++++++++++++++
+ ...est_tui_gateway_loop_noise_ws_keepalive.py | 76 +++++++++++++++++++
+ tui_gateway/loop_noise.py                     | 23 +++++-
+ 7 files changed, 251 insertions(+), 28 deletions(-)
+ create mode 100644 hermes_cli/gateway_exit_diag.py
+ create mode 100644 tests/gateway/test_channel_directory_slack_errors.py
+ create mode 100644 tests/hermes_cli/test_gateway_exit_diag.py
+ create mode 100644 tests/tui_gateway/test_tui_gateway_loop_noise_ws_keepalive.py
+
+diff --git a/gateway/channel_directory.py b/gateway/channel_directory.py
+index 5653e7599c..2f2d5ae1d0 100644
+--- a/gateway/channel_directory.py
++++ b/gateway/channel_directory.py
+@@ -255,7 +255,10 @@ async def _slack_team_channels(team_id: str, client, seen_ids: set) -> list[dict
+             if not cursor:
+                 break
+     except Exception as e:
+-        _report_slack_failure(team_id, _slack_api_error_code(e), str(e))
++        # SlackApiError's str() spans two lines; a log line must stay one record for line-based shippers.
++        error_code = _slack_api_error_code(e)
++        detail = f"users.conversations failed: {error_code}" if error_code else " ".join(str(e).split())
++        _report_slack_failure(team_id, error_code, detail)
+     return channels
+ 
+ 
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 99be52478b..9a3c0dd716 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -4018,7 +4018,6 @@ from hermes_cli.gateway_launchd import (
+     wait_for_launchd_gateway_supervision,
+     launchd_status,
+ )
+-from datetime import UTC
+ 
+ 
+ # Cached launchd domain — probe once per process invocation.
+@@ -4531,30 +4530,6 @@ def _absorb_windows_console_controls() -> None:
+         pass
+ 
+ 
+-def _make_exit_diag():
+-    """``_exit_diag(tag, **extra)`` recorder writing ``logs/gateway-exit-diag.log`` — captures every way
+-    ``asyncio.run()`` can return, for chasing silent Windows gateway deaths. HERMES_GATEWAY_EXIT_DIAG=0 opts out."""
+-    from datetime import datetime as _dt, timezone as _tz
+-
+-    def _exit_diag(tag: str, **extra: object) -> None:
+-        if os.environ.get("HERMES_GATEWAY_EXIT_DIAG", "1") != "1":
+-            return
+-        try:
+-            from hermes_constants import get_hermes_home as _ghh
+-            log_dir = _ghh() / "logs"
+-            log_dir.mkdir(parents=True, exist_ok=True)
+-            line = {
+-                "ts": _dt.now(UTC).isoformat(), "tag": tag, "pid": os.getpid(),
+-                "python": sys.version.split()[0], "platform": sys.platform, **extra,
+-            }
+-            with open(log_dir / "gateway-exit-diag.log", "a", encoding="utf-8") as f:
+-                f.write(json.dumps(line, default=str) + "\n")
+-        except Exception:
+-            pass  # never let the diagnostic itself crash the gateway
+-
+-    return _exit_diag
+-
+-
+ def _respawn_storm_backoff() -> None:
+     """Portable app-level respawn-storm breaker (for supervisors without a floor). Defaults mirror
+     DEFAULT_CONFIG ``gateway.respawn_storm``; HERMES_GATEWAY_MAX_STARTS / HERMES_GATEWAY_START_WINDOW_S
+@@ -4648,7 +4623,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
+ 
+     import atexit as _atexit
+     import traceback as _traceback
+-    _exit_diag = _make_exit_diag()
++    from hermes_cli.gateway_exit_diag import make_exit_diag
++    _exit_diag = make_exit_diag()
+     _exit_diag(
+         "gateway.start", replace=replace, argv=sys.argv, stdin_is_tty=stdin_is_tty,
+         console_window_attached=_console_window_attached, detached=_gateway_detached_env(),
+diff --git a/hermes_cli/gateway_exit_diag.py b/hermes_cli/gateway_exit_diag.py
+new file mode 100644
+index 0000000000..1acf7d230e
+--- /dev/null
++++ b/hermes_cli/gateway_exit_diag.py
+@@ -0,0 +1,48 @@
++"""``logs/gateway-exit-diag.log``: one JSON line per way ``hermes gateway run`` starts and ends.
++
++Each record carries a ``level`` so log shippers grade it by intent rather than by its words: a
++supervised restart (exit 75 back to launchd/systemd after a SIGUSR1 drain, ``hermes update`` or
++``/restart``) is routine, while a crash or a non-zero exit is an error.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import sys
++from datetime import UTC, datetime
++
++_ERROR_TAGS = frozenset({"asyncio.run.exception", "gateway.exit_nonzero"})
++
++
++def _record_level(tag: str, extra: dict[str, object]) -> str:
++    if tag in _ERROR_TAGS:
++        return "error"
++    if tag == "asyncio.run.SystemExit":
++        from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
++        return "info" if extra.get("code") in (None, 0, GATEWAY_SERVICE_RESTART_EXIT_CODE) else "error"
++    return "info"
++
++
++def make_exit_diag():
++    """``_exit_diag(tag, **extra)`` recorder writing ``logs/gateway-exit-diag.log`` — captures every way
++    ``asyncio.run()`` can return, for chasing silent Windows gateway deaths. HERMES_GATEWAY_EXIT_DIAG=0 opts out."""
++
++    def _exit_diag(tag: str, **extra: object) -> None:
++        if os.environ.get("HERMES_GATEWAY_EXIT_DIAG", "1") != "1":
++            return
++        try:
++            from hermes_constants import get_hermes_home as _ghh
++            log_dir = _ghh() / "logs"
++            log_dir.mkdir(parents=True, exist_ok=True)
++            line = {
++                "ts": datetime.now(UTC).isoformat(), "tag": tag, "level": _record_level(tag, extra),
++                "pid": os.getpid(), "python": sys.version.split()[0], "platform": sys.platform, **extra,
++            }
++            with open(log_dir / "gateway-exit-diag.log", "a", encoding="utf-8") as f:
++                f.write(json.dumps(line, default=str) + "\n")
++        except Exception:  # health: allow BLE001 -- never let the diagnostic itself crash the gateway
++            logging.getLogger(__name__).debug("gateway exit diag write failed for %s", tag, exc_info=True)
++
++    return _exit_diag
+diff --git a/tests/gateway/test_channel_directory_slack_errors.py b/tests/gateway/test_channel_directory_slack_errors.py
+new file mode 100644
+index 0000000000..d6b18fdc7c
+--- /dev/null
++++ b/tests/gateway/test_channel_directory_slack_errors.py
+@@ -0,0 +1,43 @@
++"""A Slack channel-list failure logs ONE line.
++
++``SlackApiError.__str__`` is two lines ("The request to the Slack API failed. (url: ...)" then
++"The server responded with: {...}"). Logged verbatim, the second line lands in the log file with
++no timestamp or level, so line-oriented shippers file it as its own record and grade it by its
++words — an ``invalid_auth`` warning became an error-level issue (Baby Bear mini, BB-69/BB-76).
++"""
++
++import asyncio
++import logging
++import os
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++from gateway.channel_directory import _build_slack
++
++
++class _SlackApiError(Exception):
++    """Shape of ``slack_sdk.errors.SlackApiError``: multi-line str, ``response['error']``."""
++
++    def __init__(self, url: str, error: str):
++        self.response = {"ok": False, "error": error}
++        super().__init__(
++            f"The request to the Slack API failed. (url: {url}, status: 200)\n"
++            f"The server responded with: {self.response}"
++        )
++
++
++def test_slack_api_error_is_logged_on_one_line(tmp_path, caplog):
++    client = MagicMock()
++    client.users_conversations = AsyncMock(
++        side_effect=_SlackApiError("https://slack.com/api/users.conversations", "invalid_auth"))
++    adapter = SimpleNamespace(_team_clients={"T0TEAM": client})
++
++    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), \
++            caplog.at_level(logging.WARNING, logger="gateway.channel_directory"):
++        asyncio.run(_build_slack(adapter))
++
++    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
++    assert len(warnings) == 1
++    assert "\n" not in warnings[0]
++    assert "invalid_auth" in warnings[0]
++    assert "T0TEAM" in warnings[0]
+diff --git a/tests/hermes_cli/test_gateway_exit_diag.py b/tests/hermes_cli/test_gateway_exit_diag.py
+new file mode 100644
+index 0000000000..2ca53130b1
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_exit_diag.py
+@@ -0,0 +1,56 @@
++"""``logs/gateway-exit-diag.log`` records carry a ``level`` so log shippers grade them by intent.
++
++A supervised gateway restarts by exiting 75 (SIGUSR1 drain, ``hermes update``, ``/restart``); its
++``asyncio.run.SystemExit`` record used to carry only a traceback, which log shippers that grade
++JSON lines by keywords filed as an error on every routine restart (Baby Bear mini, BB-59).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
++from hermes_cli.gateway_exit_diag import make_exit_diag
++
++
++def _rows() -> list[dict]:
++    path = Path(os.environ["HERMES_HOME"]) / "logs" / "gateway-exit-diag.log"
++    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
++
++
++@pytest.mark.parametrize("code", [None, 0, GATEWAY_SERVICE_RESTART_EXIT_CODE])
++def test_planned_system_exit_is_info(code):
++    make_exit_diag()("asyncio.run.SystemExit", code=code, traceback="Traceback (most recent call last): ...")
++    assert _rows()[-1]["level"] == "info"
++
++
++@pytest.mark.parametrize("code", [1, 2, "fatal"])
++def test_failing_system_exit_is_error(code):
++    make_exit_diag()("asyncio.run.SystemExit", code=code, traceback="Traceback (most recent call last): ...")
++    assert _rows()[-1]["level"] == "error"
++
++
++@pytest.mark.parametrize(
++    ("tag", "level"),
++    [
++        ("gateway.start", "info"),
++        ("asyncio.run.returned", "info"),
++        ("gateway.exit_clean", "info"),
++        ("atexit.hook", "info"),
++        ("gateway.exit_nonzero", "error"),
++        ("asyncio.run.exception", "error"),
++    ],
++)
++def test_lifecycle_records_carry_their_level(tag, level):
++    make_exit_diag()(tag)
++    assert _rows()[-1]["level"] == level
++
++
++def test_opt_out_writes_nothing(monkeypatch):
++    monkeypatch.setenv("HERMES_GATEWAY_EXIT_DIAG", "0")
++    make_exit_diag()("gateway.start")
++    assert not (Path(os.environ["HERMES_HOME"]) / "logs" / "gateway-exit-diag.log").exists()
+diff --git a/tests/tui_gateway/test_tui_gateway_loop_noise_ws_keepalive.py b/tests/tui_gateway/test_tui_gateway_loop_noise_ws_keepalive.py
+new file mode 100644
+index 0000000000..24dd6a7afe
+--- /dev/null
++++ b/tests/tui_gateway/test_tui_gateway_loop_noise_ws_keepalive.py
+@@ -0,0 +1,76 @@
++"""A websocket that closes while uvicorn's keepalive awaits a pong is not a loop error.
++
++websockets' legacy protocol returns ``asyncio.shield(pong_waiter)`` from ``ping()``. When the
++connection closes, ``close_connection`` cancels the keepalive task (cancelling the shield's
++outer future) and ``abort_pings`` then sets ``ConnectionClosed`` on the inner waiter. asyncio's
++shield logs that as "ConnectionClosedOK exception in shielded future" at ERROR — on every Desktop
++SSH-tunnel disconnect, where the serve backend runs keepalive pings (Baby Bear mini, BB-70/71/75).
++"""
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from tui_gateway.loop_noise import install_loop_noise_filter
++
++websockets_exceptions = pytest.importorskip("websockets.exceptions")
++websockets_frames = pytest.importorskip("websockets.frames")
++
++
++def _closed_ok():
++    close = websockets_frames.Close(websockets_frames.CloseCode.NO_STATUS_RCVD, "")
++    return websockets_exceptions.ConnectionClosedOK(close, close, True)
++
++
++def _shielded_failure(loop: asyncio.AbstractEventLoop, exc: BaseException) -> None:
++    """Replay the keepalive sequence: await a shielded waiter, cancel the awaiter, then fail the waiter."""
++    async def scenario():
++        waiter = loop.create_future()
++
++        async def keepalive():
++            await asyncio.shield(waiter)
++
++        task = asyncio.ensure_future(keepalive())
++        await asyncio.sleep(0)
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        waiter.set_exception(exc)
++        waiter.cancel()  # abort_pings' no-op cancel on the already-done waiter
++        await asyncio.sleep(0)
++
++    loop.run_until_complete(scenario())
++
++
++@pytest.fixture
++def loop_with_capture():
++    loop = asyncio.new_event_loop()
++    forwarded: list[dict] = []
++    loop.set_exception_handler(lambda _loop, ctx: forwarded.append(ctx))
++    install_loop_noise_filter(loop)
++    try:
++        yield loop, forwarded
++    finally:
++        loop.close()
++
++
++def test_closed_websocket_in_shielded_keepalive_is_not_forwarded(loop_with_capture):
++    loop, forwarded = loop_with_capture
++    _shielded_failure(loop, _closed_ok())
++    assert forwarded == []
++
++
++def test_other_exception_in_shielded_future_still_forwarded(loop_with_capture):
++    loop, forwarded = loop_with_capture
++    _shielded_failure(loop, RuntimeError("real bug behind a shield"))
++    assert len(forwarded) == 1
++    assert isinstance(forwarded[0]["exception"], RuntimeError)
++
++
++def test_closed_websocket_outside_a_shield_still_forwarded(loop_with_capture):
++    loop, forwarded = loop_with_capture
++    ctx = {"message": "Task exception was never retrieved", "exception": _closed_ok()}
++    loop.call_exception_handler(ctx)
++    assert forwarded == [ctx]
+diff --git a/tui_gateway/loop_noise.py b/tui_gateway/loop_noise.py
+index 7ae41a9830..6d7bc8a811 100644
+--- a/tui_gateway/loop_noise.py
++++ b/tui_gateway/loop_noise.py
+@@ -5,7 +5,8 @@ operations, asyncio logs a traceback per pending ``_call_connection_lost`` callb
+ ``ConnectionResetError`` (WinError 10054), ``ConnectionAbortedError`` (10053) or ``BrokenPipeError``
+ (POSIX); one disconnect can emit 50+. They are the expected side effect of the peer hanging up
+ before our writes drained, so the handler here collapses exactly that class to one debug line and
+-forwards everything else to the previous handler unchanged.
++forwards everything else to the previous handler unchanged. The same goes for a websocket closing
++while the keepalive ping awaits its pong ("ConnectionClosedOK exception in shielded future").
+ """
+ 
+ from __future__ import annotations
+@@ -33,6 +34,23 @@ def _is_benign_teardown(context: dict[str, Any]) -> bool:
+     return marker in repr(context.get("callback")) or marker in repr(context.get("handle"))
+ 
+ 
++def _is_closed_websocket_in_shield(context: dict[str, Any]) -> bool:
++    """True for asyncio's "<exc> exception in shielded future" when <exc> is a closed websocket.
++
++    websockets' legacy keepalive awaits ``asyncio.shield(pong_waiter)``; on close the keepalive task
++    is cancelled first and ``abort_pings`` then fails the waiter with ``ConnectionClosed`` — the
++    normal end of a pinged connection (SSH-tunnel Desktop backends), not a loop error. Gated on the
++    shield message so a ConnectionClosed escaping anywhere else still reaches the default handler.
++    """
++    if "exception in shielded future" not in str(context.get("message") or ""):
++        return False
++    try:
++        from websockets.exceptions import ConnectionClosed
++    except ImportError:
++        return False
++    return isinstance(context.get("exception"), ConnectionClosed)
++
++
+ def install_loop_noise_filter(loop: asyncio.AbstractEventLoop) -> None:
+     """Chain a teardown-noise filter ahead of the loop's existing handler.
+ 
+@@ -47,6 +65,9 @@ def install_loop_noise_filter(loop: asyncio.AbstractEventLoop) -> None:
+         if _is_benign_teardown(context):
+             _log.debug("ws peer hangup during teardown (suppressed): %s", context.get("exception"))
+             return
++        if _is_closed_websocket_in_shield(context):
++            _log.debug("ws closed while keepalive awaited a pong (suppressed): %s", context.get("exception"))
++            return
+         if previous is not None:
+             previous(loop, context)
+         else:
+-- 
+2.55.0
+

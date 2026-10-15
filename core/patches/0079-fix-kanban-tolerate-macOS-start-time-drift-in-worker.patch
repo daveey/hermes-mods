@@ -1,0 +1,183 @@
+From b4a68bfe18b9a5536330ab80223d67874b872f33 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 20:46:01 -0700
+Subject: [PATCH] fix(kanban): tolerate macOS start-time drift in worker
+ liveness fingerprint [daveey]
+
+_pid_recycled compared the '<epoch>|<start>' fingerprint as an exact string.
+On macOS the psutil start time follows kern.boottime, which moves on
+sleep/wake and clock sync. A restarted gateway's dispatcher read live workers
+1.00s off their spawn stamp, booked 16 of them crashed in one tick, blocked
+the cards as a systemic failure, and respawned duplicates beside them.
+
+Compare the instantiation epoch exactly and the start time within
+START_TIME_DRIFT_TOLERANCE (2s), as gateway.status already does for other
+liveness checks. Tests simulate a gateway restart with live workers (cards
+stay running, no respawn) plus controls for a really dead worker and a PID
+recycled well outside the tolerance.
+---
+ hermes_cli/kanban_db_dispatch.py              |  24 +++-
+ .../test_kanban_gateway_restart_liveness.py   | 107 ++++++++++++++++++
+ 2 files changed, 127 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_gateway_restart_liveness.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 7ae9f4dcfc..63510423dc 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -398,19 +398,35 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
+     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
+     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
+     recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
+-    boot witness was added) compares the start time only."""
++    boot witness was added) compares the start time only.
++
++    [daveey] The start times are compared within ``START_TIME_DRIFT_TOLERANCE`` (2 s), not exactly. On
++    macOS the psutil start time follows ``kern.boottime``, which moves on sleep/wake and clock sync. A
++    restarted gateway read every live worker 1.00 s off its spawn stamp, booked all of them crashed in
++    one tick, blocked their cards as a "systemic" failure, and respawned duplicates beside them. The
++    instantiation epoch is still compared exactly, so a row that survived a reboot stays foreign."""
+     if started_at is None or not pid:
+         return False
+     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
+         return True
++    from gateway.status import get_process_start_time, start_time_fingerprints_match
+     if isinstance(started_at, str) and "|" in started_at:
+-        return _process_fingerprint(int(pid)) != started_at
+-    from gateway.status import _start_times_agree, get_process_start_time
++        current_fp = _process_fingerprint(int(pid))
++        if current_fp is None:
++            return True
++        rec_epoch, _, rec_start = started_at.partition("|")
++        cur_epoch, _, cur_start = current_fp.partition("|")
++        if rec_epoch != cur_epoch:
++            return True
++        try:
++            return not start_time_fingerprints_match(rec_start, cur_start)
++        except (TypeError, ValueError):
++            return current_fp != started_at
+     current = get_process_start_time(int(pid))
+     if current is None:
+         return True
+     try:
+-        return not _start_times_agree(current, started_at)
++        return not start_time_fingerprints_match(started_at, current)
+     except (TypeError, ValueError):
+         return True
+ 
+diff --git a/tests/hermes_cli/test_kanban_gateway_restart_liveness.py b/tests/hermes_cli/test_kanban_gateway_restart_liveness.py
+new file mode 100644
+index 0000000000..222b95818d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gateway_restart_liveness.py
+@@ -0,0 +1,107 @@
++"""A gateway restart must not make live kanban workers look crashed.
++
++Observed on macOS: the dispatcher stamps each worker with ``"<epoch>|<start>"`` where ``<start>`` is
++``psutil.Process.create_time()`` in centiseconds. That value moves when ``kern.boottime`` is adjusted
++(sleep/wake, clock sync). The dispatcher in the restarted gateway then read every live worker's start
++time 1.00 s off the spawn-time stamp, and an exact string compare called them all "recycled", so dead.
++Sixteen live workers were booked ``crashed`` in one tick. Because there were three or more identical
++errors, the breaker treated it as systemic and blocked the cards. A respawn then started a duplicate
++worker next to each original.
++"""
++
++import os
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _running_task(conn, pid: int) -> str:
++    """A task claimed long ago whose live worker ``pid`` was fingerprinted at spawn."""
++    tid = kb.create_task(conn, title="job", assignee="worker")
++    kb.claim_task(conn, tid)
++    kbd._set_worker_pid(conn, tid, pid)
++    old = int(time.time()) - 3 * 3600
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (old, tid))
++    return tid
++
++
++def _restart_gateway_with_start_time_drift(monkeypatch, drift_centis: int) -> None:
++    """Model the restarted gateway's dispatcher: it reads start times shifted by ``drift_centis``."""
++    from gateway import status
++
++    real = status._get_process_start_time
++    def drifted(pid):
++        value = real(pid)
++        return None if value is None else value + drift_centis
++
++    monkeypatch.setattr(status, "_get_process_start_time", drifted)
++    kbd._recent_worker_exits.clear()  # a new process has reaped nothing
++
++
++def test_gateway_restart_leaves_live_workers_running_and_unblocked(board, monkeypatch):
++    conn = board
++    pid = os.getpid()  # alive for the whole test
++    tids = [_running_task(conn, pid) for _ in range(3)]  # 3+ identical errors would trip as systemic
++    stamped = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tids[0],)).fetchone()[0]
++    assert isinstance(stamped, str) and "|" in stamped
++
++    _restart_gateway_with_start_time_drift(monkeypatch, drift_centis=100)  # the observed 1.00 s
++
++    assert kbd._worker_alive(pid, stamped) is True
++    assert kbd.detect_crashed_workers(conn) == []
++    assert getattr(kbd.detect_crashed_workers, "_last_auto_blocked", []) == []
++    for tid in tids:
++        task = kb.get_task(conn, tid)
++        assert task.status == "running" and task.worker_pid == pid
++        kinds = {e.kind for e in kb.list_events(conn, tid)}
++        assert not kinds & {"crashed", "gave_up", "blocked"}
++
++    # A full dispatcher tick in the restarted gateway: no crash, no respawn of a duplicate.
++    spawned = []
++    res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
++    assert res.crashed == [] and res.auto_blocked == []
++    assert spawned == []
++    assert all(kb.get_task(conn, t).status == "running" for t in tids)
++
++
++def test_gateway_restart_still_reclaims_a_really_dead_worker(board, monkeypatch):
++    """Control: tolerance must not keep a claim alive for a worker that actually exited."""
++    conn = board
++    import subprocess
++    import sys
++
++    child = subprocess.Popen([sys.executable, "-c", "pass"])
++    tid = _running_task(conn, child.pid)
++    child.wait()
++    _restart_gateway_with_start_time_drift(monkeypatch, drift_centis=100)
++
++    assert tid in kbd.detect_crashed_workers(conn)
++    assert kb.get_task(conn, tid).worker_pid is None
++
++
++def test_pid_recycled_beyond_drift_tolerance_is_still_foreign(board, monkeypatch):
++    """Control: a live PID whose start time differs by far more than clock drift is a stranger."""
++    conn = board
++    pid = os.getpid()
++    tid = _running_task(conn, pid)
++    stamped = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    _restart_gateway_with_start_time_drift(monkeypatch, drift_centis=60 * 100)  # a minute apart
++
++    assert kbd._worker_alive(pid, stamped) is False
++    assert tid in kbd.detect_crashed_workers(conn)
+-- 
+2.55.0
+

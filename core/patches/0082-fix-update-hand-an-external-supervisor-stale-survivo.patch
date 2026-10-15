@@ -1,0 +1,174 @@
+From 0f103cb27db6b8ae3e0e9e0996a711923e91e8d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 08:22:58 -0700
+Subject: [PATCH] fix(update): hand an --external-supervisor stale survivor
+ back to its supervisor [daveey]
+
+signal_stale_fleet_survivors counted any non-service pid as manual, so a
+gateway run with --external-supervisor (custom launchd label) was marked
+stopped_unmapped: 'Restart manually' plus a false gateway_restart
+follow-up although launchd relaunched it. Credit it to
+externally_supervised_profiles, and map the identify 'external'
+supervisor to an external-supervisor restart mechanism in the plan.
+---
+ hermes_cli/update_cmd_stale_survivors.py      | 11 ++-
+ hermes_cli/update_inventory.py                |  3 +
+ ...date_stale_survivor_external_supervisor.py | 93 +++++++++++++++++++
+ 3 files changed, 106 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_update_stale_survivor_external_supervisor.py
+
+diff --git a/hermes_cli/update_cmd_stale_survivors.py b/hermes_cli/update_cmd_stale_survivors.py
+index d70c408117..3232abf19a 100644
+--- a/hermes_cli/update_cmd_stale_survivors.py
++++ b/hermes_cli/update_cmd_stale_survivors.py
+@@ -41,6 +41,8 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
+         service_pids = set(_get_service_pids(all_profiles=True))
+     except Exception:
+         service_pids = set()
++    from hermes_cli import gateway_supervised_restart
++
+     labels = {row.get("pid"): str(row.get("profile") or "gateway") for row in fleet if isinstance(row, dict)}
+     print()
+     print(f"  ⚠ {len(pids)} gateway process(es) still run the pre-update code — requesting a restart")
+@@ -49,10 +51,17 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
+     for pid in pids:
+         label = f"{labels.get(pid, 'gateway')} (PID {pid})"
+         try:
++            # Read before the signal: the declaration comes from the live process.
++            external = pid not in service_pids and gateway_supervised_restart.gateway_declares_external_supervisor(pid)
+             if _drain_or_signal_gateway_for_update(pid, drain_budget, label):
+                 signalled.append(pid)
+                 restart.killed_pids.add(pid)
+-                if pid not in service_pids:
++                if external:
++                    # `gateway run --external-supervisor`: its own KeepAlive manager relaunches it,
++                    # so it is handed back, not owed a manual restart.
++                    restart.externally_supervised_profiles.append(labels.get(pid, "default"))
++                    print(f"  ✓ {label}: handed back to its external supervisor")
++                elif pid not in service_pids:
+                     manual.append(pid)
+         except Exception as exc:
+             logger.warning("Could not signal stale gateway PID %s: %s", pid, exc)
+diff --git a/hermes_cli/update_inventory.py b/hermes_cli/update_inventory.py
+index 4a772082b3..1b1689bc0a 100644
+--- a/hermes_cli/update_inventory.py
++++ b/hermes_cli/update_inventory.py
+@@ -86,6 +86,8 @@ _RESTART_MECHANISMS = {
+     "systemd": "systemd", "launchd": "launchd", "desktop": "desktop",
+     "windows-service": "windows-service", "manual-serve": "respawn-argv",
+     "desktop-ssh": "desktop-ssh",
++    # Self-declared by `gateway run --external-supervisor` (control-socket identify).
++    "external": "external-supervisor",
+ }
+ 
+ _MECHANISM_DESCRIPTIONS = {
+@@ -95,6 +97,7 @@ _MECHANISM_DESCRIPTIONS = {
+     "windows-service": "sc.exe stop before venv mutation, sc.exe start after update",
+     "respawn-argv": "stop before code swap, relaunch with recorded launch args",
+     "desktop-ssh": "the remote Desktop that spawned it over SSH respawns it when it reconnects",
++    "external-supervisor": "SIGUSR1 drain, exits 75 back to its own supervisor (custom launchd/systemd), which relaunches it",
+ }
+ 
+ _SERVE_KINDS = ("serve", "dashboard")
+diff --git a/tests/hermes_cli/test_update_stale_survivor_external_supervisor.py b/tests/hermes_cli/test_update_stale_survivor_external_supervisor.py
+new file mode 100644
+index 0000000000..9d5a86c3ff
+--- /dev/null
++++ b/tests/hermes_cli/test_update_stale_survivor_external_supervisor.py
+@@ -0,0 +1,93 @@
++"""A stale gateway that declares an external supervisor is handed back, not "stopped".
++
++``hermes update``'s restart phase can miss a gateway (its process matcher found no PID), and the
++verify phase then SIGUSR1s the proven-stale survivor. A gateway launched as ``gateway run
++--external-supervisor`` (a custom launchd KeepAlive agent) exits 75 and its supervisor relaunches
++it on the new code. Counting it as a manual gateway "stopped without a successor" armed an owed
++restart that a later CLI start retried, so every update restarted the gateway twice and the
++update reported "Restart manually: hermes gateway run" for a gateway that was already back.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import io
++import os
++import signal
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
++from hermes_cli.update_inventory import _restart_mechanism, describe_restart_mechanism
++
++
++def _outcome(pid: int) -> _GatewayRestartOutcome:
++    return _GatewayRestartOutcome(
++        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[pid], restarted_services=[],
++        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
++    )
++
++
++@contextlib.contextmanager
++def _sigusr1_child():
++    child = subprocess.Popen(
++        [sys.executable, "-c",
++         "import signal, sys, time\n"
++         "signal.signal(signal.SIGUSR1, lambda *_: sys.exit(75))\n"
++         "print('ready', flush=True)\n"
++         "time.sleep(120)"],
++        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
++    )
++    try:
++        assert child.stdout.readline().strip() == "ready"
++        yield child
++    finally:
++        if child.poll() is None:
++            child.kill()
++            child.wait()
++        child.stdout.close()
++
++
++def _signal(child, monkeypatch, declares_external: bool):
++    from hermes_cli import gateway_supervised_restart
++    from hermes_cli.update_cmd_stale_survivors import signal_stale_fleet_survivors
++
++    monkeypatch.setattr(gateway_supervised_restart, "gateway_declares_external_supervisor",
++                        lambda pid, home=None: declares_external and pid == child.pid)
++    restart = _outcome(child.pid)
++    fleet = [{"profile": "default", "pid": child.pid, "state": "stale", "code_sha": "a" * 40}]
++    out = io.StringIO()
++    with contextlib.redirect_stdout(out):
++        signalled = signal_stale_fleet_survivors(fleet, restart, 10.0)
++    assert child.wait(timeout=15) == 75
++    return restart, signalled, out.getvalue()
++
++
++@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="POSIX drain-first restart signal")
++def test_externally_supervised_survivor_is_handed_back_not_owed(monkeypatch):
++    with _sigusr1_child() as child:
++        restart, signalled, output = _signal(child, monkeypatch, declares_external=True)
++
++    assert signalled == [child.pid]
++    assert restart.killed_pids == {child.pid}
++    assert restart.stopped_unmapped_pids == set()
++    assert restart.externally_supervised_profiles == ["default"]
++    assert "Restart manually" not in output
++
++
++@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="POSIX drain-first restart signal")
++def test_unsupervised_survivor_is_still_owed_a_manual_restart(monkeypatch):
++    with _sigusr1_child() as child:
++        restart, _signalled, output = _signal(child, monkeypatch, declares_external=False)
++
++    assert restart.stopped_unmapped_pids == {child.pid}
++    assert restart.externally_supervised_profiles == []
++    assert "Restart manually" in output
++
++
++def test_self_declared_external_supervisor_plans_a_hand_back_not_manual():
++    mechanism = _restart_mechanism("external", "default")
++    assert mechanism != "manual"
++    assert "supervisor" in describe_restart_mechanism(mechanism, "default")
+-- 
+2.55.0
+

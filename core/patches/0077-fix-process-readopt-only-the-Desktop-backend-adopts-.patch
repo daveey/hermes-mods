@@ -1,0 +1,164 @@
+From aafa7c61ee29b790eaa61195c8dfd6a617433cb8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 19:46:01 -0700
+Subject: [PATCH] fix(process-readopt): only the Desktop backend adopts chat
+ jobs; an unknown exit wakes its chat [daveey]
+
+The launchd `hermes dashboard` runs the same web_server lifespan, booted 3 s before the
+Desktop serve backend, won the checkpoint lock and adopted chat 20261014_142820_ff330a's job
+(proc_48f7d096bd6b). Its exit at 18:31:30 was queued in a process with no chats and no
+pollers, so it never reached the chat. Now only a Desktop-owned backend adopts, and its
+unknown-exit sink parks the event for the owner chat and, when that chat is not open,
+resumes it in-process (as the startup-resume sweep does) so its poller runs the turn.
+---
+ hermes_cli/web_server.py             |  4 +-
+ tools/process_registry_readopt.py    | 26 ++++++++++--
+ tui_gateway/session_notifications.py | 59 ++++++++++++++++++++++++++++
+ 3 files changed, 85 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 7a06a4ca23..55961b5417 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -257,7 +257,9 @@ async def _lifespan(app: FastAPI):
+     try:
+         from tools.process_registry_readopt import start_checkpoint_keeper, start_tui_orphan_recovery
+ 
+-        start_tui_orphan_recovery()
++        if is_desktop_owned_backend():  # a `hermes dashboard` hosts no chats: it must not adopt their jobs
++            tui_gateway.server._install_readopted_exit_waker()
++            start_tui_orphan_recovery()
+         start_checkpoint_keeper()
+     except Exception:
+         _log.warning("background process re-adoption did not start", exc_info=True)
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index d7765052e3..fa47bc080c 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -16,8 +16,10 @@ gateway's shutdown ``kill_all`` cannot kill a Desktop chat's job.
+ A re-adopted process has no pipe, so its exit status is never collected. When the
+ PID disappears, a ``completion`` with ``completion_reason="unknown"`` is queued
+ for the owning session ("exited (status unknown — re-adopted after restart)").
+-If that chat is not open in this backend, the poller parks the event instead of
+-dropping it, and the chat's own poller picks it up once the chat is resumed.
++The Desktop host (tui_gateway ``_readopted_exit_deliver``) parks the event for the
++chat's own poller and, when the chat is not open in this backend, resumes it in-process
++(like the startup-resume sweep) so the exit runs a turn without the user opening it.
++Only a Desktop-owned backend adopts: a ``hermes dashboard`` has no chats to deliver to.
+ """
+ 
+ from __future__ import annotations
+@@ -66,6 +68,9 @@ class ProcessReadoptMixin:
+ 
+     _detached_sweep_thread: Optional[threading.Thread] = None
+     _parked_events: Optional[list] = None
++    # Desktop host delivery for an unknown exit (tui_gateway ``_readopted_exit_deliver``): park it for the owner
++    # chat and wake that chat when it is not open. None = the bare completion queue (CLI/tests). [daveey]
++    on_unknown_exit: Optional[Callable[[dict[str, Any]], Any]] = None
+ 
+     # ----- unknown-exit completion -----
+ 
+@@ -90,7 +95,15 @@ class ProcessReadoptMixin:
+         from tools.process_registry import _redact_process_result
+         event = self._unknown_exit_event(session)
+         _redact_process_result(event)
+-        self.completion_queue.put(event)
++        sink = self.on_unknown_exit
++        if sink is None:
++            self.completion_queue.put(event)
++        else:
++            try:
++                sink(event)
++            except Exception:
++                logger.warning("unknown-exit delivery hook failed; queueing %s instead", session.id, exc_info=True)
++                self.completion_queue.put(event)
+         logger.info("Re-adopted process %s (pid=%s) exited; status unknown — notifying %s",
+                     session.id, session.pid, session.session_key)
+ 
+@@ -192,6 +205,13 @@ def _safe_owns(owns: Callable[[dict[str, Any]], bool], evt: dict[str, Any]) -> b
+ def recover_tui_orphaned_processes(registry=None, *, sweep_interval: float = DETACHED_SWEEP_SECONDS) -> int:
+     """Desktop/TUI backend startup: adopt this host's orphaned Desktop-chat processes and
+     supervise them until they exit. Never raises."""
++    # Only the backend Desktop spawned hosts chats. A launchd ``hermes dashboard`` runs the same web_server
++    # lifespan and, booting first, won the checkpoint lock: the exit then landed in a process with no chat and
++    # no poller and was lost (18:31 PDT 2026-10-14, session 20261014_142820_ff330a). [daveey]
++    from hermes_cli.process_identity import is_desktop_owned_backend
++    if not is_desktop_owned_backend():
++        logger.debug("not a Desktop-owned backend: leaving orphaned chat processes for the Desktop backend")
++        return 0
+     if registry is None:
+         from tools.process_registry import process_registry as registry
+     try:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index d05c193a85..d139d6115e 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -752,6 +752,65 @@ def _notif_take_parked(sid, session, registry, handle) -> int:
+         return 0
+ 
+ 
++def _readopted_exit_deliver(evt: dict, *, registry=None):
++    """``ProcessRegistry.on_unknown_exit`` in a Desktop backend: park a re-adopted job's exit for its chat's
++    poller, and when that chat is not open here, resume it in-process (as the startup-resume sweep does) so its
++    poller takes the event and runs the completion turn. Returns the wake thread, or None. [daveey]"""
++    if registry is None:
++        from tools.process_registry import process_registry as registry
++    registry.park_unowned_event(evt)
++    key = str(evt.get("session_key") or "")
++    if not key or _notif_live_session_matches({key, _notif_resolve_event_key(key)}):
++        return None  # open here: its poller takes the parked event within _PARKED_POLL_SECONDS
++    t = threading.Thread(target=_wake_chat_for_readopted_exit, args=(key,), daemon=True,
++                         name=f"readopt-wake-{key[-6:]}")
++    t.start()
++    return t
++
++
++def _readopt_wake_profiles() -> list:
++    """Launch store first, then each named profile with a state.db (a checkpoint entry records no profile)."""
++    from hermes_constants import get_hermes_home
++    out: list = [None]
++    with contextlib.suppress(Exception):
++        root = Path(get_hermes_home()) / "profiles"
++        out += sorted(p.name for p in root.iterdir() if (p / "state.db").is_file())
++    return out
++
++
++def _wake_chat_for_readopted_exit(key: str):
++    """Resume chat ``key`` detached in this backend; returns the profile it resumed under (None = launch), or
++    None when no store has it or the resume was refused (e.g. open in another backend). Never raises."""
++    import itertools as _it
++    handler = _methods.get("session.resume")
++    if handler is None:
++        logger.warning("readopt wake: session.resume not installed; %s waits until it is opened", key)
++        return None
++    for n, profile in zip(_it.count(1), _readopt_wake_profiles()):
++        params = {"session_id": key, "omit_messages": True, **({"profile": profile} if profile else {})}
++        try:
++            env = handler(f"readopt-wake-{n}", params) or {}
++        except Exception:
++            logger.warning("readopt wake of %s failed", key, exc_info=True)
++            return None
++        err = env.get("error") if isinstance(env, dict) else None
++        if not err:
++            logger.info("Woke chat %s (profile=%s) for its re-adopted job's exit", key, profile or "default")
++            return profile
++        if not (isinstance(err, dict) and err.get("code") == 4007):
++            logger.warning("readopt wake of %s refused (%s); the exit stays parked until it is opened here", key, err)
++            return None
++    logger.warning("readopt wake: chat %s not found in any profile store", key)
++    return None
++
++
++def _install_readopted_exit_waker(registry=None) -> None:
++    """Desktop backend boot: route re-adopted jobs' unknown exits through ``_readopted_exit_deliver``."""
++    if registry is None:
++        from tools.process_registry import process_registry as registry
++    registry.on_unknown_exit = lambda evt: _readopted_exit_deliver(evt, registry=registry)
++
++
+ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
+     with _session_profile_runtime_scope(session):
+         _notification_poller_scoped_loop(stop_event, sid, session)
+-- 
+2.55.0
+

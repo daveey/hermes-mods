@@ -1,0 +1,144 @@
+From 6fb66a5af032c9341e09de523d28ade783c2e4ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:56:04 -0700
+Subject: [PATCH] fix(process): Desktop backend re-asserts its live jobs in
+ processes.json every 30s after a pre-update writer drops them [daveey]
+
+A kanban worker or CLI still on pre-merge code overwrites the shared checkpoint with
+only its own entries. That erased a Desktop chat's notify watcher, so a later backend
+restart could not re-adopt it and the chat painted green with nothing to wake it.
+reassert_checkpoint() rewrites only when an own live id is missing; the serve backend
+runs it on a 30s keeper thread.
+---
+ hermes_cli/web_server.py                      |  3 +-
+ .../tools/test_process_orphan_readopt_tui.py  | 19 ++++++++++++
+ tools/process_registry_checkpoint.py          | 30 +++++++++++++++++++
+ tools/process_registry_readopt.py             | 28 +++++++++++++++++
+ 4 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 12368466b3..7a06a4ca23 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -255,9 +255,10 @@ async def _lifespan(app: FastAPI):
+     # Re-adopt background jobs a previous backend's chats left running (orphans of a Desktop
+     # restart) and wake each chat when its job exits (tools/process_registry_readopt.py). [daveey]
+     try:
+-        from tools.process_registry_readopt import start_tui_orphan_recovery
++        from tools.process_registry_readopt import start_checkpoint_keeper, start_tui_orphan_recovery
+ 
+         start_tui_orphan_recovery()
++        start_checkpoint_keeper()
+     except Exception:
+         _log.warning("background process re-adoption did not start", exc_info=True)
+ 
+diff --git a/tests/tools/test_process_orphan_readopt_tui.py b/tests/tools/test_process_orphan_readopt_tui.py
+index 6d081dc3d9..9f1f768b66 100644
+--- a/tests/tools/test_process_orphan_readopt_tui.py
++++ b/tests/tools/test_process_orphan_readopt_tui.py
+@@ -247,3 +247,22 @@ def test_messaging_gateway_and_desktop_backend_recover_with_their_owner_filter()
+     assert "recover_from_checkpoint()" not in gw
+     assert gw.count('recover_from_checkpoint(owner="gateway")') == 2
+     assert "start_tui_orphan_recovery()" in inspect.getsource(web_server)
++
++
++def test_reassert_checkpoint_restores_entries_a_foreign_writer_dropped(checkpoint, procs):
++    """A pre-update Hermes process overwrites processes.json with only its own entries; the
++    Desktop backend's keeper must put its live watcher back so a later restart re-adopts it. [daveey]"""
++    checkpoint.write_text(json.dumps([_entry("proc_tui", procs().pid, TUI_KEY)]))
++    registry = ProcessRegistry()
++    assert registry.recover_from_checkpoint(owner="tui") == 1
++    assert registry.reassert_checkpoint() is False  # nothing missing: no rewrite
++    checkpoint.write_text(json.dumps([{"session_id": "proc_foreign", "pid": 1, "pid_scope": "host"}]))
++    assert registry.reassert_checkpoint() is True
++    assert "proc_tui" in {e["session_id"] for e in json.loads(checkpoint.read_text())}
++    assert registry.reassert_checkpoint() is False
++
++
++def test_reassert_checkpoint_noop_without_live_sessions(checkpoint):
++    checkpoint.write_text("[]")
++    assert ProcessRegistry().reassert_checkpoint() is False
++    assert checkpoint.read_text() == "[]"
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index 32c577ec6a..a92e47f7c1 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -128,6 +128,36 @@ class ProcessCheckpointMixin:
+         from utils import atomic_json_write
+         atomic_json_write(_checkpoint_path(), entries)
+ 
++    def reassert_checkpoint(self) -> bool:
++        """Rewrite processes.json when it lacks one of this registry's live sessions; True if
++        it rewrote. Another Hermes process still on pre-merge code (a kanban worker or CLI
++        started before an update) overwrites the file with only its own entries, which drops
++        this backend's watchers: the sidebar's restart view and the next backend's re-adoption
++        both lose them, so the chat paints green and never wakes. [daveey]"""
++        from tools.process_registry import _checkpoint_path
++
++        with self._lock:
++            own = {s.id for s in self._running.values() if not s.exited}
++        if not own:
++            return False
++        try:
++            with self._checkpoint_file_lock():
++                try:
++                    existing = json.loads(_checkpoint_path().read_text(encoding="utf-8-sig"))
++                except Exception:
++                    existing = []
++                present = {e.get("session_id") for e in existing if isinstance(e, dict)} \
++                    if isinstance(existing, list) else set()
++                if own <= present:
++                    return False
++                self._write_checkpoint_locked()
++                logger.info("Re-wrote process checkpoint: another writer dropped %d live entr%s",
++                            len(own - present), "y" if len(own - present) == 1 else "ies")
++                return True
++        except Exception:
++            logger.debug("Checkpoint reassert failed", exc_info=True)
++            return False
++
+     def recover_from_checkpoint(self, owner: Optional[str] = None) -> int:
+         """On startup, probe PIDs from the checkpoint file; returns how many were
+         recovered as detached sessions.
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index 80fb662b9f..d7765052e3 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -154,6 +154,34 @@ class ProcessReadoptMixin:
+                         return
+ 
+ 
++CHECKPOINT_KEEPER_SECONDS = 30.0
++_keeper_lock = threading.Lock()
++_keeper_thread: Optional[threading.Thread] = None
++
++
++def start_checkpoint_keeper(registry=None, interval: float = CHECKPOINT_KEEPER_SECONDS) -> bool:
++    """Desktop backend: every *interval* s, put back any live entry another writer dropped from
++    processes.json (``reassert_checkpoint``). Idempotent; one file read per tick. [daveey]"""
++    global _keeper_thread
++    if registry is None:
++        from tools.process_registry import process_registry as registry
++
++    def _loop() -> None:
++        while True:
++            time.sleep(interval)
++            try:
++                registry.reassert_checkpoint()
++            except Exception:
++                logger.debug("checkpoint keeper tick failed", exc_info=True)
++
++    with _keeper_lock:
++        if _keeper_thread is not None and _keeper_thread.is_alive():
++            return False
++        _keeper_thread = threading.Thread(target=_loop, name="process-checkpoint-keeper", daemon=True)
++        _keeper_thread.start()
++    return True
++
++
+ def _safe_owns(owns: Callable[[dict[str, Any]], bool], evt: dict[str, Any]) -> bool:
+     try:
+         return bool(owns(evt))
+-- 
+2.55.0
+

@@ -1,0 +1,271 @@
+From 8ddd47bc79f8ebbfbe7d2b8d71167a492b161798 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:16:56 -0700
+Subject: [PATCH] fix(update): hand a wrapper-script launchd dashboard back to
+ its job [daveey]
+
+_loaded_launchd_backend_jobs only collects plists whose ProgramArguments
+parse as hermes dashboard/serve, so a job running a wrapper that execs
+the backend (bb-hermes redde-serve) was never seen: the update replayed
+the argv as a detached copy, raced the job's KeepAlive respawn, booked
+the runtime failed and left a gateway_restart follow-up on every receipt.
+Also attribute a backend to the job named by its own XPC_SERVICE_NAME,
+confirmed by launchctl print (live pid == pid or an ancestor). And
+capture the respawn argv via psutil on macOS: ps + shlex split the
+Hermes Python.app runpy bootstrap into a SyntaxError.
+---
+ hermes_cli/dashboard_procs.py                 |  10 +-
+ hermes_cli/main_dashboard.py                  |  44 +++++++
+ .../test_update_dashboard_launchd_wrapper.py  | 120 ++++++++++++++++++
+ .../hermes_cli/test_update_stale_dashboard.py |   4 +-
+ 4 files changed, 174 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_dashboard_launchd_wrapper.py
+
+diff --git a/hermes_cli/dashboard_procs.py b/hermes_cli/dashboard_procs.py
+index 9d33b23894..5c71e361fd 100644
+--- a/hermes_cli/dashboard_procs.py
++++ b/hermes_cli/dashboard_procs.py
+@@ -641,7 +641,11 @@ def _kill_stale_dashboard_processes(
+     launchd_jobs = _dash._loaded_launchd_backend_jobs() if sys.platform != "win32" else []
+ 
+     def _launchd_owner(pid: int, cmdline: list[str] | None):
+-        return _dash._launchd_job_owning_backend(pid, cmdline, launchd_jobs, ancestors=_process_ancestors(pid))
++        if sys.platform == "win32":
++            return None
++        ancestors = _process_ancestors(pid)
++        return (_dash._launchd_job_owning_backend(pid, cmdline, launchd_jobs, ancestors=ancestors)
++                if launchd_jobs else None) or _dash._launchd_job_from_launch_env(pid, ancestors)
+ 
+     if restart_managed and sys.platform != "win32":
+         for pid in pids:
+@@ -650,7 +654,7 @@ def _kill_stale_dashboard_processes(
+             if pid_service[pid]:
+                 continue
+             cmdline = _dash._dashboard_cmdline_for_pid(pid)
+-            if launchd_jobs and (job := _launchd_owner(pid, cmdline)):
++            if job := _launchd_owner(pid, cmdline):
+                 pid_launchd[pid] = job
+             elif cmdline:
+                 # Manual process: exact argv + HERMES_HOME for the respawn and its profile cap.
+@@ -664,7 +668,7 @@ def _kill_stale_dashboard_processes(
+                     not in already_restarted_units]
+             if not pids:
+                 return _empty_result()
+-    elif launchd_jobs:
++    elif sys.platform != "win32":
+         for pid in pids:
+             if job := _launchd_owner(pid, _dash._dashboard_cmdline_for_pid(pid)):
+                 pid_launchd[pid] = job
+diff --git a/hermes_cli/main_dashboard.py b/hermes_cli/main_dashboard.py
+index 4c28a906cf..a2d2cd2659 100644
+--- a/hermes_cli/main_dashboard.py
++++ b/hermes_cli/main_dashboard.py
+@@ -335,6 +335,40 @@ def _launchd_job_owning_backend(
+     return None
+ 
+ 
++def _launchd_job_from_launch_env(
++    pid: int, ancestors: list[int] | tuple[int, ...] = (),
++) -> tuple[str, str, int | None] | None:
++    """[daveey] ``(domain, label, live_pid)`` of the launchd job that spawned *pid*, read from the
++    process's own launch environment, or None.
++
++    ``_loaded_launchd_backend_jobs`` only collects plists whose ``ProgramArguments`` parse as a
++    ``hermes dashboard``/``serve`` command line, so a job running a wrapper script that ``exec``s the
++    backend (``ProgramArguments = [~/.bb-hermes/bin/redde-serve]``) was never seen: the update then
++    replayed the argv as a detached copy, raced the job's KeepAlive respawn and reported the
++    dashboard as not restarted. launchd stamps ``XPC_SERVICE_NAME=<label>`` on the job process; the
++    label counts only when ``launchctl print`` confirms the job is loaded with *pid* (or one of its
++    *ancestors*) as its live process, so an inherited or stale name never claims a process."""
++    if sys.platform != "darwin" or pid <= 1:
++        return None
++    from hermes_cli.dashboard_procs import _pid_environ
++    from hermes_cli.gateway import _launchd_print_service_pid
++
++    label = str((_pid_environ(pid) or {}).get("XPC_SERVICE_NAME") or "").strip()
++    if not label or label == "0":
++        return None
++    uid = os.getuid()  # windows-footgun: ok — darwin-only branch
++    for domain in (f"gui/{uid}", f"user/{uid}"):
++        try:
++            loaded, live_pid = _launchd_print_service_pid(domain, label)
++        except _SYSTEMCTL_ERRORS:
++            return None
++        if loaded:
++            if live_pid is not None and (live_pid == pid or live_pid in ancestors):
++                return (domain, label, live_pid)
++            return None
++    return None
++
++
+ def _restart_launchd_job(domain: str, label: str, old_pid: int | None, *, timeout: float = 15.0) -> bool:
+     """Bring a launchd-supervised backend back after its process was stopped: ``launchctl kickstart
+     <domain>/<label>`` (no ``-k`` — a KeepAlive job may already have respawned it, and a kill would
+@@ -362,6 +396,16 @@ def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
+                 raw = f.read()
+             argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\x00") if part]
+             return argv or None
++        # [daveey] psutil first: it returns the exact argv. ``ps -o command=`` + shlex re-splits a
++        # space-joined line, so a ``Hermes Python.app`` runpy bootstrap came back as
++        # ``['…/Hermes', 'Python.app/…', '-I', '-c', 'import', 'sys,', …]`` and its respawn died
++        # with a SyntaxError. ``ps`` stays for processes psutil may not read (another user's).
++        with contextlib.suppress(Exception):
++            import psutil  # type: ignore
++
++            exact = [str(part) for part in psutil.Process(pid).cmdline()]
++            if exact:
++                return exact
+         result = _run_probe(["ps", "-p", str(pid), "-o", "command="], timeout=10)
+         if result.returncode != 0:
+             return None
+diff --git a/tests/hermes_cli/test_update_dashboard_launchd_wrapper.py b/tests/hermes_cli/test_update_dashboard_launchd_wrapper.py
+new file mode 100644
+index 0000000000..558b9b6d2c
+--- /dev/null
++++ b/tests/hermes_cli/test_update_dashboard_launchd_wrapper.py
+@@ -0,0 +1,120 @@
++"""``hermes update`` must hand a launchd-owned dashboard back to its job even when the job's plist runs a
++wrapper script, and must capture a runpy-bootstrapped backend's argv exactly.
++
++The mini's ``com.daveey.hermes-redde-serve`` job runs ``~/.bb-hermes/bin/redde-serve``, which ``exec``s
++``hermes dashboard …``. ``_loaded_launchd_backend_jobs`` skips that plist (its ProgramArguments is not a
++dashboard command line), so the update replayed the backend's argv detached. That argv came from
++``ps -o command=`` + shlex, which split the ``Hermes Python.app`` path and the ``-c`` source, so the
++respawn died with a SyntaxError, the runtime was booked ``failed`` and the receipt kept a
++``gateway_restart`` follow-up, while launchd had already respawned the dashboard itself.
++"""
++
++import sys
++import types
++from unittest.mock import patch
++
++import pytest
++
++from hermes_cli import dashboard_procs, main_dashboard
++
++_PY = "/Users/me/Applications/Hermes Python.app/Contents/MacOS/python3.14"
++_SRC = (
++    "import sys, runpy; sys.path.insert(0, '/Users/me/code/hermes-agent'); "
++    "sys.argv = ['/Users/me/code/hermes-agent/.venv/bin/hermes', 'dashboard', '--port', '9119', '--no-open']; "
++    "runpy.run_path('/Users/me/code/hermes-agent/.venv/bin/hermes', run_name='__main__')"
++)
++ARGV = [_PY, "-I", "-c", _SRC]
++LABEL = "com.example.redde-serve"
++
++
++def _fake_psutil(argv=None, env=None):
++    proc = types.SimpleNamespace(cmdline=lambda: list(argv or []), environ=lambda: dict(env or {}))
++    return types.SimpleNamespace(Process=lambda pid: proc, pid_exists=lambda pid: False)
++
++
++@pytest.mark.platforms("macos")
++def test_cmdline_capture_keeps_exact_argv_of_spaced_runpy_backend(monkeypatch):
++    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(argv=ARGV))
++    with patch("subprocess.run", side_effect=AssertionError("ps must not be needed")):
++        assert main_dashboard._dashboard_cmdline_for_pid(4242) == ARGV
++
++
++@pytest.mark.platforms("macos")
++@pytest.mark.parametrize(
++    ("env", "print_result", "ancestors", "expected"),
++    [
++        ({"XPC_SERVICE_NAME": LABEL}, (True, 4242), (), True),
++        ({"XPC_SERVICE_NAME": LABEL}, (True, 77), (77, 1), True),  # exec-less wrapper: live pid is an ancestor
++        ({"XPC_SERVICE_NAME": LABEL}, (True, 999), (), False),  # job's live process is someone else
++        ({"XPC_SERVICE_NAME": LABEL}, (False, None), (), False),  # job not loaded
++        ({"XPC_SERVICE_NAME": "0"}, (True, 4242), (), False),
++        ({}, (True, 4242), (), False),
++    ],
++)
++def test_launchd_job_from_launch_env(monkeypatch, env, print_result, ancestors, expected):
++    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(env=env))
++    with patch("hermes_cli.gateway._launchd_print_service_pid", return_value=print_result):
++        job = main_dashboard._launchd_job_from_launch_env(4242, ancestors)
++    assert (job is not None) is expected
++    if expected:
++        assert job[1] == LABEL and job[2] == print_result[1]
++
++
++@pytest.mark.platforms("macos")
++def test_wrapper_script_launchd_dashboard_is_kickstarted_not_respawned(monkeypatch):
++    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(argv=ARGV, env={"XPC_SERVICE_NAME": LABEL}))
++
++    def _fake_kill(pid, sig):
++        if sig == 0:
++            raise ProcessLookupError
++
++    with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
++         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[4242]), \
++         patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
++         patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
++         patch.object(main_dashboard, "_loaded_launchd_backend_jobs", return_value=[]), \
++         patch("hermes_cli.gateway._launchd_print_service_pid", return_value=(True, 4242)), \
++         patch.object(main_dashboard, "_restart_launchd_job", return_value=True) as restart, \
++         patch.object(main_dashboard, "_respawn_dashboard_processes", return_value=[]) as respawn, \
++         patch("hermes_cli.dashboard_procs._process_ancestors", return_value=[1]), \
++         patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
++         patch("os.kill", side_effect=_fake_kill), \
++         patch("time.sleep"):
++        result = dashboard_procs._kill_stale_dashboard_processes(restart_managed=True)
++
++    respawn.assert_not_called()
++    restart.assert_called_once()
++    assert restart.call_args[0][1] == LABEL
++    assert result["killed"] == [4242] and result["unrecovered"] == []
++
++
++@pytest.mark.platforms("macos")
++def test_terminal_launched_dashboard_still_respawns_from_argv(monkeypatch):
++    """Control: a manual backend (XPC name of the launching terminal app, whose live pid is not
++    the backend) keeps the argv respawn."""
++    monkeypatch.setitem(
++        sys.modules, "psutil", _fake_psutil(argv=ARGV, env={"XPC_SERVICE_NAME": "application.com.example.term.1"})
++    )
++
++    def _fake_kill(pid, sig):
++        if sig == 0:
++            raise ProcessLookupError
++
++    with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
++         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[4242]), \
++         patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
++         patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
++         patch.object(main_dashboard, "_loaded_launchd_backend_jobs", return_value=[]), \
++         patch("hermes_cli.gateway._launchd_print_service_pid", return_value=(True, 555)), \
++         patch.object(main_dashboard, "_restart_launchd_job", return_value=True) as restart, \
++         patch.object(main_dashboard, "_respawn_dashboard_processes", return_value=[]) as respawn, \
++         patch("hermes_cli.dashboard_procs._process_ancestors", return_value=[1]), \
++         patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
++         patch("os.kill", side_effect=_fake_kill), \
++         patch("time.sleep"):
++        dashboard_procs._kill_stale_dashboard_processes(restart_managed=True)
++
++    restart.assert_not_called()
++    respawn.assert_called_once_with([ARGV])
++
++
+diff --git a/tests/hermes_cli/test_update_stale_dashboard.py b/tests/hermes_cli/test_update_stale_dashboard.py
+index 0d8118c574..8e974faed6 100644
+--- a/tests/hermes_cli/test_update_stale_dashboard.py
++++ b/tests/hermes_cli/test_update_stale_dashboard.py
+@@ -52,7 +52,8 @@ def _refresh_bindings_against_live_module():
+ def _no_real_launchd_jobs():
+     """The kill path now scans the host's launchd jobs on macOS; a developer's own LaunchAgents
+     must never leak into these tests. Tests that need jobs patch the scan themselves."""
+-    with patch.object(main_dashboard, "_loaded_launchd_backend_jobs", return_value=[]):
++    with patch.object(main_dashboard, "_loaded_launchd_backend_jobs", return_value=[]), \
++         patch.object(main_dashboard, "_launchd_job_from_launch_env", return_value=None):
+         yield
+ 
+ 
+@@ -813,6 +814,7 @@ class TestCmdlineCapture:
+             return MagicMock(returncode=0, stdout="hermes serve --port 8300\n", stderr="")
+ 
+         with patch.object(live.os.path, "exists", return_value=False), \
++             patch.dict(sys.modules, {"psutil": None}), \
+              patch("subprocess.run", side_effect=fake_run):
+             argv = main_dashboard._dashboard_cmdline_for_pid(888)
+ 
+-- 
+2.55.0
+

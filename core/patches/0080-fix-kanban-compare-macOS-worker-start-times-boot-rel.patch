@@ -1,0 +1,279 @@
+From a5b55ae2e4022ee160f87aeb29ebf83d21f7ed65 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 21:03:35 -0700
+Subject: [PATCH] fix(kanban): compare macOS worker start times boot-relative,
+ not just within 2s [daveey]
+
+b4a68bfe18 widened the worker liveness fingerprint compare to 2s, which covers
+the 1.00s kern.boottime re-anchor seen on 2026-10-14. A larger step (long
+sleep, manual clock set, big NTP correction) still shifts every live worker's
+psutil start time at once and books them all crashed.
+
+On macOS the fingerprint now also stamps kern.boottime: "|<start>@<boot>".
+A worker counts as the same process when the absolute start agrees within
+tolerance OR the boot-relative start (start - boot) does, so a re-anchor of
+any size is not a crash. A recycled PID started after ours died, so both
+offsets stay off by at least our worker's lifetime. Rows without the stamp
+keep the 2s compare; Linux (boot-relative ticks + boot epoch) is unchanged.
+
+Tests: 30s re-anchor keeps 3 live workers running (no crash, no breaker, no
+stale-claim release); recycled PID and dead worker still crash after a
+re-anchor; a dispatcher in a fresh process under a new claimer leaves a live
+`sleep` worker running with no respawn, and the worker completes its card
+with its run id.
+---
+ hermes_cli/kanban_db_dispatch.py              |  49 +++++-
+ .../test_kanban_worker_boottime_reanchor.py   | 157 ++++++++++++++++++
+ .../test_kanban_worker_pid_fingerprint.py     |   3 +-
+ 3 files changed, 206 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_worker_boottime_reanchor.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 63510423dc..4ebddd6854 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -376,7 +376,42 @@ def _process_fingerprint(pid: int) -> Optional[str]:
+     start = get_process_start_time(int(pid))
+     if start is None:
+         return None
+-    return f"{current_instantiation_epoch()}|{start}"
++    epoch = current_instantiation_epoch()
++    # [daveey] macOS: psutil's start time is ``kern.boottime`` + the process's uptime offset, so it
++    # moves whenever the kernel re-anchors boottime (sleep/wake, NTP step). Stamp the boottime read
++    # beside it ("<start>@<boottime>") so ``_pid_recycled`` can compare the boot-relative offset, which
++    # those adjustments leave unchanged. Linux ticks are already boot-relative (epoch is non-empty).
++    boot = None if epoch else _darwin_boottime_centis()
++    return f"{epoch}|{start}" if boot is None else f"{epoch}|{start}@{boot}"
++
++
++def _darwin_boottime_centis() -> Optional[int]:
++    """``kern.boottime`` in centiseconds (macOS only), or ``None`` when unavailable."""
++    if sys.platform != "darwin":
++        return None
++    try:
++        import ctypes
++        import ctypes.util
++
++        class _Timeval(ctypes.Structure):
++            _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int32)]
++
++        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
++        tv = _Timeval()
++        size = ctypes.c_size_t(ctypes.sizeof(tv))
++        if libc.sysctlbyname(b"kern.boottime", ctypes.byref(tv), ctypes.byref(size), None, 0) != 0:
++            return None
++        if tv.tv_sec <= 0:
++            return None
++        return int(tv.tv_sec) * 100 + int(tv.tv_usec) // 10_000
++    except Exception:
++        return None
++
++
++def _start_components(start: str) -> tuple[int, Optional[int]]:
++    """``"<start>[@<boottime>]"`` -> ``(start, boottime | None)``; raises ``ValueError`` on junk."""
++    abs_part, sep, boot_part = start.partition("@")
++    return int(abs_part), (int(boot_part) if sep else None)
+ 
+ 
+ def _worker_alive(pid: Optional[int], started_at) -> bool:
+@@ -419,9 +454,19 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
+         if rec_epoch != cur_epoch:
+             return True
+         try:
+-            return not start_time_fingerprints_match(rec_start, cur_start)
++            rec_abs, rec_boot = _start_components(rec_start)
++            cur_abs, cur_boot = _start_components(cur_start)
+         except (TypeError, ValueError):
+             return current_fp != started_at
++        # Same process when the absolute start agrees within drift tolerance (legacy rows, small NTP
++        # slews) OR, when both sides carry a boottime stamp, the boot-relative start agrees (any size of
++        # boottime re-anchor). A recycled PID started after ours died: both offsets are off by at least
++        # our worker's lifetime, so neither branch matches it.
++        if start_time_fingerprints_match(rec_abs, cur_abs):
++            return False
++        if rec_boot is not None and cur_boot is not None:
++            return not start_time_fingerprints_match(rec_abs - rec_boot, cur_abs - cur_boot)
++        return True
+     current = get_process_start_time(int(pid))
+     if current is None:
+         return True
+diff --git a/tests/hermes_cli/test_kanban_worker_boottime_reanchor.py b/tests/hermes_cli/test_kanban_worker_boottime_reanchor.py
+new file mode 100644
+index 0000000000..713c6a100c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_boottime_reanchor.py
+@@ -0,0 +1,157 @@
++"""Live workers survive a gateway restart and a ``kern.boottime`` re-anchor of any size.
++
++macOS reports a process start time as ``kern.boottime`` + the process's uptime offset, so a sleep/wake
++or NTP step moves every live worker's start time at once. The spawn fingerprint therefore carries the
++boottime read beside the start (``"|<start>@<boottime>"``); liveness compares the boot-relative offset,
++which the re-anchor leaves unchanged. A dispatcher in a different process (the restarted gateway, with
++a new claimer pid) must keep the live worker running, and that worker must still complete its card.
++"""
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++REPO = Path(__file__).resolve().parents[2]
++FAKE_BOOT = 179_126_347_110  # centiseconds; any stable value works
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++@pytest.fixture
++def macos_clock(monkeypatch):
++    """Model the macOS fingerprint (empty instantiation epoch + boottime stamp) on any platform.
++
++    ``shift(centis)`` re-anchors boottime: every start time AND the boottime read move together.
++    """
++    from gateway import drain_control, status
++
++    real_start = status._get_process_start_time
++    state = {"shift": 0}
++    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
++    monkeypatch.setattr(kbd, "_darwin_boottime_centis", lambda: FAKE_BOOT + state["shift"], raising=False)
++
++    def start(pid):
++        value = real_start(pid)
++        return None if value is None else value + state["shift"]
++
++    monkeypatch.setattr(status, "_get_process_start_time", start)
++
++    def shift(centis: int) -> None:
++        state["shift"] = centis
++        kbd._recent_worker_exits.clear()  # a restarted dispatcher has reaped nothing
++
++    return shift
++
++
++def _running(conn, pid: int, *, claimer: str) -> tuple[str, int]:
++    tid = kb.create_task(conn, title="job", assignee="worker")
++    kb.claim_task(conn, tid, claimer=claimer)
++    kbd._set_worker_pid(conn, tid, pid)
++    old = int(time.time()) - 3600
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (old, tid))
++    run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    return tid, run_id
++
++
++def _dead_claimer() -> str:
++    child = subprocess.Popen([sys.executable, "-c", "pass"])
++    child.wait()
++    return f"{kb._host_prefix()}{child.pid}"
++
++
++def test_fingerprint_carries_boottime_stamp(macos_clock):
++    fp = kbd._process_fingerprint(os.getpid())
++    assert fp is not None and fp.startswith("|") and fp.endswith(f"@{FAKE_BOOT}")
++
++
++def test_boottime_reanchor_beyond_tolerance_keeps_live_worker(board, macos_clock):
++    """A 30 s boottime step (well past the 2 s absolute tolerance) is not a crash."""
++    conn = board
++    tids = [_running(conn, os.getpid(), claimer=_dead_claimer())[0] for _ in range(3)]
++    stamped = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tids[0],)).fetchone()[0]
++    assert "@" in stamped
++
++    macos_clock(3000)
++    assert kbd._worker_alive(os.getpid(), stamped) is True
++    assert kbd.detect_crashed_workers(conn) == []
++    assert getattr(kbd.detect_crashed_workers, "_last_auto_blocked", []) == []
++    assert kb.release_stale_claims(conn) == 0
++    for tid in tids:
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_recycled_pid_is_still_foreign_after_reanchor(board, macos_clock):
++    """Control: a PID whose boot-relative start is a minute off is a stranger, re-anchor or not."""
++    conn = board
++    tid, _ = _running(conn, os.getpid(), claimer=_dead_claimer())
++    stamped = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    start, boot = kbd._start_components(stamped.split("|", 1)[1])
++    foreign = f"|{start - 6000}@{boot}"  # recorded process started 60 s before the live one
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?", (foreign, tid))
++
++    macos_clock(3000)
++    assert kbd._worker_alive(os.getpid(), foreign) is False
++    assert tid in kbd.detect_crashed_workers(conn)
++
++
++def test_dead_worker_is_still_crashed_after_reanchor(board, macos_clock):
++    conn = board
++    child = subprocess.Popen([sys.executable, "-c", "pass"])
++    tid, _ = _running(conn, child.pid, claimer=_dead_claimer())
++    child.wait()
++    macos_clock(3000)
++    assert tid in kbd.detect_crashed_workers(conn)
++    assert kb.get_task(conn, tid).worker_pid is None
++
++
++def test_restarted_dispatcher_in_another_process_adopts_live_worker(board, tmp_path):
++    """Process A spawned ``sleep`` under a now-dead claimer; dispatcher B (a fresh interpreter, new
++    claimer pid) sees it alive. The worker then completes its own card with its run id."""
++    conn = board
++    worker = subprocess.Popen(["sleep", "120"])
++    try:
++        tid, run_id = _running(conn, worker.pid, claimer=_dead_claimer())
++        script = textwrap.dedent(f"""
++            import json, sys
++            sys.path.insert(0, {str(REPO)!r})
++            from pathlib import Path
++            from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as kbd
++            conn = kbc.connect(Path({str(tmp_path / "kanban.db")!r}))
++            crashed = kbd.detect_crashed_workers(conn)
++            spawned = []
++            res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(1) or 1)
++            print(json.dumps({{"crashed": crashed, "tick_crashed": res.crashed, "spawned": len(spawned),
++                               "status": kb.get_task(conn, {tid!r}).status}}))
++        """)
++        out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120, check=False,
++                             env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
++        assert out.returncode == 0, out.stderr
++        report = json.loads(out.stdout.strip().splitlines()[-1])
++        assert report == {"crashed": [], "tick_crashed": [], "spawned": 0, "status": "running"}
++
++        assert kb.complete_task(conn, tid, summary="done", expected_run_id=run_id) is True
++        assert kb.get_task(conn, tid).status == "done"
++    finally:
++        worker.kill()
++        worker.wait()
+diff --git a/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py b/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
+index 28b4778bf4..51800bd0c3 100644
+--- a/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
++++ b/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
+@@ -89,7 +89,8 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
+     conn = board
+     killed = []
+     live_fingerprint = kbd._process_fingerprint(os.getpid())
+-    assert live_fingerprint is not None and live_fingerprint.split("|", 1)[1] == str(
++    # macOS appends "@<kern.boottime>" to the start time (boot-relative drift check).
++    assert live_fingerprint is not None and live_fingerprint.split("|", 1)[1].split("@")[0] == str(
+         __import__("gateway.status", fromlist=["x"]).get_process_start_time(os.getpid()))
+     tid = _claimed_running(conn, pid=os.getpid(), started_at=live_fingerprint, max_runtime=1)
+     assert kbd._worker_alive(os.getpid(), live_fingerprint) is True
+-- 
+2.55.0
+
