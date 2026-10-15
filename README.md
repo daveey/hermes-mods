@@ -80,6 +80,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [apple/macos-dock-management](skills/apple/macos-dock-management/) | The Dock shows dead `?` icons or stale pins. |
 | [autonomous-ai-agents/claude-usage-diagnostics](skills/autonomous-ai-agents/claude-usage-diagnostics/) | Claude usage runs out or sessions stick on 429s. |
 | [devops/cloud-service-decommission](skills/devops/cloud-service-decommission/) | Shutting down a hosted service to stop billing. |
+| [devops/github-ci-wait](skills/devops/github-ci-wait/) | Waiting for a pushed commit's GitHub CI or release: `wait_for_ci.py` waits on runs and tags that *contain* the commit, never the newest run (which a busy branch mostly cancels). |
 | [hermes-disk-plugin-backends](skills/hermes-disk-plugin-backends/) | Adding Hermes disk-plugin REST backends. |
 | [productivity/hermes-coach](skills/productivity/hermes-coach/) | Mine every host's Hermes sessions into redacted per-session digests in a private git repo, compute usage KPIs, and queue the most wasteful sessions for a coach Bot to label (rubric in `references/labeling.md`). `coach_mine.py --write-adoption` checks the coach plugin's curriculum against the digests (`reports/adoption.json`). |
 | [productivity/ambitious-requests](skills/productivity/ambitious-requests/) | Make a request more ambitious: the Altitude / Depth / Range lenses (goes with the prompt-coach plugin). |
