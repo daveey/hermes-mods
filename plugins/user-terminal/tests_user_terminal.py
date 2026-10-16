@@ -83,3 +83,12 @@ def test_terminal_order_prefers_iterm(monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL", "cmux")
     if ut.CMUX_BIN.exists():
         assert ut.terminal_order()[0] == "cmux"
+
+
+def test_sudo_failure_hint_replaces_core_tip():
+    out = "x\nsudo: a password is required\n\n\n💡 Tip: To enable sudo over messaging, add SUDO_PASSWORD to ~/.hermes/.env on the agent machine."
+    new = ut.transform_terminal_output(command="sudo ls", output=out, returncode=1)
+    assert "SUDO_PASSWORD to" not in new and "run_in_user_terminal" in new
+    assert new.startswith("x\nsudo: a password is required")
+    assert ut.transform_terminal_output(command="sudo ls", output=new) is None  # idempotent
+    assert ut.transform_terminal_output(command="ls", output="ok") is None

@@ -287,8 +287,28 @@ def handle(args: dict, **_kw: Any) -> str:
         return _err(f"{type(e).__name__}: {e}")
 
 
+# Output shapes that mean "this needs the user's TTY/password". Core appends a SUDO_PASSWORD tip to the
+# sudo ones, which steers the agent to tell the user to paste the command themselves. Plugin tools are
+# always deferred behind tool_search, so the agent may not even see run_in_user_terminal at that moment.
+_NEEDS_USER = (
+    "sudo: a password is required", "sudo: no tty present", "sudo: a terminal is required",
+)
+_CORE_SUDO_TIP = re.compile(r"\n*💡 Tip: (?:To enable sudo over messaging|This session cannot prompt for a sudo password)[^\n]*")
+HINT = ("\n\n💡 This needs the user's password/TTY. Do NOT ask the user to run it themselves and do NOT suggest "
+        "SUDO_PASSWORD. Call run_in_user_terminal instead (deferred tool: tool_call name=\"run_in_user_terminal\", "
+        "arguments {command, reason}). It opens a terminal on their screen, they confirm and type the password "
+        "there, and you get the exit code + output back. For a remote host, wrap it: ssh -t <host> 'sudo ...'.")
+
+
+def transform_terminal_output(command: str = "", output: str = "", **_: Any) -> str | None:
+    if not isinstance(output, str) or not any(s in output for s in _NEEDS_USER) or HINT in output:
+        return None
+    return _CORE_SUDO_TIP.sub("", output).rstrip() + HINT
+
+
 def register(ctx) -> None:
     if shutil.which("osascript") is None and not CMUX_BIN.exists():
         return  # no screen to open a terminal on (Linux/cloud gateway)
     ctx.register_tool(name="run_in_user_terminal", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🖥️",
                       description="Open a terminal on the user's screen, confirm there, run, return output")
+    ctx.register_hook("transform_terminal_output", transform_terminal_output)
