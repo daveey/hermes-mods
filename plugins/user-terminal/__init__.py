@@ -85,13 +85,16 @@ B=$'\e[1m'; D=$'\e[2m'; Y=$'\e[33m'; G=$'\e[32m'; R=$'\e[31m'; C=$'\e[36m'; N=$'
 status() { printf '%s' "$1" > "$JOB/status.json.tmp" && mv "$JOB/status.json.tmp" "$JOB/status.json"; }
 printf '\e]0;Hermes wants to run a command\a'
 clear
+W=$(tput cols 2>/dev/null || echo 100); W=$(( W > 120 ? 120 : W )); W=$(( W < 40 ? 40 : W ))
+wrap() { fold -s -w $((W - 2)) | sed -e 's/[[:space:]]*$//' -e 's/^/  /'; }
 echo "${B}${C}━━━ Hermes wants to run a command ━━━${N}"
 echo
-if [ -s "$JOB/reason.txt" ]; then echo "${B}Why:${N}"; fold -s -w 100 "$JOB/reason.txt" | sed 's/^/  /'; echo; fi
+if [ -s "$JOB/reason.txt" ]; then echo "${B}Why:${N}"; tr -s ' \n' ' ' < "$JOB/reason.txt" | wrap; echo; echo; fi
 echo "${B}Where:${N} $(cat "$JOB/cwd.txt")"
 echo
 echo "${B}Command:${N}"
-echo "${Y}"; sed 's/^/  /' "$JOB/cmd.sh"; echo "${N}"
+printf '%s' "${Y}"; wrap < "$JOB/cmd.sh"; printf '%s' "${N}"
+echo
 while true; do
   read -r -p "${B}Run it? [y/N]${N} " ans
   case "$ans" in
@@ -166,15 +169,36 @@ def _osa_quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+COLS, ROWS = 110, 34   # the confirm window: wide enough that the wrapped text is not re-wrapped, centred on screen
+
+# AppleScript: centre window `w` of the frontmost app on the main screen, keeping its size.
+_CENTER = """
+tell application "Finder" to set {sx, sy, sw, sh} to bounds of window of desktop
+tell application {app} to set {x1, y1, x2, y2} to bounds of w
+set ww to x2 - x1
+set wh to y2 - y1
+set nx to (sw - ww) div 2
+set ny to (sh - wh) div 3
+tell application {app} to set bounds of w to {nx, ny, nx + ww, ny + wh}
+"""
+
+
+def _center(app: str) -> str:
+    return _CENTER.replace("{app}", _osa_quote(app))
+
+
 def _open_terminal_app(shell_cmd: str) -> str:
-    subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script {_osa_quote(shell_cmd)}',
-                    "-e", 'tell application "Terminal" to activate'], check=True, capture_output=True, timeout=20)
+    script = (f'tell application "Terminal"\nset t to do script {_osa_quote(shell_cmd)}\nset w to front window\n'
+              f'set number of columns of w to {COLS}\nset number of rows of w to {ROWS}\nactivate\nend tell\n'
+              + _center("Terminal"))
+    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20)
     return "Terminal"
 
 
 def _open_iterm(shell_cmd: str) -> str:
-    script = ('tell application "iTerm"\nactivate\ncreate window with default profile command '
-              + _osa_quote(shell_cmd) + '\nend tell')
+    script = ('tell application "iTerm"\nactivate\nset w to (create window with default profile command '
+              + _osa_quote(shell_cmd) + f')\ntell current session of w\nset columns to {COLS}\nset rows to {ROWS}\n'
+              'end tell\nend tell\n' + _center("iTerm"))
     subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20)
     return "iTerm"
 
