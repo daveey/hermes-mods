@@ -1,12 +1,12 @@
 # Blocked tasks in the sidebar, quieter Kanban notifications
 
-Patches **0105** and **0107** (grouping by managing chat).
+Patches **0105**, **0107** (grouping by managing chat) and **0108** (open that chat on its own gateway).
 
 ## Behavior
 
 The left sidebar has a collapsible **Blocked** section between Pinned and Projects. It lists blocked cards across all boards and gateways, ordered by priority and then newest creation time. It shows the total count and initially five rows; load-more adds ten. Clicking a row opens that task's drawer on its own board. Hover shows its title and latest summary. The section disappears when nothing is blocked, and its open state persists in plugin storage.
 
-Since 0107 the cards are grouped under the chat managing them. Each group has a header row showing the session title (or "Untitled session") and its card count, with the cards indented below. Clicking the header opens that chat when it lives on the local gateway; on another gateway it opens the group's first card instead. Cards no chat owns sit last under "No session". A group sits where its most urgent card would rank. The five-row cap counts cards, not headers.
+Since 0107 the cards are grouped under the chat managing them. Each group has a header row showing the session title (or "Untitled session") and its card count, with the cards indented below. Clicking the header opens that chat, on whichever gateway it lives (0108). Cards no chat owns sit last under "No session". A group sits where its most urgent card would rank. The five-row cap counts cards, not headers.
 
 Kanban `completed` events no longer produce either in-app toasts or OS notifications. `blocked` events no longer toast: their persistent sidebar rows replace those popups, while the away-from-Hermes OS notification remains. `crashed`, `gave_up`, `timed_out` and `block_loop_detected` still toast.
 
@@ -16,7 +16,7 @@ Core introduces the `sidebar.sections` render-contribution area. `SidebarContrib
 
 The bundled Kanban plugin registers `BlockedTasksSection`. `fetchBlockedTasks` reads `/boards` per gateway and requests `/board?board=<slug>` only for boards whose counts report blocked cards. Older responses without counts fall back to reading each board. Results carry board/gateway ownership, populate the task-owner map for drawer routing, and are sorted by priority then creation time. A failed gateway or board does not discard successful results; all gateway-level reads failing rejects the query.
 
-**Managing chat (0107).** `GET /board` stamps each card with `managing_session_id`: its most recent `tui` notify subscriber (`kanban_notify_subs`, ordered by `created_at`), since a chat asked to shepherd someone else's card subscribes to it, else the creating `session_id`. After collecting a gateway's blocked cards, `fetchBlockedTasks` calls the new `GET /api/plugins/kanban/session-labels?ids=` on that gateway once. It returns each id's live compression tip (`SessionDB.get_compression_tip`) and title, so cards subscribed under pre-compression ids land in one group. A backend without the endpoint falls back to grouping by the raw id, untitled. `groupBlockedTasks` in `blocked-section.tsx` does the grouping, keyed by gateway and session.
+**Managing chat (0107).** `GET /board` stamps each card with `managing_session_id`: its most recent `tui` notify subscriber (`kanban_notify_subs`, ordered by `created_at`), since a chat asked to shepherd someone else's card subscribes to it, else the creating `session_id`. After collecting a gateway's blocked cards, `fetchBlockedTasks` calls the new `GET /api/plugins/kanban/session-labels?ids=` on that gateway once. It returns each id's live compression tip (`SessionDB.get_compression_tip`) and title, so cards subscribed under pre-compression ids land in one group. The endpoint also returns the answering backend's Hermes profile (`current_profile_name`). For a group on a gateway other than the routed one, `managingSessionRoute` builds an owner route (`connectionId`, `mode` from the gateway kind, `profile`/`targetProfile`), and the header calls `host.openSession(id, { route })`. That dials the session's own gateway and records the owner hint, the same owner a cross-gateway sidebar row resumes through. A backend without the endpoint falls back to grouping by the raw id, untitled. `groupBlockedTasks` in `blocked-section.tsx` does the grouping, keyed by gateway and session.
 
 The `blockedKey(scope)` query polls every 30 seconds. Live event frames also invalidate it; polling covers boards without a socket and other gateways. `blockedSectionOpen` is restored from `ctx.storage` (default true) and updated through an atom listener.
 
@@ -49,17 +49,17 @@ npx vitest run src/app/chat/sidebar/contributed-sections.test.tsx src/plugins/ka
 
 The contribution tests cover empty registration, mounting/disposal, row clicks, load-more and collapse. API tests cover count-based board selection, priority ordering, board/gateway ownership, a failed gateway and total gateway failure. The notification suite's `quiet kinds` block checks fully silent completion events, cursor advancement, continued crash toasts, and blocked events that retain OS delivery without a toast.
 
-0107 adds `src/plugins/kanban/blocked-section.test.ts` (group order, sessionless last, per-gateway keys), two `api.blocked.test.ts` cases (tip/title resolution, fallback without the endpoint), and `tests/plugins/test_kanban_managing_session.py` (latest tui subscriber beats the creator, CLI cards have none, labels follow compression; run with `scripts/run_tests.sh`).
+0108 adds `managingSessionRoute` cases (plain open on the routed gateway, remote route with the session's profile, `default` fallback and local-kind mode) and a `profile` assertion in the Python test. 0107 adds `src/plugins/kanban/blocked-section.test.ts` (group order, sessionless last, per-gateway keys), two `api.blocked.test.ts` cases (tip/title resolution, fallback without the endpoint), and `tests/plugins/test_kanban_managing_session.py` (latest tui subscriber beats the creator, CLI cards have none, labels follow compression; run with `scripts/run_tests.sh`).
 
 These are component/API unit tests, not a live multi-gateway end-to-end test.
 
 ## Applying
 
-Apply the ordered series **0001–0107** with `git am -3` from the fork/upstream merge-base in a throwaway worktree; see [README.md](README.md). Patches share sidebar, SDK and Kanban files, so 0105/0107 alone are not a verified independent apply set. Rebuild Desktop to load the UI changes and enable the bundled Kanban plugin.
+Apply the ordered series **0001–0108** with `git am -3` from the fork/upstream merge-base in a throwaway worktree; see [README.md](README.md). Patches share sidebar, SDK and Kanban files, so 0105/0107/0108 alone are not a verified independent apply set. Rebuild Desktop to load the UI changes and enable the bundled Kanban plugin.
 
 ## Gotchas
 
-- Opening a group's chat works for the local gateway only. The SDK's `openSession` route needs a full connection descriptor the plugin doesn't have for remote gateways.
+- A gateway whose backend predates 0108 returns no profile, so its chats are opened as profile `default`.
 - The manager is the latest subscriber, not necessarily the chat you last talked to about the card.
 - This is blocked Kanban cards, not the manually parked session flag toggled by ⌘B.
 - Sidebar search hides contributed sections. Empty/loading results also render no section.

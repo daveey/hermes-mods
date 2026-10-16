@@ -1,0 +1,331 @@
+From 6165c15540b5d8b8ff11edb6a569a7872615fe5a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:05:00 -0700
+Subject: [PATCH] feat(desktop/kanban): Blocked group header opens its chat on
+ that chat's own gateway [daveey]
+
+/session-labels returns the answering backend's profile; a group whose
+managing chat lives on another gateway opens through host.openSession with
+an owner route (connection + profile), the same owner a cross-gateway
+sidebar row resumes through.
+---
+ .../src/plugins/kanban/api.blocked.test.ts    | 11 ++--
+ apps/desktop/src/plugins/kanban/api.ts        | 15 ++++-
+ .../plugins/kanban/blocked-section.test.ts    | 44 ++++++++++++--
+ .../src/plugins/kanban/blocked-section.tsx    | 59 +++++++++++++++----
+ plugins/kanban/dashboard/plugin_api.py        |  9 ++-
+ tests/plugins/test_kanban_managing_session.py |  1 +
+ 6 files changed, 113 insertions(+), 26 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/kanban/api.blocked.test.ts b/apps/desktop/src/plugins/kanban/api.blocked.test.ts
+index 8b455790f8..9b87458c64 100644
+--- a/apps/desktop/src/plugins/kanban/api.blocked.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.blocked.test.ts
+@@ -157,7 +157,10 @@ describe('fetchBlockedTasks', () => {
+       }
+ 
+       if (call.path.startsWith('/session-labels?')) {
+-        return { sessions: { creator: { tip_id: 'creator', title: '' }, 'old-id': { tip_id: 'new-id', title: 'Ship it' } } }
++        return {
++          profile: 'bb',
++          sessions: { creator: { tip_id: 'creator', title: '' }, 'old-id': { tip_id: 'new-id', title: 'Ship it' } }
++        }
+       }
+ 
+       return new Error(`unexpected ${call.path}`)
+@@ -167,8 +170,8 @@ describe('fetchBlockedTasks', () => {
+ 
+     expect(calls.map(c => c.path)).toContain(`/session-labels?ids=${encodeURIComponent('old-id,creator')}`)
+     expect(Object.fromEntries(tasks.map(t => [t.id, t.manager]))).toEqual({
+-      a: { id: 'new-id', title: 'Ship it' },
+-      b: { id: 'creator', title: null },
++      a: { id: 'new-id', profile: 'bb', title: 'Ship it' },
++      b: { id: 'creator', profile: 'bb', title: null },
+       c: null
+     })
+   })
+@@ -189,7 +192,7 @@ describe('fetchBlockedTasks', () => {
+ 
+     const [only] = await fetchBlockedTasks()
+ 
+-    expect(only.manager).toEqual({ id: 'creator', title: null })
++    expect(only.manager).toEqual({ id: 'creator', profile: null, title: null })
+   })
+ 
+   it('throws when no gateway answers', async () => {
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 041c66c55b..75d56fced0 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -731,10 +731,12 @@ export interface BlockedTask extends KanbanTask {
+   board: string
+   /** The chat managing the card, resolved to its live compression tip and
+    *  title on the card's own gateway; null when no session owns it. */
+-  manager: null | { id: string; title: null | string }
++  manager: null | { id: string; profile: null | string; title: null | string }
+ }
+ 
+ interface SessionLabels {
++  /** The answering backend's Hermes profile (where these sessions live). */
++  profile?: string
+   sessions?: Record<string, { tip_id?: string; title?: null | string }>
+ }
+ 
+@@ -778,10 +780,13 @@ export async function fetchBlockedTasks(): Promise<BlockedTask[]> {
+       const found = parts.flatMap(part => (part.status === 'fulfilled' ? part.value : []))
+       const ids = [...new Set(found.map(managerId).filter((id): id is string => Boolean(id)))]
+       let labels: SessionLabels['sessions'] = {}
++      let profile: null | string = null
+ 
+       if (ids.length) {
+         try {
+-          labels = (await read<SessionLabels>(`/session-labels?ids=${encodeURIComponent(ids.join(','))}`)).sessions ?? {}
++          const answer = await read<SessionLabels>(`/session-labels?ids=${encodeURIComponent(ids.join(','))}`)
++          labels = answer.sessions ?? {}
++          profile = answer.profile?.trim() || null
+         } catch {
+           // Older backend without the endpoint: group by the raw id, untitled.
+         }
+@@ -791,7 +796,11 @@ export async function fetchBlockedTasks(): Promise<BlockedTask[]> {
+         const id = managerId(task)
+         const label = id ? labels?.[id] : undefined
+ 
+-        return { ...task, manager: id ? { id: label?.tip_id || id, title: label?.title?.trim() || null } : null }
++        return {
++          ...task,
++          gateway: task.gateway ?? (gateways.length > 1 ? gateway : undefined),
++          manager: id ? { id: label?.tip_id || id, profile, title: label?.title?.trim() || null } : null
++        }
+       })
+     })
+   )
+diff --git a/apps/desktop/src/plugins/kanban/blocked-section.test.ts b/apps/desktop/src/plugins/kanban/blocked-section.test.ts
+index 84da29f5c5..ea0498d542 100644
+--- a/apps/desktop/src/plugins/kanban/blocked-section.test.ts
++++ b/apps/desktop/src/plugins/kanban/blocked-section.test.ts
+@@ -12,19 +12,21 @@ vi.mock('@hermes/plugin-sdk', async () => ({
+   usePluginI18n: vi.fn()
+ }))
+ 
+-const { groupBlockedTasks } = await import('./blocked-section')
++const { groupBlockedTasks, managingSessionRoute } = await import('./blocked-section')
+ 
+ const card = (id: string, manager: BlockedTask['manager'], gateway?: string): BlockedTask =>
+   ({ board: 'default', gateway, id, manager, status: 'blocked', title: id }) as BlockedTask
+ 
++const mgr = (id: string, title: null | string = null, profile: null | string = null) => ({ id, profile, title })
++
+ describe('groupBlockedTasks', () => {
+   it('groups by managing session in rank order and puts sessionless cards last', () => {
+     const groups = groupBlockedTasks([
+-      card('t1', { id: 's2', title: 'Second' }),
++      card('t1', mgr('s2', 'Second')),
+       card('t2', null),
+-      card('t3', { id: 's1', title: null }),
+-      card('t4', { id: 's2', title: 'Second' }),
+-      card('t5', { id: 's1', title: 'First' })
++      card('t3', mgr('s1')),
++      card('t4', mgr('s2', 'Second')),
++      card('t5', mgr('s1', 'First'))
+     ])
+ 
+     expect(groups.map(g => [g.sessionId, g.title, g.tasks.map(t => t.id)])).toEqual([
+@@ -35,8 +37,38 @@ describe('groupBlockedTasks', () => {
+   })
+ 
+   it('keeps the same session id on two gateways apart', () => {
+-    const groups = groupBlockedTasks([card('a', { id: 's', title: 'x' }, 'local'), card('b', { id: 's', title: 'x' }, 'mini')])
++    const groups = groupBlockedTasks([card('a', mgr('s', 'x'), 'local'), card('b', mgr('s', 'x'), 'mini')])
+ 
+     expect(groups.map(g => g.key)).toEqual(['local:s', 'mini:s'])
+   })
+ })
++
++describe('managingSessionRoute', () => {
++  const gateways = [
++    { id: 'local', kind: 'local', label: 'Mac' },
++    { id: 'mini', kind: 'ssh', label: 'Mini' }
++  ]
++
++  it('opens a chat on the routed gateway with a plain open', () => {
++    expect(managingSessionRoute({ gateway: 'local', profile: 'default' }, 'local', gateways)).toBeNull()
++    expect(managingSessionRoute({ gateway: undefined, profile: null }, 'local', gateways)).toBeNull()
++  })
++
++  it('routes a chat on another gateway to that gateway and its profile', () => {
++    expect(managingSessionRoute({ gateway: 'mini', profile: 'bb' }, 'local', gateways)).toEqual({
++      connectionId: 'mini',
++      mode: 'remote',
++      profile: 'bb',
++      targetProfile: 'bb'
++    })
++  })
++
++  it('defaults the profile and keeps a local-kind connection local when the active gateway is remote', () => {
++    expect(managingSessionRoute({ gateway: 'local', profile: null }, 'mini', gateways)).toEqual({
++      connectionId: 'local',
++      mode: 'local',
++      profile: 'default',
++      targetProfile: 'default'
++    })
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/blocked-section.tsx b/apps/desktop/src/plugins/kanban/blocked-section.tsx
+index 819af988b5..1c0b352ed7 100644
+--- a/apps/desktop/src/plugins/kanban/blocked-section.tsx
++++ b/apps/desktop/src/plugins/kanban/blocked-section.tsx
+@@ -3,11 +3,21 @@
+  * gateway, between Pinned and Projects (core's `sidebar.sections` area). This
+  * replaces the in-app "task blocked" toast — the card stays visible here until
+  * someone unblocks it, instead of a popup that vanishes. Cards are grouped
+- * under the chat managing them (header click opens that chat); a card row
++ * under the chat managing them (header click opens that chat on its own
++ * gateway); a card row
+  * opens the task's drawer on its own board. Hidden while nothing is blocked.
+  */
+ 
+-import { atom, host, SidebarSection, SidebarSectionRow, useQuery, useValue } from '@hermes/plugin-sdk'
++import {
++  atom,
++  host,
++  type PluginGateway,
++  type PluginProfileRoute,
++  SidebarSection,
++  SidebarSectionRow,
++  useQuery,
++  useValue
++} from '@hermes/plugin-sdk'
+ import { Fragment, useState } from 'react'
+ 
+ import { blockedKey, type BlockedTask, boardGateways, fetchBlockedTasks, useKanbanScope } from './api'
+@@ -27,9 +37,30 @@ export interface BlockedGroup {
+   sessionId: null | string
+   title: null | string
+   gateway?: string
++  /** Hermes profile the session lives in on its gateway. */
++  profile: null | string
+   tasks: BlockedTask[]
+ }
+ 
++/** How to open a group's chat: null = on the routed gateway (plain open),
++ *  else the owner route that dials the session's own gateway + profile — the
++ *  same owner a cross-gateway sidebar row resumes through. */
++export function managingSessionRoute(
++  group: Pick<BlockedGroup, 'gateway' | 'profile'>,
++  routedGateway: string,
++  gateways: readonly PluginGateway[]
++): null | PluginProfileRoute {
++  if (!group.gateway || group.gateway === routedGateway) {
++    return null
++  }
++
++  const profile = group.profile || 'default'
++  const kind = gateways.find(gateway => gateway.id === group.gateway)?.kind
++  const mode = kind === 'local' ? ('local' as const) : ('remote' as const)
++
++  return { connectionId: group.gateway, mode, profile, targetProfile: profile }
++}
++
+ /** Cards grouped by the chat managing them, in the order the fetch ranked
+  *  them (a group sits where its most urgent card would), sessionless last. */
+ export function groupBlockedTasks(tasks: readonly BlockedTask[]): BlockedGroup[] {
+@@ -41,7 +72,14 @@ export function groupBlockedTasks(tasks: readonly BlockedTask[]): BlockedGroup[]
+     let group = groups.get(key)
+ 
+     if (!group) {
+-      group = { gateway: task.gateway, key, sessionId, tasks: [], title: task.manager?.title ?? null }
++      group = {
++        gateway: task.gateway,
++        key,
++        profile: task.manager?.profile ?? null,
++        sessionId,
++        tasks: [],
++        title: task.manager?.title ?? null
++      }
+       groups.set(key, group)
+     }
+ 
+@@ -73,7 +111,7 @@ export function BlockedTasksSection() {
+   }
+ 
+   const groups = groupBlockedTasks(tasks)
+-  const localGateway = boardGateways()[0]
++  const routedGateway = boardGateways()[0]
+   let budget = visible
+ 
+   const openTask = (task: BlockedTask) => {
+@@ -99,9 +137,7 @@ export function BlockedTasksSection() {
+         const shown = group.tasks.slice(0, budget)
+         budget -= shown.length
+         const title = group.sessionId ? group.title || k.sidebar.untitledSession : k.sidebar.noSession
+-        // Sessions on another gateway open from that gateway's own sidebar.
+         const sessionId = group.sessionId
+-        const canOpen = Boolean(sessionId) && (!group.gateway || group.gateway === localGateway)
+ 
+         return (
+           <Fragment key={group.key}>
+@@ -111,13 +147,16 @@ export function BlockedTasksSection() {
+               meta={group.tasks.length}
+               muted
+               onSelect={() => {
+-                if (canOpen && sessionId) {
+-                  void host.openSession(sessionId)
+-                } else {
++                if (!sessionId) {
+                   openTask(group.tasks[0])
++
++                  return
+                 }
++
++                const route = managingSessionRoute(group, routedGateway, host.state.gateways?.get() ?? [])
++                void host.openSession(sessionId, route ? { route } : {})
+               }}
+-              tip={canOpen ? k.sidebar.openSession(title) : title}
++              tip={sessionId ? k.sidebar.openSession(title) : title}
+             />
+             {shown.map(task => (
+               <SidebarSectionRow
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 868636ddbc..d80a9e046a 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -380,13 +380,16 @@ def get_session_labels(ids: str = Query(..., max_length=4000)):
+     """Title and live compression tip of each chat session id — the sidebar's
+     Blocked section groups cards by the session managing them, and a card keeps
+     the id it was subscribed under while compression rotates the chat onto a
+-    fresh one. Unknown ids are omitted. [daveey]"""
++    fresh one. Unknown ids are omitted. ``profile`` names this backend's Hermes
++    profile, so a Desktop on another gateway can route the open to it. [daveey]"""
++    from hermes_cli.profiles import current_profile_name
+     from hermes_cli.web_server_sessions import _open_session_db_for_profile
+ 
+     wanted = list(dict.fromkeys(s.strip() for s in ids.split(",") if s.strip()))[:100]
+     out: dict[str, dict[str, Any]] = {}
++    profile = current_profile_name("default") or "default"
+     if not wanted:
+-        return {"sessions": out}
++        return {"sessions": out, "profile": profile}
+     db = _open_session_db_for_profile(None, read_only=True)
+     try:
+         for sid in wanted:
+@@ -402,7 +405,7 @@ def get_session_labels(ids: str = Query(..., max_length=4000)):
+                 log.debug("session label lookup failed for %s: %s", sid, exc)
+     finally:
+         db.close()
+-    return {"sessions": out}
++    return {"sessions": out, "profile": profile}
+ 
+ 
+ @router.get("/board")
+diff --git a/tests/plugins/test_kanban_managing_session.py b/tests/plugins/test_kanban_managing_session.py
+index a3aa83680c..e7e80c19f3 100644
+--- a/tests/plugins/test_kanban_managing_session.py
++++ b/tests/plugins/test_kanban_managing_session.py
+@@ -88,3 +88,4 @@ def test_session_labels_follow_compression_to_the_tip(client):
+     assert sessions["tip"]["tip_id"] == "tip"
+     # The tip has no title of its own yet: fall back to the id we were handed.
+     assert sessions["root"]["title"] == "Ship the thing"
++    assert r.json()["profile"] == "default"
+-- 
+2.55.0
+

@@ -47,7 +47,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [memory-cap-headroom.md](memory-cap-headroom.md) | 0098 | Show free characters near capacity and recommend consolidation with 10% headroom |
 | [kanban-block-loop-escalation.md](kanban-block-loop-escalation.md) | 0100 | Keep block-loop escalations out of automatic decomposition until a later input event |
 | [skill-write-feedback.md](skill-write-feedback.md) | 0102 0103 | Warn on skill growth near capacity and treat already-applied patches as successful no-ops |
-| [kanban-blocked-sidebar.md](kanban-blocked-sidebar.md) | 0105 0107 | Persistent blocked cards across boards/gateways, grouped by the chat managing them (0107); completions are silent, blocked events retain only away-only OS notifications |
+| [kanban-blocked-sidebar.md](kanban-blocked-sidebar.md) | 0105 0107 0108 | Persistent blocked cards across boards/gateways, grouped by the chat managing them (0107), whose header opens that chat on its own gateway (0108); completions are silent, blocked events retain only away-only OS notifications |
 | [session-tab-status-underline.md](session-tab-status-underline.md) | 0106 | Session tab underline uses the sidebar status-stripe color (green/red/grey; neutral for draft/running) |
 
 ## Applying
