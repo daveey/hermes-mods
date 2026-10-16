@@ -1,0 +1,210 @@
+From 4543acb56d40107e0e910831dc2dcb31c5dc3be0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:58:22 -0700
+Subject: [PATCH] fix(tool_search): resolve OAuth wire names (mcp__<tool>)
+ inside tool_call/tool_describe args [daveey]
+
+On the Anthropic OAuth wire every tool is presented as mcp__<name> (plus the
+session_search/memory aliases). The transport reverses that for top-level
+tool_use blocks, but names the model copies into tool_call/tool_describe
+arguments arrived untranslated, so tool_call(name='mcp__kanban_comment')
+failed with "not a known tool name ... use tool_search" and models looped 3-4
+times. canonical_bridge_tool_name maps them back with the transport's
+registry-first order; registered names and connectors are never rewritten.
+A wire-named direct tool now gets the 'call it directly' correction.
+---
+ tests/tools/test_tool_call_wire_names.py | 95 ++++++++++++++++++++++++
+ tools/tool_search.py                     |  5 +-
+ tools/tool_search_validation.py          | 37 ++++++++-
+ 3 files changed, 135 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_tool_call_wire_names.py
+
+diff --git a/tests/tools/test_tool_call_wire_names.py b/tests/tools/test_tool_call_wire_names.py
+new file mode 100644
+index 0000000000..5f0910c89b
+--- /dev/null
++++ b/tests/tools/test_tool_call_wire_names.py
+@@ -0,0 +1,95 @@
++"""tool_call / tool_describe accept the provider wire form of a tool name.
++
++On the Anthropic OAuth wire every tool is presented to the model as ``mcp__<name>`` (and a
++couple under aliases, e.g. ``session_search`` -> ``chat_history_lookup``). The transport
++reverses that for top-level tool_use blocks, but a name the model copies INTO bridge
++arguments arrived untranslated, so ``tool_call(name="mcp__kanban_comment")`` failed with
++"'mcp__kanban_comment' is not a known tool name … use tool_search" and models looped on it
++(coach: three sessions on 2026-10-15, 3-4 identical retries each).
++"""
++
++import json
++
++import pytest
++
++from tools.registry import registry
++from tools.tool_search import dispatch_tool_describe, resolve_underlying_call
++from tools.tool_search_validation import canonical_bridge_tool_name
++
++_PLUGIN = "zz_wire_plugin_tool"
++_MCP = "mcp__zzwire__do_thing"
++
++
++def _schema(name):
++    return {"name": name, "description": "x",
++            "parameters": {"type": "object", "properties": {"body": {"type": "string"}}}}
++
++
++@pytest.fixture
++def wire_tools():
++    registry.register(name=_PLUGIN, toolset="zz-wire-plugin", handler=lambda a, **kw: "{}",
++                      schema=_schema(_PLUGIN))
++    registry.register(name=_MCP, toolset="mcp-zzwire", handler=lambda a, **kw: "{}",
++                      schema=_schema(_MCP))
++    yield
++    registry.deregister(_PLUGIN)
++    registry.deregister(_MCP)
++
++
++def test_wire_prefixed_deferred_tool_resolves_to_registered_name(wire_tools):
++    name, args, err = resolve_underlying_call(
++        {"calls": [{"name": f"mcp__{_PLUGIN}", "arguments": {"body": "hi"}}]})
++    assert err is None
++    assert name == _PLUGIN and args == {"body": "hi"}
++
++
++def test_wire_prefixed_direct_tool_says_call_directly_not_unknown(wire_tools):
++    from tools.registry import discover_builtin_tools
++    discover_builtin_tools()
++    assert registry.get_entry("read_file") is not None
++    # The exact failing shape from the coach sessions: a directly-listed tool, named as the
++    # model sees it on the OAuth wire, sent through tool_call.
++    name, _args, err = resolve_underlying_call(
++        {"calls": [{"name": "mcp__read_file", "arguments": {"path": "x"}}]})
++    assert name is None
++    assert "not a known tool name" not in err
++    assert "'read_file' is a directly-listed tool" in err
++
++
++def test_registered_mcp_names_and_connectors_are_never_rewritten(wire_tools):
++    assert canonical_bridge_tool_name(_MCP) == _MCP
++    assert canonical_bridge_tool_name("connectors__gmail__SEND") == "connectors__gmail__SEND"
++    assert canonical_bridge_tool_name("mcp__nope_not_registered") == "mcp__nope_not_registered"
++    name, _args, err = resolve_underlying_call({"calls": [{"name": _MCP, "arguments": {}}]})
++    assert err is None and name == _MCP
++
++
++def test_unknown_wire_name_still_reports_unknown(wire_tools):
++    _name, _args, err = resolve_underlying_call(
++        {"calls": [{"name": "mcp__nope_not_registered", "arguments": {}}]})
++    assert "not a known tool name" in err
++
++
++def test_oauth_alias_resolves_to_registered_tool():
++    registered = registry.get_entry("session_search") is not None
++    if not registered:
++        registry.register(name="session_search", toolset="session_search", handler=lambda a, **kw: "{}",
++                          schema=_schema("session_search"))
++    try:
++        assert canonical_bridge_tool_name("chat_history_lookup") == "session_search"
++        assert canonical_bridge_tool_name("mcp__chat_history_lookup") == "session_search"
++    finally:
++        if not registered:
++            registry.deregister("session_search")
++
++
++def test_wire_prefixed_bridge_name_is_still_refused():
++    _name, _args, err = resolve_underlying_call({"calls": [{"name": "mcp__tool_call", "arguments": {}}]})
++    assert "bridge tool" in err
++
++
++def test_tool_describe_accepts_wire_name(wire_tools):
++    defs = [{"type": "function", "function": _schema(_PLUGIN)}]
++    out = json.loads(dispatch_tool_describe({"names": [f"mcp__{_PLUGIN}"]}, current_tool_defs=defs))
++    assert _PLUGIN in out["tools"]
++    assert "not_found" not in out
+diff --git a/tools/tool_search.py b/tools/tool_search.py
+index 76fe4c6a23..8b83a79317 100644
+--- a/tools/tool_search.py
++++ b/tools/tool_search.py
+@@ -24,7 +24,8 @@ from tools.tool_search_catalog import (
+     CatalogEntry, _fn, _listing_group_label, _registry_entry, _registry_toolset,
+     build_catalog, build_catalog_listing_with_form, search_catalog)
+ from tools.tool_search_validation import (
+-    local_batch_error, normalize_tool_call_entries, not_deferrable_error, validate_deferred_call_args)
++    canonical_bridge_tool_name, local_batch_error, normalize_tool_call_entries, not_deferrable_error,
++    validate_deferred_call_args)
+ from tools.connectors import CONNECTOR_BATCH_SENTINEL, is_connector_name
+ from tools.connectors.search import (
+     connections_in_scope, connector_entries_by_group, connectors_unavailable, remote_schemas_for)
+@@ -502,6 +503,8 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
+     undescribed: list[str] = []
+     errors: dict[str, str] = {}
+     for name in names:
++        if name not in by_name and name not in remote_schemas:
++            name = canonical_bridge_tool_name(name)  # OAuth wire form (mcp__<tool>) -> registered
+         fn = by_name.get(name)
+         remote_fn = remote_schemas.get(name)
+         if fn is not None:
+diff --git a/tools/tool_search_validation.py b/tools/tool_search_validation.py
+index c2e45e2223..5a6e86ae04 100644
+--- a/tools/tool_search_validation.py
++++ b/tools/tool_search_validation.py
+@@ -136,6 +136,40 @@ def validate_deferred_call_args(name: str, args: dict[str, Any]) -> Optional[str
+         return None
+ 
+ 
++_OAUTH_WIRE_PREFIX = "mcp__"
++
++
++def canonical_bridge_tool_name(name: str) -> str:
++    """Map a provider *wire* tool name the model echoed inside bridge arguments back to the
++    registered name. On the Anthropic OAuth wire every tool is presented as ``mcp__<name>``
++    (and a few under aliases, e.g. ``session_search`` -> ``chat_history_lookup``); the
++    transport reverses that for top-level ``tool_use`` blocks, but names nested in
++    ``tool_call``/``tool_describe`` arguments arrive untranslated. The model then gets
++    "'mcp__kanban_comment' is not a known tool name … use tool_search" and loops. Same
++    resolution order as ``agent.transports.anthropic._unprefix_oauth_tool_name``: a name that
++    is already registered (or a connector) always wins; otherwise try ``mcp_<bare>``,
++    ``<bare>``, then the OAuth reverse aliases. Unresolvable names are returned unchanged."""
++    if not isinstance(name, str) or not name or name.startswith("connectors__"):
++        return name
++    if name in BRIDGE_TOOL_NAMES or _registry_entry(name) is not None:
++        return name
++    bare = name[len(_OAUTH_WIRE_PREFIX):] if name.startswith(_OAUTH_WIRE_PREFIX) else None
++    candidates = [f"mcp_{bare}", bare] if bare else []
++    if bare in BRIDGE_TOOL_NAMES:
++        return bare
++    try:
++        from agent.anthropic_adapter import _OAUTH_TOOL_NAME_REVERSE_ALIASES as _rev
++    except Exception:
++        _rev = {}
++    for key in (bare, name):
++        if key and key in _rev:
++            candidates.append(_rev[key])
++    for candidate in candidates:
++        if candidate and _registry_entry(candidate) is not None:
++            return candidate
++    return name
++
++
+ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, Any]], Optional[str]]:
+     """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
+ 
+@@ -170,6 +204,7 @@ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, An
+         name = str(raw.get("name") or "").strip()
+         if not name:
+             return [], f"tool_call calls[{position}] requires a 'name'"
++        name = canonical_bridge_tool_name(name)
+         if name in BRIDGE_TOOL_NAMES:
+             return [], f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
+         raw_args = raw.get("arguments")
+@@ -219,7 +254,7 @@ def not_deferrable_error(name: str) -> str:
+     from tools.tool_search import _core_tool_names  # late: tool_search imports this module
+     if name in _core_tool_names() or _registry_entry(name) is not None:
+         return (f"'{name}' is a directly-listed tool, not a deferred one. "
+-                "Call it directly instead of via tool_call.")
++                "Call it directly instead of via tool_call. The tool was NOT invoked.")
+     suffix = f"__{name}"
+     try:
+         from tools.registry import registry
+-- 
+2.54.0 (Apple Git-157)
+

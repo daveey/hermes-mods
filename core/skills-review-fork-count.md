@@ -4,6 +4,7 @@ Patches:
 
 - `patches/0055-fix-skills-review-fork-counts-a-replayed-still-curre.patch`: skills. Before the background review
   fork runs, skill_view results in the history it replays count as reads when they still match the file on disk.
+- `0097`: name stale replayed skill copies in the review prompt so the fork reloads them before writing.
 
 What you see: background skill reviews patch a skill the session already loaded on the first try. Before, the
 review fork's first patch was refused with "content has not been loaded in this review turn", so it re-viewed the
@@ -22,15 +23,19 @@ skill first. For a large SKILL.md (tens of KB) that was a full reload on every r
 - When the fork is routed to another model it replays a digest. Seeding uses exactly the history the fork sees, so a
   digest that dropped the view seeds nothing.
 
+- A stale replayed copy now produces a prompt note naming the skill and `SKILL.md` or supporting-file path, with instructions to call `skill_view` before writing. The guard itself is unchanged. Deleted files, failed/pruned views, and current copies do not produce this stale-copy note.
+
 ## How it works
 
 - `tools/skill_manager_guards.py`:
   - `_transcript_skill_views(messages)` collects `(name, file, content, _source_path)` from every successful, text
     `skill_view` tool result. It finds the tool name from `tool_name`/`name` on the message or from the assistant
     `tool_calls` entry the result answers.
-  - `seed_background_review_reads_from_history(messages, session_id=None)` walks those newest first. For each, it
+  - `seed_background_review_reads_from_history(messages, session_id=None, stale=None)` walks those newest first. For each, it
     calls `_current_skill_view` and adds the resolved path to the background review read marks when content and
     source match. It returns the number of files marked. Errors are logged at DEBUG and skipped.
+    With `stale=[]`, content or source-path mismatches append `(name, file_path)` to that list.
+    `stale_skill_views_note` deduplicates and sorts labels for the review prompt.
   - `_current_skill_view(name, file_path, session_id)` calls `tools.skills_tool.skill_view` inside
     `contextvars.copy_context()` with fresh marks, so `skill_view`'s own read-mark side effect does not leak into the
     fork's marks.
@@ -38,6 +43,12 @@ skill first. For a large SKILL.md (tens of KB) that was a full reload on every r
   snapshot), calls `_reset_background_review_read_marks()` then the seeder with `agent.session_id`, and passes the
   same `review_history` to `run_conversation`. The seeding is inside `suppress(Exception)`, so a failure leaves the
   old behavior.
+
+## Code
+
+Implementation: `tools/skill_manager_guards.py` and `agent/background_review.py`.
+Regression tests: `tests/tools/test_skill_manager_tool.py` and
+`tests/agent/test_background_review_memory_scope.py`.
 
 ## Tests
 
@@ -50,17 +61,31 @@ skill first. For a large SKILL.md (tens of KB) that was a full reload on every r
   `test_fork_seeds_read_marks_from_the_history_it_replays`, parametrized over routed and not routed. It checks the
   seeder and `run_conversation` get the same history.
 
+Patch `0097` adds `test_fork_prompt_names_skills_whose_replayed_copy_is_stale`,
+checks the stale list in the existing refused-write test, and adds
+`test_review_seeding_reports_no_stale_for_current_or_unviewable_copies`.
+
+```sh
+scripts/run_tests.sh tests/tools/test_skill_manager_tool.py tests/agent/test_background_review_memory_scope.py
+```
+
+Both files passed in the full-series regression run (October 16, 2026 PT).
+
 ## Applying
 
-Standalone. It builds on the upstream read-before-write guard for review forks (`_BackgroundReviewReadMarks`,
-`_reset_background_review_read_marks`) and on `skill_view` returning `_source_path`.
+Apply the ordered `0001–0097` prefix (or the complete `0001–0105` series) from this
+mirror to the fork's documented merge-base in a disposable checkout. This feature
+spans `0055` and `0097`; isolated application is not claimed. It relies on the
+review read-before-write guard and `skill_view` source-path metadata. Run tests
+from the resulting Hermes source root.
 
 ## Gotchas
 
 - Seeding runs one `skill_view` per distinct replayed view at fork start. That is a local file read, not a model
   call, but it is not free for a transcript with many views.
 - The match is exact bytes. Any change to the file, or to how `skill_view` renders it, makes the replayed copy count
-  as stale and the fork re-views as before.
+  as stale. Patch `0097` now asks the fork to re-view before its first write, instead of relying on a failed write to prompt the reload.
+- Prompt guidance does not grant read marks: stale copies remain unmarked until actually reloaded, and digest histories can only identify views they retained.
 
 ## Plugin?
 

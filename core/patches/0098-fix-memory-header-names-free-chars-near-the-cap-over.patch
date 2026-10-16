@@ -1,0 +1,170 @@
+From 340f8d60473737c769a20eb05926f1b90cc50f19 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:57:48 -0700
+Subject: [PATCH] fix(memory): header names free chars near the cap; overflow
+ errors target 10% headroom [daveey]
+
+Both memory stores lived at 97-99% (2,170/2,200 and 1,364/1,375). The
+system-prompt header showed only a percentage, so every save (foreground
+and background review) tried a bare add or a lengthening patch first,
+overflowed, and needed a second call. The retry then freed just enough to
+fit, which left the store at the cap again for the next save.
+
+- Header: once free space is under 10% of the limit, it names the free
+  char count and the same-batch rule.
+- Over-limit errors (add/patch/replace/batch) also say how much to free
+  to leave 10% headroom, so one consolidation breaks the cycle.
+- Schema IF FULL: check the header's free count and batch removes with
+  the add on the first call.
+---
+ tests/tools/test_memory_tool.py | 22 ++++++++++++++++++
+ tools/memory_tool.py            |  6 +++--
+ tools/memory_tool_store.py      | 40 ++++++++++++++++++++++++++++-----
+ 3 files changed, 61 insertions(+), 7 deletions(-)
+
+diff --git a/tests/tools/test_memory_tool.py b/tests/tools/test_memory_tool.py
+index 386ccd5f88..831872d3ed 100644
+--- a/tests/tools/test_memory_tool.py
++++ b/tests/tools/test_memory_tool.py
+@@ -276,6 +276,12 @@ class TestMemoryStoreReplace:
+         store.add("memory", "x" * 380)  # 65 + 3 + 380 = 448 of 500
+         full = store.add("memory", "y" * 54)  # 448 + 3 + 54 = 505
+         assert "by 5 chars" in full["error"] and "free at least 5 chars" in full["error"]
++        # ...and how much to free so the NEXT save fits too: 505 - 450 (90% of 500) = 55.
++        assert "Free ~55 chars instead to leave 10% headroom" in full["error"]
++        over = store.apply_batch("memory", [{"action": "patch", "old_text": "manual approval",
++                                             "content": "manual approval, " + "z" * 60}])  # +62 -> 510
++        assert "free at least 10 chars" in over["error"] and "Free ~60 chars instead" in over["error"]
++        assert store.memory_entries[0].endswith("manual approval.")  # all-or-nothing: unchanged
+         miss = store.apply_batch("memory", [{"action": "patch", "old_text": "Deploys via GitHub Actions to Fly",
+                                              "content": "Deploys: Fly.io + canary."}])
+         assert miss["closest_entries"] == ["Deploys go through GitHub Actions to Fly.io with manual approval."]
+@@ -462,6 +468,22 @@ class TestMemoryStoreSnapshot:
+         assert "loaded at start" in snapshot
+         assert "added later" not in snapshot
+ 
++    def test_header_calls_out_free_chars_when_nearly_full(self, store):
++        """Stores lived at 97-99% (2,170/2,200): the header showed only a percentage, so every
++        save tried a bare add first, overflowed, and retried. Under 10% headroom the header now
++        names the free count and the same-batch rule; with room to spare it stays terse."""
++        store.add("memory", "x" * 200)
++        store.load_from_disk()
++        roomy = store.format_for_system_prompt("memory")
++        assert "[40% — 200/500 chars]\n" in roomy and "free" not in roomy
++
++        store.add("memory", "y" * 260)  # 200 + 3 + 260 = 463 of 500
++        store.load_from_disk()
++        tight = store.format_for_system_prompt("memory")
++        header = tight.splitlines()[1]
++        assert header.startswith("MEMORY (your personal notes) [92% — 463/500 chars]")
++        assert "only 37 chars free" in header and "SAME batch" in header
++
+ 
+ # =========================================================================
+ # memory_tool() dispatcher
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+index aeb839a2e6..6e78d00887 100644
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -388,8 +388,10 @@ MEMORY_SCHEMA = {
+         "corrections for that kind of work) belongs in the task's skill via skill_manage, "
+         "where it loads only when relevant; memory is injected into every turn and must "
+         "stay small.\n\n"
+-        "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
+-        "removes or shortens enough stale entries and adds the new one together.\n\n"
++        "IF FULL: check the memory block header before writing — when it says only N chars are "
++        "free and your new text is longer, send the add/patch in ONE batch with removes or "
++        "shortening patches of stale entries on the FIRST call (an add alone is rejected). Free "
++        "enough to leave ~10% headroom so the next save fits too.\n\n"
+         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
+         "notes (environment, conventions, tool quirks, lessons).\n\n"
+         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
+diff --git a/tools/memory_tool_store.py b/tools/memory_tool_store.py
+index 3666bf9fd5..8d4f22ee77 100644
+--- a/tools/memory_tool_store.py
++++ b/tools/memory_tool_store.py
+@@ -128,6 +128,32 @@ def _over_limit(new_total: int, limit: int) -> str:
+     return f"would put memory at {new_total:,}/{limit:,} chars: free at least {new_total - limit:,} chars"
+ 
+ 
++# Stores used to sit at 97-99% full: every overflow retry freed just enough to fit, so the next
++# save overflowed again and burned a round trip each time. Consolidations should leave this much
++# of the limit free, and the system-prompt header calls out the free count once below it.
++HEADROOM_FRACTION = 0.10
++
++
++def _headroom_floor(limit: int) -> int:
++    return int(limit * (1 - HEADROOM_FRACTION))
++
++
++def _headroom_hint(new_total: int, limit: int) -> str:
++    """Sentence telling an over-limit write how much to free so the NEXT save fits too."""
++    target = new_total - _headroom_floor(limit)
++    return (f" Free ~{target:,} chars instead to leave {int(HEADROOM_FRACTION * 100)}% headroom, "
++            f"or the next save will overflow again.")
++
++
++def _low_headroom_note(current: int, limit: int) -> str:
++    """Header suffix once free space drops under the headroom floor ("" otherwise)."""
++    if limit <= 0 or current <= _headroom_floor(limit):
++        return ""
++    free = max(0, limit - current)
++    return (f" — only {free:,} chars free: a write that adds text must put removes or shortening "
++            f"patches of stale entries in the SAME batch")
++
++
+ # Patch content cannot be empty, and 'remove' would drop the sibling facts in the entry.
+ PATCH_DROP_HINT = "To drop text inside an entry, patch a longer span that contains it; 'remove' deletes the whole entry."
+ 
+@@ -383,7 +409,8 @@ class MemoryStore:
+                     f"Memory at {self._char_count(target):,}/{limit:,} chars; adding this entry ({len(content)} chars) "
+                     f"would exceed the limit by {new_total - limit:,} chars. Retry as ONE 'operations' batch that "
+                     f"removes or shortens (patch) stale entries from current_entries below to free at least "
+-                    f"{new_total - limit:,} chars AND adds this entry — the limit is checked only on the batch result."))
++                    f"{new_total - limit:,} chars AND adds this entry — the limit is checked only on the batch result."
++                    + _headroom_hint(new_total, limit)))
+             return entries + [content], "Entry added."
+         # Append-only: skip the drift guard (appending never clobbers foreign
+         # content) but still refuse a failed read — add rewrites the WHOLE file.
+@@ -433,7 +460,7 @@ class MemoryStore:
+                 return self._failure_with_entries(target, (
+                     f"Patch would put memory at {new_total:,}/{limit:,} chars. Shorten the new "
+                     f"text, or 'remove' other stale or less important entries to make room "
+-                    f"(see current_entries below), then retry — all in this turn."))
++                    f"(see current_entries below), then retry — all in this turn." + _headroom_hint(new_total, limit)))
+             return patched, "Entry patched.", {
+                 "patched_entry_before": before, "patched_entry_after": after}
+         return self._mutate(target, _apply)
+@@ -484,7 +511,8 @@ class MemoryStore:
+                 return self._failure_with_entries(target, (
+                     f"Replacement {_over_limit(new_total, limit)}. Shorten the new content, or retry as ONE "
+                     f"'operations' batch with this replace plus removes/shortenings of other stale entries "
+-                    f"(see current_entries below) — the limit is checked only on the batch result."))
++                    f"(see current_entries below) — the limit is checked only on the batch result."
++                    + _headroom_hint(new_total, limit)))
+             return replaced, "Entry replaced.", {"replaced_entry": entries[idx]}
+         return self._mutate(target, _apply)
+ 
+@@ -594,7 +622,8 @@ class MemoryStore:
+             if new_total > limit:
+                 return self._batch_failure(target, (
+                     f"Applying all {len(operations)} operations {_over_limit(new_total, limit)} more. Add "
+-                    f"removes or shortening patches of other stale entries to the same batch, then retry."),
++                    f"removes or shortening patches of other stale entries to the same batch, then retry."
++                    + _headroom_hint(new_total, limit)),
+                     "over_budget")
+             if not commit:
+                 return {"success": True, "matched_entries": matched}
+@@ -641,7 +670,8 @@ class MemoryStore:
+             return ""
+         content, sep = ENTRY_DELIMITER.join(entries), "═" * 46
+         title = MEMORY_BLOCK_HEADERS["user" if target == "user" else "memory"]
+-        return f"{sep}\n{title} [{self._usage_pct(target, len(content))}]\n{sep}\n{content}"
++        note = _low_headroom_note(len(content), self._char_limit(target))
++        return f"{sep}\n{title} [{self._usage_pct(target, len(content))}]{note}\n{sep}\n{content}"
+ 
+     @staticmethod
+     def _read_raw_checked(path: Path) -> tuple[str, bool]:
+-- 
+2.54.0 (Apple Git-157)
+

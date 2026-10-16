@@ -1,9 +1,9 @@
 # Sidebar status stripe + gateway device glyph (Desktop)
 
-Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091`, `0094`, `0095` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
+Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091`, `0094`, `0095`, `0099`, `0104` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
 only, as does `0089`; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints; `0091`
 is backend-only (`tui_gateway/server.py`), as is `0094` (`tui_gateway/session_reaper.py`); `0095` touches cron, the
-session-list endpoints and `apps/desktop`. Replaces the per-gateway
+session-list endpoints and `apps/desktop`. `0099` and `0104` are Desktop-only refresh fixes. Replaces the per-gateway
 row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `0038`: stripe shows session status (green/red); gateway becomes a device glyph after the age.
@@ -16,6 +16,8 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `0091`: a turn running longer than 5 min no longer paints red while its tools are still active.
 - `0094`: the backend no longer reaps a detached session that owns a running background job.
 - `0095`: a session that owns a live cron job shows a grey loop glyph instead of the stripe (never green).
+- `0099`: activity-only list refreshes update badges and stripes even when messages have not changed.
+- `0104`: a store-level sweep refreshes stale running background rows, including hidden sessions.
 - Red for blocked kanban cards is `0092`, documented in [kanban-session-links.md](kanban-session-links.md).
 
 ## Behavior
@@ -53,6 +55,13 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
   All three count over the session's whole compression lineage. Once the work ends the row goes back to green.
   A live turn still wins: the row reads `working`.
+- Activity-only list changes now repaint the row (`0099`): kanban counts and goal, cron or background
+  activity no longer wait for the session’s own messages to change.
+- Hidden sessions with renderer-cached running background rows are re-polled every 30 s (`0104`),
+  even when their composer pane is not visible. A confirmed-gone runtime loses its running rows;
+  completed rows remain for existing linger/Stop handling. Transient failures retain running rows.
+  Removing stale activity allows an otherwise finished session to go green; other busy/blocked/periodic
+  state still determines its stripe.
 - The row shows kanban task counts right after the age and before the gateway glyph (`0063`): open
   (queued/running) with a project glyph, blocked with an amber `?`. A side that is zero is hidden; with no
   kanban work nothing renders. The tooltip reads e.g. "3 kanban tasks open, 1 blocked".
@@ -133,7 +142,35 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   (a `perf_counter_ns` stamp), capped at `now`. Idle sessions keep their stored stamp. Desktop's
   `rehydrateLiveSessionStatuses` is unchanged: it still marks a working row `stalled` once `last_active` is 5+ min old.
 
+## Code
+
+Paths below are relative to `apps/desktop/src/` (backend paths above are repository-relative).
+
+- `lib/session-signatures.ts` (`0099`): `sameCronSignature` now compares `kanban_active`,
+  `kanban_blocked`, `goal_active`, `cron_active` and `background_active` alongside content, pin and
+  archive fields. A difference prevents the refresh gate from retaining the old `$sessions` array.
+- `store/composer-status.ts` (`0104`): `writeBackground` calls `syncRunningSweep`;
+  `sessionsWithRunningRows` selects session ids from `$backgroundStatusBySession`. A single
+  `RUNNING_SWEEP_MS = 30_000` interval calls `refreshBackgroundProcesses` for each selected id,
+  and stops when none remain. This supplements, rather than replaces, visible-pane polling.
+- In the same file, `dropRunningRows` filters only `state === 'running'` items.
+  `refreshBackgroundProcesses` invokes it both when `isSessionGone(sid)` is already latched and
+  after a terminal session-gone error is detected and recorded with `markSessionGone`. The
+  backend’s `background_active` stamp still accounts for genuinely live processes.
+
 ## Tests
+
+The three 0099/0104 regression files below passed in the full-series verification (October 16, 2026 PT). Earlier feature tests listed afterward were not rerun in this update.
+
+- `lib/session-signatures.test.ts` (`0099`): parameterized “is false when only %s changed”
+  covers each of the five activity fields, including removal to `undefined`; unchanged values
+  still compare equal.
+- `store/composer-status.test.ts` (`0104`), “stale running rows”: re-polls without a pane,
+  reconciles a failed exit, makes no sweep requests with only finished rows, drops running rows
+  for both newly reported and already-latched gone runtimes, and retains them on a timeout.
+- `app/chat/composer/status-stack/polling-guard.test.tsx` (`0104`): the hidden/visible pane
+  test uses two 12 s windows below the store’s 30 s sweep, preserving the assertion that hidden
+  panes skip their own 5 s timer while visible panes poll.
 
 - `store/session-dot-state.test.ts`: `sessionStatusStripe`; "kanban work in flight
   (`$kanbanBusySessionIds`)" and "standing goal in flight (`$goalActiveSessionIds`)" (background not done,
@@ -162,17 +199,19 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 ## Applying
 
-Apply after `0024`. Name your gateways so the regexes match (e.g. a connection labelled `macbook`, or
+Use a disposable checkout at the fork/upstream merge-base and apply the numbered series in order
+through `0104` for the complete behavior here. The full series through `0105` applied cleanly;
+no isolated-apply validation is claimed. Rebuild Desktop afterward.
+
+Earlier dependency notes (not a minimal apply recipe): name your gateways so the regexes match (e.g. a connection labelled `macbook`, or
 an ssh host containing `mini`). Apply `0044` before `0051` and `0063`: both edit code it adds in
 `kanban_session_activity.py`, `session-dot-state.ts` and `types/hermes.ts`. `0063` also edits the
 subscriber-counting part of `_read_counts` and sits after a test, both added by `0059` (sessions that
 shepherd a kanban card subscribe to it; not covered here), so apply `0059` first. Apply `0070` after `0051`:
 its hunks sit next to the goal code in `session-dot-state.ts`, `types/hermes.ts` and both routers. `0070` reads
 `processes.json`, so it works best with `0069` ([process-readoption.md](process-readoption.md)), which stops
-Hermes processes from erasing each other's entries there; it does not need `0069` to apply. `0089` is a two-file change to `session-row.tsx` and its test and applies on
-its own; it drops the row's use of `showsRunningArc` but leaves that helper in `session-dot-state.ts`. `0091` applies
-on its own (one helper in `tui_gateway/server.py` plus a test) and needs no Desktop change.
- `0094` applies on its own. Apply `0095` after `0092`
+Hermes processes from erasing each other's entries there; it does not need `0069` to apply. `0089` is a two-file change to `session-row.tsx` and its test; it drops the row's use of `showsRunningArc` but leaves that helper in `session-dot-state.ts`. `0091` changes one helper in `tui_gateway/server.py` plus a test and needs no Desktop change.
+`0094` changes the backend reaper. Apply `0095` after `0092`
 (it extends `sessionStatusStripe`'s `kanbanBlocked` signature) and after `0051`/`0070` (adjacent router lines).
 
 ## Gotchas
@@ -193,7 +232,18 @@ on its own (one helper in `tui_gateway/server.py` plus a test) and needs no Desk
 - `0091` only helps when the agent stamps `_last_activity_ts`. A tool that blocks for 5+ min without heartbeats
   still reads as stalled; that is the signal working as intended.
 - Any live background process keeps the row off green, including a long-lived server or watcher you meant to
-  leave running. Kill it (or let it exit) and the row goes green within the poll interval plus the 3 s cache.
+  leave running. After it exits, the backend stamp clears on the list poll plus the 3 s cache;
+  a cached renderer running row may additionally wait for the 30 s sweep (`0104`).
+- The sweep only revisits sessions already holding running rows; it is not a discovery scan of
+  all sessions. A watch-pattern-only process can exit without a process-status event, which is why
+  the sweep is needed. A timeout is not evidence that a runtime is gone.
 - Background ownership is only as good as `processes.json`: without `0069`, a process missing from the file
   and not in this backend's registry leaves the row green.
 - The `kanbanTasks` tooltip is untranslated outside English.
+
+## Could this be a plugin instead?
+
+Not as a replacement for these fixes. The built-in stripe depends on core session-list comparison,
+row state and composer process reconciliation. `0099` changes the equality gate that admits new
+activity stamps; `0104` changes the shared background store and gone-runtime handling. A plugin
+can display a separate indicator but cannot fix those built-in refresh paths through a UI contribution.

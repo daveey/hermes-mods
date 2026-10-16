@@ -1,0 +1,232 @@
+From 737763d15984b27d2657a8bfbfd6f7b7b953f9fe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 00:43:39 -0700
+Subject: [PATCH] fix(desktop): sweep stale background rows so idle sessions go
+ green [daveey]
+
+A hidden session's running background row never refreshed: the status
+stack polls only a visible pane, and a watch_patterns-only process exits
+without a status.update kind=process event. The sidebar kept the row as
+'Background task running' (no stripe) with nothing alive. A 30s store
+sweep now re-polls every session holding a running row, and a gone
+runtime's running rows are dropped (backend background_active still
+covers live pids).
+---
+ .../status-stack/polling-guard.test.tsx       | 10 ++-
+ .../desktop/src/store/composer-status.test.ts | 79 +++++++++++++++++++
+ apps/desktop/src/store/composer-status.ts     | 62 ++++++++++++++-
+ 3 files changed, 146 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/composer/status-stack/polling-guard.test.tsx b/apps/desktop/src/app/chat/composer/status-stack/polling-guard.test.tsx
+index 510ac0644c..aa9382b083 100644
+--- a/apps/desktop/src/app/chat/composer/status-stack/polling-guard.test.tsx
++++ b/apps/desktop/src/app/chat/composer/status-stack/polling-guard.test.tsx
+@@ -120,18 +120,20 @@ describe('ComposerStatusStack hidden-pane poll', () => {
+   })
+ 
+   it('hidden tile skips the 5s poll; visible tile polls; reveal resumes', async () => {
++    // Both windows together stay under the store's 30s stale-row sweep
++    // (RUNNING_SWEEP_MS), so only the pane's own 5s poll is counted here.
+     const hidden = renderStackBg(false)
+     await vi.advanceTimersByTimeAsync(0)
+-    await vi.advanceTimersByTimeAsync(15_000)
++    await vi.advanceTimersByTimeAsync(12_000)
+     // Mount seed only — the interval never armed while hidden.
+     expect(processListCalls()).toBe(1)
+     hidden.unmount()
+ 
+     const shown = renderStackBg(true)
+     await vi.advanceTimersByTimeAsync(0)
+-    await vi.advanceTimersByTimeAsync(15_000)
+-    // Mount seed + three 5s ticks.
+-    expect(processListCalls()).toBe(1 + 1 + 3)
++    await vi.advanceTimersByTimeAsync(12_000)
++    // Mount seed + two 5s ticks.
++    expect(processListCalls()).toBe(1 + 1 + 2)
+     shown.unmount()
+   })
+ 
+diff --git a/apps/desktop/src/store/composer-status.test.ts b/apps/desktop/src/store/composer-status.test.ts
+index a2caf2615f..703afa8cfe 100644
+--- a/apps/desktop/src/store/composer-status.test.ts
++++ b/apps/desktop/src/store/composer-status.test.ts
+@@ -8,6 +8,7 @@ import {
+   reconcileBackgroundProcesses,
+   refreshBackgroundProcesses,
+   resetBackgroundPollingGuard,
++  RUNNING_SWEEP_MS,
+   stopBackgroundProcess
+ } from './composer-status'
+ import { $gateway } from './gateway'
+@@ -413,3 +414,81 @@ describe('refreshBackgroundProcesses dead-session guard hardenings', () => {
+     expect(request).toHaveBeenCalledTimes(4)
+   })
+ })
++
++// [daveey] A hidden session's running row went stale: the status stack only
++// polls a visible pane, and a watch_patterns-only process exits without a
++// `status.update kind=process` event. The sidebar then read "Background task
++// running" for hours with nothing alive.
++describe('stale running rows', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++    $backgroundStatusBySession.set({})
++    resetBackgroundPollingGuard()
++  })
++
++  afterEach(() => {
++    $backgroundStatusBySession.set({})
++    $gateway.set(null as never)
++    resetBackgroundPollingGuard()
++    vi.clearAllTimers()
++    vi.useRealTimers()
++  })
++
++  it('re-polls a session with a running row even when no pane polls it', async () => {
++    const request = vi.fn(async () => ({ processes: [exited('w', 1)] }))
++    $gateway.set({ request } as never)
++
++    reconcileBackgroundProcesses(SID, [running('w')])
++    expect(items()[0]!.state).toBe('running')
++
++    await vi.advanceTimersByTimeAsync(RUNNING_SWEEP_MS)
++
++    expect(request).toHaveBeenCalledWith('process.list', { session_id: SID })
++    expect(items()[0]!.state).toBe('failed')
++  })
++
++  it('stops sweeping once no running rows remain', async () => {
++    const request = vi.fn(async () => ({ processes: [] }))
++    $gateway.set({ request } as never)
++
++    reconcileBackgroundProcesses(SID, [exited('done', 0)])
++    await vi.advanceTimersByTimeAsync(RUNNING_SWEEP_MS * 3)
++
++    expect(request).not.toHaveBeenCalled()
++  })
++
++  it('drops running rows once the runtime is reported gone', async () => {
++    const request = vi.fn(async () => {
++      throw new Error('session not found')
++    })
++
++    $gateway.set({ request } as never)
++
++    reconcileBackgroundProcesses(SID, [running('w')])
++    await refreshBackgroundProcesses(SID)
++
++    expect(items()).toEqual([])
++  })
++
++  it('drops running rows of a session another poller already latched gone', async () => {
++    reconcileBackgroundProcesses(SID, [running('w')])
++    markSessionGone(SID)
++
++    await refreshBackgroundProcesses(SID)
++
++    expect(items()).toEqual([])
++  })
++
++  it('keeps running rows across a transient failure', async () => {
++    const request = vi.fn(async () => {
++      throw new Error('request timed out after 30s: process.list')
++    })
++
++    $gateway.set({ request } as never)
++
++    reconcileBackgroundProcesses(SID, [running('w')])
++    await refreshBackgroundProcesses(SID)
++
++    expect(items().map(i => i.state)).toEqual(['running'])
++  })
++})
+diff --git a/apps/desktop/src/store/composer-status.ts b/apps/desktop/src/store/composer-status.ts
+index 4f1b043d20..af2704114a 100644
+--- a/apps/desktop/src/store/composer-status.ts
++++ b/apps/desktop/src/store/composer-status.ts
+@@ -285,6 +285,59 @@ const writeBackground = (sid: string, items: ComposerStatusItem[]) => {
+   }
+ 
+   $backgroundStatusBySession.set(next)
++  syncRunningSweep()
++}
++
++// [daveey] Running rows go stale when nobody re-polls them. The status stack
++// polls only while its pane is visible, and a process started without
++// `notify_on_complete` (e.g. watch_patterns only) exits with no
++// `status.update kind=process` event, so a hidden session kept a `running` row
++// forever and its sidebar row read "Background task running" (no stripe) with
++// nothing left alive. This low-rate sweep re-polls every session that still
++// has a running row, visible or not; it stops itself once none remain.
++export const RUNNING_SWEEP_MS = 30_000
++let runningSweep: null | ReturnType<typeof setInterval> = null
++
++const sessionsWithRunningRows = () =>
++  Object.entries($backgroundStatusBySession.get())
++    .filter(([, items]) => items.some(item => item.state === 'running'))
++    .map(([sid]) => sid)
++
++function syncRunningSweep() {
++  const active = sessionsWithRunningRows().length > 0
++
++  if (active && runningSweep === null) {
++    runningSweep = setInterval(() => {
++      const sids = sessionsWithRunningRows()
++
++      for (const sid of sids) {
++        void refreshBackgroundProcesses(sid)
++      }
++
++      if (sids.length === 0) {
++        syncRunningSweep()
++      }
++    }, RUNNING_SWEEP_MS)
++  } else if (!active && runningSweep !== null) {
++    clearInterval(runningSweep)
++    runningSweep = null
++  }
++}
++
++/** [daveey] A gone runtime can never report its processes again, so its
++ *  `running` rows would claim the session forever. Drop them; the backend's
++ *  `background_active` row stamp (live pids from every processes.json) still
++ *  keeps the sidebar busy for anything really alive. Finished rows stay for
++ *  their linger/Stop handling. */
++function dropRunningRows(sid: string) {
++  const list = $backgroundStatusBySession.get()[sid] ?? []
++
++  if (list.some(item => item.state === 'running')) {
++    writeBackground(
++      sid,
++      list.filter(item => item.state !== 'running')
++    )
++  }
+ }
+ 
+ // `tui_gateway` process.list entry (tools/process_registry.list_sessions + output_tail).
+@@ -411,7 +464,13 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
+ export async function refreshBackgroundProcesses(sid: string): Promise<void> {
+   const gateway = $gateway.get()
+ 
+-  if (!sid || !gateway || isSessionGone(sid)) {
++  if (sid && isSessionGone(sid)) {
++    dropRunningRows(sid)
++
++    return
++  }
++
++  if (!sid || !gateway) {
+     return
+   }
+ 
+@@ -432,6 +491,7 @@ export async function refreshBackgroundProcesses(sid: string): Promise<void> {
+     // or the 5s timer hammers the gateway with 4001s for the window's lifetime.
+     if (isSessionGoneForBackgroundPolling(error)) {
+       markSessionGone(sid)
++      dropRunningRows(sid)
+ 
+       return
+     }
+-- 
+2.54.0 (Apple Git-157)
+

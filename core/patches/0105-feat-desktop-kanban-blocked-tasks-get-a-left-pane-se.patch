@@ -1,0 +1,948 @@
+From e9a0573ff190d191daa4c9498401b1e3371d6ed2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 12:35:02 -0700
+Subject: [PATCH] feat(desktop/kanban): blocked tasks get a left-pane section
+ above Projects; no completion/blocked toasts [daveey]
+
+- core: new `sidebar.sections` contribution area rendered between Pinned and
+  Projects, with SidebarSection / SidebarSectionRow chrome exported via the SDK
+- kanban: Blocked section lists every blocked card across boards and gateways
+  (click opens its drawer); polled 30s + invalidated by live events
+- completion-notify: per-kind quiet policy; the plugin silences 'completed'
+  entirely and drops the in-app toast for 'blocked' (away-only OS
+  notification kept). Failures/triage still toast.
+---
+ .../sidebar/contributed-sections.test.tsx     |  80 ++++++++++
+ .../app/chat/sidebar/contributed-sections.tsx | 145 +++++++++++++++++
+ apps/desktop/src/app/chat/sidebar/index.tsx   |   4 +
+ apps/desktop/src/app/routes.ts                |   9 ++
+ .../src/plugins/kanban/api.blocked.test.ts    | 148 ++++++++++++++++++
+ apps/desktop/src/plugins/kanban/api.ts        |  68 +++++++-
+ .../src/plugins/kanban/blocked-section.tsx    |  69 ++++++++
+ .../plugins/kanban/completion-notify.test.ts  |  37 ++++-
+ .../src/plugins/kanban/completion-notify.ts   |  61 +++++---
+ apps/desktop/src/plugins/kanban/i18n.ts       |  21 +++
+ apps/desktop/src/plugins/kanban/plugin.tsx    |  22 ++-
+ apps/desktop/src/sdk/index.ts                 |  10 ++
+ 12 files changed, 649 insertions(+), 25 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/sidebar/contributed-sections.test.tsx
+ create mode 100644 apps/desktop/src/app/chat/sidebar/contributed-sections.tsx
+ create mode 100644 apps/desktop/src/plugins/kanban/api.blocked.test.ts
+ create mode 100644 apps/desktop/src/plugins/kanban/blocked-section.tsx
+
+diff --git a/apps/desktop/src/app/chat/sidebar/contributed-sections.test.tsx b/apps/desktop/src/app/chat/sidebar/contributed-sections.test.tsx
+new file mode 100644
+index 0000000000..ab4fece34d
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/contributed-sections.test.tsx
+@@ -0,0 +1,80 @@
++import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { useState } from 'react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { SIDEBAR_SECTIONS_AREA } from '@/app/routes'
++import { registry } from '@/contrib/registry'
++
++import { SidebarContributedSections, SidebarSection, SidebarSectionRow } from './contributed-sections'
++
++// [daveey] `sidebar.sections`: plugin lists mounted between Pinned and Projects.
++
++let dispose: (() => void) | undefined
++
++afterEach(() => {
++  dispose?.()
++  dispose = undefined
++  cleanup()
++})
++
++function Demo({ onSelect }: { onSelect: (id: string) => void }) {
++  const [open, setOpen] = useState(true)
++  const [visible, setVisible] = useState(1)
++  const rows = ['alpha', 'beta', 'gamma']
++
++  return (
++    <SidebarSection
++      count={rows.length}
++      hiddenCount={rows.length - visible}
++      label="Blocked"
++      onLoadMore={() => setVisible(n => n + 10)}
++      onToggle={() => setOpen(!open)}
++      open={open}
++    >
++      {rows.slice(0, visible).map(id => (
++        <SidebarSectionRow key={id} label={id} meta="2h" onSelect={() => onSelect(id)} />
++      ))}
++    </SidebarSection>
++  )
++}
++
++describe('SidebarContributedSections', () => {
++  it('renders nothing without contributions', () => {
++    const { container } = render(<SidebarContributedSections />)
++
++    expect(container.innerHTML).toBe('')
++  })
++
++  it('mounts a contributed section; rows click, load more and collapse', () => {
++    const onSelect = vi.fn()
++    dispose = registry.register({ area: SIDEBAR_SECTIONS_AREA, id: 'demo', render: () => <Demo onSelect={onSelect} /> })
++
++    render(<SidebarContributedSections />)
++
++    expect(screen.getByText('Blocked')).toBeTruthy()
++    expect(screen.getByText('3')).toBeTruthy()
++    expect(screen.getByText('2h')).toBeTruthy()
++
++    fireEvent.click(screen.getByText('alpha'))
++    expect(onSelect).toHaveBeenCalledWith('alpha')
++
++    expect(screen.queryByText('beta')).toBeNull()
++    fireEvent.click(screen.getByRole('button', { name: /2/ }))
++    expect(screen.getByText('gamma')).toBeTruthy()
++
++    fireEvent.click(screen.getByRole('button', { expanded: true }))
++    expect(screen.queryByText('alpha')).toBeNull()
++  })
++
++  it('drops a section when its contribution is disposed', () => {
++    dispose = registry.register({ area: SIDEBAR_SECTIONS_AREA, id: 'demo', render: () => <Demo onSelect={vi.fn()} /> })
++    render(<SidebarContributedSections />)
++    expect(screen.getByText('Blocked')).toBeTruthy()
++
++    act(() => {
++      dispose?.()
++      dispose = undefined
++    })
++    expect(screen.queryByText('Blocked')).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/contributed-sections.tsx b/apps/desktop/src/app/chat/sidebar/contributed-sections.tsx
+new file mode 100644
+index 0000000000..97b74215af
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/contributed-sections.tsx
+@@ -0,0 +1,145 @@
++/**
++ * [daveey] Plugin-contributed sidebar sections (`sidebar.sections`), mounted
++ * between Pinned and Projects, plus the section/row chrome they build from so a
++ * plugin's list sits on the same grid as the core sections around it.
++ */
++
++import type * as React from 'react'
++
++import { SIDEBAR_SECTIONS_AREA } from '@/app/routes'
++import { Codicon } from '@/components/ui/codicon'
++import { DisclosureCaret } from '@/components/ui/disclosure-caret'
++import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
++import { Tip } from '@/components/ui/tooltip'
++import { useContributions } from '@/contrib'
++import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
++import { cn } from '@/lib/utils'
++
++import { SidebarPanelLabel } from '../../shell/sidebar-label'
++
++import { SidebarRowBody, SidebarRowLabel, SidebarRowLead, SidebarRowShell, SidebarSectionMeta } from './chrome'
++import { SidebarLoadMoreRow } from './load-more-row'
++
++/** Renders every `sidebar.sections` contribution in order. */
++export function SidebarContributedSections() {
++  const items = useContributions(SIDEBAR_SECTIONS_AREA)
++
++  if (!items.length) {
++    return null
++  }
++
++  return (
++    <>
++      {items.map(item =>
++        item.render ? (
++          <ContribBoundary id={item.id} key={item.id} variant="chip">
++            <ContribRender render={item.render} />
++          </ContribBoundary>
++        ) : null
++      )}
++    </>
++  )
++}
++
++export interface SidebarSectionProps {
++  label: string
++  /** Muted count beside the label. */
++  count?: number
++  open: boolean
++  onToggle: () => void
++  children?: React.ReactNode
++  /** Rows hidden behind the cap; > 0 shows the load-more control. */
++  hiddenCount?: number
++  onLoadMore?: () => void
++  loadMoreStep?: number
++}
++
++/** Collapsible sidebar section — the header and body geometry of the core
++ *  Cron / messaging sections. */
++export function SidebarSection({
++  children,
++  count,
++  hiddenCount = 0,
++  label,
++  loadMoreStep = 10,
++  onLoadMore,
++  onToggle,
++  open
++}: SidebarSectionProps) {
++  return (
++    <SidebarGroup className="shrink-0 p-0 pb-1">
++      <div className="group/section flex shrink-0 items-center justify-between pb-1 pt-1.5">
++        <button
++          aria-expanded={open}
++          className="group/section-label flex w-fit min-w-0 items-center gap-1 bg-transparent text-left leading-none"
++          onClick={onToggle}
++          type="button"
++        >
++          <SidebarPanelLabel>{label}</SidebarPanelLabel>
++          {count !== undefined && <SidebarSectionMeta>{count}</SidebarSectionMeta>}
++          <DisclosureCaret
++            className="text-(--ui-text-tertiary) opacity-0 transition group-hover/section-label:opacity-100"
++            open={open}
++          />
++        </button>
++      </div>
++      {open && (
++        <SidebarGroupContent className="scrollbar-fade flex max-h-72 flex-col gap-px overflow-x-hidden overflow-y-auto overscroll-contain pb-1.75 compact:max-h-none compact:overflow-visible">
++          {children}
++          {hiddenCount > 0 && onLoadMore && (
++            <SidebarLoadMoreRow onClick={onLoadMore} step={Math.min(loadMoreStep, hiddenCount)} />
++          )}
++        </SidebarGroupContent>
++      )}
++    </SidebarGroup>
++  )
++}
++
++export interface SidebarSectionRowProps {
++  label: string
++  onSelect: () => void
++  /** Hover tooltip (defaults to the label). */
++  tip?: React.ReactNode
++  /** Leading codicon; omitted = a small dot. */
++  icon?: string
++  /** CSS color for the leading icon/dot. */
++  accentColor?: string
++  /** Muted trailing text (age, owner). */
++  meta?: React.ReactNode
++  active?: boolean
++}
++
++/** One clickable row on the session-row grid. */
++export function SidebarSectionRow({ accentColor, active, icon, label, meta, onSelect, tip }: SidebarSectionRowProps) {
++  return (
++    <SidebarRowShell
++      actions={
++        meta ? <span className="text-[0.6875rem] text-(--ui-text-tertiary) tabular-nums">{meta}</span> : undefined
++      }
++      className={cn(
++        'group/contrib-row relative hover:bg-(--chrome-action-hover)',
++        active && 'bg-(--chrome-action-hover)'
++      )}
++    >
++      <Tip label={tip ?? label}>
++        <SidebarRowBody
++          className="focus-visible:bg-(--chrome-action-hover) focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
++          onClick={onSelect}
++        >
++          <SidebarRowLead style={accentColor ? { color: accentColor } : undefined}>
++            {icon ? (
++              <Codicon name={icon} size="0.75rem" />
++            ) : (
++              <span
++                aria-hidden="true"
++                className="size-1 rounded-full bg-current"
++                style={accentColor ? undefined : { color: 'var(--ui-text-quaternary)' }}
++              />
++            )}
++          </SidebarRowLead>
++          <SidebarRowLabel className="group-hover/contrib-row:text-foreground">{label}</SidebarRowLabel>
++        </SidebarRowBody>
++      </Tip>
++    </SidebarRowShell>
++  )
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index cedd8fab6d..248a5d187b 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -152,6 +152,7 @@ import type { SidebarNavItem } from '../../types'
+ import { type NewSessionSplitHandler, startNewSessionDrag } from '../new-session-drag'
+ 
+ import { SidebarSectionAddButton } from './chrome'
++import { SidebarContributedSections } from './contributed-sections'
+ import { SidebarCronJobsSection } from './cron-jobs-section'
+ import { SidebarFilterMenu } from './filter-menu'
+ import { buildGatewaySessionGroups, scopeGatewaySessionGroups, useGatewaySessionGroups } from './gateway-group-model'
+@@ -1842,6 +1843,9 @@ export function ChatSidebar({
+               />
+             )}
+ 
++            {/* [daveey] Plugin sections (Kanban's Blocked tasks) sit above Projects. */}
++            {!trimmedQuery && <SidebarContributedSections />}
++
+             {!trimmedQuery && inProject && projectLoadFailed && <SidebarLoadErrorState onRetry={retryProject} />}
+             {!trimmedQuery && (
+               <SidebarSessionsSection
+diff --git a/apps/desktop/src/app/routes.ts b/apps/desktop/src/app/routes.ts
+index 3ed1c01c2b..6b9ef53baa 100644
+--- a/apps/desktop/src/app/routes.ts
++++ b/apps/desktop/src/app/routes.ts
+@@ -138,6 +138,15 @@ export interface SidebarNavContribution {
+   tier?: InterfaceTier
+ }
+ 
++// ── [daveey] Contributed sidebar sections — the `sidebar.sections` area ──────
++// A RENDER contribution mounted in the sessions sidebar between Pinned and
++// Projects, for plugin-owned lists that deserve a standing place in the left
++// pane (the Kanban plugin's Blocked tasks). Build it from the SDK's
++// `SidebarSection` + `SidebarSectionRow` so it reads like the core sections.
++// Return null to hide the section entirely (e.g. nothing blocked).
++
++export const SIDEBAR_SECTIONS_AREA = 'sidebar.sections'
++
+ // ── Contributed profile-group header — the `sidebar.profileGroup.header` area ─
+ // A RENDER contribution mounted at the top of each gateway/profile group in the
+ // Sessions sidebar (above its session rows) while the group is expanded. The
+diff --git a/apps/desktop/src/plugins/kanban/api.blocked.test.ts b/apps/desktop/src/plugins/kanban/api.blocked.test.ts
+new file mode 100644
+index 0000000000..c2d2a2a829
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/api.blocked.test.ts
+@@ -0,0 +1,148 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] fetchBlockedTasks — the left pane's Blocked section: every blocked
++// card on every board of every gateway.
++
++const routed = vi.hoisted(() => ({ id: null as null | string }))
++
++vi.mock('@/hermes', () => ({ setApiRequestProfile: vi.fn() }))
++vi.mock('@/store/gateway', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  activeGatewayConnectionId: () => routed.id
++}))
++
++const api = await import('./api')
++const { $connectionsRegistry } = await import('@/store/connection-registry-state')
++const { queryClient } = await import('@/lib/query-client')
++
++const { $boardSlug, bindApi, fetchBlockedTasks, resetGatewayCooldowns, taskGateway } = api
++
++type Call = { opts?: { connectionId?: string; method?: string; body?: unknown }; path: string }
++
++const task = (id: string, extra: Record<string, unknown> = {}) => ({ id, status: 'ready', title: id, ...extra })
++
++const board = (columns: Record<string, ReturnType<typeof task>[]>, extra: Record<string, unknown> = {}) => ({
++  assignees: [],
++  columns: Object.entries(columns).map(([name, tasks]) => ({ name, tasks })),
++  latest_event_id: 0,
++  now: 0,
++  tenants: [],
++  ...extra
++})
++
++const storage = { get: <T>(_key: string, fallback: T) => fallback, remove: vi.fn(), set: vi.fn() }
++
++function registry(...ids: string[]) {
++  $connectionsRegistry.set({
++    connections: ids.map(id => ({ id, kind: id === 'local' ? 'local' : 'ssh', label: id.toUpperCase() })),
++    primary: 'local'
++  } as never)
++}
++
++let calls: Call[] = []
++let dispose: () => void = () => undefined
++
++async function bind(respond: (call: Call) => unknown) {
++  const socket = vi.fn(() => vi.fn())
++  calls = []
++  dispose = bindApi(
++    (async (path: string, opts?: Call['opts']) => {
++      const call = { opts, path }
++      calls.push(call)
++      const out = respond(call)
++
++      if (out instanceof Error) {
++        throw out
++      }
++
++      return out
++    }) as never,
++    storage,
++    socket
++  )
++  // bindApi's own events-socket snapshot read is not what these tests assert.
++  await vi.waitFor(() => expect(socket).toHaveBeenCalled())
++  calls = []
++}
++
++beforeEach(() => {
++  routed.id = 'local'
++})
++
++afterEach(() => {
++  dispose()
++  $connectionsRegistry.set(null)
++  $boardSlug.set('')
++  resetGatewayCooldowns()
++  queryClient.clear()
++  vi.useRealTimers()
++})
++
++describe('fetchBlockedTasks', () => {
++  it('reads only boards whose counts hold blocked cards and tags each card with its board', async () => {
++    registry('local')
++    await bind(call => {
++      if (call.path === '/boards') {
++        return {
++          boards: [
++            { counts: { blocked: 1, ready: 3 }, slug: 'default' },
++            { counts: { ready: 2 }, slug: 'idle' },
++            { counts: { blocked: 1 }, slug: 'ops' }
++          ],
++          current: 'default'
++        }
++      }
++
++      if (call.path === '/board?board=default') {
++        return board({ blocked: [task('b1', { created_at: 5, status: 'blocked' })], ready: [task('r1')] })
++      }
++
++      if (call.path === '/board?board=ops') {
++        return board({ blocked: [task('b2', { created_at: 9, priority: 1, status: 'blocked' })] })
++      }
++
++      return new Error(`unexpected ${call.path}`)
++    })
++
++    const tasks = await fetchBlockedTasks()
++
++    expect(calls.map(c => c.path)).toEqual(['/boards', '/board?board=default', '/board?board=ops'])
++    // Priority first, then newest.
++    expect(tasks.map(t => [t.id, t.board])).toEqual([
++      ['b2', 'ops'],
++      ['b1', 'default']
++    ])
++  })
++
++  it('fans out to every gateway, survives a dead one, and routes the drawer to the owner', async () => {
++    registry('local', 'mini', 'cloud')
++    await bind(call => {
++      const gw = call.opts?.connectionId ?? 'local'
++
++      if (gw === 'cloud') {
++        return new Error('timed out')
++      }
++
++      if (call.path === '/boards') {
++        return { boards: [{ counts: { blocked: 1 }, slug: 'default' }], current: 'default' }
++      }
++
++      return board({ blocked: [task(`${gw}-b`, { status: 'blocked' })] })
++    })
++
++    const tasks = await fetchBlockedTasks()
++
++    expect(tasks.map(t => [t.id, t.gateway]).sort()).toEqual([
++      ['local-b', 'local'],
++      ['mini-b', 'mini']
++    ])
++    expect(taskGateway('mini-b')).toBe('mini')
++  })
++
++  it('throws when no gateway answers', async () => {
++    registry('local')
++    await bind(() => new Error('down'))
++
++    await expect(fetchBlockedTasks()).rejects.toThrow('down')
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index fdfe5b0662..8b317b0d5e 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -28,7 +28,12 @@ import {
+ } from '@hermes/plugin-sdk'
+ 
+ // Native completion notification.
+-import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from './completion-notify'
++import {
++  bindCompletionNotify,
++  type CompletionEvent,
++  type CompletionNotifyQuiet,
++  onKanbanEventsFrame
++} from './completion-notify'
+ import type {
+   BoardExportResult,
+   BoardImportResult,
+@@ -178,6 +183,8 @@ function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug
+   void queryClient.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
+   // Any event can change a board's card count — keep the switcher badge honest.
+   void queryClient.invalidateQueries({ queryKey: boardsKey(scope) })
++  // [daveey] The sidebar's Blocked section spans every board.
++  void queryClient.invalidateQueries({ queryKey: blockedKey(scope) })
+ 
+   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
+     void queryClient.invalidateQueries({ queryKey: taskKey(scope, slug, taskId!) })
+@@ -208,11 +215,11 @@ export function bindApi(
+   r: Rest,
+   storage: PluginStorage,
+   socket: Socket,
+-  notifyDoors?: { os?: PluginOs; t?: PluginTranslate }
++  notifyDoors?: { os?: PluginOs; quiet?: CompletionNotifyQuiet; t?: PluginTranslate }
+ ): () => void {
+   rest = r
+   os = notifyDoors?.os ?? null
+-  bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os)
++  bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os, notifyDoors?.quiet)
+   const unsubs: Array<() => void> = []
+ 
+   queryClient.setQueryDefaults(KANBAN_KEY_ROOT, { enabled: routedToScope })
+@@ -388,6 +395,8 @@ export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
+ export const profilesKey = (scope: string) => ['kanban', 'profiles', scope] as const
+ export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
+ export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', scope] as const
++/** [daveey] Blocked cards across every board and gateway (sidebar section). */
++export const blockedKey = (scope: string) => ['kanban', 'blocked', scope] as const
+ 
+ // ── gateways [daveey] ────────────────────────────────────────────────────────
+ //
+@@ -715,6 +724,59 @@ export function mergeBoardLists(parts: Array<{ gateway: string; boards: BoardsRe
+   return { boards: [...bySlug.values()], current }
+ }
+ 
++// ── [daveey] blocked cards across every board (the sidebar's Blocked section) ─
++
++/** A blocked card plus the board it lives on (the drawer opens it there). */
++export interface BlockedTask extends KanbanTask {
++  board: string
++}
++
++interface BoardsWithCounts extends BoardsResponse {
++  boards: Array<BoardMeta & { counts?: Record<string, number> }>
++}
++
++/** Every `blocked` card on every board of every gateway, highest priority
++ *  first, then newest. Boards whose `/boards` counts say they hold no blocked
++ *  card are skipped, so an idle fleet costs one `/boards` read per gateway.
++ *  A gateway that fails contributes nothing; throws only when all fail. */
++export async function fetchBlockedTasks(): Promise<BlockedTask[]> {
++  const gateways = boardGateways()
++
++  const perGateway = await Promise.allSettled(
++    gateways.map(async (gateway, index) => {
++      const read = <T>(path: string) => (index === 0 ? call<T>(path) : remoteRead<T>(gateway, path))
++      const { boards } = await read<BoardsWithCounts>('/boards')
++
++      const slugs = (boards ?? [])
++        .filter(meta => (meta.counts ? (meta.counts.blocked ?? 0) > 0 : true))
++        .map(meta => meta.slug)
++
++      const parts = await Promise.allSettled(
++        slugs.map(async slug => {
++          const board = await read<KanbanBoard>(withSlug('/board', slug))
++          const tasks = board.columns.find(col => col.name === 'blocked')?.tasks ?? []
++
++          return tasks.map(task => ({ ...task, board: slug, gateway: gateways.length > 1 ? gateway : task.gateway }))
++        })
++      )
++
++      return parts.flatMap(part => (part.status === 'fulfilled' ? part.value : []))
++    })
++  )
++
++  if (perGateway.every(result => result.status === 'rejected')) {
++    throw (perGateway[0] as PromiseRejectedResult).reason
++  }
++
++  const tasks = perGateway.flatMap(result => (result.status === 'fulfilled' ? result.value : []))
++
++  for (const task of tasks) {
++    taskOwners.set(task.id, { board: task.board, gateway: task.gateway ?? gateways[0] })
++  }
++
++  return tasks.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || (b.created_at ?? 0) - (a.created_at ?? 0))
++}
++
+ /** The assignee roster of `gateway` (default: the routed one) — profiles are
+  *  per gateway, so a create aimed at another gateway lists ITS profiles. */
+ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profiles')
+diff --git a/apps/desktop/src/plugins/kanban/blocked-section.tsx b/apps/desktop/src/plugins/kanban/blocked-section.tsx
+new file mode 100644
+index 0000000000..4ecec6d1e0
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/blocked-section.tsx
+@@ -0,0 +1,69 @@
++/**
++ * [daveey] Left-pane "Blocked" section: every blocked card on every board and
++ * gateway, between Pinned and Projects (core's `sidebar.sections` area). This
++ * replaces the in-app "task blocked" toast — the card stays visible here until
++ * someone unblocks it, instead of a popup that vanishes. Clicking a row opens
++ * the task's drawer on its own board. Hidden while nothing is blocked.
++ */
++
++import { atom, host, SidebarSection, SidebarSectionRow, useQuery, useValue } from '@hermes/plugin-sdk'
++import { useState } from 'react'
++
++import { blockedKey, fetchBlockedTasks, useKanbanScope } from './api'
++import { $openTaskRequest } from './open-task'
++import { ago, useKanban } from './ui'
++
++/** Collapsed? Persisted by plugin.tsx through ctx.storage. */
++export const $blockedSectionOpen = atom<boolean>(true)
++
++const INITIAL_ROWS = 5
++const LOAD_STEP = 10
++const POLL_MS = 30_000
++
++export function BlockedTasksSection() {
++  const k = useKanban()
++  const scope = useKanbanScope()
++  const open = useValue($blockedSectionOpen)
++  const [visible, setVisible] = useState(INITIAL_ROWS)
++
++  // Socket frames invalidate this key (api.ts onEventsFrame); the poll covers
++  // boards without an open socket and the other gateways.
++  const { data: tasks } = useQuery({
++    queryFn: fetchBlockedTasks,
++    queryKey: blockedKey(scope),
++    refetchInterval: POLL_MS
++  })
++
++  if (!tasks?.length) {
++    return null
++  }
++
++  const shown = tasks.slice(0, visible)
++
++  return (
++    <SidebarSection
++      count={tasks.length}
++      hiddenCount={tasks.length - shown.length}
++      label={k.sidebar.blocked}
++      loadMoreStep={LOAD_STEP}
++      onLoadMore={() => setVisible(n => n + LOAD_STEP)}
++      onToggle={() => $blockedSectionOpen.set(!open)}
++      open={open}
++    >
++      {shown.map(task => (
++        <SidebarSectionRow
++          accentColor="var(--ui-yellow)"
++          icon="question"
++          key={`${task.gateway ?? ''}:${task.board}:${task.id}`}
++          label={task.title || task.id}
++          meta={ago(task.created_at) ?? undefined}
++          onSelect={() => {
++            $openTaskRequest.set({ board: task.board, taskId: task.id })
++            host.navigate('/kanban')
++          }}
++          tip={k.sidebar.blockedTip(task.title || task.id, (task.latest_summary ?? '').trim())}
++        />
++      ))}
++    </SidebarSection>
++  )
++}
+diff --git a/apps/desktop/src/plugins/kanban/completion-notify.test.ts b/apps/desktop/src/plugins/kanban/completion-notify.test.ts
+index 3f31019db6..19ae3ce046 100644
+--- a/apps/desktop/src/plugins/kanban/completion-notify.test.ts
++++ b/apps/desktop/src/plugins/kanban/completion-notify.test.ts
+@@ -20,7 +20,12 @@ interface OsDoor {
+   notify: (input: { title: string; body?: string; silent?: boolean }) => void
+ }
+ interface Mod {
+-  bindCompletionNotify(r: Rest, t?: Translate, os?: OsDoor): void
++  bindCompletionNotify(
++    r: Rest,
++    t?: Translate,
++    os?: OsDoor,
++    quiet?: { silent?: readonly string[]; toastless?: readonly string[] }
++  ): void
+   onKanbanEventsFrame(slug: string, events?: CompletionEvent[]): Promise<boolean>
+ }
+ 
+@@ -545,6 +550,36 @@ describe('native OS door', () => {
+   })
+ })
+ 
++describe('quiet kinds', () => {
++  it('silent kinds fire neither toast nor OS notification but still advance the cursor', async () => {
++    const os = { notify: vi.fn() }
++    const m = await loadModule()
++    m.bindCompletionNotify(makeRest(() => 100) as never, undefined, os, { silent: ['completed'] })
++
++    const fired = await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Done' })])
++    expect(fired).toBe(false)
++    expect(hostMock.notify).not.toHaveBeenCalled()
++    expect(os.notify).not.toHaveBeenCalled()
++
++    // Cursor moved to 101: a replay stays silent, a later crash still toasts.
++    await m.onKanbanEventsFrame('smoke', [ev(101, 'crashed'), ev(102, 'crashed')])
++    expect(hostMock.notify).toHaveBeenCalledTimes(1)
++    expect(lastNotify().message).toBe('t102')
++  })
++
++  it('toastless kinds skip the in-app toast but keep the away-only OS notification', async () => {
++    const os = { notify: vi.fn() }
++    const m = await loadModule()
++    m.bindCompletionNotify(makeRest(() => 100) as never, undefined, os, { toastless: ['blocked'] })
++
++    const fired = await m.onKanbanEventsFrame('smoke', [ev(101, 'blocked', { reason: 'needs input' })])
++    expect(fired).toBe(true)
++    expect(hostMock.notify).not.toHaveBeenCalled()
++    expect(os.notify).toHaveBeenCalledTimes(1)
++    expect(os.notify.mock.calls[0][0]).toMatchObject({ body: 'needs input\nt101' })
++  })
++})
++
+ describe('i18n routing', () => {
+   it('uses the bound plugin translator when it resolves the key', async () => {
+     const t = vi.fn((key: string, ...args: unknown[]) => {
+diff --git a/apps/desktop/src/plugins/kanban/completion-notify.ts b/apps/desktop/src/plugins/kanban/completion-notify.ts
+index 88f257de23..d6c7c38f55 100644
+--- a/apps/desktop/src/plugins/kanban/completion-notify.ts
++++ b/apps/desktop/src/plugins/kanban/completion-notify.ts
+@@ -78,6 +78,17 @@ const baselinePending = new Set<string>()
+ let rest: Rest | null = null
+ let translate: PluginTranslate | null = null
+ let osDoor: PluginOs | null = null
++let silentKinds: ReadonlySet<string> = new Set()
++let toastlessKinds: ReadonlySet<string> = new Set()
++
++/** [daveey] Per-kind delivery overrides. `silent` kinds fire nothing (no toast,
++ *  no OS notification); `toastless` kinds skip the in-app toast but keep the
++ *  native OS notification the shell shows only while the user is away. Both
++ *  still advance the cursor. Unset = every terminal kind toasts (upstream). */
++export interface CompletionNotifyQuiet {
++  silent?: readonly string[]
++  toastless?: readonly string[]
++}
+ 
+ /** Resolve a dot-path against the plugin's own English bundle — the same
+  *  last-rung fallback the plugin i18n registry applies, usable before (or
+@@ -103,10 +114,17 @@ function t(key: string, ...args: unknown[]): string {
+   return translated && translated !== key ? translated : fallbackT(key, ...args)
+ }
+ 
+-export function bindCompletionNotify(r: Rest, pluginTranslate?: PluginTranslate, os?: PluginOs): void {
++export function bindCompletionNotify(
++  r: Rest,
++  pluginTranslate?: PluginTranslate,
++  os?: PluginOs,
++  quiet?: CompletionNotifyQuiet
++): void {
+   rest = r
+   translate = pluginTranslate ?? null
+   osDoor = os ?? null
++  silentKinds = new Set(quiet?.silent ?? [])
++  toastlessKinds = new Set(quiet?.toastless ?? [])
+ }
+ 
+ async function ensureBaseline(slug: string): Promise<void> {
+@@ -186,26 +204,29 @@ function notifyOne(
+   const detail = [taskId, artifactText, rawErrorFor(kind, ev)].filter(Boolean).join(' · ')
+   const title = t(spec.titleKey)
+   const message = body || taskId || title
+-  host.notify({
+-    kind: spec.toast,
+-    icon: spec.icon,
+-    accentColor: spec.accentColor,
+-    title,
+-    message,
+-    ...(detail ? { detail } : {}),
+-    action: {
+-      label: t('notify.openKanban'),
+-      onClick: () => {
+-        // Land on the event's board with the task's drawer open, not just
+-        // whatever board the page last showed.
+-        if (taskId) {
+-          $openTaskRequest.set({ board: slug, taskId })
+-        }
+ 
+-        host.navigate('/kanban')
++  if (!toastlessKinds.has(kind)) {
++    host.notify({
++      kind: spec.toast,
++      icon: spec.icon,
++      accentColor: spec.accentColor,
++      title,
++      message,
++      ...(detail ? { detail } : {}),
++      action: {
++        label: t('notify.openKanban'),
++        onClick: () => {
++          // Land on the event's board with the task's drawer open, not just
++          // whatever board the page last showed.
++          if (taskId) {
++            $openTaskRequest.set({ board: slug, taskId })
++          }
++
++          host.navigate('/kanban')
++        }
+       }
+-    }
+-  })
++    })
++  }
+ 
+   // Native OS notification — the desktop shell fires it only while the user
+   // is away from Hermes (the toast above covers the foreground case). Isolated:
+@@ -244,7 +265,7 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
+     seenEventIdByBoard.set(slug, cursor)
+     const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
+ 
+-    if (spec) {
++    if (spec && !silentKinds.has(ev.kind!)) {
+       try {
+         notifyOne(slug, ev.kind!, spec, ev)
+         fired = true
+diff --git a/apps/desktop/src/plugins/kanban/i18n.ts b/apps/desktop/src/plugins/kanban/i18n.ts
+index 3be82efa43..1bd933b64b 100644
+--- a/apps/desktop/src/plugins/kanban/i18n.ts
++++ b/apps/desktop/src/plugins/kanban/i18n.ts
+@@ -215,6 +215,11 @@ type KanbanMessages = {
+   profileDescriptionsHint: string
+   profileGoodAt: string
+   auto: string
++  // [daveey] left-pane Blocked section (blocked-section.tsx)
++  sidebar: {
++    blocked: string
++    blockedTip: (title: string, reason: string) => string
++  }
+   // native/toast notifications for terminal worker events (completion-notify)
+   notify: {
+     completedTitle: string
+@@ -450,6 +455,10 @@ export const en: KanbanMessages = {
+     'Descriptions guide the decomposer’s routing. Auto-generate with the auxiliary model, or write your own.',
+   profileGoodAt: 'What is this profile good at?',
+   auto: 'Auto',
++  sidebar: {
++    blocked: 'Blocked',
++    blockedTip: (title: string, reason: string) => (reason ? `${title} — ${reason}` : title)
++  },
+   notify: {
+     completedTitle: 'Task completed',
+     blockedTitle: 'Task blocked — needs your input',
+@@ -682,6 +691,10 @@ const ja: KanbanMessages = {
+     '説明はデコンポーザーのルーティングを導きます。補助モデルで自動生成するか、自分で書いてください。',
+   profileGoodAt: 'このプロフィールの得意分野は？',
+   auto: '自動',
++  sidebar: {
++    blocked: 'ブロック中',
++    blockedTip: (title: string, reason: string) => (reason ? `${title} — ${reason}` : title)
++  },
+   notify: {
+     completedTitle: 'タスク完了',
+     blockedTitle: 'タスクがブロック中 — 入力が必要です',
+@@ -911,6 +924,10 @@ const zh: KanbanMessages = {
+   profileDescriptionsHint: '说明用于引导分解器的路由。可用辅助模型自动生成，或自行填写。',
+   profileGoodAt: '这个配置档擅长什么？',
+   auto: '自动',
++  sidebar: {
++    blocked: '受阻',
++    blockedTip: (title: string, reason: string) => (reason ? `${title} — ${reason}` : title)
++  },
+   notify: {
+     completedTitle: '任务已完成',
+     blockedTitle: '任务受阻 — 需要你的输入',
+@@ -1140,6 +1157,10 @@ const zhHant: KanbanMessages = {
+   profileDescriptionsHint: '說明用於引導分解器的路由。可用輔助模型自動產生，或自行填寫。',
+   profileGoodAt: '這個設定檔擅長什麼？',
+   auto: '自動',
++  sidebar: {
++    blocked: '受阻',
++    blockedTip: (title: string, reason: string) => (reason ? `${title} — ${reason}` : title)
++  },
+   notify: {
+     completedTitle: '任務已完成',
+     blockedTitle: '任務受阻 — 需要你的輸入',
+diff --git a/apps/desktop/src/plugins/kanban/plugin.tsx b/apps/desktop/src/plugins/kanban/plugin.tsx
+index 91ba8bd82d..e297cd3b29 100644
+--- a/apps/desktop/src/plugins/kanban/plugin.tsx
++++ b/apps/desktop/src/plugins/kanban/plugin.tsx
+@@ -23,6 +23,7 @@ import {
+   type RouteContribution,
+   ROUTES_AREA,
+   SIDEBAR_NAV_AREA,
++  SIDEBAR_SECTIONS_AREA,
+   type SidebarNavContribution,
+   STATUSBAR_AREAS,
+   Tip,
+@@ -31,6 +32,7 @@ import {
+ } from '@hermes/plugin-sdk'
+ 
+ import { $boardSlug, bindApi, boardKey, fetchBoard, useKanbanScope } from './api'
++import { $blockedSectionOpen, BlockedTasksSection } from './blocked-section'
+ import { KanbanBoardPage } from './board'
+ import { KANBAN_LOCALES } from './i18n'
+ import { $newTaskLane, useKanban } from './ui'
+@@ -85,7 +87,19 @@ const plugin: HermesPlugin = {
+   defaultEnabled: false,
+   register(ctx) {
+     ctx.i18n.register(KANBAN_LOCALES)
+-    ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket, { os: ctx.os, t: ctx.i18n.t }))
++    // [daveey] Completions never pop a card (the board/session already show
++    // them); blocked cards live in the left pane's Blocked section instead of
++    // a toast, keeping only the away-from-Hermes OS notification.
++    ctx.onDispose(
++      bindApi(ctx.rest, ctx.storage, ctx.socket, {
++        os: ctx.os,
++        quiet: { silent: ['completed'], toastless: ['blocked'] },
++        t: ctx.i18n.t
++      })
++    )
++
++    $blockedSectionOpen.set(ctx.storage.get('blockedSectionOpen', true))
++    ctx.onDispose($blockedSectionOpen.listen(value => ctx.storage.set('blockedSectionOpen', value)))
+ 
+     // The plugin command pattern: ONE action id (`kanban.newTask`) wired into
+     // two areas — a keybind (dispatch + rebindable panel row) and a palette row
+@@ -111,6 +125,12 @@ const plugin: HermesPlugin = {
+         data: { path: '/kanban' } satisfies RouteContribution,
+         render: () => <KanbanBoardPage />
+       },
++      {
++        id: 'blocked',
++        area: SIDEBAR_SECTIONS_AREA,
++        order: 10,
++        render: () => <BlockedTasksSection />
++      },
+       {
+         id: 'count',
+         area: STATUSBAR_AREAS.right,
+diff --git a/apps/desktop/src/sdk/index.ts b/apps/desktop/src/sdk/index.ts
+index dd9159d58f..a340ba9bb4 100644
+--- a/apps/desktop/src/sdk/index.ts
++++ b/apps/desktop/src/sdk/index.ts
+@@ -1719,6 +1719,15 @@ export { SidebarRowLead } from '@/app/chat/sidebar/chrome'
+  *  switcher, the fleet profile rail and any plugin rail listing gateways share
+  *  it, so a connection looks the same wherever it is named. */
+ export { ConnectionGlyph } from '@/app/chat/sidebar/connection-glyph'
++/** [daveey] Chrome for a `SIDEBAR_SECTIONS_AREA` contribution (left pane,
++ *  between Pinned and Projects): the collapsible header + capped body of the
++ *  core sections, and a clickable row on the session-row grid. */
++export {
++  SidebarSection,
++  type SidebarSectionProps,
++  SidebarSectionRow,
++  type SidebarSectionRowProps
++} from '@/app/chat/sidebar/contributed-sections'
+ /** [daveey] The sidebar session row's "which machine" glyph (laptop / Mac
+  *  mini / cloud) for a registry connection id. Renders nothing with fewer
+  *  than two gateways, so single-gateway users see no change. */
+@@ -1770,6 +1779,7 @@ export {
+   ROUTES_AREA,
+   SIDEBAR_NAV_AREA,
+   SIDEBAR_PROFILE_GROUP_HEADER_AREA,
++  SIDEBAR_SECTIONS_AREA,
+   type SidebarNavContribution,
+   WORKSPACE_PAGE_HEADER_AREA
+ } from '@/app/routes'
+-- 
+2.54.0 (Apple Git-157)
+

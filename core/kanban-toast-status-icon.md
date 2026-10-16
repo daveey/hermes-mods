@@ -7,8 +7,11 @@ Patches:
 
 ## Behavior
 
-The popup Hermes shows when a Kanban task reaches a terminal event leads with an icon that says where the task
-stands:
+Since **0105**, the bundled plugin suppresses completion delivery entirely and blocked in-app toasts
+(away-only OS notification retained). Blocked cards instead live in the sidebar; see
+[kanban-blocked-sidebar.md](kanban-blocked-sidebar.md). Failure/retry/triage toasts retain their icons and Open action.
+
+The underlying icon mapping introduced by 0058/0062 remains available when a notification is delivered:
 
 | Event | Icon |
 |---|---|

@@ -1,0 +1,184 @@
+From d484c2e101aafcb5ac4ea759da1a3b1e4ac55782 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:37:23 -0700
+Subject: [PATCH] fix(kanban): auto-decomposer leaves block-loop escalations
+ for a human [daveey]
+
+A card that block_loop_detected routed to triage was re-specified and
+re-promoted by the dispatcher's auto-decompose sweep ~25 s later, so the
+worker re-blocked and the loop burned a run every ~2 min (t_ccd21c19: 9
+runs in 15 min). The sweep now skips triage cards whose latest
+block_loop_detected has no later human input (comment/edit/status move);
+explicit specify/decompose of an id is unchanged.
+---
+ gateway/kanban_watchers_dispatcher.py         |  4 +-
+ hermes_cli/kanban_db.py                       | 27 ++++++++
+ hermes_cli/kanban_decompose.py                | 11 +++-
+ ...test_kanban_auto_decompose_secret_scope.py |  2 +-
+ tests/hermes_cli/test_kanban_block_kinds.py   | 65 +++++++++++++++++++
+ 5 files changed, 105 insertions(+), 4 deletions(-)
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index c6003a32c4..bd129f7b5e 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -268,7 +268,9 @@ class _KanbanDispatcher:
+                 try:
+                     os.environ["HERMES_KANBAN_BOARD"] = slug
+                     try:
+-                        triage_ids = _decomp.list_triage_ids()
++                        # Cards a block loop escalated for a human stay put until
++                        # a human adds input; re-specifying them restarts the loop.
++                        triage_ids = _decomp.list_triage_ids(skip_awaiting_human=True)
+                     except Exception as exc:
+                         logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
+                         triage_ids = []
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 36d5736f73..43e2d3c084 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3753,6 +3753,33 @@ def invalidate_descendants_for_parent_reopen(
+     return {"invalidated": invalidated, "terminations": terminations}
+ 
+ 
++# Events after a ``block_loop_detected`` that count as new human input on a
++# triage card: a comment, an edit, or a manual status move. Worker comments land
++# before the escalation (same txn window), so anything later came from someone else.
++_HUMAN_INPUT_EVENT_KINDS = ("commented", "edited", "status")
++
++
++def awaiting_human_after_block_loop(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when a triage card was escalated by ``block_loop_detected`` and has had
++    no human input (comment/edit/status move) since. The auto-decomposer must leave
++    such cards alone: re-specifying them re-promotes the same blocked work and the
++    worker just re-blocks, burning a run every couple of minutes.
++    """
++    row = conn.execute(
++        "SELECT MAX(id) AS eid FROM task_events WHERE task_id = ? AND kind = 'block_loop_detected'",
++        (task_id,),
++    ).fetchone()
++    loop_eid = row[0] if row is not None else None
++    if loop_eid is None:
++        return False
++    kinds = ", ".join("?" for _ in _HUMAN_INPUT_EVENT_KINDS)
++    later = conn.execute(
++        f"SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN ({kinds}) LIMIT 1",
++        (task_id, loop_eid, *_HUMAN_INPUT_EVENT_KINDS),
++    ).fetchone()
++    return later is None
++
++
+ def specify_triage_task(
+     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+diff --git a/hermes_cli/kanban_decompose.py b/hermes_cli/kanban_decompose.py
+index 47d280089a..6a4cf5225e 100644
+--- a/hermes_cli/kanban_decompose.py
++++ b/hermes_cli/kanban_decompose.py
+@@ -336,8 +336,15 @@ def decompose_task(
+     return _apply_fanout(task_id, parsed, routing, audit_author)
+ 
+ 
+-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
+-    """Return task ids currently in the triage column."""
++def list_triage_ids(*, tenant: Optional[str] = None, skip_awaiting_human: bool = False) -> list[str]:
++    """Return task ids currently in the triage column.
++
++    ``skip_awaiting_human`` (the dispatcher's auto-decompose sweep) drops cards
++    that ``block_loop_detected`` escalated for a human and that have had no human
++    input since; explicit specify/decompose of one id still works on them.
++    """
+     with kbc.connect_closing() as conn:
+         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
++        if skip_awaiting_human:
++            rows = [row for row in rows if not kb.awaiting_human_after_block_loop(conn, row.id)]
+     return [row.id for row in rows]
+diff --git a/tests/gateway/test_kanban_auto_decompose_secret_scope.py b/tests/gateway/test_kanban_auto_decompose_secret_scope.py
+index 86f725e4a4..90eff42420 100644
+--- a/tests/gateway/test_kanban_auto_decompose_secret_scope.py
++++ b/tests/gateway/test_kanban_auto_decompose_secret_scope.py
+@@ -33,7 +33,7 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
+         seen["value"] = ss.get_secret("ANTHROPIC_API_KEY")
+         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
+ 
+-    fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
++    fake = SimpleNamespace(list_triage_ids=lambda **_kw: ["t1"], decompose_task=fake_decompose)
+     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
+     monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
+ 
+diff --git a/tests/hermes_cli/test_kanban_block_kinds.py b/tests/hermes_cli/test_kanban_block_kinds.py
+index 788169203b..be959f21bc 100644
+--- a/tests/hermes_cli/test_kanban_block_kinds.py
++++ b/tests/hermes_cli/test_kanban_block_kinds.py
+@@ -198,3 +198,68 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
+ # ---------------------------------------------------------------------------
+ 
+ 
++
++
++# ---------------------------------------------------------------------------
++# Auto-decomposer must not re-promote a block-loop escalation without human input
++# ---------------------------------------------------------------------------
++
++
++def _loop_to_triage(conn) -> str:
++    tid = _running_task(conn)
++    kb.block_task(conn, tid, reason="needs David", kind="needs_input")
++    kb.unblock_task(conn, tid)
++    _make_running_again(conn, tid)
++    kb.block_task(conn, tid, reason="needs David", kind="needs_input")
++    assert kb.get_task(conn, tid).status == "triage"
++    return tid
++
++
++def test_auto_decompose_sweep_skips_block_loop_escalation(kanban_home: Path) -> None:
++    from hermes_cli import kanban_decompose as decomp
++
++    with kbc.connect_closing() as conn:
++        looped = _loop_to_triage(conn)
++        plain = kb.create_task(conn, title="rough idea", triage=True)
++        assert kb.awaiting_human_after_block_loop(conn, looped) is True
++        assert kb.awaiting_human_after_block_loop(conn, plain) is False
++
++    swept = decomp.list_triage_ids(skip_awaiting_human=True)
++    assert plain in swept
++    assert looped not in swept
++    # The explicit/CLI listing is unchanged.
++    assert looped in decomp.list_triage_ids()
++
++
++def test_human_comment_after_escalation_reenables_auto_decompose(kanban_home: Path) -> None:
++    from hermes_cli import kanban_decompose as decomp
++
++    with kbc.connect_closing() as conn:
++        looped = _loop_to_triage(conn)
++        kb.add_comment(conn, looped, "david", "Try channel 11 on the new AP.")
++        assert kb.awaiting_human_after_block_loop(conn, looped) is False
++
++    assert looped in decomp.list_triage_ids(skip_awaiting_human=True)
++
++
++def test_dispatcher_auto_decompose_tick_requests_human_skip(monkeypatch) -> None:
++    import sys
++    from types import SimpleNamespace
++
++    import hermes_cli
++    from gateway import kanban_watchers_dispatcher as kwd
++
++    seen = {}
++
++    def fake_list(**kw):
++        seen.update(kw)
++        return []
++
++    fake = SimpleNamespace(list_triage_ids=fake_list, decompose_task=lambda *a, **k: None)
++    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
++    monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
++    monkeypatch.setattr(kwd, "_board_slugs", lambda kb_: ["default"])
++    settings = kwd._DispatcherSettings(60.0, None, None, 2, 0, True, None, None)
++    disp = kwd._KanbanDispatcher(SimpleNamespace(DEFAULT_BOARD="default"), settings)
++    assert disp.auto_decompose_tick(5) == 0
++    assert seen.get("skip_awaiting_human") is True
+-- 
+2.54.0 (Apple Git-157)
+

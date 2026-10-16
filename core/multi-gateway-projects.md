@@ -1,13 +1,14 @@
 # Multi-gateway projects (Desktop)
 
-Patches: `0023`, `0024`, `0025`, `0028`, `0029`, `0054` in `core/patches/`. All touch `apps/desktop` only.
+Patches: `0023`, `0024`, `0025`, `0028`, `0029`, `0054`, `0101` in `core/patches/`. All touch `apps/desktop` only.
 
 If the connections registry has more than one gateway (for example a laptop plus a `mac-mini`),
 the Desktop sidebar already lists sessions from all of them. Upstream, though, the actions on
 those rows still go to the **active** gateway. That gateway doesn't own the remote rows, so
 archive, move and resume fail with "session not found". Projects also come only from the active
 gateway. With these patches the sidebar works across gateways: you see every gateway's projects,
-rows are colored by gateway, and each action runs on the gateway that owns the session.
+project headers retain gateway colors, rows show status stripes/device glyphs (since `0038`), and
+each action runs on the gateway that owns the session.
 
 | Patch | Kind | Summary |
 |---|---|---|
@@ -17,6 +18,7 @@ rows are colored by gateway, and each action runs on the gateway that owns the s
 | 0028 | fix | Cross-gateway move creates an empty project folder instead of cloning (amends 0025) |
 | 0029 | fix | A gateway-qualified `@session` ref is never parsed as a profile name |
 | 0054 | fix | Clicking a `@session` ref opens it on the gateway that owns the session, not the active one |
+| 0101 | fix | Active-gateway session placement wins over remote copies; emptied remote projects disappear |
 
 Terms:
 - **owning gateway**: the registry connection a session row came from (`session.connection_id`).
@@ -37,7 +39,11 @@ Terms:
   - The base (active) tree keeps its ids, order and structure.
   - Home matches Home. Any other project matches on its case-folded label, so a repo checked out
     on two machines shows up as **one lane**.
-  - In a merged lane, session counts, tokens and cost are summed. Preview rows are deduped and
+  - Before merging (`0101`), session ids claimed anywhere in the active tree are removed from
+    remote previews, `sessionIds` and repo/group rows. Earlier remote gateways also win over later
+    ones. A remote copy filed under Home cannot duplicate a live active-gateway project row or
+    replace its activity badge/stripe with a stale copy. Projects emptied by this filtering are dropped.
+  - In a merged lane, remaining session counts, tokens and cost are summed. Preview rows are deduped and
     sorted newest first. The `sessionIds` sets are unioned.
   - A project that only a remote has gets its **own lane** with the id `gw:<connectionId>:<id>`.
     Its repo and group ids are namespaced the same way. It has `path: null` and `isAuto: true`,
@@ -46,10 +52,9 @@ Terms:
   - Every remote row is stamped with its `connection_id`, so clicking it resumes on the right
     gateway.
   - Remote session ids are added to the scoped (live) set.
-- (Superseded by `0038`, [sidebar-status-stripe.md](sidebar-status-stripe.md): the row stripe now shows
-  status and the gateway is a device glyph.) Every session row gets a 3 px stripe on its left edge in its gateway's color
-  (`data-slot="session-gateway-stripe"`). Stripes only appear when the registry has more than one
-  connection.
+- Since `0038`, [sidebar-status-stripe.md](sidebar-status-stripe.md), the row stripe shows status
+  and a device glyph identifies the gateway. The gateway-colored row stripe introduced in `0024`
+  is superseded; gateway color settings still apply to project headers.
 - Default colors: `kind: 'local'` gets no color. Each remote takes the next slot of an 8-color
   palette (violet, amber, teal, rose, sky, lime, orange, fuchsia) in registry order. Colors are
   therefore the same on every launch, and adding a gateway doesn't change existing ones.
@@ -167,6 +172,13 @@ backend methods used all exist upstream in `tui_gateway/`: `projects.tree`, `pro
     `lastLocalTree` (so a late remote answer can repaint). `applyProjectTreePayload` now merges.
   - UI: `src/app/chat/sidebar/filter-menu.tsx` (`GatewaysSubmenu`), `sidebar/index.tsx` (drops
     rows on hidden gateways), `sidebar/session-row.tsx` (the stripe).
+- **0101** (`src/store/gateway-project-merge.ts`): `claimedIds` collects ids from `sessionIds`,
+  previews and all repo/group sessions. `withoutClaimed` filters those three representations,
+  recomputes repo counts from retained group rows, and subtracts removed ids from the project
+  count (falling back to removed previews when `sessionIds` is absent, clamped at zero). It returns
+  `null` when the resulting count is zero and no previews remain. The claimed set starts with the
+  entire base tree; each remote gateway adds its claims only after all its projects are filtered,
+  so projects within that same gateway do not shadow one another.
 - **0025/0028** (`src/store/projects.ts`): `moveTargetGateway` → `ensureProjectRootOn` →
   `moveTargetRequest('session.workspace.move')` → `expireRemoteProjectTree`.
   `moveToProjectTargets` accepts `gw:` lanes.
@@ -180,7 +192,7 @@ backend methods used all exist upstream in `tui_gateway/`: `projects.tree`, `pro
 
 Excerpts below are condensed (types and comments trimmed). The patches are authoritative.
 
-### `apps/desktop/src/store/gateway-project-merge.ts` (0024, new)
+### `apps/desktop/src/store/gateway-project-merge.ts` (0024, amended by 0101)
 ```ts
 const REMOTE_ID_PREFIX = 'gw:'
 export const remoteProjectId = (connectionId: string, id: string) => `${REMOTE_ID_PREFIX}${connectionId}:${id}`
@@ -195,10 +207,16 @@ export function mergeGatewayProjectTrees(base, remotes: GatewayProjectTree[], pr
   const indexByKey = new Map<string, number>()
   out.forEach((p, i) => { if (!p.archived && !indexByKey.has(projectKey(p))) indexByKey.set(projectKey(p), i) })
 
+  const claimed = new Set(base.flatMap(claimedIds))
   for (const { connectionId, projects } of remotes) {
-    for (const raw of projects) {
-      if (raw.archived) continue
-      const remote = stampTree(raw, connectionId)      // stampRowsWithOwningConnection on previews + repo groups
+    const fresh = projects.flatMap(raw => {
+      const unique = raw.archived ? null : withoutClaimed(raw, claimed)
+      return unique ? [unique] : []
+    })
+    // Claim only after filtering the whole gateway.
+    for (const project of fresh) for (const id of claimedIds(project)) claimed.add(id)
+    for (const unique of fresh) {
+      const remote = stampTree(unique, connectionId)   // owner stamp on previews + repo groups
       const at = indexByKey.get(projectKey(remote))
       if (at !== undefined) { out[at] = mergeInto(out[at], remote, previewLimit); continue }
       indexByKey.set(projectKey(remote), out.length)
@@ -271,7 +289,8 @@ function applyProjectTreePayload(res, owner) {
 }
 // fetchProjectSessions(projectId): if isRemoteProjectId(projectId) return the tree node as is.
 ```
-Session row stripe (`sidebar/session-row.tsx`):
+Historical `0024` session row stripe (`sidebar/session-row.tsx`), replaced by `0038`:
+(not the current status-stripe implementation):
 ```tsx
 const gatewayId = sessionGatewayId(session, gatewayRegistry)
 const gatewayColor = gatewayColorsActive ? (gatewayColors[gatewayId] ?? null) : null
@@ -406,6 +425,14 @@ New or changed vitest files, all under `apps/desktop/src/`:
 | 0025/0028 | `store/projects-cross-gateway-move.test.ts` (see below) |
 | 0029 | `lib/session-refs.test.ts`, `store/session-owner-hint-qualified.test.ts` (new) |
 | 0054 | `app/chat/session-ref-owner.test.ts` (new), `app/open-session.test.ts` |
+| 0101 | `store/gateway-project-merge.test.ts` |
+
+`0101` adds “drops a remote copy of a session the active gateway already places (no duplicate row)”
+and “drops a remote-only project whose every row the active gateway already has”. The first
+checks that Home retains only unique remote/local previews with an adjusted count, while the
+active project keeps the original row and its `kanban_active` value. The second checks that a
+fully duplicated remote-only project disappears. `gateway-project-merge.test.ts` passed in the
+full-series regression run (October 16, 2026 PT); the older feature tests below were not rerun.
 
 `projects-cross-gateway-move.test.ts` is new in 0025. 0028 replaces its clone cases. It covers:
 - a local control case;
@@ -426,30 +453,19 @@ npx vitest run src/store/gateway-project-merge.test.ts src/store/gateway-visibil
   src/i18n/overlay-completeness.test.ts
 npm run typecheck
 ```
-Verified on `upstream/main` with `0004 0018 0023 0024 0025 0028 0029` applied: all 7 feature test
-files pass (63 tests). `overlay-completeness.test.ts` passes once 0031 is applied too (see Gotchas).
+The commands above are a suggested verification set, not results from this documentation update.
+Include the `0054` test files from the table when verifying that patch as well.
 
 ## Applying
 
-Order: `0023 → 0024 → 0025 → 0028 → 0029`, then `0031` (translations for 0024's labels).
-- 0028 rewrites code that 0025 added.
-- 0025 needs 0024 (`remoteTrees`, `ownerGatewayId`, `isRemoteProjectId`).
-- 0023 and 0029 can each be applied on their own. 0054 needs 0029 (`parseSessionRefValue` returns `gateway`).
+Apply the numbered series in order in a disposable checkout at the fork/upstream merge-base,
+through `0101` for the behavior documented here. `0101` amends the merge helper introduced by
+`0024`; do not treat it as a standalone feature patch. Rebuild Desktop after applying.
+The full series through `0105` applied cleanly; no isolated apply check is claimed.
 
-Textual dependencies on earlier patches (checked against `upstream/main`):
-- **0004** (moving a session into a project doesn't switch to it). Without it, 0024 conflicts in
-  `store/projects.ts`. 0025 also relies on the `suppressMoveFollow` that 0004 adds.
-- **0018** (⌘⇧P palette move). Without it, 0025 conflicts in `store/projects.ts`.
-
-The minimal set that applies cleanly:
-```sh
-cd ~/.hermes/hermes-agent        # your checkout
-for n in 0004 0018 0023 0024 0025 0028 0029; do
-  git am -3 ~/code/hermes-mods/core/patches/$n-*.patch || break
-done
-```
-Applying the whole series in order also works, except 0013, which conflicts in
-`tui_gateway/server.py` and is unrelated to this feature.
+Dependency landmarks (not a validated minimal subset): `0025` uses `0024`'s remote-tree state,
+`0028` rewrites `0025`'s move behavior, and `0054` uses `0029`'s parsed gateway qualifier.
+`0004` and `0018` also modify the project-move code, while `0031` supplies `0024`'s translations.
 
 To re-implement on a newer upstream instead, work from the Code section. It relies only on these
 upstream pieces:
@@ -474,7 +490,11 @@ upstream pieces:
   a `shell=True` subprocess with a 30 s timeout and a dangerous-command filter. If the call is
   blocked or unavailable, the move fails with the `Could not create …` error. Reusing an existing
   same-named project never calls it.
-- **Label is the only identity.** Two unrelated projects with the same name on different
+- **Project labels and session ids have different roles.** `0101` dedupes session placement by
+  bare session id, not by gateway/profile or compression lineage. Earlier gateways win; it does
+  not repair duplicates within one gateway. Removed copies adjust session counts, not token/cost
+  aggregates, so those totals are not a deduplicated accounting report.
+  Two unrelated projects with the same name on different
   gateways merge into one lane, and a move reuses the same-named project on the destination.
 - **No code is copied.** A cross-gateway move creates the folder empty; it never clones or syncs.
   If you want the code on the other machine, clone it there yourself.
@@ -503,4 +523,6 @@ composer areas; see `desktop-plugins/spin-out/plugin.js`) can add UI and actions
 offer a separate "move to project on owning gateway" palette action, but only if the SDK exposes a
 per-connection RPC like `requestGatewayForAgent`. Even then, the built-in sidebar would still
 show only the active gateway's projects, and the built-in actions would still go to the wrong
-gateway. The clean path is to upstream all five patches.
+gateway. `0101` likewise belongs in the core project-tree merge rather than a plugin overlay:
+its claimed-id filtering must happen before built-in lanes are rendered. These patches are
+candidates for upstream fixes.

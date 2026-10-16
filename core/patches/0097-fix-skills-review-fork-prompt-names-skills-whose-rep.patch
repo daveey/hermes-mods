@@ -1,0 +1,221 @@
+From 6a8ff7c670aaf8b86ed9444595369a9d0750a2f5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:12:55 -0700
+Subject: [PATCH] fix(skills): review fork prompt names skills whose replayed
+ copy is stale [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Long-lived sessions load a skill once (e.g. kanban-orchestrator), and other
+sessions' reviews edit it later. Each later review of that session replays
+the old copy, patches from it, and read-before-write refuses (correctly) with
+'content has not been loaded in this review turn' — one failed call per
+review before the fork re-views (coach: kanban-orchestrator, 2bde8f).
+
+Read seeding already compares every replayed skill_view against the live
+file; it now also reports the mismatches, and the review prompt lists them:
+'these skills changed on disk ... call skill_view before any write'. The fork
+re-views first instead of being refused. The guard itself is unchanged.
+---
+ agent/background_review.py                    | 14 +++++---
+ .../test_background_review_memory_scope.py    | 35 ++++++++++++++++++-
+ tests/tools/test_skill_manager_tool.py        | 26 +++++++++++++-
+ tools/skill_manager_guards.py                 | 26 +++++++++++---
+ 4 files changed, 91 insertions(+), 10 deletions(-)
+
+diff --git a/agent/background_review.py b/agent/background_review.py
+index fc033f0904..d1178d1a50 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -1170,23 +1170,29 @@ def _run_review_fork(
+     )
+     # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
+     review_history = _digest_history(messages_snapshot) if _routed else messages_snapshot
++    stale_note = ""
+     with suppress(Exception):
+         from tools.skill_manager_guards import (
+-            _reset_background_review_read_marks, seed_background_review_reads_from_history)
++            _reset_background_review_read_marks, seed_background_review_reads_from_history,
++            stale_skill_views_note)
+ 
+         _reset_background_review_read_marks()
+         # A skill_view result the fork replays byte-identical to the file on disk IS a read of the
+         # current content; without this every review re-viewed the parent's loaded skill (or got
+-        # refused patching it) just to satisfy read-before-write. Stale copies stay unmarked.
++        # refused patching it) just to satisfy read-before-write. Stale copies stay unmarked, and
++        # the prompt names them so the fork re-views first instead of patching blind and being
++        # refused (long-lived sessions whose loaded skill other sessions' reviews keep editing).
++        stale: list = []
+         seed_background_review_reads_from_history(
+-            review_history, session_id=getattr(agent, "session_id", None))
++            review_history, session_id=getattr(agent, "session_id", None), stale=stale)
++        stale_note = stale_skill_views_note(stale)
+     try:
+         if review_run is None or review_run.begin_request(st.review_agent):
+             st.review_agent.run_conversation(
+                 user_message=(
+                     prompt + "\n\nYou can only call " + memory_phrase_prompt +
+                     "management tools. Other tools will be denied "
+-                    "at runtime — do not attempt them." + prompt_extra
++                    "at runtime — do not attempt them." + prompt_extra + stale_note
+                 ),
+                 conversation_history=review_history,
+             )
+diff --git a/tests/agent/test_background_review_memory_scope.py b/tests/agent/test_background_review_memory_scope.py
+index e97e21f73a..4ab629bf2f 100644
+--- a/tests/agent/test_background_review_memory_scope.py
++++ b/tests/agent/test_background_review_memory_scope.py
+@@ -138,7 +138,7 @@ class TestExplicitRefineOrigin:
+                 patch.object(bg, "finish_background_review_run", noop), \
+                 patch.object(bg, "_release_fork_clients", noop), \
+                 patch("tools.skill_manager_guards.seed_background_review_reads_from_history",
+-                      lambda history, session_id=None: seeded.append((history, session_id)) or 0):
++                      lambda history, session_id=None, stale=None: seeded.append((history, session_id)) or 0):
+             bg._run_review_fork(SimpleNamespace(session_id="s1"), snapshot, "p", None, None,
+                                 bg._ReviewForkState())
+         expected = digest if routed else snapshot
+@@ -146,6 +146,39 @@ class TestExplicitRefineOrigin:
+         assert replayed == [expected]
+ 
+ 
++    def test_fork_prompt_names_skills_whose_replayed_copy_is_stale(self):
++        """The parent loaded kanban-orchestrator; another session's review edited it since. The
++        fork must be told its copy is stale, else it patches blind and read-before-write refuses
++        (coach bug: kanban-orchestrator refusals in long-lived sessions)."""
++        prompts = []
++
++        def fake_build(agent, task_cfg=None, *, max_iterations, write_origin="background_review"):
++            fork = SimpleNamespace(
++                _memory_enabled=True, _user_profile_enabled=False, _memory_write_origin=write_origin,
++                run_conversation=lambda **kw: prompts.append(kw["user_message"]),
++                _session_messages=[])
++            return fork, {}, False
++
++        def fake_seed(history, session_id=None, stale=None):
++            stale.extend([("kanban-orchestrator", None), ("bb", "references/x.md")])
++            return 0
++
++        noop = lambda *a, **k: None
++        with patch.object(bg, "build_cache_parity_fork", fake_build), \
++                patch.object(bg, "_track_review_fork", noop), \
++                patch.object(bg, "_snapshot_review_usage", lambda a: {}), \
++                patch.object(bg, "_record_review_usage_to_parent", noop), \
++                patch.object(bg, "finish_background_review_run", noop), \
++                patch.object(bg, "_release_fork_clients", noop), \
++                patch("tools.skill_manager_guards.seed_background_review_reads_from_history", fake_seed):
++            bg._run_review_fork(SimpleNamespace(session_id="s1"), [{"role": "user", "content": "hi"}],
++                                "p", None, None, bg._ReviewForkState())
++        assert len(prompts) == 1
++        assert "kanban-orchestrator (SKILL.md)" in prompts[0]
++        assert "bb (references/x.md)" in prompts[0]
++        assert "stale" in prompts[0] and "skill_view" in prompts[0]
++
++
+ class TestConsolidationProposalSurfaces:
+     """The fork's own review summary is never published back, so a consolidation the delete
+     gate staged must surface through ``summarize_background_review_actions`` — otherwise the
+diff --git a/tests/tools/test_skill_manager_tool.py b/tests/tools/test_skill_manager_tool.py
+index 4d6535c88d..da06cb0739 100644
+--- a/tests/tools/test_skill_manager_tool.py
++++ b/tests/tools/test_skill_manager_tool.py
+@@ -1391,7 +1391,9 @@ class TestCuratorConsolidationDeleteGuard:
+             _reset_background_review_read_marks()
+ 
+             # Seeding compares via skill_view, whose own read-mark must not leak in.
+-            assert seed_background_review_reads_from_history(history) == 0
++            stale = []
++            assert seed_background_review_reads_from_history(history, stale=stale) == 0
++            assert stale == [("reviewed", None)]  # reported so the fork prompt can name it
+             blocked = json.loads(skill_manage(
+                 action="patch", name="reviewed",
+                 old_string="Step 1: Do the thing.", new_string="Step 1: Do the thing safely."))
+@@ -1451,3 +1453,25 @@ class TestCuratorConsolidationDeleteGuard:
+             assert blocked.get("_read_before_write_required") is True
+ 
+         _reset_background_review_read_marks()
++
++    def test_review_seeding_reports_no_stale_for_current_or_unviewable_copies(self, tmp_path, monkeypatch):
++        """Only a replayed copy that differs from the live file is stale: current copies, stubs
++        and pruned results are not (the note must not nag about skills the fork can patch)."""
++        from tools.skills_tool import skill_view
++        from tools.skill_manager_guards import (
++            _reset_background_review_read_marks, seed_background_review_reads_from_history,
++            stale_skill_views_note)
++
++        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
++            _create_curator_skill("reviewed", _skill_content("reviewed"))
++            history = (self._replayed_view("c1", "[pruned: tool output summarised]")
++                       + self._replayed_view("c2", skill_view("reviewed")))
++            _reset_background_review_read_marks()
++            stale = []
++            assert seed_background_review_reads_from_history(history, stale=stale) == 1
++            assert stale == []
++            assert stale_skill_views_note(stale) == ""
++            note = stale_skill_views_note([("reviewed", None), ("reviewed", "references/a.md")])
++            assert "reviewed (SKILL.md)" in note and "reviewed (references/a.md)" in note
++
++        _reset_background_review_read_marks()
+diff --git a/tools/skill_manager_guards.py b/tools/skill_manager_guards.py
+index 407a11f6a9..a4c5b8510e 100644
+--- a/tools/skill_manager_guards.py
++++ b/tools/skill_manager_guards.py
+@@ -104,7 +104,8 @@ def _transcript_skill_views(messages: list) -> list[tuple[str, Optional[str], st
+     return views
+ 
+ 
+-def seed_background_review_reads_from_history(messages: list, session_id: Optional[str] = None) -> int:
++def seed_background_review_reads_from_history(messages: list, session_id: Optional[str] = None,
++                                              stale: Optional[list] = None) -> int:
+     """Treat skill_view results the review fork replays verbatim as reads of the current file.
+ 
+     The fork resumes the parent's transcript, so a skill the parent loaded is already in the fork's
+@@ -113,7 +114,9 @@ def seed_background_review_reads_from_history(messages: list, session_id: Option
+     forced a redundant re-view (a 90 KB SKILL.md reloaded per review). A stale, pruned or stubbed copy
+     does not match and stays unmarked, so the guard still fires for it. Call after
+     ``_reset_background_review_read_marks()`` in the context the fork's tool workers copy. Returns the
+-    number of files marked."""
++    number of files marked. When ``stale`` is a list, ``(name, file_path)`` is appended for every
++    replayed copy that no longer matches the file (edited by another session since it was loaded), so
++    the fork can be told to re-view those before writing instead of being refused first."""
+     if (marks := _background_review_read_paths.get()) is None:
+         _background_review_read_paths.set(marks := _BackgroundReviewReadMarks())
+     seen: set[tuple[str, Optional[str]]] = set()
+@@ -127,17 +130,32 @@ def seed_background_review_reads_from_history(messages: list, session_id: Option
+         except Exception:
+             logger.debug("review read seeding failed for %s/%s", name, file_path, exc_info=True)
+             continue
+-        if current is None or current[1] != content:
++        if current is None:  # deleted/renamed since: nothing to re-view
+             continue
+         resolved = _resolved_str(current[0])
+         # Same name but a different file (a shadowing copy appeared since): not a read of the target.
+-        if source and _resolved_str(Path(source)) != resolved:
++        if current[1] != content or (source and _resolved_str(Path(source)) != resolved):
++            if stale is not None:
++                stale.append((name, file_path))
+             continue
+         marks.add(resolved)
+         marked += 1
+     return marked
+ 
+ 
++def stale_skill_views_note(stale: list) -> str:
++    """Review-prompt line naming replayed skill copies that are out of date, or ''.
++
++    Without it the fork patches from the parent's old copy, read-before-write refuses (correctly),
++    and every such review burns a failed call before the re-view (coach: kanban-orchestrator)."""
++    if not stale:
++        return ""
++    labels = ", ".join(sorted({f"{n} ({fp or 'SKILL.md'})" for n, fp in stale}))
++    return (f"\n\nThese skills changed on disk after this conversation loaded them, so the copies above "
++            f"are stale: {labels}. Before any skill_manage write to them, call skill_view (with "
++            f"file_path for a supporting file) and base the edit on the content it returns.")
++
++
+ def _current_skill_view(name: str, file_path: Optional[str], session_id: Optional[str]):
+     """``(source path, content)`` skill_view would serve now, or None. Runs in a throwaway context
+     so skill_view's own read-mark side effect cannot leak into the fork's marks."""
+-- 
+2.54.0 (Apple Git-157)
+

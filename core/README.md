@@ -18,8 +18,8 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 0049 0050 0065 | ⌘]/⌘[ next/prev session with a green/red status stripe (stepping from the focused tab), ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume (⌥⌘R in 0064–0070), ⌥⇧⌘R window reload |
 | [ai-session-rename.md](ai-session-rename.md) | 0020 0032 0042 | ⌘⇧E rename (was ⌘⇧N until 0042), pre-filled with an AI short name (`session.title.suggest` RPC) |
 | [project-palette.md](project-palette.md) | 0004 0018 0030 0061 | ⌘⇧P moves a session to a project by typeahead (a new name offers "Create project" with an empty `~/code/<slug>`); typing a project name in ⌘P lists "Move to project: <name>" |
-| [multi-gateway-projects.md](multi-gateway-projects.md) | 0023 0024 0025 0028 0029 0031 0054 | Sidebar shows every connected gateway's projects (colored, with show/hide toggles); move a session into any gateway's project; archive on the owning gateway; `@session` ref clicks open on the owning gateway |
-| [sidebar-status-stripe.md](sidebar-status-stripe.md) | 0038 0039 0044 0051 0063 0070 0089 0091 0094 0095 | Sidebar row stripe shows status (green = done, waiting on you; red = stuck), never green while its Kanban tasks, `/goal` or a live background process are still running (and the backend no longer reaps a detached session whose background job still runs); a session that owns a live cron job shows a grey loop glyph and is skipped like a parked row; the row shows open/blocked Kanban task counts and a laptop / Mac mini / cloud glyph for the owning gateway; the travelling arc marks only the selected row |
+| [multi-gateway-projects.md](multi-gateway-projects.md) | 0023 0024 0025 0028 0029 0031 0054 0101 | Sidebar shows every connected gateway's projects (colored, with show/hide toggles); move a session into any gateway's project; archive on the owning gateway; `@session` ref clicks open on the owning gateway |
+| [sidebar-status-stripe.md](sidebar-status-stripe.md) | 0038 0039 0044 0051 0063 0070 0089 0091 0094 0095 0099 0104 | Sidebar row stripe shows status (green = done, waiting on you; red = stuck), never green while its Kanban tasks, `/goal` or a live background process are still running (and the backend no longer reaps a detached session whose background job still runs); a session that owns a live cron job shows a grey loop glyph and is skipped like a parked row; the row shows open/blocked Kanban task counts and a laptop / Mac mini / cloud glyph for the owning gateway; the travelling arc marks only the selected row |
 | [new-chat-gateway-hotkeys.md](new-chat-gateway-hotkeys.md) | 0042 | ⌘N starts the new chat on This device (switches the gateway to local); ⌘⇧N keeps the selected gateway |
 | [persistent-new-session-draft.md](persistent-new-session-draft.md) | 0036 | ⌘N returns to the unsent new-session draft (text + attachments) instead of an empty composer |
 | [session-takeover.md](session-takeover.md) | 0013 0014 0015 0060 | "Take over here" for a chat that's live in another Hermes window, naming the machine that holds it; a hidden chat's agent keeps its Browser page |
@@ -30,12 +30,12 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-drop-attachments.md](kanban-drop-attachments.md) | 0057 | Drag files from Finder onto a Kanban task card or open task dialog to attach them |
 | [kanban-all-gateways.md](kanban-all-gateways.md) | 0090 | One Kanban board across every gateway: merged cards, a gateway filter, and device glyphs on cards; writes go to the owning gateway |
 | [reload-backend-hotkey.md](reload-backend-hotkey.md) | 0064 0071 | ⇧⌘R restarts the backend and reloads the window, so core/plugin edits land without quitting the app; ⌘R is resume; forceReload on ⌥⇧⌘R |
-| [kanban-toast-status-icon.md](kanban-toast-status-icon.md) | 0058 0062 | Kanban task popups lead with a green check (done), yellow ? (blocked) or red X (triage / failed), and Open goes straight to that task's drawer on its board |
+| [kanban-toast-status-icon.md](kanban-toast-status-icon.md) | 0058 0062 | Kanban toast status icons and task-specific Open action; 0105 supersedes completion/blocked popups with quiet notifications and a persistent sidebar list |
 | [owning-gateway-routing.md](owning-gateway-routing.md) | 0040 0041 0045 0046 0047 | With several gateways, opening a session, its tiles and its background RPCs all go to the gateway that owns it (following a 4007 to the right one) instead of opening an empty chat on the selected gateway |
 | [kanban-session-links.md](kanban-session-links.md) | 0059 0067 0068 0092 0093 | Chats stay tied to the Kanban cards they create (including `hermes kanban create` from an agent terminal) or shepherd: the cards show in the chat's Tasks view (listed by `GET /api/session-kanban-tasks`), its sidebar row stays busy until they land and turns red while one is blocked |
 | [dashboard-cloudflare-access.md](dashboard-cloudflare-access.md) | 0037 | Opt-in: a verified Cloudflare Access login for an allowlisted email counts as a dashboard session, so you log in once |
 | [pre-verify-every-turn.md](pre-verify-every-turn.md) | 0052 | `agent.pre_verify_every_turn: true` runs the `pre_verify` plugin hook on every final answer, not only after file edits |
-| [skills-review-fork-count.md](skills-review-fork-count.md) | 0055 | The background skill-review fork can patch a skill the session already loaded, as long as the loaded copy still matches the file on disk |
+| [skills-review-fork-count.md](skills-review-fork-count.md) | 0055 0097 | The background skill-review fork can patch a skill the session already loaded, as long as the loaded copy still matches the file on disk |
 | [process-readoption.md](process-readoption.md) | 0069 0072 0073 0076 0077 0085 | Background jobs stay in the shared `processes.json` while other Hermes processes run; after a Desktop restart the backend re-adopts the orphaned ones and wakes their chat when they exit, even one you haven't opened |
 | [gateway-exit-diagnostics.md](gateway-exit-diagnostics.md) | 0074 0075 0081 | Gateway exit records carry an info/warning/error level, so routine restarts stop showing as errors; fewer false Slack/websocket errors; `hermes update` finds a gateway whose interpreter path has a space |
 | [credential-pool-429-rotation.md](credential-pool-429-rotation.md) | 0078 | A 429 with a reset window over 60 s rotates to another pooled key right away instead of sleeping out the window |
@@ -43,6 +43,11 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [update-external-supervisor.md](update-external-supervisor.md) | 0082 0083 0084 | `hermes update` leaves launchd-supervised gateways and dashboards for launchd to restart, instead of starting a racing copy |
 | [session-lease-wake.md](session-lease-wake.md) | 0086 0087 0088 | Running turns survive laptop sleep (the lease is renewed on wake if nobody else claimed the session); a turn that really lost its session shows a "Hermes stopped this reply" card with Retry instead of silently stopping |
 | [small-fixes.md](small-fixes.md) | 0001 0002 0003 0005 0006 0009 0053 | Completion sound "Off", sidebar chevron, no session preview cap, sleep isn't idleness, compression reload spares context engines, desktop-only plugin packages, full-width tab titles |
+| [oauth-wire-tool-names.md](oauth-wire-tool-names.md) | 0096 | Resolve OAuth wire names inside tool_call/tool_describe without changing registered names or bridge restrictions |
+| [memory-cap-headroom.md](memory-cap-headroom.md) | 0098 | Show free characters near capacity and recommend consolidation with 10% headroom |
+| [kanban-block-loop-escalation.md](kanban-block-loop-escalation.md) | 0100 | Keep block-loop escalations out of automatic decomposition until a later input event |
+| [skill-write-feedback.md](skill-write-feedback.md) | 0102 0103 | Warn on skill growth near capacity and treat already-applied patches as successful no-ops |
+| [kanban-blocked-sidebar.md](kanban-blocked-sidebar.md) | 0105 | Persistent blocked cards across boards/gateways; completions are silent, blocked events retain only away-only OS notifications |
 
 ## Applying
 
@@ -51,17 +56,19 @@ The patches touch shared files (keybind registry, i18n, sidebar, the RPC contrac
 need. Revert what you don't want afterwards.
 
 ```bash
-cd ~/.hermes/hermes-agent              # the checkout `hermes` runs from (`hermes --version` shows it)
-git switch -c mods                     # or work on your fork's main; see fork-updates-and-relaunch.md
+cd /path/to/hermes-agent
+git worktree add --detach ../hermes-mods-test 4957bbd0a0
+cd ../hermes-mods-test
 git am -3 ~/code/hermes-mods/core/patches/*.patch
 ```
 
-When I last tested (Oct 2026), all 36 applied on `upstream/main` except **0013**, which conflicts in
-`tui_gateway/server.py`. [session-takeover.md](session-takeover.md) explains how to resolve it. After
-resolving: `git add tui_gateway/server.py && git am --continue`.
+Verified on October 16, 2026 (PT): all **105** patches applied cleanly with `git am -3`
+in a detached worktree starting at merge-base `4957bbd0a0`. Start from that merge-base
+(`git merge-base upstream/main origin/main` for this fork snapshot), not a newer
+`upstream/main`; upstream changes can otherwise conflict with the early patches.
 
-Each doc's **Applying** section lists the smallest set of patches that applies and passes its tests,
-for when you only want one feature.
+Each doc's **Applying** section describes its dependencies and verification limits.
+The verified apply set here is the full ordered series; do not assume individual patches are independent.
 
 If a later patch conflicts because upstream moved, re-implement it from its doc instead of forcing
 the hunk. Each doc's **Code** and **Tests** sections are the spec.
@@ -88,6 +95,10 @@ the hunk. Each doc's **Code** and **Tests** sections are the spec.
    `remote-lifecycle`, native-deps and similar). Those fail the same way on the unpatched base on a Mac, so
    they're environment-dependent, not caused by these patches. One `hermes-bots/group-activity` test is flaky
    with or without the patches.
+
+The 0096–0105 mirror verification (October 16, 2026 PT) applied all 105 patches cleanly
+and passed all changed regression files: 197 Python tests across 8 files and 99 Desktop
+tests across 7 files. This targeted run did not rerun the full suite or typecheck.
 
 ## Gotchas
 

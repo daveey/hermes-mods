@@ -1,0 +1,217 @@
+From 39ff093e203d021e558a9243067d3042680412e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 23:36:54 -0700
+Subject: [PATCH] fix(skills): skill_manage patch that changes nothing is a
+ no_change success, not a batch-aborting error [daveey]
+
+Agents send old_string == new_string on purpose to probe that a skill is
+patchable (after a split or a patch-path fix), and re-send edits that already
+landed. skill_manage rejected both with 'old_string and new_string are
+identical', and since operations[] is the only call shape the error aborted
+and rolled back every other op in the batch. The file patch tool already
+treats these as no_change successes (is_already_applied); skill_manage never
+got that path.
+
+Now: identical strings present in the file, or new_string present with
+old_string gone, return success + no_change + a note; the batch row carries
+no_change/note; background-review summaries skip no_change rows so a no-op
+is not announced as 'patched'. Identical strings absent from the file still
+fail.
+---
+ agent/background_review.py                |  4 +-
+ tests/tools/test_skill_manager_tool.py    |  4 +-
+ tests/tools/test_skill_patch_no_change.py | 88 +++++++++++++++++++++++
+ tools/skill_manager_batch.py              |  2 +-
+ tools/skill_manager_tool.py               | 24 +++++++
+ 5 files changed, 119 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tools/test_skill_patch_no_change.py
+
+diff --git a/agent/background_review.py b/agent/background_review.py
+index d1178d1a50..8ca6f40928 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -658,6 +658,8 @@ def _prior_tool_keys(prior_snapshot: list[dict]) -> tuple[set, set]:
+ 
+ def _action_lines(data: dict, detail: dict, verbose: bool) -> list[str]:
+     """Summary line(s) for one successful notify-tool result (``[]`` when nothing to report)."""
++    if data.get("no_change"):
++        return []
+     if data.get("staged"):
+         # The fork's own review summary is never published back, so an unattended-review
+         # consolidation proposal must surface here or it is silently lost (#105921).
+@@ -675,7 +677,7 @@ def _action_lines(data: dict, detail: dict, verbose: bool) -> list[str]:
+             return []
+         lines = []
+         for result in results:
+-            if not isinstance(result, dict) or result.get("success") is not True:
++            if not isinstance(result, dict) or result.get("success") is not True or result.get("no_change"):
+                 continue
+             verb_key = verbs.get(result.get("action"))
+             if verb_key and result.get("name"):
+diff --git a/tests/tools/test_skill_manager_tool.py b/tests/tools/test_skill_manager_tool.py
+index da06cb0739..7ab2ee731c 100644
+--- a/tests/tools/test_skill_manager_tool.py
++++ b/tests/tools/test_skill_manager_tool.py
+@@ -786,7 +786,9 @@ Step 2: Do the other thing.
+     @pytest.mark.parametrize("kwargs", [
+         {"old_string": None, "new_string": "x"},
+         {"old_string": "", "new_string": "x"},
+-        {"old_string": "Step 1: Do the thing.", "new_string": "Step 1: Do the thing."},
++        # Identical strings present in the file are a no_change success
++        # (test_skill_patch_no_change.py); absent ones are still rejected.
++        {"old_string": "Step 9: Not in the skill.", "new_string": "Step 9: Not in the skill."},
+     ])
+     def test_rejected_patch_leaves_file_byte_identical(self, tmp_path, kwargs):
+         """A rejected patch must not partially mutate the skill."""
+diff --git a/tests/tools/test_skill_patch_no_change.py b/tests/tools/test_skill_patch_no_change.py
+new file mode 100644
+index 0000000000..518bc4060c
+--- /dev/null
++++ b/tests/tools/test_skill_patch_no_change.py
+@@ -0,0 +1,88 @@
++"""skill_manage patch: an edit that leaves the file unchanged is a success-shaped no-op.
++
++Agents send old_string == new_string on purpose to probe that a skill is patchable (after a split,
++or after a fix to the patch path), and re-send edits that already landed. Both used to fail with
++"old_string and new_string are identical" and, because operations[] is the only call shape, abort
++and roll back every other op in the batch. The file patch tool already treats both as
++``no_change`` successes; skill_manage now does the same.
++"""
++import json
++
++import pytest
++
++SKILL = (
++    "---\nname: probe\ndescription: Use when probing no-op patches. Behavior.\n---\n"
++    "# Probe\n\nEach failed connection adds about 10 s to every BB worker job.\n"
++)
++
++
++@pytest.fixture
++def skill_md(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    (home / "skills" / "probe").mkdir(parents=True)
++    (home / "skills" / "probe" / "SKILL.md").write_text(SKILL, encoding="utf-8")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
++    import importlib
++
++    import tools.skill_manager_tool as mod
++    importlib.reload(mod)
++    return home / "skills" / "probe" / "SKILL.md"
++
++
++def _dispatch(ops):
++    from tools.registry import registry
++    return json.loads(registry.dispatch("skill_manage", {"operations": ops}))
++
++
++@pytest.mark.parametrize("anchor", [
++    "Each failed connection adds about 10 s to every BB worker job.",  # session 150532_ef6e95
++    "---\n",  # session 180340_6b9349: short anchors are fine when nothing changes
++])
++def test_identical_probe_on_present_text_is_no_change_success(skill_md, anchor):
++    r = _dispatch([{"action": "patch", "name": "probe", "old_string": anchor, "new_string": anchor}])
++    assert r["success"] is True, r
++    assert r["results"][0]["no_change"] is True
++    assert "no write" in r["results"][0]["note"]
++    assert skill_md.read_text(encoding="utf-8") == SKILL
++
++
++def test_no_op_does_not_abort_the_rest_of_the_batch(skill_md):
++    line = "Each failed connection adds about 10 s to every BB worker job."
++    r = _dispatch([
++        {"action": "patch", "name": "probe", "old_string": line, "new_string": line},
++        {"action": "patch", "name": "probe", "old_string": "# Probe\n", "new_string": "# Probe v2\n"},
++    ])
++    assert r["success"] is True, r
++    assert r["operations_applied"] == 2
++    assert "# Probe v2\n" in skill_md.read_text(encoding="utf-8")
++
++
++def test_resent_edit_that_already_landed_is_no_change(skill_md):
++    op = {"action": "patch", "name": "probe", "old_string": "about 10 s to every BB worker job",
++          "new_string": "about 12 s to every BB worker job"}
++    assert _dispatch([dict(op)])["success"] is True
++    after = skill_md.read_text(encoding="utf-8")
++    r = _dispatch([dict(op)])
++    assert r["success"] is True, r
++    assert r["results"][0]["no_change"] is True
++    assert skill_md.read_text(encoding="utf-8") == after
++
++
++def test_identical_strings_absent_from_file_still_fail(skill_md):
++    r = _dispatch([{"action": "patch", "name": "probe", "old_string": "not in the skill at all",
++                    "new_string": "not in the skill at all"}])
++    assert r["success"] is False
++    assert "identical" in r["error"]
++
++
++def test_background_review_summary_does_not_report_a_no_op_as_patched():
++    from agent.background_review import summarize_background_review_actions
++    payload = {"success": True, "operations_applied": 1, "results": [
++        {"name": "probe", "action": "patch", "file_path": None, "success": True, "no_change": True}]}
++    review = [
++        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {
++            "name": "skill_manage", "arguments": json.dumps({"operations": [{"action": "patch"}]})}}]},
++        {"role": "tool", "tool_call_id": "c1", "content": json.dumps(payload)},
++    ]
++    assert summarize_background_review_actions(review, prior_snapshot=[]) == []
+diff --git a/tools/skill_manager_batch.py b/tools/skill_manager_batch.py
+index 7b194a106b..20f711b56b 100644
+--- a/tools/skill_manager_batch.py
++++ b/tools/skill_manager_batch.py
+@@ -213,7 +213,7 @@ def _rollback(snapshots, find_skill, results):
+     return ("; ".join(notes) if notes else "all touched skills rolled back"), bool(notes)
+ 
+ 
+-_ADVISORY_KEYS = ("lint_warnings", "lint_hint", "size_warning")
++_ADVISORY_KEYS = ("lint_warnings", "lint_hint", "size_warning", "no_change", "note")
+ 
+ 
+ def _skill_manage_batch(operations, default_name: str | None = None, task_id: str | None = None,
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index 4a9f234297..6532085c8c 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -564,6 +564,28 @@ def _edit_skill(name: str, content: str) -> dict[str, Any]:
+     return _attach_size_warning(_add_description_prompt_preview(result, content), before, content)
+ 
+ 
++def _already_applied_patch(name: str, label: str, content: str, old_string: str,
++                           new_string: str) -> dict[str, Any] | None:
++    """Success-shaped no-op for a patch that would leave the file unchanged, else None.
++
++    Agents send old_string == new_string on purpose to probe that a skill is patchable after a
++    fix or split, and re-send edits that already landed. Both are not failures; an error here
++    aborts the whole batch and rolls back its other ops. Same contract as the file patch tool.
++    """
++    from tools.fuzzy_match import is_already_applied
++    if old_string == new_string and old_string.strip() and old_string in content:
++        note = (f"old_string and new_string are identical and old_string is present in {label}, so "
++                f"there is nothing to change; no write performed. To edit the text, send the changed "
++                f"text in new_string.")
++    elif is_already_applied(content, old_string, new_string):
++        note = (f"{label} already contains new_string and old_string is gone: the edit appears to be "
++                f"already applied. No write performed; do not re-send this patch.")
++    else:
++        return None
++    return {"success": True, "no_change": True,
++            "message": f"No change to {label} in skill '{name}'.", "note": note}
++
++
+ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | None = None,
+                  replace_all: bool = False) -> dict[str, Any]:
+     """Targeted find-and-replace in SKILL.md (default) or a supporting file; unique match unless replace_all."""
+@@ -595,6 +617,8 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
+     new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
+         content, old_string, new_string, replace_all, correction_notes=correction_notes)
+     if match_error:
++        if noop := _already_applied_patch(name, target_label, content, old_string, new_string):
++            return noop
+         with suppress(Exception):
+             from tools.fuzzy_match import format_no_match_hint
+             match_error += format_no_match_hint(match_error, match_count, old_string, content)
+-- 
+2.54.0 (Apple Git-157)
+
