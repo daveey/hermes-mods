@@ -63,3 +63,24 @@ test('sessionTaskChips: every listed status, shepherded cards marked, running fi
   assert.match(chips[2].title, /board bb/)
   assert.equal(chips[0].since, 100)
 })
+
+test('machineChips keeps machines bound to the session lineage on this gateway/profile', () => {
+  const own = (session_id, extra = {}) => [{ gateway_id: 'gw', profile: 'default', session_id, ...extra }]
+  const machines = [
+    { key: 'k1', provider: 'vast', display_name: 'box-a', status: 'stopped', ownership: own('s_root'), hourly_rate: '0.4', currency: 'USD' },
+    { key: 'k2', provider: 'vast', display_name: 'box-b', status: 'running', ownership: own('s_tip'), hourly_rate: '1.234', currency: 'USD', started_at: new Date(Date.now() - 120_000).toISOString(), hardware: '1 × H100' },
+    { key: 'k3', provider: 'ec2', display_name: 'other', status: 'running', ownership: own('s_other') },
+    { key: 'k4', provider: 'ec2', display_name: 'other-gw', status: 'running', ownership: [{ gateway_id: 'gw2', profile: 'default', session_id: 's_tip' }] },
+    { key: 'k5', provider: 'ec2', display_name: 'other-profile', status: 'running', ownership: own('s_tip', { profile: 'work' }) },
+    { key: 'k6', provider: 'slurm', display_name: 'node', status: 'running', ownership: [], hourly_rate: null }
+  ]
+  const chips = m.machineChips(machines, { gatewayId: 'gw', profile: 'default', ids: new Set(['s_tip', 's_root']) })
+  assert.deepEqual(chips.map(c => c.id), ['k2', 'k1'])
+  assert.equal(chips[0].extra, '$1.23/h')
+  assert.equal(chips[0].state, 'running')
+  assert.equal(m.elapsed(chips[0].since), '2m')
+  assert.match(chips[0].title, /1 × H100/)
+  assert.equal(chips[1].state, 'stopped')
+  assert.equal(chips[1].since, 0)
+  assert.deepEqual(m.machineChips(machines, { gatewayId: '', profile: 'default', ids: ['s_tip'] }), [])
+})

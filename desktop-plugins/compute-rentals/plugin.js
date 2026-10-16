@@ -206,6 +206,24 @@ function Inventory({ ctx, identity }) {
     setSelected(key)
     setOpen(true)
   }
+  // Session Tasks' machine chips open a machine here. A chip can name a machine
+  // bound to an ancestor of the focused chat (lineage), which Session mode lists
+  // only for the exact id, so fall back to Mine for those.
+  const showRef = useRef(null)
+  showRef.current = (key) => {
+    if (sessionKeys.has(key)) return show(null, key)
+    setMode(mineMachines(data?.machines).some((row) => row.key === key) ? 'Mine' : 'Global')
+    setProvider(null)
+    setSelected(key)
+    setOpen(true)
+  }
+  useEffect(() => {
+    const open = (key) => showRef.current?.(String(key))
+    window.__computeRentalsShow = open
+    return () => {
+      if (window.__computeRentalsShow === open) delete window.__computeRentalsShow
+    }
+  }, [])
   const mineRows = mineMachines(data?.machines)
   const rows = (mode === 'Session' ? sessionRows : mode === 'Mine' ? mineRows : data?.machines || []).filter(
     (row) => !provider || row.provider === provider,

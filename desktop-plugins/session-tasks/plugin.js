@@ -9,10 +9,14 @@
  *          — the same cards the sidebar row's kanban counts cover
  *          (`/api/session-kanban-tasks?ids=<lineage>`; older backends: a scan of the
  *          current `/api/plugins/kanban/board` for cards the lineage created)
+ *   ▣ box  rented machines linked to this session (or an ancestor in its lineage)
+ *          by the compute-rentals plugin's local registry
+ *          (`/api/plugins/compute-rentals/inventory`, polled every 30 s; absent → no chips)
  *
  * Hidden when nothing is running. Polls every 5 s while the window is visible.
  * Clicking a kanban chip opens the Task Mentions popup when that plugin is
- * loaded, else the Kanban page. Hover any chip for the full title.
+ * loaded, else the Kanban page; a machine chip opens that machine in the
+ * Compute Rentals status-bar popover. Hover any chip for the full title.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
@@ -21,6 +25,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'session-tasks'
 const POLL_MS = 5_000
 const KANBAN_POLL_MS = 10_000
+const MACHINE_POLL_MS = 30_000
 const LINEAGE_TTL_MS = 5 * 60_000
 const MAX_LABEL = 38
 const KANBAN_ACTIVE = new Set(['todo', 'ready', 'running', 'scheduled', 'blocked', 'review'])
@@ -28,6 +33,9 @@ const SUBAGENT_DONE = new Set(['completed', 'failed', 'interrupted', 'cancelled'
 
 const STATE_COLOR = {
   running: 'var(--accent, #3b82f6)',
+  stopped: '#8b949e',
+  unknown: '#8b949e',
+  error: '#f85149',
   ready: '#8b949e',
   todo: '#8b949e',
   scheduled: '#8b949e',
@@ -123,6 +131,53 @@ export function kanbanChips(board, sessionIds) {
   return byRank(out)
 }
 
+// Rented machines (compute-rentals inventory rows). A machine belongs to the
+// session when one of its ownership bindings names this gateway + profile and
+// any id in the session's lineage (bindings keep the id they were made under).
+const MACHINE_RANK = { running: 0, error: 1 }
+
+function rateLabel(m) {
+  if (m?.billing_class === 'internal_prepaid') return ''
+  const rate = Number(m?.hourly_rate)
+  if (!m?.currency || m?.hourly_rate == null || !Number.isFinite(rate)) return ''
+  const amount = rate === 0 ? '0' : rate >= 10 ? rate.toFixed(0) : rate.toFixed(2)
+  return m.currency === 'USD' ? `$${amount}/h` : `${amount} ${m.currency}/h`
+}
+
+export function machineChips(machines, { gatewayId, profile, ids } = {}) {
+  const lineage = ids instanceof Set ? ids : new Set(ids || [])
+  if (!gatewayId || !profile || !lineage.size) return []
+  const seen = new Set()
+  const out = []
+  for (const m of Array.isArray(machines) ? machines : []) {
+    if (!m?.key || seen.has(m.key)) continue
+    const mine = (m.ownership || []).some(
+      o => o && o.gateway_id === gatewayId && o.profile === profile && lineage.has(str(o.session_id))
+    )
+    if (!mine) continue
+    seen.add(m.key)
+    const status = str(m.status).toLowerCase() || 'unknown'
+    const rate = rateLabel(m)
+    const name = str(m.display_name) || str(m.provider_id) || 'machine'
+    out.push({
+      key: `box:${m.key}`,
+      kind: 'machine',
+      id: str(m.key),
+      state: status,
+      label: name,
+      extra: rate,
+      title: [
+        `${name} · ${str(m.provider)}${m.region ? ` ${m.region}` : ''} · ${status}${m.stale ? ' (stale)' : ''}`,
+        str(m.hardware),
+        rate || (m.billing_class === 'internal_prepaid' ? 'internal prepaid' : 'rate unknown'),
+        m.ssh ? `ssh: ${m.ssh}` : ''
+      ].filter(Boolean).join('\n'),
+      since: status === 'running' ? (Date.parse(str(m.started_at)) || 0) / 1000 : 0
+    })
+  }
+  return out.sort((a, b) => (MACHINE_RANK[a.state] ?? 9) - (MACHINE_RANK[b.state] ?? 9))
+}
+
 // ── data ────────────────────────────────────────────────────────────────────
 
 function activeConnection() {
@@ -177,6 +232,8 @@ const subs = new Set()
 let timer = null
 let lastKanbanAt = 0
 let kanbanCache = []
+let lastMachinesAt = 0
+let machineCache = []
 let running = false
 let rerun = false
 
@@ -190,6 +247,27 @@ async function loadKanban(ids) {
   if (list && Array.isArray(list.tasks)) return sessionTaskChips(list.tasks)
   const board = await safe(() => api('/api/plugins/kanban/board'), null)
   return board ? kanbanChips(board, ids) : null
+}
+
+function focusedProfile() {
+  try {
+    const owner = host.state.focusedSessionOwner?.get?.()
+    const conn = activeConnection()
+    // The inventory is read through the active connection; a session owned by
+    // another connection/profile would be matched against the wrong registry.
+    if (owner?.connectionId && conn && owner.connectionId !== conn) return null
+    return owner?.profile || host.state.profile?.get?.() || 'default'
+  } catch {
+    return null
+  }
+}
+
+async function loadMachines(ids) {
+  const profile = focusedProfile()
+  if (!profile) return []
+  const inv = await safe(() => api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id='), null)
+  if (!inv || !Array.isArray(inv.machines)) return null
+  return machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile, ids })
 }
 
 async function refresh() {
@@ -213,21 +291,30 @@ async function refresh() {
       runtime ? safe(() => host.request('process.list', { session_id: runtime }), null) : null,
       runtime ? safe(() => host.request('subagent.list', { session_id: runtime }), null) : null
     ])
-    if (stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)) {
-      lastKanbanAt = Date.now()
+    const kanbanDue = stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)
+    const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
+    if (kanbanDue || machinesDue) {
       const ids = await lineageIds(stored)
-      const chips = await loadKanban(ids)
-      if (chips) kanbanCache = chips
-      else if (!sameSession) kanbanCache = [] // never show the previous chat's cards
-    } else if (!stored) {
+      const [kChips, mChips] = await Promise.all([
+        kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids)) : undefined,
+        machinesDue ? ((lastMachinesAt = Date.now()), loadMachines(ids)) : undefined
+      ])
+      // null = fetch failed: keep this chat's last good list, never the previous chat's.
+      if (kChips) kanbanCache = kChips
+      else if (kanbanDue && !sameSession) kanbanCache = []
+      if (mChips) machineCache = mChips
+      else if (machinesDue && !sameSession) machineCache = []
+    }
+    if (!stored) {
       kanbanCache = []
+      machineCache = []
     }
     // Focus moved while we were fetching: drop this round, the next tick reloads.
     if (host.state.focusedSessionId.get() !== runtime) return
     snapshot = {
       runtime,
       stored,
-      chips: [...kanbanCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
+      chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
     }
     emit()
   } catch (e) {
@@ -258,17 +345,20 @@ function subscribe(fn) {
 
 // ── UI ──────────────────────────────────────────────────────────────────────
 
-const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist' }
+const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist', machine: 'codicon-vm' }
 
 function Chip({ chip, now }) {
   const color = STATE_COLOR[chip.state] || STATE_COLOR.running
-  const clickable = chip.kind === 'kanban'
-  const onClick = clickable
+  const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
+  const clickable = chip.kind === 'kanban' || showMachine
+  const onClick = chip.kind === 'kanban'
     ? () => {
         if (typeof window.__taskMentionsOpen === 'function') window.__taskMentionsOpen(chip.id)
         else host.navigate?.('/kanban')
       }
-    : undefined
+    : showMachine
+      ? () => window.__computeRentalsShow(chip.id)
+      : undefined
   const age = elapsed(chip.since, now)
   return jsxs(clickable ? 'button' : 'span', {
     type: clickable ? 'button' : undefined,
@@ -300,6 +390,7 @@ function Chip({ chip, now }) {
       jsx('i', { 'aria-hidden': true, className: `codicon ${KIND_GLYPH[chip.kind]}`, style: { fontSize: 12, flex: 'none', opacity: 0.8 } }),
       chip.kind === 'kanban' && jsx('span', { style: { opacity: 0.7, fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 10.5 }, children: chip.id }),
       jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 11 }, children: truncate(chip.label) }),
+      chip.extra && jsx('span', { style: { opacity: 0.7, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: chip.extra }),
       chip.state !== 'running' && jsx('span', { style: { color, fontSize: 10.5 }, children: chip.state }),
       age && jsx('span', { style: { opacity: 0.6, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: age })
     ]
