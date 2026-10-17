@@ -1,0 +1,92 @@
+---
+name: kanban-hands-digest
+description: "Use when asked 'what do you need from me' or for blocked-on-human Kanban cards. One ordered checklist + auto-unblock checks."
+version: 1.0.0
+author: daveey
+license: MIT
+metadata:
+  hermes:
+    tags: [kanban, digest, blocked, human-in-the-loop, cron, auto-unblock]
+    related_skills: [kanban-worker, kanban-orchestrator]
+---
+
+# Kanban hands-on digest
+
+Cards that wait on a human (tap a screen, install a build, flip a setting, answer a question) each block
+separately, so the human gets piecemeal asks and cards sit for hours. This skill turns every such card into
+**one ordered checklist** the human can clear in one sitting, and auto-unblocks cards whose completion a
+machine can verify.
+
+## On demand ("what do you need from me?")
+
+```
+python3 <skill_dir>/scripts/hands_digest.py --config <your config.json> --run-checks --no-unblock
+```
+
+Paste the output as-is (plain text). `--run-checks` runs the auto-checks so already-done steps move to the
+"Already done" section; `--no-unblock` is right inside a Kanban worker or delegate child, where the
+`hermes kanban unblock` CLI is refused anyway. Drop `--no-unblock` in a normal session to let passing
+checks unblock their cards. Other flags: `--json`, `--max-chars N` (shrinks item text to fit a chat post),
+`--checks-only` (silent unless it unblocked something; for a frequent cron), `--dry-run`, `--home`.
+
+## What it reads
+
+Every board (`$HERMES_HOME/kanban.db` + `kanban/boards/*/kanban.db`, `_archived` skipped), read-only.
+A card is included when `status='blocked'` and its latest `blocked` event has kind `needs_input` or
+`capability`, or it was created blocked (`initial_status`) — then the body's structured keys or its
+`Blocked until:` line are the reason. `transient`/dependency blocks are not human work.
+
+## Block-reason format workers should write
+
+```
+ACTION: <one imperative line the human can do, with the device>
+DEVICE: <group name from config, e.g. iPhone>
+UNBLOCKS-WHEN: <observable condition>
+CHECK: <check name> [args]          (optional; must exist in config `checks`)
+DEADLINE: 2026-10-18T19:55-07:00    (optional; hard deadline, e.g. an invite expiry)
+```
+
+Keys may be on separate lines or run together in one line; `ACTION:` may repeat. Free-text reasons still
+work through heuristics (imperative sentences kept, shipping/status chatter dropped, `expires <date>` and
+`before/after HH:MM PT` picked up), but the structured form gives a clean one-liner.
+
+## Config (JSON; keep the personal one outside this repo)
+
+`references/config-example.json` shows every key:
+- `groups`: ordered `{name, keywords, weight}`; a card goes to the group with the highest weighted keyword
+  count. Display order = list order, after the TIME-SENSITIVE block (deadline within
+  `deadline_horizon_hours`).
+- `shared_steps`: dedupe one step shared by several cards. `sentence` regex picks the clause (only the
+  matching clause is removed from each card's own action), `value` regex extracts a number, `agg`
+  (`max`/`min`) combines them, `label`/`check` format with `{max}`.
+- `rules`: `{match, group, check, action, unblocks_when}` applied by regex to the reason.
+- `cards`: per-card overrides by id.
+- `checks`: `{name: {cmd, unblock, timeout}}`. `cmd` is a shell command formatted with the check's args
+  (`{0}`, `{args}`). Exit 0 = satisfied, 1 = not yet, else error; the first stdout line is shown. With
+  `unblock: true`, a passing check bound to a card runs `hermes kanban [--board B] unblock --reason
+  "auto-check ... passed: <line>" <id>`. Checks bound to a shared step only mark the step done.
+
+## Scheduling (Hermes cron, no-agent)
+
+Two no-agent jobs pointing at a small wrapper in `~/.hermes/scripts/` that passes your config:
+a morning digest (`0 8 * * *`, `--run-checks --max-chars 3400`) and a frequent auto-unblock pass
+(`every 15m`, `--checks-only`, empty stdout = silent). Prove delivery once with `hermes cron run <id>`.
+
+## Tests
+
+```
+uv run --with pytest python -m pytest -q -p no:cacheprovider skills/devops/kanban-hands-digest/tests
+```
+
+Covers board discovery/filtering, structured + free-text parsing, shared-step dedupe, deadline/urgency
+ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (incl. `--board`),
+`--max-chars` shrinking, and the CLI's `--json` / silent `--checks-only`.
+
+## Pitfalls
+
+- A `mode=ro` sqlite open can fail transiently while a writer truncates the WAL; the reader retries,
+  then falls back to `query_only`.
+- Checks that read a remote DB must not `.backup` a big live database per call (tens of seconds); open
+  it `-readonly` with a busy timeout.
+- Inside a Kanban worker the `hermes kanban` CLI refuses mutations, so auto-unblock only works from cron or
+  a normal session; run on-demand with `--no-unblock` there.
