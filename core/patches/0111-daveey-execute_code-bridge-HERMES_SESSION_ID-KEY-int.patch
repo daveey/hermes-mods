@@ -1,0 +1,140 @@
+From 5013d1378a64809d181c98e65fe12773c5b2e6f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:42:22 -0700
+Subject: [PATCH] [daveey] execute_code: bridge HERMES_SESSION_ID/KEY into the
+ sandbox child
+
+Cards created by 'hermes kanban create' from execute_code had no session_id
+(the scrub drops every HERMES_SESSION_* var), so they never showed in the
+owning chat's task strip or sidebar badge. Bridge only the two non-secret ids;
+ContextVar wins over the os.environ mirror when the session context is engaged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../test_code_execution_session_identity.py   | 68 +++++++++++++++++++
+ tools/code_execution_env.py                   | 27 ++++++++
+ 2 files changed, 95 insertions(+)
+ create mode 100644 tests/tools/test_code_execution_session_identity.py
+
+diff --git a/tests/tools/test_code_execution_session_identity.py b/tests/tools/test_code_execution_session_identity.py
+new file mode 100644
+index 0000000000..56677493d4
+--- /dev/null
++++ b/tests/tools/test_code_execution_session_identity.py
+@@ -0,0 +1,68 @@
++"""execute_code child env carries the turn's session id/key. [daveey]
++
++A sandbox script that shells out to ``hermes kanban create`` must stamp the owning
++chat (the CLI reads HERMES_SESSION_KEY / HERMES_SESSION_ID), exactly like the
++terminal tool; otherwise the cards never appear in that chat's task strip or
++sidebar badge. Only these two non-secret ids are bridged, and in a multiplexed
++process the ContextVar wins over a possibly-foreign ``os.environ`` mirror.
++"""
++
++import sys
++
++import pytest
++
++import gateway.session_context as sc
++from tools.code_execution_env import _build_child_env
++
++
++def _child_env():
++    return _build_child_env(rpc_endpoint="sock", rpc_token="tok",
++                            tmpdir="/tmp/hermes-test", child_python=sys.executable)
++
++
++@pytest.fixture
++def bound_session():
++    tokens = []
++
++    def _bind(**kw):
++        tokens.append(sc.set_session_vars(**kw))
++
++    yield _bind
++    for t in reversed(tokens):
++        sc.clear_session_vars(t)
++
++
++def test_bound_session_ids_reach_child(bound_session, monkeypatch):
++    monkeypatch.setenv("HERMES_SESSION_ID", "foreign_session")
++    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign_session")
++    bound_session(session_id="20261016_185414_c283c2", session_key="20261016_185414_c283c2",
++                  chat_name="evil; rm -rf /", source="desktop")
++    env = _child_env()
++    assert env["HERMES_SESSION_ID"] == "20261016_185414_c283c2"
++    assert env["HERMES_SESSION_KEY"] == "20261016_185414_c283c2"
++    # Only the identity ids are bridged; other session vars stay scrubbed.
++    assert "HERMES_SESSION_CHAT_NAME" not in env
++    assert "HERMES_SESSION_SOURCE" not in env
++
++
++def test_engaged_but_cleared_context_does_not_leak_mirror(bound_session, monkeypatch):
++    bound_session(session_id="", session_key="")
++    monkeypatch.setenv("HERMES_SESSION_ID", "foreign_session")
++    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign_session")
++    env = _child_env()
++    assert "HERMES_SESSION_ID" not in env
++    assert "HERMES_SESSION_KEY" not in env
++
++
++def test_unengaged_cli_falls_back_to_environ(monkeypatch):
++    monkeypatch.setattr(sc, "_session_context_engaged", False)
++    tok = [v.set(sc._UNSET) for v in (sc._VAR_MAP["HERMES_SESSION_ID"], sc._VAR_MAP["HERMES_SESSION_KEY"])]
++    try:
++        monkeypatch.setenv("HERMES_SESSION_ID", "cli_session")
++        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
++        env = _child_env()
++        assert env["HERMES_SESSION_ID"] == "cli_session"
++        assert "HERMES_SESSION_KEY" not in env
++    finally:
++        for v, t in zip((sc._VAR_MAP["HERMES_SESSION_ID"], sc._VAR_MAP["HERMES_SESSION_KEY"]), tok):
++            v.reset(t)
+diff --git a/tools/code_execution_env.py b/tools/code_execution_env.py
+index c4d8ab66af..89274eb910 100644
+--- a/tools/code_execution_env.py
++++ b/tools/code_execution_env.py
+@@ -113,6 +113,32 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+     return delegated_child_subprocess_env(scrubbed)
+ 
+ 
++# Session identity (non-secret ids) the sandbox child needs so a script shelling out to
++# `hermes kanban create` stamps the owning chat, exactly like the terminal tool does;
++# without it the card never shows in that chat's task strip / sidebar badge. [daveey]
++_SESSION_IDENTITY_VARS = ("HERMES_SESSION_ID", "HERMES_SESSION_KEY")
++
++
++def _bridge_session_identity(env: dict) -> None:
++    """Copy the turn's session id/key into *env*. ContextVars are authoritative once the
++    session context is engaged (the os.environ mirror may belong to a concurrent turn);
++    an unengaged CLI falls back to os.environ. Empty/unbound values are left out."""
++    try:
++        from gateway.session_context import _UNSET, _VAR_MAP, session_context_engaged
++    except Exception:
++        return
++    engaged = session_context_engaged()
++    for name in _SESSION_IDENTITY_VARS:
++        var = _VAR_MAP.get(name)
++        value = var.get() if var is not None else _UNSET
++        if value is _UNSET:
++            value = None if engaged else os.environ.get(name)
++        if value:
++            env[name] = str(value)
++        else:
++            env.pop(name, None)
++
++
+ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
+                      child_python: str) -> dict[str, str]:
+     """Build the scrubbed child environment both execution paths share."""
+@@ -135,6 +161,7 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
+     if _tz_name and not _IS_WINDOWS:
+         child_env["TZ"] = _tz_name
+     child_env.pop("HERMES_TIMEZONE", None)
++    _bridge_session_identity(child_env)
+     apply_subprocess_home_env(child_env)
+     # Multiplexed gateway/Desktop (#110303): the server process env carries the machine-default
+     # HERMES_HOME, but this turn runs under a per-profile override (ContextVar bound per turn).
+-- 
+2.55.0
+

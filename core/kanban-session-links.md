@@ -13,6 +13,9 @@ Patches:
   are `blocked` gets the red (stuck) sidebar stripe instead of green.
 - `patches/0093-feat-kanban-GET-api-session-kanban-tasks-lists-the-c.patch`: backend. `GET
   /api/session-kanban-tasks?ids=…` lists the cards behind a sidebar row's kanban counts.
+- `patches/0111-daveey-execute_code-bridge-HERMES_SESSION_ID-KEY-int.patch`: tools. `execute_code`'s sandbox child
+  gets the turn's `HERMES_SESSION_ID` / `HERMES_SESSION_KEY`, so `hermes kanban create` run from a script stamps
+  and subscribes the chat too (0067/0068 alone only covered the terminal tool).
 
 What you see: a chat that starts or babysits Kanban cards stays tied to them. Ask a chat to "make sure t_x finishes"
 and, with the config flag on, it wakes when the card completes or blocks. Its sidebar row stays busy until the card
@@ -44,6 +47,9 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
   The card gets `creator_task_id` and inherits its creator task's session instead.
 - **Idempotency hits are left alone (0068).** If `--idempotency-key` matches an existing non-archived card, the CLI
   returns it without re-stamping or re-subscribing.
+- **execute_code too (0111).** The sandbox scrub drops every non-allowlisted `HERMES_*` var, so before 0111 a script
+  that ran `subprocess.run('hermes kanban create …')` made unstamped cards: the chat reported them running while its
+  task strip and sidebar badge showed nothing. 0111 bridges just the two session ids into the child.
 
 - **Blocked cards paint red (0092).** If any card the session created or shepherds (its `kanban_blocked` count, from
   0063) is `blocked`, the sidebar stripe is red (`stuck`) unless a turn is actively `working`. A ⌘B user block
@@ -76,6 +82,12 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
   the session's notify poller listens on. Before `kb.create_task` it checks for an existing non-archived card with
   the same `idempotency_key`. After the create, if there is a session key and no idempotency hit, it calls
   `_maybe_auto_subscribe(conn, task_id)`, so `kanban.auto_subscribe_on_create` gates it too.
+- 0111, `tools/code_execution_env.py`: `_build_child_env` calls `_bridge_session_identity(child_env)`, which copies
+  `HERMES_SESSION_ID` and `HERMES_SESSION_KEY` from the `gateway.session_context` ContextVars. Once the session
+  context is engaged the ContextVar is authoritative (an unbound/empty value is dropped, never taken from the
+  possibly-foreign `os.environ` mirror); an unengaged CLI falls back to `os.environ`. No other session var (chat
+  name, user id, …) is bridged, keeping #27303's hardening. Both the per-call and persistent-kernel paths use
+  `_build_child_env`; kernels are keyed per owning session, so the snapshot at spawn is that session's.
 
 - 0092, `apps/desktop/src/store/session-dot-state.ts`: `sessionStatusStripe(state, hasTurns, userBlocked, kanbanBlocked = 0)`
   returns `stuck` when `kanbanBlocked > 0 && state !== 'working'` (after the user-blocked check).
@@ -115,6 +127,10 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
   `test_session_tasks_empty_ids_and_old_schema`, `test_session_kanban_tasks_endpoint` (filters by id, 422 without
   `ids`).
 
+- `tests/tools/test_code_execution_session_identity.py` (0111): bound ids reach the child and other session vars
+  don't; an engaged-but-cleared context doesn't leak the `os.environ` mirror; an unengaged CLI falls back to it.
+  Two of the three fail without the patch.
+
 ## Applying
 
 - 0059 modifies `hermes_cli/kanban_session_activity.py` and the `kanban_active` count, which 0044 added (sidebar
@@ -135,7 +151,12 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
   to the import 0044 added in `web_routers/sessions.py`. Its subscriber query matches 0059's counting; without
   0059 the counts and the list disagree on shepherded cards.
 
+- 0111 is independent of the others (it only adds env vars); without 0067/0068 the CLI ignores them.
+
 ## Gotchas
+
+- Cards created before 0111 from execute_code stay unstamped. Backfill: set `tasks.session_id` and call
+  `_maybe_auto_subscribe` with `HERMES_SESSION_KEY` set to the chat's id.
 
 - `auto_subscribe_on_touch` is off by default, so 0059's subscribe-on-touch does nothing until you enable it. The
   sidebar change (counting `tui` subscriptions) is always on.
