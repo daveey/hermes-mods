@@ -394,12 +394,21 @@ def order(items, cfg):
 
 def run_check(spec: str, cfg: dict) -> tuple[str, str]:
     """-> (state, line) with state in ok / pending / error / unknown."""
-    parts = shlex.split(spec)
+    try:
+        parts = shlex.split(spec)
+    except ValueError:
+        return "error", "invalid check syntax"
+    if not parts:
+        return "error", "empty check"
     name, args = parts[0], parts[1:]
     chk = (cfg.get("checks") or {}).get(name)
     if not chk:
         return "unknown", f"no check named {name!r} in config"
-    cmd = chk["cmd"].format(*args, args=" ".join(shlex.quote(a) for a in args))
+    try:
+        quoted = [shlex.quote(a) for a in args]
+        cmd = chk["cmd"].format(*quoted, args=" ".join(quoted))
+    except (IndexError, KeyError, ValueError):
+        return "error", "check arguments do not match configured command"
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=chk.get("timeout", 60))
     except subprocess.TimeoutExpired:
@@ -560,7 +569,8 @@ def collect(cfg, home: Path | None = None) -> list[dict]:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--config", help="JSON config (groups, shared_steps, rules, checks)")
+    ap.add_argument("--config", default=str(hermes_home() / "kanban-hands/config.json") if (hermes_home() / "kanban-hands/config.json").exists() else None,
+                    help="JSON config (defaults to ~/.hermes/kanban-hands/config.json when present)")
     ap.add_argument("--home", help="Hermes home (default $HERMES_HOME or ~/.hermes)")
     ap.add_argument("--run-checks", action="store_true", help="run auto-checks (and auto-unblock)")
     ap.add_argument("--no-unblock", action="store_true", help="run checks but never unblock")
