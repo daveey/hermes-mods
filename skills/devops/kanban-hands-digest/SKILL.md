@@ -1,6 +1,6 @@
 ---
 name: kanban-hands-digest
-description: "Use when asked 'what do you need from me' or for blocked-on-human Kanban cards. One ordered checklist + auto-unblock checks."
+description: "Use when asked what's blocked or what do you need from me. Session-scoped by default; global digest on request."
 version: 1.0.0
 author: daveey
 license: MIT
@@ -17,7 +17,15 @@ separately, so the human gets piecemeal asks and cards sit for hours. This skill
 **one ordered checklist** the human can clear in one sitting, and auto-unblocks cards whose completion a
 machine can verify.
 
-## On demand ("what do you need from me?")
+## Scope: this session by default
+
+"What's blocked?" / "what do you need from me?" means **this chat's cards** (the ones it created or is
+subscribed to — its task strip), not every board. Find them from this session's own `kanban_create` results /
+task strip, then `kanban_show` each and report the blocked ones. Go global (the digest script below, all
+boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
+say it's a global view.
+
+## Global digest
 
 ```
 python3 <skill_dir>/scripts/hands_digest.py --config <your config.json> --run-checks --no-unblock
