@@ -178,6 +178,17 @@ export function machineChips(machines, { gatewayId, profile, ids } = {}) {
   return out.sort((a, b) => (MACHINE_RANK[a.state] ?? 9) - (MACHINE_RANK[b.state] ?? 9))
 }
 
+// Archive guard line: the machines this chat still holds, so archiving it
+// (which only hides the chat) doesn't leave them running unnoticed.
+export function machineArchiveLines(chips, max = 3) {
+  const machines = (chips || []).filter(c => c?.kind === 'machine')
+  if (!machines.length) return []
+  const part = c => `${c.label} (${[c.state, c.extra].filter(Boolean).join(', ')})`
+  const shown = machines.slice(0, max).map(part).join(', ')
+  const more = machines.length > max ? ` +${machines.length - max} more` : ''
+  return [{ label: machines.length === 1 ? 'Rented machine' : `Rented machines (${machines.length})`, value: shown + more }]
+}
+
 // ── data ────────────────────────────────────────────────────────────────────
 
 function activeConnection() {
@@ -188,25 +199,26 @@ function activeConnection() {
   }
 }
 
-function api(path) {
+function api(path, connection, timeoutMs = 15_000) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
-  const connectionId = activeConnection()
-  return bridge({ path, ...(connectionId ? { connectionId } : {}), timeoutMs: 15_000 })
+  const connectionId = connection || activeConnection()
+  return bridge({ path, ...(connectionId ? { connectionId } : {}), timeoutMs })
 }
 
 // stored id → { at, ids:Set } — the session plus its parent chain (compression
 // rotates the stored id; kanban tasks keep the id they were created under).
 const lineageCache = new Map()
 
-async function lineageIds(storedId) {
-  const hit = lineageCache.get(storedId)
+async function lineageIds(storedId, connection) {
+  const cacheKey = connection ? `${connection}\u0000${storedId}` : storedId
+  const hit = lineageCache.get(cacheKey)
   if (hit && Date.now() - hit.at < LINEAGE_TTL_MS) return hit.ids
   const ids = new Set([storedId])
   let cur = storedId
   for (let hop = 0; hop < 12 && cur; hop++) {
     try {
-      const row = await api(`/api/sessions/${encodeURIComponent(cur)}`)
+      const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, connection, 5_000)
       if (row?.id) ids.add(str(row.id))
       cur = str(row?.parent_session_id)
       if (cur) ids.add(cur)
@@ -214,7 +226,7 @@ async function lineageIds(storedId) {
       break
     }
   }
-  lineageCache.set(storedId, { at: Date.now(), ids })
+  lineageCache.set(cacheKey, { at: Date.now(), ids })
   return ids
 }
 
@@ -268,6 +280,18 @@ async function loadMachines(ids) {
   const inv = await safe(() => api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id='), null)
   if (!inv || !Array.isArray(inv.machines)) return null
   return machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile, ids })
+}
+
+// ctx.registerArchiveGuard: look up the machines bound to the chat being
+// archived on ITS gateway (connectionId from the row), across its lineage.
+export async function archiveGuard({ sessionId, ids, profile, connectionId } = {}) {
+  if (!sessionId) return []
+  const lineage = new Set(ids || [])
+  for (const id of await lineageIds(sessionId, connectionId)) lineage.add(id)
+  const inv = await api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id=', connectionId, 2_000)
+  if (!inv || !Array.isArray(inv.machines)) return []
+  const chips = machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile: profile || 'default', ids: lineage })
+  return machineArchiveLines(chips)
 }
 
 async function refresh() {
@@ -427,6 +451,9 @@ export default {
       document.head.appendChild(el)
     }
     ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -10, render: () => jsx(Strip, {}) })
+    // Hosts with the fork's archive confirmation ask before archiving a chat
+    // that still holds rented machines (Kanban tasks are core's own check).
+    ctx.registerArchiveGuard?.(archiveGuard)
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
     window.__sessionTasks = { get snapshot() { return snapshot }, refresh }

@@ -84,3 +84,24 @@ test('machineChips keeps machines bound to the session lineage on this gateway/p
   assert.equal(chips[1].since, 0)
   assert.deepEqual(m.machineChips(machines, { gatewayId: '', profile: 'default', ids: ['s_tip'] }), [])
 })
+
+test('machineArchiveLines summarizes machine chips for the archive confirm', () => {
+  assert.deepEqual(m.machineArchiveLines([]), [])
+  assert.deepEqual(m.machineArchiveLines([{ kind: 'kanban', label: 'x' }]), [])
+  assert.deepEqual(m.machineArchiveLines([{ kind: 'machine', label: 'vast-4090', state: 'running', extra: '$0.40/h' }]), [
+    { label: 'Rented machine', value: 'vast-4090 (running, $0.40/h)' }
+  ])
+  const many = ['a', 'b', 'c', 'd', 'e'].map(n => ({ kind: 'machine', label: n, state: 'stopped', extra: '' }))
+  assert.deepEqual(m.machineArchiveLines(many), [
+    { label: 'Rented machines (5)', value: 'a (stopped), b (stopped), c (stopped) +2 more' }
+  ])
+})
+
+test('machineChips + machineArchiveLines match ownership across the lineage only', () => {
+  const machines = [
+    { key: 'k1', display_name: 'box-1', status: 'running', currency: 'USD', hourly_rate: '0.4', ownership: [{ gateway_id: 'g', profile: 'default', session_id: 's_root' }] },
+    { key: 'k2', display_name: 'box-2', status: 'running', ownership: [{ gateway_id: 'g', profile: 'default', session_id: 's_other' }] }
+  ]
+  const chips = m.machineChips(machines, { gatewayId: 'g', profile: 'default', ids: new Set(['s_tip', 's_root']) })
+  assert.deepEqual(m.machineArchiveLines(chips), [{ label: 'Rented machine', value: 'box-1 (running, $0.40/h)' }])
+})
