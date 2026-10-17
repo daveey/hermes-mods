@@ -85,7 +85,6 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [hermes-disk-plugin-backends](skills/hermes-disk-plugin-backends/) | Adding Hermes disk-plugin REST backends. |
 | [productivity/hermes-coach](skills/productivity/hermes-coach/) | Mine every host's Hermes sessions into redacted per-session digests in a private git repo, compute usage KPIs, and queue the most wasteful sessions for a coach Bot to label (rubric in `references/labeling.md`). `coach_mine.py --write-adoption` checks the coach plugin's curriculum against the digests (`reports/adoption.json`). |
 | [productivity/ambitious-requests](skills/productivity/ambitious-requests/) | Make a request more ambitious: the Altitude / Depth / Range lenses (goes with the prompt-coach plugin). |
-| [productivity/todoist-cli](skills/productivity/todoist-cli/) | Todoist tasks, projects, labels and reminders via Doist's official `td` CLI (upstream MIT skill plus Hermes install/auth notes). |
 | [productivity/quiet-mode](skills/productivity/quiet-mode/) | You want Hermes off the screen and speakers (goes with the quiet-mode plugin). |
 | [social-media/messaging-bridges](skills/social-media/messaging-bridges/) | WhatsApp/Signal bridges: QR-pair once, the session persists. |
 | [social-media/slack-workspace-bot](skills/social-media/slack-workspace-bot/) | Acting as a team Slack bot: use observed context, join channels, call the Slack API, handle approvals (goes with the slack-workspace plugin). |
