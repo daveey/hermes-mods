@@ -17,7 +17,7 @@ description: Use when a Mac is low on disk. Find, clean, ask first.
 4. **Clear safe, rebuildable items without asking.** Run each command separately so one hang can't block the rest:
    - `brew cleanup -s --prune=all`, `npm cache clean --force`, `uv cache clean`, `pip cache purge`
    - `rm -rf ~/Library/Caches/<app>` for browser, Codex, SwiftPM and Homebrew caches
-   - Empty the Trash: `find ~/.Trash -mindepth 1 -maxdepth 1 -exec rm -rf {} +`
+   - Empty Trash only with explicit approval for permanent deletion; it may contain user files deliberately retained for recovery, not rebuildable cache data.
    - Old large logs and tarballs in `/private/tmp` owned by the user: `find /private/tmp -maxdepth 1 -type f \( -name '*.log' -o -name '*.tar.gz' \) -mtime +1 -size +5M -user $USER -delete`
    - `podman image prune -f` (dangling images only)
    - App log dirs that grow huge, e.g. `~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Logs` (5.7 GB seen). Delete files older than a day: `find <dir> -type f -mtime +1 -delete`.
@@ -27,10 +27,21 @@ description: Use when a Mac is low on disk. Find, clean, ask first.
 5. **Ask once before deleting app state, VMs or work dirs.** Use a single multi-select `clarify` question. Each option gives the size and what happens if it's deleted, e.g. 'redownloads when used', 'rebuilt on next CI job', 'old images and volumes lost'. Never touch the user's own project data, source trees or running VM disks without asking.
 6. **Re-run `df`** and report the before and after free space, what was deleted, what failed and the fix, what is still large, and what will fill back up.
 
+## Targeted screenshot cleanup
+
+1. Read `defaults read com.apple.screencapture` to discover a configured save location; inspect Desktop if none is configured, plus any other user-requested folder. Inventory candidates before choosing an age cutoff.
+2. Match screenshot image names (`Screenshot ` or `Screen Shot `) **and** image extensions such as PNG/JPEG/HEIC. Exclude `Screen Recording` videos unless separately requested; broad prefix groups can misreport recordings as old screenshots.
+3. State the retention window. If no images meet it, report that and ask before shortening the window rather than silently deleting newer captures.
+4. Move selected files to `~/.Trash` without overwriting existing names; keep a source/destination manifest and verify each destination exists and its source is gone. Leave unrelated files and recordings alone.
+5. Report the verified file count and retained window. Moving files to Trash is reversible cleanup, not disk space reclaimed, and it is not evidence that screenshot dragging was repaired.
+
 ## Daily automation
 A Hermes cron job (`ea9100b0961a`, 04:00 daily, no_agent, deliver=all) runs `~/.hermes/scripts/disk_cleanup.sh` and logs to `~/.hermes/logs/disk_cleanup.log`. It prints output only when free space is under 25 GB, has dropped by 15 GB or more since the last run, or the cleanup freed 2 GB or more. When adding a new obvious cleanup target, extend that script rather than doing a one-off cleanup.
 
 ## Pitfalls
+
+- **Parallel coding agents are the biggest filler.** Each worktree build leaves 2–15 GB of gitignored output (`.build`, `.embuild`, `target`, `node_modules`) and each Xcode run leaves ~2 GB of DerivedData in `$TMPDIR` (`getconf DARWIN_USER_TEMP_DIR`). Hundreds of worktrees reached ~1.2 TB, and `$TMPDIR` reached 90 GB. Check both first. To delete safely, list ignored dirs with `git ls-files -o -i --exclude-standard --directory` and remove only those with build-artifact names in checkouts idle at least 1–2 days, skipping any with open files (`lsof -Fn`). Erase shut-down simulators (`simctl erase`) that have sat idle. `du` overcounts what this frees because APFS clones share blocks.
+- **Free space falling steadily (~0.5 GB/min) can just be churn from builds or tests**, not a leak. Measure per-process bytes written with `proc_pid_rusage` (`ri_diskio_byteswritten`) before you chase it.
 
 - **Never chain cleanup commands with `;` in one long call.** One hang (brew waiting on a lock, uv waiting on its lock) eats the whole tool timeout and nothing after it runs. macOS has no `timeout` binary, so give each risky step its own call or run it in the background.
 - **uv lock timeout:** another uv process holds `~/.cache/uv/.lock`. Skip it and tell the user to run it later. Don't kill the other process.
