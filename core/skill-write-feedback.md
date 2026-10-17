@@ -1,6 +1,6 @@
 # Skill write size pressure and no-change feedback
 
-Patches: `0102` (size feedback), `0103` (no-change success).
+Patches: `0102` (size feedback), `0103` (no-change success), `0116` (stale-patch recovery).
 
 ## Behavior
 
@@ -16,6 +16,13 @@ identical nonblank old/new strings present in the file, or a recognized already-
 applied edit whose replacement is present and old text is gone. No file write is
 performed. Such an operation no longer aborts an otherwise valid batch, and
 background-review summaries do not announce it as a patch.
+
+Failed patches return a structured `recovery` call to `skill_view` for the exact
+skill/file, with instructions to use a fresh unique anchor and preserve newer
+content. Batch failures expose `rollback_complete`; successful rollback reports
+`operations_applied: 0` and instructs retrying the entire corrected batch. Failed
+rollback instead requires inspecting all affected files before retrying. Matching
+thresholds are unchanged: this improves recovery, not automatic stale-edit merging.
 
 ## How it works
 
@@ -55,6 +62,13 @@ advisories, section-aware cap errors, shrink-before-grow success, and fenced
 headings. No-change tests cover present identical anchors, a continuing batch,
 repeated applied edits, absent-anchor failure, and suppressed review summaries.
 All three files passed in the full-series regression run (October 16, 2026 PT).
+
+Patch 0116 regression coverage: `tests/tools/test_skill_patch_recovery.py` tests
+both stale integration-list anchors against default/supporting-file targets,
+rollback followed by whole-batch retry, ambiguous anchors, and failed rollback.
+All six tests passed, together with 97 existing skill-manager, batch, and no-change
+tests (103 total). Targeted Ruff passed; the full `scripts/check` command timed out
+without output. These are registry-dispatch tests, not a live model recovery test.
 
 ## Applying
 

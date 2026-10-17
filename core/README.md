@@ -50,7 +50,8 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [oauth-wire-tool-names.md](oauth-wire-tool-names.md) | 0096 | Resolve OAuth wire names inside tool_call/tool_describe without changing registered names or bridge restrictions |
 | [memory-cap-headroom.md](memory-cap-headroom.md) | 0098 | Show free characters near capacity and recommend consolidation with 10% headroom |
 | [kanban-block-loop-escalation.md](kanban-block-loop-escalation.md) | 0100 | Keep block-loop escalations out of automatic decomposition until a later input event |
-| [skill-write-feedback.md](skill-write-feedback.md) | 0102 0103 | Warn on skill growth near capacity and treat already-applied patches as successful no-ops |
+| [skill-write-feedback.md](skill-write-feedback.md) | 0102 0103 0116 | Skill size warnings, no-op success, and explicit stale-patch reload/atomic-batch retry guidance |
+| [kanban-pr-unblock.md](kanban-pr-unblock.md) | 0115 | An explicit unblock after a PR comment releases the active-PR respawn guard |
 | [kanban-blocked-sidebar.md](kanban-blocked-sidebar.md) | 0105 0107 0108 | Persistent blocked cards across boards/gateways, grouped by the chat managing them (0107), whose header opens that chat on its own gateway (0108); completions are silent, blocked events retain only away-only OS notifications |
 | [session-tab-status-underline.md](session-tab-status-underline.md) | 0106 | Session tab underline uses the sidebar status-stripe color (green/red/grey; neutral for draft/running) |
 

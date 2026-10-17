@@ -1,0 +1,95 @@
+From 38bf5650b52c219e09d37a2528ba22e4b7999e47 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 01:28:15 -0700
+Subject: [PATCH] fix(kanban): an unblock after the PR comment lifts the
+ active_pr respawn guard [daveey]
+
+A worker that opened its PR and blocked itself waiting for the merge was
+unblocked by the merge queue, then sat in ready for the rest of the 24 h
+window: the PR-URL comment kept active_pr on. The unblock is the resume
+signal for that PR (ship, verify, close), like a handoff. A crash/reclaim
+still guards, and a newer PR comment after the unblock guards again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_db_dispatch.py              | 10 +++--
+ .../test_kanban_review_lifecycle.py           | 38 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 4ebddd6854..939e67d3fa 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1672,8 +1672,12 @@ def check_respawn_guard(
+     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
+     #    reviewer changes_requested, review reopen) names the profile that must
+     #    now work on THAT PR — a closer or the implementer finishing it, not a
+-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
+-    #    so the worker that opened the PR is still not re-spawned against it.
++    #    duplicate implementation (#111910). So does an ``unblocked`` event: a
++    #    worker that opened its PR and blocked itself waiting for the merge is
++    #    resumed by that unblock to ship/verify THAT PR; without this the card
++    #    sat in ``ready`` for the rest of the 24 h window after its PR merged.
++    #    A crash/reclaim is not a handoff, so the worker that opened the PR is
++    #    still not re-spawned against it.
+     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
+                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+@@ -1681,7 +1685,7 @@ def check_respawn_guard(
+         # Strictly after: a same-second tie stays guarded (fail closed).
+         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
+                 conn, "task_events", task_id, max(pr_times),
+-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
++                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')", cols=", kind, payload", strict=True)):
+             return None
+         return "active_pr"
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_lifecycle.py b/tests/hermes_cli/test_kanban_review_lifecycle.py
+index c7c4f8516b..88a13c3893 100644
+--- a/tests/hermes_cli/test_kanban_review_lifecycle.py
++++ b/tests/hermes_cli/test_kanban_review_lifecycle.py
+@@ -928,3 +928,41 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
+             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
+         ).fetchone()
+         assert (run["outcome"], run["profile"]) == ("blocked", None)
++
++
++def test_active_pr_guard_lifts_when_the_card_is_unblocked_after_the_pr(
++    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A worker opens its PR, blocks waiting for the merge, and is unblocked.
++
++    The unblock is the resume signal for THAT PR (ship, verify, close), not a
++    duplicate implementation; without it the card sat in ``ready`` for the
++    rest of the 24 h window after its PR merged. A crash/reclaim still guards,
++    and a newer PR comment after the unblock guards again.
++    """
++    import hermes_cli.config as cfgmod
++    import hermes_cli.profiles as profmod
++
++    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
++    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
++    pr_comment = "Fix done; PR #300 (https://github.com/example/repo/pull/300) is waiting in the merge queue."
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="blocked on own pr", assignee="dev")
++        claimed = kb.claim_task(conn, tid)
++        assert claimed is not None
++        kb.add_comment(conn, tid, author="dev", body=pr_comment)
++        assert kb.block_task(conn, tid, reason="waiting for the merge queue")
++        _backdate_comments(conn, tid)
++        control = kb.create_task(conn, title="crashed after pr", assignee="dev")
++        kb.add_comment(conn, control, author="dev", body=pr_comment)
++        _backdate_comments(conn, control)
++        assert kbd.check_respawn_guard(conn, control) == "active_pr"
++
++        assert kb.unblock_task(conn, tid)
++        assert kbd.check_respawn_guard(conn, tid) is None
++        res = kbd.dispatch_once(conn, dry_run=True)
++        assert tid in [s[0] for s in res.spawned]
++        assert dict(res.respawn_guarded).get(control) == "active_pr"
++
++        kb.add_comment(conn, tid, author="dev", body="Opened https://github.com/example/repo/pull/301")
++        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+-- 
+2.55.0
+
