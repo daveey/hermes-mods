@@ -76,6 +76,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 
 | Skill | Use when |
 |---|---|
+| [apple/invisible-chrome-agent](skills/apple/invisible-chrome-agent/) | A real Chrome on an invisible virtual display, kept there by a launchd CDP supervisor; Touch ID notifications for passkeys. |
 | [apple/local-chrome-remote-debugging](skills/apple/local-chrome-remote-debugging/) | Driving Chrome with remote debugging on macOS. |
 | [apple/macos-disk-space-cleanup](skills/apple/macos-disk-space-cleanup/) | A Mac is low on disk: find, clean, ask first. |
 | [apple/macos-dock-management](skills/apple/macos-dock-management/) | The Dock shows dead `?` icons or stale pins. |
