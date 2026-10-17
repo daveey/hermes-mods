@@ -176,6 +176,9 @@ def initial_reason(body: str) -> str:
     m = re.search(r"(?im)^\s*(?:\*\*)?blocked until(?:\*\*)?\s*:\s*(.+)$", body)
     if m:
         return m.group(1).strip()
+    steps = re.search(r"(?ims)^.*(?:human|your|\w+'s) steps[^\n]*:\s*\n(.*?)(?=\n\s*(?:Agent steps|Done when|Acceptance)\b|\Z)", body)
+    if steps:
+        return steps.group(1).strip()
     first = next((ln.strip() for ln in body.splitlines() if ln.strip() and not ln.startswith("#")), "")
     return first
 
@@ -267,7 +270,7 @@ def clip(s: str, n: int) -> str:
     cut = s[:n]
     sp = max(cut.rfind(". "), cut.rfind("; "))
     if sp > n * 0.6:
-        return cut[:sp + 1]
+        return cut[:sp + 1] + " …"
     return cut[:cut.rfind(" ")].rstrip(",;:") + "…"
 
 
@@ -440,7 +443,7 @@ def apply_checks(digest: dict, cfg: dict, do_unblock=True, dry=False) -> list[di
             continue
         state, line = run_check(it["check"], cfg)
         it["status"] = {"state": state, "line": line}
-        name = shlex.split(it["check"])[0]
+        name = (it["check"].split() or [""])[0]
         if state == "ok" and it["kind"] == "card" and checks.get(name, {}).get("unblock") and do_unblock:
             card = it["cards"][0]
             ok, out = unblock(card, f"auto-check `{it['check']}` passed: {line}", cfg, dry=dry)
@@ -525,7 +528,7 @@ def _render(digest: dict, cfg: dict, lim: int) -> str:
 def _auto_unblocks(it, cfg) -> bool:
     if not it.get("check") or it["kind"] != "card":
         return False
-    return bool((cfg.get("checks") or {}).get(shlex.split(it["check"])[0], {}).get("unblock"))
+    return bool((cfg.get("checks") or {}).get((it["check"].split() or [""])[0], {}).get("unblock"))
 
 
 def detect_text(it, cfg) -> str:
@@ -577,10 +580,13 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="print the unblock commands instead of running them")
     ap.add_argument("--checks-only", action="store_true",
                     help="run checks; print only auto-unblock events (silent otherwise) — for a frequent cron")
+    ap.add_argument("--full", action="store_true", help="retain complete actions (no chat-post shortening)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--max-chars", type=int, default=None, help="shrink item text until the digest fits")
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
+    if a.full:
+        cfg["max_action_chars"] = 100_000
     cards = collect(cfg, Path(a.home).expanduser() if a.home else None)
     digest = build(cards, cfg)
     events = []
