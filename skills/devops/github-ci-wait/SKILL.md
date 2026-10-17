@@ -40,6 +40,10 @@ until one run or tag contains all of them.
 How to run it from an agent:
 - Start it with `terminal(background=true, notify=true)` and end the turn. Don't run a foreground sleep loop:
   it hits the tool timeout. Don't poll a background job either.
+- In a Kanban worker there is no async notify, and a poll loop burns `max_runtime_seconds` (most worker
+  timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
+  check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
+  next run starts with `--once` again.
 - Before telling the user something is "waiting on CI/the release", run `--once`. It has often shipped already.
 - On exit 1, investigate the printed run (`gh run view <id> --log-failed`). If an earlier commit by
   someone else broke it, say whose.
