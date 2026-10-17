@@ -1,0 +1,760 @@
+From 80c40d385574f74528b0d326b94ed1bf8b5fcdc1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:35:08 -0700
+Subject: [PATCH] feat(desktop): confirm before archiving a chat with linked
+ tasks or machines [daveey]
+
+Archiving only hides a chat; its open Kanban tasks and rented machines keep
+running out of sight. archiveSession now collects linked work and asks first:
+core reports the row's kanban_active/kanban_blocked counts, and plugins add
+their own lines via the new ctx.registerArchiveGuard (capped at 2.5 s, skipped
+on error, so a guard can never block archiving). Covers every archive door
+(row menu, hover button, tile menu, hotkey) since they all route through
+archiveSession. skipLinkedConfirm opts out.
+---
+ .../archive-linked-confirm.test.tsx           | 197 ++++++++++++++++++
+ .../hooks/use-session-actions/index.ts        |  37 +++-
+ apps/desktop/src/contrib/plugin.ts            |  10 +
+ apps/desktop/src/i18n/ar_chat.ts              |   6 +
+ apps/desktop/src/i18n/de.ts                   |   6 +
+ apps/desktop/src/i18n/en.ts                   |   6 +
+ apps/desktop/src/i18n/es.ts                   |   6 +
+ apps/desktop/src/i18n/fr.ts                   |   6 +
+ apps/desktop/src/i18n/ja.ts                   |   6 +
+ apps/desktop/src/i18n/ru.ts                   |   6 +
+ apps/desktop/src/i18n/types.ts                |   6 +
+ apps/desktop/src/i18n/zh-hant_chat.ts         |   6 +
+ apps/desktop/src/i18n/zh.ts                   |   6 +
+ apps/desktop/src/store/archive-guards.test.ts |  74 +++++++
+ apps/desktop/src/store/archive-guards.ts      | 120 +++++++++++
+ locales/_keys.desktop.json                    |   6 +
+ .../developer-guide/desktop-plugin-sdk.md     |   3 +
+ 17 files changed, 506 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+ create mode 100644 apps/desktop/src/store/archive-guards.test.ts
+ create mode 100644 apps/desktop/src/store/archive-guards.ts
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+new file mode 100644
+index 0000000000..0e39768245
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -0,0 +1,197 @@
++// [daveey] Archiving a chat that still has linked work (open Kanban tasks,
++// rented machines reported by a plugin guard) asks first; a chat with nothing
++// linked archives straight away, as before.
++import { act, cleanup, render, waitFor } from '@testing-library/react'
++import type { MutableRefObject } from 'react'
++import { useEffect } from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { type SessionInfo, setSessionArchived } from '@/hermes'
++import { registerArchiveGuard, resetArchiveGuardsForTests } from '@/store/archive-guards'
++import { $confirmRequest, settleConfirm } from '@/store/confirm'
++import { $sessions, setSessions } from '@/store/session'
++
++import type { ClientSessionState } from '../../../types'
++
++import { useSessionActions } from './index'
++
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  deleteSession: vi.fn(),
++  getSession: vi.fn(),
++  getAllSessionMessages: vi.fn(),
++  getLatestSessionMessages: vi.fn(),
++  listAllProfileSessions: vi.fn(),
++  setApiRequestProfile: vi.fn(),
++  setSessionArchived: vi.fn()
++}))
++
++vi.mock('@/store/profile', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  ensureGatewayProfile: vi.fn().mockResolvedValue(undefined)
++}))
++
++function row(overrides: Partial<SessionInfo> = {}): SessionInfo {
++  return {
++    archived: false,
++    ended_at: null,
++    id: 's-1',
++    input_tokens: 0,
++    is_active: false,
++    last_active: 1,
++    message_count: 2,
++    model: null,
++    output_tokens: 0,
++    preview: null,
++    profile: 'default',
++    source: 'desktop',
++    started_at: 1,
++    title: 'GPU sweep',
++    tool_call_count: 0,
++    ...overrides
++  } as SessionInfo
++}
++
++type Handle = Pick<ReturnType<typeof useSessionActions>, 'archiveSession'>
++
++function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
++  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
++
++  const actions = useSessionActions({
++    activeSessionId: null,
++    activeSessionIdRef: ref<string | null>(null),
++    busyRef: ref(false),
++    creatingSessionRef: ref(false),
++    ensureSessionState: () => ({}) as ClientSessionState,
++    getRouteToken: () => 'token',
++    getRoutedStoredSessionId: () => null,
++    navigate: vi.fn() as never,
++    requestGateway: vi.fn().mockResolvedValue(undefined),
++    resetViewSync: vi.fn(),
++    routedSessionId: null,
++    runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
++    selectedStoredSessionId: null,
++    selectedStoredSessionIdRef: ref<string | null>(null),
++    sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
++    syncSessionStateToView: vi.fn(),
++    updateSessionState: () => ({}) as ClientSessionState
++  })
++
++  useEffect(() => {
++    onReady({ archiveSession: actions.archiveSession })
++  }, [actions, onReady])
++
++  return null
++}
++
++async function mountHarness(): Promise<Handle> {
++  let handle: Handle | undefined
++  render(<Harness onReady={h => (handle = h)} />)
++  await waitFor(() => expect(handle).toBeDefined())
++
++  return handle!
++}
++
++describe('archiveSession linked-work confirmation', () => {
++  beforeEach(() => {
++    setSessions([])
++    resetArchiveGuardsForTests()
++    $confirmRequest.set(null)
++    vi.mocked(setSessionArchived).mockReset()
++    vi.mocked(setSessionArchived).mockResolvedValue({ ok: true })
++  })
++
++  afterEach(() => {
++    settleConfirm(false)
++    cleanup()
++    setSessions([])
++    resetArchiveGuardsForTests()
++  })
++
++  it('archives a chat with nothing linked without asking (control)', async () => {
++    setSessions([row()])
++    const handle = await mountHarness()
++
++    await act(() => handle.archiveSession('s-1'))
++
++    expect($confirmRequest.get()).toBeNull()
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, 'default')
++  })
++
++  it('asks before archiving a chat with open Kanban tasks; Cancel keeps it', async () => {
++    setSessions([row({ kanban_active: 2, kanban_blocked: 1 })])
++    const handle = await mountHarness()
++
++    let done: Promise<void> | undefined
++    act(() => {
++      done = handle.archiveSession('s-1')
++    })
++    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++
++    const request = $confirmRequest.get()!
++    expect(request.title).toBe('Archive “GPU sweep”?')
++    expect(request.details).toEqual([{ label: 'Kanban tasks', value: '2 open · 1 blocked' }])
++
++    await act(async () => {
++      settleConfirm(false)
++      await done
++    })
++
++    expect(vi.mocked(setSessionArchived)).not.toHaveBeenCalled()
++    expect($sessions.get().map(session => session.id)).toEqual(['s-1'])
++  })
++
++  it('archives after the user confirms', async () => {
++    setSessions([row({ kanban_blocked: 1 })])
++    const handle = await mountHarness()
++
++    let done: Promise<void> | undefined
++    act(() => {
++      done = handle.archiveSession('s-1')
++    })
++    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++    expect($confirmRequest.get()!.details).toEqual([{ label: 'Kanban tasks', value: '1 blocked' }])
++
++    await act(async () => {
++      settleConfirm(true)
++      await done
++    })
++
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, 'default')
++    expect($sessions.get()).toEqual([])
++  })
++
++  it('lists what a plugin guard reports (machines), with the row context it was given', async () => {
++    setSessions([row({ _lineage_root_id: 'root-0', connection_id: 'mini', id: 's-1' } as Partial<SessionInfo>)])
++    const guard = vi.fn().mockResolvedValue([{ label: 'Rented machines', value: 'vast-4090 (running, $0.40/h)' }])
++    registerArchiveGuard('plugin:session-tasks', guard)
++    const handle = await mountHarness()
++
++    let done: Promise<void> | undefined
++    act(() => {
++      done = handle.archiveSession('s-1')
++    })
++    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++
++    expect(guard).toHaveBeenCalledWith(
++      expect.objectContaining({ connectionId: 'mini', ids: ['s-1', 'root-0'], profile: 'default', sessionId: 's-1' })
++    )
++    expect($confirmRequest.get()!.details).toEqual([{ label: 'Rented machines', value: 'vast-4090 (running, $0.40/h)' }])
++
++    await act(async () => {
++      settleConfirm(false)
++      await done
++    })
++    expect(vi.mocked(setSessionArchived)).not.toHaveBeenCalled()
++  })
++
++  it('skipLinkedConfirm archives without asking', async () => {
++    setSessions([row({ kanban_active: 3 })])
++    const handle = await mountHarness()
++
++    await act(() => handle.archiveSession('s-1', { skipLinkedConfirm: true }))
++
++    expect($confirmRequest.get()).toBeNull()
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 816ce3fb92..7f0da8492e 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -34,6 +34,7 @@ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+ import { purgeInFlightTurnJournals, recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+ import { latestSessionTodoSnapshot } from '@/lib/todos'
+ import { setSessionYolo } from '@/lib/yolo-session'
++import { collectArchiveLinks, kanbanArchiveLinks } from '@/store/archive-guards'
+ import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
+ import {
+   announceGoneSessionDraft,
+@@ -44,6 +45,7 @@ import {
+ } from '@/store/composer'
+ import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+ import { resetSessionBackground } from '@/store/composer-status'
++import { confirm as confirmAction } from '@/store/confirm'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $connectionRequests } from '@/store/connection-request'
+ import {
+@@ -3452,7 +3454,8 @@ export function useSessionActions({
+   const archiveSession = useCallback(
+     // `onDeselect` replaces the fresh-draft fallback when the archived session
+     // was the open one (the ⌘⇧A hotkey steps to the next sidebar session).
+-    async (storedSessionId: string, options?: { onDeselect?: () => void }) => {
++    // `skipLinkedConfirm` archives without the linked-work prompt.
++    async (storedSessionId: string, options?: { onDeselect?: () => void; skipLinkedConfirm?: boolean }) => {
+       clearNotifications()
+ 
+       const listed = findListedSession(storedSessionId)
+@@ -3471,6 +3474,38 @@ export function useSessionActions({
+         return
+       }
+ 
++      // [daveey] Archiving only hides the chat: its Kanban tasks and rented
++      // machines keep running out of sight. Ask first when anything is linked.
++      if (!options?.skipLinkedConfirm) {
++        const linked = [
++          ...kanbanArchiveLinks(archived, {
++            label: copy.archiveLinkedTasksLabel,
++            value: copy.archiveLinkedTasksValue
++          }),
++          ...(await collectArchiveLinks({
++            connectionId: archived?.connection_id,
++            ids: [...new Set([storedSessionId, archived?.id, archived?._lineage_root_id].filter(Boolean) as string[])],
++            profile: profile || undefined,
++            session: archived,
++            sessionId: storedSessionId
++          }))
++        ]
++
++        if (linked.length > 0) {
++          const ok = await confirmAction({
++            cancelLabel: copy.archiveLinkedCancel,
++            confirmLabel: copy.archiveLinkedConfirm,
++            description: copy.archiveLinkedBody,
++            details: linked,
++            title: copy.archiveLinkedTitle(archived?.title?.trim() || '')
++          })
++
++          if (!ok) {
++            return
++          }
++        }
++      }
++
+       const wasSelected = selectedStoredSessionIdRef.current === storedSessionId
+       const previousPinned = $pinnedSessionIds.get()
+       // Pins are keyed on the durable lineage-root id; the stored id may be the
+diff --git a/apps/desktop/src/contrib/plugin.ts b/apps/desktop/src/contrib/plugin.ts
+index d487729ac1..568cfc9f86 100644
+--- a/apps/desktop/src/contrib/plugin.ts
++++ b/apps/desktop/src/contrib/plugin.ts
+@@ -24,6 +24,7 @@ import {
+   runPluginAppAction
+ } from '@/lib/keybinds/plugin-actions'
+ import { readKey, writeKey } from '@/lib/storage'
++import { type ArchiveGuard, registerArchiveGuard } from '@/store/archive-guards'
+ import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
+ import { $petActive } from '@/store/pet'
+ import { clearPetMessages, type PetSayOptions, sayPetMessage } from '@/store/pet-plugin-messages'
+@@ -39,6 +40,7 @@ import type { Contribution } from './types'
+ export type { PluginRestOptions } from '@/hermes'
+ export type { HermesOpenTarget } from '@/lib/hermes-open-target'
+ export type { PluginAppActionId, PluginAppActionInfo, PluginRunActionResult } from '@/lib/keybinds/plugin-actions'
++export type { ArchiveGuard, ArchiveGuardContext, ArchiveLinkedItem } from '@/store/archive-guards'
+ export type { PluginNativeNotificationInput, PluginNotificationAction } from '@/store/native-notifications'
+ export type { PetMessageTone, PetSayOptions } from '@/store/pet-plugin-messages'
+ 
+@@ -119,6 +121,13 @@ export interface PluginContext {
+    *  Removed with the plugin on disable/unload. Feature-detect on older hosts:
+    *  `ctx.registerSettingsPage?.(...)`. */
+   registerSettingsPage: (page: PluginSettingsPage) => () => void
++  /** [daveey] Report work still linked to a chat (rented machines, jobs, …)
++   *  before the user archives it. The guard gets the chat's ids, row, profile
++   *  and owning connection and resolves `{label, value}` lines; any line makes
++   *  the archive ask for confirmation first. Capped at ~2.5 s and skipped on
++   *  error, so it can never block archiving. Removed on unload. Feature-detect
++   *  on older hosts: `ctx.registerArchiveGuard?.(...)`. */
++  registerArchiveGuard: (guard: ArchiveGuard) => () => void
+   /** Register an arbitrary cleanup to run on unload/disable — for side effects
+    *  that aren't contributions or sockets (store subscriptions, timers). Runs
+    *  alongside every other disposer when the plugin deactivates. */
+@@ -360,6 +369,7 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
+     register: c => track(registry.register(scope(c))),
+     registerMany: cs => track(registry.registerMany(cs.map(scope))),
+     registerSettingsPage: page => track(registry.register(scope(settingsPageContribution(page)))),
++    registerArchiveGuard: guard => track(registerArchiveGuard(source, guard)),
+     onDispose: fn => void track(fn),
+     onEvent: (type, listener) => track(onGatewayEvent(type, listener)),
+     ...createPluginLifetime(track),
+diff --git a/apps/desktop/src/i18n/ar_chat.ts b/apps/desktop/src/i18n/ar_chat.ts
+index 49c99c4e5c..1d15cb0ca5 100644
+--- a/apps/desktop/src/i18n/ar_chat.ts
++++ b/apps/desktop/src/i18n/ar_chat.ts
+@@ -435,6 +435,12 @@ export const arChat = {
+     deleteFailed: 'فشل الحذف',
+     archived: 'تمت الأرشفة',
+     archiveFailed: 'فشلت الأرشفة',
++    archiveLinkedTitle: (title: string) => (title ? `أرشفة «${title}»؟` : 'أرشفة هذه المحادثة؟'),
++    archiveLinkedBody: 'لا يزال هناك عمل مرتبط بهذه المحادثة. الأرشفة تخفي المحادثة فقط، وتستمر المهام والأجهزة في العمل.',
++    archiveLinkedConfirm: 'أرشفة على أي حال',
++    archiveLinkedCancel: 'إبقاء المحادثة',
++    archiveLinkedTasksLabel: 'مهام كانبان',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `${open} مفتوحة` : '', blocked ? `${blocked} محظورة` : ''].filter(Boolean).join(' · '),
+     restored: 'تمت الاستعادة',
+     unarchiveFailed: 'فشل إلغاء الأرشفة',
+     cwdChangeFailed: 'فشل تغيير مجلد العمل',
+diff --git a/apps/desktop/src/i18n/de.ts b/apps/desktop/src/i18n/de.ts
+index 5055672baa..a7d1beb93a 100644
+--- a/apps/desktop/src/i18n/de.ts
++++ b/apps/desktop/src/i18n/de.ts
+@@ -5654,6 +5654,12 @@ export const deOverrides = {
+     deleteFailed: 'Löschen fehlgeschlagen',
+     archived: 'Archiviert',
+     archiveFailed: 'Archivieren fehlgeschlagen',
++    archiveLinkedTitle: (title: string) => (title ? `„${title}“ archivieren?` : 'Diesen Chat archivieren?'),
++    archiveLinkedBody: 'Mit diesem Chat ist noch Arbeit verknüpft. Archivieren blendet nur den Chat aus – Aufgaben und Maschinen laufen weiter.',
++    archiveLinkedConfirm: 'Trotzdem archivieren',
++    archiveLinkedCancel: 'Chat behalten',
++    archiveLinkedTasksLabel: 'Kanban-Aufgaben',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `${open} offen` : '', blocked ? `${blocked} blockiert` : ''].filter(Boolean).join(' · '),
+     restored: 'Wiederhergestellt',
+     unarchiveFailed: 'Archivierung aufheben fehlgeschlagen',
+     cwdChangeFailed: 'Arbeitsverzeichnis-Änderung fehlgeschlagen',
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 233407b0ec..ecc05197cc 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -5102,6 +5102,12 @@ export const en: Translations = {
+     deleteFailed: 'Delete failed',
+     archived: 'Archived',
+     archiveFailed: 'Archive failed',
++    archiveLinkedTitle: (title: string) => (title ? `Archive “${title}”?` : 'Archive this chat?'),
++    archiveLinkedBody: 'This chat still has work linked to it. Archiving only hides the chat — the tasks and machines keep running.',
++    archiveLinkedConfirm: 'Archive anyway',
++    archiveLinkedCancel: 'Keep chat',
++    archiveLinkedTasksLabel: 'Kanban tasks',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `${open} open` : '', blocked ? `${blocked} blocked` : ''].filter(Boolean).join(' · '),
+     restored: 'Restored',
+     unarchiveFailed: 'Unarchive failed',
+     cwdChangeFailed: 'Working directory change failed',
+diff --git a/apps/desktop/src/i18n/es.ts b/apps/desktop/src/i18n/es.ts
+index ee8b53ec1f..e04416036d 100644
+--- a/apps/desktop/src/i18n/es.ts
++++ b/apps/desktop/src/i18n/es.ts
+@@ -5647,6 +5647,12 @@ export const esOverrides = {
+     deleteFailed: 'No se pudo eliminar',
+     archived: 'Archivado',
+     archiveFailed: 'No se pudo archivar',
++    archiveLinkedTitle: (title: string) => (title ? `¿Archivar «${title}»?` : '¿Archivar este chat?'),
++    archiveLinkedBody: 'Este chat todavía tiene trabajo vinculado. Archivar solo oculta el chat: las tareas y las máquinas siguen en marcha.',
++    archiveLinkedConfirm: 'Archivar de todos modos',
++    archiveLinkedCancel: 'Conservar chat',
++    archiveLinkedTasksLabel: 'Tareas de Kanban',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `${open} abiertas` : '', blocked ? `${blocked} bloqueadas` : ''].filter(Boolean).join(' · '),
+     restored: 'Restaurado',
+     unarchiveFailed: 'No se pudo desarchivar',
+     cwdChangeFailed: 'No se pudo cambiar el directorio de trabajo',
+diff --git a/apps/desktop/src/i18n/fr.ts b/apps/desktop/src/i18n/fr.ts
+index 9a75acb3c8..c28180be35 100644
+--- a/apps/desktop/src/i18n/fr.ts
++++ b/apps/desktop/src/i18n/fr.ts
+@@ -5663,6 +5663,12 @@ export const frOverrides = {
+     deleteFailed: 'Échec de la suppression',
+     archived: 'Archivé',
+     archiveFailed: "Échec de l'archivage",
++    archiveLinkedTitle: (title: string) => (title ? `Archiver « ${title} » ?` : 'Archiver ce chat ?'),
++    archiveLinkedBody: "Du travail est encore lié à ce chat. L'archivage masque seulement le chat : les tâches et les machines continuent de tourner.",
++    archiveLinkedConfirm: 'Archiver quand même',
++    archiveLinkedCancel: 'Garder le chat',
++    archiveLinkedTasksLabel: 'Tâches Kanban',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `${open} ouvertes` : '', blocked ? `${blocked} bloquées` : ''].filter(Boolean).join(' · '),
+     restored: 'Restauré',
+     unarchiveFailed: 'Échec de la restauration',
+     cwdChangeFailed: 'Échec du changement de répertoire de travail',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 11b993d7b7..6f5cc73e9d 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -3842,6 +3842,12 @@ export const jaOverrides = {
+     deleteFailed: '削除に失敗しました',
+     archived: 'アーカイブしました',
+     archiveFailed: 'アーカイブに失敗しました',
++    archiveLinkedTitle: (title: string) => (title ? `「${title}」をアーカイブしますか？` : 'このチャットをアーカイブしますか？'),
++    archiveLinkedBody: 'このチャットにはまだ作業が紐付いています。アーカイブはチャットを隠すだけで、タスクやマシンは動き続けます。',
++    archiveLinkedConfirm: 'アーカイブする',
++    archiveLinkedCancel: '残す',
++    archiveLinkedTasksLabel: 'Kanban タスク',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `未完了 ${open}` : '', blocked ? `ブロック中 ${blocked}` : ''].filter(Boolean).join(' · '),
+     restored: '復元しました',
+     unarchiveFailed: 'アーカイブ解除に失敗しました',
+     cwdChangeFailed: '作業ディレクトリの変更に失敗しました',
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index 38e23f7ac5..fcd8ad9f74 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -4025,6 +4025,12 @@ export const ruOverrides = {
+     deleteFailed: 'Удаление не удалось',
+     archived: 'В архиве',
+     archiveFailed: 'Архивирование не удалось',
++    archiveLinkedTitle: (title: string) => (title ? `Архивировать «${title}»?` : 'Архивировать этот чат?'),
++    archiveLinkedBody: 'С этим чатом ещё связана работа. Архивирование лишь скрывает чат — задачи и машины продолжают работать.',
++    archiveLinkedConfirm: 'Всё равно архивировать',
++    archiveLinkedCancel: 'Оставить чат',
++    archiveLinkedTasksLabel: 'Задачи Kanban',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `открыто: ${open}` : '', blocked ? `заблокировано: ${blocked}` : ''].filter(Boolean).join(' · '),
+     restored: 'Восстановлено',
+     unarchiveFailed: 'Не удалось восстановить',
+     cwdChangeFailed: 'Изменение рабочего каталога не удалось',
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 904b68bd90..430b285baa 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -4320,6 +4320,12 @@ export interface Translations extends NoticeTranslations {
+     deleteFailed: string
+     archived: string
+     archiveFailed: string
++    archiveLinkedTitle: (title: string) => string
++    archiveLinkedBody: string
++    archiveLinkedConfirm: string
++    archiveLinkedCancel: string
++    archiveLinkedTasksLabel: string
++    archiveLinkedTasksValue: (open: number, blocked: number) => string
+     restored: string
+     unarchiveFailed: string
+     cwdChangeFailed: string
+diff --git a/apps/desktop/src/i18n/zh-hant_chat.ts b/apps/desktop/src/i18n/zh-hant_chat.ts
+index a61e1f0fef..df2b52b8e4 100644
+--- a/apps/desktop/src/i18n/zh-hant_chat.ts
++++ b/apps/desktop/src/i18n/zh-hant_chat.ts
+@@ -457,6 +457,12 @@ export const zhHantChat = {
+     deleteFailed: '刪除失敗',
+     archived: '已封存',
+     archiveFailed: '封存失敗',
++    archiveLinkedTitle: (title: string) => (title ? `封存「${title}」？` : '封存此對話？'),
++    archiveLinkedBody: '此對話仍有連結的工作。封存只會隱藏對話，任務和機器會繼續執行。',
++    archiveLinkedConfirm: '仍要封存',
++    archiveLinkedCancel: '保留對話',
++    archiveLinkedTasksLabel: '看板任務',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `${open} 個未完成` : '', blocked ? `${blocked} 個受阻` : ''].filter(Boolean).join(' · '),
+     restored: '已還原',
+     unarchiveFailed: '取消封存失敗',
+     cwdChangeFailed: '工作目錄變更失敗',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 8361b2ba31..e2fa4e1e4f 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -4827,6 +4827,12 @@ export const zhOverrides = {
+     deleteFailed: '删除失败',
+     archived: '已归档',
+     archiveFailed: '归档失败',
++    archiveLinkedTitle: (title: string) => (title ? `归档“${title}”？` : '归档此对话？'),
++    archiveLinkedBody: '此对话仍有关联的工作。归档只会隐藏对话，任务和机器会继续运行。',
++    archiveLinkedConfirm: '仍然归档',
++    archiveLinkedCancel: '保留对话',
++    archiveLinkedTasksLabel: '看板任务',
++    archiveLinkedTasksValue: (open: number, blocked: number) => [open ? `${open} 个未完成` : '', blocked ? `${blocked} 个受阻` : ''].filter(Boolean).join(' · '),
+     restored: '已恢复',
+     unarchiveFailed: '取消归档失败',
+     cwdChangeFailed: '工作目录更改失败',
+diff --git a/apps/desktop/src/store/archive-guards.test.ts b/apps/desktop/src/store/archive-guards.test.ts
+new file mode 100644
+index 0000000000..26133a9bd0
+--- /dev/null
++++ b/apps/desktop/src/store/archive-guards.test.ts
+@@ -0,0 +1,74 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { createPluginContext } from '@/contrib/plugin'
++
++import {
++  collectArchiveLinks,
++  kanbanArchiveLinks,
++  registerArchiveGuard,
++  resetArchiveGuardsForTests
++} from './archive-guards'
++
++const ctx = { ids: ['a'], sessionId: 'a' }
++
++describe('archive guards', () => {
++  afterEach(() => {
++    vi.useRealTimers()
++    resetArchiveGuardsForTests()
++  })
++
++  it('collects every guard in registration order and drops malformed lines', async () => {
++    registerArchiveGuard('one', () => [{ label: 'Machines', value: '1 running' }])
++    registerArchiveGuard('two', async () => [
++      { label: 'Jobs', value: '2' },
++      { label: '', value: 'x' },
++      { bogus: true } as never
++    ])
++    registerArchiveGuard('three', () => null)
++
++    expect(await collectArchiveLinks(ctx)).toEqual([
++      { label: 'Machines', value: '1 running' },
++      { label: 'Jobs', value: '2' }
++    ])
++  })
++
++  it('skips a guard that throws or misses the deadline', async () => {
++    registerArchiveGuard('boom', () => {
++      throw new Error('nope')
++    })
++    registerArchiveGuard('slow', () => new Promise(() => {}))
++    registerArchiveGuard('ok', () => [{ label: 'Machines', value: '1' }])
++
++    expect(await collectArchiveLinks(ctx, 20)).toEqual([{ label: 'Machines', value: '1' }])
++  })
++
++  it('disposer removes only its own registration', async () => {
++    const first = vi.fn(() => [{ label: 'A', value: '1' }])
++    const dispose = registerArchiveGuard('same', first)
++    registerArchiveGuard('same', () => [{ label: 'B', value: '2' }])
++    dispose()
++
++    expect(await collectArchiveLinks(ctx)).toEqual([{ label: 'B', value: '2' }])
++    expect(first).not.toHaveBeenCalled()
++  })
++
++  it('plugin ctx.registerArchiveGuard is removed when the plugin unloads', async () => {
++    const disposers: Array<() => void> = []
++    const plugin = createPluginContext('session-tasks', dispose => disposers.push(dispose))
++    plugin.registerArchiveGuard(() => [{ label: 'Machines', value: '1' }])
++
++    expect(await collectArchiveLinks(ctx)).toHaveLength(1)
++    disposers.forEach(dispose => dispose())
++    expect(await collectArchiveLinks(ctx)).toEqual([])
++  })
++
++  it('kanbanArchiveLinks reads the row counts', () => {
++    const copy = { label: 'Kanban tasks', value: (open: number, blocked: number) => `${open}/${blocked}` }
++
++    expect(kanbanArchiveLinks(undefined, copy)).toEqual([])
++    expect(kanbanArchiveLinks({ kanban_active: 0 } as never, copy)).toEqual([])
++    expect(kanbanArchiveLinks({ kanban_active: 2, kanban_blocked: 1 } as never, copy)).toEqual([
++      { label: 'Kanban tasks', value: '2/1' }
++    ])
++  })
++})
+diff --git a/apps/desktop/src/store/archive-guards.ts b/apps/desktop/src/store/archive-guards.ts
+new file mode 100644
+index 0000000000..a330920c4b
+--- /dev/null
++++ b/apps/desktop/src/store/archive-guards.ts
+@@ -0,0 +1,120 @@
++// [daveey] Archive guards: things still linked to a chat (open Kanban tasks,
++// rented machines, …) that the user should see before the chat is archived.
++// Archiving only hides the chat; the linked work keeps running (and billing)
++// out of sight. `archiveSession` collects every guard's findings and asks for
++// confirmation when any come back.
++//
++// Core contributes the Kanban guard from the row's own counts (the same ones
++// the sidebar badge shows). Plugins add theirs through
++// `ctx.registerArchiveGuard` (e.g. session-tasks reports rented machines from
++// compute-rentals). A guard that throws or outlives the deadline is skipped,
++// so a slow or broken plugin can delay archiving by at most the timeout and
++// never blocks it.
++
++import type { SessionInfo } from '@/types/hermes'
++
++/** One line in the confirm dialog: `label` = the kind ("Kanban tasks"),
++ *  `value` = what's linked ("3 open, 1 blocked"). */
++export interface ArchiveLinkedItem {
++  label: string
++  value: string
++}
++
++export interface ArchiveGuardContext {
++  /** The stored id being archived (may be the compression tip). */
++  sessionId: string
++  /** The listed sidebar row, when the session is listed. */
++  session?: SessionInfo
++  /** Every id the chat is known under: the stored id, the row id and its
++   *  lineage root. Guards that bind by session id should also walk
++   *  `parent_session_id` if they need the full chain. */
++  ids: string[]
++  /** Owning profile, when known. */
++  profile?: string
++  /** Registry connection that owns the row; absent = primary/local gateway. */
++  connectionId?: string
++}
++
++export type ArchiveGuard = (
++  context: ArchiveGuardContext
++) => ArchiveLinkedItem[] | null | Promise<ArchiveLinkedItem[] | null | undefined> | undefined
++
++const guards = new Map<string, ArchiveGuard>()
++
++/** Register a guard under a unique id; the returned disposer removes it. A
++ *  second registration under the same id replaces the first. */
++export function registerArchiveGuard(id: string, guard: ArchiveGuard): () => void {
++  guards.set(id, guard)
++
++  return () => {
++    if (guards.get(id) === guard) {
++      guards.delete(id)
++    }
++  }
++}
++
++export const ARCHIVE_GUARD_TIMEOUT_MS = 2_500
++
++function validItems(value: unknown): ArchiveLinkedItem[] {
++  if (!Array.isArray(value)) {
++    return []
++  }
++
++  return value.filter(
++    (item): item is ArchiveLinkedItem =>
++      Boolean(item) &&
++      typeof item.label === 'string' &&
++      typeof item.value === 'string' &&
++      item.label.trim() !== '' &&
++      item.value.trim() !== ''
++  )
++}
++
++/** Run every registered guard in parallel (each capped at `timeoutMs`) and
++ *  return their findings in registration order. Never throws. */
++export async function collectArchiveLinks(
++  context: ArchiveGuardContext,
++  timeoutMs = ARCHIVE_GUARD_TIMEOUT_MS
++): Promise<ArchiveLinkedItem[]> {
++  const runs = [...guards.values()].map(async guard => {
++    let timer: ReturnType<typeof setTimeout> | undefined
++
++    try {
++      const deadline = new Promise<null>(resolve => {
++        timer = setTimeout(() => resolve(null), timeoutMs)
++      })
++
++      return validItems(await Promise.race([Promise.resolve().then(() => guard(context)), deadline]))
++    } catch {
++      return []
++    } finally {
++      if (timer) {
++        clearTimeout(timer)
++      }
++    }
++  })
++
++  return (await Promise.all(runs)).flat()
++}
++
++/** Core guard: the row's own Kanban counts (summed over its lineage by the
++ *  backend, same numbers as the sidebar badge). `copy.value` renders the value
++ *  so the caller owns the copy. */
++export function kanbanArchiveLinks(
++  session: SessionInfo | undefined,
++  copy: { label: string; value: (open: number, blocked: number) => string }
++): ArchiveLinkedItem[] {
++  const open = Math.max(0, Number(session?.kanban_active) || 0)
++  const blocked = Math.max(0, Number(session?.kanban_blocked) || 0)
++
++  if (open + blocked === 0) {
++    return []
++  }
++
++  return [{ label: copy.label, value: copy.value(open, blocked) }]
++}
++
++/** Test seam. */
++export function resetArchiveGuardsForTests(): void {
++  guards.clear()
++}
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index bb2aa5852a..2f5320d76c 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -1422,6 +1422,12 @@
+     "cron.updated",
+     "cron.weekdaysAt",
+     "desktop.archiveFailed",
++    "desktop.archiveLinkedBody",
++    "desktop.archiveLinkedCancel",
++    "desktop.archiveLinkedConfirm",
++    "desktop.archiveLinkedTasksLabel",
++    "desktop.archiveLinkedTasksValue",
++    "desktop.archiveLinkedTitle",
+     "desktop.archived",
+     "desktop.attachImages",
+     "desktop.audioReadFailed",
+diff --git a/website/docs/developer-guide/desktop-plugin-sdk.md b/website/docs/developer-guide/desktop-plugin-sdk.md
+index c3ef14bdd6..a35023282e 100644
+--- a/website/docs/developer-guide/desktop-plugin-sdk.md
++++ b/website/docs/developer-guide/desktop-plugin-sdk.md
+@@ -184,6 +184,9 @@ interface PluginContext {
+   registerMany: (cs: PluginContribution[]) => () => void
+   /** Own entry (+ sub-pages) under Settings → Plugins. Removed on disable/unload. */
+   registerSettingsPage: (page: PluginSettingsPage) => () => void
++  /** Report work still linked to a chat before it is archived; any returned
++   *  `{ label, value }` line makes the archive ask first. Removed on unload. */
++  registerArchiveGuard: (guard: (ctx: ArchiveGuardContext) => Promise<ArchiveLinkedItem[] | null>) => () => void
+   /** REST to this plugin's own backend namespace (`/api/plugins/<id>`). */
+   rest: <T>(path: string, opts?: PluginRestOptions) => Promise<T>
+   /** Live WebSocket to this plugin's own namespace. Returns a disposer. */
+-- 
+2.55.0
+
