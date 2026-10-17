@@ -1,0 +1,206 @@
+From 3b22272402bd69927d4571c35ef1f09c6bf069e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:16:54 -0700
+Subject: [PATCH] [daveey] kanban: warn when an agent's CLI create can't link a
+ chat; entry-path parity test
+
+hermes kanban create run by an agent (terminal/execute_code env markers) that
+can't stamp a known session now prints a stderr warning naming the card and
+the notify-subscribe command that links it. A plain user shell stays quiet.
+
+test_kanban_create_entry_parity drives every way an agent creates a card
+(kanban_create tool, CLI from terminal, CLI from execute_code) with the env
+each tool really builds and asserts the card is in the chat's session_tasks.
+It fails if 0111's execute_code bridge is removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban.py                          |  20 +++
+ .../test_kanban_create_entry_parity.py        | 137 ++++++++++++++++++
+ 2 files changed, 157 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_create_entry_parity.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 2b22ce0bc2..efb5e454ef 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -199,6 +199,17 @@ def kanban_command(args: argparse.Namespace) -> int:
+ 
+ # --- Handlers ---
+ 
++# Env vars only an agent's tool process carries (terminal session bridge, execute_code
++# sandbox RPC). A plain user shell has none of them, so it never gets the warning. [daveey]
++_AGENT_ENV_MARKERS = ("HERMES_SESSION_KEY", "HERMES_SESSION_ID", "HERMES_SESSION_SOURCE",
++                      "HERMES_RPC_SOCKET", "HERMES_KERNEL_SENTINEL")
++
++
++def _agent_invoked() -> bool:
++    """Whether this CLI call came from an agent tool (terminal / execute_code)."""
++    return any(os.environ.get(name) for name in _AGENT_ENV_MARKERS)
++
++
+ def _profile_author() -> str:
+     """Best-effort author name for an interactive CLI call."""
+     from hermes_cli.profiles import current_profile_name
+@@ -401,6 +412,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             from tools.kanban_tools import _maybe_auto_subscribe
+             _maybe_auto_subscribe(conn, task_id)
+         task = kb.get_task(conn, task_id)
++    if not in_worker and not session_id and not idem_hit and _agent_invoked():
++        # An agent shelled out but no chat could be stamped (unknown/missing session env:
++        # ssh to another host, `env -i`, another profile...). Say so loudly: an unlinked card
++        # silently never shows in the chat's task strip or sidebar badge. [daveey]
++        print(f"⚠  {task_id} is not linked to any chat (no known HERMES_SESSION_KEY/ID in this "
++              "environment), so it won't show in the chat's task strip. Create cards with the "
++              "kanban_create tool instead, or link it to the chat: "
++              f"hermes kanban notify-subscribe {task_id} --platform tui --chat-id <session_id>",
++              file=sys.stderr)
+     if getattr(args, "json", False):
+         _print_json(_task_to_dict(task))
+     else:
+diff --git a/tests/hermes_cli/test_kanban_create_entry_parity.py b/tests/hermes_cli/test_kanban_create_entry_parity.py
+new file mode 100644
+index 0000000000..73ea027c92
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_create_entry_parity.py
+@@ -0,0 +1,137 @@
++"""Every way an agent can create a Kanban card links it to the calling chat. [daveey]
++
++The chat's task strip and sidebar badge list exactly ``session_tasks(<lineage ids>)``.
++A card that misses the chat there is invisible while the chat says it is running.
++Each entry path got the link separately (tool; CLI from the terminal in 0067/0068;
++CLI from execute_code in 0111) and the execute_code path shipped broken while its
++doc claimed it worked. This test drives all of them with the env each tool really
++builds, so a new or regressed path fails here instead of in a user's chat.
++Add a case here whenever a new way to create cards appears.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import pytest
++
++import gateway.session_context as sc
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as ksa
++
++SID = "20261016_185414_c283c2"
++_SESSION_ENV = ("HERMES_SESSION_KEY", "HERMES_SESSION_ID", "HERMES_SESSION_SOURCE",
++                "HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_RPC_SOCKET",
++                "HERMES_KERNEL_SENTINEL", "HERMES_KANBAN_TASK")
++
++
++@pytest.fixture
++def chat(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in _SESSION_ENV:
++        monkeypatch.delenv(var, raising=False)
++    ksa._reset_cache_for_tests()
++    kb.init_db()
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db.create_session(session_id=SID, source="desktop")
++    finally:
++        db.close()
++    tokens = sc.set_session_vars(session_id=SID, session_key=SID, source="desktop")
++    yield home
++    sc.clear_session_vars(tokens)
++
++
++def _cli_create(title: str) -> str:
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    assert kc._cmd_create(root.parse_args(["kanban", "create", title])) == 0
++    with kbc.connect_closing() as conn:
++        return next(t for t in kb.list_tasks(conn) if t.title == title).id
++
++
++def _run_cli_in(env: dict, title: str, monkeypatch) -> str:
++    """Run the CLI as the child process would: os.environ = the env the tool built.
++    The CLI is a separate process, so the parent's ContextVars must not leak in."""
++    for var in _SESSION_ENV:
++        monkeypatch.delenv(var, raising=False)
++    for name, value in env.items():
++        if name.startswith("HERMES_SESSION_") or name in ("HERMES_RPC_SOCKET", "HERMES_KERNEL_SENTINEL"):
++            monkeypatch.setenv(name, value)
++    tokens = [var.set(sc._UNSET) for var in sc._VAR_MAP.values()]
++    engaged = sc._session_context_engaged
++    sc._session_context_engaged = False
++    try:
++        return _cli_create(title)
++    finally:
++        sc._session_context_engaged = engaged
++        for var, tok in zip(sc._VAR_MAP.values(), tokens):
++            var.reset(tok)
++
++
++def _via_tool(title: str, monkeypatch) -> str:
++    from tools.kanban_tools import _handle_create
++    out = json.loads(_handle_create({"title": title, "assignee": "default"}))
++    return out["task_id"]
++
++
++def _via_terminal(title: str, monkeypatch) -> str:
++    from tools.environments.local import _inject_session_context_env
++    env: dict = {}
++    _inject_session_context_env(env)
++    return _run_cli_in(env, title, monkeypatch)
++
++
++def _via_execute_code(title: str, monkeypatch) -> str:
++    from tools.code_execution_env import _build_child_env
++    env = _build_child_env(rpc_endpoint="sock", rpc_token="tok", tmpdir="/tmp/hermes-test",
++                           child_python=sys.executable)
++    env.setdefault("HERMES_RPC_SOCKET", "sock")
++    return _run_cli_in(env, title, monkeypatch)
++
++
++PATHS = {"kanban_create tool": _via_tool, "terminal: hermes kanban create": _via_terminal,
++         "execute_code: hermes kanban create": _via_execute_code}
++
++
++@pytest.mark.parametrize("path", list(PATHS))
++def test_card_shows_in_the_creating_chats_task_list(chat, monkeypatch, capsys, path):
++    task_id = PATHS[path](f"card via {path}", monkeypatch)
++    ksa._reset_cache_for_tests()
++    listed = {t["id"] for t in ksa.session_tasks([SID])}
++    assert task_id in listed, f"{path}: card {task_id} is not in chat {SID}'s task list"
++    assert "not linked to any chat" not in capsys.readouterr().err
++
++
++def test_agent_cli_create_without_a_known_chat_warns(chat, monkeypatch, capsys):
++    # e.g. execute_code on another host / another profile: agent env, but no known session.
++    task_id = _run_cli_in({"HERMES_RPC_SOCKET": "sock", "HERMES_SESSION_ID": "not_a_real_session"},
++                          "orphan", monkeypatch)
++    err = capsys.readouterr().err
++    assert f"{task_id} is not linked to any chat" in err
++    assert f"notify-subscribe {task_id} --platform tui --chat-id" in err
++
++
++def test_plain_user_shell_create_does_not_warn(chat, monkeypatch, capsys):
++    _run_cli_in({}, "from my own shell", monkeypatch)
++    assert "not linked to any chat" not in capsys.readouterr().err
++
++
++def test_suggested_notify_subscribe_links_the_orphan(chat, monkeypatch, capsys):
++    task_id = _run_cli_in({"HERMES_RPC_SOCKET": "sock"}, "orphan to fix", monkeypatch)
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    args = root.parse_args(["kanban", "notify-subscribe", task_id, "--platform", "tui", "--chat-id", SID])
++    assert kc._cmd_notify_subscribe(args) == 0
++    ksa._reset_cache_for_tests()
++    assert task_id in {t["id"] for t in ksa.session_tasks([SID])}
+-- 
+2.55.0
+

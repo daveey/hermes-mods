@@ -16,6 +16,8 @@ Patches:
 - `patches/0111-daveey-execute_code-bridge-HERMES_SESSION_ID-KEY-int.patch`: tools. `execute_code`'s sandbox child
   gets the turn's `HERMES_SESSION_ID` / `HERMES_SESSION_KEY`, so `hermes kanban create` run from a script stamps
   and subscribes the chat too (0067/0068 alone only covered the terminal tool).
+- `patches/0112-daveey-kanban-warn-when-an-agent-s-CLI-create-can-t-.patch`: CLI + tests. An agent's
+  `hermes kanban create` that can't link a chat warns on stderr, and one parity test covers every way to create a card.
 
 What you see: a chat that starts or babysits Kanban cards stays tied to them. Ask a chat to "make sure t_x finishes"
 and, with the config flag on, it wakes when the card completes or blocks. Its sidebar row stays busy until the card
@@ -50,6 +52,11 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
 - **execute_code too (0111).** The sandbox scrub drops every non-allowlisted `HERMES_*` var, so before 0111 a script
   that ran `subprocess.run('hermes kanban create …')` made unstamped cards: the chat reported them running while its
   task strip and sidebar badge showed nothing. 0111 bridges just the two session ids into the child.
+- **Unlinked agent cards warn (0112).** If the CLI runs with an agent env marker (`HERMES_SESSION_KEY/ID/SOURCE`,
+  `HERMES_RPC_SOCKET`, `HERMES_KERNEL_SENTINEL`) but stamps no known session, it prints
+  `⚠  <id> is not linked to any chat … hermes kanban notify-subscribe <id> --platform tui --chat-id <session_id>` to
+  stderr. Typical causes: ssh to another host, `env -i`, another profile's home. That command adds the `tui`
+  subscription, which `session_tasks` counts, so the card shows in the chat. Plain user shells and workers stay quiet.
 
 - **Blocked cards paint red (0092).** If any card the session created or shepherds (its `kanban_blocked` count, from
   0063) is `blocked`, the sidebar stripe is red (`stuck`) unless a turn is actively `working`. A ⌘B user block
@@ -82,6 +89,8 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
   the session's notify poller listens on. Before `kb.create_task` it checks for an existing non-archived card with
   the same `idempotency_key`. After the create, if there is a session key and no idempotency hit, it calls
   `_maybe_auto_subscribe(conn, task_id)`, so `kanban.auto_subscribe_on_create` gates it too.
+- 0112, `hermes_cli/kanban.py`: `_AGENT_ENV_MARKERS` + `_agent_invoked()`; `_cmd_create` prints the warning after
+  the create when `not in_worker and not session_id and not idem_hit and _agent_invoked()`.
 - 0111, `tools/code_execution_env.py`: `_build_child_env` calls `_bridge_session_identity(child_env)`, which copies
   `HERMES_SESSION_ID` and `HERMES_SESSION_KEY` from the `gateway.session_context` ContextVars. Once the session
   context is engaged the ContextVar is authoritative (an unbound/empty value is dropped, never taken from the
@@ -130,6 +139,12 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
 - `tests/tools/test_code_execution_session_identity.py` (0111): bound ids reach the child and other session vars
   don't; an engaged-but-cleared context doesn't leak the `os.environ` mirror; an unengaged CLI falls back to it.
   Two of the three fail without the patch.
+- `tests/hermes_cli/test_kanban_create_entry_parity.py` (0112): one parametrized case per entry path (the
+  `kanban_create` tool; the CLI with the env `_inject_session_context_env` gives the terminal; the CLI with the env
+  `_build_child_env` gives execute_code), each asserting the card is in `session_tasks([chat])`. The CLI cases run with
+  the parent's ContextVars unset, the way a real child process would. Removing 0111's bridge fails the execute_code
+  case. Also: the warning fires for an agent env without a known chat, doesn't fire in a plain shell, and the
+  printed `notify-subscribe` command really links the card. **Add a case here for any new way to create cards.**
 
 ## Applying
 
@@ -151,6 +166,8 @@ are blocked on a human shows red in the sidebar, and the open chat's task strip 
   to the import 0044 added in `web_routers/sessions.py`. Its subscriber query matches 0059's counting; without
   0059 the counts and the list disagree on shepherded cards.
 
+- 0112 needs 0067/0068 (`in_worker`, `idem_hit`, `session_id` in `_cmd_create`), 0093 (`session_tasks`) and 0111
+  (its execute_code case).
 - 0111 is independent of the others (it only adds env vars); without 0067/0068 the CLI ignores them.
 
 ## Gotchas

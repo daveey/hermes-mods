@@ -42,6 +42,9 @@ the private repo `daveey/hermes` (`~/code/hermes`, branch `state`).
 - Core patches (`core/patches/NNNN-*.patch`) ship with their feature doc in the same commit: a new or extended
   `core/<feature>.md` and the patch number in its `core/README.md` row. The pre-commit hook
   (`core/check_coverage.py`) refuses a commit that leaves any patch without a row.
+- A feature doc may only claim what its tests prove. Each Behavior bullet that names an entry path (terminal,
+  execute_code, tool, REST, Desktop...) needs a test for that path listed under `## Tests`. Don't widen a claim
+  ("terminal or execute_code") without adding the test for the new path; mark an untested path "untested".
 
 ## Never
 
