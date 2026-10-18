@@ -233,8 +233,19 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
     return result + NOTE.format(title=(res.get("tab") or {}).get("title") or "?")
 
 
+_HYPOTHETICAL = re.compile(r"\b(unless|if|in case|won't|will not|don't need|no need|nothing will|not need|shouldn't need)\b", re.I)
+
+
 def asks_user_in_browser(text: str) -> bool:
-    return bool(_ASKS_BROWSER.search(text) and _ASKS_ACTION.search(text))
+    """A sentence that asks for a browser action (the browser may be named in the sentence before it), not one that
+    only mentions it ("unless Nest asks you to sign in")."""
+    sents = [s for s in re.split(r"(?<=[.!?:])\s+|\n+", text) if s.strip()]
+    for i, s in enumerate(sents):
+        if not _ASKS_ACTION.search(s) or _HYPOTHETICAL.search(s):
+            continue
+        if _ASKS_BROWSER.search(s) or (i and _ASKS_BROWSER.search(sents[i - 1])):
+            return True
+    return False
 
 
 def transform_llm_output(response_text: str = "", session_id: str = "", **_):

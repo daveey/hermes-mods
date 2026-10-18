@@ -88,6 +88,11 @@ class T(unittest.TestCase):
     def test_asks_user_in_browser(self):
         self.assertTrue(bf.asks_user_in_browser("Click Allow on the tab I opened"))
         self.assertFalse(bf.asks_user_in_browser("I checked the thermostat history."))
+        # mentions without an ask (the false positive that stole focus)
+        self.assertFalse(bf.asks_user_in_browser(
+            "It works in the hidden Chrome, so nothing will pop up unless Nest asks you to sign in again."))
+        self.assertFalse(bf.asks_user_in_browser("The Chrome tab stays hidden. I read the schedule.\nYou can sign in later from your phone."))
+        self.assertTrue(bf.asks_user_in_browser("The Nest page is open in Chrome. Please sign in, then say done."))
 
 
 if __name__ == "__main__":
