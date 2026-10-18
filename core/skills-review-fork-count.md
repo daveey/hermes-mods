@@ -5,6 +5,8 @@ Patches:
 - `patches/0055-fix-skills-review-fork-counts-a-replayed-still-curre.patch`: skills. Before the background review
   fork runs, skill_view results in the history it replays count as reads when they still match the file on disk.
 - `0097`: name stale replayed skill copies in the review prompt so the fork reloads them before writing.
+- `0128`: a read-before-write refusal serves the file's current text and counts as the read, so the fork's next
+  call can be the corrected write.
 
 What you see: background skill reviews patch a skill the session already loaded on the first try. Before, the
 review fork's first patch was refused with "content has not been loaded in this review turn", so it re-viewed the
@@ -25,6 +27,12 @@ skill first. For a large SKILL.md (tens of KB) that was a full reload on every r
 
 - A stale replayed copy now produces a prompt note naming the skill and `SKILL.md` or supporting-file path, with instructions to call `skill_view` before writing. The guard itself is unchanged. Deleted files, failed/pruned views, and current copies do not produce this stale-copy note.
 
+- Patch `0128`: when the guard still refuses (the fork never loaded the file), the refusal carries
+  `current_content` (the file's current text, up to 120,000 chars) and marks the file read. The write itself is
+  still refused, and the message tells the fork to rebuild the edit against `current_content` and resend it now
+  (every operation, for a batch). Larger files get the old "call skill_view" refusal. Before, recovery took
+  refuse → `skill_view` → retry, and review forks often stopped after the re-view with nothing saved.
+
 ## How it works
 
 - `tools/skill_manager_guards.py`:
@@ -43,6 +51,11 @@ skill first. For a large SKILL.md (tens of KB) that was a full reload on every r
   snapshot), calls `_reset_background_review_read_marks()` then the seeder with `agent.session_id`, and passes the
   same `review_history` to `run_conversation`. The seeding is inside `suppress(Exception)`, so a failure leaves the
   old behavior.
+
+- Patch `0128`, `tools/skill_manager_guards.py` `_background_review_read_before_write_guard`: reads the target
+  (`utf-8-sig`, errors suppressed); at or under `_INLINE_REFUSAL_MAX_CHARS` it calls
+  `mark_background_review_skill_read(target)` and returns `_refusal(..., _read_before_write_required=True,
+  current_file=..., current_content=...)`.
 
 ## Code
 
@@ -71,11 +84,17 @@ scripts/run_tests.sh tests/tools/test_skill_manager_tool.py tests/agent/test_bac
 
 Both files passed in the full-series regression run (October 16, 2026 PT).
 
+Patch `0128` adds, in `TestCuratorConsolidationDeleteGuard`,
+`test_background_review_refusal_serves_current_content_so_retry_lands` (single-op and batched: the very next
+corrected write lands with no `skill_view` in between) and
+`test_background_review_refusal_falls_back_when_file_too_large_to_inline`. `tests/tools/test_skill_manager_tool.py`
+(83 tests) passes on the full 0001–0129 series (October 18, 2026 PT).
+
 ## Applying
 
 Apply the ordered `0001–0097` prefix (or the complete `0001–0105` series) from this
 mirror to the fork's documented merge-base in a disposable checkout. This feature
-spans `0055` and `0097`; isolated application is not claimed. It relies on the
+spans `0055`, `0097` and `0128` (apply `0001–0128` for all three); isolated application is not claimed. It relies on the
 review read-before-write guard and `skill_view` source-path metadata. Run tests
 from the resulting Hermes source root.
 

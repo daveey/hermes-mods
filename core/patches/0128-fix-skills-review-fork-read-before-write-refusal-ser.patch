@@ -1,0 +1,125 @@
+From 57370fbce272f39496c177e3fa9d46e91932ed46 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 20:48:05 -0700
+Subject: [PATCH] fix(skills): review-fork read-before-write refusal serves the
+ current file and counts as the read, so the next call is the retry [daveey]
+
+The fork patched myapp-devices-home after seeing it only through a
+search_files snippet, was refused, re-viewed it, then ended the turn with
+nothing saved. The refusal now inlines current_content (<=120k chars) and
+marks the file read, so recovery is refuse -> corrected write instead of
+refuse -> skill_view -> retry. Larger files keep the old skill_view hint.
+---
+ tests/tools/test_skill_manager_tool.py | 51 ++++++++++++++++++++++++++
+ tools/skill_manager_guards.py          | 29 ++++++++++++++-
+ 2 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tools/test_skill_manager_tool.py b/tests/tools/test_skill_manager_tool.py
+index 7ab2ee731c..dbbf718ca5 100644
+--- a/tests/tools/test_skill_manager_tool.py
++++ b/tests/tools/test_skill_manager_tool.py
+@@ -1314,6 +1314,57 @@ class TestCuratorConsolidationDeleteGuard:
+ 
+         _reset_background_review_read_marks()
+ 
++    def test_background_review_refusal_serves_current_content_so_retry_lands(
++        self, tmp_path, monkeypatch
++    ):
++        """Coach bug (myapp-devices-home): the fork saw the skill only through a search_files
++        snippet, patched it, was refused, re-viewed it and ended the turn with nothing saved. The
++        refusal now carries the current text and counts as the read: the very next call — the
++        corrected write, no skill_view in between — must land, single-op and batched."""
++        from tools.skill_manager_guards import _reset_background_review_read_marks
++
++        _reset_background_review_read_marks()
++        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
++            _create_curator_skill("reviewed", _skill_content("reviewed"))
++            current = (tmp_path / ".hermes" / "skills" / "reviewed" / "SKILL.md").read_text()
++
++            blocked = json.loads(skill_manage(
++                action="", name="", operations=[{"action": "patch", "name": "reviewed",
++                                                 "old_string": "Step 1: Do the thing.",
++                                                 "new_string": "Step 1: Do the thing safely."}]))
++            assert blocked["success"] is False
++            assert blocked.get("_read_before_write_required") is True
++            assert blocked["current_content"] == current
++            assert blocked["current_file"] == "SKILL.md"
++            assert "Do not stop here" in blocked["error"]
++
++            retried = json.loads(skill_manage(
++                action="", name="", operations=[{"action": "patch", "name": "reviewed",
++                                                 "old_string": "Step 1: Do the thing.",
++                                                 "new_string": "Step 1: Do the thing safely."}]))
++            assert retried["success"] is True, retried
++
++        _reset_background_review_read_marks()
++
++    def test_background_review_refusal_falls_back_when_file_too_large_to_inline(
++        self, tmp_path, monkeypatch
++    ):
++        from tools import skill_manager_guards as guards
++
++        guards._reset_background_review_read_marks()
++        monkeypatch.setattr(guards, "_INLINE_REFUSAL_MAX_CHARS", 10)
++        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
++            _create_curator_skill("reviewed", _skill_content("reviewed"))
++            for _ in range(2):  # no inline content => no read mark => still refused
++                blocked = json.loads(skill_manage(
++                    action="patch", name="reviewed",
++                    old_string="Step 1: Do the thing.", new_string="Step 1: Do the thing safely."))
++                assert blocked.get("_read_before_write_required") is True
++                assert "current_content" not in blocked
++                assert "Call skill_view(name)" in blocked["error"]
++
++        guards._reset_background_review_read_marks()
++
+     def test_background_review_support_file_overwrite_requires_that_file_read(self, tmp_path, monkeypatch):
+         from tools.skills_tool import skill_view
+         from tools.skill_manager_guards import _reset_background_review_read_marks
+diff --git a/tools/skill_manager_guards.py b/tools/skill_manager_guards.py
+index a4c5b8510e..de6124453a 100644
+--- a/tools/skill_manager_guards.py
++++ b/tools/skill_manager_guards.py
+@@ -309,11 +309,38 @@ def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[dict
+     return None
+ 
+ 
++# Inline the refused file's current text up to this size: past it the refusal falls back to
++# "call skill_view" (SKILL.md content is capped well below this, so in practice always inline).
++_INLINE_REFUSAL_MAX_CHARS = 120_000
++
++
+ def _background_review_read_before_write_guard(
+     name: str, target: Path, action: str, file_label: str) -> Optional[dict[str, Any]]:
+-    """Require review forks to load the exact target before mutating it."""
++    """Require review forks to load the exact target before mutating it.
++
++    The refusal itself serves the current file and counts as the read, so the fork's next call
++    can be the corrected write. Refuse -> skill_view -> retry was a three-step recovery and review
++    forks kept stopping after the re-view, so the learning was never saved (coach:
++    myapp-devices-home, seen only through a search_files snippet, patched, refused, re-viewed,
++    turn ended with nothing written). The write is still refused: the fork must rebuild the edit
++    against the full current text, not resend the blind one."""
+     if not _is_background_review() or _background_review_has_read(target):
+         return None
++    current: Optional[str] = None
++    with suppress(Exception):
++        text = target.read_text(encoding="utf-8-sig")
++        if len(text) <= _INLINE_REFUSAL_MAX_CHARS:
++            current = text
++    if current is not None:
++        mark_background_review_skill_read(target)
++        return _refusal(
++            f"Refusing background curator {action} for skill '{name}': the current {file_label} "
++            f"content had not been loaded in this review turn, so nothing was written. Its current "
++            f"text is in current_content and now counts as loaded. Do not stop here: rebuild the "
++            f"edit from current_content (anchor old_string on it, skip guidance it already has, "
++            f"keep newer content) and send the corrected skill_manage call now. In a batch, resend "
++            f"every operation; the earlier ones were rolled back.",
++            _read_before_write_required=True, current_file=file_label, current_content=current)
+     return _refusal(
+         f"Refusing background curator {action} for skill '{name}': the current {file_label} "
+         f"content has not been loaded in this review turn. Call skill_view(name) for SKILL.md, or "
+-- 
+2.55.0
+

@@ -1,0 +1,189 @@
+From e7e3b89f6f5dfcc83831b5601b6b1a816c1fff5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 11:28:32 -0700
+Subject: [PATCH] [daveey] background review: optional evidence gate for skill
+ updates
+
+auxiliary.background_review.require_evidence (default false = upstream prompts byte-for-byte). When true, the skill-only and combined review prompts replace the 'Be ACTIVE ... not a neutral outcome.' push and the closing 'don't default to Nothing to save' nudge with an evidence gate (edit only on a specific observed moment; Nothing to save is neutral). Memory-only prompt unchanged. build_review_prompt() applies it at prompt selection, so per-agent overrides and run_agent's class constants stay untouched.
+---
+ agent/background_review.py                    | 51 +++++++++++++-
+ hermes_cli/config_defaults.py                 |  5 +-
+ .../test_background_review_evidence_gate.py   | 67 +++++++++++++++++++
+ 3 files changed, 121 insertions(+), 2 deletions(-)
+ create mode 100644 tests/agent/test_background_review_evidence_gate.py
+
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 89b344ca43..74f5133d6b 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -11,6 +11,7 @@ import copy
+ import json
+ import logging
+ import os
++import re
+ import threading
+ from contextlib import contextmanager, suppress
+ from dataclasses import dataclass, field
+@@ -1323,6 +1324,52 @@ def _live_memory_budget_note(agent: Any) -> str:
+         return ""
+ 
+ 
++# [daveey] Optional evidence gate (``auxiliary.background_review.require_evidence``, default off =
++# upstream prompts byte-for-byte). When on, the skill-review and combined prompts swap their
++# "Be ACTIVE ... not a neutral outcome." push (and the closing "don't default to Nothing to save"
++# nudge) for a gate: edit a skill only when a specific moment in the conversation shows the
++# mechanism. The memory-only prompt is never touched.
++_EVIDENCE_GATE = (
++    "Update a skill only when a SPECIFIC moment in this conversation shows the mechanism: a "
++    "command that failed and the fix that worked, a user correction, a step that cost time. Name "
++    "that moment to yourself before writing. 'This looks like good practice' is not evidence. A "
++    "failure seen once that did not reproduce is noise; don't write a rule for it. 'Nothing to "
++    "save.' is a valid, neutral outcome: an edit the conversation doesn't support is a regression, "
++    "because it costs context on every later load. Always-on SKILL.md text is paid on every load; "
++    "if you add some, look for something to cut."
++)
++_BE_ACTIVE_RE = re.compile(r"Be ACTIVE — .*?not a neutral outcome\.", re.DOTALL)
++_GATED_CLOSINGS = (
++    ("'Nothing to save.' is a real option but should NOT be the default. If the session ran "
++     "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
++     "stop. Otherwise, act.",
++     "If no specific moment in this conversation supports an edit, say 'Nothing to save.' and stop."),
++    ("If genuinely nothing stands out on either, say 'Nothing to save.' and stop — but don't reach "
++     "for that conclusion as a default.",
++     "If nothing on either dimension has evidence behind it, say 'Nothing to save.' and stop."),
++)
++
++
++def _require_evidence(task_cfg: Optional[dict[str, Any]]) -> bool:
++    try:
++        from utils import is_truthy_value
++        return is_truthy_value(_background_review_task_config(task_cfg).get("require_evidence"),
++                               default=False)
++    except Exception:
++        return False
++
++
++def build_review_prompt(name: str, base: str, require_evidence: bool) -> str:
++    """Return review prompt ``name`` (``base`` is its text, possibly a per-agent override) with
++    the evidence gate applied when ``require_evidence`` and the prompt reviews skills."""
++    if not require_evidence or name == "_MEMORY_REVIEW_PROMPT":
++        return base
++    prompt = _BE_ACTIVE_RE.sub(lambda _m: _EVIDENCE_GATE, base, count=1)
++    for old, new in _GATED_CLOSINGS:
++        prompt = prompt.replace(old, new)
++    return prompt
++
++
+ # (review_memory, review_skills) -> prompt attribute name; skills-only is also the default.
+ _PROMPT_NAME_BY_SCOPE = {
+     (True, True): "_COMBINED_REVIEW_PROMPT", (True, False): "_MEMORY_REVIEW_PROMPT",
+@@ -1346,7 +1393,8 @@ def spawn_background_review_thread(
+         task_cfg = _background_review_task_config()
+     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
+     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
+-    prompt = getattr(agent, name, globals()[name])
++    prompt = build_review_prompt(name, getattr(agent, name, globals()[name]),
++                                 _require_evidence(task_cfg))
+     if review_memory and not explicit and (budget := _live_memory_budget_note(agent)):
+         prompt = f"{prompt}\n\n{budget}"
+     if focus := (focus or "").strip():
+@@ -1368,6 +1416,7 @@ __all__ = [
+     "_MEMORY_REVIEW_PROMPT",
+     "_SKILL_REVIEW_PROMPT",
+     "build_memory_write_metadata",
++    "build_review_prompt",
+     "load_background_review_settings",
+     "spawn_background_review_thread",
+     "summarize_background_review_actions",
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 370050a72a..4498004a96 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -811,7 +811,10 @@ DEFAULT_CONFIG = {
+         # conversation's reasoning config verbatim so its request bytes keep the parent's warm
+         # prompt-cache prefix (#30532). Set provider/model below to route the review to another model
+         # if you want a different effort level; a one-time warning says so when the key is set.
+-        "background_review": {"enabled": True, **_aux(120)},
++        # [daveey] require_evidence: gate skill edits on a specific observed moment instead of
++        # upstream's "Be ACTIVE" push (agent/background_review.py build_review_prompt). Off =
++        # upstream prompts byte-for-byte.
++        "background_review": {"enabled": True, "require_evidence": False, **_aux(120)},
+         # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
+         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
+         "moa_reference": _aux(900, reasoning_effort=False),
+diff --git a/tests/agent/test_background_review_evidence_gate.py b/tests/agent/test_background_review_evidence_gate.py
+new file mode 100644
+index 0000000000..89f0aeee16
+--- /dev/null
++++ b/tests/agent/test_background_review_evidence_gate.py
+@@ -0,0 +1,67 @@
++"""[daveey] Tests for the optional evidence gate (auxiliary.background_review.require_evidence)."""
++
++from unittest.mock import MagicMock
++
++from agent.background_review import (
++    _COMBINED_REVIEW_PROMPT,
++    _EVIDENCE_GATE,
++    _MEMORY_REVIEW_PROMPT,
++    _SKILL_REVIEW_PROMPT,
++    spawn_background_review_thread,
++)
++
++
++def _bare_agent():
++    agent = MagicMock()
++    del agent._COMBINED_REVIEW_PROMPT
++    del agent._MEMORY_REVIEW_PROMPT
++    del agent._SKILL_REVIEW_PROMPT
++    agent._memory_store = None  # no live budget note on the memory path
++    return agent
++
++
++def _prompt(task_cfg, memory, skills):
++    _t, prompt = spawn_background_review_thread(
++        _bare_agent(), [], review_memory=memory, review_skills=skills, task_cfg=task_cfg)
++    return prompt
++
++
++def test_flag_unset_prompts_are_upstream_constants():
++    for cfg in ({}, {"require_evidence": False}):
++        assert _prompt(cfg, False, True) == _SKILL_REVIEW_PROMPT
++        assert _prompt(cfg, True, True) == _COMBINED_REVIEW_PROMPT
++
++
++def test_skill_only_prompt_gated():
++    prompt = _prompt({"require_evidence": True}, False, True)
++    assert _EVIDENCE_GATE in prompt
++    assert "Be ACTIVE" not in prompt
++    assert "should NOT be the default" not in prompt
++    assert "Otherwise, act." not in prompt
++
++
++def test_combined_prompt_gated():
++    prompt = _prompt({"require_evidence": True}, True, True)
++    assert _EVIDENCE_GATE in prompt
++    assert "Be ACTIVE" not in prompt
++    assert "don't reach for that conclusion as a default" not in prompt
++    assert prompt.startswith("Review the conversation above and update two things")
++
++
++def test_memory_only_prompt_unchanged_when_gated():
++    gated = _prompt({"require_evidence": True}, True, False)
++    plain = _prompt({}, True, False)
++    assert gated == plain
++    assert gated.startswith(_MEMORY_REVIEW_PROMPT)
++    assert _EVIDENCE_GATE not in gated
++
++
++def test_gate_keeps_lesson_layer_block():
++    from agent.background_review import _LESSON_LAYER_BLOCK
++    assert _LESSON_LAYER_BLOCK in _prompt({"require_evidence": True}, False, True)
++    assert _LESSON_LAYER_BLOCK in _prompt({"require_evidence": True}, True, True)
++
++
++def test_gate_does_not_touch_constants():
++    _prompt({"require_evidence": True}, True, True)
++    assert "Be ACTIVE" in _SKILL_REVIEW_PROMPT and "Be ACTIVE" in _COMBINED_REVIEW_PROMPT
+-- 
+2.55.0
+
