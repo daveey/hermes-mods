@@ -24,3 +24,37 @@ test('findConnection matches slugged labels and ids', () => {
   assert.equal(m.findConnection(conns, 'skint-polycentrism'), 'skint-polycentrism')
   assert.equal(m.findConnection(conns, 'nope'), null)
 })
+
+test('openCard calls the core open-task hook with the explicit board', async () => {
+  const calls = []
+  const win = { [m.OPEN_TASK_HOOK]: (...a) => (calls.push(a), true) }
+  const nav = { navigate: () => calls.push(['navigate']) }
+  assert.equal(await m.openCard('t_1a2b3c4d', { board: 'bb', conn: 'local' }, win, nav), true)
+  assert.deepEqual(calls, [['t_1a2b3c4d', 'bb', null]])
+})
+
+test('openCard passes the owning gateway for a card on another gateway', async () => {
+  const calls = []
+  const win = { [m.OPEN_TASK_HOOK]: (...a) => (calls.push(a), true) }
+  assert.equal(await m.openCard('t_1a2b3c4d', { board: 'bb', conn: 'skint-polycentrism' }, win, {}), true)
+  assert.deepEqual(calls, [['t_1a2b3c4d', 'bb', 'skint-polycentrism']])
+})
+
+test('openCard resolves the current board when the task was found without one', async () => {
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => (path.endsWith('/boards') ? { boards: [], current: 'ops' } : null) } }
+  try {
+    const calls = []
+    const win = { [m.OPEN_TASK_HOOK]: (...a) => (calls.push(a), true) }
+    await m.openCard('t_00000000', { board: '', conn: 'local' }, win, {})
+    assert.deepEqual(calls, [['t_00000000', 'ops', null]])
+  } finally {
+    delete globalThis.window
+  }
+})
+
+test('openCard falls back to the board page on a core without the hook', async () => {
+  const seen = []
+  const nav = { navigate: p => seen.push(p), notify: n => seen.push(n.kind) }
+  assert.equal(await m.openCard('t_1a2b3c4d', { board: 'bb', conn: 'local' }, {}, nav), false)
+  assert.deepEqual(seen, ['/kanban', 'info'])
+})

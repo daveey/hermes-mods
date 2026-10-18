@@ -3,8 +3,8 @@
  *
  *   hover  → small preview card: title, status, assignee, priority, age, board
  *   click  → task popup: body, latest summary/result, parents/children (clickable),
- *            runs, comments, recent events; buttons to open the worker session,
- *            open the board, copy the id, refresh. Esc / click outside closes.
+ *            runs, comments, recent events; buttons to open the card (the board's
+ *            drawer: edit + comment), the worker session, the board, copy the id, refresh. Esc / click outside closes.
  *
  * The chat DOM is React-owned, so this plugin never edits it. Ids are styled with the
  * CSS Custom Highlight API (`::highlight(task-mention)`, Ranges over existing text
@@ -185,6 +185,33 @@ async function loadTask(id) {
   }
   if (lastError && order.length === 1) throw lastError
   throw new Error(`task ${id} not found on ${named ? hint.gateway : 'any connected gateway'}`)
+}
+
+/** Explicit board slug for an entry: '' means the gateway's current board, which the Desktop board page
+ *  may not have selected — resolve it so the drawer fetches the right board. */
+async function resolveBoard(entry) {
+  if (entry.board) return entry.board
+  try {
+    const res = await api('/api/plugins/kanban/boards', entry.conn)
+    return (res && !Array.isArray(res) && typeof res.current === 'string' && res.current) || 'default'
+  } catch {
+    return 'default'
+  }
+}
+
+/** Hook name core's kanban plugin installs (fork patch: kanban open-task hook). */
+export const OPEN_TASK_HOOK = '__hermesKanbanOpenTask'
+
+/** Open a task's card drawer on the board page. Falls back to the plain board on an older core. */
+export async function openCard(id, entry, win = globalThis, nav = hostRef) {
+  const board = await resolveBoard(entry)
+  const hook = win[OPEN_TASK_HOOK]
+  // Owning gateway only for a card on another gateway; the routed one needs no hint.
+  const gateway = entry.conn && entry.conn !== activeConnection() ? entry.conn : null
+  if (typeof hook === 'function' && hook(id, board, gateway) !== false) return true
+  nav.navigate?.('/kanban')
+  nav.notify?.({ kind: 'info', title: 'Opened the board', message: `This Hermes build can't open card ${id} directly yet; it can after the next Hermes update.` })
+  return false
 }
 
 export function getTask(id, force = false) {
@@ -571,9 +598,13 @@ function createUI(host) {
     const foot = h(
       'div',
       { class: 'tm-foot' },
+      // Open card: the board page's drawer for this task (edit fields, comment), on its own gateway + board.
+      typeof host.navigate === 'function'
+        ? h('button', { class: 'tm-btn tm-primary', title: 'Open this card on the board to edit it or comment', onclick: () => (closeModal(), void openCard(t.id, entry)) }, 'Open card')
+        : null,
       // Worker session + board live on the task's gateway; both buttons open the ACTIVE one.
       !remote && t.session_id && typeof host.openSession === 'function'
-        ? h('button', { class: 'tm-btn tm-primary', onclick: () => (closeModal(), void host.openSession(t.session_id).catch(e => host.notifyError?.(e, 'Could not open worker session'))) }, 'Open worker session')
+        ? h('button', { class: 'tm-btn', onclick: () => (closeModal(), void host.openSession(t.session_id).catch(e => host.notifyError?.(e, 'Could not open worker session'))) }, 'Open worker session')
         : null,
       !remote && typeof host.navigate === 'function' ? h('button', { class: 'tm-btn', onclick: () => (closeModal(), host.navigate('/kanban')) }, 'Open board') : null,
       h('button', { class: 'tm-btn', onclick: e => copy(t.id, e.currentTarget) }, 'Copy id'),
