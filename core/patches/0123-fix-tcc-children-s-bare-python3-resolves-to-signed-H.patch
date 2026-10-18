@@ -1,0 +1,129 @@
+From 8606c526e48884f0deff52861458bb9f8a4c37a4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 15:10:44 -0700
+Subject: [PATCH] fix(tcc): children's bare python3 resolves to signed Hermes
+ Python.app [daveey]
+
+The launchd gateway's wrapper is /usr/bin/osascript (platform binary), so TCC
+attributes child requests to the accessing binary. Kanban-worker terminals and
+cron scripts resolved python3 to the ad-hoc ~/.hermes/tools/python-*/bin and
+triggered generic 'python3.14' Automation prompts. _scrubbed_env now puts the
+version-matched Hermes Python.app ahead of that store bin dir.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/_launchers.py                    | 23 +++++++++
+ tests/hermes_cli/test_signed_python_path.py | 52 +++++++++++++++++++++
+ tools/environments/local.py                 |  3 ++
+ 3 files changed, 78 insertions(+)
+ create mode 100644 tests/hermes_cli/test_signed_python_path.py
+
+diff --git a/hermes_cli/_launchers.py b/hermes_cli/_launchers.py
+index b09272a872..5364493b12 100644
+--- a/hermes_cli/_launchers.py
++++ b/hermes_cli/_launchers.py
+@@ -174,6 +174,29 @@ def signed_python_app(store_python: Path) -> Path | None:
+     return None
+ 
+ 
++def prefer_signed_python_on_path(path: str) -> str:
++    """[daveey] Put the signed Hermes Python.app ahead of the matching store Python's ``bin`` on *path*.
++
++    Children of the launchd gateway (kanban workers' terminals, cron scripts) resolve bare ``python3``
++    to the store's ad-hoc ``~/.hermes/tools/python-*/bin/python3``. The gateway's launchd wrapper is
++    ``/usr/bin/osascript`` (a platform binary), so TCC attributes their Automation/Photos/FDA requests
++    to that bare binary and prompts for "python3.14" instead of using Hermes Python.app's grants.
++    """
++    if sys.platform != "darwin" or not path:
++        return path
++    entries = [e for e in path.split(os.pathsep) if e]
++    out: list[str] = []
++    for entry in entries:
++        exe = signed_python_app(Path(entry) / "python3") if entry.rstrip("/").endswith("/bin") else None
++        if exe is not None:
++            signed_dir = str(exe.parent)
++            if signed_dir not in out:
++                out.append(signed_dir)
++        if entry not in out:
++            out.append(entry)
++    return os.pathsep.join(out)
++
++
+ def _load_script_maker():
+     """distlib's ScriptMaker — standalone first, then pip's vendored copy."""
+     try:
+diff --git a/tests/hermes_cli/test_signed_python_path.py b/tests/hermes_cli/test_signed_python_path.py
+new file mode 100644
+index 0000000000..0145afe28b
+--- /dev/null
++++ b/tests/hermes_cli/test_signed_python_path.py
+@@ -0,0 +1,52 @@
++"""[daveey] Children's bare python3 resolves to the signed Hermes Python.app, not the ad-hoc store Python."""
++import plistlib
++from pathlib import Path
++
++import pytest
++
++from hermes_cli._launchers import prefer_signed_python_on_path
++
++
++def _bundle(home: Path, version: str) -> Path:
++    contents = home / "Applications" / "Hermes Python.app" / "Contents"
++    (contents / "MacOS").mkdir(parents=True)
++    exe = contents / "MacOS" / "python3.14"
++    exe.write_bytes(b"")
++    (contents / "Info.plist").write_bytes(plistlib.dumps(
++        {"CFBundleShortVersionString": version, "CFBundleExecutable": "python3.14"}))
++    return exe
++
++
++@pytest.mark.platforms("macos")
++def test_signed_dir_goes_before_matching_store_bin(tmp_path, monkeypatch):
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    store_bin = str(tmp_path / "tools" / "python-3.14.7+20260901-darwin-arm64" / "bin")
++    path = f"/a/node/bin:{store_bin}:/usr/bin"
++    assert prefer_signed_python_on_path(path) == path  # no bundle: unchanged
++    exe = _bundle(tmp_path, "3.14.7")
++    signed = str(exe.parent)
++    assert prefer_signed_python_on_path(path) == f"/a/node/bin:{signed}:{store_bin}:/usr/bin"
++    # idempotent, and an existing later copy of the signed dir moves up instead of duplicating
++    assert prefer_signed_python_on_path(f"{store_bin}:/usr/bin:{signed}") == f"{signed}:{store_bin}:/usr/bin"
++
++
++@pytest.mark.platforms("macos")
++def test_version_mismatch_keeps_store_first(tmp_path, monkeypatch):
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    _bundle(tmp_path, "3.14.7")
++    newer = str(tmp_path / "tools" / "python-3.14.8+20261001-darwin-arm64" / "bin")
++    assert prefer_signed_python_on_path(f"{newer}:/usr/bin") == f"{newer}:/usr/bin"
++
++
++@pytest.mark.platforms("macos")
++def test_child_env_resolves_signed_python(tmp_path, monkeypatch):
++    """The terminal/cron sanitizer (``_scrubbed_env``) applies it to every child PATH."""
++    from tools.environments import local
++
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(local, "_prepend_hermes_bin_dir", lambda p: p)
++    exe = _bundle(tmp_path, "3.14.7")
++    store_bin = str(tmp_path / "tools" / "python-3.14.7+20260901-darwin-arm64" / "bin")
++    env = local._scrubbed_env([({"PATH": f"{store_bin}:/usr/bin"}, True)], frozenset(), lambda p: p)
++    dirs = env["PATH"].split(":")
++    assert dirs.index(str(exe.parent)) < dirs.index(store_bin)
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 5a9d39af73..db75645319 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -304,6 +304,9 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
+     # already applies this invariant; Cron scripts use this sanitizer directly (#92998).
+     if path_key is not None:
+         out[path_key] = _prepend_hermes_bin_dir(fix_path(out.get(path_key, "")))
++        # [daveey] bare python3 -> the Developer-ID Hermes Python.app, so macOS TCC uses its grants.
++        from hermes_cli._launchers import prefer_signed_python_on_path
++        out[path_key] = prefer_signed_python_on_path(out[path_key])
+     return _finalize_child_env(out)
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

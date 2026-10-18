@@ -1,0 +1,187 @@
+From e167ad8f3fc7e1d0ba600b28581c72789acf9567 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 19:45:56 -0700
+Subject: [PATCH] feat(desktop/kanban): window.__hermesKanbanOpenTask hook so
+ disk plugins can open a card's drawer [daveey]
+
+---
+ apps/desktop/src/plugins/kanban/api.ts        |  7 +++
+ .../src/plugins/kanban/open-task.test.ts      | 62 +++++++++++++++++++
+ apps/desktop/src/plugins/kanban/open-task.ts  | 49 +++++++++++++++
+ apps/desktop/src/plugins/kanban/plugin.tsx    |  6 +-
+ 4 files changed, 123 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/plugins/kanban/open-task.test.ts
+
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 75d56fced0..9a593f70e0 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -471,6 +471,13 @@ interface TaskOwner {
+ 
+ const taskOwners = new Map<string, TaskOwner>()
+ 
++/** [daveey] Record where a task lives before the board has read it (the
++ *  open-task hook: a card opened from a chat on another gateway), so the
++ *  drawer's first fetch goes to the owning gateway + board. */
++export function rememberTaskOwner(id: string, board: string, gateway: string): void {
++  taskOwners.set(id, { board, gateway })
++}
++
+ /** Registry ids of every gateway, the routed (active) one first. A single
+  *  gateway, or a legacy profile-only Desktop, yields just the routed scope. */
+ export function boardGateways(): string[] {
+diff --git a/apps/desktop/src/plugins/kanban/open-task.test.ts b/apps/desktop/src/plugins/kanban/open-task.test.ts
+new file mode 100644
+index 0000000000..7b3f07f99e
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/open-task.test.ts
+@@ -0,0 +1,62 @@
++import { describe, expect, it, vi } from 'vitest'
++
++vi.mock('@hermes/plugin-sdk', async () => ({ atom: (await import('nanostores')).atom }))
++
++const { $openTaskRequest, installOpenTaskHook, OPEN_TASK_HOOK } = await import('./open-task')
++
++describe('installOpenTaskHook', () => {
++  it('parks the request on the named board and navigates to the board page', () => {
++    const target: Record<string, unknown> = {}
++    const navigate = vi.fn()
++    installOpenTaskHook({ navigate }, target)
++
++    const hook = target[OPEN_TASK_HOOK] as (id: string, board?: string) => boolean
++    expect(hook('t_1a2b3c4d', 'bb')).toBe(true)
++    expect($openTaskRequest.get()).toEqual({ board: 'bb', taskId: 't_1a2b3c4d' })
++    expect(navigate).toHaveBeenCalledWith('/kanban')
++  })
++
++  it('keeps the current board when none is named and rejects an empty id', () => {
++    const target: Record<string, unknown> = {}
++    const navigate = vi.fn()
++    $openTaskRequest.set(null)
++    installOpenTaskHook({ navigate }, target)
++    const hook = target[OPEN_TASK_HOOK] as (id: string, board?: null | string) => boolean
++
++    expect(hook('t_00000000', null)).toBe(true)
++    expect($openTaskRequest.get()).toEqual({ board: '', taskId: 't_00000000' })
++    $openTaskRequest.set(null)
++    expect(hook('')).toBe(false)
++    expect($openTaskRequest.get()).toBeNull()
++    expect(navigate).toHaveBeenCalledTimes(1)
++  })
++
++  it('seeds the owning gateway for a card on another gateway', () => {
++    const target: Record<string, unknown> = {}
++    const navigate = vi.fn()
++    const rememberOwner = vi.fn()
++    installOpenTaskHook({ navigate, rememberOwner }, target)
++    const hook = target[OPEN_TASK_HOOK] as (id: string, board?: string, gateway?: string) => boolean
++
++    expect(hook('t_abcdef01', 'bb', 'mini')).toBe(true)
++    expect(rememberOwner).toHaveBeenCalledWith('t_abcdef01', 'bb', 'mini')
++    expect($openTaskRequest.get()).toEqual({ board: 'bb', taskId: 't_abcdef01' })
++
++    rememberOwner.mockClear()
++    hook('t_abcdef02', 'bb')
++    expect(rememberOwner).not.toHaveBeenCalled()
++  })
++
++  it('disposer removes only its own hook', () => {
++    const target: Record<string, unknown> = {}
++    const dispose = installOpenTaskHook({ navigate: vi.fn() }, target)
++    const other = () => true
++    target[OPEN_TASK_HOOK] = other
++    dispose()
++    expect(target[OPEN_TASK_HOOK]).toBe(other)
++
++    const dispose2 = installOpenTaskHook({ navigate: vi.fn() }, target)
++    dispose2()
++    expect(OPEN_TASK_HOOK in target).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/open-task.ts b/apps/desktop/src/plugins/kanban/open-task.ts
+index 5750d5d2e7..4e53c9d8bb 100644
+--- a/apps/desktop/src/plugins/kanban/open-task.ts
++++ b/apps/desktop/src/plugins/kanban/open-task.ts
+@@ -16,3 +16,52 @@ export interface OpenTaskRequest {
+ }
+ 
+ export const $openTaskRequest = atom<null | OpenTaskRequest>(null)
++
++/** [daveey] Global name of the cross-plugin "open this card" hook. */
++export const OPEN_TASK_HOOK = '__hermesKanbanOpenTask'
++
++type OpenTaskHook = (taskId: string, board?: null | string, gateway?: null | string) => boolean
++
++export interface OpenTaskHookDeps {
++  navigate: (path: string) => void
++  /** Seed the task's owning gateway + board (api.ts `rememberTaskOwner`). */
++  rememberOwner?: (taskId: string, board: string, gateway: string) => void
++}
++
++/**
++ * [daveey] Expose `window.__hermesKanbanOpenTask(taskId, board?, gateway?)` so
++ * disk plugins (task-mentions' popup) can open a card's drawer, where it can be
++ * edited and commented on, without importing this module. `gateway` is the
++ * owning connection id for a card on another gateway. Parks the request and
++ * navigates to /kanban; returns false for an invalid id. The returned disposer
++ * removes the hook only if it is still ours.
++ */
++export function installOpenTaskHook(
++  deps: OpenTaskHookDeps,
++  target: Record<string, unknown> = globalThis as unknown as Record<string, unknown>
++): () => void {
++  const hook: OpenTaskHook = (taskId, board, gateway) => {
++    if (typeof taskId !== 'string' || !taskId) {
++      return false
++    }
++
++    const slug = typeof board === 'string' ? board : ''
++
++    if (typeof gateway === 'string' && gateway) {
++      deps.rememberOwner?.(taskId, slug, gateway)
++    }
++
++    $openTaskRequest.set({ board: slug, taskId })
++    deps.navigate('/kanban')
++
++    return true
++  }
++
++  target[OPEN_TASK_HOOK] = hook
++
++  return () => {
++    if (target[OPEN_TASK_HOOK] === hook) {
++      delete target[OPEN_TASK_HOOK]
++    }
++  }
++}
+diff --git a/apps/desktop/src/plugins/kanban/plugin.tsx b/apps/desktop/src/plugins/kanban/plugin.tsx
+index e297cd3b29..b6719a3f20 100644
+--- a/apps/desktop/src/plugins/kanban/plugin.tsx
++++ b/apps/desktop/src/plugins/kanban/plugin.tsx
+@@ -31,10 +31,11 @@ import {
+   useValue
+ } from '@hermes/plugin-sdk'
+ 
+-import { $boardSlug, bindApi, boardKey, fetchBoard, useKanbanScope } from './api'
++import { $boardSlug, bindApi, boardKey, fetchBoard, rememberTaskOwner, useKanbanScope } from './api'
+ import { $blockedSectionOpen, BlockedTasksSection } from './blocked-section'
+ import { KanbanBoardPage } from './board'
+ import { KANBAN_LOCALES } from './i18n'
++import { installOpenTaskHook } from './open-task'
+ import { $newTaskLane, useKanban } from './ui'
+ 
+ // Live "N running / ready" pill — one glance at fleet activity from anywhere,
+@@ -98,6 +99,9 @@ const plugin: HermesPlugin = {
+       })
+     )
+ 
++    // [daveey] window.__hermesKanbanOpenTask(id, board?, gateway?) for disk plugins.
++    ctx.onDispose(installOpenTaskHook({ navigate: path => host.navigate(path), rememberOwner: rememberTaskOwner }))
++
+     $blockedSectionOpen.set(ctx.storage.get('blockedSectionOpen', true))
+     ctx.onDispose($blockedSectionOpen.listen(value => ctx.storage.set('blockedSectionOpen', value)))
+ 
+-- 
+2.54.0 (Apple Git-157)
+

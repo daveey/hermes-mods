@@ -1,4 +1,4 @@
-# Kanban keeps live workers running when the macOS clock shifts
+# Kanban keeps live workers running across clock shifts, hostname changes and restarts
 
 Patches:
 
@@ -7,6 +7,10 @@ Patches:
 - `patches/0080-fix-kanban-compare-macOS-worker-start-times-boot-rel.patch`: kanban dispatcher. On macOS the
   worker fingerprint also records `kern.boottime`, and start times are compared relative to boot, so a clock shift of
   any size is not read as a crash.
+- `patches/0117-fix-kanban-preserve-worker-ownership-and-retry-conte.patch`: kanban claims and retries. On macOS
+  the claim lock is keyed to the boot session instead of the hostname, so a hostname change on wake or a network
+  switch does not make live workers look foreign. A retried run gets a bounded, read-only tail of the previous
+  run's transcript so it continues instead of starting over.
 
 What you see: restart the gateway (or wake the Mac) while kanban workers are running, and the cards stay `running`.
 The workers finish their cards as normal. Stock Hermes could read every live worker's start time as 1 s off on
@@ -28,6 +32,18 @@ macOS. It then booked all of them `crashed` in one tick (16 at once in the obser
   exactly.
 - Rows written before 0080 (no boot-time stamp) get the 2 s compare only. Linux behavior is unchanged apart from the
   2 s tolerance.
+- **A hostname change does not orphan workers (0117, macOS).** macOS can rename the host on wake or a network
+  change (`foo.local` → `foo-2.local`). Claims are now `boot-<kern.bootsessionuuid>:<pid>`, shared by every
+  dispatcher on this boot and stable across gateway and Desktop restarts, so the dispatcher still treats its workers
+  as local (it can check, reap and time them out) instead of leaving them unowned. A claim from another host or a
+  previous boot never matches. Old hostname-style claims from the current hostname are still read as local. Other
+  platforms keep the hostname prefix.
+- **A retried run picks up where the last one stopped (0117).** When a card is re-run after a crash, a reclaim or an
+  iteration-budget stop, the worker context ends with an "Interrupted worker continuation" section: the last
+  assistant/tool messages (and compression summaries) of the previous run's own session, at most 24 messages and
+  16,000 characters. The section says it is history, not instructions or proof of completion, and tells the worker to
+  verify files and processes before repeating side effects. Nothing is resumed or replayed and the new run gets its
+  own claim.
 
 ## How it works
 
@@ -49,6 +65,24 @@ macOS. It then booked all of them `crashed` in one tick (16 at once in the obser
   carry a boot stamp, when `start - boot` matches within 2 s. Unparseable values fall back to an exact string
   compare.
 
+- 0117 ownership: new `hermes_cli/kanban_host_identity.py`. `claim_prefix()` returns `boot-<uuid>:` from
+  `/usr/sbin/sysctl -n kern.bootsessionuuid` on macOS (cached; any error or a non-UUID → hostname prefix) and
+  `<hostname>:` elsewhere. `kanban_db._claimer_id()` uses it. `is_local_claim(lock, prefix)` accepts the prefix, plus
+  the current hostname prefix when the local prefix is a boot prefix (legacy claims). Every place in
+  `kanban_db.py` / `kanban_db_dispatch.py` that compared `claim_lock.startswith(host_prefix)`
+  (`release_stale_claims`, `_terminate_reclaimed_worker`, `reap_terminal_workers`, `enforce_max_runtime`,
+  `_reclaim_dead_workers`, `adopt_worker_pid`) now calls `_claim_is_local`.
+- 0117 retry context: new `hermes_cli/kanban_worker_recovery.py`. `run_agent.py` calls
+  `register_worker_session(session_db, session_id)` when a `kanban`-source session is created (also after
+  compression rotates the id). It records `(run_id, task_id, profile, state_db, session_id)` in a new
+  `worker_recovery_sessions` table on the board, under `BEGIN IMMEDIATE`, only if the process is a
+  dispatcher-owned worker whose env (`HERMES_KANBAN_DB/TASK/RUN_ID/CLAIM_LOCK`) matches the live, unexpired claim,
+  the session is in this profile's own `state.db` with source `kanban`, and the run's profile matches. A session
+  already bound to another run is never rebound. `build_worker_context` appends `build_recovery_context(conn,
+  task_id)`: the latest *closed* run of this task whose registered profile is the run's and the assignee, read from
+  its state DB read-only, with SQL-side row and field limits. Missing table, transcript or a retagged session →
+  empty string (fail closed; never guessed from cwd, title or the task's origin chat).
+
 ## Tests
 
 - `tests/hermes_cli/test_kanban_gateway_restart_liveness.py` (0079), with a 1.00 s start-time shift:
@@ -68,11 +102,37 @@ macOS. It then booked all of them `crashed` in one tick (16 at once in the obser
     new claimer, sees a live `sleep` worker as alive and spawns nothing. The card then completes with its run id.
 - `tests/hermes_cli/test_kanban_worker_pid_fingerprint.py`: one assertion updated to strip the `@<boottime>` suffix.
 
+- 0117 ownership, `tests/hermes_cli/test_kanban_host_identity.py`:
+  - `test_boot_identity_survives_hostname_change_and_dispatcher_restart` (macOS-marked): a claim taken under
+    `before.local` is still local under `after.local` with a fresh cache; a legacy current-hostname claim is local; a
+    foreign hostname and a different boot UUID are not.
+  - `test_unavailable_identity_uses_hostname` (macOS-marked): empty or non-UUID sysctl output → hostname prefix.
+  - `test_hostname_change_does_not_reclaim_live_run`: `release_stale_claims` releases nothing and the run id is kept
+    after the hostname changes.
+- 0117 restarts, `tests/hermes_cli/test_kanban_restart_survival.py`:
+  `test_worker_survives_entrypoint_restart[gateway|desktop]` spawns a real detached worker through `_default_spawn`,
+  kills the parent's whole process group, and the worker still completes its card with its run id. The desktop case
+  skips when no `node` is on PATH.
+- 0117 retry context, `tests/hermes_cli/test_kanban_worker_recovery.py` (29 cases): crash and budget-exhaustion
+  continuations survive a board reopen; an open run is not its own recovery; stale/foreign claims, mismatched env
+  pins, unrelated or delegate sessions and a foreign state DB cannot register; registration is idempotent but never
+  rebinds; board/task/profile isolation with no fallback to the task's origin session; a missing or retagged
+  transcript yields nothing; the tail excludes system/user/reasoning/inactive rows and stays bounded; a real-schema
+  lazy agent registration followed by reclaim; compression rotation uses the latest registered session.
+- Untested: a real macOS wake that renames the host (covered only with a patched `gethostname`), and the worker
+  actually acting on the continuation text (the tests check the context string, not model behavior).
+- All three files pass (Oct 17, 2026 PT, `scripts/run_tests.sh`).
+
 ## Applying
 
 Apply 0079 then 0080. 0080 edits the code 0079 adds, so it does not apply alone. 0079 alone fixes the observed 1 s
 case but not larger re-anchors. Both rely on `start_time_fingerprints_match` and `START_TIME_DRIFT_TOLERANCE` already
 being in `gateway/status.py`.
+
+0117 is independent of 0079/0080 in code (different functions) but is the same failure family; apply it after them.
+It edits `run_agent.py` and `build_worker_context`, so a rebase conflict usually lands there. 0121
+([kanban-soft-deadline.md](kanban-soft-deadline.md)) puts its checkpoint above 0117's continuation tail and its tests
+expect that tail. Verified: 0001–0127 apply with `git am -3` at merge-base `4957bbd0a0` (Oct 17, 2026 PT).
 
 ## Gotchas
 
@@ -80,8 +140,12 @@ being in `gateway/status.py`.
 - A PID recycled within 2 s of the old worker's start would still be taken for the original. The patches accept this
   as very unlikely.
 - If `sysctlbyname` fails, the fingerprint has no boot stamp and the 2 s compare applies.
+- 0117: after a reboot every old claim is foreign (new boot UUID). That is intended: the old PIDs are gone.
+- 0117: registration is best-effort. A worker whose session was created before the patch, or whose env lacks the
+  claim pins, gets no continuation tail on retry; it starts from the card body as before.
+- 0117: the tail can include tool calls that never finished; it is labelled "execution not guaranteed".
 
 ## Plugin?
 
-No. The fix is inside the dispatcher's private liveness check in `hermes_cli/kanban_db_dispatch.py`, and there is no
-plugin hook for it.
+No. The fixes are inside the dispatcher's private liveness and claim-ownership checks and `build_worker_context`, and
+there is no plugin hook for any of them.

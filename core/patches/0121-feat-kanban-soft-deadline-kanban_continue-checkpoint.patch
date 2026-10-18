@@ -1,0 +1,928 @@
+From 6a93795d45cc435ae8d69f4ca976fdbdffc92607 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 09:52:54 -0700
+Subject: [PATCH] feat(kanban): soft deadline + kanban_continue checkpoint
+ instead of dying at max_runtime [daveey]
+
+At kanban.soft_deadline_fraction (0.85) of max_runtime_seconds the worker gets an
+OUT-OF-BAND steer (and a final one near the cap) to checkpoint with the new
+kanban_continue tool. The run closes as outcome 'continued' and the card is
+re-queued at once (or after resume_after_seconds, woken by the dispatcher tick),
+with the checkpoint rendered at the top of the next run's context ahead of the
+b78e9861e6 transcript tail. Continuations never touch consecutive_failures or
+block_recurrences; their own bound is kanban.max_continuations (12). The hard
+kill at 100% is unchanged. Kanban workers starting a background job are told to
+hand long waits off with resume_after_seconds instead of polling (14-day data:
+61% of timed-out run time was sleep/poll on CI, releases and soaks).
+---
+ agent/activity_tracking.py                   |   5 +-
+ agent/kanban_stop.py                         |   1 +
+ agent/prompt_builder.py                      |   6 +
+ agent/transports/hermes_tools_mcp_server.py  |   2 +-
+ hermes_cli/config_defaults.py                |   7 +
+ hermes_cli/kanban_continuation.py            | 253 +++++++++++++++++++
+ hermes_cli/kanban_db.py                      |  10 +-
+ hermes_cli/kanban_db_dispatch.py             |   4 +
+ tests/hermes_cli/test_kanban_continuation.py | 238 +++++++++++++++++
+ tools/kanban_tools.py                        |  86 ++++++-
+ tools/kanban_tools_schemas.py                |  38 +++
+ tools/terminal_tool_background.py            |  12 +-
+ website/docs/user-guide/features/kanban.md   |  22 ++
+ 13 files changed, 677 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_continuation.py
+ create mode 100644 tests/hermes_cli/test_kanban_continuation.py
+
+diff --git a/agent/activity_tracking.py b/agent/activity_tracking.py
+index 7c1e54eb66..083629df16 100644
+--- a/agent/activity_tracking.py
++++ b/agent/activity_tracking.py
+@@ -78,11 +78,14 @@ class ActivityTrackingMixin:
+             # Never let the bridge break the loop; this guard covers import-time failures.
+             with suppress(Exception):
+                 from tools.kanban_tools import (
+-                    heartbeat_current_worker_from_env, inject_new_comments_from_env
++                    heartbeat_current_worker_from_env, inject_new_comments_from_env,
++                    inject_soft_deadline_from_env,
+                 )
+                 heartbeat_current_worker_from_env()
+                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
+                 inject_new_comments_from_env(self)
++                # Near max_runtime: tell the worker to checkpoint via kanban_continue.
++                inject_soft_deadline_from_env(self)
+         if force_persist or is_terminal_compression_provenance(resolved_provenance):
+             # A terminal compression stamp must land durably NOW. The heartbeat wrote "context compression
+             # in progress" moments ago, so deferring this write to the next 60s window leaves the durable
+diff --git a/agent/kanban_stop.py b/agent/kanban_stop.py
+index 439c7b125b..7691222844 100644
+--- a/agent/kanban_stop.py
++++ b/agent/kanban_stop.py
+@@ -23,6 +23,7 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
+     "kanban_complete",
+     "kanban_block",
+     "kanban_schedule",
++    "kanban_continue",
+     "kanban_request_review",
+     "kanban_request_changes",
+ })
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index a4b731a216..a288d6e756 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -282,6 +282,12 @@ KANBAN_GUIDANCE = (
+     "`kanban.dispatch_stale_timeout_seconds` (default 4 hours) when no heartbeat has arrived in the last hour. A "
+     "reclaim re-queues the task as `ready` without penalty (no failure counter tick), but you lose your current run's "
+     "progress.\n"
++    "   **Runtime budget.** A card with `max_runtime_seconds` is SIGTERMed at the cap. Near it you get a "
++    "`[Kanban soft deadline]` message: if you will not finish within minutes, call `kanban_continue(checkpoint=...)` "
++    "(done so far, current state, next steps, background PIDs/process ids/logs to re-adopt) and end your turn; a "
++    "fresh run resumes from the checkpoint and it never counts as a failure or a block. Do not burn runtime in "
++    "sleep/poll loops: for waits over ~10 minutes (CI, releases, soaks, training checkpoints) start the work in the "
++    "background and call `kanban_continue(checkpoint=..., resume_after_seconds=N)` so the card wakes when it is due.\n"
+     "4. **Block on genuine ambiguity.** If you need a human decision you cannot infer (missing credentials, UX choice, "
+     "paywalled source, peer output you need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. The "
+     "user will unblock with context and the dispatcher will respawn you "
+diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
+index 6f6d43fc22..5265639cf2 100644
+--- a/agent/transports/hermes_tools_mcp_server.py
++++ b/agent/transports/hermes_tools_mcp_server.py
+@@ -60,7 +60,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+     "vision_analyze", "image_generate", "skill_view", "skills_list", "text_to_speech",
+     # Kanban handoff tools: stateless (read HERMES_KANBAN_TASK, write kanban.db).
+     # Without them a codex-runtime worker can't report completion and hangs.
+-    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_request_review",
++    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_continue", "kanban_request_review",
+     "kanban_request_changes", "kanban_comment",
+     "kanban_heartbeat", "kanban_show", "kanban_list",
+     # Orchestrator-only (the kanban tool gates them on HERMES_KANBAN_TASK unset).
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 0c744b1ccb..370050a72a 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1952,6 +1952,13 @@ DEFAULT_CONFIG = {
+         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
+         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
+         "dispatch_stale_timeout_seconds": 14400,
++        # Soft deadline for cards with max_runtime_seconds: at this fraction of the cap the worker
++        # gets an OUT-OF-BAND steer to checkpoint with kanban_continue (re-queued as a fresh run,
++        # not a failure) before the hard kill at 100%. 0 = off (hard kill only).
++        "soft_deadline_fraction": 0.85,
++        # Bound on back-to-back kanban_continue runs without a completion; past it the worker
++        # must complete or block.
++        "max_continuations": 12,
+         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+new file mode 100644
+index 0000000000..e7b739d598
+--- /dev/null
++++ b/hermes_cli/kanban_continuation.py
+@@ -0,0 +1,253 @@
++"""Checkpoint + continue for Kanban runs that would otherwise die at ``max_runtime_seconds``.
++
++A worker that is not going to finish inside its cap (or is about to sit in a long wait) ends
++its run with ``continue_task``: the run closes with outcome ``continued`` and the card goes
++straight back to ``ready`` (or to ``scheduled`` with a wake time when it is only waiting), with
++the worker's checkpoint rendered at the top of the next run's context. The next run also gets
++the b78e9861e6 transcript tail from ``kanban_worker_recovery``.
++
++A continuation is neither a failure nor a block: ``consecutive_failures`` and
++``block_recurrences`` are left exactly as they were, so it never trips the give-up breaker or
++the unblock-loop detector. Its own bound is ``MAX_CONSECUTIVE_CONTINUATIONS`` trailing
++``continued`` runs, after which the worker must complete or block.
++
++The soft deadline itself is worker-side (``tools.kanban_tools.inject_soft_deadline_from_env``):
++at ``soft_deadline_fraction`` of the cap the running turn gets an OUT-OF-BAND steer telling it to
++checkpoint. The dispatcher's hard kill (``enforce_max_runtime``) is unchanged and still fires at
++100% for a worker that ignores it.
++"""
++from __future__ import annotations
++
++import sqlite3
++import time
++from typing import Any, Optional
++
++CONTINUED_OUTCOME = "continued"
++CONTINUATION_WOKEN_EVENT = "continuation_woken"
++DEFAULT_SOFT_DEADLINE_FRACTION = 0.85
++# Bound on back-to-back continuations without a completion (12 x the 4 h default = 48 h).
++MAX_CONSECUTIVE_CONTINUATIONS = 12
++# A wait handed off with ``resume_after_seconds`` may not park the card longer than this.
++MAX_RESUME_AFTER_SECONDS = 24 * 3600
++MAX_CHECKPOINT_CHARS = 12000
++
++
++def soft_deadline_fraction(cfg: Optional[dict] = None) -> float:
++    """``kanban.soft_deadline_fraction`` clamped to [0, 0.99]; 0 disables the soft deadline."""
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config
++            cfg = load_config()
++        except Exception:
++            cfg = {}
++    raw = ((cfg or {}).get("kanban") or {}).get("soft_deadline_fraction", DEFAULT_SOFT_DEADLINE_FRACTION)
++    try:
++        value = float(raw)
++    except (TypeError, ValueError):
++        return DEFAULT_SOFT_DEADLINE_FRACTION
++    return 0.0 if value <= 0 else min(value, 0.99)
++
++
++def max_consecutive_continuations(cfg: Optional[dict] = None) -> int:
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config
++            cfg = load_config()
++        except Exception:
++            cfg = {}
++    raw = ((cfg or {}).get("kanban") or {}).get("max_continuations", MAX_CONSECUTIVE_CONTINUATIONS)
++    try:
++        return max(1, int(raw))
++    except (TypeError, ValueError):
++        return MAX_CONSECUTIVE_CONTINUATIONS
++
++
++def consecutive_continuations(conn: sqlite3.Connection, task_id: str) -> int:
++    """Trailing closed runs with outcome ``continued`` (a hard timeout/crash in between does not
++    reset the streak; a completed or human-unblocked run does)."""
++    rows = conn.execute(
++        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC",
++        (task_id,),
++    ).fetchall()
++    count = 0
++    for row in rows:
++        outcome = row[0]
++        if outcome == CONTINUED_OUTCOME:
++            count += 1
++        elif outcome in ("timed_out", "crashed", "reclaimed", "rate_limited"):
++            continue
++        else:
++            break
++    return count
++
++
++def continue_task(
++    conn: sqlite3.Connection, task_id: str, *, checkpoint: str,
++    resume_after_seconds: int = 0, expected_run_id: Optional[int] = None,
++    max_continuations: Optional[int] = None, metadata: Optional[dict] = None,
++) -> dict[str, Any]:
++    """End the running run as ``continued`` and re-queue the card.
++
++    ``resume_after_seconds`` 0 -> back to its source phase (``ready``, or ``review`` for a
++    reviewer run) at once; > 0 -> ``scheduled`` until ``wake_due_continuations`` promotes it.
++    Returns ``{"ok": True, "status", "run_id", "continuation", "wake_at"}`` or
++    ``{"ok": False, "error"}``. Never touches ``consecutive_failures`` / ``block_recurrences``.
++    """
++    from hermes_cli import kanban_db as kb
++
++    checkpoint = (checkpoint or "").strip()
++    if not checkpoint:
++        return {"ok": False, "error": "checkpoint is required"}
++    if len(checkpoint) > MAX_CHECKPOINT_CHARS:
++        checkpoint = checkpoint[:MAX_CHECKPOINT_CHARS] + "\n… [checkpoint truncated]"
++    try:
++        resume_after = int(resume_after_seconds or 0)
++    except (TypeError, ValueError):
++        return {"ok": False, "error": "resume_after_seconds must be an integer"}
++    if resume_after < 0 or resume_after > MAX_RESUME_AFTER_SECONDS:
++        return {"ok": False, "error": f"resume_after_seconds must be between 0 and {MAX_RESUME_AFTER_SECONDS}"}
++    limit = max_continuations if max_continuations is not None else max_consecutive_continuations()
++    now = int(time.time())
++    with kb.write_txn(conn):
++        row = conn.execute(
++            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
++        ).fetchone()
++        if row is None:
++            return {"ok": False, "error": f"task {task_id} not found"}
++        if row["status"] != "running" or row["current_run_id"] is None:
++            return {"ok": False, "error": f"task {task_id} is {row['status']}, not running"}
++        if expected_run_id is not None and int(row["current_run_id"]) != int(expected_run_id):
++            return {"ok": False, "error": "this run no longer owns the task"}
++        streak = consecutive_continuations(conn, task_id)
++        if streak >= limit:
++            return {"ok": False, "error": (
++                f"continuation limit reached ({streak} consecutive continued runs, limit {limit}). "
++                "Finish with kanban_complete, or kanban_block with what is stopping progress.")}
++        source_status = kb._retry_status_for_run(conn, task_id)
++        new_status = "scheduled" if resume_after > 0 else source_status
++        wake_at = now + resume_after if resume_after > 0 else None
++        cur = conn.execute(
++            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
++            "worker_pid = NULL, worker_started_at = NULL, last_heartbeat_at = NULL "
++            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
++            (new_status, task_id, int(row["current_run_id"])),
++        )
++        if cur.rowcount != 1:
++            return {"ok": False, "error": "task changed state concurrently"}
++        meta = dict(metadata or {})
++        meta.update({"checkpoint": checkpoint, "continuation": streak + 1,
++                     "resume_after_seconds": resume_after, "resume_status": source_status})
++        if wake_at is not None:
++            meta["wake_at"] = wake_at
++        run_id = kb._end_run(
++            conn, task_id, outcome=CONTINUED_OUTCOME, status=CONTINUED_OUTCOME,
++            summary=kb._first_line(checkpoint, 400) or "checkpoint", metadata=meta,
++        )
++        payload = {"continuation": streak + 1, "status": new_status, "resume_status": source_status}
++        if wake_at is not None:
++            payload["wake_at"] = wake_at
++        kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
++    return {"ok": True, "status": new_status, "run_id": run_id,
++            "continuation": streak + 1, "wake_at": wake_at}
++
++
++def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
++    """Promote ``scheduled`` cards whose latest event is a due ``continued`` wait.
++
++    Cards scheduled by ``kanban_schedule`` (no wake time) are left for a human/cron unblock.
++    Counters are untouched (``unblock_task`` would reset ``consecutive_failures``).
++    """
++    from hermes_cli import kanban_db as kb
++
++    now = int(time.time()) if now is None else int(now)
++    woken: list[str] = []
++    for row in conn.execute("SELECT id FROM tasks WHERE status = 'scheduled'").fetchall():
++        tid = row[0]
++        event = conn.execute(
++            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
++        ).fetchone()
++        if not event or event[0] != CONTINUED_OUTCOME:
++            continue
++        payload = kb._json_dict(event[1])
++        wake_at = payload.get("wake_at")
++        if not isinstance(wake_at, (int, float)) or wake_at > now:
++            continue
++        resume = payload.get("resume_status") if payload.get("resume_status") in ("ready", "review") else "ready"
++        with kb.write_txn(conn):
++            landing = kb._landing_status_after_parents(conn, tid)
++            new_status = "review" if landing == "ready" and resume == "review" else landing
++            cur = conn.execute(
++                "UPDATE tasks SET status = ?, current_run_id = NULL WHERE id = ? AND status = 'scheduled'",
++                (new_status, tid),
++            )
++            if cur.rowcount == 1:
++                kb._append_event(conn, tid, CONTINUATION_WOKEN_EVENT,
++                                 {"status": new_status, "wake_at": wake_at})
++                woken.append(tid)
++    return woken
++
++
++def render_checkpoint_context(conn: sqlite3.Connection, task_id: str) -> str:
++    """The newest ``continued`` checkpoint, if no run has completed since. Placed near the top
++    of the worker context so the next run resumes instead of re-orienting from scratch."""
++    from hermes_cli import kanban_db as kb
++
++    rows = conn.execute(
++        "SELECT id, outcome, metadata, summary FROM task_runs WHERE task_id = ? "
++        "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 20", (task_id,),
++    ).fetchall()
++    checkpoint_row = None
++    later: list[str] = []
++    for row in rows:
++        if row["outcome"] == CONTINUED_OUTCOME:
++            checkpoint_row = row
++            break
++        if row["outcome"] in ("completed", "review_requested", "changes_requested"):
++            return ""
++        later.append(f"run {row['id']}: {row['outcome']}")
++    if checkpoint_row is None:
++        return ""
++    meta = kb._json_dict(checkpoint_row["metadata"])
++    checkpoint = meta.get("checkpoint") or checkpoint_row["summary"] or ""
++    n = meta.get("continuation")
++    lines = [
++        f"## Continuation checkpoint (from run {checkpoint_row['id']}"
++        + (f", continuation #{n}" if n else "") + ")",
++        "The previous run of this task hit its runtime budget (or handed off a wait) and wrote this "
++        "checkpoint on purpose. Resume from it: verify the listed state (git log/status, files, "
++        "`kill -0 <pid>` and log tails for background jobs), re-adopt anything still "
++        "running, and continue with the next steps. Do not restart finished steps.",
++    ]
++    if later:
++        lines.append("Runs after the checkpoint (did not checkpoint again): " + ", ".join(reversed(later)) + ".")
++    lines += ["", checkpoint.strip(), ""]
++    return "\n".join(lines) + "\n"
++
++
++def soft_deadline_message(*, elapsed: int, limit: int, final: bool) -> str:
++    remaining = max(0, limit - elapsed)
++    head = ("FINAL WARNING — the dispatcher hard-kills this run in about "
++            f"{_fmt(remaining)}." if final else
++            f"This run has used {_fmt(elapsed)} of its {_fmt(limit)} max runtime; the dispatcher "
++            f"hard-kills it in about {_fmt(remaining)}.")
++    return (
++        f"[Kanban soft deadline] {head} If the task will not be fully finished (complete / "
++        "request_review) within the next few minutes, stop starting new work and call "
++        "`kanban_continue(checkpoint=...)` now. The checkpoint must let a fresh run resume without "
++        "re-deriving anything: what is done (commits, branches, files, deploys), current state, the "
++        "exact next steps, background processes to re-adopt (PIDs and log paths — the next run is a "
++        "new process, so process_manage ids do not carry over; jobs must be persist_on_release or "
++        "nohup to survive), worktrees, and what must not be redone. If you are only waiting on CI, a "
++        "release, a soak or a training checkpoint, pass `resume_after_seconds` instead of polling. A "
++        "continuation re-queues the card with your checkpoint and transcript; it is not a failure "
++        "or a block. After kanban_continue returns, end your turn with a one-line reply."
++    )
++
++
++def _fmt(seconds: int) -> str:
++    seconds = int(seconds)
++    if seconds >= 3600:
++        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
++    if seconds >= 60:
++        return f"{seconds // 60}m" + (f"{seconds % 60:02d}s" if seconds % 60 else "")
++    return f"{seconds}s"
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index aadb3451d8..b7458ac554 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -236,7 +236,7 @@ _TICK_ACTIVITY_FIELDS = (
+     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
+     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
+-    "skipped_nonspawnable",
++    "skipped_nonspawnable", "woken_continuations",
+ )
+ 
+ 
+@@ -955,7 +955,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
+     ended_at            INTEGER,
+     outcome             TEXT,
+     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
+-    --          gave_up | reclaimed | (null while still running)
++    --          gave_up | reclaimed | continued | (null while still running)
+     summary             TEXT,
+     metadata            TEXT,
+     error               TEXT
+@@ -2279,6 +2279,8 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
+     "changes_requested": "changes_requested",
+     "blocked": "blocked",
+     "dependency_wait": "blocked",
++    # Checkpointed for a fresh run (kanban_continuation): this run's goal loop stops.
++    "continued": "continued",
+ }
+ 
+ 
+@@ -3953,6 +3955,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     now = int(time.time())
+     lines: list[str] = []
+     _ctx_header(lines, task)
++    from hermes_cli.kanban_continuation import render_checkpoint_context
++    checkpoint = render_checkpoint_context(conn, task_id)
++    if checkpoint:
++        lines.append(checkpoint)
+     _ctx_attachments(lines, list_attachments(conn, task_id))
+     _ctx_prior_attempts(lines, conn, task_id, now)
+     _ctx_parent_results(lines, conn, task_id, now)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index e5dcb532dc..20bd365cd2 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -136,6 +136,8 @@ class DispatchResult:
+     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+     timed_out: list[str] = field(default_factory=list)
+     """Task ids whose workers exceeded ``max_runtime_seconds``."""
++    woken_continuations: list[str] = field(default_factory=list)
++    """Task ids whose ``kanban_continue(resume_after_seconds=...)`` wait came due this tick."""
+     stale: list[str] = field(default_factory=list)
+     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
+@@ -2264,6 +2266,8 @@ def _run_reclaim_phase(
+     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
+     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+     result.timed_out = enforce_max_runtime(conn)
++    from hermes_cli.kanban_continuation import wake_due_continuations
++    result.woken_continuations = wake_due_continuations(conn)
+     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_continuation.py b/tests/hermes_cli/test_kanban_continuation.py
+new file mode 100644
+index 0000000000..59ccbad28b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_continuation.py
+@@ -0,0 +1,238 @@
++"""Checkpoint + continue instead of dying at ``max_runtime_seconds``.
++
++One test per acceptance path:
++  1. a worker reaching the soft deadline is steered, checkpoints with kanban_continue, and the
++     re-queued run resumes from that checkpoint (plus the prior run's transcript tail);
++  2. a worker that ignores the soft deadline is still hard-killed at the cap, and its retry
++     carries the transcript context;
++  3. continuations never trip the give-up breaker or the unblock-loop counter (they have their
++     own bound).
++Plus the wait hand-off (``resume_after_seconds``) waking through the dispatcher tick.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++import tools.kanban_tools as kt
++
++
++class FakeAgent:
++    def __init__(self):
++        self.steers: list[str] = []
++
++    def steer(self, text: str) -> bool:
++        self.steers.append(text)
++        return True
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(kc, "soft_deadline_fraction", lambda cfg=None: 0.85)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    kt._soft_deadline_sent.clear()
++    kt._soft_deadline_last_attempt = 0.0
++    return home
++
++
++def _start_run(monkeypatch, tid: str, *, started_ago: int) -> int:
++    """Claim like the dispatcher, pin the worker env, backdate the active run."""
++    with kbc.connect_closing() as conn:
++        kb.claim_task(conn, tid)
++        kbd._set_worker_pid(conn, tid, os.getpid())
++        run_id = kb._current_run_id(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?",
++                         (int(time.time()) - started_ago, run_id))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    kt._soft_deadline_last_attempt = 0.0
++    return run_id
++
++
++def _register_transcript(home: Path, tid: str, run_id: int, text: str) -> None:
++    """What b78e9861e6's register_worker_session leaves behind for a worker session."""
++    state = home / "state.db"
++    with sqlite3.connect(state) as s:
++        s.executescript(
++            "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, profile_name TEXT);"
++            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,"
++            " content TEXT, tool_calls TEXT, active INTEGER DEFAULT 1, _compressed_summary INTEGER DEFAULT 0);")
++        sid = f"sess-{run_id}"
++        s.execute("INSERT INTO sessions VALUES (?, 'kanban', 'default')", (sid,))
++        s.execute("INSERT INTO messages(session_id, role, content) VALUES (?, 'assistant', ?)", (sid, text))
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute(
++                "CREATE TABLE IF NOT EXISTS worker_recovery_sessions (run_id INTEGER NOT NULL, task_id TEXT NOT NULL,"
++                " profile TEXT NOT NULL, state_db TEXT NOT NULL, session_id TEXT NOT NULL, registered_at REAL NOT NULL,"
++                " PRIMARY KEY (state_db, session_id))")
++            conn.execute("INSERT INTO worker_recovery_sessions VALUES (?, ?, 'default', ?, ?, ?)",
++                         (run_id, tid, str(state), sid, time.time()))
++
++
++def test_soft_deadline_checkpoint_requeues_and_next_run_resumes(home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="long build", assignee="default", max_runtime_seconds=1000)
++
++    # Before the soft deadline: nothing is injected.
++    run1 = _start_run(monkeypatch, tid, started_ago=500)
++    agent = FakeAgent()
++    assert kt.inject_soft_deadline_from_env(agent) is False
++    assert agent.steers == []
++
++    # At 85%: one steer naming kanban_continue; not repeated on the next poll.
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (int(time.time()) - 860, run1))
++    kt._soft_deadline_last_attempt = 0.0
++    assert kt.inject_soft_deadline_from_env(agent) is True
++    assert "kanban_continue" in agent.steers[0] and "soft deadline" in agent.steers[0]
++    kt._soft_deadline_last_attempt = 0.0
++    assert kt.inject_soft_deadline_from_env(agent) is False
++
++    # The worker checkpoints through the real tool handler.
++    _register_transcript(home, tid, run1, "Built stage 1 of 3; stage 2 needs the cache in /tmp/c")
++    checkpoint = "Done: stage 1 (commit abc123).\nNext: stage 2. Re-adopt pid 4242 (log /tmp/b.log)."
++    out = json.loads(kt._handle_continue({"checkpoint": checkpoint}))
++    assert out["ok"] is True and out["status"] == "ready" and out["continuation"] == 1
++
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert (task.status, task.worker_pid, task.claim_lock) == ("ready", None, None)
++        run = kb.latest_run(conn, tid)
++        assert (run.id, run.outcome) == (run1, "continued")
++        assert run.metadata["checkpoint"] == checkpoint
++        assert any(e.kind == "continued" for e in kb.list_events(conn, tid))
++        # Re-queued for the very next tick: the dispatcher can claim it again right away.
++        assert kb.claim_task(conn, tid) is not None
++        context = kb.build_worker_context(conn, tid)
++    assert f"## Continuation checkpoint (from run {run1}, continuation #1)" in context
++    assert "Re-adopt pid 4242" in context
++    # b78e9861e6 transcript recovery rides along.
++    assert "Built stage 1 of 3" in context and "outcome continued" in context
++    # The checkpoint sits above the transcript tail, right after the body.
++    assert context.index("Continuation checkpoint") < context.index("Interrupted worker continuation")
++
++
++def test_ignoring_soft_deadline_is_hard_killed_and_retry_carries_context(home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="stubborn", assignee="default", max_runtime_seconds=100)
++    run1 = _start_run(monkeypatch, tid, started_ago=96)
++    agent = FakeAgent()
++    assert kt.inject_soft_deadline_from_env(agent) is True       # warned...
++    assert "FINAL WARNING" in agent.steers[0]                     # (96s >= final threshold 95s of a 100s cap)
++    _register_transcript(home, tid, run1, "Still polling CI run 777 every 5 minutes")
++
++    # ...ignored it; the cap passes and the dispatcher kills as before.
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (int(time.time()) - 130, run1))
++        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++        killed = []
++        assert kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append(pid)) == [tid]
++        assert killed == [os.getpid()]
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.consecutive_failures == 1
++        assert kb.latest_run(conn, tid).outcome == "timed_out"
++        context = kb.build_worker_context(conn, tid)
++    assert "Still polling CI run 777" in context and "outcome timed_out" in context
++    assert "Continuation checkpoint" not in context   # no checkpoint was written
++
++
++def test_continuations_do_not_trip_give_up_or_block_loop(home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="marathon", assignee="default", max_runtime_seconds=600)
++        with kb.write_txn(conn):
++            # One earlier hard timeout and one earlier unblock cycle already on the card.
++            conn.execute("UPDATE tasks SET consecutive_failures = 1, block_kind = 'transient', "
++                         "block_recurrences = 1 WHERE id = ?", (tid,))
++
++    for i in range(1, 6):
++        _start_run(monkeypatch, tid, started_ago=550)
++        out = json.loads(kt._handle_continue({"checkpoint": f"step {i} done"}))
++        assert out["ok"] is True and out["continuation"] == i
++        with kbc.connect_closing() as conn:
++            task = kb.get_task(conn, tid)
++            assert task.status == "ready"
++            assert task.consecutive_failures == 1     # breaker trips at 2: never reached
++            assert (task.block_kind, task.block_recurrences) == ("transient", 1)
++            assert not any(e.kind in ("gave_up", "block_loop_detected", "blocked")
++                           for e in kb.list_events(conn, tid))
++            assert kb.recompute_ready(conn) >= 0 and kb.get_task(conn, tid).status == "ready"
++
++    # Continuations have their own bound instead.
++    _start_run(monkeypatch, tid, started_ago=10)
++    with kbc.connect_closing() as conn:
++        res = kc.continue_task(conn, tid, checkpoint="again", max_continuations=5,
++                               expected_run_id=int(os.environ["HERMES_KANBAN_RUN_ID"]))
++        assert res["ok"] is False and "continuation limit" in res["error"]
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_wait_handoff_wakes_on_dispatcher_tick(home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="ci wait", assignee="default", max_runtime_seconds=600)
++    _start_run(monkeypatch, tid, started_ago=60)
++    out = json.loads(kt._handle_continue({"checkpoint": "pushed abc; waiting for CI run 9",
++                                          "resume_after_seconds": 900}))
++    assert out["status"] == "scheduled" and out["wake_at"] >= int(time.time()) + 890
++    with kbc.connect_closing() as conn:
++        assert kc.wake_due_continuations(conn) == []                       # not due yet
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert kc.wake_due_continuations(conn, now=out["wake_at"]) == [tid]
++        task = kb.get_task(conn, tid)
++        assert (task.status, task.consecutive_failures) == ("ready", 0)
++        assert "waiting for CI run 9" in kb.build_worker_context(conn, tid)
++        # A plain kanban_schedule park is never auto-woken.
++        tid2 = kb.create_task(conn, title="parked", assignee="default")
++        kb.claim_task(conn, tid2)
++        kb.schedule_task(conn, tid2, reason="SCHEDULED_UNTIL=2030-01-01")
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == []
++
++
++def test_continue_refuses_stale_run_and_bad_args(home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="x", assignee="default", max_runtime_seconds=600)
++    run_id = _start_run(monkeypatch, tid, started_ago=10)
++    assert "error" in json.loads(kt._handle_continue({"checkpoint": " "}))
++    assert "error" in json.loads(kt._handle_continue({"checkpoint": "c", "resume_after_seconds": 10 ** 9}))
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 99))
++    assert "error" in json.loads(kt._handle_continue({"checkpoint": "c"}))
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_background_notify_note_points_kanban_workers_at_wait_handoff(monkeypatch):
++    from types import SimpleNamespace
++    import gateway.session_context as sc
++    from tools import terminal_tool_background as ttb
++
++    monkeypatch.setattr(sc, "async_delivery_supported", lambda: False)
++    for task, expect in ((None, False), ("t_x", True)):
++        if task:
++            monkeypatch.setenv("HERMES_KANBAN_TASK", task)
++        else:
++            monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++        data: dict = {}
++        assert ttb._apply_async_support(SimpleNamespace(id="p"), data, True, None) == (False, None)
++        assert ("resume_after_seconds" in data["notify_unsupported"]) is expect
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index b5abb9ed64..e13403cc81 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -22,7 +22,7 @@ from hermes_cli.config import cfg_get, load_config
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
++    KANBAN_COMPLETE_SCHEMA, KANBAN_CONTINUE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+ 
+@@ -109,7 +109,7 @@ def _check_kanban_orchestrator_mode() -> bool:
+ # would silently skip the run-ownership CAS in kanban_db. Non-lifecycle tools
+ # (heartbeat / attach / attach_url) do not terminate a run and are not gated.
+ _RUN_LIFECYCLE_TOOLS = frozenset({
+-    "kanban_complete", "kanban_block", "kanban_schedule",
++    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_continue",
+     "kanban_request_review", "kanban_request_changes",
+ })
+ 
+@@ -657,6 +657,59 @@ def inject_new_comments_from_env(agent: Any) -> bool:
+         return False
+ 
+ 
++# Soft deadline: near ``max_runtime_seconds`` steer the running turn to checkpoint with
++# kanban_continue instead of being SIGTERMed mid-work by enforce_max_runtime. Two notices per
++# run: at ``kanban.soft_deadline_fraction`` of the cap and a final one two thirds of the way
++# from there to the cap. The deadline is read from the board (live max_runtime, active run's
++# started_at) with the dispatcher's own wall clock, so both sides agree on "elapsed".
++_SOFT_DEADLINE_POLL_MIN_INTERVAL_SECONDS = 15.0
++_soft_deadline_last_attempt: float = 0.0
++_soft_deadline_sent: dict[tuple[str, int], int] = {}  # (task, run) -> notices delivered
++
++
++def inject_soft_deadline_from_env(agent: Any, *, now: Optional[float] = None) -> bool:
++    """Steer a soft-deadline notice into ``agent`` when due; True iff one was injected."""
++    global _soft_deadline_last_attempt
++    tid = os.environ.get("HERMES_KANBAN_TASK") if _is_dispatcher_owned_worker() else None
++    mono = time.monotonic()
++    if (not tid or agent is None or not hasattr(agent, "steer")
++            or (mono - _soft_deadline_last_attempt) < _SOFT_DEADLINE_POLL_MIN_INTERVAL_SECONDS):
++        return False
++    _soft_deadline_last_attempt = mono
++    run_id = _worker_run_id(tid)
++    if run_id is None or _soft_deadline_sent.get((tid, run_id), 0) >= 2:
++        return False
++    try:
++        from hermes_cli import kanban_continuation as kc
++        fraction = kc.soft_deadline_fraction()
++        if fraction <= 0:
++            return False
++        with _board(None, quiet_close=True) as (kb, conn):
++            row = conn.execute(
++                "SELECT t.max_runtime_seconds, r.started_at FROM tasks t "
++                "JOIN task_runs r ON r.id = t.current_run_id "
++                "WHERE t.id = ? AND t.current_run_id = ? AND t.status = 'running'",
++                (tid, run_id),
++            ).fetchone()
++            started = kb._to_epoch(row["started_at"]) if row else None
++        if not row or not row["max_runtime_seconds"] or started is None:
++            return False
++        limit = int(row["max_runtime_seconds"])
++        elapsed = int((time.time() if now is None else now) - started)
++        soft_at = int(limit * fraction)
++        final_at = soft_at + (limit - soft_at) * 2 // 3
++        sent = _soft_deadline_sent.get((tid, run_id), 0)
++        due = 2 if elapsed >= final_at else 1 if elapsed >= soft_at else 0
++        if due <= sent:
++            return False
++        note = kc.soft_deadline_message(elapsed=elapsed, limit=limit, final=due == 2)
++        _soft_deadline_sent[(tid, run_id)] = due
++        return bool(agent.steer(note))
++    except Exception:
++        logger.debug("soft-deadline inject failed", exc_info=True)
++        return False
++
++
+ # --- Handlers ---
+ 
+ @_kanban_handler("kanban_show")
+@@ -870,6 +923,34 @@ def _handle_schedule(args: dict, **kw) -> str:
+         return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
+ 
+ 
++@_kanban_handler("kanban_continue")
++def _handle_continue(args: dict, **kw) -> str:
++    """Checkpoint + end this run; the dispatcher re-queues the card for a fresh run."""
++    tid = _worker_guard("kanban_continue", args)
++    checkpoint = _redact(_require_text(
++        args, "checkpoint", "checkpoint is required — write what is done, current state, next "
++        "steps and background jobs to re-adopt so the next run can resume"))
++    raw_after = args.get("resume_after_seconds", 0)
++    _check(raw_after is None or (isinstance(raw_after, (int, float)) and not isinstance(raw_after, bool)),
++           "resume_after_seconds must be an integer number of seconds")
++    metadata = args.get("metadata")
++    _require_dict_metadata(metadata)
++    if metadata is not None:
++        metadata = _redact_metadata(metadata)
++        _check(metadata is not None, "metadata could not be safely serialized")
++    metadata = _stamp_worker_session_metadata(tid, metadata)
++    from hermes_cli.kanban_continuation import continue_task
++    with _board(args.get("board")) as (kb, conn):
++        res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
++                            expected_run_id=_worker_run_id(tid), metadata=metadata)
++        _check(res.get("ok"), f"could not continue {tid}: {res.get('error')}")
++        note = ("Checkpoint saved; a fresh run will resume this card"
++                + (f" after {int(raw_after)}s" if raw_after else " now")
++                + ". End your turn with a one-line reply; do not call more tools.")
++        return _ok_landed(kb, conn, tid, res["status"], continuation=res["continuation"],
++                          wake_at=res.get("wake_at"), next=note)
++
++
+ @_kanban_handler("kanban_request_review")
+ def _handle_request_review(args: dict, **kw) -> str:
+     """Move implementation into the first-class review phase."""
+@@ -1315,6 +1396,7 @@ _TOOLS = (
+     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
+     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
+     ("kanban_schedule", KANBAN_SCHEDULE_SCHEMA, _handle_schedule, "⏰"),
++    ("kanban_continue", KANBAN_CONTINUE_SCHEMA, _handle_continue, "⏭"),
+     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
+     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
+     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index dc79891441..690998be04 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -224,6 +224,44 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+ )
+ 
+ 
++KANBAN_CONTINUE_SCHEMA = _schema(
++    "kanban_continue",
++    (
++        "Checkpoint your current task and end this run so a FRESH run continues "
++        "it. Use when the work will not finish inside this run's max runtime "
++        "(you get a 'Kanban soft deadline' message near the cap), or when the "
++        "next step is a long wait (CI, a release, a soak, a training "
++        "checkpoint) that should not burn runtime in a sleep/poll loop. The "
++        "run closes with outcome 'continued' and the card is re-queued at once "
++        "(or after ``resume_after_seconds``) with your checkpoint at the top of "
++        "the next run's context plus this run's transcript tail. A "
++        "continuation is NOT a failure or a block: it never counts toward the "
++        "retry give-up or unblock-loop limits. After it returns, end your turn "
++        "with a one-line reply; do not call more tools."
++    ),
++    {
++        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
++        "checkpoint": _prop("string", (
++            "Everything the next run needs to resume without re-deriving it: "
++            "what is done (commits/branches/files/deploys, with ids), current "
++            "state, the exact next steps, background processes to re-adopt "
++            "(PIDs, process_manage session ids, log paths, worktrees), what is "
++            "being waited on and how to check it, and what must not be redone. "
++            "Markdown. No secrets."
++        )),
++        "resume_after_seconds": {"type": "integer", "description": (
++            "Optional. 0 (default) re-queues immediately. N > 0 parks the card in "
++            "'scheduled' and the dispatcher re-queues it after N seconds (max "
++            "86400): use this to hand off a wait instead of polling."
++        )},
++        "metadata": {"type": "object", "description": (
++            "Optional machine-readable state (e.g. {\"pids\": [...], \"ci_run\": ...})."
++        )},
++    },
++    ["checkpoint"],
++)
++
++
+ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
+     "kanban_request_review",
+     (
+diff --git a/tools/terminal_tool_background.py b/tools/terminal_tool_background.py
+index 3247cdcccc..369cf49002 100644
+--- a/tools/terminal_tool_background.py
++++ b/tools/terminal_tool_background.py
+@@ -7,6 +7,7 @@ monkeypatch points authoritative.
+ 
+ import json
+ import logging
++import os
+ import sys
+ from typing import Any, List, Optional
+ 
+@@ -53,6 +54,14 @@ _ASYNC_UNSUPPORTED_NOTE = (
+     'job, a Kanban worker, or a stateless HTTP endpoint). The process is running in the '
+     "background; retrieve its result with process(action='poll') or process(action='wait')."
+ )
++# Kanban workers: max_runtime timeouts were mostly sleep/poll loops on CI, releases and soaks.
++_KANBAN_WAIT_HANDOFF_NOTE = (
++    " Kanban worker: if this takes more than ~10 minutes, do not sit in a poll/wait loop — call "
++    "kanban_continue(checkpoint=<what is running: pid, log path, how to check it, next steps>, "
++    "resume_after_seconds=N) and end the run; the card re-queues itself after N seconds. A job that "
++    "must outlive this run needs persist_on_release=true (or nohup); the next run is a new process, "
++    "so check it by pid/log path, not by process id."
++)
+ 
+ # proc_session attribute -> HERMES_SESSION_* env var carrying it.
+ _ROUTING_FIELDS = (
+@@ -109,7 +118,8 @@ def _apply_async_support(proc_session, result_data, notify_on_complete, watch_pa
+         _stamp_gateway_routing(proc_session, get_session_env)
+         return notify_on_complete, watch_patterns
+     result_data["notify_on_complete"] = False
+-    result_data["notify_unsupported"] = _ASYNC_UNSUPPORTED_NOTE
++    result_data["notify_unsupported"] = _ASYNC_UNSUPPORTED_NOTE + (
++        _KANBAN_WAIT_HANDOFF_NOTE if os.environ.get("HERMES_KANBAN_TASK") else "")
+     logger.info("background proc %s: async delivery unsupported on this "
+                 "session; notify_on_complete/watch_patterns disabled", proc_session.id)
+     return False, None
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2c3d2377e0..2f6607a8ff 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -359,6 +359,28 @@ retrying them; it does not replay tools or reopen the old session. Existing
+ iteration and failure limits still apply. Older runs without registration, deleted
+ transcripts and cross-profile handoffs do not receive transcript recovery.
+ 
++#### Runtime caps: checkpoint and continue
++
++A card with `max_runtime_seconds` is still hard-killed at the cap (`timed_out`,
++which counts toward the failure breaker). Before that, at
++`kanban.soft_deadline_fraction` of the cap (default `0.85`; `0` disables it),
++the running worker gets an out-of-band notice, and a final one shortly before the
++kill. A worker that will not finish in time calls
++`kanban_continue(checkpoint=...)`. The run closes with outcome `continued` and the
++card goes straight back to `ready` (or `review` for a reviewer run). The next
++run's context opens with that checkpoint, followed by the transcript tail
++described above.
++
++`kanban_continue(..., resume_after_seconds=N)` hands off a wait (CI, a release,
++a soak) instead of polling inside the run: the card parks in `scheduled` and
++the dispatcher re-queues it after `N` seconds (at most 24 h). Plain
++`kanban_schedule` parks are never auto-woken.
++
++Continuations leave `consecutive_failures` and the unblock-loop counter
++untouched, so they never trip the give-up or block-loop limits. Their own
++bound is `kanban.max_continuations` (default 12) consecutive `continued` runs.
++Past that, the worker has to complete or block.
++
+ #### Workers and systemd cgroups
+ 
+ Workers are fire-and-forget processes that outlive the dispatcher tick, so
+-- 
+2.54.0 (Apple Git-157)
+

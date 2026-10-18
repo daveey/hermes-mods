@@ -1,6 +1,6 @@
-# macOS: run Hermes on a Developer-ID-signed Python (patches 0017, 0027)
+# macOS: run Hermes on a Developer-ID-signed Python (patches 0017, 0027, 0123)
 
-Two fork patches make Hermes on macOS run on a code-signed copy of its own Python interpreter. With
+Three fork patches make Hermes on macOS run on a code-signed copy of its own Python interpreter. With
 that copy, privacy grants (Full Disk Access, Accessibility, Automation, Photos, Contacts, Calendar…)
 survive Python upgrades.
 
@@ -8,8 +8,9 @@ survive Python upgrades.
 |---|---|---|
 | `0017-…re-exec-into-Developer-ID-signed-Hermes-Pytho.patch` | `hermes_cli/_launchers.py`, `hermes_cli/venv_sync.py`, `tests/hermes_cli/test_signed_python_app.py` | Re-exec into `~/Applications/Hermes Python.app` when its Python version matches the store Python |
 | `0027-…gateway-status-quote-spaced-argv-so-a-Hermes-.patch` | `gateway/status.py`, `tests/gateway/test_status_cmdline_spaced_exe.py` | Quote argv elements that contain whitespace, so a gateway running from that bundle still counts as a running gateway |
+| `0123-fix-tcc-children-s-bare-python3-resolves-to-signed-H.patch` | `hermes_cli/_launchers.py`, `tools/environments/local.py`, `tests/hermes_cli/test_signed_python_path.py` | Put the bundle's `Contents/MacOS` ahead of the matching store `bin` on every child PATH, so a bare `python3` in a terminal command or cron script runs the signed bundle |
 
-Both patches do nothing unless the bundle exists. On Linux and Windows, and on Macs without
+All three patches do nothing unless the bundle exists. On Linux and Windows, and on Macs without
 `~/Applications/Hermes Python.app`, Hermes behaves exactly like upstream.
 
 ## Behavior
@@ -22,6 +23,11 @@ Both patches do nothing unless the bundle exists. On Linux and Windows, and on M
 - Bundle missing, unreadable plist, version mismatch, or executable missing → silent fallback to the
   store Python (`~/.hermes/tools/python-X.Y.Z+…/bin/python3`). No warning is printed.
 - Not macOS → `signed_python_app()` always returns `None`.
+- Children's bare `python3` (0123): every command run through the terminal tool's local backend and every cron
+  script gets a PATH where the bundle's `Contents/MacOS` sits directly ahead of the store Python's `bin` (only when
+  the versions match). `python3 foo.py` in a Kanban worker's terminal or a cron script then runs the signed bundle
+  and uses its grants, instead of the ad-hoc store binary that triggers a generic "python3.14 wants to control …"
+  prompt. Directories elsewhere on PATH keep their order; the rewrite is idempotent and never duplicates an entry.
 - `hermes gateway status` / restart / duplicate-gateway detection recognise a gateway whose argv[0]
   contains spaces (patch 0027). Applies on every OS where psutil supplies the cmdline (macOS,
   Windows; Linux reads `/proc/<pid>/cmdline` first and is unaffected).
@@ -44,9 +50,11 @@ that holds a grant by its **code identity**:
   (bundle id + Team ID). Rebuild it, upgrade the Python inside it, or copy it to another Mac signed
   with the same certificate: the requirement still matches, so the grant stays.
 
-TCC also treats a launchd-started process as "responsible" for its children. Once the gateway runs on
-the signed interpreter, every cron job, script and `osascript` it spawns inherits the gateway's
-grants.
+TCC usually treats the *responsible* process (the app that launched the chain) as the one asking. A
+launchd-started gateway whose launchd wrapper is a platform binary (for example `/usr/bin/osascript`) has no
+responsible app to inherit from, so TCC attributes each child's request to the binary that makes it. A child that
+runs a bare `python3` from the store `bin` is therefore the ad-hoc store binary in TCC's eyes, whatever the gateway
+itself runs on. Patch 0123 fixes that for children by PATH ordering.
 
 ### Patch 0017: re-exec into the signed twin
 
@@ -96,6 +104,15 @@ as not running.
 The fix wraps each argv element that contains whitespace in double quotes before joining. It skips
 elements that already contain a `"` (for example an inline `-c` source), so those are left
 unchanged. The non-psutil `ps` fallback is unchanged.
+
+### Patch 0123: children's bare `python3`
+
+`hermes_cli._launchers.prefer_signed_python_on_path(path)` walks PATH; for each entry ending in `/bin` it asks
+`signed_python_app(<entry>/python3)` (so the same exact-version rule applies) and, on a match, inserts the bundle's
+`Contents/MacOS` directly before that entry (moving an existing later copy up instead of duplicating it). Off macOS,
+or with an empty PATH, it returns PATH unchanged. `tools/environments/local.py::_scrubbed_env`, the sanitizer the
+terminal tool's local backend and cron scripts both build child environments with, applies it after
+`_prepend_hermes_bin_dir`.
 
 ## Code
 
@@ -154,21 +171,35 @@ e.g. test `HERMES_HOME`s) and `publish_launchers` still use the store path.
 `_gateway_command_subcommand` already tokenizes with `shlex.split(command, posix=False)` and strips
 surrounding quotes per token, so no change is needed on the parsing side.
 
+### `hermes_cli/_launchers.py` → `prefer_signed_python_on_path()` and `tools/environments/local.py` → `_scrubbed_env()` (0123)
+
+```python
+        out[path_key] = _prepend_hermes_bin_dir(fix_path(out.get(path_key, "")))
+        # [daveey] bare python3 -> the Developer-ID Hermes Python.app, so macOS TCC uses its grants.
+        from hermes_cli._launchers import prefer_signed_python_on_path
+        out[path_key] = prefer_signed_python_on_path(out[path_key])
+```
+
 ## Tests
 
 | File | Patch | Checks |
 |---|---|---|
 | `tests/hermes_cli/test_signed_python_app.py` (new) | 0017 | no bundle → `None`; matching `3.14.7` bundle → bundle exe; store `3.14.8` with `3.14.7` bundle → `None`. Marked `@pytest.mark.platforms("macos")` (skipped elsewhere); monkeypatches `Path.home` to `tmp_path`. |
+| `tests/hermes_cli/test_signed_python_path.py` (new) | 0123 | no bundle → PATH unchanged; matching bundle → its dir lands right before the store `bin`; idempotent and de-duplicating; version mismatch keeps the store first; `_scrubbed_env` (the terminal/cron child-env sanitizer) puts the bundle dir ahead of the store `bin`. All `@pytest.mark.platforms("macos")`. |
 | `tests/gateway/test_status_cmdline_spaced_exe.py` (new) | 0027 | fake `psutil` module returns an argv whose argv[0] is `…/Hermes Python.app/…`; asserts the joined string starts with a quoted path and `looks_like_gateway_runtime_command_line()` is true. Stubs `Path.read_bytes` so the `/proc` branch is skipped on Linux. |
 
 Run from the repo root with the repo's test runner (it locates the right interpreter; a bare
 `venv/bin/python -m pytest` may lack runtime deps such as `ruamel.yaml`):
 
 ```sh
-scripts/run_tests.sh tests/hermes_cli/test_signed_python_app.py tests/gateway/test_status_cmdline_spaced_exe.py
+scripts/run_tests.sh tests/hermes_cli/test_signed_python_app.py tests/gateway/test_status_cmdline_spaced_exe.py \
+  tests/hermes_cli/test_signed_python_path.py
 ```
 
-Both pass on current upstream/main + the two patches.
+0017/0027's tests passed on upstream/main + those two patches; `test_signed_python_path.py` passed on the full
+0001–0127 series (Oct 17, 2026 PT). Untested: an actual TCC prompt or grant (only PATH ordering is checked), and the
+cron path end to end (the test calls `_scrubbed_env` directly, which cron scripts use, rather than running a cron
+job).
 
 ## Applying
 
@@ -184,6 +215,9 @@ git am -3 ~/code/hermes-mods/core/patches/0017-*.patch \
 If re-implementing against a newer upstream: locate wherever the launcher decides which interpreter
 to re-exec into (today `prepare_launch`, called from `hermes_bootstrap.py`) and wrap that value; and
 make sure any psutil-joined cmdline quotes spaced args before the gateway-identity tokenizer sees it.
+
+0123 needs 0017 (`signed_python_app`). Verified: 0001–0127 apply with `git am -3` at merge-base `4957bbd0a0`
+(Oct 17, 2026 PT).
 
 ## Gotchas
 
@@ -203,6 +237,9 @@ make sure any psutil-joined cmdline quotes spaced args before the gateway-identi
   rebase them. Both touch small regions (`_launchers.py` append, one line in `prepare_launch`, one
   return in `_read_process_cmdline`), so conflicts are rare but possible in `prepare_launch`, which
   upstream edits often.
+- **0123 only covers PATH lookups.** A script that names the store interpreter by absolute path, or a venv's
+  own `python`, still runs whatever that path points at. Names resolve only if the bundle's `Contents/MacOS` has
+  them (step 1 links `python3` and `python`).
 - **Desktop app signing is separate.** `APPLE_SIGNING_IDENTITY` for `hermes desktop --build-only`
   signs the Electron app, not this Python bundle; TCC grants for one don't cover the other.
 

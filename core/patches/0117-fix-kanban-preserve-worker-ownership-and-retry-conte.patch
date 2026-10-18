@@ -1,0 +1,802 @@
+From b78e9861e613b051efa664f514560e2746c5b0d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:32:10 -0700
+Subject: [PATCH] fix(kanban): preserve worker ownership and retry context
+ across restarts [daveey]
+
+---
+ hermes_cli/kanban_db.py                       |  16 +-
+ hermes_cli/kanban_db_dispatch.py              |  10 +-
+ hermes_cli/kanban_host_identity.py            |  50 ++++
+ hermes_cli/kanban_worker_recovery.py          | 154 ++++++++++++
+ run_agent.py                                  |   3 +
+ tests/hermes_cli/test_kanban_host_identity.py |  56 +++++
+ .../test_kanban_restart_survival.py           | 119 ++++++++++
+ .../hermes_cli/test_kanban_worker_recovery.py | 224 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  18 ++
+ 9 files changed, 636 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_host_identity.py
+ create mode 100644 hermes_cli/kanban_worker_recovery.py
+ create mode 100644 tests/hermes_cli/test_kanban_host_identity.py
+ create mode 100644 tests/hermes_cli/test_kanban_restart_survival.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_recovery.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 43e2d3c084..aadb3451d8 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -29,6 +29,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
++from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+ from toolsets import get_toolset_names
+ 
+@@ -1020,16 +1021,12 @@ def _new_task_id() -> str:
+ 
+ def _claimer_id() -> str:
+     """Return a ``host:pid`` string that identifies this claimer."""
+-    import socket
+-    try:
+-        host = socket.gethostname() or "unknown"
+-    except Exception:
+-        host = "unknown"
+-    return f"{host}:{os.getpid()}"
++    from hermes_cli.kanban_host_identity import claim_prefix
++    return f"{claim_prefix()}{os.getpid()}"
+ 
+ 
+ def _host_prefix() -> str:
+-    """``"<host>:"`` prefix shared by every claim lock issued from this host."""
++    """Stable local claim prefix, shared across dispatcher restarts."""
+     return f"{_claimer_id().split(':', 1)[0]}:"
+ 
+ 
+@@ -2381,7 +2378,7 @@ def release_stale_claims(
+         "  AND claim_expires < ?", (now,),
+     ).fetchall()
+     for row in stale:
+-        host_local = (row["claim_lock"] or "").startswith(host_prefix)
++        host_local = _claim_is_local(row["claim_lock"], host_prefix)
+         hb = _to_epoch(row["last_heartbeat_at"])
+         # Backstop: a heartbeat older than the max-stale threshold means no
+         # observable progress — reclaim even if the PID is alive (logic loop).
+@@ -3961,7 +3958,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     _ctx_parent_results(lines, conn, task_id, now)
+     _ctx_role_history(lines, conn, task, now)
+     _ctx_comments(lines, list_comments(conn, task_id), now)
+-    return "\n".join(lines).rstrip() + "\n"
++    from hermes_cli.kanban_worker_recovery import build_recovery_context
++    return "\n".join(lines).rstrip() + "\n" + build_recovery_context(conn, task_id)
+ 
+ 
+ def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 939e67d3fa..e5dcb532dc 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -524,7 +524,7 @@ def _terminate_reclaimed_worker(
+     }
+     if not pid or pid <= 0 or not claim_lock:
+         return info
+-    if not str(claim_lock).startswith(_kb._host_prefix()):
++    if not _kb._claim_is_local(claim_lock):
+         return info
+     info["host_local"] = True
+ 
+@@ -595,7 +595,7 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
+ 
+ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
+     pid, fingerprint = int(row["worker_pid"]), row["worker_started_at"]
+-    if pid == os.getpid() or not str(row["claim_lock"] or "").startswith(host_prefix):
++    if pid == os.getpid() or not _kb._claim_is_local(row["claim_lock"], host_prefix):
+         return
+     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
+         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
+@@ -731,7 +731,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+     ).fetchall()
+     for row in rows:
+         lock = row["claim_lock"] or ""
+-        if not lock.startswith(host_prefix):
++        if not _kb._claim_is_local(lock, host_prefix):
+             continue
+         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
+         # so retries must be measured from the active task_runs row.
+@@ -1217,7 +1217,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+         host_prefix = _kb._host_prefix()
+         for row in rows:
+             lock = row["claim_lock"] or ""
+-            if not lock.startswith(host_prefix):
++            if not _kb._claim_is_local(lock, host_prefix):
+                 continue
+             # Launch-window grace so a freshly-spawned worker isn't reclaimed
+             # before its PID is visible on /proc.
+@@ -1559,7 +1559,7 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
+         if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
+             return False
+         # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
+-        if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
++        if row["worker_pid"] is None and _kb._claim_is_local(row["claim_lock"]):
+             conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                          (int(pid), started_at, task_id))
+             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+diff --git a/hermes_cli/kanban_host_identity.py b/hermes_cli/kanban_host_identity.py
+new file mode 100644
+index 0000000000..ff6bdca4e7
+--- /dev/null
++++ b/hermes_cli/kanban_host_identity.py
+@@ -0,0 +1,50 @@
++"""Restart- and network-stable macOS claim ownership (not a PID identity).
++
++macOS can change gethostname() on wake/network changes. A boot-session UUID is
++shared by all dispatchers on this host and survives app/gateway restarts, but
++cannot cause us to signal a PID on another host or after reboot. Other platforms
++retain the existing hostname contract. Legacy hostname claims remain readable.
++"""
++from functools import lru_cache
++import socket
++import subprocess
++import sys
++import uuid
++
++
++def hostname_prefix() -> str:
++    try:
++        return f"{socket.gethostname() or 'unknown'}:"
++    except OSError:
++        return "unknown:"
++
++
++@lru_cache(maxsize=1)
++def boot_prefix() -> str | None:
++    if sys.platform != "darwin":
++        return None
++    try:
++        result = subprocess.run(
++            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
++            capture_output=True, text=True, timeout=2, check=True,
++        )
++        return f"boot-{uuid.UUID(result.stdout.strip())}:"
++    except (OSError, ValueError, subprocess.SubprocessError):
++        return None
++
++
++def claim_prefix() -> str:
++    return boot_prefix() or hostname_prefix()
++
++
++def is_local_claim(lock: str | None, prefix: str | None = None) -> bool:
++    if prefix is None:
++        from hermes_cli import kanban_db
++        prefix = kanban_db._host_prefix()
++    if not lock:
++        return False
++    if lock.startswith(prefix):
++        return True
++    # Compatibility with workers launched before the stable prefix was deployed.
++    # Never accept an arbitrary foreign hostname merely because its PID exists.
++    return bool(prefix.startswith("boot-") and lock.startswith(hostname_prefix()))
+diff --git a/hermes_cli/kanban_worker_recovery.py b/hermes_cli/kanban_worker_recovery.py
+new file mode 100644
+index 0000000000..04e46ffaff
+--- /dev/null
++++ b/hermes_cli/kanban_worker_recovery.py
+@@ -0,0 +1,154 @@
++"""Read-only continuation notes from exactly registered Kanban worker sessions.
++
++Never resume a session or replay tools. A new run owns its own lease and receives
++only a bounded transcript tail, including budget-exhaustion summaries. Registration
++is best-effort; missing/legacy/corrupt state fails closed rather than guessing by
++cwd, title, timestamps, or the task's user-origin session_id.
++"""
++from __future__ import annotations
++
++from contextlib import closing
++import logging
++import os
++from pathlib import Path
++import sqlite3
++import time
++
++logger = logging.getLogger(__name__)
++MAX_CONTEXT_CHARS = 16000
++MAX_MESSAGES = 24
++MAX_FIELD_CHARS = 3000
++
++_SCHEMA = """CREATE TABLE IF NOT EXISTS worker_recovery_sessions (
++    run_id INTEGER NOT NULL,
++    task_id TEXT NOT NULL,
++    profile TEXT NOT NULL,
++    state_db TEXT NOT NULL,
++    session_id TEXT NOT NULL,
++    registered_at REAL NOT NULL,
++    PRIMARY KEY (state_db, session_id)
++)"""
++
++
++def register_worker_session(session_db, session_id: str) -> bool:
++    """Bind a persisted worker session to the exact live dispatcher claim.
++
++    Called after lazy session creation, including compression rotation. No board
++    or session DB is created by discovery; all ownership checks and registration
++    occur under the board write lock so reclaim cannot race the binding.
++    """
++    from agent.delegation_context import is_dispatcher_owned_worker_context
++    if not is_dispatcher_owned_worker_context():
++        return False
++    board = os.environ.get("HERMES_KANBAN_DB", "")
++    task_id = os.environ.get("HERMES_KANBAN_TASK", "")
++    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "")
++    lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "")
++    if not all((board, task_id, run_id, lock, session_id)):
++        return False
++    try:
++        from hermes_constants import get_hermes_home
++        from hermes_cli.profiles import get_active_profile_name
++        state_path = Path(session_db.db_path).resolve()
++        # Do not bind a session from a foreign profile/store, even if IDs collide.
++        if state_path != (get_hermes_home() / "state.db").resolve():
++            return False
++        profile = get_active_profile_name()
++        with closing(sqlite3.connect(state_path.as_uri() + "?mode=ro", uri=True)) as state:
++            session = state.execute(
++                "SELECT source, profile_name FROM sessions WHERE id=?", (session_id,),
++            ).fetchone()
++        if session != ("kanban", profile):
++            return False
++        with closing(sqlite3.connect(Path(board).resolve().as_uri() + "?mode=rw", uri=True, timeout=2)) as conn, conn:
++            conn.execute("BEGIN IMMEDIATE")
++            row = conn.execute(
++                "SELECT t.status, t.current_run_id, t.claim_lock, t.claim_expires, "
++                "t.worker_pid, r.ended_at, r.claim_expires, r.worker_pid, r.profile "
++                "FROM tasks t JOIN task_runs r ON r.id=t.current_run_id AND r.task_id=t.id "
++                "WHERE t.id=?", (task_id,),
++            ).fetchone()
++            now = time.time()
++            if not row or not (
++                row[0] == "running" and str(row[1]) == run_id and row[2] == lock
++                and row[3] is not None and row[3] >= int(now)
++                and row[4] in (None, os.getpid()) and row[5] is None
++                and row[6] is not None and row[6] >= int(now)
++                and row[7] in (None, os.getpid()) and row[8] == profile
++            ):
++                return False
++            conn.execute(_SCHEMA)
++            existing = conn.execute(
++                "SELECT run_id, task_id, profile FROM worker_recovery_sessions "
++                "WHERE state_db=? AND session_id=?", (str(state_path), session_id),
++            ).fetchone()
++            if existing:
++                return existing == (int(run_id), task_id, profile)
++            conn.execute(
++                "INSERT INTO worker_recovery_sessions VALUES (?, ?, ?, ?, ?, ?)",
++                (int(run_id), task_id, profile, str(state_path), session_id, now),
++            )
++        return True
++    except (OSError, ValueError, TypeError, sqlite3.Error):
++        logger.warning("Kanban recovery session registration unavailable", exc_info=True)
++        return False
++
++
++def build_recovery_context(conn: sqlite3.Connection, task_id: str) -> str:
++    """Return bounded notes from the latest closed run of this task/profile.
++
++    Caller uses its already-selected board connection. No cross-board lookup,
++    lineage search, profile fallback, or task-origin session is ever consulted.
++    """
++    try:
++        rows = conn.execute(
++            "SELECT s.state_db, s.session_id, s.profile, r.id, r.outcome "
++            "FROM worker_recovery_sessions s "
++            "JOIN task_runs r ON r.id=s.run_id AND r.task_id=s.task_id "
++            "JOIN tasks t ON t.id=s.task_id "
++            "WHERE t.id=? AND r.ended_at IS NOT NULL AND s.profile=r.profile "
++            "AND s.profile=t.assignee "
++            "ORDER BY r.id DESC, s.registered_at DESC LIMIT 1", (task_id,),
++        ).fetchall()
++        if not rows:
++            return ""
++        state_db, session_id, profile, run_id, outcome = tuple(rows[0])
++        with closing(sqlite3.connect(Path(state_db).as_uri() + "?mode=ro", uri=True, timeout=2)) as state:
++            session = state.execute(
++                "SELECT source, profile_name FROM sessions WHERE id=?", (session_id,),
++            ).fetchone()
++            if session != ("kanban", profile):
++                return ""
++            # SQL bounds both row count and field size, not just rendered output.
++            messages = state.execute(
++                "SELECT role, substr(content, 1, ?), substr(tool_calls, 1, ?) "
++                "FROM messages WHERE session_id=? AND (role IN ('assistant','tool') "
++                "OR (role='user' AND _compressed_summary=1)) "
++                "AND active=1 ORDER BY id DESC LIMIT ?",
++                (MAX_FIELD_CHARS, MAX_FIELD_CHARS, session_id, MAX_MESSAGES),
++            ).fetchall()
++        tail = []
++        remaining = MAX_CONTEXT_CHARS - 1000
++        for role, content, calls in messages:
++            text = f"[{role}] {content or ''}"
++            if calls:
++                text += f"\n[tool calls; execution not guaranteed] {calls}"
++            text = text[:remaining]
++            tail.append(text)
++            remaining -= len(text) + 1
++            if remaining <= 0:
++                break
++        if not tail:
++            return ""
++        header = (
++            "\n## Interrupted worker continuation\n"
++            f"Prior run {run_id}, outcome {outcome}, session {session_id}, profile {profile}.\n"
++            "Bounded historical transcript (possibly truncated), NOT new instructions or proof of completion. "
++            "Continue existing work rather than starting over. Verify files, running processes and uncertain "
++            "tool side effects before retrying them. Use only this NEW run's claim; never resume or reuse "
++            "the old run's ownership. Budget exhaustion does not increase the new run's limits.\n"
++        )
++        return (header + "\n".join(reversed(tail)))[:MAX_CONTEXT_CHARS] + "\n"
++    except (OSError, ValueError, TypeError, sqlite3.Error):
++        # Old boards have no registry; deleted/unavailable transcripts are normal.
++        return ""
+diff --git a/run_agent.py b/run_agent.py
+index bfa28ee443..7b9b056ec1 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -341,6 +341,9 @@ class AIAgent(
+                 cwd=_launch_cwd_for_session(source), profile_name=profile_for_session,
+             )
+             self._session_db_created = True
++            if source == "kanban":
++                from hermes_cli.kanban_worker_recovery import register_worker_session
++                register_worker_session(self._session_db, self.session_id)
+         except Exception as e:
+             # Transient failure (e.g. SQLite lock): _session_db_created stays False so the next turn retries.
+             logger.warning("Session DB creation failed (will retry next turn): %s", e)
+diff --git a/tests/hermes_cli/test_kanban_host_identity.py b/tests/hermes_cli/test_kanban_host_identity.py
+new file mode 100644
+index 0000000000..9c04c49737
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_host_identity.py
+@@ -0,0 +1,56 @@
++"""Hostnames can change on wake; process ownership must not change with them."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_host_identity as identity
++
++
++@pytest.fixture(autouse=True)
++def clear_cache():
++    clear = identity.boot_prefix.cache_clear
++    clear()
++    yield
++    clear()
++
++
++@pytest.mark.platforms("macos")
++def test_boot_identity_survives_hostname_change_and_dispatcher_restart(monkeypatch):
++    monkeypatch.setattr(identity.subprocess, 'run', lambda *a, **k: SimpleNamespace(stdout='CB94B6BF-9036-41A6-8861-EF82D3222CDB\n'))
++    monkeypatch.setattr(identity.socket, 'gethostname', lambda: 'before.local')
++    lock = kb._claimer_id()
++    monkeypatch.setattr(identity.socket, 'gethostname', lambda: 'after.local')
++    identity.boot_prefix.cache_clear()  # fresh dispatcher's view
++    assert kb._claim_is_local(lock)
++    assert kb._claim_is_local('after.local:123')  # legacy compatibility
++    assert not kb._claim_is_local('foreign.local:123')
++    assert not kb._claim_is_local('boot-00000000-0000-0000-0000-000000000000:123')
++
++
++@pytest.mark.platforms("macos")
++@pytest.mark.parametrize('output', ['', 'not-a-uuid'])
++def test_unavailable_identity_uses_hostname(monkeypatch, output):
++    monkeypatch.setattr(identity.subprocess, 'run', lambda *a, **k: SimpleNamespace(stdout=output))
++    monkeypatch.setattr(identity.socket, 'gethostname', lambda: 'fallback')
++    assert identity.claim_prefix() == 'fallback:'
++
++
++def test_hostname_change_does_not_reclaim_live_run(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setattr(identity, 'boot_prefix', lambda: 'boot-test:')
++    monkeypatch.setattr(identity.socket, 'gethostname', lambda: 'before.local')
++    path = tmp_path / 'board.db'
++    kbc.init_db(path)
++    with kbc.connect_closing(path) as conn:
++        tid = kb.create_task(conn, title='survivor', assignee='default')
++        kb.recompute_ready(conn)
++        task = kb.claim_task(conn, tid)
++        conn.execute('UPDATE tasks SET worker_pid=123, claim_expires=0 WHERE id=?', (tid,))
++        conn.commit()
++        monkeypatch.setattr(identity.socket, 'gethostname', lambda: 'after.local')
++        monkeypatch.setattr(kb, '_worker_alive', lambda *a: True)
++        assert kb.release_stale_claims(conn) == 0
++        assert kb.get_task(conn, tid).current_run_id == task.current_run_id
++        assert kb.get_task(conn, tid).status == 'running'
+diff --git a/tests/hermes_cli/test_kanban_restart_survival.py b/tests/hermes_cli/test_kanban_restart_survival.py
+new file mode 100644
+index 0000000000..535fc06007
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_restart_survival.py
+@@ -0,0 +1,119 @@
++"""Real detached workers outlive gateway and Desktop backend group teardown."""
++import json
++import os
++from pathlib import Path
++import shutil
++import signal
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++
++
++def wait_for(predicate):
++    until = time.monotonic() + 30
++    while time.monotonic() < until:
++        if predicate():
++            return
++        time.sleep(.05)
++    raise AssertionError('subprocess readiness timed out')
++
++
++@pytest.mark.live_system_guard_bypass  # signals only PIDs spawned by this test, intentionally orphaned
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('entry', ['gateway', 'desktop'])
++def test_worker_survives_entrypoint_restart(tmp_path, monkeypatch, entry):
++    node = shutil.which('node')
++    if entry == 'desktop' and not node:
++        pytest.skip('Desktop requires Node with TypeScript support')
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    board = tmp_path / 'board.db'
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(board))
++    kbc.init_db(board)
++    with kbc.connect_closing(board) as conn:
++        tid = kb.create_task(conn, title='restart survival', assignee='default')
++        kb.recompute_ready(conn)
++    root = Path(__file__).resolve().parents[2]
++    # Both entrypoints use _default_spawn. Replace only the LLM command with a
++    # deterministic worker; keep the real environment, file FDs and setsid.
++    worker_code = f'''
++import sys
++sys.path[:] = {sys.path!r}
++from pathlib import Path
++import os, time
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++root = Path({str(tmp_path)!r})
++(root / 'worker-ready').write_text(str(os.getpid()))
++while not (root / 'continue').exists(): time.sleep(.05)
++with kbc.connect_closing(root / 'board.db') as conn:
++    kb.complete_task(conn, {tid!r}, result='survived restart', expected_run_id=int(os.environ['HERMES_KANBAN_RUN_ID']))
++(root / 'done').write_text('done')
++'''
++    parent_code = f'''
++import sys
++sys.path[:] = {sys.path!r}
++import time
++from pathlib import Path
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as d
++root = Path({str(tmp_path)!r})
++d._worker_argv = lambda *a: [{sys.executable!r}, '-c', {worker_code!r}]
++d._retag_legacy_worker_sessions = lambda *a: None
++with kbc.connect_closing(root / 'board.db') as conn:
++    task = kb.claim_task(conn, {tid!r})
++    pid = d._default_spawn(task, str(root))
++    d._set_worker_pid(conn, task.id, pid)
++(root / 'parent-ready').write_text(str(pid))
++while True: time.sleep(1)
++'''
++    env = dict(os.environ)
++    for key in list(env):
++        if key.startswith('HERMES_KANBAN_') and key != 'HERMES_KANBAN_DB':
++            env.pop(key)
++    parent = subprocess.Popen([sys.executable, '-c', parent_code], env=env,
++                              start_new_session=True, stdout=subprocess.DEVNULL,
++                              stderr=(tmp_path / 'parent.log').open('w'))
++    pid = None
++    try:
++        wait_for(lambda: (tmp_path / 'parent-ready').exists())
++        wait_for(lambda: (tmp_path / 'worker-ready').exists())
++        pid = int((tmp_path / 'worker-ready').read_text())
++        assert os.getpgid(pid) != os.getpgid(parent.pid)
++        with kbc.connect_closing(board) as conn:
++            run_id = kb.get_task(conn, tid).current_run_id
++        if entry == 'desktop':
++            # Execute Desktop's actual managed-backend teardown, not a copy.
++            module = (root / 'apps/desktop/electron/backend-child.ts').as_uri()
++            js = f"import {{stopBackendChild}} from {json.dumps(module)}; stopBackendChild({{pid:{parent.pid},kill:s=>process.kill({parent.pid},s)}},{{forceKillProcessTree:()=>{{throw Error('unexpected')}}}});"
++            subprocess.run([node, '--input-type=module', '-e', js], check=True, timeout=20)
++        else:
++            os.killpg(parent.pid, signal.SIGTERM)
++        parent.wait(timeout=15)
++        assert dispatch._pid_alive(pid)
++        # A fresh dispatcher connection must preserve this same run, even when
++        # its old dispatcher's lease has expired.
++        with kbc.connect_closing(board) as conn:
++            conn.execute('UPDATE tasks SET claim_expires=0 WHERE id=?', (tid,))
++            conn.commit()
++            assert kb.release_stale_claims(conn) == 0
++            assert dispatch.detect_crashed_workers(conn) == []
++            assert kb.get_task(conn, tid).current_run_id == run_id
++        (tmp_path / 'continue').touch()
++        wait_for(lambda: (tmp_path / 'done').exists())
++        with kbc.connect_closing(board) as conn:
++            assert kb.get_task(conn, tid).status == 'done'
++            row = conn.execute('SELECT outcome FROM task_runs WHERE id=?', (run_id,)).fetchone()
++            assert row[0] == 'completed'
++    finally:
++        if parent.poll() is None:
++            os.killpg(parent.pid, signal.SIGKILL)
++            parent.wait(timeout=5)
++        if pid and dispatch._pid_alive(pid):
++            os.kill(pid, signal.SIGKILL)
+diff --git a/tests/hermes_cli/test_kanban_worker_recovery.py b/tests/hermes_cli/test_kanban_worker_recovery.py
+new file mode 100644
+index 0000000000..6544470c53
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_recovery.py
+@@ -0,0 +1,224 @@
++"""Durable continuation is scoped to a board, task, run and profile, never guessed."""
++import json
++import os
++import sqlite3
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_worker_recovery as recovery
++from run_agent import AIAgent
++
++
++@pytest.fixture
++def worker(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++
++    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
++    board = tmp_path / "kanban.db"
++    conn = sqlite3.connect(board)
++    conn.executescript("""
++        CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, current_run_id INTEGER,
++            claim_lock TEXT, claim_expires INTEGER, worker_pid INTEGER, assignee TEXT);
++        CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, ended_at INTEGER,
++            claim_expires INTEGER, worker_pid INTEGER, profile TEXT, outcome TEXT);
++    """)
++    expiry = int(time.time()) + 3600
++    conn.execute("INSERT INTO tasks VALUES ('t_one','running',1,'lock',?,?,'default')", (expiry, os.getpid()))
++    conn.execute("INSERT INTO task_runs VALUES (1,'t_one',NULL,?,?,'default',NULL)", (expiry, os.getpid()))
++    conn.commit()
++    state_path = tmp_path / "state.db"
++    state = sqlite3.connect(state_path)
++    state.executescript("""
++        CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, profile_name TEXT);
++        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
++            content TEXT, tool_calls TEXT, active INTEGER DEFAULT 1, _compressed_summary INTEGER DEFAULT 0);
++        INSERT INTO sessions VALUES ('worker','kanban','default');
++        INSERT INTO messages(session_id,role,content) VALUES ('worker','assistant','Implemented parser; next run tests');
++    """)
++    state.commit()
++    for key, value in {"DB": str(board), "TASK": "t_one", "RUN_ID": "1", "CLAIM_LOCK": "lock"}.items():
++        monkeypatch.setenv("HERMES_KANBAN_" + key, value)
++    yield SimpleNamespace(conn=conn, state=state, db_path=state_path, board=board)
++    state.close()
++    conn.close()
++
++
++def close_run(worker, outcome="crashed"):
++    worker.conn.execute("UPDATE task_runs SET ended_at=1,outcome=? WHERE id=1", (outcome,))
++    worker.conn.execute("UPDATE tasks SET status='ready',current_run_id=NULL,claim_lock=NULL")
++    worker.conn.commit()
++
++
++@pytest.mark.parametrize("outcome", ["crashed", "reclaimed", "failed", "max_iterations"])
++def test_crash_and_budget_continuation_survives_reopen(worker, outcome):
++    assert recovery.register_worker_session(worker, "worker")
++    close_run(worker, outcome)
++    with sqlite3.connect(worker.board) as reopened:
++        result = recovery.build_recovery_context(reopened, "t_one")
++    assert "Implemented parser; next run tests" in result
++    assert outcome in result
++    assert "NEW run's claim" in result
++    assert "does not increase" in result
++
++
++def test_open_run_is_not_its_own_recovery(worker):
++    assert recovery.register_worker_session(worker, "worker")
++    assert recovery.build_recovery_context(worker.conn, "t_one") == ""
++
++
++@pytest.mark.parametrize("mutation", [
++    "UPDATE tasks SET current_run_id=2",
++    "UPDATE tasks SET claim_lock='other'",
++    "UPDATE tasks SET status='ready'",
++    "UPDATE tasks SET claim_expires=0",
++    "UPDATE tasks SET worker_pid=-1",
++    "UPDATE task_runs SET ended_at=1",
++    "UPDATE task_runs SET claim_expires=0",
++    "UPDATE task_runs SET worker_pid=-1",
++    "UPDATE task_runs SET profile='foreign'",
++    "UPDATE task_runs SET task_id='other'",
++])
++def test_stale_or_foreign_claim_cannot_register(worker, mutation):
++    worker.conn.execute(mutation)
++    worker.conn.commit()
++    assert not recovery.register_worker_session(worker, "worker")
++
++
++@pytest.mark.parametrize("key,value", [("RUN_ID", "01"), ("RUN_ID", "bad"), ("TASK", "other"), ("CLAIM_LOCK", "")])
++def test_exact_pins_required(worker, monkeypatch, key, value):
++    monkeypatch.setenv("HERMES_KANBAN_" + key, value)
++    assert not recovery.register_worker_session(worker, "worker")
++
++
++@pytest.mark.parametrize("mutation", [
++    "UPDATE sessions SET source='cli'", "UPDATE sessions SET profile_name='foreign'",
++    "UPDATE sessions SET profile_name=NULL",
++])
++def test_unrelated_sessions_rejected(worker, mutation):
++    worker.state.execute(mutation)
++    worker.state.commit()
++    assert not recovery.register_worker_session(worker, "worker")
++
++
++def test_delegates_and_foreign_store_rejected(worker, monkeypatch):
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
++    assert not recovery.register_worker_session(worker, "worker")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
++    assert not recovery.register_worker_session(SimpleNamespace(db_path=worker.board), "worker")
++
++
++def test_idempotent_but_cannot_rebind_to_another_run(worker, monkeypatch):
++    assert recovery.register_worker_session(worker, "worker")
++    assert recovery.register_worker_session(worker, "worker")
++    worker.conn.execute("INSERT INTO task_runs SELECT 2,task_id,NULL,claim_expires,worker_pid,profile,NULL FROM task_runs WHERE id=1")
++    worker.conn.execute("UPDATE tasks SET current_run_id=2")
++    worker.conn.commit()
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "2")
++    assert not recovery.register_worker_session(worker, "worker")
++
++
++def test_board_task_profile_isolation_and_no_origin_fallback(worker):
++    assert recovery.register_worker_session(worker, "worker")
++    close_run(worker)
++    assert recovery.build_recovery_context(worker.conn, "t_other") == ""
++    with sqlite3.connect(":memory:") as other_board:
++        assert recovery.build_recovery_context(other_board, "t_one") == ""
++    worker.conn.execute("UPDATE tasks SET assignee='foreign'")
++    assert recovery.build_recovery_context(worker.conn, "t_one") == ""
++
++
++def test_missing_or_retagged_transcript_fails_closed(worker):
++    assert recovery.register_worker_session(worker, "worker")
++    close_run(worker)
++    worker.state.execute("UPDATE sessions SET profile_name='foreign'")
++    worker.state.commit()
++    assert recovery.build_recovery_context(worker.conn, "t_one") == ""
++    worker.db_path.unlink()
++    assert recovery.build_recovery_context(worker.conn, "t_one") == ""
++    assert not worker.db_path.exists()
++
++
++def test_tail_bounded_excludes_system_user_reasoning_and_inactive(worker):
++    assert recovery.register_worker_session(worker, "worker")
++    worker.state.executemany(
++        "INSERT INTO messages(session_id,role,content) VALUES ('worker','tool',?)",
++        [(f"output {i} " + "x" * 10000,) for i in range(40)],
++    )
++    worker.state.execute("INSERT INTO messages(session_id,role,content) VALUES ('worker','assistant','CONTINUE_FROM_HERE')")
++    worker.state.execute("INSERT INTO messages(session_id,role,content,active) VALUES ('worker','tool','INACTIVE_SECRET',0)")
++    worker.state.execute("INSERT INTO messages(session_id,role,content) VALUES ('worker','system','SYSTEM_SECRET')")
++    worker.state.execute("INSERT INTO messages(session_id,role,content) VALUES ('worker','user','USER_SECRET')")
++    worker.state.commit()
++    close_run(worker)
++    result = recovery.build_recovery_context(worker.conn, "t_one")
++    assert len(result) <= recovery.MAX_CONTEXT_CHARS + 1
++    assert "CONTINUE_FROM_HERE" in result
++    assert "output 0 " not in result
++    assert "SECRET" not in result
++
++
++def test_real_schema_lazy_agent_registration_and_reclaim(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_state import SessionDB
++
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
++    path = tmp_path / "board.db"
++    kbc.init_db(path)
++    with kbc.connect_closing(path) as conn:
++        tid = kb.create_task(conn, title="Continue parser", assignee="default")
++        kb.recompute_ready(conn)
++        task = kb.claim_task(conn, tid)
++        assert task is not None
++        for key, value in {"DB": str(path), "TASK": tid, "RUN_ID": str(task.current_run_id), "CLAIM_LOCK": task.claim_lock}.items():
++            monkeypatch.setenv("HERMES_KANBAN_" + key, value)
++        state = SessionDB(db_path=tmp_path / "state.db")
++        try:
++            agent = SimpleNamespace(
++                _session_db=state, _session_db_created=False, session_id="real-worker",
++                platform="cli", model="test", _cached_system_prompt="", _parent_session_id=None,
++                _session_row_model_config=dict,
++            )
++            AIAgent._ensure_db_session(agent)
++            assert agent._session_db_created
++            assert conn.execute("SELECT session_id FROM worker_recovery_sessions").fetchone()[0] == "real-worker"
++            state.append_message("real-worker", "assistant", "Budget reached; parser complete, run tests next")
++            conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (tid,))
++            conn.commit()
++            kb.release_stale_claims(conn)
++            context = recovery.build_recovery_context(conn, tid)
++            assert "parser complete, run tests next" in context
++            new_task = kb.claim_task(conn, tid)
++            assert new_task is not None
++            assert "parser complete, run tests next" in recovery.build_recovery_context(conn, tid)
++            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(new_task.current_run_id))
++            monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", new_task.claim_lock)
++            from tools import kanban_tools
++            shown = json.loads(kanban_tools._handle_show({}))
++            assert "parser complete, run tests next" in shown["worker_context"]
++        finally:
++            state.close()
++
++
++def test_compression_rotation_uses_latest_registered_session(worker):
++    assert recovery.register_worker_session(worker, "worker")
++    worker.state.execute("INSERT INTO sessions VALUES ('compressed','kanban','default')")
++    worker.state.execute("INSERT INTO messages(session_id,role,content,_compressed_summary) VALUES ('compressed','user','Compressed progress and next actions',1)")
++    worker.state.commit()
++    assert recovery.register_worker_session(worker, "compressed")
++    close_run(worker)
++    result = recovery.build_recovery_context(worker.conn, "t_one")
++    assert "Compressed progress and next actions" in result
++    assert "Implemented parser" not in result
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 66e7224230..2c3d2377e0 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -341,6 +341,24 @@ gateway docs). Without a running gateway, `ready` tasks stay where they are
+ until one comes up — `hermes kanban create` warns about this at creation
+ time.
+ 
++#### Restart survival and retry context
++
++On POSIX, workers start in separate process sessions with file-backed logs, so
++terminating the gateway or Desktop backend process group does not signal them.
++The next dispatcher observes the existing PID and run rather than starting a
++replacement. On macOS, new claim ownership uses the boot-session UUID, not the
++network-dependent hostname; hostname changes on wake do not make these claims
++appear remote. Legacy hostname claims remain recognized under that hostname.
++
++Workers register their persisted session against their exact board, task, run,
++profile and live claim. After a crash, reclaim or iteration-budget exhaustion,
++`kanban_show` includes a bounded historical transcript tail from the latest
++registered closed run (including a compression summary when available). The new
++run keeps its own ownership and must verify uncertain tool side effects before
++retrying them; it does not replay tools or reopen the old session. Existing
++iteration and failure limits still apply. Older runs without registration, deleted
++transcripts and cross-profile handoffs do not receive transcript recovery.
++
+ #### Workers and systemd cgroups
+ 
+ Workers are fire-and-forget processes that outlive the dispatcher tick, so
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,246 @@
+From 1d7493205bfbaeaffdf610d9c2f5a02a78e87ae5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 15:55:35 -0700
+Subject: [PATCH] fix(memory): unattended reviews at the cap get live budget +
+ staging rule, not 'add removes' advice [daveey]
+
+Background review forks only append unattended; patch/remove are staged for
+approval (#105921). At the cap, the fork read the replayed system-prompt header
+(frozen at session start, possibly days stale), tried a bare add, overflowed,
+then followed the over-budget advice ('add removes to the same batch'), which
+only staged a proposal. Net: MEMORY.md/USER.md unchanged since 10-14 and 50
+pending proposals, with an over_budget error on every review save.
+
+- The unattended memory review prompt now carries live per-store usage read
+  from disk and the max entry size that fits, plus the staging rule.
+- Over-budget errors inside an unattended review say removes/patches are
+  staged, so skip (or use a skill) or send one batch that stages the whole
+  consolidation.
+- Tests: TestUnattendedReviewAtCap, TestReviewPromptLiveBudget.
+---
+ agent/background_review.py                    | 18 ++++++++
+ .../test_background_review_memory_scope.py    | 34 +++++++++++++++
+ tests/tools/test_memory_tool.py               | 43 +++++++++++++++++++
+ tools/memory_tool.py                          | 16 ++++++-
+ tools/memory_tool_store.py                    | 35 +++++++++++++++
+ 5 files changed, 145 insertions(+), 1 deletion(-)
+
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 8ca6f40928..89b344ca43 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -1307,6 +1307,22 @@ def _run_review_in_thread(
+         _set_thread_approval_callback(None)
+ 
+ 
++def _live_memory_budget_note(agent: Any) -> str:
++    """Live per-store free space for an unattended memory review. The fork replays the parent's
++    system prompt, whose memory header is frozen at session start, while only appends land
++    unattended — so without the live figures the fork tried bare adds into a store other
++    sessions had already filled, overflowed, then staged proposals nobody approved."""
++    store = getattr(agent, "_memory_store", None)
++    if store is None or not hasattr(store, "review_budget_note"):
++        return ""
++    try:
++        note = store.review_budget_note()
++        return note if isinstance(note, str) else ""
++    except Exception:
++        logger.debug("Could not read live memory budget for review prompt", exc_info=True)
++        return ""
++
++
+ # (review_memory, review_skills) -> prompt attribute name; skills-only is also the default.
+ _PROMPT_NAME_BY_SCOPE = {
+     (True, True): "_COMBINED_REVIEW_PROMPT", (True, False): "_MEMORY_REVIEW_PROMPT",
+@@ -1331,6 +1347,8 @@ def spawn_background_review_thread(
+     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
+     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
+     prompt = getattr(agent, name, globals()[name])
++    if review_memory and not explicit and (budget := _live_memory_budget_note(agent)):
++        prompt = f"{prompt}\n\n{budget}"
+     if focus := (focus or "").strip():
+         prompt = (
+             f"{prompt}\n\nThe user explicitly requested this review with the following "
+diff --git a/tests/agent/test_background_review_memory_scope.py b/tests/agent/test_background_review_memory_scope.py
+index 4ab629bf2f..7eb672d2b0 100644
+--- a/tests/agent/test_background_review_memory_scope.py
++++ b/tests/agent/test_background_review_memory_scope.py
+@@ -261,3 +261,37 @@ class TestConsolidationProposalSurfaces:
+         ]
+         actions = bg.summarize_background_review_actions(review_messages, [])
+         assert any("staged for your approval" in a for a in actions)
++
++
++class TestReviewPromptLiveBudget:
++    """An unattended memory review gets live per-store free space plus the staging rule; the
++    replayed system-prompt header is frozen at session start and was days stale."""
++
++    def _agent(self, tmp_path, monkeypatch):
++        from tools.memory_tool_store import MemoryStore
++        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
++        store = MemoryStore(memory_char_limit=200, user_char_limit=100)
++        store.load_from_disk()
++        store.add("memory", "m" * 150)
++        return SimpleNamespace(_memory_store=store)
++
++    def test_unattended_memory_review_prompt_has_live_budget(self, tmp_path, monkeypatch):
++        agent = self._agent(tmp_path, monkeypatch)
++        _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True, review_skills=False)
++        assert "Live memory budget" in prompt
++        assert "150/200 chars — a new entry of at most 47 chars fits" in prompt
++        assert "staged for the user's approval" in prompt
++        _, combined = bg.spawn_background_review_thread(agent, [], review_memory=True, review_skills=True)
++        assert "Live memory budget" in combined
++
++    def test_skill_only_and_explicit_reviews_omit_it(self, tmp_path, monkeypatch):
++        agent = self._agent(tmp_path, monkeypatch)
++        _, skills = bg.spawn_background_review_thread(agent, [], review_memory=False, review_skills=True)
++        _, explicit = bg.spawn_background_review_thread(
++            agent, [], review_memory=True, review_skills=False, explicit=True)
++        assert "Live memory budget" not in skills
++        assert "Live memory budget" not in explicit
++
++    def test_agent_without_store_keeps_plain_prompt(self):
++        _, prompt = bg.spawn_background_review_thread(SimpleNamespace(), [], review_memory=True)
++        assert prompt == bg._MEMORY_REVIEW_PROMPT
+diff --git a/tests/tools/test_memory_tool.py b/tests/tools/test_memory_tool.py
+index 831872d3ed..a927847db4 100644
+--- a/tests/tools/test_memory_tool.py
++++ b/tests/tools/test_memory_tool.py
+@@ -1039,3 +1039,46 @@ class TestBackgroundReviewDeleteGate:
+             reset_current_write_origin(token)
+         assert result["success"] is True
+         assert "rewritten by refine" in store._entries_for("memory")
++
++
++class TestUnattendedReviewAtCap:
++    """A review fork at the cap was told to "add removes to the same batch", but unattended
++    reviews only stage removes/patches. Every review save overflowed, then staged a proposal no
++    one approved (MEMORY.md/USER.md unchanged for days, 50 pending). Both the over-budget error
++    and the review prompt must say what actually works unattended, from live disk usage."""
++
++    def _fill(self, store):
++        for i in range(8):
++            assert store.add("memory", f"standing fact number {i:02d} " + "x" * 30)["success"] is True
++
++    def test_over_budget_add_in_review_names_the_staging_rule(self, store):
++        self._fill(store)
++        token = set_current_write_origin("background_review")
++        try:
++            result = json.loads(memory_tool(action="add", content="y" * 120, store=store))
++            batch = json.loads(memory_tool(operations=[{"action": "add", "content": "z" * 120}], store=store))
++        finally:
++            reset_current_write_origin(token)
++        for r in (result, batch):
++            assert r["success"] is False
++            assert "staged for the user's approval" in r["error"]
++            assert "skip it" in r["error"]
++
++    def test_foreground_over_budget_keeps_plain_advice(self, store):
++        self._fill(store)
++        result = json.loads(memory_tool(action="add", content="y" * 120, store=store))
++        assert result["success"] is False
++        assert "staged for the user's approval" not in result["error"]
++
++    def test_review_budget_note_reads_live_disk_not_snapshot(self, store, tmp_path):
++        # Another session fills the store after this one loaded its snapshot.
++        other = MemoryStore(memory_char_limit=500, user_char_limit=300)
++        other.load_from_disk()
++        for i in range(8):
++            other.add("memory", f"other session fact {i:02d} " + "x" * 30)
++        used, limit = other.live_usage("memory")
++        note = store.review_budget_note()
++        assert f"{used:,}/{limit:,}" in note
++        assert f"at most {limit - used - 3:,} chars fits" in note
++        assert "staged for the user's approval" in note
++        assert "USER.md (target='user'): 0/300 chars" in note
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+index 6e78d00887..07c499c752 100644
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -41,7 +41,16 @@ def get_memory_dir() -> Path:
+ 
+ 
+ from tools.memory_tool_store import (
+-    ENTRY_DELIMITER, FAILURE_CLASS, MEMORY_BLOCK_HEADERS, PATCH_DROP_HINT, MemoryStore, _scan_memory_content)
++    ENTRY_DELIMITER, FAILURE_CLASS, MEMORY_BLOCK_HEADERS, PATCH_DROP_HINT, UNATTENDED_REVIEW_FULL_HINT,
++    MemoryStore, _scan_memory_content)
++
++
++def _is_unattended_review() -> bool:
++    try:
++        from tools.skill_provenance import is_unattended_review
++        return is_unattended_review()
++    except Exception:
++        return False
+ 
+ 
+ def load_on_disk_store() -> MemoryStore:
+@@ -239,6 +248,11 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str
+ 
+ 
+ def _applied(result: dict[str, Any]) -> tuple[str, str]:
++    # An unattended review cannot follow the store's "add removes to the same batch" advice
++    # (those ops are staged, not applied), so say what does work there.
++    if (not result.get("success") and not result.get("done") and FAILURE_CLASS.get() == "over_budget"
++            and _is_unattended_review()):
++        result = {**result, "error": f"{result.get('error', '')} {UNATTENDED_REVIEW_FULL_HINT}"}
+     return ("success" if result.get("success") else "failed"), json.dumps(result, ensure_ascii=False)
+ 
+ 
+diff --git a/tools/memory_tool_store.py b/tools/memory_tool_store.py
+index 8d4f22ee77..76f75366a0 100644
+--- a/tools/memory_tool_store.py
++++ b/tools/memory_tool_store.py
+@@ -154,6 +154,18 @@ def _low_headroom_note(current: int, limit: int) -> str:
+             f"patches of stale entries in the SAME batch")
+ 
+ 
++# An unattended background review may only append: its patch/remove ops are staged for
++# approval (#105921). The generic over-budget advice ("add removes to the same batch")
++# cannot land a save there, so reviews at the cap overflowed, then staged a proposal no one
++# approved, every time. Both the review prompt and over-budget errors say this instead.
++UNATTENDED_REVIEW_FULL_HINT = (
++    "This is an unattended background review: 'patch'/'remove' are staged for the user's "
++    "approval, not applied, so only a plain add that fits the free space lands now. If the fact "
++    "does not fit, skip it (or record it in the relevant skill instead); do not retry a bare add. "
++    "Only if the fact clearly matters, send ONE batch with the removes/patches AND the add — the "
++    "whole batch is staged as a single proposal for approval.")
++
++
+ # Patch content cannot be empty, and 'remove' would drop the sibling facts in the entry.
+ PATCH_DROP_HINT = "To drop text inside an entry, patch a longer span that contains it; 'remove' deletes the whole entry."
+ 
+@@ -644,6 +656,29 @@ class MemoryStore:
+             return working, f"Applied {len(operations)} operation(s).", replaced_fields
+         return self._mutate(target, _apply, skip_drift=not commit)
+ 
++    def live_usage(self, target: str) -> tuple[int, int]:
++        """``(used, limit)`` chars read from disk NOW. The system-prompt header is frozen at
++        session start, and other sessions keep writing, so a long-lived session's header (and
++        every review fork replaying it) can be days stale."""
++        entries = list(dict.fromkeys(self._read_file(self._path_for(target))))
++        return len(ENTRY_DELIMITER.join(entries)), self._char_limit(target)
++
++    def review_budget_note(self) -> str:
++        """Live free-space block for an unattended background-review prompt ("" if no store)."""
++        lines = []
++        for target, label in (("memory", "MEMORY.md (target='memory')"), ("user", "USER.md (target='user')")):
++            if not self.target_enabled(target):
++                continue
++            used, limit = self.live_usage(target)
++            free = max(0, limit - used)
++            # Each extra entry also costs the delimiter, so the usable add size is smaller.
++            fits = max(0, free - len(ENTRY_DELIMITER)) if used else free
++            lines.append(f"  • {label}: {used:,}/{limit:,} chars — a new entry of at most {fits:,} chars fits")
++        if not lines:
++            return ""
++        return ("Live memory budget (read just now; the usage in the system prompt header was frozen "
++                "at session start and may be stale):\n" + "\n".join(lines) + "\n" + UNATTENDED_REVIEW_FULL_HINT)
++
+     def format_for_system_prompt(self, target: str) -> Optional[str]:
+         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
+         it, preserving the prefix cache); None if empty."""
+-- 
+2.54.0 (Apple Git-157)
+

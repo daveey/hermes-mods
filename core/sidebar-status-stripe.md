@@ -1,9 +1,10 @@
 # Sidebar status stripe + gateway device glyph (Desktop)
 
-Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091`, `0094`, `0095`, `0099`, `0104` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
+Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091`, `0094`, `0095`, `0099`, `0104`, `0124` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
 only, as does `0089`; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints; `0091`
 is backend-only (`tui_gateway/server.py`), as is `0094` (`tui_gateway/session_reaper.py`); `0095` touches cron, the
-session-list endpoints and `apps/desktop`. `0099` and `0104` are Desktop-only refresh fixes. Replaces the per-gateway
+session-list endpoints and `apps/desktop`. `0099` and `0104` are Desktop-only refresh fixes; `0124` touches the
+project-tree RPCs and `apps/desktop`. Replaces the per-gateway
 row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `0038`: stripe shows session status (green/red); gateway becomes a device glyph after the age.
@@ -18,6 +19,8 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `0095`: a session that owns a live cron job shows a grey loop glyph instead of the stripe (never green).
 - `0099`: activity-only list refreshes update badges and stripes even when messages have not changed.
 - `0104`: a store-level sweep refreshes stale running background rows, including hidden sessions.
+- `0124`: project-mode rows older than the recents page get the same activity stamps, so they no longer paint
+  green while their `/goal`, cards or background jobs run.
 - Red for blocked kanban cards is `0092`, documented in [kanban-session-links.md](kanban-session-links.md).
 
 ## Behavior
@@ -69,6 +72,11 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   counts): laptop, Mac mini or cloud (a generic monitor when nothing matches). Shown only when the registry
   has more than one connection. With the age column off, the counts and glyph are the row's last trailing
   items. Like the age, they fade for the ⋯ button on hover.
+
+- **Project-mode rows past the recents page (`0124`).** In project mode an older session's only loaded row comes
+  from the project tree (`projects.tree` previews, `projects.project_sessions` lanes), not from `$sessions`. Those
+  rows now carry `goal_active`, `kanban_active`/`kanban_blocked`, `cron_active` and `background_active`, and the
+  row's stripe and status dot fold them in, so such a row stays off green while that work runs, like a recents row.
 
 ## How it works
 
@@ -142,9 +150,21 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   (a `perf_counter_ns` stamp), capped at `now`. Idle sessions keep their stored stamp. Desktop's
   `rehydrateLiveSessionStatuses` is unchanged: it still marks a working row `stalled` once `last_active` is 5+ min old.
 
+- `0124`: `tui_gateway/methods_projects.py::_annotate_tree_activity` runs the four session-list annotators
+  (`annotate_kanban_activity`, `annotate_goal_activity`, `annotate_cron_activity`, `annotate_background_activity`)
+  over the rows `_project_tree_inputs` builds (never raising; the tree renders without them). `build_tree` passes the
+  dicts by reference, so previews and hydrated lanes share the stamps; `projects.tree`, `projects.project_sessions`
+  and the all-profiles REST tree all go through `_project_tree_inputs`. On the Desktop side `$sessionDotStateById`
+  still reads only `$sessions`/`$messagingSessions`; `withRowActivity(state, row)` lifts `idle`/`unread`/`draft` to
+  `background` when the row itself carries an activity stamp (louder states win), the same claim and priority the
+  store applies.
+
 ## Code
 
 Paths below are relative to `apps/desktop/src/` (backend paths above are repository-relative).
+
+- `store/session-dot-state.ts` (`0124`): `withRowActivity`. `app/chat/sidebar/session-row.tsx` and
+  `app/chat/session-status-dot.tsx` wrap the store's state with it, so the stripe and the dot agree.
 
 - `lib/session-signatures.ts` (`0099`): `sameCronSignature` now compares `kanban_active`,
   `kanban_blocked`, `goal_active`, `cron_active` and `background_active` alongside content, pin and
@@ -172,6 +192,16 @@ The three 0099/0104 regression files below passed in the full-series verificatio
   test uses two 12 s windows below the store’s 30 s sweep, preserving the assertion that hidden
   panes skip their own 5 s timer while visible panes poll.
 
+- `0124` (passed on the full 0001–0127 series, Oct 17, 2026 PT):
+  - `tests/tui_gateway/test_projects_rpc.py::test_tree_rows_carry_session_activity_stamps`: `projects.tree`
+    previews and `projects.project_sessions` lanes carry `goal_active` and `kanban_active`/`kanban_blocked`; an idle
+    session carries none of the four (control). `cron_active` and `background_active` are only checked as absent.
+  - `store/session-dot-state.test.ts` "withRowActivity": each stamp lifts idle/unread/draft to background; louder
+    states and stamp-less rows are unchanged.
+  - `app/chat/sidebar/session-row.test.tsx` "SidebarSessionRow own activity stamps": a row not in `$sessions` with
+    `goal_active`, `kanban_active` or `background_active` shows no green stripe; with no stamps it shows done.
+  - Untested: the all-profiles REST project tree (same `_project_tree_inputs`, but no test calls it) and the status
+    dot's use of `withRowActivity` (only the row stripe is rendered in tests).
 - `store/session-dot-state.test.ts`: `sessionStatusStripe`; "kanban work in flight
   (`$kanbanBusySessionIds`)" and "standing goal in flight (`$goalActiveSessionIds`)" (background not done,
   back to done when the work ends, yields to a live turn), and the same three cases in "backend-registered
@@ -213,6 +243,9 @@ its hunks sit next to the goal code in `session-dot-state.ts`, `types/hermes.ts`
 Hermes processes from erasing each other's entries there; it does not need `0069` to apply. `0089` is a two-file change to `session-row.tsx` and its test; it drops the row's use of `showsRunningArc` but leaves that helper in `session-dot-state.ts`. `0091` changes one helper in `tui_gateway/server.py` plus a test and needs no Desktop change.
 `0094` changes the backend reaper. Apply `0095` after `0092`
 (it extends `sessionStatusStripe`'s `kanbanBlocked` signature) and after `0051`/`0070` (adjacent router lines).
+`0124` needs the four annotators from `0044`/`0051`/`0070`/`0095` and the project tree from
+[multi-gateway-projects.md](multi-gateway-projects.md). Verified: 0001–0127 apply with `git am -3` at merge-base
+`4957bbd0a0` (Oct 17, 2026 PT).
 
 ## Gotchas
 
@@ -240,6 +273,8 @@ Hermes processes from erasing each other's entries there; it does not need `0069
 - Background ownership is only as good as `processes.json`: without `0069`, a process missing from the file
   and not in this backend's registry leaves the row green.
 - The `kanbanTasks` tooltip is untranslated outside English.
+- `0124`: a project-tree row's stamps refresh with the tree fetch, not the session-list poll, so they can lag
+  longer than a recents row's.
 
 ## Could this be a plugin instead?
 

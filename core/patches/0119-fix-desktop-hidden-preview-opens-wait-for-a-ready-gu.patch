@@ -1,0 +1,915 @@
+From f1848c45dc7d00357e488d1f9206f0e26b572a1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:35:34 -0700
+Subject: [PATCH] fix(desktop): hidden preview opens wait for a ready guest and
+ host other profiles off view [daveey]
+
+preview.open acknowledged as soon as the pane registered its script runner,
+which happens before Electron attaches the guest; the next read/act could
+throw 'preview webview is not ready'. The pane now publishes the guest's
+lifecycle (loading / dom-ready / main-frame failure) and the open waits for a
+fresh dom-ready for the page it asked for, or fails with the load error.
+
+A hidden chat of a profile not in view used to be refused. Its tab now joins
+its own profile's bucket and mounts parked off view ($offViewPreviewTabs):
+the viewed profile's rail, drawer and pins never see it, its owner's
+read/act reach it, and focusing that chat later shows the same guest.
+
+Born-parked hosts get a 1280x800 kept size: a 0x0 guest has a 0x0 viewport
+where trusted input never lands (verified in an isolated Electron run).
+---
+ .../app/chat/preview-open-readiness.test.tsx  | 243 ++++++++++++++++++
+ .../app/chat/preview-tile-live-body.test.tsx  |   3 +
+ apps/desktop/src/app/chat/preview-tile.tsx    |  21 +-
+ .../chat/right-rail/preview-guest-ready.ts    |  42 +++
+ .../src/app/chat/right-rail/preview-pane.tsx  |  49 +++-
+ .../chat/right-rail/preview-script-runner.ts  |   4 -
+ .../src/app/chat/right-rail/preview.tsx       |   6 +-
+ .../gateway-event/server-requests.test.ts     |   2 +-
+ .../gateway-event/server-requests.ts          |  85 ++++--
+ .../tree/renderer/keep-alive-panes.tsx        |  14 +-
+ apps/desktop/src/store/preview.ts             |  98 ++++++-
+ 11 files changed, 523 insertions(+), 44 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/preview-open-readiness.test.tsx
+ create mode 100644 apps/desktop/src/app/chat/right-rail/preview-guest-ready.ts
+
+diff --git a/apps/desktop/src/app/chat/preview-open-readiness.test.tsx b/apps/desktop/src/app/chat/preview-open-readiness.test.tsx
+new file mode 100644
+index 0000000000..7af61e7b3c
+--- /dev/null
++++ b/apps/desktop/src/app/chat/preview-open-readiness.test.tsx
+@@ -0,0 +1,243 @@
++import { act, cleanup, render, waitFor } from '@testing-library/react'
++import { createElement } from 'react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import { group } from '@/components/pane-shell/tree/model'
++import { LayoutTreeRoot } from '@/components/pane-shell/tree/renderer'
++import { declareDefaultTree, treePanesWithPrefix, watchContributedPanes } from '@/components/pane-shell/tree/store'
++import { registry } from '@/contrib/registry'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $previewTabs, $visiblePreviewTabs, setPreviewScope } from '@/store/preview'
++import { $selectedStoredSessionId } from '@/store/session'
++import { $sessionStates, recordSessionEventScope } from '@/store/session-states'
++import { stubMenuDomApis } from '@/test/jsdom'
++
++import {
++  handleServerRequest,
++  type ServerRequestContext
++} from '../session/hooks/use-message-stream/gateway-event/server-requests'
++
++import { watchPreviewTiles } from './preview-tile'
++
++// The REAL PreviewTilePane lifecycle: the pane creates a <webview>, registers
++// its reader/runner at once, and the guest only becomes usable at dom-ready.
++// An acknowledgement before that is a lie the agent's next read trips over.
++vi.mock('./right-rail/real-profile-consent-dialog', () => ({
++  RealProfileConsentDialog: () => null
++}))
++
++class ResizeObserverStub {
++  observe() {}
++  unobserve() {}
++  disconnect() {}
++}
++
++const disconnected: Element[] = []
++const originalRemove = Element.prototype.remove
++
++beforeEach(() => {
++  disconnected.length = 0
++  vi.stubGlobal('ResizeObserver', ResizeObserverStub)
++  vi.stubGlobal('CSS', { ...globalThis.CSS, escape: (value: string) => value })
++  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
++    window.setTimeout(() => callback(Date.now()), 0)
++  )
++  vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id))
++
++  Element.prototype.remove = function remove(this: Element) {
++    if (this.tagName === 'WEBVIEW') {
++      disconnected.push(this)
++    }
++
++    originalRemove.call(this)
++  }
++
++  stubMenuDomApis()
++})
++
++afterEach(() => {
++  cleanup()
++  Element.prototype.remove = originalRemove
++  vi.unstubAllGlobals()
++})
++
++let seq = 0
++
++function setupTree() {
++  registry.register({
++    area: 'panes',
++    data: { placement: 'main', uncloseable: true },
++    id: 'workspace',
++    render: () => null,
++    title: 'workspace'
++  })
++  declareDefaultTree(group(['workspace'], { active: 'workspace', id: 'grp-main' }))
++  watchContributedPanes()
++  watchPreviewTiles()
++}
++
++function deps(active: string) {
++  return {
++    activeSessionIdRef: { current: active },
++    sessionInterrupted: () => false,
++    updateSessionState: vi.fn(),
++    upsertToolCall: vi.fn(),
++    sessionStateByRuntimeIdRef: { current: new Map() }
++  } as unknown as ServerRequestContext['deps']
++}
++
++function send(method: string, params: Record<string, unknown>, active: string, profile = 'default') {
++  const respond = vi.fn()
++  seq += 1
++  handleServerRequest(
++    { id: `${method}-${seq}`, method, profile, params, respond, fail: vi.fn(), decline: vi.fn() },
++    deps(active),
++    active
++  )
++
++  return respond
++}
++
++type Guest = HTMLElement & { executeJavaScript?: (code: string) => Promise<unknown> }
++
++const guests = (root: ParentNode) => new Set(root.querySelectorAll<Guest>('webview'))
++
++/** The webview the open just created (earlier tests' parked guests persist in
++ *  the module-level stores). */
++async function newGuest(root: ParentNode, before: Set<Guest>): Promise<Guest> {
++  return waitFor(() => {
++    const fresh = [...guests(root)].filter(guest => !before.has(guest))
++    expect(fresh).toHaveLength(1)
++
++    return fresh[0]!
++  })
++}
++
++const value = (respond: ReturnType<typeof vi.fn>) => JSON.parse(respond.mock.calls[0]![0].value)
++
++/** Make a webview behave like an attached Electron guest showing `text`. */
++function attach(webview: Guest, text: string) {
++  webview.executeJavaScript = async (code: string) =>
++    code.includes('innerText') ? text : JSON.stringify({ success: true, elements: [{ ref: 'e1', text: 'Continue' }] })
++  Object.assign(webview, { getTitle: () => 'Page', getURL: () => 'https://a.example/' })
++  webview.dispatchEvent(new Event('dom-ready'))
++}
++
++it('acknowledges a hidden open only once its guest is ready, then reads it', async () => {
++  setupTree()
++  $selectedStoredSessionId.set('ready-b')
++  $sessionStates.set({ 'ready-a': createClientSessionState('ready-a') })
++  const { container } = render(createElement(LayoutTreeRoot))
++
++  const before = guests(container)
++  let respond!: ReturnType<typeof vi.fn>
++  await act(async () => {
++    respond = send('preview.open', { session_id: 'ready-a', url: 'https://a.example', label: 'A' }, 'ready-b')
++  })
++
++  const webview = await newGuest(container, before)
++
++  // A page never on screen still gets a real viewport: 0x0 has nothing to click.
++  expect(webview.closest<HTMLElement>('[data-pane-host]')!.style.width).toContain('1280px')
++
++  // The reader/runner are registered already, but the guest has not attached.
++  await new Promise(resolve => setTimeout(resolve, 150))
++  expect(respond).not.toHaveBeenCalled()
++
++  act(() => attach(webview, 'Hidden page text'))
++  await waitFor(() => expect(respond).toHaveBeenCalled())
++  expect(value(respond)).toMatchObject({ success: true, url: 'https://a.example' })
++  expect($visiblePreviewTabs.get()).toEqual([])
++
++  let read!: ReturnType<typeof vi.fn>
++  await act(async () => {
++    read = send('preview.read', { session_id: 'ready-a' }, 'ready-b')
++  })
++  await waitFor(() => expect(read).toHaveBeenCalled())
++  expect(value(read)).toMatchObject({ text: 'Hidden page text' })
++})
++
++it('fails a hidden open whose main-frame load fails instead of acknowledging it', async () => {
++  setupTree()
++  $selectedStoredSessionId.set('fail-b')
++  $sessionStates.set({ 'fail-a': createClientSessionState('fail-a') })
++  const { container } = render(createElement(LayoutTreeRoot))
++
++  const before = guests(container)
++  let respond!: ReturnType<typeof vi.fn>
++  await act(async () => {
++    respond = send('preview.open', { session_id: 'fail-a', url: 'https://down.example' }, 'fail-b')
++  })
++
++  const webview = await newGuest(container, before)
++
++  act(() => {
++    webview.dispatchEvent(
++      Object.assign(new Event('did-fail-load'), {
++        errorCode: -105,
++        errorDescription: 'ERR_NAME_NOT_RESOLVED',
++        isMainFrame: true,
++        validatedURL: 'https://down.example/'
++      })
++    )
++  })
++
++  await waitFor(() => expect(respond).toHaveBeenCalled())
++  expect(value(respond)).toMatchObject({ success: false })
++  expect(value(respond).error).toContain('ERR_NAME_NOT_RESOLVED')
++})
++
++it("hosts another profile's hidden open off view and keeps the same guest when that chat is focused", async () => {
++  setupTree()
++  recordSessionEventScope({ connectionId: 'conn-1', profile: 'alpha', session_id: 'cross-a' })
++  recordSessionEventScope({ connectionId: 'conn-1', profile: 'beta', session_id: 'cross-b' })
++  setPreviewScope('beta')
++  $selectedStoredSessionId.set('cross-b')
++  $sessionStates.set({ 'cross-a': createClientSessionState('cross-a') })
++  const betaTabsBefore = $previewTabs.get()
++  const { container } = render(createElement(LayoutTreeRoot))
++
++  const before = guests(container)
++  let respond!: ReturnType<typeof vi.fn>
++  await act(async () => {
++    respond = send('preview.open', { session_id: 'cross-a', url: 'https://a.example', label: 'A' }, 'cross-b', 'alpha')
++  })
++
++  const webview = await newGuest(container, before)
++
++  act(() => attach(webview, 'Alpha page text'))
++  await waitFor(() => expect(respond).toHaveBeenCalled())
++  expect(value(respond)).toMatchObject({ success: true })
++
++  // Beta's rail never sees alpha's tab, and nothing in beta's drawer moved.
++  expect($previewTabs.get()).toEqual(betaTabsBefore)
++  expect($visiblePreviewTabs.get()).toEqual([])
++  expect(webview.closest('[inert]')).not.toBeNull()
++
++  let read!: ReturnType<typeof vi.fn>
++  await act(async () => {
++    read = send('preview.read', { session_id: 'cross-a' }, 'cross-b', 'alpha')
++  })
++  await waitFor(() => expect(read).toHaveBeenCalled())
++  expect(value(read)).toMatchObject({ text: 'Alpha page text' })
++
++  // The user focuses A: the rail re-homes onto alpha and shows the SAME guest.
++  act(() => {
++    setPreviewScope('alpha')
++    $selectedStoredSessionId.set('cross-a')
++  })
++  await waitFor(() => expect(treePanesWithPrefix('preview-tile:')).toHaveLength(1))
++  expect($visiblePreviewTabs.get().map(tab => tab.sessionId)).toEqual(['cross-a'])
++  expect([...guests(container)].filter(guest => !before.has(guest))).toEqual([webview])
++  expect(webview.isConnected).toBe(true)
++  expect(disconnected).not.toContain(webview)
++  expect(webview.closest('[inert]')).toBeNull()
++
++  // And leaving alpha again keeps it parked, not destroyed.
++  act(() => {
++    setPreviewScope('beta')
++    $selectedStoredSessionId.set('cross-b')
++  })
++  expect(webview.isConnected).toBe(true)
++  expect(disconnected).not.toContain(webview)
++})
+diff --git a/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx b/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx
+index cdd13598b2..b0ed2aaeef 100644
+--- a/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx
++++ b/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx
+@@ -18,6 +18,7 @@ import {
+ } from '../session/hooks/use-message-stream/gateway-event/server-requests'
+ 
+ import { watchPreviewTiles } from './preview-tile'
++import { setPreviewGuestState } from './right-rail/preview-guest-ready'
+ import { registerPreviewPageReader } from './right-rail/preview-reader'
+ import { registerPreviewScriptRunner } from './right-rail/preview-script-runner'
+ 
+@@ -41,6 +42,8 @@ vi.mock('./right-rail/preview', () => ({
+   PreviewTilePane: ({ tabId }: { tabId: string }) => {
+     useEffect(() => {
+       mounts.set(tabId, (mounts.get(tabId) ?? 0) + 1)
++      // The stand-in guest is attached at once (the real pane reports dom-ready).
++      setPreviewGuestState(tabId, { status: 'ready' })
+ 
+       const stopRead = registerPreviewPageReader(tabId, async () => ({
+         text: 'Hidden page text',
+diff --git a/apps/desktop/src/app/chat/preview-tile.tsx b/apps/desktop/src/app/chat/preview-tile.tsx
+index 38b4c21c32..ee8dab40a8 100644
+--- a/apps/desktop/src/app/chat/preview-tile.tsx
++++ b/apps/desktop/src/app/chat/preview-tile.tsx
+@@ -30,6 +30,7 @@ import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '
+ import {
+   $browserPages,
+   $dockedVisiblePreviewTabs,
++  $offViewPreviewTabs,
+   $poppedBrowserTabIds,
+   $previewTabs,
+   $requestedPreviewMounts,
+@@ -42,6 +43,7 @@ import {
+   newBrowserTab,
+   popOutBrowserTab,
+   preferredVisibleTabId,
++  previewTabById,
+   type PreviewTarget,
+   setPreviewTabPinned
+ } from '@/store/preview'
+@@ -54,7 +56,7 @@ import { forgetPreviewConsole } from './right-rail/preview-console-store'
+ 
+ /** The target behind a tile id, or null once its tab is gone. */
+ function targetFor(tabId: string): PreviewTarget | null {
+-  return $previewTabs.get().find(tab => tab.id === tabId)?.target ?? null
++  return previewTabById(tabId)?.target ?? null
+ }
+ 
+ /** Schemes that are not a page the user's default browser can usefully open
+@@ -348,8 +350,21 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
+   // to that session shows the same guest, not a reload; a popped-out
+   // Browser's pane leaves the docked tree for good.
+   source: $dockedVisiblePreviewTabs,
+-  initiallyParked: computed([$previewTabs, $poppedBrowserTabIds, $requestedPreviewMounts], (tabs, popped, requested) =>
+-    [...requested].flatMap(id => tabs.filter(tab => tab.id === id && !popped.has(id))).slice(-HIDDEN_LIVE_PREVIEW_LIMIT)
++  // Agent opens for hidden sessions mount parked before they are ever shown —
++  // another profile's included (`$offViewPreviewTabs`), so its page loads
++  // without entering this profile's rail.
++  initiallyParked: computed(
++    [$previewTabs, $offViewPreviewTabs, $poppedBrowserTabIds, $requestedPreviewMounts],
++    (tabs, offView, popped, requested) => {
++      const known = new Map<string, (typeof tabs)[number]>([...offView, ...tabs].map(tab => [tab.id, tab]))
++
++      return [...requested].flatMap(id => {
++        const tab = known.get(id)
++
++        return tab && !popped.has(tab.id) ? [tab] : []
++      })
++        .slice(-HIDDEN_LIVE_PREVIEW_LIMIT)
++    }
+   ),
+   retain: retainHiddenPreview,
+   retainLimit: HIDDEN_LIVE_PREVIEW_LIMIT,
+diff --git a/apps/desktop/src/app/chat/right-rail/preview-guest-ready.ts b/apps/desktop/src/app/chat/right-rail/preview-guest-ready.ts
+new file mode 100644
+index 0000000000..45b4298aef
+--- /dev/null
++++ b/apps/desktop/src/app/chat/right-rail/preview-guest-ready.ts
+@@ -0,0 +1,42 @@
++/** Whether a pane's live guest can answer an agent yet. The page reader and
++ *  script runner are registered the moment the pane mounts, long before
++ *  Electron attaches the guest and fires dom-ready; an `open` acknowledged on
++ *  registration alone hands the agent a page that throws "not ready" (or runs
++ *  script into a document that is about to be replaced). The pane publishes
++ *  the guest's real lifecycle here; `epoch` advances on every change so a
++ *  waiter can tell a fresh dom-ready from the previous page's. */
++export type PreviewGuestState =
++  | { epoch: number; status: 'failed'; error: string }
++  | { epoch: number; status: 'loading' }
++  | { epoch: number; status: 'ready' }
++
++type GuestStatus = { status: 'failed'; error: string } | { status: 'loading' } | { status: 'ready' }
++
++const states = new Map<string, PreviewGuestState>()
++let epoch = 0
++
++export function setPreviewGuestState(tabId: string, next: GuestStatus): void {
++  epoch += 1
++  states.set(tabId, { ...next, epoch })
++}
++
++/** A navigation that needed no load (the guest already shows the address)
++ *  still answers a waiter for "the page after this open". */
++export function touchPreviewGuestReady(tabId: string): void {
++  if (states.get(tabId)?.status === 'ready') {
++    setPreviewGuestState(tabId, { status: 'ready' })
++  }
++}
++
++export function clearPreviewGuestState(tabId: string): void {
++  states.delete(tabId)
++}
++
++export function previewGuestState(tabId: string): PreviewGuestState | undefined {
++  return states.get(tabId)
++}
++
++/** The current epoch counter, for a waiter to snapshot before it acts. */
++export function previewGuestEpoch(): number {
++  return epoch
++}
+diff --git a/apps/desktop/src/app/chat/right-rail/preview-pane.tsx b/apps/desktop/src/app/chat/right-rail/preview-pane.tsx
+index 5ca86b1e12..746a3a784a 100644
+--- a/apps/desktop/src/app/chat/right-rail/preview-pane.tsx
++++ b/apps/desktop/src/app/chat/right-rail/preview-pane.tsx
+@@ -71,6 +71,7 @@ import { type ConsoleEntry } from './preview-console-state'
+ import { previewConsoleState } from './preview-console-store'
+ import { LocalFilePreview, PreviewEmptyState, PreviewModeSwitcher } from './preview-file'
+ import { usePreviewGuestOffscreen } from './preview-guest-offscreen'
++import { clearPreviewGuestState, setPreviewGuestState, touchPreviewGuestReady } from './preview-guest-ready'
+ import { type PreviewInputEvent, registerPreviewInput, toWebviewInputSpace } from './preview-input'
+ import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
+ import { registerPreviewPageReader } from './preview-reader'
+@@ -1247,6 +1248,19 @@ export function PreviewPane({
+         url: detail.validatedURL || guestPage(webview, liveUrlRef.current).url
+       })
+       setLoading(false)
++
++      if (tabId) {
++        setPreviewGuestState(tabId, {
++          error: copy.loadFailedConsole(errorCode, detail.errorDescription || detail.validatedURL || copy.unknownError),
++          status: 'failed'
++        })
++      }
++    }
++
++    const onGuestReady = () => {
++      if (tabId) {
++        setPreviewGuestState(tabId, { status: 'ready' })
++      }
+     }
+ 
+     const onStart = () => setLoading(true)
+@@ -1365,6 +1379,12 @@ export function PreviewPane({
+     // #101880: never let a guest reach the native print panel.
+     webview.addEventListener('dom-ready', armPrintGuard)
+     webview.addEventListener('dom-ready', noteGuestReady)
++    webview.addEventListener('dom-ready', onGuestReady)
++
++    if (tabId) {
++      setPreviewGuestState(tabId, { status: 'loading' })
++    }
++
+     host.appendChild(webview)
+     webviewRef.current = webview
+ 
+@@ -1383,7 +1403,13 @@ export function PreviewPane({
+       webview.removeEventListener('page-title-updated', notePage)
+       webview.removeEventListener('dom-ready', armPrintGuard)
+       webview.removeEventListener('dom-ready', noteGuestReady)
++      webview.removeEventListener('dom-ready', onGuestReady)
+       webview.remove()
++
++      if (tabId) {
++        clearPreviewGuestState(tabId)
++      }
++
+       setAnnotate(session => (session.mode ? { ...endAnnotateMode(session), stack: emptyAnnotateStack() } : session))
+     }
+   }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, noteGuestReady, tabId, target.kind])
+@@ -1409,9 +1435,17 @@ export function PreviewPane({
+     const nextUrl = targetUrlRef.current
+ 
+     if (liveUrlRef.current === nextUrl) {
++      if (tabId) {
++        touchPreviewGuestReady(tabId)
++      }
++
+       return
+     }
+ 
++    if (tabId) {
++      setPreviewGuestState(tabId, { status: 'loading' })
++    }
++
+     annotateLoopRef.current += 1
+     const guest = annotateGuest()
+ 
+@@ -1427,13 +1461,18 @@ export function PreviewPane({
+     setLoading(true)
+     setCurrentUrl(nextUrl)
+     void webview.loadURL?.(nextUrl)?.catch((error: unknown) => {
+-      setLoadError({
+-        description: error instanceof Error ? error.message : copy.unreachableDescription,
+-        url: nextUrl
+-      })
++      const description = error instanceof Error ? error.message : copy.unreachableDescription
++
++      setLoadError({ description, url: nextUrl })
+       setLoading(false)
++
++      // An aborted load was superseded (a redirect, a newer navigation); the
++      // page that replaced it reports its own dom-ready or failure.
++      if (tabId && !description.includes('ERR_ABORTED')) {
++        setPreviewGuestState(tabId, { error: description, status: 'failed' })
++      }
+     })
+-  }, [annotateGuest, consoleState, copy.unreachableDescription, isRemoteHtml, isWebPreview, target.url])
++  }, [annotateGuest, consoleState, copy.unreachableDescription, isRemoteHtml, isWebPreview, tabId, target.url])
+ 
+   return (
+     <aside
+diff --git a/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts b/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts
+index 5fa377be86..b2b52f782e 100644
+--- a/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts
++++ b/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts
+@@ -19,10 +19,6 @@ export type PreviewScriptRunner = (code: string) => Promise<unknown>
+ 
+ const runners = new Map<string, PreviewScriptRunner>()
+ 
+-export function hasPreviewScriptRunner(tabId: string): boolean {
+-  return runners.has(tabId)
+-}
+-
+ /** Register a live preview's script runner; returns an idempotent unregister. */
+ export function registerPreviewScriptRunner(tabId: string, runner: PreviewScriptRunner): () => void {
+   runners.set(tabId, runner)
+diff --git a/apps/desktop/src/app/chat/right-rail/preview.tsx b/apps/desktop/src/app/chat/right-rail/preview.tsx
+index f6412cd1a6..06edfd2edd 100644
+--- a/apps/desktop/src/app/chat/right-rail/preview.tsx
++++ b/apps/desktop/src/app/chat/right-rail/preview.tsx
+@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
+ import { useEffect } from 'react'
+ 
+ import { $restartPreviewServer } from '@/app/contrib/panes'
+-import { $previewReloadRequest, $previewTabs, adoptPersistedBrowserTab } from '@/store/preview'
++import { $offViewPreviewTabs, $previewReloadRequest, $previewTabs, adoptPersistedBrowserTab } from '@/store/preview'
+ import { isBrowserWindow } from '@/store/windows'
+ 
+ import { registerPreviewPaneMount } from './preview-mount'
+@@ -28,6 +28,8 @@ interface PreviewTilePaneProps {
+ export function PreviewTilePane({ onClose, tabId }: PreviewTilePaneProps) {
+   const previewReloadRequest = useStore($previewReloadRequest)
+   const previewTabs = useStore($previewTabs)
++  // Another profile's hidden agent page, parked while this profile is in view.
++  const offViewTabs = useStore($offViewPreviewTabs)
+   const restartPreviewServer = useStore($restartPreviewServer)
+ 
+   // A popped-out Browser is a fresh renderer: no session ever pushes a scope
+@@ -40,7 +42,7 @@ export function PreviewTilePane({ onClose, tabId }: PreviewTilePaneProps) {
+     }
+   }, [previewTabs, tabId])
+ 
+-  const target = previewTabs.find(tab => tab.id === tabId)?.target
++  const target = (previewTabs.find(tab => tab.id === tabId) ?? offViewTabs.find(tab => tab.id === tabId))?.target
+ 
+   useEffect(() => (target ? registerPreviewPaneMount(tabId) : undefined), [tabId, target])
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+index 343633cbe2..31bef26d32 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+@@ -80,7 +80,7 @@ describe('acknowledged preview open', () => {
+     const result = deliver('preview.open', { session_id: 'hidden', url: 'https://example.com' }, 'foreground')
+     expect(result.handled).toBe(true)
+     expect(result.respond).not.toHaveBeenCalled()
+-    await vi.advanceTimersByTimeAsync(6000)
++    await vi.advanceTimersByTimeAsync(13_000)
+     expect(result.respond).toHaveBeenCalledWith({ value: expect.stringContaining('"success":false') })
+     closeRightRail()
+     vi.useRealTimers()
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+index 8cf57235d5..84fbb2ea90 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+@@ -1,6 +1,7 @@
+ import { JSON_RPC_INTERNAL_ERROR } from '@hermes/shared'
+ 
+ import { backgroundPreviewTabFor } from '@/app/chat/right-rail/preview-active-tab'
++import { previewGuestEpoch, previewGuestState } from '@/app/chat/right-rail/preview-guest-ready'
+ import { hasPreviewPaneMount } from '@/app/chat/right-rail/preview-mount'
+ import {
+   hasLivePreviewSurface,
+@@ -8,7 +9,6 @@ import {
+   requestPopoutPreviewRead
+ } from '@/app/chat/right-rail/preview-popout-bridge'
+ import { readActivePreview } from '@/app/chat/right-rail/preview-reader'
+-import { hasPreviewScriptRunner } from '@/app/chat/right-rail/preview-script-runner'
+ import {
+   abortPreviewTyping,
+   releasePreviewTyping,
+@@ -25,7 +25,7 @@ import type { TourAction, TourStep } from '@/lib/tour'
+ import { type ClarifyRequest, normalizeQuestions, normalizeSetupChoose, setClarifyRequest } from '@/store/clarify'
+ import type { ScopedServerRequest } from '@/store/gateway'
+ import { dispatchNativeNotification } from '@/store/native-notifications'
+-import { openPreview, renderedHtmlTarget } from '@/store/preview'
++import { $offViewPreviewTabs, $previewTabs, openPreview, renderedHtmlTarget } from '@/store/preview'
+ import type { PreviewOwner } from '@/store/preview-ownership'
+ import {
+   receiveApprovalRequest,
+@@ -87,42 +87,83 @@ const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : und
+ const answerValue = (request: ScopedServerRequest, result: unknown) =>
+   request.respond({ value: result ? JSON.stringify(result) : '' })
+ 
++/** How long a hidden open may take to reach a usable page: under the tool's
++ *  15s server-request deadline, so the agent always hears this verdict. */
++const PREVIEW_OPEN_READY_MS = 12_000
++
++const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
++
++/** Wait until `tabId`'s guest can answer: dom-ready for the page this open
++ *  asked for (a reused tab steering to a new address must report a NEW
++ *  dom-ready, not the previous page's), or a mounted pane for surfaces with
++ *  no guest. A main-frame load failure ends the wait with that error. */
++async function waitForPreviewSurface(tabId: string, guest: boolean, sinceEpoch: number | null): Promise<void> {
++  const deadline = performance.now() + PREVIEW_OPEN_READY_MS
++
++  for (;;) {
++    if (!guest) {
++      if (hasPreviewPaneMount(tabId)) {
++        return
++      }
++    } else {
++      const state = previewGuestState(tabId)
++
++      if (state && (sinceEpoch === null || state.epoch > sinceEpoch)) {
++        if (state.status === 'ready') {
++          return
++        }
++
++        if (state.status === 'failed') {
++          throw new Error(state.error)
++        }
++      }
++    }
++
++    if (performance.now() >= deadline) {
++      throw new Error(guest ? 'Preview page did not finish loading before timeout.' : 'Preview surface did not mount before timeout.')
++    }
++
++    await sleep(25)
++  }
++}
++
+ const previewOpen: Handler = ({ request, sessionId }) => {
+   void (async () => {
+     try {
+-      if (!sessionId) {throw new Error('Preview open requires a session.')}
++      if (!sessionId) {
++        throw new Error('Preview open requires a session.')
++      }
++
+       const source = str(request.params.url).trim()
+       const label = str(request.params.label).trim()
+       const resolved = await normalizeOrLocalPreviewTarget(source)
+ 
+-      if (!resolved) {throw new Error('Unsupported preview target.')}
++      if (!resolved) {
++        throw new Error('Unsupported preview target.')
++      }
++
+       const url = resolved.kind === 'url' ? await reachablePreviewUrl(resolved.url) : resolved.url
++      const target = renderedHtmlTarget({ ...resolved, url, label: label || resolved.label })
+ 
++      // The same owner (and so the same profile bucket) the follow-up
++      // read/act requests resolve, so they find the page this open mounted.
+       const owner = {
+-        profile: request.profile || previewScopeForRuntime(sessionId),
++        profile: previewScopeForRuntime(sessionId),
+         runtimeId: sessionId,
+         sessionId: storedSessionIdForRuntimeId(sessionId)
+       }
+ 
+-      const tabId = openPreview(
+-        renderedHtmlTarget({ ...resolved, url, label: label || resolved.label }),
+-        owner.sessionId,
+-        sessionId,
+-        owner.profile,
+-        true
+-      )
+-
+-      const deadline = performance.now() + 5000
+-      const isWeb = resolved.kind === 'url' || resolved.previewKind === 'html'
+-
+-      while (!(isWeb ? hasPreviewScriptRunner(tabId) : hasPreviewPaneMount(tabId))) {
+-        if (performance.now() >= deadline) {throw new Error('Preview surface did not mount before timeout.')}
+-        await new Promise(resolve => setTimeout(resolve, 25))
+-      }
+-
++      const priorTabs = [...$previewTabs.get(), ...$offViewPreviewTabs.get()]
++      const epoch = previewGuestEpoch()
++      const tabId = openPreview(target, owner.sessionId, sessionId, owner.profile, true)
++      // A reused tab already showing this address loads nothing new: its
++      // current guest state is the answer. Anything else waits for a fresh one.
++      const unchanged = priorTabs.find(tab => tab.id === tabId)?.target.url === target.url
++      const guest = (target.kind === 'url' || target.previewKind === 'html') && !target.dataUrl && !target.transient
++      await waitForPreviewSurface(tabId, guest, unchanged ? null : epoch)
+       answerValue(request, { success: true, url: source, label })
+     } catch (error) {
+-      answerValue(request, { success: false, error: String(error) })
++      answerValue(request, { success: false, error: error instanceof Error ? error.message : String(error) })
+     }
+   })()
+ }
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx
+index bfed7620bd..885694d9b3 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx
+@@ -31,6 +31,10 @@ interface Placement {
+   groupId: string
+   headerVisible: boolean
+   visible: boolean
++  /** Mounted parked before it was ever placed (an agent's page for a chat
++   *  that is not on screen): it has no measured size to keep, and a 0×0 guest
++   *  has a 0×0 viewport, where nothing on the page can be located or clicked. */
++  bornParked?: boolean
+   overlay?: boolean
+   onMouseLeave?: MouseEventHandler<HTMLDivElement>
+ }
+@@ -39,6 +43,10 @@ type Placements = ReadonlyMap<string, Placement>
+ type PlacePane = (paneId: string, placement: Placement) => () => void
+ const PlacementContext = createContext<PlacePane | null>(null)
+ 
++/** A laptop-sized viewport for a page that has never been on screen. */
++const BORN_PARKED_WIDTH = '1280px'
++const BORN_PARKED_HEIGHT = '800px'
++
+ /** Own the live bodies outside the replaceable split/group tree. Neither React
+  * remounts nor DOM moves are safe for a native guest: even moveBefore destroys
+  * an Electron webview's guest. Only its CSS anchor and contexts may change. */
+@@ -82,7 +90,7 @@ export function KeepAlivePanes({ children }: { children: ReactNode }) {
+ 
+       for (const id of parked) {
+         if (present.has(id) && !next.has(id)) {
+-          next.set(id, { anchor: '', groupId: '', headerVisible: false, visible: false })
++          next.set(id, { anchor: '', bornParked: true, groupId: '', headerVisible: false, visible: false })
+         }
+       }
+ 
+@@ -168,8 +176,8 @@ const KeepAlivePaneHost = memo(function KeepAlivePaneHost({ pane, placement, epo
+           positionAnchor: placement.anchor,
+           left: 'anchor(left)',
+           top: 'anchor(top)',
+-          width: placement.visible ? 'anchor-size(width)' : 'var(--pane-kept-width, 0px)',
+-          height: placement.visible ? 'anchor-size(height)' : 'var(--pane-kept-height, 0px)'
++          width: placement.visible ? 'anchor-size(width)' : `var(--pane-kept-width, ${placement.bornParked ? BORN_PARKED_WIDTH : '0px'})`,
++          height: placement.visible ? 'anchor-size(height)' : `var(--pane-kept-height, ${placement.bornParked ? BORN_PARKED_HEIGHT : '0px'})`
+         } as CSSProperties
+       }
+     >
+diff --git a/apps/desktop/src/store/preview.ts b/apps/desktop/src/store/preview.ts
+index 1c9557d242..241a2894c7 100644
+--- a/apps/desktop/src/store/preview.ts
++++ b/apps/desktop/src/store/preview.ts
+@@ -240,6 +240,8 @@ function persistTabs() {
+       ? null
+       : JSON.stringify(buckets, (key, value) => (key === 'dataUrl' ? undefined : value))
+   )
++  // Every bucket edit lands here; a parked off-view page must follow it.
++  syncOffViewTabs()
+ }
+ 
+ // Tabs are scoped to THE CHAT ON SCREEN, not to the window's gateway socket.
+@@ -262,6 +264,37 @@ export const $previewTabs = atom<PreviewTab[]>([])
+  * tabs must remain lazy; the mirror applies the same bounded retention policy. */
+ export const $requestedPreviewMounts = atom<ReadonlySet<string>>(new Set())
+ 
++/** Agent-opened tabs of profiles NOT in view, still mounted (parked) so a
++ *  hidden chat of another profile keeps a live page. They stay in their own
++ *  profile's bucket — never in `$previewTabs`, so the viewed profile's rail,
++ *  drawer and agents never see them; only their owner's read/act requests
++ *  (`previewTabsFor`) and the pane host resolve them. */
++export const $offViewPreviewTabs = atom<readonly PreviewTab[]>([])
++
++function offViewTabsFor(key: string): PreviewTab[] {
++  const requested = $requestedPreviewMounts.get()
++
++  return Object.entries(tabsByProfile)
++    .filter(([bucket]) => bucket !== key)
++    .flatMap(([, tabs]) => tabs.filter(tab => requested.has(tab.id)))
++}
++
++function syncOffViewTabs(): void {
++  const next = offViewTabsFor(viewKey)
++  const current = $offViewPreviewTabs.get()
++
++  if (next.length !== current.length || next.some((tab, index) => tab !== current[index])) {
++    $offViewPreviewTabs.set(next)
++  }
++}
++
++$requestedPreviewMounts.listen(syncOffViewTabs)
++
++/** The tab `tabId` names, in view or parked off view. */
++export function previewTabById(tabId: string): PreviewTab | undefined {
++  return $previewTabs.get().find(tab => tab.id === tabId) ?? $offViewPreviewTabs.get().find(tab => tab.id === tabId)
++}
++
+ // Adoption phase: emissions that carry storage THIS MODULE JUST READ, not a
+ // change. nanostores' subscribe fires immediately, and writing what was just
+ // read back is a data-loss clobber: every renderer boots against storage it
+@@ -315,8 +348,13 @@ function applyPreviewScope(next: string) {
+     persistTabs()
+   }
+ 
++  // A parked off-view page must never be absent from both lists, even for one
++  // notification: a pane whose tab vanishes is destroyed (its guest with it).
++  // Publish the union first, then the view, then the settled off-view list.
++  $offViewPreviewTabs.set([...new Set([...$offViewPreviewTabs.get(), ...offViewTabsFor(next)])])
+   viewKey = next
+   $previewTabs.set(tabsByProfile[next] ?? [])
++  syncOffViewTabs()
+ }
+ 
+ /** Drop one profile's rail. Delete counterpart of the tiles store's
+@@ -331,6 +369,7 @@ export function dropPreviewTabsForProfile(profile: string) {
+     $previewTabs.set([])
+   } else {
+     forgetGonePendingTabs()
++    syncOffViewTabs()
+   }
+ }
+ 
+@@ -366,6 +405,8 @@ export function migratePreviewTabsForProfile(oldProfile: string, newProfile: str
+   if (wasInView) {
+     $previewTabs.set(tabsByProfile[to] ?? [])
+   }
++
++  syncOffViewTabs()
+ }
+ 
+ if (typeof window !== 'undefined') {
+@@ -388,7 +429,15 @@ export function previewTabsFor(owner: PreviewOwner = $focusedStoredSessionId.get
+     return $previewTabs.get().filter(tab => tab.id === own)
+   }
+ 
+-  return bucketTabsFor($previewTabs.get(), ownerIdentity(owner), viewKey, viewKey)
++  const who = ownerIdentity(owner)
++  const inView = bucketTabsFor($previewTabs.get(), who, viewKey, viewKey)
++
++  if (!who.profile || who.profile === viewKey) {
++    return inView
++  }
++
++  // Another profile's agent also reaches its own pages parked off view.
++  return [...inView, ...bucketTabsFor($offViewPreviewTabs.get(), who, who.profile, viewKey).filter(tab => !tab.pinned)]
+ }
+ 
+ /** Ids of the tabs `owner` may see in ANY profile's rail, for scoping a
+@@ -941,8 +990,10 @@ export function openPreview(
+   profile?: null | string,
+   ownTabOnly = false
+ ) {
+-  if (ownTabOnly && profile && (normalizeProfileKey(profile) || 'default') !== viewKey) {
+-    throw new Error('Preview profile is not mounted in this window.')
++  const bucketKey = profile ? normalizeProfileKey(profile) || 'default' : viewKey
++
++  if (ownTabOnly && bucketKey !== viewKey) {
++    return openOffViewPreview(target, requestedOwner, runtimeId, bucketKey)
+   }
+ 
+   // Stamp the tip, not an alias: the alias map is memory-only, so a tab
+@@ -980,7 +1031,7 @@ export function openPreview(
+   }
+ 
+   if (ownTabOnly) {
+-    const openIds = new Set<string>(current.map(item => item.id))
++    const openIds = new Set<string>([...current, ...Object.values(tabsByProfile).flat()].map(item => item.id))
+     $requestedPreviewMounts.set(
+       new Set([...$requestedPreviewMounts.get()].filter(key => key !== id && openIds.has(key)).concat(id))
+     )
+@@ -1002,6 +1053,45 @@ export function openPreview(
+   return id
+ }
+ 
++/** `openPreview` for an agent of a profile that is not in view: the tab joins
++ *  that profile's own bucket and mounts parked off view (`$offViewPreviewTabs`),
++ *  so the viewed profile's rail, selection and pins are untouched. Reuse is
++ *  among the owner's own non-pinned tabs in that bucket. */
++function openOffViewPreview(
++  target: PreviewTarget,
++  requestedOwner: null | string,
++  runtimeId: null | string,
++  key: string
++): RightRailTabId {
++  const owner = currentSessionId(requestedOwner)
++  const bucket = tabsByProfile[key] ?? []
++
++  const own = bucketTabsFor(
++    bucket,
++    ownerIdentity({ profile: key, runtimeId: owner === null ? runtimeId : null, sessionId: owner }),
++    key,
++    viewKey
++  ).filter(tab => !tab.pinned)
++
++  const existing = target.kind === 'url' ? browserTabFor(own) : target.kind === 'file' ? fileTabFor(own, target) : undefined
++  const everyTab = [...$previewTabs.get(), ...Object.values(tabsByProfile).flat()]
++
++  const id =
++    existing?.id ?? (target.kind === 'url' ? mintBrowserTabId() : unusedTabId(previewTabId(target, owner), everyTab))
++
++  const tab: PreviewTab = { id, pinned: false, sessionId: owner ?? undefined, target: withRenderMode(target, existing?.target) }
++
++  setPendingRuntime(id, tab.sessionId == null ? runtimeId : null)
++  tabsByProfile[key] = existing ? bucket.map(item => (item === existing ? tab : item)) : [...bucket, tab]
++  persistTabs()
++  rememberActiveTab(owner, id)
++  // Publishing the mount request re-derives `$offViewPreviewTabs`.
++  $requestedPreviewMounts.set(new Set([...$requestedPreviewMounts.get()].filter(item => item !== id).concat(id)))
++  syncOffViewTabs()
++
++  return id
++}
++
+ const blankPage = (): PreviewTarget => ({ kind: 'url', label: 'Browser', source: 'about:blank', url: 'about:blank' })
+ 
+ /** Tombstone the tabs for a confirmed-missing file: keep them open this
+-- 
+2.54.0 (Apple Git-157)
+

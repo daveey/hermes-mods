@@ -1,0 +1,485 @@
+From 732b4140d791781ea17d38575e9c47667c468b0c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 10:34:21 -0700
+Subject: [PATCH] fix(kanban): reject unresolvable worktree workspaces at
+ create; block on first spawn [daveey]
+
+kanban_create / hermes kanban create now validate a non-project worktree
+workspace with the resolver's own rules (linked worktree, repo root, or a
+path whose parent is in a repo; no path -> board default_workdir) and return
+an error naming the fix (worktree:<repo root>, or git -C <repo> worktree add
+...), suggesting the sibling repo for <repo>-<slug> names.
+
+The resolver raises WorktreeWorkspaceConfigError for these deterministic
+cases; the dispatcher force-trips it (sticky) on the first spawn failure
+instead of burning the retry budget. Transient workspace errors still retry.
+---
+ hermes_cli/kanban.py                          |  39 ++--
+ hermes_cli/kanban_db.py                       |  14 ++
+ hermes_cli/kanban_db_dispatch.py              |   7 +
+ hermes_cli/kanban_db_workspace.py             |  88 ++++++++-
+ .../test_kanban_worktree_create_validation.py | 180 ++++++++++++++++++
+ tools/kanban_tools.py                         |   5 +-
+ tools/kanban_tools_schemas.py                 |   5 +-
+ 7 files changed, 312 insertions(+), 26 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_worktree_create_validation.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index efb5e454ef..46f19e0cb0 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -389,23 +389,28 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         idem_hit = bool(idem_key) and conn.execute(
+             "SELECT 1 FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1",
+             (idem_key,)).fetchone() is not None
+-        task_id = kb.create_task(
+-            conn, title=args.title, body=body, assignee=args.assignee, session_id=session_id,
+-            created_by=args.created_by or _profile_author(),
+-            workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+-            project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+-            idempotency_key=idem_key,
+-            max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
+-            provider_override=getattr(args, "provider_override", None),
+-            goal_mode=bool(getattr(args, "goal_mode", False)),
+-            goal_max_turns=getattr(args, "goal_max_turns", None),
+-            completion_contract=getattr(args, "completion_contract", None),
+-            initial_status=getattr(args, "initial_status", "running"),
+-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+-                             if in_worker else None),
+-        )
++        from hermes_cli.kanban_db_workspace import WorktreeWorkspaceConfigError
++        try:
++            task_id = kb.create_task(
++                conn, title=args.title, body=body, assignee=args.assignee, session_id=session_id,
++                created_by=args.created_by or _profile_author(),
++                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
++                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
++                parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
++                idempotency_key=idem_key,
++                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
++                max_retries=max_retries, model_override=getattr(args, "model_override", None),
++                provider_override=getattr(args, "provider_override", None),
++                goal_mode=bool(getattr(args, "goal_mode", False)),
++                goal_max_turns=getattr(args, "goal_max_turns", None),
++                completion_contract=getattr(args, "completion_contract", None),
++                initial_status=getattr(args, "initial_status", "running"),
++                creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
++                                 if in_worker else None),
++                validate_workspace=True,
++            )
++        except WorktreeWorkspaceConfigError as exc:
++            return _err(f"kanban: --workspace: {exc}", 2)
+         if session_key and not idem_hit:
+             # Same completion subscription the kanban_create tool adds, so the chat
+             # that shelled out hears when the card lands (and its row stays busy).
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index b7458ac554..de31ac6486 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1192,9 +1192,15 @@ def create_task(
+     project_source_task_id: Optional[str] = None,
+     creator_task_id: Optional[str] = None,
+     completion_contract: Optional[str] = None,
++    validate_workspace: bool = False,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
++    ``validate_workspace=True`` (agent/CLI create surfaces) rejects a non-project
++    ``worktree`` workspace that could never resolve at spawn with
++    ``WorktreeWorkspaceConfigError`` naming the fix, instead of letting the
++    dispatcher discover it later. [daveey]
++
+     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
+     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+     ``idempotency_key``: an existing non-archived task with the key is returned
+@@ -1257,6 +1263,14 @@ def create_task(
+         if row:
+             return row["id"]
+ 
++    if validate_workspace and workspace_kind == "worktree" and not project_id:
++        from hermes_cli.kanban_db_workspace import (
++            WorktreeWorkspaceConfigError, worktree_workspace_problem,
++        )
++        problem = worktree_workspace_problem(workspace_path, board=board)
++        if problem:
++            raise WorktreeWorkspaceConfigError(problem)
++
+     now = int(time.time())
+ 
+     # Only persistent kinds inherit the board ``default_workdir``: a scratch
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 20bd365cd2..bafcef9ded 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2170,9 +2170,16 @@ def _dispatch_lane_task(
+         else:
+             workspace = _kbw.resolve_workspace(claimed, board=board)
+     except Exception as exc:
++        # A misconfigured worktree (no repo to anchor it, relative path, board
++        # without default_workdir) fails identically on every retry: block on the
++        # first occurrence (sticky) with the reason instead of spending the
++        # retry budget. [daveey]
++        config_error = isinstance(exc, _kbw.WorktreeWorkspaceConfigError)
+         if _record_task_failure(
+             conn, claimed.id, f"workspace: {exc}",
+             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
++            force_trip=config_error,
++            event_payload_extra={"workspace_config_error": True} if config_error else None,
+         ):
+             result.auto_blocked.append(claimed.id)
+         return False
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index bf5d878fc0..f10e8088f8 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -622,6 +622,78 @@ def _maybe_emit_scratch_tip(
+ # Workspace resolution
+ # ---------------------------------------------------------------------------
+ 
++class WorktreeWorkspaceConfigError(ValueError):
++    """A ``worktree`` workspace that can never resolve as configured (no repo to
++    anchor it on, relative path, board without ``default_workdir``). Retrying the
++    spawn cannot fix it, so the dispatcher blocks on the first occurrence and
++    ``create_task(validate_workspace=True)`` rejects it up front. [daveey]"""
++
++
++def _sibling_repo_hint(requested: Path) -> Optional[Path]:
++    """For a sibling-worktree name like ``~/code/<repo>-<slug>``, the ``<repo>``
++    root it most likely meant (longest matching sibling that is a repo root)."""
++    parent = _nearest_existing_path(requested.parent)
++    if parent != requested.parent:
++        return None
++    best: Optional[Path] = None
++    try:
++        siblings = [p for p in parent.iterdir() if p.is_dir()]
++    except OSError:
++        return None
++    for sib in siblings:
++        if not requested.name.startswith(sib.name + "-"):
++            continue
++        if best is not None and len(sib.name) <= len(best.name):
++            continue
++        top = _git_toplevel(sib)
++        if top is not None and _path_key(top) == _path_key(sib.resolve(strict=False)):
++            best = sib
++    return best
++
++
++def worktree_workspace_problem(
++    workspace_path: Optional[str], *, board: Optional[str] = None,
++) -> Optional[str]:
++    """Why a ``worktree`` workspace with this path would fail to resolve at
++    spawn, or ``None`` when it resolves. Same acceptance rules as
++    :func:`_resolve_worktree_workspace`, without creating anything: an existing
++    linked worktree, a repo root, or a path whose parent is inside a repo; no
++    path -> the board's ``default_workdir`` must be an absolute path in a repo."""
++    if not workspace_path:
++        board_slug = board if board else _kb.get_current_board()
++        board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
++        if not board_default:
++            return (
++                f"workspace_kind=worktree with no workspace_path needs a board default_workdir, "
++                f"and board {board_slug!r} has none. Pass workspace_path=<absolute git repo root> "
++                "(the dispatcher then creates <repo>/.worktrees/<task-id>)."
++            )
++        anchor = Path(board_default).expanduser()
++        if not anchor.is_absolute() or _git_toplevel(anchor) is None:
++            return (
++                f"board {board_slug!r} default_workdir {board_default!r} is not an absolute path "
++                "inside a git repo. Pass workspace_path=<absolute git repo root> instead."
++            )
++        return None
++    requested = Path(workspace_path).expanduser()
++    if not requested.is_absolute():
++        return f"worktree workspace_path {workspace_path!r} is not absolute; use an absolute path"
++    if requested.exists() and _is_linked_worktree_checkout(requested):
++        return None
++    if _git_toplevel(requested) is not None:
++        return None
++    if _repo_root_for_worktree_target(requested.parent) is not None:
++        return None
++    hint = _sibling_repo_hint(requested)
++    repo = str(hint) if hint is not None else "<repo root>"
++    return (
++        f"worktree path {workspace_path!r} is not inside a git repo and does not point at a "
++        f"git repo root. Fix: use workspace_path={repo!r} (the dispatcher creates "
++        f"<repo>/.worktrees/<task-id>), or first run: "
++        f"git -C {repo} worktree add {workspace_path} -b <branch>"
++    )
++
++
+ def _git_toplevel(path: Path) -> Optional[Path]:
+     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
+     out = _kb._git_out(path, "rev-parse", "--show-toplevel")
+@@ -723,7 +795,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
+         board_slug = board if board else _kb.get_current_board()
+         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
+         if not board_default:
+-            raise ValueError(
++            raise WorktreeWorkspaceConfigError(
+                 f"task {task.id} has workspace_kind=worktree but no workspace_path, "
+                 f"and board {board_slug!r} has no default_workdir set. Set a board "
+                 "default workdir (a git repo) or create the task with "
+@@ -731,13 +803,13 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
+             )
+         anchor = Path(board_default).expanduser()
+         if not anchor.is_absolute():
+-            raise ValueError(
++            raise WorktreeWorkspaceConfigError(
+                 f"board {board_slug!r} default_workdir {board_default!r} is not "
+                 "absolute; use an absolute path to a git repo"
+             )
+         repo_root = _git_toplevel(anchor)
+         if repo_root is None:
+-            raise ValueError(
++            raise WorktreeWorkspaceConfigError(
+                 f"task {task.id} has workspace_kind=worktree but board "
+                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
+             )
+@@ -745,7 +817,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
+ 
+     requested = Path(task.workspace_path).expanduser()
+     if not requested.is_absolute():
+-        raise ValueError(
++        raise WorktreeWorkspaceConfigError(
+             f"task {task.id} has non-absolute worktree path "
+             f"{task.workspace_path!r}; use an absolute path"
+         )
+@@ -776,9 +848,11 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
+ 
+     repo_root = _repo_root_for_worktree_target(requested.parent)
+     if repo_root is None:
+-        raise ValueError(
+-            f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
+-            "and does not point at a git repo root"
++        raise WorktreeWorkspaceConfigError(
++            f"task {task.id} "
++            + (worktree_workspace_problem(task.workspace_path, board=board)
++               or f"worktree path {task.workspace_path!r} is not inside a git repo "
++                  "and does not point at a git repo root")
+         )
+     _ensure_git_worktree(repo_root, requested, branch_name)
+     return requested, branch_name
+diff --git a/tests/hermes_cli/test_kanban_worktree_create_validation.py b/tests/hermes_cli/test_kanban_worktree_create_validation.py
+new file mode 100644
+index 0000000000..1240db3fba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worktree_create_validation.py
+@@ -0,0 +1,180 @@
++"""Worktree workspaces that can never resolve are rejected at create time and,
++for legacy rows, block on the FIRST spawn failure instead of burning retries.
++
++Regression: a worker created a card with ``workspace_path=~/code/<repo>-<slug>``
++(a sibling of the repo, outside any git repo, board without default_workdir).
++``_resolve_worktree_workspace`` failed identically on every dispatch, the card
++spent its retry budget (spawn_failed -> gave_up) and the creator never saw why.
++"""
++
++from __future__ import annotations
++
++import argparse
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_workspace as kbw
++
++# Match by base class + name: other kanban tests ``importlib.reload`` the workspace
++# module, which rebinds the class object this file imported at collection.
++_CONFIG_ERR = ValueError
++
++
++def _is_config_err(exc: BaseException) -> bool:
++    return type(exc).__name__ == "WorktreeWorkspaceConfigError"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _git(cwd: Path, *args: str) -> None:
++    subprocess.run(
++        ["git", "-C", str(cwd), "-c", "user.name=T", "-c", "user.email=t@example.com",
++         "-c", "commit.gpgsign=false", *args],
++        check=True, capture_output=True, text=True,
++    )
++
++
++@pytest.fixture
++def code_dir(tmp_path):
++    """``<tmp>/code`` (not a repo) holding repo ``myapp``."""
++    code = tmp_path / "code"
++    repo = code / "myapp"
++    repo.mkdir(parents=True)
++    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
++    (repo / "README.md").write_text("x\n", encoding="utf-8")
++    _git(repo, "add", "README.md")
++    _git(repo, "commit", "-m", "init")
++    return code
++
++
++def test_create_rejects_sibling_path_outside_repo_and_names_fix(kanban_home, code_dir):
++    bad = str(code_dir / "myapp-s4-speaker-admission")
++    with kbc.connect() as conn:
++        with pytest.raises(_CONFIG_ERR) as ei:
++            kb.create_task(conn, title="t", assignee="a", workspace_kind="worktree",
++                           workspace_path=bad, validate_workspace=True)
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++    assert _is_config_err(ei.value)
++    msg = str(ei.value)
++    repo = str(code_dir / "myapp")
++    assert "not inside a git repo" in msg and "Fix:" in msg
++    assert f"workspace_path={repo!r}" in msg  # sibling repo suggested
++    assert f"git -C {repo} worktree add {bad} -b <branch>" in msg
++
++
++@pytest.mark.parametrize("which", ["repo_root", "inside_repo", "linked_worktree"])
++def test_create_accepts_resolvable_worktree_paths(kanban_home, code_dir, which):
++    repo = code_dir / "myapp"
++    if which == "repo_root":
++        path = repo
++    elif which == "inside_repo":
++        path = repo / ".worktrees" / "new-one"  # parent need not exist yet
++    else:
++        path = code_dir / "myapp-feature"
++        _git(repo, "worktree", "add", str(path), "-b", "feature", "HEAD")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="a", workspace_kind="worktree",
++                             workspace_path=str(path), validate_workspace=True)
++        assert kb.get_task(conn, tid).workspace_kind == "worktree"
++
++
++def test_create_rejects_relative_and_missing_board_default(kanban_home):
++    with kbc.connect() as conn:
++        with pytest.raises(_CONFIG_ERR, match="not absolute") as rel:
++            kb.create_task(conn, title="t", assignee="a", workspace_kind="worktree",
++                           workspace_path="rel/path", validate_workspace=True)
++        with pytest.raises(_CONFIG_ERR, match="default_workdir") as nodef:
++            kb.create_task(conn, title="t", assignee="a", workspace_kind="worktree",
++                           validate_workspace=True)
++    assert _is_config_err(rel.value) and _is_config_err(nodef.value)
++
++
++def test_create_without_validation_keeps_legacy_behaviour(kanban_home, code_dir):
++    # Internal callers (decompose, tests, imports) are unchanged.
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="a", workspace_kind="worktree",
++                             workspace_path=str(code_dir / "myapp-x"))
++        assert kb.get_task(conn, tid) is not None
++
++
++def test_kanban_create_tool_returns_error_to_creator(kanban_home, code_dir, monkeypatch):
++    import json
++
++    from tools import kanban_tools
++
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    out = json.loads(kanban_tools._handle_create({
++        "title": "t", "assignee": "a", "workspace_kind": "worktree",
++        "workspace_path": str(code_dir / "myapp-s4-speaker-admission"),
++    }))
++    assert "error" in out, out
++    assert "worktree add" in out["error"]
++    with kbc.connect() as conn:
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++def test_cli_create_rejects_bad_worktree(kanban_home, code_dir, capsys):
++    from hermes_cli import kanban as kcli
++
++    ns = argparse.Namespace(
++        title="t", body=None, body_file=None, assignee="a", created_by="test",
++        workspace=f"worktree:{code_dir / 'myapp-s4'}", branch=None, max_runtime=None,
++        max_retries=None, tenant=None, priority=0, parent=None, triage=False,
++        idempotency_key=None, skills=None, json=False,
++    )
++    rc = kcli._cmd_create(ns)
++    assert rc == 2
++    assert "worktree add" in capsys.readouterr().err
++    with kbc.connect() as conn:
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++def test_dispatcher_blocks_config_error_on_first_failure(kanban_home, code_dir, all_assignees_spawnable):
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="a", workspace_kind="worktree",
++                             workspace_path=str(code_dir / "myapp-s4"))
++        spawned = []
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1234, failure_limit=3)
++        task = kb.get_task(conn, tid)
++        assert spawned == []
++        assert task.status == "blocked"
++        assert task.consecutive_failures == 1
++        assert "not inside a git repo" in task.last_failure_error
++        assert "Fix: use workspace_path=" in task.last_failure_error
++        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
++        assert gave_up and gave_up[-1].payload.get("sticky") is True
++        assert gave_up[-1].payload.get("workspace_config_error") is True
++        # Sticky: recompute_ready must not auto-resume it.
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_dispatcher_transient_workspace_error_still_retries(
++    kanban_home, monkeypatch, all_assignees_spawnable,
++):
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    def boom(task, board=None):
++        raise OSError("disk hiccup")
++
++    monkeypatch.setattr(kbd._kbw, "resolve_workspace", boom)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="a")
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1234, failure_limit=3)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready"
++        assert task.consecutive_failures == 1
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index e13403cc81..1988ff6b4d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1228,7 +1228,10 @@ def _handle_create(args: dict, **kw) -> str:
+             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+             completion_contract=args.get("completion_contract"),
+             initial_status=str(args.get("initial_status") or "running"),
+-            created_by=_persisted_identity(), session_id=session_id)
++            created_by=_persisted_identity(), session_id=session_id,
++            # Reject a worktree path the dispatcher could never resolve now, to the
++            # creator, instead of burning spawn retries on it later. [daveey]
++            validate_workspace=True)
+         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 690998be04..68c450d79a 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -485,7 +485,10 @@ KANBAN_CREATE_SCHEMA = _schema(
+         },
+         "workspace_path": _prop("string", (
+                 "Absolute path for 'dir' or 'worktree' workspace. "
+-                "Relative paths are rejected at dispatch."
++                "Relative paths are rejected at dispatch. A 'worktree' path must be a git repo "
++                "root (the dispatcher creates <repo>/.worktrees/<task-id>), an existing linked "
++                "worktree, or a new path whose parent is inside a repo; anything else is "
++                "rejected at create time."
+         )),
+         "project": _prop("string", (
+                 "Optional project id or slug to link the task to. When "
+-- 
+2.54.0 (Apple Git-157)
+

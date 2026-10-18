@@ -1,0 +1,1195 @@
+From c729ed37b0c71b248c0e91d54cbc686f359ecf2e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:52:22 -0700
+Subject: [PATCH] fix(desktop): mount hidden session preview opens before
+ acknowledging [daveey]
+
+---
+ apps/desktop/src/app/chat/pane-mirror.ts      | 25 ++++-
+ .../app/chat/preview-tile-live-body.test.tsx  | 91 ++++++++++++++++++-
+ .../desktop/src/app/chat/preview-tile.test.ts | 38 ++++++++
+ apps/desktop/src/app/chat/preview-tile.tsx    | 10 +-
+ .../src/app/chat/right-rail/preview-mount.ts  | 15 +++
+ .../chat/right-rail/preview-script-runner.ts  |  4 +
+ .../src/app/chat/right-rail/preview.tsx       |  3 +
+ .../gateway-event/server-requests.test.ts     | 31 +++++++
+ .../gateway-event/server-requests.ts          | 46 ++++++++++
+ .../tree/renderer/keep-alive-panes.tsx        | 13 ++-
+ apps/desktop/src/store/preview.ts             | 26 +++++-
+ apps/shared/src/gateway-contract.generated.ts |  8 ++
+ apps/shared/src/gateway-contract.openrpc.json | 42 +++++++++
+ tests/tools/test_desktop_tools_diet.py        | 11 ++-
+ tests/tools/test_open_preview_tool.py         | 34 +++----
+ tests/tools/test_preview_open_ack.py          | 55 +++++++++++
+ tests/tui_gateway/contracts/test_generated.py |  5 +-
+ .../tui_gateway/test_preview_open_routing.py  | 37 ++++++++
+ tools/open_preview_tool.py                    | 26 ++++--
+ tui_gateway/contracts/server_requests.py      |  9 ++
+ tui_gateway/server.py                         |  3 +-
+ tui_gateway/server_requests.py                | 39 ++++++--
+ tui_gateway/session_transports.py             | 24 +++++
+ 23 files changed, 540 insertions(+), 55 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/right-rail/preview-mount.ts
+ create mode 100644 tests/tools/test_preview_open_ack.py
+ create mode 100644 tests/tui_gateway/test_preview_open_routing.py
+
+diff --git a/apps/desktop/src/app/chat/pane-mirror.ts b/apps/desktop/src/app/chat/pane-mirror.ts
+index 6b7507bc4a..82024ebb3b 100644
+--- a/apps/desktop/src/app/chat/pane-mirror.ts
++++ b/apps/desktop/src/app/chat/pane-mirror.ts
+@@ -29,6 +29,8 @@ interface DockHint {
+ export interface PaneMirror<T> {
+   /** Reactive source list. */
+   source: ReadableAtom<T[]>
++  /** Tiles born offscreen, registered without adopting into a zone. */
++  initiallyParked?: ReadableAtom<T[]>
+   /** Extra atoms whose changes should re-sync (e.g. titles living elsewhere). */
+   also?: ReadableAtom<unknown>[]
+   /** Stable key + pane-id seed for a tile. */
+@@ -99,20 +101,26 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
+     removeTreePane(paneId(key))
+   }
+ 
+-  const sync = () => {
+-    const tiles = cfg.source.get()
+-    const wanted = new Set(tiles.map(cfg.key))
++  const registerTiles = (tiles: T[], wanted: Set<string>) => {
+     let unparked = false
+ 
+-    for (const tile of tiles) {
++    const hidden = (cfg.initiallyParked?.get() ?? []).filter(tile => !wanted.has(cfg.key(tile)))
++
++    for (const tile of [...tiles, ...hidden]) {
+       const key = cfg.key(tile)
+       const title = cfg.title(key)
+       const current = registered.get(key)
++      const isHidden = !wanted.has(key)
++
++      if (isHidden && !current) {
++        parked.add(key)
++        setTreePaneParked(paneId(key), true)
++      }
+ 
+       // A retained tile coming back keeps its registration — re-registering
+       // would remount its body — and re-docks where it fits NOW (its old
+       // anchor may have left the tree), before the tiles leaving below go.
+-      if (current && parked.delete(key)) {
++      if (!isHidden && current && parked.delete(key)) {
+         Object.assign(current.dock, dockFor(tile))
+         setTreePaneParked(paneId(key), false)
+         unparked = true
+@@ -159,6 +167,12 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
+     if (unparked) {
+       adoptContributedPanes()
+     }
++  }
++
++  const sync = () => {
++    const tiles = cfg.source.get()
++    const wanted = new Set(tiles.map(cfg.key))
++    registerTiles(tiles, wanted)
+ 
+     for (const key of [...registered.keys()]) {
+       if (wanted.has(key)) {
+@@ -196,6 +210,7 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
+   return () => {
+     sync()
+     cfg.source.listen(sync)
++    cfg.initiallyParked?.listen(sync)
+     cfg.also?.forEach(atom => atom.listen(sync))
+   }
+ }
+diff --git a/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx b/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx
+index 7973d56c7b..cdd13598b2 100644
+--- a/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx
++++ b/apps/desktop/src/app/chat/preview-tile-live-body.test.tsx
+@@ -1,4 +1,4 @@
+-import { act, cleanup, render } from '@testing-library/react'
++import { act, cleanup, render, waitFor } from '@testing-library/react'
+ import { createElement, useEffect } from 'react'
+ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+ 
+@@ -6,11 +6,20 @@ import { group } from '@/components/pane-shell/tree/model'
+ import { LayoutTreeRoot } from '@/components/pane-shell/tree/renderer'
+ import { declareDefaultTree, treePanesWithPrefix, watchContributedPanes } from '@/components/pane-shell/tree/store'
+ import { registry } from '@/contrib/registry'
+-import { $previewTabs, openPreview } from '@/store/preview'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $previewTabs, $visiblePreviewTabs } from '@/store/preview'
+ import { $selectedStoredSessionId } from '@/store/session'
++import { $sessionStates } from '@/store/session-states'
+ import { stubMenuDomApis } from '@/test/jsdom'
+ 
++import {
++  handleServerRequest,
++  type ServerRequestContext
++} from '../session/hooks/use-message-stream/gateway-event/server-requests'
++
+ import { watchPreviewTiles } from './preview-tile'
++import { registerPreviewPageReader } from './right-rail/preview-reader'
++import { registerPreviewScriptRunner } from './right-rail/preview-script-runner'
+ 
+ // A native guest has a lifetime beyond React: a remount, or any detach of its
+ // element, destroys the Electron guest (unsaved input, page JS state). Count
+@@ -32,6 +41,21 @@ vi.mock('./right-rail/preview', () => ({
+   PreviewTilePane: ({ tabId }: { tabId: string }) => {
+     useEffect(() => {
+       mounts.set(tabId, (mounts.get(tabId) ?? 0) + 1)
++
++      const stopRead = registerPreviewPageReader(tabId, async () => ({
++        text: 'Hidden page text',
++        title: 'A',
++        url: 'https://a.example'
++      }))
++
++      const stopScript = registerPreviewScriptRunner(tabId, async () =>
++        JSON.stringify({ success: true, elements: [{ ref: 'e1', tag: 'button', text: 'Continue' }] })
++      )
++
++      return () => {
++        stopRead()
++        stopScript()
++      }
+     }, [tabId])
+ 
+     return createElement('preview-live-guest', { 'data-tab': tabId }, createElement('input', { defaultValue: '' }))
+@@ -64,7 +88,7 @@ afterEach(() => {
+ // The behaviour a user sees: switching A -> B -> A shows A's Browser with the
+ // page they left — the same guest, never torn down in between — and B's drawer
+ // does not show it.
+-it("keeps a hidden session's live Browser body alive and shows the same one on return", () => {
++it('mounts a hidden-born Browser offscreen and preserves its guest on focus', async () => {
+   registry.register({
+     area: 'panes',
+     data: { placement: 'main', uncloseable: true },
+@@ -76,11 +100,35 @@ it("keeps a hidden session's live Browser body alive and shows the same one on r
+   watchContributedPanes()
+   watchPreviewTiles()
+ 
+-  $selectedStoredSessionId.set('sess-live-a')
+-  act(() => openPreview({ kind: 'url', label: 'A', source: 'https://a.example', url: 'https://a.example' }))
++  $selectedStoredSessionId.set('sess-live-b')
++  $sessionStates.set({ 'sess-live-a': createClientSessionState('sess-live-a') })
++  const respond = vi.fn()
++  await act(async () => {
++    handleServerRequest(
++      {
++        id: 'open-hidden',
++        method: 'preview.open',
++        profile: 'default',
++        params: { session_id: 'sess-live-a', url: 'https://a.example', label: 'A' },
++        respond,
++        fail: vi.fn()
++      },
++      {
++        activeSessionIdRef: { current: 'sess-live-b' },
++        sessionStateByRuntimeIdRef: { current: new Map() }
++      } as ServerRequestContext['deps'],
++      'sess-live-b'
++    )
++  })
++  expect(respond).not.toHaveBeenCalled()
+   const aTab = $previewTabs.get()[0]!.id
+ 
+   const { container } = render(createElement(LayoutTreeRoot))
++  await waitFor(() =>
++    expect(respond).toHaveBeenCalledWith({
++      value: JSON.stringify({ success: true, url: 'https://a.example', label: 'A' })
++    })
++  )
+ 
+   const guestFor = (tabId: string) => container.querySelector<HTMLElement>(`preview-live-guest[data-tab="${tabId}"]`)
+ 
+@@ -92,6 +140,39 @@ it("keeps a hidden session's live Browser body alive and shows the same one on r
+   expect(treePanesWithPrefix('preview-tile:')).toEqual([])
+   expect(aGuest.isConnected).toBe(true)
+   expect(aGuest.closest('[inert]')).not.toBeNull()
++  expect($visiblePreviewTabs.get()).toEqual([])
++
++  for (const method of ['preview.read', 'preview.act']) {
++    const answer = vi.fn()
++    await act(async () => {
++      handleServerRequest(
++        {
++          id: method,
++          method,
++          profile: 'default',
++          params: { session_id: 'sess-live-a', action: 'elements' },
++          respond: answer,
++          fail: vi.fn(),
++          decline: vi.fn()
++        },
++        {
++          activeSessionIdRef: { current: 'sess-live-b' },
++          sessionInterrupted: () => false,
++          updateSessionState: vi.fn(),
++          upsertToolCall: vi.fn(),
++          sessionStateByRuntimeIdRef: { current: new Map() }
++        } as ServerRequestContext['deps'],
++        'sess-live-b'
++      )
++    })
++    await waitFor(() => expect(answer).toHaveBeenCalled())
++    const result = JSON.parse(answer.mock.calls[0]![0].value)
++    expect(result).toMatchObject(
++      method === 'preview.read'
++        ? { text: 'Hidden page text' }
++        : { success: true, elements: [{ ref: 'e1', tag: 'button', text: 'Continue' }] }
++    )
++  }
+ 
+   act(() => $selectedStoredSessionId.set('sess-live-a'))
+   expect(treePanesWithPrefix('preview-tile:')).toEqual([`preview-tile:${aTab}`])
+diff --git a/apps/desktop/src/app/chat/preview-tile.test.ts b/apps/desktop/src/app/chat/preview-tile.test.ts
+index bd393b0a0e..5a5695cb12 100644
+--- a/apps/desktop/src/app/chat/preview-tile.test.ts
++++ b/apps/desktop/src/app/chat/preview-tile.test.ts
+@@ -261,6 +261,44 @@ describe('preview tiles mirror the visible session tabs', () => {
+     expect(tree.treePanesWithPrefix('preview-tile:')).toEqual([`preview-tile:${ids[0]}`])
+   })
+ 
++  it('does not eagerly mount hidden restored tabs', async () => {
++    const { preview, session } = await setup()
++    const { registry } = await import('@/contrib/registry')
++    session.$selectedStoredSessionId.set('focused')
++    preview.$previewTabs.set([
++      { id: 'url:restored', sessionId: 'hidden', target: browserTarget('https://restored.example') }
++    ])
++    expect(registry.getArea('panes').some(pane => pane.id === 'preview-tile:url:restored')).toBe(false)
++  })
++
++  it('does not remount cap-evicted background opens on unrelated updates', async () => {
++    const { preview, session } = await setup()
++    const { registry } = await import('@/contrib/registry')
++    session.$selectedStoredSessionId.set('focused')
++
++    const ids = Array.from({ length: 9 }, (_, n) =>
++      preview.openPreview(browserTarget(`https://hidden-${n}.example`), `hidden-${n}`, `runtime-${n}`, 'default', true)
++    )
++
++    const panes = () => registry.getArea('panes').filter(pane => pane.id.startsWith('preview-tile:'))
++    expect(panes()).toHaveLength(8)
++    expect(panes().some(pane => pane.id === `preview-tile:${ids[0]}`)).toBe(false)
++    preview.$previewTabs.set([...preview.$previewTabs.get()])
++    expect(panes()).toHaveLength(8)
++    expect(panes().some(pane => pane.id === `preview-tile:${ids[0]}`)).toBe(false)
++
++    const reopened = preview.openPreview(
++      browserTarget('https://hidden-0.example'),
++      'hidden-0',
++      'runtime-0',
++      'default',
++      true
++    )
++
++    expect(reopened).toBe(ids[0])
++    expect(panes().some(pane => pane.id === `preview-tile:${ids[0]}`)).toBe(true)
++  })
++
+   it('does not create panes for another session tabs', async () => {
+     const { preview, session, tree } = await setup()
+ 
+diff --git a/apps/desktop/src/app/chat/preview-tile.tsx b/apps/desktop/src/app/chat/preview-tile.tsx
+index ed48c25035..38b4c21c32 100644
+--- a/apps/desktop/src/app/chat/preview-tile.tsx
++++ b/apps/desktop/src/app/chat/preview-tile.tsx
+@@ -11,6 +11,7 @@
+  */
+ 
+ import { useStore } from '@nanostores/react'
++import { computed } from 'nanostores'
+ 
+ import { findGroup } from '@/components/pane-shell/tree/model'
+ import {
+@@ -31,6 +32,7 @@ import {
+   $dockedVisiblePreviewTabs,
+   $poppedBrowserTabIds,
+   $previewTabs,
++  $requestedPreviewMounts,
+   $visiblePreviewTabs,
+   adoptPersistedBrowserTab,
+   type BrowserPage,
+@@ -328,7 +330,10 @@ const HIDDEN_LIVE_PREVIEW_LIMIT = 8
+ function keepsLiveBody(tabId: string): boolean {
+   const target = targetFor(tabId)
+ 
+-  return target?.kind === 'url' || target?.previewKind === 'html'
++  return (
++    Boolean(target) &&
++    (target?.kind === 'url' || target?.previewKind === 'html' || $requestedPreviewMounts.get().has(tabId))
++  )
+ }
+ 
+ /** A tab whose session left the screen keeps its live body when it is a page
+@@ -343,6 +348,9 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
+   // to that session shows the same guest, not a reload; a popped-out
+   // Browser's pane leaves the docked tree for good.
+   source: $dockedVisiblePreviewTabs,
++  initiallyParked: computed([$previewTabs, $poppedBrowserTabIds, $requestedPreviewMounts], (tabs, popped, requested) =>
++    [...requested].flatMap(id => tabs.filter(tab => tab.id === id && !popped.has(id))).slice(-HIDDEN_LIVE_PREVIEW_LIMIT)
++  ),
+   retain: retainHiddenPreview,
+   retainLimit: HIDDEN_LIVE_PREVIEW_LIMIT,
+   key: tab => tab.id,
+diff --git a/apps/desktop/src/app/chat/right-rail/preview-mount.ts b/apps/desktop/src/app/chat/right-rail/preview-mount.ts
+new file mode 100644
+index 0000000000..17a96c9d3a
+--- /dev/null
++++ b/apps/desktop/src/app/chat/right-rail/preview-mount.ts
+@@ -0,0 +1,15 @@
++/** Mounted pane bodies, including non-scriptable file previews. Open requests
++ * acknowledge a real surface, not just a tab stored for a future render. */
++const mounted = new Set<string>()
++
++export function registerPreviewPaneMount(tabId: string): () => void {
++  mounted.add(tabId)
++
++  return () => {
++    mounted.delete(tabId)
++  }
++}
++
++export function hasPreviewPaneMount(tabId: string): boolean {
++  return mounted.has(tabId)
++}
+diff --git a/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts b/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts
+index b2b52f782e..5fa377be86 100644
+--- a/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts
++++ b/apps/desktop/src/app/chat/right-rail/preview-script-runner.ts
+@@ -19,6 +19,10 @@ export type PreviewScriptRunner = (code: string) => Promise<unknown>
+ 
+ const runners = new Map<string, PreviewScriptRunner>()
+ 
++export function hasPreviewScriptRunner(tabId: string): boolean {
++  return runners.has(tabId)
++}
++
+ /** Register a live preview's script runner; returns an idempotent unregister. */
+ export function registerPreviewScriptRunner(tabId: string, runner: PreviewScriptRunner): () => void {
+   runners.set(tabId, runner)
+diff --git a/apps/desktop/src/app/chat/right-rail/preview.tsx b/apps/desktop/src/app/chat/right-rail/preview.tsx
+index 545de50cdd..f6412cd1a6 100644
+--- a/apps/desktop/src/app/chat/right-rail/preview.tsx
++++ b/apps/desktop/src/app/chat/right-rail/preview.tsx
+@@ -5,6 +5,7 @@ import { $restartPreviewServer } from '@/app/contrib/panes'
+ import { $previewReloadRequest, $previewTabs, adoptPersistedBrowserTab } from '@/store/preview'
+ import { isBrowserWindow } from '@/store/windows'
+ 
++import { registerPreviewPaneMount } from './preview-mount'
+ import { PreviewPane } from './preview-pane'
+ 
+ interface PreviewTilePaneProps {
+@@ -41,6 +42,8 @@ export function PreviewTilePane({ onClose, tabId }: PreviewTilePaneProps) {
+ 
+   const target = previewTabs.find(tab => tab.id === tabId)?.target
+ 
++  useEffect(() => (target ? registerPreviewPaneMount(tabId) : undefined), [tabId, target])
++
+   // The tab closed while this pane was still mounted (the mirror disposes it a
+   // tick later).
+   if (!target) {
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+index 4562f1cce2..343633cbe2 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+@@ -56,6 +56,37 @@ function deliver(method: string, params: Record<string, unknown>, activeSessionI
+   return { decline, fail, handled, respond }
+ }
+ 
++describe('acknowledged preview open', () => {
++  afterEach(() => vi.useRealTimers())
++  it('acknowledges a mounted text file without requiring a browser script runner', async () => {
++    vi.useFakeTimers()
++    const { registerPreviewPaneMount } = await import('@/app/chat/right-rail/preview-mount')
++    closeRightRail()
++    const result = deliver('preview.open', { session_id: 'hidden', url: '/work/readme.txt' }, 'foreground')
++    await vi.advanceTimersByTimeAsync(100)
++    expect(result.respond).not.toHaveBeenCalled()
++    const tab = $previewTabs.get()[0]!
++    const unregister = registerPreviewPaneMount(tab.id)
++    await vi.advanceTimersByTimeAsync(100)
++    expect(result.respond).toHaveBeenCalledWith({
++      value: JSON.stringify({ success: true, url: '/work/readme.txt', label: '' })
++    })
++    unregister()
++    closeRightRail()
++  })
++
++  it('fails instead of acknowledging a tab that never mounts', async () => {
++    vi.useFakeTimers()
++    const result = deliver('preview.open', { session_id: 'hidden', url: 'https://example.com' }, 'foreground')
++    expect(result.handled).toBe(true)
++    expect(result.respond).not.toHaveBeenCalled()
++    await vi.advanceTimersByTimeAsync(6000)
++    expect(result.respond).toHaveBeenCalledWith({ value: expect.stringContaining('"success":false') })
++    closeRightRail()
++    vi.useRealTimers()
++  })
++})
++
+ describe('connection request routing', () => {
+   it('does not route connection operations through the server-request rail', () => {
+     const { handled, respond } = deliver(
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+index da3943cda4..8cf57235d5 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.ts
+@@ -1,12 +1,14 @@
+ import { JSON_RPC_INTERNAL_ERROR } from '@hermes/shared'
+ 
+ import { backgroundPreviewTabFor } from '@/app/chat/right-rail/preview-active-tab'
++import { hasPreviewPaneMount } from '@/app/chat/right-rail/preview-mount'
+ import {
+   hasLivePreviewSurface,
+   requestPopoutPreviewAct,
+   requestPopoutPreviewRead
+ } from '@/app/chat/right-rail/preview-popout-bridge'
+ import { readActivePreview } from '@/app/chat/right-rail/preview-reader'
++import { hasPreviewScriptRunner } from '@/app/chat/right-rail/preview-script-runner'
+ import {
+   abortPreviewTyping,
+   releasePreviewTyping,
+@@ -16,11 +18,14 @@ import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
+ import { pendingClarifyToolPayload } from '@/app/session/hooks/use-session-actions/restore-pending-clarify'
+ import { translateNow } from '@/i18n'
+ import { restorePendingClarifyToolCall } from '@/lib/chat-messages'
++import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+ import type { PreviewActAction } from '@/lib/preview-act/act-in-page'
++import { reachablePreviewUrl } from '@/lib/preview-reach'
+ import type { TourAction, TourStep } from '@/lib/tour'
+ import { type ClarifyRequest, normalizeQuestions, normalizeSetupChoose, setClarifyRequest } from '@/store/clarify'
+ import type { ScopedServerRequest } from '@/store/gateway'
+ import { dispatchNativeNotification } from '@/store/native-notifications'
++import { openPreview, renderedHtmlTarget } from '@/store/preview'
+ import type { PreviewOwner } from '@/store/preview-ownership'
+ import {
+   receiveApprovalRequest,
+@@ -82,6 +87,46 @@ const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : und
+ const answerValue = (request: ScopedServerRequest, result: unknown) =>
+   request.respond({ value: result ? JSON.stringify(result) : '' })
+ 
++const previewOpen: Handler = ({ request, sessionId }) => {
++  void (async () => {
++    try {
++      if (!sessionId) {throw new Error('Preview open requires a session.')}
++      const source = str(request.params.url).trim()
++      const label = str(request.params.label).trim()
++      const resolved = await normalizeOrLocalPreviewTarget(source)
++
++      if (!resolved) {throw new Error('Unsupported preview target.')}
++      const url = resolved.kind === 'url' ? await reachablePreviewUrl(resolved.url) : resolved.url
++
++      const owner = {
++        profile: request.profile || previewScopeForRuntime(sessionId),
++        runtimeId: sessionId,
++        sessionId: storedSessionIdForRuntimeId(sessionId)
++      }
++
++      const tabId = openPreview(
++        renderedHtmlTarget({ ...resolved, url, label: label || resolved.label }),
++        owner.sessionId,
++        sessionId,
++        owner.profile,
++        true
++      )
++
++      const deadline = performance.now() + 5000
++      const isWeb = resolved.kind === 'url' || resolved.previewKind === 'html'
++
++      while (!(isWeb ? hasPreviewScriptRunner(tabId) : hasPreviewPaneMount(tabId))) {
++        if (performance.now() >= deadline) {throw new Error('Preview surface did not mount before timeout.')}
++        await new Promise(resolve => setTimeout(resolve, 25))
++      }
++
++      answerValue(request, { success: true, url: source, label })
++    } catch (error) {
++      answerValue(request, { success: false, error: String(error) })
++    }
++  })()
++}
++
+ export interface ServerRequestContext {
+   deps: Pick<
+     GatewayEventDeps,
+@@ -719,6 +764,7 @@ export const SERVER_REQUEST_HANDLERS: Record<string, Handler> = {
+   clarify,
+   'display.install.sudo': displayInstallSudo,
+   'preview.act': previewAct,
++  'preview.open': previewOpen,
+   'preview.read': previewRead,
+   secret,
+   setup_choose: setupChoose,
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx
+index 51130f540c..bfed7620bd 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/keep-alive-panes.tsx
+@@ -21,6 +21,7 @@ import { cn } from '@/lib/utils'
+ 
+ import { $layoutEditMode } from '../../edit-mode'
+ import { hiddenPaneProps, PaneGroupContext, PaneLifecycleContext, PaneVisibleContext } from '../../pane-visibility'
++import { $parkedTreePanes } from '../parked-panes'
+ import { $collapsedTreeSides, $treePaneEpochs, paneRootSide } from '../store'
+ 
+ import { paneChrome } from './track-model'
+@@ -43,6 +44,7 @@ const PlacementContext = createContext<PlacePane | null>(null)
+  * an Electron webview's guest. Only its CSS anchor and contexts may change. */
+ export function KeepAlivePanes({ children }: { children: ReactNode }) {
+   const panes = useContributions('panes')
++  const parked = useStore($parkedTreePanes)
+   const epochs = useStore($treePaneEpochs)
+   const [placements, setPlacements] = useState<Placements>(() => new Map())
+ 
+@@ -76,10 +78,17 @@ export function KeepAlivePanes({ children }: { children: ReactNode }) {
+       )
+ 
+       const retained = [...previous].filter(([id]) => present.has(id))
++      const next = new Map(retained)
+ 
+-      return retained.length === previous.size ? previous : new Map(retained)
++      for (const id of parked) {
++        if (present.has(id) && !next.has(id)) {
++          next.set(id, { anchor: '', groupId: '', headerVisible: false, visible: false })
++        }
++      }
++
++      return next.size === previous.size && retained.length === previous.size ? previous : next
+     })
+-  }, [panes])
++  }, [panes, parked])
+ 
+   return (
+     <PlacementContext value={place}>
+diff --git a/apps/desktop/src/store/preview.ts b/apps/desktop/src/store/preview.ts
+index e36aa5707e..1c9557d242 100644
+--- a/apps/desktop/src/store/preview.ts
++++ b/apps/desktop/src/store/preview.ts
+@@ -258,6 +258,10 @@ let viewKey = 'default'
+ 
+ export const $previewTabs = atom<PreviewTab[]>([])
+ 
++/** Explicit agent opens may mount before their session is ever shown. Restored
++ * tabs must remain lazy; the mirror applies the same bounded retention policy. */
++export const $requestedPreviewMounts = atom<ReadonlySet<string>>(new Set())
++
+ // Adoption phase: emissions that carry storage THIS MODULE JUST READ, not a
+ // change. nanostores' subscribe fires immediately, and writing what was just
+ // read back is a data-loss clobber: every renderer boots against storage it
+@@ -934,8 +938,13 @@ export function openPreview(
+   runtimeId: null | string = $activeSessionId.get(),
+   /** The asking agent's profile, when it is not the chat on screen: only that
+    *  profile's pins may be reused. Omitted = the viewed profile. */
+-  profile?: null | string
++  profile?: null | string,
++  ownTabOnly = false
+ ) {
++  if (ownTabOnly && profile && (normalizeProfileKey(profile) || 'default') !== viewKey) {
++    throw new Error('Preview profile is not mounted in this window.')
++  }
++
+   // Stamp the tip, not an alias: the alias map is memory-only, so a tab
+   // stamped with a rotated-away id would be orphaned by the next relaunch.
+   const owner = currentSessionId(requestedOwner)
+@@ -949,7 +958,7 @@ export function openPreview(
+     ownerIdentity({ profile, runtimeId: owner === null ? runtimeId : null, sessionId: owner }),
+     viewKey,
+     viewKey
+-  )
++  ).filter(tab => !ownTabOnly || !tab.pinned)
+ 
+   const existing =
+     target.kind === 'url'
+@@ -970,18 +979,27 @@ export function openPreview(
+     target: withRenderMode(target, existing?.target)
+   }
+ 
+-  $previewTabs.set(existing ? current.map(item => (item === existing ? tab : item)) : [...current, tab])
++  if (ownTabOnly) {
++    const openIds = new Set<string>(current.map(item => item.id))
++    $requestedPreviewMounts.set(
++      new Set([...$requestedPreviewMounts.get()].filter(key => key !== id && openIds.has(key)).concat(id))
++    )
++  }
+ 
++  // Stamp before publishing so an unknown runtime never flashes as a draft.
+   setPendingRuntime(id, tab.sessionId == null && !tab.pinned ? runtimeId : null)
++  $previewTabs.set(existing ? current.map(item => (item === existing ? tab : item)) : [...current, tab])
+ 
+   if (!$visiblePreviewTabs.get().some(item => item.id === id)) {
+     rememberActiveTab(owner, id)
+ 
+-    return
++    return id
+   }
+ 
+   noteExplicitPreviewOpen(id)
+   selectRightRailTab(id)
++
++  return id
+ }
+ 
+ const blankPage = (): PreviewTarget => ({ kind: 'url', label: 'Browser', source: 'about:blank', url: 'about:blank' })
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 95ccf29ca8..b15cac20c9 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -4562,6 +4562,11 @@ export interface VaultCodeRequestParams {
+   site?: string | null
+   hint?: string | null
+ }
++export interface PreviewOpenRequestParams {
++  session_id: string
++  url: string
++  label?: string
++}
+ export interface ReadRangeRequestParams {
+   session_id: string
+   start?: number | null
+@@ -5848,6 +5853,8 @@ export interface ServerRequestMap {
+   'display.install.sudo': { params: DisplayInstallSudoParams; result: ValueResult }
+   /** Click / type / scroll / annotate inside the in-app browser preview. */
+   'preview.act': { params: PreviewActRequestParams; result: ValueResult }
++  /** Create and mount a preview tab in one selected window (JSON acknowledgement). */
++  'preview.open': { params: PreviewOpenRequestParams; result: ValueResult }
+   /** Read the in-app browser preview's text (JSON text answer). */
+   'preview.read': { params: ReadRangeRequestParams; result: ValueResult }
+   /** Masked value for a named env var (skills / setup flows). */
+@@ -5874,6 +5881,7 @@ export const SERVER_REQUEST_METHODS = [
+   'clarify',
+   'display.install.sudo',
+   'preview.act',
++  'preview.open',
+   'preview.read',
+   'secret',
+   'setup_choose',
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index c8f780fa38..bf53f68811 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -23461,6 +23461,30 @@
+         "title": "PreviewOpenPayload",
+         "type": "object"
+       },
++      "PreviewOpenRequestParams": {
++        "additionalProperties": false,
++        "properties": {
++          "session_id": {
++            "title": "Session Id",
++            "type": "string"
++          },
++          "url": {
++            "title": "Url",
++            "type": "string"
++          },
++          "label": {
++            "default": "",
++            "title": "Label",
++            "type": "string"
++          }
++        },
++        "required": [
++          "session_id",
++          "url"
++        ],
++        "title": "PreviewOpenRequestParams",
++        "type": "object"
++      },
+       "PreviewRestartParams": {
+         "additionalProperties": false,
+         "properties": {
+@@ -40546,6 +40570,24 @@
+         }
+       }
+     },
++    {
++      "name": "preview.open",
++      "summary": "Create and mount a preview tab in one selected window (JSON acknowledgement).",
++      "params": [
++        {
++          "name": "params",
++          "schema": {
++            "$ref": "#/components/schemas/PreviewOpenRequestParams"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/ValueResult"
++        }
++      }
++    },
+     {
+       "name": "preview.read",
+       "summary": "Read the in-app browser preview's text (JSON text answer).",
+diff --git a/tests/tools/test_desktop_tools_diet.py b/tests/tools/test_desktop_tools_diet.py
+index fe3c8c5e26..46206a728f 100644
+--- a/tests/tools/test_desktop_tools_diet.py
++++ b/tests/tools/test_desktop_tools_diet.py
+@@ -17,17 +17,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+ 
+ 
+ class TestPreviewHandler(unittest.TestCase):
+-    def test_open_and_close_route_through_desktop_ui(self):
++    def test_open_is_acknowledged_and_close_emits(self):
+         from tools import preview_tool
+ 
+         sent = []
+-        with patch("tools.desktop_ui.emit", side_effect=lambda ev, p: sent.append((ev, p)) or True):
++        with patch("tools.desktop_ui.emit", side_effect=lambda ev, p: sent.append((ev, p)) or True), patch(
++            "tui_gateway.server_requests.send",
++            return_value={"value": json.dumps({"success": True, "url": "https://www.cnn.com"})},
++        ) as request:
+             r = json.loads(preview_tool._handle_preview({"action": "open", "url": "www.cnn.com"}))
+             self.assertTrue(r["success"])
+             self.assertEqual(r["url"], "https://www.cnn.com")  # normalizer kept
+             r = json.loads(preview_tool._handle_preview({"action": "close"}))
+             self.assertTrue(r["success"])
+-        self.assertEqual([e for e, _ in sent], ["preview.open", "preview.close"])
++        self.assertEqual(request.call_args.args[0], "preview.open")
++        self.assertEqual(request.call_args.args[2]["url"], "https://www.cnn.com")
++        self.assertEqual([e for e, _ in sent], ["preview.close"])
+ 
+     def test_read_outside_desktop_session_teaches(self):
+         from tools import preview_tool
+diff --git a/tests/tools/test_open_preview_tool.py b/tests/tools/test_open_preview_tool.py
+index d1aac2d615..4959c0d610 100644
+--- a/tests/tools/test_open_preview_tool.py
++++ b/tests/tools/test_open_preview_tool.py
+@@ -5,6 +5,7 @@ import json
+ import pytest
+ 
+ from tools import desktop_ui, open_preview_tool as op
++from tui_gateway import server_requests
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -17,27 +18,28 @@ def _reset_emitter():
+ 
+ 
+ 
+-def test_emitter_failure_is_reported():
+-    def _boom(*_a):
++def test_emitter_failure_is_reported(monkeypatch):
++    def _boom(*_a, **_kw):
+         raise RuntimeError("no window")
+ 
+-    desktop_ui.set_emitter(_boom)
++    monkeypatch.setattr(server_requests, "send", _boom)
+     assert "no window" in json.loads(op.open_preview_tool("https://x.example"))["error"]
+ 
+ 
+-def _capture_emits():
++def _capture_emits(monkeypatch):
+     emitted: list = []
+ 
+-    def _emit(_sid, event, payload):
++    def _send(event, _sid, payload, **kwargs):
+         emitted.append((event, payload))
++        return {"value": json.dumps({"success": True, **payload})}
+ 
+-    desktop_ui.set_emitter(_emit)
++    monkeypatch.setattr(server_requests, "send", _send)
+     return emitted
+ 
+ 
+-def test_existing_directory_is_an_error_not_success(tmp_path):
++def test_existing_directory_is_an_error_not_success(tmp_path, monkeypatch):
+     """#95853: a directory must not report success while opening nothing."""
+-    emitted = _capture_emits()
++    emitted = _capture_emits(monkeypatch)
+     folder = tmp_path / "Active"
+     folder.mkdir()
+ 
+@@ -49,8 +51,8 @@ def test_existing_directory_is_an_error_not_success(tmp_path):
+     assert emitted == []
+ 
+ 
+-def test_existing_file_still_opens(tmp_path):
+-    emitted = _capture_emits()
++def test_existing_file_still_opens(tmp_path, monkeypatch):
++    emitted = _capture_emits(monkeypatch)
+     path = tmp_path / "notes.md"
+     path.write_text("hi", encoding="utf-8")
+ 
+@@ -61,16 +63,16 @@ def test_existing_file_still_opens(tmp_path):
+     assert emitted == [("preview.open", {"url": str(path), "label": ""})]
+ 
+ 
+-def test_https_url_is_not_treated_as_a_directory():
+-    emitted = _capture_emits()
++def test_https_url_is_not_treated_as_a_directory(monkeypatch):
++    emitted = _capture_emits(monkeypatch)
+     result = json.loads(op.open_preview_tool("https://example.com/docs"))
+ 
+     assert result["success"] is True
+     assert emitted[0][0] == "preview.open"
+ 
+ 
+-def test_file_uri_directory_is_an_error(tmp_path):
+-    emitted = _capture_emits()
++def test_file_uri_directory_is_an_error(tmp_path, monkeypatch):
++    emitted = _capture_emits(monkeypatch)
+     folder = tmp_path / "docs"
+     folder.mkdir()
+     uri = folder.resolve().as_uri()
+@@ -82,9 +84,9 @@ def test_file_uri_directory_is_an_error(tmp_path):
+     assert emitted == []
+ 
+ 
+-def test_missing_path_still_emits(tmp_path):
++def test_missing_path_still_emits(tmp_path, monkeypatch):
+     """Reject only existing directories — a missing path is the renderer's call."""
+-    emitted = _capture_emits()
++    emitted = _capture_emits(monkeypatch)
+     missing = tmp_path / "no-such-folder"
+ 
+     result = json.loads(op.open_preview_tool(str(missing)))
+diff --git a/tests/tools/test_preview_open_ack.py b/tests/tools/test_preview_open_ack.py
+new file mode 100644
+index 0000000000..702a11e0c1
+--- /dev/null
++++ b/tests/tools/test_preview_open_ack.py
+@@ -0,0 +1,55 @@
++"""Opening a preview is acknowledged by exactly one renderer, never an event."""
++import json
++
++import pytest
++
++from tools import desktop_ui
++from tools import preview_tool  # register the real handler
++from tools.registry import registry
++from tui_gateway import server_requests as requests
++
++
++def desktop_preview_tool(**args):
++    return registry.dispatch("desktop_preview", args)
++
++
++@pytest.fixture
++def bridge(monkeypatch):
++    requests.reset_for_tests()
++    frames = []
++    monkeypatch.setattr(requests, "_write", frames.append)
++    monkeypatch.setattr(requests, "_emit", lambda *args: None)
++    monkeypatch.setattr(requests, "_answerable", lambda sid: True)
++    monkeypatch.setattr(requests, "_preview_client", lambda sid: None, raising=False)
++    monkeypatch.setattr(desktop_ui, "_emit", lambda *args: frames.append(args))
++    monkeypatch.setenv("HERMES_UI_SESSION_ID", "hidden")
++    yield frames
++    requests.reset_for_tests()
++
++
++def test_open_without_a_window_cannot_report_success(bridge):
++    result = json.loads(desktop_preview_tool(action="open", url="example.com"))
++    assert result.get("success") is not True
++    assert "Desktop window" in result["error"]
++    assert bridge == []
++
++
++@pytest.mark.parametrize("answer", [
++    {"success": True, "url": "https://example.com", "label": "Demo"},
++    {"success": False, "error": "mount failed"},
++])
++def test_open_returns_only_the_selected_renderers_ack(bridge, monkeypatch, answer):
++    class Window:
++        def write(self, frame):
++            bridge.append(frame)
++            assert requests.open_requests("hidden") == []  # never replay creation to another window
++            requests.resolve_response({"id": frame["id"], "result": {"value": json.dumps(answer)}}, self)
++            return True
++
++    window = Window()
++    monkeypatch.setattr(requests, "_preview_client", lambda sid: window, raising=False)
++    result = json.loads(desktop_preview_tool(action="open", url="example.com", label=" Demo "))
++    assert result == answer
++    assert len(bridge) == 1
++    assert bridge[0]["method"] == "preview.open"
++    assert bridge[0]["params"] == {"session_id": "hidden", "url": "https://example.com", "label": "Demo"}
+diff --git a/tests/tui_gateway/contracts/test_generated.py b/tests/tui_gateway/contracts/test_generated.py
+index 263a4a225e..ab52dcb57c 100644
+--- a/tests/tui_gateway/contracts/test_generated.py
++++ b/tests/tui_gateway/contracts/test_generated.py
+@@ -74,12 +74,15 @@ def emitted_event_names() -> set[str]:
+     names.update(_BROKER_FRAME.findall(_read(REPO / "gateway" / "browser_control_broker.py")))
+     names.update(_SETUP_READY.findall(_read(REPO / "hermes_cli" / "free_tier_bootstrap.py")))
+     names.update(_FREE_TIER_CHALLENGE.findall(_read(REPO / "hermes_cli" / "anon_challenge.py")))
++    # Older backends still emit this notification; current renderers retain its
++    # decoder while acknowledged opens use the request contract.
++    names.add("preview.open")
+     return names
+ 
+ 
+ def sent_server_requests() -> set[str]:
+     names: set[str] = set()
+-    for src in (REPO / "tui_gateway").glob("*.py"):
++    for src in [*(REPO / "tui_gateway").glob("*.py"), *(REPO / "tools").glob("*.py")]:
+         names.update(_LITERAL_REQUEST.findall(_read(src)))
+     return names
+ 
+diff --git a/tests/tui_gateway/test_preview_open_routing.py b/tests/tui_gateway/test_preview_open_routing.py
+new file mode 100644
+index 0000000000..a7b3a38186
+--- /dev/null
++++ b/tests/tui_gateway/test_preview_open_routing.py
+@@ -0,0 +1,37 @@
++"""Preview creation picks one capable peer and preserves hidden-session routing."""
++from tui_gateway import server, server_requests
++from tui_gateway.transport import FanoutTransport
++
++
++class Window:
++    _closed = False
++    auth_identity = None
++
++    def write(self, frame):
++        return True
++
++
++def test_preview_owner_then_stable_fallback(monkeypatch):
++    first, owner = Window(), Window()
++    monkeypatch.setattr(server, "_live_transports", {first, owner})
++    monkeypatch.setattr(server, "_sessions", {"hidden": {"session_key": "hidden"}, "owned": {"transport": owner}})
++    monkeypatch.setattr(server_requests, "answers_requests", lambda peer: True)
++    assert server._preview_request_client("owned") is owner
++    chosen = server._preview_request_client("hidden")
++    assert chosen in {first, owner}
++    assert server._sessions["hidden"]["transport"] is chosen
++    assert server._preview_request_client("hidden") is chosen
++    monkeypatch.setitem(server._sessions, "owned", {"transport": FanoutTransport(owner, first)})
++    assert server._preview_request_client("owned") is owner
++    chosen._closed = True
++    assert server._preview_request_client("hidden") is not chosen
++
++
++def test_no_capable_or_same_identity_window_is_unavailable(monkeypatch):
++    peer = Window()
++    monkeypatch.setattr(server, "_live_transports", {peer})
++    monkeypatch.setattr(server, "_sessions", {"hidden": {"auth_user_id": "basic:alice"}})
++    monkeypatch.setattr(server_requests, "answers_requests", lambda peer: False)
++    assert server._preview_request_client("hidden") is None
++    monkeypatch.setattr(server_requests, "answers_requests", lambda peer: True)
++    assert server._preview_request_client("hidden") is None
+diff --git a/tools/open_preview_tool.py b/tools/open_preview_tool.py
+index 15a9408a3a..870cfba71d 100644
+--- a/tools/open_preview_tool.py
++++ b/tools/open_preview_tool.py
+@@ -2,16 +2,18 @@
+ """Open a URL, dev server, or file in the Hermes desktop GUI's preview pane.
+ 
+ Registration lives in the `desktop_preview` tool (``tools.preview_tool``); this module keeps
+-the normalizer + open action. Emits ``preview.open`` via ``desktop_ui``: the renderer opens
+-the pane for the window that asked and never steals focus for a background session.
++the normalizer + open action. Requests ``preview.open`` from one renderer and returns
++only its acknowledgement; hidden sessions are mounted without stealing focus.
+ """
+ 
++import json
+ import os
+ import re
+ from pathlib import Path
+ from urllib.parse import unquote, urlparse
+ 
+-from tools import desktop_ui
++from gateway.session_context import get_session_env
++from tui_gateway import server_requests
+ from tools.registry import tool_error
+ 
+ 
+@@ -81,9 +83,15 @@ def open_preview_tool(url: str, label: str = "") -> str:
+         )
+ 
+     label = (label or "").strip()
+-    return desktop_ui.emit_or_error(
+-        "preview.open",
+-        {"url": target, "label": label},
+-        "Failed to open the preview pane: ",
+-        "The preview pane is only available in the Hermes desktop app.",
+-        {"success": True, "url": target, "label": label})
++    try:
++        answer = server_requests.send(
++            "preview.open", get_session_env("HERMES_UI_SESSION_ID", ""),
++            {"url": target, "label": label}, timeout=15)
++        value = (answer or {}).get("value")
++        result = json.loads(value) if isinstance(value, str) else None
++        if isinstance(result, dict):
++            return json.dumps(result, ensure_ascii=False)
++    except (ValueError, RuntimeError, OSError) as exc:
++        return tool_error(f"Failed to open the preview pane: {exc}")
++    return tool_error("No Hermes Desktop window acknowledged opening the preview. "
++                      "Open or update the Desktop app, then retry.")
+diff --git a/tui_gateway/contracts/server_requests.py b/tui_gateway/contracts/server_requests.py
+index e02f87978c..a415f97c74 100644
+--- a/tui_gateway/contracts/server_requests.py
++++ b/tui_gateway/contracts/server_requests.py
+@@ -187,6 +187,15 @@ server_request("vault.code", params=VaultCodeRequestParams, result=ValueResult,
+ # ── desktop GUI bridges ───────────────────────────────────────────────────────────────────────
+ 
+ 
++class PreviewOpenRequestParams(ServerRequestParams):
++    url: str
++    label: str = ""
++
++
++server_request("preview.open", params=PreviewOpenRequestParams, result=ValueResult,
++               doc="Create and mount a preview tab in one selected window (JSON acknowledgement).")
++
++
+ class ReadRangeRequestParams(ServerRequestParams):
+     start: int | None = None
+     count: int | None = None
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index da5d97de9c..c84d12e969 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -717,7 +717,8 @@ from tui_gateway import server_requests as _server_requests
+ 
+ _server_requests.bind_sinks(lambda frame: write_json(frame), lambda event, sid, payload: _emit(event, sid, payload),
+                             lambda sid: _session_client_answers_requests(sid),
+-                            lambda sid: _session_answering_clients(sid))
++                            lambda sid: _session_answering_clients(sid),
++                            lambda sid: _preview_request_client(sid))
+ 
+ 
+ # Live WS peer transports (maintained by tui_gateway.ws): the only route for session-less background
+diff --git a/tui_gateway/server_requests.py b/tui_gateway/server_requests.py
+index 5da7bb3bd0..4b10f15951 100644
+--- a/tui_gateway/server_requests.py
++++ b/tui_gateway/server_requests.py
+@@ -60,12 +60,14 @@ class ServerRequest:
+         "qids",
+         "result",
+         "sid",
++        "target",
+     )
+ 
+     def __init__(self, sid: str, method: str, params: dict, *, qids: list[str] | None = None,
+                  on_result: Callable[[dict | None], None] | None = None) -> None:
+         self.id = f"srq-{uuid.uuid4().hex[:12]}"
+         self.sid = sid
++        self.target = None
+         self.method = method
+         self.params = dict(params)
+         self.event = threading.Event()
+@@ -106,6 +108,7 @@ _answerable: Callable[[str], bool] = lambda sid: True
+ # ``clients(sid)``: the attached client transports that answer server→client requests — the set whose
+ # unanimous NOT_SHOWN_CODE decline settles a window-owned request (session_transports.py).
+ _clients: Callable[[str], list] = lambda sid: []
++_preview_client: Callable[[str], Any] = lambda sid: None
+ 
+ # Error code a client answers when none of its windows shows the request's session, and the refusal the
+ # tool reports once every attached client said so. Mirrored in apps/desktop server-requests.ts.
+@@ -119,11 +122,14 @@ _answering_clients: set = set()
+ 
+ 
+ def bind_sinks(write_json: Callable[[dict], Any], emit: Callable[[str, str, dict], Any],
+-               answerable: Callable[[str], bool], clients: Callable[[str], list] | None = None) -> None:
+-    global _write, _emit, _answerable, _clients
++               answerable: Callable[[str], bool], clients: Callable[[str], list] | None = None,
++               preview_client: Callable[[str], Any] | None = None) -> None:
++    global _write, _emit, _answerable, _clients, _preview_client
+     _write, _emit, _answerable = write_json, emit, answerable
+     if clients is not None:
+         _clients = clients
++    if preview_client is not None:
++        _preview_client = preview_client
+ 
+ 
+ def advertise(transport: Any, server_requests: bool) -> None:
+@@ -169,7 +175,10 @@ def _register(req: ServerRequest) -> None:
+         raise ValueError(problem)  # a key the renderer's typed handler would never read: our bug
+     with _lock:
+         _open[req.id] = req
+-    _write(req.frame())
++    if req.target is None:
++        _write(req.frame())
++    elif not req.target.write(req.frame()):
++        resolve_response({"id": req.id, "error": {"message": "Desktop window disconnected"}}, req.target)
+ 
+ 
+ def send(method: str, sid: str, params: dict, *, timeout: float | None,
+@@ -181,10 +190,19 @@ def send(method: str, sid: str, params: dict, *, timeout: float | None,
+     cancelled, 0 → return immediately, > 0 → bounded wait. A batch (``qids``) that settled returns
+     ``{"answers": <locked so far>, "outcome"}`` (``submitted`` / ``cancelled`` / ``timed_out``).
+     """
+-    if _unanswerable(method, sid):
++    target = _preview_client(sid) if method == "preview.open" else None
++    if method == "preview.open" and target is None:
++        return None
++    if target is None and _unanswerable(method, sid):
+         return None
+     req = ServerRequest(sid, method, params, qids=qids)
+-    _register(req)
++    req.target = target
++    try:
++        _register(req)
++    except BaseException:
++        with _lock:
++            _open.pop(req.id, None)
++        raise
+     try:
+         req.event.wait(timeout)
+     except BaseException:
+@@ -269,7 +287,11 @@ def resolve_response(frame: dict, transport: Any = None) -> bool:
+     rid = frame.get("id")
+     if not isinstance(rid, str):
+         return False
+-    if _is_not_shown(frame):
++    with _lock:
++        pending = _open.get(rid)
++        if pending is not None and pending.target is not None and pending.target is not transport:
++            return False
++    if _is_not_shown(frame) and (pending is None or pending.target is None):
+         return _decline(rid, transport)
+     with _lock:
+         req = _open.get(rid)
+@@ -347,9 +369,10 @@ def cancel(sid: str | None = None, reason: str = "interrupted") -> int:
+ 
+ 
+ def open_requests(sid: str) -> list[dict]:
+-    """Unanswered requests for *sid*, oldest first."""
++    """Replayable requests for *sid*, oldest first. Targeted creation must not replay
++    into a different window and create a duplicate tab."""
+     with _lock:
+-        reqs = sorted((req for req in _open.values() if req.sid == sid), key=lambda r: r.created_at)
++        reqs = sorted((req for req in _open.values() if req.sid == sid and req.target is None), key=lambda r: r.created_at)
+     return [req.snapshot() for req in reqs]
+ 
+ 
+diff --git a/tui_gateway/session_transports.py b/tui_gateway/session_transports.py
+index ddb65ad48b..005dc80128 100644
+--- a/tui_gateway/session_transports.py
++++ b/tui_gateway/session_transports.py
+@@ -56,6 +56,30 @@ def _session_answering_clients(sid: str) -> list:
+             if isinstance(peer, WSTransport) and server_requests.answers_requests(peer)]
+ 
+ 
++def _preview_request_client(sid: str):
++    """Prefer a session peer; otherwise choose one stable, same-login attached peer.
++
++    Never fan out creation: the renderer mounts hidden sessions without activating them.
++    """
++    from tui_gateway import server_requests
++
++    session = _sessions.get(sid)
++    if session is None:
++        return None
++    identity = _session_auth_user_id(session)
++    with _live_transports_lock:
++        fallback = sorted(_live_transports, key=id)
++    candidates = _session_live_transports(session) + fallback
++    selected = next((peer for peer in candidates
++                 if _transport_is_live_peer(peer)
++                 and server_requests.answers_requests(peer)
++                 and _transport_auth_user_id(peer) == identity), None)
++    if selected is not None:
++        # Later preview.read/act requests use this same session transport.
++        _attach_session_transport(session, selected)
++    return selected
++
++
+ def _warn_foreign_login(session: dict, transport) -> None:
+     """Ownership is not enforced; a second login sharing a session is only logged, and the agent keeps the
+     creator's user id."""
+-- 
+2.54.0 (Apple Git-157)
+
