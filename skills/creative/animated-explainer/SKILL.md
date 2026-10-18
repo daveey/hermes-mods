@@ -75,4 +75,10 @@ the stage, ←/→/space/m keys. Muted mode runs chapters on a timer sized to th
 - `transform-box: fill-box` + `transform-origin` for any CSS-rotated SVG part, or it pivots around the canvas.
 - A scene that hides something (camouflage game) needs enough foreground covering to be hard, and a reveal.
 - Gemini TTS sometimes reads the style instruction aloud; the transcription check catches it. Re-run that line.
+- Transcription check: use `gemini-flash-latest` (or `gemini-3-flash-preview`); plain `gemini-2.5-flash` can 404.
+  A clip may come back `PROHIBITED_CONTENT` (false positive); split it with `ffmpeg -ss/-t` and transcribe the parts.
+- Headless Chrome may never load the inlined audio (readyState 0), so seeking `audio.currentTime` does nothing. To test
+  cue states, click the sound toggle (muted timer mode), then shift the clock: patch `performance.now` to add
+  `window.__off*1000`, open a chapter with `#toc button`, then set `__off` to the target second. Bring the tab to
+  the front first, or timers get throttled and the states look random.
 - Don't put the narration in `body`: `body` is the readable English card; the caption already shows narration.
