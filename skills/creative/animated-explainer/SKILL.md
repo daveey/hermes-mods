@@ -1,6 +1,6 @@
 ---
 name: animated-explainer
-description: "Use when asked for an illustrated/animated explainer. Narrated, responsive single-file HTML."
+description: "Use when asked for an animated explainer. Narrated single-file HTML."
 version: 1.0.0
 author: daveey
 license: MIT
@@ -11,6 +11,10 @@ metadata:
 ---
 
 # Animated explainer
+
+## When to Use
+"Make an (illustrated / animated) explainer about X", "explain X to my kid", an animated story or lesson about an
+animal, process or concept, optionally narrated in a given language. Not for slide decks or product UI (claude-design).
 
 An "explainer about X" (a bug, a planet, how a heart works) = a short illustrated story: 4–7 chapters of animated SVG
 scenes, narrated (any language, Gemini TTS), with a karaoke caption, chapter list and big touch controls. One
@@ -24,7 +28,14 @@ scripts/build.py <dir>   explainer.js + explainer.css + narration + audio -> <di
 examples/fork-tailed-bush-katydid/   complete reference (6 chapters, Russian narration, 6-year-old audience)
 ```
 
+Depth (drawing the subject, CSS motion rules, voice-sync patterns, muted audio tests, narration QA):
+`references/motion-and-sync.md`.
+
 ## Defaults (don't ask)
+- Build and ship without a question round: the brief ("explainer about X") is enough. Must work on an iPhone and a
+  desktop; the shell handles both, so check both sizes before delivering.
+- "Give me a link" means a URL someone can open on a phone. A `file://` path only works on this Mac: publish
+  (below) if configured, otherwise send the file via `MEDIA:` and offer hosting.
 - Audience: a curious kid (~6) unless told otherwise. Short sentences, one idea per chapter, a game or a
   "can you find it?" moment, a friendly face on the main character. For adults, same shell with denser body text.
 - Narration language = the language asked for; UI text (titles, story card) in English unless asked otherwise. The

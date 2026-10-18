@@ -105,8 +105,24 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   have Bluetooth metadata"; it is launched by launchd, not Finder. iCloud Keychain passkeys work.
 - This Chrome shows a second Chrome icon in the Dock / app switcher; activating it does not move its windows.
   Raising the app or `setWindowBounds` onto the main screen just flashes the window: the 1s re-home loop pulls it
-  straight back. Anything that must show the user a page calls `show` first. The browser-focus plugin does this
-  (`show --minutes 20`) before raising the window, and `browser_focus {hide:true}` sends it back.
+  straight back. Show pages the way the next section describes.
+- `show --minutes N` expiry is enforced by the supervisor's re-home loop, so it needs a supervisor restart to take
+  effect, and a restart closes every tab. Never restart it while a tab holds a login or an in-flight task the user
+  still needs.
+
+## Showing the user a page (sign-in, 2FA, click)
+The user wants the window brought to them, never "find the Chrome window" instructions, and sent back once done.
+1. Call `browser_focus` (browser-focus plugin; `match` = URL/title substring). It runs `show --minutes 20`, activates
+   the tab over CDP and raises the app. Without the plugin: `hermes-chrome-agent show`, then
+   `curl 127.0.0.1:9333/json/activate/<id>` and JXA `NSRunningApplication...activateWithOptions(3)` on Chrome's pid.
+2. If the harness keeps timing out (`Runtime.evaluate`/`Page.navigate` on background tabs), skip it: open the page
+   with `curl -X PUT 'http://127.0.0.1:9333/json/new?<url>'` and activate that id. Let the user click the first
+   button themselves.
+3. Tell them it's in front and what to click. Detect completion by polling `/json/list` for the tab leaving its login
+   URL (the plugin's watcher hides automatically); otherwise `browser_focus {hide:true}` / `hermes-chrome-agent hide`.
+   The Desktop status bar has a Browser shown/hidden toggle (desktop-plugins/browser-focus) for manual control.
+4. Verify placement from `CGWindowListCopyWindowInfo` bounds for Chrome's pid (on the main display, not the virtual
+   one) and the frontmost pid, not from the activate call's return value.
 - Chrome restarts lose open tabs (no session restore, by design).
 - Don't run a second Chrome on `$HERMES_HOME/chrome-agent`; the supervisor stops any stale one on startup.
 - `CGDisplayCreateImage` is unavailable in the macOS 15+ SDK; use ScreenCaptureKit or `screencapture`.

@@ -6,6 +6,15 @@ other step yourself and hand them one short numbered list.
 
 ## Diagnose first
 
+- One Slack app per Socket Mode consumer. A new bot persona or a non-Hermes service (e.g. a home-assistant
+  bridge) gets its OWN app and tokens, never another gateway's: Slack spreads events across every open
+  connection of an app, so a second consumer silently steals half of the first one's DMs.
+- Never write a second app's tokens into `~/.hermes/.env` under `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN` (the
+  stock clipboard helper does): that replaces the gateway's own Slack identity. Use service-specific names
+  (e.g. `SLACK_<SERVICE>_BOT_TOKEN`) in that service's env file. When the service runs on another host, the
+  same clipboard pattern works: a background watcher (`pbpaste` poll, match `xoxb-`/`xapp-`, clear the
+  clipboard) pipes the tokens over ssh stdin into the remote env file (chmod 600) and runs the installer,
+  printing no token; start it with `terminal(background=true, notify=[...])` before handing the user the steps.
 - `grep -iE "\[slack\]|slack.*(token|connect)" ~/.hermes/logs/gateway.log | tail` — `SLACK_BOT_TOKEN not set` /
   `SLACK_APP_TOKEN not set` means `platforms.slack.enabled: true` but no credentials; the platform is parked.
 - Check secret stores the user already uses before asking them to create an app.

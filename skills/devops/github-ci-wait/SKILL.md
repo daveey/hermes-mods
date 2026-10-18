@@ -1,6 +1,6 @@
 ---
 name: github-ci-wait
-description: "Use when waiting for a pushed commit's GitHub CI or release. Waits on runs/tags that contain the commit, never the newest run."
+description: "Use when waiting for a pushed commit's GitHub CI or release, or for Actions blocked by billing. Waits on runs/tags containing the commit, never the newest run."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -60,6 +60,46 @@ How to run it from an agent:
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
   maps to) takes precedence; check the repo's AGENTS.md first.
 - Tests: `python3 -B -m unittest discover -s tests` from this skill's dir.
+
+## CI refused for billing (account-wide outage)
+
+Symptom: every job fails in 1–4 s with zero steps, across all workflows and repos of the account. The cause is
+in the job's check-run annotation, not the log: `gh api repos/R/check-runs/<job id>/annotations --jq '.[].message'`
+contains "The job was not started because recent account payments have failed or your spending limit needs to
+be increased". This is not a code failure: don't fix-forward or revert anything for it, and tell running repair
+workers to stop chasing tests.
+
+1. **Wait for it to clear with this skill's `scripts/actions_billing_probe.sh OWNER/REPO [cheap-workflow.yml]`**
+   (don't write a new probe script: this one already handles the in-progress and zero-steps cases), started in
+   the background with notify on `ACTIONS OK` / `STILL BLOCKED`. The probe re-runs a cheap Linux workflow, so it
+   doesn't depend on someone pushing. "I raised the limit" isn't proof: confirm with the probe before relaying it.
+2. **List everyone who is waiting before it clears**, and save the list to a scratch file so it survives compaction:
+   - chats: `session_search` on the exact phrases `"payments have failed"` and `"spending limit"`. One search
+     misses sessions that only quoted the other phrase.
+   - Kanban: read the *latest* `blocked` event reason of each blocked card, not the title:
+     `select t.id,t.session_id,json_extract(e.payload,'$.reason') from tasks t join task_events e on e.task_id=t.id where t.status='blocked' and e.kind='blocked' and e.created_at=(select max(created_at) from task_events where task_id=t.id and kind='blocked') and (e.payload like '%spending limit%' or e.payload like '%payments have failed%' or e.payload like '%billing%')`.
+     Run it on every board/host that has workers, e.g. a remote host's board db over ssh.
+   - The card `session_id`s add the chats that own those cards.
+3. **Notify only after the probe passes.** A message arrives as a user turn, so sending it early makes every
+   session retry into the same refusal. Once it passes: `cross_session send` each chat (CI is back, resume),
+   then `kanban_comment` + `kanban_unblock` each card (or `hermes kanban --board <b> comment/unblock` on the
+   remote board).
+4. **If the probe keeps failing more than ~30 min after the user's change,** tell the user what you observed (how
+   many probes, first and last times), then narrow the cause yourself before handing them pages to click:
+   - Scope: list the account's repos' newest runs. Public repos still running while private ones are refused
+     means GitHub is blocking all *paid* usage on the account, not one workflow or repo.
+   - Usage: `gh api /users/<user>/settings/billing/usage/summary` gives month-to-date spend per SKU. There's
+     no API for a personal account's budgets (`/users/<u>/settings/billing/budgets` is 404), so ask the user for
+     a screenshot of the Budgets and Payment history pages instead of guessing.
+   - Mail: search the user's inbox for GitHub mail since the block began (budget reached, payment failed). No
+     such mail plus a budget under its cap plus all-successful payments points away from budget/charges.
+   - Then the remaining documented cause is a failed card **authorization hold**: GitHub places holds after
+     significant metered usage or a budget increase, a declined hold locks billing, and it never appears in
+     payment history (that only lists completed charges). Docs:
+     https://docs.github.com/en/billing/how-tos/troubleshooting/locked-account. Tell the user to look for a
+     declined GitHub authorization at the bank, re-save the card on the Payment information page (that triggers a
+     new authorization), and otherwise open a support ticket asking for a billing-lock review.
+   - Keep the probe running throughout; it ends the wait the moment any of these clears it.
 
 ## Rescuing a session already stuck on a hand-rolled watcher
 
