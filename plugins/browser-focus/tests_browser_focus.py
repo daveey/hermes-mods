@@ -60,6 +60,18 @@ class T(unittest.TestCase):
             f.assert_called_once()
             self.assertIsNone(bf.transform_llm_output("The AC is set to 75.", session_id="s"))
 
+    def test_focus_unhides_virtual_display_chrome_before_raising(self):
+        calls = []
+        with mock.patch.object(bf, "_quiet", return_value=False), \
+             mock.patch.object(bf, "agent_chromes", return_value=[(101, 9333)]), \
+             mock.patch.object(bf, "_chrome_agent", side_effect=lambda c: calls.append(c) or True), \
+             mock.patch.object(bf, "_get", side_effect=lambda u: TABS if u.endswith("/json/list") else "ok"), \
+             mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True):
+            r = bf.focus("accounts.google.com")
+        self.assertEqual(calls, [["show", "--minutes", str(bf.SHOW_MINUTES)], "activate"])
+        self.assertEqual(r["tab"]["title"], "Sign in - Google Accounts")
+        self.assertTrue(r["shown_on_main_display"])
+
     def test_asks_user_in_browser(self):
         self.assertTrue(bf.asks_user_in_browser("Click Allow on the tab I opened"))
         self.assertFalse(bf.asks_user_in_browser("I checked the thermostat history."))

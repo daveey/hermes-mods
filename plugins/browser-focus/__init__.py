@@ -115,12 +115,35 @@ def _quiet() -> bool:
         return False
 
 
+SHOW_MINUTES = 20
+
+
+def _chrome_agent_cli() -> str | None:
+    """The invisible-chrome-agent supervisor keeps its Chrome on a virtual display and re-homes any window
+    that leaves it within ~1s, so raising the app alone just flashes it. Its `show` pauses that."""
+    path = os.path.join(_hermes_home(), "chrome-agent-tools", "hermes-chrome-agent")
+    return path if os.access(path, os.X_OK) else None
+
+
+def _chrome_agent(cmd: list[str]) -> bool:
+    cli = _chrome_agent_cli()
+    if not cli:
+        return False
+    r = subprocess.run(["/usr/bin/python3", cli, *cmd], capture_output=True, text=True, timeout=20)
+    return r.returncode == 0
+
+
+def hide() -> dict:
+    return {"hidden": _chrome_agent(["hide"])}
+
+
 def focus(match: str | None = None) -> dict:
     if _quiet():
         return {"focused": False, "error": "quiet mode is on; not raising windows"}
     chromes = agent_chromes()
     if not chromes:
         return {"focused": False, "error": "no agent-driven Chrome is running"}
+    shown = _chrome_agent(["show", "--minutes", str(SHOW_MINUTES)])
     pid, port, tab = chromes[0][0], chromes[0][1], None
     for c_pid, c_port in chromes:   # several visible agent Chromes: take the one holding the wanted tab
         try:
@@ -139,7 +162,7 @@ def focus(match: str | None = None) -> dict:
     except Exception as e:
         log.debug("browser-focus: CDP activate failed: %s", e)
     app = activate_app(pid)
-    return {"focused": bool(app or tab), "app_activated": app, "pid": pid,
+    return {"focused": bool(app or tab), "app_activated": app, "pid": pid, "shown_on_main_display": shown,
             "tab": {"title": tab.get("title"), "url": str(tab.get("url", ""))[:200]} if tab else None}
 
 
@@ -207,13 +230,17 @@ SCHEMA = {
                     "hunt for the window. `match` picks the tab by URL/title substring; default is a sign-in tab, "
                     "else the most recent tab."),
     "parameters": {"type": "object", "properties": {
-        "match": {"type": "string", "description": "Substring of the tab URL or title to show (optional)."}}},
+        "match": {"type": "string", "description": "Substring of the tab URL or title to show (optional)."},
+        "hide": {"type": "boolean", "description": ("true = the user is finished: send a hidden (virtual-display) "
+                                                    "agent Chrome back out of sight. Shown windows also auto-hide "
+                                                    "after 20 minutes.")}}},
 }
 
 
 def handle(args: dict, **_) -> str:
     try:
-        return json.dumps(focus((args or {}).get("match") or None))
+        args = args or {}
+        return json.dumps(hide() if args.get("hide") else focus(args.get("match") or None))
     except Exception as e:
         return json.dumps({"focused": False, "error": f"{type(e).__name__}: {e}"})
 

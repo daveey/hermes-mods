@@ -58,6 +58,7 @@ hermes config set browser.cdp_url http://127.0.0.1:9333     # every Hermes sessi
 
 hermes-chrome-agent status     # supervisor, displays, every Chrome window + URL
 hermes-chrome-agent show       # windows → main display, re-homing paused (look at / click the page)
+hermes-chrome-agent show --minutes 20   # same, auto-hides after 20 min (supervisor restart needed to pick up)
 hermes-chrome-agent hide       # resume: windows go back within ~1s
 launchctl kickstart -k gui/$UID/<label>                    # restart (graceful: SIGTERM → Chrome and display stop)
 tail -f ~/.hermes/logs/chrome-agent.log
@@ -103,6 +104,9 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
 - Bluetooth (phone/hybrid passkeys, security keys over BLE) is unavailable: Chrome logs "responsible app ... does not
   have Bluetooth metadata"; it is launched by launchd, not Finder. iCloud Keychain passkeys work.
 - This Chrome shows a second Chrome icon in the Dock / app switcher; activating it does not move its windows.
+  Raising the app or `setWindowBounds` onto the main screen just flashes the window: the 1s re-home loop pulls it
+  straight back. Anything that must show the user a page calls `show` first. The browser-focus plugin does this
+  (`show --minutes 20`) before raising the window, and `browser_focus {hide:true}` sends it back.
 - Chrome restarts lose open tabs (no session restore, by design).
 - Don't run a second Chrome on `$HERMES_HOME/chrome-agent`; the supervisor stops any stale one on startup.
 - `CGDisplayCreateImage` is unavailable in the macOS 15+ SDK; use ScreenCaptureKit or `screencapture`.
