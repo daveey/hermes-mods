@@ -1,7 +1,7 @@
 ---
 name: macos-dock-management
 aliases: [macos-dock, dock-cleanup]
-description: Use when Dock icons are dead, stale or missing badges.
+description: Use when macOS Dock shows dead '?' icons or stale pins.
 category: apple
 version: 1.0
 author: hermes-curator
@@ -52,17 +52,6 @@ metadata:
    defaults read com.apple.dock persistent-apps | grep -ic 'TERM'   # must print 0
    ```
 4. `dockutil` is not preinstalled: `brew install dockutil`. If used anyway, never trust its exit status — re-list with `dockutil --list | grep <label>`.
-
-## Missing unread badge on a Dock icon
-
-1. Ask the app what it is publishing: `lsappinfo info -only StatusLabel "<App>"`. A label (e.g. `"label"="9"`) means the app is setting a badge and macOS is hiding it, so the problem is system settings, not the app or its own preferences. Compare with an app whose badge does show.
-2. Read the app's notification settings: `open "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=<bundle id>"` (bundle id from `osascript -e 'id of app "<App>"'` or `ncprefs.plist`), then read the page with an accessibility snapshot (e.g. BB Pod `ui.snapshot {"app":"System Settings"}`). If `allow-notifications` is off, the Dock badge is hidden even though `badge-app-icon-toggle` below it still reads on (it is greyed out). Turning on Allow notifications is the fix.
-3. Also check Focus: a Focus mode that silences the app can hide badges too.
-
-Pitfalls:
-- Don't restart the Dock (`killall Dock`) for a missing badge: a published label that isn't drawn is a settings gate, and the restart only blanks every other app's badge for a moment.
-- Look at what the user's screenshot actually shows before loading app-specific skills: a screenshot of another app's window with unread counts isn't evidence about the app's Dock badge.
-- Background clicks (`ui.click` without `foreground`) on the System Settings Allow switch may do nothing, and a foreground click can report `confirmed` while the snapshot still reads off. Re-snapshot after every click. If the switch is still off and the user is working in another window, stop and tell them the exact switch to flip instead of repeatedly bringing Settings forward over their work.
 
 ## Duplicate icons for one app
 
