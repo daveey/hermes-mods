@@ -93,7 +93,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [social-media/messaging-bridges](skills/social-media/messaging-bridges/) | WhatsApp/Signal bridges: QR-pair once, the session persists. |
 | [social-media/slack-workspace-bot](skills/social-media/slack-workspace-bot/) | Acting as a team Slack bot: use observed context, join channels, call the Slack API, handle approvals (goes with the slack-workspace plugin). |
 | [software-development/repo-security-audit](skills/software-development/repo-security-audit/) | Auditing a repo for security flaws and fixing them. |
-| [software-development/skill-audit](skills/software-development/skill-audit/) | Auditing skills: size cap, notes lost to failed `skill_manage` writes, orphan references, overlaps; daily guard + weekly refactor cron recipe. |
+| [software-development/skill-audit](skills/software-development/skill-audit/) | Auditing skills: size cap, notes lost to failed `skill_manage` writes, orphan references, overlaps, rules without evidence behind them; daily guard + weekly refactor cron recipe. |
 
 ## Contributing / my own workflow
 
