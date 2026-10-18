@@ -35,6 +35,8 @@ BLOCK_TOOLS = {
     "text_to_speech",
     # opens a terminal window on screen
     "run_in_user_terminal",
+    # raises the agent's Chrome window to the front
+    "browser_focus",
     # browser: config uses a local, real-profile (visible) Chrome
     "browser_exec", "browser_cdp", "browser_dialog", "browser_vault_fill", "browser_vault_enter_code",
     "browser_vault_save_login", "browser_vault_unlock",
