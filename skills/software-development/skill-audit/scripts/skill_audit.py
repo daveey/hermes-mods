@@ -174,10 +174,31 @@ def ref_issues(skills, custom):
             if not any(os.path.exists(c) for c in cands):
                 broken.append((s["name"], ref))
     corpus = "\n".join(by_dir.values())
+    # Reachable = named in a SKILL.md, or in a text file that is itself reachable (a reference may index scripts).
+    texts = {f: None for s in skills.values() for f in s["files"] if f.endswith((".md", ".txt"))}
+    seen = set()
+    while True:
+        new = [f for f in texts if f not in seen and os.path.basename(f) in corpus]
+        if not new:
+            break
+        for f in new:
+            seen.add(f)
+            corpus += "\n" + open(f, encoding="utf-8", errors="replace").read()
+
+    def mentioned(f, d):
+        rel = os.path.relpath(f, d)
+        parts = rel.split(os.sep)
+        if os.path.basename(f) in corpus:
+            return True
+        if any(p + "/" in corpus for p in parts[1:-1]):  # a mentioned sub-dir covers its files
+            return True
+        b = os.path.basename(f)  # test_x.py next to a mentioned x.py
+        return b.startswith("test_") and b[5:] in corpus and os.path.exists(os.path.join(os.path.dirname(f), b[5:]))
+
     for s in custom.values():
         for f in s["files"]:
             rel = os.path.relpath(f, s["dir"])
-            if rel.split(os.sep)[0] in ("references", "scripts", "templates") and os.path.basename(f) not in corpus:
+            if rel.split(os.sep)[0] in ("references", "scripts", "templates") and not mentioned(f, s["dir"]):
                 orphans.append((s["name"], rel))
     return broken, orphans
 
