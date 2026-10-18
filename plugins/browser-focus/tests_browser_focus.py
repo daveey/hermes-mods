@@ -12,6 +12,7 @@ PS = """\
   102 /Applications/Google Chrome.app/Contents/Frameworks/x --type=renderer --user-data-dir=/h/.hermes/chrome-agent --remote-debugging-port=9333
   103 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/tmp/other --remote-debugging-port=9222
   104 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+  105 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --remote-debugging-port=9336 --user-data-dir=/h/.hermes/cache/scratch/x
 """
 TABS = [
     {"id": "a", "type": "page", "title": "Example", "url": "https://example.net/"},

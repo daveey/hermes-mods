@@ -61,7 +61,7 @@ def agent_chromes(home: str | None = None, ps_output: str | None = None) -> list
         ps_output = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
     found = []
     for line in ps_output.splitlines():
-        if "--type=" in line or "--remote-debugging-port=" not in line:
+        if "--type=" in line or "--headless" in line or "--remote-debugging-port=" not in line:
             continue
         m_dir = re.search(r"--user-data-dir=(\S+)", line)
         m_port = re.search(r"--remote-debugging-port=(\d+)", line)
@@ -121,10 +121,19 @@ def focus(match: str | None = None) -> dict:
     chromes = agent_chromes()
     if not chromes:
         return {"focused": False, "error": "no agent-driven Chrome is running"}
-    pid, port = chromes[0]
-    tab = None
+    pid, port, tab = chromes[0][0], chromes[0][1], None
+    for c_pid, c_port in chromes:   # several visible agent Chromes: take the one holding the wanted tab
+        try:
+            t = pick_tab(_get(f"http://127.0.0.1:{c_port}/json/list"), match)
+        except Exception as e:
+            log.debug("browser-focus: CDP list failed on %s: %s", c_port, e)
+            continue
+        hit = t and (not match or match.lower() in (str(t.get("url", "")) + str(t.get("title", ""))).lower())
+        if t and (tab is None or hit):
+            pid, port, tab = c_pid, c_port, t
+            if hit:
+                break
     try:
-        tab = pick_tab(_get(f"http://127.0.0.1:{port}/json/list"), match)
         if tab:
             _get(f"http://127.0.0.1:{port}/json/activate/{tab['id']}")
     except Exception as e:
