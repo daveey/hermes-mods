@@ -64,8 +64,19 @@ metadata:
    absorbed skill with `hermes curator archive <name>` or `skill_manage delete` with `absorbed_into`).
 7. **Stale facts**: for skills used in the last week, spot-check 3-5 concrete claims (paths, hostnames, commands,
    "X is fixed in Y") against the live system or repo; fix or mark historical ones.
-8. **Descriptions**: first 57 chars self-contained, `Use when <trigger>. <behaviour>.`
-9. Finish: commit and sync per `hermes-mods-repo` (public skills in hermes-mods, everything else via
+8. **Unearned rules** (skills patched since the last audit: `git log -p --since=<last audit> -- <skill dir>` in
+   hermes-mods or `~/code/hermes`). Each added rule must name a mechanism a reader can check: what fails and why.
+   Find the session that wrote it (grep a distinctive phrase in `state.db` messages) and classify it:
+   - kept: the failure it prevents happened and the rule's step would have stopped it.
+   - revised: real failure, but the rule is broader or vaguer than the evidence ("be careful with X").
+   - dropped: born from one non-reproducible flake, a since-fixed environment problem, or no failure at all
+     ("looks like good practice").
+   One occurrence of a nondeterministic failure is noise, not a rule. Always-on SKILL.md text is paid on every
+   load: if the router grew with no matching removal, move the depth to `references/`. Leaving a skill unchanged
+   is a valid result; an edit the evidence doesn't support is a regression. Report one line per rule:
+   `kept|revised|dropped -> <rule> -> <the session moment that decided it>`.
+9. **Descriptions**: first 57 chars self-contained, `Use when <trigger>. <behaviour>.`
+10. Finish: commit and sync per `hermes-mods-repo` (public skills in hermes-mods, everything else via
    `hermes-sync run`), then report a short table: what changed, what was recovered, what needs the user.
 
 ## Scheduling it (cron)
