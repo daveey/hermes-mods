@@ -137,6 +137,32 @@ def hide() -> dict:
     return {"hidden": _chrome_agent(["hide"])}
 
 
+def show(minutes: int | None = None) -> dict:
+    """Manual show (status-bar toggle): no login watcher, stays until hidden or `minutes` pass."""
+    ok = _chrome_agent(["show", "--minutes", str(minutes)] if minutes else ["show"])
+    chromes = agent_chromes()
+    if ok and chromes:
+        activate_app(chromes[0][0])
+    return {"shown": ok}
+
+
+def status() -> dict:
+    cli = _chrome_agent_cli()
+    flag = os.path.join(_hermes_home(), "cache", "chrome-agent", "show")
+    return {"available": bool(cli and agent_chromes()), "shown": os.path.exists(flag)}
+
+
+def _watch_login(port: int, target_id: str) -> None:
+    """Hide again once the user finishes signing in (detached so it outlives one-shot CLI turns)."""
+    cli = _chrome_agent_cli()
+    if not cli:
+        return
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch_login.py")
+    subprocess.Popen(["/usr/bin/python3", script, str(port), target_id, cli, str(SHOW_MINUTES * 60)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
 def focus(match: str | None = None) -> dict:
     if _quiet():
         return {"focused": False, "error": "quiet mode is on; not raising windows"}
@@ -162,6 +188,8 @@ def focus(match: str | None = None) -> dict:
     except Exception as e:
         log.debug("browser-focus: CDP activate failed: %s", e)
     app = activate_app(pid)
+    if shown and tab and _LOGIN_URL.search(str(tab.get("url", ""))):
+        _watch_login(port, tab["id"])
     return {"focused": bool(app or tab), "app_activated": app, "pid": pid, "shown_on_main_display": shown,
             "tab": {"title": tab.get("title"), "url": str(tab.get("url", ""))[:200]} if tab else None}
 

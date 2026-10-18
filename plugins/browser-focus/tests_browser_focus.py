@@ -66,11 +66,24 @@ class T(unittest.TestCase):
              mock.patch.object(bf, "agent_chromes", return_value=[(101, 9333)]), \
              mock.patch.object(bf, "_chrome_agent", side_effect=lambda c: calls.append(c) or True), \
              mock.patch.object(bf, "_get", side_effect=lambda u: TABS if u.endswith("/json/list") else "ok"), \
-             mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True):
+             mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True), \
+             mock.patch.object(bf, "_watch_login", side_effect=lambda port, tid: calls.append(("watch", port, tid))):
             r = bf.focus("accounts.google.com")
-        self.assertEqual(calls, [["show", "--minutes", str(bf.SHOW_MINUTES)], "activate"])
+        self.assertEqual(calls, [["show", "--minutes", str(bf.SHOW_MINUTES)], "activate", ("watch", 9333, "b")])
         self.assertEqual(r["tab"]["title"], "Sign in - Google Accounts")
         self.assertTrue(r["shown_on_main_display"])
+
+    def test_login_watcher_done_when_tab_leaves_sign_in(self):
+        _s = importlib.util.spec_from_file_location("wl", pathlib.Path(__file__).with_name("watch_login.py"))
+        wl = importlib.util.module_from_spec(_s)
+        _s.loader.exec_module(wl)
+        on = [{"id": "x", "url": "https://accounts.google.com/v3/signin/challenge/pwd?a"}]
+        nest_login = [{"id": "x", "url": "https://home.nest.com/login/"}]
+        home = [{"id": "x", "url": "https://home.nest.com/home/9a7e"}]
+        self.assertFalse(wl.done(on, "x", bf._LOGIN_URL))
+        self.assertFalse(wl.done(nest_login, "x", bf._LOGIN_URL))
+        self.assertTrue(wl.done(home, "x", bf._LOGIN_URL))
+        self.assertTrue(wl.done([], "x", bf._LOGIN_URL))   # tab closed
 
     def test_asks_user_in_browser(self):
         self.assertTrue(bf.asks_user_in_browser("Click Allow on the tab I opened"))
