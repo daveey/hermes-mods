@@ -1,0 +1,836 @@
+From d7acab90a8078f8edde5bd4fd95d2593f41808a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 03:25:18 -0700
+Subject: [PATCH] fix(usage): account-usage refresh claims can no longer wedge
+ a slot for the process lifetime [daveey]
+
+Long-lived Desktop backends rendered every pooled account 'unknown': a refresh claim
+that leaked (thread start raising under load, a worker dying mid-batch, or a worker
+releasing a key re-derived under a different home) blocked that slot forever.
+
+- release (and un-throttle) claims when the refresh thread fails to start
+- the per-account worker releases the exact claimed keys, every one, even if a fetch
+  escapes; one failing slot no longer starves its siblings
+- inflight claims carry a token + clock and expire after INFLIGHT_EXPIRE_S (4x the 15 s
+  fetch bound); a stale worker cannot release a newer claim
+- read-only diagnostics.account_usage_cache RPC + account_usage_cache_diagnostics()
+  (inflight count/ages, last-try and snapshot ages for the scoped home); expiry and
+  start failures log a warning
+---
+ agent/account_usage_cache.py                  | 189 ++++++++++++++----
+ apps/shared/src/gateway-contract.generated.ts |  26 +++
+ apps/shared/src/gateway-contract.openrpc.json | 176 ++++++++++++++++
+ .../agent/test_account_usage_cache_claims.py  | 164 +++++++++++++++
+ .../test_diagnostics_account_usage_cache.py   |  42 ++++
+ .../contracts/config_free_tier_control.py     |  37 +++-
+ tui_gateway/methods_config.py                 |  11 +
+ 7 files changed, 604 insertions(+), 41 deletions(-)
+ create mode 100644 tests/agent/test_account_usage_cache_claims.py
+ create mode 100644 tests/tui_gateway/test_diagnostics_account_usage_cache.py
+
+diff --git a/agent/account_usage_cache.py b/agent/account_usage_cache.py
+index 695361b8d8..5951318bcd 100644
+--- a/agent/account_usage_cache.py
++++ b/agent/account_usage_cache.py
+@@ -15,6 +15,7 @@ gauge: a per-turn or ``/usage`` fetch still lands there, so non-pooled chips are
+ 
+ from __future__ import annotations
+ 
++import logging
+ import threading
+ import time
+ from contextvars import copy_context
+@@ -30,6 +31,17 @@ REFRESH_AFTER_S = 120.0
+ # account that may have recovered (or worsened) in the meantime.
+ SNAPSHOT_STALE_AFTER_S = 15 * 60.0
+ 
++# Built-in fetchers bound each HTTP call at 15 s (httpx), plugin hooks at 10 s; a Codex read may try
++# two backend URLs. A refresh still claimed after twice that is wedged, not slow.
++USAGE_FETCH_BOUND_S = 15.0
++# An inflight claim older than this no longer blocks a new refresh. A leaked claim (a thread start
++# that raised, a worker that died before its ``finally``) would otherwise hide the slot's usage for
++# the life of the process: the snapshot ages past ``SNAPSHOT_STALE_AFTER_S`` and renders
++# ``unknown`` forever. A duplicate fetch after expiry is harmless (the late-fetch guard orders it).
++INFLIGHT_EXPIRE_S = 4 * USAGE_FETCH_BOUND_S
++
++logger = logging.getLogger(__name__)
++
+ _lock = threading.Lock()
+ # slot key (home, provider, identity_id, base_url) → snapshot
+ _snapshots: dict[tuple[str, str, str, str], AccountUsageSnapshot] = {}
+@@ -37,7 +49,8 @@ _snapshots: dict[tuple[str, str, str, str], AccountUsageSnapshot] = {}
+ _started: dict[tuple[str, str, str, str], float] = {}
+ # slot key → monotonic time of the last refresh try (success or failure)
+ _last_try: dict[tuple[str, str, str, str], float] = {}
+-_inflight: set[tuple[str, str, str, str]] = set()
++# slot key → (claim token, monotonic time the claim was taken or last touched by its worker)
++_inflight: dict[tuple[str, str, str, str], tuple[object, float]] = {}
+ 
+ 
+ def _key(provider: str, identity_id: Optional[str] = None, base_url: Optional[str] = None) -> tuple[str, str, str, str]:
+@@ -146,22 +159,55 @@ def snapshot_is_stale(snapshot: Optional[AccountUsageSnapshot]) -> bool:
+     return age < 0 or age > SNAPSHOT_STALE_AFTER_S
+ 
+ 
+-def _claim_refresh(key: tuple[str, str, str, str], now: float) -> bool:
++def _claim_refresh(key: tuple[str, str, str, str], now: float) -> Optional[object]:
+     """Take the refresh right for *key* unless one is inflight or tried too recently.
+ 
+-    A failed or empty fetch still counts as a try, so a dead credential (or a provider with no
+-    usage API) isn't re-asked on every picker open."""
++    Returns the claim token (truthy) or ``None``. A failed or empty fetch still counts as a try,
++    so a dead credential (or a provider with no usage API) isn't re-asked on every picker open.
++    An inflight claim older than ``INFLIGHT_EXPIRE_S`` is presumed leaked and taken over."""
+     with _lock:
+-        if key in _inflight or now - _last_try.get(key, float("-inf")) < REFRESH_AFTER_S:
+-            return False
+-        _inflight.add(key)
++        held = _inflight.get(key)
++        if held is not None:
++            age = now - held[1]
++            if age < INFLIGHT_EXPIRE_S:
++                return None
++            logger.warning(
++                "account usage: refresh claim for %s/%s expired after %.0fs inflight; reclaiming",
++                key[1], key[2] or "-", age)
++        if now - _last_try.get(key, float("-inf")) < REFRESH_AFTER_S:
++            return None
++        token = object()
++        _inflight[key] = (token, now)
+         _last_try[key] = now
+-        return True
++        return token
++
++
++def _touch_refresh(key: tuple[str, str, str, str], token: Optional[object]) -> None:
++    """Restart *key*'s inflight clock as its worker begins the fetch, so a slot queued behind
++    serial siblings is not mistaken for a wedged one."""
++    with _lock:
++        held = _inflight.get(key)
++        if held is not None and (token is None or held[0] is token):
++            _inflight[key] = (held[0], time.monotonic())
++
++
++def _release_refresh(key: tuple[str, str, str, str], token: Optional[object] = None) -> None:
++    """Drop *key*'s claim. With *token*, only that exact claim: a worker whose claim expired and
++    was retaken must not release the newer one."""
++    with _lock:
++        held = _inflight.get(key)
++        if held is not None and (token is None or held[0] is token):
++            del _inflight[key]
+ 
+ 
+-def _release_refresh(key: tuple[str, str, str, str]) -> None:
++def _abandon_refresh(key: tuple[str, str, str, str], token: Optional[object]) -> None:
++    """Undo a claim whose worker never started: release it and forget the try, so the next
++    picker open retries instead of waiting out ``REFRESH_AFTER_S`` for a fetch that never ran."""
+     with _lock:
+-        _inflight.discard(key)
++        held = _inflight.get(key)
++        if held is not None and (token is None or held[0] is token):
++            del _inflight[key]
++            _last_try.pop(key, None)
+ 
+ 
+ def refresh_account_usage_async(providers: Iterable[str]) -> list[threading.Thread]:
+@@ -171,23 +217,30 @@ def refresh_account_usage_async(providers: Iterable[str]) -> list[threading.Thre
+     now = time.monotonic()
+     for provider in dict.fromkeys(providers):
+         key = _key(provider)
+-        if not _claim_refresh(key, now):
++        token = _claim_refresh(key, now)
++        if token is None:
++            continue
++        try:
++            thread = threading.Thread(
++                target=copy_context().run, args=(_refresh_legacy, provider, key, token),
++                name="hermes-account-usage-refresh", daemon=True)
++            thread.start()
++        except Exception as exc:  # e.g. RuntimeError("can't start new thread") under load
++            _abandon_refresh(key, token)
++            logger.warning("account usage: could not start refresh for %s: %s", provider, exc)
+             continue
+-        thread = threading.Thread(
+-            target=copy_context().run, args=(_refresh_legacy, provider, key),
+-            name="hermes-account-usage-refresh", daemon=True)
+-        thread.start()
+         started.append(thread)
+     return started
+ 
+ 
+-def _refresh_legacy(provider: str, key: tuple[str, str, str, str]) -> None:
++def _refresh_legacy(provider: str, key: tuple[str, str, str, str], token: Optional[object] = None) -> None:
+     from agent.account_usage import fetch_account_usage
+ 
+     try:
++        _touch_refresh(key, token)
+         fetch_account_usage(provider)  # remembers its own result
+     finally:
+-        _release_refresh(key)
++        _release_refresh(key, token)
+ 
+ 
+ def refresh_account_usage_entries_async(requests: Iterable[dict]) -> list[threading.Thread]:
+@@ -199,33 +252,89 @@ def refresh_account_usage_entries_async(requests: Iterable[dict]) -> list[thread
+     refreshing the credential. Throttled per account slot, failures included."""
+     due: list[dict] = []
+     now = time.monotonic()
+-    for request in requests:
+-        provider = str(request.get("provider") or "").strip().lower()
+-        identity_id = str(request.get("identity_id") or "").strip()
+-        if not provider or not identity_id or not str(request.get("api_key") or "").strip():
+-            continue
+-        if not _claim_refresh(_key(provider, identity_id), now):
+-            continue
+-        due.append(request)
+-    if not due:
++    try:
++        for request in requests:
++            provider = str(request.get("provider") or "").strip().lower()
++            identity_id = str(request.get("identity_id") or "").strip()
++            if not provider or not identity_id or not str(request.get("api_key") or "").strip():
++                continue
++            key = _key(provider, identity_id)
++            token = _claim_refresh(key, now)
++            if token is None:
++                continue
++            # The worker releases exactly this key/claim; it never re-derives the key in-thread.
++            due.append({**request, "provider": provider, "identity_id": identity_id,
++                        "_claim_key": key, "_claim_token": token})
++        if not due:
++            return []
++        thread = threading.Thread(
++            target=copy_context().run, args=(_refresh_entries, list(due)),
++            name="hermes-account-usage-refresh", daemon=True)
++        thread.start()
++    except Exception as exc:
++        for request in due:
++            _abandon_refresh(request["_claim_key"], request["_claim_token"])
++        logger.warning("account usage: could not start per-account refresh (%d slots): %s", len(due), exc)
+         return []
+-    thread = threading.Thread(
+-        target=copy_context().run, args=(_refresh_entries, list(due)),
+-        name="hermes-account-usage-refresh", daemon=True)
+-    thread.start()
+     return [thread]
+ 
+ 
+ def _refresh_entries(requests: list[dict]) -> None:
+     from agent.account_usage import fetch_account_usage
+ 
+-    for request in requests:
+-        provider = request["provider"]
+-        key = _key(provider, request["identity_id"])
+-        try:
+-            fetch_account_usage(
+-                provider, base_url=request.get("base_url"), api_key=request.get("api_key"),
+-                read_only=True, identity_id=request["identity_id"],
+-            )
+-        finally:
+-            _release_refresh(key)
++    claims = [(request.get("_claim_key") or _key(request["provider"], request["identity_id"]),
++               request.get("_claim_token")) for request in requests]
++    try:
++        for request, (key, token) in zip(requests, claims):
++            try:
++                _touch_refresh(key, token)
++                fetch_account_usage(
++                    request["provider"], base_url=request.get("base_url"), api_key=request.get("api_key"),
++                    read_only=True, identity_id=request["identity_id"],
++                )
++            except Exception as exc:  # one bad slot must not starve its siblings
++                logger.debug("account usage: refresh for %s/%s failed: %s",
++                             request.get("provider"), request.get("identity_id"), exc)
++            finally:
++                _release_refresh(key, token)
++    finally:
++        # Anything escaping the loop (a BaseException) must not strand the slots behind it.
++        for key, token in claims:
++            _release_refresh(key, token)
++
++
++def account_usage_cache_diagnostics(*, now: Optional[float] = None) -> dict:
++    """Read-only view of this process's usage cache for the CURRENT home: which slots hold a
++    refresh claim and for how long, when each was last tried, and how old its snapshot is.
++    Confirms (or rules out) a wedged claim behind accounts rendering ``unknown``."""
++    mono = time.monotonic() if now is None else now
++    wall = time.time()
++    home = _key("")[0]
++
++    def _age(value: Optional[float]) -> Optional[float]:
++        return None if value is None else round(mono - value, 1)
++
++    with _lock:
++        keys = {k for store in (_snapshots, _last_try, _inflight) for k in store if k[0] == home}
++        slots = []
++        for key in sorted(keys):
++            held = _inflight.get(key)
++            snapshot = _snapshots.get(key)
++            try:
++                snapshot_age = round(wall - snapshot.fetched_at.timestamp(), 1) if snapshot else None
++            except (AttributeError, TypeError, ValueError, OSError, OverflowError):
++                snapshot_age = None
++            slots.append({
++                "provider": key[1], "identity_id": key[2] or None, "base_url": key[3] or None,
++                "inflight": held is not None,
++                "inflight_age_s": _age(held[1]) if held else None,
++                "last_try_age_s": _age(_last_try.get(key)),
++                "snapshot_age_s": snapshot_age,
++                "stale": snapshot_is_stale(snapshot),
++            })
++        inflight_count = sum(1 for k in _inflight if k[0] == home)
++    return {
++        "home": home, "inflight_count": inflight_count, "slots": slots,
++        "refresh_after_s": REFRESH_AFTER_S, "inflight_expire_s": INFLIGHT_EXPIRE_S,
++        "snapshot_stale_after_s": SNAPSHOT_STALE_AFTER_S,
++    }
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 3acc4d710a..f21df4ffb9 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -630,6 +630,29 @@ export interface DiagnosticsShareNousResult {
+   expires_at?: string | null
+   error?: string | null
+ }
++export interface DiagnosticsAccountUsageCacheParams {
++  profile?: string | null
++  session_id?: string | null
++}
++export interface DiagnosticsAccountUsageCacheResult {
++  home: string
++  inflight_count: number
++  slots: AccountUsageCacheSlot[]
++  refresh_after_s: number
++  inflight_expire_s: number
++  snapshot_stale_after_s: number
++}
++/** One ``agent/account_usage_cache.py`` slot (home-scoped; never a token). */
++export interface AccountUsageCacheSlot {
++  provider: string
++  identity_id?: string | null
++  base_url?: string | null
++  inflight: boolean
++  inflight_age_s?: number | null
++  last_try_age_s?: number | null
++  snapshot_age_s?: number | null
++  stale: boolean
++}
+ /** ``available`` = an identity exists AND the tier is on; whether inference runs on it is ``setup.runtime_check.free_tier_route``'s question. */
+ export interface FreeTierStatusResult {
+   has_guest: boolean
+@@ -5158,6 +5181,8 @@ export interface RpcMethods {
+   'delegation.pause': { params: DelegationPauseParams; result: DelegationPauseResult }
+   /** Running subagent tree plus the spawn pause flag and limits. */
+   'delegation.status': { params: ProfileParams; result: DelegationStatusResult }
++  /** Read-only usage-cache state (inflight refresh claims, try/snapshot ages) for the scoped home. */
++  'diagnostics.account_usage_cache': { params: DiagnosticsAccountUsageCacheParams; result: DiagnosticsAccountUsageCacheResult }
+   /** Upload a force-redacted debug bundle to Nous-internal diagnostics storage. */
+   'diagnostics.share_nous': { params: DiagnosticsShareNousParams; result: DiagnosticsShareNousResult }
+   /** Run the distro package install on the gateway host; progress streams as display.install.log/.done. */
+@@ -5634,6 +5659,7 @@ export const RPC_METHODS = [
+   'cron.manage',
+   'delegation.pause',
+   'delegation.status',
++  'diagnostics.account_usage_cache',
+   'diagnostics.share_nous',
+   'display.install',
+   'display.lease.acquire',
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 16f7403d36..afce075318 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -816,6 +816,24 @@
+         }
+       }
+     },
++    {
++      "name": "diagnostics.account_usage_cache",
++      "summary": "Read-only usage-cache state (inflight refresh claims, try/snapshot ages) for the scoped home.",
++      "params": [
++        {
++          "name": "params",
++          "schema": {
++            "$ref": "#/components/schemas/DiagnosticsAccountUsageCacheParams"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/DiagnosticsAccountUsageCacheResult"
++        }
++      }
++    },
+     {
+       "name": "diagnostics.share_nous",
+       "summary": "Upload a force-redacted debug bundle to Nous-internal diagnostics storage.",
+@@ -4722,6 +4740,91 @@
+         "title": "AccountOwner",
+         "type": "object"
+       },
++      "AccountUsageCacheSlot": {
++        "additionalProperties": false,
++        "description": "One ``agent/account_usage_cache.py`` slot (home-scoped; never a token).",
++        "properties": {
++          "provider": {
++            "title": "Provider",
++            "type": "string"
++          },
++          "identity_id": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Identity Id"
++          },
++          "base_url": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Base Url"
++          },
++          "inflight": {
++            "title": "Inflight",
++            "type": "boolean"
++          },
++          "inflight_age_s": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Inflight Age S"
++          },
++          "last_try_age_s": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Last Try Age S"
++          },
++          "snapshot_age_s": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Snapshot Age S"
++          },
++          "stale": {
++            "title": "Stale",
++            "type": "boolean"
++          }
++        },
++        "required": [
++          "provider",
++          "inflight",
++          "stale"
++        ],
++        "title": "AccountUsageCacheSlot",
++        "type": "object"
++      },
+       "ActiveIdResult": {
+         "additionalProperties": false,
+         "properties": {
+@@ -12625,6 +12728,79 @@
+         "title": "DelegationStatusResult",
+         "type": "object"
+       },
++      "DiagnosticsAccountUsageCacheParams": {
++        "additionalProperties": false,
++        "properties": {
++          "profile": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Profile"
++          },
++          "session_id": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Session Id"
++          }
++        },
++        "title": "DiagnosticsAccountUsageCacheParams",
++        "type": "object"
++      },
++      "DiagnosticsAccountUsageCacheResult": {
++        "additionalProperties": false,
++        "properties": {
++          "home": {
++            "title": "Home",
++            "type": "string"
++          },
++          "inflight_count": {
++            "title": "Inflight Count",
++            "type": "integer"
++          },
++          "slots": {
++            "items": {
++              "$ref": "#/components/schemas/AccountUsageCacheSlot"
++            },
++            "title": "Slots",
++            "type": "array"
++          },
++          "refresh_after_s": {
++            "title": "Refresh After S",
++            "type": "number"
++          },
++          "inflight_expire_s": {
++            "title": "Inflight Expire S",
++            "type": "number"
++          },
++          "snapshot_stale_after_s": {
++            "title": "Snapshot Stale After S",
++            "type": "number"
++          }
++        },
++        "required": [
++          "home",
++          "inflight_count",
++          "slots",
++          "refresh_after_s",
++          "inflight_expire_s",
++          "snapshot_stale_after_s"
++        ],
++        "title": "DiagnosticsAccountUsageCacheResult",
++        "type": "object"
++      },
+       "DiagnosticsShareNousParams": {
+         "additionalProperties": false,
+         "properties": {
+diff --git a/tests/agent/test_account_usage_cache_claims.py b/tests/agent/test_account_usage_cache_claims.py
+new file mode 100644
+index 0000000000..f6ad126d63
+--- /dev/null
++++ b/tests/agent/test_account_usage_cache_claims.py
+@@ -0,0 +1,164 @@
++"""Refresh claims in ``agent.account_usage_cache`` can never wedge a slot for the process lifetime.
++
++A long-lived Desktop backend rendered every pooled account ``unknown`` forever: once a slot's
++refresh claim leaked (a thread start that raised, a worker that died between claims), that slot
++was never refreshed again and its snapshot aged past the staleness bound. These pin the release
++paths, the inflight expiry, and the read-only diagnostic that confirms the next occurrence.
++"""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++import agent.account_usage_cache as cache
++from datetime import UTC
++
++
++@pytest.fixture(autouse=True)
++def _isolated_cache(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    for store in (cache._snapshots, cache._started, cache._last_try, cache._inflight):
++        store.clear()
++    yield
++    for store in (cache._snapshots, cache._started, cache._last_try, cache._inflight):
++        store.clear()
++
++
++class _BoomThread(threading.Thread):
++    def start(self):
++        raise RuntimeError("can't start new thread")
++
++
++def _request(identity: str, provider: str = "anthropic") -> dict:
++    return {"provider": provider, "identity_id": identity, "base_url": None, "api_key": f"tok-{identity}"}
++
++
++def test_legacy_thread_start_failure_releases_claim(monkeypatch):
++    monkeypatch.setattr(cache.threading, "Thread", _BoomThread)
++    assert cache.refresh_account_usage_async(["anthropic"]) == []
++    key = cache._key("anthropic")
++    assert key not in cache._inflight, "a failed thread start must not leave the slot claimed"
++    assert key not in cache._last_try, "a refresh that never ran must not throttle the next try"
++
++
++def test_entries_thread_start_failure_releases_every_claim(monkeypatch):
++    monkeypatch.setattr(cache.threading, "Thread", _BoomThread)
++    assert cache.refresh_account_usage_entries_async([_request("fp:a"), _request("fp:b")]) == []
++    assert not cache._inflight
++    assert not cache._last_try
++
++
++def test_entries_worker_releases_remaining_claims_when_a_fetch_raises(monkeypatch):
++    """One fetch escaping (anything but the fetcher's own swallowed Exception) must not strand
++    the slots queued behind it in the same batch."""
++    from agent import account_usage
++
++    calls: list[str] = []
++
++    def exploding_fetch(provider, **kw):
++        calls.append(kw["identity_id"])
++        raise KeyboardInterrupt  # BaseException: fetch_account_usage's `except Exception` misses it
++
++    monkeypatch.setattr(account_usage, "fetch_account_usage", exploding_fetch)
++    claims = [(cache._key("anthropic", ident), _request(ident)) for ident in ("fp:a", "fp:b", "fp:c")]
++    for key, _ in claims:
++        assert cache._claim_refresh(key, 0.0)
++    with pytest.raises(KeyboardInterrupt):
++        cache._refresh_entries([request for _, request in claims])
++    assert calls == ["fp:a"]
++    assert not cache._inflight, f"stranded claims: {list(cache._inflight)}"
++
++
++def test_entries_worker_keeps_going_after_an_ordinary_fetch_error(monkeypatch):
++    from agent import account_usage
++
++    calls: list[str] = []
++
++    def flaky_fetch(provider, **kw):
++        calls.append(kw["identity_id"])
++        if kw["identity_id"] == "fp:a":
++            raise RuntimeError("boom")
++
++    monkeypatch.setattr(account_usage, "fetch_account_usage", flaky_fetch)
++    requests = [_request("fp:a"), _request("fp:b")]
++    for request in requests:
++        assert cache._claim_refresh(cache._key("anthropic", request["identity_id"]), 0.0)
++    cache._refresh_entries(requests)
++    assert calls == ["fp:a", "fp:b"]
++    assert not cache._inflight
++
++
++def test_wedged_inflight_claim_expires(monkeypatch):
++    key = cache._key("anthropic", "fp:a")
++    assert cache._claim_refresh(key, 1000.0)
++    # Still fresh: inside both the retry throttle and the inflight bound.
++    assert not cache._claim_refresh(key, 1000.0 + cache.REFRESH_AFTER_S - 1)
++    # Past the throttle but the claim is still inside the inflight bound (only if the bound is longer).
++    later = 1000.0 + max(cache.REFRESH_AFTER_S, cache.INFLIGHT_EXPIRE_S) + 1
++    assert cache._claim_refresh(key, later), "a claim older than INFLIGHT_EXPIRE_S must be reclaimable"
++
++
++def test_inflight_expire_bound_is_a_small_multiple_of_the_fetch_timeout():
++    assert cache.USAGE_FETCH_BOUND_S >= 15.0
++    assert 2 * cache.USAGE_FETCH_BOUND_S <= cache.INFLIGHT_EXPIRE_S <= cache.REFRESH_AFTER_S
++
++
++def test_stale_worker_release_does_not_drop_a_newer_claim():
++    """A wedged worker that finally finishes after its claim expired and was retaken must not
++    release the NEW claim (that would let a third refresh pile on)."""
++    key = cache._key("anthropic", "fp:a")
++    old = cache._claim_refresh(key, 0.0)
++    new = cache._claim_refresh(key, cache.INFLIGHT_EXPIRE_S + cache.REFRESH_AFTER_S + 1)
++    assert old and new and old is not new
++    cache._release_refresh(key, old)
++    assert key in cache._inflight
++    cache._release_refresh(key, new)
++    assert key not in cache._inflight
++
++
++def test_worker_releases_the_key_it_claimed_even_if_home_changes(monkeypatch, tmp_path):
++    """The entries worker must release the exact claimed key, not one recomputed under whatever
++    home is current inside the thread."""
++    from agent import account_usage
++
++    def fetch_after_home_flip(provider, **kw):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other"))
++
++    monkeypatch.setattr(account_usage, "fetch_account_usage", fetch_after_home_flip)
++    threads = cache.refresh_account_usage_entries_async([_request("fp:a"), _request("fp:b")])
++    for thread in threads:
++        thread.join(5)
++    assert not cache._inflight
++
++
++def test_diagnostics_reports_inflight_and_ages_for_current_home(monkeypatch, tmp_path):
++    from datetime import datetime, timedelta, timezone
++
++    from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
++
++    key = cache._key("anthropic", "fp:a")
++    cache._claim_refresh(key, cache.time.monotonic() - 42)
++    snap = AccountUsageSnapshot(
++        provider="anthropic", source="test",
++        fetched_at=datetime.now(UTC) - timedelta(minutes=20),
++        windows=(AccountUsageWindow(label="Session", used_percent=10.0),),
++    )
++    cache.remember_account_usage("anthropic", snap, identity_id="fp:b")
++    # A slot belonging to another home is not reported.
++    cache._inflight[("/elsewhere", "anthropic", "fp:z", "")] = (object(), 0.0)
++
++    diag = cache.account_usage_cache_diagnostics()
++    assert diag["home"] == cache._key("x")[0]
++    assert diag["inflight_count"] == 1
++    slots = {(s["provider"], s["identity_id"]): s for s in diag["slots"]}
++    a = slots[("anthropic", "fp:a")]
++    assert a["inflight"] is True and 41 <= a["inflight_age_s"] <= 60
++    assert a["last_try_age_s"] is not None and a["snapshot_age_s"] is None
++    b = slots[("anthropic", "fp:b")]
++    assert b["inflight"] is False and b["stale"] is True and b["snapshot_age_s"] >= 20 * 60 - 5
++    assert ("anthropic", "fp:z") not in slots
++    assert diag["inflight_expire_s"] == cache.INFLIGHT_EXPIRE_S
++    # Read-only: nothing claimed, released or dropped.
++    assert len(cache._inflight) == 2
+diff --git a/tests/tui_gateway/test_diagnostics_account_usage_cache.py b/tests/tui_gateway/test_diagnostics_account_usage_cache.py
+new file mode 100644
+index 0000000000..efa4d6bbc4
+--- /dev/null
++++ b/tests/tui_gateway/test_diagnostics_account_usage_cache.py
+@@ -0,0 +1,42 @@
++"""diagnostics.account_usage_cache RPC: read-only view of the usage cache's refresh claims.
++
++Pinned: the result validates against its declared contract, reports an inflight claim with its
++age for the scoped home, and leaves every claim untouched.
++"""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++import agent.account_usage_cache as cache
++from tui_gateway import server
++from tui_gateway.contracts.config_free_tier_control import DiagnosticsAccountUsageCacheResult
++
++
++@pytest.fixture(autouse=True)
++def _isolated_cache(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    for store in (cache._snapshots, cache._started, cache._last_try, cache._inflight):
++        store.clear()
++    yield
++    for store in (cache._snapshots, cache._started, cache._last_try, cache._inflight):
++        store.clear()
++
++
++def test_rpc_reports_inflight_claim_and_is_read_only():
++    fn = server._methods.get("diagnostics.account_usage_cache")
++    assert fn is not None, "diagnostics.account_usage_cache not registered"
++    key = cache._key("openai-codex", "codex:acct:user")
++    cache._claim_refresh(key, time.monotonic() - 3600)  # a claim wedged for an hour
++
++    resp = fn("r1", {})
++    result = resp["result"]
++    DiagnosticsAccountUsageCacheResult.model_validate(result)
++    assert result["inflight_count"] == 1
++    (slot,) = result["slots"]
++    assert slot["provider"] == "openai-codex" and slot["identity_id"] == "codex:acct:user"
++    assert slot["inflight"] is True and slot["inflight_age_s"] >= 3599
++    assert slot["stale"] is True and slot["snapshot_age_s"] is None
++    assert key in cache._inflight, "a diagnostic must never release or expire a claim"
+diff --git a/tui_gateway/contracts/config_free_tier_control.py b/tui_gateway/contracts/config_free_tier_control.py
+index 73eb0a505f..1fbeba10c8 100644
+--- a/tui_gateway/contracts/config_free_tier_control.py
++++ b/tui_gateway/contracts/config_free_tier_control.py
+@@ -1,7 +1,7 @@
+ """Contracts: config, setup readiness, free tier, model inventory, connectors, diagnostics,
+ image generation and structured session control.
+ 
+-Handlers: ``tui_gateway/methods_config.py`` (``config.get``, ``setup.*``, ``diagnostics.share_nous``),
++Handlers: ``tui_gateway/methods_config.py`` (``config.get``, ``setup.*``, ``diagnostics.*``),
+ ``methods_config_set.py`` (``config.set``), ``methods_free_tier.py``, ``methods_shared_metrics.py``,
+ ``methods_complete.py``
+ (``model.options``), ``methods_connectors.py``, ``methods_images.py``, ``methods_session_control.py``
+@@ -178,6 +178,41 @@ method("diagnostics.share_nous", params=DiagnosticsShareNousParams, result=Diagn
+        doc="Upload a force-redacted debug bundle to Nous-internal diagnostics storage.")
+ 
+ 
++# ── diagnostics.account_usage_cache ───────────────────────────────────────────────────────────
++
++
++class DiagnosticsAccountUsageCacheParams(Params):
++    profile: str | None = None
++    session_id: str | None = None
++
++
++class AccountUsageCacheSlot(Result):
++    """One ``agent/account_usage_cache.py`` slot (home-scoped; never a token)."""
++
++    provider: str
++    identity_id: str | None = None
++    base_url: str | None = None
++    inflight: bool
++    inflight_age_s: float | None = None
++    last_try_age_s: float | None = None
++    snapshot_age_s: float | None = None
++    stale: bool
++
++
++class DiagnosticsAccountUsageCacheResult(Result):
++    home: str
++    inflight_count: int
++    slots: list[AccountUsageCacheSlot]
++    refresh_after_s: float
++    inflight_expire_s: float
++    snapshot_stale_after_s: float
++
++
++method("diagnostics.account_usage_cache", params=DiagnosticsAccountUsageCacheParams,
++       result=DiagnosticsAccountUsageCacheResult,
++       doc="Read-only usage-cache state (inflight refresh claims, try/snapshot ages) for the scoped home.")
++
++
+ # ── free tier ─────────────────────────────────────────────────────────────────────────────────
+ 
+ 
+diff --git a/tui_gateway/methods_config.py b/tui_gateway/methods_config.py
+index bf520f6606..758f1e0563 100644
+--- a/tui_gateway/methods_config.py
++++ b/tui_gateway/methods_config.py
+@@ -502,6 +502,17 @@ def _safe_client_label(label: str) -> str:
+     return safe.lstrip(".").strip()
+ 
+ 
++@method("diagnostics.account_usage_cache")
++@_profile_scoped
++def _(rid, params: dict) -> dict:
++    """Read-only snapshot of this process's subscription-usage cache for the scoped home: refresh
++    claims inflight and their ages, last-try and snapshot ages per slot. Confirms a wedged claim
++    behind pooled accounts rendering ``unknown`` without restarting the backend. [daveey]"""
++    from agent.account_usage_cache import account_usage_cache_diagnostics
++
++    return _ok(rid, account_usage_cache_diagnostics())
++
++
+ @method("diagnostics.share_nous")
+ def _(rid, params: dict) -> dict:
+     """Upload a redacted debug bundle to Nous-internal diagnostics storage — same collection +
+-- 
+2.55.0
+
