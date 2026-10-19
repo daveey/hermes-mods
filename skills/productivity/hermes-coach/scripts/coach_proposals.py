@@ -10,8 +10,15 @@ A proposal is a fenced block in the weekly report:
 
     ```coach-proposal
     {"kind": "config", "target": "agent.max_turns", "change": {"value": 150},
-     "evidence": "macbook/default/<id> — <title>: ...", "risk": "low", "title": "..."}
+     "evidence": "macbook/default/<id> — <title>: ...", "risk": "low", "title": "...",
+     "short": "Park cards on an outside blocker",
+     "effect": "When a chat mentions a billing or quota failure, you get a tip to park the affected cards.",
+     "before": "93 Kanban runs retried the same GitHub billing error ($460)."}
     ```
+
+short / effect / before are the user-facing copy of the Inbox card (optional, but write them): `short` is the
+row title (<= 45 chars, plain words, no tool names when avoidable), `effect` one sentence on what is different FOR
+THE USER now (not what the coach did), `before` one sentence on the problem with one number from the evidence.
 
 kind is one of skill_patch | config | shared_config | curriculum | plugin_rule | core | fix | trial. The `change` shape per kind:
   config / shared_config  {"value": <json value>}
@@ -203,7 +210,8 @@ def cmd_add(a):
         n += 1
         rec = {"id": f"{date}-{n}", "fp": fp, "date": date, "report": os.path.relpath(report, Path(a.data).resolve()),
                "status": "pending", "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        rec.update({k: p[k] for k in ("kind", "target", "change", "evidence", "title", "risk", "feature", "signal",
+        rec.update({k: p[k] for k in ("kind", "target", "change", "evidence", "title", "short", "effect", "before",
+                                      "risk", "feature", "signal",
                                       "paid", "cost_usd_day", "idea_id", "idea_ids", "trial_id", "source_url") if k in p})
         rec["tier"] = effective_tier(p)
         append(a.data, rec)

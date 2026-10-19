@@ -122,8 +122,9 @@ class Inbox:
     # ── posting ─────────────────────────────────────────────────────────────
     def post(self, title: str, body: str, accept_prompt: str, *, key: Optional[str] = None,
              poster: Optional[str] = None, cwd: Optional[str] = None,
-             model: Optional[str] = None) -> dict[str, Any]:
+             model: Optional[str] = None, prompt_label: Optional[str] = None) -> dict[str, Any]:
         title = " ".join(str(title or "").split())[:MAX_TITLE]
+        prompt_label = " ".join(str(prompt_label or "").split())[:200] or None
         body = str(body or "").strip()[:MAX_BODY]
         accept_prompt = str(accept_prompt or "").strip()[:MAX_PROMPT]
         key = (str(key).strip() or None) if key else None
@@ -140,7 +141,7 @@ class Inbox:
                 existing = self._open_by_key(side, db, key) if key else None
                 if existing:
                     sid = existing
-                    db.append_message(sid, "assistant", _update_text(body, accept_prompt, now))
+                    db.append_message(sid, "assistant", _update_text(body, accept_prompt, now, prompt_label))
                     side.execute("UPDATE items SET title=?, poster=COALESCE(?, poster), accept_prompt=?, "
                                  "updated_at=? WHERE session_id=?", (title, poster, accept_prompt, now, sid))
                     side.commit()
@@ -149,7 +150,7 @@ class Inbox:
                     return {"session_id": sid, "updated": True}
                 talking = self._accepted_by_key(side, db, key) if key else None
                 if talking:  # the user replied to this card: the follow-up joins that conversation
-                    db.append_message(talking, "assistant", _update_text(body, accept_prompt, now))
+                    db.append_message(talking, "assistant", _update_text(body, accept_prompt, now, prompt_label))
                     side.execute("UPDATE items SET updated_at=? WHERE session_id=?", (now, talking))
                     side.commit()
                     db.set_session_read(talking, False)
@@ -158,7 +159,7 @@ class Inbox:
                 sid = new_session_id()
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
                 db.set_session_hidden(sid, True)
-                db.append_message(sid, "assistant", _post_text(title, body, accept_prompt, poster))
+                db.append_message(sid, "assistant", _post_text(title, body, accept_prompt, poster, prompt_label))
                 _set_title(db, sid, title)
                 db.set_session_read(sid, False)
                 side.execute("INSERT INTO items(session_id,key,title,poster,accept_prompt,created_at,updated_at,state) "
@@ -292,20 +293,29 @@ def _set_title(db, sid: str, title: str) -> None:
             continue
 
 
-def _post_text(title: str, body: str, accept_prompt: str, poster: Optional[str]) -> str:
+def _do_it_line(accept_prompt: str, prompt_label: Optional[str]) -> str:
+    """With a short label the full prompt stays out of the card (Do it still sends all of it)."""
+    return f"**Do it:** {prompt_label}" if prompt_label else f"**Proposed:** {accept_prompt}"
+
+
+def _post_text(title: str, body: str, accept_prompt: str, poster: Optional[str],
+               prompt_label: Optional[str] = None) -> str:
     parts = [f"**{title}**"]
     if body:
         parts.append(body)
-    parts.append(f"**Proposed:** {accept_prompt}")
+    parts.append(_do_it_line(accept_prompt, prompt_label))
+    if prompt_label:
+        parts.append(f"_From {poster or 'Hermes'}. Reply to adjust it, or archive to dismiss._")
+        return "\n\n".join(parts)
     parts.append(f"_Inbox message{f' from {poster}' if poster else ''}. Press **Do it** to run the "
                  "proposal, reply to adjust it, or archive to dismiss._")
     return "\n\n".join(parts)
 
 
-def _update_text(body: str, accept_prompt: str, now: float) -> str:
+def _update_text(body: str, accept_prompt: str, now: float, prompt_label: Optional[str] = None) -> str:
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
     parts = [f"**Update {stamp}**"]
     if body:
         parts.append(body)
-    parts.append(f"**Proposed:** {accept_prompt}")
+    parts.append(_do_it_line(accept_prompt, prompt_label))
     return "\n\n".join(parts)

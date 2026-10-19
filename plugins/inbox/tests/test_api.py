@@ -41,3 +41,17 @@ def test_root_lists_profile_items_and_accepts_them_by_profile(client):
     assert a["session_id"] not in {i["session_id"] for i in c.get("/items").json()["items"]}
     assert c.post(f"/items/{b['session_id']}/archive").json() == {"ok": True}
     assert c.get("/items/x?profile=../etc").status_code == 400
+
+
+def test_rest_post_passes_prompt_label(client):
+    c, api, root = client
+    r = c.post("/items", json={"title": "t", "body": "b", "accept_prompt": "the whole long prompt",
+                               "prompt_label": "stop the idle box"})
+    assert r.status_code == 200, r.text
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=root / "state.db")
+    try:
+        content = db.get_messages(r.json()["session_id"])[0]["content"]
+    finally:
+        db.close()
+    assert "**Do it:** stop the idle box" in content and "the whole long prompt" not in content

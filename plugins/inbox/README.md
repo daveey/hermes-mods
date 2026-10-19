@@ -11,12 +11,14 @@ Each message is a real session. It has the normal transcript, can be resumed and
 | accepted | **Do it** (sends `accept_prompt`), or you type any reply | un-hidden → a normal chat in Recents |
 | archived | Archive button (row hover / composer bar), `hermes inbox archive`, or the normal session archive | archived view (restorable) |
 
+The card ends with the full **Proposed:** prompt, or, when the poster passes `prompt_label`, one line **Do it:** <label> (Do it still sends the whole prompt).
+
 Re-posting with the same `key` updates the open message (new assistant note, title, prompt; marked unread again) instead of adding a duplicate. Once you replied to it (accepted, not archived), a re-post with that key lands in that chat as an unread update instead of opening a second card; after Archive the next post is a new card. At most 20 open messages are kept. Past that, the oldest read ones are archived.
 
 ## Posting
 
-- **Agent tool** `inbox_post(title, body, accept_prompt, key?, cwd?)`. The poster label (`cron · <job title>`, `kanban · …`) and cwd come from the calling session. The tool is deferred, so call it via `tool_call` (name `inbox_post`).
-- **CLI**: `hermes inbox post "<title>" --body "<md>" (or '-' for stdin) --prompt "<instruction>" [--key K] [--poster P] [--cwd D]`, plus `hermes inbox list` and `hermes inbox archive <session_id>`.
+- **Agent tool** `inbox_post(title, body, accept_prompt, key?, cwd?, prompt_label?)`. The poster label (`cron · <job title>`, `kanban · …`) and cwd come from the calling session. The tool is deferred, so call it via `tool_call` (name `inbox_post`).
+- **CLI**: `hermes inbox post "<title>" --body "<md>" (or '-' for stdin) --prompt "<instruction>" [--key K] [--poster P] [--cwd D] [--prompt-label L]`, plus `hermes inbox list` and `hermes inbox archive <session_id>`.
 - **REST** (`/api/plugins/inbox`): `GET /items`, `POST /items`, `GET /items/{sid}`, `POST /items/{sid}/accept`, `POST /items/{sid}/archive`.
 
 ## Desktop half

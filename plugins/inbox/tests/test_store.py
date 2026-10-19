@@ -193,3 +193,41 @@ def test_same_key_after_a_reply_lands_in_that_conversation_not_a_new_card(env):
     inbox.archive(a["session_id"])
     c = inbox.post("Board seat? (3rd)", "again", "p", key="slack:C1:1.0:board")
     assert c["session_id"] != a["session_id"] and not c["updated"]
+
+
+def test_prompt_label_replaces_the_prompt_dump_on_the_card(env):
+    inbox, db, clock = env
+    long_prompt = "Review improvement 1 (coach-apply show 1). " * 10
+    r = inbox.post("Tip: Park cards", "**Now:** x", long_prompt, key="k:1", poster="coach · improvements",
+                   prompt_label="check whether this is helping, then keep or undo it")
+    [m] = db.get_messages(r["session_id"])
+    assert "**Do it:** check whether this is helping, then keep or undo it" in m["content"]
+    assert "Review improvement 1" not in m["content"] and "**Proposed:**" not in m["content"]
+    assert "_From coach · improvements. Reply to adjust it, or archive to dismiss._" in m["content"]
+    assert inbox.list()[0]["accept_prompt"] == long_prompt.strip()  # Do it still sends the whole prompt
+    clock["t"] += 10
+    inbox.post("Tip: Park cards", "update", long_prompt, key="k:1", prompt_label="keep or undo")
+    assert "**Do it:** keep or undo" in db.get_messages(r["session_id"])[-1]["content"]
+
+
+def test_without_prompt_label_the_card_still_shows_the_prompt(env):
+    inbox, db, _ = env
+    r = inbox.post("t", "b", "Destroy vast 123")
+    assert "**Proposed:** Destroy vast 123" in db.get_messages(r["session_id"])[0]["content"]
+
+
+def test_tool_and_cli_pass_prompt_label(env, monkeypatch):
+    inbox, db, _ = env
+    plugin = _load("_inbox_plugin_test2", HERE / "__init__.py")
+    monkeypatch.setattr(plugin, "store_module", lambda: type("M", (), {"Inbox": lambda *a, **k: inbox}))
+    monkeypatch.setattr(plugin, "_poster_for", lambda sid: ("cron · audit", "/work"))
+    out = json.loads(plugin.handle_post({"title": "t", "body": "b", "accept_prompt": "long p",
+                                         "prompt_label": "stop the box"}, session_id="x"))
+    assert "**Do it:** stop the box" in db.get_messages(out["session_id"])[0]["content"]
+    import argparse
+    ap = argparse.ArgumentParser()
+    plugin._setup_cli(ap)
+    args = ap.parse_args(["post", "t2", "--body", "b", "--prompt", "p", "--prompt-label", "do the thing"])
+    assert plugin._run_cli(args) == 0
+    sid = [i for i in inbox.list() if i["title"] == "t2"][0]["session_id"]
+    assert "**Do it:** do the thing" in db.get_messages(sid)[0]["content"]

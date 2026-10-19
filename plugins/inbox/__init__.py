@@ -50,6 +50,8 @@ SCHEMA = {
             "accept_prompt": {"type": "string", "description": "Self-contained instruction run on 'Do it'."},
             "key": {"type": "string", "description": "Dedupe key; re-posting with it updates the open message."},
             "cwd": {"type": "string", "description": "Working directory for the work (defaults to yours)."},
+            "prompt_label": {"type": "string", "description": "Optional one-line summary of what Do it will do, "
+                             "shown on the card instead of the full accept_prompt (e.g. 'stop the idle Vast box')."},
         },
         "required": ["title", "body", "accept_prompt"],
         "additionalProperties": False,
@@ -82,7 +84,7 @@ def handle_post(args: dict, **context) -> str:
         poster, cwd = _poster_for(context.get("session_id"))
         result = store_module().Inbox().post(
             args.get("title", ""), args.get("body", ""), args.get("accept_prompt", ""),
-            key=args.get("key"), poster=poster, cwd=args.get("cwd") or cwd,
+            key=args.get("key"), poster=poster, cwd=args.get("cwd") or cwd, prompt_label=args.get("prompt_label"),
         )
         result["posted"] = True
         return json.dumps(result)
@@ -109,6 +111,7 @@ def _setup_cli(parser) -> None:
     p.add_argument("--key")
     p.add_argument("--poster")
     p.add_argument("--cwd")
+    p.add_argument("--prompt-label", help="one line shown on the card instead of the full prompt")
     sub.add_parser("list", help="list open messages")
     a = sub.add_parser("archive", help="archive a message")
     a.add_argument("session_id")
@@ -120,7 +123,7 @@ def _run_cli(args) -> int:
     if cmd == "post":
         body = sys.stdin.read() if args.body == "-" else args.body
         print(json.dumps(inbox.post(args.title, body, args.prompt, key=args.key, poster=args.poster,
-                                    cwd=args.cwd)))
+                                    cwd=args.cwd, prompt_label=getattr(args, "prompt_label", None))))
         return 0
     if cmd == "list":
         for item in inbox.list():

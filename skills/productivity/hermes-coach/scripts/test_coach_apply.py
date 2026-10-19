@@ -150,13 +150,13 @@ class Inbox(Base):
                        change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
                                "new_string": "- Verify end to end.\n- Then check the device.\n"})
         self.run_auto()
-        self.assertEqual(self.posts(), [("Applied: Check the device", f"coach-improvement:{pid}")])
+        self.assertEqual(self.posts(), [("Rule: Check the device", f"coach-improvement:{pid}")])
         row = json.loads(Path(os.environ["FAKE_CFG"] + ".inbox").read_text().splitlines()[0])
         body = row[row.index("--body") + 1]
         self.assertIn(f"coach-apply revert {pid}", body)
         self.assertIn(f"coach-apply show {pid}", row[row.index("--prompt") + 1])
         ca.cmd_revert(self.env, type("A", (), {"id": pid, "note": ""})())
-        self.assertEqual(self.posts()[-1], ("Reverted: Check the device", f"coach-improvement:{pid}"))
+        self.assertEqual(self.posts()[-1], ("Undone · Rule: Check the device", f"coach-improvement:{pid}"))
 
     def test_canary_then_kept_same_key(self):
         pid = self.add(kind="config", target="agent.max_turns", change={"value": 400})
@@ -168,7 +168,7 @@ class Inbox(Base):
         finally:
             ca.canary_verdict = orig
         heads = [t.split(":")[0] for t, _ in self.posts()]
-        self.assertEqual(heads, ["Trying on this Mac", "Kept after canary"])
+        self.assertEqual(heads, ["Trying · Setting", "Kept · Setting"])
         self.assertEqual({k for _, k in self.posts()}, {f"coach-improvement:{pid}"})
 
     def test_cards_and_failures_never_post(self):
@@ -196,7 +196,67 @@ class Inbox(Base):
                      "--by", "kanban t_1", "--result", "shipped abc123"])
         finally:
             os.environ.pop("COACH_HERMES")
-        self.assertEqual(self.posts(), [("Applied: Retry on 529", f"coach-improvement:{pid}")])
+        self.assertEqual(self.posts(), [("Code: Retry on 529", f"coach-improvement:{pid}")])
+
+    def row(self, i=-1):
+        return json.loads(Path(os.environ["FAKE_CFG"] + ".inbox").read_text().splitlines()[i])
+
+    def body(self, i=-1):
+        r = self.row(i)
+        return r[r.index("--body") + 1]
+
+    def test_card_copy_now_before_and_literal_tip(self):
+        pid = self.add(kind="curriculum", target=str(self.home / "coach/curriculum.yaml"),
+                       title="Teach parking cards", short="Park cards on an outside blocker",
+                       effect="When a chat mentions a billing failure, you get a tip to park the cards.",
+                       before="93 Kanban runs retried the same billing error ($460).",
+                       evidence="macbook/default/20261017_183803_d4f3fe — Dot UX 1: 'refused every job'",
+                       change={"append": RUNNABLE})
+        self.run_auto()
+        self.assertEqual(self.st(pid)["status"], "applied")
+        self.assertEqual(self.posts(), [("Tip: Park cards on an outside blocker", f"coach-improvement:{pid}")])
+        b = self.body()
+        self.assertTrue(b.startswith("**Now:** When a chat mentions a billing failure"), b)
+        self.assertIn("**Before:** 93 Kanban runs retried", b)
+        self.assertIn("> [!TIP]\n> Send one numbered checklist.", b)  # the tip text, unescaped
+        self.assertIn("this Mac only", b)
+        self.assertIn(f"Undo: `coach-apply revert {pid}`", b)
+        self.assertIn("“Dot UX 1”", b)  # session not on this host: its title, not a raw id
+        self.assertNotIn("20261017_183803_d4f3fe", b)
+        self.assertNotIn("curriculum.yaml", b)  # no file path as "what changed"
+        self.assertEqual(self.row()[self.row().index("--prompt-label") + 1], ca.PROMPT_LABEL)
+
+    def test_card_copy_fallbacks_rule_text_and_core_left_out(self):
+        pid = self.add(kind="skill_patch", target="demo-skill", title="Check the device",
+                       evidence="macbook/default/20261016_190336_ccc9cb — Camera audio: 'every live check was silent'; "
+                                "also 20261014_205123_3d7c36",
+                       change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+                               "new_string": "- Verify end to end.\n- Then check the device.\n"})
+        self.run_auto()
+        b = self.body()
+        self.assertIn("**Before:** 'every live check was silent'", b)  # evidence quote, without the session id
+        self.assertIn("Added to the `demo-skill` skill:\n\n> Then check the device.", b)
+        self.assertIn("all Macs (synced)", b)
+        title, body = ca.inbox_card(self.env, {"id": "x-1", "kind": "core", "target": "tools/kanban_tools.py",
+                                               "title": "Classify rejections", "at": "2026-10-19T17:08:40Z",
+                                               "note": "part 2 declined: retry already blocks",
+                                               "evidence": "e"}, "applied", "core 13c3780570: rejection class")
+        self.assertEqual(title, "Code: Classify rejections")
+        self.assertIn("**Shipped:** core 13c3780570: rejection class", body)
+        self.assertIn("**Left out:** part 2 declined", body)
+        self.assertIn("live Oct 19, 10:08 AM PDT", body)
+
+    def test_old_plugin_without_prompt_label_still_posts(self):
+        fake = Path(self.env.hermes)
+        fake.write_text(FAKE_HERMES.replace('elif a[0] == "inbox":',
+                                            'elif a[0] == "inbox" and "--prompt-label" in a:\n'
+                                            '    sys.stderr.write("unrecognized arguments: --prompt-label"); sys.exit(2)\n'
+                                            'elif a[0] == "inbox":'))
+        pid = self.add(kind="skill_patch", target="demo-skill", title="Check the device",
+                       change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+                               "new_string": "- Verify end to end.\n- X.\n"})
+        self.run_auto()
+        self.assertEqual(self.posts(), [("Rule: Check the device", f"coach-improvement:{pid}")])
 
     def test_opt_out(self):
         os.environ["COACH_INBOX"] = "0"

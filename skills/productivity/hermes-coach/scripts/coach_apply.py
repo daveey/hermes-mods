@@ -348,13 +348,160 @@ def mark(env, pid, status, by="coach-apply", note="", result="", **extra):
             sys.stdout = so
 
 
-INBOX_HEAD = {
-    "applied": "Applied",
-    "canary": "Trying on this Mac",
-    "kept": "Kept after canary",
-    "promoted": "Kept + shared to all hosts",
-    "reverted": "Reverted",
-}
+# Inbox card copy (design: "Now / Before", ~/design/coach-inbox-cards). Row title = "<Kind>: <short>", with a
+# status prefix only when it is not simply live. Body = Now / Before lines, the literal change, one muted meta line.
+INBOX_HEAD = {"applied": "", "canary": "Trying", "kept": "Kept", "promoted": "Kept", "reverted": "Undone"}
+KIND_LABEL = {"curriculum": "Tip", "skill_patch": "Rule", "plugin_rule": "Rule", "config": "Setting",
+              "shared_config": "Setting", "core": "Code", "fix": "Fix", "trial": "Trial"}
+PROMPT_LABEL = "check whether this is helping, then keep or undo it"
+
+
+def _yaml_str(block, key):
+    """First `key: "..."` (or unquoted) scalar in a curriculum YAML snippet, unescaped; '' if absent."""
+    m = re.search(rf"^\s*-?\s*{key}:\s*(\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\n]+)\s*$", block or "", re.M)
+    if not m:
+        return ""
+    v = m.group(1).strip()
+    if v[:1] == '"':
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v.strip('"')
+    return v.strip("'")
+
+
+def _added_text(change):
+    """The text a skill/curriculum edit adds (append, or new_string minus old_string)."""
+    if "append" in change:
+        return change["append"]
+    old, new = change.get("old_string") or "", change.get("new_string") or ""
+    if new.startswith(old):
+        return new[len(old):]
+    added = [l[2:] for l in difflib.ndiff(old.splitlines(), new.splitlines()) if l.startswith("+ ")]
+    return "\n".join(added)
+
+
+def _quote(text, limit=700):
+    text = " ".join(str(text).split())
+    text = text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+    return "> " + text
+
+
+def _when_pt(at):
+    try:
+        from zoneinfo import ZoneInfo
+        t = calendar.timegm(time.strptime(str(at)[:19], "%Y-%m-%dT%H:%M:%S"))
+        import datetime as _dt
+        d = _dt.datetime.fromtimestamp(t, ZoneInfo("America/Los_Angeles"))
+        return f"{d:%b} {d.day}, {d:%I:%M %p}".replace(" 0", " ") + f" {d.tzname()}"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _evidence_source(env, evidence):
+    """First evidence session as a link chip when it lives on this host, else its title; '' if none."""
+    m = re.match(r"\s*([\w.-]+)/([\w.-]+)/(\d{8}_\d{6}_[0-9a-f]+)\s+—\s+([^:]+)", str(evidence or ""))
+    if not m:
+        return ""
+    _host, prof, sid, title = m.groups()
+    db = env.home / ("state.db" if prof == "default" else f"profiles/{prof}/state.db")
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            if con.execute("select 1 from sessions where id=?", (sid,)).fetchone():
+                return f"@session:{prof}/{sid}"
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return f"“{title.strip()[:60]}”"
+
+
+def _before_fallback(evidence):
+    """Without a `before` field: the first evidence item's quote/facts, without the session id."""
+    first = re.split(r";\s*(?=[\w.-]+/[\w.-]+/\d{8}_)", str(evidence or ""))[0]
+    first = re.sub(r"^\s*[\w.-]+/[\w.-]+/\d{8}_\d{6}_[0-9a-f]+\s+—\s+[^:]+:\s*", "", first)
+    first = " ".join(first.split())
+    return first if len(first) <= 220 else first[:219].rstrip() + "…"
+
+
+def _scope(p, action):
+    k = p["kind"]
+    if k == "curriculum":
+        return "this Mac only"
+    if k == "skill_patch":
+        return "all Macs (synced)"
+    if k == "core":
+        return "all Macs on next update"
+    if k in ("config", "shared_config", "plugin_rule"):
+        return "all Macs" if action == "promoted" or k == "shared_config" and action != "canary" else \
+            "this Mac only (7-day trial)" if action == "canary" else "this Mac only"
+    return ""
+
+
+def _change_block(p, action, detail):
+    """Markdown for the literal change: the tip as it will appear, the rule text added, the setting, or the commit."""
+    k, ch = p["kind"], p.get("change") or {}
+    if action == "reverted":
+        return f"**Undone:** {detail or p.get('result') or 'reverted'}"
+    if k == "curriculum":
+        added = _added_text(ch)
+        tip, try_ = _yaml_str(added, "tip"), _yaml_str(added, "try")
+        if tip:
+            return "> [!TIP]\n" + _quote(tip) + (f"\n>\n> Try: “{try_}”" if try_ else "")
+        return "Added to the coach tips:\n\n" + _quote(added)
+    if k in ("skill_patch", "plugin_rule"):
+        added = _added_text(ch).strip().lstrip("- ")
+        where = f"the `{p['target']}` skill" if k == "skill_patch" else f"`{Path(str(p['target'])).name}`"
+        return f"Added to {where}:\n\n" + _quote(added)
+    if k in ("config", "shared_config"):
+        prev = p.get("prev")
+        prev = "(unset)" if prev in (None, "__unset__") else json.dumps(prev)
+        return f"`{p['target']}`: {prev} → {json.dumps(ch.get('value'))}"
+    res = str(detail or p.get("result") or "").strip()
+    out = f"**Shipped:** {res}" if res else f"**Planned:** {ch.get('summary', '')}"
+    note = str(p.get("note") or "").strip()
+    if note and action == "applied":
+        out += f"\n\n**Left out:** {note}" if re.search(r"declin|not (done|implemented)|skipp|left out", note, re.I) \
+            else f"\n\n**Note:** {note}"
+    return out
+
+
+def inbox_card(env, p, action, detail=""):
+    """(title, body) for an improvement's Inbox card. Optional proposal fields `short` (row title), `effect`
+    (what is different for the user now) and `before` (the problem, with a number) make it readable at a glance."""
+    kind = KIND_LABEL.get(p["kind"], p["kind"])
+    short = (p.get("short") or p.get("title") or f"{p['kind']} {p['target']}").strip().rstrip(".")
+    title = (f"{INBOX_HEAD[action]} · " if INBOX_HEAD[action] else "") + f"{kind}: {short}"
+    effect = str(p.get("effect") or "").strip()
+    before = str(p.get("before") or "").strip() or _before_fallback(p.get("evidence"))
+    lines = []
+    if action == "reverted":
+        lines.append(f"**Undone:** this no longer applies{f' ({effect[0].lower() + effect[1:]})' if effect else ''}.")
+    elif effect:
+        lines.append(f"**Now:** {effect}")
+    elif p.get("title") and p.get("short"):
+        lines.append(f"**Now:** {p['title']}")
+    if before:
+        lines.append(f"**Before:** {before}")
+    parts = ["  \n".join(lines)] if lines else []
+    if action != "reverted" or p["kind"] != "curriculum":
+        parts.append(_change_block(p, action, detail))
+    elif detail:
+        parts.append(f"_{detail}_")
+    meta = [kind, _scope(p, action)]
+    when = _when_pt(p.get("at"))
+    if when:
+        meta.append(("undone " if action == "reverted" else "trying since " if action == "canary" else "live ")
+                    + when)
+    meta.append(f"id {p['id']}")
+    tail = [f"Undo: `coach-apply revert {p['id']}`"] if action != "reverted" else []
+    src = _evidence_source(env, p.get("evidence"))
+    if src:
+        tail.append(f"Source: {src}")
+    parts.append("_" + " · ".join(m for m in meta if m) + "_" + ("  \n" + " · ".join(tail) if tail else ""))
+    return title[:80], "\n\n".join(x for x in parts if x)
 
 
 def notify_inbox(env, p, action, detail="", out=print):
@@ -364,24 +511,18 @@ def notify_inbox(env, p, action, detail="", out=print):
     if os.environ.get("COACH_INBOX", "1") == "0" or action not in INBOX_HEAD:
         return None
     pid = p["id"]
-    title = f"{INBOX_HEAD[action]}: {p.get('title') or (p['kind'] + ' ' + str(p['target']))}"[:80]
-    verb = "rolled back" if action == "reverted" else "accepted"
-    body = (f"The coach {verb} improvement **{pid}** ({p.get('tier') or cp.effective_tier(p)} tier, "
-            f"{p['kind']} → `{p['target']}`).\n\n"
-            f"**What changed:** {detail or p.get('result') or '(see proposal)'}\n\n"
-            f"**Why:** {str(p.get('evidence') or '')[:600]}\n\n"
-            + (f"**Source:** {p.get('report')}\n\n" if p.get("report") else "")
-            + ("" if action == "reverted" else f"Undo: `coach-apply revert {pid}`\n\n")
-            + "**Do it** reviews whether this is helping; **Archive** just acknowledges it.")
+    title, body = inbox_card(env, p, action, detail)
     prompt = (f"Review coach improvement {pid} (`coach-apply show {pid}`; the change is recorded in "
               "~/code/hermes-coach-data/reports/proposals.jsonl). Show me exactly what changed, then check whether "
               "it is helping using the coach's before/after KPI (coach_weekly check for this proposal, or the latest "
               "reports/weekly-*.md) and recent sessions. Give a one-line verdict: keep or revert. If it is clearly "
               f"hurting, run `coach-apply revert {pid} \"<why>\"` and tell me.")
     try:
-        r = sh([env.hermes, "inbox", "post", title, "--body", body, "--prompt", prompt,
-                "--key", f"coach-improvement:{pid}", "--poster", "coach · improvements",
-                "--cwd", str(env.data)], check=False)
+        args = [env.hermes, "inbox", "post", title, "--body", body, "--prompt", prompt,
+                "--key", f"coach-improvement:{pid}", "--poster", "coach · improvements", "--cwd", str(env.data)]
+        r = sh(args + ["--prompt-label", PROMPT_LABEL], check=False)
+        if r.returncode and "--prompt-label" in (r.stderr or ""):  # an inbox plugin older than prompt_label
+            r = sh(args, check=False)
         if r.returncode:
             out(f"inbox post failed for {pid}: {(r.stderr or r.stdout).strip()[-200:]}")
             return None

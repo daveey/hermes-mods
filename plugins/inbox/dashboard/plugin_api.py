@@ -2,7 +2,7 @@
 
 GET  /ping                      {ok, api}
 GET  /items                     {items:[...], profile}  (root + every profile with an inbox; item.profile)
-POST /items                     {title, body, accept_prompt, key?, poster?, cwd?} -> {session_id, updated}
+POST /items                     {title, body, accept_prompt, key?, poster?, cwd?, prompt_label?} -> {session_id, updated}
 GET  /items/{sid}[?profile=p]    item (any state) or 404
 POST /items/{sid}/accept[?profile=p]   un-hide -> Recents; returns {accept_prompt, ...}
 POST /items/{sid}/archive[?profile=p]  archive the session
@@ -84,7 +84,8 @@ async def post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     try:
         return await asyncio.to_thread(lambda: _store().Inbox().post(
             payload.get("title", ""), payload.get("body", ""), payload.get("accept_prompt", ""),
-            key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd")))
+            key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd"),
+            prompt_label=payload.get("prompt_label")))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
