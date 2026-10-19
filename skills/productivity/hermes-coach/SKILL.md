@@ -28,7 +28,8 @@ which finds anti-patterns and proposes improvements. Phase 1 of a measure → de
 | `scripts/coach_feed.py` | hosts that push | pull → digest → commit `<host>/` → push, to a private git repo (`--exclude-profile` skips shared bots holding other people's chats) |
 | `scripts/coach_mine.py` | the coach | KPIs per host + overall (this window vs previous), top-N unlabeled sessions by waste score; `--write-kpis` writes today's row of `reports/kpis.jsonl` (a rerun replaces it); `--write-adoption` evaluates the coach plugin's curriculum `adopted` tests (public file + `curriculum/*.yaml` overlays) into sticky `reports/adoption.json` (needs PyYAML or ruamel.yaml) |
 | `scripts/coach_weekly.py` | the coach | weekly context: the 6 plan KPIs (latest `kpis.jsonl` row vs the row a week earlier, gaps recomputed from digests), top findings by est. waste, `--check key=value@UTC#signal` before/after verdicts (keep / raise / revert), proposal state + rejected list |
-| `scripts/coach_proposals.py` | both | `add` parses ```` ```coach-proposal ```` JSON blocks from a report into the append-only `reports/proposals.jsonl` (drops anything matching a rejected fingerprint); `list`, `rejected`, `mark` |
+| `scripts/coach_proposals.py` | both | `add` parses ```` ```coach-proposal ```` JSON blocks from a report into the append-only `reports/proposals.jsonl` (drops anything matching a rejected fingerprint) and assigns the rollout `tier` (auto / canary / review from kind+target+cost+risk; a block's `tier` may only raise it); `list`, `rejected`, `mark` |
+| `scripts/coach_apply.py` | the user's machine | `coach-apply` engine: show/apply/reject/revert, and `auto` = the daily rollout pass (auto tier: gate then apply; canary: this host only + a before/after `check`, promote on KEEP, revert on REVERT; review: a Kanban card; pending > 7 days with a failing gate: dropped with the reason). Tests: `test_coach_apply.py` |
 
 The private repo layout is `<host>/<profile>/<session_id>.json`. Each host writes only its own subtree, so pushes never conflict.
 
@@ -59,10 +60,11 @@ A Bot profile on an always-on gateway owns the model work. Two crons: a no-agent
 The Bot labels per `references/labeling.md`, writes `findings/` + `reports/`, then commits through a push helper.
 Put the KPI goals and the user's learning track in its SOUL.md so every report names the next drill.
 A weekly cron (Sunday, after the daily mine) prints `coach_weekly.py` output with instructions; the Bot writes
-`reports/weekly-<date>.md` with 1-3 `coach-proposal` blocks (`{kind: skill_patch|config|shared_config|curriculum|plugin_rule,
-target, change, evidence, title, risk}`), registers them with `coach_proposals.py add`, and replies with the summary.
-The user applies or rejects each from their own machine with a small CLI that reads `proposals.jsonl`, edits through
-the normal mod path (config set / shared config / skill file in the mods repo, committed), and appends the decision.
+`reports/weekly-<date>.md` with 1-3 `coach-proposal` blocks (`{kind: skill_patch|config|shared_config|curriculum|plugin_rule|core,
+target, change, evidence, title, risk, tier, signal}`), registers them with `coach_proposals.py add`, and replies with the summary.
+On the user's machine a daily `coach_apply.py auto` (launchd) rolls them out by tier, editing through the normal mod
+path (config set / shared config / skill file in the mods repo, committed) and appending each decision with its revert
+info; the next digest lists every apply with `coach-apply revert <id>`. The user can still reject or revert by hand.
 The cloud Bot can't read Mac paths: ship any doc that SOUL.md points at (e.g. the plan) into the profile's `work/`
 and reference it by that cloud path. Re-ship whenever the source changes.
 

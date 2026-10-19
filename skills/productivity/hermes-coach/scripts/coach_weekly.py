@@ -237,19 +237,56 @@ def check_change(ds, spec, now):
     return out
 
 
-def section_proposals(data):
+def section_proposals(data, now=None, days=7):
+    """Proposal state by rollout tier. Every auto/canary apply of the last `days` + 1 is listed with its revert."""
+    now = now or time.time()
     st = list(coach_proposals.state(data).values())
-    pend = [p for p in st if p.get("status") == "pending"]
-    rej = [p for p in st if p.get("status") == "rejected"]
-    app = [p for p in st if p.get("status") == "applied"]
-    out = ["## Proposal state", "", f"Pending ({len(pend)}):"]
-    out += [f"- {p['id']} {p['kind']} {p['target']}: {p.get('title', '')}" for p in pend] or ["- none"]
-    out += ["", f"Applied ({len(app)}):"]
+    by = lambda *s: [p for p in st if p.get("status") in s]  # noqa: E731
+
+    def recent(p):
+        t = parse_ts(p.get("at", "")) if p.get("at") else 0
+        return t and now - t <= (days + 1) * 86400
+
+    out = ["## Proposal state", "",
+           "Tiers: auto = applied by `coach-apply auto` once its gate passes; canary = MacBook first + 7-day check, "
+           "promoted to every host on KEEP; review = a Kanban card. Emit `tier` only to RAISE the default.", ""]
+    pend = by("pending")
+    out += [f"Pending ({len(pend)}):"]
+    out += [f"- {p['id']} [{p.get('tier')}] {p['kind']} {p['target']}: {p.get('title', '')}" for p in pend] or ["- none"]
+    rec = [p for p in by("applied", "canary") if recent(p)]
+    out += ["", f"Applied in the last {days:g} days, each with its one-line revert ({len(rec)}):"]
+    out += [f"- {p['id']} [{p.get('tier')}{', canary on the MacBook' if p['status'] == 'canary' else ''}] "
+            f"{p.get('title') or p['kind'] + ' ' + p['target']} ({p.get('at', '')[:10]}) — "
+            + (f"revert: `coach-apply revert {p['id']}`" if revertible(p) else "applied by hand, revert by hand")
+            for p in rec] or ["- none"]
+    can = by("canary")
+    if can:
+        out += ["", "Canary checks in flight (verdict decides promote/revert):"]
+        out += [f"- {p['id']} `{p.get('check')}`" for p in can]
+    card = by("carded")
+    out += ["", f"Review tier, on the Kanban board ({len(card)}):"]
+    out += [f"- {p['id']} card {p.get('card')}: {p.get('title', '')}" for p in card] or ["- none"]
+    gone = [p for p in by("dropped", "reverted") if recent(p)]
+    if gone:
+        out += ["", "Dropped / reverted this week (do not re-propose unchanged):"]
+        out += [f"- {p['id']} {p['status']}: {p.get('note') or p.get('result') or ''}"[:300] for p in gone]
+    app = by("applied")
+    out += ["", f"Applied, all time ({len(app)}):"]
     out += [f"- {p['id']} {p['kind']} {p['target']} ({p.get('at', '')[:10]})" for p in app] or ["- none"]
+    rej = by("rejected")
     out += ["", f"REJECTED — never propose these again ({len(rej)}):"]
     out += [f"- {p['kind']} {p['target']}: {json.dumps(p['change'], ensure_ascii=False)[:160]}"
             f"{' — ' + p['note'] if p.get('note') else ''}" for p in rej] or ["- none"]
     return out
+
+
+def revertible(p):
+    return any(p.get(k) for k in ("commit", "shared_commit", "backup")) or "prev" in p
+
+
+def canary_checks(data):
+    """CHECKS entries registered by canary applies (status canary with a `check` spec)."""
+    return [p["check"] for p in coach_proposals.state(data).values() if p.get("status") == "canary" and p.get("check")]
 
 
 def main():
@@ -267,15 +304,16 @@ def main():
            f"Digests: {len(ds)} across hosts {sorted({d['host'] for d in ds})}.", ""]
     out += section_kpis(data, ds, now, a.days) + [""]
     out += section_findings(data, ds, now, a.days, a.top) + [""]
-    if a.check:
+    checks = list(dict.fromkeys(a.check + canary_checks(data)))
+    if checks:
         out += ["## Config-change checks", ""]
-        for c in a.check:
+        for c in checks:
             out += check_change(ds, c, now) + [""]
     ideas = [p for p in (data / "ideas.md", data / "reports" / "ideas.md") if p.exists()]
     out.append(f"## Phase 4 ideas: {ideas[0].relative_to(data)}" if ideas else
                "## Phase 4 ideas: none yet (no ideas.md in the data repo).")
     out.append("")
-    out += section_proposals(data)
+    out += section_proposals(data, now, a.days)
     print("\n".join(out))
 
 

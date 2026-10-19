@@ -23,12 +23,14 @@ MACHINE = ("cron", "kanban", "oneshot", "api_server")
 def load(data: Path):
     out = []
     for f in glob.glob(str(data / "*" / "*" / "*.json")):
-        if "/reports/" in f or "/findings/" in f:
+        if "/reports/" in f or "/findings/" in f or "/research/" in f:
             continue
         try:
-            out.append(json.load(open(f)))
+            d = json.load(open(f))
         except Exception:
-            pass
+            continue
+        if isinstance(d, dict) and d.get("host"):  # research/state/seen.json etc. are not digests
+            out.append(d)
     return out
 
 

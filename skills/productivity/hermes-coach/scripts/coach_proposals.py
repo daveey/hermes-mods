@@ -13,25 +13,75 @@ A proposal is a fenced block in the weekly report:
      "evidence": "macbook/default/<id> — <title>: ...", "risk": "low", "title": "..."}
     ```
 
-kind is one of skill_patch | config | shared_config | curriculum | plugin_rule. The `change` shape per kind:
+kind is one of skill_patch | config | shared_config | curriculum | plugin_rule | core. The `change` shape per kind:
   config / shared_config  {"value": <json value>}
   skill_patch             {"old_string": "...", "new_string": "...", "file_path": "SKILL.md"}   (target = skill name)
   curriculum/plugin_rule  {"old_string": "...", "new_string": "..."} or {"append": "..."}       (target = file path)
+  core                    {"summary": "..."}  (target = area; never applied by a script, always a Kanban card)
+
+Rollout tier (sets the autonomy; `tier` in the block may only RAISE the default from `default_tier`):
+  auto    curriculum tips, skill patches, coach.* detector thresholds  -> `coach-apply auto` applies them when the
+          gate passes and the weekly digest lists each with `coach-apply revert <id>`
+  canary  config / shared_config / plugin_rule  -> applied on the MacBook only, 7-day before/after check (`check`),
+          promoted to shared-config on KEEP, reverted on REVERT
+  review  core, hermes-agent files, model/provider keys, `paid: true`, `cost_usd_day` > REVIEW_COST_USD_DAY,
+          risk high  -> a card on the `hermes` Kanban board instead of an apply
 
 reports/proposals.jsonl is an append-only event log: one `status: pending` line per new proposal, then one
-line per decision (`applied` / `rejected`). The current state of a proposal is its last line. A proposal whose
+line per decision (applied | canary | carded | rejected | dropped | reverted). The current state of a proposal is its last line. A proposal whose
 fingerprint (kind + target + change) was ever rejected is dropped by `add`, so it is never proposed again.
 """
-import argparse, hashlib, json, os, re, sys, time
+import argparse, calendar, hashlib, json, os, re, sys, time
 from pathlib import Path
 
-KINDS = ("skill_patch", "config", "shared_config", "curriculum", "plugin_rule")
+KINDS = ("skill_patch", "config", "shared_config", "curriculum", "plugin_rule", "core")
+TIERS = ("auto", "canary", "review")
+STATUSES = ("pending", "applied", "canary", "carded", "rejected", "dropped", "reverted")
+STALE_DAYS = 7
+REVIEW_COST_USD_DAY = 2.0
+IDENTITY = ("id", "fp", "date", "report", "kind", "target", "change", "evidence", "title", "risk", "feature")
+REVIEW_KEYS = re.compile(r"^(model|provider|providers|fallback|auxiliary|delegation\.(model|provider)|"
+                         r"custom_providers|credential)", re.I)
+AUTO_KEYS = re.compile(r"^(coach|plugins\.coach)\.|threshold", re.I)
 BLOCK = re.compile(r"```coach-proposal\s*\n(.*?)\n```", re.S)
 
 
 def fingerprint(p):
     raw = json.dumps([p.get("kind"), p.get("target"), p.get("change")], sort_keys=True)
     return hashlib.sha1(raw.encode()).hexdigest()[:12]
+
+
+def tier_rank(t):
+    return TIERS.index(t) if t in TIERS else 0
+
+
+def default_tier(p):
+    """Lowest tier a proposal may run at, from its kind/target/cost/risk."""
+    kind, tgt = p.get("kind"), str(p.get("target") or "")
+    if (kind == "core" or "hermes-agent" in tgt or p.get("paid")
+            or float(p.get("cost_usd_day") or 0) > REVIEW_COST_USD_DAY or p.get("risk") == "high"):
+        return "review"
+    if kind in ("config", "shared_config"):
+        if REVIEW_KEYS.search(tgt):
+            return "review"
+        return "auto" if AUTO_KEYS.search(tgt) else "canary"
+    if kind == "plugin_rule":
+        return "canary"
+    return "auto"  # curriculum, skill_patch
+
+
+def effective_tier(p):
+    """The Bot may raise the tier, never lower it."""
+    d, asked = default_tier(p), p.get("tier")
+    return asked if asked in TIERS and tier_rank(asked) > tier_rank(d) else d
+
+
+def age_days(p, now=None):
+    try:
+        t = calendar.timegm(time.strptime(p.get("date", "")[:10], "%Y-%m-%d"))
+    except ValueError:
+        return 0.0
+    return ((now or time.time()) - t) / 86400
 
 
 def log_path(data):
@@ -59,9 +109,11 @@ def state(data):
         if not pid:
             continue
         if pid in cur:
-            cur[pid].update({k: v for k, v in e.items() if k in ("status", "at", "note", "by", "result")})
+            cur[pid].update({k: v for k, v in e.items() if k not in IDENTITY})
         else:
             cur[pid] = dict(e)
+    for p in cur.values():  # rows registered before tiers existed get the default
+        p.setdefault("tier", effective_tier(p))
     return cur
 
 
@@ -86,6 +138,8 @@ def validate(p):
     ch = p.get("change") if isinstance(p.get("change"), dict) else {}
     if p.get("change") is not None and not isinstance(p.get("change"), dict):
         errs.append("change must be an object")
+    if p.get("tier") is not None and p.get("tier") not in TIERS:
+        errs.append(f"tier must be one of {TIERS}")
     kind = p.get("kind")
     if kind in ("config", "shared_config") and "value" not in ch:
         errs.append("config change needs {value}")
@@ -130,10 +184,13 @@ def cmd_add(a):
         n += 1
         rec = {"id": f"{date}-{n}", "fp": fp, "date": date, "report": os.path.relpath(report, Path(a.data).resolve()),
                "status": "pending", "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        rec.update({k: p[k] for k in ("kind", "target", "change", "evidence", "title", "risk", "feature") if k in p})
+        rec.update({k: p[k] for k in ("kind", "target", "change", "evidence", "title", "risk", "feature", "signal",
+                                      "paid", "cost_usd_day") if k in p})
+        rec["tier"] = effective_tier(p)
         append(a.data, rec)
         seen[fp] = rec
-        msgs.append(f"added {rec['id']} {p['kind']}:{p['target']}")
+        raised = f" (asked {p['tier']}, default is higher)" if p.get("tier") and p["tier"] != rec["tier"] else ""
+        msgs.append(f"added {rec['id']} [{rec['tier']}] {p['kind']}:{p['target']}{raised}")
     print("\n".join(msgs) or "no coach-proposal blocks found")
     return 0 if props else 1
 
@@ -144,7 +201,7 @@ def cmd_list(a):
         print(json.dumps(rows, indent=1, ensure_ascii=False))
         return 0
     for p in rows:
-        print(f"{p['id']:<14} {p.get('status'):<8} {p.get('risk', '?'):<5} {p['kind']:<13} {p['target']}"
+        print(f"{p['id']:<14} {p.get('status'):<8} {p.get('tier', '?'):<6} {p.get('risk', '?'):<5} {p['kind']:<13} {p['target']}"
               f"  {p.get('title') or ''}")
     if not rows:
         print(f"no {a.status} proposals")
@@ -163,8 +220,10 @@ def cmd_mark(a):
     if a.id not in st:
         print(f"unknown proposal {a.id}", file=sys.stderr)
         return 2
-    append(a.data, {"id": a.id, "status": a.status, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "by": a.by, **({"note": a.note} if a.note else {}), **({"result": a.result} if a.result else {})})
+    rec = {"id": a.id, "status": a.status, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "by": a.by, **({"note": a.note} if a.note else {}), **({"result": a.result} if a.result else {})}
+    rec.update({k: v for k, v in (getattr(a, "extra", None) or {}).items() if k not in IDENTITY})
+    append(a.data, rec)
     print(f"{a.id} -> {a.status}")
     return 0
 
@@ -182,7 +241,7 @@ def main(argv=None):
             s.add_argument("--json", action="store_true")
         if name == "mark":
             s.add_argument("--id", required=True)
-            s.add_argument("--status", required=True, choices=("applied", "rejected", "pending"))
+            s.add_argument("--status", required=True, choices=STATUSES)
             s.add_argument("--note", default="")
             s.add_argument("--result", default="")
             s.add_argument("--by", default="coach-apply")
