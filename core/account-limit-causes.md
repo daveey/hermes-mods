@@ -7,6 +7,9 @@ Patches:
 - `patches/0134-feat-inventory-usage-accounts-say-why-they-are-limit.patch`: inventory + gateway contract. Each
   pooled account row in the `model.options` payload says why it is limited, until when, and which models alone
   are cooling down.
+- `patches/0144-fix-inventory-a-duplicate-login-s-stale-bench-no-lon.patch`: inventory fix-up. When one account
+  is signed in twice, a leftover bench on one credential no longer paints the account red while its live usage
+  window shows quota left and the other credential is usable.
 
 What you see: one aux 429 on a Claude account no longer takes that account out of rotation for every model for
 an hour. Before this fix, the account-usage chip then showed a red dot while the account still had quota. Now the
@@ -50,7 +53,10 @@ amber for a temporary cooldown. Each row says why ("cooling down · rate limited
   is quota/billing, a quota reason code (`usage_limit_reached`, `insufficient_quota`, ...) is quota/usage_limit,
   401 or auth is cooldown/auth, and a 429 is cooldown/rate_limit. `_live_model_cooldowns` lists live
   model cooldowns shorter than half the entitlement bench (the same cut `limit_state` uses). Dedupe of one account
-  seen under two credentials now prefers a `quota` row over a `cooldown` row.
+  seen under two credentials prefers a `quota` row over a `cooldown` row. Since 0144 a `ready` row of the same
+  account wins over a `limited` one (rank `ready > limited > unknown > unavailable`). Both rows share the account's
+  usage windows, so `ready` means the live windows have quota left and that credential is usable. Before 0144 an
+  old Codex `usage_limit_reached` on a duplicate login showed a Pro account as out of quota at 30% weekly use.
 - `tui_gateway/contracts/config_free_tier_control.py`: additive optional fields; contract files regenerated.
 
 ## Tests
@@ -69,6 +75,11 @@ amber for a temporary cooldown. Each row says why ("cooling down · rate limited
   cause), exhausted window (quota), window outranks cooldown, billing cooldown (quota), model-only cooldown (ready
   plus `model_cooldowns`, entitlement and expired ones left out), Codex explicit `usage_limit_reached` reset
   (quota until the reset), dead row (`reason: auth`). Every case also asserts `auth.json` is byte-identical.
+- Same file, 0144: `test_duplicate_login_with_live_quota_left_shows_ready[stale first|second]` (two credentials
+  of one Codex account, one benched by `usage_limit_reached`, live window 30% → one `ready` row);
+  controls `test_duplicate_login_without_live_usage_keeps_the_limit` (no live usage → `limited`/`quota`) and
+  `test_duplicate_login_with_exhausted_window_stays_red` (100% → `limited`/`quota`), both orders. The new test
+  failed before the rank change and passed after; the controls passed both times.
 - Both files were RED before the production change and GREEN after it.
 
 ## Applying
@@ -83,6 +94,9 @@ mixin (`agent/credential_pool_model_cooldowns.py`), both present upstream. 0134 
 - Persisted benches written before 0133 stay until they expire (1 h for a plain 429). No auth state is reset.
 - A payment-flavoured 429 on a sole credential now gets the full billing bench rather than the short sole-key
   bench, which matches the main agent's classification.
+- 0144 only changes the display. The pool already skips the benched credential and uses the healthy one. The
+  stale bench stays on that credential until it expires, or `hermes auth refresh` clears it, or the duplicate is
+  removed (`hermes auth remove <provider> <id>`).
 - `limit_kind` is absent from older backends. The plugin then keeps a limited row red, so it never shows green
   for a live restriction.
 
