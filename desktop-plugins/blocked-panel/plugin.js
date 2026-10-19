@@ -6,8 +6,11 @@
  *   - one of its Kanban cards (created or shepherded by any id in its compression
  *     lineage, any board) sits in `blocked` waiting on a human. Each card shows the
  *     instructions the worker wrote when it blocked (the latest `blocked` event's
- *     reason; for a card created blocked with no reason, the card body), split into
- *     numbered steps when the text enumerates them. Buttons: Open card · Done → unblock
+ *     reason; for a card created blocked with no reason, the card body) as a NUMBERED
+ *     checklist. Source order: the `blocked-panel` agent plugin's model rewrite
+ *     (POST /api/plugins/blocked-panel/steps, disk-cached) → the note's own numbering →
+ *     one step per sentence. The list always ends with how to hand the card back; the raw
+ *     note stays one click away ("Agent's note"). Buttons: Open card · Done → unblock
  *     · Reply & unblock (posts your note as a card comment, then unblocks, so the
  *     resumed worker reads it).
  *     Skipped: `transient` blocks (they clear on their own) and reasons that say
@@ -163,6 +166,47 @@ export function blockedItems(tasks, details) {
 
 export const detailKey = t => `${str(t?.board) || 'default'}:${str(t?.id)}`
 
+export const HANDBACK = 'When you\u2019re done, click Done \u2192 unblock (or Reply & unblock to send the agent an answer).'
+const HANDBACK_RE = /\bunblock\b/i
+
+/** Prose → one step per sentence (fallback when the note isn't enumerated and no rewrite exists). */
+export function sentenceSteps(text) {
+  const t = str(text).replace(/\s+/g, ' ').trim()
+  if (!t) return []
+  return t
+    .split(/(?<=[.!?;])\s+(?=[A-Z0-9"'\u201c(])/)
+    .map(s => s.trim().replace(/;$/, '.'))
+    .filter(s => s.length > 1)
+}
+
+/** The numbered checklist the panel shows: model rewrite → the note's own numbering → one step per
+ *  sentence. Always ends with how to hand the card back. */
+export function checklist(item, rewritten) {
+  let steps
+  let start = 1
+  let intro = ''
+  let source
+  if (Array.isArray(rewritten) && rewritten.length) {
+    steps = rewritten.slice()
+    source = 'rewritten'
+  } else if (item?.steps?.length >= 2) {
+    steps = item.steps.slice()
+    start = item.start ?? 1
+    intro = item.intro || ''
+    source = 'parsed'
+  } else {
+    steps = sentenceSteps(item?.text)
+    source = 'sentences'
+  }
+  if (!steps.length) steps = ['Open the card to see what it needs.']
+  if (!HANDBACK_RE.test(steps[steps.length - 1])) steps.push(HANDBACK)
+  return { steps, start, intro, source }
+}
+
+export const PARKED_STEPS = ['Do what you parked this chat for (see its last messages above).', 'Press \u2318B to unblock it.']
+
+export const rewriteKey = item => `${item.board}:${item.id}|${item.text.length}|${item.text.slice(0, 64)}|${item.text.slice(-64)}`
+
 // ── data ────────────────────────────────────────────────────────────────────
 
 function activeConnection() {
@@ -244,6 +288,63 @@ const details = new Map() // detailKey → { at, data }
 let timer = null
 let running = false
 let rerun = false
+const rewrites = new Map() // rewriteKey → { status: 'pending'|'done'|'failed', steps, at }
+let backend = { ok: null, at: 0 } // blocked-panel agent plugin present?
+const REWRITE_RETRY_MS = 5 * 60_000
+
+const withRewrites = items =>
+  items.map(it => {
+    const r = rewrites.get(rewriteKey(it))
+    return { ...it, rewritten: r?.status === 'done' ? r.steps : null, rewriting: r?.status === 'pending' }
+  })
+
+async function backendReady() {
+  if (backend.ok !== null && Date.now() - backend.at < REWRITE_RETRY_MS) return backend.ok
+  try {
+    const r = await api('/api/plugins/blocked-panel/ping', { timeoutMs: 5_000 })
+    backend = { ok: Boolean(r?.ok), at: Date.now() }
+  } catch {
+    backend = { ok: false, at: Date.now() }
+  }
+  return backend.ok
+}
+
+/** Ask the backend (aux model, disk-cached) to rewrite each card's note as steps; re-emit as they land. */
+async function requestRewrites(items, detailMap) {
+  const todo = items.filter(it => {
+    if (!it.loaded || !it.text) return false
+    const r = rewrites.get(rewriteKey(it))
+    return !r || (r.status === 'failed' && Date.now() - r.at > REWRITE_RETRY_MS)
+  })
+  if (!todo.length || !(await backendReady())) return
+  for (const it of todo) rewrites.set(rewriteKey(it), { status: 'pending', at: Date.now() })
+  snapshot = { ...snapshot, items: withRewrites(snapshot.items) }
+  emit()
+  for (const it of todo) {
+    const k = rewriteKey(it)
+    const d = detailMap.get(`${it.board}:${it.id}`)
+    const comments = (Array.isArray(d?.comments) ? d.comments : []).slice(-3).map(c => str(c?.body)).filter(Boolean)
+    api('/api/plugins/blocked-panel/steps', {
+      method: 'POST',
+      timeoutMs: 60_000,
+      body: { title: it.title, reason: it.fromBody ? '' : it.text, body: str(d?.task?.body), comments }
+    })
+      .then(r => {
+        const steps = Array.isArray(r?.steps) ? r.steps.map(str).filter(Boolean) : []
+        rewrites.set(k, steps.length ? { status: 'done', steps, at: Date.now() } : { status: 'failed', at: Date.now() })
+      })
+      .catch(e => {
+        log('rewrite failed', it.id, e?.message || e)
+        rewrites.set(k, { status: 'failed', at: Date.now() })
+      })
+      .finally(() => {
+        if (snapshot.items.some(x => rewriteKey(x) === k)) {
+          snapshot = { ...snapshot, items: withRewrites(snapshot.items) }
+          emit()
+        }
+      })
+  }
+}
 
 const emit = () => subs.forEach(fn => fn(snapshot))
 
@@ -286,13 +387,15 @@ export async function refresh(force = false) {
     if (tasks) await loadDetails(tasks)
     if (host.state.focusedStoredSessionId.get() !== stored) return
     const flat = new Map([...details].map(([k, v]) => [k, v.data]))
+    const items = tasks ? blockedItems(tasks, flat) : snapshot.stored === stored ? snapshot.items : []
     snapshot = {
       stored,
       // fetch failed: keep this chat's last list, never another chat's
-      items: tasks ? blockedItems(tasks, flat) : snapshot.stored === stored ? snapshot.items : [],
+      items: withRewrites(items),
       parked: isParked(ids, readParked())
     }
     emit()
+    void requestRewrites(items, flat)
   } catch (e) {
     log('refresh failed', e)
   } finally {
@@ -347,7 +450,9 @@ function Item({ item }) {
   const [replying, setReplying] = useState(false)
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
-  const long = item.steps.length > COLLAPSED_LINES || item.text.length > 360
+  const [showNote, setShowNote] = useState(false)
+  const list = checklist(item, item.rewritten)
+  const long = list.steps.length > COLLAPSED_LINES + 1
 
   const act = async withNote => {
     setBusy(true)
@@ -364,8 +469,7 @@ function Item({ item }) {
     }
   }
 
-  const clamp = !open && long ? { maxHeight: '6.2em', overflow: 'hidden', maskImage: 'linear-gradient(#000 60%, transparent)' } : {}
-  const steps = open || !long ? item.steps : item.steps.slice(0, COLLAPSED_LINES)
+  const steps = open || !long ? list.steps : list.steps.slice(0, COLLAPSED_LINES)
 
   return jsxs('div', {
     'data-blocked-card': item.id,
@@ -380,24 +484,40 @@ function Item({ item }) {
         ]
       }),
       jsxs('div', {
-        style: { fontSize: 12.5, lineHeight: 1.45, color: 'var(--foreground, inherit)', userSelect: 'text', ...(item.steps.length ? {} : clamp) },
+        style: { fontSize: 12.5, lineHeight: 1.45, color: 'var(--foreground, inherit)', userSelect: 'text' },
         children: [
           !item.loaded && jsx('span', { style: { opacity: 0.6 }, children: 'Loading instructions…' }),
-          item.loaded && !item.text && jsx('span', { style: { opacity: 0.7 }, children: 'No instructions were recorded. Open the card to see what it needs.' }),
-          item.fromBody && item.text && jsx('div', { style: { fontSize: 10.5, opacity: 0.6, marginBottom: 2 }, children: 'No block reason recorded; from the card description:' }),
-          item.intro && jsx('div', { style: { whiteSpace: 'pre-wrap' }, children: item.intro }),
-          item.steps.length > 0 &&
+          item.loaded &&
+            jsx('div', {
+              style: { fontSize: 10.5, opacity: 0.6, marginBottom: 2 },
+              children: item.rewriting && list.source !== 'rewritten'
+                ? 'Writing clearer steps…'
+                : !item.text
+                  ? 'No instructions were recorded.'
+                  : item.fromBody
+                    ? 'No block reason recorded; from the card description. To unblock:'
+                    : 'To unblock:'
+            }),
+          item.loaded && list.intro && jsx('div', { style: { whiteSpace: 'pre-wrap' }, children: list.intro }),
+          item.loaded &&
             jsx('ol', {
-              start: item.start,
-              style: { margin: '2px 0 0', paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 2 },
-              children: steps.map((s, i) => jsx('li', { children: s }, i))
+              'data-blocked-steps': list.source,
+              start: list.start,
+              style: { margin: '2px 0 0', paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 3 },
+              children: steps.map((s, i) => jsx('li', { style: { paddingLeft: 2 }, children: s }, i))
+            }),
+          showNote &&
+            jsx('div', {
+              style: { marginTop: 4, padding: '4px 8px', borderLeft: `2px solid color-mix(in srgb, ${AMBER} 50%, transparent)`, fontSize: 11.5, opacity: 0.8, whiteSpace: 'pre-wrap' },
+              children: item.text
             })
         ]
       }),
       jsxs('div', {
         style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' },
         children: [
-          long && jsx('button', { type: 'button', style: { ...btn(), border: 'none', padding: '2px 4px', opacity: 0.75 }, onClick: () => setOpen(!open), children: open ? 'Show less' : 'Show all' }),
+          long && jsx('button', { type: 'button', style: { ...btn(), border: 'none', padding: '2px 4px', opacity: 0.75 }, onClick: () => setOpen(!open), children: open ? 'Show less' : `Show all ${list.steps.length} steps` }),
+          item.text && list.source !== 'parsed' && jsx('button', { type: 'button', style: { ...btn(), border: 'none', padding: '2px 4px', opacity: 0.75 }, onClick: () => setShowNote(!showNote), children: showNote ? 'Hide agent\u2019s note' : 'Agent\u2019s note' }),
           jsx('span', { style: { flex: 1 } }),
           jsx('button', { type: 'button', style: btn(), onClick: () => openCard(item), children: 'Open card' }),
           jsx('button', { type: 'button', style: btn(), disabled: busy, onClick: () => setReplying(!replying), children: 'Reply & unblock' }),
@@ -482,7 +602,7 @@ function Panel() {
         children: [
           jsx('i', { 'aria-hidden': true, className: 'codicon codicon-debug-pause', style: { color: AMBER, fontSize: 13 } }),
           jsx('span', { style: { fontWeight: 600 }, children: header }),
-          !items.length && jsx('span', { style: { opacity: 0.75 }, children: 'No instructions recorded. Press ⌘B when it can continue.' }),
+          !items.length && jsx('span', { style: { opacity: 0.6, fontSize: 11 }, children: 'To unblock:' }),
           parked && items.length > 0 && jsx('span', { style: { opacity: 0.6, fontSize: 11 }, children: '· also parked with ⌘B' }),
           items.length > 0 &&
             jsx('button', {
@@ -494,6 +614,12 @@ function Panel() {
             })
         ]
       }),
+      !items.length &&
+        jsx('ol', {
+          'data-blocked-steps': 'parked',
+          style: { margin: '2px 0 0', paddingLeft: 20, fontSize: 12.5, lineHeight: 1.45, display: 'flex', flexDirection: 'column', gap: 3 },
+          children: PARKED_STEPS.map((s, i) => jsx('li', { children: s }, i))
+        }),
       !collapsed && items.map(item => jsx(Item, { item }, item.id))
     ]
   })
@@ -506,7 +632,7 @@ export default {
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -20, render: () => jsx(Panel, {}) })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__blockedPanel = { get snapshot() { return snapshot }, refresh }
+    window.__blockedPanel = { version: 2, get snapshot() { return snapshot }, refresh, checklist }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel

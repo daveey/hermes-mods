@@ -125,3 +125,34 @@ test('unescapeText turns literal \\uXXXX escapes into characters', () => {
   assert.equal(m.unescapeText('panel host \\u2014 video'), 'panel host \u2014 video')
   assert.equal(m.unescapeText(null), '')
 })
+
+test('checklist: model rewrite wins and gets a hand-back step only when missing', () => {
+  const item = { id: 't_x', board: 'default', text: 'Code shipped. Plug the phone in.', steps: [], start: 1, intro: '' }
+  const a = m.checklist(item, ['Plug the phone into the Mac.', 'Click Done → unblock.'])
+  assert.equal(a.source, 'rewritten')
+  assert.deepEqual(a.steps, ['Plug the phone into the Mac.', 'Click Done → unblock.'])
+  const b = m.checklist(item, ['Plug the phone into the Mac.'])
+  assert.deepEqual(b.steps, ['Plug the phone into the Mac.', m.HANDBACK])
+})
+
+test('checklist: falls back to the note numbering, then one step per sentence, always numbered', () => {
+  const parsed = m.checklist({ text: 'x', steps: ['plug in', 'open app'], start: 0, intro: 'Do:' }, null)
+  assert.equal(parsed.source, 'parsed')
+  assert.equal(parsed.start, 0)
+  assert.equal(parsed.intro, 'Do:')
+  assert.deepEqual(parsed.steps, ['plug in', 'open app', m.HANDBACK])
+  const prose = m.checklist({ text: 'Code is on main; the watch is on 295. After 07:00 PT, update the watch to 316. Then reply with what you heard.', steps: [], start: 1 }, [])
+  assert.equal(prose.source, 'sentences')
+  assert.deepEqual(prose.steps, ['Code is on main; the watch is on 295.', 'After 07:00 PT, update the watch to 316.', 'Then reply with what you heard.', m.HANDBACK])
+  assert.deepEqual(m.checklist({ text: '', steps: [] }, null).steps, ['Open the card to see what it needs.', m.HANDBACK])
+})
+
+test('sentenceSteps keeps decimals and abbreviations-free prose intact', () => {
+  assert.deepEqual(m.sentenceSteps('Median was 0.99 s. Restart the app!  Then wait'), ['Median was 0.99 s.', 'Restart the app!', 'Then wait'])
+  assert.deepEqual(m.sentenceSteps(''), [])
+})
+
+test('parked chats get numbered steps too', () => {
+  assert.equal(m.PARKED_STEPS.length, 2)
+  assert.match(m.PARKED_STEPS[1], /⌘B/)
+})
