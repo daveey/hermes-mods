@@ -64,10 +64,22 @@ The Bot labels per `references/labeling.md`, writes `findings/` + `reports/`, th
 Put the KPI goals and the user's learning track in its SOUL.md so every report names the next drill.
 A weekly cron (Sunday, after the daily mine) prints `coach_weekly.py` output with instructions; the Bot writes
 `reports/weekly-<date>.md` with 1-3 `coach-proposal` blocks (`{kind: skill_patch|config|shared_config|curriculum|plugin_rule|core,
-target, change, evidence, title, risk, tier, signal}`), registers them with `coach_proposals.py add`, and replies with the summary.
+target, change, evidence, title, short, effect, before, risk, tier, signal}`; `short`/`effect`/`before` are the Inbox
+card copy, see the `coach_proposals.py` docstring), registers them with `coach_proposals.py add`, and replies with the summary.
 On the user's machine a daily `coach_apply.py auto` (launchd) rolls them out by tier, editing through the normal mod
 path (config set / shared config / skill file in the mods repo, committed) and appending each decision with its revert
 info; the next digest lists every apply with `coach-apply revert <id>`. The user can still reject or revert by hand.
+The user wants every accepted improvement in the Hermes Inbox: `notify_inbox` in `coach_apply.py` posts one card per
+proposal (`hermes inbox post --key coach-improvement:<id>`, so canary → kept/reverted updates the same card) from every
+path that changes status: auto, canary verdicts, hand apply/revert, and `coach_proposals.py mark` (review-tier cards
+mark there, bypassing coach-apply). A new status-changing path must call it too. `coach-apply inbox --days N` backfills.
+Card layout ("Now / Before", board `~/design/coach-inbox-cards/`): row title `<Tip|Rule|Code|Setting>: <short>` with a
+`Trying · ` / `Kept · ` / `Undone · ` prefix only off the plain applied state; body = **Now** (effect) + **Before**
+(the problem), then the literal change (the tip as a `[!TIP]` alert, the rule text added, `key: old → new`, or what
+a commit shipped and left out), then one muted line (scope · live time PT · `@session` source · undo · id). The Do-it
+prompt goes out with `--prompt-label`, so the card shows one line instead of the whole review prompt. A proposal
+without `effect`/`before` falls back to the evidence quote; append a field-only line to `proposals.jsonl` (`{"id",
+"short", "effect", "before"}`, no `status`/`at`) to fix the copy of an old one.
 The cloud Bot can't read Mac paths: ship any doc that SOUL.md points at (e.g. the plan) into the profile's `work/`
 and reference it by that cloud path. Re-ship whenever the source changes.
 
@@ -83,6 +95,11 @@ digests share one version (`DIGEST_V`).
   empty; the post URLs are in the answer text. Check them with `https://publish.twitter.com/oembed?url=<post>`
   (in testing 21/21 resolved).
 
+- Before recommending a harness change from outside material (a tweet, an article, a scout idea), grep for an existing
+  mechanism first: coach detectors (`plugins/coach/fix_loop.py`, `reply_check.py`), core `VALID_HOOKS` in
+  `hermes_cli/plugins.py` (e.g. `pre_verify`), `config.yaml` (`delegation`, `auxiliary`), and the target app's own
+  code. Write the proposal as a delta on what exists ("make the hint act"), never as a new build, because a
+  config-only skim proposes duplicates of features that already ship.
 - Verify redaction before the first push to a new repo: `gitleaks dir <repo>/<host>` must report no leaks.
 - Hermes writes many user-role messages itself: delegation results, cross-session messages, turn-cap notices,
   `/goal` continuations, `[IMPORTANT: …]` notices, compression summaries, model-switch notes. Counted as user turns,
