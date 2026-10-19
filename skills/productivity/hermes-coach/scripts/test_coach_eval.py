@@ -18,6 +18,17 @@ from test_coach_fixer import kdb, sdb  # noqa: E402
 REAL = Path(os.environ.get("COACH_SETS") or Path.home() / ".hermes/coach")
 
 
+class _NoPaidRunner:
+    """Tests never reach a provider: building the real DirectRunner (no runner passed) fails here."""
+
+    def __init__(self, *a, **k):
+        raise ValueError("paid DirectRunner disabled in tests")
+
+
+_DirectRunnerReal = ce.DirectRunner
+ce.DirectRunner = _NoPaidRunner
+
+
 def synth_replyset(root, n=400, seed=3):
     """A labeled reply set where the judge's p separates gold well above ~0.7 and is noisy below: the shape the real
     2026-10-14 backtest had. Low thresholds buy recall with a precision collapse."""
@@ -378,7 +389,7 @@ class Behavior(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(stdout.getvalue())["verdict"], "INCOMPLETE")
         self.assertEqual(ledger.read_text(), before)  # no run-level double charge
-        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "disabled"):
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "disabled in tests"):
             ce.main(["behavior", "--candidate", str(candidate), "--bench", str(self.bench), "--no-log"])
         self.assertEqual(ledger.read_text(), before)
 
@@ -413,6 +424,186 @@ class Behavior(unittest.TestCase):
             ce.Budget(5, ledger=self.tmp / "paid.jsonl").call(runner, "fake")
         self.assertEqual(runner.calls, 0)
         self.assertFalse((self.tmp / "paid.jsonl").exists())
+
+
+FAKE_WORKER = r"""
+import json, sys
+print("noise on stdout before hello")
+print(json.dumps({"ready": True, "provider": "fake", "oauth": True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req["op"] == "price":
+        if req["model"] == "unpriced":
+            print(json.dumps({"error": "no price"}), flush=True); continue
+        print(json.dumps({"input": 2.0, "output": 10.0, "cache_write": 2.5, "cache_read": 0.1, "request": 0.0,
+                          "source": "fake", "prefix": "PFX"}), flush=True)
+    elif "FAIL" in req["user"] or "FAIL" in req["system"]:
+        print(json.dumps({"error": "HTTP 529 overloaded"}), flush=True)
+    elif "REFUSE" in req["system"]:
+        print(json.dumps({"text": "", "stop_reason": "refusal", "usage": {"input_tokens": 10, "output_tokens": 0,
+                          "cache_write_tokens": 0, "cache_read_tokens": 0}}), flush=True)
+    else:
+        n = (len(req["system"]) + len(req["user"])) // 4
+        out = 999999 if "OVERRUN" in req["user"] else min(100, req["max_tokens"])
+        sys.stderr.write("SYSTEM=" + req["system"][:20])
+        print(json.dumps({"text": "SYS:" + req["system"] + "\nMAXTOK:" + str(req["max_tokens"])
+                          + "\nTHINK:" + json.dumps(req.get("thinking")),
+                          "stop_reason": "end_turn", "usage": {"input_tokens": n, "output_tokens": out,
+                          "cache_write_tokens": 0, "cache_read_tokens": 0}}), flush=True)
+"""
+
+
+class Direct(unittest.TestCase):
+    """The bounded direct-provider runner against a fake worker process (same JSON-lines protocol, no network)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        w = self.tmp / "worker.py"
+        w.write_text(FAKE_WORKER)
+        self.cmd = [sys.executable, str(w)]
+        self.runner = DirectRunnerReal(jobs=2, worker_cmd=self.cmd, live=self.tmp)
+        self.addCleanup(self.runner.close)
+        self.home = self.tmp / "home"
+        (self.home / "memories").mkdir(parents=True)
+        (self.home / "skills/cat/demo").mkdir(parents=True)
+        (self.home / "SOUL.md").write_text("I am SOUL\n")
+        (self.home / "memories/MEMORY.md").write_text("mem fact\n")
+        (self.home / "memories/USER.md").write_text("user fact\n")
+        (self.home / "skills/cat/demo/SKILL.md").write_text("---\nname: demo\ndescription: Demo skill.\n---\nDEMO BODY\n")
+        self.cwd = self.home / "work"
+        self.cwd.mkdir()
+        (self.cwd / "AGENTS.md").write_text("RULE-A\n")
+
+    def test_system_layering_matches_hermes_order(self):
+        s = ce.compose_system(self.home, self.cwd, preload=["skills/cat/demo/SKILL.md"])
+        order = [s.index(x) for x in ("I am SOUL", "# Project Context", "RULE-A", "<available_skills>",
+                                      "- demo: Demo skill.", "MEMORY (your personal notes)", "mem fact",
+                                      "USER PROFILE", "user fact", "DEMO BODY")]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("DEMO BODY", ce.compose_system(self.home, self.cwd))
+
+    def test_bound_covers_bytes_and_max_tokens_and_settles_to_measured(self):
+        from decimal import Decimal
+        req = self.runner.prepare("hello", home=self.home, cwd=self.cwd, model="m")
+        nbytes = len("PFX".encode()) + len(req.system.encode()) + len(b"hello") + DirectRunnerReal.BYTE_SLACK
+        self.assertEqual(req.bound_usd, (Decimal(nbytes) * Decimal("2.5") + 4000 * Decimal(10)) / Decimal(10**6))
+        ledger = self.tmp / "spend.jsonl"
+        budget = ce.Budget(5, ledger=ledger)
+        text, usage = budget.call(self.runner, "hello", home=self.home, cwd=self.cwd, model="m")
+        self.assertIn("RULE-A", text)  # the request carried the composed system prompt
+        self.assertIn("MAXTOK:4000", text)
+        self.assertIn("THINK:null", text)  # replays keep the model's default thinking, like Hermes
+        rows = ce.load_jsonl(ledger)
+        self.assertEqual([r["kind"] for r in rows], ["reserve", "settle"])
+        self.assertAlmostEqual(sum(r["usd"] for r in rows), usage["estimated_cost_usd"], places=6)
+        self.assertAlmostEqual(budget.spent, usage["estimated_cost_usd"], places=6)
+        self.assertLess(usage["estimated_cost_usd"], float(req.bound_usd))
+        # judge calls: no Hermes layering, their own max_tokens
+        text, _ = budget.call(self.runner, "grade", model="m", ignore_rules=True)
+        self.assertIn("MAXTOK:3000", text)
+        self.assertIn('THINK:{"type": "disabled"}', text)
+        self.assertNotIn("I am SOUL", text)
+
+    def test_cap_is_hard_with_concurrency_and_failures_keep_reservation(self):
+        from concurrent.futures import ThreadPoolExecutor
+        ledger = self.tmp / "spend.jsonl"
+        bound = float(self.runner.prepare("x" * 2000, home=self.home, cwd=self.cwd, model="m").bound_usd)
+        cap = bound * 3.5
+        budget = ce.Budget(cap, ledger=ledger)
+
+        def one(i):
+            try:
+                return budget.call(self.runner, "x" * 2000, home=self.home, cwd=self.cwd, model="m")
+            except RuntimeError:
+                return "failed"
+        with ThreadPoolExecutor(6) as ex:
+            res = list(ex.map(one, range(20)))
+        self.assertTrue(budget.stopped)
+        rows = ce.load_jsonl(ledger)
+        self.assertLessEqual(sum(r["usd"] for r in rows), cap + 1e-9)
+        self.assertGreater(sum(1 for r in res if r not in (None, "failed")), 3)  # settlements free headroom
+        # a failed request keeps its full worst case
+        before = budget.spent
+        with self.assertRaises(RuntimeError):
+            ce.Budget(5, ledger=self.tmp / "f.jsonl").call(self.runner, "FAIL", home=self.home, cwd=self.cwd, model="m")
+        frows = ce.load_jsonl(self.tmp / "f.jsonl")
+        self.assertEqual([r["kind"] for r in frows], ["reserve"])
+        self.assertEqual(budget.spent, before)
+
+    def test_lane_allowance_counts_settled_spend_and_rejects_bad_negatives(self):
+        ledger = self.tmp / "spend.jsonl"
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        ledger.write_text(json.dumps({"date": day, "lane": "trial", "usd": 9.99}) + "\n")
+        self.assertIsNone(ce.Budget(5, ledger=ledger).call(self.runner, "hi", home=self.home, cwd=self.cwd, model="m"))
+        ledger.write_text(json.dumps({"date": day, "lane": "trial", "usd": 9.99}) + "\n" +
+                          json.dumps({"date": day, "lane": "trial", "usd": -5.0, "kind": "settle"}) + "\n")
+        self.assertIsNotNone(ce.Budget(5, ledger=ledger).call(self.runner, "hi", home=self.home, cwd=self.cwd,
+                                                              model="m"))
+        ledger.write_text(json.dumps({"date": day, "lane": "trial", "usd": -5.0}) + "\n")
+        with self.assertRaisesRegex(ValueError, "invalid trial accounting"):
+            ce.Budget(5, ledger=ledger).call(self.runner, "hi", home=self.home, cwd=self.cwd, model="m")
+
+    def test_overrun_and_unpriced_model_fail_closed(self):
+        ledger = self.tmp / "spend.jsonl"
+        with self.assertRaisesRegex(ValueError, "violated"):
+            ce.Budget(5, ledger=ledger).call(self.runner, "OVERRUN", home=self.home, cwd=self.cwd, model="m")
+        self.assertEqual([r["kind"] for r in ce.load_jsonl(ledger)], ["reserve"])  # full worst case kept
+        with self.assertRaises(SystemExit):
+            self.runner.prepare("x", home=self.home, cwd=self.cwd, model="unpriced")
+
+    def test_run_behavior_end_to_end_on_fake_worker(self):
+        """Full replay + judge through DirectRunner: failed provider requests leave the run INCOMPLETE, not crashed."""
+        bench_f = bench(self.tmp / "bench.jsonl")
+        live = self.tmp / "live"
+        (live / "memories").mkdir(parents=True)
+        (live / "config.yaml").write_text("model:\n  default: x\n")
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"COACH_DATA": str(self.tmp / "data")}):
+            (self.tmp / "data/research/state").mkdir(parents=True)
+            r = ce.run_behavior({"name": "c", "target": "unverified_done",
+                                 "edits": [{"file": "AGENTS.md", "append": "FAIL"}]}, bench_f, None, 5.0,
+                                runner=self.runner, root=self.tmp / "ev" / "root", live=live, jobs=2,
+                                log=lambda *_: None)
+        self.assertEqual(r["verdict"], "INCOMPLETE")  # the fake judge reply isn't a JSON grade list
+        self.assertGreater(r["calls"], 0)
+        self.assertLessEqual(r["cost_usd"], 5.0)
+
+    def test_refusal_is_a_graded_reply_not_a_gap(self):
+        bench_f = bench(self.tmp / "bench.jsonl")
+        live = self.tmp / "live"
+        (live / "memories").mkdir(parents=True)
+        (live / "config.yaml").write_text("model:\n  default: x\n")
+        from unittest.mock import patch
+        logs = []
+        with patch.dict(os.environ, {"COACH_DATA": str(self.tmp / "data")}):
+            (self.tmp / "data/research/state").mkdir(parents=True)
+            r = ce.run_behavior({"name": "c", "target": "unverified_done",
+                                 "edits": [{"file": "AGENTS.md", "append": "REFUSE"}]}, bench_f, None, 5.0,
+                                runner=self.runner, root=self.tmp / "ev" / "root", live=live, jobs=2, log=logs.append)
+        n = len(ce.load_jsonl(bench_f))
+        self.assertEqual(r["refusals"], {"base": 0, "cand": n})
+        self.assertTrue(all(row["cand_reply"] == ce.REFUSAL_TEXT for row in r["rows"]))
+        self.assertTrue(any("judge batch rejected: not JSON" in x for x in logs))  # judge failures are logged
+
+    def test_launcher_parsing(self):
+        launcher = self.tmp / "hermes"
+        launcher.write_text("#!/bin/sh\nexec /opt/py/bin/python3 -I -c 'import os\nsys.path.insert(0, "
+                            "'\"'\"'/srv/hermes-agent'\"'\"')\n' \"$@\"\n")
+        launcher.chmod(0o755)
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PATH": str(self.tmp), "COACH_HERMES_PYTHON": "", "COACH_HERMES_ROOT": ""}):
+            self.assertEqual(ce.hermes_interpreter(), ("/opt/py/bin/python3", "/srv/hermes-agent"))
+        # a ~/.local/bin style shim that execs the real launcher is followed
+        real = self.tmp / "real"
+        real.mkdir()
+        launcher.rename(real / "hermes")
+        (self.tmp / "hermes").write_text(f'#!/bin/sh\nexec {real / "hermes"} "$@"\n')
+        (self.tmp / "hermes").chmod(0o755)
+        with patch.dict(os.environ, {"PATH": str(self.tmp), "COACH_HERMES_PYTHON": "", "COACH_HERMES_ROOT": ""}):
+            self.assertEqual(ce.hermes_interpreter(), ("/opt/py/bin/python3", "/srv/hermes-agent"))
+
+
+DirectRunnerReal = _DirectRunnerReal
 
 
 class BehaviorVerdict(unittest.TestCase):

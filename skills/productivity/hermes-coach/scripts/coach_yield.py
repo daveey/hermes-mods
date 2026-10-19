@@ -343,7 +343,7 @@ def spend_buckets(records, now):
         day, lane, usd = r.get("date"), r.get("lane"), r.get("usd")
         if day not in buckets:
             continue
-        if lane not in CAPS or isinstance(usd, bool) or not isinstance(usd, (float, int)) or not math.isfinite(usd) or usd < 0:
+        if lane not in CAPS or isinstance(usd, bool) or not isinstance(usd, (float, int)) or not math.isfinite(usd) or (usd < 0 and r.get("kind") != "settle"):
             flags.append(f"{day}: invalid/unknown lane or amount; excluded")
             continue
         if timestamp(r.get("at")) is not None and timestamp(r["at"]) > now:

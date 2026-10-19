@@ -168,6 +168,14 @@ class YieldFixtures(unittest.TestCase):
         self.assertTrue(any("$140" in f for f in flags))
         self.assertTrue(any("invalid" in f for f in flags))
 
+    def test_eval_settle_rows_net_against_reservations(self):
+        records = [{"date": "2026-06-14", "lane": "trial", "usd": 0.1, "kind": "reserve"},
+                   {"date": "2026-06-14", "lane": "trial", "usd": -0.07, "kind": "settle"},
+                   {"date": "2026-06-14", "lane": "trial", "usd": -1.0}]
+        buckets, total, flags = y.spend_buckets(records, self.now)
+        self.assertAlmostEqual(buckets["2026-06-14"]["trial"], 0.03)
+        self.assertEqual(sum("invalid" in f for f in flags), 1)  # a bare negative row is still invalid
+
     def test_pt_report_and_dst_budget_boundary(self):
         now = y.timestamp("2026-11-03T01:00:00Z")
         text = "\n".join(y.section_yield(self.data, now, self.sources))

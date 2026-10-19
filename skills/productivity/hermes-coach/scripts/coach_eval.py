@@ -23,20 +23,27 @@ Two modes. Both print a markdown report (or JSON with --json) and exit 0 on PASS
              CAND.json = {"name", "target": <pattern>, "edits": [{"file": "AGENTS.md" | "SOUL.md" |
              "memories/MEMORY.md" | "skills/<cat>/<n>/SKILL.md" | <abs path of a skill under an external dir>,
              "append": "..."} | {"file", "old_string", "new_string"}]}. A coach-proposal of kind skill_patch also
-             works (--proposal <id>). The edits are applied ONLY inside a private eval HERMES_HOME
-             (a disjoint root: config copy without MCP servers or memory provider, auth/.env copied,
-             no plugins, its own state.db), never to the live home.
+             works (--proposal <id>). The edits are applied ONLY inside a private eval home (a disjoint root:
+             config copy without MCP servers or memory provider, no credentials, no plugins), never to the live home.
              Each episode = user ask + what the agent did (tool log) or the failed-fix exchange; the replay asks
-             `hermes -z` (tools: todo, skills) for the next tool calls + the message it would send.
+             for the next tool calls + the message it would send.
+             Runner (DirectRunner + coach_llm_worker.py under the Hermes interpreter): exactly one provider request
+             per call, no tools, no retries, explicit max_tokens (replay 4000, judge 3000 with thinking off; thinking
+             tokens count against max_tokens). The system prompt is
+             layered like Hermes's: SOUL.md -> cwd AGENTS.md (project context) -> skills index -> MEMORY.md/USER.md,
+             plus the full body of any skill the candidate edits (both variants). Credentials and the price table
+             come from Hermes (COACH_EVAL_PROVIDER, default anthropic). A provider refusal (stop_reason refusal) is
+             the model's real behavior on that turn: it is graded as a refusal reply and counted in `refusals`.
+             Hard cost bound: before dispatch each call reserves its worst case = (utf-8 bytes of prefix + system +
+             user + 512) x max(input, cache-write price) + max_tokens x output price, appended durably to
+             research/state/spend.jsonl (lane trial) under a lock; a call that would pass --budget (default $5) or
+             today's $10 trial-lane allowance is refused. A finished call appends a `settle` row returning the
+             unused part (measured cost from the provider's usage); failed/interrupted calls keep the worst case.
              PASS = the target gains >= max(2, n/4) passes (identical runs move one pattern by 2 of 6, so +1 is
              noise), no other pattern drops by more than max(1, n/6), non-target net >= -max(1, n/6). Repeat a
              run and pool it (--pool earlier.json, or `coach_eval.py verdict --target T a.json b.json`) to
              shrink noise; the bar scales with n. Full coverage of every benchmark pattern and pair is
-             mandatory; smoke, partial and legacy reports cannot PASS or pool. Paid CLI execution is
-             disabled until enforceable provider bounds exist. Offline test runners explicitly declare
-             offline_only=True and max_cost_usd; every call/retry reserves that amount durably before
-             dispatch against --budget and the shared $10 UTC-day trial allowance. Exceptions retain
-             reservations. cost_usd is conservative reserved spend, not measured provider billing.
+             mandatory; smoke, partial and legacy reports cannot PASS or pool.
 
 Roots (env): COACH_DATA (~/code/hermes-coach-data; benchmark = eval/bench-v1.jsonl, reports = eval/reports/),
 COACH_SETS (~/.hermes/coach; replyset/, fixloop/), COACH_MODS (~/code/hermes-mods), HERMES_HOME (~/.hermes),
@@ -436,6 +443,9 @@ Judge each item independently and strictly from the evidence shown.
 Return ONLY a JSON array, one object per item in order: {"id": "<item id>", "pass": 0|1, "why": "<one short sentence>"}"""
 
 
+REFUSAL_TEXT = "[REFUSED: the model declined to respond to this turn and sent no message]"
+
+
 def judge_item_text(item_id, ep, response):
     return (f"=== ITEM id={item_id} ===\nPATTERN: {ep['pattern']}\nUSER ASK: {_clip(ep['user_ask'], 900)}\n"
             f"WHAT WENT WRONG ORIGINALLY / LABEL: {ep['label']}\nUSER'S REACTION THEN: {ep.get('user_reaction', '')}\n"
@@ -460,12 +470,17 @@ def usage_cost(u, model=""):
 
 
 class Budget:
-    """Conservative, durable pre-call reservations; uncertain calls keep the full charge.
+    """Hard per-run and per-UTC-day caps via durable pre-call reservations.
 
-    Only explicitly offline test runners are supported. The Hermes CLI has no proven
-    request/token/auxiliary retry upper bound and is deliberately disabled for paid evals.
-    Reservations count against both this run and the shared UTC-day trial allowance.
-    They are never refunded, including exceptions, cancellation and missing usage.
+    Before every call (and every judge retry) the runner's worst-case cost for that one request is appended to the
+    shared ledger (lane trial) under an exclusive lock, and the call is refused if this run's reservations would pass
+    `usd` or today's trial lane would pass `lane_allowance`. So spend can never exceed the caps, even with concurrent
+    calls, other runs on the same ledger, crashes or interrupts. After a call returns, a `settle` row gives back the
+    unused part of its reservation (worst case minus the measured cost); a call that raised, was interrupted or
+    reported no usage keeps its full reservation.
+
+    Runners: a bounded paid runner (`bounded = True`, `prepare(prompt, **kw)` -> request with `.bound_usd`,
+    `dispatch(request)` -> (text, usage)), or an offline test runner (`offline_only = True`, `max_cost_usd`).
     """
 
     def __init__(self, usd, ledger=None, lane_allowance=10.0):
@@ -480,49 +495,292 @@ class Budget:
         self.lock = threading.Lock()
         self.ledger = Path(ledger or data_dir() / "research/state/spend.jsonl")
 
+    def _append(self, fh, row):
+        fh.write(json.dumps(row) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    def _today_used(self, fh, day):
+        from decimal import Decimal
+        fh.seek(0)
+        used = Decimal(0)
+        for line in fh:
+            if not line.strip():
+                continue
+            row = json.loads(line)  # corrupt accounting fails closed
+            if row.get("lane") == "trial" and row.get("date") == day:
+                value = Decimal(str(row["usd"]))
+                if not value.is_finite() or (value < 0 and row.get("kind") != "settle"):
+                    raise ValueError("invalid trial accounting")
+                used += value
+        return used
+
     def call(self, runner, prompt, **kwargs):
         import fcntl
+        import math
         from decimal import Decimal
-        if getattr(runner, "offline_only", False) is not True:
-            raise ValueError("paid runners disabled: no enforceable provider request/token cost bound")
-        bound = Decimal(str(getattr(runner, "max_cost_usd", "NaN")))
+        if getattr(runner, "bounded", False) is True:
+            req = runner.prepare(prompt, **kwargs)
+            bound = Decimal(str(getattr(req, "bound_usd", "NaN")))
+            dispatch = lambda: runner.dispatch(req)  # noqa: E731
+        elif getattr(runner, "offline_only", False) is True:
+            bound = Decimal(str(getattr(runner, "max_cost_usd", "NaN")))
+            dispatch = lambda: runner(prompt, **kwargs)  # noqa: E731
+        else:
+            raise ValueError("runner disabled: it declares no per-request cost bound (bounded or offline_only)")
         if not bound.is_finite() or bound < 0:
-            raise ValueError("offline runner must declare a finite nonnegative max_cost_usd")
+            raise ValueError("runner must declare a finite nonnegative per-request cost bound")
+        rid = hashlib.sha1(f"{os.getpid()}|{time.time()}|{random.random()}".encode()).hexdigest()[:12]
         with self.lock:
             self.ledger.parent.mkdir(parents=True, exist_ok=True)
             with open(self.ledger, "a+") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
-                fh.seek(0)
                 day = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-                used = Decimal(0)
-                for line in fh:
-                    row = json.loads(line)  # corrupt accounting fails closed
-                    if row.get("lane") == "trial" and row.get("date") == day:
-                        value = Decimal(str(row["usd"]))
-                        if not value.is_finite() or value < 0:
-                            raise ValueError("invalid trial accounting")
-                        used += value
+                used = self._today_used(fh, day)
                 if self.reserved + bound > self.cap or used + bound > self.lane_allowance:
                     self.stopped = True
                     return None
-                fh.write(json.dumps({"date": day, "lane": "trial", "usd": float(bound),
-                                     "what": "coach_eval pre-call reservation (not refunded)"}) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+                self._append(fh, {"date": day, "lane": "trial", "usd": float(bound), "kind": "reserve", "id": rid,
+                                  "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                                  "what": "coach_eval pre-call reservation (worst case)"})
                 self.reserved += bound
                 self.spent = float(self.reserved)
                 self.calls += 1
-        # Charge is already durable before dispatch, even if a BaseException escapes.
-        result = runner(prompt, **kwargs)
+        # The worst case is durable before dispatch, so an exception or interrupt keeps the full charge.
+        result = dispatch()
         cost = usage_cost(result[1], kwargs.get("model", ""))
-        if not __import__("math").isfinite(cost) or cost < 0 or Decimal(str(cost)) > bound:
-            raise ValueError("offline runner violated its declared cost bound")
+        if not math.isfinite(cost) or cost < 0 or Decimal(str(cost)) > bound:
+            raise ValueError(f"runner violated its declared cost bound (${cost} > ${bound})")
+        refund = bound - Decimal(str(round(cost, 6)))
+        if refund > 0:
+            with self.lock:
+                with open(self.ledger, "a+") as fh:
+                    fcntl.flock(fh, fcntl.LOCK_EX)
+                    self._append(fh, {"date": day, "lane": "trial", "usd": -float(refund), "kind": "settle",
+                                      "id": rid, "what": "coach_eval settle: measured cost below reservation"})
+                    self.reserved -= refund
+                    self.spent = float(self.reserved)
         return result
 
 
+# --- bounded direct-provider runner -------------------------------------------------------------------------------
+
+def hermes_interpreter():
+    """(python, source root) of the installed Hermes: COACH_HERMES_PYTHON/COACH_HERMES_ROOT, else parsed from the
+    `hermes` launcher script (`exec <python> -I -c '... sys.path.insert(0, <root>) ...'`)."""
+    py, root = os.environ.get("COACH_HERMES_PYTHON"), os.environ.get("COACH_HERMES_ROOT")
+    if py and root:
+        return py, root
+    live = env_path("HERMES_HOME", HOME / ".hermes")
+    todo = [shutil.which("hermes"), str(HOME / ".local/bin/hermes"), str(live / "hermes-agent/.hermes/bin/hermes")]
+    seen = set()
+    while todo:
+        exe = todo.pop(0)
+        if not exe or exe in seen or not Path(exe).is_file():
+            continue
+        seen.add(exe)
+        try:
+            text = Path(exe).read_text(errors="replace")[:20000]
+        except OSError:
+            continue
+        m = re.search(r"^exec (\S+python3?[\d.]*) ", text, re.M)
+        r = re.search(r"sys\.path\.insert\(0, '\"'\"'([^']+)'\"'\"'\)", text) or \
+            re.search(r"sys\.path\.insert\(0, ['\"]([^'\"]+)['\"]\)", text)
+        if m and r:
+            return py or m.group(1), root or r.group(1)
+        shim = re.search(r"^exec ['\"]?(/[^'\"\s]+)['\"]?", text, re.M)  # a shim that execs the real launcher
+        if shim:
+            todo.insert(0, shim.group(1))
+    raise SystemExit("can't find the Hermes interpreter: set COACH_HERMES_PYTHON and COACH_HERMES_ROOT")
+
+
+class _Worker:
+    def __init__(self, cmd, env):
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, env=env, bufsize=1)
+        hello = self._read()
+        if not hello.get("ready"):
+            raise SystemExit(f"coach_llm_worker failed to start: {hello.get('fatal') or hello}")
+        self.info = hello
+
+    def _read(self):
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("coach_llm_worker exited")
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    pass
+
+    def ask(self, obj):
+        self.p.stdin.write(json.dumps(obj) + "\n")
+        self.p.stdin.flush()
+        return self._read()
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(10)
+        except Exception:
+            self.p.kill()
+        finally:
+            self.p.stdout.close()
+
+
+SKILL_PREAMBLE = ("Before replying, scan the skills below. If a skill matches or is even partially relevant to your task, "
+                  "you MUST load it with skill_view(name) and follow its instructions.")
+
+
+def _frontmatter(text):
+    m = re.match(r"(?s)^---\n(.*?)\n---\n?", text)
+    meta = {}
+    if m:
+        for line in m.group(1).splitlines():
+            k, _, v = line.partition(":")
+            if k and not k.startswith(" ") and v.strip():
+                meta[k.strip()] = v.strip().strip("'\"")
+    return meta, text[m.end():] if m else text
+
+
+def compose_system(home, cwd, preload=()):
+    """The replay system prompt, layered the way Hermes builds it (agent/system_prompt.py): identity (SOUL.md) ->
+    project context (cwd AGENTS.md) -> skills index -> memory (MEMORY.md, USER.md); skills named in `preload` are
+    appended in full the way a session launched with --skills sees them. Reads only the eval home + its cwd."""
+    home, cwd = Path(home), Path(cwd)
+    parts = []
+    soul = home / "SOUL.md"
+    parts.append(soul.read_text().strip() if soul.is_file() else "You are Hermes, a helpful AI agent.")
+    agents = cwd / "AGENTS.md"
+    if agents.is_file():
+        parts.append("# Project Context\n\nThe following project context files have been loaded and should be "
+                     "followed:\n\n## AGENTS.md\n\n" + agents.read_text().strip())
+    cats = {}
+    for f in sorted((home / "skills").rglob("SKILL.md")) if (home / "skills").is_dir() else []:
+        meta, _ = _frontmatter(f.read_text(errors="replace"))
+        rel = f.parent.relative_to(home / "skills")
+        cat = "/".join(rel.parts[:-1]) or "general"
+        cats.setdefault(cat, []).append((meta.get("name") or rel.name, meta.get("description", "")[:120]))
+    if cats:
+        lines = []
+        for cat in sorted(cats):
+            lines.append(f"  {cat}:")
+            lines += [f"    - {n}: {d}" if d else f"    - {n}" for n, d in sorted(set(cats[cat]))]
+        parts.append("## Skills\n" + SKILL_PREAMBLE + "\n\n<available_skills>\n" + "\n".join(lines) +
+                     "\n</available_skills>")
+    for fname, title in (("MEMORY.md", "MEMORY (your personal notes)"), ("USER.md", "USER PROFILE (who the user is)")):
+        f = home / "memories" / fname
+        if f.is_file() and f.read_text().strip():
+            parts.append("═" * 46 + f"\n{title}\n" + "═" * 46 + "\n" + f.read_text().strip())
+    for rel in preload:
+        f = home / rel
+        if f.is_file():
+            meta, body = _frontmatter(f.read_text(errors="replace"))
+            name = meta.get("name") or f.parent.name
+            parts.append(f'[IMPORTANT: The user launched this session with the "{name}" skill preloaded. Treat its '
+                         f"instructions as active guidance for the duration of this session.]\n\n{body.strip()}")
+    return "\n\n".join(parts)
+
+
+JUDGE_SYSTEM = "You are a strict, careful grader. Follow the instructions in the user message exactly."
+
+
+class DirectRequest:
+    __slots__ = ("model", "system", "user", "max_tokens", "bound_usd", "price", "thinking")
+
+
+class DirectRunner:
+    """One provider request per call through the Hermes credentials (coach_llm_worker.py), no tools, explicit
+    max_tokens. prepare() computes the worst case before dispatch: utf-8 bytes of (route prefix + system + user)
+    + 512 as the input-token bound (a token covers >= 1 byte), priced at max(input, cache write), plus max_tokens at
+    the output price and any per-request fee, from the provider's price table. The dispatched request is exactly the
+    one that was bounded."""
+
+    bounded = True
+    BYTE_SLACK = 512
+
+    def __init__(self, jobs=4, max_tokens=4000, judge_max_tokens=3000, preload=(), live=None, worker_cmd=None):
+        self.max_tokens, self.judge_max_tokens, self.preload = max_tokens, judge_max_tokens, list(preload)
+        if worker_cmd is None:
+            py, root = hermes_interpreter()
+            w = str(HERE / "coach_llm_worker.py")
+            worker_cmd = [py, "-I", "-c", "import runpy, sys; sys.path.insert(0, %r); import hermes_bootstrap; "
+                          "sys.argv = [%r]; runpy.run_path(%r, run_name='__main__')" % (root, w, w)]
+        env = dict(os.environ)
+        env["HERMES_HOME"] = str(live or env_path("HERMES_HOME", HOME / ".hermes"))
+        import queue
+        import threading
+        self.pool = queue.Queue()
+        self.workers, errs = [], []
+
+        def start():
+            try:
+                w = _Worker(worker_cmd, env)
+                self.workers.append(w)
+                self.pool.put(w)
+            except BaseException as exc:
+                errs.append(exc)
+        ts = [threading.Thread(target=start) for _ in range(max(1, jobs))]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        if errs:
+            self.close()
+            raise errs[0]
+        self.prices, self.plock = {}, threading.Lock()
+
+    def close(self):
+        for w in self.workers:
+            w.close()
+        self.workers = []
+
+    def _with_worker(self, obj):
+        w = self.pool.get()
+        try:
+            return w.ask(obj)
+        finally:
+            self.pool.put(w)
+
+    def price(self, model):
+        with self.plock:
+            if model not in self.prices:
+                p = self._with_worker({"op": "price", "model": model})
+                if p.get("error") or not p.get("input") or not p.get("output"):
+                    raise SystemExit(f"no provider price for {model}: {p.get('error')}")
+                self.prices[model] = p
+            return self.prices[model]
+
+    def prepare(self, prompt, home=None, cwd=None, model=None, toolsets=None, ignore_rules=False):
+        from decimal import Decimal
+        p = self.price(model)
+        r = DirectRequest()
+        r.model, r.user, r.price = model, prompt, p
+        r.system = JUDGE_SYSTEM if ignore_rules else compose_system(home, cwd, self.preload)
+        r.max_tokens = self.judge_max_tokens if ignore_rules else self.max_tokens
+        r.thinking = {"type": "disabled"} if ignore_rules else None  # the judge needs its whole budget for the JSON
+        nbytes = len((p.get("prefix") or "").encode()) + len(r.system.encode()) + len(prompt.encode()) + self.BYTE_SLACK
+        pin = max(Decimal(str(p["input"])), Decimal(str(p.get("cache_write") or 0)))
+        r.bound_usd = (Decimal(nbytes) * pin + Decimal(r.max_tokens) * Decimal(str(p["output"]))) / Decimal(10**6) \
+            + Decimal(str(p.get("request") or 0))
+        return r
+
+    def dispatch(self, r):
+        out = self._with_worker({"op": "call", "model": r.model, "system": r.system, "user": r.user,
+                                 "max_tokens": r.max_tokens, "thinking": r.thinking})
+        if "error" in out:
+            raise RuntimeError(f"provider request failed: {out['error']}")
+        u, p = out.get("usage") or {}, r.price
+        cost = ((u.get("input_tokens") or 0) * p["input"] + (u.get("output_tokens") or 0) * p["output"]
+                + (u.get("cache_write_tokens") or 0) * (p.get("cache_write") or p["input"])
+                + (u.get("cache_read_tokens") or 0) * (p.get("cache_read") or p["input"])) / 1e6 + (p.get("request") or 0)
+        usage = dict(u, model=r.model, estimated_cost_usd=round(cost, 6), stop_reason=out.get("stop_reason"))
+        return out.get("text") or "", usage
+
+
 def hermes_runner(hermes_bin=None, timeout=900):
-    """Fail closed: CLI max-turns/usage files do not enforce a dollar upper bound."""
-    raise ValueError("paid Hermes runner disabled until provider-enforced token/request bounds are supported")
+    """Fail closed: `hermes -z` has no per-request dollar bound (--run-budget is wall-clock). Use DirectRunner."""
+    raise ValueError("hermes -z runner disabled: no enforceable per-request cost bound; use DirectRunner")
 
 
 # --- the private eval home -------------------------------------------------------------------------------------
@@ -607,7 +865,7 @@ def prepare_home(root, live, edits, agents_src=None):
         shutil.rmtree(root)
     root.mkdir(parents=True, mode=0o700)
     (root / "config.yaml").write_text(_strip_config((live / "config.yaml").read_text()))
-    for n in ("auth.json", ".env", "SOUL.md"):
+    for n in ("SOUL.md",):  # no credentials: the runner authenticates from the live home
         if (live / n).is_file():
             shutil.copy2(live / n, root / n)
     (root / "memories").mkdir()
@@ -665,10 +923,21 @@ def replay_variant(name, eps, root, live, edits, runner, budget, model, jobs, re
 
     def one(item):
         ep, k = item
-        result = budget.call(runner, replay_prompt(ep), home=root, cwd=cwd, model=model, toolsets="todo,skills")
+        try:
+            result = budget.call(runner, replay_prompt(ep), home=root, cwd=cwd, model=model, toolsets="todo,skills")
+        except Exception as exc:  # a failed request keeps its reservation; the pair stays ungraded -> INCOMPLETE
+            log(f"  {name} {ep['id']}: {str(exc)[:200]}")
+            result = None
         if result is None:
             return ep["id"], k, None, 0.0
         text, usage = result
+        stop = (usage or {}).get("stop_reason")
+        if not (text or "").strip() and stop == "refusal":
+            # The model's real behavior on this episode: graded like any reply (same for both variants).
+            log(f"  {name} {ep['id']}: refused (graded as a refusal)")
+            return ep["id"], k, REFUSAL_TEXT, 0.0
+        if not (text or "").strip():
+            log(f"  {name} {ep['id']}: empty reply (stop_reason {stop})")
         return ep["id"], k, (text or "").strip() or None, 0.0
 
     with ThreadPoolExecutor(jobs) as ex:
@@ -679,8 +948,9 @@ def replay_variant(name, eps, root, live, edits, runner, budget, model, jobs, re
     return out
 
 
-def judge_all(items, runner, budget, model, batch=8, jobs=4):
+def judge_all(items, runner, budget, model, batch=6, jobs=4, log=None):
     """items: [(item_id, ep, response)] -> {item_id: {pass, why}}."""
+    log = log or (lambda *_: None)
     res = {}
     batches = [items[i:i + batch] for i in range(0, len(items), batch)]
 
@@ -690,19 +960,26 @@ def judge_all(items, runner, budget, model, batch=8, jobs=4):
             return []
         prompt = JUDGE_SYS + "\n\n" + "\n\n".join(judge_item_text(i, ep, r) for i, ep, r in b)
         for _ in range(2):
-            result = budget.call(runner, prompt, model=model, toolsets="todo", ignore_rules=True)
+            try:
+                result = budget.call(runner, prompt, model=model, toolsets="todo", ignore_rules=True)
+            except RuntimeError as exc:  # provider request failed (reservation kept): retry once, then leave ungraded
+                log(f"  judge batch failed: {str(exc)[:160]}")
+                continue
             if result is None:
                 return []
             try:
-                got = json.loads(result[0])
+                raw = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", result[0] or "")
+                got = json.loads(raw)
                 if (isinstance(got, list) and len(got) == len(expected)
                         and all(isinstance(o, dict) and type(o.get("id")) is str
                                 and type(o.get("pass")) is int and o["pass"] in (0, 1)
                                 and isinstance(o.get("why"), str) for o in got)
                         and {o["id"] for o in got} == expected):
                     return got
+                log(f"  judge batch rejected: wrong ids/shape (stop_reason {(result[1] or {}).get('stop_reason')})")
             except (ValueError, TypeError):
-                pass
+                log(f"  judge batch rejected: not JSON (stop_reason {(result[1] or {}).get('stop_reason')}): "
+                    f"{(result[0] or '')[:120]!r}")
         return []
 
     if len({i for i, _, _ in items}) != len(items):
@@ -801,14 +1078,29 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
     target = target or cand.get("target") or "unverified_done"
     if target not in PATTERNS:
         raise SystemExit(f"--target must be one of {PATTERNS}")
-    runner = runner or hermes_runner()
     root = Path(root or HOME / ".cache/coach-eval/root")
     live = Path(live or env_path("HERMES_HOME", HOME / ".hermes"))
+    preload = [str(rel) for _, rel, _ in _validated_edits(live, cand.get("edits") or [])
+               if rel.parts and rel.parts[0] == "skills" and rel.name == "SKILL.md"]
+    own_runner = runner is None
+    runner = runner or DirectRunner(jobs=jobs, preload=preload, live=live)
+    if hasattr(runner, "preload"):
+        runner.preload = preload  # an edited skill is shown in full to both variants
     model = model or os.environ.get("COACH_EVAL_MODEL") or "claude-sonnet-5-5"
     judge_model = judge_model or os.environ.get("COACH_JUDGE_MODEL") or model
     _validated_edits(live, cand.get("edits") or [])
     budget = Budget(budget_usd)
     t0 = time.time()
+    try:
+        return _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner, root, live, model,
+                             judge_model, jobs, repeats, limit, patterns, log, t0)
+    finally:
+        if own_runner:
+            runner.close()
+
+
+def _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner, root, live, model, judge_model, jobs,
+                  repeats, limit, patterns, log, t0):
     log(f"behavior eval: {len(eps)} episodes x {repeats} x 2 variants, target {target}, budget ${budget_usd:.2f}")
     base = replay_variant("baseline", eps, root, live, [], runner, budget, model, jobs, repeats, log)
     candr = replay_variant("candidate", eps, root, live, cand.get("edits") or [], runner, budget, model, jobs,
@@ -823,7 +1115,7 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
                     key[iid] = (var, ep, k)
                     items.append((iid, ep, src[(ep["id"], k)]))
     random.Random(11).shuffle(items)
-    grades = judge_all(items, runner, budget, judge_model, jobs=jobs)
+    grades = judge_all(items, runner, budget, judge_model, jobs=jobs, log=log)
     by_pattern, rows = {}, []
     for ep in eps:
         for k in range(repeats):
@@ -851,6 +1143,8 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
             "calls": budget.calls, "minutes": round((time.time() - t0) / 60, 1), "model": model,
             "judge_model": judge_model, "bench": str(bench), "episodes": len(eps), "repeats": repeats,
             "edits": cand.get("edits") or [], "complete": complete, "manifest": manifest,
+            "refusals": {"base": sum(v == REFUSAL_TEXT for v in base.values()),
+                         "cand": sum(v == REFUSAL_TEXT for v in candr.values())},
             "benchmark_sha256": hashlib.sha256(Path(bench).read_bytes()).hexdigest()}
 
 
@@ -858,7 +1152,9 @@ def behavior_markdown(r):
     lines = [f"# coach_eval behavior: {r['candidate']}", "",
              f"Target pattern `{r['target']}`; {r['episodes']} episodes x {r['repeats']} repeat(s) from `{r['bench']}`; "
              f"replay model {r['model']}, judge {r['judge_model']}; {r['calls']} model calls, ${r['cost_usd']:.2f}, "
-             f"{r['minutes']} min.", "", f"**Verdict: {r['verdict']}**", ""]
+             f"{r['minutes']} min." + (f" Provider refusals (graded as refusals): baseline {r['refusals']['base']}, "
+                                         f"candidate {r['refusals']['cand']}." if any((r.get('refusals') or {}).values())
+                                         else ""), "", f"**Verdict: {r['verdict']}**", ""]
     lines += [f"- {x}" for x in r["reasons"]]
     lines += ["", "| pattern | graded | baseline pass | candidate pass |", "|---|---|---|---|"]
     for pat in PATTERNS:
