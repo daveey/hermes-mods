@@ -1,0 +1,191 @@
+From a28ba76fe06a4f6b97892fb01907a326a9d72f45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 12:51:29 -0700
+Subject: [PATCH] fix(gateway): signed Hermes Python.app owns the launchd job,
+ not osascript [daveey]
+
+TCC attributes a gateway child's Accessibility/Automation requests to the
+job's responsible process, so terminal-tool 'tell application "System
+Events"' prompted for "osascript". When Hermes Python.app is installed,
+launch through it instead (Developer-ID bundle with
+NSLocalNetworkUsageDescription keeps LAN access; verified live). Same
+wait/exit/SIGTERM semantics as the JXA wrapper; status.py ignores its ps line.
+---
+ gateway/status.py                        |  9 ++++
+ hermes_cli/gateway_launchd.py            | 37 +++++++++++--
+ tests/hermes_cli/test_gateway_service.py | 66 ++++++++++++++++++++++++
+ 3 files changed, 108 insertions(+), 4 deletions(-)
+
+diff --git a/gateway/status.py b/gateway/status.py
+index d0d72b0f02..67c03fe116 100644
+--- a/gateway/status.py
++++ b/gateway/status.py
+@@ -552,6 +552,10 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
+     return None
+ 
+ 
++
++# [daveey] Unique fragment of the signed-bundle launchd wrapper's inline source (hermes_cli.gateway_launchd).
++SIGNED_LAUNCHD_WRAPPER_MARKER = "subprocess.Popen(['/bin/sh', '-c', sys.argv[1]])"
++
+ def _gateway_command_subcommand(command: str | None) -> str | None:
+     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
+     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
+@@ -560,6 +564,11 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
+     argv since ``_apply_profile_override`` removes them before argparse."""
+     if not command:
+         return None
++    # [daveey] The signed-bundle launchd wrapper (gateway_launchd.launchd_program_arguments) carries the gateway
++    # argv as data, like the osascript wrapper below; its interpreter path ("Hermes Python.app") has a space, so
++    # the token checks can't see it is a ``-c`` program. The gateway is its child, matched on its own line.
++    if SIGNED_LAUNCHD_WRAPPER_MARKER in command:
++        return None
+     try:
+         raw_tokens = shlex.split(command, posix=False)
+     except ValueError:
+diff --git a/hermes_cli/gateway_launchd.py b/hermes_cli/gateway_launchd.py
+index 0617ef2d56..9f9973503d 100644
+--- a/hermes_cli/gateway_launchd.py
++++ b/hermes_cli/gateway_launchd.py
+@@ -216,7 +216,26 @@ def _gateway_run_command() -> list[str]:
+                            python=_gw().get_python_path())
+ 
+ 
+-def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: Path) -> list[str]:
++# [daveey] Inline source of the signed-bundle launchd wrapper (see ``launchd_program_arguments``). Default
++# SIGTERM disposition on purpose: launchd signals the job's process group, so the gateway gets exactly one
++# SIGTERM, the same as under the osascript wrapper. Signal deaths map to 128+N like the JXA wrapper.
++# gateway.status matches SIGNED_LAUNCHD_WRAPPER_MARKER so the wrapper's ps line is never taken for the gateway.
++_SIGNED_WRAPPER_SOURCE = (
++    "import signal, subprocess, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); "
++    "rc = subprocess.Popen(['/bin/sh', '-c', sys.argv[1]]).wait(); "
++    "sys.exit(128 - rc if rc < 0 else rc)"
++)
++
++
++def launchd_responsible_python() -> Path | None:
++    """[daveey] The Developer-ID-signed Hermes Python.app executable to own the launchd job, if installed."""
++    from hermes_cli._launchers import signed_python_app
++    return signed_python_app(Path(_gw().get_python_path()))
++
++
++def launchd_program_arguments(
++    command: list[str], stdout_log: Path, stderr_log: Path, *, responsible: Path | None = None,
++) -> list[str]:
+     """launchd ``ProgramArguments`` that run ``command`` with a Local Network identity macOS accepts (#71206).
+ 
+     macOS Local Network Privacy attributes a socket to the process launchd spawned for the job. A bare
+@@ -236,8 +255,18 @@ def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log:
+     bootout`` / ``kickstart -k`` still deliver SIGTERM to it. stdout/stderr are appended inside the shell
+     command because ``system()`` otherwise inherits osascript's plist log handles. The encoded wait status
+     is translated back to a process exit code so KeepAlive's ``SuccessfulExit`` semantics are preserved.
++
++    [daveey] ``responsible``: a Developer-ID-signed app executable (Hermes Python.app) to own the job instead
++    of osascript. macOS attributes every child's Accessibility/Automation request to the job's responsible
++    process, so under osascript a terminal-tool ``osascript -e 'tell application "System Events"…'`` prompts
++    for "osascript", a grant that also covers every unrelated script on the Mac. A signed bundle with
++    ``NSLocalNetworkUsageDescription`` keeps LAN access (verified live on macOS 26.6), and its grants survive
++    rebuilds because TCC keys them by bundle id + team. It waits for ``/bin/sh -c exec …`` like JXA's
++    ``system()`` and dies on launchd's SIGTERM like osascript, so lifecycle semantics are unchanged.
+     """
+     shell = f"exec {shlex.join(command)} >> {shlex.quote(str(stdout_log))} 2>> {shlex.quote(str(stderr_log))}"
++    if responsible is not None:
++        return [str(responsible), "-I", "-c", _SIGNED_WRAPPER_SOURCE, shell]
+     javascript = (
+         'ObjC.import("stdlib"); '
+         f"const status=$.system({json.dumps(shell)}); "
+@@ -367,11 +396,11 @@ def generate_launchd_plist() -> str:
+ 
+     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
+     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
++    # [daveey] With Hermes Python.app installed, the signed bundle owns the job instead (TCC attribution).
+     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
+     command = _timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
+-    prog_args_xml = "\n        ".join(
+-        f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
+-    )
++    prog_args = launchd_program_arguments(command, stdout_log, stderr_log, responsible=launchd_responsible_python())
++    prog_args_xml = "\n        ".join(f"<string>{escape(part)}</string>" for part in prog_args)
+ 
+     # Persist the configured RLIMIT_NOFILE floor: launchd defaults to soft 256, and every plist
+     # rewrite would otherwise strip a manual limit and reintroduce EMFILE crashes.
+diff --git a/tests/hermes_cli/test_gateway_service.py b/tests/hermes_cli/test_gateway_service.py
+index ded5b696fd..51c503696d 100644
+--- a/tests/hermes_cli/test_gateway_service.py
++++ b/tests/hermes_cli/test_gateway_service.py
+@@ -1778,6 +1778,72 @@ class TestProfileArg:
+         # The wrapper's own ps line must never be taken for the gateway (stop/status would signal osascript).
+         assert status.looks_like_gateway_command_line(" ".join(program_args)) is False
+ 
++    def test_launchd_signed_python_owns_job_when_installed(self, tmp_path, monkeypatch):
++        """[daveey] With Hermes Python.app installed, it (not osascript) is the job's first executable, so
++        macOS attributes children's Accessibility/Automation requests to the signed bundle."""
++        profile_dir = tmp_path / ".hermes"
++        profile_dir.mkdir(parents=True)
++        monkeypatch.setattr(Path, "home", lambda: tmp_path)
++        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
++        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
++        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
++        signed = tmp_path / "Applications" / "Hermes Python.app" / "Contents" / "MacOS" / "python3.14"
++        from hermes_cli import gateway_launchd
++        monkeypatch.setattr(gateway_launchd, "launchd_responsible_python", lambda: signed)
++
++        program_args = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))["ProgramArguments"]
++
++        assert program_args[:3] == [str(signed), "-I", "-c"]
++        assert len(program_args) == 5
++        assert status.SIGNED_LAUNCHD_WRAPPER_MARKER in program_args[3]
++        exec_, *argv = shlex.split(program_args[4])
++        assert exec_ == "exec"
++        assert argv[-4:] == [">>", str(profile_dir / "logs" / "gateway.log"),
++                             "2>>", str(profile_dir / "logs" / "gateway.error.log")]
++        assert argv[0] == "/usr/bin/python3"
++        assert argv[-5] == "--external-supervisor"
++        # The wrapper's own ps line must never be taken for the gateway (stop/status would signal it).
++        assert status.looks_like_gateway_command_line(" ".join(program_args)) is False
++
++    def test_launchd_signed_python_absent_keeps_osascript(self, tmp_path, monkeypatch):
++        """[daveey] No signed bundle (any non-fork install): the upstream osascript wrapper is unchanged."""
++        profile_dir = tmp_path / ".hermes"
++        profile_dir.mkdir(parents=True)
++        monkeypatch.setattr(Path, "home", lambda: tmp_path)
++        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
++        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
++        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(tmp_path / "python-3.14.7+x" / "bin" / "python3"))
++
++        program_args = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))["ProgramArguments"]
++
++        assert program_args[0] == "/usr/bin/osascript"
++
++    @pytest.mark.platforms("macos")
++    @pytest.mark.parametrize(("child", "expected"), [
++        ("import os, sys; print(os.getpgrp()); sys.exit(23)", 23),
++        ("import os, signal; print(os.getpgrp()); os.kill(os.getpid(), signal.SIGTERM)", 128 + 15),
++    ])
++    def test_launchd_signed_wrapper_preserves_process_group_and_exit_status(self, tmp_path, child, expected):
++        """[daveey] The signed-bundle wrapper keeps the osascript wrapper's group and KeepAlive exit semantics."""
++        stdout_log = tmp_path / "stdout.log"
++        stderr_log = tmp_path / "stderr.log"
++        command = [sys.executable, "-c", child]
++
++        wrapper = subprocess.Popen(
++            launchd_program_arguments(command, stdout_log, stderr_log, responsible=Path(sys.executable)),
++            start_new_session=True,
++        )
++        try:
++            returncode = wrapper.wait(timeout=10)
++        finally:
++            if wrapper.poll() is None:
++                os.killpg(wrapper.pid, signal.SIGKILL)
++                wrapper.wait()
++
++        assert returncode == expected
++        assert int(stdout_log.read_text()) == wrapper.pid
++        assert stderr_log.read_text() == ""
++
+     @pytest.mark.platforms("macos")
+     def test_launchd_osascript_wrapper_preserves_process_group_and_exit_status(self, tmp_path):
+         """The non-polling JXA wait keeps lifecycle signals and KeepAlive failure semantics intact."""
+-- 
+2.54.0 (Apple Git-157)
+

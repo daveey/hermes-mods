@@ -1,6 +1,6 @@
-# macOS: run Hermes on a Developer-ID-signed Python (patches 0017, 0027, 0123)
+# macOS: run Hermes on a Developer-ID-signed Python (patches 0017, 0027, 0123, 0142)
 
-Three fork patches make Hermes on macOS run on a code-signed copy of its own Python interpreter. With
+Four fork patches make Hermes on macOS run on a code-signed copy of its own Python interpreter. With
 that copy, privacy grants (Full Disk Access, Accessibility, Automation, Photos, Contacts, Calendar…)
 survive Python upgrades.
 
@@ -9,8 +9,9 @@ survive Python upgrades.
 | `0017-…re-exec-into-Developer-ID-signed-Hermes-Pytho.patch` | `hermes_cli/_launchers.py`, `hermes_cli/venv_sync.py`, `tests/hermes_cli/test_signed_python_app.py` | Re-exec into `~/Applications/Hermes Python.app` when its Python version matches the store Python |
 | `0027-…gateway-status-quote-spaced-argv-so-a-Hermes-.patch` | `gateway/status.py`, `tests/gateway/test_status_cmdline_spaced_exe.py` | Quote argv elements that contain whitespace, so a gateway running from that bundle still counts as a running gateway |
 | `0123-fix-tcc-children-s-bare-python3-resolves-to-signed-H.patch` | `hermes_cli/_launchers.py`, `tools/environments/local.py`, `tests/hermes_cli/test_signed_python_path.py` | Put the bundle's `Contents/MacOS` ahead of the matching store `bin` on every child PATH, so a bare `python3` in a terminal command or cron script runs the signed bundle |
+| `0142-fix-gateway-signed-Hermes-Python.app-owns-the-launch.patch` | `hermes_cli/gateway_launchd.py`, `gateway/status.py`, `tests/hermes_cli/test_gateway_service.py` | The launchd gateway job is started by the signed bundle instead of `/usr/bin/osascript`, so children's Accessibility/Automation prompts name Hermes Python, not "osascript" |
 
-All three patches do nothing unless the bundle exists. On Linux and Windows, and on Macs without
+All four patches do nothing unless the bundle exists. On Linux and Windows, and on Macs without
 `~/Applications/Hermes Python.app`, Hermes behaves exactly like upstream.
 
 ## Behavior
@@ -28,6 +29,12 @@ All three patches do nothing unless the bundle exists. On Linux and Windows, and
   the versions match). `python3 foo.py` in a Kanban worker's terminal or a cron script then runs the signed bundle
   and uses its grants, instead of the ad-hoc store binary that triggers a generic "python3.14 wants to control …"
   prompt. Directories elsewhere on PATH keep their order; the rewrite is idempotent and never duplicates an entry.
+- launchd gateway job (0142): `hermes gateway install` / any plist rewrite makes the bundle's executable the job's
+  first program (`<bundle>/Contents/MacOS/python3.X -I -c <wrapper> "exec <gateway argv> >> gateway.log 2>>
+  gateway.error.log"`) instead of upstream's `/usr/bin/osascript -l JavaScript` wrapper. macOS treats the job's
+  first process as responsible for every child, so a terminal-tool `osascript -e 'tell application "System
+  Events"…'` now prompts for (and uses the grant of) Hermes Python rather than "osascript", a grant that would
+  also cover every unrelated script on the Mac. Without the bundle the osascript wrapper is unchanged.
 - `hermes gateway status` / restart / duplicate-gateway detection recognise a gateway whose argv[0]
   contains spaces (patch 0027). Applies on every OS where psutil supplies the cmdline (macOS,
   Windows; Linux reads `/proc/<pid>/cmdline` first and is unaffected).
@@ -114,6 +121,20 @@ or with an empty PATH, it returns PATH unchanged. `tools/environments/local.py::
 terminal tool's local backend and cron scripts both build child environments with, applies it after
 `_prepend_hermes_bin_dir`.
 
+### Patch 0142: the signed bundle owns the launchd job
+
+Upstream wraps the gateway in `osascript` (JXA `$.system(...)`) so the job has a Local Network identity macOS
+accepts (#71206). 0142 adds `launchd_responsible_python()` (= `signed_python_app(<gateway python>)`) and a
+`responsible=` argument to `launchd_program_arguments`; `generate_launchd_plist` passes it. With a bundle, the
+ProgramArguments become the bundle executable running a one-line Python wrapper (`_SIGNED_WRAPPER_SOURCE`):
+`subprocess.Popen(['/bin/sh', '-c', sys.argv[1]]).wait()`, exiting with the child's code, or `128+N` for a
+signal death (the JXA wrapper's mapping, so KeepAlive's `SuccessfulExit` semantics hold). SIGTERM keeps its
+default disposition: launchd signals the job's process group, so the gateway gets exactly one SIGTERM, as under
+osascript. The bundle's Info.plist must carry `NSLocalNetworkUsageDescription` for LAN access to keep working.
+`gateway/status.py` returns `None` from `_gateway_command_subcommand` for any command line containing
+`SIGNED_LAUNCHD_WRAPPER_MARKER`, so `stop`/`status` never take the wrapper's ps line for the gateway (its spaced
+interpreter path defeats the usual `-c` token check).
+
 ## Code
 
 ### `hermes_cli/_launchers.py` (new function, after `_store_python`)
@@ -186,6 +207,7 @@ surrounding quotes per token, so no change is needed on the parsing side.
 |---|---|---|
 | `tests/hermes_cli/test_signed_python_app.py` (new) | 0017 | no bundle → `None`; matching `3.14.7` bundle → bundle exe; store `3.14.8` with `3.14.7` bundle → `None`. Marked `@pytest.mark.platforms("macos")` (skipped elsewhere); monkeypatches `Path.home` to `tmp_path`. |
 | `tests/hermes_cli/test_signed_python_path.py` (new) | 0123 | no bundle → PATH unchanged; matching bundle → its dir lands right before the store `bin`; idempotent and de-duplicating; version mismatch keeps the store first; `_scrubbed_env` (the terminal/cron child-env sanitizer) puts the bundle dir ahead of the store `bin`. All `@pytest.mark.platforms("macos")`. |
+| `tests/hermes_cli/test_gateway_service.py` (3 new) | 0142 | with a bundle the plist's ProgramArguments are `[bundle, -I, -c, <wrapper>, "exec … >> gateway.log 2>> gateway.error.log"]` and that line is not taken for a gateway; without one the first argument stays `/usr/bin/osascript`; the wrapper (run with the test interpreter as `responsible`) keeps the child in its process group and maps exit 23 → 23 and SIGTERM → 143 (macOS only). Run Oct 19, 2026 PT on 0001–0143: 5 of the 6 `launchd_signed or launchd_osascript` tests pass. The SIGTERM case **fails**: its exit code (143) is checked and correct, but the child's `print(os.getpgrp())` is block-buffered into the log file and lost when the child kills itself, so the process-group assertion reads an empty file. A test bug (needs `flush=True`), tracked as a fork follow-up; until then the process-group claim for a signal death is untested. |
 | `tests/gateway/test_status_cmdline_spaced_exe.py` (new) | 0027 | fake `psutil` module returns an argv whose argv[0] is `…/Hermes Python.app/…`; asserts the joined string starts with a quoted path and `looks_like_gateway_runtime_command_line()` is true. Stubs `Path.read_bytes` so the `/proc` branch is skipped on Linux. |
 
 Run from the repo root with the repo's test runner (it locates the right interpreter; a bare
@@ -216,8 +238,10 @@ If re-implementing against a newer upstream: locate wherever the launcher decide
 to re-exec into (today `prepare_launch`, called from `hermes_bootstrap.py`) and wrap that value; and
 make sure any psutil-joined cmdline quotes spaced args before the gateway-identity tokenizer sees it.
 
-0123 needs 0017 (`signed_python_app`). Verified: 0001–0127 apply with `git am -3` at merge-base `4957bbd0a0`
-(Oct 17, 2026 PT).
+0123 and 0142 need 0017 (`signed_python_app`). 0142 also needs upstream's osascript launchd wrapper
+(`launchd_program_arguments`, #71206). It takes effect only once the launchd plist is regenerated (reinstall the
+gateway service); then grant Accessibility/Automation to Hermes Python once. Verified: 0001–0143 apply with
+`git am -3` at merge-base `4957bbd0a0` (Oct 19, 2026 PT).
 
 ## Gotchas
 
@@ -240,6 +264,11 @@ make sure any psutil-joined cmdline quotes spaced args before the gateway-identi
 - **0123 only covers PATH lookups.** A script that names the store interpreter by absolute path, or a venv's
   own `python`, still runs whatever that path points at. Names resolve only if the bundle's `Contents/MacOS` has
   them (step 1 links `python3` and `python`).
+- **0142 needs `NSLocalNetworkUsageDescription` in the bundle's Info.plist** (step 3 lists it among the optional
+  keys; for the launchd job it is required), or the gateway loses LAN access (Home Assistant, local devices)
+  once the bundle owns the job. Only verified live on macOS 26.6.
+- **0142 and terminal launches.** Only the launchd job changes. A gateway started from a terminal still has the
+  terminal as its responsible process, so prompts name the terminal app.
 - **Desktop app signing is separate.** `APPLE_SIGNING_IDENTITY` for `hermes desktop --build-only`
   signs the Electron app, not this Python bundle; TCC grants for one don't cover the other.
 

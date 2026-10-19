@@ -1,0 +1,725 @@
+From d6efa15c2780227edcb13e01e04f842c9e9825a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 13:44:03 -0700
+Subject: [PATCH] feat(desktop): sessions waiting on a code review stripe red,
+ or grey while only others were asked <24h [daveey]
+
+Backend stamps review_wait on session rows whose latest assistant reply links
+an open GitHub PR with reviewDecision=REVIEW_REQUIRED (viewer-authored or
+asking the viewer): 'stuck' when the review is on the viewer, nobody is
+requested, or others were asked over 24h ago; 'parked' when only others were
+requested in the last 24h. gh lookups run on a background thread, cached 5 min.
+The sidebar/tab stripe maps stuck -> red and parked -> grey (like Cmd-B);
+both beat a running watcher and done, never a working turn.
+---
+ .../src/app/chat/session-tab-accent.tsx       |   3 +-
+ .../src/app/chat/sidebar/session-row.tsx      |   6 +-
+ apps/desktop/src/lib/session-signatures.ts    |   3 +-
+ .../src/store/session-dot-state.test.ts       |  14 +
+ apps/desktop/src/store/session-dot-state.ts   |  17 +-
+ .../src/store/sidebar-visible-order.ts        |   3 +-
+ apps/desktop/src/types/hermes.ts              |   7 +
+ hermes_cli/review_session_activity.py         | 299 ++++++++++++++++++
+ hermes_cli/web_routers/profiles.py            |   4 +-
+ hermes_cli/web_routers/sessions.py            |   2 +
+ .../test_review_session_activity.py           | 159 ++++++++++
+ tui_gateway/methods_projects.py               |   7 +-
+ 12 files changed, 513 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/review_session_activity.py
+ create mode 100644 tests/hermes_cli/test_review_session_activity.py
+
+diff --git a/apps/desktop/src/app/chat/session-tab-accent.tsx b/apps/desktop/src/app/chat/session-tab-accent.tsx
+index 45f7e8b3f6..9c9c17cbe1 100644
+--- a/apps/desktop/src/app/chat/session-tab-accent.tsx
++++ b/apps/desktop/src/app/chat/session-tab-accent.tsx
+@@ -26,7 +26,8 @@ export function SessionTabAccent({ children, session, storedSessionId }: Session
+         (session?.message_count ?? 0) > 0,
+         blocked,
+         session?.kanban_blocked,
+-        session?.cron_active
++        session?.cron_active,
++        session?.review_wait
+       )
+ 
+   return (
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index 560a1920da..594ead37e1 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -328,7 +328,8 @@ function SidebarSessionRowImpl({
+   // [daveey] The left stripe is the session's status: green = its turn is done
+   // and waiting on you (stays after you open it); red = not done but stuck
+   // (blocked on a prompt, or gone quiet mid-turn, or kanban cards it made are
+-  // blocked on a human). Working: no stripe.
++  // blocked on a human, or a PR it links waits on a review that's on you).
++  // Working: no stripe. A review only others were asked for (<24h) is grey.
+   // ⌘B parks a session as blocked: grey stripe, skipped by ⌘] / ⌘[.
+   const userBlocked = useStoreSelector($blockedSessionIds, ids => isSessionBlocked(session.id, ids))
+ 
+@@ -339,7 +340,8 @@ function SidebarSessionRowImpl({
+         session.message_count > 0,
+         userBlocked,
+         kanbanBlocked,
+-        session.cron_active === true
++        session.cron_active === true,
++        session.review_wait
+       )
+ 
+   // Card header line: the workspace this belongs to — the project when it
+diff --git a/apps/desktop/src/lib/session-signatures.ts b/apps/desktop/src/lib/session-signatures.ts
+index cac7bde7d5..5abacbd4d9 100644
+--- a/apps/desktop/src/lib/session-signatures.ts
++++ b/apps/desktop/src/lib/session-signatures.ts
+@@ -43,7 +43,8 @@ export function sameCronSignature(a: SessionInfo[], b: SessionInfo[]): boolean {
+       session.kanban_blocked === other.kanban_blocked &&
+       session.goal_active === other.goal_active &&
+       session.cron_active === other.cron_active &&
+-      session.background_active === other.background_active
++      session.background_active === other.background_active &&
++      session.review_wait === other.review_wait
+     )
+   })
+ }
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 6249c10b69..5ee7f8cbc4 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -91,6 +91,20 @@ describe('sessionStatusStripe', () => {
+     expect(sessionStatusStripe('needs-input', true, false, 0, true)).toBe('stuck')
+     expect(sessionStatusStripe('idle', true, true, 0, true)).toBe('blocked')
+   })
++
++  it('[daveey] a PR waiting on my review is red; on others for <24h is grey; working wins', () => {
++    for (const state of ['idle', 'unread', 'background'] as const) {
++      expect(sessionStatusStripe(state, true, false, 0, false, 'stuck')).toBe('stuck')
++      expect(sessionStatusStripe(state, true, false, 0, false, 'parked')).toBe('blocked')
++    }
++
++    expect(sessionStatusStripe('working', true, false, 0, false, 'stuck')).toBeNull()
++    expect(sessionStatusStripe('working', true, false, 0, false, 'parked')).toBeNull()
++    expect(sessionStatusStripe('needs-input', true, false, 0, false, 'parked')).toBe('stuck')
++    expect(sessionStatusStripe('idle', true, true, 0, false, 'stuck')).toBe('blocked')
++    expect(sessionStatusStripe('idle', true, false, 0, false, null)).toBe('done')
++    expect(sessionStatusStripe('idle', true, false, 0, false, undefined)).toBe('done')
++  })
+ })
+ 
+ describe('hasLiveTurn', () => {
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 102cc2cc1d..2725a12320 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -149,19 +149,32 @@ export const showsRunningArc = (state: SessionDotState): boolean => state === 's
+  *  `blocked` (⌘] / ⌘[ skip it); only a real prompt (needs-input) beats it. */
+ export type SessionStatusStripe = 'blocked' | 'done' | 'periodic' | 'stuck'
+ 
++/** [daveey] Backend `review_wait` stamp: the session's latest reply links an
++ *  open PR still needing a code review. `stuck` = the review is on the user
++ *  (requested from them, nobody requested, or others asked over 24h ago) →
++ *  red; `parked` = only others requested, under 24h → grey like ⌘B. Either
++ *  beats a running watcher (`background`) and `done`, never a working turn. */
++export type ReviewWait = 'parked' | 'stuck'
++
+ export const sessionStatusStripe = (
+   state: SessionDotState,
+   hasTurns: boolean,
+   userBlocked = false,
+   kanbanBlocked = 0,
+-  periodic = false
++  periodic = false,
++  reviewWait: null | ReviewWait | undefined = null
+ ): null | SessionStatusStripe =>
+   userBlocked
+     ? 'blocked'
+     : periodic && state !== 'needs-input'
+     ? 'periodic'
+-    : state === 'needs-input' || state === 'stalled' || (kanbanBlocked > 0 && state !== 'working')
++    : state === 'needs-input' ||
++        state === 'stalled' ||
++        (kanbanBlocked > 0 && state !== 'working') ||
++        (reviewWait === 'stuck' && state !== 'working')
+     ? 'stuck'
++    : reviewWait === 'parked' && state !== 'working'
++    ? 'blocked'
+     : state === 'unread' || (state === 'idle' && hasTurns)
+       ? 'done'
+       : null
+diff --git a/apps/desktop/src/store/sidebar-visible-order.ts b/apps/desktop/src/store/sidebar-visible-order.ts
+index 2b84b420c5..4224d74ca7 100644
+--- a/apps/desktop/src/store/sidebar-visible-order.ts
++++ b/apps/desktop/src/store/sidebar-visible-order.ts
+@@ -124,7 +124,8 @@ export function sessionHasStatusStripe(id: string): boolean {
+         hasTurns,
+         false,
+         session?.kanban_blocked ?? 0,
+-        session?.cron_active === true
++        session?.cron_active === true,
++        session?.review_wait
+       )
+     )
+   )
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index c13809a562..56154e6cd9 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -659,6 +659,13 @@ export interface SessionInfo {
+    *  row off "done" even when this window never polled the session. Absent
+    *  when zero or against an older backend. */
+   background_active?: number
++  /** [daveey] Set when this conversation's latest reply links an open GitHub
++   *  PR still waiting on a code review: `stuck` when the review is on the
++   *  viewer (or nobody / others asked >24h ago), `parked` when only other
++   *  reviewers were requested in the last 24h. Absent otherwise. */
++  review_wait?: 'parked' | 'stuck'
++  /** [daveey] The PR `review_wait` refers to. */
++  review_wait_pr?: string
+   preview: null | string
+   source: null | string
+   started_at: number
+diff --git a/hermes_cli/review_session_activity.py b/hermes_cli/review_session_activity.py
+new file mode 100644
+index 0000000000..98ad9cdefe
+--- /dev/null
++++ b/hermes_cli/review_session_activity.py
+@@ -0,0 +1,299 @@
++"""Which sessions are waiting on a code review.
++
++A session that opened a PR and is waiting for someone to approve it finished
++its turn (green "done" stripe) or keeps a watcher running (no stripe), so the
++sidebar never said a human was needed. Session-list endpoints now stamp each
++row whose latest assistant message links an open GitHub PR still needing a
++review (``reviewDecision == REVIEW_REQUIRED``) with ``review_wait``:
++
++* ``"stuck"`` (red): the review is on the viewer — they are a requested
++  reviewer, nobody is requested at all, or the other reviewers were asked
++  more than 24 hours ago;
++* ``"parked"`` (grey, like ⌘B): only other people are requested and the
++  latest request is under 24 hours old.
++
++Only PRs the viewer authored or was asked to review count, so a message that
++merely cites someone else's PR changes nothing. [daveey]
++
++The list call never blocks on GitHub: PR state is fetched with ``gh`` on a
++background thread and cached for a few minutes; a row gets its stamp on the
++next poll once the lookup lands. Message reads are cached per
++(row, last_active, message_count). Never raises.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import shutil
++import sqlite3
++import subprocess
++import threading
++import time
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Callable, Iterable
++
++_log = logging.getLogger(__name__)
++
++PARK_WINDOW_S = 24 * 3600
++_PR_TTL_S = 300.0
++_PR_ERROR_TTL_S = 120.0
++_MAX_PRS_PER_MESSAGE = 5
++
++_PR_URL = re.compile(r"https?://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)", re.IGNORECASE)
++
++_QUERY = """
++query($o:String!,$r:String!,$n:Int!){
++  viewer{login}
++  repository(owner:$o,name:$r){pullRequest(number:$n){
++    state isDraft reviewDecision createdAt author{login}
++    reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug} ... on Bot{login}}}}
++    timelineItems(itemTypes:[REVIEW_REQUESTED_EVENT],last:30){nodes{... on ReviewRequestedEvent{
++      createdAt requestedReviewer{__typename ... on User{login} ... on Team{slug} ... on Bot{login}}}}}
++  }}
++}
++"""
++
++_lock = threading.Lock()
++# (owner, repo, number) -> (expires_monotonic, info | None)
++_pr_cache: dict[tuple[str, str, int], tuple[float, dict[str, Any] | None]] = {}
++_inflight: set[tuple[str, str, int]] = set()
++# row id -> ((last_active, message_count), [pr keys])
++_msg_cache: dict[str, tuple[tuple[Any, Any], list[tuple[str, str, int]]]] = {}
++
++# Test seams: replace the GitHub fetch and run lookups synchronously.
++_fetch_override: Callable[[tuple[str, str, int]], dict[str, Any] | None] | None = None
++_sync_fetch = False
++
++
++def pr_keys(text: str) -> list[tuple[str, str, int]]:
++    """GitHub PR references in ``text``, in order, deduped."""
++    out: list[tuple[str, str, int]] = []
++    for m in _PR_URL.finditer(text or ""):
++        key = (m.group(1).lower(), m.group(2).lower(), int(m.group(3)))
++        if key not in out:
++            out.append(key)
++    return out[:_MAX_PRS_PER_MESSAGE]
++
++
++def _ts(value: Any) -> float | None:
++    try:
++        return datetime.fromisoformat(str(value)).timestamp()
++    except Exception:
++        return None
++
++
++def _reviewer_name(node: Any) -> str:
++    node = node if isinstance(node, dict) else {}
++    name = node.get("login") or node.get("slug") or ""
++    return f"{node.get('__typename', '')}:{name}".lower()
++
++
++def parse_pr(data: dict[str, Any]) -> dict[str, Any] | None:
++    """Reduce a GraphQL response to the fields the stripe needs."""
++    d = (data or {}).get("data") or {}
++    viewer = str(((d.get("viewer") or {}).get("login")) or "").lower()
++    pr = ((d.get("repository") or {}).get("pullRequest")) or None
++    if not pr:
++        return None
++    requested = [
++        _reviewer_name((n or {}).get("requestedReviewer"))
++        for n in ((pr.get("reviewRequests") or {}).get("nodes") or [])
++    ]
++    events: dict[str, float] = {}
++    for n in ((pr.get("timelineItems") or {}).get("nodes") or []):
++        name = _reviewer_name((n or {}).get("requestedReviewer"))
++        at = _ts((n or {}).get("createdAt"))
++        if at is not None:
++            events[name] = max(at, events.get(name, 0.0))
++    requested_at = [events[r] for r in requested if r in events]
++    return {
++        "open": pr.get("state") == "OPEN" and not pr.get("isDraft"),
++        "review_required": pr.get("reviewDecision") == "REVIEW_REQUIRED",
++        "viewer": viewer,
++        "author": str(((pr.get("author") or {}).get("login")) or "").lower(),
++        "requested": [r for r in requested if r],
++        "requested_at": max(requested_at) if requested_at else _ts(pr.get("createdAt")),
++    }
++
++
++def review_state(info: dict[str, Any] | None, now: float | None = None) -> str | None:
++    """``"stuck"`` / ``"parked"`` / None for one PR (see module doc)."""
++    if not info or not info.get("open") or not info.get("review_required"):
++        return None
++    viewer = info.get("viewer") or ""
++    me = f"user:{viewer}"
++    requested = info.get("requested") or []
++    if viewer and me in requested:
++        return "stuck"
++    if not viewer or info.get("author") != viewer:
++        return None  # someone else's PR that isn't asking me: not this session's wait
++    if not requested:
++        return "stuck"
++    since = info.get("requested_at")
++    now = time.time() if now is None else now
++    if since is not None and now - since < PARK_WINDOW_S:
++        return "parked"
++    return "stuck"
++
++
++def _gh() -> str | None:
++    found = shutil.which("gh")
++    if found:
++        return found
++    for cand in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"):
++        if os.access(cand, os.X_OK):
++            return cand
++    return None
++
++
++def _fetch_pr(key: tuple[str, str, int]) -> dict[str, Any] | None:
++    if _fetch_override is not None:
++        return _fetch_override(key)
++    gh = _gh()
++    if not gh:
++        return None
++    owner, repo, number = key
++    proc = subprocess.run(
++        [gh, "api", "graphql", "-F", f"o={owner}", "-F", f"r={repo}", "-F", f"n={number}",
++         "-f", f"query={_QUERY}"],
++        capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL, check=False,
++    )
++    if proc.returncode != 0:
++        raise RuntimeError(proc.stderr.strip()[:200])
++    return parse_pr(json.loads(proc.stdout))
++
++
++def _refresh(key: tuple[str, str, int]) -> None:
++    try:
++        info, ttl = _fetch_pr(key), _PR_TTL_S
++    except Exception as exc:
++        _log.debug("review lookup %s failed: %s", key, exc)
++        info, ttl = None, _PR_ERROR_TTL_S
++    with _lock:
++        _pr_cache[key] = (time.monotonic() + ttl, info)
++        _inflight.discard(key)
++
++
++def _pr_info(key: tuple[str, str, int]) -> dict[str, Any] | None:
++    """Cached PR info; schedules a refresh when missing or stale."""
++    with _lock:
++        hit = _pr_cache.get(key)
++        stale = hit is None or time.monotonic() >= hit[0]
++        start = stale and key not in _inflight
++        if start:
++            _inflight.add(key)
++    if start:
++        if _sync_fetch:
++            _refresh(key)
++            with _lock:
++                hit = _pr_cache.get(key)
++        else:
++            threading.Thread(target=_refresh, args=(key,), daemon=True,
++                             name="review-wait-lookup").start()
++    return hit[1] if hit else None
++
++
++def _db_path(profile: Any) -> Path | None:
++    try:
++        from hermes_constants import get_default_hermes_root, get_hermes_home
++
++        name = str(profile or "").strip()
++        if name and name != "default":
++            p = Path(get_default_hermes_root()) / "profiles" / name / "state.db"
++        elif name == "default":
++            p = Path(get_default_hermes_root()) / "state.db"
++        else:
++            p = Path(get_hermes_home()) / "state.db"
++        return p if p.is_file() else None
++    except Exception:
++        return None
++
++
++def _row_ids(row: dict[str, Any]) -> list[str]:
++    seen: list[str] = []
++    for sid in (row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())):
++        if sid and sid not in seen:
++            seen.append(str(sid))
++    return seen
++
++
++def _last_assistant_text(conn: sqlite3.Connection, ids: list[str]) -> str:
++    marks = ",".join("?" * len(ids))
++    cur = conn.execute(
++        f"select content from messages where session_id in ({marks}) and role='assistant'"
++        " and coalesce(content,'') <> '' order by id desc limit 1",
++        ids,
++    )
++    hit = cur.fetchone()
++    return str(hit[0]) if hit and hit[0] else ""
++
++
++def _row_prs(rows: Iterable[dict[str, Any]]) -> dict[int, list[tuple[str, str, int]]]:
++    """PR keys per row (by list position), reading only rows that changed."""
++    out: dict[int, list[tuple[str, str, int]]] = {}
++    pending: dict[Path, list[tuple[int, dict[str, Any], tuple[Any, Any]]]] = {}
++    for i, row in enumerate(rows):
++        rid = str(row.get("id") or "")
++        if not rid:
++            continue
++        sig = (row.get("last_active"), row.get("message_count"))
++        with _lock:
++            hit = _msg_cache.get(rid)
++        if hit and hit[0] == sig:
++            out[i] = hit[1]
++            continue
++        path = _db_path(row.get("profile"))
++        if path is not None:
++            pending.setdefault(path, []).append((i, row, sig))
++    for path, items in pending.items():
++        try:
++            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
++        except Exception:
++            continue
++        try:
++            for i, row, sig in items:
++                try:
++                    keys = pr_keys(_last_assistant_text(conn, _row_ids(row)))
++                except Exception:
++                    continue
++                with _lock:
++                    _msg_cache[str(row["id"])] = (sig, keys)
++                out[i] = keys
++        finally:
++            conn.close()
++    return out
++
++
++def annotate_review_wait(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Stamp ``review_wait`` (``"stuck"`` / ``"parked"``) and ``review_wait_pr``
++    on rows waiting on a code review; ``stuck`` wins across several PRs."""
++    if not rows:
++        return rows
++    try:
++        prs = _row_prs(rows)
++        now = time.time()
++        for i, row in enumerate(rows):
++            best: tuple[str, str] | None = None
++            for key in prs.get(i, ()):
++                state = review_state(_pr_info(key), now)
++                if state and (best is None or (state == "stuck" and best[0] != "stuck")):
++                    best = (state, f"https://github.com/{key[0]}/{key[1]}/pull/{key[2]}")
++            if best:
++                row["review_wait"], row["review_wait_pr"] = best
++            else:
++                row.pop("review_wait", None)
++                row.pop("review_wait_pr", None)
++    except Exception:
++        _log.debug("review wait annotation failed", exc_info=True)
++    return rows
++
++
++def _reset_cache_for_tests() -> None:
++    with _lock:
++        _pr_cache.clear()
++        _inflight.clear()
++        _msg_cache.clear()
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index dea7d382bb..63161f3171 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -39,6 +39,7 @@ from hermes_cli.kanban_session_activity import annotate_kanban_activity
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity
++from hermes_cli.review_session_activity import annotate_review_wait
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+ from hermes_cli.web_server_profiles import (
+@@ -514,6 +515,7 @@ def get_profiles_sessions(
+     annotate_goal_activity(window)
+     annotate_cron_activity(window)
+     annotate_background_activity(window)
++    annotate_review_wait(window)
+     return {"sessions": window, "total": sum(totals.values()), "profile_totals": totals,
+             "limit": limit, "offset": offset, "errors": errors,
+             "storage": _corrupt_profile_stores(targets)}
+@@ -617,7 +619,7 @@ def get_profiles_sessions_sidebar(
+         rows[key].sort(key=_recency, reverse=True)
+         win = _pinned_window(rows[key], 0, cap[key])
+         _strip_session_list_rows(win)
+-        return annotate_background_activity(annotate_cron_activity(annotate_goal_activity(annotate_kanban_activity(win))))
++        return annotate_review_wait(annotate_background_activity(annotate_cron_activity(annotate_goal_activity(annotate_kanban_activity(win)))))
+ 
+     storage = _corrupt_profile_stores(scanned)
+     retryable = _retryable_profile_errors(errors, scanned)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 701f3f0c50..223c0212a1 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -24,6 +24,7 @@ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity
++from hermes_cli.review_session_activity import annotate_review_wait
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
+ from hermes_cli.web_models import (
+@@ -251,6 +252,7 @@ def get_sessions(
+             annotate_goal_activity(sessions)
+             annotate_cron_activity(sessions)
+             annotate_background_activity(sessions)
++            annotate_review_wait(sessions)
+             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
+             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
+             storage = {row_profile: STORAGE_CORRUPT} if storage_state(db.db_path) == STORAGE_CORRUPT else {}
+diff --git a/tests/hermes_cli/test_review_session_activity.py b/tests/hermes_cli/test_review_session_activity.py
+new file mode 100644
+index 0000000000..8e2549e6fa
+--- /dev/null
++++ b/tests/hermes_cli/test_review_session_activity.py
+@@ -0,0 +1,159 @@
++"""review_wait stamps: sessions waiting on a code review go red, or grey while
++only other reviewers were asked in the last 24h. [daveey]"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import review_session_activity as rsa
++
++PR = "https://github.com/Acme/widgets/pull/42"
++KEY = ("acme", "widgets", 42)
++NOW = 1_800_000_000.0
++
++
++def _gql(*, state="OPEN", decision="REVIEW_REQUIRED", author="me", requested=(), requested_at=None,
++         draft=False, created="2026-10-19T19:00:00Z"):
++    return {"data": {"viewer": {"login": "me"}, "repository": {"pullRequest": {
++        "state": state, "isDraft": draft, "reviewDecision": decision, "createdAt": created,
++        "author": {"login": author},
++        "reviewRequests": {"nodes": [{"requestedReviewer": {"__typename": t, "login": n}} for t, n in requested]},
++        "timelineItems": {"nodes": [
++            {"createdAt": requested_at, "requestedReviewer": {"__typename": t, "login": n}}
++            for t, n in requested if requested_at]},
++    }}}}
++
++
++def _iso(ts: float) -> str:
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
++
++
++def test_pr_keys_dedupes_and_lowercases():
++    text = f"see {PR} and {PR.upper().replace('HTTPS', 'https')} plus https://github.com/a/b/pull/7"
++    assert rsa.pr_keys(text) == [KEY, ("a", "b", 7)]
++    assert rsa.pr_keys("https://github.com/a/b/issues/7") == []
++
++
++@pytest.mark.parametrize("requested,age_s,expected", [
++    ((("User", "me"),), 60, "stuck"),             # review asked of me
++    ((), None, "stuck"),                          # nobody asked: on me
++    ((("User", "alice"),), 3600, "parked"),       # others, < 24h: grey
++    ((("Team", "core"),), 3600, "parked"),        # a team counts as others
++    ((("User", "alice"),), 25 * 3600, "stuck"),   # others, > 24h: red
++])
++def test_review_state_my_pr(requested, age_s, expected):
++    at = _iso(NOW - age_s) if age_s is not None else None
++    info = rsa.parse_pr(_gql(requested=requested, requested_at=at))
++    assert rsa.review_state(info, NOW) == expected
++
++
++def test_review_state_parks_from_pr_creation_without_request_event():
++    info = rsa.parse_pr(_gql(requested=(("User", "alice"),), created=_iso(NOW - 600)))
++    assert rsa.review_state(info, NOW) == "parked"
++
++
++@pytest.mark.parametrize("kw", [
++    {"state": "MERGED"}, {"state": "CLOSED"}, {"draft": True},
++    {"decision": "APPROVED"}, {"decision": None}, {"decision": "CHANGES_REQUESTED"},
++    {"author": "bob", "requested": (("User", "alice"),)},  # someone else's PR, not asking me
++])
++def test_review_state_not_waiting(kw):
++    assert rsa.review_state(rsa.parse_pr(_gql(**kw)), NOW) is None
++
++
++def test_someone_elses_pr_requesting_me_is_stuck():
++    info = rsa.parse_pr(_gql(author="bob", requested=(("User", "me"),), requested_at=_iso(NOW - 60)))
++    assert rsa.review_state(info, NOW) == "stuck"
++
++
++@pytest.fixture
++def store(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    db = sqlite3.connect(home / "state.db")
++    db.execute("create table messages (id integer primary key, session_id text, role text, content text)")
++    db.commit()
++    rsa._reset_cache_for_tests()
++    monkeypatch.setattr(rsa, "_sync_fetch", True)
++    yield db
++    rsa._reset_cache_for_tests()
++    db.close()
++
++
++def _say(db, sid, role, content):
++    db.execute("insert into messages (session_id, role, content) values (?,?,?)", (sid, role, content))
++    db.commit()
++
++
++def test_annotate_stamps_from_latest_assistant_message(store, monkeypatch):
++    calls = []
++
++    def fetch(key):
++        calls.append(key)
++        return rsa.parse_pr(_gql(requested=(("User", "alice"),), requested_at=_iso(time.time() - 60)))
++
++    monkeypatch.setattr(rsa, "_fetch_override", fetch)
++    _say(store, "s1", "assistant", f"PR is up: {PR}")
++    _say(store, "s2", "assistant", f"old {PR}")
++    _say(store, "s2", "assistant", "all merged, nothing pending")
++    _say(store, "s3", "user", f"look at {PR}")  # user text alone doesn't count
++    rows = [{"id": "s1", "last_active": 1, "message_count": 1},
++            {"id": "s2", "last_active": 1, "message_count": 2},
++            {"id": "s3", "last_active": 1, "message_count": 1}]
++    rsa.annotate_review_wait(rows)
++    assert rows[0]["review_wait"] == "parked"
++    assert rows[0]["review_wait_pr"] == "https://github.com/acme/widgets/pull/42"
++    assert "review_wait" not in rows[1] and "review_wait" not in rows[2]
++    # Cached: a second poll doesn't refetch the PR.
++    rsa.annotate_review_wait(rows)
++    assert calls == [KEY]
++
++
++def test_annotate_reads_the_newest_message_across_the_lineage(store, monkeypatch):
++    monkeypatch.setattr(rsa, "_fetch_override", lambda key: rsa.parse_pr(_gql()))
++    _say(store, "root", "assistant", "starting")
++    _say(store, "tip", "assistant", f"waiting on review {PR}")
++    rows = [{"id": "root", "_lineage_ids": ["root", "tip"], "last_active": 2, "message_count": 2}]
++    rsa.annotate_review_wait(rows)
++    assert rows[0]["review_wait"] == "stuck"
++
++
++def test_annotate_clears_stale_stamp_and_survives_fetch_errors(store, monkeypatch):
++    def boom(key):
++        raise RuntimeError("gh: not logged in")
++
++    monkeypatch.setattr(rsa, "_fetch_override", boom)
++    _say(store, "s1", "assistant", PR)
++    rows = [{"id": "s1", "last_active": 1, "message_count": 1, "review_wait": "stuck"}]
++    rsa.annotate_review_wait(rows)
++    assert "review_wait" not in rows[0]
++
++
++def test_annotate_does_not_block_on_github(store, monkeypatch):
++    import threading
++
++    gate = threading.Event()
++
++    def slow(key):
++        gate.wait(5)
++        return rsa.parse_pr(_gql())
++
++    monkeypatch.setattr(rsa, "_sync_fetch", False)
++    monkeypatch.setattr(rsa, "_fetch_override", slow)
++    _say(store, "s1", "assistant", PR)
++    rows = [{"id": "s1", "last_active": 1, "message_count": 1}]
++    t0 = time.monotonic()
++    rsa.annotate_review_wait(rows)
++    assert time.monotonic() - t0 < 1.0
++    assert "review_wait" not in rows[0]  # first poll: lookup still in flight
++    gate.set()
++    for _ in range(50):
++        if KEY in rsa._pr_cache:
++            break
++        time.sleep(0.05)
++    rsa.annotate_review_wait(rows)
++    assert rows[0]["review_wait"] == "stuck"
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index ff79286b18..5daf48cae7 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -338,7 +338,7 @@ def _project_tree_row(r: dict) -> dict:
+ 
+ def _annotate_tree_activity(sessions: list[dict]) -> list[dict]:
+     """[daveey] Stamp the same activity fields the session lists carry (``kanban_active`` /
+-    ``kanban_blocked``, ``goal_active``, ``cron_active``, ``background_active``) on tree rows.
++    ``kanban_blocked``, ``goal_active``, ``cron_active``, ``background_active``, ``review_wait``) on tree rows.
+     In project mode an older session's ONLY loaded row is this one (it's past the recents
+     page), so without them the sidebar painted it done (green) while its /goal, cards or
+     background jobs were still in flight. ``build_tree`` passes these dicts through by
+@@ -348,8 +348,9 @@ def _annotate_tree_activity(sessions: list[dict]) -> list[dict]:
+         from hermes_cli.goal_session_activity import annotate_goal_activity
+         from hermes_cli.kanban_session_activity import annotate_kanban_activity
+         from hermes_cli.process_session_activity import annotate_background_activity
+-        annotate_background_activity(annotate_cron_activity(
+-            annotate_goal_activity(annotate_kanban_activity(sessions))))
++        from hermes_cli.review_session_activity import annotate_review_wait
++        annotate_review_wait(annotate_background_activity(annotate_cron_activity(
++            annotate_goal_activity(annotate_kanban_activity(sessions)))))
+     except Exception:  # the tree must render without them
+         pass
+     return sessions
+-- 
+2.54.0 (Apple Git-157)
+

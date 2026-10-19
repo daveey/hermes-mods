@@ -1,0 +1,831 @@
+From 3b88d3be58d9e5c497e4ead394839365dd4e6345 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:22:52 -0700
+Subject: [PATCH] feat(kanban): park cards behind one shared external blocker
+ and probe it once [daveey]
+
+Workers can tag kanban_block / kanban_continue with blocker_id when the wall is
+outside their card (CI billing, an outage). While that blocker is open the
+dispatcher spawns one probe card per kanban.shared_blocker_probe_seconds
+(default 1800; a human unblock lets that card probe at once) and holds the rest
+with respawn guard reason shared_blocker. A probe that ends without the id
+clears it: held cards dispatch and blocked ones are unblocked automatically.
+Probe re-assertions do not count toward the unblock-loop triage limit. Worker
+context lists open blockers so later cards reuse the id.
+
+State is derived from task_runs metadata (no schema change). Coach proposal
+2026-10-19-5: 93 runs ($460) on 20 cards each rediscovering the same GitHub
+Actions billing refusal.
+---
+ agent/prompt_builder.py                       |   5 +-
+ hermes_cli/config_defaults.py                 |   4 +
+ hermes_cli/kanban_continuation.py             |   8 +
+ hermes_cli/kanban_db.py                       |  47 ++-
+ hermes_cli/kanban_db_dispatch.py              |  23 +-
+ hermes_cli/kanban_ops.py                      |   3 +
+ hermes_cli/kanban_shared_blockers.py          | 268 ++++++++++++++++++
+ .../hermes_cli/test_kanban_shared_blockers.py | 212 ++++++++++++++
+ tools/kanban_tools.py                         |  21 +-
+ tools/kanban_tools_schemas.py                 |  16 ++
+ 10 files changed, 603 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_shared_blockers.py
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blockers.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index a288d6e756..1869f67428 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -293,7 +293,10 @@ KANBAN_GUIDANCE = (
+     "user will unblock with context and the dispatcher will respawn you "
+     "Waiting on time is not a block: when the next step must wait for a clock or an external event (a run cap, a soak, "
+     "a release window), call `kanban_schedule(reason=\"SCHEDULED_UNTIL=<ISO8601> — what you're waiting for\")` and "
+-    "say what wakes the card. A blocked card marks its chat red as needing a human.\n"
++    "say what wakes the card. A blocked card marks its chat red as needing a human. When the wall is outside "
++    "your card and would stop other cards too (CI billing/quota refused, a service outage), also pass "
++    "`blocker_id=\"<short-slug>\"` to `kanban_block`/`kanban_continue`, reusing an id from \"Open shared "
++    "blockers\" in your context: the dispatcher then probes that wall with one card instead of every card.\n"
+     "5. **Finish with the review model encoded by the task graph.** Always include the structured handoff (`summary`, "
+     "`metadata`) on the lifecycle transition itself; never put secrets, tokens, or raw PII in these durable fields. If "
+     "`kanban_show()` lists child IDs, inspect those cards with `kanban_show(task_id=...)` before choosing the terminal "
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 4498004a96..f5642a8002 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1962,6 +1962,10 @@ DEFAULT_CONFIG = {
+         # Bound on back-to-back kanban_continue runs without a completion; past it the worker
+         # must complete or block.
+         "max_continuations": 12,
++        # Shared external blockers (kanban_block/kanban_continue blocker_id): while one is open,
++        # the dispatcher spawns at most one card behind it per this many seconds (one probe at a
++        # time either way); a human unblock lets that card probe at once. [daveey]
++        "shared_blocker_probe_seconds": 1800,
+         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index e7b739d598..43916fd412 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -135,6 +135,12 @@ def continue_task(
+         if cur.rowcount != 1:
+             return {"ok": False, "error": "task changed state concurrently"}
+         meta = dict(metadata or {})
++        from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++        if "blocker_id" in meta:
++            # Shared external blocker (kanban_shared_blockers); drop an unusable id. [daveey]
++            bid = normalize_blocker_id(meta.pop("blocker_id"))
++            if bid:
++                meta["blocker_id"] = bid
+         meta.update({"checkpoint": checkpoint, "continuation": streak + 1,
+                      "resume_after_seconds": resume_after, "resume_status": source_status})
+         if wake_at is not None:
+@@ -144,6 +150,8 @@ def continue_task(
+             summary=kb._first_line(checkpoint, 400) or "checkpoint", metadata=meta,
+         )
+         payload = {"continuation": streak + 1, "status": new_status, "resume_status": source_status}
++        if meta.get("blocker_id"):
++            payload["blocker_id"] = meta["blocker_id"]
+         if wake_at is not None:
+             payload["wake_at"] = wake_at
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index de31ac6486..e90d1be4ce 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3158,6 +3158,7 @@ def edit_task(
+ def block_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
++    blocker_id: Optional[str] = None,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
+@@ -3166,6 +3167,10 @@ def block_task(
+     toward the loop breaker so a forever-flaky task escalates. True on any
+     transition.
+ 
++    ``blocker_id`` names a shared external blocker (``kanban_shared_blockers``):
++    it is stored on the closed run's metadata and the event payload, so other
++    cards stopped by the same wall are held behind one probe. [daveey]
++
+     An already-``blocked`` card that the failure breaker parked UNTYPED
+     (``block_kind IS NULL``, no live run) is classified in place when *kind*
+     is supplied: ``block_kind``/``block_recurrences`` are set and a ``blocked``
+@@ -3220,6 +3225,21 @@ def block_task(
+         if rekind_reason:
+             payload["requested_kind"] = requested_kind
+             payload["rekind_reason"] = rekind_reason
++        from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++        blocker_id = normalize_blocker_id(blocker_id)
++        if blocker_id:
++            payload["blocker_id"] = blocker_id
++            if (new_status == "triage" and _row_get(cur_row, "block_kind") == kind
++                    and _latest_run_blocker(conn, task_id) == blocker_id):
++                # A probe re-asserting the shared blocker it was parked behind is the
++                # dispatcher's bounded probe cadence, not an unblock loop: keep the
++                # recurrence count where it was and stay ``blocked``. [daveey]
++                prev = max(int(_row_get(cur_row, "block_recurrences") or 0), 1)
++                new_status, event_kind = "blocked", "blocked"
++                params = (kind, prev)
++                payload["recurrences"] = prev
++                payload.pop("limit", None)
++                payload["shared_blocker_probe"] = True
+         sql = f"""
+                 UPDATE tasks
+                    SET status        = '{new_status}',
+@@ -3237,7 +3257,9 @@ def block_task(
+         if conn.execute(sql, params).rowcount != 1:
+             return False
+         run_id = _end_or_synthesize_run(
+-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
++            conn, task_id, outcome="blocked", status="blocked", summary=reason,
++            metadata={"blocker_id": blocker_id} if blocker_id else None,
++            synthesize=bool(reason or blocker_id),
+         )
+         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+         blocked_task = get_task(conn, task_id)
+@@ -3249,6 +3271,21 @@ def block_task(
+     return True
+ 
+ 
++def _latest_run_blocker(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """``blocker_id`` of the task's latest non-neutral closed run, if any. [daveey]"""
++    from hermes_cli.kanban_shared_blockers import NEUTRAL_OUTCOMES, normalize_blocker_id
++    for row in conn.execute(
++        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
++        "ORDER BY id DESC LIMIT 20", (task_id,),
++    ):
++        bid = normalize_blocker_id(_json_dict(row["metadata"]).get("blocker_id"))
++        if bid is not None:
++            return bid
++        if (row["outcome"] or "") not in NEUTRAL_OUTCOMES:
++            return None
++    return None
++
++
+ def _route_block(
+     kind: Optional[str], reason: Optional[str], source_status: str, *,
+     prev_kind: Optional[str], prev_recurrences: int,
+@@ -3973,6 +4010,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     checkpoint = render_checkpoint_context(conn, task_id)
+     if checkpoint:
+         lines.append(checkpoint)
++    from hermes_cli.kanban_shared_blockers import render_blocker_context
++    try:
++        blockers = render_blocker_context(conn, task_id)
++    except Exception:  # advisory only; never break context assembly
++        _log.debug("shared blocker context failed for %s", task_id, exc_info=True)
++        blockers = ""
++    if blockers:
++        lines.append(blockers)
+     _ctx_attachments(lines, list_attachments(conn, task_id))
+     _ctx_prior_attempts(lines, conn, task_id, now)
+     _ctx_parent_results(lines, conn, task_id, now)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index bafcef9ded..0f4ade54db 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -142,8 +142,12 @@ class DispatchResult:
+     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
+     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
+-    (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
++    (quota/auth error — also auto-blocked), ``"shared_blocker"`` (parked behind
++    a declared shared blocker another card is probing), ``"recent_success"`` (completed run
+     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
++    shared_blocker_released: list[str] = field(default_factory=list)
++    """Blocked task ids unblocked because a probe cleared the shared blocker
++    they were parked behind (``kanban_shared_blockers``). [daveey]"""
+     rate_limited: list[str] = field(default_factory=list)
+     """Task ids whose workers bailed on a provider rate-limit / quota wall
+     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
+@@ -1655,6 +1659,18 @@ def check_respawn_guard(
+     if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+         return "blocker_auth"
+ 
++    # 2b. Shared external blocker (``kanban_shared_blockers``): while another
++    #     card probes the same declared wall, or the last probe was recent,
++    #     hold this one instead of letting every card rediscover it. [daveey]
++    from hermes_cli.kanban_shared_blockers import shared_blocker_guard
++    try:
++        shared = shared_blocker_guard(conn, task_id, now=now)
++    except Exception:
++        _kb._log.debug("kanban: shared blocker guard failed for %s", task_id, exc_info=True)
++        shared = None
++    if shared is not None:
++        return shared
++
+     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
+     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
+     if lane == "review":
+@@ -2276,6 +2292,11 @@ def _run_reclaim_phase(
+     from hermes_cli.kanban_continuation import wake_due_continuations
+     result.woken_continuations = wake_due_continuations(conn)
+     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
++    from hermes_cli.kanban_shared_blockers import release_cleared_blockers
++    try:
++        result.shared_blocker_released = release_cleared_blockers(conn)
++    except Exception:
++        _kb._log.warning("kanban: releasing cleared shared blockers failed", exc_info=True)
+ 
+ 
+ def _tick_spawn_budget(
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 37acd1872e..9e43b6d359 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -111,6 +111,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+                 for (tid, reason) in res.respawn_guarded
+             ],
+             "rate_limited": res.rate_limited,
++            "shared_blocker_released": res.shared_blocker_released,
+             "skipped_locked": res.skipped_locked,
+             "memory_pressure": res.memory_pressure,
+         }, ascii=True)
+@@ -150,6 +151,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+         print(f"Guarded ({reason}): {tid}")
+     if res.rate_limited:
+         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
++    if res.shared_blocker_released:
++        print(f"Released (shared blocker cleared): {', '.join(res.shared_blocker_released)}")
+     if res.skipped_locked:
+         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
+     if res.memory_pressure:
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+new file mode 100644
+index 0000000000..bba44bfe4f
+--- /dev/null
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -0,0 +1,268 @@
++"""Shared external blockers: park many cards behind ONE blocker and probe it once. [daveey]
++
++A worker that hits a wall outside its card (CI billing refused, a provider outage, a release
++pipeline down) ends its run with ``kanban_block(..., blocker_id="<slug>")`` or
++``kanban_continue(..., blocker_id="<slug>")``. The id lands in that run's metadata
++(``blocker_id``); nothing else is stored, so the blocker's state is derived from run history:
++
++* a card is **behind** blocker X while its latest non-neutral closed run carries X;
++* X was **asserted** at the newest ``ended_at`` of any run carrying X;
++* X was **cleared** at the newest ``ended_at`` of a run that followed an X-run on the same card
++  and did NOT carry X (it completed, handed off, or stopped on something else);
++* X is **open** while asserted > cleared.
++
++While X is open the dispatcher spawns at most one card behind it (the *probe*) per
++``kanban.shared_blocker_probe_seconds``; the others are held with respawn guard reason
++``shared_blocker`` instead of each re-discovering the same wall. A human unblock of a card lets
++that card probe at once (still one probe at a time). When a probe ends without re-asserting X,
++X clears: held ``ready`` cards dispatch normally and cards still ``blocked`` behind X are
++unblocked by :func:`release_cleared_blockers`.
++
++Neutral outcomes (crash, timeout, reclaim, spawn failure, rate limit, give-up) say nothing about
++the external condition, so they neither assert nor clear a blocker.
++
++Matching on normalized error text was considered and left out: crash/timeout/protocol-violation
++errors share fixed preambles across unrelated cards (``_error_fingerprint`` keeps 80 chars), and
++LLM-written block reasons never match verbatim. Same-tick identical crash waves are already
++tripped by ``_account_crashes``.
++"""
++from __future__ import annotations
++
++import re
++import sqlite3
++import time
++from dataclasses import dataclass, field
++from typing import Optional
++
++GUARD_REASON = "shared_blocker"
++CLEARED_EVENT = "shared_blocker_cleared"
++DEFAULT_PROBE_SECONDS = 1800
++MAX_BLOCKER_ID_CHARS = 64
++# Outcomes that prove nothing about an external condition.
++NEUTRAL_OUTCOMES = frozenset({
++    "crashed", "timed_out", "reclaimed", "spawn_failed", "rate_limited", "gave_up", "released",
++})
++# Only blockers asserted this recently are considered (bounds the scan on old boards).
++_LOOKBACK_SECONDS = 14 * 86400
++
++_ID_RE = re.compile(r"[^a-z0-9._-]+")
++
++
++def normalize_blocker_id(raw) -> Optional[str]:
++    """Lower-case slug (``[a-z0-9._-]``, max 64 chars) or None for empty/invalid input."""
++    if not isinstance(raw, str):
++        return None
++    slug = _ID_RE.sub("-", raw.strip().lower()).strip("-._")
++    return slug[:MAX_BLOCKER_ID_CHARS] or None
++
++
++def probe_interval_seconds(cfg: Optional[dict] = None) -> int:
++    """``kanban.shared_blocker_probe_seconds`` (>= 0); 0 = no spacing, still one probe at a time."""
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config
++            cfg = load_config()
++        except Exception:
++            cfg = {}
++    raw = ((cfg or {}).get("kanban") or {}).get("shared_blocker_probe_seconds", DEFAULT_PROBE_SECONDS)
++    try:
++        return max(0, int(raw))
++    except (TypeError, ValueError):
++        return DEFAULT_PROBE_SECONDS
++
++
++@dataclass
++class BlockerState:
++    blocker_id: str
++    asserted_at: int = 0
++    cleared_at: int = 0
++    cleared_by: Optional[tuple[str, int]] = None   # (task_id, run_id) of the clearing run
++    reason: str = ""                                # summary of the newest asserting run
++    # task_id -> ended_at of the asserting run the card is still behind
++    behind: dict[str, int] = field(default_factory=dict)
++    # task_id -> started_at of the newest run started after the card's asserting run
++    probe_starts: dict[str, int] = field(default_factory=dict)
++
++    @property
++    def is_open(self) -> bool:
++        return self.asserted_at > self.cleared_at
++
++
++def _meta_blocker(kb, metadata) -> Optional[str]:
++    return normalize_blocker_id(kb._json_dict(metadata).get("blocker_id"))
++
++
++def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> dict[str, BlockerState]:
++    """Derive every recently asserted blocker's state from ``task_runs`` (read-only)."""
++    from hermes_cli import kanban_db as kb
++
++    now = int(time.time()) if now is None else int(now)
++    asserting = conn.execute(
++        "SELECT id, task_id, ended_at, metadata, summary FROM task_runs "
++        "WHERE ended_at IS NOT NULL AND ended_at >= ? AND metadata LIKE '%\"blocker_id\"%' "
++        "ORDER BY id",
++        (now - _LOOKBACK_SECONDS,),
++    ).fetchall()
++    states: dict[str, BlockerState] = {}
++    task_ids: set[str] = set()
++    for row in asserting:
++        bid = _meta_blocker(kb, row["metadata"])
++        if bid is None:
++            continue
++        st = states.setdefault(bid, BlockerState(bid))
++        ended = kb._to_epoch(row["ended_at"]) or 0
++        if ended >= st.asserted_at:
++            st.asserted_at = ended
++            st.reason = kb._first_line(row["summary"], 300)
++        task_ids.add(row["task_id"])
++    if not states:
++        return states
++    for tid in task_ids:
++        status_row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
++        live = status_row is not None and status_row["status"] not in ("done", "archived")
++        runs = conn.execute(
++            "SELECT id, outcome, started_at, ended_at, metadata FROM task_runs "
++            "WHERE task_id = ? ORDER BY id", (tid,),
++        ).fetchall()
++        current: Optional[tuple[str, int]] = None   # (blocker, asserting ended_at)
++        for run in runs:
++            started = kb._to_epoch(run["started_at"]) or 0
++            if current is not None and current[0] in states:
++                st = states[current[0]]
++                st.probe_starts[tid] = max(st.probe_starts.get(tid, 0), started)
++            if run["ended_at"] is None:
++                continue
++            ended = kb._to_epoch(run["ended_at"]) or 0
++            bid = _meta_blocker(kb, run["metadata"])
++            if bid is not None:
++                if current is not None and current[0] != bid and current[0] in states:
++                    _mark_cleared(states[current[0]], tid, run["id"], ended)
++                current = (bid, ended)
++                continue
++            if (run["outcome"] or "") in NEUTRAL_OUTCOMES:
++                continue
++            if current is not None and current[0] in states:
++                _mark_cleared(states[current[0]], tid, run["id"], ended)
++            current = None
++        if current is not None and live and current[0] in states:
++            states[current[0]].behind[tid] = current[1]
++    for st in states.values():
++        # Probe starts only count once the card is (still) behind the blocker.
++        st.probe_starts = {t: s for t, s in st.probe_starts.items() if t in st.behind}
++    return states
++
++
++def _mark_cleared(st: BlockerState, task_id: str, run_id: int, ended: int) -> None:
++    if ended >= st.cleared_at:
++        st.cleared_at = ended
++        st.cleared_by = (task_id, int(run_id))
++
++
++def blocker_for_task(states: dict[str, BlockerState], task_id: str) -> Optional[BlockerState]:
++    for st in states.values():
++        if task_id in st.behind:
++            return st
++    return None
++
++
++def _unblocked_since_assertion(conn: sqlite3.Connection, task_id: str, blocker_id: str) -> bool:
++    """True when ``task_id`` was unblocked after the newest event asserting ``blocker_id``
++    (event ids, not seconds: a bulk unblock and a re-assertion often share a second)."""
++    from hermes_cli import kanban_db as kb
++
++    newest = 0
++    for row in conn.execute(
++        "SELECT id, payload FROM task_events WHERE kind IN ('blocked', 'continued', 'block_loop_detected') "
++        "AND payload LIKE ? ORDER BY id DESC LIMIT 50", (f'%"{blocker_id}"%',),
++    ):
++        if normalize_blocker_id(kb._json_dict(row["payload"]).get("blocker_id")) == blocker_id:
++            newest = int(row["id"])
++            break
++    return conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unblocked' AND id > ? LIMIT 1",
++        (task_id, newest),
++    ).fetchone() is not None
++
++
++def shared_blocker_guard(
++    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
++    interval: Optional[int] = None,
++) -> Optional[str]:
++    """:data:`GUARD_REASON` when ``task_id`` sits behind an open blocker and must wait for the
++    probe; None when it may spawn (no blocker, blocker cleared, or this card is the probe)."""
++    now = int(time.time()) if now is None else int(now)
++    states = blocker_states(conn, now=now)
++    st = blocker_for_task(states, task_id)
++    if st is None or not st.is_open:
++        return None
++    others = [t for t in st.behind if t != task_id]
++    if others:
++        marks = ",".join("?" * len(others))
++        if conn.execute(
++            f"SELECT 1 FROM tasks WHERE id IN ({marks}) AND status = 'running' LIMIT 1", others,
++        ).fetchone():
++            return GUARD_REASON   # a probe is already in flight
++    if interval is None:
++        interval = probe_interval_seconds()
++    last = max([st.asserted_at, *st.probe_starts.values()])
++    if now - last >= interval:
++        return None
++    # A human unblock after the newest assertion is a deliberate "try again now".
++    if _unblocked_since_assertion(conn, task_id, st.blocker_id):
++        return None
++    return GUARD_REASON
++
++
++def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
++    """Unblock ``blocked`` cards behind a blocker a later probe cleared. Returns task ids."""
++    from hermes_cli import kanban_db as kb
++
++    released: list[str] = []
++    for st in blocker_states(conn, now=now).values():
++        if st.is_open or st.cleared_by is None:
++            continue
++        for tid, asserted in sorted(st.behind.items()):
++            if asserted >= st.cleared_at:
++                continue
++            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
++            if row is None or row["status"] != "blocked":
++                continue
++            if not kb.unblock_task(conn, tid):
++                continue
++            by_task, by_run = st.cleared_by
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, CLEARED_EVENT, {
++                    "blocker_id": st.blocker_id, "cleared_by_task": by_task, "cleared_by_run": by_run,
++                })
++                kb._insert_comment(
++                    conn, tid, "dispatcher",
++                    f"shared blocker `{st.blocker_id}` cleared: {by_task} run {by_run} ended without "
++                    "hitting it, so this card was unblocked automatically.",
++                    int(time.time()),
++                )
++            released.append(tid)
++    return released
++
++
++def render_blocker_context(conn: sqlite3.Connection, task_id: str) -> str:
++    """Worker-context section naming open blockers so workers reuse the same id."""
++    states = [s for s in blocker_states(conn).values() if s.is_open]
++    if not states:
++        return ""
++    lines = ["## Open shared blockers on this board",
++             "External walls other cards already hit. If yours is one of them, stop early and end "
++             "with kanban_block/kanban_continue passing the same `blocker_id` instead of rediscovering "
++             "it; only one card probes a blocker at a time."]
++    mine = None
++    for st in sorted(states, key=lambda s: -s.asserted_at):
++        if task_id in st.behind:
++            mine = st
++        lines.append(f"- `{st.blocker_id}` ({len(st.behind)} card(s) parked): {st.reason or '(no reason)'}")
++    if mine is not None:
++        lines.append("")
++        lines.append(
++            f"This run is the probe for `{mine.blocker_id}`. Check first whether it still holds. If it "
++            f"does, end again with `blocker_id: \"{mine.blocker_id}\"`. If it is gone, carry on: ending "
++            "without that id clears it and releases the other parked cards.")
++    lines.append("")
++    return "\n".join(lines)
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+new file mode 100644
+index 0000000000..0ad9733f84
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -0,0 +1,212 @@
++"""Shared external blockers: many cards parked behind one blocker, probed once. [daveey]
++
++Repro of the waste this fixes: ~20 cards each hit the same GitHub Actions billing wall,
++were bulk-unblocked, and each one then re-discovered (and re-polled) the same wall on its
++own. With ``blocker_id`` the dispatcher holds every card behind the blocker and spawns one
++probe; a probe that ends without the id clears it and releases the rest.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_shared_blockers as ksb
++import tools.kanban_tools as kt
++
++BID = "github-actions-billing"
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "3600")  # fake pids must not "crash"
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
++                "HERMES_SESSION_ID", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(ksb, "probe_interval_seconds", lambda cfg=None: 1800)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++@pytest.fixture
++def spawns(monkeypatch):
++    spawned: list[str] = []
++
++    def fake_spawn(task, workspace, board=None):
++        spawned.append(task.id)
++
++    return spawned, fake_spawn
++
++
++def _blocked_behind(conn, title: str, blocker_id=BID) -> str:
++    tid = kb.create_task(conn, title=title, assignee="default")
++    assert kb.claim_task(conn, tid) is not None
++    assert kb.block_task(conn, tid, reason="GitHub Actions refuses every job: billing",
++                         kind="capability", blocker_id=blocker_id)
++    return tid
++
++
++def _age_runs(conn, seconds: int) -> None:
++    """Shift every run and event into the past (as if ``seconds`` had elapsed)."""
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET started_at = started_at - ?, "
++                     "ended_at = CASE WHEN ended_at IS NULL THEN NULL ELSE ended_at - ? END", (seconds, seconds))
++        conn.execute("UPDATE task_events SET created_at = created_at - ?", (seconds,))
++
++
++def _spawned_ids(res) -> list[str]:
++    return [row[0] for row in res.spawned]
++
++
++def test_block_records_blocker_on_run_and_event(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _blocked_behind(conn, "a", blocker_id="  GitHub Actions Billing! ")
++        run = conn.execute("SELECT metadata FROM task_runs WHERE task_id = ?", (tid,)).fetchone()
++        assert json.loads(run["metadata"]) == {"blocker_id": BID}
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'",
++                          (tid,)).fetchone()
++        assert json.loads(ev["payload"])["blocker_id"] == BID
++        # Control: a plain block stores no blocker metadata.
++        plain = kb.create_task(conn, title="p", assignee="default")
++        kb.claim_task(conn, plain)
++        kb.block_task(conn, plain, reason="need a decision", kind="needs_input")
++        assert conn.execute("SELECT metadata FROM task_runs WHERE task_id = ?", (plain,)).fetchone()[0] is None
++        assert ksb.blocker_for_task(ksb.blocker_states(conn), plain) is None
++
++
++def test_unblocked_cards_behind_open_blocker_get_one_probe(kanban_home, spawns):
++    _spawned, fake_spawn = spawns
++    with kbc.connect_closing() as conn:
++        cards = [_blocked_behind(conn, f"card {i}") for i in range(3)]
++        for tid in cards:
++            assert kb.unblock_task(conn, tid)        # the human's bulk unblock
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert len(_spawned_ids(res)) == 1           # one probe, not three
++        probe = _spawned_ids(res)[0]
++        held = sorted(t for t, reason in res.respawn_guarded if reason == ksb.GUARD_REASON)
++        assert held == sorted(set(cards) - {probe})
++        # While the probe runs, nobody else spawns.
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == []
++        # Probe hits the wall again and re-asserts: the rest stay held within the interval.
++        assert kb.block_task(conn, probe, reason="still refused", kind="capability", blocker_id=BID)
++        # Probe re-assertion is not an unblock loop: no triage escalation.
++        assert kb.get_task(conn, probe).status == "blocked"
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == []
++        assert {t for t, r in res.respawn_guarded if r == ksb.GUARD_REASON} == set(cards) - {probe}
++        # Interval elapses: exactly one more probe.
++        _age_runs(conn, 1900)
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert len(_spawned_ids(res)) == 1
++        probe2 = _spawned_ids(res)[0]
++        assert probe2 != probe
++        # Probe 2 gets through (completes): blocker clears, remaining ready card spawns and the
++        # still-blocked first probe is released automatically.
++        assert kb.complete_task(conn, probe2, result="released fine")
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert res.shared_blocker_released == [probe]
++        rest = set(cards) - {probe, probe2}
++        assert set(_spawned_ids(res)) == rest | {probe}
++        assert not [t for t, r in res.respawn_guarded if r == ksb.GUARD_REASON]
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                          (probe, ksb.CLEARED_EVENT)).fetchone()
++        assert json.loads(ev["payload"])["cleared_by_task"] == probe2
++
++
++def test_cleared_blocker_releases_blocked_cards_without_human_unblock(kanban_home, spawns):
++    _spawned, fake_spawn = spawns
++    with kbc.connect_closing() as conn:
++        a, b = _blocked_behind(conn, "a"), _blocked_behind(conn, "b")
++        _age_runs(conn, 60)
++        kb.unblock_task(conn, a)                     # human retries just one card
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == [a]
++        assert kb.get_task(conn, b).status == "blocked"
++        kb.complete_task(conn, a, result="CI ran")
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert res.shared_blocker_released == [b]
++        assert b in _spawned_ids(res)
++        # Released card's context names who cleared it.
++        assert "cleared" in " ".join(c.body for c in kb.list_comments(conn, b))
++
++
++def test_neutral_outcomes_neither_clear_nor_assert(kanban_home):
++    with kbc.connect_closing() as conn:
++        a, b = _blocked_behind(conn, "a"), _blocked_behind(conn, "b")
++        _age_runs(conn, 60)
++        kb.unblock_task(conn, a)
++        kb.claim_task(conn, a)
++        with kb.write_txn(conn):                     # the probe crashes: says nothing about CI
++            kb._end_run(conn, a, outcome="crashed", error="pid gone")
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (a,))
++        st = ksb.blocker_states(conn)[BID]
++        assert st.is_open and set(st.behind) == {a, b}
++        # The crashed probe started recently, so it consumed this interval's probe.
++        assert ksb.shared_blocker_guard(conn, b, interval=1800) == ksb.GUARD_REASON
++        assert ksb.shared_blocker_guard(conn, b, interval=0) is None
++        # A different blocker on the next run clears the first (the wall moved).
++        kb.claim_task(conn, a)
++        kb.block_task(conn, a, reason="other wall", kind="capability", blocker_id="provider-outage")
++        states = ksb.blocker_states(conn)
++        assert set(states[BID].behind) == {b} and states[BID].cleared_by[0] == a
++        assert not states[BID].is_open
++
++
++def test_no_blocker_no_guard(kanban_home, spawns):
++    _spawned, fake_spawn = spawns
++    with kbc.connect_closing() as conn:
++        tids = [kb.create_task(conn, title=f"plain {i}", assignee="default") for i in range(3)]
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert sorted(_spawned_ids(res)) == sorted(tids)
++
++
++def test_continue_tool_carries_blocker_and_context_names_probe(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        other = _blocked_behind(conn, "other")
++        tid = kb.create_task(conn, title="waits on CI", assignee="default")
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++        kbd._set_worker_pid(conn, tid, os.getpid())
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    bad = json.loads(kt._handle_continue({"checkpoint": "c", "blocker_id": 7}))
++    assert "error" in bad
++    out = json.loads(kt._handle_continue({"checkpoint": "fix on main; CI refused (billing)",
++                                          "resume_after_seconds": 600, "blocker_id": BID}))
++    assert out["status"] == "scheduled"
++    with kbc.connect_closing() as conn:
++        meta = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0])
++        assert meta["blocker_id"] == BID
++        st = ksb.blocker_states(conn)[BID]
++        assert set(st.behind) == {tid, other}
++        ctx = kb.build_worker_context(conn, other)
++        assert "Open shared blockers" in ctx and f"`{BID}` (2 card(s) parked)" in ctx
++        assert f"This run is the probe for `{BID}`" in ctx
++
++
++def test_block_tool_validates_and_reports_blocker(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="default")
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    assert "error" in json.loads(kt._handle_block({"reason": "r", "blocker_id": "!!!"}))
++    out = json.loads(kt._handle_block({"reason": "1) fix billing", "kind": "capability",
++                                       "blocker_id": BID}))
++    assert out.get("blocker_id") == BID
++    assert ksb.normalize_blocker_id("A b/C") == "a-b-c"
++    assert ksb.normalize_blocker_id("x" * 100) == "x" * 64
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 7cd24bb9ba..200fd01b59 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -913,6 +913,18 @@ def _handle_complete(args: dict, **kw) -> str:
+                        for a in kb.list_attachments(conn, tid)])
+ 
+ 
++def _blocker_id_arg(args: dict) -> Optional[str]:
++    """Validated ``blocker_id`` (shared external blocker slug) or None. [daveey]"""
++    raw = args.get("blocker_id")
++    if raw is None or (isinstance(raw, str) and not raw.strip()):
++        return None
++    _check(isinstance(raw, str), "blocker_id must be a string")
++    from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++    bid = normalize_blocker_id(raw)
++    _check(bid is not None, "blocker_id must be a short slug like 'github-actions-billing'")
++    return bid
++
++
+ @_kanban_handler("kanban_block")
+ def _handle_block(args: dict, **kw) -> str:
+     """Transition the task to blocked with a reason a human will read."""
+@@ -939,10 +951,14 @@ def _handle_block(args: dict, **kw) -> str:
+                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
+                f"finished or cannot proceed for another reason, call kanban_complete instead — "
+                f"the completion judge will evaluate it.")
+-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
++        blocker_id = _blocker_id_arg(args)
++        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
++                           blocker_id=blocker_id)
+         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+         landed_kind = kb.get_task(conn, tid).block_kind
+         extra: dict = {"block_kind": landed_kind}
++        if blocker_id:
++            extra["blocker_id"] = blocker_id
+         if kind == "dependency" and landed_kind != kind:
+             # block_task re-kinds a dependency wait that no open parent can satisfy.
+             extra["requested_kind"] = kind
+@@ -991,6 +1007,9 @@ def _handle_continue(args: dict, **kw) -> str:
+         metadata = _redact_metadata(metadata)
+         _check(metadata is not None, "metadata could not be safely serialized")
+     metadata = _stamp_worker_session_metadata(tid, metadata)
++    blocker_id = _blocker_id_arg(args)
++    if blocker_id:
++        metadata = {**(metadata or {}), "blocker_id": blocker_id}
+     from hermes_cli.kanban_continuation import continue_task
+     with _board(args.get("board")) as (kb, conn):
+         res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index b407deb981..9d4b89e0c3 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -207,6 +207,14 @@ KANBAN_BLOCK_SCHEMA = _schema(
+                 "The others surface to a human. Omit only if none apply."
+             ),
+         },
++        "blocker_id": _prop("string", (
++            "Optional. Set ONLY when the wall is outside this card and would stop other "
++            "cards too (CI billing/quota refused, a provider or service outage, a release "
++            "pipeline down): a short slug such as 'github-actions-billing'. Reuse an id "
++            "from 'Open shared blockers' in your context when it is the same wall. The "
++            "dispatcher then holds every card behind it and runs one probe card per "
++            "interval; a run that ends without the id clears it and releases the rest."
++        )),
+     },
+     ["reason"],
+ )
+@@ -264,6 +272,14 @@ KANBAN_CONTINUE_SCHEMA = _schema(
+         "metadata": {"type": "object", "description": (
+             "Optional machine-readable state (e.g. {\"pids\": [...], \"ci_run\": ...})."
+         )},
++        "blocker_id": _prop("string", (
++            "Optional. Set ONLY when the wall is outside this card and would stop other "
++            "cards too (CI billing/quota refused, a provider or service outage, a release "
++            "pipeline down): a short slug such as 'github-actions-billing'. Reuse an id "
++            "from 'Open shared blockers' in your context when it is the same wall. The "
++            "dispatcher then holds every card behind it and runs one probe card per "
++            "interval; a run that ends without the id clears it and releases the rest."
++        )),
+     },
+     ["checkpoint"],
+ )
+-- 
+2.54.0 (Apple Git-157)
+
