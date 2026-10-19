@@ -200,8 +200,6 @@ def test_live_checkout_attributes_mutation_to_its_own_directory(tmp_path, monkey
                 f"ls {live}; cd /tmp && npm run build",
                 f"cd {live} && git show HEAD:a.ts > $TMPDIR/a.ts",
                 f"# the last {live} build ran hermes desktop --build-only\necho done"):
-                f"cd {live} && git show HEAD:a.ts > $TMPDIR/a.ts",
-                f"# the last {live} build ran hermes desktop --build-only\necho done"):
         assert tlc("terminal", {"command": cmd}, live) is None, cmd
     for cmd in (f"cd /tmp && git status; cd {live} && git pull",
                 f"cat {live}/a.py; git -C {live} stash",
