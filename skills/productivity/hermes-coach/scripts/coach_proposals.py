@@ -13,11 +13,14 @@ A proposal is a fenced block in the weekly report:
      "evidence": "macbook/default/<id> — <title>: ...", "risk": "low", "title": "..."}
     ```
 
-kind is one of skill_patch | config | shared_config | curriculum | plugin_rule | core. The `change` shape per kind:
+kind is one of skill_patch | config | shared_config | curriculum | plugin_rule | core | fix. The `change` shape per kind:
   config / shared_config  {"value": <json value>}
   skill_patch             {"old_string": "...", "new_string": "...", "file_path": "SKILL.md"}   (target = skill name)
   curriculum/plugin_rule  {"old_string": "...", "new_string": "..."} or {"append": "..."}       (target = file path)
   core                    {"summary": "..."}  (target = area; never applied by a script, always a Kanban card)
+  fix                     {"sessions": [">=2 session ids"], "hypothesis": "...", "acceptance": ["..."], "repro": "...",
+                           "area": "plugin:coach | core | skill:<n>"}  (target = pattern slug; the fixer lane:
+                           coach_fixer.py files one `coach-fix:<slug>` card a day while the lane is under $7/day)
 
 Rollout tier (sets the autonomy; `tier` in the block may only RAISE the default from `default_tier`):
   auto    curriculum tips, skill patches, coach.* detector thresholds  -> `coach-apply auto` applies them when the
@@ -34,7 +37,7 @@ fingerprint (kind + target + change) was ever rejected is dropped by `add`, so i
 import argparse, calendar, hashlib, json, os, re, sys, time
 from pathlib import Path
 
-KINDS = ("skill_patch", "config", "shared_config", "curriculum", "plugin_rule", "core")
+KINDS = ("skill_patch", "config", "shared_config", "curriculum", "plugin_rule", "core", "fix")
 TIERS = ("auto", "canary", "review")
 STATUSES = ("pending", "applied", "canary", "carded", "rejected", "dropped", "reverted")
 STALE_DAYS = 7
@@ -58,7 +61,7 @@ def tier_rank(t):
 def default_tier(p):
     """Lowest tier a proposal may run at, from its kind/target/cost/risk."""
     kind, tgt = p.get("kind"), str(p.get("target") or "")
-    if (kind == "core" or "hermes-agent" in tgt or p.get("paid")
+    if (kind in ("core", "fix") or "hermes-agent" in tgt or p.get("paid")
             or float(p.get("cost_usd_day") or 0) > REVIEW_COST_USD_DAY or p.get("risk") == "high"):
         return "review"
     if kind in ("config", "shared_config"):
@@ -147,6 +150,9 @@ def validate(p):
         errs.append("skill_patch change needs {old_string, new_string}")
     if kind in ("curriculum", "plugin_rule") and not ("append" in ch or ("old_string" in ch and "new_string" in ch)):
         errs.append(f"{kind} change needs {{append}} or {{old_string, new_string}}")
+    if kind == "fix":
+        from coach_fixer import validate_fix
+        errs += validate_fix(p)
     return errs
 
 
@@ -178,6 +184,11 @@ def cmd_add(a):
             msgs.append(f"skipped {p.get('kind')}:{p.get('target')}: " + "; ".join(errs))
             continue
         fp = fingerprint(p)
+        dup = next((q for q in st.values() if p["kind"] == "fix" and q.get("kind") == "fix"
+                    and q.get("target") == p["target"] and q.get("status") in ("pending", "carded")), None)
+        if dup:
+            msgs.append(f"skipped fix:{p['target']}: slug already {dup.get('status')} as {dup['id']}")
+            continue
         if fp in seen:
             msgs.append(f"skipped {p['kind']}:{p['target']}: same as {seen[fp]['id']} ({seen[fp].get('status')})")
             continue
@@ -189,6 +200,7 @@ def cmd_add(a):
         rec["tier"] = effective_tier(p)
         append(a.data, rec)
         seen[fp] = rec
+        st[rec["id"]] = rec
         raised = f" (asked {p['tier']}, default is higher)" if p.get("tier") and p["tier"] != rec["tier"] else ""
         msgs.append(f"added {rec['id']} [{rec['tier']}] {p['kind']}:{p['target']}{raised}")
     print("\n".join(msgs) or "no coach-proposal blocks found")

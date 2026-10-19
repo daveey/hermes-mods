@@ -10,6 +10,8 @@
         auto tier    -> gate (applies cleanly, YAML/frontmatter valid, repo pre-commit + plugin tests) -> applied
         canary tier  -> applied on THIS host only + a 7-day before/after check -> promote on KEEP, revert on REVERT
         review tier  -> a card on the `hermes` Kanban board (status carded)
+        kind fix     -> the fixer lane: one `coach-fix:<slug>` card a day (1 h runtime) while the lane's spend
+                        today is under $7; fixer spend is logged to research/state/spend.jsonl (lane fixer)
         pending > 7 days whose gate still fails -> dropped with the reason
     coach_apply.py list --status all|pending|applied|canary|carded|rejected|dropped|reverted
 
@@ -23,6 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import coach_proposals as cp  # noqa: E402
+import coach_fixer as fx  # noqa: E402
 
 HOME = Path.home()
 SYNCED = ("skills", "desktop-plugins", "bin", "scripts", "local-fixes", "compute-rentals")  # hermes-sync SHARED_DIRS
@@ -103,7 +106,8 @@ def push_data(env, msg):
     f = env.data / "reports/proposals.jsonl"
     if not (env.data / ".git").exists():
         return "data repo is not git"
-    sha = git_commit(env, env.data, [f.relative_to(env.data)], msg)
+    paths = [f.relative_to(env.data)] + [s.relative_to(env.data) for s in [fx.spend_log_path(env.data)] if s.exists()]
+    sha = git_commit(env, env.data, paths, msg)
     return (git_push(env, env.data) if sha else "nothing to commit")
 
 
@@ -364,6 +368,29 @@ def file_card(env, p, dry=False):
     return m.group(1) if m.groups() else m.group(0)
 
 
+def file_fix(env, p, dry=False, now=None, by_day=None):
+    """Fixer lane: (status, detail). carded = a new or existing coach-fix:<slug> card; deferred raises ApplyError
+    (stays pending; dropped once stale)."""
+    errs = fx.validate_fix(p)
+    if errs:
+        raise ApplyError("fix proposal invalid: " + "; ".join(errs))
+    have = fx.existing_card(env.home, env.board, p["target"])
+    if have:
+        return "carded", have["id"], f"already a card ({have['status']})"
+    ok, why, _usd = fx.gate(env.home, env.board, now, by_day)
+    if not ok:
+        raise ApplyError(f"fixer lane closed: {why}")
+    if dry:
+        return "carded", "dry-run", "would file"
+    r = sh([env.hermes, "kanban", "--board", env.board, "create", "--assignee", "default", "--json",
+            "--created-by", "coach", "--idempotency-key", f"coach-fix:{p['target']}",
+            "--max-runtime", str(fx.FIX_RUNTIME_S), "--body", fx.card_body(p), fx.card_title(p)])
+    m = re.search(r'"id"\s*:\s*"([^"]+)"', r.stdout) or re.search(r"\bt_[0-9a-f]{6,}\b", r.stdout)
+    if not m:
+        raise ApplyError(f"kanban create gave no id: {r.stdout[-300:]}")
+    return "carded", (m.group(1) if m.groups() else m.group(0)), "filed"
+
+
 def canary_verdict(env, p, now):
     """KEEP | KEEP (provisional) | RAISE | REVERT from coach_weekly's before/after check."""
     import coach_mine, coach_weekly  # noqa: E401
@@ -376,12 +403,21 @@ def auto(env, dry=False, now=None, out=print):
     pull_data(env)
     now = now or time.time()
     done = []
-    for p in list(cp.state(env.data).values()):
+    by_day = fx.spend_by_day(env.home, env.board, 3, now)
+    if not dry and (env.data / ".git").exists():
+        fx.log_spend(env.data, by_day)
+    for p in sorted(cp.state(env.data).values(), key=lambda q: (q.get("kind") != "fix", q.get("at", ""))):
         st, pid = p.get("status"), p["id"]
         try:
             if st == "pending":
                 tier = cp.effective_tier(p)
                 stale = cp.age_days(p, now) > cp.STALE_DAYS
+                if p.get("kind") == "fix":
+                    st2, card, how = file_fix(env, p, dry, now, by_day)
+                    dry or mark(env, pid, st2, by="coach-apply auto", card=card, tier=tier,
+                                result=f"fix card {card} on board {env.board} ({how})")
+                    done.append((pid, "carded", f"{card} ({how})"))
+                    continue
                 if tier == "review":
                     card = file_card(env, p, dry)
                     dry or mark(env, pid, "carded", by="coach-apply auto", card=card, tier=tier,
@@ -426,8 +462,9 @@ def auto(env, dry=False, now=None, out=print):
         out(f"{d[0]:<13} {d[1]:<14} {str(d[2])[:300]}")
     if not done:
         out("coach-apply auto: nothing to do")
-    if not dry and any(d[1] not in ("gate failed",) for d in done):
-        out("data " + push_data(env, f"coach-apply auto: {', '.join(d[0] + ' ' + d[1] for d in done)}"[:200]))
+    if not dry:
+        msg = ", ".join(d[0] + " " + d[1] for d in done if d[1] != "gate failed") or "fixer spend"
+        out("data " + push_data(env, f"coach-apply auto: {msg}"[:200]))
     return done
 
 
