@@ -294,6 +294,7 @@ def test_mbp_pull_claims_due_requests_once_and_done_settles_them(env):
     store, engs, _, _ = env
     e = engs.create("C1", "x", private=True)
     q = engs.queue_mbp(e["id"], "@session:default@mac/s1", "check X", "C1", "7.0")
+    store.update_policy(follower={"mbp_delivery": "pull"})
     got = follow.engagement_op(engs, "mbp_pull", {})
     assert [x["id"] for x in got["requests"]] == [q["id"]] and got["requests"][0]["message"] == "check X"
     assert follow.engagement_op(engs, "mbp_pull", {})["requests"] == []  # claimed, not handed out twice
@@ -316,3 +317,78 @@ def test_runner_leaves_mbp_queue_to_the_puller_when_policy_says_pull(env, monkey
     store.update_policy(follower={"mbp_delivery": "courier"})
     r.deliver_mbp()
     assert sent == ["@session:default@mac/s1"]
+
+
+def test_courier_names_the_mac_for_this_device_owner_refs():
+    assert follow.target_route("@session:default@this-device/s1") == "this-device"
+    assert follow.courier_target("@session:default@this-device/s1", "david-mbp") == "@session:default@david-mbp/s1"
+    assert follow.courier_target("@session:default@mac-mini/s1", "david-mbp") == "@session:default@mac-mini/s1"
+    assert follow.courier_target("@session:alpha-follow/s1", "david-mbp") == "@session:alpha-follow/s1"
+
+
+def test_courier_request_carries_route_so_only_that_mac_claims_it(env, tmp_path):
+    store, engs, _, _ = env
+    r = make_runner(store, engs, [])
+    r.root_home = tmp_path
+    import threading, json as _j
+    def desktop():
+        out = tmp_path / "session_mentions" / "outbox"
+        for _ in range(100):
+            files = list(out.glob("*.json")) if out.exists() else []
+            if files:
+                req = _j.loads(files[0].read_text())
+                files[0].unlink()
+                seen.append(req)
+                (tmp_path / "session_mentions" / "results" / files[0].name).write_text(
+                    _j.dumps({"ok": True, "queued": True, "status": "queued"}))
+                return
+            time.sleep(0.05)
+    seen = []
+    t = threading.Thread(target=desktop); t.start()
+    assert r._courier_send("@session:default@david-mbp/s1", "hi") == (True, "queued", False)
+    t.join()
+    assert seen[0]["route"] == "david-mbp" and seen[0]["args"]["target"] == "@session:default@david-mbp/s1"
+
+
+def test_courier_first_then_pull_fallback_never_both(env, monkeypatch):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    q = engs.queue_mbp(e["id"], "@session:default@this-device/s1", "m", "C1", "")
+    r = make_runner(store, engs, [])
+    sent = []
+    # Default mode is courier with pull fallback: a fresh request is the courier's, not the puller's.
+    assert follow.engagement_op(engs, "mbp_pull", {})["requests"] == []
+    monkeypatch.setattr(r, "_courier_send", lambda t, m: sent.append(t) or (False, "Desktop courier offline", False))
+    r.deliver_mbp()
+    assert sent == ["@session:default@david-mbp/s1"]  # this-device -> the named Mac
+    r.deliver_mbp()
+    assert len(sent) == 1  # courier backs off
+    got = follow.engagement_op(engs, "mbp_pull", {})["requests"]
+    assert [x["id"] for x in got] == [q["id"]]  # failed courier send -> due for the puller at once
+    r._courier_backoff.clear()
+    r.deliver_mbp()
+    assert len(sent) == 1  # claimed by the puller: courier keeps off it
+    follow.engagement_op(engs, "mbp_done", {"id": q["id"], "ok": True})
+    assert engs.mbp_get(q["id"])["state"] == "delivered"
+
+
+def test_pull_takes_requests_the_courier_left_past_grace(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    q = engs.queue_mbp(e["id"], "@session:default@mac/s1", "m", "C1", "")
+    assert engs.mbp_claim(now=time.time() + 10, courier_grace=follow.PULL_GRACE_S) == []
+    assert [x["id"] for x in engs.mbp_claim(now=time.time() + follow.PULL_GRACE_S + 1,
+                                            courier_grace=follow.PULL_GRACE_S)] == [q["id"]]
+    store.update_policy(follower={"mbp_delivery": "courier_only"})
+    assert follow.engagement_op(engs, "mbp_pull", {})["requests"] == []
+
+
+def test_unknown_courier_outcome_is_never_resent(env, monkeypatch):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    q = engs.queue_mbp(e["id"], "@session:default@mac/s1", "m", "C1", "")
+    r = make_runner(store, engs, [])
+    monkeypatch.setattr(r, "_courier_send", lambda t, m: (False, "socket closed", True))
+    r.deliver_mbp()
+    assert engs.mbp_get(q["id"])["state"] == "uncertain"
+    assert follow.engagement_op(engs, "mbp_pull", {})["requests"] == [] and engs.due_mbp(time.time() + 9999) == []

@@ -50,6 +50,36 @@ QUIET_WARN_S = 6 * 86400
 QUIET_END_S = engage.QUIET_END_DAYS * 86400
 MBP_RETRY_S = 300
 PICKUP_WAIT_S = 25
+# follower.mbp_delivery: "courier" (default) = the Mac's Desktop courier delivers through the session's
+# owning socket; a request it couldn't deliver (Desktop not running, Mac asleep) or that waited longer
+# than PULL_GRACE_S goes to the Mac's pull cron (slack_follow_pull.py). "courier_only" = no pull
+# fallback. "pull" = the pull cron only. Why courier first: see DELIVERY.md in this plugin.
+PULL_GRACE_S = 180
+MBP_DEVICE = "david-mbp"  # follower.mbp_device: courier name for owner refs that say `@this-device`
+LOCAL_ALIASES = ("this-device", "local")
+
+
+def mbp_mode(policy: dict) -> str:
+    mode = ((policy or {}).get("follower") or {}).get("mbp_delivery") or "courier"
+    return mode if mode in ("courier", "courier_only", "pull") else "courier"
+
+
+def target_route(target: str) -> str:
+    """The gateway part of `@session:<profile>@<gw>/<id>` ('' when none)."""
+    text = (target or "").strip().strip("`\"'")
+    while text.startswith("@session:"):
+        text = text[len("@session:"):]
+    head = text.split("/", 1)[0] if "/" in text else ""
+    return head.rsplit("@", 1)[1].strip().lower() if "@" in head else ""
+
+
+def courier_target(target: str, device: str) -> str:
+    """Owner refs made on a Mac say `@this-device`, which is ambiguous from this gateway (every
+    Desktop calls its own Mac that): name the Mac."""
+    if target_route(target) not in LOCAL_ALIASES:
+        return target
+    head, sid = target.rsplit("/", 1)
+    return f"{head.rsplit('@', 1)[0]}@{device}/{sid}"
 
 
 # =================================================================================================
@@ -198,8 +228,13 @@ def engagement_op(engs: "engage.Engagements", op: str, args: dict) -> dict:
             engs.store.update_policy(test_inbox=bool(args["enabled"]))
         return {"ok": True, "test_inbox": engs.test_inbox()}
     if op == "mbp_pull":  # the other machine fetches requests for its sessions (works across sleep)
-        return {"ok": True, "requests": [{k: r[k] for k in ("id", "engagement", "target", "message", "channel", "thread")}
-                                         for r in engs.mbp_claim()]}
+        mode = mbp_mode(engs.store.policy())
+        if mode == "courier_only":
+            return {"ok": True, "requests": [], "mode": mode}
+        got = engs.mbp_claim(courier_grace=PULL_GRACE_S if mode == "courier" else None)
+        return {"ok": True, "mode": mode,
+                "requests": [{k: r[k] for k in ("id", "engagement", "target", "message", "channel", "thread")}
+                             for r in got]}
     if op == "mbp_done":
         if not engs.mbp_get(args.get("id") or ""):
             return {"ok": False, "error": "no such request"}
@@ -276,6 +311,7 @@ class Runner:
         self.self_gateway = self_gateway
         self._busy: set[str] = set()
         self._again: set[str] = set()
+        self._courier_backoff: dict[str, float] = {}
         self._lock = threading.Lock()
         self._ticker: Optional[threading.Thread] = None
 
@@ -440,22 +476,43 @@ class Runner:
 
     # ---- queue to another machine's session (session-mentions courier) ------------------------
     def deliver_mbp(self, now: Optional[float] = None) -> None:
-        # "pull": the other machine fetches its requests itself (engagement op mbp_pull); a Desktop
-        # courier is shared by every Desktop connected to this gateway, so it can't target one Mac.
-        if (self.store.policy().get("follower") or {}).get("mbp_delivery") == "pull":
+        # See mbp_mode(). The courier claims each request atomically, so it and the pull cron never
+        # both deliver one; a failed courier send is due for the puller at once (fallback) and for
+        # the courier again after MBP_RETRY_S. An unknown outcome is never resent.
+        policy = self.store.policy()
+        mode = mbp_mode(policy)
+        if mode == "pull":
             return
+        device = (policy.get("follower") or {}).get("mbp_device") or MBP_DEVICE
+        now = time.time() if now is None else now
         for q in self.engs.due_mbp(now):
-            ok, err = self._courier_send(q["target"], q["message"])
-            self.engs.mbp_attempt(q["id"], ok=ok, error=err, retry_in=MBP_RETRY_S)
+            if self._courier_backoff.get(q["id"], 0) > now:
+                continue
+            if not self.engs.mbp_claim_one(q["id"], now=now, lease=PICKUP_WAIT_S + 300):
+                continue
+            target = courier_target(q["target"], device)
+            res = self._courier_send(target, q["message"])
+            ok, err = res[0], res[1]
+            if len(res) > 2 and res[2]:
+                self.engs.mbp_uncertain(q["id"], err)
+                logger.warning("slack-follow %s to %s: outcome unknown (%s); not resending", q["id"], target, err)
+                continue
+            self.engs.mbp_attempt(q["id"], ok=ok, error=f"courier: {err}" if err else "",
+                                  retry_in=0 if mode == "courier" else MBP_RETRY_S)
             if ok:
-                logger.info("slack-follow delivered %s to %s", q["id"], q["target"])
+                self._courier_backoff.pop(q["id"], None)
+                logger.info("slack-follow delivered %s to %s", q["id"], target)
+            else:
+                self._courier_backoff[q["id"]] = now + MBP_RETRY_S
 
-    def _courier_send(self, target: str, message: str) -> tuple[bool, str]:
+    def _courier_send(self, target: str, message: str) -> tuple[bool, str, bool]:
+        """(ok, error, uncertain). uncertain = the Desktop may have delivered it."""
         base = self.root_home / "session_mentions"
         for sub in ("outbox", "claimed", "results"):
             (base / sub).mkdir(parents=True, exist_ok=True)
         rid = uuid.uuid4().hex
-        req = {"id": rid, "action": "send", "args": {"target": target, "message": message},
+        req = {"id": rid, "action": "send", "route": target_route(target),
+               "args": {"target": target, "message": message},
                "wait_for_reply": 0, "sender": {"session_id": "", "title": "slack follower", "profile": DEFAULT_FOLLOWER},
                "created_at": time.time(), "ttl": 600}
         out = base / "outbox" / f"{rid}.json"
@@ -472,12 +529,19 @@ class Runner:
                     time.sleep(0.3)
                     continue
                 res.unlink(missing_ok=True)
-                return bool(data.get("ok")), str(data.get("error") or "")
+                ok = bool(data.get("ok"))
+                uncertain = not ok and (data.get("status") == "unknown" or data.get("delivered") is None
+                                        and data.get("retry_safe") is False)
+                return ok, str(data.get("error") or data.get("status") or ""), uncertain
             if out.exists() and time.time() > deadline:
-                out.unlink(missing_ok=True)
-                return False, "Desktop courier offline (Mac asleep or Desktop not running)"
+                try:
+                    out.unlink()
+                except FileNotFoundError:  # claimed just now: keep waiting for the result
+                    deadline += 120
+                    continue
+                return False, "Desktop courier offline (Mac asleep or Desktop not running)", False
             time.sleep(0.5)
-        return False, "courier timed out"
+        return False, "courier claimed it but sent no result", True
 
 
 # =================================================================================================

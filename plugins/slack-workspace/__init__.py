@@ -801,8 +801,8 @@ def ftool_defer(peer, args: dict, session_id: str = "", **_) -> str:
            + (f" (or cross_session action=send target={me})." if me else "."))
     q = peer.engs().queue_mbp(e["id"], target, msg, ch, thread)
     return _out({"ok": True, "queued": q["id"], "target": target,
-                 "note": "Delivered by the bot gateway's tick within ~1 min when the Desktop is online; "
-                         "retried every 5 min otherwise. Tell the thread you'll follow up."})
+                 "note": "Delivered by the Mac's Desktop within ~1 min when it's running; otherwise the Mac's "
+                         "pull cron runs it (every 2 min while the Mac is awake). Tell the thread you'll follow up."})
 
 
 def ftool_engage(peer, args: dict, session_id: str = "", **_) -> str:

@@ -261,15 +261,31 @@ class Engagements:
         now = time.time() if now is None else now
         return [r for r in self.mbp_list() if r["state"] == "queued" and (r["next_at"] or 0) <= now]
 
-    def mbp_claim(self, now: Optional[float] = None, lease: float = 600) -> list[dict]:
+    def mbp_claim(self, now: Optional[float] = None, lease: float = 600,
+                  courier_grace: Optional[float] = None) -> list[dict]:
         """Hand due requests to a puller (the other machine fetching its own work) exactly once; an
-        unsettled claim becomes due again after ``lease`` seconds."""
+        unsettled claim becomes due again after ``lease`` seconds. With ``courier_grace`` (courier
+        first, pull as fallback) only requests the courier already failed, or that have waited longer
+        than the grace, are handed out."""
         now = time.time() if now is None else now
         due = self.due_mbp(now)
+        if courier_grace is not None:
+            due = [r for r in due if (r["attempts"] or 0) > 0 or (r["created"] or 0) <= now - courier_grace]
+        return [r for r in due if self.mbp_claim_one(r["id"], now=now, lease=lease)]
+
+    def mbp_claim_one(self, qid: str, *, now: Optional[float] = None, lease: float = 600) -> bool:
+        """Atomically take one due request (courier and puller run in different processes)."""
+        now = time.time() if now is None else now
         with self.store._conn() as c:
-            for r in due:
-                c.execute("UPDATE eng_mbp_queue SET next_at=? WHERE id=?", (now + lease, r["id"]))
-        return due
+            cur = c.execute("UPDATE eng_mbp_queue SET next_at=? WHERE id=? AND state='queued' "
+                            "AND COALESCE(next_at, 0)<=?", (now + lease, qid, now))
+            return cur.rowcount == 1
+
+    def mbp_uncertain(self, qid: str, error: str) -> None:
+        """The courier may have delivered it (outcome unknown): never resend automatically."""
+        with self.store._conn() as c:
+            c.execute("UPDATE eng_mbp_queue SET state='uncertain', attempts=attempts+1, error=? WHERE id=?",
+                      (error[:500], qid))
 
     def mbp_attempt(self, qid: str, *, ok: bool, error: str = "", retry_in: float = 120) -> None:
         now = time.time()
