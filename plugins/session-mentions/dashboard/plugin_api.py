@@ -1,13 +1,18 @@
-"""GET  /api/plugins/session-mentions/outbox[?home=1] -> {"requests": [...]}  (claims them)
+"""GET  /api/plugins/session-mentions/outbox[?home=1&courier=<device>&reach=a,b&aliases=x,y]
+                                                    -> {"requests": [...]}  (claims the ones this courier may serve)
 POST /api/plugins/session-mentions/result  {id, result}  -> {"ok": true}
-GET  /api/plugins/session-mentions/ping    -> {"ok": true, "home_courier": bool, "forwarding": true}
+GET  /api/plugins/session-mentions/ping    -> {"ok": true, "home_courier": bool, "forwarding": true, "targeting": true,
+                                                "device": "<this machine's courier name>", "aliases": [...]}
 POST /api/plugins/session-mentions/enqueue {request}     -> {"ok": bool}  (forwarded by another Desktop)
 GET  /api/plugins/session-mentions/status/{id}           -> {"state": pending|claimed|done|unknown, "result"?}
 POST /api/plugins/session-mentions/cancel  {id}          -> {"ok": bool}  (only while unclaimed)
 
 ``home=1`` marks this gateway's own Desktop courier. Any other drainer (another Mac's Desktop,
 reaching this gateway through a separate serve process) gets nothing while the home courier is
-alive — see relay_files.py for why.
+alive — see relay_files.py for why (and for the targeted-request claim rule).
+
+Routes are mounted once per backend, so they stay thin: every call goes through ``_rf()``, which
+re-executes relay_files.py whenever the file changes, so protocol fixes land without a restart.
 """
 from __future__ import annotations
 
@@ -16,31 +21,44 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Request
 
 router = APIRouter()
 
 
 def _rf():
     name = "_session_mentions_relay_files"
+    path = Path(__file__).resolve().parent.parent / "relay_files.py"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
     mod = sys.modules.get(name)
-    if mod is None or not hasattr(mod, "enqueue"):  # an older copy may be cached in this process
-        path = Path(__file__).resolve().parent.parent / "relay_files.py"
+    if mod is None or getattr(mod, "_sm_mtime", None) != mtime:  # new file on disk (or an older cached copy)
         spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
-        sys.modules[name] = mod
+        fresh = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(fresh)  # type: ignore[union-attr]
+        fresh._sm_mtime = mtime
+        sys.modules[name] = mod = fresh
     return mod
 
 
 @router.get("/ping")
 async def ping() -> Dict[str, Any]:
-    return {"ok": True, "home_courier": bool(_rf().home_courier_alive()), "forwarding": True}
+    rf = _rf()
+    info = rf.device_info() if hasattr(rf, "device_info") else {}
+    return {"ok": True, "home_courier": bool(rf.home_courier_alive()), "forwarding": True, "targeting": True, **info}
 
 
 @router.get("/outbox")
-async def outbox(home: int = 0) -> Dict[str, Any]:
-    return {"requests": _rf().claim_pending(home=bool(home))}
+async def outbox(request: Request) -> Dict[str, Any]:
+    q = request.query_params
+    home = str(q.get("home") or "") in ("1", "true")
+    rf = _rf()
+    if "courier" not in q:  # legacy courier
+        return {"requests": rf.claim_pending(home=home)}
+    return {"requests": rf.claim_pending(home=home, courier=q.get("courier"), reach=q.get("reach") or "",
+                                         aliases=q.get("aliases") or "")}
 
 
 @router.post("/result")

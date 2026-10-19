@@ -6,13 +6,17 @@
  *      @photo-gal    "-", "_", "." act as spaces (the @ token can't hold a space)
  *      @session:     the most recent sessions
  *    Sessions on the active gateway insert `@session:<profile>/<id>`; sessions on another
- *    gateway insert `@session:<profile>@<gateway>/<id>`.
+ *    gateway insert `@session:<profile>@<gateway>/<id>`. This Mac's own connection is named by its
+ *    device name (backend config `session_mentions.device_name`, else the hostname), never the
+ *    ambiguous `this-device` (every Desktop calls its own Mac that).
  * 2. Referencing. The agent resolves cross-gateway links with the `cross_session` tool
  *    (agent plugin ~/.hermes/plugins/session-mentions); this plugin is its courier.
  * 3. Sending. `/tell @session:… <message>` delivers <message> into that session as a new turn.
  * 4. Agent messaging. Courier loop: drains `cross_session` requests from every connected
- *    gateway that has the agent plugin (GET /api/plugins/session-mentions/outbox), performs
- *    list/read/send on the target gateway's own connection, posts the result back.
+ *    gateway that has the agent plugin (GET /api/plugins/session-mentions/outbox, with this Mac's
+ *    device name + every gateway name it can reach, so a request for one Mac goes to that Mac),
+ *    performs list/read/send on the target gateway's own connection (routed RPCs name the target
+ *    profile), posts the result back.
  *
  * 5. Kanban tasks. `@task:` / `@<title words>` / `@t_1a2b` complete tasks from every board on
  *    every gateway, inserting `@task:<board>/<id>` (this gateway) or
@@ -99,11 +103,51 @@ export function score(row, query) {
 
 let connCache = { at: 0, rows: [] }
 
-export function gatewayKeys(conns) {
-  // Prefer the slugged label (`nous-1`); fall back to the id when labels collide.
+export function gatewayKeys(conns, device = null) {
+  // Prefer the slugged label (`nous-1`); fall back to the id when labels collide. This Mac's own
+  // connection (kind local, labelled "This device" on EVERY Mac) is keyed by its device name
+  // (`macbook`) once known: a `@this-device` ref handed to an agent on a shared gateway names
+  // whichever Desktop happens to drain it.
+  const name = c => (c.kind === 'local' && device?.device ? device.device : slug(c.label))
   const counts = new Map()
-  for (const c of conns) counts.set(slug(c.label), (counts.get(slug(c.label)) || 0) + 1)
-  return conns.map(c => ({ ...c, key: slug(c.label) && counts.get(slug(c.label)) === 1 ? slug(c.label) : c.id }))
+  for (const c of conns) counts.set(name(c), (counts.get(name(c)) || 0) + 1)
+  return conns.map(c => {
+    const key = name(c) && counts.get(name(c)) === 1 ? name(c) : c.id
+    return c.kind === 'local' && device?.device ? { ...c, key, device: device.device, aliases: device.aliases } : { ...c, key }
+  })
+}
+
+// This Mac's courier name, from its own backend's /ping (config `session_mentions.device_name`,
+// else the hostname). null until known, or on a backend that predates targeting.
+let deviceCache = { at: 0, info: null }
+
+async function deviceInfo(conns) {
+  if (deviceCache.info && Date.now() - deviceCache.at < 10 * STALE_MS) return deviceCache.info
+  const home = conns.find(c => c.kind === 'local')
+  if (!home) return null
+  const ping = await api(home.id, `/api/plugins/${PLUGIN_ID}/ping`, { timeoutMs: 8_000 }).catch(() => null)
+  let device = slug(ping?.device)
+  let aliases = (ping?.aliases || []).map(slug).filter(Boolean)
+  if (!device && ping) {
+    // Backend still serving the pre-targeting routes (mounted once per process): the hostname is
+    // always one of the device's aliases, so refs minted now keep resolving after its restart.
+    const stats = await api(home.id, '/api/system/stats', { timeoutMs: 8_000 }).catch(() => null)
+    device = slug(String(stats?.hostname || '').split('.')[0])
+  }
+  deviceCache = { at: Date.now(), info: device ? { device, aliases: [...new Set([device, ...aliases])] } : deviceCache.info }
+  return deviceCache.info
+}
+
+/** Every name this Desktop can resolve to a connection (sent as `reach` when draining). */
+export function reachNames(conns) {
+  const out = new Set()
+  for (const c of conns) {
+    for (const n of [c.key, c.id, slug(c.label), ...(c.aliases || [])]) {
+      const s = slug(n)
+      if (s && s !== 'this-device' && s !== 'local') out.add(s)
+    }
+  }
+  return [...out].sort()
 }
 
 const FALLBACK_CONNS = [{ id: 'local', label: 'This device', kind: 'local', primary: true }]
@@ -115,7 +159,8 @@ async function connections(force = false) {
     const list = (Array.isArray(rows) ? rows : [])
       .filter(r => r && r.id)
       .map(r => ({ id: String(r.id), label: String(r.label || r.name || r.id), kind: String(r.kind || ''), primary: !!r.primary }))
-    connCache = { at: Date.now(), rows: gatewayKeys(list.length ? list : FALLBACK_CONNS) }
+    const base = list.length ? list : FALLBACK_CONNS
+    connCache = { at: Date.now(), rows: gatewayKeys(base, await deviceInfo(base).catch(() => null)) }
   } catch {
     if (!connCache.rows.length) connCache = { at: Date.now(), rows: gatewayKeys(FALLBACK_CONNS) }
   }
@@ -135,7 +180,11 @@ function activeConnectionId(conns = connCache.rows) {
 export function findGateway(conns, name) {
   const n = String(name || '').trim().toLowerCase()
   if (!n) return null
-  return conns.find(c => c.id.toLowerCase() === n || c.key.toLowerCase() === n || slug(c.label) === slug(n)) || null
+  return (
+    conns.find(c => c.id.toLowerCase() === n || c.key.toLowerCase() === n || slug(c.label) === slug(n)) ||
+    conns.find(c => (c.aliases || []).includes(slug(n))) ||
+    null
+  )
 }
 
 // ── session refs ─────────────────────────────────────────────────────────────
@@ -354,7 +403,10 @@ export async function deliver(target, text, waitSeconds = 0) {
       if (await primaryConnection() !== primaryId || host.state.profile?.get?.() !== primaryProfile) throw new Error('Gateway changed during delivery; no automatic retry')
       return host.request(method, { ...params, profile: target.profile || 'default' }, timeout)
     }
-    return host.requestProfile(route, method, params, timeout)
+    // A cloud gateway serves every profile from one backend: without `profile` the RPC lands in
+    // ITS launch (default) profile — session.resume found nothing in default's state.db and the
+    // turn ran there (stray root session). Name the backend profile explicitly, like the primary path.
+    return host.requestProfile(route, method, { ...params, profile: route.targetProfile || route.profile || target.profile || 'default' }, timeout)
   }
   const release = !primary && typeof host.retainProfile === 'function' ? await host.retainProfile(route) : null
   try {
@@ -940,6 +992,18 @@ export async function forwardSend(target, text, waitSeconds = 0) {
 
 let lastHomeBeat = 0
 
+/** Drain query: home flag, plus (once this Mac's device name is known) who is draining and every
+ *  gateway name it can reach, so the gateway hands it only requests it can serve. */
+export function outboxPath(conn, conns) {
+  const q = []
+  if (isHome(conn)) q.push('home=1')
+  const me = conns.find(isHome)
+  if (me?.device) {
+    q.push(`courier=${enc(me.device)}`, `aliases=${enc(me.aliases.join(','))}`, `reach=${enc(reachNames(conns).join(','))}`)
+  }
+  return `/outbox${q.length ? `?${q.join('&')}` : ''}`
+}
+
 /** This Desktop's own machine. Its backend owns the chats open in this Desktop's windows. */
 const isHome = conn => conn?.kind === 'local'
 
@@ -964,7 +1028,7 @@ export async function courierTick() {
         if (st && Date.now() < st.until) return
         let res
         try {
-          res = await relay(conn.id, `/outbox${isHome(conn) ? '?home=1' : ''}`, { timeoutMs: 10_000 })
+          res = await relay(conn.id, outboxPath(conn, conns), { timeoutMs: 10_000 })
         } catch (error) {
           const msg = String(error?.message || error)
           courierState.set(conn.id, { until: Date.now() + (/404|not found/i.test(msg) ? UNSUPPORTED_BACKOFF_MS : ERROR_BACKOFF_MS) })
@@ -1017,6 +1081,7 @@ export default {
     courierState.clear()
     lastHomeBeat = 0
     connCache = { at: 0, rows: [] }
+    deviceCache = { at: 0, info: null }
     refreshStale()
     refreshStaleTasks()
 

@@ -180,12 +180,26 @@ def handle_task(args: dict, session_id: str | None = None, **_kw) -> str:
     return _relay(f"task_{action}", args, session_id, 0)
 
 
+def _devices_note(base) -> str:
+    try:
+        seen = sorted({c.get("device") for c in rf.live_couriers(base) if c.get("device")})
+    except Exception:
+        seen = []
+    return ("Desktops draining this gateway now: " + ", ".join(seen)) if seen else "No Desktop is draining this gateway right now."
+
+
 def _relay(action: str, args: dict, session_id: str | None, wait: int) -> str:
     base = rf.root()
     rid = uuid.uuid4().hex
+    # Which gateway/Mac the request is for, so only a Desktop that can reach it claims it.
+    route = rf.route_of_target(args.get("target")) if args.get("target") else rf.norm_name(args.get("gateway"))
+    if route in rf.LOCAL_ALIASES and not rf.home_courier_alive(base):
+        return _err(f"`@{route}` is ambiguous from this gateway: every connected Desktop calls its own Mac that. "
+                    "Name the Mac instead (`@session:<profile>@<device>/<id>`). " + _devices_note(base))
     req = {
         "id": rid,
         "action": action,
+        "route": route,
         "args": {k: args.get(k) for k in ("target", "query", "gateway", "message", "limit", "status") if args.get(k) not in (None, "")},
         "wait_for_reply": wait,
         "sender": _sender_info(session_id),
@@ -216,6 +230,9 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int) -> str:
                 outbox.unlink()
             except OSError:
                 pass
+            if route:
+                return _err(f"No connected Hermes Desktop that can reach `{route}` picked up the request "
+                            f"(only a Desktop that knows that gateway/Mac claims it). " + _devices_note(base))
             return _err("The Hermes Desktop app did not pick up the request — it must be running with the "
                         "session-mentions plugin enabled to reach other gateways.")
         time.sleep(0.5)
