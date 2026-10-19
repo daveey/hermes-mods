@@ -60,6 +60,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [turn-stop-notice.md](turn-stop-notice.md) | 0126 | A turn stopped from a client ends with a visible "Stopped by <login>" line, and the log names who sent the Stop |
 | [kanban-open-task-hook.md](kanban-open-task-hook.md) | 0127 | `window.__hermesKanbanOpenTask(taskId, board?, gateway?)` lets disk plugins open a card's drawer on its own board and gateway |
 | [review-evidence-gate.md](review-evidence-gate.md) | 0129 | `auxiliary.background_review.require_evidence` makes background skill review edit a skill only when a specific moment in the conversation justifies it; "Nothing to save." becomes a neutral outcome |
+| [kanban-block-instructions.md](kanban-block-instructions.md) | 0130 | `kanban_block`'s `reason` asks for ask-first, numbered, concrete unblock steps (what the blocked-panel Desktop plugin shows above the composer) |
 
 ## Applying
 
@@ -118,6 +119,9 @@ and passed every test file those patches add or touch: 195 Python tests across 1
 
 The 0128–0129 mirror verification (October 18, 2026 PT) applied all 129 patches cleanly and
 passed the changed test files: 92 Python tests across 3 files.
+
+The 0130 mirror verification (October 18, 2026 PT) applied all 130 patches cleanly with `git am -3`
+at merge-base `4957bbd0a0`; the patch's new schema test passes (and fails without it).
 
 ## Gotchas
 
