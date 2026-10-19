@@ -159,3 +159,11 @@ test('reconnect POSTs the account, refreshes on success, offers sign-in when the
  reply=new Error('503 pool unavailable'); await r.reconnect('anthropic',{id:'acct-3'})
  assert.match(r.$state.get()[r.key('anthropic','acct-3')].message,/Reconnect failed: 503/)
 })
+test('fmtReset rounds to the minute so a reset at 6:59:59.6 reads 7 AM, not 6 AM', async () => {
+ const {plugin}=await setup()
+ const now=Date.parse('2026-10-19T21:00:00Z')
+ const fmt=t=>new Date(t).toLocaleString(undefined,{weekday:'short',hour:'numeric'})
+ assert.equal(plugin.fmtReset('2026-10-25T13:59:59.592286+00:00',now), fmt(Date.parse('2026-10-25T14:00:00Z')))
+ assert.equal(plugin.fmtReset('2026-10-25T14:00:00.022215+00:00',now), fmt(Date.parse('2026-10-25T14:00:00Z')))
+ assert.equal(plugin.fmtReset('2026-10-24T15:29:00Z',now), fmt(Date.parse('2026-10-24T15:29:00Z')))
+})

@@ -75,7 +75,9 @@ export function fmtReset(iso, now = Date.now()) {
   const mins = Math.round(ms / 60_000)
   if (mins < 60) return `${mins}m`
   if (mins < 24 * 60) return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, '0')}m`
-  return new Date(t).toLocaleString(undefined, { weekday: 'short', hour: 'numeric' })
+  // Round to the minute: resets land a few ms either side of the hour (13:59:59.6Z), and the
+  // hour-only format truncates, which would show the reset an hour early.
+  return new Date(Math.round(t / 60_000) * 60_000).toLocaleString(undefined, { weekday: 'short', hour: 'numeric' })
 }
 
 // One line on why an account is not ready, from sanitized fields only (codes + timestamps).
