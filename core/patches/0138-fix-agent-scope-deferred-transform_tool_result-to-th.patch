@@ -1,0 +1,188 @@
+From 18443c4f2bf4ee0bfa5473490c2331f32b9fc827 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 03:24:53 -0700
+Subject: [PATCH] fix(agent): scope deferred transform_tool_result to the
+ executor's own call [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to 1b352eae1c. The defer queue lived in a ContextVar that nested
+tool calls inherit (execute_code's sandbox RPC thread copies the context via
+propagate_context_to_thread), so an inner handle_function_call queued its
+transform onto the OUTER result: the inner result came back untransformed and
+the outer one got the inner tool's transform run under the inner tool's name.
+
+handle_function_call now claims the queue on entry and clears the var for its
+dispatch, so only its own transform is queued; nested calls (any thread)
+transform inline as before. The Tool Search tool_call bridge recursion is the
+same call and gets the claimed queue back. New test: nested call via an RPC
+thread and on the same thread — inner result gets only the inner transform,
+outer only the outer; fails on 1b352eae1c.
+---
+ model_tools.py                      | 58 ++++++++++++++++++++++------
+ tests/agent/test_tool_hook_order.py | 60 +++++++++++++++++++++++++++++
+ 2 files changed, 107 insertions(+), 11 deletions(-)
+
+diff --git a/model_tools.py b/model_tools.py
+index 283b56de3e..6cd28982d8 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -888,12 +888,9 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: dict[st
+ 
+     Runs after post_tool_call and before the result enters context. Fail-open;
+     first string return wins. Gated on has_hook so the no-listener path is cheap.
+-    Inside defer_transform_tool_result_hook() the call is queued and *result* returned as-is.
++    handle_function_call queues it instead when it claimed an executor's
++    defer_transform_tool_result_hook() queue.
+     """
+-    deferred = _deferred_transform_tool_results.get()
+-    if deferred is not None:
+-        deferred.append((function_name, function_args, duration_ms, ids))
+-        return result
+     try:
+         from hermes_cli.lifecycle import has_hook, invoke_hook
+         if has_hook("transform_tool_result"):
+@@ -927,6 +924,35 @@ def handle_function_call(
+     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
+     bridge catalog to this session's grant (None = unrestricted).
+     """
++    # [daveey] Claim the executor's transform deferral for THIS call only: the dispatch below runs
++    # with it cleared, so nested calls (execute_code's sandbox RPC thread inherits this context via
++    # propagate_context_to_thread) transform their own results inline instead of queueing onto ours.
++    own_deferred = _deferred_transform_tool_results.get()
++    if own_deferred is None:
++        return _handle_function_call(function_name, function_args, task_id, tool_call_id, session_id, turn_id,
++                                     api_request_id, user_task, enabled_tools, skip_pre_tool_call_hook,
++                                     skip_tool_request_middleware, skip_tool_execution_middleware,
++                                     tool_request_middleware_trace, enabled_toolsets, disabled_toolsets, None)
++    token = _deferred_transform_tool_results.set(None)
++    try:
++        return _handle_function_call(function_name, function_args, task_id, tool_call_id, session_id, turn_id,
++                                     api_request_id, user_task, enabled_tools, skip_pre_tool_call_hook,
++                                     skip_tool_request_middleware, skip_tool_execution_middleware,
++                                     tool_request_middleware_trace, enabled_toolsets, disabled_toolsets,
++                                     own_deferred)
++    finally:
++        _deferred_transform_tool_results.reset(token)
++
++
++def _handle_function_call(
++    function_name: str, function_args: dict[str, Any], task_id: Optional[str], tool_call_id: Optional[str],
++    session_id: Optional[str], turn_id: Optional[str], api_request_id: Optional[str], user_task: Optional[str],
++    enabled_tools: Optional[list[str]], skip_pre_tool_call_hook: bool, skip_tool_request_middleware: bool,
++    skip_tool_execution_middleware: bool, tool_request_middleware_trace: Optional[list[dict[str, Any]]],
++    enabled_toolsets: Optional[list[str]], disabled_toolsets: Optional[list[str]], own_deferred: Optional[list],
++) -> str:
++    """Body of handle_function_call. *own_deferred*: the executor's transform queue claimed by this
++    call (None = run transform_tool_result inline)."""
+     function_args = coerce_tool_args(function_name, function_args)
+     if not isinstance(function_args, dict):
+         function_args = {}
+@@ -956,12 +982,19 @@ def handle_function_call(
+                 enabled_tools=enabled_tools, middleware_trace=trace,
+                 enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+             ), duration_ms=_elapsed_ms(start))
+-        return handle_function_call(
+-            *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
+-            skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
+-            skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
+-            enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+-        )
++        # The bridged tool_call IS this call: hand it our claimed deferral.
++        rec_token = _deferred_transform_tool_results.set(own_deferred)
++        try:
++            return handle_function_call(
++                *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
++                skip_pre_tool_call_hook=skip_pre_tool_call_hook,
++                skip_tool_request_middleware=skip_tool_request_middleware,
++                skip_tool_execution_middleware=skip_tool_execution_middleware,
++                tool_request_middleware_trace=list(trace),
++                enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
++            )
++        finally:
++            _deferred_transform_tool_results.reset(rec_token)
+ 
+     from tools.connectors import is_connector_name
+     from tools.connectors.gateway.names import parse_connector_name
+@@ -998,6 +1031,9 @@ def handle_function_call(
+                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+         duration_ms = _elapsed_ms(start)
+         _emit(result, duration_ms=duration_ms)
++        if own_deferred is not None:
++            own_deferred.append((function_name, function_args, duration_ms, ids))
++            return result
+         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+ 
+     except Exception as e:
+diff --git a/tests/agent/test_tool_hook_order.py b/tests/agent/test_tool_hook_order.py
+index c045a6af5c..abef81ee5a 100644
+--- a/tests/agent/test_tool_hook_order.py
++++ b/tests/agent/test_tool_hook_order.py
+@@ -74,3 +74,63 @@ def test_post_tool_call_fires_before_transform_tool_result(agent, monkeypatch, c
+         content = results[call_id]
+         text = content if isinstance(content, str) else str(content)
+         assert f"HINT-{call_id}" in text, (call_id, text)
++
++
++@pytest.mark.parametrize("via_thread", [True, False], ids=["rpc-thread", "same-thread"])
++def test_nested_call_transforms_its_own_result(agent, monkeypatch, via_thread):
++    """A tool call made from inside a sequential registry tool (execute_code's sandbox RPC thread
++    inherits the executor's context via propagate_context_to_thread) runs its OWN
++    transform_tool_result inline on the inner result; only the outer hook touches the outer result."""
++    import threading
++
++    import model_tools
++    from tools.registry import registry
++    from tools.thread_context import propagate_context_to_thread
++
++    events: list[tuple[str, str, str]] = []
++
++    def _hook(hook_name, **kw):
++        if hook_name in ("post_tool_call", "transform_tool_result"):
++            events.append((hook_name, kw.get("tool_name"), kw.get("tool_call_id") or ""))
++        if hook_name == "transform_tool_result":
++            return [f"{kw['result']}|T({kw.get('tool_name')})"]
++        return []
++
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _hook)
++    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
++    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook, raising=False)
++    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True, raising=False)
++
++    inner: dict = {}
++
++    def _dispatch(name, args, **kw):
++        if name == "web_search":
++            return '{"output": "inner"}'
++
++        def _rpc():
++            inner["r"] = model_tools.handle_function_call("web_search", {"query": "x"}, task_id="task-1")
++
++        if via_thread:
++            t = threading.Thread(target=propagate_context_to_thread(_rpc), daemon=True)
++            t.start()
++            t.join(10)
++        else:
++            _rpc()
++        return '{"output": "outer"}'
++
++    monkeypatch.setattr(registry, "dispatch", _dispatch)
++
++    msg = _mock_assistant_msg(content="", tool_calls=[
++        _mock_tool_call(name="web_extract", arguments='{"urls": ["https://x"]}', call_id="c1")])
++    messages: list = []
++    agent.session_id = "session-1"
++    agent._execute_tool_calls_sequential(msg, messages, "task-1")
++
++    assert inner["r"] == '{"output": "inner"}|T(web_search)', inner
++    outer = [m["content"] for m in messages if m.get("role") == "tool"]
++    assert len(outer) == 1
++    text = outer[0] if isinstance(outer[0], str) else str(outer[0])
++    assert "|T(web_extract)" in text and "T(web_search)" not in text, text
++    # The outer call still runs post_tool_call before its transform.
++    mine = [h for h, name, cid in events if cid == "c1"]
++    assert mine == ["post_tool_call", "transform_tool_result"], events
+-- 
+2.54.0 (Apple Git-157)
+
