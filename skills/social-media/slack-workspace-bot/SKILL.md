@@ -106,6 +106,19 @@ any session where the plugin is configured (same host: `<HERMES_HOME>/slack-work
 (alert/bot feeds: observed and readable by name, but never injected as context and left out of the
 `slack_recent` overview), `admins` (extra to `allow_admin_from`), `retention_days`.
 
+## Operator setup (once per bot profile)
+
+1. Install the plugin into the bot's profile and add `slack-workspace` to `plugins.enabled` and
+   `slack_workspace` to `platform_toolsets.slack`. Restart and look for `Wired native handlers from plugin
+   'slack-workspace'` in the profile's agent log.
+2. Gate speaking: `platforms.slack.extra` `require_mention`, `strict_mention`, `thread_require_mention` all true;
+   `allow_bots: mentions` if it should work with other bots.
+3. App config: `channels:join` plus the `message.*` bot events, or there is nothing to observe.
+4. Join channels as the operator (direct API, ~1 s apart), then put alert/CI/bot-feed channels in
+   `quiet_channels`. Those feeds are most of the volume, so this is what keeps context useful.
+5. Add a short "Slack awareness" section to the bot's SOUL.md pointing at this skill: SOUL is always
+   loaded, while this skill only loads on demand.
+
 ## Pitfalls
 
 - `not_in_channel` → join (public) or ask for an `/invite` (private).
