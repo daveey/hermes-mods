@@ -1,0 +1,301 @@
+From 1b352eae1c0426c9e70e52354095d1e64af50294 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 02:34:08 -0700
+Subject: [PATCH] fix(agent): fire transform_tool_result after post_tool_call
+ on the sequential registry path [daveey]
+
+The sequential executor suppresses handle_function_call's inner post_tool_call
+and emits it itself after the call returns, but the inner call still ran
+transform_tool_result immediately, so on registry tools (terminal, read_file,
+...) the transform fired BEFORE post_tool_call. That breaks the hook's
+documented contract ("Runs after post_tool_call") and the common plugin
+pattern of queueing a hint in post_tool_call and attaching it in
+transform_tool_result: the hint landed on the NEXT tool's result.
+
+model_tools gains defer_transform_tool_result_hook(): inside it,
+_apply_transform_tool_result_hook queues its call instead of running it. The
+sequential registry dispatch wraps handle_function_call in it and
+_publish_sequential_result fires the queued transforms right after
+emit_post. suppress_post_tool_call_hook(False) (connector batch entries that
+own their post) lifts the deferral so those still transform inline. Concurrent
+and inline paths already ran post first; the new test pins all four
+(sequential/concurrent x registry/inline) and fails before on
+sequential-registry only.
+---
+ agent/tool_executor.py              | 62 ++++++++++++++---------
+ model_tools.py                      | 43 +++++++++++++++-
+ tests/agent/test_tool_hook_order.py | 76 +++++++++++++++++++++++++++++
+ 3 files changed, 156 insertions(+), 25 deletions(-)
+ create mode 100644 tests/agent/test_tool_hook_order.py
+
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index f0783edaa7..da861983c7 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1653,7 +1653,9 @@ class _SequentialDispatch:
+     is_delegate: bool = False
+     finish_spinner: bool = True
+     finish_in_finally: bool = True  # inline tools print their completion line only on success
+-    transform_applied: bool = False  # True when execute already fired transform_tool_result
++    # Registry calls: transform_tool_result calls handle_function_call queued (not ran), to be
++    # fired after the executor's post_tool_call. None → the executor applies the transform itself.
++    deferred_transforms: Optional[list] = None
+ 
+ 
+ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _SequentialDispatch:
+@@ -1688,27 +1690,33 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
+             error_log="memory_manager.handle_tool_call raised for %s: %s",
+         )
+ 
+-    # Registry tools: post hook is owned by this executor (inner observer suppressed).
++    # Registry tools: post hook is owned by this executor (inner observer suppressed), so the
++    # inner transform_tool_result is deferred until after it (the hook's documented order).
++    deferred_transforms: list = []
++
+     def _execute(next_args: dict) -> Any:
+         import model_tools
+ 
+-        with model_tools.suppress_post_tool_call_hook():
+-            return model_tools.handle_function_call(
+-                function_name,
+-                next_args,
+-                effective_task_id,
+-                tool_call_id=tool_call_id,
+-                session_id=agent.session_id or "",
+-                turn_id=getattr(agent, "_current_turn_id", "") or "",
+-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+-                skip_pre_tool_call_hook=True,
+-                skip_tool_request_middleware=True,
+-                skip_tool_execution_middleware=True,
+-                tool_request_middleware_trace=list(middleware_trace),
+-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+-            )
++        with model_tools.suppress_post_tool_call_hook(), model_tools.defer_transform_tool_result_hook() as queued:
++            try:
++                return model_tools.handle_function_call(
++                    function_name,
++                    next_args,
++                    effective_task_id,
++                    tool_call_id=tool_call_id,
++                    session_id=agent.session_id or "",
++                    turn_id=getattr(agent, "_current_turn_id", "") or "",
++                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
++                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
++                    skip_pre_tool_call_hook=True,
++                    skip_tool_request_middleware=True,
++                    skip_tool_execution_middleware=True,
++                    tool_request_middleware_trace=list(middleware_trace),
++                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
++                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
++                )
++            finally:
++                deferred_transforms[:] = queued
+ 
+     return _SequentialDispatch(
+         execute=_execute,
+@@ -1718,7 +1726,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
+         error_log="handle_function_call raised for %s: %s",
+         handles_keyboard_interrupt=True,
+         finish_spinner=bool(agent.quiet_mode),
+-        transform_applied=True,  # handle_function_call fires transform_tool_result itself
++        deferred_transforms=deferred_transforms,
+     )
+ 
+ 
+@@ -1790,7 +1798,7 @@ def _run_sequential_call(
+     return managed, tool_duration
+ 
+ 
+-def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed: _ManagedToolResult, *, tool_duration: float, index: int, budget: BudgetConfig, transform_applied: bool) -> bool:
++def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed: _ManagedToolResult, *, tool_duration: float, index: int, budget: BudgetConfig, deferred_transforms: Optional[list] = None) -> bool:
+     """Terminal hook → observe → commit → completion callbacks/print for one sequential
+     result; False when the incremental flush failed (the caller must stop the batch)."""
+     ref.args, ref.trace, function_result = managed.args, managed.middleware_trace, managed.result
+@@ -1798,10 +1806,16 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
+     # Inline-dispatched runtime tools never reach handle_function_call, so the
+     # executor owns the one terminal post_tool_call per tool_call_id (the inner
+     # observer is suppressed); also stops an abandoned timeout worker reporting late.
+-    # transform_tool_result follows the observer, unless the dispatch already fired it.
++    # transform_tool_result follows the observer; registry dispatches queued theirs (see
++    # _SequentialDispatch.deferred_transforms) and fire them here, after post_tool_call.
+     if not managed.blocked and not _execution_timed_out:
+         ref.emit_post(agent, function_result, duration_ms=int(tool_duration * 1000))
+-        if not transform_applied:
++        if deferred_transforms is not None:
++            import model_tools
++
++            for _entry in list(deferred_transforms):
++                function_result = model_tools.apply_deferred_transform_tool_result(_entry, function_result)
++        else:
+             function_result = apply_transform_tool_result(
+                 agent, function_name=ref.name, function_args=ref.args, result=function_result,
+                 effective_task_id=ref.task_id, tool_call_id=ref.call_id,
+@@ -1890,7 +1904,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
+             tool_start_time=tool_start_time,
+         )
+         if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i,
+-                                          budget=_tool_budget, transform_applied=dispatch.transform_applied):
++                                          budget=_tool_budget, deferred_transforms=dispatch.deferred_transforms):
+             return
+ 
+         if agent._interrupt_requested and i < len(tool_calls):
+diff --git a/model_tools.py b/model_tools.py
+index 8dd93efc5e..283b56de3e 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -28,18 +28,54 @@ from utils import file_signature
+ logger = logging.getLogger(__name__)
+ 
+ _post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_hook_suppressed", default=False)
++# [daveey] Non-None inside defer_transform_tool_result_hook(): transform_tool_result calls are
++# queued here instead of run, so the outer executor that owns post_tool_call fires them after it.
++_deferred_transform_tool_results: ContextVar[Optional[list]] = ContextVar(
++    "deferred_transform_tool_results", default=None
++)
+ 
+ 
+ @contextmanager
+ def suppress_post_tool_call_hook(suppressed: bool = True):
+     """Let an outer executor own the terminal post-tool event. ``suppressed=False`` re-enables it
+-    inside such a block, for calls that are their own (each entry of a connector batch)."""
++    inside such a block, for calls that are their own (each entry of a connector batch); such
++    calls also run their own transform_tool_result inline (any deferral is lifted)."""
+     token = _post_tool_call_hook_suppressed.set(suppressed)
++    defer_token = None if suppressed else _deferred_transform_tool_results.set(None)
+     try:
+         yield
+     finally:
++        if defer_token is not None:
++            _deferred_transform_tool_results.reset(defer_token)
+         _post_tool_call_hook_suppressed.reset(token)
+ 
++
++@contextmanager
++def defer_transform_tool_result_hook():
++    """Queue transform_tool_result instead of running it inside handle_function_call.
++
++    An executor that suppresses the inner post_tool_call emits it later itself; running the
++    transform inside the call would fire it BEFORE post_tool_call, against the hook contract
++    (a hint a plugin queues in post_tool_call then lands on the next tool's result). Yields the
++    queue; the executor runs each entry with apply_deferred_transform_tool_result() after its
++    post_tool_call. [daveey]"""
++    queue: list = []
++    token = _deferred_transform_tool_results.set(queue)
++    try:
++        yield queue
++    finally:
++        _deferred_transform_tool_results.reset(token)
++
++
++def apply_deferred_transform_tool_result(entry: tuple, result: Any) -> Any:
++    """Run one transform queued by defer_transform_tool_result_hook() against *result*."""
++    function_name, function_args, duration_ms, ids = entry
++    token = _deferred_transform_tool_results.set(None)
++    try:
++        return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
++    finally:
++        _deferred_transform_tool_results.reset(token)
++
+ # Platform-bundle names already flagged in disabled_toolsets (advisory logged once per name).
+ _WARNED_DISABLED_BUNDLES: set = set()
+ 
+@@ -852,7 +888,12 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: dict[st
+ 
+     Runs after post_tool_call and before the result enters context. Fail-open;
+     first string return wins. Gated on has_hook so the no-listener path is cheap.
++    Inside defer_transform_tool_result_hook() the call is queued and *result* returned as-is.
+     """
++    deferred = _deferred_transform_tool_results.get()
++    if deferred is not None:
++        deferred.append((function_name, function_args, duration_ms, ids))
++        return result
+     try:
+         from hermes_cli.lifecycle import has_hook, invoke_hook
+         if has_hook("transform_tool_result"):
+diff --git a/tests/agent/test_tool_hook_order.py b/tests/agent/test_tool_hook_order.py
+new file mode 100644
+index 0000000000..c045a6af5c
+--- /dev/null
++++ b/tests/agent/test_tool_hook_order.py
+@@ -0,0 +1,76 @@
++"""post_tool_call fires before transform_tool_result on every executor path.
++
++``model_tools._apply_transform_tool_result_hook`` documents "Runs after post_tool_call".
++A plugin whose ``post_tool_call`` queues a hint and whose ``transform_tool_result``
++attaches it relies on that order; when the sequential registry path ran the transform
++inside ``handle_function_call`` (post suppressed there, emitted later by the executor),
++the hint landed on the NEXT tool result instead.
++"""
++
++import pytest
++
++from agent import inline_tool_executors
++from tests.agent import test_run_agent as _base
++from tests.agent.test_run_agent import _mock_assistant_msg, _mock_tool_call
++
++agent = _base.agent
++_mock_plugin_discovery = _base._mock_plugin_discovery
++
++
++def _run(agent, monkeypatch, *, concurrent: bool, tool: str):
++    """Drive one executor with a hint-queueing plugin; returns (hook order, messages)."""
++    events: list[tuple[str, str]] = []
++    queued: dict[str, str] = {}
++
++    def _hook(hook_name, **kw):
++        call_id = kw.get("tool_call_id")
++        if hook_name == "post_tool_call":
++            events.append(("post", call_id))
++            queued[call_id] = f"HINT-{call_id}"
++            return []
++        if hook_name == "transform_tool_result":
++            events.append(("transform", call_id))
++            hint = queued.pop(call_id, None)
++            return [f"{kw['result']}\n{hint}"] if hint else []
++        return []
++
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _hook)
++    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
++    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook, raising=False)
++    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True, raising=False)
++
++    if tool == "inline":
++        name = "todo_list"
++        monkeypatch.setitem(inline_tool_executors.INLINE_TOOL_EXECUTORS, name,
++                            lambda _agent, _args, _ctx: '{"output": "inline"}')
++        agent.valid_tool_names = set(agent.valid_tool_names or ()) | {name}
++    else:
++        name = "web_search"
++        from tools.registry import registry
++        monkeypatch.setattr(registry, "dispatch", lambda n, a, **kw: '{"output": "registry"}')
++
++    ids = ("c1", "c2") if concurrent else ("c1",)
++    calls = [_mock_tool_call(name=name, arguments='{"q": "x"}', call_id=i) for i in ids]
++    msg = _mock_assistant_msg(content="", tool_calls=calls)
++    messages: list = []
++    agent.session_id = "session-1"
++    run = agent._execute_tool_calls_concurrent if concurrent else agent._execute_tool_calls_sequential
++    run(msg, messages, "task-1")
++    return events, messages, ids
++
++
++@pytest.mark.parametrize("tool", ["registry", "inline"])
++@pytest.mark.parametrize("concurrent", [False, True], ids=["sequential", "concurrent"])
++def test_post_tool_call_fires_before_transform_tool_result(agent, monkeypatch, concurrent, tool):
++    events, messages, ids = _run(agent, monkeypatch, concurrent=concurrent, tool=tool)
++
++    for call_id in ids:
++        mine = [kind for kind, cid in events if cid == call_id]
++        assert mine == ["post", "transform"], (call_id, events)
++
++    # The hint queued by THIS call's post_tool_call lands on THIS call's result.
++    results = {m["tool_call_id"]: m["content"] for m in messages if m.get("role") == "tool"}
++    for call_id in ids:
++        content = results[call_id]
++        text = content if isinstance(content, str) else str(content)
++        assert f"HINT-{call_id}" in text, (call_id, text)
+-- 
+2.54.0 (Apple Git-157)
+
