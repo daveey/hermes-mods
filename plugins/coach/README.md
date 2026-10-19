@@ -45,7 +45,7 @@ this user's agents can reach). A hit keeps the turn going with a nudge the user 
 | `handoff` | the reply hands the user a step the agent could do itself (log in, click, run, paste...) | try it first with shell/ssh/browser/vault/token-broker; hand off only what needs hands or judgment, and say why |
 | `confirm` | the reply ends with "Want me to…?" about a reversible, in-scope step | proceed, verify, report; ask only before irreversible or external actions |
 | `unwatched` | the reply promises to continue after outside work finishes ("I'll write the report once the runs finish", "waiting on CI") and `wake_sources()` finds nothing armed: no live background process for the session or its compression ancestors, no open kanban card, no active goal, and no delegate/kanban/cron call this turn. A row like this gets painted done and its follow-up never runs | arm one `terminal(background=true, notify=true)` watcher on the real completion signal with a time cap (a kanban card for multi-hour work), or say plainly that the user owns the follow-up |
-| `unverified` (off by default) | "done/fixed" with no check on the user's real path | verify on the user's path or say what's unchecked |
+| `unverified` (off by default) | "done/fixed" with no check on the user's real path | verify on the user's path or say what's unchecked. With `diff_review` on it is also judged on turns that changed a git repo, and a hit there runs an Opus review of the diff (see Second opinions) |
 
 Measured on 360 real replies against hindsight labels (the labeler also saw the user's next message). At
 threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
@@ -71,6 +71,55 @@ Backtest on 313 real (reply → user) pairs against hindsight labels (the labele
 0.8: precision 0.84, recall 0.35. The old regex scored 0.47 / 0.15. Held-out fired only 3 times, so its 0.33
 says little; most of the disagreements were cases the hindsight labeler excused, like "it turned out to be the
 old GIF".
+
+### Second opinions that run (`second_opinion.py`)
+
+The two checkpoints above used to be advice only ("consider a second opinion", "verify it"). With these settings on,
+each one now starts a strong-model review itself. Both are off by default, which keeps the old behaviour; the shared
+config turns them on.
+
+- **Fix loop → review card.** On the 2nd judge-confirmed failed fix inside one window (8 user turns), the plugin opens
+  ONE Kanban card through the `kanban_create` tool handler. That is the path that stamps this session as the card's
+  origin and subscribes the chat, so the card shows in the chat's task strip. The card is pinned to
+  `model: claude-opus-5-5`, has a 30-minute runtime cap, and is assigned to `default`. Its body holds the original
+  ask, each "fixed" claim the agent made and the user's reply to it, the files touched in those turns (from the tool
+  log), and the instruction **"trace and report what you observe; do not edit"**. The agent's hint names the card and
+  says not to patch again until it has read the handoff (`kanban_show`). Idempotent: the key is
+  `coach-fixloop:<session>:<first failure time in the window>`, the card id is cached in the loop state, and a 3rd
+  failure in the same window reuses the card. The loop state now persists in `sessions/<id>.json`, so a window
+  survives backend restarts and `hermes chat -q --resume` (one process per turn). A refused create, for example from a
+  Kanban worker's fenced subprocess, is logged as `fixloop_card_error` and leaves the hint as it was. Logged as
+  `fixloop_card`.
+- **Unverified + repo diff → diff review.** At `pre_verify`, if this turn changed a git repo (core's
+  `changed_paths`, `patch`/`write_file` in the tool log including V4A multi-file headers, or a `git commit` under
+  `git -C X`/`cd X`), `unverified` joins the judged rules for that turn only. If the judge then flags it (threshold
+  0.7), one review runs on the strong model (aux task `coach_diff_review`). The reviewer sees the ask, the final
+  message, the tool log, and the turn's diff: commits made since the turn started, the uncommitted diff, and new
+  untracked files the turn wrote. It is prompted neutrally: trace the diff against the claims and report what it
+  observes. Its findings come back through the existing `pre_verify` continue path, so the agent keeps working.
+  Bounds: at most one review per turn, the diff capped at 60k chars, and a 120 s call timeout. If the review fails
+  or the diff is empty, the turn falls back to the next real rule over threshold, or nothing. Logged as `diff_review`
+  (repos, findings, diff size, seconds).
+
+Settings (env wins, then config `plugins.entries.coach.settings.<key>`): `fixloop_review` / `COACH_FIXLOOP_REVIEW`,
+`fixloop_review_model` (default `claude-opus-5-5`), `fixloop_review_provider`, `fixloop_review_assignee` (default
+`default`), `diff_review` / `COACH_DIFF_REVIEW`, `diff_review_max_chars` (60000), `diff_review_timeout_s` (120), and
+`diff_review_threshold` (default: the reply threshold). The reviewer model is `auxiliary.coach_diff_review.{provider,model}`
+(shared config: anthropic / claude-opus-5-5). Without that key, `fixloop_review_model` is passed.
+
+**Cost, measured (MacBook `state.db`, 14 days to 2026-10-19, 6,717 non-cron turns in 2,484 sessions).** Method:
+`eval/second_opinion_replay.py --judge` rebuilds every turn and replays the shipped detectors, including the real
+aux judges.
+- Fix-loop cards: the prefilter hit 429 user messages. The judge confirmed 16 failed fixes, and **2** of them were a
+  2nd failure in a window, so **2 Opus review cards in 14 days**.
+- Diff reviews: 579 turns had a "done/fixed" reply and changed a git repo (desktop 249, kanban 328, other 2). Repos
+  are checked on today's filesystem, so deleted scratch workspaces don't count, and this undercounts Kanban work. The
+  judge scored `unverified` ≥ 0.7 on **1** of them, so **1 Opus diff review in 14 days**. The larger cost is the
+  judge itself: up to 579 extra Sonnet `coach_reply` calls (~41/day). Some of those turns already reached the judge
+  through `handoff`/`confirm`/`unwatched`.
+- The replay eval doesn't regress: `coach_eval.py detector` with the new modules against HEAD gives identical
+  numbers on every rule (replyset handoff P 0.91 / R 0.33, confirm 1.00 / 0.11; fixloop 0.84 / 0.35). Its verdict is
+  "REJECT: no gain", because these changes add actions, not detection.
 
 ### Lessons from corrections (`lessons.py`)
 
@@ -154,6 +203,8 @@ Both calls fail open when coach isn't loaded.
 - `__init__.py`: the hooks (`pre_llm_call`, `post_tool_call`, `transform_tool_result`).
 - `agent_rules.py`: the agent-channel rules, plus the signals the user channel needs (subagents, long jobs, bug signatures).
 - `core.py`: the file store under `<HERMES_HOME>/coach/` (`sessions/<id>.json`, `bugs.jsonl`, `log.jsonl`), the gate, the user-rule evaluation, the briefs (spin-out's transcript reader + aux task `coach`) and stats.
+- `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the
+  neutral reviewer prompt); `eval/second_opinion_replay.py` counts how often each would fire over `state.db`.
 - `curriculum.py` + `curriculum.yaml`: the tips (loading/overlay, live triggers, spacing, adoption read).
 - `dashboard/plugin_api.py`: `/state`, `/offer`, `/event`, `/restart`, `/board`, `/file-bug`, `/stats`.
 - `desktop-plugins/coach/plugin.js`: the panel. It checks after each finished turn, every 60 s while a turn runs, and on screenshot sends.

@@ -398,6 +398,7 @@ class AgentCoach:
         s["turn"] += 1
         s["turn_tools"] = 0
         s["turn_log"].clear()
+        s["turn_t0"] = time.time()  # wall clock: the diff review asks git for commits made since the turn began
         if isinstance(user_message, str) and user_message.strip():
             s["ask"] = user_message[:2000]
         return self.take(sid)
@@ -422,6 +423,10 @@ class AgentCoach:
         """(latest user ask, this turn's tool log) for the reply check."""
         s = self._s(sid)
         return s["ask"], list(s["turn_log"])
+
+    def turn_started(self, sid: str) -> float | None:
+        """Wall-clock start of the session's current turn (None before the first turn)."""
+        return self._s(sid).get("turn_t0")
 
     def take(self, sid: str) -> Optional[str]:
         s = self.sessions.get(sid)

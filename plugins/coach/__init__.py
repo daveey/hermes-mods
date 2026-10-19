@@ -6,6 +6,7 @@ import importlib.util
 import logging
 import threading
 import os
+import time
 import sys
 from pathlib import Path
 
@@ -42,14 +43,20 @@ def build(store=None, checkout=None):
         try:
             if not session_id:
                 return None
-            store.user_turn(session_id, user_message)
+            rec = store.user_turn(session_id, user_message) or {}
             hint = coach.turn_start(session_id, user_message)
+            # The fix-loop window survives process boundaries (`hermes chat -q --resume`, backend restarts): the
+            # in-memory loop state is re-seeded from the session file, and windows count persistent user turns.
+            st = coach.loop_state(session_id)
+            if not st.get("last_reply") and isinstance(rec.get("loop"), dict):
+                st.update(rec["loop"])
+            turn = rec.get("turns") or coach.turn_number(session_id)
             # Lessons judge nearly every message, so it runs in the background; its hint rides the next tool result
             # (or the next turn). The fix-loop judge is prefilter-gated and its hint matters before the first patch,
             # so it stays inline.
             prev = coach.loop_state(session_id).get("last_reply") or ""
             threading.Thread(target=_lesson_bg, args=(session_id, user_message, prev), daemon=True).start()
-            loop_hint = _fix_loop(session_id, user_message)
+            loop_hint = _fix_loop(session_id, user_message, turn)
             hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "") if h)
             return {"context": hint} if hint else None
         except Exception as exc:
@@ -87,7 +94,7 @@ def build(store=None, checkout=None):
             pass
         return {"action": "block", "message": rules.block_message(what, coach.checkout)}
 
-    def _fix_loop(session_id, user_message):
+    def _fix_loop(session_id, user_message, turn=None):
         """Judge whether this user message reports that the agent's last fix failed (once per turn, sync,
         prefilter-gated, short timeout). Fail-open."""
         try:
@@ -98,7 +105,8 @@ def build(store=None, checkout=None):
             st = coach.loop_state(session_id)
             s1 = _load("system_one")
             m = s1.mode()
-            hit = fl.assess(st, coach.turn_number(session_id), user_message, fl.aux_judge, threshold=cfg["threshold"],
+            turn = turn or coach.turn_number(session_id)
+            hit = fl.assess(st, turn, user_message, fl.aux_judge, threshold=cfg["threshold"],
                             screen=s1.fixloop_screen if m != "off" else None, screen_below=s1.below(),
                             shadow=m == "shadow", log=s1.log)
             if not hit:
@@ -106,10 +114,48 @@ def build(store=None, checkout=None):
             store.log({"event": "agent_hint", "session_id": session_id, "rule": "fix_loop", "n": hit["n"],
                        "p": hit["p"], "issue": hit["issue"]})
             store.confirmed_fail(session_id)
-            return hit["hint"]
+            return " ".join(h for h in (hit["hint"], _fixloop_card(session_id, st, hit, user_message, turn)) if h)
         except Exception as exc:
             log.debug("coach fix_loop: %s", exc)
             return None
+
+    def _fixloop_card(session_id, st, hit, user_message, turn):
+        """2nd confirmed failure in the window -> one read-only review card pinned to the strong model."""
+        try:
+            so = _load("second_opinion")
+            created = []
+
+            def create(args):
+                res = so.create_card(args)
+                created.append(res)
+                return res
+            extra = so.fixloop_review(st, session_id, turn, hit, user_message, create=create)
+            if extra and created:
+                store.log({"event": "fixloop_card", "session_id": session_id, "task_id": created[0].get("task_id"),
+                           "n": hit["n"], "issue": hit["issue"]})
+            elif created:  # the tool refused (e.g. a fenced subprocess of a Kanban worker): audit it, hint unchanged
+                store.log({"event": "fixloop_card_error", "session_id": session_id,
+                           "error": str(created[0].get("error") or created[0])[:300]})
+            return extra
+        except Exception as exc:
+            log.debug("coach fix_loop: %s", exc)
+            return None
+
+    def _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos):
+        """One bounded strong-model review of this turn's diff; its findings become the pre_verify nudge."""
+        coach.loop_state(session_id)["diff_reviewed"] = coach.turn_number(session_id)
+        t0 = time.time()
+        since = getattr(coach, "turn_started", lambda _s: None)(session_id)
+        try:
+            v = so.diff_review(ask, final_response, log_lines, changed_paths, since, repos=repos)
+        except Exception as exc:
+            log.debug("coach diff_review: %s", exc)
+            v = None
+        store.log({"event": "diff_review", "session_id": session_id, "p": hit["p"], "ok": bool(v),
+                   "repos": (v or {}).get("repos") or list(repos), "findings": len((v or {}).get("findings") or []),
+                   "supported": (v or {}).get("supported"), "diff_chars": (v or {}).get("diff_chars"),
+                   "secs": round(time.time() - t0, 1)})
+        return so.review_nudge(v, hit.get("evidence") or "") if v else None
 
     def _lesson_bg(session_id, user_message, prev):
         h = _lesson(session_id, user_message, prev)
@@ -146,6 +192,9 @@ def build(store=None, checkout=None):
         try:
             if session_id and isinstance(assistant_response, str) and assistant_response.strip():
                 coach.turn_end(session_id, assistant_response)
+                coach.loop_state(session_id)["last_ask"] = coach.turn_context(session_id)[0][:1500]
+                loop = {k: v for k, v in coach.loop_state(session_id).items() if k != "diff_reviewed"}
+                store._update(session_id, lambda s: s.__setitem__("loop", loop))
         except Exception as exc:
             log.debug("coach post_llm_call: %s", exc)
 
@@ -157,17 +206,40 @@ def build(store=None, checkout=None):
                 return None
             rc = _load("reply_check")
             cfg = rc.settings()
-            if not cfg["rules"]:
-                return None
             ask, log_lines = coach.turn_context(session_id)
+            so = _load("second_opinion")
+            # unverified + this turn changed a git repo -> one bounded diff review on the strong model. The rule
+            # joins the judged set only for such turns, so diff_review off (default) = the old behaviour exactly.
+            repos = (so.changed_repos(log_lines, changed_paths)
+                     if so.setting("diff_review") and "unverified" in rc.prefilter(final_response)
+                     and coach.loop_state(session_id).get("diff_reviewed") != coach.turn_number(session_id) else {})
+            only = list(cfg["rules"]) + (["unverified"] if repos and "unverified" not in cfg["rules"] else [])
+            if not only:
+                return None
+            th_unv = so.setting("diff_review_threshold")
+            thresholds = {"unverified": th_unv} if repos and th_unv is not None else None
             s1 = _load("system_one")
             m = s1.mode()
             screen = ((lambda cands: s1.reply_screen(cands, ask, log_lines, final_response, rc.profile_text()))
                       if m != "off" else None)
             hit = rc.check(final_response, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
-                           only=cfg["rules"], changed_paths=changed_paths,
+                           only=only, changed_paths=changed_paths,
                            wake=lambda: rc.wake_sources(session_id, log_lines),
-                           screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log)
+                           screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log,
+                           **({"thresholds": thresholds} if thresholds else {}))
+            if hit and hit["rule"] == "unverified" and repos:
+                msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
+                if msg:
+                    return {"action": "continue", "message": msg}
+                if "unverified" not in cfg["rules"]:  # added only for the review: fall back to the next real rule
+                    v = hit["verdict"]
+                    rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response) and v.get(r, 0) >= cfg["threshold"]
+                            and r != "unwatched"]
+                    hit = None
+                    if rest:
+                        r = max(rest, key=lambda x: v[x])
+                        hit = {"rule": r, "p": v[r], "evidence": v["evidence"],
+                               "nudge": rc.NUDGES[r].format(evidence=v["evidence"] or "see your last message")}
             if not hit:
                 return None
             store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],

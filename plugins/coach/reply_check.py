@@ -276,8 +276,11 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           changed_paths: Optional[list] = None,
           wake: Optional[Callable[[], list]] = None,
           screen: Optional[Callable[[list], Optional[dict]]] = None, screen_below: float = 0.2,
-          shadow: bool = False, log: Optional[Callable[[dict], None]] = None) -> Optional[dict]:
+          shadow: bool = False, log: Optional[Callable[[dict], None]] = None,
+          thresholds: Optional[dict] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `thresholds` ({rule: th}) overrides `threshold` per rule; with it, the top rule among those over their own
+    threshold wins.
     `wake()` lists the session's wake sources; any source drops the `unwatched` candidate before the judge runs
     (no wake callable = can't tell, so `unwatched` is skipped).
     `screen(candidates) -> {rule: p} | None` (a System One model) drops screened candidates below `screen_below`
@@ -311,8 +314,14 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
              "llm": {r: v[r] for r in sp} if v else None, "would_drop": [r for r in sp if sp[r] < screen_below]})
     if not v:
         return None
-    best = max(cands, key=lambda r: v[r])
-    if v[best] < threshold:
-        return None
+    if thresholds:
+        passing = [r for r in cands if v[r] >= thresholds.get(r, threshold)]
+        if not passing:
+            return None
+        best = max(passing, key=lambda r: v[r])
+    else:
+        best = max(cands, key=lambda r: v[r])
+        if v[best] < threshold:
+            return None
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
             "nudge": NUDGES[best].format(evidence=v["evidence"] or "see your last message")}

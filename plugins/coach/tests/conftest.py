@@ -8,3 +8,7 @@ def _no_system_one_network(monkeypatch, tmp_path):
     monkeypatch.setenv("SYSTEM_ONE_MODE", "off")
     monkeypatch.setenv("TYPESAFE_API_KEY", "")
     monkeypatch.setenv("SYSTEM_ONE_LOG", str(tmp_path / "system-one-log.jsonl"))
+    # The second-opinion actions are on in the live config (shared-config); tests opt in explicitly so no test
+    # creates a real Kanban card or makes a real strong-model call.
+    monkeypatch.setenv("COACH_FIXLOOP_REVIEW", "0")
+    monkeypatch.setenv("COACH_DIFF_REVIEW", "0")
