@@ -10,7 +10,7 @@
  * gateway (owner route), which marks it read. Do it = POST …/accept (the session
  * moves to Recents) then submit the proposal's prompt into the chat. Typing a
  * reply accepts it too (agent-side hook). Archive = POST …/archive.
- * The section hides when the inbox is empty.
+ * An empty inbox shows one muted "Nothing to review" row.
  */
 import {
   atom,
@@ -215,7 +215,20 @@ function Section({ store }) {
   const open = useValue(store.$open)
   const focused = useValue(host.state.focusedStoredSessionId)
   const [visible, setVisible] = useState(FIRST)
-  if (!items.length) return null
+  if (!items.length) {
+    return jsx(SidebarSection, {
+      label: 'Inbox',
+      open,
+      onToggle: () => store.setOpen(!open),
+      children: jsx(SidebarSectionRow, {
+        label: 'Nothing to review',
+        muted: true,
+        icon: 'inbox',
+        tip: 'Hermes posts proposals of work here (inbox_post)',
+        onSelect: () => void store.refresh()
+      })
+    })
+  }
   const unread = items.filter(i => i.unread).length
   return jsx(SidebarSection, {
     label: 'Inbox',
