@@ -25,7 +25,9 @@ reached: `hermes kanban schedule <id> "SCHEDULED_UNTIL=<next UTC midnight> — b
 day"`, then SIGTERM of its worker (only a process whose env carries HERMES_KANBAN_TASK=<id>). Non-engine cards are
 never touched. Each stop is appended to research/state/budget-stops.jsonl (the weekly digest's budget section lists
 them) and one Inbox card per UTC day (key engine-budget:<day>) carries the per-lane numbers with a Do-it prompt to
-raise the cap. On a later UTC day the watchdog unblocks the cards it scheduled (still `scheduled`).
+raise the cap. On a later UTC day the watchdog unblocks the cards it scheduled for a lane/total cap (still
+`scheduled`). A card that spent its OWN budget is instead blocked needs_input and never auto-resumes (its lifetime
+cost never drops, so a resume would only be stopped again every day): raise its Budget line or close it.
 
 Roots (env): COACH_DATA (~/code/hermes-coach-data), HERMES_HOME (~/.hermes), COACH_KANBAN_BOARD (hermes).
 """
@@ -238,13 +240,30 @@ def worker_pids(task_id, hint=None):
     return out
 
 
-def stop_card(hermes, board, card, reason, until, kill=os.kill, pids=worker_pids, run=subprocess.run):
-    """Schedule the card to the next UTC day, then SIGTERM its worker. Returns a short result string."""
-    msg = f"SCHEDULED_UNTIL={until} — budget cap reached; resumes next UTC day ({reason})"
+def stop_kind(usd, cap):
+    """'card' = the card spent its own lifetime budget (never resumes by itself); 'cap' = lane/total cap (next day)."""
+    return "card" if usd >= cap else "cap"
+
+
+def stop_card(hermes, board, card, reason, until, kill=os.kill, pids=worker_pids, run=subprocess.run, kind="cap"):
+    """Stop the card, then SIGTERM its worker. Returns a short result string.
+
+    kind 'cap' (lane/total cap): schedule to the next UTC midnight; resume_due unblocks it then.
+    kind 'card' (its own lifetime budget): block needs_input for a human. Lifetime cost never drops, so an automatic
+    resume would only restart it to be stopped again every day."""
     found = pids(card["id"], card.get("worker_pid"))
-    r = run([hermes, "kanban", "--board", board, "schedule", card["id"], msg], capture_output=True, text=True)
+    if kind == "card":
+        msg = (f"budget: {reason}. Not resumed automatically: raise this card's 'Budget for this card <= $N' line "
+               "and unblock it, or close it.")
+        r = run([hermes, "kanban", "--board", board, "block", card["id"], "--kind", "needs_input", msg],
+                capture_output=True, text=True)
+        verb, done = "block", "blocked needs_input (card budget; no auto-resume)"
+    else:
+        msg = f"SCHEDULED_UNTIL={until} — budget cap reached; resumes next UTC day ({reason})"
+        r = run([hermes, "kanban", "--board", board, "schedule", card["id"], msg], capture_output=True, text=True)
+        verb, done = "schedule", f"scheduled until {until}"
     if r.returncode:
-        return f"schedule FAILED: {(r.stderr or r.stdout).strip()[-200:]}"
+        return f"{verb} FAILED: {(r.stderr or r.stdout).strip()[-200:]}"
     killed = []
     for p in found:
         try:
@@ -252,14 +271,17 @@ def stop_card(hermes, board, card, reason, until, kill=os.kill, pids=worker_pids
             killed.append(p)
         except ProcessLookupError:
             pass
-    return f"scheduled until {until}; SIGTERM {killed or 'no live worker'}"
+    return f"{done}; SIGTERM {killed or 'no live worker'}"
 
 
 def resume_due(hermes, board, data, home, now, dry=False, run=subprocess.run):
-    """Unblock cards this watchdog scheduled on an earlier UTC day that are still `scheduled`."""
+    """Unblock cards this watchdog scheduled on an earlier UTC day for a lane/total cap that are still `scheduled`.
+
+    Card-budget stops (kind 'card'; older rows without kind: card_usd >= card_budget) never auto-resume."""
     day = fx.utc_day(now)
     ids = {r["card"] for r in jsonl(state_dir(data) / "budget-stops.jsonl")
-           if r.get("action") == "stop" and r.get("date", day) < day and r.get("card")}
+           if r.get("action") == "stop" and r.get("date", day) < day and r.get("card")
+           and (r.get("kind") or stop_kind(r.get("card_usd") or 0, r.get("card_budget") or float("inf"))) != "card"}
     ids -= {r["card"] for r in jsonl(state_dir(data) / "budget-stops.jsonl")
             if r.get("action") == "resume" and r.get("card")}
     if not ids:
@@ -301,7 +323,9 @@ def inbox_post(hermes, snap, stops, data, run=subprocess.run):
     body = (f"**Now** the improvement engine is paused for UTC day {snap['day']} (resumes at the next UTC midnight).\n\n"
             f"| lane | today | cap |\n|---|---:|---:|\n{rows}\n| **total** | **${snap['total']:.2f}** | "
             f"**${snap['total_cap']:g}** |\n\n" + (f"**Stopped cards**\n{stopped}\n\n" if stopped else "")
-            + "Stopped cards are scheduled, not lost: the watchdog unblocks them on the next UTC day.")
+            + "Cards stopped on a lane/total cap are scheduled, not lost: the watchdog unblocks them on the next UTC day. "
+            "Cards that spent their own budget are blocked for you: raise the card's 'Budget for this card' line and "
+            "unblock it, or close it.")
     prompt = (f"The improvement engine hit its budget cap today (UTC day {snap['day']}): {lane_line(snap)}, total "
               f"${snap['total']:.2f}/${snap['total_cap']:g}. Raise the cap for today only: ask me how much (default: "
               f"total ${snap['total_cap'] + 10:g}), then append one JSON row per raised lane, e.g. "
@@ -340,11 +364,12 @@ def watchdog(home=None, board=None, data=None, hermes=None, now=None, dry=False,
     until = next_utc_midnight(now)
     stops, rows = [], []
     for c, usd, cap, why in todo:
-        res = "dry-run: would stop" if dry else stop_card(hermes, board, c, why, until, kill, pids, run)
+        kind = stop_kind(usd, cap)
+        res = "dry-run: would stop" if dry else stop_card(hermes, board, c, why, until, kill, pids, run, kind)
         out(f"  stop {c['id']} [{c['lane']}] {c['title'][:70]}: {why} -> {res}")
         stops.append((c, usd, cap, why, res))
         rows.append({"date": snap["day"], "at": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(timespec="seconds"),
-                     "action": "stop", "card": c["id"], "lane": c["lane"], "card_usd": usd, "card_budget": cap,
+                     "action": "stop", "kind": kind, "card": c["id"], "lane": c["lane"], "card_usd": usd, "card_budget": cap,
                      "lane_usd": snap["lanes"].get(c["lane"]), "total_usd": snap["total"], "reason": why,
                      "result": res, "host": host()})
     rows += [{"date": snap["day"], "at": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(timespec="seconds"),

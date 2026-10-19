@@ -122,9 +122,12 @@ class Engine(unittest.TestCase):
                           run=self.run_)
         stopped = sorted(c["id"] for c, *_ in res["stops"])
         self.assertEqual(stopped, ["t_eng", "t_trial"])
-        sched = [c for c in self.calls if "schedule" in c]
-        self.assertEqual(sorted(c[c.index("schedule") + 1] for c in sched), ["t_eng", "t_trial"])
-        self.assertTrue(all("SCHEDULED_UNTIL=" in c[-1] and "resumes next UTC day" in c[-1] for c in sched))
+        # both spent their OWN budget: blocked for a human (needs_input), not scheduled for an automatic resume
+        blocks = [c for c in self.calls if "block" in c]
+        self.assertEqual(sorted(c[c.index("block") + 1] for c in blocks), ["t_eng", "t_trial"])
+        self.assertTrue(all(c[c.index("--kind") + 1] == "needs_input" and "Budget for this card" in c[-1]
+                            for c in blocks))
+        self.assertFalse(any("schedule" in c for c in self.calls))
         self.assertIn(4242, killed)
         self.assertFalse(any("t_human" in " ".join(c) for c in self.calls))
         rows = eb.jsonl(self.data / "research/state/budget-stops.jsonl")
@@ -177,6 +180,27 @@ class Engine(unittest.TestCase):
         eb.watchdog(self.home, "hermes", self.data, "hermes", tomorrow + 900, out=lambda m: None,
                     kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=self.run_)
         self.assertFalse(any("unblock" in c for c in self.calls))
+
+    def test_card_budget_stop_is_not_resumed_next_day(self):
+        self.over_total()
+        self.card("t_cap", "coach-fix:y", cost=0.1)                          # lane/total cap stop: resumes
+        self.card("t_own", "coach-fix:z", cost=7.5)                          # over its own $7 budget: stays parked
+        res = eb.watchdog(self.home, "hermes", self.data, "hermes", self.now, out=lambda m: None,
+                          kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=self.run_)
+        kinds = {r["card"]: r["kind"] for r in eb.jsonl(self.data / "research/state/budget-stops.jsonl")}
+        self.assertEqual(kinds, {"t_cap": "cap", "t_own": "card"})
+        self.assertEqual(len(res["stops"]), 2)
+        # even if the card-budget card sits in `scheduled` (e.g. a legacy row from before kinds), no resume
+        self.k.execute("update tasks set status='scheduled' where id in ('t_cap','t_own')"); self.k.commit()
+        with (self.data / "research/state/budget-stops.jsonl").open("a") as fh:   # legacy row, no kind
+            fh.write(json.dumps({"date": fx.utc_day(self.now), "action": "stop", "card": "t_old",
+                                 "card_usd": 9.0, "card_budget": 7.0}) + "\n")
+        self.card("t_old", "coach-fix:w", cost=9.0, status="scheduled")
+        self.calls.clear()
+        res = eb.watchdog(self.home, "hermes", self.data, "hermes", self.now + DAY, out=lambda m: None,
+                          kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=self.run_)
+        self.assertEqual(res["resumed"], [("t_cap", "resumed")])
+        self.assertFalse(any(c[-2:] in (["unblock", "t_own"], ["unblock", "t_old"]) for c in self.calls))
 
     def test_weekly_budget_section_lists_enforced_stops(self):
         import coach_yield as y
