@@ -72,6 +72,12 @@ digests share one version (`DIGEST_V`).
 
 ## Pitfalls
 
+- xAI `x_search` via the Responses API (outside research scout): send `"tool_choice": "required"` and use
+  `grok-4.5`, or the model often answers `[]` from memory without searching (`usage.num_server_side_tools_used: 0`).
+  Each call costs ~$0.4–0.7 (`usage.cost_in_usd_ticks` / 1e10 = USD), so log it and cap per day. Citations come back
+  empty; the post URLs are in the answer text. Check them with `https://publish.twitter.com/oembed?url=<post>`
+  (in testing 21/21 resolved).
+
 - Verify redaction before the first push to a new repo: `gitleaks dir <repo>/<host>` must report no leaks.
 - Hermes writes many user-role messages itself: delegation results, cross-session messages, turn-cap notices,
   `/goal` continuations, `[IMPORTANT: …]` notices, compression summaries, model-switch notes. Counted as user turns,
