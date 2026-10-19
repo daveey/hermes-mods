@@ -13,6 +13,11 @@ def loaded_local_plugin(monkeypatch, tmp_path):
         return
     from hermes_constants import get_hermes_home
     from hermes_cli.plugins import PluginManager
+    # Warm core first: register() installs at once only when run_agent is fully imported
+    # (otherwise it defers to the first pre_api_request; see test_load.py).
+    import run_agent  # noqa: F401
+    import agent.turn_recovery  # noqa: F401
+    import agent.turn_api_error  # noqa: F401
     source = Path(os.environ['FAST_RATE_LIMIT_PLUGIN_SOURCE'])
     target = get_hermes_home() / 'plugins' / 'fast-rate-limit-fallback'
     shutil.copytree(source, target, ignore=shutil.ignore_patterns('tests', '__pycache__'))

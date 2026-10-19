@@ -116,6 +116,43 @@ class Combined(unittest.TestCase):
             with self.assertRaises(self.s.SelectionRejected):
                 self.s.ExecutionIntegration(observe=lambda *a: None).install()
 
+    def test_warm_fingerprint_caches_skip_seam_compiles_and_still_catch_drift(self):
+        """A cold compile of the audited seam files took seconds under load and pushed both
+        plugins' loads past core's 10 s deadline. With both caches warm (same home, same file
+        bytes) neither plugin compiles them; a drifted live code object still misses the cache,
+        so the compile stays authoritative."""
+        from agent import agent_runtime_helpers as h
+        guards = {'_audited_recovery_base', 'verified'}  # FRL's / account-usage's compile sites
+        compiled, recording = [], [False]
+
+        def audit(event, args):
+            if recording[0] and event == 'compile':
+                compiled.append((str(args[1]), sys._getframe(1).f_code.co_name))
+        sys.addaudithook(audit)
+        manager = self.load()
+        self.assert_active(manager)
+        manager.unload()
+        cache = self.home / 'cache' / 'fast-rate-limit-fallback' / 'code-fingerprints.json'
+        self.assertTrue(cache.is_file())
+        recording[0] = True
+        try:
+            manager = self.load()
+        finally:
+            recording[0] = False
+        self.assert_active(manager)
+        self.assertEqual([c for c in compiled if c[1] in guards], [])
+        fast = manager._plugins['fast-rate-limit-fallback'].module
+        original = h.recover_with_credential_pool
+        base = original.__wrapped__
+        code = base.__code__
+        try:
+            base.__code__ = code.replace(co_consts=code.co_consts + ('drift',))
+            with self.assertRaisesRegex(ValueError, 'captured core'):
+                fast._audited_recovery_base(original, fast._Fingerprints(self.home))
+        finally:
+            base.__code__ = code
+        self.assertIs(fast._audited_recovery_base(original, fast._Fingerprints(self.home)), base)
+
     def test_selected_and_unselected_long_reset_rotation_and_fallback(self):
         import time
         from types import SimpleNamespace
