@@ -261,6 +261,16 @@ class Engagements:
         now = time.time() if now is None else now
         return [r for r in self.mbp_list() if r["state"] == "queued" and (r["next_at"] or 0) <= now]
 
+    def mbp_claim(self, now: Optional[float] = None, lease: float = 600) -> list[dict]:
+        """Hand due requests to a puller (the other machine fetching its own work) exactly once; an
+        unsettled claim becomes due again after ``lease`` seconds."""
+        now = time.time() if now is None else now
+        due = self.due_mbp(now)
+        with self.store._conn() as c:
+            for r in due:
+                c.execute("UPDATE eng_mbp_queue SET next_at=? WHERE id=?", (now + lease, r["id"]))
+        return due
+
     def mbp_attempt(self, qid: str, *, ok: bool, error: str = "", retry_in: float = 120) -> None:
         now = time.time()
         with self.store._conn() as c:

@@ -197,6 +197,15 @@ def engagement_op(engs: "engage.Engagements", op: str, args: dict) -> dict:
         if args.get("enabled") is not None:
             engs.store.update_policy(test_inbox=bool(args["enabled"]))
         return {"ok": True, "test_inbox": engs.test_inbox()}
+    if op == "mbp_pull":  # the other machine fetches requests for its sessions (works across sleep)
+        return {"ok": True, "requests": [{k: r[k] for k in ("id", "engagement", "target", "message", "channel", "thread")}
+                                         for r in engs.mbp_claim()]}
+    if op == "mbp_done":
+        if not engs.mbp_get(args.get("id") or ""):
+            return {"ok": False, "error": "no such request"}
+        engs.mbp_attempt(args["id"], ok=bool(args.get("ok")), error=str(args.get("error") or ""),
+                         retry_in=float(args.get("retry_in") if args.get("retry_in") is not None else MBP_RETRY_S))
+        return {"ok": True}
     if op == "create":
         e = engs.create(args["channel"], args.get("brief") or "", thread=args.get("thread") or "",
                         name=args.get("name") or "", context=args.get("context") or "",
@@ -431,6 +440,10 @@ class Runner:
 
     # ---- queue to another machine's session (session-mentions courier) ------------------------
     def deliver_mbp(self, now: Optional[float] = None) -> None:
+        # "pull": the other machine fetches its requests itself (engagement op mbp_pull); a Desktop
+        # courier is shared by every Desktop connected to this gateway, so it can't target one Mac.
+        if (self.store.policy().get("follower") or {}).get("mbp_delivery") == "pull":
+            return
         for q in self.engs.due_mbp(now):
             ok, err = self._courier_send(q["target"], q["message"])
             self.engs.mbp_attempt(q["id"], ok=ok, error=err, retry_in=MBP_RETRY_S)

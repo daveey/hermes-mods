@@ -3,7 +3,7 @@
 
   engage_cli.py --home <bot profile HERMES_HOME> <op> [--json-file F | --b64 B64JSON] [--hex]
 
-op: create | list | get | pause | resume | end | update | message | test_inbox | queue. Prints one JSON line
+op: create | list | get | pause | resume | end | update | message | test_inbox | mbp_pull | mbp_done | queue. Prints one JSON line
 ({"ok": ...}); with --hex the JSON is hex-encoded in 32-char lines between HEX-BEGIN/HEX-END
 markers (for shells that mangle long tokens). ``create`` checks the channel with the bot token
 from <home>/.env: a private channel the bot is not in fails with an invite instruction.

@@ -288,3 +288,31 @@ def test_message_op_wakes_the_follower_with_the_note_once(env):
     assert "result: 42" in spawned[0][1] and "@session:default@mac/s1" in spawned[0][1]
     assert not runner.run_once(e["id"])  # delivered once
     assert follow.engagement_op(engs, "message", {"id": e["id"]})["ok"] is False  # needs text
+
+
+def test_mbp_pull_claims_due_requests_once_and_done_settles_them(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    q = engs.queue_mbp(e["id"], "@session:default@mac/s1", "check X", "C1", "7.0")
+    got = follow.engagement_op(engs, "mbp_pull", {})
+    assert [x["id"] for x in got["requests"]] == [q["id"]] and got["requests"][0]["message"] == "check X"
+    assert follow.engagement_op(engs, "mbp_pull", {})["requests"] == []  # claimed, not handed out twice
+    follow.engagement_op(engs, "mbp_done", {"id": q["id"], "ok": False, "error": "hermes failed", "retry_in": 0})
+    assert [x["id"] for x in follow.engagement_op(engs, "mbp_pull", {})["requests"]] == [q["id"]]
+    follow.engagement_op(engs, "mbp_done", {"id": q["id"], "ok": True})
+    assert engs.mbp_get(q["id"])["state"] == "delivered"
+
+
+def test_runner_leaves_mbp_queue_to_the_puller_when_policy_says_pull(env, monkeypatch):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    engs.queue_mbp(e["id"], "@session:default@mac/s1", "m", "C1", "")
+    r = make_runner(store, engs, [])
+    sent = []
+    monkeypatch.setattr(r, "_courier_send", lambda t, m: sent.append(t) or (True, ""))
+    store.update_policy(follower={"mbp_delivery": "pull"})
+    r.deliver_mbp()
+    assert sent == []
+    store.update_policy(follower={"mbp_delivery": "courier"})
+    r.deliver_mbp()
+    assert sent == ["@session:default@mac/s1"]
