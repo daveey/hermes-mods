@@ -1,0 +1,371 @@
+From 8d3eff9abba3f224c6d701cb8d88d4b482871a19 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 15:58:00 -0700
+Subject: [PATCH] feat(kanban): default model tier for unpinned cards
+ (kanban.default_model) [daveey]
+
+When kanban.default_model is set the dispatcher runs a card with no pinned
+model on it (in-memory pin, card row unchanged). Cards keep the profile model
+when pinned, in the review lane, retried after a failed run/changes_requested,
+matching kanban.default_model_keep_patterns, or assigned outside
+kanban.default_model_profiles. Each decision is a model_tier task event.
+Empty default_model = upstream behaviour.
+---
+ hermes_cli/config_defaults.py              |   9 ++
+ hermes_cli/kanban_db_dispatch.py           |   4 +
+ hermes_cli/kanban_model_tier.py            | 131 ++++++++++++++++
+ tests/hermes_cli/test_kanban_model_tier.py | 169 +++++++++++++++++++++
+ 4 files changed, 313 insertions(+)
+ create mode 100644 hermes_cli/kanban_model_tier.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_tier.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 057f926807..0ab7090197 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1970,6 +1970,15 @@ DEFAULT_CONFIG = {
+         # the dispatcher spawns at most one card behind it per this many seconds (one probe at a
+         # time either way); a human unblock lets that card probe at once. [daveey]
+         "shared_blocker_probe_seconds": 1800,
++        # Default model tier [daveey] (hermes_cli/kanban_model_tier.py): model (+ optional provider) the
++        # dispatcher runs a card on when the card pins no model. "" = upstream (the profile's own model).
++        # Cards keep the profile model when pinned, in the review lane, retried after a failed run or
++        # changes_requested, or matching a keep pattern. default_model_profiles limits it to those
++        # assignees ([] = all); default_model_keep_patterns are case-insensitive regexes on title+body.
++        "default_model": "",
++        "default_provider": "",
++        "default_model_profiles": [],
++        "default_model_keep_patterns": [],
+         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 0f4ade54db..a5e8293fc5 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2207,6 +2207,10 @@ def _dispatch_lane_task(
+         # Force-load sdlc-review; the kanban lifecycle is already in every
+         # worker's system prompt via KANBAN_GUIDANCE.
+         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
++    # Default model tier (kanban.default_model): pins a cheaper model on the in-memory task unless the card is
++    # pinned, a review, a retry after a failure or matches a keep pattern. Never raises. [daveey]
++    from hermes_cli.kanban_model_tier import apply_model_tier
++    apply_model_tier(conn, claimed, lane=lane)
+     try:
+         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+         if pid:
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+new file mode 100644
+index 0000000000..fed45e8a9f
+--- /dev/null
++++ b/hermes_cli/kanban_model_tier.py
+@@ -0,0 +1,131 @@
++"""Kanban default model tier [daveey].
++
++When ``kanban.default_model`` is set, the dispatcher runs a card that has no pinned model on that model
++(typically a cheaper tier) instead of the assignee profile's own model. The pin is applied to the in-memory
++task only (``model_override``/``provider_override`` on the claimed ``Task``), so the card row never changes
++and a later run re-decides. Cards keep the profile's model when:
++
++* the card pins ``model`` itself (``kanban_create(model=...)`` / ``hermes kanban create --model``);
++* it runs in the review lane (``sdlc-review`` loaded — claimed from the review column);
++* an earlier run on the card failed (``crashed``/``timed_out``/``gave_up``/``failed``) or a reviewer asked for
++  changes: the second attempt after a failed fix gets the stronger model;
++* its title/body matches one of ``kanban.default_model_keep_patterns`` (case-insensitive regexes);
++* its assignee is not in ``kanban.default_model_profiles`` (empty = every profile).
++
++Unset ``kanban.default_model`` (the default) = upstream behaviour: every card runs on its profile's model.
++Each decision is recorded as a ``model_tier`` task event on the run so tier effects can be measured later.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++import sqlite3
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++# Run outcomes that mean "the previous attempt did not work" (not a checkpoint, a human block or a reclaim).
++FAILED_RUN_OUTCOMES = ("crashed", "timed_out", "gave_up", "failed")
++# Events that mean "a reviewer rejected the previous attempt".
++REWORK_EVENT_KINDS = ("changes_requested", "review_reopened")
++REVIEW_SKILL = "sdlc-review"
++
++
++def _str(value: Any) -> str:
++    return str(value or "").strip()
++
++
++def _as_list(value: Any) -> list[str]:
++    if value is None:
++        return []
++    if isinstance(value, str):
++        return [v.strip() for v in value.split(",") if v.strip()]
++    if isinstance(value, (list, tuple)):
++        return [_str(v) for v in value if _str(v)]
++    return []
++
++
++def load_tier_config() -> dict[str, Any]:
++    """The ``kanban`` config section (empty dict when unreadable)."""
++    try:
++        from hermes_cli.config import load_config
++        section = (load_config() or {}).get("kanban") or {}
++        return section if isinstance(section, dict) else {}
++    except Exception as exc:  # never break dispatch over config
++        logger.debug("kanban model tier: config unreadable (%s)", exc)
++        return {}
++
++
++def _prior_failure(conn: sqlite3.Connection, task_id: str, current_run_id: Optional[int]) -> Optional[str]:
++    marks = ",".join("?" for _ in FAILED_RUN_OUTCOMES)
++    row = conn.execute(
++        f"SELECT outcome FROM task_runs WHERE task_id = ? AND id IS NOT ? AND outcome IN ({marks}) "
++        "ORDER BY id DESC LIMIT 1",
++        (task_id, current_run_id, *FAILED_RUN_OUTCOMES),
++    ).fetchone()
++    if row is not None:
++        return f"run_{row[0]}"
++    marks = ",".join("?" for _ in REWORK_EVENT_KINDS)
++    row = conn.execute(
++        f"SELECT kind FROM task_events WHERE task_id = ? AND kind IN ({marks}) ORDER BY id DESC LIMIT 1",
++        (task_id, *REWORK_EVENT_KINDS),
++    ).fetchone()
++    return row[0] if row is not None else None
++
++
++def resolve_model_tier(
++    conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None,
++) -> tuple[Optional[str], Optional[str], str]:
++    """``(model, provider, reason)`` for a claimed task. ``model`` is None when the worker keeps whatever it
++    would have run on anyway (its own pin or the profile's model); ``reason`` names the rule that decided."""
++    cfg = load_tier_config() if cfg is None else cfg
++    default_model = _str(cfg.get("default_model"))
++    if _str(getattr(task, "model_override", None)):
++        return None, None, "pinned"
++    if not default_model:
++        return None, None, "off"
++    profiles = _as_list(cfg.get("default_model_profiles"))
++    if profiles and _str(getattr(task, "assignee", None)) not in profiles:
++        return None, None, "profile_out_of_scope"
++    if lane == "review" or REVIEW_SKILL in (getattr(task, "skills", None) or []):
++        return None, None, "review"
++    try:
++        failure = _prior_failure(conn, task.id, getattr(task, "current_run_id", None))
++    except sqlite3.Error as exc:
++        logger.debug("kanban model tier: prior-failure lookup failed for %s (%s)", task.id, exc)
++        failure = None
++    if failure:
++        return None, None, f"retry_after_{failure}"
++    text = f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}"
++    for pattern in _as_list(cfg.get("default_model_keep_patterns")):
++        try:
++            if re.search(pattern, text, re.IGNORECASE):
++                return None, None, f"pattern:{pattern}"
++        except re.error as exc:
++            logger.warning("kanban model tier: bad default_model_keep_patterns entry %r (%s)", pattern, exc)
++    return default_model, _str(cfg.get("default_provider")) or None, "default"
++
++
++def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
++    """Pin the tier's model on the in-memory ``task`` (never the DB row) and record a ``model_tier`` event.
++    Returns the reason. Never raises: a failure leaves the task on its profile's model."""
++    try:
++        model, provider, reason = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
++    except Exception as exc:
++        logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc)
++        return "error"
++    if model:
++        task.model_override = model
++        task.provider_override = provider
++    if reason != "off":
++        try:
++            from hermes_cli import kanban_db as _kb
++            payload = {"reason": reason, "model": model or _str(getattr(task, "model_override", None)) or None,
++                       "provider": provider or _str(getattr(task, "provider_override", None)) or None,
++                       "lane": lane}
++            with _kb.write_txn(conn):
++                _kb._append_event(conn, task.id, "model_tier", payload, run_id=getattr(task, "current_run_id", None))
++        except Exception as exc:
++            logger.debug("kanban model tier: event write failed for %s (%s)", getattr(task, "id", "?"), exc)
++    return reason
+diff --git a/tests/hermes_cli/test_kanban_model_tier.py b/tests/hermes_cli/test_kanban_model_tier.py
+new file mode 100644
+index 0000000000..2933b1db5d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_tier.py
+@@ -0,0 +1,169 @@
++"""Kanban default model tier (kanban.default_model) [daveey].
++
++Entry paths covered: dispatcher default for a card with no model (kb.create_task), the ``kanban_create`` tool
++with and without ``model``, the review lane, a retry after a failed run, keep patterns, profile scoping, and
++the worker argv the pin turns into.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_model_tier as tier
++
++SONNET, OPUS = "claude-sonnet-5-5", "claude-opus-5-5"
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++def _write_cfg(home: Path, **kanban) -> None:
++    lines = ["kanban:"]
++    for k, v in kanban.items():
++        lines.append(f"  {k}: {json.dumps(v)}")
++    home.joinpath("config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++def _dispatch(conn) -> dict[str, tuple]:
++    """One tick; returns {task_id: (model_override, provider_override, skills)} as the spawn fn saw them."""
++    seen: dict[str, tuple] = {}
++
++    def spawn(task, workspace):
++        seen[task.id] = (task.model_override, task.provider_override, list(task.skills or []))
++
++    kbd.dispatch_once(conn, dry_run=False, spawn_fn=spawn)
++    return seen
++
++
++def _tier_events(conn, tid):
++    return [e.payload for e in kb.list_events(conn, tid) if e.kind == "model_tier"]
++
++
++def test_dispatcher_default_applies_to_unpinned_card_and_records_event(board):
++    _write_cfg(board, default_model=SONNET, default_provider="anthropic")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine fix", assignee="default")
++        seen = _dispatch(conn)
++        events = _tier_events(conn, tid)
++        row = kb.get_task(conn, tid)
++    assert seen[tid][:2] == (SONNET, "anthropic")
++    assert events and events[0]["reason"] == "default" and events[0]["model"] == SONNET
++    # The pin is per run: the card row itself stays unpinned.
++    assert row.model_override is None
++
++
++def test_dispatcher_default_off_is_upstream_behaviour(board):
++    _write_cfg(board)  # no default_model
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine fix", assignee="default")
++        seen = _dispatch(conn)
++        events = _tier_events(conn, tid)
++    assert seen[tid][:2] == (None, None)
++    assert events == []
++
++
++def test_kanban_create_tool_pin_survives_default_and_unpinned_gets_default(board, monkeypatch):
++    _write_cfg(board, default_model=SONNET)
++    from tools import kanban_tools as kt
++    pinned = json.loads(kt._handle_create({"title": "adversarial review", "assignee": "default", "model": OPUS}))
++    plain = json.loads(kt._handle_create({"title": "routine docs", "assignee": "default"}))
++    assert pinned["ok"] and plain["ok"], (pinned, plain)
++    with kbc.connect() as conn:
++        seen = _dispatch(conn)
++        pinned_events = _tier_events(conn, pinned["task_id"])
++    assert seen[pinned["task_id"]][0] == OPUS
++    assert seen[plain["task_id"]][0] == SONNET
++    assert pinned_events[0]["reason"] == "pinned" and pinned_events[0]["model"] == OPUS
++
++
++def test_review_lane_keeps_profile_model(board):
++    _write_cfg(board, default_model=SONNET)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="impl", assignee="default")
++        kb.claim_task(conn, tid)
++        kb.request_review(conn, tid, summary="done, please review")
++        seen = _dispatch(conn)
++        events = _tier_events(conn, tid)
++    assert "sdlc-review" in seen[tid][2]
++    assert seen[tid][0] is None
++    assert events[-1]["reason"] == "review"
++
++
++def test_retry_after_failed_run_keeps_profile_model(board):
++    _write_cfg(board, default_model=SONNET)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="flaky fix", assignee="default")
++        kb.claim_task(conn, tid)
++        # A crashed attempt: the run ends with outcome 'crashed' and the card goes back to ready.
++        conn.execute("UPDATE task_runs SET status='crashed', outcome='crashed', ended_at=1 WHERE task_id=?", (tid,))
++        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL "
++                     "WHERE id=?", (tid,))
++        conn.commit()
++        seen = _dispatch(conn)
++        events = _tier_events(conn, tid)
++    assert seen[tid][0] is None
++    assert events[-1]["reason"] == "retry_after_run_crashed"
++
++
++def test_continued_run_is_not_a_failure(board):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="long job", assignee="default")
++        kb.claim_task(conn, tid)
++        conn.execute("UPDATE task_runs SET status='released', outcome='continued', ended_at=1 WHERE task_id=?", (tid,))
++        conn.commit()
++        task = kb.get_task(conn, tid)
++        task.current_run_id = None
++        model, _prov, reason = tier.resolve_model_tier(conn, task, lane="ready", cfg={"default_model": SONNET})
++    assert (model, reason) == (SONNET, "default")
++
++
++def test_keep_patterns_and_profile_scope(board):
++    cfg = {"default_model": SONNET, "default_model_keep_patterns": [r"\bsecurity\b", "hermes-core-wt"],
++           "default_model_profiles": ["default"]}
++    with kbc.connect() as conn:
++        sec = kb.get_task(conn, kb.create_task(conn, title="Self-fix SECURITY tiers", assignee="default"))
++        core = kb.get_task(conn, kb.create_task(conn, title="x", body="build in hermes-core-wt", assignee="default"))
++        other = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="bb-dev"))
++        plain = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
++        got = {name: tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg)
++               for name, t in (("sec", sec), ("core", core), ("other", other), ("plain", plain))}
++    assert got["sec"][0] is None and got["sec"][2].startswith("pattern:")
++    assert got["core"][0] is None and got["core"][2] == "pattern:hermes-core-wt"
++    assert got["other"] == (None, None, "profile_out_of_scope")
++    assert got["plain"] == (SONNET, None, "default")
++
++
++def test_bad_pattern_is_ignored_not_fatal(board):
++    with kbc.connect() as conn:
++        t = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
++        got = tier.resolve_model_tier(conn, t, lane="ready",
++                                      cfg={"default_model": SONNET, "default_model_keep_patterns": ["("]})
++    assert got == (SONNET, None, "default")
++
++
++def test_tier_pin_reaches_worker_argv(board, monkeypatch):
++    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
++    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda home: None)
++    with kbc.connect() as conn:
++        t = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
++        tier.apply_model_tier(conn, t, lane="ready", cfg={"default_model": SONNET, "default_provider": "anthropic"})
++    argv = kbd._worker_argv(t, "default", None)
++    assert argv[argv.index("-m") + 1] == SONNET
++    assert argv[argv.index("--provider") + 1] == "anthropic"
+-- 
+2.54.0 (Apple Git-157)
+
