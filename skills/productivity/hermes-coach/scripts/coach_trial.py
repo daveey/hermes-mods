@@ -88,8 +88,8 @@ def existing_card(home, board, slug):
     return {"id": r[0], "status": r[1]} if r else None
 
 
-def gate(home, board, data, now=None, by_day=None):
-    """(ok, reason, today_usd)."""
+def gate(home, board, data, now=None, by_day=None, snap=None):
+    """(ok, reason, today_usd). Closed at the lane's card/spend cap or the engine's $20/day total (engine_budget)."""
     now = now or time.time()
     day = fx.utc_day(now)
     if by_day is None:
@@ -98,6 +98,11 @@ def gate(home, board, data, now=None, by_day=None):
     usd = round(cards + ev, 4)
     if usd >= TRIAL_USD_DAY:
         return False, f"trial lane spend today ${usd:.2f} >= ${TRIAL_USD_DAY:.0f} cap", usd
+    import engine_budget as eb
+    snap = snap or eb.snapshot(home, board, data, now, by_lane={"trial": by_day})
+    ok, why = eb.check(snap, "trial")
+    if not ok:
+        return False, why, usd
     filed = trial_cards_filed(home, board, day)
     if len(filed) >= TRIAL_CARDS_PER_DAY:
         return False, f"trial lane already filed {', '.join(filed)} today (cap {TRIAL_CARDS_PER_DAY}/day)", usd

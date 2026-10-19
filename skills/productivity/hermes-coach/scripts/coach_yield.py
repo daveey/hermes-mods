@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 UTC = timezone.utc
 PT = ZoneInfo("America/Los_Angeles")
 CAPS = {"scout": 3, "fixer": 7, "trial": 10}
+LANES = {**CAPS, "bot": None}  # bot = the coach Bot's own chat turns: no lane cap, counts toward the $20 total
 STAGES = ("scouted", "ideas", "proposed", "trialed", "applied", "kept")
 URL_RX = re.compile(r"https?://[^\s<>\]\)\"']+")
 REF_RX = re.compile(r"(?:reports/)?ideas\.md\s+(\d{4}-\d{2}-\d{2})\s*#(\d+)")
@@ -337,13 +338,13 @@ def spend_buckets(records, now):
     """Seven UTC calendar buckets ending today (today is partial), not 168h rolling."""
     today = datetime.fromtimestamp(now, UTC).date()
     buckets: dict[str, dict[str, float | None]] = {
-        str(today - timedelta(days=i)): {k: None for k in CAPS} for i in reversed(range(7))}
+        str(today - timedelta(days=i)): {k: None for k in LANES} for i in reversed(range(7))}
     flags = []
     for r in records:
         day, lane, usd = r.get("date"), r.get("lane"), r.get("usd")
         if day not in buckets:
             continue
-        if lane not in CAPS or isinstance(usd, bool) or not isinstance(usd, (float, int)) or not math.isfinite(usd) or (usd < 0 and r.get("kind") != "settle"):
+        if lane not in LANES or isinstance(usd, bool) or not isinstance(usd, (float, int)) or not math.isfinite(usd) or (usd < 0 and r.get("kind") != "settle"):
             flags.append(f"{day}: invalid/unknown lane or amount; excluded")
             continue
         if timestamp(r.get("at")) is not None and timestamp(r["at"]) > now:
@@ -351,7 +352,7 @@ def spend_buckets(records, now):
         buckets[day][lane] = (buckets[day][lane] or 0) + usd
     for day, lanes in buckets.items():
         for lane, value in lanes.items():
-            if value is not None and value > CAPS[lane]:
+            if value is not None and CAPS.get(lane) is not None and value > CAPS[lane]:
                 flags.append(f"{day}: {lane} OVER ${CAPS[lane]}/day")
         if sum(v or 0 for v in lanes.values()) > 20:
             flags.append(f"{day}: total OVER $20/day")
@@ -359,6 +360,21 @@ def spend_buckets(records, now):
     if total > 140:
         flags.append("Weekly total OVER $140/week")
     return buckets, total, flags
+
+
+def enforced_stops(data, buckets):
+    """Lines for the watchdog's stops/resumes (research/state/budget-stops.jsonl) in the seven budget days."""
+    out = []
+    for r in rows(Path(data) / "research/state/budget-stops.jsonl", set()):
+        if r.get("date") not in buckets:
+            continue
+        if r.get("action") == "stop":
+            out.append(f"- {r['date']}: stopped `{r.get('card')}` ({r.get('lane')}, card ${float(r.get('card_usd') or 0):.2f}"
+                       f" of ${float(r.get('card_budget') or 0):g}; lane ${float(r.get('lane_usd') or 0):.2f}, total "
+                       f"${float(r.get('total_usd') or 0):.2f}): {r.get('reason')} -> {r.get('result')}")
+        elif r.get("action") == "resume":
+            out.append(f"- {r['date']}: resumed `{r.get('card')}` ({r.get('result')})")
+    return out or ["None: no running engine card was stopped for budget in these seven days."]
 
 
 def is_source_rule(proposal):
@@ -454,8 +470,8 @@ def section_yield(data, now, sources_dir=None, source_target_root=None):
             "The ledger `date` is the UTC budget day (backfills may have a later `at`). "
             "UTC midnight falls at 16:00 PST / 17:00 PDT on the preceding PT date. Today is partial. "
             "Missing lane/day ledger entries are unknown, NOT known zero; recorded totals are lower bounds.", "",
-            "| UTC budget day | PT start → end (exclusive) | scout / 3 | fixer / 7 | trial / 10 | recorded total / 20 |",
-            "|---|---|---:|---:|---:|---:|"]
+            "| UTC budget day | PT start → end (exclusive) | scout / 3 | fixer / 7 | trial / 10 | bot | recorded total / 20 |",
+            "|---|---|---:|---:|---:|---:|---:|"]
     buckets, total, flags = spend_buckets(r["spend"], now)
     for day, lanes in buckets.items():
         begin = datetime.fromisoformat(day).replace(tzinfo=UTC)
@@ -464,6 +480,7 @@ def section_yield(data, now, sources_dir=None, source_target_root=None):
                    + f" | ≥${sum(v or 0 for v in lanes.values()):.2f} |")
     out += [f"Recorded weekly total: ≥${total:.2f} / $140; missing coverage prevents an under-budget claim."]
     out.extend("- " + flag for flag in flags)
+    out += ["", "### Enforced budget stops (engine_budget watchdog)", ""] + enforced_stops(data, buckets)
     out += ["", "### Source adjustments (candidates, not live edits)",
             "Drop requires zero PROPOSED ideas in six weeks, an observation at least six weeks old and another in the last week. "
             "Fresh/unobserved sources are never pruned. Config is read via AST only; no scripts are imported. "

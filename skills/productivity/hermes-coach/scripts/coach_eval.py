@@ -36,8 +36,9 @@ Two modes. Both print a markdown report (or JSON with --json) and exit 0 on PASS
              the model's real behavior on that turn: it is graded as a refusal reply and counted in `refusals`.
              Hard cost bound: before dispatch each call reserves its worst case = (utf-8 bytes of prefix + system +
              user + 512) x max(input, cache-write price) + max_tokens x output price, appended durably to
-             research/state/spend.jsonl (lane trial) under a lock; a call that would pass --budget (default $5) or
-             today's $10 trial-lane allowance is refused. A finished call appends a `settle` row returning the
+             research/state/spend.jsonl (lane trial) under a lock; a call that would pass --budget (default $5),
+             today's $10 trial-lane allowance or the engine's $20/day total (engine_budget.py: every lane, live
+             card spend included) is refused. A finished call appends a `settle` row returning the
              unused part (measured cost from the provider's usage); failed/interrupted calls keep the worst case.
              PASS = the target gains >= max(2, n/4) passes (identical runs move one pattern by 2 of 6, so +1 is
              noise), no other pattern drops by more than max(1, n/6), non-target net >= -max(1, n/6). Repeat a
@@ -469,6 +470,13 @@ def usage_cost(u, model=""):
     return (tin * pi + tout * po + tw * pw + tr * pr) / 1e6
 
 
+def live_engine():
+    """engine_budget.snapshot over the live board + the data repo ledger (every lane, $20/day total)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import engine_budget as eb
+    return lambda: eb.snapshot(data=data_dir())
+
+
 class Budget:
     """Hard per-run and per-UTC-day caps via durable pre-call reservations.
 
@@ -483,17 +491,23 @@ class Budget:
     `dispatch(request)` -> (text, usage)), or an offline test runner (`offline_only = True`, `max_cost_usd`).
     """
 
-    def __init__(self, usd, ledger=None, lane_allowance=10.0):
+    def __init__(self, usd, ledger=None, lane_allowance=10.0, total_allowance=20.0, engine=None, engine_ttl=60):
         import threading
         from decimal import Decimal
         self.cap = Decimal(str(usd))
         self.lane_allowance = Decimal(str(lane_allowance))
-        if not self.cap.is_finite() or self.cap <= 0 or not self.lane_allowance.is_finite() or self.lane_allowance <= 0:
-            raise ValueError("budget and lane allowance must be finite and positive")
+        self.total_allowance = Decimal(str(total_allowance))
+        if not self.cap.is_finite() or self.cap <= 0 or not self.lane_allowance.is_finite() or self.lane_allowance <= 0 \
+                or not self.total_allowance.is_finite() or self.total_allowance <= 0:
+            raise ValueError("budget and lane/total allowances must be finite and positive")
         self.spent, self.calls, self.stopped = 0.0, 0, False
         self.reserved = Decimal(0)
         self.lock = threading.Lock()
         self.ledger = Path(ledger or data_dir() / "research/state/spend.jsonl")
+        # engine: () -> engine_budget.snapshot (live board card spend + every lane). Without one, the engine total
+        # is the ledger's own rows for today (all lanes). Cached for engine_ttl seconds; a failing engine fails closed.
+        self.engine, self.engine_ttl, self._snap = engine, engine_ttl, (0.0, None)
+        self.stop_reason = ""
 
     def _append(self, fh, row):
         fh.write(json.dumps(row) + "\n")
@@ -501,19 +515,54 @@ class Budget:
         os.fsync(fh.fileno())
 
     def _today_used(self, fh, day):
+        """(trial lane used, eval rows used, every lane's rows) for today from the ledger."""
         from decimal import Decimal
         fh.seek(0)
-        used = Decimal(0)
+        used = ev = total = Decimal(0)
         for line in fh:
             if not line.strip():
                 continue
             row = json.loads(line)  # corrupt accounting fails closed
-            if row.get("lane") == "trial" and row.get("date") == day:
+            if row.get("date") != day:
+                continue
+            if row.get("lane") == "trial":
                 value = Decimal(str(row["usd"]))
                 if not value.is_finite() or (value < 0 and row.get("kind") != "settle"):
                     raise ValueError("invalid trial accounting")
                 used += value
-        return used
+                if "cards" not in row:
+                    ev += value
+            if row.get("lane") in ("scout", "fixer", "trial", "bot"):
+                try:
+                    value = Decimal(str(row.get("usd") or 0))
+                except Exception:
+                    value = Decimal(0)
+                total += value if value.is_finite() else 0
+        return used, ev, total
+
+    def _engine(self):
+        """Live engine snapshot (cached), or None without an engine."""
+        if self.engine is None:
+            return None
+        at, snap = self._snap
+        if snap is None or time.time() - at > self.engine_ttl:
+            snap = self.engine()  # raises -> the call is refused by the caller (fail closed)
+            self._snap = (time.time(), snap)
+        return snap
+
+    def _limits(self, fh, day):
+        """(trial lane used, engine total used, lane cap, total cap) with today's eval rows read under the lock."""
+        from decimal import Decimal
+        used, ev, total = self._today_used(fh, day)
+        snap = self._engine()
+        if snap is None or snap.get("day") != day:
+            return used, total, self.lane_allowance, self.total_allowance
+        d = lambda x: Decimal(str(x))  # noqa: E731
+        stale_ev = d(snap.get("eval", 0))
+        lane = d(snap["lanes"]["trial"]) - stale_ev + ev
+        tot = d(snap["total"]) - stale_ev + ev
+        return (lane, tot, min(self.lane_allowance, d(snap["caps"].get("trial", self.lane_allowance))),
+                min(self.total_allowance, d(snap.get("total_cap", self.total_allowance))))
 
     def call(self, runner, prompt, **kwargs):
         import fcntl
@@ -536,9 +585,11 @@ class Budget:
             with open(self.ledger, "a+") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
                 day = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-                used = self._today_used(fh, day)
-                if self.reserved + bound > self.cap or used + bound > self.lane_allowance:
+                used, total, lane_cap, total_cap = self._limits(fh, day)
+                if self.reserved + bound > self.cap or used + bound > lane_cap or total + bound > total_cap:
                     self.stopped = True
+                    self.stop_reason = ("run budget" if self.reserved + bound > self.cap else
+                                        "trial lane cap" if used + bound > lane_cap else "engine total cap")
                     return None
                 self._append(fh, {"date": day, "lane": "trial", "usd": float(bound), "kind": "reserve", "id": rid,
                                   "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -1089,7 +1140,8 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
     model = model or os.environ.get("COACH_EVAL_MODEL") or "claude-sonnet-5-5"
     judge_model = judge_model or os.environ.get("COACH_JUDGE_MODEL") or model
     _validated_edits(live, cand.get("edits") or [])
-    budget = Budget(budget_usd)
+    # Paid (bounded) runners also stop at the engine's $20/day total; offline test runners spend nothing real.
+    budget = Budget(budget_usd, engine=live_engine() if getattr(runner, "bounded", False) is True else None)
     t0 = time.time()
     try:
         return _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner, root, live, model,
@@ -1136,7 +1188,8 @@ def _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner
     complete = not (limit is not None or patterns is not None or budget.stopped) and graded == len(manifest) * repeats and set(by_pattern) == set(PATTERNS)
     if not complete:
         reasons.append(f"only {graded}/{len(eps) * repeats} episode pairs graded"
-                       + (f"; budget ${budget_usd:.2f} reached" if budget.stopped else ""))
+                       + (f"; budget ${budget_usd:.2f} reached" if budget.stopped and budget.stop_reason in ("", "run budget")
+                          else f"; {budget.stop_reason} reached" if budget.stopped else ""))
         verdict = "INCOMPLETE"
     return {"mode": "behavior", "candidate": cand.get("name") or "candidate", "target": target, "verdict": verdict,
             "reasons": reasons, "by_pattern": by_pattern, "rows": rows, "cost_usd": round(budget.spent, 4),

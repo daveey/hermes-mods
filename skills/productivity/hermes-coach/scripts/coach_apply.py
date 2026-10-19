@@ -12,6 +12,8 @@
         review tier  -> a card on the `hermes` Kanban board (status carded)
         kind fix     -> the fixer lane: one `coach-fix:<slug>` card a day (1 h runtime) while the lane's spend
                         today is under $7; fixer spend is logged to research/state/spend.jsonl (lane fixer)
+        every pass   -> engine_budget watchdog: running engine cards over their card/lane cap or the $20/day
+                        engine total are scheduled to the next UTC day (worker SIGTERMed); Inbox engine-budget:<day>
         kind trial   -> the trial lane: one `coach-trial:<slug>` card a day (goal mode, 2 h) while the lane's spend
                         (trial cards + coach_eval runs) today is under $10; logged as lane trial
         pending > 7 days whose gate still fails -> dropped with the reason
@@ -32,6 +34,7 @@ sys.path.insert(0, str(HERE))
 import coach_proposals as cp  # noqa: E402
 import coach_fixer as fx  # noqa: E402
 import coach_trial as ct  # noqa: E402
+import engine_budget as eb  # noqa: E402
 
 HOME = Path.home()
 SYNCED = ("skills", "desktop-plugins", "bin", "scripts", "local-fixes", "compute-rentals")  # hermes-sync SHARED_DIRS
@@ -112,7 +115,9 @@ def push_data(env, msg):
     f = env.data / "reports/proposals.jsonl"
     if not (env.data / ".git").exists():
         return "data repo is not git"
-    paths = [f.relative_to(env.data)] + [s.relative_to(env.data) for s in [fx.spend_log_path(env.data)] if s.exists()]
+    paths = [f.relative_to(env.data)] + [s.relative_to(env.data) for s in
+                                         [fx.spend_log_path(env.data), eb.state_dir(env.data) / "budget-stops.jsonl"]
+                                         if s.exists()]
     sha = git_commit(env, env.data, paths, msg)
     return (git_push(env, env.data) if sha else "nothing to commit")
 
@@ -567,7 +572,7 @@ def file_fix(env, p, dry=False, now=None, by_day=None, force=False, initial_stat
     have = fx.existing_card(env.home, env.board, p["target"])
     if have:
         return "carded", have["id"], f"already a card ({have['status']})"
-    ok, why, _usd = fx.gate(env.home, env.board, now, by_day)
+    ok, why, _usd = fx.gate(env.home, env.board, now, by_day, data=env.data)
     if not ok and not force:
         raise ApplyError(f"fixer lane closed: {why}")
     if dry:
@@ -623,6 +628,11 @@ def auto(env, dry=False, now=None, out=print):
     if not dry and (env.data / ".git").exists():
         fx.log_spend(env.data, by_day)
         fx.log_spend(env.data, trial_by_day, lane="trial")
+    try:  # in-flight enforcement: stop running engine cards over their card/lane/total budget (engine_budget.py)
+        wd = eb.watchdog(env.home, env.board, env.data, env.hermes, now, dry, out=lambda m: out("budget " + m))
+        done += [(c["id"], "budget stop", f"{why} -> {res}") for c, _u, _b, why, res in wd["stops"]]
+    except Exception as e:  # noqa: BLE001 — never block the rollout pass on the watchdog
+        out(f"budget watchdog failed: {type(e).__name__}: {e}")
     for p in sorted(cp.state(env.data).values(),
                     key=lambda q: (q.get("kind") not in ("fix", "trial"), q.get("at", ""))):
         st, pid = p.get("status"), p["id"]

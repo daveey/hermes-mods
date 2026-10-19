@@ -101,25 +101,28 @@ def spend_by_day(home, board, days=3, now=None, lane="fixer"):
         for task_id, _key, _run, started, sdb, sid, title, ended in fixer_runs(kdb, start.timestamp(), lane):
             day = out.setdefault(utc_day(started), {"usd": 0.0, "cards": {}, "runs": 0})
             day["runs"] += 1
-            usd = 0.0
-            sdb = sdb or str(Path(home) / "state.db")
-            if sdb not in conns and Path(sdb).exists():
-                conns[sdb] = _ro(sdb)
-            c = conns.get(sdb)
-            if c is not None and not sid and title:
-                # runs older than the worker-recovery ledger: the worker session carries the card title
-                r = c.execute("select id from sessions where source='kanban' and parent_session_id is null and "
-                              "title like ? and started_at between ? and ? order by started_at limit 1",
-                              (title[:60].replace("%", "_") + "%", started - 300, (ended or started + 14400))).fetchone()
-                sid = r[0] if r else None
-            if c is not None and sid:
-                usd = session_cost(c, sid)
+            usd = run_usd(home, conns, started, sdb, sid, title, ended)
             day["usd"] = round(day["usd"] + usd, 4)
             day["cards"][task_id] = round(day["cards"].get(task_id, 0.0) + usd, 4)
     finally:
         for c in conns.values():
             c.close()
     return out
+
+
+def run_usd(home, conns, started, sdb, sid, title, ended):
+    """Session cost of one worker run (subagents folded in). `conns` caches read-only state.db connections."""
+    sdb = sdb or str(Path(home) / "state.db")
+    if sdb not in conns and Path(sdb).exists():
+        conns[sdb] = _ro(sdb)
+    c = conns.get(sdb)
+    if c is not None and not sid and title:
+        # runs older than the worker-recovery ledger: the worker session carries the card title
+        r = c.execute("select id from sessions where source='kanban' and parent_session_id is null and "
+                      "title like ? and started_at between ? and ? order by started_at limit 1",
+                      (title[:60].replace("%", "_") + "%", started - 300, (ended or started + 14400))).fetchone()
+        sid = r[0] if r else None
+    return session_cost(c, sid) if c is not None and sid else 0.0
 
 
 def spend_log_path(data):
@@ -187,14 +190,20 @@ def existing_card(home, board, slug):
     return {"id": r[0], "status": r[1]} if r else None
 
 
-def gate(home, board, now=None, by_day=None):
-    """(ok, reason, today_usd). ok=False while the lane is at its daily card cap or spend cap."""
+def gate(home, board, now=None, by_day=None, data=None, snap=None):
+    """(ok, reason, today_usd). ok=False while the lane is at its daily card cap or spend cap, or the whole
+    improvement engine is at its $20/day total (engine_budget)."""
     now = now or time.time()
     day = utc_day(now)
     by_day = by_day or spend_by_day(home, board, 1, now)
     usd = by_day.get(day, {}).get("usd", 0.0)
     if usd >= FIXER_USD_DAY:
         return False, f"fixer lane spend today ${usd:.2f} >= ${FIXER_USD_DAY:.0f} cap", usd
+    import engine_budget as eb
+    snap = snap or eb.snapshot(home, board, data, now, by_lane={"fixer": by_day})
+    ok, why = eb.check(snap, "fixer")
+    if not ok:
+        return False, why, usd
     filed = fix_cards_filed(home, board, day)
     if len(filed) >= FIX_CARDS_PER_DAY:
         return False, f"fixer lane already filed {', '.join(filed)} today (cap {FIX_CARDS_PER_DAY}/day)", usd
@@ -257,7 +266,7 @@ def main(argv=None):
         if not a.no_log:
             print(f"logged to {log_spend(a.data, by_day)}")
         return 0
-    ok, why, usd = gate(a.home, a.board)
+    ok, why, usd = gate(a.home, a.board, data=a.data)
     print(f"fixer gate: {'open' if ok else 'closed'} (today ${usd:.2f}/${FIXER_USD_DAY:.0f}){': ' + why if why else ''}")
     return 0 if ok else 1
 
