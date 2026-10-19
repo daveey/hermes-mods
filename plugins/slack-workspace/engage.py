@@ -209,6 +209,19 @@ class Engagements:
     def test_inbox(self) -> bool:
         return bool(self.store.policy().get("test_inbox"))
 
+    # ---- notes for the follower (results coming back from another machine's session) --------
+    def add_note(self, eid: str, text: str, sender: str = "") -> int:
+        notes = self.store.kv_get("notes:" + eid) or []
+        notes.append({"text": text, "sender": sender, "at": time.time()})
+        self.store.kv_set("notes:" + eid, notes)
+        return len(notes)
+
+    def notes(self, eid: str) -> list[dict]:
+        return self.store.kv_get("notes:" + eid) or []
+
+    def take_notes(self, eid: str, n: int) -> None:
+        self.store.kv_set("notes:" + eid, self.notes(eid)[n:])
+
     # ---- escalations (Inbox cards) ----------------------------------------------------------
     def record_escalation(self, key: str, *, channel: str, thread: str, topic: str, title: str,
                           session_id: str = "", suppressed: Optional[dict] = None) -> None:

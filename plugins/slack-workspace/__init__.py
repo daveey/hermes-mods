@@ -784,8 +784,9 @@ def ftool_defer(peer, args: dict, session_id: str = "", **_) -> str:
     gw = peer.cfg().get("self_gateway") or ""
     me = f"@session:{peer.cfg().get('self_profile') or follow.DEFAULT_FOLLOWER}@{gw}/{session_id}" if gw and session_id else ""
     msg = (f"[From the Slack follower for {follow.scope_label(e)}, engagement {e['id']}]\n\n{args.get('message', '')}"
-           + (f"\n\nWhen done, send the result back with cross_session action=send target={me} "
-              f"(include what to post in thread {thread or '(top level)'})." if me else ""))
+           + f"\n\nWhen done, send the result back with slack_engagements(action='message', id='{e['id']}', "
+             f"text=<result, incl. what to post in thread {thread or '(top level)'}>)"
+           + (f" (or cross_session action=send target={me})." if me else "."))
     q = peer.engs().queue_mbp(e["id"], target, msg, ch, thread)
     return _out({"ok": True, "queued": q["id"], "target": target,
                  "note": "Delivered by the bot gateway's tick within ~1 min when the Desktop is online; "
@@ -805,8 +806,12 @@ def ftool_engage(peer, args: dict, session_id: str = "", **_) -> str:
     return _out(follow.engagement_op(peer.engs(), "create", args))
 
 
-def ftool_engagements(peer, args: dict, **_) -> str:
+def ftool_engagements(peer, args: dict, session_id: str = "", **_) -> str:
     op = args.get("action") or "list"
+    if op == "message" and not args.get("sender") and session_id:
+        gw = peer.cfg().get("self_gateway") or ""
+        prof = peer.cfg().get("self_profile") or "default"
+        args = dict(args, sender=f"@session:{prof}@{gw}/{session_id}" if gw else f"@session:{prof}/{session_id}")
     if peer.remote:
         return _out(peer.remote_op(op, args))
     return _out(follow.engagement_op(peer.engs(), op, args))
@@ -856,10 +861,14 @@ FSCHEMAS = {
         "test": {"type": "boolean", "description": "test engagement: escalations are recorded but kept out of "
                                                    "the owner's Inbox unless the test_inbox toggle is on"}},
         ["channel", "brief"], "any"),
-    "slack_engagements": ("List / get / pause / resume / end / update Slack engagements. update test=true|false "
+    "slack_engagements": ("List / get / pause / resume / end / update Slack engagements. action=message (id, text) "
+                          "sends a result to the engagement's follower, which posts what the channel needs. "
+                          "update test=true|false "
                           "marks a test engagement; action=test_inbox (enabled=true|false, omit to read) is the "
                           "global toggle for whether test engagements' escalations reach the Inbox (default off).", {
-        "action": {"type": "string", "enum": ["list", "get", "pause", "resume", "end", "update", "test_inbox"]},
+        "action": {"type": "string", "enum": ["list", "get", "pause", "resume", "end", "update", "message",
+                                              "test_inbox"]},
+        "text": {"type": "string", "description": "message: result/answer for the follower"},
         "id": {"type": "string"}, "brief": {"type": "string"}, "context": {"type": "string"},
         "kanban_ids": {"type": "array", "items": {"type": "string"}}, "budget": {"type": "string"},
         "until": {"type": "string"}, "test": {"type": "boolean"}, "enabled": {"type": "boolean"}}, [], "any"),

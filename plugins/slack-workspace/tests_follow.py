@@ -274,3 +274,17 @@ def test_owner_approved_post_bypasses_the_bot_cap_but_not_one_reply_per_message(
     assert not poster.post("C1", "a3", thread_ts="9.0", reply_to="13.0")["ok"]
     assert poster.post("C1", "a3", thread_ts="9.0", reply_to="13.0", owner_approved=True)["ok"]
     assert not poster.post("C1", "again", thread_ts="9.0", reply_to="13.0", owner_approved=True)["ok"]
+
+
+def test_message_op_wakes_the_follower_with_the_note_once(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    engs.update(e["id"], kickoff=0)
+    r = follow.engagement_op(engs, "message", {"id": e["id"], "text": "result: 42", "sender": "@session:default@mac/s1"})
+    assert r["ok"] and r["queued"] == 1
+    spawned = []
+    runner = make_runner(store, engs, spawned)
+    assert runner.run_once(e["id"])
+    assert "result: 42" in spawned[0][1] and "@session:default@mac/s1" in spawned[0][1]
+    assert not runner.run_once(e["id"])  # delivered once
+    assert follow.engagement_op(engs, "message", {"id": e["id"]})["ok"] is False  # needs text

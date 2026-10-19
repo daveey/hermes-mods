@@ -215,6 +215,12 @@ def engagement_op(engs: "engage.Engagements", op: str, args: dict) -> dict:
         return {"ok": False, "error": f"{op} needs id"}
     if not engs.get(eid):
         return {"ok": False, "error": f"no engagement {eid}"}
+    if op == "message":
+        # A result/answer for the follower from another session (e.g. the Mac session it deferred to).
+        if not (args.get("text") or "").strip():
+            return {"ok": False, "error": "message needs text"}
+        return {"ok": True, "queued": engs.add_note(eid, args["text"], args.get("sender") or ""),
+                "note": "the follower gets it within ~1 minute and posts what the channel needs"}
     if op == "get":
         e = engs.get(eid)
         return {"ok": True, "engagement": pub(e) | {"brief": e.get("brief"), "context": e.get("context")},
@@ -311,6 +317,19 @@ class Runner:
                 logger.warning("slack-follow %s kickoff failed rc=%s: %s", eid, rc, out[-500:])
                 return False
             return True
+        notes = self.engs.notes(eid)
+        if notes:
+            lines = [f"[Slack engagement {eid} · {scope_label(e)} · message for you]"]
+            for n in notes:
+                lines += [f"From {n.get('sender') or 'another session'}:", n["text"], ""]
+            lines += ["Act on it per the participation rules: usually post the headline in the thread that was "
+                      "waiting (slack_post), then end with a one-line activity note."]
+            rc, out = self.spawn(e, "\n".join(lines))
+            if rc != 0:
+                logger.warning("slack-follow %s note turn failed rc=%s: %s", eid, rc, out[-500:])
+                return False
+            self.engs.take_notes(eid, len(notes))
+            return True
         batch = self.engs.unhandled(eid, bot_user_id=bot)
         if not batch["newest"]:
             return False
@@ -406,7 +425,7 @@ class Runner:
                 except Exception:
                     logger.warning("slack-follow quiet card failed", exc_info=True)
                 self.engs.update(e["id"], warned_quiet=now)
-            if e.get("kickoff") or self.engs.unhandled(e["id"], bot_user_id=bot)["trigger"]:
+            if e.get("kickoff") or self.engs.notes(e["id"]) or self.engs.unhandled(e["id"], bot_user_id=bot)["trigger"]:
                 self.kick(e["id"])
         self.deliver_mbp(now)
 
