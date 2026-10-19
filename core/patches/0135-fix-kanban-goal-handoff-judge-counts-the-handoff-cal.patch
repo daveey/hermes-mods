@@ -1,0 +1,167 @@
+From 05f472115778a669bc79beebf3260f9f9553928a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 02:34:39 -0700
+Subject: [PATCH] fix(kanban): goal handoff judge counts the handoff call as
+ the card's finish step [daveey]
+
+Cards whose body ends 'Finish with kanban_request_review' could never reach review in goal
+mode: the gate judges inside the call, so the judge always saw the required final review
+handoff as unconfirmed and rejected it. Both handoff gates (tool + CLI) now pass the judge a
+grading note that the call being graded satisfies that step. Live replay of t_a6e9276d:
+old 3/3 rejected, new 3/3 done; an incomplete summary is still rejected 3/3.
+---
+ hermes_cli/goals.py                           | 19 ++++++++
+ hermes_cli/kanban.py                          | 10 +++--
+ .../test_kanban_goal_judge_affinity.py        | 43 +++++++++++++++++++
+ tools/kanban_tools.py                         |  5 ++-
+ 4 files changed, 71 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+index c00618e36b..087199c3b6 100644
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -891,6 +891,25 @@ def _call_goal_judge_llm(call_llm, system_prompt: str, user_prompt: str, timeout
+         return ""
+ 
+ 
++def handoff_judge_goal(title: str, body: Optional[str], handoff: str) -> str:
++    """Goal text for a kanban terminal-handoff gate (``kanban_complete`` / ``kanban_request_review``).
++
++    The gate runs *inside* the handoff call, before it returns. A card body that ends with
++    "Finish with kanban_request_review" lists that call as an acceptance item the judge can never
++    see confirmed, so every review handoff was rejected as "the final kanban_request_review has
++    not been performed". Tell the judge the call being graded is that step.
++    """
++    goal = f"{title}\n\n{body or ''}".strip()
++    if not goal:
++        return goal
++    return (
++        f"{goal}\n\n[Grading note: this verdict gates the worker's `{handoff}` call, which is being "
++        f"made right now and only takes effect if you answer done. Any instruction to finish with, "
++        f"hand off via, or request review through `{handoff}` (or a kanban review/complete "
++        f"handoff) is satisfied by this call; do not withhold done for it. Judge only the rest.]"
++    )
++
++
+ def judge_goal(
+     goal: str,
+     last_response: str,
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 46f19e0cb0..b7e5d0ac31 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -872,7 +872,8 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
+         return None
+ 
+ 
+-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
++def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
++                                 handoff_tool: str = "kanban_complete"):
+     """Goal judge for every terminal worker handoff (including review).
+ 
+     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
+@@ -895,7 +896,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
+     if client is None or not model:
+         return ("done", None)
+ 
+-    from hermes_cli.goals import judge_goal
++    from hermes_cli.goals import handoff_judge_goal, judge_goal
+ 
+     verdict, reason, transport_failed = "done", "", False
+     try:
+@@ -905,7 +906,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
+         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
+         try:
+             verdict, reason, _, _, transport_failed = judge_goal(
+-                goal=f"{task.title}\n\n{task.body or ''}".strip(),
++                goal=handoff_judge_goal(task.title, task.body, handoff_tool),
+                 last_response=evidence.strip())
+         finally:
+             if affinity_token is not None:
+@@ -930,7 +931,8 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint:
+     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
+     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
+     None to allow."""
+-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
++    tool = "kanban_request_review" if handoff.startswith("review") else "kanban_complete"
++    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, tool)
+     if verdict == "blocked":
+         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
+                 f"the goal unachievable — {rejection}. {blocked_hint}")
+diff --git a/tests/hermes_cli/test_kanban_goal_judge_affinity.py b/tests/hermes_cli/test_kanban_goal_judge_affinity.py
+index 3e8d40bc31..66bcc6414e 100644
+--- a/tests/hermes_cli/test_kanban_goal_judge_affinity.py
++++ b/tests/hermes_cli/test_kanban_goal_judge_affinity.py
+@@ -110,3 +110,46 @@ def test_goal_loop_judge_binds_per_task_affinity_scope():
+     assert result["outcome"] == "blocked_budget"
+     assert seen == ["kanban:task-7", "kanban:task-7"]
+     assert get_affinity_scope() is None
++
++
++_FINISH_WITH_REVIEW_BODY = "Fix the widget and add a test.\n\nDone when: tests pass. Finish with kanban_request_review."
++
++
++def _strict_handoff_judge(seen):
++    """Stand-in for the real judge's failure: it withholds ``done`` for an unperformed
++    "finish with kanban_request_review" step unless the goal says the call being graded is it."""
++    def fake_judge(*, goal, last_response, **_kw):
++        seen.append(goal)
++        if "Finish with kanban_request_review" in goal and "satisfied by this call" not in goal:
++            return ("continue", "the required final kanban_request_review has not been confirmed",
++                    False, None, False)
++        return ("done", "ok", False, None, False)
++    return fake_judge
++
++
++def test_tool_review_gate_counts_the_review_call_as_the_finish_step():
++    task = SimpleNamespace(id="t1", title="fix widget", body=_FINISH_WITH_REVIEW_BODY, goal_mode=True)
++    seen = []
++    with patch.object(kanban_tools, "_goal_judge_available", return_value=True), \
++            patch.object(kanban_tools, "judge_goal", side_effect=_strict_handoff_judge(seen)):
++        kanban_tools._goal_gate("kanban_request_review", task, "t1", "tests pass: 3/3")  # no raise
++    assert "`kanban_request_review` call" in seen[-1]
++    assert seen[-1].startswith("fix widget\n\n" + _FINISH_WITH_REVIEW_BODY)
++
++
++def test_cli_review_gate_counts_the_review_call_as_the_finish_step():
++    task = SimpleNamespace(id="t1", title="fix widget", body=_FINISH_WITH_REVIEW_BODY, goal_mode=True)
++    seen = []
++    with _aux_client(), patch("hermes_cli.goals.judge_goal", side_effect=_strict_handoff_judge(seen)):
++        assert kanban_cli._goal_mode_handoff_rejection(
++            task, "tests pass", "kanban_request_review") == ("done", None)
++    assert "`kanban_request_review` call" in seen[-1]
++
++
++def test_handoff_goal_text_keeps_real_criteria_and_names_the_tool():
++    from hermes_cli.goals import handoff_judge_goal
++
++    text = handoff_judge_goal("t", "Done when: X. Finish with kanban_complete.", "kanban_complete")
++    assert text.startswith("t\n\nDone when: X. Finish with kanban_complete.")
++    assert "`kanban_complete` call" in text and "Judge only the rest" in text
++    assert handoff_judge_goal("", None, "kanban_complete") == ""  # empty goal still skips
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 1988ff6b4d..3f0a1ae888 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -16,7 +16,7 @@ from contextlib import contextmanager
+ from typing import Any, Callable, Optional
+ 
+ from agent.redact import redact_sensitive_text
+-from hermes_cli.goals import judge_goal
++from hermes_cli.goals import handoff_judge_goal, judge_goal
+ from tools.registry import no_cache_check_fn, registry, tool_error
+ from hermes_cli.config import cfg_get, load_config
+ from tools.kanban_tools_schemas import (
+@@ -497,7 +497,8 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
+         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
+         try:
+             verdict, reason, _, _, transport_failed = judge_goal(
+-                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
++                goal=handoff_judge_goal(task.title, task.body, tool_name),
++                last_response=evidence.strip())
+         finally:
+             if affinity_token is not None:
+                 reset_affinity_scope(affinity_token)
+-- 
+2.54.0 (Apple Git-157)
+
