@@ -7,7 +7,8 @@ only while the lane's spend today is under FIXER_USD_DAY (stdlib only).
     coach_fixer.py gate [--data DIR]                           can a fix card be filed now? (exit 0 yes, 1 no)
 
 Called by `coach_apply.py auto` for every pending `kind: fix` proposal. Fixer cards = every card on the board
-with created_by "coach" (the Bot's `coach-fix:<slug>` cards and the panel's `coach-bug:<hash>` cards). A card's
+with created_by "coach" or a `coach-fix:<slug>` / `coach-bug:<hash>` idempotency key (Bot fix cards, panel bug cards,
+and fix cards a worker filed by hand with kanban_create). A card's
 cost is the summed session cost of its worker runs (state.db `estimated_cost_usd`, subagent sessions folded in),
 charged to the UTC day the run started.
 
@@ -62,7 +63,8 @@ def fixer_runs(kdb, since_ts):
              "from task_runs r join tasks t on t.id = r.task_id "
              + ("left join worker_recovery_sessions w on w.run_id = r.id " if has_rec else
                 "left join (select null run_id, null state_db, null session_id) w on 0 ")
-             + "where t.created_by = 'coach' and r.started_at >= ? order by r.started_at")
+             + "where (t.created_by = 'coach' or t.idempotency_key like 'coach-fix:%' "
+               "or t.idempotency_key like 'coach-bug:%') and r.started_at >= ? order by r.started_at")
         return k.execute(q, (int(since_ts),)).fetchall()
 
 
