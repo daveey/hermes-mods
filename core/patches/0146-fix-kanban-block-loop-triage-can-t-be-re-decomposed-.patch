@@ -1,0 +1,503 @@
+From 46bdd1298e5a3a02564e47d7f60bde196f863452 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:32:58 -0700
+Subject: [PATCH] fix(kanban): block-loop triage can't be re-decomposed;
+ needs_input reason change isn't a loop; unblock/promote exit triage [daveey]
+
+A shipped goal-mode card escalated by block_loop_detected was re-decomposed
+into 5 children that re-implemented the shipped feature, because a human
+comment lifted the awaiting-human skip.
+
+- kanban_db.decomposition_refusal: cards that already ran (started_at or any
+  task_runs row) or were ever escalated by block_loop_detected are never
+  decomposition candidates; list_triage_ids (auto sweep + decompose --all)
+  drops them and decompose_task refuses them unless force=True
+  (hermes kanban decompose --force).
+- _route_block: a worker needs_input re-block whose reason changed restarts
+  the recurrence count (progress, not a loop); rekinded dependency waits
+  still count.
+- unblock_task / kanban_unblock and promote_task accept triage -> ready
+  (parent-gated), so no raw SQL is needed.
+---
+ hermes_cli/kanban.py                        |   7 +-
+ hermes_cli/kanban_db.py                     |  93 +++++++++++++++---
+ hermes_cli/kanban_decompose.py              |  23 +++--
+ hermes_cli/kanban_parser.py                 |   9 +-
+ tests/hermes_cli/test_kanban_block_kinds.py | 103 +++++++++++++++++++-
+ tools/kanban_tools.py                       |   4 +-
+ tools/kanban_tools_schemas.py               |   3 +-
+ website/docs/user-guide/features/kanban.md  |  11 ++-
+ 8 files changed, 221 insertions(+), 32 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index b7e5d0ac31..e8cad65478 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1362,7 +1362,12 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
+     """Fan a triage task (or all) out into child tasks via the auxiliary LLM."""
+     from hermes_cli import kanban_decompose as decomp
+ 
+-    return _run_triage_sweep(args, "decompose", decomp, decomp.decompose_task, "decomposed",
++    force = bool(getattr(args, "force", False))
++
++    def run_one(tid: str, *, author: str):
++        return decomp.decompose_task(tid, author=author, force=force)
++
++    return _run_triage_sweep(args, "decompose", decomp, run_one, "decomposed",
+                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
+ 
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e90d1be4ce..924b51a835 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3221,6 +3221,10 @@ def block_task(
+         new_status, event_kind, set_sql, params, payload = _route_block(
+             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
++            prev_reason=_latest_block_reason(conn, task_id),
++            # A dependency re-kinded to needs_input is an impossible wait, not a
++            # human question: its rewording is no progress.
++            compare_reason=requested_kind == "needs_input",
+         )
+         if rekind_reason:
+             payload["requested_kind"] = requested_kind
+@@ -3286,9 +3290,27 @@ def _latest_run_blocker(conn: sqlite3.Connection, task_id: str) -> Optional[str]
+     return None
+ 
+ 
++def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """``reason`` of the newest ``blocked``/``block_loop_detected`` event, if any. [daveey]"""
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? "
++        "AND kind IN ('blocked', 'block_loop_detected') ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if row is None:
++        return None
++    value = _json_dict(_row_get(row, "payload")).get("reason")
++    return value if isinstance(value, str) else None
++
++
++def _normalized_reason(reason: Optional[str]) -> str:
++    return " ".join((reason or "").split()).casefold()
++
++
+ def _route_block(
+     kind: Optional[str], reason: Optional[str], source_status: str, *,
+-    prev_kind: Optional[str], prev_recurrences: int,
++    prev_kind: Optional[str], prev_recurrences: int, prev_reason: Optional[str] = None,
++    compare_reason: bool = False,
+ ) -> tuple[str, str, str, tuple, dict]:
+     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
+ 
+@@ -3302,11 +3324,19 @@ def _route_block(
+     incoming one means blocked -> unblocked -> re-block for the same cause
+     (un-typed None compares equal to a prior un-typed block). At
+     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
++
++    A ``needs_input`` re-block whose reason differs from the previous block's
++    is progress (the human answered one question, the worker asks the next),
++    not a loop, so it restarts the count at 1. [daveey]
+     """
+     payload = {"reason": reason, "kind": kind, "source_status": source_status}
+     if kind == "dependency":
+         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
++    same_cause = prev_kind == kind and (
++        not (compare_reason and kind == "needs_input")
++        or _normalized_reason(reason) == _normalized_reason(prev_reason)
++    )
++    recurrences = prev_recurrences + 1 if same_cause else 1
+     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+     if recurrences >= BLOCK_RECURRENCE_LIMIT:
+@@ -3549,21 +3579,27 @@ def request_changes(
+     return True, implementer
+ 
+ 
++_PROMOTABLE_STATUSES = ("todo", "blocked", "triage")
++
++
+ def promote_task(
+     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
+     dry_run: bool = False,
+ ) -> tuple[bool, Optional[str]]:
+-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
++    """Operator promotion ``todo``/``blocked``/``triage`` -> ``ready`` with an
++    audit event. ``triage`` is the supported exit for a card a block loop
++    escalated (or any triage card a human has already specified) without
++    running the specifier/decomposer. [daveey]
+     Refused while a parent is unfinished; ``dry_run`` only validates.
+     Returns ``(ok, reason)``."""
+     cur_status = _task_status(conn, task_id)
+     if cur_status is None:
+         return False, f"task {task_id} not found"
+ 
+-    if cur_status not in ("todo", "blocked"):
++    if cur_status not in _PROMOTABLE_STATUSES:
+         return False, (
+             f"task {task_id} is {cur_status!r}; promote only applies to "
+-            f"'todo' or 'blocked'"
++            f"'todo', 'blocked' or 'triage'"
+         )
+ 
+     # No override: claim_task demotes ready -> todo on an undone parent whichever
+@@ -3589,11 +3625,14 @@ def promote_task(
+     with write_txn(conn):
+         upd = conn.execute(
+             "UPDATE tasks SET status = 'ready' "
+-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
++            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')", (task_id,),
+         )
+         if upd.rowcount != 1:
+             return False, f"task {task_id} status changed during promotion"
+-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
++        _append_event(conn, task_id, "promoted_manual", {
++            "actor": actor, "reason": reason,
++            **({"from_status": cur_status} if cur_status != "todo" else {}),
++        })
+ 
+     return True, None
+ 
+@@ -3629,17 +3668,19 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
+ 
+ 
+ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
+-    when that is where it left off), closing any leaked run first."""
++    """``blocked``/``scheduled``/``triage`` -> its resumable phase (parent
++    re-gated; ``review`` when that is where it left off), closing any leaked run
++    first. ``triage`` is accepted so a card a block loop escalated can go back
++    to work without the specifier/decomposer rewriting it. [daveey]"""
+     now = int(time.time())
+     with write_txn(conn):
+         resume_status = (
+             _resume_status_from_events(conn, task_id)
+-            if _task_status(conn, task_id) == "blocked"
++            if _task_status(conn, task_id) in ("blocked", "triage")
+             else "ready"
+         )
+         _reclaim_dangling_run(
+-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
++            conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
+             note="invariant recovery on unblock",
+         )
+         # Re-gate on parent completion before restoring the source phase.
+@@ -3657,7 +3698,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+         cur = conn.execute(
+             "UPDATE tasks SET status = ?, current_run_id = NULL, "
+             "consecutive_failures = 0, last_failure_error = NULL "
+-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
++            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')", (new_status, task_id),
+         )
+         if cur.rowcount != 1:
+             return False
+@@ -3830,6 +3871,34 @@ def awaiting_human_after_block_loop(conn: sqlite3.Connection, task_id: str) -> b
+     return later is None
+ 
+ 
++def decomposition_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """Why *task_id* must not be specified/decomposed by the aux LLM, or None.
++
++    Only never-started cards are candidates. A card that has run (``started_at``
++    set or any ``task_runs`` row) carries shipped work and handoffs the LLM does
++    not see; re-decomposing it from its body re-implements the shipped feature.
++    A ``block_loop_detected`` escalation is a wait for a human, not a request
++    for a new spec. Either way the exit is ``hermes kanban promote`` /
++    ``kanban_unblock`` (triage -> ready). [daveey]
++    """
++    row = conn.execute("SELECT started_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return None
++    ran = row["started_at"] is not None or conn.execute(
++        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,),
++    ).fetchone() is not None
++    if ran:
++        return ("task has already run; decomposing it would redo its shipped work. "
++                f"Return it to work with `hermes kanban promote {task_id}` or kanban_unblock")
++    if conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'block_loop_detected' LIMIT 1",
++        (task_id,),
++    ).fetchone() is not None:
++        return ("task was escalated to triage by block-loop detection and is waiting for a human; "
++                f"return it to work with `hermes kanban promote {task_id}` or kanban_unblock")
++    return None
++
++
+ def specify_triage_task(
+     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+diff --git a/hermes_cli/kanban_decompose.py b/hermes_cli/kanban_decompose.py
+index 6a4cf5225e..f4e74e9d52 100644
+--- a/hermes_cli/kanban_decompose.py
++++ b/hermes_cli/kanban_decompose.py
+@@ -305,13 +305,20 @@ def decompose_task(
+     *,
+     author: Optional[str] = None,
+     timeout: Optional[int] = None,
++    force: bool = False,
+ ) -> DecomposeOutcome:
+     """Decompose a triage task into a graph of child tasks. Expected failures
+     (not in triage, no aux client, API error, malformed/empty reply) surface
+-    as ``ok=False``."""
++    as ``ok=False``. A card that already ran or was escalated by a block loop
++    is refused (:func:`kanban_db.decomposition_refusal`) unless ``force``."""
+     task, reason = _load_triage_task(task_id)
+     if task is None:
+         return DecomposeOutcome(task_id, False, reason)
++    if not force:
++        with kbc.connect_closing() as conn:
++            refusal = kb.decomposition_refusal(conn, task_id)
++        if refusal:
++            return DecomposeOutcome(task_id, False, refusal)
+ 
+     routing = _load_routing(root_assignee=task.assignee)
+     raw, reason = _call_aux(
+@@ -337,14 +344,16 @@ def decompose_task(
+ 
+ 
+ def list_triage_ids(*, tenant: Optional[str] = None, skip_awaiting_human: bool = False) -> list[str]:
+-    """Return task ids currently in the triage column.
++    """Return the triage task ids that are decomposition candidates.
+ 
+-    ``skip_awaiting_human`` (the dispatcher's auto-decompose sweep) drops cards
+-    that ``block_loop_detected`` escalated for a human and that have had no human
+-    input since; explicit specify/decompose of one id still works on them.
++    Every sweep (the dispatcher's auto-decompose and ``decompose --all``) drops
++    cards that already ran or that ``block_loop_detected`` escalated, even after
++    a human comments on them (:func:`kanban_db.decomposition_refusal`); those wait
++    for ``promote``/``unblock``. ``skip_awaiting_human`` is kept for callers and
++    is now implied. [daveey]
+     """
++    del skip_awaiting_human
+     with kbc.connect_closing() as conn:
+         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
+-        if skip_awaiting_human:
+-            rows = [row for row in rows if not kb.awaiting_human_after_block_loop(conn, row.id)]
++        rows = [row for row in rows if kb.decomposition_refusal(conn, row.id) is None]
+     return [row.id for row in rows]
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 8a65d41346..83aa80e1f5 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -331,7 +331,7 @@ _SPECS = [
+     _cmd("unblock", [
+         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+         _TASK_IDS,
+-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
++    ], help="Return blocked/scheduled/triage tasks to ready, or todo while parents remain open"),
+     _cmd("request-review", [
+         _TASK_ID,
+         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
+@@ -353,7 +353,7 @@ _SPECS = [
+         _bulk_ids("promote"),
+         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
+         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
+-    ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
++    ], help="Manually move one or more todo/blocked/triage tasks to ready (recovery path)"),
+     _cmd("archive", [
+         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
+         _arg("--rm", dest="purge_ids", nargs="+",
+@@ -429,7 +429,10 @@ _SPECS = [
+          help="Flesh out a triage-column task into a concrete spec (title + "
+               "body) and promote it to todo. Uses the auxiliary LLM "
+               "configured under auxiliary.triage_specifier."),
+-    _cmd("decompose", _triage_sweep_args("decompose", "Decompose", "decomposer"),
++    _cmd("decompose", (*_triage_sweep_args("decompose", "Decompose", "decomposer"),
++                       _arg("--force", action="store_true",
++                            help="Decompose even a card that already ran or was escalated by "
++                                 "block-loop detection (normally refused: it redoes shipped work)")),
+          help="Decompose a triage-column task into a graph of child tasks "
+               "routed to specialist profiles by description. Falls back "
+               "to specify-style single-task promotion when the task "
+diff --git a/tests/hermes_cli/test_kanban_block_kinds.py b/tests/hermes_cli/test_kanban_block_kinds.py
+index be959f21bc..66cd7579cf 100644
+--- a/tests/hermes_cli/test_kanban_block_kinds.py
++++ b/tests/hermes_cli/test_kanban_block_kinds.py
+@@ -227,19 +227,112 @@ def test_auto_decompose_sweep_skips_block_loop_escalation(kanban_home: Path) ->
+     swept = decomp.list_triage_ids(skip_awaiting_human=True)
+     assert plain in swept
+     assert looped not in swept
+-    # The explicit/CLI listing is unchanged.
+-    assert looped in decomp.list_triage_ids()
++    # ``decompose --all`` is a sweep too: it skips the escalation as well.
++    assert looped not in decomp.list_triage_ids()
+ 
+ 
+-def test_human_comment_after_escalation_reenables_auto_decompose(kanban_home: Path) -> None:
++def test_human_comment_after_escalation_does_not_reenable_auto_decompose(kanban_home: Path) -> None:
++    """A comment on a block-loop escalation is the human working the acceptance
++    step, not a request for a new spec: the sweep must still leave it alone
++    (it re-decomposed a shipped card into 5 re-implementation children)."""
+     from hermes_cli import kanban_decompose as decomp
+ 
+     with kbc.connect_closing() as conn:
+         looped = _loop_to_triage(conn)
+         kb.add_comment(conn, looped, "david", "Try channel 11 on the new AP.")
+-        assert kb.awaiting_human_after_block_loop(conn, looped) is False
++        assert kb.decomposition_refusal(conn, looped) is not None
+ 
+-    assert looped in decomp.list_triage_ids(skip_awaiting_human=True)
++    assert looped not in decomp.list_triage_ids(skip_awaiting_human=True)
++
++
++def _ran_then_triaged(conn) -> str:
++    """A card that has run and reached triage by some path other than a block loop."""
++    tid = _running_task(conn, title="shipped feature")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage', current_run_id=NULL, claim_lock=NULL "
++                     "WHERE id=?", (tid,))
++    return tid
++
++
++def test_decomposer_refuses_card_that_already_ran(kanban_home: Path, monkeypatch) -> None:
++    from hermes_cli import kanban_decompose as decomp
++
++    with kbc.connect_closing() as conn:
++        ran = _ran_then_triaged(conn)
++        fresh = kb.create_task(conn, title="rough idea", triage=True)
++        assert kb.decomposition_refusal(conn, fresh) is None
++        assert "already run" in (kb.decomposition_refusal(conn, ran) or "")
++
++    calls = []
++    monkeypatch.setattr(decomp, "_call_aux", lambda *a, **k: calls.append(a) or (None, "no aux"))
++    assert ran not in decomp.list_triage_ids(skip_awaiting_human=True)
++    assert fresh in decomp.list_triage_ids(skip_awaiting_human=True)
++    outcome = decomp.decompose_task(ran, author="auto-decomposer")
++    assert outcome.ok is False and "already run" in outcome.reason
++    assert calls == []  # refused before any LLM call
++    # An explicit --force still reaches the LLM.
++    decomp.decompose_task(ran, author="david", force=True)
++    assert len(calls) == 1
++
++
++def test_cli_decompose_threads_force_flag(kanban_home: Path, monkeypatch) -> None:
++    from hermes_cli import kanban_decompose as decomp
++
++    seen = []
++
++    def fake(tid, *, author=None, timeout=None, force=False):
++        seen.append(force)
++        return decomp.DecomposeOutcome(tid, False, "stub")
++
++    monkeypatch.setattr(decomp, "decompose_task", fake)
++    for force in (False, True):
++        args = argparse.Namespace(task_id="t_x", all_triage=False, author="david",
++                                  json=False, tenant=None, force=force)
++        kanban_cli._cmd_decompose(args)
++    assert seen == [False, True]
++
++
++def test_needs_input_reblock_with_new_reason_is_progress_not_a_loop(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running_task(conn)
++        kb.block_task(conn, tid, reason="Approve the Google sign-in on your iPhone", kind="needs_input")
++        kb.unblock_task(conn, tid)
++        _make_running_again(conn, tid)
++        kb.block_task(conn, tid, reason="Now tap Allow on the MacBook prompt", kind="needs_input")
++        task = kb.get_task(conn, tid)
++        assert task.status == "blocked"
++        assert task.block_recurrences == 1
++        # Same question again (only whitespace/case differs) IS a loop.
++        kb.unblock_task(conn, tid)
++        _make_running_again(conn, tid)
++        kb.block_task(conn, tid, reason="now tap allow on the  MacBook prompt", kind="needs_input")
++        assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_unblock_moves_block_loop_triage_card_back_to_ready(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        looped = _loop_to_triage(conn)
++        assert kb.unblock_task(conn, looped) is True
++        assert kb.get_task(conn, looped).status == "ready"
++        # Plain blocked/scheduled behaviour is unchanged; unknown/done still refused.
++        assert kb.unblock_task(conn, looped) is False
++
++
++def test_promote_moves_triage_card_to_ready_with_audit(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        looped = _loop_to_triage(conn)
++        ok, err = kb.promote_task(conn, looped, actor="david", reason="human step done")
++        assert ok, err
++        assert kb.get_task(conn, looped).status == "ready"
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='promoted_manual'",
++                          (looped,)).fetchone()
++        assert '"from_status": "triage"' in ev[0]
++        # Parent gating still applies to a triage card.
++        parent = kb.create_task(conn, title="p", assignee="worker")
++        child = kb.create_task(conn, title="c", triage=True)
++        kb.link_tasks(conn, parent_id=parent, child_id=child)
++        ok, err = kb.promote_task(conn, child, actor="david")
++        assert not ok and "unsatisfied parent" in err
+ 
+ 
+ def test_dispatcher_auto_decompose_tick_requests_human_skip(monkeypatch) -> None:
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 200fd01b59..0e96f82768 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1428,7 +1428,7 @@ def _maybe_subscribe_on_touch(conn: Any, task_id: str) -> bool:
+ 
+ @_kanban_handler("kanban_unblock")
+ def _handle_unblock(args: dict, **kw) -> str:
+-    """Transition a blocked task to ready, or todo while parents remain open."""
++    """Transition a blocked (or triage/scheduled) task to ready, or todo while parents remain open."""
+     _reject_delegated_child_mutation("kanban_unblock")
+     _require_orchestrator_tool("kanban_unblock")
+     tid = args.get("task_id")
+@@ -1436,7 +1436,7 @@ def _handle_unblock(args: dict, **kw) -> str:
+     tid = str(tid)
+     _enforce_worker_task_ownership(tid)
+     with _board(args.get("board")) as (kb, conn):
+-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
++        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
+         subscribed = _maybe_subscribe_on_touch(conn, tid)
+         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)),
+                    **({"subscribed": True} if subscribed else {}))
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 9d4b89e0c3..5ef197dbed 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -599,7 +599,8 @@ KANBAN_CREATE_SCHEMA = _schema(
+ KANBAN_UNBLOCK_SCHEMA = _schema(
+     "kanban_unblock",
+     (
+-        "Unblock a Kanban task. It moves to ready when all parents are done, "
++        "Unblock a Kanban task (blocked, scheduled, or a triage card a block "
++        "loop escalated). It moves to ready when all parents are done, "
+         "or todo while any parent remains open. Orchestrator-only — only "
+         "profiles with the kanban toolset can unblock routed work; "
+         "dispatcher-spawned task workers never see this tool."
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2f6607a8ff..3c21ee79b2 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -469,6 +469,15 @@ survives each unblock (it resets only on a successful `complete`). To keep an
+ unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
+ parent, missing input, unmet capability) before unblocking, or raise
+ `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
++
++A `needs_input` re-block whose reason text changed since the previous block
++(the human answered one question, the worker asks the next) counts as
++progress and restarts the counter at 1. A card escalated to `triage` this way,
++or any triage card that has already run, is never picked up by the
++specifier/decomposer sweeps (rewriting it from its body would redo shipped
++work), even after someone comments on it. Return it to work with
++`hermes kanban unblock <id>` / `kanban_unblock`, or `hermes kanban promote <id>`;
++`hermes kanban decompose <id> --force` overrides the refusal explicitly.
+ :::
+ 
+ ## Enabling tools for a chat profile
+@@ -999,7 +1008,7 @@ hermes kanban assign <id> <profile>                    # or 'none' to unassign
+ hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
+ hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
+         [--priority N]
+-hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
++hermes kanban promote <id>...                          # move todo/blocked/triage tasks to ready (recovery)
+ hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+ hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
+ hermes kanban link <parent_id> <child_id>
+-- 
+2.55.0
+

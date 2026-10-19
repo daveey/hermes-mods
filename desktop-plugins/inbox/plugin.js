@@ -10,6 +10,8 @@
  * gateway (owner route), which marks it read. Do it = POST …/accept (the session
  * moves to Recents) then submit the proposal's prompt into the chat. Typing a
  * reply accepts it too (agent-side hook). Archive = POST …/archive.
+ * ⌘⇧A on a message archives it and opens the next message; on the last one it
+ * steps to the next session like core's ⌘⇧A (ctx.registerArchiveHotkeyHandler).
  * An empty inbox shows one muted "Nothing to review" row.
  */
 import {
@@ -93,6 +95,15 @@ export function sessionPath(item) {
 export function itemFor(items, sessionId) {
   if (!sessionId) return null
   return items.find(i => i.session_id === sessionId) || null
+}
+
+/** The message ⌘⇧A opens after archiving `item`: the one below it, else the
+ *  top of what's left; null when it was the last one (core steps on). */
+export function nextItemAfter(items, item) {
+  const rest = items.filter(i => i !== item)
+  if (!rest.length) return null
+  const at = items.indexOf(item)
+  return (at >= 0 && items[at + 1]) || rest[0]
 }
 
 // ── store ───────────────────────────────────────────────────────────────────
@@ -198,12 +209,28 @@ export function createStore(ctx) {
     }
   }
 
+  // ⌘⇧A on an inbox message (core `session.archive` hotkey → handler): archive
+  // it through the inbox (owner gateway/profile) and open the next message;
+  // on the last one, hand back to core's own next-session step.
+  const archiveHotkey = ({ sessionId, isFocused, openNextSession }) => {
+    const items = $items.get()
+    const item = itemFor(items, sessionId)
+    if (!item) return false
+    const next = nextItemAfter(items, item)
+    void archive(item)
+    if (isFocused) {
+      if (next) open(next)
+      else openNextSession?.()
+    }
+    return true
+  }
+
   const setOpen = v => {
     $open.set(v)
     ctx.storage?.set?.('open', v)
   }
 
-  return { $items, $open, $busy, refresh, open, markRead, archive, accept, setOpen }
+  return { $items, $open, $busy, refresh, open, markRead, archive, archiveHotkey, accept, setOpen }
 }
 
 // ── UI ──────────────────────────────────────────────────────────────────────
@@ -324,6 +351,8 @@ export default {
     // Focusing a message (from any door) marks it read.
     const unsub = host.state.focusedStoredSessionId?.listen?.(sid => store.markRead(itemFor(store.$items.get(), sid)))
     if (unsub) ctx.onDispose?.(unsub)
+    // ⌘⇧A: archive + next inbox message (fork core; older cores archive via core).
+    ctx.registerArchiveHotkeyHandler?.(store.archiveHotkey)
     ctx.register({ id: 'section', area: SIDEBAR_SECTIONS_AREA, order: 5, render: () => jsx(Section, { store }) })
     ctx.register({ id: 'bar', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Bar, { store }) })
     log('registered')

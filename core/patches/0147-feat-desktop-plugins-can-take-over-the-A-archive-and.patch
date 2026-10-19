@@ -1,0 +1,275 @@
+From 2b646892911075a0ea9318beaaaa5d4dc7d8e881 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:37:27 -0700
+Subject: [PATCH] =?UTF-8?q?feat(desktop):=20plugins=20can=20take=20over=20?=
+ =?UTF-8?q?the=20=E2=8C=98=E2=87=A7A=20archive-and-advance=20hotkey=20[dav?=
+ =?UTF-8?q?eey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+New store/archive-hotkey.ts registry + ctx.registerArchiveHotkeyHandler: a
+handler claims the target session (e.g. an Inbox message, hidden from the
+sidebar and maybe on another gateway), archives it its own way and picks the
+next one; openNextSession() falls back to core's next-sidebar step. Unclaimed
+sessions archive through archiveSession as before. Tests: archive-hotkey.test.ts.
+---
+ apps/desktop/src/app/contrib/wiring.tsx       |  9 +-
+ apps/desktop/src/contrib/plugin.ts            |  8 ++
+ apps/desktop/src/store/archive-hotkey.test.ts | 88 +++++++++++++++++++
+ apps/desktop/src/store/archive-hotkey.ts      | 88 +++++++++++++++++++
+ 4 files changed, 192 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/store/archive-hotkey.test.ts
+ create mode 100644 apps/desktop/src/store/archive-hotkey.ts
+
+diff --git a/apps/desktop/src/app/contrib/wiring.tsx b/apps/desktop/src/app/contrib/wiring.tsx
+index 44b675a377..d6a16d7db7 100644
+--- a/apps/desktop/src/app/contrib/wiring.tsx
++++ b/apps/desktop/src/app/contrib/wiring.tsx
+@@ -43,6 +43,7 @@ import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
+ import { isMessagingSource } from '@/lib/session-source'
+ import { activateWakeIndicator } from '@/lib/wake-indicator'
+ import { playWakeSound } from '@/lib/wake-sound'
++import { dispatchArchiveHotkey } from '@/store/archive-hotkey'
+ import { $billingSettingsRequest } from '@/store/billing-block'
+ import { $desktopBoot } from '@/store/boot'
+ import { requestVoiceConversationStart } from '@/store/composer'
+@@ -1019,7 +1020,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
+     const next = nextSidebarSessionId(sessionId, 1, false, true)
+     const onDeselect = next && next !== sessionId ? () => openSession(next, navigate) : undefined
+ 
+-    void archiveSession(sessionId, { onDeselect })
++    // [daveey] A plugin that owns this session (Inbox) may archive it and pick
++    // the next one itself (`store/archive-hotkey.ts`); otherwise core archives.
++    dispatchArchiveHotkey(sessionId, {
++      archive: archiveSession,
++      focusedId: $focusedStoredSessionId.get(),
++      onDeselect
++    })
+   }, [archiveSession, navigate])
+ 
+   // Single global listener for every rebindable hotkey plus the on-screen
+diff --git a/apps/desktop/src/contrib/plugin.ts b/apps/desktop/src/contrib/plugin.ts
+index 568cfc9f86..bcd26afc20 100644
+--- a/apps/desktop/src/contrib/plugin.ts
++++ b/apps/desktop/src/contrib/plugin.ts
+@@ -25,6 +25,7 @@ import {
+ } from '@/lib/keybinds/plugin-actions'
+ import { readKey, writeKey } from '@/lib/storage'
+ import { type ArchiveGuard, registerArchiveGuard } from '@/store/archive-guards'
++import { type ArchiveHotkeyHandler, registerArchiveHotkeyHandler } from '@/store/archive-hotkey'
+ import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
+ import { $petActive } from '@/store/pet'
+ import { clearPetMessages, type PetSayOptions, sayPetMessage } from '@/store/pet-plugin-messages'
+@@ -128,6 +129,12 @@ export interface PluginContext {
+    *  error, so it can never block archiving. Removed on unload. Feature-detect
+    *  on older hosts: `ctx.registerArchiveGuard?.(...)`. */
+   registerArchiveGuard: (guard: ArchiveGuard) => () => void
++  /** [daveey] Take over the ⌘⇧A archive-and-advance hotkey for sessions this
++   *  plugin owns (e.g. Inbox messages). The handler gets the target id,
++   *  whether it is the open chat, and `openNextSession()` (core's own next
++   *  step); return true when handled, false to let core archive as usual.
++   *  Removed on unload. Feature-detect: `ctx.registerArchiveHotkeyHandler?.(...)`. */
++  registerArchiveHotkeyHandler: (handler: ArchiveHotkeyHandler) => () => void
+   /** Register an arbitrary cleanup to run on unload/disable — for side effects
+    *  that aren't contributions or sockets (store subscriptions, timers). Runs
+    *  alongside every other disposer when the plugin deactivates. */
+@@ -370,6 +377,7 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
+     registerMany: cs => track(registry.registerMany(cs.map(scope))),
+     registerSettingsPage: page => track(registry.register(scope(settingsPageContribution(page)))),
+     registerArchiveGuard: guard => track(registerArchiveGuard(source, guard)),
++    registerArchiveHotkeyHandler: handler => track(registerArchiveHotkeyHandler(source, handler)),
+     onDispose: fn => void track(fn),
+     onEvent: (type, listener) => track(onGatewayEvent(type, listener)),
+     ...createPluginLifetime(track),
+diff --git a/apps/desktop/src/store/archive-hotkey.test.ts b/apps/desktop/src/store/archive-hotkey.test.ts
+new file mode 100644
+index 0000000000..f15dec980b
+--- /dev/null
++++ b/apps/desktop/src/store/archive-hotkey.test.ts
+@@ -0,0 +1,88 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { createPluginContext } from '@/contrib/plugin'
++
++import {
++  dispatchArchiveHotkey,
++  registerArchiveHotkeyHandler,
++  resetArchiveHotkeyHandlersForTests,
++  runArchiveHotkeyHandlers
++} from './archive-hotkey'
++
++const base = { isFocused: true, openNextSession: () => {}, sessionId: 's1' }
++
++describe('archive hotkey handlers', () => {
++  afterEach(() => {
++    resetArchiveHotkeyHandlersForTests()
++    vi.restoreAllMocks()
++  })
++
++  it('core archives with its own next step when no handler claims the session', () => {
++    const archive = vi.fn()
++    const onDeselect = vi.fn()
++    registerArchiveHotkeyHandler('declines', () => false)
++
++    expect(dispatchArchiveHotkey('s1', { archive, focusedId: 's1', onDeselect })).toBe('core')
++    expect(archive).toHaveBeenCalledWith('s1', { onDeselect })
++  })
++
++  it('a claiming handler replaces core archive and gets the target, focus and core next step', () => {
++    const archive = vi.fn()
++    const onDeselect = vi.fn()
++    const seen: unknown[] = []
++
++    registerArchiveHotkeyHandler('inbox', ctx => {
++      seen.push({ id: ctx.sessionId, focused: ctx.isFocused })
++      ctx.openNextSession()
++
++      return true
++    })
++
++    expect(dispatchArchiveHotkey('s1', { archive, focusedId: 'other', onDeselect })).toBe('handled')
++    expect(archive).not.toHaveBeenCalled()
++    expect(seen).toEqual([{ id: 's1', focused: false }])
++    expect(onDeselect).toHaveBeenCalledTimes(1)
++  })
++
++  it('openNextSession is a no-op when core has no next session', () => {
++    registerArchiveHotkeyHandler('inbox', ctx => {
++      ctx.openNextSession()
++
++      return true
++    })
++
++    expect(dispatchArchiveHotkey('s1', { archive: vi.fn(), focusedId: 's1', onDeselect: undefined })).toBe('handled')
++  })
++
++  it('skips a handler that throws and keeps asking the rest in order', () => {
++    vi.spyOn(console, 'warn').mockImplementation(() => {})
++    const order: string[] = []
++    registerArchiveHotkeyHandler('boom', () => {
++      order.push('boom')
++      throw new Error('nope')
++    })
++    registerArchiveHotkeyHandler('ok', () => {
++      order.push('ok')
++
++      return true
++    })
++    registerArchiveHotkeyHandler('never', () => {
++      order.push('never')
++
++      return true
++    })
++
++    expect(runArchiveHotkeyHandlers(base)).toBe(true)
++    expect(order).toEqual(['boom', 'ok'])
++  })
++
++  it('plugin ctx.registerArchiveHotkeyHandler is removed when the plugin unloads', () => {
++    const disposers: Array<() => void> = []
++    const plugin = createPluginContext('inbox', dispose => disposers.push(dispose))
++    plugin.registerArchiveHotkeyHandler(() => true)
++
++    expect(runArchiveHotkeyHandlers(base)).toBe(true)
++    disposers.forEach(dispose => dispose())
++    expect(runArchiveHotkeyHandlers(base)).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/store/archive-hotkey.ts b/apps/desktop/src/store/archive-hotkey.ts
+new file mode 100644
+index 0000000000..47cf23f7a5
+--- /dev/null
++++ b/apps/desktop/src/store/archive-hotkey.ts
+@@ -0,0 +1,88 @@
++// [daveey] Archive-hotkey handlers: let a plugin take over the ⌘⇧A
++// "archive and advance" hotkey (`session.archive`) for the sessions it owns.
++//
++// Core's default archives the session through `archiveSession` and steps to
++// the next sidebar session. That is wrong for sessions that live in a plugin's
++// own list instead of the sidebar (e.g. Inbox messages: hidden from Recents,
++// possibly on another gateway). A handler sees the target id first; returning
++// true means "handled" and core does nothing else. To fall back to core's
++// navigation after archiving its last item, the handler calls
++// `openNextSession()`, which opens the session core itself would have picked.
++
++export interface ArchiveHotkeyContext {
++  /** The stored id the hotkey targets (the selected row, else the open chat). */
++  sessionId: string
++  /** Whether that session is the one open in the main view. */
++  isFocused: boolean
++  /** Open the session core's default would step to (next status-striped
++   *  sidebar row, else the plain neighbour). No-op when there is none. */
++  openNextSession: () => void
++}
++
++/** Return true when the handler archived (or deliberately ignored) the
++ *  session; false/undefined lets the next handler, then core, run. */
++export type ArchiveHotkeyHandler = (context: ArchiveHotkeyContext) => boolean | undefined | void
++
++const handlers = new Map<string, ArchiveHotkeyHandler>()
++
++/** Register a handler under a unique id; the disposer removes it. A second
++ *  registration under the same id replaces the first. */
++export function registerArchiveHotkeyHandler(id: string, handler: ArchiveHotkeyHandler): () => void {
++  handlers.set(id, handler)
++
++  return () => {
++    if (handlers.get(id) === handler) {
++      handlers.delete(id)
++    }
++  }
++}
++
++/** Offer the hotkey to each handler in registration order; true as soon as one
++ *  claims it. A handler that throws is skipped, so a broken plugin can never
++ *  break the hotkey. */
++export function runArchiveHotkeyHandlers(context: ArchiveHotkeyContext): boolean {
++  for (const handler of handlers.values()) {
++    try {
++      if (handler(context) === true) {
++        return true
++      }
++    } catch (error) {
++      console.warn('[archive-hotkey] handler failed', error)
++    }
++  }
++
++  return false
++}
++
++/** The ⌘⇧A dispatch: offer the target to the handlers, else run core's
++ *  `archive` with `onDeselect` (open the next sidebar session). Wiring passes
++ *  `archiveSession`; split out so both paths are unit-testable. */
++export function dispatchArchiveHotkey(
++  sessionId: string,
++  options: {
++    focusedId: null | string | undefined
++    onDeselect: (() => void) | undefined
++    archive: (sessionId: string, options: { onDeselect?: () => void }) => unknown
++  }
++): 'handled' | 'core' {
++  const { archive, focusedId, onDeselect } = options
++
++  if (
++    runArchiveHotkeyHandlers({
++      isFocused: focusedId === sessionId,
++      openNextSession: () => onDeselect?.(),
++      sessionId
++    })
++  ) {
++    return 'handled'
++  }
++
++  void archive(sessionId, { onDeselect })
++
++  return 'core'
++}
++
++/** Test seam. */
++export function resetArchiveHotkeyHandlersForTests(): void {
++  handlers.clear()
++}
+-- 
+2.55.0
+

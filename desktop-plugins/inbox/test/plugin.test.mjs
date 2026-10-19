@@ -141,3 +141,68 @@ test('markRead clears unread once and posts to the owning gateway', async () => 
   assert.deepEqual(apiCalls, [{ connectionId: 'mini', path: '/api/sessions/s5', method: 'PATCH', body: { unread: false } }])
   delete globalThis.window
 })
+
+test('nextItemAfter: the one below, else the top of what is left, null on the last', () => {
+  const [a, b, c] = [{ session_id: 'a' }, { session_id: 'b' }, { session_id: 'c' }]
+  assert.equal(m.nextItemAfter([a, b, c], a), b)
+  assert.equal(m.nextItemAfter([a, b, c], c), a)
+  assert.equal(m.nextItemAfter([a], a), null)
+})
+
+function hotkeyStore() {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [{ id: 'local', kind: 'local' }, { id: 'mini', kind: 'ssh' }] }
+  const opened = []
+  host.openSession = async (sid, opts) => { opened.push([sid, opts]) }
+  const ctx = fakeCtx(() => ({ ok: true, items: [] }))
+  const store = m.createStore(ctx)
+  return { ctx, store, opened }
+}
+
+test('archiveHotkey on an inbox message: archives via the inbox on its gateway and opens the next message', async () => {
+  const { ctx, store, opened } = hotkeyStore()
+  store.$items.set([{ session_id: 's1', gateway: 'mini' }, { session_id: 's2', gateway: 'local' }])
+  let coreNext = 0
+  assert.equal(store.archiveHotkey({ sessionId: 's1', isFocused: true, openNextSession: () => coreNext++ }), true)
+  assert.deepEqual(ctx.calls[0], ['/items/s1/archive', { method: 'POST', connectionId: 'mini' }])
+  assert.deepEqual(opened, [['s2', {}]])
+  assert.equal(coreNext, 0)
+  assert.deepEqual(store.$items.get().map(i => i.session_id), ['s2'])
+})
+
+test('archiveHotkey on the last message: archives it, then core steps to the next session', () => {
+  const { ctx, store, opened } = hotkeyStore()
+  store.$items.set([{ session_id: 's9', gateway: 'local' }])
+  let coreNext = 0
+  assert.equal(store.archiveHotkey({ sessionId: 's9', isFocused: true, openNextSession: () => coreNext++ }), true)
+  assert.deepEqual(ctx.calls[0], ['/items/s9/archive', { method: 'POST' }])
+  assert.deepEqual(opened, [])
+  assert.equal(coreNext, 1)
+})
+
+test('archiveHotkey on a selected-but-not-open message archives without navigating', () => {
+  const { ctx, store, opened } = hotkeyStore()
+  store.$items.set([{ session_id: 's1', gateway: 'local' }, { session_id: 's2', gateway: 'local' }])
+  let coreNext = 0
+  assert.equal(store.archiveHotkey({ sessionId: 's1', isFocused: false, openNextSession: () => coreNext++ }), true)
+  assert.equal(ctx.calls[0][0], '/items/s1/archive')
+  assert.deepEqual(opened, [])
+  assert.equal(coreNext, 0)
+})
+
+test('archiveHotkey leaves non-inbox sessions to core', () => {
+  const { ctx, store } = hotkeyStore()
+  store.$items.set([{ session_id: 's1', gateway: 'local' }])
+  assert.equal(store.archiveHotkey({ sessionId: 'other', isFocused: true, openNextSession: () => {} }), false)
+  assert.equal(ctx.calls.length, 0)
+})
+
+test('register hooks the archive hotkey when the core offers it, and tolerates older cores', () => {
+  const handlers = []
+  const base = { storage: { get: (k, f) => f, set() {} }, rest: async () => ({ items: [] }), setInterval() {}, register() {}, onDispose() {} }
+  host.state.focusedStoredSessionId = { get: () => null, listen: () => () => {} }
+  m.default.register({ ...base, registerArchiveHotkeyHandler: h => (handlers.push(h), () => {}) })
+  assert.equal(handlers.length, 1)
+  assert.equal(handlers[0]({ sessionId: 'nope', isFocused: true, openNextSession() {} }), false)
+  m.default.register(base)
+})

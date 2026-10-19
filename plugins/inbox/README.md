@@ -27,6 +27,7 @@ Re-posting with the same `key` updates the open message (new assistant note, tit
 - Opens rows on their own gateway (owner route).
 - Marks a message read through core's `PATCH /api/sessions/{id} {unread:false}` when its chat is focused.
 - Adds a composer bar (**Do it** / **Archive**) when the focused chat is an open message.
+- **⌘⇧A** on a message archives it and opens the next message (the one below, else the top); on the last one it steps to the next session like core's ⌘⇧A. Uses `ctx.registerArchiveHotkeyHandler` (fork core patch 0147, `core/plugin-archive-hotkey.md`); on an older core ⌘⇧A archives through core.
 
 The row's hover Archive button and bold unread title use the `actions`/`strong` props of `SidebarSectionRow` (fork core patch, see `core/sidebar-row-actions.md`). On an older core the row ignores them and still works: archive it from the composer bar.
 
