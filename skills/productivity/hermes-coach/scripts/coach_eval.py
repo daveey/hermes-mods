@@ -28,8 +28,10 @@ Two modes. Both print a markdown report (or JSON with --json) and exit 0 on PASS
              no plugins, its own state.db), never to the live home.
              Each episode = user ask + what the agent did (tool log) or the failed-fix exchange; the replay asks
              `hermes -z` (tools: todo, skills) for the next tool calls + the message it would send.
-             PASS = candidate passes >= 1 more target episode than baseline, no other pattern drops by more than
-             1, and the non-target total drops by at most 1. Spend is summed from --usage-file reports (token
+             PASS = the target gains >= max(2, n/4) passes (identical runs move one pattern by 2 of 6, so +1 is
+             noise), no other pattern drops by more than max(1, n/6), non-target net >= -max(1, n/6). Repeat a
+             run and pool it (--pool earlier.json, or `coach_eval.py verdict --target T a.json b.json`) to
+             shrink noise; the bar scales with n. Spend is summed from --usage-file reports (token
              estimate when the provider reports none), capped by --budget (default $5), and logged to
              research/state/spend.jsonl in the data repo as lane "trial".
 
@@ -697,33 +699,54 @@ def judge_all(items, runner, budget, model, batch=8, jobs=4):
     return res
 
 
+def min_gain(n):
+    """Target gain needed to beat run-to-run noise: identical baseline runs of the 36-episode benchmark moved a single
+    pattern by 2 of 6 (handoff 3/6 -> 5/6 on 2026-10-19), so a +1 on 6 episodes is noise."""
+    return max(2, -(-n // 4))
+
+
 def behavior_verdict(by_pattern, target):
-    """by_pattern: {pattern: {"base": passes, "cand": passes, "n": graded pairs}} -> (verdict, reasons)."""
+    """by_pattern: {pattern: {"base": passes, "cand": passes, "n": graded pairs}} -> (verdict, reasons).
+
+    PASS = target gain >= min_gain(n), no other pattern drops by more than max(1, n/6), non-target net >= -1 per
+    6 graded target episodes. Pool repeated runs (--pool) to shrink the noise instead of lowering the bar."""
     reasons, ok = [], True
     t = by_pattern.get(target)
     if not t or not t["n"]:
         return "INCOMPLETE", [f"no graded {target} episodes"]
-    d = t["cand"] - t["base"]
-    if d >= 1:
-        reasons.append(f"target {target}: {t['base']}/{t['n']} -> {t['cand']}/{t['n']} (+{d})")
+    d, need = t["cand"] - t["base"], min_gain(t["n"])
+    if d >= need:
+        reasons.append(f"target {target}: {t['base']}/{t['n']} -> {t['cand']}/{t['n']} (+{d}, needs +{need})")
     else:
         ok = False
-        reasons.append(f"no gain on target {target}: {t['base']}/{t['n']} -> {t['cand']}/{t['n']}")
-    other = 0
+        reasons.append(f"not enough gain on target {target}: {t['base']}/{t['n']} -> {t['cand']}/{t['n']} "
+                       f"({d:+d}, needs +{need} to beat run-to-run noise)")
+    other, slack = 0, max(1, t["n"] // 6)
     for pat, v in sorted(by_pattern.items()):
         if pat == target:
             continue
         dd = v["cand"] - v["base"]
         other += dd
-        if dd < -1:
+        if dd < -max(1, v["n"] // 6):
             ok = False
             reasons.append(f"regression on {pat}: {v['base']}/{v['n']} -> {v['cand']}/{v['n']}")
-    if other < -1:
+    if other < -slack:
         ok = False
         reasons.append(f"non-target patterns lost {-other} passes in total")
     else:
         reasons.append(f"non-target patterns net {other:+d}")
     return ("PASS" if ok else "REJECT"), reasons
+
+
+def pool_reports(reports):
+    """Sum by_pattern counts of several behavior reports (same candidate + benchmark)."""
+    tot = {}
+    for r in reports:
+        for pat, v in r["by_pattern"].items():
+            t = tot.setdefault(pat, {"base": 0, "cand": 0, "n": 0})
+            for k in t:
+                t[k] += v[k]
+    return tot
 
 
 def log_spend(data, usd, what, day=None):
@@ -824,6 +847,35 @@ def behavior_markdown(r):
     return "\n".join(lines) + "\n"
 
 
+def pooled_result(reports, target, names):
+    tot = pool_reports(reports)
+    verdict, reasons = behavior_verdict(tot, target)
+    return {"mode": "behavior-pooled", "candidate": reports[-1].get("candidate"), "target": target,
+            "verdict": verdict, "reasons": reasons, "by_pattern": tot, "runs": [
+                {"report": str(n), "verdict_own_target": r.get("verdict"), "own_target": r.get("target"),
+                 "by_pattern": r["by_pattern"], "cost_usd": r.get("cost_usd")} for n, r in zip(names, reports)],
+            "cost_usd": round(sum(float(r.get("cost_usd") or 0) for r in reports), 4)}
+
+
+def pooled_markdown(r):
+    lines = [f"# coach_eval behavior (pooled {len(r['runs'])} runs): {r['candidate']}", "",
+             f"Target pattern `{r['target']}`; total spend ${r['cost_usd']:.2f}.", "",
+             f"**Verdict: {r['verdict']}**", ""]
+    lines += [f"- {x}" for x in r["reasons"]]
+    hdr = " | ".join(f"run {i + 1}" for i in range(len(r["runs"])))
+    lines += ["", f"| pattern | pooled base/cand (n) | {hdr} |", "|---|---|" + "---|" * len(r["runs"])]
+    for pat in PATTERNS:
+        v = r["by_pattern"].get(pat)
+        if v:
+            cells = " | ".join(f"{x['by_pattern'].get(pat, {}).get('base', '-')}->"
+                               f"{x['by_pattern'].get(pat, {}).get('cand', '-')}" for x in r["runs"])
+            lines.append(f"| {pat}{' (target)' if pat == r['target'] else ''} | {v['base']}/{v['cand']} ({v['n']}) "
+                         f"| {cells} |")
+    lines += [""] + [f"- run {i + 1}: `{x['report']}` (own target {x['own_target']}: {x['verdict_own_target']}, "
+                     f"${float(x['cost_usd'] or 0):.2f})" for i, x in enumerate(r["runs"])]
+    return "\n".join(lines) + "\n"
+
+
 # ----------------------------------------------------------------------------------------------- CLI
 
 def main(argv=None):
@@ -856,10 +908,21 @@ def main(argv=None):
     h.add_argument("--out")
     h.add_argument("--json", action="store_true")
     h.add_argument("--no-log", action="store_true")
+    h.add_argument("--pool", action="append", default=[],
+                   help="earlier report .json of the same candidate + benchmark: the verdict is on the pooled counts")
+    v = sub.add_parser("verdict", help="recompute the (pooled) verdict of saved behavior reports; no model calls")
+    v.add_argument("reports", nargs="+")
+    v.add_argument("--target", required=True)
+    v.add_argument("--out")
+    v.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "detector":
         r = run_detector(a.set, a.rule, a.baseline, a.candidate, a.sets)
         md = detector_markdown(r)
+    elif a.cmd == "verdict":
+        reps = [json.loads(Path(f).read_text()) for f in a.reports]
+        r = pooled_result(reps, a.target, a.reports)
+        md = pooled_markdown(r)
     elif a.cmd == "bench-build":
         out = a.out or data_dir() / "eval" / "bench-v1.jsonl"
         if Path(out).exists():
@@ -881,9 +944,14 @@ def main(argv=None):
         r = run_behavior(cand, bench, a.target, a.budget, jobs=a.jobs, repeats=a.repeats, limit=a.limit,
                          patterns=a.patterns.split(",") if a.patterns else None,
                          model=a.model, log=lambda s: print(s, file=sys.stderr, flush=True))
-        md = behavior_markdown(r)
         if not a.no_log and r["cost_usd"] > 0:
             log_spend(data_dir(), r["cost_usd"], f"coach_eval behavior {r['candidate']} ({r['verdict']})")
+        md = behavior_markdown(r)
+        if a.pool:
+            run_md = md
+            r = pooled_result([json.loads(Path(f).read_text()) for f in a.pool] + [r], r["target"],
+                              a.pool + ["(this run)"])
+            md = pooled_markdown(r) + "\n---\n\n" + run_md
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
         Path(a.out).write_text(md)

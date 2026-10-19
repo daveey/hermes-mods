@@ -249,6 +249,24 @@ class BehaviorVerdict(unittest.TestCase):
         self.assertEqual(v({"unverified_done": {"base": 0, "cand": 2, "n": 6}, "handoff": {"base": 3, "cand": 2, "n": 6},
                             "control": {"base": 6, "cand": 5, "n": 6}}, "unverified_done")[0], "REJECT")
 
+    def test_plus_one_on_six_is_noise(self):
+        # the real 2026-10-19 confirmatory run: repeat_fix 3/6 -> 4/6, others net 0
+        r = ce.behavior_verdict({"repeat_fix": {"base": 3, "cand": 4, "n": 6}, "control": {"base": 6, "cand": 6, "n": 6}},
+                                "repeat_fix")
+        self.assertEqual(r[0], "REJECT")
+        self.assertIn("noise", r[1][0])
+        self.assertEqual([ce.min_gain(n) for n in (6, 12, 18)], [2, 3, 5])
+
+    def test_pooled_verdict(self):
+        a = {"candidate": "c", "target": "x", "verdict": "REJECT", "cost_usd": 1,
+             "by_pattern": {"repeat_fix": {"base": 3, "cand": 5, "n": 6}, "control": {"base": 6, "cand": 6, "n": 6}}}
+        b = {"candidate": "c", "target": "x", "verdict": "PASS", "cost_usd": 2,
+             "by_pattern": {"repeat_fix": {"base": 3, "cand": 4, "n": 6}, "control": {"base": 6, "cand": 6, "n": 6}}}
+        r = ce.pooled_result([a, b], "repeat_fix", ["a.json", "b.json"])
+        self.assertEqual((r["by_pattern"]["repeat_fix"], r["verdict"], r["cost_usd"]),
+                         ({"base": 6, "cand": 9, "n": 12}, "PASS", 3))
+        self.assertIn("pooled 2 runs", ce.pooled_markdown(r))
+
 
 # ------------------------------------------------------------------------------------------------- trial lane
 
