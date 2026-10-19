@@ -147,6 +147,13 @@ class Inbox:
                     _set_title(db, sid, title)
                     db.set_session_read(sid, False)
                     return {"session_id": sid, "updated": True}
+                talking = self._accepted_by_key(side, db, key) if key else None
+                if talking:  # the user replied to this card: the follow-up joins that conversation
+                    db.append_message(talking, "assistant", _update_text(body, accept_prompt, now))
+                    side.execute("UPDATE items SET updated_at=? WHERE session_id=?", (now, talking))
+                    side.commit()
+                    db.set_session_read(talking, False)
+                    return {"session_id": talking, "updated": True, "conversation": True}
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
@@ -168,6 +175,14 @@ class Inbox:
                                 "ORDER BY updated_at DESC", (key,)):
             s = db.get_session(row["session_id"])
             if s and not s.get("archived") and s.get("hidden"):
+                return row["session_id"]
+        return None
+
+    def _accepted_by_key(self, side, db, key) -> Optional[str]:
+        for row in side.execute("SELECT session_id FROM items WHERE key=? AND state='accepted' "
+                                "ORDER BY updated_at DESC", (key,)):
+            s = db.get_session(row["session_id"])
+            if s and not s.get("archived"):
                 return row["session_id"]
         return None
 

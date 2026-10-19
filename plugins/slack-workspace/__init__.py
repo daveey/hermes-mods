@@ -213,8 +213,14 @@ def _make_factory(state: State):
             try:
                 if isinstance(body, dict) and body.get("type") == "event_callback":
                     ev = body.get("event") or {}
-                    await asyncio.to_thread(state.store.record_event, ev, body.get("team_id") or "")
-                    engaged = await asyncio.to_thread(_route_event, state, ev)
+                    # Inline (a few ms of sqlite), not asyncio.to_thread: a busy default executor
+                    # delayed the ack past Slack's 3 s deadline and Slack redelivered the event.
+                    t0 = time.time()
+                    state.store.record_event(ev, body.get("team_id") or "")
+                    engaged = _route_event(state, ev)
+                    if engaged:
+                        logger.info("slack-follow: event %s (%s) swallowed in %.3fs", body.get("event_id"),
+                                    ev.get("type"), time.time() - t0)
             except Exception as exc:  # never break dispatch
                 logger.debug("slack-workspace observe failed: %s", exc)
             if engaged:  # the follower owns this channel/thread: ack and stop here
@@ -693,10 +699,19 @@ def _engaged_scope(peer, channel: str, thread: str) -> Optional[dict]:
     return peer.engs().active_for(channel, thread or "")
 
 
-def ftool_post(peer, args: dict, **_) -> str:
+def _is_inbox_card(peer, session_id: str) -> bool:
+    """True when this turn runs inside one of this profile's Inbox cards (the owner pressed Do it or
+    replied there)."""
+    try:
+        return bool(session_id and _inbox_for(peer.home).get(session_id))
+    except Exception:
+        return False
+
+
+def ftool_post(peer, args: dict, session_id: str = "", **_) -> str:
     p = follow.Poster(peer.engs(), peer.api, peer.bot_user_id)
     return _out(p.post(args.get("channel", ""), args.get("text", ""), args.get("thread_ts") or "",
-                       args.get("reply_to") or ""))
+                       args.get("reply_to") or "", owner_approved=_is_inbox_card(peer, session_id)))
 
 
 def ftool_react(peer, args: dict, **_) -> str:

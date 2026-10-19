@@ -11,7 +11,7 @@ Each message is a real session. It has the normal transcript, can be resumed and
 | accepted | **Do it** (sends `accept_prompt`), or you type any reply | un-hidden → a normal chat in Recents |
 | archived | Archive button (row hover / composer bar), `hermes inbox archive`, or the normal session archive | archived view (restorable) |
 
-Re-posting with the same `key` updates the open message (new assistant note, title, prompt; marked unread again) instead of adding a duplicate. At most 20 open messages are kept. Past that, the oldest read ones are archived.
+Re-posting with the same `key` updates the open message (new assistant note, title, prompt; marked unread again) instead of adding a duplicate. Once you replied to it (accepted, not archived), a re-post with that key lands in that chat as an unread update instead of opening a second card; after Archive the next post is a new card. At most 20 open messages are kept. Past that, the oldest read ones are archived.
 
 ## Posting
 

@@ -464,7 +464,10 @@ class Poster:
         rows = [r for r in self.engs.store.recent(channel, float(ts) - 0.0001, limit=5) if r["ts"] == ts]
         return rows[0] if rows else None
 
-    def post(self, channel: str, text: str, thread_ts: str = "", reply_to: str = "") -> dict:
+    def post(self, channel: str, text: str, thread_ts: str = "", reply_to: str = "",
+             owner_approved: bool = False) -> dict:
+        """``owner_approved``: the owner pressed Do it on an Inbox card (the bot cap is the follower's
+        own brake, not a limit on the owner)."""
         thread_ts = thread_ts or ""
         e = self.engs.active_for(channel, thread_ts or reply_to or "")
         if not e:
@@ -478,7 +481,7 @@ class Poster:
         if reply_to:
             m = self._message(channel, reply_to)
             to_bot = bool(m and m.get("bot") and m.get("user") != self.bot_user_id())
-            if to_bot and not self.engs.bot_turn_allowed(channel, thread_ts or reply_to):
+            if to_bot and not owner_approved and not self.engs.bot_turn_allowed(channel, thread_ts or reply_to):
                 return {"ok": False, "error": f"bot_loop_cap: {engage.BOT_TURN_CAP} bot-to-bot turns in this "
                                               "thread already; stop replying and post one Inbox card with "
                                               "slack_escalate (topic 'bot loop') instead"}

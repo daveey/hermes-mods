@@ -262,3 +262,15 @@ def test_new_engagements_use_the_follower_profile_from_policy(env):
     assert follow.engagement_op(engs, "create", {"channel": "C1", "brief": "b"})["engagement"]["follower_profile"] == "slack-follow"
     store.update_policy(follower={"profile": "my-follower"})
     assert follow.engagement_op(engs, "create", {"channel": "C2", "brief": "b"})["engagement"]["follower_profile"] == "my-follower"
+
+
+def test_owner_approved_post_bypasses_the_bot_cap_but_not_one_reply_per_message(env):
+    store, engs, api, poster = env
+    engs.create("C1", "a")
+    for i in range(4):
+        rec(store, "C1", f"{10 + i}.0", f"<@{BOTSELF}> q{i}", user="UOTHERBOT", thread="9.0", bot_id="BF")
+    for i in range(3):
+        assert poster.post("C1", f"a{i}", thread_ts="9.0", reply_to=f"{10 + i}.0")["ok"]
+    assert not poster.post("C1", "a3", thread_ts="9.0", reply_to="13.0")["ok"]
+    assert poster.post("C1", "a3", thread_ts="9.0", reply_to="13.0", owner_approved=True)["ok"]
+    assert not poster.post("C1", "again", thread_ts="9.0", reply_to="13.0", owner_approved=True)["ok"]

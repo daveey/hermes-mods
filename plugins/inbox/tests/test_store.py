@@ -174,3 +174,22 @@ def test_for_home_binds_a_profiles_own_state_db(tmp_path, monkeypatch):
         db.close()
     assert [i["session_id"] for i in store.Inbox.for_home(prof).list()] == [r["session_id"]]
     assert store.Inbox.for_home(tmp_path).list() == []
+
+
+def test_same_key_after_a_reply_lands_in_that_conversation_not_a_new_card(env):
+    """The user replied to a card (accepted -> a normal chat); a follow-up on the same key goes into
+    that chat, unread, instead of opening a duplicate card. Archived = dismissed: a new card."""
+    inbox, db, clock = env
+    a = inbox.post("Board seat?", "asked in #x", "post reply", key="slack:C1:1.0:board")
+    assert inbox.on_user_turn(a["session_id"])  # the user typed a reply
+    db.set_session_read(a["session_id"], True)
+    clock["t"] += 10
+    b = inbox.post("Board seat? (follow-up)", "asked again", "post reply 2", key="slack:C1:1.0:board")
+    assert b == {"session_id": a["session_id"], "updated": True, "conversation": True}
+    s = db.get_session(a["session_id"])
+    assert not s["hidden"] and float(s.get("last_read_at") or 0) < clock["t"]
+    assert "asked again" in db.get_messages(a["session_id"])[-1]["content"]
+    assert inbox.list() == []  # still a chat in Recents, not back in the Inbox
+    inbox.archive(a["session_id"])
+    c = inbox.post("Board seat? (3rd)", "again", "p", key="slack:C1:1.0:board")
+    assert c["session_id"] != a["session_id"] and not c["updated"]
