@@ -52,7 +52,15 @@ def session_cost(conn, sid, _seen=None):
     return total
 
 
-def fixer_runs(kdb, since_ts):
+# Which cards a lane pays for. Trial cards (coach_trial.py) are created_by coach too but belong to lane "trial".
+LANE_WHERE = {
+    "fixer": "((t.created_by = 'coach' and coalesce(t.idempotency_key, '') not like 'coach-trial:%') "
+             "or t.idempotency_key like 'coach-fix:%' or t.idempotency_key like 'coach-bug:%')",
+    "trial": "t.idempotency_key like 'coach-trial:%'",
+}
+
+
+def fixer_runs(kdb, since_ts, lane="fixer"):
     """[(task_id, idempotency_key, run_id, started_at, state_db, session_id)] for coach-created cards' runs."""
     with _ro(kdb) as k:
         cols = {r[1] for r in k.execute("pragma table_info(tasks)")}
@@ -63,12 +71,11 @@ def fixer_runs(kdb, since_ts):
              "from task_runs r join tasks t on t.id = r.task_id "
              + ("left join worker_recovery_sessions w on w.run_id = r.id " if has_rec else
                 "left join (select null run_id, null state_db, null session_id) w on 0 ")
-             + "where (t.created_by = 'coach' or t.idempotency_key like 'coach-fix:%' "
-               "or t.idempotency_key like 'coach-bug:%') and r.started_at >= ? order by r.started_at")
+             + f"where {LANE_WHERE[lane]} and r.started_at >= ? order by r.started_at")
         return k.execute(q, (int(since_ts),)).fetchall()
 
 
-def spend_by_day(home, board, days=3, now=None):
+def spend_by_day(home, board, days=3, now=None, lane="fixer"):
     """{day: {"usd": float, "cards": {task_id: usd}, "runs": n}} for the last `days` UTC days (today included)."""
     now = now or time.time()
     start = dt.datetime.fromtimestamp(now, dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -80,7 +87,7 @@ def spend_by_day(home, board, days=3, now=None):
         return out
     conns = {}
     try:
-        for task_id, _key, _run, started, sdb, sid, title, ended in fixer_runs(kdb, start.timestamp()):
+        for task_id, _key, _run, started, sdb, sid, title, ended in fixer_runs(kdb, start.timestamp(), lane):
             day = out.setdefault(utc_day(started), {"usd": 0.0, "cards": {}, "runs": 0})
             day["runs"] += 1
             usd = 0.0
@@ -108,8 +115,9 @@ def spend_log_path(data):
     return Path(data) / "research" / "state" / "spend.jsonl"
 
 
-def log_spend(data, by_day, host=None):
-    """Replace this host's lane-"fixer" rows for the given days in spend.jsonl (one row per day; idempotent)."""
+def log_spend(data, by_day, host=None, lane="fixer"):
+    """Replace this host's card-spend rows of `lane` for the given days in spend.jsonl (one row per day; idempotent).
+    Rows without a "cards" key (e.g. coach_eval runs logged under lane trial) are kept."""
     f = spend_log_path(data)
     f.parent.mkdir(parents=True, exist_ok=True)
     host = host or os.uname().nodename.split(".")[0]
@@ -121,12 +129,13 @@ def log_spend(data, by_day, host=None):
             except Exception:
                 keep.append(line)
                 continue
-            if not (r.get("lane") == "fixer" and r.get("date") in by_day and r.get("host", host) == host):
+            if not (r.get("lane") == lane and r.get("date") in by_day and r.get("host", host) == host
+                    and ("cards" in r or lane == "fixer")):
                 keep.append(line)
     at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     for day, d in sorted(by_day.items()):
         if d["runs"] or d["usd"]:
-            keep.append(json.dumps({"date": day, "at": at, "lane": "fixer", "usd": round(d["usd"], 4), "host": host,
+            keep.append(json.dumps({"date": day, "at": at, "lane": lane, "usd": round(d["usd"], 4), "host": host,
                                     "what": f"{d['runs']} run(s) on {len(d['cards'])} coach card(s)",
                                     "cards": d["cards"]}))
     f.write_text("\n".join(keep) + ("\n" if keep else ""))

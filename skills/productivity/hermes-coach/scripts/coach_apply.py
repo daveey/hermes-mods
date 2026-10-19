@@ -12,6 +12,8 @@
         review tier  -> a card on the `hermes` Kanban board (status carded)
         kind fix     -> the fixer lane: one `coach-fix:<slug>` card a day (1 h runtime) while the lane's spend
                         today is under $7; fixer spend is logged to research/state/spend.jsonl (lane fixer)
+        kind trial   -> the trial lane: one `coach-trial:<slug>` card a day (goal mode, 2 h) while the lane's spend
+                        (trial cards + coach_eval runs) today is under $10; logged as lane trial
         pending > 7 days whose gate still fails -> dropped with the reason
     coach_apply.py list --status all|pending|applied|canary|carded|rejected|dropped|reverted
 
@@ -26,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import coach_proposals as cp  # noqa: E402
 import coach_fixer as fx  # noqa: E402
+import coach_trial as ct  # noqa: E402
 
 HOME = Path.home()
 SYNCED = ("skills", "desktop-plugins", "bin", "scripts", "local-fixes", "compute-rentals")  # hermes-sync SHARED_DIRS
@@ -392,6 +395,30 @@ def file_fix(env, p, dry=False, now=None, by_day=None, force=False, initial_stat
     return "carded", (m.group(1) if m.groups() else m.group(0)), "filed"
 
 
+def file_trial(env, p, dry=False, now=None, by_day=None, force=False):
+    """Trial lane: (status, card, how), like file_fix. The card builds the idea behind a flag and gates it with
+    coach_eval.py; a pass becomes a normal proposal with its own tier."""
+    errs = ct.validate_trial(p)
+    if errs:
+        raise ApplyError("trial proposal invalid: " + "; ".join(errs))
+    have = ct.existing_card(env.home, env.board, p["target"])
+    if have:
+        return "carded", have["id"], f"already a card ({have['status']})"
+    ok, why, _usd = ct.gate(env.home, env.board, env.data, now, by_day)
+    if not ok and not force:
+        raise ApplyError(f"trial lane closed: {why}")
+    if dry:
+        return "carded", "dry-run", "would file"
+    r = sh([env.hermes, "kanban", "--board", env.board, "create", "--assignee", "default", "--json",
+            "--created-by", "coach", "--idempotency-key", f"coach-trial:{p['target']}", "--goal",
+            "--max-runtime", str(ct.TRIAL_RUNTIME_S), "--skill", "hermes-coach", "--body", ct.card_body(p),
+            ct.card_title(p)])
+    m = re.search(r'"id"\s*:\s*"([^"]+)"', r.stdout) or re.search(r"\bt_[0-9a-f]{6,}\b", r.stdout)
+    if not m:
+        raise ApplyError(f"kanban create gave no id: {r.stdout[-300:]}")
+    return "carded", (m.group(1) if m.groups() else m.group(0)), "filed"
+
+
 def canary_verdict(env, p, now):
     """KEEP | KEEP (provisional) | RAISE | REVERT from coach_weekly's before/after check."""
     import coach_mine, coach_weekly  # noqa: E401
@@ -405,9 +432,12 @@ def auto(env, dry=False, now=None, out=print):
     now = now or time.time()
     done = []
     by_day = fx.spend_by_day(env.home, env.board, 3, now)
+    trial_by_day = fx.spend_by_day(env.home, env.board, 3, now, lane="trial")
     if not dry and (env.data / ".git").exists():
         fx.log_spend(env.data, by_day)
-    for p in sorted(cp.state(env.data).values(), key=lambda q: (q.get("kind") != "fix", q.get("at", ""))):
+        fx.log_spend(env.data, trial_by_day, lane="trial")
+    for p in sorted(cp.state(env.data).values(),
+                    key=lambda q: (q.get("kind") not in ("fix", "trial"), q.get("at", ""))):
         st, pid = p.get("status"), p["id"]
         try:
             if st == "pending":
@@ -417,6 +447,12 @@ def auto(env, dry=False, now=None, out=print):
                     st2, card, how = file_fix(env, p, dry, now, by_day)
                     dry or mark(env, pid, st2, by="coach-apply auto", card=card, tier=tier,
                                 result=f"fix card {card} on board {env.board} ({how})")
+                    done.append((pid, "carded", f"{card} ({how})"))
+                    continue
+                if p.get("kind") == "trial":
+                    st2, card, how = file_trial(env, p, dry, now, trial_by_day)
+                    dry or mark(env, pid, st2, by="coach-apply auto", card=card, tier=tier,
+                                result=f"trial card {card} on board {env.board} ({how})")
                     done.append((pid, "carded", f"{card} ({how})"))
                     continue
                 if tier == "review":
@@ -509,11 +545,12 @@ def cmd_apply(env, a):
     p = get(env, a.id)
     if p.get("status") != "pending" and not a.force:
         raise SystemExit(f"{a.id} is {p.get('status')}; --force to apply anyway")
-    if p.get("kind") == "fix":  # file the fix card now; --force also passes the lane's daily caps
-        st, card, how = file_fix(env, p, a.dry_run, force=a.force)
-        print(f"{p['id']} fix:{p['target']} -> {card} ({how})")
+    if p.get("kind") in ("fix", "trial"):  # file the lane card now; --force also passes the lane's daily caps
+        st, card, how = (file_fix if p["kind"] == "fix" else file_trial)(env, p, a.dry_run, force=a.force)
+        print(f"{p['id']} {p['kind']}:{p['target']} -> {card} ({how})")
         if not a.dry_run:
-            mark(env, a.id, st, card=card, tier="review", result=f"fix card {card} on board {env.board} ({how})")
+            mark(env, a.id, st, card=card, tier="review",
+                 result=f"{p['kind']} card {card} on board {env.board} ({how})")
             print("data " + push_data(env, f"coach-apply: {a.id} carded"))
         return
     desc, run = plan(env, p)
