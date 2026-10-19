@@ -200,10 +200,15 @@ class Combined(unittest.TestCase):
                     gc.collect()
 
     def test_unselected_short_unknown_and_exact_cutoff_unchanged(self):
+        # Core (fork f8ff20e57b) rotates on the first 429 once the window exceeds
+        # LIVE_RETRY_WAIT_CAP_S (60s); the plugin's >600s bump only re-enters that
+        # same rotate branch. Unknown and short windows still retry once.
         from agent import agent_runtime_helpers as h
+        from agent.retry_utils import LIVE_RETRY_WAIT_CAP_S
         manager = self.load()
         self.assert_active(manager)
-        for delay in (None, 599, 600, 601):
+        cap = int(LIVE_RETRY_WAIT_CAP_S)
+        for delay in (None, 30, cap, cap + 1, 599, 600, 601):
             pool = Mock()
             pool.entries.return_value = []
             pool.current.return_value = None
@@ -212,8 +217,9 @@ class Combined(unittest.TestCase):
                 result = h._recover_rate_limit(pool, has_retried_429=False,
                     error_context={} if delay is None else {'reset_at': 2_000_000_000 + delay},
                     api_key_hint=None, credential_id=None, rotate_and_swap=rotate)
-            self.assertEqual(result, (True, False) if delay == 601 else (False, True))
-            self.assertEqual(rotate.call_count, int(delay == 601))
+            long_window = delay is not None and delay > cap
+            self.assertEqual(result, (True, False) if long_window else (False, True), delay)
+            self.assertEqual(rotate.call_count, int(long_window), delay)
 
 
 if __name__ == '__main__':

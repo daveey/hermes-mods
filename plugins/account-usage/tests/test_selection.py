@@ -2,8 +2,8 @@
 
 Uses REAL installed core methods with only disk/network boundaries replaced.
 Never loads the user's credential store and never performs provider requests.
-Run Contract for RED acceptance evidence; Characterization for observed behavior.
-No production selection feature is installed while these contract gates fail.
+Characterization pins the unsafe core seams (reclaim, _swap_credential) the
+plugin must never use; Contract pins the plugin's own path on the same fixtures.
 """
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -90,22 +90,99 @@ class Characterization(unittest.TestCase):
             'recorded_entry_id': 'B'})
 
 
+def _load_selection():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / 'selection.py'
+    name = 'account_usage_selection_contract'
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # dataclasses resolve their module by name
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def probe_plugin_choice(target='ready'):
+    """The plugin's own selection path over the SAME fixture rows probe_reclaim uses."""
+    from agent.account_usage_cache import _identity_id_for
+    selection = _load_selection()
+    now = time.time()
+    entries = [
+        PooledCredential(provider='openai-codex', id='ready', label='duplicate label',
+                         auth_type='oauth', priority=0, source='fixture',
+                         access_token='fixture-ready-not-a-secret', last_status='ok',
+                         base_url='https://chatgpt.com/backend-api/codex'),
+        PooledCredential(provider='openai-codex', id='cooling', label='duplicate label',
+                         auth_type='oauth', priority=1, source='fixture',
+                         access_token='fixture-cooling-not-a-secret', last_status='exhausted',
+                         last_status_at=now, last_error_reset_at=now + 86400,
+                         base_url='https://chatgpt.com/backend-api/codex'),
+    ]
+    target_entry = next(e for e in entries if e.id == target)
+    with patch.object(CredentialPool, '_persist') as persist, \
+         patch.object(CredentialPool, 'reclaim') as reclaim:
+        try:
+            snapshot = selection.choose_snapshot(
+                entries, provider='openai-codex', model='gpt-fixture',
+                account_id=_identity_id_for('openai-codex', target_entry),
+                base_url='https://chatgpt.com/backend-api/codex')
+            chosen = snapshot.entry_id
+        except selection.SelectionRejected:
+            chosen = None
+    return {'chosen': chosen,
+            'cooldown_status': next(e.last_status for e in entries if e.id == 'cooling'),
+            'persist_calls': persist.call_count, 'reclaim_calls': reclaim.call_count}
+
+
+def probe_plugin_anthropic_dispatch():
+    """Same agent fixture as probe_anthropic_dispatch, through the plugin's factory."""
+    selection = _load_selection()
+    agent = SimpleNamespace(provider='anthropic', model='claude-fixture',
+                            api_key='fixture-A', base_url='https://api.anthropic.com',
+                            _anthropic_api_key='fixture-A')
+    def build(key):
+        return SimpleNamespace(selected_key=key[1], default_headers={'x-api-key': key[1]},
+                               close=lambda: None)
+    agent._build_anthropic_client_for_key = build
+    snapshot = selection.CredentialSnapshot('anthropic', 'claude-fixture', 'acct-B', 'B',
+                                            'https://api.anthropic.com', 'fixture-B')
+    create = selection.anthropic_factory(ClientLifecycleMixin._create_request_anthropic_client)
+    token = selection._dispatch.set((agent, snapshot))
+    try:
+        client = create(agent, reason='selection-test')
+    finally:
+        selection._dispatch.reset(token)
+    return {'request_key': client.selected_key, 'shared_key_after': agent._anthropic_api_key}
+
+
 class Contract(unittest.TestCase):
+    """The plugin's selection path must hold what the core seams above do not.
+
+    These used to target the core seams directly (RED by design: those seams
+    are why the plugin never calls reclaim/_swap_credential). They now pin the
+    plugin's own path on the same fixtures.
+    """
     def test_click_must_not_clear_other_accounts_cooldowns(self):
-        result = probe_reclaim()
+        result = probe_plugin_choice()
+        self.assertEqual(result['chosen'], 'ready')
         self.assertEqual(result['cooldown_status'], 'exhausted',
-                         'Approved reclaim seam clears an unrelated future cooldown')
-        self.assertEqual(result['persist_calls'], 0)
+                         'Selecting an account clears an unrelated future cooldown')
+        self.assertEqual((result['persist_calls'], result['reclaim_calls']), (0, 0))
 
     def test_cooling_account_must_be_unavailable_not_reset(self):
-        self.assertIsNone(probe_reclaim('cooling')['chosen'],
-                          'Approved reclaim seam can return a cooling account after clearing it')
+        result = probe_plugin_choice('cooling')
+        self.assertIsNone(result['chosen'], 'A cooling account was selectable')
+        self.assertEqual(result['cooldown_status'], 'exhausted')
+        self.assertEqual((result['persist_calls'], result['reclaim_calls']), (0, 0))
 
     def test_selected_anthropic_identity_must_reach_request_client(self):
-        result = probe_anthropic_dispatch()
-        self.assertTrue(result['swapped'])
+        result = probe_plugin_anthropic_dispatch()
         self.assertEqual(result['request_key'], 'fixture-B',
                          'Request-client refresh overwrites the selection before dispatch')
+        self.assertEqual(result['shared_key_after'], 'fixture-A',
+                         'Selection must not swap the shared agent credential')
 
 
 if __name__ == '__main__':

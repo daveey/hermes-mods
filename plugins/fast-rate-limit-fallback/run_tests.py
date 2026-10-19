@@ -12,7 +12,11 @@ import sys
 import tempfile
 
 PLUGIN = Path(__file__).resolve().parent
+# The plugin used to live at ~/.hermes/plugins/<name>; from a hermes-mods clone
+# (symlinked into ~/.hermes/plugins) parents[1] is the clone, not the Hermes home.
 INSTALLED = PLUGIN.parents[1] / 'hermes-agent'
+if not INSTALLED.is_dir():
+    INSTALLED = Path(os.environ.get('HERMES_AGENT_ROOT') or Path.home() / '.hermes' / 'hermes-agent')
 parser = argparse.ArgumentParser()
 parser.add_argument('--repo', type=Path, default=INSTALLED)
 parser.add_argument('--test-site-packages', type=Path)

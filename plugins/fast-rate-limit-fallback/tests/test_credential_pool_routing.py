@@ -168,8 +168,8 @@ class TestPoolRotationCycle:
         agent._swap_credential.assert_called_once_with(entries[1])
 
     @pytest.mark.parametrize("reset_at", [
-        None, "invalid", float("nan"), float("inf"),
-        1_999_999_999, 2_000_000_030, 2_000_000_171, 2_000_000_600,
+        None, "invalid", float("nan"),
+        1_999_999_999, 2_000_000_030, 2_000_000_060,
     ])
     def test_first_429_short_or_unknown_reset_retries_same(self, reset_at):
         agent, pool, _ = self._make_agent_with_pool(3)
@@ -181,6 +181,23 @@ class TestPoolRotationCycle:
         assert (recovered, has_retried) == (False, True)
         pool.mark_exhausted_and_rotate.assert_not_called()
         agent._swap_credential.assert_not_called()
+
+    @pytest.mark.parametrize("reset_at", [
+        2_000_000_061, 2_000_000_171, 2_000_000_600, float("inf"),
+    ])
+    def test_first_429_past_live_wait_cap_rotates_in_core(self, reset_at):
+        # Core (fork f8ff20e57b) rotates on the first 429 once the window exceeds
+        # LIVE_RETRY_WAIT_CAP_S (60s), below this plugin's own 600s cutoff; an
+        # infinite reset parses as an infinitely long window.
+        agent, pool, entries = self._make_agent_with_pool(3)
+        with patch("agent.fallback_cooldown.time.time", return_value=2_000_000_000):
+            recovered, has_retried = agent._recover_with_credential_pool(
+                status_code=429, has_retried_429=False,
+                error_context={"message": "Rate limit", "reset_at": reset_at},
+            )
+        assert (recovered, has_retried) == (True, False)
+        pool.mark_exhausted_and_rotate.assert_called_once()
+        agent._swap_credential.assert_called_once_with(entries[1])
 
     def test_second_429_rotates_to_next(self):
         """Second consecutive 429 should rotate to next credential."""

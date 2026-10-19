@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import time
 from unittest.mock import MagicMock, patch
 import logging
 
@@ -58,7 +59,10 @@ def test_incompatible_core_warns_and_leaves_all_seams_alone(loaded_local_plugin,
     ctx.on_unload.assert_not_called()
 
 
-@pytest.mark.parametrize('delay, rotated', [(599, False), (600, False), (601, True)])
+# Core rotates past LIVE_RETRY_WAIT_CAP_S (60s) on its own since fork f8ff20e57b;
+# the plugin's 600s cutoff only re-enters that same rotate branch.
+@pytest.mark.parametrize('delay, rotated', [(30, False), (60, False), (61, True),
+                                            (599, True), (600, True), (601, True)])
 def test_exact_cutoff(delay, rotated):
     import agent.agent_runtime_helpers as helpers
     pool = MagicMock()
@@ -76,15 +80,20 @@ def test_exact_cutoff(delay, rotated):
 def test_other_profile_keeps_original_transient_policy(monkeypatch, tmp_path):
     import agent.agent_runtime_helpers as helpers
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    rotate = MagicMock(return_value=True)
-    pool = MagicMock()
-    pool.current.return_value = None
-    token = set_hermes_home_override(tmp_path / 'another-profile')
-    try:
-        result = helpers._recover_rate_limit(pool, has_retried_429=False,
-            error_context={'reset_at': 4_000_000_000}, api_key_hint=None,
-            credential_id=None, rotate_and_swap=rotate)
-    finally:
-        reset_hermes_home_override(token)
-    assert result == (False, True)
-    rotate.assert_not_called()
+    original = getattr(helpers._recover_rate_limit, '__wrapped__', helpers._recover_rate_limit)
+    results = []
+    for function in (helpers._recover_rate_limit, original):
+        rotate = MagicMock(return_value=True)
+        pool = MagicMock()
+        pool.current.return_value = None
+        # Short window: the only case where the plugin's has_retried_429 bump
+        # could differ from core (core itself rotates past 60s since f8ff20e57b).
+        context = {'reset_at': time.time() + 30}
+        token = set_hermes_home_override(tmp_path / 'another-profile')
+        try:
+            results.append((function(pool, has_retried_429=False, error_context=context,
+                                     api_key_hint=None, credential_id=None,
+                                     rotate_and_swap=rotate), rotate.call_count))
+        finally:
+            reset_hermes_home_override(token)
+    assert results[0] == results[1] == ((False, True), 0)
