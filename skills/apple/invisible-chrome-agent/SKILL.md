@@ -47,8 +47,12 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
   the click, hands activation to Chrome's pid; JXA as backup). Re-homing skips that window until the request
   succeeds (+3s grace) or 180s pass. A failed request (a hidden tab's `get` usually fails at once with
   NotAllowedError; sites retry) keeps the notification and the revealed window. One live notification per tab.
-  Without the app, or with its notifications denied, it falls back to the old osascript notification, which
-  belongs to Script Editor: clicking that opens Script Editor and shows nothing (the original bug).
+  There is deliberately no osascript fallback: `display notification` belongs to Script Editor, and clicking it
+  opens Script Editor and shows nothing (the original bug). Notifications not allowed for Hermes Touch ID → the
+  asking window is revealed on the main display at once (no activation) and the app shows a floating alert
+  (Show / Dismiss / Notification Settings…) whose Show works like the notification's. App missing → window
+  revealed and Chrome raised at once. Supervisor start and `status` print the permission and, when it is off,
+  the deep link `x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.hermes.chrome-agent.notify`.
   Conditional mediation (passkey autofill on page load) is ignored. This needs `Page.enable` +
   `Runtime.enable` on each page session: without them the script and binding vanish on the first cross-site
   navigation.
@@ -102,6 +106,12 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   just means the screen was locked).
 
 ## Pitfalls
+
+- **Chrome's tab-modal dialogs don't follow a window to another display.** "Use a saved passkey for <site>" is
+  a child window; after `Browser.setWindowBounds` moves its window to the main display it stays clamped to the
+  virtual one, so the revealed page shows dimmed with no dialog. `place()` therefore nudges the width (-1, then
+  back), which re-anchors the dialog on the window. Check with CGWindowList: the 448x387 Chrome window must sit
+  inside the revealed window's bounds.
 
 - **Notification permission is asked once per bundle id, and a withdrawn prompt counts as denied.** If the
   helper quits while macOS's "Hermes Touch ID Notifications" prompt is up, the app ends up denied (status

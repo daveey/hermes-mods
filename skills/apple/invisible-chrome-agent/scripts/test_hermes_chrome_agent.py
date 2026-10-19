@@ -86,8 +86,6 @@ class ClickThrough(unittest.TestCase):
         self.flag.start()
         self.activate = mock.patch.object(hca, "activate_pid")
         self.activated = self.activate.start()
-        self.osa = mock.patch.object(hca, "notify")
-        self.osa_notify = self.osa.start()
 
     def tearDown(self):
         mock.patch.stopall()
@@ -124,6 +122,15 @@ class ClickThrough(unittest.TestCase):
         s, proc = self._click("action show")
         self._assert_revealed(s, proc)
 
+    def test_reveal_reanchors_tab_modal_dialog(self):
+        # The passkey dialog is a child window that stays on the virtual display when only moved; the
+        # window must be resized after the move so Chrome re-anchors it on the main display.
+        s, proc = self._click("action default")
+        sets = [p["bounds"] for m, p in s.cdp.calls if m == "Browser.setWindowBounds" and p["windowId"] == 2]
+        moved = next(i for i, b in enumerate(sets) if b.get("left") == s.main_rect()[0])
+        self.assertEqual([b.get("width") for b in sets[moved + 1:moved + 3]],
+                         [sets[moved]["width"] - 1, sets[moved]["width"]])
+
     def test_settle_hides_again_after_grace(self):
         s, proc = self._click("action show")
         passkey_request(s, op="done")
@@ -158,17 +165,41 @@ class ClickThrough(unittest.TestCase):
         self.assertFalse(s.cdp.on_main(2))
         self.activated.assert_not_called()
 
-    def test_notifier_error_falls_back_to_osascript(self):
-        s = supervisor()
-        s.on_notifier_line("error not authorized: denied\n", "PK", FakeProc(), "T", "B")
-        self.osa_notify.assert_called_once_with("T", "B")
+    def test_no_osascript_notification_anywhere(self):
+        # An osascript "display notification" belongs to Script Editor: clicking it opens Script Editor (the bug).
+        src = pathlib.Path(_path).read_text()
+        self.assertNotIn("display notification", src)
+        self.assertFalse(hasattr(hca, "notify"))
 
-    def test_missing_notifier_falls_back_to_osascript(self):
+    def test_notifications_off_reveals_window_then_alert_show_activates(self):
+        s = supervisor()
+        proc = FakeProc()
+        s.notices["PK"] = proc
+        s.on_notifier_line("error not authorized: denied\n", "PK", proc, "T", "B")
+        c = s.cdp
+        self.assertTrue(c.on_main(2), "passkey window not revealed when notifications are off")
+        self.assertIn(("Target.activateTarget", {"targetId": "PK"}), c.calls)
+        self.activated.assert_not_called()                # Chrome stays behind the floating alert for now
+        for _ in range(3):
+            s.rehome()
+        self.assertTrue(c.on_main(2))
+        s.on_notifier_line("action show\n", "PK", proc)     # the alert's Show button
+        self.assertIn("activate 4242\n", proc.stdin.getvalue())
+        self.activated.assert_called_with(4242)
+
+    def test_missing_notifier_reveals_and_activates(self):
         s = supervisor()
         with mock.patch.object(hca, "NOTIFIER_BIN", "/nonexistent/notifier"):
             self.assertIsNone(s.notify_passkey("PK", "T", "B"))
-        self.osa_notify.assert_called_once_with("T", "B")
+        self.assertTrue(s.cdp.on_main(2))
+        self.activated.assert_called_with(4242)
 
+    def test_status_names_settings_link_when_not_allowed(self):
+        for st, ok in (("authorized style=banner", True), ("denied style=none", False),
+                       ("notDetermined style=none", False), ("not built", False)):
+            self.assertEqual(hca.notifier_ok(st), ok, st)
+        self.assertEqual(hca.NOTIFIER_SETTINGS_URL, "x-apple.systempreferences:com.apple.Notifications-Settings."
+                                                    "extension?id=com.hermes.chrome-agent.notify")
 
 if __name__ == "__main__":
     unittest.main()

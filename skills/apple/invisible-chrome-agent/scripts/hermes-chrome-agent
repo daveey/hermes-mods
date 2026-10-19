@@ -22,8 +22,10 @@ Stdlib only (runs under /usr/bin/python3). Configuration via environment:
 
 Passkey notifications come from "Hermes Touch ID.app" (notifier.swift, built by `install`): clicking the
 notification or its Show button moves the window holding the asking tab onto the main display, selects that
-tab and brings Chrome to the front until the request settles. Without the app (or with notifications denied
-for it) the supervisor falls back to a plain osascript notification, which cannot be clicked through.
+tab and brings Chrome to the front until the request settles. If notifications are not allowed for the app,
+it reveals the asking window on the main display at once and the app shows a floating alert with a Show button
+instead. If the app is missing, the window is revealed and Chrome brought forward right away. There is no
+osascript fallback: an osascript notification belongs to Script Editor and cannot bring Chrome forward.
 """
 import base64
 import json
@@ -58,6 +60,8 @@ SHOW_ON_PASSKEY = os.environ.get("HERMES_CHROME_AGENT_SHOW_ON_PASSKEY", "") not 
 NOTIFIER_APP = os.path.join(TOOLS, "Hermes Touch ID.app")
 NOTIFIER_BUNDLE_ID = "com.hermes.chrome-agent.notify"
 NOTIFIER_BIN = os.path.join(NOTIFIER_APP, "Contents", "MacOS", "hermes-touchid-notify")
+NOTIFIER_SETTINGS_URL = ("x-apple.systempreferences:com.apple.Notifications-Settings.extension?id="
+                         + NOTIFIER_BUNDLE_ID)
 REVEAL_S = 180      # a clicked-through passkey window stays on the main display at most this long
 SETTLE_GRACE_S = 3  # after the request settles, keep it shown briefly (sites often retry right away)
 
@@ -262,14 +266,6 @@ def inside(b, r, tol=2):
             and b["left"] + b["width"] <= r[0] + r[2] + tol and b["top"] + b["height"] <= r[1] + r[3] + tol)
 
 
-def notify(title, text):
-    script = 'display notification %s with title %s sound name "Glass"' % (json.dumps(text), json.dumps(title))
-    try:
-        subprocess.Popen(["/usr/bin/osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        log("notify failed: %s" % e)
-
-
 def activate_pid(pid):
     """Bring an app to the front (JXA, no Accessibility grant needed). macOS may refuse this from a background
     process; the notifier app, frontmost right after the click, hands activation over as well."""
@@ -471,17 +467,20 @@ class Supervisor:
         return bool(p and p.poll() is None)
 
     def notify_passkey(self, target, title, text):
-        """Post via Hermes Touch ID.app so a click comes back to us; plain osascript if that is unavailable."""
+        """Post via Hermes Touch ID.app so a click comes back to us. Without the app nothing clickable can be
+        posted (an osascript notification opens Script Editor when clicked), so reveal the asking tab at once."""
         if not os.access(NOTIFIER_BIN, os.X_OK):
-            notify(title, text)
+            log("NOTIFIER MISSING (%s): revealing the passkey tab directly; run `hermes-chrome-agent install`"
+                % NOTIFIER_BIN)
+            self.reveal(target)
             return None
         try:
             proc = subprocess.Popen([NOTIFIER_BIN, "--title", title, "--body", text, "--timeout", str(REVEAL_S)],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     universal_newlines=True, bufsize=1)
         except Exception as e:
-            log("notifier failed to start (%s); osascript fallback" % e)
-            notify(title, text)
+            log("NOTIFIER FAILED to start (%s): revealing the passkey tab directly" % e)
+            self.reveal(target)
             return None
         self.notices[target] = proc
         threading.Thread(target=self._notice_reader, args=(proc, target, title, text), daemon=True).start()
@@ -493,10 +492,15 @@ class Supervisor:
 
     def on_notifier_line(self, line, target, proc, title="", text=""):
         line = line.strip()
-        if line.startswith("error"):
-            log("notifier: %s; osascript fallback (allow notifications for Hermes Touch ID in System Settings)"
-                % line)
-            notify(title, text)
+        if line.startswith("error not authorized"):
+            # The app now shows a floating alert with a Show button; put the window in front of the human
+            # already (no activation, which would bury the alert), so the passkey is never stuck out of sight.
+            log("NOTIFICATIONS OFF for Hermes Touch ID (%s): passkey window revealed, alert shown instead. "
+                "Allow them: open '%s'" % (line, NOTIFIER_SETTINGS_URL))
+            self.reveal(target, activate=False)
+        elif line.startswith("error"):
+            log("notifier: %s; revealing the passkey tab directly" % line)
+            self.reveal(target, proc)
         elif line in ("action default", "action show"):
             log("notifier: %s clicked for target %s" % ("notification" if line.endswith("default") else "Show",
                                                          target))
@@ -504,7 +508,7 @@ class Supervisor:
         elif line:
             log("notifier: " + line)
 
-    def reveal(self, target, proc=None):
+    def reveal(self, target, proc=None, activate=True):
         """The human clicked the passkey notification: put the window holding `target` on the main display,
         select that tab, bring Chrome forward, and keep re-homing off it until the request settles."""
         c = self.cdp
@@ -520,7 +524,7 @@ class Supervisor:
                 log("passkey: window %d -> main display, tab %s selected" % (wid, target))
             except CDPError as e:
                 log("passkey reveal failed: %s" % e)
-        if chrome_pid:
+        if chrome_pid and activate:
             if proc and proc.poll() is None:
                 try:
                     proc.stdin.write("activate %d\n" % chrome_pid)
@@ -570,6 +574,11 @@ class Supervisor:
         target = {"left": rect[0], "top": rect[1] + MENU_BAR,
                   "width": rect[2], "height": rect[3] - MENU_BAR}
         c.call("Browser.setWindowBounds", {"windowId": wid, "bounds": target})
+        # Chrome's tab-modal dialogs (e.g. "Use a saved passkey for <site>") don't follow a window moved to
+        # another display: they stay clamped to the old one, so a revealed passkey tab showed a dimmed page
+        # with its dialog still on the virtual display. A resize re-anchors them on the window.
+        c.call("Browser.setWindowBounds", {"windowId": wid, "bounds": {"width": target["width"] - 1}})
+        c.call("Browser.setWindowBounds", {"windowId": wid, "bounds": {"width": target["width"]}})
         return target
 
     def main_rect(self):
@@ -627,6 +636,11 @@ class Supervisor:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stop", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stop", True))
         log("supervisor pid %d starting (port %d, profile %s)" % (os.getpid(), PORT, PROFILE))
+        ns = notifier_status()
+        log("passkey notifier: %s" % ns)
+        if not notifier_ok(ns):
+            log("NOTIFICATIONS NOT ALLOWED for Hermes Touch ID (%s): passkey requests reveal the window plus a "
+                "floating alert instead. Allow them: open '%s'" % (ns, NOTIFIER_SETTINGS_URL))
         self.start_vdisplay()
         self.start_chrome()
         backoff_until = 0
@@ -680,9 +694,10 @@ def cmd_status():
     print("virtual display: %s   main display: %s" % (st.get("vdisplay_bounds"), st.get("main_bounds")))
     print("mode: %s" % ("SHOW (windows on main display)" if os.path.exists(SHOW_FLAG) else "hidden"))
     ns = notifier_status()
-    print("passkey notifier: %s%s" % (ns, "  (System Settings > Notifications > Hermes Touch ID > Allow; until then"
-                                          " alerts fall back to an unclickable osascript one)"
-                                          if ns.startswith("denied") else ""))
+    print("passkey notifier: %s" % ns)
+    if not notifier_ok(ns):
+        print("  notifications not allowed for Hermes Touch ID: passkey requests reveal the window plus a floating"
+              " alert instead.\n  Allow them: open '%s'" % NOTIFIER_SETTINGS_URL)
     v = cdp_version()
     print("cdp: http://127.0.0.1:%d %s" % (PORT, v["Browser"] if v else "NOT answering"))
     if v:
@@ -775,6 +790,10 @@ def notifier_status():
         return subprocess.run([NOTIFIER_BIN, "--status"], capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception as e:
         return "error %s" % e
+
+
+def notifier_ok(status):
+    return status.split(" ")[0] in ("authorized", "provisional", "ephemeral")
 
 
 def cmd_install():
