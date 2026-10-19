@@ -16,6 +16,12 @@ pending at the end of a turn rides the next turn's `pre_llm_call` context. Each 
 | `live_checkout` | `write_file`/`patch` under the running Hermes checkout, or `git commit/pull/reset/…`, `sed -i`, `npm run pack` there | use `hermes-core-wt new/ship` |
 
 The live checkout is the tree that `hermes_cli` is imported from. Override it with `COACH_LIVE_CHECKOUT`.
+The `live_checkout` hint attributes each mutation to its own directory (`git -C`, the last `cd` including one after a
+newline or inside `bash -c '…'`, or `workdir`) or to a live path in the same simple command, so `cd other-repo && git
+pull; grep x ~/.hermes/hermes-agent/f.py` no longer fires; `$VAR` redirect targets and whole-line `#` comments don't
+count. The hint is checked in `transform_tool_result` too, because core's sequential path runs that hook before
+`post_tool_call` and the hint used to land on the NEXT (often read-only) call. Backtest over 102k past terminal calls:
+hints 296 → 131 (0 new), blocks unchanged at 61 (one false block gone, one newline-`cd` live merge now caught).
 
 **Live-checkout guard (`pre_tool_call`, blocks before running).** A terminal command that would move the live
 checkout's HEAD (`git commit/pull/reset/checkout/switch/merge/rebase/am/cherry-pick/revert`, attributed per

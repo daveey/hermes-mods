@@ -46,7 +46,8 @@ GIT_MUTATE_RE = re.compile(r"\bgit\b[^;&|]*?\b(commit|pull|reset|checkout|switch
 FILE_MUTATE_RE = re.compile(r"(\bsed\s+-i\b|\bperl\s+-pi\b|\bnpm\s+run\s+(pack|build)\b|\bhermes\s+desktop\b.*--build)")
 # Output redirects: `>`, `>>`, `>|`, `N>`, `&>`. The target group is either an fd dup (`&1`, `&2`, `&-`) or a path.
 REDIRECT_RE = re.compile(r"""(?<![-=<>])(?:&|\d*)>>?\|?\s*(&[\d-]*|"[^"]*"|'[^']*'|[^\s;&|()<>]+)""")
-CD_RE = re.compile(r"""(?:^|[;&|(]\s*)cd\s+("[^"]*"|'[^']*'|[^\s;&|()]+)""")
+CD_RE = re.compile(r"""(?:^|[;&|(\n'"]\s*)cd\s+("[^"]*"|'[^']*'|[^\s;&|()'"]+)""")
+GIT_C_RE = re.compile(r"""^git\s+-C\s+("[^"]*"|'[^']*'|\S+)""")
 HERMES_INFRA_TOOLS = {
     "cross_session", "delegate_task", "session_search", "memory", "skill_manage", "skill_view", "cronjob",
     "process_manage", "send_message", "todo", "clarify", "tool_search", "tool_describe", "tool_call",
@@ -177,6 +178,7 @@ def _mask_quoted(cmd: str) -> str:
 def shell_code(cmd: str) -> str:
     """The parts of a terminal command the shell executes: $HOME expanded, heredoc bodies and quoted data blanked."""
     cmd = HOME_VAR_RE.sub(lambda _: str(Path.home()), cmd or "")
+    cmd = re.sub(r"(?m)^[ \t]*#.*$", "", cmd)  # whole-line comments are notes, not commands
     return _mask_quoted(_strip_heredocs(cmd))
 
 
@@ -189,8 +191,8 @@ def redirect_writes_into(cmd: str, workdir: str, root: str) -> bool:
     """
     for m in REDIRECT_RE.finditer(cmd):
         target = m.group(1).strip("\"'")
-        if not target or target.startswith("&"):
-            continue
+        if not target or target.startswith("&") or target.startswith("$"):
+            continue  # fd dup, or an unexpanded variable like $TMPDIR/x (never the live tree; $HOME is pre-expanded)
         t = os.path.expanduser(target)
         if not os.path.isabs(t):
             cds = [c.group(1).strip("\"'") for c in CD_RE.finditer(cmd[:m.start()])]
@@ -222,11 +224,45 @@ def touches_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Op
     if tool == "terminal":
         cmd = shell_code(str(args.get("command") or ""))
         wd = str(args.get("workdir") or "")
-        in_tree = root in cmd or home_form in cmd or bool(wd and _inside(wd, root))
-        if in_tree and (GIT_MUTATE_RE.search(cmd) or FILE_MUTATE_RE.search(cmd)
-                        or redirect_writes_into(cmd, wd, root)):
+        if mutation_in_tree(cmd, wd, root, home_form) or redirect_writes_into(cmd, wd, root):
             return root
     return None
+
+
+def _segment(cmd: str, start: int) -> str:
+    """The simple command starting at `start` (up to the next ; & | or newline)."""
+    m = re.compile(r"[;&|\n]").search(cmd, start)
+    return cmd[start:m.start() if m else len(cmd)]
+
+
+def mutation_in_tree(cmd: str, workdir: str, root: str, home_form: str) -> bool:
+    """True when a git mutation / in-place edit / build in `cmd` runs on the live tree.
+
+    Each mutation is attributed to its own directory (`git -C X`, else the last `cd` before it, else
+    `workdir`) or to a live-tree path inside its own simple command. A live path elsewhere in the command
+    (e.g. a later `grep` of a file in the tree) doesn't count: that made `cd other-repo && git pull; grep x
+    ~/.hermes/hermes-agent/f.py` look like a live-tree change."""
+    def mentions(seg: str) -> bool:
+        return root in seg or home_form in seg
+
+    for m in GIT_MUTATE_RE.finditer(cmd):
+        seg = _segment(cmd, m.start())
+        c = GIT_C_RE.match(seg)
+        d = _target_dir(cmd, m.start(), c.group(1) if c else "", workdir)
+        if c and d is None and mentions(c.group(1)):
+            return True
+        if d and _inside(d, root):
+            return True
+        if d is None and not c and mentions(seg):
+            return True
+    for m in FILE_MUTATE_RE.finditer(cmd):
+        seg = _segment(cmd, m.start())
+        if mentions(seg):
+            return True
+        d = _target_dir(cmd, m.start(), "", workdir)
+        if d and _inside(d, root):
+            return True
+    return False
 
 
 GIT_HEAD_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)[^;&|\n]*?\s"
@@ -395,6 +431,15 @@ class AgentCoach:
         s["pending"] = []
         return out
 
+    def check_live(self, sid: str, tool: str, args: Any) -> None:
+        """live_checkout rule for one call. Also run from transform_tool_result: core's sequential path fires
+        transform BEFORE post_tool_call, so a hint queued only from observe() lands on the NEXT result."""
+        if not sid:
+            return
+        hit = touches_live_checkout(tool, args if isinstance(args, dict) else {}, self.checkout)
+        if hit:
+            self._fire(self._s(sid), sid, "live_checkout", "session", path=hit.replace(str(Path.home()), "~", 1))
+
     def observe(self, sid: str, tool: str, args: Any, result: Any = None, status: Optional[str] = None,
                 duration_ms: int = 0, error_type: Optional[str] = None, error_message: Optional[str] = None) -> None:
         if not sid:
@@ -434,9 +479,7 @@ class AgentCoach:
             self._fire(s, sid, "no_checkpoint", f"t{s['turn']}", n=s["turn_tools"])
 
         # live_checkout (once per session)
-        hit = touches_live_checkout(tool, args, self.checkout)
-        if hit:
-            self._fire(s, sid, "live_checkout", "session", path=hit.replace(str(Path.home()), "~", 1))
+        self.check_live(sid, tool, args)
 
         if not self.signals:
             return

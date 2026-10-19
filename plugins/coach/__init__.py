@@ -63,8 +63,9 @@ def build(store=None, checkout=None):
         except Exception as exc:
             log.debug("coach post_tool_call: %s", exc)
 
-    def transform_tool_result(tool_name="", result=None, session_id="", **_):
+    def transform_tool_result(tool_name="", result=None, session_id="", args=None, **_):
         try:
+            coach.check_live(session_id, tool_name, args)
             hint = coach.take(session_id)
             return rules.attach_hint(result, hint) if hint and isinstance(result, str) else None
         except Exception as exc:

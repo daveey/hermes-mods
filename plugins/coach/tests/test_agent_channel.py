@@ -181,6 +181,49 @@ def test_live_checkout_ignores_quoted_and_heredoc_text(tmp_path):
         assert tlc("terminal", {"command": cmd}, live) is None, cmd
 
 
+def test_live_checkout_attributes_mutation_to_its_own_directory(tmp_path, monkeypatch):
+    """2026-10-18 false positive: `git pull` ran in another repo, and the live checkout was only READ later in
+    the same command (grep of a file in it). Mutation and live path must belong to the same command."""
+    tlc = rules.touches_live_checkout
+    home = tmp_path.resolve()
+    monkeypatch.setenv("HOME", str(home))
+    live = home / ".hermes" / "hermes-agent"
+    (live / "tools").mkdir(parents=True)
+    (home / "code" / "hermes-coach-data").mkdir(parents=True)
+    real = ("cd ~/code/hermes-coach-data && git pull -q 2>&1|tail -2; ls research reports | head -50; "
+            "python3 - <<'E'\nimport json\nprint(1)\nE\n"
+            "grep -nE 'XAI_API_KEY|def check' ~/.hermes/hermes-agent/tools/x_search_tool.py | head -20")
+    for cmd in (real,
+                f"cd /tmp && git stash; cat {live}/run_agent.py",
+                f"git -C {home}/code/hermes-coach-data pull; ls {live}",
+                f"cd {home}/code/hermes-coach-data && sed -i '' s/a/b/ notes.md; grep x {live}/a.py",
+                f"ls {live}; cd /tmp && npm run build",
+                f"cd {live} && git show HEAD:a.ts > $TMPDIR/a.ts",
+                f"# the last {live} build ran hermes desktop --build-only\necho done"):
+                f"cd {live} && git show HEAD:a.ts > $TMPDIR/a.ts",
+                f"# the last {live} build ran hermes desktop --build-only\necho done"):
+        assert tlc("terminal", {"command": cmd}, live) is None, cmd
+    for cmd in (f"cd /tmp && git status; cd {live} && git pull",
+                f"cat {live}/a.py; git -C {live} stash",
+                f"cd /tmp; sed -i '' s/a/b/ {live}/run_agent.py",
+                f"cd {live}/apps/desktop && npm run build",
+                f"git -C ~/.hermes/hermes-agent pull"):
+        assert tlc("terminal", {"command": cmd}, live) == str(live), cmd
+
+
+def test_live_checkout_hint_lands_on_the_call_that_caused_it(tmp_path):
+    """Core's sequential path runs transform_tool_result BEFORE post_tool_call, so a hint fired from observe()
+    was attached to the NEXT tool result (a read-only one). The transform hook must check the call itself."""
+    live = (tmp_path / "hermes-agent"); live.mkdir(); live = live.resolve()
+    _, hooks = plugin.build(store=core.Store(tmp_path / "coach"), checkout=live)
+    bad = {"command": f"cd {live} && git stash"}
+    out = hooks["transform_tool_result"](tool_name="terminal", args=bad, result='{"output": ""}', session_id="s1")
+    assert out and "LIVE Hermes checkout" in out
+    hooks["post_tool_call"](tool_name="terminal", args=bad, result='{"output": ""}', session_id="s1")
+    ok = {"command": "ls /tmp"}
+    assert hooks["transform_tool_result"](tool_name="terminal", args=ok, result='{"output": ""}', session_id="s1") is None
+
+
 def test_live_checkout_shell_scripts_and_home_var_still_fire(tmp_path, monkeypatch):
     tlc = rules.touches_live_checkout
     home = tmp_path.resolve()
