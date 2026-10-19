@@ -73,7 +73,8 @@ def default_tier(p):
             return "review"
         return "auto" if AUTO_KEYS.search(tgt) else "canary"
     if kind == "plugin_rule":
-        return "canary"
+        from coach_yield import is_source_rule
+        return "auto" if is_source_rule(p) else "canary"
     return "auto"  # curriculum, skill_patch
 
 
@@ -203,7 +204,7 @@ def cmd_add(a):
         rec = {"id": f"{date}-{n}", "fp": fp, "date": date, "report": os.path.relpath(report, Path(a.data).resolve()),
                "status": "pending", "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         rec.update({k: p[k] for k in ("kind", "target", "change", "evidence", "title", "risk", "feature", "signal",
-                                      "paid", "cost_usd_day") if k in p})
+                                      "paid", "cost_usd_day", "idea_id", "idea_ids", "trial_id", "source_url") if k in p})
         rec["tier"] = effective_tier(p)
         append(a.data, rec)
         seen[fp] = rec

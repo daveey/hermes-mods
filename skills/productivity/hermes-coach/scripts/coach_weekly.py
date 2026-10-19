@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import coach_mine  # noqa: E402
 import coach_proposals  # noqa: E402
+import coach_yield  # noqa: E402
 
 PLAN_KPIS = [  # (n, key, label, goal, better)
     (1, "repeat_fix_rate", "Repeat-fix rate", "halve", "down"),
@@ -294,13 +295,16 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--days", type=float, default=7)
     ap.add_argument("--top", type=int, default=3)
+    ap.add_argument("--sources-dir", default=str(Path(__file__).resolve().parent),
+                    help="Read-only directory containing coach_scout.py and coach_research.py source lists")
     ap.add_argument("--check", action="append", default=[],
                     help="key=value@ISO-UTC[#signal], e.g. agent.max_turns=150@2026-10-14T05:39Z#synthetic_turn_cap")
+    ap.add_argument("--source-target-root", help="Local rollout checkout directory for source-list proposals")
     a = ap.parse_args()
     data = Path(a.data)
     ds = coach_mine.load(data)
     now = time.time()
-    out = [f"# Weekly coach context — {time.strftime('%Y-%m-%d', time.gmtime(now))} (last {a.days:g} days)",
+    out = [f"# Weekly coach context — {datetime.fromtimestamp(now, coach_yield.PT):%Y-%m-%d %Z} (last {a.days:g} days)",
            f"Digests: {len(ds)} across hosts {sorted({d['host'] for d in ds})}.", ""]
     out += section_kpis(data, ds, now, a.days) + [""]
     out += section_findings(data, ds, now, a.days, a.top) + [""]
@@ -314,6 +318,7 @@ def main():
                "## Phase 4 ideas: none yet (no ideas.md in the data repo).")
     out.append("")
     out += section_proposals(data, now, a.days)
+    out += [""] + coach_yield.section_yield(data, now, a.sources_dir, a.source_target_root)
     print("\n".join(out))
 
 
