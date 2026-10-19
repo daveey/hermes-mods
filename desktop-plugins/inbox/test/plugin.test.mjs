@@ -47,6 +47,19 @@ test('routeFor / restOpts: plain on the routed gateway, owner route elsewhere', 
   assert.deepEqual(m.restOpts({ gateway: 'mini' }, 'local', { method: 'POST' }), { method: 'POST', connectionId: 'mini' })
 })
 
+test('profile items: item.profile wins, routes even on the routed gateway, REST paths carry ?profile', () => {
+  const out = m.mergeItems([{ gateway: 'nous', profile: 'default', items: [{ session_id: 'x', profile: 'alpha-follow' }, { session_id: 'y' }] }])
+  assert.deepEqual(out.map(i => i.profile), ['alpha-follow', 'default'])
+  const gws = [{ id: 'local', kind: 'local' }, { id: 'nous', kind: 'cloud' }]
+  assert.deepEqual(m.routeFor({ gateway: 'local', profile: 'alpha-follow' }, 'local', gws),
+    { connectionId: 'local', mode: 'local', profile: 'alpha-follow', targetProfile: 'alpha-follow' })
+  assert.equal(m.routeFor({ gateway: 'local', profile: 'default' }, 'local', gws), null)
+  assert.equal(m.itemPath({ session_id: 'x', profile: 'alpha-follow' }, 'accept'), '/items/x/accept?profile=alpha-follow')
+  assert.equal(m.itemPath({ session_id: 'a b', profile: 'default' }, 'archive'), '/items/a%20b/archive')
+  assert.equal(m.sessionPath({ session_id: 'x', profile: 'alpha-follow' }), '/api/sessions/x?profile=alpha-follow')
+  assert.equal(m.sessionPath({ session_id: 'x' }), '/api/sessions/x')
+})
+
 function fakeCtx(answers) {
   const calls = []
   return {

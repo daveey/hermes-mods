@@ -146,3 +146,31 @@ def test_tool_handler(env, monkeypatch):
     assert out["posted"] and db.get_session(out["session_id"])["cwd"] == "/work"
     bad = json.loads(plugin.handle_post({"title": "", "body": "b", "accept_prompt": "p"}))
     assert bad["posted"] is False and "title" in bad["error"]
+
+
+def test_profile_homes_lists_root_then_profiles_with_an_inbox(tmp_path):
+    (tmp_path / "profiles" / "alpha-follow" / "inbox").mkdir(parents=True)
+    (tmp_path / "profiles" / "alpha-follow" / "inbox" / "inbox.db").write_text("")
+    (tmp_path / "profiles" / "no-inbox").mkdir(parents=True)
+    homes = store.profile_homes(tmp_path)
+    assert homes == [("default", tmp_path), ("alpha-follow", tmp_path / "profiles" / "alpha-follow")]
+    assert store.profile_home(tmp_path, "alpha-follow") == tmp_path / "profiles" / "alpha-follow"
+    assert store.profile_home(tmp_path, "default") == tmp_path
+    assert store.profile_home(tmp_path, "") == tmp_path
+    with pytest.raises(ValueError):
+        store.profile_home(tmp_path, "../etc")
+
+
+def test_for_home_binds_a_profiles_own_state_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    prof = tmp_path / "profiles" / "p1"
+    prof.mkdir(parents=True)
+    r = store.Inbox.for_home(prof).post("t", "b", "do", key="k")
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=prof / "state.db")
+    try:
+        assert db.get_session(r["session_id"])["hidden"]
+    finally:
+        db.close()
+    assert [i["session_id"] for i in store.Inbox.for_home(prof).list()] == [r["session_id"]]
+    assert store.Inbox.for_home(tmp_path).list() == []

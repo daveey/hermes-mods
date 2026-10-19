@@ -89,3 +89,17 @@ def test_enqueue_rejects_bad_ids_and_actions(tmp_path):
     assert not rf.enqueue({"id": "ok", "action": "rm"}, base)
     assert not list((base / "outbox").glob("*.json"))
     json.dumps(rf.request_status("../evil", base))
+
+
+def test_named_profile_shares_the_gateway_root_outbox(tmp_path, monkeypatch):
+    """The Desktop courier drains only the gateway's root dashboard, so a request from a named
+    profile (HERMES_HOME=<root>/profiles/<name>) must land in the root outbox."""
+    prof = tmp_path / "profiles" / "alpha-follow"
+    prof.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(prof))
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: prof))
+    assert rf.root() == tmp_path / "session_mentions"
+    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: tmp_path))
+    assert rf.root() == tmp_path / "session_mentions"

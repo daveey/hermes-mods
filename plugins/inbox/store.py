@@ -50,6 +50,30 @@ def _home() -> Path:
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
+_PROFILE_NAME = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def profile_homes(root: Path) -> list[tuple[str, Path]]:
+    """('default', root) plus every named profile under ``root/profiles`` that has an inbox, so a
+    gateway's one dashboard can list messages its profiles posted (Desktop reads root only)."""
+    root = Path(root)
+    out = [("default", root)]
+    pdir = root / "profiles"
+    if pdir.is_dir():
+        for p in sorted(pdir.iterdir()):
+            if p.is_dir() and _PROFILE_NAME.match(p.name) and (p / "inbox" / "inbox.db").exists():
+                out.append((p.name, p))
+    return out
+
+
+def profile_home(root: Path, profile: Optional[str]) -> Path:
+    if not profile or profile == "default":
+        return Path(root)
+    if not _PROFILE_NAME.match(profile):
+        raise ValueError(f"bad profile name {profile!r}")
+    return Path(root) / "profiles" / profile
+
+
 class Inbox:
     """``db_factory`` returns a SessionDB (injectable for tests); ``home`` holds the sidecar."""
 
@@ -59,6 +83,16 @@ class Inbox:
         self.path = self.home / "inbox" / "inbox.db"
         self._db_factory = db_factory
         self.clock = clock
+
+    @classmethod
+    def for_home(cls, home: Path, **kw) -> "Inbox":
+        """An inbox bound to *home*'s own sidecar AND state.db (another profile's home)."""
+        home = Path(home)
+
+        def factory():
+            from hermes_state import SessionDB
+            return SessionDB(db_path=home / "state.db")
+        return cls(home=home, db_factory=factory, **kw)
 
     # ── plumbing ────────────────────────────────────────────────────────────
     def _side(self) -> sqlite3.Connection:

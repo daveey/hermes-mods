@@ -223,3 +223,36 @@ def test_observer_middleware_records_and_continues(env):
     asyncio.run(app.mw({"type": "event_callback", "team_id": "T1", "event": {
         "type": "message", "channel": "C1", "ts": f"{time.time():.6f}", "user": "UBOB", "text": "yo"}}, nxt))
     assert called == [1] and st.store.recent("C1")[0]["text"] == "yo"
+
+
+def test_middleware_swallows_engaged_channel_and_kicks_follower_once(env):
+    st, fake, _ = env
+    import asyncio
+
+    class App:
+        def use(self, fn):
+            self.mw = fn
+
+    class Runner:
+        kicked = []
+
+        def kick(self, eid):
+            self.kicked.append(eid)
+
+    app = App()
+    sw._make_factory(st)(app, st.adapter)
+    st.runner = Runner()
+    e = st.engs.create("C1", "follow")
+    called = []
+
+    async def nxt():
+        called.append(1)
+
+    ts = f"{time.time() + 1:.6f}"
+    text = f"<@{st.bot_user_id()}> help"
+    for ev in ({"type": "message", "channel": "C1", "ts": ts, "user": "UBOB", "text": text},
+               {"type": "app_mention", "channel": "C1", "ts": ts, "user": "UBOB", "text": text},
+               {"type": "message", "channel": "C2", "ts": ts, "user": "UBOB", "text": "elsewhere"}):
+        asyncio.run(app.mw({"type": "event_callback", "team_id": "T1", "event": ev}, nxt, "RESP"))
+    assert called == [1]  # only the unengaged channel reaches the ambient bot
+    assert Runner.kicked == [e["id"]]

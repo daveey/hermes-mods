@@ -33,6 +33,10 @@ def root() -> Path:
         base = Path(str(get_hermes_home()))
     except Exception:
         base = Path(os.path.expanduser("~/.hermes"))
+    # A named profile (<root>/profiles/<name>) shares the gateway root's outbox: the Desktop
+    # courier drains only the root dashboard, so a profile-local outbox would never be picked up.
+    if base.parent.name == "profiles":
+        base = base.parent.parent
     path = base / "session_mentions"
     for sub in ("outbox", "claimed", "results"):
         (path / sub).mkdir(parents=True, exist_ok=True)

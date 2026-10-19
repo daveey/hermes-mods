@@ -30,6 +30,13 @@ Re-posting with the same `key` updates the open message (new assistant note, tit
 
 The row's hover Archive button and bold unread title use the `actions`/`strong` props of `SidebarSectionRow` (fork core patch, see `core/sidebar-row-actions.md`). On an older core the row ignores them and still works: archive it from the composer bar.
 
+## Profiles
+
+Messages posted from a named profile (`<root>/profiles/<p>`) live in that profile's own sidecar and
+`state.db`. The gateway's root dashboard is the only one Desktop asks, so `GET /items` also lists every
+profile that has an inbox and tags each item with `profile`; accept / archive / get take `?profile=<p>`,
+and the Desktop half opens such items with an owner route for that profile.
+
 ## Data
 
 The sidecar `<HERMES_HOME>/inbox/inbox.db` (`items`: session_id, key, title, poster, accept_prompt, created/updated, state) records which sessions are inbox messages and holds their metadata. Visibility is derived from the session row, so archiving or un-hiding the session another way is respected.
@@ -37,7 +44,7 @@ The sidecar `<HERMES_HOME>/inbox/inbox.db` (`items`: session_id, key, title, pos
 ## Tests
 
 ```bash
-SP=<runtime site-packages: lsof -p <hermes serve pid> | grep -o '/Users/.*/site-packages'>
-PYTHONPATH=~/.hermes/hermes-agent:$SP <venv with pytest on Hermes Python 3.14>/bin/python -m pytest -q -p no:cacheprovider plugins/inbox/tests
+PYTHONPATH=~/.hermes/hermes-agent uv run --python 3.11 --with pytest --with ruamel.yaml --with pyyaml \
+  --with python-dotenv --with fastapi --with httpx python -m pytest -q -p no:cacheprovider plugins/inbox/tests
 /opt/homebrew/bin/node --test desktop-plugins/inbox/test/plugin.test.mjs
 ```

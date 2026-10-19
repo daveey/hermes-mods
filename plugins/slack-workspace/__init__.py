@@ -28,12 +28,22 @@ from pathlib import Path
 from typing import Any, Optional
 
 if __package__:
-    from . import core
+    from . import core, engage, follow
 else:  # imported outside a package (e.g. pytest collecting this dir)
     import importlib.util as _ilu
-    _spec = _ilu.spec_from_file_location("slack_workspace_core", Path(__file__).with_name("core.py"))
-    core = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
-    _spec.loader.exec_module(core)  # type: ignore[union-attr]
+    import sys as _sys
+
+    def _sib(name, file):
+        mod = _sys.modules.get(name)
+        if mod is None:
+            spec = _ilu.spec_from_file_location(name, Path(__file__).with_name(file))
+            mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+            _sys.modules[name] = mod
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
+    core = _sib("slack_workspace_core", "core.py")
+    engage = _sib("slack_workspace_engage", "engage.py")
+    follow = _sib("slack_workspace_follow", "follow.py")
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +64,8 @@ def _session(name: str) -> str:
 class State:
     def __init__(self, root: Path):
         self.store = core.Store(root)
+        self.engs = engage.Engagements(self.store)
+        self.runner: Any = None
         self.adapter: Any = None
         self.native: Any = None
         self._chan_list: tuple[float, list] = (0.0, [])
@@ -178,17 +190,35 @@ STATE: dict[str, State] = {}
 # Observation
 # =================================================================================================
 
+def _route_event(state: State, ev: dict) -> bool:
+    """Record + route one event. True = it belongs to an engagement (ambient bot must not see it)."""
+    r = engage.route(ev, state.engs, bot_user_id=state.bot_user_id())
+    if r.decision != "engaged":
+        return False
+    if r.trigger and r.engagement:
+        lag = time.time() - float(ev.get("ts") or time.time())
+        logger.info("slack-follow: %s ts=%s -> follower (event lag %.1fs)", r.engagement["id"], ev.get("ts"), lag)
+        state.engs.update(r.engagement["id"], last_activity=time.time())
+        if state.runner is not None:
+            state.runner.kick(r.engagement["id"])
+    return True
+
+
 def _make_factory(state: State):
     def slack_workspace_wire(native, adapter):
         state.native, state.adapter = native, adapter
 
-        async def _observe(body, next):  # noqa: A002 - slack_bolt injects by name
+        async def _observe(body, next, resp=None):  # noqa: A002 - slack_bolt injects by name
+            engaged = False
             try:
                 if isinstance(body, dict) and body.get("type") == "event_callback":
                     ev = body.get("event") or {}
                     await asyncio.to_thread(state.store.record_event, ev, body.get("team_id") or "")
+                    engaged = await asyncio.to_thread(_route_event, state, ev)
             except Exception as exc:  # never break dispatch
                 logger.debug("slack-workspace observe failed: %s", exc)
+            if engaged:  # the follower owns this channel/thread: ack and stop here
+                return resp
             await next()
 
         native.use(_observe)
@@ -196,8 +226,57 @@ def _make_factory(state: State):
             state.store.prune()
         except Exception:
             pass
+        if state.runner is None:
+            state.runner = _make_runner(state)
+            state.runner.start()
         logger.info("slack-workspace: observing Slack events for this profile")
     return slack_workspace_wire
+
+
+def _make_runner(state: State):
+    try:
+        from hermes_constants import get_default_hermes_root
+        root_home = Path(get_default_hermes_root())
+    except Exception:
+        root_home = state.store.root.parent
+    fcfg = state.store.policy().get("follower") or {}
+
+    def inbox_post(title, body, accept_prompt, key=None, profile=None, **_):
+        home = root_home / "profiles" / profile if profile else root_home
+        return _inbox_for(home).post(title, body, accept_prompt, key=key, poster="slack follower")
+
+    return follow.Runner(state.store, state.engs, token=state.token, bot_user_id=state.bot_user_id,
+                         name=state.user_name, root_home=root_home, inbox_post=inbox_post,
+                         self_gateway=fcfg.get("self_gateway") or "")
+
+
+def _inbox_for(home: Path):
+    """The inbox plugin's store bound to *home* (a profile's HERMES_HOME), next to this plugin."""
+    import importlib.util as ilu
+    import sys as _s
+    path = Path(__file__).resolve().parent.parent / "inbox" / "store.py"
+    name = "_slack_workspace_inbox_store"
+    home = Path(home)
+    if not path.exists():
+        try:
+            from hermes_constants import get_default_hermes_root
+            alt = Path(get_default_hermes_root()) / "plugins" / "inbox" / "store.py"
+        except Exception:
+            alt = home / "plugins" / "inbox" / "store.py"
+        path = alt
+    mod = _s.modules.get(name)
+    if mod is None:
+        if not path.exists():
+            raise RuntimeError("the inbox plugin is not installed (needed for escalations)")
+        spec = ilu.spec_from_file_location(name, path)
+        mod = ilu.module_from_spec(spec)  # type: ignore[arg-type]
+        _s.modules[name] = mod
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+    def db_factory():
+        from hermes_state import SessionDB
+        return SessionDB(db_path=home / "state.db")
+    return mod.Inbox(home=home, db_factory=db_factory)
 
 
 # =================================================================================================
@@ -606,6 +685,171 @@ HANDLERS = {"slack_recent": tool_recent, "slack_join": tool_join, "slack_api": t
             "slack_request": tool_request}
 
 
+# =================================================================================================
+# Follower / engagement tools (toolset slack_workspace; visible only where peer.json configures them)
+# =================================================================================================
+
+def _engaged_scope(peer, channel: str, thread: str) -> Optional[dict]:
+    return peer.engs().active_for(channel, thread or "")
+
+
+def ftool_post(peer, args: dict, **_) -> str:
+    p = follow.Poster(peer.engs(), peer.api, peer.bot_user_id)
+    return _out(p.post(args.get("channel", ""), args.get("text", ""), args.get("thread_ts") or "",
+                       args.get("reply_to") or ""))
+
+
+def ftool_react(peer, args: dict, **_) -> str:
+    ch, ts = args.get("channel", ""), args.get("ts", "")
+    m = [r for r in peer.store().recent(ch, float(ts or 0) - 0.0001, limit=5) if r["ts"] == ts]
+    if not _engaged_scope(peer, ch, (m[0]["thread_ts"] or ts) if m else ts):
+        return _out({"ok": False, "error": "not_engaged"})
+    try:
+        peer.api("reactions.add", {"channel": ch, "timestamp": ts, "name": (args.get("name") or "eyes").strip(":")})
+    except core.SlackError as exc:
+        if exc.error != "already_reacted":
+            return _out({"ok": False, "error": exc.error})
+    return _out({"ok": True})
+
+
+def ftool_read(peer, args: dict, **_) -> str:
+    ch, thread = args.get("channel", ""), args.get("thread_ts") or ""
+    e = _engaged_scope(peer, ch, thread)
+    if not e and not peer.engs().list():
+        return _out({"error": "not_engaged"})
+    if thread:
+        try:
+            d = peer.api("conversations.replies", {"channel": ch, "ts": thread, "limit": 200})
+            rows = [{"ts": m["ts"], "thread_ts": m.get("thread_ts") or "", "user": m.get("user") or "",
+                     "bot": m.get("bot_id") or "", "text": m.get("text") or ""} for m in d.get("messages") or []]
+        except core.SlackError as exc:
+            return _out({"error": exc.error})
+    else:
+        hours = float(args.get("hours") or 72)
+        rows = peer.store().recent(ch, time.time() - hours * 3600, limit=int(args.get("limit") or 80))
+    bot = peer.bot_user_id()
+    names: dict[str, str] = {}
+
+    def name(uid: str) -> str:
+        if not uid:
+            return "?"
+        if uid not in names:
+            hit = peer.store().cached(uid)
+            if hit:
+                names[uid] = hit["name"]
+            else:
+                try:
+                    u = peer.api("users.info", {"user": uid})["user"]
+                    names[uid] = (u.get("profile") or {}).get("display_name") or u.get("real_name") or u.get("name") or uid
+                except core.SlackError:
+                    names[uid] = uid
+        return names[uid]
+    return _out({"channel": ch, "thread_ts": thread or None, "messages": follow._fmt(rows, name, bot),
+                 "engagement": e and e["id"]})
+
+
+def ftool_escalate(peer, args: dict, **_) -> str:
+    def post(title, body, accept_prompt, key=None, poster=None):
+        return _inbox_for(peer.home).post(title, body, accept_prompt, key=key, poster=poster)
+    return _out(follow.escalate(peer.engs(), post, channel=args.get("channel", ""),
+                                thread_ts=args.get("thread_ts") or "", topic=args.get("topic") or "",
+                                title=args.get("title") or "", body=args.get("body") or "",
+                                reply_text=args.get("reply_text") or "", reply_to=args.get("reply_to") or "",
+                                action=args.get("action") or "", permalink=args.get("permalink") or ""))
+
+
+def ftool_defer(peer, args: dict, session_id: str = "", **_) -> str:
+    ch, thread = args.get("channel", ""), args.get("thread_ts") or ""
+    e = _engaged_scope(peer, ch, thread)
+    if not e:
+        return _out({"ok": False, "error": "not_engaged"})
+    target = (args.get("target") or e.get("owner") or "").strip()
+    if not target:
+        return _out({"ok": False, "error": "no target session (engagement has no owner); pass target"})
+    gw = peer.cfg().get("self_gateway") or ""
+    me = f"@session:{peer.cfg().get('self_profile') or follow.DEFAULT_FOLLOWER}@{gw}/{session_id}" if gw and session_id else ""
+    msg = (f"[From the Slack follower for {follow.scope_label(e)}, engagement {e['id']}]\n\n{args.get('message', '')}"
+           + (f"\n\nWhen done, send the result back with cross_session action=send target={me} "
+              f"(include what to post in thread {thread or '(top level)'})." if me else ""))
+    q = peer.engs().queue_mbp(e["id"], target, msg, ch, thread)
+    return _out({"ok": True, "queued": q["id"], "target": target,
+                 "note": "Delivered by the bot gateway's tick within ~1 min when the Desktop is online; "
+                         "retried every 5 min otherwise. Tell the thread you'll follow up."})
+
+
+def ftool_engage(peer, args: dict, session_id: str = "", **_) -> str:
+    args = dict(args)
+    if not args.get("owner") and session_id:
+        gw = peer.cfg().get("self_gateway") or ""
+        prof = peer.cfg().get("self_profile") or "default"
+        args["owner"] = f"@session:{prof}@{gw}/{session_id}" if gw else f"@session:{prof}/{session_id}"
+    if isinstance(args.get("kanban_ids"), str):
+        args["kanban_ids"] = [x for x in re.split(r"[\s,]+", args["kanban_ids"]) if x]
+    if peer.remote:
+        return _out(peer.remote_op("create", args))
+    return _out(follow.engagement_op(peer.engs(), "create", args))
+
+
+def ftool_engagements(peer, args: dict, **_) -> str:
+    op = args.get("action") or "list"
+    if peer.remote:
+        return _out(peer.remote_op(op, args))
+    return _out(follow.engagement_op(peer.engs(), op, args))
+
+
+_CH = {"type": "string", "description": "channel id (C…/G…)"}
+FSCHEMAS = {
+    "slack_post": ("Post as the bot in an engaged channel (follower only). One reply per message: pass "
+                   "reply_to=<ts of the message you answer>; a second reply to it is refused. Replies to bots "
+                   "stop after 3 bot-to-bot turns per thread. Returns the verified ts.", {
+        "channel": _CH, "text": {"type": "string", "description": "Slack mrkdwn"},
+        "thread_ts": {"type": "string", "description": "thread to reply in ('' = top level)"},
+        "reply_to": {"type": "string", "description": "ts of the message this answers"}}, ["channel", "text"], "local"),
+    "slack_react": ("Add a reaction (eyes = on it, white_check_mark = done) in an engaged channel.", {
+        "channel": _CH, "ts": {"type": "string"}, "name": {"type": "string", "description": "emoji name"}},
+        ["channel", "ts"], "local"),
+    "slack_read": ("Read an engaged channel (observed log) or one thread (live conversations.replies).", {
+        "channel": _CH, "thread_ts": {"type": "string"}, "hours": {"type": "number"},
+        "limit": {"type": "integer"}}, ["channel"], "local"),
+    "slack_escalate": ("Post ONE Inbox card for the owner (nothing is posted in Slack): commitments, personal/"
+                       "business topics, out-of-brief or over-budget work, bot-loop cap, questions you can't "
+                       "ground. Same channel+thread+topic updates the same card. 'Do it' runs `action` and/or "
+                       "posts `reply_text` in the thread.", {
+        "channel": _CH, "thread_ts": {"type": "string"}, "reply_to": {"type": "string"},
+        "topic": {"type": "string", "description": "short stable topic, e.g. 'board seat'"},
+        "title": {"type": "string"}, "body": {"type": "string", "description": "who asked what, evidence"},
+        "reply_text": {"type": "string", "description": "drafted reply to post on Do it"},
+        "action": {"type": "string", "description": "exact instruction to run on Do it"},
+        "permalink": {"type": "string"}}, ["channel", "topic", "title", "body"], "local"),
+    "slack_defer_to_mbp": ("Hand work that needs the Mac (local checkouts, its Kanban cards, browser, rented "
+                           "machines) to the engagement's originating Mac session. Queued and retried until the "
+                           "Desktop is online; the session is asked to send the result back to you.", {
+        "channel": _CH, "thread_ts": {"type": "string"}, "message": {"type": "string"},
+        "target": {"type": "string", "description": "@session link (default: the engagement owner)"}},
+        ["channel", "message"], "local"),
+    "slack_engage": ("Bring the Slack bot into a channel with a follower agent that monitors and participates "
+                     "there with the owner's context (replies, Inbox escalations). Public channels are joined "
+                     "automatically; private ones need the bot invited first.", {
+        "channel": {"type": "string", "description": "channel id"},
+        "brief": {"type": "string", "description": "what to follow, members, goals, rules, what is in/out of scope"},
+        "context": {"type": "string", "description": "handoff: summary of this session, links, open work"},
+        "thread": {"type": "string", "description": "limit to one thread ts"},
+        "until": {"type": "string", "description": "end time: ISO date, epoch, or '7d'"},
+        "kanban_ids": {"type": "array", "items": {"type": "string"}},
+        "budget": {"type": "string"}, "name": {"type": "string", "description": "channel name"},
+        "last_handled_ts": {"type": "string", "description": "skip messages up to this ts"}},
+        ["channel", "brief"], "any"),
+    "slack_engagements": ("List / get / pause / resume / end / update Slack engagements.", {
+        "action": {"type": "string", "enum": ["list", "get", "pause", "resume", "end", "update"]},
+        "id": {"type": "string"}, "brief": {"type": "string"}, "context": {"type": "string"},
+        "kanban_ids": {"type": "array", "items": {"type": "string"}}, "budget": {"type": "string"},
+        "until": {"type": "string"}}, [], "any"),
+}
+FHANDLERS = {"slack_post": ftool_post, "slack_react": ftool_react, "slack_read": ftool_read,
+             "slack_escalate": ftool_escalate, "slack_defer_to_mbp": ftool_defer, "slack_engage": ftool_engage,
+             "slack_engagements": ftool_engagements}
+
+
 def register(ctx):
     try:
         from hermes_constants import get_hermes_home
@@ -635,3 +879,20 @@ def register(ctx):
             "type": "object", "properties": props, "required": required}}
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler, description=desc,
                           check_fn=lambda: state.adapter is not None)
+
+    peer = follow.Peer(root.parent)
+    for name, (desc, props, required, where) in FSCHEMAS.items():
+        fn = FHANDLERS[name]
+
+        def fhandler(args, _fn=fn, **kw):
+            try:
+                return _fn(peer, dict(args or {}), **kw)
+            except Exception as exc:
+                logger.warning("slack-workspace %s failed: %s", _fn.__name__, exc, exc_info=True)
+                return _out({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+        schema = {"name": name, "description": desc, "parameters": {
+            "type": "object", "properties": props, "required": required}}
+        check = (lambda: peer.local) if where == "local" else (lambda: peer.local or peer.remote)
+        ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=fhandler, description=desc,
+                          check_fn=check)

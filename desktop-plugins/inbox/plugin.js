@@ -60,7 +60,7 @@ export function mergeItems(answers) {
       const key = `${gateway}:${sid}`
       if (!sid || seen.has(key)) continue
       seen.add(key)
-      out.push({ ...item, session_id: sid, gateway, profile: profile || 'default' })
+      out.push({ ...item, session_id: sid, gateway, profile: item.profile || profile || 'default' })
     }
   }
   return out.sort((a, b) => Number(!!b.unread) - Number(!!a.unread) || Number(b.updated_at) - Number(a.updated_at))
@@ -68,14 +68,26 @@ export function mergeItems(answers) {
 
 /** Owner route for an item on another gateway; null = the routed gateway. */
 export function routeFor(item, routed, gateways) {
-  if (!item.gateway || item.gateway === routed) return null
   const profile = item.profile || 'default'
+  if ((!item.gateway || item.gateway === routed) && profile === 'default') return null
   const kind = (gateways || []).find(g => g.id === item.gateway)?.kind
   return { connectionId: item.gateway, mode: kind === 'local' ? 'local' : 'remote', profile, targetProfile: profile }
 }
 
 export function restOpts(item, routed, extra = {}) {
   return item.gateway && item.gateway !== routed ? { ...extra, connectionId: item.gateway } : extra
+}
+
+/** REST path for an item action on its own profile (the gateway's root dashboard serves all profiles). */
+export function itemPath(item, action) {
+  const p = item.profile && item.profile !== 'default' ? `?profile=${encodeURIComponent(item.profile)}` : ''
+  return `/items/${encodeURIComponent(item.session_id)}/${action}${p}`
+}
+
+/** Core session path, scoped to the item's profile. */
+export function sessionPath(item) {
+  const p = item.profile && item.profile !== 'default' ? `?profile=${encodeURIComponent(item.profile)}` : ''
+  return `/api/sessions/${encodeURIComponent(item.session_id)}${p}`
 }
 
 export function itemFor(items, sessionId) {
@@ -144,7 +156,7 @@ export function createStore(ctx) {
     if (!api) return
     const via = item.gateway && item.gateway !== routedGateway() ? { connectionId: item.gateway } : {}
     void Promise.resolve(
-      api({ ...via, path: `/api/sessions/${encodeURIComponent(item.session_id)}`, method: 'PATCH', body: { unread: false } })
+      api({ ...via, path: sessionPath(item), method: 'PATCH', body: { unread: false } })
     ).catch(() => {})
   }
 
@@ -158,7 +170,7 @@ export function createStore(ctx) {
     $busy.set(item.session_id)
     $items.set($items.get().filter(i => i !== item))
     try {
-      await ctx.rest(`/items/${encodeURIComponent(item.session_id)}/archive`, restOpts(item, routedGateway(), { method: 'POST' }))
+      await ctx.rest(itemPath(item, 'archive'), restOpts(item, routedGateway(), { method: 'POST' }))
     } catch (e) {
       host.notifyError?.(e, 'Could not archive inbox message')
     } finally {
@@ -170,7 +182,7 @@ export function createStore(ctx) {
   const accept = async item => {
     $busy.set(item.session_id)
     try {
-      const r = await ctx.rest(`/items/${encodeURIComponent(item.session_id)}/accept`, restOpts(item, routedGateway(), { method: 'POST' }))
+      const r = await ctx.rest(itemPath(item, 'accept'), restOpts(item, routedGateway(), { method: 'POST' }))
       const prompt = str((r && r.accept_prompt) || item.accept_prompt)
       $items.set($items.get().filter(i => i !== item))
       const sent = prompt && host.composer?.submit?.(item.session_id, prompt)

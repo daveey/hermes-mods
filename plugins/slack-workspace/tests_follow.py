@@ -1,0 +1,245 @@
+"""Tests for the follower side (follow.py): posting invariants, escalation, runner turns, ops.
+Run: uv run --with pytest python -m pytest -q -p no:cacheprovider plugins/slack-workspace"""
+
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).parent
+
+
+def _load(name, file):
+    spec = importlib.util.spec_from_file_location(name, HERE / file)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+core = _load("slack_workspace_core", "core.py")
+engage = _load("slack_workspace_engage", "engage.py")
+follow = _load("slack_workspace_follow_t", "follow.py")
+
+BOTSELF = "UBOTSELF"
+
+
+class FakeAPI:
+    def __init__(self):
+        self.posts, self.n = [], 100
+
+    def __call__(self, method, params=None):
+        params = params or {}
+        if method == "chat.postMessage":
+            self.n += 1
+            ts = f"{self.n}.0"
+            self.posts.append(dict(params, ts=ts))
+            return {"ok": True, "ts": ts, "channel": params["channel"]}
+        if method == "conversations.replies":
+            return {"ok": True, "messages": [{"ts": p["ts"]} for p in self.posts]}
+        if method == "reactions.add":
+            return {"ok": True}
+        raise AssertionError(method)
+
+
+@pytest.fixture
+def env(tmp_path):
+    store = core.Store(tmp_path)
+    engs = engage.Engagements(store)
+    api = FakeAPI()
+    poster = follow.Poster(engs, api, lambda: BOTSELF)
+    return store, engs, api, poster
+
+
+def rec(store, ch, ts, text="q?", user="UBOB", thread="", bot_id=""):
+    ev = {"type": "message", "channel": ch, "ts": ts, "text": text, "user": user}
+    if thread:
+        ev["thread_ts"] = thread
+    if bot_id:
+        ev["bot_id"] = bot_id
+    store.record_event(ev)
+
+
+# ---- slack_post invariants ----------------------------------------------------------------------
+def test_post_refused_outside_an_active_engagement(env):
+    _, engs, api, poster = env
+    assert poster.post("C1", "hi")["error"].startswith("not_engaged")
+    e = engs.create("C1", "a")
+    engs.set_state(e["id"], "ended")
+    assert poster.post("C1", "hi")["error"].startswith("not_engaged")
+    assert api.posts == []
+
+
+def test_exactly_one_reply_per_message(env):
+    store, engs, api, poster = env
+    engs.create("C1", "a")
+    rec(store, "C1", "5.0")
+    first = poster.post("C1", "answer", thread_ts="5.0", reply_to="5.0")
+    second = poster.post("C1", "answer again", thread_ts="5.0", reply_to="5.0")
+    assert first["ok"] and first["verified"]
+    assert second["error"].startswith("already_replied") and second["posted_ts"] == first["ts"]
+    assert len(api.posts) == 1 and api.posts[0]["thread_ts"] == "5.0"
+
+
+def test_bot_to_bot_cap_refuses_fourth_reply_until_a_human_speaks(env):
+    store, engs, api, poster = env
+    engs.create("C1", "a")
+    for i in range(4):
+        rec(store, "C1", f"{10 + i}.0", f"<@{BOTSELF}> q{i}", user="UOTHERBOT", thread="9.0", bot_id="BF")
+    for i in range(3):
+        assert poster.post("C1", f"a{i}", thread_ts="9.0", reply_to=f"{10 + i}.0")["ok"]
+    capped = poster.post("C1", "a3", thread_ts="9.0", reply_to="13.0")
+    assert capped["error"].startswith("bot_loop_cap") and "slack_escalate" in capped["error"]
+    assert len(api.posts) == 3
+    # the refused message is not burned: after a human speaks it can still be answered
+    engage.route({"type": "message", "channel": "C1", "ts": "14.0", "thread_ts": "9.0", "text": "ok",
+                  "user": "UBOB"}, engs, bot_user_id=BOTSELF)
+    assert poster.post("C1", "a3", thread_ts="9.0", reply_to="13.0")["ok"]
+
+
+# ---- escalation ---------------------------------------------------------------------------------
+def test_escalate_posts_one_inbox_card_per_topic_and_nothing_in_channel(env):
+    store, engs, api, poster = env
+    engs.create("C1", "research only", name="proj")
+    rec(store, "C1", "20.0", "can David join our board?")
+    cards = {}
+
+    def inbox_post(title, body, accept_prompt, key=None, **_):
+        updated = key in cards
+        cards[key] = {"title": title, "body": body, "accept_prompt": accept_prompt,
+                      "n": cards.get(key, {}).get("n", 0) + 1}
+        return {"session_id": "s-" + key, "updated": updated}
+
+    r1 = follow.escalate(engs, inbox_post, channel="C1", thread_ts="20.0", reply_to="20.0",
+                         topic="Board seat", title="Board seat ask", body="who/what", reply_text="Let me check with David.")
+    r2 = follow.escalate(engs, inbox_post, channel="C1", thread_ts="20.0", reply_to="21.0",
+                         topic="board seat", title="Board seat ask (follow-up)", body="again", reply_text="x")
+    assert r1["ok"] and r2["ok"] and r2["updated"] and r1["key"] == r2["key"] == "slack:C1:20.0:board-seat"
+    assert len(cards) == 1 and cards[r1["key"]]["n"] == 2
+    prompt = cards[r1["key"]]["accept_prompt"]
+    assert "slack_post" in prompt and "thread_ts='20.0'" in prompt and "reply_to='21.0'" in prompt
+    assert api.posts == []
+
+
+def test_escalations_are_remembered_per_channel_for_topic_reuse(env):
+    store, engs, api, poster = env
+    engs.create("C1", "a")
+    follow.escalate(engs, lambda **kw: {"session_id": "s1", "updated": False}, channel="C1", thread_ts="20.0",
+                    topic="Board seat", title="Board seat ask", body="b", reply_text="x")
+    follow.escalate(engs, lambda **kw: {"session_id": "s2", "updated": False}, channel="C2", thread_ts="1.0",
+                    topic="other", title="t", body="b", reply_text="x")
+    got = engs.escalations("C1")
+    assert [(g["key"], g["topic"], g["title"]) for g in got] == [("slack:C1:20.0:board-seat", "Board seat", "Board seat ask")]
+    e = engs.get(engs.list()[0]["id"])
+    prompt = follow.batch_prompt(e, {"trigger": [], "all": []}, [], str, "U", engs.escalations("C1"))
+    assert "slack:C1:20.0:board-seat" in prompt and "Board seat" in prompt
+
+
+# ---- runner -------------------------------------------------------------------------------------
+def make_runner(store, engs, spawned):
+    def spawn(e, prompt):
+        spawned.append((e["id"], prompt))
+        return 0, "PROBE\n\nsession_id: 20261019_000000_abcdef\n"
+    return follow.Runner(store, engs, token=lambda: "x", bot_user_id=lambda: BOTSELF, name=lambda u: u.lower(),
+                         root_home=store.root, spawn=spawn)
+
+
+def test_runner_kickoff_then_one_turn_per_batch_and_watermark(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "follow X", name="proj", owner="@session:default@this-device/s1", private=True,
+                    last_handled_ts="1.0")
+    spawned = []
+    r = make_runner(store, engs, spawned)
+    assert r.run_once(e["id"])
+    assert "kickoff" in spawned[0][1] and "follow X" in spawned[0][1] and "@session:default@this-device/s1" in spawned[0][1]
+    assert engs.get(e["id"])["follower_session"] == "20261019_000000_abcdef"
+    assert not r.run_once(e["id"])  # nothing new
+    rec(store, "C1", "2.0", "first")
+    rec(store, "C1", "3.0", "second")
+    assert r.run_once(e["id"])
+    assert "ts=2.0" in spawned[-1][1] and "ts=3.0" in spawned[-1][1]
+    assert engs.get(e["id"])["last_handled_ts"] == "3.0"
+    assert not r.run_once(e["id"])
+    assert len(spawned) == 2
+
+
+def test_runner_failed_turn_does_not_spin_and_keeps_work_for_the_next_tick(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    calls = []
+
+    def bad(e_, prompt):
+        calls.append(prompt)
+        return 1, "Error: boom"
+    r = follow.Runner(store, engs, token=lambda: "x", bot_user_id=lambda: BOTSELF, name=str,
+                      root_home=store.root, spawn=bad)
+    assert not r.run_once(e["id"])  # kickoff failed: stop, the tick retries
+    assert engs.get(e["id"])["kickoff"] == 1
+    engs.update(e["id"], kickoff=0)
+    rec(store, "C1", "2.0", "hello")
+    assert not r.run_once(e["id"])
+    assert engs.get(e["id"])["last_handled_ts"] == "1.0"  # not marked handled
+    assert len(calls) == 2
+
+
+def test_spawn_env_points_hermes_home_at_the_gateway_root(env, monkeypatch, tmp_path):
+    store, engs, _, _ = env
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(cmd=cmd, env=kw["env"])
+
+        class R:
+            returncode, stdout, stderr = 0, "session_id: s1\n", ""
+        return R()
+    monkeypatch.setattr(follow.subprocess, "run", fake_run)
+    monkeypatch.setenv("HERMES_HOME", "/somewhere/profiles/bot")
+    r = follow.Runner(store, engs, token=lambda: "x", bot_user_id=lambda: BOTSELF, name=str, root_home=tmp_path)
+    e = engs.create("C1", "x", private=True)
+    r._spawn(e, "hi")
+    assert seen["env"]["HERMES_HOME"] == str(tmp_path)
+    assert seen["cmd"][seen["cmd"].index("-p") + 1] == "slack-follow"
+
+
+def test_runner_skips_ended_engagements(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    engs.update(e["id"], kickoff=0)
+    engs.set_state(e["id"], "ended")
+    rec(store, "C1", f"{time.time() + 5:.6f}", "hello?")
+    spawned = []
+    assert not make_runner(store, engs, spawned).run_once(e["id"])
+    assert spawned == []
+
+
+def test_tick_ends_expired_and_quiet_engagements(env):
+    store, engs, _, _ = env
+    a = engs.create("C1", "x", until=time.time() - 1, private=True)
+    b = engs.create("C2", "y", private=True)
+    engs.update(b["id"], kickoff=0, last_activity=time.time() - 8 * 86400)
+    make_runner(store, engs, []).tick()
+    assert engs.get(a["id"])["state"] == engs.get(b["id"])["state"] == "ended"
+
+
+# ---- ops ----------------------------------------------------------------------------------------
+def test_engagement_ops_roundtrip(env):
+    _, engs, _, _ = env
+    c = follow.engagement_op(engs, "create", {"channel": "C1", "brief": "b", "until": "2d", "kanban_ids": ["t_1"]})
+    eid = c["engagement"]["id"]
+    assert c["ok"] and c["engagement"]["expires"] > time.time() + 86400
+    assert [x["id"] for x in follow.engagement_op(engs, "list", {})["engagements"]] == [eid]
+    assert follow.engagement_op(engs, "pause", {"id": eid})["engagement"]["state"] == "paused"
+    assert follow.engagement_op(engs, "resume", {"id": eid})["engagement"]["state"] == "active"
+    assert follow.engagement_op(engs, "end", {"id": eid})["engagement"]["state"] == "ended"
+    assert follow.engagement_op(engs, "list", {})["engagements"] == []
+    assert not follow.engagement_op(engs, "get", {"id": "nope"})["ok"]
+
+
+def test_new_engagements_use_the_follower_profile_from_policy(env):
+    store, engs, _, _ = env
+    assert follow.engagement_op(engs, "create", {"channel": "C1", "brief": "b"})["engagement"]["follower_profile"] == "slack-follow"
+    store.update_policy(follower={"profile": "my-follower"})
+    assert follow.engagement_op(engs, "create", {"channel": "C2", "brief": "b"})["engagement"]["follower_profile"] == "my-follower"
