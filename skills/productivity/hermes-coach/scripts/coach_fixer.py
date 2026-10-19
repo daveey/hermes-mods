@@ -35,7 +35,18 @@ def kanban_db(home, board):
 
 
 def _ro(path):
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    """Read-only connection. `mode=ro` fails on a WAL db whose -shm is absent (nobody holds it open), so fall
+    back to a normal open pinned with query_only (sqlite may create the -shm; writes are still refused)."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+        c.execute("select 1 from sqlite_master limit 1").fetchall()
+        return c
+    except sqlite3.OperationalError:
+        if not Path(path).exists():
+            raise
+        c = sqlite3.connect(path, timeout=10)
+        c.execute("pragma query_only = on")
+        return c
 
 
 def session_cost(conn, sid, _seen=None):

@@ -140,5 +140,25 @@ class Fixer(Base):
         self.assertIn("evidence", FIX)
 
 
+class ReadOnlyOpen(unittest.TestCase):
+    def test_wal_board_without_shm_is_readable(self):
+        """A WAL board nobody holds open has no -shm file; `mode=ro` can't create one and failed with
+        'unable to open database file' (found by the real-CLI integration run on a fresh board)."""
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        p = d / "kanban.db"
+        c = sqlite3.connect(p)
+        c.execute("pragma journal_mode=wal")
+        c.execute("create table tasks (id text, created_by text)")
+        c.execute("insert into tasks values ('t_1', 'coach')")
+        c.commit(); c.close()
+        for side in ("kanban.db-shm", "kanban.db-wal"):
+            (d / side).unlink(missing_ok=True)
+        with fx._ro(p) as k:
+            self.assertEqual(k.execute("select id from tasks").fetchall(), [("t_1",)])
+            with self.assertRaises(sqlite3.OperationalError):
+                k.execute("insert into tasks values ('t_2', 'x')")
+
+
 if __name__ == "__main__":
     unittest.main()
