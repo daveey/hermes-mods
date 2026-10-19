@@ -138,3 +138,24 @@ test('cooling-down and out-of-quota rows stay unselectable: visible refusal, no 
  await s.select('anthropic',claude.accounts.find(a=>a.id==='part'))
  assert.equal(calls.filter(c=>c.method==='PUT').length,1)
 })
+
+test('needsReconnect only flags dead or auth-benched accounts', async () => {
+ const {plugin}=await setup()
+ assert.equal(plugin.needsReconnect({state:'unavailable',reason:'auth'}),true)
+ assert.equal(plugin.needsReconnect({state:'limited',limit_kind:'cooldown',reason:'auth'}),true)
+ for (const a of [{state:'ready'},{state:'limited',limit_kind:'quota',reason:'usage_limit'},{state:'limited',limit_kind:'cooldown',reason:'rate_limit'},{state:'unknown'}]) assert.equal(plugin.needsReconnect(a),false)
+})
+test('reconnect POSTs the account, refreshes on success, offers sign-in when the grant is dead', async () => {
+ const {plugin}=await setup(); const calls=[]; let refreshed=0; let reply={ok:true,renewed:1}
+ const ctx={onDispose(){},async rest(path,opts){calls.push({path,...opts});if(reply instanceof Error)throw reply;return reply}}
+ const r=plugin.createReconnectStore(ctx,()=>refreshed++)
+ await r.reconnect('openai-codex',{id:'acct-1'})
+ assert.deepEqual(calls[0],{path:'/reconnect',method:'POST',body:{provider:'openai-codex',account_id:'acct-1'}})
+ assert.equal(refreshed,1); assert.equal(r.$state.get()[r.key('openai-codex','acct-1')].done,true)
+ reply={ok:false,needs_sign_in:true,sign_in_command:'hermes auth add anthropic --type oauth --label x'}
+ await r.reconnect('anthropic',{id:'acct-2'})
+ const st=r.$state.get()[r.key('anthropic','acct-2')]
+ assert.equal(st.needsSignIn,true); assert.equal(st.command,'hermes auth add anthropic --type oauth --label x'); assert.equal(refreshed,1)
+ reply=new Error('503 pool unavailable'); await r.reconnect('anthropic',{id:'acct-3'})
+ assert.match(r.$state.get()[r.key('anthropic','acct-3')].message,/Reconnect failed: 503/)
+})

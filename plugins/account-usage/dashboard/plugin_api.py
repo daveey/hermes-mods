@@ -97,3 +97,64 @@ def put_selection(body: SelectionBody, service=Depends(selection_service)):
 def delete_selection(session_id: str = Query(min_length=1, max_length=256),
                      expected_revision: int = Query(ge=0), service=Depends(selection_service)):
     return _call(service, 'delete', session_id, expected_revision=expected_revision)
+
+
+# ── Reconnect: renew a disconnected account's OAuth grant in place ─────────────
+
+RECONNECT_PROVIDERS = frozenset({'anthropic', 'openai-codex'})
+
+
+class ReconnectBody(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    provider: str = Field(min_length=1, max_length=64)
+    account_id: str = Field(min_length=1, max_length=512)
+
+
+def _pool_tools():
+    """(load_pool, identity_for, STATUS_DEAD) from core; isolated so tests can stub it."""
+    from agent.account_usage_cache import _identity_id_for
+    from agent.credential_pool import STATUS_DEAD, load_pool
+    return load_pool, _identity_id_for, STATUS_DEAD
+
+
+def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, Any]:
+    """Force-refresh every pooled OAuth credential of one account (the wire ``accounts[].id``).
+
+    Same effect as ``hermes auth refresh <provider> <entry>``: a live refresh token mints new
+    tokens and clears the entry's local block. A dead grant can't be renewed here, so the reply
+    says ``needs_sign_in`` and the panel sends the user to the sign-in flow. Never returns tokens,
+    raw errors or entry secrets."""
+    if provider not in RECONNECT_PROVIDERS:
+        raise HTTPException(400, detail=f'Reconnect is not supported for {provider}')
+    try:
+        load_pool, identity_for, status_dead = tools or _pool_tools()
+        pool = load_pool(provider)
+        matches = [e for e in pool.entries() if identity_for(provider, e) == account_id]
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, detail='Credential pool is unavailable; retry') from None
+    if not matches:
+        raise HTTPException(404, detail='Account not found; refresh the panel')
+    renewed = 0
+    for entry in matches:
+        if getattr(entry, 'auth_type', None) != 'oauth' or not getattr(entry, 'refresh_token', None):
+            continue
+        try:
+            refreshed = pool.try_refresh_matching(credential_id=entry.id)
+        except Exception:
+            refreshed = None
+        if refreshed is not None and getattr(refreshed, 'last_status', None) != status_dead:
+            renewed += 1
+    sign_in = f'hermes auth add {provider} --type oauth'
+    label = str(getattr(matches[0], 'label', '') or '')
+    if label:
+        import shlex
+        sign_in += f' --label {shlex.quote(label)}'
+    return {'ok': renewed > 0, 'renewed': renewed, 'needs_sign_in': renewed == 0,
+            'sign_in_command': sign_in}
+
+
+@router.post('/reconnect')
+def post_reconnect(body: ReconnectBody):
+    return reconnect_account(body.provider, body.account_id)

@@ -31,6 +31,10 @@ const CSS = `
 .hermes-au-row:hover { background: var(--chrome-action-hover) }
 .hermes-au-row:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px }
 .hermes-au-row:disabled { cursor: wait }
+.hermes-au-fix { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0 3px 5px 21px; font-size: 10.5px }
+.hermes-au-fix button { color: var(--ui-accent, var(--accent)); border: 1px solid currentColor; border-radius: 3px; padding: 1px 7px; background: transparent; cursor: pointer; font-size: 10.5px }
+.hermes-au-fix button:disabled { cursor: wait; opacity: .6 }
+.hermes-au-fix code { overflow-wrap: anywhere; opacity: .8 }
 .hermes-au-next { display: inline-block; white-space: nowrap; color: var(--ui-accent); border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 5px }
 @media (prefers-reduced-motion: reduce) { .hermes-au-dot[data-mark='active'] { animation: none } }
 `
@@ -122,6 +126,11 @@ export function summarize(payload, last = {}, now = Date.now()) {
     }
     return { ...p, accounts, ready, cooling, limited, total: accounts.length, nextBack, markId, mark, markAt: rec ? rec.at * 1000 : null }
   }).filter(Boolean)
+}
+
+// A disconnected account: dead grant, or benched for an auth error. These get a Reconnect button.
+export function needsReconnect(account) {
+  return !!account && (account.state === 'unavailable' || account.reason === 'auth')
 }
 
 // ── state ─────────────────────────────────────────────────────────────────
@@ -252,6 +261,29 @@ export function createSelectionStore(ctx) {
   return { $state, refresh, select: mutate, cancel: () => mutate() }
 }
 
+// Reconnect = renew the account's OAuth grant in place (backend force-refresh). When the grant is
+// dead the reply says needs_sign_in and the row offers the provider sign-in flow instead.
+export function createReconnectStore(ctx, onDone = () => {}) {
+  const $state = atom({})
+  const key = (provider, id) => `${provider}\u0000${id}`
+  const put = (k, v) => $state.set({ ...$state.get(), [k]: v })
+  const reconnect = async (provider, account) => {
+    const k = key(provider, account.id)
+    if ($state.get()[k]?.busy) return
+    put(k, { busy: true })
+    try {
+      const r = await ctx.rest('/reconnect', { method: 'POST', body: { provider, account_id: account.id } })
+      put(k, r && r.ok
+        ? { done: true, message: 'Reconnected' }
+        : { needsSignIn: true, command: r?.sign_in_command || `hermes auth add ${provider} --type oauth`, message: 'Saved sign-in expired — sign in again' })
+      if (r && r.ok) onDone()
+    } catch (err) {
+      put(k, { error: true, message: `Reconnect failed: ${String(err?.message || err)}` })
+    }
+  }
+  return { $state, key, reconnect }
+}
+
 // ── UI ────────────────────────────────────────────────────────────────────
 
 function Dot({ t, size = 7, mark = null }) {
@@ -288,9 +320,27 @@ function Meter({ win }) {
   ] })
 }
 
-const GRID = { display: 'grid', gridTemplateColumns: '10px minmax(90px,1.1fr) 1fr 1fr', gap: 8, alignItems: 'center' }
+// minmax(0, …) lets long cause text wrap instead of widening the popover.
+const GRID = { display: 'grid', gridTemplateColumns: '10px minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr)', gap: 8, alignItems: 'center' }
+const PANEL_STYLE = { width: 'min(460px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)', maxHeight: 'min(80vh, 680px)', overflowY: 'auto', overflowX: 'hidden' }
 
-function GroupPanel({ g, selectionStore, selectionState }) {
+function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
+  const st = reconnectState[reconnectStore.key(g.slug, a.id)] || {}
+  if (!needsReconnect(a) && !st.message) return null
+  const children = []
+  if (st.needsSignIn) {
+    children.push(jsx('button', { type: 'button', 'aria-label': `Sign in to ${a.label || a.id} again`,
+      onClick: () => host.navigate('/settings?tab=providers'), children: 'Sign in again…' }))
+    children.push(jsxs('span', { children: [st.message, ' · or run ', jsx('code', { children: st.command })] }))
+  } else {
+    if (!st.done) children.push(jsx('button', { type: 'button', 'aria-label': `Reconnect ${a.label || a.id}`, disabled: !!st.busy,
+      onClick: () => reconnectStore.reconnect(g.slug, a), children: st.busy ? 'Reconnecting…' : 'Reconnect' }))
+    if (st.message) children.push(jsx('span', { style: { color: st.error ? COLORS.limited : COLORS.ready }, children: st.message }))
+  }
+  return jsxs('div', { className: 'hermes-au-fix', children })
+}
+
+function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconnectState }) {
   const limited = g.limited, cooling = g.cooling
   const unknown = g.total - g.ready - limited - cooling
   const parts = [`${g.ready} ready`, limited && `${limited} out of quota`, cooling && `${cooling} cooling down`, unknown && `${unknown} unknown`].filter(Boolean)
@@ -300,19 +350,19 @@ function GroupPanel({ g, selectionStore, selectionState }) {
       jsx('span', { style: { fontSize: 10.5, opacity: 0.65 }, children: parts.join(' · ') })
     ] }),
     jsxs('div', { style: { ...GRID, fontSize: 10, opacity: 0.55 }, children: [jsx('span', {}), jsx('span', { children: 'Account' }), jsx('span', { children: '5-hour session' }), jsx('span', { children: 'Weekly' })] }),
-    ...g.accounts.map(a => jsxs('button', { key: a.id, type: 'button', className: 'hermes-au-row',
+    ...g.accounts.map(a => jsxs('div', { key: a.id, children: [jsxs('button', { type: 'button', className: 'hermes-au-row',
       'aria-label': `Try ${a.label || a.id} next`, disabled: selectionState.busy || selectionState.loading,
       onClick: () => selectionStore.select(g.slug, a),
       style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.72 }, title: `${describe(a) || a.state} · Next request in the focused chat only`, children: [
       jsx(Dot, { t: tone(a), mark: a.id === g.markId ? g.mark : null }),
-      jsxs('span', { style: { overflowWrap: 'anywhere', fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
+      jsxs('span', { style: { minWidth: 0, overflowWrap: 'anywhere', fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
         a.label || a.id, a.id === g.markId ? jsx(MarkBadge, { g }) : null,
         selectionState.selection?.state === 'pending' && selectionState.selection.provider === g.slug && selectionState.selection.account_id === a.id
           ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null,
         describe(a) ? jsx('span', { className: 'hermes-au-why', 'data-tone': tone(a), style: { display: 'block', fontSize: 10, color: COLORS[tone(a)] || undefined, opacity: 0.9 }, children: describe(a) }) : null] }),
       jsx(Meter, { win: pickWindow(a.windows, 'session') }),
       jsx(Meter, { win: pickWindow(a.windows, 'week') })
-    ] }))
+    ] }), jsx(ReconnectLine, { g, a, reconnectStore, reconnectState })] }))
   ] })
 }
 
@@ -322,8 +372,9 @@ function ago(ts) {
   return s < 60 ? `${s}s ago` : `${Math.round(s / 60)}m ago`
 }
 
-function UsageBar({ store, selectionStore }) {
+function UsageBar({ store, selectionStore, reconnectStore }) {
   const { groups, fetchedAt, loading, error } = useValue(store.$state)
+  const reconnectState = useValue(reconnectStore.$state)
   const selectionState = useValue(selectionStore.$state)
   // Subscriptions invalidate immediately; effect hydrates the newly focused route.
   const focused = useValue(host.state.focusedSessionId)
@@ -347,7 +398,7 @@ function UsageBar({ store, selectionStore }) {
           jsx('span', { style: { color: g.ready === 0 ? (!g.limited && g.cooling ? COLORS.cooldown : COLORS.limited) : undefined }, children: `${g.ready}/${g.total}` })
         ] }))
     }) }),
-    jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[440px]', children:
+    jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[460px]', style: PANEL_STYLE, children:
       jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: 4, fontSize: 12 }, children: [
         jsx('div', { style: { fontSize: 11, lineHeight: 1.5 }, children: 'Click an account for this chat’s next request only. Provider and model stay unchanged; other chats and global priority are unaffected.' }),
         jsx('div', { style: { fontSize: 10.5, opacity: 0.75 }, children: 'In use / last used is a provider-global observation, not this chat’s queued account.' }),
@@ -357,7 +408,7 @@ function UsageBar({ store, selectionStore }) {
           jsx('button', { type: 'button', disabled: selectionState.busy || selectionState.loading, onClick: () => selectionStore.refresh(), style: { marginLeft: 8, textDecoration: 'underline' }, children: 'Refresh selection' })
         ] }),
         selectionState.error ? jsx('div', { role: 'alert', style: { color: 'var(--ui-text-primary)', border: '1px solid var(--ui-stroke-secondary)', padding: 7, overflowWrap: 'anywhere' }, children: selectionState.error }) : null,
-        ...groups.flatMap((g, i) => [i ? jsx('div', { key: `sep-${g.slug}`, style: { borderTop: '1px solid var(--border)' } }) : null, jsx(GroupPanel, { key: g.slug, g, selectionStore, selectionState })]).filter(Boolean),
+        ...groups.flatMap((g, i) => [i ? jsx('div', { key: `sep-${g.slug}`, style: { borderTop: '1px solid var(--border)' } }) : null, jsx(GroupPanel, { key: g.slug, g, selectionStore, selectionState, reconnectStore, reconnectState })]).filter(Boolean),
         jsx('div', { style: { borderTop: '1px solid var(--border)' } }),
         jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10.5, opacity: 0.7 }, children: [
           jsx('span', { children: error ? `Refresh failed: ${error}` : `Updated ${ago(fetchedAt)} · auto every 30s` }),
@@ -379,10 +430,11 @@ export default {
     ctx.onDispose(() => style.remove())
     const store = createStore(ctx)
     const selectionStore = createSelectionStore(ctx)
+    const reconnectStore = createReconnectStore(ctx, () => store.refresh())
     store.refresh()
     // Second read shortly after: the first call kicks background usage fetches.
     ctx.setTimeout(() => store.refresh(), 8_000)
     ctx.setInterval(() => { store.refresh(); selectionStore.refresh() }, POLL_MS)
-    ctx.register({ id: 'chips', area: STATUSBAR_AREAS.right, order: 5, render: () => jsx(UsageBar, { store, selectionStore }) })
+    ctx.register({ id: 'chips', area: STATUSBAR_AREAS.right, order: 5, render: () => jsx(UsageBar, { store, selectionStore, reconnectStore }) })
   }
 }
