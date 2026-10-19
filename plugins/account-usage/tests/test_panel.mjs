@@ -86,3 +86,55 @@ test('click queues inventory identity for runtime chat; readback then cancel use
  assert.match(calls.find(x=>x.method==='DELETE').path,/expected_revision=1/)
  assert.equal(s.$state.get().selection.state,'cancelled')
 })
+
+// ── limited-account causes: red quota vs amber cooldown (sanitized backend fields) ──
+const SOON = new Date(Date.now() + 23 * 60_000).toISOString()
+const LATER = new Date(Date.now() + 3 * 86400_000).toISOString()
+function causePayload() {
+ return {providers:[{slug:'anthropic',usage:{accounts:[
+  {id:'ok',label:'ok',state:'ready',windows:[{label:'Session',used_percent:20,scope:'account'}],model_cooldowns:[]},
+  {id:'cool',label:'cool',state:'limited',limit_kind:'cooldown',reason:'rate_limit',cooldown_until:SOON,resets_at:SOON,windows:[{label:'Session',used_percent:40,scope:'account'}]},
+  {id:'spent',label:'spent',state:'limited',limit_kind:'quota',reason:'quota_window',resets_at:LATER,cooldown_until:null,windows:[{label:'Session',used_percent:100,scope:'account'}]},
+  {id:'old',label:'old',state:'limited',resets_at:null,windows:[]},
+  {id:'part',label:'part',state:'ready',windows:[{label:'Session',used_percent:10,scope:'account'}],model_cooldowns:[{model:'claude-sonnet-5-5',until:SOON}]},
+ ]}},{slug:'openai-codex',usage:{accounts:[
+  {id:'dc',label:'device_code',state:'limited',limit_kind:'quota',reason:'usage_limit',cooldown_until:LATER,resets_at:LATER,windows:[]},
+  {id:'c2',label:'c2',state:'ready',windows:[{label:'Session',used_percent:5,scope:'account'}]},
+ ]}}]}
+}
+test('cooldown is amber, quota is red, a legacy limited row without limit_kind stays red', async () => {
+ const {plugin}=await setup()
+ const [claude, codex]=plugin.summarize(causePayload())
+ const tones=Object.fromEntries(claude.accounts.map(a=>[a.id,plugin.tone(a)]))
+ assert.deepEqual(tones,{ok:'ready',cool:'cooldown',spent:'limited',old:'limited',part:'ready'})
+ assert.equal(plugin.tone(codex.accounts[0]),'limited','Codex usage_limit_reached is a real exhaustion')
+ assert.equal(claude.ready,2); assert.equal(claude.cooling,1); assert.equal(claude.limited,2); assert.equal(claude.total,5)
+ assert.equal(claude.nextBack,SOON,'earliest limited account (cooldown) is next back')
+})
+test('describe shows the sanitized cause and expiry, and model-only cooldowns', async () => {
+ const {plugin}=await setup()
+ const [claude, codex]=plugin.summarize(causePayload())
+ const byId=Object.fromEntries(claude.accounts.map(a=>[a.id,a]))
+ assert.match(plugin.describe(byId.cool),/^cooling down · rate limited · back 2[23]m$/)
+ assert.match(plugin.describe(byId.spent),/^out of quota · quota used up · back /)
+ assert.equal(plugin.describe(byId.old),'out of quota')
+ assert.match(plugin.describe(byId.part),/^claude-sonnet-5-5 cooling 2[23]m$/)
+ assert.equal(plugin.describe(byId.ok),'')
+ assert.match(plugin.describe(codex.accounts[0]),/^out of quota · usage limit reached · back /)
+})
+test('cooling-down and out-of-quota rows stay unselectable: visible refusal, no PUT', async () => {
+ const {plugin,ctx,calls}=await setup()
+ const [claude]=plugin.summarize(causePayload())
+ const s=plugin.createSelectionStore(ctx); await s.refresh()
+ for (const id of ['cool','spent','old']) {
+  await s.select('anthropic',claude.accounts.find(a=>a.id===id))
+  assert.match(s.$state.get().error,/Cooldowns are not reset/)
+ }
+ assert.match(s.$state.get().error,/limited: out of quota/)
+ await s.select('anthropic',claude.accounts.find(a=>a.id==='cool'))
+ assert.match(s.$state.get().error,/cooling down · rate limited/)
+ assert.equal(calls.filter(c=>c.method==='PUT').length,0)
+ // A model-only cooldown leaves the account ready, hence selectable.
+ await s.select('anthropic',claude.accounts.find(a=>a.id==='part'))
+ assert.equal(calls.filter(c=>c.method==='PUT').length,1)
+})

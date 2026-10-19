@@ -1,0 +1,401 @@
+From 423d773e79150a1acf0fc5eb98322a0c00379695 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 02:06:35 -0700
+Subject: [PATCH] fix(auxiliary): pool rotation names the failed wire model and
+ credential [daveey]
+
+_recover_provider_pool called mark_exhausted_and_rotate without model or
+failure_reason, so the pool could not scope a generic Anthropic 429 to the
+rate-limited model: every auxiliary 429 (goal judge, titles, compression)
+benched the whole Claude credential for an hour although its quota windows
+had room. The rotated retry's failure was reported with no credential at
+all, so the pool benched whatever current() was.
+
+- pass the failed request's wire model and a classified failure_reason
+  (billing for payment/quota, rate_limit for 429) so billing/auth stay
+  account-wide and a generic 429 benches only that model
+- same-provider retries (sync and async) stamp the (api_key, model) they
+  used on their exception; the ladder reports that identity for the
+  rotated retry instead of none
+---
+ agent/auxiliary_client.py                     |  85 +++++--
+ ...st_auxiliary_pool_model_scoped_rotation.py | 214 ++++++++++++++++++
+ 2 files changed, 281 insertions(+), 18 deletions(-)
+ create mode 100644 tests/agent/test_auxiliary_pool_model_scoped_rotation.py
+
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 5f90dd890f..e5ad10047d 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -3718,11 +3718,40 @@ def _recoverable_pool_provider(
+     return None
+ 
+ 
+-def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "") -> bool:
++# Attribute stamped on an exception raised by a same-provider retry: the (api_key, wire model)
++# that request actually used, so pool recovery benches the credential that failed rather than
++# the original client's (or whatever ``current()`` is by then).
++_AUX_FAILED_IDENTITY_ATTR = "_hermes_aux_failed_identity"
++
++
++def _stamp_failed_identity(exc: BaseException, client: Any, request_kwargs: Optional[dict]) -> None:
++    """Record which credential and model a failed request used (innermost stamp wins)."""
++    if getattr(exc, _AUX_FAILED_IDENTITY_ATTR, None) is not None:
++        return
++    identity = (str(getattr(client, "api_key", "") or ""), str((request_kwargs or {}).get("model") or ""))
++    with contextlib.suppress(Exception):
++        setattr(exc, _AUX_FAILED_IDENTITY_ATTR, identity)
++
++
++def _failed_identity(exc: BaseException, client: Any, request_kwargs: Optional[dict]) -> tuple[str, str]:
++    """``(api_key, model)`` of the request that raised *exc*: the retry's stamp when present,
++    else the given client/kwargs (the original request)."""
++    stamped = getattr(exc, _AUX_FAILED_IDENTITY_ATTR, None)
++    if isinstance(stamped, tuple) and len(stamped) == 2:
++        return str(stamped[0] or ""), str(stamped[1] or "")
++    return str(getattr(client, "api_key", "") or ""), str((request_kwargs or {}).get("model") or "")
++
++
++def _recover_provider_pool(
++    provider: str, exc: Exception, *, failed_api_key: str = "", failed_model: str = "",
++) -> bool:
+     """Try same-provider credential-pool recovery for auxiliary calls.
+ 
+     ``failed_api_key`` lets mark_exhausted_and_rotate identify the right pool entry even if
+-    another process already rotated (current() would be None).
++    another process already rotated (current() would be None). ``failed_model`` is the wire
++    model of the failed request: the pool scopes a generic Anthropic 429 to that model only.
++    Without it the pool benches the whole credential for every model. The classified
++    ``failure_reason`` keeps billing/quota failures account-wide even with a model.
+     """
+     normalized = _normalize_aux_provider(provider)
+     try:
+@@ -3734,13 +3763,18 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
+         return False
+     status_code = getattr(exc, "status_code", None)
+ 
+-    def _rotate(fallback_status: int) -> bool:
++    def _rotate(fallback_status: int, failure_reason: Optional[str] = None) -> bool:
+         error_context: dict[str, Any] = {"message": str(exc)}
+         if status_code is not None:
+             error_context["status_code"] = status_code
++        rotate_kwargs: dict[str, Any] = {}
++        if failure_reason:
++            rotate_kwargs["failure_reason"] = failure_reason
++        if failed_model:
++            rotate_kwargs["model"] = failed_model
+         next_entry = pool.mark_exhausted_and_rotate(
+             status_code=status_code if status_code is not None else fallback_status,
+-            error_context=error_context, api_key_hint=failed_api_key or None,
++            error_context=error_context, api_key_hint=failed_api_key or None, **rotate_kwargs,
+         )
+         if next_entry is None:
+             return False
+@@ -3753,9 +3787,9 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
+             return True
+         return _rotate(401)
+     if _is_payment_error(exc):
+-        return _rotate(402)
++        return _rotate(402, "billing")
+     if _is_rate_limit_error(exc) and not _is_overloaded_error(exc):
+-        return _rotate(429)
++        return _rotate(429, "rate_limit")
+     return False
+ 
+ 
+@@ -3807,19 +3841,29 @@ def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Opti
+     retry_client, retry_kwargs = _prepare_same_provider_retry(
+         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
+     )
+-    return _validate_llm_response(
+-        _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
+-    )
++    try:
++        return _validate_llm_response(
++            _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
++            task,
++        )
++    except Exception as exc:
++        _stamp_failed_identity(exc, retry_client, retry_kwargs)
++        raise
+ 
+ 
+ async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+     retry_client, retry_kwargs = _prepare_same_provider_retry(
+         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=True, **prep,
+     )
+-    return _validate_llm_response(
+-        await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
+-        task,
+-    )
++    try:
++        return _validate_llm_response(
++            await _relay_async_completion(
++                retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
++            task,
++        )
++    except Exception as exc:
++        _stamp_failed_identity(exc, retry_client, retry_kwargs)
++        raise
+ 
+ 
+ def _creds_have_api_key(creds: dict[str, Any]) -> bool:
+@@ -7796,9 +7840,9 @@ def _ladder_credential_rungs(
+             # value. An unclaimed failure (e.g. a 500) re-raised out of ``_rung`` above
+             # instead, since the provider-fallback rung only acts on ``_FALLBACK_REASONS``.
+     pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=route.main_runtime)
+-    # Capture the exact key used so recovery finds the right pool entry even if another
+-    # process rotated the pool meanwhile (current() would be None).
+-    _client_api_key = str(getattr(client, "api_key", "") or "")
++    # Capture the exact key and wire model used so recovery finds the right pool entry even if
++    # another process rotated the pool meanwhile (current() would be None), and scopes a
++    # per-model 429 to that model instead of benching the whole credential.
+     # Gate on the narrowed error: a connection failure from the retry above arrives here
+     # unaccepted on purpose (a fresh key cannot fix an unreachable endpoint), so rotation
+     # is skipped and ``first_err`` is handed to the provider-fallback chain as-is.
+@@ -7811,7 +7855,9 @@ def _ladder_credential_rungs(
+                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
+             if recovery_err is None:
+                 return resp, None
+-        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
++        _failed_key, _failed_model = _failed_identity(recovery_err, client, kwargs)
++        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_failed_key,
++                                  failed_model=_failed_model):
+             logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
+                         task or "call", tag, pool_provider, type(recovery_err).__name__)
+             try:
+@@ -7822,7 +7868,10 @@ def _ladder_credential_rungs(
+                 # then fall through to the provider fallback.
+                 if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
+                         or _is_rate_limit_error(retry2_err)):
+-                    _recover_provider_pool(pool_provider, retry2_err)
++                    # The stamp names the rotated credential and model that just failed.
++                    _rot_key, _rot_model = _failed_identity(retry2_err, None, None)
++                    _recover_provider_pool(pool_provider, retry2_err, failed_api_key=_rot_key,
++                                           failed_model=_rot_model or _failed_model)
+                     first_err = retry2_err
+                 else:
+                     raise
+diff --git a/tests/agent/test_auxiliary_pool_model_scoped_rotation.py b/tests/agent/test_auxiliary_pool_model_scoped_rotation.py
+new file mode 100644
+index 0000000000..5350d056eb
+--- /dev/null
++++ b/tests/agent/test_auxiliary_pool_model_scoped_rotation.py
+@@ -0,0 +1,214 @@
++"""Auxiliary pool rotation must name the failed credential AND the failed wire model.
++
++``_recover_provider_pool`` used to call ``mark_exhausted_and_rotate`` without ``model``.
++The pool only scopes a generic Anthropic 429 to the rate-limited model when it is told
++which model failed, so every auxiliary 429 (goal judge, title, compression...) benched the
++whole Claude account credential-wide for an hour, though its quota windows had room.
++The rotated retry's failure was also reported with no credential at all, so the pool
++guessed ``current()`` instead of the key that actually failed.
++
++These tests drive the real recovery ladder (sync ``call_llm`` and async
++``async_call_llm``) with synthetic keys, record exactly what reaches
++``mark_exhausted_and_rotate``, and then prove the end state on a real pool.
++"""
++import asyncio
++import json
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++import agent.auxiliary_client as aux
++
++MODEL_A = "claude-haiku-4-5"
++MODEL_B = "claude-sonnet-4-5"
++KEY_A = "sk-ant-api03-synthetic-key-aaaa"
++KEY_B = "sk-ant-api03-synthetic-key-bbbb"
++ANTHROPIC_URL = "https://api.anthropic.com"
++
++
++class _ApiError(Exception):
++    def __init__(self, message, status_code):
++        super().__init__(message)
++        self.status_code = status_code
++
++
++def _rate_limit():
++    return _ApiError("Error code: 429 - rate_limit_error: Number of request tokens has exceeded your "
++                     "per-minute rate limit", 429)
++
++
++def _billing_429():
++    return _ApiError("Error code: 429 - Your credit balance is too low (billing)", 429)
++
++
++class _Response:
++    def __init__(self, text):
++        self.choices = [SimpleNamespace(message=SimpleNamespace(content=text, tool_calls=None),
++                                        finish_reason="stop")]
++        self.usage = None
++        self.model = MODEL_A
++
++
++class _RecordingPool:
++    def __init__(self):
++        self.rotate_calls = []
++
++    def has_credentials(self):
++        return True
++
++    def try_refresh_current(self):
++        return None
++
++    def mark_exhausted_and_rotate(self, **kwargs):
++        self.rotate_calls.append(kwargs)
++        return SimpleNamespace(id=f"next-{len(self.rotate_calls)}")
++
++
++def _client(key, side_effect, *, async_mode):
++    client = MagicMock()
++    client.api_key = key
++    client.base_url = ANTHROPIC_URL
++    create = AsyncMock(side_effect=side_effect) if async_mode else MagicMock(side_effect=side_effect)
++    client.chat.completions.create = create
++    return client
++
++
++def _run(async_mode, first_client, second_client, pool):
++    """One auxiliary call: first_client serves the initial request, second the rotated retry."""
++    patches = (
++        patch("agent.auxiliary_client._resolve_task_provider_model",
++              return_value=("anthropic", MODEL_A, None, None, None)),
++        patch("agent.auxiliary_client._get_cached_client",
++              side_effect=[(first_client, MODEL_A), (second_client, MODEL_A)]),
++        patch("agent.auxiliary_client._recoverable_pool_provider", return_value="anthropic"),
++        patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
++        patch("agent.auxiliary_client._evict_cached_clients", return_value=None),
++        patch("agent.auxiliary_client.load_pool", return_value=pool),
++        patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task, **_kw: resp),
++        # Keep the provider-fallback rung offline: no fallback candidate configured.
++        patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")),
++        patch("agent.auxiliary_client._try_main_fallback_chain", return_value=(None, None, "")),
++        patch("agent.auxiliary_client._try_payment_fallback", return_value=(None, None, "")),
++    )
++    for p in patches:
++        p.start()
++    try:
++        kwargs = dict(task="goal_judge", provider="anthropic", model=MODEL_A,
++                      messages=[{"role": "user", "content": "hi"}])
++        if async_mode:
++            return asyncio.run(aux.async_call_llm(**kwargs))
++        return aux.call_llm(**kwargs)
++    finally:
++        for p in reversed(patches):
++            p.stop()
++
++
++@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
++def test_initial_429_reports_failed_model_and_credential(async_mode):
++    pool = _RecordingPool()
++    first = _client(KEY_A, [_rate_limit(), _rate_limit()], async_mode=async_mode)
++    second = _client(KEY_B, [_Response("ok")], async_mode=async_mode)
++
++    resp = _run(async_mode, first, second, pool)
++
++    assert resp.choices[0].message.content == "ok"
++    assert len(pool.rotate_calls) == 1
++    call = pool.rotate_calls[0]
++    assert call["model"] == MODEL_A
++    assert call["api_key_hint"] == KEY_A
++    assert call["status_code"] == 429
++    assert call["failure_reason"] == "rate_limit"
++
++
++@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
++def test_rotated_retry_failure_reports_the_rotated_credential(async_mode):
++    """The second failure came from KEY_B; reporting it without identity let the pool bench
++    whatever ``current()`` happened to be (or, after another process rotated, nothing)."""
++    pool = _RecordingPool()
++    first = _client(KEY_A, [_rate_limit(), _rate_limit()], async_mode=async_mode)
++    second = _client(KEY_B, [_rate_limit()], async_mode=async_mode)
++
++    with pytest.raises(Exception):
++        _run(async_mode, first, second, pool)
++
++    assert [c["api_key_hint"] for c in pool.rotate_calls] == [KEY_A, KEY_B]
++    assert [c["model"] for c in pool.rotate_calls] == [MODEL_A, MODEL_A]
++    assert all(c["failure_reason"] == "rate_limit" for c in pool.rotate_calls)
++
++
++@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
++def test_billing_429_is_reported_as_billing(async_mode):
++    """A quota/billing 429 must stay account-wide even though the model is passed."""
++    pool = _RecordingPool()
++    first = _client(KEY_A, [_billing_429()], async_mode=async_mode)
++    second = _client(KEY_B, [_Response("ok")], async_mode=async_mode)
++
++    _run(async_mode, first, second, pool)
++
++    assert pool.rotate_calls[0]["failure_reason"] == "billing"
++    assert pool.rotate_calls[0]["api_key_hint"] == KEY_A
++
++
++# ── real pool: the recorded arguments produce the right persisted state ─────────
++
++
++@pytest.fixture
++def real_pool(tmp_path, monkeypatch):
++    root = tmp_path / "hermes-root"
++    root.mkdir()
++    (tmp_path / "fakehome").mkdir()
++    monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "fakehome"))
++    for var in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    import hermes_constants
++    hermes_constants._default_hermes_root_memo = None  # type: ignore[attr-defined]
++    (root / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [
++        {"id": "seat-a", "label": "seat-a", "auth_type": "api_key", "priority": 0,
++         "source": "manual", "access_token": KEY_A},
++        {"id": "seat-b", "label": "seat-b", "auth_type": "api_key", "priority": 1,
++         "source": "manual", "access_token": KEY_B},
++    ]}}))
++    from agent.credential_pool import load_pool
++    return load_pool
++
++
++def _entry(pool, entry_id):
++    return next(e for e in pool.entries() if e.id == entry_id)
++
++
++def test_model_a_429_does_not_bench_model_b_on_a_real_pool(real_pool, monkeypatch):
++    monkeypatch.setattr(aux, "_evict_cached_clients", lambda *a, **k: None)
++    pool = real_pool("anthropic")
++    with patch("agent.auxiliary_client.load_pool", return_value=pool):
++        assert aux._recover_provider_pool("anthropic", _rate_limit(), failed_api_key=KEY_A,
++                                          failed_model=MODEL_A) is True
++
++    fresh = real_pool("anthropic")
++    seat_a = _entry(fresh, "seat-a")
++    assert seat_a.last_status is None  # credential-wide state untouched
++    assert MODEL_A in (seat_a.model_cooldowns or {})
++    assert MODEL_B not in (seat_a.model_cooldowns or {})
++    assert fresh.select(model=MODEL_B).id == "seat-a"  # unrelated model keeps the account
++    assert fresh.select(model=MODEL_A).id == "seat-b"
++
++
++@pytest.mark.parametrize("exc_factory,status", [
++    (_billing_429, 429),
++    (lambda: _ApiError("Error code: 402 - payment required", 402), 402),
++    (lambda: _ApiError("Error code: 401 - invalid x-api-key", 401), 401),
++])
++def test_billing_and_auth_stay_account_wide_on_a_real_pool(real_pool, monkeypatch, exc_factory, status):
++    from agent.credential_pool import STATUS_EXHAUSTED
++
++    monkeypatch.setattr(aux, "_evict_cached_clients", lambda *a, **k: None)
++    pool = real_pool("anthropic")
++    with patch("agent.auxiliary_client.load_pool", return_value=pool):
++        aux._recover_provider_pool("anthropic", exc_factory(), failed_api_key=KEY_A, failed_model=MODEL_A)
++
++    seat_a = _entry(real_pool("anthropic"), "seat-a")
++    assert seat_a.last_status == STATUS_EXHAUSTED
++    assert seat_a.last_error_code == status
++    assert not seat_a.model_cooldowns
+-- 
+2.55.0
+

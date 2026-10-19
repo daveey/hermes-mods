@@ -4,7 +4,10 @@
  * popover with per-account 5-hour session + weekly bars and reset times.
  *
  * Data: gateway JSON-RPC `model.options` (same payload the model picker uses).
- * Pooled providers carry `usage.accounts[]` = {label, state, windows[], resets_at}.
+ * Pooled providers carry `usage.accounts[]` = {label, state, windows[], resets_at} plus the
+ * sanitized cause fields {limit_kind: quota|cooldown, reason, cooldown_until, model_cooldowns[]}.
+ * Red = out of quota (waits for the provider reset); amber = a temporary pool cooldown. Both
+ * stay unselectable; an older backend without limit_kind stays red (never masked as green).
  * Read-only: the call serves cached snapshots and kicks a background refresh,
  * so polling it never blocks a turn or rotates a credential.
  */
@@ -37,7 +40,9 @@ const PROVIDERS = [
   { slug: 'openai-codex', name: 'GPT', title: 'ChatGPT (Codex)' }
 ]
 
-const COLORS = { ready: '#3fb950', warn: '#d29922', limited: '#f85149', unknown: 'var(--ui-text-tertiary, #888)', unavailable: 'var(--ui-text-tertiary, #888)' }
+const COLORS = { ready: '#3fb950', warn: '#d29922', cooldown: '#e3b341', limited: '#f85149', unknown: 'var(--ui-text-tertiary, #888)', unavailable: 'var(--ui-text-tertiary, #888)' }
+
+const REASONS = { quota_window: 'quota used up', billing: 'billing / credits', usage_limit: 'usage limit reached', rate_limit: 'rate limited', auth: 'auth error', cooldown: 'cooling down' }
 
 const BAR_CLASS =
   'inline-flex h-full items-center gap-1.5 rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground'
@@ -50,7 +55,8 @@ export function pickWindow(windows, kind) {
 }
 
 export function tone(account) {
-  if (account.state === 'limited') return 'limited'
+  // Only an explicit backend 'cooldown' verdict turns a limited account amber.
+  if (account.state === 'limited') return account.limit_kind === 'cooldown' ? 'cooldown' : 'limited'
   if (account.state !== 'ready') return account.state === 'unavailable' ? 'unavailable' : 'unknown'
   const hi = Math.max(...(account.windows || []).filter(w => w.scope !== 'model').map(w => Number(w.used_percent) || 0), 0)
   return hi >= WARN_PCT ? 'warn' : 'ready'
@@ -68,6 +74,24 @@ export function fmtReset(iso, now = Date.now()) {
   return new Date(t).toLocaleString(undefined, { weekday: 'short', hour: 'numeric' })
 }
 
+// One line on why an account is not ready, from sanitized fields only (codes + timestamps).
+export function describe(account, now = Date.now()) {
+  if (!account) return ''
+  const parts = []
+  if (account.state === 'limited') {
+    parts.push(account.limit_kind === 'cooldown' ? 'cooling down' : 'out of quota')
+    const why = REASONS[account.reason]
+    if (why && why !== parts[0]) parts.push(why)
+    const until = account.limit_kind === 'cooldown' ? account.cooldown_until || account.resets_at : account.resets_at || account.cooldown_until
+    if (until) parts.push(`back ${fmtReset(until, now)}`)
+  } else if (account.state === 'unavailable') {
+    parts.push(account.reason === 'auth' ? 'sign-in needed' : 'unavailable')
+  }
+  const models = (account.model_cooldowns || []).filter(m => m && m.model && Date.parse(m.until) > now)
+  if (models.length) parts.push(models.map(m => `${m.model} cooling ${fmtReset(m.until, now)}`).join(', '))
+  return parts.join(' · ')
+}
+
 export function summarize(payload, last = {}, now = Date.now()) {
   const rows = (payload && payload.providers) || []
   return PROVIDERS.map(p => {
@@ -76,10 +100,12 @@ export function summarize(payload, last = {}, now = Date.now()) {
     // Single-account provider: legacy gauge shape `usage.windows`.
     if (!accounts && row && row.usage && Array.isArray(row.usage.windows)) {
       const limited = row.usage.windows.some(w => w.scope !== 'model' && Number(w.used_percent) >= 100)
-      accounts = [{ id: p.slug, selectable: false, label: row.name || p.title, windows: row.usage.windows, state: limited ? 'limited' : 'ready', resets_at: null }]
+      accounts = [{ id: p.slug, selectable: false, label: row.name || p.title, windows: row.usage.windows, state: limited ? 'limited' : 'ready', resets_at: null, limit_kind: limited ? 'quota' : null, reason: limited ? 'quota_window' : null }]
     }
     if (!accounts || !accounts.length) return null
     const ready = accounts.filter(a => a.state === 'ready').length
+    const cooling = accounts.filter(a => tone(a) === 'cooldown').length
+    const limited = accounts.filter(a => tone(a) === 'limited').length
     const nextBack = accounts
       .filter(a => a.state === 'limited' && a.resets_at)
       .map(a => a.resets_at)
@@ -94,7 +120,7 @@ export function summarize(payload, last = {}, now = Date.now()) {
         mark = now - rec.at * 1000 < ACTIVE_MS ? 'active' : 'last'
       }
     }
-    return { ...p, accounts, ready, total: accounts.length, nextBack, markId, mark, markAt: rec ? rec.at * 1000 : null }
+    return { ...p, accounts, ready, cooling, limited, total: accounts.length, nextBack, markId, mark, markAt: rec ? rec.at * 1000 : null }
   }).filter(Boolean)
 }
 
@@ -196,7 +222,8 @@ export function createSelectionStore(ctx) {
     if (!row || $state.get().loading) { refuse('Selection is loading; refresh before trying again.'); return }
     if (account && provider !== row.provider) { refuse(`This chat uses ${row.provider}; selecting another provider would change its route.`); return }
     if (account && (account.state !== 'ready' || !account.id || account.selectable === false)) {
-      refuse(`Account unavailable (${account.state || 'unknown'}). Cooldowns are not reset.`); return
+      const why = describe(account)
+      refuse(`Account unavailable (${account.state || 'unknown'}${why ? `: ${why}` : ''}). Cooldowns are not reset.`); return
     }
     if (!account && row.state !== 'pending') { refuse('No pending selection to cancel.'); return }
     locks.add(s.key); ++read
@@ -264,9 +291,9 @@ function Meter({ win }) {
 const GRID = { display: 'grid', gridTemplateColumns: '10px minmax(90px,1.1fr) 1fr 1fr', gap: 8, alignItems: 'center' }
 
 function GroupPanel({ g, selectionStore, selectionState }) {
-  const limited = g.accounts.filter(a => a.state === 'limited').length
-  const unknown = g.total - g.ready - limited
-  const parts = [`${g.ready} ready`, limited && `${limited} limited`, unknown && `${unknown} unknown`].filter(Boolean)
+  const limited = g.limited, cooling = g.cooling
+  const unknown = g.total - g.ready - limited - cooling
+  const parts = [`${g.ready} ready`, limited && `${limited} out of quota`, cooling && `${cooling} cooling down`, unknown && `${unknown} unknown`].filter(Boolean)
   return jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 7 }, children: [
     jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }, children: [
       jsx('b', { style: { fontSize: 12 }, children: `${g.title} · ${g.total} account${g.total === 1 ? '' : 's'}` }),
@@ -276,12 +303,13 @@ function GroupPanel({ g, selectionStore, selectionState }) {
     ...g.accounts.map(a => jsxs('button', { key: a.id, type: 'button', className: 'hermes-au-row',
       'aria-label': `Try ${a.label || a.id} next`, disabled: selectionState.busy || selectionState.loading,
       onClick: () => selectionStore.select(g.slug, a),
-      style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.72 }, title: `${a.state} · Next request in the focused chat only`, children: [
+      style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.72 }, title: `${describe(a) || a.state} · Next request in the focused chat only`, children: [
       jsx(Dot, { t: tone(a), mark: a.id === g.markId ? g.mark : null }),
       jsxs('span', { style: { overflowWrap: 'anywhere', fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
         a.label || a.id, a.id === g.markId ? jsx(MarkBadge, { g }) : null,
         selectionState.selection?.state === 'pending' && selectionState.selection.provider === g.slug && selectionState.selection.account_id === a.id
-          ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null] }),
+          ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null,
+        describe(a) ? jsx('span', { className: 'hermes-au-why', 'data-tone': tone(a), style: { display: 'block', fontSize: 10, color: COLORS[tone(a)] || undefined, opacity: 0.9 }, children: describe(a) }) : null] }),
       jsx(Meter, { win: pickWindow(a.windows, 'session') }),
       jsx(Meter, { win: pickWindow(a.windows, 'week') })
     ] }))
@@ -313,10 +341,10 @@ function UsageBar({ store, selectionStore }) {
   return jsxs(Popover, { open, onOpenChange: v => { setOpen(v); if (v) store.refresh() }, children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage', children:
       groups.map(g => jsxs('span', { key: g.slug, style: { display: 'inline-flex', alignItems: 'center', gap: 5, marginRight: 6 },
-        title: `${g.title}: ${g.ready} of ${g.total} ready${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
+        title: `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} out of quota` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
           jsx('b', { style: { fontWeight: 600 }, children: g.name }),
           jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
-          jsx('span', { style: { color: g.ready === 0 ? COLORS.limited : undefined }, children: `${g.ready}/${g.total}` })
+          jsx('span', { style: { color: g.ready === 0 ? (!g.limited && g.cooling ? COLORS.cooldown : COLORS.limited) : undefined }, children: `${g.ready}/${g.total}` })
         ] }))
     }) }),
     jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[440px]', children:
