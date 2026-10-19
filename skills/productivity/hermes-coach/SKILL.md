@@ -84,8 +84,12 @@ The cloud Bot can't read Mac paths: ship any doc that SOUL.md points at (e.g. th
 and reference it by that cloud path. Re-ship whenever the source changes.
 
 After changing a script: commit to hermes-mods (the Macs fast-forward through sync), then re-ship the changed files
-to the cloud profile's `scripts/` and its skill copy, compare byte counts, and rerun the feed on every host so all
-digests share one version (`DIGEST_V`).
+to the cloud profile's `scripts/` (`bash <administering-remote-hermes-gateways>/scripts/nx.sh <ship.sh>`), compare byte
+counts, and rerun the feed on every host so all digests share one version (`DIGEST_V`). The cloud profile has no
+`coach_apply.py`: guard any import of it from a shipped script with `try/except ImportError`, or that path crashes there.
+To re-render an OPEN Inbox card in a new format, `hermes inbox archive <sid>` then post again (a same-key re-post onto
+an open card appends an update under the old message); rename the archived copy first, or the new card's title gets a
+` (2)` suffix.
 
 ## Pitfalls
 
