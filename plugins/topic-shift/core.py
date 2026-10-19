@@ -217,7 +217,7 @@ def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = Non
         except Exception:
             pj = None
     if mode == "on" and pj is not None and pj < CONFIDENCE_THRESHOLD:
-        _jev_log({"name": "topic_shift", "jev": pj, "skipped_llm": True})
+        _jev_log({"name": "topic_shift", "session_id": session_id, "jev": pj, "skipped_llm": True})
         return {"shift": False, "confidence": pj, "label": "", "reason": "", "title": info.get("title") or "",
                 "judge": "jev"}
     user = (
@@ -236,7 +236,8 @@ def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = Non
     except (TypeError, ValueError):
         p = 0.0
     if pj is not None:
-        _jev_log({"name": "topic_shift", "jev": pj, "llm": p, "skipped_llm": False, "mode": mode})
+        _jev_log({"name": "topic_shift", "session_id": session_id, "jev": pj, "llm": p, "skipped_llm": False,
+                  "mode": mode})  # id only (for hindsight labelling against state.db), never message text
     if mode == "on" and pj is not None:  # Jev decided "shift"; the LLM supplied the label
         return {"shift": True, "confidence": pj, "label": str(out.get("label") or "")[:60],
                 "reason": str(out.get("reason") or "")[:140], "title": info.get("title") or "", "judge": "jev",
