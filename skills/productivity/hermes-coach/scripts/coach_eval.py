@@ -24,16 +24,19 @@ Two modes. Both print a markdown report (or JSON with --json) and exit 0 on PASS
              "memories/MEMORY.md" | "skills/<cat>/<n>/SKILL.md" | <abs path of a skill under an external dir>,
              "append": "..."} | {"file", "old_string", "new_string"}]}. A coach-proposal of kind skill_patch also
              works (--proposal <id>). The edits are applied ONLY inside a private eval HERMES_HOME
-             (~/.hermes/coach/eval/root: config copy without MCP servers or memory provider, auth/.env linked,
+             (a disjoint root: config copy without MCP servers or memory provider, auth/.env copied,
              no plugins, its own state.db), never to the live home.
              Each episode = user ask + what the agent did (tool log) or the failed-fix exchange; the replay asks
              `hermes -z` (tools: todo, skills) for the next tool calls + the message it would send.
              PASS = the target gains >= max(2, n/4) passes (identical runs move one pattern by 2 of 6, so +1 is
              noise), no other pattern drops by more than max(1, n/6), non-target net >= -max(1, n/6). Repeat a
              run and pool it (--pool earlier.json, or `coach_eval.py verdict --target T a.json b.json`) to
-             shrink noise; the bar scales with n. Spend is summed from --usage-file reports (token
-             estimate when the provider reports none), capped by --budget (default $5), and logged to
-             research/state/spend.jsonl in the data repo as lane "trial".
+             shrink noise; the bar scales with n. Full coverage of every benchmark pattern and pair is
+             mandatory; smoke, partial and legacy reports cannot PASS or pool. Paid CLI execution is
+             disabled until enforceable provider bounds exist. Offline test runners explicitly declare
+             offline_only=True and max_cost_usd; every call/retry reserves that amount durably before
+             dispatch against --budget and the shared $10 UTC-day trial allowance. Exceptions retain
+             reservations. cost_usd is conservative reserved spend, not measured provider billing.
 
 Roots (env): COACH_DATA (~/code/hermes-coach-data; benchmark = eval/bench-v1.jsonl, reports = eval/reports/),
 COACH_SETS (~/.hermes/coach; replyset/, fixloop/), COACH_MODS (~/code/hermes-mods), HERMES_HOME (~/.hermes),
@@ -457,53 +460,69 @@ def usage_cost(u, model=""):
 
 
 class Budget:
-    """Thread-safe spend cap: a call starts only while spent < cap, so at most `jobs` in-flight calls overshoot."""
+    """Conservative, durable pre-call reservations; uncertain calls keep the full charge.
 
-    def __init__(self, usd):
+    Only explicitly offline test runners are supported. The Hermes CLI has no proven
+    request/token/auxiliary retry upper bound and is deliberately disabled for paid evals.
+    Reservations count against both this run and the shared UTC-day trial allowance.
+    They are never refunded, including exceptions, cancellation and missing usage.
+    """
+
+    def __init__(self, usd, ledger=None, lane_allowance=10.0):
         import threading
-        self.cap, self.spent, self.calls, self.stopped = float(usd), 0.0, 0, False
+        from decimal import Decimal
+        self.cap = Decimal(str(usd))
+        self.lane_allowance = Decimal(str(lane_allowance))
+        if not self.cap.is_finite() or self.cap <= 0 or not self.lane_allowance.is_finite() or self.lane_allowance <= 0:
+            raise ValueError("budget and lane allowance must be finite and positive")
+        self.spent, self.calls, self.stopped = 0.0, 0, False
+        self.reserved = Decimal(0)
         self.lock = threading.Lock()
+        self.ledger = Path(ledger or data_dir() / "research/state/spend.jsonl")
 
-    def ok(self):
+    def call(self, runner, prompt, **kwargs):
+        import fcntl
+        from decimal import Decimal
+        if getattr(runner, "offline_only", False) is not True:
+            raise ValueError("paid runners disabled: no enforceable provider request/token cost bound")
+        bound = Decimal(str(getattr(runner, "max_cost_usd", "NaN")))
+        if not bound.is_finite() or bound < 0:
+            raise ValueError("offline runner must declare a finite nonnegative max_cost_usd")
         with self.lock:
-            if self.spent >= self.cap:
-                self.stopped = True
-            return not self.stopped
-
-    def add(self, usd):
-        with self.lock:
-            self.spent += usd
-            self.calls += 1
+            self.ledger.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.ledger, "a+") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                fh.seek(0)
+                day = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+                used = Decimal(0)
+                for line in fh:
+                    row = json.loads(line)  # corrupt accounting fails closed
+                    if row.get("lane") == "trial" and row.get("date") == day:
+                        value = Decimal(str(row["usd"]))
+                        if not value.is_finite() or value < 0:
+                            raise ValueError("invalid trial accounting")
+                        used += value
+                if self.reserved + bound > self.cap or used + bound > self.lane_allowance:
+                    self.stopped = True
+                    return None
+                fh.write(json.dumps({"date": day, "lane": "trial", "usd": float(bound),
+                                     "what": "coach_eval pre-call reservation (not refunded)"}) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+                self.reserved += bound
+                self.spent = float(self.reserved)
+                self.calls += 1
+        # Charge is already durable before dispatch, even if a BaseException escapes.
+        result = runner(prompt, **kwargs)
+        cost = usage_cost(result[1], kwargs.get("model", ""))
+        if not __import__("math").isfinite(cost) or cost < 0 or Decimal(str(cost)) > bound:
+            raise ValueError("offline runner violated its declared cost bound")
+        return result
 
 
 def hermes_runner(hermes_bin=None, timeout=900):
-    """Default runner: (prompt, home, cwd, model, toolsets, ignore_rules) -> (text, usage dict)."""
-    hb = hermes_bin or shutil.which("hermes") or str(HOME / ".local/bin/hermes")
-
-    def run(prompt, home=None, cwd=None, model=None, toolsets="todo", ignore_rules=False):
-        uf = Path(os.environ.get("TMPDIR") or "/tmp") / f"coach-eval-{os.getpid()}-{random.randrange(1 << 30)}.json"
-        args = [hb, "-z", prompt.replace("\x00", ""), "-m", model, "-t", toolsets, "--usage-file", str(uf)]
-        if ignore_rules:
-            args.append("--ignore-rules")
-        env = dict(os.environ)
-        if home:
-            env["HERMES_HOME"] = str(home)
-        if cwd:
-            env["TERMINAL_CWD"] = str(cwd)  # project-context (AGENTS.md) discovery follows TERMINAL_CWD
-        for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE", "HERMES_SESSION_ID"):
-            env.pop(k, None)
-        try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=str(cwd or HOME), env=env)
-            text = r.stdout
-        except subprocess.TimeoutExpired:
-            text = ""
-        try:
-            usage = json.loads(uf.read_text())
-        except Exception:
-            usage = {}
-        uf.unlink(missing_ok=True)
-        return text, usage
-    return run
+    """Fail closed: CLI max-turns/usage files do not enforce a dollar upper bound."""
+    raise ValueError("paid Hermes runner disabled until provider-enforced token/request bounds are supported")
 
 
 # --- the private eval home -------------------------------------------------------------------------------------
@@ -514,30 +533,6 @@ def _strip_config(text):
     text = re.sub(r"(?ms)^mcp_servers:.*?(?=^\S|\Z)", "mcp_servers: {}\n", text)
     text = re.sub(r"(?m)^(memory:\n(?:[ \t]+[^\n]*\n)*?[ \t]+provider:)[^\n]*", r"\1 ''", text)
     return text
-
-
-def _materialize(root, rel):
-    """Make every directory on root/rel a real dir (a symlinked dir becomes a dir of symlinks to its children) so a
-    file under it can be replaced without touching the symlink target."""
-    cur = Path(root)
-    for part in Path(rel).parts[:-1]:
-        nxt = cur / part
-        if nxt.is_symlink():
-            target = nxt.resolve()
-            nxt.unlink()
-            nxt.mkdir()
-            for child in target.iterdir():
-                (nxt / child.name).symlink_to(child)
-        elif not nxt.exists():
-            nxt.mkdir()
-        cur = nxt
-    f = cur / Path(rel).name
-    if f.is_symlink():
-        src = f.resolve()
-        f.unlink()
-        if src.is_file():
-            shutil.copy2(src, f)
-    return f
 
 
 def _external_skill_dirs(live):
@@ -554,73 +549,89 @@ def _external_skill_dirs(live):
     return out
 
 
+def _no_symlink_path(path):
+    path = Path(path).absolute()
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise SystemExit(f"symlink in eval destination: {path}")
+    return path.resolve()
+
+
+def _validated_edits(live, edits):
+    """Validate the entire allowlist before any writes; map external Markdown by containment."""
+    out = []
+    ext = [d.resolve() for d in _external_skill_dirs(live)]
+    for e in edits or []:
+        f = e.get("file")
+        if not isinstance(f, str) or not f or ".." in Path(f).parts:
+            raise SystemExit("invalid edit target")
+        fp = Path(f)
+        source = None
+        if fp.is_absolute():
+            resolved = fp.resolve()
+            base = next((d for d in ext if resolved.is_relative_to(d)), None)
+            if base is None:
+                raise SystemExit("external edit escapes configured skill roots")
+            rel = Path("skills") / resolved.relative_to(base)
+            source = resolved
+        else:
+            rel = fp
+        allowed = str(rel) in ("AGENTS.md", "SOUL.md", "memories/MEMORY.md", "memories/USER.md")
+        allowed |= len(rel.parts) >= 3 and rel.parts[0] == "skills" and rel.suffix == ".md"
+        if not allowed or (source is not None and not source.is_file()):
+            raise SystemExit(f"unsupported edit target: {f}")
+        keys = set(e) - {"file"}
+        if keys not in ({"append"}, {"old_string", "new_string"}) or any(not isinstance(e[k], str) for k in keys):
+            raise SystemExit("invalid edit operation")
+        if "old_string" in e and not e["old_string"]:
+            raise SystemExit("empty edit anchor")
+        out.append((e, rel, source))
+    return out
+
+
 def prepare_home(root, live, edits, agents_src=None):
-    """(Re)build the eval HERMES_HOME at root for one variant; returns the cwd (holds AGENTS.md). The runtime's
-    install cache under root (installs/, cache/) survives between variants and runs: rebuilding it costs minutes."""
-    root, live = Path(root), Path(live)
-    root.mkdir(parents=True, exist_ok=True)
+    """Build a disposable isolated home. No destination symlinks or live-root overlap.
+
+    Skills are copied (symlinks dereferenced), never linked back to live instructions.
+    Runtime caches are no longer retained. Caller must not mutate the root concurrently.
+    """
+    root = _no_symlink_path(root)
+    live = Path(live).resolve()
+    protected = [live, *(d.resolve() for d in _external_skill_dirs(live))]
+    if any(root.is_relative_to(d) or d.is_relative_to(root) for d in protected):
+        raise SystemExit("eval root and live home/skill roots must not overlap")
+    mapped = _validated_edits(live, edits)
+    # Reject existing symlinks before touching any files (including config/work links).
+    if root.exists() and any(p.is_symlink() for p in root.rglob("*")):
+        raise SystemExit("existing eval root contains symlinks")
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True, mode=0o700)
     (root / "config.yaml").write_text(_strip_config((live / "config.yaml").read_text()))
-    for n in ("auth.json", ".env"):
-        p = root / n
-        if p.is_symlink() or p.exists():
-            p.unlink()
-        if (live / n).exists():
-            p.symlink_to(live / n)
-    for n in ("SOUL.md",):
-        (root / n).unlink(missing_ok=True)
-        if (live / n).exists():
+    for n in ("auth.json", ".env", "SOUL.md"):
+        if (live / n).is_file():
             shutil.copy2(live / n, root / n)
-    mem = root / "memories"
-    shutil.rmtree(mem, ignore_errors=True)
-    mem.mkdir()
+    (root / "memories").mkdir()
     for n in ("MEMORY.md", "USER.md"):
-        if (live / "memories" / n).exists():
-            shutil.copy2(live / "memories" / n, mem / n)
-    sk = root / "skills"
-    if sk.is_symlink():
-        sk.unlink()
-    shutil.rmtree(sk, ignore_errors=True)
+        if (live / "memories" / n).is_file():
+            shutil.copy2(live / "memories" / n, root / "memories" / n)
     if (live / "skills").exists():
-        sk.symlink_to(live / "skills")
-    shutil.rmtree(root / "plugins", ignore_errors=True)
-    cwd = root.parent / "work"
-    shutil.rmtree(cwd, ignore_errors=True)
-    cwd.mkdir(parents=True)
+        shutil.copytree(live / "skills", root / "skills", symlinks=False)
+    cwd = root / "work"
+    cwd.mkdir()
     agents = Path(agents_src or HOME / "AGENTS.md")
     if agents.exists():
         shutil.copy2(agents, cwd / "AGENTS.md")
-    ext = _external_skill_dirs(live)
-    for e in edits or []:
-        f = str(e["file"])
-        if f == "AGENTS.md":
-            path = cwd / "AGENTS.md"
-        else:
-            fp = Path(f).expanduser()
-            if fp.is_absolute():
-                base = next((d for d in ext if str(fp).startswith(str(d.resolve()) + "/") or
-                             str(fp).startswith(str(d) + "/")), None)
-                if not base:
-                    raise SystemExit(f"edit target {f} is outside the eval home and the external skill dirs")
-                rel = Path("skills") / fp.relative_to(base.resolve() if str(fp).startswith(str(base.resolve()))
-                                                      else base)
-                # an external skill is shadowed by a same-path local copy: copy the whole skill dir in
-                skill_dir = fp.parent
-                dest = _materialize(root, rel).parent
-                for child in skill_dir.iterdir():
-                    t = dest / child.name
-                    if not t.exists():
-                        (shutil.copytree if child.is_dir() else shutil.copy2)(child, t)
-                path = dest / fp.name
-                if not path.exists():
-                    shutil.copy2(fp, path)
-            else:
-                path = _materialize(root, f)
+    for e, rel, source in mapped:
+        path = cwd / "AGENTS.md" if str(rel) == "AGENTS.md" else root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if source is not None and not path.exists():
+            shutil.copy2(source, path)
         old = path.read_text() if path.exists() else ""
         if "append" in e:
             new = old.rstrip("\n") + "\n\n" + e["append"].strip("\n") + "\n"
         else:
             if old.count(e["old_string"]) != 1:
-                raise SystemExit(f"edit on {f}: old_string found {old.count(e['old_string'])} times (need exactly 1)")
+                raise SystemExit("edit anchor must occur exactly once")
             new = old.replace(e["old_string"], e["new_string"])
         path.write_text(new)
     return cwd
@@ -654,10 +665,10 @@ def replay_variant(name, eps, root, live, edits, runner, budget, model, jobs, re
 
     def one(item):
         ep, k = item
-        if not budget.ok():
+        result = budget.call(runner, replay_prompt(ep), home=root, cwd=cwd, model=model, toolsets="todo,skills")
+        if result is None:
             return ep["id"], k, None, 0.0
-        text, usage = runner(replay_prompt(ep), home=root, cwd=cwd, model=model, toolsets="todo,skills")
-        budget.add(usage_cost(usage, model))
+        text, usage = result
         return ep["id"], k, (text or "").strip() or None, 0.0
 
     with ThreadPoolExecutor(jobs) as ex:
@@ -674,28 +685,33 @@ def judge_all(items, runner, budget, model, batch=8, jobs=4):
     batches = [items[i:i + batch] for i in range(0, len(items), batch)]
 
     def work(b):
-        if not budget.ok():
-            return [], 0.0
+        expected = {i for i, _, _ in b}
+        if len(expected) != len(b):
+            return []
         prompt = JUDGE_SYS + "\n\n" + "\n\n".join(judge_item_text(i, ep, r) for i, ep, r in b)
         for _ in range(2):
-            text, usage = runner(prompt, model=model, toolsets="todo", ignore_rules=True)
-            budget.add(usage_cost(usage, model))
-            m = re.search(r"\[\s*\{.*\}\s*\]", text or "", re.S)
-            if m:
-                try:
-                    return json.loads(m.group(0)), 0.0
-                except Exception:
-                    pass
-        return [], 0.0
+            result = budget.call(runner, prompt, model=model, toolsets="todo", ignore_rules=True)
+            if result is None:
+                return []
+            try:
+                got = json.loads(result[0])
+                if (isinstance(got, list) and len(got) == len(expected)
+                        and all(isinstance(o, dict) and type(o.get("id")) is str
+                                and type(o.get("pass")) is int and o["pass"] in (0, 1)
+                                and isinstance(o.get("why"), str) for o in got)
+                        and {o["id"] for o in got} == expected):
+                    return got
+            except (ValueError, TypeError):
+                pass
+        return []
 
+    if len({i for i, _, _ in items}) != len(items):
+        return {}
     with ThreadPoolExecutor(jobs) as ex:
-        for got, _ in ex.map(work, batches):
+        for got in ex.map(work, batches):
             for o in got:
-                if isinstance(o, dict) and o.get("id"):
-                    try:
-                        res[str(o["id"])] = {"pass": int(o.get("pass") or 0), "why": str(o.get("why") or "")[:300]}
-                    except (TypeError, ValueError):
-                        pass
+                res[o["id"]] = {"pass": o["pass"], "why": o["why"][:300]}
+
     return res
 
 
@@ -711,6 +727,12 @@ def behavior_verdict(by_pattern, target):
     PASS = target gain >= min_gain(n), no other pattern drops by more than max(1, n/6), non-target net >= -1 per
     6 graded target episodes. Pool repeated runs (--pool) to shrink the noise instead of lowering the bar."""
     reasons, ok = [], True
+    if set(by_pattern) != set(PATTERNS) or target not in PATTERNS:
+        return "INCOMPLETE", ["all benchmark patterns, control and non-target coverage required"]
+    for v in by_pattern.values():
+        if (not isinstance(v, dict) or any(type(v.get(k)) is not int for k in ("n", "base", "cand"))
+                or v["n"] <= 0 or not 0 <= v["base"] <= v["n"] or not 0 <= v["cand"] <= v["n"]):
+            return "INCOMPLETE", ["invalid pattern counts"]
     t = by_pattern.get(target)
     if not t or not t["n"]:
         return "INCOMPLETE", [f"no graded {target} episodes"]
@@ -764,7 +786,14 @@ def log_spend(data, usd, what, day=None):
 
 def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=None, live=None, model=None,
                  judge_model=None, jobs=4, repeats=1, limit=None, patterns=None, log=print):
-    eps = load_jsonl(bench)
+    eps = [json.loads(line) for line in Path(bench).read_text().splitlines() if line.strip()]
+    if (not eps or any(not isinstance(e, dict) or type(e.get("id")) is not str or not e["id"]
+                       or e.get("pattern") not in PATTERNS for e in eps)
+            or len({e["id"] for e in eps}) != len(eps)):
+        raise ValueError("invalid or duplicate benchmark IDs/patterns")
+    manifest = [{"id": e["id"], "pattern": e["pattern"]} for e in eps]
+    if type(repeats) is not int or repeats < 1 or jobs < 1:
+        raise ValueError("positive repeats/jobs required")
     if patterns:
         eps = [e for e in eps if e["pattern"] in patterns]
     if limit:
@@ -773,10 +802,11 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
     if target not in PATTERNS:
         raise SystemExit(f"--target must be one of {PATTERNS}")
     runner = runner or hermes_runner()
-    root = Path(root or sets_dir() / "eval" / "root")
+    root = Path(root or HOME / ".cache/coach-eval/root")
     live = Path(live or env_path("HERMES_HOME", HOME / ".hermes"))
     model = model or os.environ.get("COACH_EVAL_MODEL") or "claude-sonnet-5-5"
     judge_model = judge_model or os.environ.get("COACH_JUDGE_MODEL") or model
+    _validated_edits(live, cand.get("edits") or [])
     budget = Budget(budget_usd)
     t0 = time.time()
     log(f"behavior eval: {len(eps)} episodes x {repeats} x 2 variants, target {target}, budget ${budget_usd:.2f}")
@@ -811,16 +841,17 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
                          "base_reply": base.get((ep["id"], k), "")[:1200], "cand_reply": candr.get((ep["id"], k), "")[:1200]})
     verdict, reasons = behavior_verdict(by_pattern, target)
     graded = sum(v["n"] for v in by_pattern.values())
-    if budget.stopped or graded < len(eps) * repeats * 0.8:
+    complete = not (limit is not None or patterns is not None or budget.stopped) and graded == len(manifest) * repeats and set(by_pattern) == set(PATTERNS)
+    if not complete:
         reasons.append(f"only {graded}/{len(eps) * repeats} episode pairs graded"
                        + (f"; budget ${budget_usd:.2f} reached" if budget.stopped else ""))
-        if verdict == "PASS" and budget.stopped:
-            verdict = "INCOMPLETE"
+        verdict = "INCOMPLETE"
     return {"mode": "behavior", "candidate": cand.get("name") or "candidate", "target": target, "verdict": verdict,
             "reasons": reasons, "by_pattern": by_pattern, "rows": rows, "cost_usd": round(budget.spent, 4),
             "calls": budget.calls, "minutes": round((time.time() - t0) / 60, 1), "model": model,
             "judge_model": judge_model, "bench": str(bench), "episodes": len(eps), "repeats": repeats,
-            "edits": cand.get("edits") or []}
+            "edits": cand.get("edits") or [], "complete": complete, "manifest": manifest,
+            "benchmark_sha256": hashlib.sha256(Path(bench).read_bytes()).hexdigest()}
 
 
 def behavior_markdown(r):
@@ -848,12 +879,50 @@ def behavior_markdown(r):
 
 
 def pooled_result(reports, target, names):
-    tot = pool_reports(reports)
-    verdict, reasons = behavior_verdict(tot, target)
-    return {"mode": "behavior-pooled", "candidate": reports[-1].get("candidate"), "target": target,
+    errors = []
+    signatures, identities = set(), set()
+    for r in reports:
+        try:
+            if r.get("mode") != "behavior" or r.get("complete") is not True or r.get("verdict") == "INCOMPLETE":
+                raise ValueError("partial, smoke or legacy report")
+            manifest = r["manifest"]
+            ids = [e["id"] for e in manifest]
+            if (len(set(ids)) != len(ids) or not all(type(i) is str and i for i in ids)
+                    or set(e["pattern"] for e in manifest) != set(PATTERNS)
+                    or type(r["repeats"]) is not int or r["repeats"] < 1):
+                raise ValueError("invalid manifest")
+            expected = {(e["id"], k): e["pattern"] for e in manifest for k in range(r["repeats"])}
+            counts, seen = {}, set()
+            for row in r["rows"]:
+                key = (row["episode"], row["repeat"])
+                if type(row["repeat"]) is not int or key in seen or expected.get(key) != row["pattern"]:
+                    raise ValueError("invalid/duplicate row")
+                seen.add(key)
+                v = counts.setdefault(row["pattern"], {"n": 0, "base": 0, "cand": 0})
+                for variant in ("base", "cand"):
+                    grade = row[variant]["pass"]
+                    if type(grade) is not int or grade not in (0, 1):
+                        raise ValueError("nonbinary grade")
+                    v[variant] += grade
+                v["n"] += 1
+            if seen != set(expected) or counts != r["by_pattern"] or r["episodes"] != len(manifest):
+                raise ValueError("missing coverage or inconsistent totals")
+            identity = json.dumps([r["benchmark_sha256"], manifest, r["edits"], r["model"], r["judge_model"]], sort_keys=True)
+            identities.add(identity)
+            signature = json.dumps(r, sort_keys=True)
+            if signature in signatures:
+                raise ValueError("duplicate report")
+            signatures.add(signature)
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"ineligible pool input: {exc}")
+    if len(identities) != 1 or not reports:
+        errors.append("pool requires the same benchmark, edits and models")
+    tot = pool_reports(reports) if not errors else {}
+    verdict, reasons = ("INCOMPLETE", errors) if errors else behavior_verdict(tot, target)
+    return {"mode": "behavior-pooled", "candidate": reports[-1].get("candidate") if reports else None, "target": target,
             "verdict": verdict, "reasons": reasons, "by_pattern": tot, "runs": [
                 {"report": str(n), "verdict_own_target": r.get("verdict"), "own_target": r.get("target"),
-                 "by_pattern": r["by_pattern"], "cost_usd": r.get("cost_usd")} for n, r in zip(names, reports)],
+                 "by_pattern": r.get("by_pattern", {}), "cost_usd": r.get("cost_usd")} for n, r in zip(names, reports)],
             "cost_usd": round(sum(float(r.get("cost_usd") or 0) for r in reports), 4)}
 
 
@@ -907,7 +976,7 @@ def main(argv=None):
     h.add_argument("--model")
     h.add_argument("--out")
     h.add_argument("--json", action="store_true")
-    h.add_argument("--no-log", action="store_true")
+    h.add_argument("--no-log", action="store_true", help="deprecated; mandatory reservation accounting cannot be disabled")
     h.add_argument("--pool", action="append", default=[],
                    help="earlier report .json of the same candidate + benchmark: the verdict is on the pooled counts")
     v = sub.add_parser("verdict", help="recompute the (pooled) verdict of saved behavior reports; no model calls")
@@ -944,8 +1013,7 @@ def main(argv=None):
         r = run_behavior(cand, bench, a.target, a.budget, jobs=a.jobs, repeats=a.repeats, limit=a.limit,
                          patterns=a.patterns.split(",") if a.patterns else None,
                          model=a.model, log=lambda s: print(s, file=sys.stderr, flush=True))
-        if not a.no_log and r["cost_usd"] > 0:
-            log_spend(data_dir(), r["cost_usd"], f"coach_eval behavior {r['candidate']} ({r['verdict']})")
+        # Calls are already durably reserved; never double-log a run or pooled report.
         md = behavior_markdown(r)
         if a.pool:
             run_md = md

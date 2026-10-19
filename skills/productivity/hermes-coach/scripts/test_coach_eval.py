@@ -100,7 +100,7 @@ class DetectorReal(unittest.TestCase):
 
 def bench(path):
     eps = []
-    for pat in ("unverified_done", "handoff", "control"):
+    for pat in ce.PATTERNS:
         for i in range(4):
             eps.append({"id": f"{pat}:{i}", "pattern": pat, "kind": "reply", "user_ask": f"ask {i}",
                         "tool_log": ["-> terminal(make install)", "   <- ok"], "label": "lbl", "user_reaction": "r",
@@ -112,6 +112,12 @@ def bench(path):
 class FakeRunner:
     """Replays answer from the eval home's AGENTS.md: a VERIFY rule makes unverified_done replies verify. The judge
     passes a reply containing VERIFIED (or any reply for non-target patterns unless `hurt` is set)."""
+
+    offline_only = True
+
+    @property
+    def max_cost_usd(self):
+        return self.cost
 
     def __init__(self, hurt=False, cost=0.01):
         self.hurt, self.cost, self.calls, self.homes = hurt, cost, 0, set()
@@ -143,7 +149,7 @@ class FakeRunner:
 
 class Behavior(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.live = self.tmp / "live"
         (self.live / "memories").mkdir(parents=True)
         (self.live / "skills/cat/demo").mkdir(parents=True)
@@ -161,6 +167,10 @@ class Behavior(unittest.TestCase):
         self.root = self.tmp / "evalhome" / "root"
         self.data = self.tmp / "data"
         (self.data / "research/state").mkdir(parents=True)
+        from unittest.mock import patch
+        env = patch.dict(os.environ, {"COACH_DATA": str(self.data)})
+        env.start()
+        self.addCleanup(env.stop)
         ce_home = ce.HOME
         self.addCleanup(setattr, ce, "HOME", ce_home)
         ce.HOME = self.tmp  # prepare_home copies HOME/AGENTS.md into the replay cwd
@@ -190,7 +200,7 @@ class Behavior(unittest.TestCase):
 
     def test_budget_stops_the_run(self):
         r = self.run_b(FakeRunner(cost=0.5), budget=2.0)
-        self.assertLessEqual(r["cost_usd"], 2.0 + 0.5 * 2)  # at most one in-flight call per job past the cap
+        self.assertLessEqual(r["cost_usd"], 2.0)
         self.assertIn(r["verdict"], ("INCOMPLETE", "REJECT"))
         self.assertTrue(any("graded" in x for x in r["reasons"]), r["reasons"])
 
@@ -209,7 +219,7 @@ class Behavior(unittest.TestCase):
         cfg = (self.root / "config.yaml").read_text()
         self.assertIn("mcp_servers: {}", cfg)
         self.assertIn("provider: ''", cfg)
-        self.assertTrue((self.root / "skills").is_symlink())
+        self.assertFalse((self.root / "skills").is_symlink())
         self.assertEqual((self.root / "memories/MEMORY.md").read_text(), "mem\n")
         self.assertFalse((self.root / "plugins").exists())
 
@@ -237,22 +247,194 @@ class Behavior(unittest.TestCase):
         self.assertEqual(ce.usage_cost({"total_including_auxiliary": {"estimated_cost_usd": 0.2}}), 0.2)
 
 
+    def test_unsupported_targets_fail_before_any_write(self):
+        for target in ("../outside.txt", "config.yaml", "auth.json", ".env", "memories/OTHER.md",
+                       "skills/x/run.py", "skills/x/../../SOUL.md", "skills/file.md"):
+            with self.subTest(target=target), self.assertRaises(SystemExit):
+                ce.prepare_home(self.root, self.live, [
+                    {"file": "SOUL.md", "append": "allowed"}, {"file": target, "append": "bad"}])
+            self.assertFalse(self.root.exists())
+        self.assertFalse((self.root.parent / "outside.txt").exists())
+
+    def test_overlap_and_destination_symlinks(self):
+        for root in (self.live, self.live / "eval", self.tmp, self.tmp / "ext",
+                     self.tmp / "other/../live"):
+            with self.assertRaises(SystemExit):
+                ce.prepare_home(root, self.live, [])
+        self.root.parent.mkdir(parents=True)
+        self.root.symlink_to(self.live, target_is_directory=True)
+        with self.assertRaises(SystemExit):
+            ce.prepare_home(self.root, self.live, [])
+        self.root.unlink()
+        self.root.mkdir()
+        (self.root / "config.yaml").symlink_to(self.live / "config.yaml")
+        before = (self.live / "config.yaml").read_text()
+        with self.assertRaises(SystemExit):
+            ce.prepare_home(self.root, self.live, [])
+        self.assertEqual((self.live / "config.yaml").read_text(), before)
+
+    def test_external_symlink_escape_and_markdown_only(self):
+        alias = self.tmp / "ext/escape.md"
+        alias.symlink_to(self.live / "SOUL.md")
+        for f in (alias, self.tmp / "ext/../live/SOUL.md", self.tmp / "ext/cat2/extskill/run.py"):
+            with self.assertRaises(SystemExit):
+                ce.prepare_home(self.root, self.live, [{"file": str(f), "append": "bad"}])
+        self.assertFalse(self.root.exists())
+
+    def test_live_skill_symlink_is_copied_not_written_through(self):
+        link = self.live / "skills/cat/demo/link.md"
+        link.symlink_to(self.live / "SOUL.md")
+        ce.prepare_home(self.root, self.live, [{"file": "skills/cat/demo/link.md", "append": "new"}])
+        self.assertEqual((self.live / "SOUL.md").read_text(), "soul\n")
+        self.assertFalse((self.root / "skills/cat/demo/link.md").is_symlink())
+
+    def test_reviewer_cost_1_2_cap_5(self):
+        runner = FakeRunner(cost=1.2)
+        r = self.run_b(runner)
+        self.assertEqual(runner.calls, 4)
+        self.assertEqual(r["cost_usd"], 4.8)
+        self.assertEqual(r["verdict"], "INCOMPLETE")
+
+    def test_partial_and_smoke_never_pass_or_pool(self):
+        r = ce.run_behavior(self.cand(), self.bench, runner=FakeRunner(), root=self.root,
+                            live=self.live, limit=4, log=lambda *_: None)
+        self.assertEqual(r["verdict"], "INCOMPLETE")
+        self.assertEqual(ce.pooled_result([r], "unverified_done", ["smoke"])["verdict"], "INCOMPLETE")
+        class Missing(FakeRunner):
+            def __call__(self, *args, **kwargs):
+                text, usage = super().__call__(*args, **kwargs)
+                if kwargs.get("ignore_rules"):
+                    text = json.dumps(json.loads(text)[:-1])
+                return text, usage
+        self.assertEqual(self.run_b(Missing())["verdict"], "INCOMPLETE")
+
+    def test_pool_checks_full_rows_counts_and_identity(self):
+        import copy
+        r = self.run_b(FakeRunner())
+        self.assertEqual(ce.pooled_result([r], r["target"], ["r"])["verdict"], "PASS")
+        for mutate in (lambda x: x["rows"].pop(),
+                       lambda x: x["rows"].append(x["rows"][0]),
+                       lambda x: x["rows"][0]["cand"].update({"pass": 2}),
+                       lambda x: x.update({"complete": False})):
+            bad = copy.deepcopy(r)
+            mutate(bad)
+            self.assertEqual(ce.pooled_result([bad], r["target"], ["r"])["verdict"], "INCOMPLETE")
+        other = copy.deepcopy(r)
+        other["edits"] = []
+        self.assertEqual(ce.pooled_result([r, other], r["target"], ["r", "s"])["verdict"], "INCOMPLETE")
+        self.assertEqual(ce.pooled_result([r, r], r["target"], ["r", "r"])["verdict"], "INCOMPLETE")
+
+    def test_judge_strict_grades_ids_and_retry_reservations(self):
+        ep = ce.load_jsonl(self.bench)[0]
+        class Bad(FakeRunner):
+            def __call__(self, *args, **kwargs):
+                self.calls += 1
+                return json.dumps(grades), {"estimated_cost_usd": self.cost}
+        for grades in ([{"id": "id", "pass": x, "why": "x"}] for x in (True, "1", 2, -1, None)):
+            runner = Bad(cost=1.2)
+            budget = ce.Budget(2, ledger=self.tmp / (str(grades[0]["pass"]) + ".jsonl"))
+            self.assertEqual(ce.judge_all([("id", ep, "r")], runner, budget, "fake"), {})
+            self.assertEqual(runner.calls, 1)
+            self.assertEqual(budget.spent, 1.2)
+        for grades in ([{"id": "other", "pass": 1, "why": "x"}],
+                       [{"id": "id", "pass": 1, "why": "x"}] * 2, []):
+            runner = Bad(cost=0)
+            self.assertEqual(ce.judge_all([("id", ep, "r")], runner,
+                             ce.Budget(5, ledger=self.tmp / "zero.jsonl"), "fake"), {})
+
+    def test_concurrent_calls_and_interruptions_are_durably_reserved(self):
+        from concurrent.futures import ThreadPoolExecutor
+        ledger = self.tmp / "spend.jsonl"
+        class Broken(FakeRunner):
+            def __call__(self, *args, **kwargs):
+                raise KeyboardInterrupt("offline interruption")
+        budgets = [ce.Budget(5, ledger=ledger, lane_allowance=5) for _ in range(2)]
+        def call(i):
+            try:
+                return budgets[i % 2].call(Broken(cost=1.2), "fake")
+            except KeyboardInterrupt:
+                return "interrupted"
+        with ThreadPoolExecutor(8) as ex:
+            results = list(ex.map(call, range(20)))
+        self.assertEqual(results.count("interrupted"), 4)
+        rows = ce.load_jsonl(ledger)
+        self.assertEqual(len(rows), 4)
+        self.assertAlmostEqual(sum(x["usd"] for x in rows), 4.8)
+        self.assertIsNone(ce.Budget(5, ledger=ledger, lane_allowance=5).call(FakeRunner(cost=1.2), "fake"))
+
+    def test_cli_pool_and_mandatory_accounting(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        import io
+        report = self.run_b(FakeRunner())
+        candidate = self.tmp / "candidate.json"
+        candidate.write_text(json.dumps(self.cand()))
+        previous = self.tmp / "old.json"
+        previous.write_text(json.dumps(dict(report, complete=False)))
+        ledger = self.data / "research/state/spend.jsonl"
+        before = ledger.read_text()
+        with patch.object(ce, "run_behavior", return_value=report), redirect_stdout(io.StringIO()) as stdout:
+            code = ce.main(["behavior", "--candidate", str(candidate), "--pool", str(previous), "--json"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout.getvalue())["verdict"], "INCOMPLETE")
+        self.assertEqual(ledger.read_text(), before)  # no run-level double charge
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "disabled"):
+            ce.main(["behavior", "--candidate", str(candidate), "--bench", str(self.bench), "--no-log"])
+        self.assertEqual(ledger.read_text(), before)
+
+    def test_exception_and_concurrent_judge_retries(self):
+        ledger = self.tmp / "exceptions.jsonl"
+        class Broken(FakeRunner):
+            def __call__(self, *args, **kwargs):
+                raise RuntimeError("request failed")
+        budget = ce.Budget(5, ledger=ledger)
+        with self.assertRaises(RuntimeError):
+            budget.call(Broken(cost=1.2), "offline")
+        self.assertEqual(budget.spent, 1.2)
+        self.assertEqual(len(ce.load_jsonl(ledger)), 1)
+        class Invalid(FakeRunner):
+            def __call__(self, *args, **kwargs):
+                self.calls += 1
+                return "invalid JSON", {"estimated_cost_usd": self.cost}
+        runner = Invalid(cost=1.2)
+        ep = ce.load_jsonl(self.bench)[0]
+        grades = ce.judge_all([(str(i), ep, "r") for i in range(20)], runner, budget, "fake", batch=1, jobs=8)
+        self.assertEqual(grades, {})
+        self.assertEqual(runner.calls, 3)
+        self.assertEqual(budget.spent, 4.8)
+        self.assertEqual(len(ce.load_jsonl(ledger)), 4)
+
+    def test_paid_runner_is_refused_without_dispatch(self):
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            ce.hermes_runner()
+        runner = FakeRunner()
+        runner.offline_only = False
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            ce.Budget(5, ledger=self.tmp / "paid.jsonl").call(runner, "fake")
+        self.assertEqual(runner.calls, 0)
+        self.assertFalse((self.tmp / "paid.jsonl").exists())
+
+
 class BehaviorVerdict(unittest.TestCase):
     def test_rules(self):
-        v = ce.behavior_verdict
+        def v(counts, target):
+            full = {p: {"base": 6, "cand": 6, "n": 6} for p in ce.PATTERNS}
+            full.update(counts)
+            return ce.behavior_verdict(full, target)
         self.assertEqual(v({"unverified_done": {"base": 1, "cand": 3, "n": 6}, "control": {"base": 5, "cand": 4, "n": 6}},
                            "unverified_done")[0], "PASS")
         self.assertEqual(v({"unverified_done": {"base": 1, "cand": 3, "n": 6}, "control": {"base": 5, "cand": 3, "n": 6}},
                            "unverified_done")[0], "REJECT")
         self.assertEqual(v({"unverified_done": {"base": 2, "cand": 2, "n": 6}}, "unverified_done")[0], "REJECT")
-        self.assertEqual(v({"handoff": {"base": 1, "cand": 1, "n": 6}}, "unverified_done")[0], "INCOMPLETE")
+        self.assertEqual(ce.behavior_verdict({"handoff": {"base": 1, "cand": 1, "n": 6}}, "unverified_done")[0], "INCOMPLETE")
         self.assertEqual(v({"unverified_done": {"base": 0, "cand": 2, "n": 6}, "handoff": {"base": 3, "cand": 2, "n": 6},
                             "control": {"base": 6, "cand": 5, "n": 6}}, "unverified_done")[0], "REJECT")
 
     def test_plus_one_on_six_is_noise(self):
         # the real 2026-10-19 confirmatory run: repeat_fix 3/6 -> 4/6, others net 0
-        r = ce.behavior_verdict({"repeat_fix": {"base": 3, "cand": 4, "n": 6}, "control": {"base": 6, "cand": 6, "n": 6}},
-                                "repeat_fix")
+        counts = {p: {"base": 6, "cand": 6, "n": 6} for p in ce.PATTERNS}
+        counts["repeat_fix"] = {"base": 3, "cand": 4, "n": 6}
+        r = ce.behavior_verdict(counts, "repeat_fix")
         self.assertEqual(r[0], "REJECT")
         self.assertIn("noise", r[1][0])
         self.assertEqual([ce.min_gain(n) for n in (6, 12, 18)], [2, 3, 5])
@@ -263,8 +445,8 @@ class BehaviorVerdict(unittest.TestCase):
         b = {"candidate": "c", "target": "x", "verdict": "PASS", "cost_usd": 2,
              "by_pattern": {"repeat_fix": {"base": 3, "cand": 4, "n": 6}, "control": {"base": 6, "cand": 6, "n": 6}}}
         r = ce.pooled_result([a, b], "repeat_fix", ["a.json", "b.json"])
-        self.assertEqual((r["by_pattern"]["repeat_fix"], r["verdict"], r["cost_usd"]),
-                         ({"base": 6, "cand": 9, "n": 12}, "PASS", 3))
+        self.assertEqual((r["by_pattern"], r["verdict"], r["cost_usd"]),
+                         ({}, "INCOMPLETE", 3))
         self.assertIn("pooled 2 runs", ce.pooled_markdown(r))
 
 
