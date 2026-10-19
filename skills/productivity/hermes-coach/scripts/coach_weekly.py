@@ -9,11 +9,14 @@ Prints a Markdown block the coach Bot turns into reports/weekly-<date>.md:
      KPI 4 (coaching precision) = applied / (applied + rejected) proposals; KPI 5 (adoption) = sessions using
      each feature a curriculum proposal taught, since it was applied.
   2. Top findings of the window from findings/*.jsonl, ranked by estimated waste, as `host/profile/id — title`.
+  2b. Spend vs output per agent (host/profile x lane: each cron job, Kanban, chats, ...): $ this vs previous window,
+     no-op share (empty / [SILENT] / 'nothing to fix' last replies), flags for mostly-no-op agents, crons repeated
+     across hosts, and spend that doubled.
   3. Each --check: before/after comparison for a config change at a timestamp (sessions fully before vs started
      after, equal-length windows), with a keep / raise / revert recommendation.
   4. Pending and rejected proposals (the Bot must not re-propose rejected ones).
 """
-import argparse, collections, glob, json, statistics, sys, time
+import argparse, collections, glob, json, re, statistics, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -188,6 +191,83 @@ def section_findings(data, ds, now, days, top):
     return out
 
 
+NOOP_RE = re.compile(r"^\s*\[SILENT\]|^\s*$|\b(nothing (new |to )?(fix|report|do|change)|no action( needed)?|"
+                     r"no changes?|all (clear|healthy)|healthy, no action|self-managing)\b", re.I)
+INTERACTIVE = {"desktop", "cli", "tui", "slack", "discord", "telegram", "whatsapp", "signal", "imessage"}
+
+
+def agent_key(d):
+    """(host/profile, lane): one cron job, the profile's Kanban workers, its chats, or another session source."""
+    src = d.get("source") or "?"
+    sid = d.get("id") or ""
+    if src == "cron" or sid.startswith("cron_"):
+        job = sid.split("_")[1] if sid.count("_") >= 2 else "?"
+        name = (d.get("title") or "").split(" · ")[0].strip() or job
+        lane = f"cron:{name} ({job})"
+    elif src in INTERACTIVE:
+        lane = "chats"
+    else:
+        lane = src
+    return f"{d.get('host', '?')}/{d.get('profile', '?')}", lane
+
+
+def is_noop(d):
+    return bool(NOOP_RE.search((d.get("last_reply") or "")[:200]))
+
+
+def section_spend(ds, now, days, top=15, min_cost=5.0, noop_flag=0.5):
+    """Spend vs output per agent: cost this window vs the previous one, and the share of runs that produced nothing
+    (an empty / [SILENT] / 'nothing to fix' last reply). Flags mostly-no-op agents and cron jobs repeated across hosts."""
+    lo, plo = now - days * 86400, now - 2 * days * 86400
+    cur, prev = collections.defaultdict(list), collections.defaultdict(float)
+    for d in ds:
+        t, c = act(d), float(d.get("cost_usd") or 0)
+        if lo <= t < now:
+            cur[agent_key(d)].append(d)
+        elif plo <= t < lo:
+            prev[agent_key(d)] += c
+    rows = []
+    for k, v in cur.items():
+        cost = sum(float(d.get("cost_usd") or 0) for d in v)
+        noop = sum(is_noop(d) for d in v) / len(v)
+        stuck = sum(1 for d in v if (d.get("signals") or {}).get("stuck")) / len(v)
+        rows.append({"key": k, "runs": len(v), "cost": cost, "prev": prev.get(k, 0.0), "noop": noop, "stuck": stuck})
+    rows.sort(key=lambda r: -r["cost"])
+    total = sum(r["cost"] for r in rows) or 1.0
+    out = [f"## Spend vs output by agent (last {days:g} days; {len(rows)} agents, ${total:,.0f})", "",
+           "No-op = runs whose last reply is empty, [SILENT] or 'nothing to fix/report'. "
+           "Flag one of these per week as a cut / merge / lower-frequency proposal.", "",
+           "| Agent | Lane | Runs | $ | $ prev | $/run | No-op | Stuck | Flag |",
+           "|---|---|---:|---:|---:|---:|---:|---:|---|"]
+    by_cron = collections.defaultdict(set)
+    for r in rows:
+        if r["key"][1].startswith("cron:"):
+            by_cron[r["key"][1].split(" (")[0]].add(r["key"][0])
+    flagged = []
+    for r in rows:
+        (agent, lane), flag = r["key"], []
+        if r["cost"] >= min_cost and r["noop"] >= noop_flag:
+            flag.append(f"mostly no-op: ~${r['cost'] * r['noop']:,.0f} spent on nothing")
+        if lane.startswith("cron:") and len(by_cron[lane.split(" (")[0]]) > 1:
+            flag.append("same cron on " + ", ".join(sorted(by_cron[lane.split(" (")[0]])))
+        if r["prev"] >= min_cost and r["cost"] >= 2 * r["prev"]:
+            flag.append(f"spend x{r['cost'] / r['prev']:.1f} vs prev")
+        r["flag"] = "; ".join(flag)
+        if flag:
+            flagged.append(r)
+    shown = rows[:top] + [r for r in flagged if r not in rows[:top]]
+    for r in shown:
+        agent, lane = r["key"]
+        out.append(f"| {agent} | {lane} | {r['runs']} | {r['cost']:,.2f} | {r['prev']:,.2f} | "
+                   f"{r['cost'] / r['runs']:,.2f} | {r['noop']:.0%} | {r['stuck']:.0%} | {r['flag']} |")
+    rest = [r for r in rows if r not in shown]
+    if rest:
+        out.append(f"\n{len(rest)} more agents, ${sum(r['cost'] for r in rest):,.2f} together.")
+    if not rows:
+        out.append("No sessions in this window.")
+    return out
+
+
 def check_change(ds, spec, now):
     """spec = key=value@ISO-UTC[#signal]. Sessions fully before vs started after, equal windows."""
     head, _, rest = spec.partition("@")
@@ -308,6 +388,7 @@ def main():
            f"Digests: {len(ds)} across hosts {sorted({d['host'] for d in ds})}.", ""]
     out += section_kpis(data, ds, now, a.days) + [""]
     out += section_findings(data, ds, now, a.days, a.top) + [""]
+    out += section_spend(ds, now, a.days) + [""]
     checks = list(dict.fromkeys(a.check + canary_checks(data)))
     if checks:
         out += ["## Config-change checks", ""]

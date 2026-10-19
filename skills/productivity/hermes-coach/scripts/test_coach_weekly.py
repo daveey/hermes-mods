@@ -224,3 +224,42 @@ class YieldFixtures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpendSection(unittest.TestCase):
+    NOW = 1_800_000_000.0
+
+    def s(self, sid, cost, reply, ago_days=1, host="mac", profile="default", source="cron", title="job-a · Oct 1"):
+        return {"id": sid, "host": host, "profile": profile, "source": source, "title": title, "cost_usd": cost,
+                "last_reply": reply, "last_activity_at": self.NOW - ago_days * 86400, "signals": {}}
+
+    def test_flags_mostly_noop_cron_and_duplicates_and_spikes(self):
+        ds = [self.s(f"cron_aaa111_{i}", 1.0, "[SILENT]") for i in range(6)]
+        ds += [self.s("cron_aaa111_x", 1.0, "Fixed the disk alert")]
+        ds += [self.s("cron_bbb222_1", 0.5, "team self-managing, nothing to fix", host="mini")]
+        ds += [self.s("cron_ccc333_1", 0.2, "nothing to report", title="job-c · Oct 1"),
+               self.s("k1", 20.0, "Shipped PR #4", source="kanban"),
+               self.s("k0", 6.0, "Shipped PR #3", source="kanban", ago_days=9),
+               self.s("d1", 3.0, "Here is the plan", source="desktop")]
+        out = "\n".join(coach_weekly.section_spend(ds, self.NOW, 7))
+        row = next(l for l in out.splitlines() if "| mac/default | cron:job-a (aaa111)" in l)
+        self.assertIn("| 7 | 7.00 |", row)
+        self.assertIn("86%", row)
+        self.assertIn("mostly no-op: ~$6 spent on nothing", row)
+        self.assertIn("same cron on mac/default, mini/default", row)
+        krow = next(l for l in out.splitlines() if "| kanban |" in l)
+        self.assertIn("spend x3.3 vs prev", krow)
+        self.assertIn("| 20.00 | 6.00 |", krow)
+        self.assertIn("| mac/default | chats | 1 | 3.00 |", out)
+        ccc = next(l for l in out.splitlines() if "job-c" in l)
+        self.assertTrue(ccc.rstrip().endswith("|  |"))  # cheap no-op job: under min_cost, not flagged
+
+    def test_empty_window(self):
+        self.assertIn("No sessions in this window.", coach_weekly.section_spend([], self.NOW, 7))
+
+    def test_top_cut_keeps_flagged_rows(self):
+        ds = [self.s(f"k{i}", 100.0 - i, "done", source=f"src{i}") for i in range(5)]
+        ds += [self.s(f"cron_zzz999_{i}", 2.0, "[SILENT]", title="idle") for i in range(3)]
+        out = "\n".join(coach_weekly.section_spend(ds, self.NOW, 7, top=2))
+        self.assertIn("cron:idle (zzz999)", out)
+        self.assertIn("3 more agents", out)
