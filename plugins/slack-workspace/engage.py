@@ -197,11 +197,26 @@ class Engagements:
         with self.store._conn() as c:
             c.execute("DELETE FROM eng_bot_turns WHERE channel=? AND thread=?", (channel, thread))
 
+    # ---- test engagements ---------------------------------------------------------------------
+    # A test engagement exercises the follower without bothering the owner: its escalations are
+    # recorded but not sent to the Inbox unless the policy's ``test_inbox`` toggle is on.
+    def set_test(self, eid: str, on: bool) -> None:
+        self.store.kv_set("test:" + eid, bool(on))
+
+    def is_test(self, eid: str) -> bool:
+        return bool(self.store.kv_get("test:" + eid))
+
+    def test_inbox(self) -> bool:
+        return bool(self.store.policy().get("test_inbox"))
+
     # ---- escalations (Inbox cards) ----------------------------------------------------------
     def record_escalation(self, key: str, *, channel: str, thread: str, topic: str, title: str,
-                          session_id: str = "") -> None:
-        self.store.kv_set("esc:" + key, {"key": key, "channel": channel, "thread": thread, "topic": topic,
-                                         "title": title, "session_id": session_id, "at": time.time()})
+                          session_id: str = "", suppressed: Optional[dict] = None) -> None:
+        row = {"key": key, "channel": channel, "thread": thread, "topic": topic,
+               "title": title, "session_id": session_id, "at": time.time()}
+        if suppressed:
+            row["suppressed"] = suppressed  # the card that would have gone to the Inbox (test engagement)
+        self.store.kv_set("esc:" + key, row)
 
     def escalations(self, channel: str) -> list[dict]:
         with self.store._conn() as c:

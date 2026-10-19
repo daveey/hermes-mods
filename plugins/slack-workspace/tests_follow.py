@@ -222,6 +222,25 @@ def test_tick_ends_expired_and_quiet_engagements(env):
     engs.update(b["id"], kickoff=0, last_activity=time.time() - 8 * 86400)
     make_runner(store, engs, []).tick()
     assert engs.get(a["id"])["state"] == engs.get(b["id"])["state"] == "ended"
+def test_test_engagement_escalations_stay_out_of_the_inbox_unless_toggled(env):
+    store, engs, api, poster = env
+    real = engs.create("C1", "real")
+    test = follow.engagement_op(engs, "create", {"channel": "C2", "brief": "t", "test": True})["engagement"]
+    assert test["test"] and not follow.engagement_op(engs, "get", {"id": real["id"]})["engagement"]["test"]
+    sent = []
+    post = lambda **kw: sent.append(kw) or {"session_id": "s", "updated": False}  # noqa: E731
+    kw = dict(topic="Money", title="t", body="b", reply_text="r")
+    r = follow.escalate(engs, post, channel="C2", thread_ts="5.0", **kw)
+    assert r["ok"] and r["suppressed"] and sent == [] and api.posts == []
+    assert engs.escalations("C2")[0]["suppressed"]["title"] == "t"  # recorded for verification
+    assert follow.escalate(engs, post, channel="C1", thread_ts="5.0", **kw)["ok"] and len(sent) == 1
+    assert follow.engagement_op(engs, "test_inbox", {}) == {"ok": True, "test_inbox": False}
+    assert follow.engagement_op(engs, "test_inbox", {"enabled": True})["test_inbox"]
+    r = follow.escalate(engs, post, channel="C2", thread_ts="5.0", **kw)
+    assert not r.get("suppressed") and len(sent) == 2
+    follow.engagement_op(engs, "test_inbox", {"enabled": False})
+    follow.engagement_op(engs, "update", {"id": test["id"], "test": False})
+    assert not follow.escalate(engs, post, channel="C2", thread_ts="6.0", **kw).get("suppressed") and len(sent) == 3
 
 
 # ---- ops ----------------------------------------------------------------------------------------

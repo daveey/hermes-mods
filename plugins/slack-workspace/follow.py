@@ -177,13 +177,26 @@ def _public(e: Optional[dict]) -> Optional[dict]:
     out = {k: e.get(k) for k in ("id", "channel", "thread", "name", "state", "owner", "kanban_ids",
                                  "budget", "follower_profile", "follower_session", "last_handled_ts",
                                  "expires", "last_activity")}
+    out["test"] = bool(e.get("test"))
     out["brief"] = (e.get("brief") or "")[:400]
     return out
+
+
+def _with_test(engs, e: Optional[dict]) -> Optional[dict]:
+    if e:
+        e = dict(e, test=engs.is_test(e["id"]))
+    return e
 
 
 def engagement_op(engs: "engage.Engagements", op: str, args: dict) -> dict:
     op = (op or "list").strip()
     eid = (args.get("id") or args.get("engagement") or "").strip()
+    pub = lambda e: _public(_with_test(engs, e))  # noqa: E731
+    if op == "test_inbox":
+        # Global toggle: do test engagements' escalations reach the owner's Inbox? (default off)
+        if args.get("enabled") is not None:
+            engs.store.update_policy(test_inbox=bool(args["enabled"]))
+        return {"ok": True, "test_inbox": engs.test_inbox()}
     if op == "create":
         e = engs.create(args["channel"], args.get("brief") or "", thread=args.get("thread") or "",
                         name=args.get("name") or "", context=args.get("context") or "",
@@ -192,29 +205,33 @@ def engagement_op(engs: "engage.Engagements", op: str, args: dict) -> dict:
                         private=bool(args.get("private")),
                         follower_profile=args.get("follower_profile") or default_follower(engs),
                         last_handled_ts=args.get("last_handled_ts"))
-        return {"ok": True, "engagement": _public(e)}
+        if args.get("test"):
+            engs.set_test(e["id"], True)
+        return {"ok": True, "engagement": pub(e)}
     if op == "list":
         states = args.get("states") or ("active", "paused")
-        return {"ok": True, "engagements": [_public(e) for e in engs.list(states=states)]}
+        return {"ok": True, "engagements": [pub(e) for e in engs.list(states=states)]}
     if not eid:
         return {"ok": False, "error": f"{op} needs id"}
     if not engs.get(eid):
         return {"ok": False, "error": f"no engagement {eid}"}
     if op == "get":
         e = engs.get(eid)
-        return {"ok": True, "engagement": _public(e) | {"brief": e.get("brief"), "context": e.get("context")},
+        return {"ok": True, "engagement": pub(e) | {"brief": e.get("brief"), "context": e.get("context")},
                 "mbp_queue": engs.mbp_list(eid)}
     if op in ("pause", "end"):
-        return {"ok": True, "engagement": _public(engs.set_state(eid, "paused" if op == "pause" else "ended"))}
+        return {"ok": True, "engagement": pub(engs.set_state(eid, "paused" if op == "pause" else "ended"))}
     if op == "resume":
         # Skip what was said while paused rather than answering a backlog.
-        return {"ok": True, "engagement": _public(engs.update(eid, state="active", last_handled_ts=f"{time.time():.6f}",
+        return {"ok": True, "engagement": pub(engs.update(eid, state="active", last_handled_ts=f"{time.time():.6f}",
                                                               last_activity=time.time()))}
     if op == "update":
         fields = {k: args[k] for k in ("brief", "context", "kanban_ids", "budget", "name", "owner") if k in args}
         if "until" in args:
             fields["expires"] = parse_until(args["until"])
-        return {"ok": True, "engagement": _public(engs.update(eid, **fields))}
+        if args.get("test") is not None:
+            engs.set_test(eid, bool(args["test"]))
+        return {"ok": True, "engagement": pub(engs.update(eid, **fields))}
     return {"ok": False, "error": f"unknown op {op}"}
 
 
@@ -506,6 +523,12 @@ def escalate(engs, inbox_post: Callable, *, channel: str, thread_ts: str, topic:
         accept = action
     else:
         return {"ok": False, "error": "give reply_text (drafted answer) and/or action (exact instruction)"}
+    if e and engs.is_test(e["id"]) and not engs.test_inbox():
+        card = {"title": title, "body": body, "accept_prompt": accept}
+        engs.record_escalation(key, channel=channel, thread=thread_ts, topic=topic, title=title, suppressed=card)
+        return {"ok": True, "key": key, "suppressed": True,
+                "note": "test engagement: escalation recorded, NOT sent to the owner's Inbox (test_inbox is off). "
+                        "Post nothing in the channel, as for a real escalation."}
     full_body = (f"**Where:** {where}" + (f" ({permalink})" if permalink else "")
                  + (f" · engagement `{e['id']}`" if e else "") + f"\n\n{body}")
     res = inbox_post(title=title, body=full_body, accept_prompt=accept, key=key,

@@ -837,13 +837,17 @@ FSCHEMAS = {
         "until": {"type": "string", "description": "end time: ISO date, epoch, or '7d'"},
         "kanban_ids": {"type": "array", "items": {"type": "string"}},
         "budget": {"type": "string"}, "name": {"type": "string", "description": "channel name"},
-        "last_handled_ts": {"type": "string", "description": "skip messages up to this ts"}},
+        "last_handled_ts": {"type": "string", "description": "skip messages up to this ts"},
+        "test": {"type": "boolean", "description": "test engagement: escalations are recorded but kept out of "
+                                                   "the owner's Inbox unless the test_inbox toggle is on"}},
         ["channel", "brief"], "any"),
-    "slack_engagements": ("List / get / pause / resume / end / update Slack engagements.", {
-        "action": {"type": "string", "enum": ["list", "get", "pause", "resume", "end", "update"]},
+    "slack_engagements": ("List / get / pause / resume / end / update Slack engagements. update test=true|false "
+                          "marks a test engagement; action=test_inbox (enabled=true|false, omit to read) is the "
+                          "global toggle for whether test engagements' escalations reach the Inbox (default off).", {
+        "action": {"type": "string", "enum": ["list", "get", "pause", "resume", "end", "update", "test_inbox"]},
         "id": {"type": "string"}, "brief": {"type": "string"}, "context": {"type": "string"},
         "kanban_ids": {"type": "array", "items": {"type": "string"}}, "budget": {"type": "string"},
-        "until": {"type": "string"}}, [], "any"),
+        "until": {"type": "string"}, "test": {"type": "boolean"}, "enabled": {"type": "boolean"}}, [], "any"),
 }
 FHANDLERS = {"slack_post": ftool_post, "slack_react": ftool_react, "slack_read": ftool_read,
              "slack_escalate": ftool_escalate, "slack_defer_to_mbp": ftool_defer, "slack_engage": ftool_engage,

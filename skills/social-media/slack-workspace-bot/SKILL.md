@@ -79,6 +79,10 @@ Speak only when it adds something:
   ground. The card says who asked what where (link), the evidence, and a drafted reply/action; its
   topic is stable, so a follow-up on the same topic updates the same card (reuse topics listed in
   your prompt). *Do it* on the card posts the drafted reply in the right thread.
+- Test engagements (`slack_engage ... test=true`, or `slack_engagements action=update test=true`): escalations
+  are recorded but not sent to the Inbox (result `suppressed: true`), so tests don't land in the owner's Inbox.
+  Still post nothing in the channel. `slack_engagements action=test_inbox enabled=true` (global, default off)
+  lets them through; mark any engagement whose brief or name says it is a test as `test`.
 - Work that needs the owner's other machine (local checkouts, its Kanban board, browser, rented
   machines): `slack_defer_to_mbp`; it is queued until that machine is online. Say in the thread
   that you'll follow up, then post the headline when the result comes back.
