@@ -114,6 +114,13 @@ class Fixer(Base):
         self.assertEqual((self.st(pid)["status"], self.st(pid)["card"]), ("carded", "t_old"))
         self.assertEqual(self.cards_created(), [])
 
+    def test_apply_force_files_past_daily_cap(self):
+        self.card("t_today", "coach-fix:earlier", cost=0.5)
+        pid = self.add(**FIX)
+        ca.cmd_apply(self.env, type("A", (), {"id": pid, "force": True, "dry_run": False})())
+        self.assertEqual((self.st(pid)["status"], self.st(pid)["card"]), ("carded", "t_abc12345"))
+        self.assertEqual(len(self.cards_created()), 1)
+
     def test_validation_needs_recurrence_hypothesis_acceptance(self):
         bad = dict(FIX, change={"sessions": ["one"], "hypothesis": "", "acceptance": []})
         errs = cp.validate(bad)

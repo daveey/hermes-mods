@@ -368,9 +368,9 @@ def file_card(env, p, dry=False):
     return m.group(1) if m.groups() else m.group(0)
 
 
-def file_fix(env, p, dry=False, now=None, by_day=None):
-    """Fixer lane: (status, detail). carded = a new or existing coach-fix:<slug> card; deferred raises ApplyError
-    (stays pending; dropped once stale)."""
+def file_fix(env, p, dry=False, now=None, by_day=None, force=False, initial_status=None):
+    """Fixer lane: (status, card, how). carded = a new or existing coach-fix:<slug> card; a closed lane raises
+    ApplyError (stays pending; dropped once stale). force = file past the daily caps (a human backlog pass)."""
     errs = fx.validate_fix(p)
     if errs:
         raise ApplyError("fix proposal invalid: " + "; ".join(errs))
@@ -378,13 +378,14 @@ def file_fix(env, p, dry=False, now=None, by_day=None):
     if have:
         return "carded", have["id"], f"already a card ({have['status']})"
     ok, why, _usd = fx.gate(env.home, env.board, now, by_day)
-    if not ok:
+    if not ok and not force:
         raise ApplyError(f"fixer lane closed: {why}")
     if dry:
         return "carded", "dry-run", "would file"
     r = sh([env.hermes, "kanban", "--board", env.board, "create", "--assignee", "default", "--json",
             "--created-by", "coach", "--idempotency-key", f"coach-fix:{p['target']}",
-            "--max-runtime", str(fx.FIX_RUNTIME_S), "--body", fx.card_body(p), fx.card_title(p)])
+            "--max-runtime", str(fx.FIX_RUNTIME_S), "--body", fx.card_body(p)]
+           + (["--initial-status", initial_status] if initial_status else []) + [fx.card_title(p)])
     m = re.search(r'"id"\s*:\s*"([^"]+)"', r.stdout) or re.search(r"\bt_[0-9a-f]{6,}\b", r.stdout)
     if not m:
         raise ApplyError(f"kanban create gave no id: {r.stdout[-300:]}")
@@ -508,6 +509,13 @@ def cmd_apply(env, a):
     p = get(env, a.id)
     if p.get("status") != "pending" and not a.force:
         raise SystemExit(f"{a.id} is {p.get('status')}; --force to apply anyway")
+    if p.get("kind") == "fix":  # file the fix card now; --force also passes the lane's daily caps
+        st, card, how = file_fix(env, p, a.dry_run, force=a.force)
+        print(f"{p['id']} fix:{p['target']} -> {card} ({how})")
+        if not a.dry_run:
+            mark(env, a.id, st, card=card, tier="review", result=f"fix card {card} on board {env.board} ({how})")
+            print("data " + push_data(env, f"coach-apply: {a.id} carded"))
+        return
     desc, run = plan(env, p)
     print(f"{p['id']} [{p.get('tier')}/{p.get('risk', '?')}] {p['kind']} {p['target']}: {p.get('title') or ''}")
     show_diff(*desc) if isinstance(desc, tuple) else print(" ", desc)
