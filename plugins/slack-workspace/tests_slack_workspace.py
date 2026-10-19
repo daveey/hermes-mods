@@ -253,6 +253,8 @@ def test_middleware_swallows_engaged_channel_and_kicks_follower_once(env):
     for ev in ({"type": "message", "channel": "C1", "ts": ts, "user": "UBOB", "text": text},
                {"type": "app_mention", "channel": "C1", "ts": ts, "user": "UBOB", "text": text},
                {"type": "message", "channel": "C2", "ts": ts, "user": "UBOB", "text": "elsewhere"}):
-        asyncio.run(app.mw({"type": "event_callback", "team_id": "T1", "event": ev}, nxt, "RESP"))
+        out = asyncio.run(app.mw({"type": "event_callback", "team_id": "T1", "event": ev}, nxt))
+        if ev["channel"] == "C1":  # bolt does not inject `resp`; the swallow must still ack with a 200
+            assert getattr(out, "status", None) == 200
     assert called == [1]  # only the unengaged channel reaches the ambient bot
     assert Runner.kicked == [e["id"]]

@@ -204,11 +204,23 @@ def _route_event(state: State, ev: dict) -> bool:
     return True
 
 
+def _ack_response():
+    """A 200 for bolt to ack the envelope with. bolt does not inject ``resp`` into global middleware,
+    and returning None (no next()) becomes a 404: no Socket Mode ack, and Slack redelivers the event
+    after 3 s, 1 min and 5 min (and too many failures disable Event Subscriptions)."""
+    try:
+        from slack_bolt.response import BoltResponse
+        return BoltResponse(status=200, body="")
+    except Exception:  # bolt missing (unit tests)
+        import types
+        return types.SimpleNamespace(status=200, body="", headers={})
+
+
 def _make_factory(state: State):
     def slack_workspace_wire(native, adapter):
         state.native, state.adapter = native, adapter
 
-        async def _observe(body, next, resp=None):  # noqa: A002 - slack_bolt injects by name
+        async def _observe(body, next):  # noqa: A002 - slack_bolt injects by name
             engaged = False
             try:
                 if isinstance(body, dict) and body.get("type") == "event_callback":
@@ -223,8 +235,8 @@ def _make_factory(state: State):
                                     ev.get("type"), time.time() - t0)
             except Exception as exc:  # never break dispatch
                 logger.debug("slack-workspace observe failed: %s", exc)
-            if engaged:  # the follower owns this channel/thread: ack and stop here
-                return resp
+            if engaged:  # the follower owns this channel/thread: ack (200) and stop here
+                return _ack_response()
             await next()
 
         native.use(_observe)
