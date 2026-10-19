@@ -15,6 +15,49 @@ import time
 # method temporarily or rely on the mutable pool.current() pointer.
 _dispatch = ContextVar('account_usage_dispatch', default=None)
 _install_failures = {}
+# Profile homes whose plugin load overran core's deadline in THIS process: no
+# middleware will ever consume a queued choice here, so GET rejects it visibly.
+_load_abandoned = {}
+_unloaded = []  # set once any integration unloads; install() then gc.collect()s
+
+# install() proves each seam's live code object came from the audited file. A
+# cold compile of those files costs seconds under load (it used to push plugin
+# load past core's 10 s deadline), so the code fingerprints of each audited file
+# are cached per (interpreter, file digest). A miss or mismatch falls back to the
+# compile, which stays authoritative; the cache can only make a check faster.
+_FINGERPRINT_VERSION = 1
+
+
+def _fingerprint_cache_path(home):
+    from pathlib import Path
+    return Path(home) / 'cache' / 'account-usage' / 'code-fingerprints.json'
+
+
+def _canonical(value):
+    import types
+    if isinstance(value, types.CodeType):
+        return ('code', _code_fingerprint(value))
+    if isinstance(value, tuple):
+        return ('tuple', tuple(_canonical(v) for v in value))
+    if isinstance(value, frozenset):  # repr order follows string hash randomization
+        return ('frozenset', tuple(sorted(repr(_canonical(v)) for v in value)))
+    return (type(value).__qualname__, repr(value))
+
+
+def _code_fingerprint(code):
+    """Process-independent digest of everything code equality compares (and more)."""
+    import hashlib
+    parts = (code.co_name, code.co_qualname, code.co_argcount, code.co_posonlyargcount,
+             code.co_kwonlyargcount, code.co_flags, code.co_firstlineno, code.co_code,
+             code.co_names, code.co_varnames, code.co_freevars, code.co_cellvars,
+             code.co_linetable, code.co_exceptiontable,
+             tuple(_canonical(c) for c in code.co_consts))
+    return hashlib.sha256(repr(parts).encode()).hexdigest()
+
+
+def _cache_key(relative, digest):
+    import sys
+    return f'{_FINGERPRINT_VERSION}|{sys.implementation.cache_tag}|{sys.version}|{relative}|{digest}'
 _IDENTITY_HEADERS = frozenset({'authorization', 'x-api-key', 'chatgpt-account-id',
     'x-openai-internal-codex-residency', 'openai-organization', 'openai-project'})
 
@@ -219,6 +262,13 @@ class PendingStore:
                 "WHERE profile=? AND session=? AND state='pending' AND (provider<>? OR model<>?)",
                 (*key, model)).rowcount
             return bool(changed)
+
+    def reject_pending(self, key):
+        """Terminally reject this key's queued choice (visible on the next read)."""
+        from contextlib import closing
+        with closing(self._connection()) as db, db:
+            return bool(db.execute("UPDATE selection SET state='rejected', revision=revision+1 "
+                "WHERE profile=? AND session=? AND provider=? AND state='pending'", key).rowcount)
 
     def reject_consumed(self, key, *, revision):
         # Do not clobber a newer click which arrived while credential I/O ran.
@@ -636,8 +686,9 @@ class ExecutionIntegration:
                 self._restore_if_idle()
 
     def install(self):
-        import gc
-        gc.collect()  # release completed exception tracebacks from a prior unload
+        if _unloaded:
+            import gc
+            gc.collect()  # release completed exception tracebacks from a prior unload
         import hashlib
         import json
         import inspect
@@ -658,8 +709,21 @@ class ExecutionIntegration:
                    (chat_completion_helpers, 'interruptible_streaming_api_call', self.terminal_wrapper)]
         # Validate every target BEFORE installing anything. Refuse other wrappers.
         compiled = {}
-        def verified(original):
+        cache_path = _fingerprint_cache_path(self.home)
+        try:
+            cache = json.loads(cache_path.read_text())
+            if not isinstance(cache, dict) or not isinstance(cache.get('files'), dict):
+                raise ValueError
+        except (OSError, ValueError):
+            cache = {'files': {}}
+        dirty = []
+        def codes(code):
             import types
+            yield code
+            for child in code.co_consts:
+                if isinstance(child, types.CodeType):
+                    yield from codes(child)
+        def verified(original):
             if not inspect.isfunction(original) or hasattr(original, '__wrapped__'):
                 return False
             path = Path(original.__code__.co_filename).resolve()
@@ -669,19 +733,25 @@ class ExecutionIntegration:
                 return False
             if relative not in expected:
                 return False
+            # The file's bytes were pinned above; the cache maps that digest to
+            # the fingerprints of every code object compiling it yields.
+            key = _cache_key(relative, expected[relative])
+            known = cache['files'].get(key)
+            if isinstance(known, list) and _code_fingerprint(original.__code__) in known:
+                return True
             if relative not in compiled:
                 compiled[relative] = compile(path.read_bytes(), str(path), 'exec', dont_inherit=True)
-            def codes(code):
-                yield code
-                for child in code.co_consts:
-                    if isinstance(child, types.CodeType):
-                        yield from codes(child)
+                cache['files'][key] = sorted({_code_fingerprint(c) for c in codes(compiled[relative])})
+                dirty.append(key)
             return any(code == original.__code__ for code in codes(compiled[relative]))
         if not verified(turn_api_call.perform_api_call):
             raise SelectionRejected('Account selection execution boundary is customized')
         for obj, name, factory in targets:
             if not verified(getattr(obj, name)):
                 raise SelectionRejected(f'Account selection execution seam is already customized: {name}')
+        if dirty:
+            pins = {f'|{relative}|{digest}' for relative, digest in expected.items()}
+            self._save_fingerprints(cache_path, cache, pins)
         # Cover already-imported aliases as well as the defining module. Core's
         # class forwarders resolve these module attributes dynamically.
         import sys
@@ -703,9 +773,43 @@ class ExecutionIntegration:
         self.active = True
         _install_failures.pop(self.home, None)
 
+    @staticmethod
+    def _save_fingerprints(path, cache, pins):
+        # Merge with what other processes wrote meanwhile, keep entries for the
+        # current pins only (any interpreter), drop stale core versions. A write
+        # failure only costs the next process a compile.
+        import json
+        import os
+        try:
+            try:
+                old = json.loads(path.read_text()).get('files', {})
+            except (OSError, ValueError, AttributeError):
+                old = {}
+            merged = {**(old if isinstance(old, dict) else {}), **cache['files']}
+            files = {k: v for k, v in merged.items()
+                     if isinstance(v, list) and any(k.endswith(pin) for pin in pins)}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            import threading
+            tmp = path.with_name(f'{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+            tmp.write_text(json.dumps({'files': files}))
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
     def disable(self):
         self.error = 'Account selection compatibility check failed; reload after re-auditing the plugin'
         _install_failures[self.home] = self.error
+
+    def abandon(self):
+        """Core abandoned this plugin's load (deadline overrun): its middleware and
+        on_unload are never registered, so undo every patch now and refuse queued
+        and new selections in this process instead of silently ignoring them."""
+        message = ('Account selection is unavailable: the account-usage plugin did not finish '
+                   'loading in this Hermes process; restart Hermes and choose again')
+        _install_failures[self.home] = message
+        _load_abandoned[self.home] = message
+        self.error = message
+        self.unload()
 
     def route_wrapper(self, original):
         @wraps(original)
@@ -805,6 +909,8 @@ class ExecutionIntegration:
     def unload(self):
         with self._lifetime_lock:
             self.active = False
+            if not _unloaded:
+                _unloaded.append(True)
             self._restore_if_idle()
 
     def _restore_if_idle(self):
@@ -943,9 +1049,12 @@ class SelectionService:
         with owner_scope(runtime_id, profile_home=self.home, server=self.server) as owner:
             store = self.store()
             invalidated = store.invalidate_route(owner.key, model=owner.model)
+            abandoned = _load_abandoned.get(self.home)
+            if abandoned and store.reject_pending(owner.key):
+                return {**self.metadata(owner, store.read(owner.key)), 'error': abandoned}
             result = self.metadata(owner, store.read(owner.key))
             if invalidated or result['state'] == 'rejected':
-                result['error'] = 'Account selection was rejected; choose an available account for the current route'
+                result['error'] = abandoned or 'Account selection was rejected; choose an available account for the current route'
             return result
 
     def consume_for_agent(self, agent):

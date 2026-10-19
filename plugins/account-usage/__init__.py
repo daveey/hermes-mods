@@ -149,29 +149,91 @@ def _observe_selected(agent, snapshot):
         pass
 
 
-def register(ctx):
-    ctx.register_hook("post_api_request", _on_api)
+# A load slower than this is logged with pid + process role (core's own timeout
+# warning names neither), well before core's 10 s plugins.load_timeout_seconds.
+_SLOW_LOAD_SECS = 4.0
+
+
+def _process_role() -> str:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return f"kanban-worker:{os.environ['HERMES_KANBAN_TASK']}"
+    if os.environ.get("HERMES_DESKTOP"):
+        return "desktop-backend"
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    known = {"serve", "gateway", "dashboard", "chat", "cron", "acp", "mcp", "kanban", "tui"}
+    return next((a for a in args if a in known), "cli")
+
+
+def _load_selection():
+    """The ONE module identity shared with the REST API (dashboard/plugin_api.py loads the same
+    sys.modules name). Loaded directly: importing plugin_api here pulled fastapi + pydantic into
+    every process, ~4 s of a 10 s load deadline on a loaded host."""
     import importlib.util
     from pathlib import Path
-    spec = importlib.util.spec_from_file_location('account_usage_execution_api', Path(__file__).parent / 'dashboard/plugin_api.py')
-    api = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(api)
-    selection = api.load_selection_module()
+    name = "account_usage_selection"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / "selection.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return sys.modules[name]
+
+
+def register(ctx):
+    import logging
+    log = logging.getLogger(__name__)
+    started = time.perf_counter()
+    phases = {}
+
+    def mark(phase, since=[started]):
+        now = time.perf_counter()
+        phases[phase] = round(now - since[0], 2)
+        since[0] = now
+
+    ctx.register_hook("post_api_request", _on_api)
+    selection = _load_selection()
     if not hasattr(selection, 'ExecutionIntegration'):
         # The earlier API-only version may already be cached in this gateway.
         # It installed no factories or middleware. Upgrade that inert module IN
         # PLACE so existing mounted API handlers retain the same module object.
         # Never replace/re-execute an execution-capable module with live contexts.
         selection.__spec__.loader.exec_module(selection)
+    mark("selection")
     integration = selection.ExecutionIntegration(observe=_observe_selected)
+    mark("core-imports")
     try:
         integration.install()
     except Exception:
         # Preserve observation and a fail-closed refusal path for queued intents.
         # Never emit raw loader exceptions: custom factories may carry secrets.
-        import logging
         integration.disable()
-        logging.getLogger(__name__).warning(integration.error)
+        log.warning(integration.error)
+    mark("install")
+    where = f"pid={os.getpid()} role={_process_role()}"
+    if getattr(ctx, "_load_abandoned", False):
+        return _abandoned(integration, log, where, started, phases)
     ctx.on_unload(integration.unload)
     ctx.register_middleware('llm_execution', integration.middleware)
+    if getattr(ctx, "_load_abandoned", False):
+        # Core's deadline fired between the check above and these calls, which
+        # it then ignored (or swept): same as abandoned before them.
+        return _abandoned(integration, log, where, started, phases)
+    elapsed = time.perf_counter() - started
+    if elapsed > _SLOW_LOAD_SECS:
+        log.warning("account-usage: slow plugin load %.1fs (%s) %s", elapsed, where,
+                    " ".join(f"{k}={v}s" for k, v in phases.items()))
+
+
+def _abandoned(integration, log, where, started, phases):
+    # Core timed this load out: middleware/on_unload never land, so the patched
+    # seams would serve no one and a queued choice would be ignored silently.
+    # Undo the patches and make this process refuse selections visibly.
+    integration.abandon()
+    log.warning("account-usage: load finished after core's deadline (%.1fs, %s) %s; account selection "
+                "is refused in this process until Hermes restarts", time.perf_counter() - started, where,
+                " ".join(f"{k}={v}s" for k, v in phases.items()))
 
