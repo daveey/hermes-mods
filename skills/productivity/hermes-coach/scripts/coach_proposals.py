@@ -266,7 +266,14 @@ def main(argv=None):
             s.add_argument("--result", default="")
             s.add_argument("--by", default="coach-apply")
     a = ap.parse_args(argv)
-    return {"add": cmd_add, "list": cmd_list, "rejected": cmd_rejected, "mark": cmd_mark}[a.cmd](a)
+    rc = {"add": cmd_add, "list": cmd_list, "rejected": cmd_rejected, "mark": cmd_mark}[a.cmd](a)
+    if a.cmd == "mark" and rc == 0 and a.status in ("applied", "reverted"):
+        # A card that lands a review-tier proposal marks it here, not through coach-apply: post it to the Inbox too.
+        import coach_apply  # noqa: E402 — lazy: coach_apply imports this module
+        p = state(a.data).get(a.id)
+        if p:
+            coach_apply.notify_inbox(coach_apply.Env(data=a.data), p, a.status, a.result or a.note)
+    return rc
 
 
 if __name__ == "__main__":

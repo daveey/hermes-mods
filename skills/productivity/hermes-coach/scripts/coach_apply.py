@@ -16,6 +16,9 @@
                         (trial cards + coach_eval runs) today is under $10; logged as lane trial
         pending > 7 days whose gate still fails -> dropped with the reason
     coach_apply.py list --status all|pending|applied|canary|carded|rejected|dropped|reverted
+    coach_apply.py inbox [--days 7]    re-post recent applied/canary improvements to the Hermes Inbox
+Every applied / canary / kept / reverted improvement is posted to the Hermes Inbox (`hermes inbox post`, key
+coach-improvement:<id>, one card per proposal; COACH_INBOX=0 turns it off).
 
 Roots (env): COACH_DATA (~/code/hermes-coach-data), COACH_MODS (~/code/hermes-mods), COACH_PRIV (~/code/hermes,
 holds shared-config.json), HERMES_HOME (~/.hermes), COACH_HERMES (hermes binary), COACH_KANBAN_BOARD (hermes).
@@ -345,6 +348,49 @@ def mark(env, pid, status, by="coach-apply", note="", result="", **extra):
             sys.stdout = so
 
 
+INBOX_HEAD = {
+    "applied": "Applied",
+    "canary": "Trying on this Mac",
+    "kept": "Kept after canary",
+    "promoted": "Kept + shared to all hosts",
+    "reverted": "Reverted",
+}
+
+
+def notify_inbox(env, p, action, detail="", out=print):
+    """Post an accepted (or rolled-back) improvement to the Hermes Inbox. One card per proposal (key
+    coach-improvement:<id>), so canary -> kept/reverted updates the same card. Best effort: never fails the apply.
+    COACH_INBOX=0 turns it off."""
+    if os.environ.get("COACH_INBOX", "1") == "0" or action not in INBOX_HEAD:
+        return None
+    pid = p["id"]
+    title = f"{INBOX_HEAD[action]}: {p.get('title') or (p['kind'] + ' ' + str(p['target']))}"[:80]
+    verb = "rolled back" if action == "reverted" else "accepted"
+    body = (f"The coach {verb} improvement **{pid}** ({p.get('tier') or cp.effective_tier(p)} tier, "
+            f"{p['kind']} → `{p['target']}`).\n\n"
+            f"**What changed:** {detail or p.get('result') or '(see proposal)'}\n\n"
+            f"**Why:** {str(p.get('evidence') or '')[:600]}\n\n"
+            + (f"**Source:** {p.get('report')}\n\n" if p.get("report") else "")
+            + ("" if action == "reverted" else f"Undo: `coach-apply revert {pid}`\n\n")
+            + "**Do it** reviews whether this is helping; **Archive** just acknowledges it.")
+    prompt = (f"Review coach improvement {pid} (`coach-apply show {pid}`; the change is recorded in "
+              "~/code/hermes-coach-data/reports/proposals.jsonl). Show me exactly what changed, then check whether "
+              "it is helping using the coach's before/after KPI (coach_weekly check for this proposal, or the latest "
+              "reports/weekly-*.md) and recent sessions. Give a one-line verdict: keep or revert. If it is clearly "
+              f"hurting, run `coach-apply revert {pid} \"<why>\"` and tell me.")
+    try:
+        r = sh([env.hermes, "inbox", "post", title, "--body", body, "--prompt", prompt,
+                "--key", f"coach-improvement:{pid}", "--poster", "coach · improvements",
+                "--cwd", str(env.data)], check=False)
+        if r.returncode:
+            out(f"inbox post failed for {pid}: {(r.stderr or r.stdout).strip()[-200:]}")
+            return None
+        return True
+    except Exception as e:  # noqa: BLE001 — the inbox is a notification, not part of the apply
+        out(f"inbox post failed for {pid}: {e}")
+        return None
+
+
 def check_spec(p, at=None):
     v = p["change"].get("value")
     return f"{p['target']}={cfg_value(v)}@{at or now_iso()[:16]}Z#{p.get('signal') or 'synthetic_turn_cap'}" \
@@ -470,9 +516,11 @@ def auto(env, dry=False, now=None, out=print):
                     ev["check"] = check_spec(p)
                     mark(env, pid, "canary", by="coach-apply auto", tier=tier, **ev)
                     done.append((pid, "canary", ev["result"]))
+                    notify_inbox(env, {**p, "tier": tier}, "canary", ev["result"], out)
                 else:
                     mark(env, pid, "applied", by="coach-apply auto", tier=tier, **ev)
                     done.append((pid, "applied", ev["result"]))
+                    notify_inbox(env, {**p, "tier": tier}, "applied", ev["result"], out)
             elif st == "canary" and p.get("check"):
                 verdict = canary_verdict(env, p, now)
                 age = (now - calendar.timegm(time.strptime(p["check"].split("@")[1][:16], "%Y-%m-%dT%H:%M"))) / 86400
@@ -480,6 +528,7 @@ def auto(env, dry=False, now=None, out=print):
                     res = "dry-run" if dry else revert_event(env, p)
                     dry or mark(env, pid, "reverted", by="coach-apply auto", note=verdict, result=res)
                     done.append((pid, "reverted", verdict))
+                    dry or notify_inbox(env, p, "reverted", f"canary verdict {verdict}: {res}", out)
                 elif verdict.startswith(("KEEP:", "RAISE")) or age > CANARY_MAX_DAYS:
                     ev = {}
                     if p["kind"] == "shared_config" and not dry:
@@ -488,6 +537,8 @@ def auto(env, dry=False, now=None, out=print):
                     dry or mark(env, pid, "applied", by="coach-apply auto", note=f"canary verdict: {verdict}",
                                 result="promoted to shared-config" if ev else "kept", **ev)
                     done.append((pid, "promoted" if ev else "kept", verdict))
+                    dry or notify_inbox(env, p, "promoted" if ev else "kept",
+                                        f"{p.get('result') or ''} — canary verdict: {verdict}", out)
         except ApplyError as e:
             if st == "pending" and cp.age_days(p, now) > cp.STALE_DAYS:
                 dry or mark(env, pid, "dropped", by="coach-apply auto",
@@ -562,7 +613,26 @@ def cmd_apply(env, a):
     ev = run()
     print(ev["result"])
     mark(env, a.id, "applied", **ev)
+    notify_inbox(env, p, "applied", ev["result"])
     print("data " + push_data(env, f"coach-apply: {a.id} applied"))
+
+
+def cmd_inbox(env, a):
+    """Re-post applied/canary improvements from the last N days to the Inbox (same keys: no duplicates)."""
+    pull_data(env)
+    cut = time.time() - a.days * 86400
+    n = 0
+    for p in cp.state(env.data).values():
+        if p.get("status") not in ("applied", "canary"):
+            continue
+        try:
+            at = calendar.timegm(time.strptime(str(p.get("at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            continue
+        if at >= cut and notify_inbox(env, p, p["status"]):
+            n += 1
+            print(f"{p['id']:<13} {p['status']:<8} {p.get('title') or p['target']}")
+    print(f"{n} improvement(s) posted to the Inbox")
 
 
 def cmd_reject(env, a):
@@ -581,6 +651,7 @@ def cmd_revert(env, a):
     res = revert_event(env, p)
     print(res)
     mark(env, a.id, "reverted", note=a.note or "reverted by hand", result=res)
+    notify_inbox(env, p, "reverted", res)
     print("data " + push_data(env, f"coach-apply: {a.id} reverted"))
 
 
@@ -595,6 +666,7 @@ def main(argv=None):
     s = sub.add_parser("reject"); s.add_argument("id"); s.add_argument("note", nargs="?", default="")
     s = sub.add_parser("revert"); s.add_argument("id"); s.add_argument("note", nargs="?", default="")
     s = sub.add_parser("auto"); s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("inbox"); s.add_argument("--days", type=int, default=7)
     a = ap.parse_args(argv)
     env = Env(push=not a.no_push)
     if not a.cmd:
@@ -604,7 +676,8 @@ def main(argv=None):
             print(f"[coach-apply auto {now_iso()}]")
             auto(env, dry=a.dry_run)
             return 0
-        {"list": cmd_list, "show": cmd_show, "apply": cmd_apply, "reject": cmd_reject, "revert": cmd_revert}[a.cmd](env, a)
+        {"list": cmd_list, "show": cmd_show, "apply": cmd_apply, "reject": cmd_reject, "revert": cmd_revert,
+         "inbox": cmd_inbox}[a.cmd](env, a)
     except ApplyError as e:
         raise SystemExit(str(e))
     return 0

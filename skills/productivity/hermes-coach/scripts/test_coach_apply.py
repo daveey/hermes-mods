@@ -21,6 +21,9 @@ elif a[:2] == ["config", "set"]:
     cfg[a[2]] = a[3]
 elif a[:2] == ["config", "unset"]:
     cfg.pop(a[2], None)
+elif a[0] == "inbox":
+    if os.environ.get("FAKE_INBOX_FAIL"): sys.exit(3)
+    open(f + ".inbox", "a").write(json.dumps(a) + "\n")
 elif a[0] == "kanban":
     open(f + ".cards", "a").write(json.dumps(a) + "\n")
     print(json.dumps({"id": "t_abc12345"}))
@@ -134,6 +137,77 @@ class TierDefaults(unittest.TestCase):
             cp.append(d, {"id": "a", "kind": "curriculum", "target": "c.yaml", "change": {"append": "x"},
                           "status": "pending", "date": "2026-10-14"})
             self.assertEqual(cp.state(d)["a"]["tier"], "auto")
+
+
+class Inbox(Base):
+    def posts(self):
+        f = Path(os.environ["FAKE_CFG"] + ".inbox")
+        rows = [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+        return [(r[2], r[r.index("--key") + 1]) for r in rows]
+
+    def test_applied_then_reverted_updates_one_card(self):
+        pid = self.add(kind="skill_patch", target="demo-skill", title="Check the device",
+                       change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+                               "new_string": "- Verify end to end.\n- Then check the device.\n"})
+        self.run_auto()
+        self.assertEqual(self.posts(), [("Applied: Check the device", f"coach-improvement:{pid}")])
+        row = json.loads(Path(os.environ["FAKE_CFG"] + ".inbox").read_text().splitlines()[0])
+        body = row[row.index("--body") + 1]
+        self.assertIn(f"coach-apply revert {pid}", body)
+        self.assertIn(f"coach-apply show {pid}", row[row.index("--prompt") + 1])
+        ca.cmd_revert(self.env, type("A", (), {"id": pid, "note": ""})())
+        self.assertEqual(self.posts()[-1], ("Reverted: Check the device", f"coach-improvement:{pid}"))
+
+    def test_canary_then_kept_same_key(self):
+        pid = self.add(kind="config", target="agent.max_turns", change={"value": 400})
+        self.run_auto()
+        orig = ca.canary_verdict
+        try:
+            ca.canary_verdict = lambda env, p, now: "KEEP: cap hits/session -90%."
+            self.run_auto()
+        finally:
+            ca.canary_verdict = orig
+        heads = [t.split(":")[0] for t, _ in self.posts()]
+        self.assertEqual(heads, ["Trying on this Mac", "Kept after canary"])
+        self.assertEqual({k for _, k in self.posts()}, {f"coach-improvement:{pid}"})
+
+    def test_cards_and_failures_never_post(self):
+        self.add(kind="core", target="agent loop", change={"summary": "retry on 529"})
+        self.add(kind="skill_patch", target="demo-skill", change={"old_string": "nope", "new_string": "y"})
+        self.run_auto()
+        self.assertEqual(self.posts(), [])
+
+    def test_inbox_failure_does_not_block_apply(self):
+        os.environ["FAKE_INBOX_FAIL"] = "1"
+        try:
+            pid = self.add(kind="skill_patch", target="demo-skill",
+                           change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+                                   "new_string": "- Verify end to end.\n- X.\n"})
+            self.run_auto()
+        finally:
+            os.environ.pop("FAKE_INBOX_FAIL")
+        self.assertEqual(self.st(pid)["status"], "applied")
+
+    def test_cli_mark_applied_posts(self):
+        pid = self.add(kind="core", target="agent loop", title="Retry on 529", change={"summary": "x"})
+        os.environ["COACH_HERMES"] = self.env.hermes
+        try:
+            cp.main(["mark", "--data", str(self.env.data), "--id", pid, "--status", "applied",
+                     "--by", "kanban t_1", "--result", "shipped abc123"])
+        finally:
+            os.environ.pop("COACH_HERMES")
+        self.assertEqual(self.posts(), [("Applied: Retry on 529", f"coach-improvement:{pid}")])
+
+    def test_opt_out(self):
+        os.environ["COACH_INBOX"] = "0"
+        try:
+            self.add(kind="skill_patch", target="demo-skill",
+                     change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+                             "new_string": "- Verify end to end.\n- X.\n"})
+            self.run_auto()
+        finally:
+            os.environ.pop("COACH_INBOX")
+        self.assertEqual(self.posts(), [])
 
 
 class AutoApply(Base):
