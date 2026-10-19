@@ -1,0 +1,406 @@
+From dabf5552b439a275550cda4ab16d030d87580f54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 00:15:44 -0700
+Subject: [PATCH] fix(tui): hand a refused kanban notice back to the chat's
+ owning backend [daveey]
+
+A chat open in two backends polls its kanban notices in both. The non-owner claimed the
+cursor, its turn was refused (SESSION_NOT_OWNED), and the batch was dropped, so the owner
+never saw the completion (a parent missed its child's 'invite minted, not sent' handoff).
+A refused or failed turn now rewinds its claims (CAS via rewind_notify_cursor) and backs
+off claiming; the owner re-claims and delivers. Partially delivered claims stay buffered.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tui_gateway/test_kanban_notify_refusal.py | 186 ++++++++++++++++++
+ tui_gateway/session_notifications.py          | 119 +++++++++--
+ 2 files changed, 289 insertions(+), 16 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_notify_refusal.py
+
+diff --git a/tests/tui_gateway/test_kanban_notify_refusal.py b/tests/tui_gateway/test_kanban_notify_refusal.py
+new file mode 100644
+index 0000000000..a49f67e0d5
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_notify_refusal.py
+@@ -0,0 +1,186 @@
++"""A kanban notice whose agent turn is refused must not be lost. [daveey]
++
++Live incident (2026-10-18, session 20990101_000000_aaaaaa): the chat was open in two backends. At 21:17:35 the
++backend that did NOT hold the session lease polled the board, claimed the ``completed`` event of child card
++t_05d71bf2 (advancing ``last_event_id``), then ``_run_prompt_submit`` refused the turn with SESSION_NOT_OWNED.
++The batch had already left ``_kanban_pending`` and the cursor stayed claimed, so the owning backend never saw
++the completion and the parent never ran its "send the invite when it's ready" follow-up. The same happened to
++t_27101455 at 19:13:50.
++
++Fix: a refused turn rewinds (CAS) its claimed cursor ranges so the owner's poller claims them, and the refused
++session backs off claiming. These tests drive ``_notif_poll_kanban_scoped`` against a real kanban DB with only
++the admission gate faked.
++"""
++
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from tui_gateway import server
++
++KEY = "20990101_000000_aaaaaa"
++
++
++def _session(key: str = KEY) -> dict:
++    return {"session_key": key, "history_lock": threading.RLock(), "running": False}
++
++
++def _task(title: str = "Mac person invite") -> str:
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title=title, assignee="default")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=KEY)
++        return tid
++    finally:
++        conn.close()
++
++
++def _complete(tid: str, summary: str) -> None:
++    conn = kbc.connect()
++    try:
++        assert kb.complete_task(conn, tid, summary=summary)
++    finally:
++        conn.close()
++
++
++def _cursor(tid: str) -> int:
++    conn = kbc.connect()
++    try:
++        return kbn.list_notify_subs(conn, task_id=tid)[0]["last_event_id"]
++    finally:
++        conn.close()
++
++
++@pytest.fixture
++def gate(monkeypatch):
++    """Fake admission gate: ``gate["accept"]`` decides; every submitted text is recorded."""
++    state = {"accept": True, "submitted": []}
++
++    def _submit(rid, sid, session, text, **kwargs):
++        state["submitted"].append((sid, text))
++        if not state["accept"]:
++            with session["history_lock"]:
++                session["running"] = False  # what _admit_prompt_turn does on SESSION_NOT_OWNED
++            return False
++        with session["history_lock"]:
++            session["running"] = False  # the turn "ran"
++        return True
++
++    monkeypatch.setattr(server, "_run_prompt_submit", _submit)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    return state
++
++
++def test_refused_completion_is_handed_back_to_the_owning_backend(gate):
++    tid = _task()
++    before = _cursor(tid)
++    _complete(tid, "Alex's Mac invite is minted but NOT sent: <invite url>")
++
++    non_owner, owner = _session(), _session()
++    gate["accept"] = False
++    server._notif_poll_kanban_scoped("ui-non-owner", non_owner)
++
++    assert len(gate["submitted"]) == 1 and tid in gate["submitted"][0][1]
++    assert _cursor(tid) == before, "the refused claim must be rewound, not left claimed"
++    assert non_owner["_kanban_pending"] == [] and non_owner["_kanban_claims"] == []
++    assert non_owner["running"] is False
++
++    gate["accept"] = True
++    server._notif_poll_kanban_scoped("ui-owner", owner)
++
++    assert [sid for sid, _ in gate["submitted"]] == ["ui-non-owner", "ui-owner"]
++    assert "NOT sent" in gate["submitted"][1][1]
++    assert _cursor(tid) > before
++    assert owner["_kanban_claims"] == []
++
++
++def test_refused_session_backs_off_instead_of_reclaiming_every_poll(gate):
++    tid = _task()
++    _complete(tid, "done")
++    non_owner = _session()
++    gate["accept"] = False
++    server._notif_poll_kanban_scoped("ui-non-owner", non_owner)
++    server._notif_poll_kanban_scoped("ui-non-owner", non_owner)  # inside the backoff: no claim, no turn
++
++    assert len(gate["submitted"]) == 1
++    assert non_owner["_kanban_refused_until"] > time.monotonic()
++
++    non_owner["_kanban_refused_until"] = 0  # backoff elapsed; this backend now owns the chat
++    gate["accept"] = True
++    server._notif_poll_kanban_scoped("ui-non-owner", non_owner)
++    assert len(gate["submitted"]) == 2 and tid in gate["submitted"][1][1]
++    assert "_kanban_refused_until" not in non_owner and "_kanban_refusal_delay" not in non_owner
++
++
++def test_completion_arriving_while_busy_with_other_notices_is_delivered_once(gate):
++    """Parent is mid-turn handling another card's notice when the child completes."""
++    other, child = _task("verify watch"), _task("Mac person invite")
++    session = _session()
++    _complete(other, "watch verified")
++    server._notif_poll_kanban_scoped("ui", session)
++    assert len(gate["submitted"]) == 1
++
++    session["running"] = True  # a turn (the user's, or the previous notice's) is live
++    _complete(child, "invite minted, NOT sent")
++    server._notif_poll_kanban_scoped("ui", session)
++    assert len(gate["submitted"]) == 1, "no second turn while busy"
++    assert any(child in t for t in session["_kanban_pending"])
++
++    session["running"] = False
++    server._notif_poll_kanban_scoped("ui", session)
++    server._notif_poll_kanban_scoped("ui", session)
++    assert len(gate["submitted"]) == 2 and child in gate["submitted"][1][1]
++    assert session["_kanban_pending"] == [] and session["_kanban_claims"] == []
++
++
++def test_refusal_after_a_busy_wait_still_rewinds(gate):
++    tid = _task()
++    session = _session()
++    session["running"] = True
++    _complete(tid, "done")
++    server._notif_poll_kanban_scoped("ui", session)  # claimed + buffered while busy
++    claimed = _cursor(tid)
++    session["running"] = False
++    gate["accept"] = False
++    server._notif_poll_kanban_scoped("ui", session)
++    assert _cursor(tid) < claimed
++    assert session["_kanban_pending"] == []
++
++
++def test_repeated_completion_after_reopen_notifies_each_event_once(gate):
++    """A retried/reopened card re-notifies its new event only; the delivered one never replays."""
++    tid = _task()
++    session = _session()
++    _complete(tid, "first")
++    server._notif_poll_kanban_scoped("ui", session)
++    server._notif_poll_kanban_scoped("ui", session)
++    conn = kbc.connect()
++    try:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert kb.complete_task(conn, tid, summary="second")
++    finally:
++        conn.close()
++    server._notif_poll_kanban_scoped("ui", session)
++    server._notif_poll_kanban_scoped("ui", session)
++    texts = [t for _, t in gate["submitted"]]
++    assert len(texts) == 2 and "first" in texts[0] and "second" in texts[1] and "first" not in texts[1]
++
++
++def test_submit_exception_rewinds_too(gate, monkeypatch):
++    tid = _task()
++    before = _cursor(tid)
++    _complete(tid, "done")
++
++    def _boom(*a, **k):
++        raise RuntimeError("emit failed")
++
++    monkeypatch.setattr(server, "_run_prompt_submit", _boom)
++    session = _session()
++    server._notif_poll_kanban_scoped("ui", session)
++    assert _cursor(tid) == before
++    assert session["running"] is False
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index d139d6115e..823ef32ee9 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -160,14 +160,17 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
+     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
+ 
+ 
+-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
+-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
++def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> Any:
++    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure.
++    Returns the gate's verdict (False = refused, no turn runs)."""
+     try:
+         from gateway.warning_notifications import render_notification
+         with _session_profile_runtime_scope(session):
+             render_notification(lambda: _emit("message.start", sid), platform="tui",
+                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
+-        _run_prompt_submit(rid, sid, session, text, **kwargs)
++        # The admission gate's verdict: False = refused (e.g. SESSION_NOT_OWNED, another backend owns the
++        # chat). Callers that already took the notice off a durable store must put it back. [daveey]
++        return _run_prompt_submit(rid, sid, session, text, **kwargs)
+     except Exception as exc:
+         _notif_log_failure(what, exc)
+         _notif_release_turn(session)
+@@ -376,7 +379,7 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
+         return slug, f"slug:{slug}"
+ 
+ 
+-def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
++def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None) -> list:
+     """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
+     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
+     falls through so delivery is preserved)."""
+@@ -403,13 +406,22 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
+             _old, _new, events = _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
+             if not events:
+                 continue
++            claim = None
++            if claims is not None:  # so a refused turn can hand the range back (_kb_rewind_refused) [daveey]
++                claim = {"board": slug, **sub_ident, "old": _old, "new": _new, "texts": []}
++                claims.append(claim)
+             task = _kb.get_task(conn, sub["task_id"])
+             from gateway.kanban_watchers_notifier import diagnostic_event
+             from gateway.warning_notifications import DiagnosticText
+             for ev in events:
+                 text = _format_kanban_event_text(sub, task, ev, slug)
+                 if text:
+-                    texts.append(DiagnosticText(text) if diagnostic_event(ev) else text)
++                    text = DiagnosticText(text) if diagnostic_event(ev) else _KanbanText(text)
++                    texts.append(text)
++                    if claim is not None:
++                        claim["texts"].append(text)
++            if claim is not None and not claim["texts"]:
++                claims.remove(claim)  # silent kinds only (archived/unblocked): nothing to deliver or hand back
+             # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a
+             # later reopen notify the same session. The claimed cursor prevents replay.
+             if task and getattr(task, "status", "") == "archived":
+@@ -418,7 +430,7 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
+     return texts
+ 
+ 
+-def _collect_kanban_notifications(session: dict) -> list:
++def _collect_kanban_notifications(session: dict, claims: list | None = None) -> list:
+     """Claim unseen terminal kanban events for this session's ``platform="tui"`` subscriptions (``kanban_create``
+     auto-subscribes with ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the
+     delivery path). Same atomic cursor-claim as the gateway notifier: exactly-once even if a gateway polls the same DB.
+@@ -443,7 +455,7 @@ def _collect_kanban_notifications(session: dict) -> list:
+     unique = {}
+     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
+         unique.setdefault(resolved, slug)
+-    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key)]
++    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, claims)]
+ 
+ 
+ def _notif_poll_kanban(sid: str, session: dict) -> None:
+@@ -451,20 +463,89 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
+         _notif_poll_kanban_scoped(sid, session)
+ 
+ 
++class _KanbanText(str):
++    """A plain kanban notice with identity, so a claim can tell which of its texts were delivered. [daveey]"""
++
++
++# A refused kanban turn (another backend owns the chat: SESSION_NOT_OWNED) hands its claimed cursor range back
++# and this session stops claiming for a while, so the owner's poller gets the events instead of this one
++# re-claiming them every 5 s. [daveey]
++_KANBAN_REFUSAL_BACKOFF_S = 15.0
++_KANBAN_REFUSAL_BACKOFF_MAX_S = 300.0
++
++
++def _kb_rewind_refused(session: dict, batch: list) -> None:
++    """The turn for ``batch`` was refused: rewind (CAS) every claim none of whose texts were delivered, newest
++    first, and drop those texts from the buffer; whoever owns the chat re-claims them. A claim with some texts
++    already delivered keeps its rest buffered here (rewinding it would re-send the delivered part).
++    Lost before: the cursor was already claimed and the batch dropped, so a completion that arrived while
++    another backend held the chat never reached the agent (t_05d71bf2, 2026-10-18)."""
++    from hermes_cli import kanban_db_connect as _kbc
++    from hermes_cli import kanban_db_notify as _kbn
++    claims = session.get("_kanban_claims") or []
++    refused = {id(t) for t in batch}
++    keep_back: set = set()
++    remaining = []
++    for claim in reversed(claims):
++        texts = claim.get("texts") or []
++        if texts and all(id(t) in refused for t in texts):
++            try:
++                conn = _kbc.connect(board=claim["board"])
++                with contextlib.closing(conn):
++                    ok = _kbn.rewind_notify_cursor(
++                        conn, task_id=claim["task_id"], platform=claim["platform"], chat_id=claim["chat_id"],
++                        thread_id=claim.get("thread_id") or "", claimed_cursor=claim["new"], old_cursor=claim["old"])
++            except Exception as exc:
++                _notif_log_failure("kanban notification rewind failed", exc)
++                ok = False
++            if ok:
++                continue
++        keep_back.update(id(t) for t in texts if id(t) in refused)
++        remaining.append(claim)
++    session["_kanban_claims"] = list(reversed(remaining))
++    rewound = refused - keep_back
++    with session["history_lock"]:
++        session["_kanban_pending"] = [t for t in batch if id(t) not in rewound] + [
++            t for t in (session.get("_kanban_pending") or []) if id(t) not in refused]
++        delay = session.get("_kanban_refusal_delay") or _KANBAN_REFUSAL_BACKOFF_S
++        session["_kanban_refusal_delay"] = min(delay * 2, _KANBAN_REFUSAL_BACKOFF_MAX_S)
++        session["_kanban_refused_until"] = time.monotonic() + delay
++    logger.info("kanban notification turn refused for session %s: rewound %d of %d notice(s); retry in %.0fs",
++                session.get("session_key") or "", len(rewound), len(refused), delay)
++
++
++def _kb_mark_delivered(session: dict, batch: list) -> None:
++    delivered = {id(t) for t in batch}
++    claims = []
++    for claim in session.get("_kanban_claims") or []:
++        claim["texts"] = [t for t in claim.get("texts") or [] if id(t) not in delivered]
++        if claim["texts"]:
++            claims.append(claim)
++    session["_kanban_claims"] = claims
++    session.pop("_kanban_refusal_delay", None)
++    session.pop("_kanban_refused_until", None)
++
++
+ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
+     """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
+-    cursor-claimed (never re-queued), so they wait in the buffer instead of dropping the agent turn."""
+-    try:
+-        texts = _collect_kanban_notifications(session)
+-    except Exception as exc:
+-        _notif_log_failure("kanban notification poll failed", exc)
++    cursor-claimed, so they wait in the buffer instead of dropping the agent turn; a turn the admission gate
++    refuses hands its claims back (_kb_rewind_refused)."""
++    claims: list = []
++    if time.monotonic() < float(session.get("_kanban_refused_until") or 0):
+         texts = []
++    else:
++        try:
++            texts = _collect_kanban_notifications(session, claims)
++        except Exception as exc:
++            _notif_log_failure("kanban notification poll failed", exc)
++            texts = []
+     for text in texts:
+         from gateway.warning_notifications import DiagnosticText, render_notification
+         render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
+                             platform="tui", diagnostic=isinstance(text, DiagnosticText))
+     if texts:
+         session.setdefault("_kanban_pending", []).extend(texts)
++        session.setdefault("_kanban_claims", []).extend(claims)
+     if not session.get("_kanban_pending") or not _notif_claim_turn(session):
+         return
+     with session["history_lock"]:
+@@ -474,10 +555,16 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
+         diagnostic = split and isinstance(pending[0], DiagnosticText)
+         batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
+         session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
+-    with contextlib.suppress(Exception):
+-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
+-                      "kanban notification dispatch failed",
+-                      **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
++    try:
++        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
++                                 "kanban notification dispatch failed",
++                                 **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
++    except Exception:
++        accepted = False
++    if accepted is False:
++        _kb_rewind_refused(session, batch)
++    else:
++        _kb_mark_delivered(session, batch)
+ 
+ 
+ def _background_notifications_off(session: dict) -> bool:
+-- 
+2.55.0
+

@@ -62,6 +62,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [review-evidence-gate.md](review-evidence-gate.md) | 0129 | `auxiliary.background_review.require_evidence` makes background skill review edit a skill only when a specific moment in the conversation justifies it; "Nothing to save." becomes a neutral outcome |
 | [kanban-block-instructions.md](kanban-block-instructions.md) | 0130 | `kanban_block`'s `reason` asks for ask-first, numbered, concrete unblock steps (what the blocked-panel Desktop plugin shows above the composer) |
 | [sidebar-row-actions.md](sidebar-row-actions.md) | 0131 | `SidebarSectionRow` takes hover-revealed `actions` and a `strong` (unread) label, for the inbox plugin's per-row Archive |
+| [kanban-notice-refusal-rewind.md](kanban-notice-refusal-rewind.md) | 0132 | A Kanban notice whose turn is refused (`SESSION_NOT_OWNED`, chat open in two backends) is rewound for the owning backend instead of dropped |
 
 ## Applying
 
