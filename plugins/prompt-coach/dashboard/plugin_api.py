@@ -45,7 +45,8 @@ class ChoiceBody(BaseModel):
     edited: bool = False
 
 
-def create_router(llm=None, db_path=None, log_path=None):
+def create_router(llm=None, db_path=None, log_path=None, jev=None):
+    """jev: System One stage-1 judge; defaults to core.jev_worth only when the real LLM is used (tests inject llm)."""
     router = APIRouter()
 
     @router.get("/ping")
@@ -55,7 +56,8 @@ def create_router(llm=None, db_path=None, log_path=None):
     @router.post("/check")
     def check(body: CheckBody):  # sync: FastAPI runs it in the threadpool
         core = _core()
-        return core.coach(body.session_id, body.text, llm or core.aux_llm, db_path, log_path)
+        return core.coach(body.session_id, body.text, llm or core.aux_llm, db_path, log_path,
+                          jev=jev if jev is not None else (None if llm else core.jev_worth))
 
     @router.post("/seed")
     def seed(body: SeedBody):

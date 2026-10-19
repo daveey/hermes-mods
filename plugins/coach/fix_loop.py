@@ -94,12 +94,29 @@ def aux_judge(system: str, prompt: str) -> str:
 
 
 def assess(state: dict, turn: int, user_text: str, llm: Callable[[str, str], str],
-           threshold: float = 0.8) -> Optional[dict]:
+           threshold: float = 0.8, screen: Optional[Callable[[str, list, str], Optional[float]]] = None,
+           screen_below: float = 0.2, shadow: bool = False,
+           log: Optional[Callable[[dict], None]] = None) -> Optional[dict]:
     """state: per-session dict with last_reply, last_log, fails (list of turn numbers).
-    Returns {"n", "issue", "p", "hint"} when this message confirms a failed fix, else None."""
+    Returns {"n", "issue", "p", "hint"} when this message confirms a failed fix, else None.
+    `screen(prev_reply, prev_log, user_text) -> p | None` (a System One model) runs before the LLM judge: below
+    `screen_below` the LLM is skipped (unless `shadow`). None from the screen = unavailable, LLM runs."""
     if not state.get("last_reply") or not prefilter(user_text):
         return None
+    s = None
+    if screen is not None:
+        try:
+            s = screen(state["last_reply"], state.get("last_log") or [], user_text)
+        except Exception:
+            s = None
+    if s is not None and s < screen_below and not shadow:
+        if log:
+            log({"name": "coach_fixloop", "screen": s, "skipped_llm": True})
+        return None
     v = parse(llm(JUDGE_SYS, judge_prompt(state["last_reply"], state.get("last_log") or [], user_text)))
+    if s is not None and log:
+        log({"name": "coach_fixloop", "screen": s, "skipped_llm": False, "shadow": shadow,
+             "llm": v["p"] if v else None, "would_skip": s < screen_below})
     if not v or v["p"] < threshold:
         return None
     fails = [t for t in state.get("fails", []) if turn - t < WINDOW_TURNS] + [turn]

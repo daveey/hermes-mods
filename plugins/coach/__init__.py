@@ -96,7 +96,11 @@ def build(store=None, checkout=None):
             if not cfg["on"] or not isinstance(user_message, str):
                 return None
             st = coach.loop_state(session_id)
-            hit = fl.assess(st, coach.turn_number(session_id), user_message, fl.aux_judge, threshold=cfg["threshold"])
+            s1 = _load("system_one")
+            m = s1.mode()
+            hit = fl.assess(st, coach.turn_number(session_id), user_message, fl.aux_judge, threshold=cfg["threshold"],
+                            screen=s1.fixloop_screen if m != "off" else None, screen_below=s1.below(),
+                            shadow=m == "shadow", log=s1.log)
             if not hit:
                 return None
             store.log({"event": "agent_hint", "session_id": session_id, "rule": "fix_loop", "n": hit["n"],
@@ -156,9 +160,14 @@ def build(store=None, checkout=None):
             if not cfg["rules"]:
                 return None
             ask, log_lines = coach.turn_context(session_id)
+            s1 = _load("system_one")
+            m = s1.mode()
+            screen = ((lambda cands: s1.reply_screen(cands, ask, log_lines, final_response, rc.profile_text()))
+                      if m != "off" else None)
             hit = rc.check(final_response, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
                            only=cfg["rules"], changed_paths=changed_paths,
-                           wake=lambda: rc.wake_sources(session_id, log_lines))
+                           wake=lambda: rc.wake_sources(session_id, log_lines),
+                           screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log)
             if not hit:
                 return None
             store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],

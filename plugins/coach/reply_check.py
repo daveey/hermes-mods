@@ -187,16 +187,21 @@ def _hermes_home():
         return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 
 
+def profile_text() -> str:
+    """The private user-environment overlay (COACH_REPLY_PROFILE or <HERMES_HOME>/coach/reply_profile.md), or ''."""
+    from pathlib import Path
+    p = Path(os.environ.get("COACH_REPLY_PROFILE") or (_hermes_home() / "coach" / "reply_profile.md"))
+    try:
+        return p.read_text()[:4000]
+    except Exception:
+        return ""
+
+
 def judge_system() -> str:
     """JUDGE_SYS + the private user-environment overlay (COACH_REPLY_PROFILE or <HERMES_HOME>/coach/reply_profile.md),
     which tells the judge what this user's agents can reach (credential stores, hosts, browsers). Without it the judge
     can't tell a real hand-off from a lazy one."""
-    from pathlib import Path
-    p = Path(os.environ.get("COACH_REPLY_PROFILE") or (_hermes_home() / "coach" / "reply_profile.md"))
-    try:
-        prof = p.read_text()[:4000]
-    except Exception:
-        prof = ""
+    prof = profile_text()
     return JUDGE_SYS + (f"\n\nUSER ENVIRONMENT (what this user's agents can reach; use it to judge handoffs):\n{prof}"
                         if prof.strip() else "")
 
@@ -269,10 +274,14 @@ def aux_judge(system: str, prompt: str) -> str:
 def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
           threshold: float = 0.8, only: Optional[list[str]] = None,
           changed_paths: Optional[list] = None,
-          wake: Optional[Callable[[], list]] = None) -> Optional[dict]:
+          wake: Optional[Callable[[], list]] = None,
+          screen: Optional[Callable[[list], Optional[dict]]] = None, screen_below: float = 0.2,
+          shadow: bool = False, log: Optional[Callable[[dict], None]] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
     `wake()` lists the session's wake sources; any source drops the `unwatched` candidate before the judge runs
-    (no wake callable = can't tell, so `unwatched` is skipped)."""
+    (no wake callable = can't tell, so `unwatched` is skipped).
+    `screen(candidates) -> {rule: p} | None` (a System One model) drops screened candidates below `screen_below`
+    before the LLM judge; when no candidate survives, the LLM is skipped. `shadow` = log only, drop nothing."""
     cands = [r for r in prefilter(reply) if not only or r in only]
     if "unwatched" in cands:
         try:
@@ -282,7 +291,24 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             cands.remove("unwatched")
     if not cands:
         return None
+    sp = None
+    if screen is not None:
+        try:
+            sp = screen(cands)
+        except Exception:
+            sp = None
+    if sp:
+        kept = [r for r in cands if r not in sp or sp[r] >= screen_below]
+        if not shadow:
+            if not kept:
+                if log:
+                    log({"name": "coach_reply", "screen": sp, "skipped_llm": True})
+                return None
+            cands = kept
     v = parse_verdict(llm(judge_system(), judge_prompt(user_ask, tool_log, reply)))
+    if sp and log:
+        log({"name": "coach_reply", "screen": sp, "skipped_llm": False, "shadow": shadow,
+             "llm": {r: v[r] for r in sp} if v else None, "would_drop": [r for r in sp if sp[r] < screen_below]})
     if not v:
         return None
     best = max(cands, key=lambda r: v[r])

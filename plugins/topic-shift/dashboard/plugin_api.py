@@ -38,7 +38,8 @@ class BriefBody(BaseModel):
     profile: str = ""
 
 
-def create_router(llm=None, db_path=None):
+def create_router(llm=None, db_path=None, jev=None):
+    """jev: System One judge; defaults to core.jev_p_new only when the real LLM is used (tests inject llm)."""
     router = APIRouter()
 
     def _llm():
@@ -50,7 +51,7 @@ def create_router(llm=None, db_path=None):
 
     @router.post("/check")
     def check(body: CheckBody):  # sync: FastAPI runs it in the threadpool
-        return _core().classify(body.session_id, body.text, _llm(), db_path)
+        return _core().classify(body.session_id, body.text, _llm(), db_path, jev=jev if jev is not None else (None if llm else _core().jev_p_new))
 
     @router.post("/brief")
     def make_brief(body: BriefBody):

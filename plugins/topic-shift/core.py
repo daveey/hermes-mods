@@ -18,6 +18,7 @@ MIN_WORDS = 3
 MIN_PRIOR_USER_MSGS = 1  # check from the session's second message on
 CONFIDENCE_THRESHOLD = 0.6  # on p_new, the probability the message starts a new task
 PRIOR_USER_WINDOW = 8
+JEV_DEFAULT_MODE = "shadow"  # System One (Jev) detection; flip with SYSTEM_ONE_MODE_TOPIC_SHIFT=on
 BRIEF_MSG_WINDOW = 60
 
 LLM = Callable[[list, int], str]  # (messages, max_tokens) -> text
@@ -141,7 +142,62 @@ def _p_new(out: dict) -> float:
     return conf if out.get("new_topic") else 1 - conf if "new_topic" in out else 0.0
 
 
-def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = None) -> dict:
+def _system_one():
+    """plugins/system-one/client.py next to this plugin (symlinks resolved), or None."""
+    try:
+        import importlib.util
+        import sys
+        path = Path(__file__).resolve().parent.parent / "system-one" / "client.py"
+        if not path.exists():
+            return None
+        mod = sys.modules.get("_system_one_client")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location("_system_one_client", path)
+            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            mod = sys.modules.setdefault("_system_one_client", mod)  # register only once fully loaded (threads)
+        return mod
+    except Exception:
+        return None
+
+
+def jev_mode() -> str:
+    """SYSTEM_ONE_MODE_TOPIC_SHIFT: on (Jev decides; the LLM only names a detected shift) | shadow (both run, the LLM
+    decides, both logged) | off."""
+    c = _system_one()
+    return c.mode("topic_shift", default=JEV_DEFAULT_MODE) if c else "off"
+
+
+JEV_QUESTION = {"new_task": {
+    "type": "noul",
+    "instructions": ("Does `newest_message` start a NEW task with a different goal from the session's current work "
+                     "(shown by `session_title`, `recent_user_messages` and `last_assistant_reply`)? Judge the goal of "
+                     "the message, not shared words, host, repo or product."),
+    "criteria": {
+        "true": ("A different goal that needs its own investigation or design and does not depend on finishing the "
+                 "recent work, even on the same machine, project, repo or product."),
+        "false": ("Continues the current work: an approval or answer to the assistant's question ('do it', 'yes'), a "
+                  "status check, follow-up, refinement, correction, bug report about what was just built, or a small "
+                  "addition that only makes sense on top of the current change."),
+    }}}
+
+
+def jev_p_new(state: dict) -> Optional[float]:
+    c = _system_one()
+    if not c:
+        return None
+    return c.p(c.decide("topic_shift", state, JEV_QUESTION), "new_task")
+
+
+def _jev_log(rec: dict) -> None:
+    c = _system_one()
+    if c:
+        c.log(rec)
+
+
+def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = None,
+             jev: Optional[Callable[[dict], Optional[float]]] = None, mode: Optional[str] = None) -> dict:
+    """`jev(state) -> p_new | None` is the System One judge (production: jev_p_new); `mode` defaults to jev_mode()."""
     info = session_info(session_id, db_path)
     if not info:
         return {"shift": False, "skipped": "unknown_session"}
@@ -151,6 +207,19 @@ def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = Non
     recent = prior[-PRIOR_USER_WINDOW:]
     last_asst = next((_norm(m["content"])[:600] for m in reversed(_before(info["messages"], text))
                       if m["role"] == "assistant" and m["content"]), "")
+    mode = (mode or jev_mode()) if jev else "off"
+    pj = None
+    if mode in ("on", "shadow"):
+        try:
+            pj = jev({"session_title": info.get("title") or "(none)", "working_dir": info.get("cwd") or "?",
+                      "recent_user_messages": [u[:300] for u in recent], "last_assistant_reply": last_asst,
+                      "newest_message": _norm(text)[:1500]})
+        except Exception:
+            pj = None
+    if mode == "on" and pj is not None and pj < CONFIDENCE_THRESHOLD:
+        _jev_log({"name": "topic_shift", "jev": pj, "skipped_llm": True})
+        return {"shift": False, "confidence": pj, "label": "", "reason": "", "title": info.get("title") or "",
+                "judge": "jev"}
     user = (
         f"Session title: {info.get('title') or '(none)'}\n"
         f"Working dir: {info.get('cwd') or '?'}\n"
@@ -166,6 +235,12 @@ def classify(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = Non
         p = max(0.0, min(1.0, _p_new(out)))
     except (TypeError, ValueError):
         p = 0.0
+    if pj is not None:
+        _jev_log({"name": "topic_shift", "jev": pj, "llm": p, "skipped_llm": False, "mode": mode})
+    if mode == "on" and pj is not None:  # Jev decided "shift"; the LLM supplied the label
+        return {"shift": True, "confidence": pj, "label": str(out.get("label") or "")[:60],
+                "reason": str(out.get("reason") or "")[:140], "title": info.get("title") or "", "judge": "jev",
+                "llm_confidence": p}
     return {"shift": p >= CONFIDENCE_THRESHOLD, "confidence": p, "label": str(out.get("label") or "")[:60],
             "reason": str(out.get("reason") or "")[:140], "title": info.get("title") or ""}
 

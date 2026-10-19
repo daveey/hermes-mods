@@ -26,6 +26,11 @@ GAIN_THRESHOLD = 0.3        # stage-1 gate
 CONFIDENCE_THRESHOLD = 0.8  # stage-2 gate
 PRIOR_USER_WINDOW = 6
 LENSES = ("altitude", "depth", "range")
+# System One (Jev) screen in front of stage 1. Backtest 2026-10-19 (659 logged checks): every shown coaching had
+# Jev >= 0.71, so a 0.6 screen skips 49% of stage-1 calls with 0/34 shown and 0/17 accepted lost. Jev is too generous
+# to REPLACE stage 1 (a lossless gate would send ~3x more messages to the strong rewrite model), so it only screens.
+JEV_DEFAULT_MODE = "on"      # SYSTEM_ONE_MODE_PROMPT_COACH=on|shadow|off
+JEV_GATE = 0.6               # on: below this Jev p(worth coaching), stop before any LLM call
 
 LLM = Callable[[str, list, int], str]  # (stage, messages, max_tokens) -> text
 
@@ -158,19 +163,100 @@ def _context_block(info: dict, text: str) -> str:
     )
 
 
+def _system_one():
+    """plugins/system-one/client.py next to this plugin (symlinks resolved), or None."""
+    try:
+        import importlib.util
+        import sys
+        path = Path(__file__).resolve().parent.parent / "system-one" / "client.py"
+        if not path.exists():
+            return None
+        mod = sys.modules.get("_system_one_client")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location("_system_one_client", path)
+            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            mod = sys.modules.setdefault("_system_one_client", mod)  # register only once fully loaded (threads)
+        return mod
+    except Exception:
+        return None
+
+
+def jev_mode() -> str:
+    """SYSTEM_ONE_MODE_PROMPT_COACH: on (Jev screens out clear no's before the stage-1 LLM) | shadow (both run, the LLM
+    decides) | off."""
+    c = _system_one()
+    return c.mode("prompt_coach", default=JEV_DEFAULT_MODE) if c else "off"
+
+
+JEV_QUESTION = {"worth_coaching": {
+    "type": "noul",
+    "instructions": ("Is `newest_message` a fresh TASK REQUEST to an AI agent (which has a computer, tools and the "
+                     "user's data) whose framing leaves a lot on the table, so that a rewritten request would get a "
+                     "materially better outcome?"),
+    "criteria": {
+        "true": ("It asks for a single step when the real goal is an ongoing outcome; or a shallow version of something "
+                 "an expert would do from raw data with real tools and outside validation; or frames it narrowly where "
+                 "other fields' methods would change the result."),
+        "false": ("A follow-up, an answer to the agent's question, a correction, an approval ('ok', 'do it'), a bug "
+                  "report on what was just built, a quick factual question, chit-chat, or a request that is already "
+                  "outcome-level, specific and well-scoped."),
+    }}}
+
+
+def jev_state(info: dict, text: str) -> dict:
+    return {"session_title": info.get("title") or "(new session)", "working_dir": info.get("cwd") or "?",
+            "earlier_user_message_count": len(info.get("prior_user", [])),
+            "recent_user_messages": [u[:300] for u in info.get("prior_user", [])[-PRIOR_USER_WINDOW:]],
+            "last_assistant_reply": info.get("last_assistant") or "", "newest_message": _norm(text)[:2000]}
+
+
+def jev_worth(state: dict) -> Optional[float]:
+    c = _system_one()
+    if not c:
+        return None
+    return c.p(c.decide("prompt_coach", state, JEV_QUESTION), "worth_coaching")
+
+
+def _jev_log(rec: dict) -> None:
+    c = _system_one()
+    if c:
+        c.log(rec)
+
+
 def coach(session_id: str, text: str, llm: LLM, db_path: Optional[Path] = None,
-          log: Optional[Path] = None, write_log: bool = True) -> dict:
+          log: Optional[Path] = None, write_log: bool = True,
+          jev: Optional[Callable[[dict], Optional[float]]] = None, mode: Optional[str] = None) -> dict:
+    """`jev(state) -> p | None` is the System One stage-1 judge (production: jev_worth); `mode` defaults to
+    jev_mode(). on: below JEV_GATE no LLM runs; otherwise both stages run unchanged."""
     cid = uuid.uuid4().hex[:12]
     base = {"id": cid, "coach": False}
     if (why := skip_reason(text)):
         return {**base, "skipped": why}
     info = session_context(session_id, text, db_path)
     ctx = _context_block(info, text)
+    mode = (mode or jev_mode()) if jev else "off"
+    pj = None
+    if mode in ("on", "shadow"):
+        try:
+            pj = jev(jev_state(info, text))
+        except Exception:
+            pj = None
+    if mode == "on" and pj is not None and pj < JEV_GATE:
+        _jev_log({"name": "prompt_coach", "jev": pj, "skipped_llm": True})
+        if write_log:
+            append_log({"event": "check", "id": cid, "session_id": session_id, "text": _norm(text)[:2000],
+                        "stage1": {"judge": "jev", "p": pj}, "coach": False}, log)
+        return {**base, "skipped": "not_worth_it", "gain": pj, "why": "system-one screen"}
     try:
         s1 = _parse_json(llm("classify", [{"role": "system", "content": CLASSIFY_SYSTEM},
                                           {"role": "user", "content": ctx}], 200))
     except Exception as exc:  # fail open: never block the user
         return {**base, "skipped": f"llm_error: {type(exc).__name__}"}
+    if pj is not None:
+        g = float(s1.get("gain") or 0)
+        _jev_log({"name": "prompt_coach", "jev": pj, "skipped_llm": False, "mode": mode,
+                  "llm_pass": bool(s1.get("task_request") and not s1.get("followup") and g >= GAIN_THRESHOLD)})
     gain = float(s1.get("gain") or 0)
     rec = {"id": cid, "session_id": session_id, "text": _norm(text)[:2000], "stage1": s1}
     if not s1.get("task_request") or s1.get("followup") or gain < GAIN_THRESHOLD:
