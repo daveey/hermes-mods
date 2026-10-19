@@ -227,8 +227,10 @@ def worker_pids(task_id, hint=None):
     out = []
     for p in dict.fromkeys(x for x in cands if x):
         try:
-            env = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(p)], capture_output=True, text=True,
-                                 timeout=10).stdout
+            proc = Path(f"/proc/{p}/environ")
+            env = (proc.read_bytes().replace(b"\0", b" ").decode("utf-8", "replace") if proc.exists() else
+                   subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(p)], capture_output=True,
+                                  text=True, timeout=10).stdout)
         except Exception:
             continue
         if re.search(rf"\bHERMES_KANBAN_TASK={re.escape(task_id)}(\s|$)", env):
