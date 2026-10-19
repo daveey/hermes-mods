@@ -25,6 +25,8 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
 |---|---|
 | `vdisplay.swift` + `CGVirtualDisplay.h` | `hermes-vdisplay`: creates a 1440x900 `CGVirtualDisplay` (override with `HERMES_VDISPLAY_SIZE=WxH`) that lives while the process runs. Parks it at the bottom-right corner of the desktop arrangement (corner contact only, so the cursor rarely wanders in), re-parks it if a monitor change makes it share an edge, and prints `display <id> bounds x,y WxH main x,y WxH` at start and on every change. |
 | `hermes-chrome-agent` | Stdlib-only Python supervisor + CLI (runs under `/usr/bin/python3`, ships its own minimal CDP websocket client). |
+| `notifier.swift` | `Hermes Touch ID.app` (bundle `com.hermes.chrome-agent.notify`, LSUIElement, Developer-ID signed when the keychain has one), built by `install`: posts the passkey notification with UNUserNotificationCenter and reports clicks back to the supervisor over stdout. |
+| `test_hermes_chrome_agent.py` | Unit tests for the click-through path (`/usr/bin/python3 -m unittest -v test_hermes_chrome_agent` in `scripts/`). |
 
 `hermes-chrome-agent run` (what launchd runs):
 - starts `hermes-vdisplay`, then Chrome with `--user-data-dir=$HERMES_HOME/chrome-agent --remote-debugging-port=9333
@@ -39,8 +41,15 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
   second launch on the same profile would just hand off to it;
 - auto-attaches to every page target and injects a wrapper around `navigator.credentials.get/create`
   (`Page.addScriptToEvaluateOnNewDocument` + `Runtime.addBinding`). A non-conditional WebAuthn request posts a macOS
-  notification "Hermes needs Touch ID — Tap Touch ID to sign in with a passkey for <rpId>" (osascript, so it shows as
-  Script Editor). Conditional mediation (passkey autofill on page load) is ignored. This needs `Page.enable` +
+  notification "Hermes needs Touch ID — Tap Touch ID to sign in with a passkey for <rpId>" from
+  `Hermes Touch ID.app`. Clicking the notification or its **Show** button moves the window holding the asking tab
+  onto the main display, `Target.activateTarget`s that tab, and brings Chrome forward (the notifier, frontmost after
+  the click, hands activation to Chrome's pid; JXA as backup). Re-homing skips that window until the request
+  succeeds (+3s grace) or 180s pass. A failed request (a hidden tab's `get` usually fails at once with
+  NotAllowedError; sites retry) keeps the notification and the revealed window. One live notification per tab.
+  Without the app, or with its notifications denied, it falls back to the old osascript notification, which
+  belongs to Script Editor: clicking that opens Script Editor and shows nothing (the original bug).
+  Conditional mediation (passkey autofill on page load) is ignored. This needs `Page.enable` +
   `Runtime.enable` on each page session: without them the script and binding vanish on the first cross-site
   navigation.
 - `HERMES_CHROME_AGENT_SHOW_ON_PASSKEY=1` additionally moves the requesting window to the main display until the
@@ -56,7 +65,7 @@ HERMES_CHROME_AGENT_LABEL=com.example.hermes-chrome-agent $S install   # builds 
 #   (RunAtLoad, KeepAlive, log $HERMES_HOME/logs/chrome-agent.log). Default label com.hermes.chrome-agent.
 hermes config set browser.cdp_url http://127.0.0.1:9333     # every Hermes session now attaches here
 
-hermes-chrome-agent status     # supervisor, displays, every Chrome window + URL
+hermes-chrome-agent status     # supervisor, displays, notifier permission, every Chrome window + URL
 hermes-chrome-agent show       # windows → main display, re-homing paused (look at / click the page)
 hermes-chrome-agent show --minutes 20   # same, auto-hides after 20 min (supervisor restart needed to pick up)
 hermes-chrome-agent hide       # resume: windows go back within ~1s
@@ -94,6 +103,11 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
 
 ## Pitfalls
 
+- **Notification permission is asked once per bundle id, and a withdrawn prompt counts as denied.** If the
+  helper quits while macOS's "Hermes Touch ID Notifications" prompt is up, the app ends up denied (status
+  `denied`) and only System Settings > Notifications > Hermes Touch ID can fix it. The helper therefore stays alive
+  until the prompt is answered, and its timeout starts only once the notification is posted. Notification
+  settings read `denied` while that first prompt is still pending, so status can't tell "pending" apart.
 - **Hidden tabs can stall.** Background tabs in a headed Chrome get throttled; even with the flags and savers off,
   CDP calls into a non-selected tab were seen to hang for ~20-60s at a time (also in a fresh Chrome without this
   supervisor), then recover. Upstream: NousResearch/hermes-agent#135435. If a session times out on

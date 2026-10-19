@@ -19,6 +19,11 @@ Stdlib only (runs under /usr/bin/python3). Configuration via environment:
   HERMES_CHROME_AGENT_CHROME     Chrome binary (default /Applications/Google Chrome.app/Contents/MacOS/Google Chrome)
   HERMES_CHROME_AGENT_LABEL      LaunchAgent label (default com.hermes.chrome-agent)
   HERMES_CHROME_AGENT_SHOW_ON_PASSKEY=1  bring the passkey-requesting window to the main display until it settles
+
+Passkey notifications come from "Hermes Touch ID.app" (notifier.swift, built by `install`): clicking the
+notification or its Show button moves the window holding the asking tab onto the main display, selects that
+tab and brings Chrome to the front until the request settles. Without the app (or with notifications denied
+for it) the supervisor falls back to a plain osascript notification, which cannot be clicked through.
 """
 import base64
 import json
@@ -50,6 +55,11 @@ MENU_BAR = 40  # leave room for the virtual display's own menu bar
 # Move the window asking for a passkey onto the main display until the request settles (max 120s), so the
 # human sees which site they are approving. Off by default: the Touch ID sensor works without seeing it.
 SHOW_ON_PASSKEY = os.environ.get("HERMES_CHROME_AGENT_SHOW_ON_PASSKEY", "") not in ("", "0", "false")
+NOTIFIER_APP = os.path.join(TOOLS, "Hermes Touch ID.app")
+NOTIFIER_BUNDLE_ID = "com.hermes.chrome-agent.notify"
+NOTIFIER_BIN = os.path.join(NOTIFIER_APP, "Contents", "MacOS", "hermes-touchid-notify")
+REVEAL_S = 180      # a clicked-through passkey window stays on the main display at most this long
+SETTLE_GRACE_S = 3  # after the request settles, keep it shown briefly (sites often retry right away)
 
 # Wraps navigator.credentials.get/create and reports the request through a CDP binding. Conditional
 # mediation (passkey autofill, fired on page load without user intent) is not reported.
@@ -67,9 +77,9 @@ WEBAUTHN_HOOK = r"""(() => {
           if (pk && opts.mediation !== 'conditional' && typeof window.%s === 'function') {
             const report = window.%s, rpId = pk.rpId || (pk.rp && pk.rp.id) || location.hostname;
             report(JSON.stringify({op, origin: location.origin, rpId}));
-            const done = () => { try { report(JSON.stringify({op: 'done', origin: location.origin, rpId})); } catch (e) {} };
+            const done = (ok, err) => { try { report(JSON.stringify({op: 'done', ok, error: err ? String(err.name || err) : '', origin: location.origin, rpId})); } catch (e) {} };
             const p = orig(opts);
-            p.then(done, done);
+            p.then(() => done(true), (e) => done(false, e));
             return p;
           }
         } catch (e) {}
@@ -260,6 +270,18 @@ def notify(title, text):
         log("notify failed: %s" % e)
 
 
+def activate_pid(pid):
+    """Bring an app to the front (JXA, no Accessibility grant needed). macOS may refuse this from a background
+    process; the notifier app, frontmost right after the click, hands activation over as well."""
+    js = ('ObjC.import("AppKit"); var a=$.NSRunningApplication.runningApplicationWithProcessIdentifier(%d);'
+          ' a ? a.activateWithOptions(3) : false' % pid)
+    try:
+        subprocess.Popen(["/usr/bin/osascript", "-l", "JavaScript", "-e", js],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log("activate failed: %s" % e)
+
+
 class Supervisor:
     def __init__(self):
         self.vd = None
@@ -274,6 +296,7 @@ class Supervisor:
         self.stop = False
         self.chrome_fails = 0
         self.shown = False
+        self.notices = {}   # targetId -> running notifier Popen (its notification is still on screen)
 
     # -- children
     def start_vdisplay(self):
@@ -428,18 +451,104 @@ class Supervisor:
             except ValueError:
                 req = {}
             site = req.get("rpId") or req.get("origin") or "a site"
-            log("webauthn %s %s from %s" % (req.get("op"), "settled" if req.get("op") == "done" else "request",
-                                             req.get("origin")))
+            log("webauthn %s %s from %s" % (req.get("op"), ("settled ok=%s %s" % (req.get("ok"), req.get("error") or ""))
+                                             if req.get("op") == "done" else "request", req.get("origin")))
+            target = self.sess_target.get(m.get("sessionId"))
             if req.get("op") == "done":
-                self.passkey = None
+                self.settled(target, req.get("ok") is not False)
                 return
             op = "sign in with" if req.get("op") == "get" else "create"
             now = time.time()
             if SHOW_ON_PASSKEY:
-                self.passkey = {"target": self.sess_target.get(m.get("sessionId")), "until": now + 120, "wid": None}
-            if now - self.last_notice.get(site, 0) > 10:
+                self.passkey = {"target": target, "until": now + 120, "wid": None}
+            if now - self.last_notice.get(site, 0) > 10 and not self._notice_live(target):
                 self.last_notice[site] = now
-                notify("Hermes needs Touch ID", "Tap Touch ID to %s a passkey for %s" % (op, site))
+                self.notify_passkey(target, "Hermes needs Touch ID", "Tap Touch ID to %s a passkey for %s" % (op, site))
+
+    # -- clickable passkey notification
+    def _notice_live(self, target):
+        p = self.notices.get(target)
+        return bool(p and p.poll() is None)
+
+    def notify_passkey(self, target, title, text):
+        """Post via Hermes Touch ID.app so a click comes back to us; plain osascript if that is unavailable."""
+        if not os.access(NOTIFIER_BIN, os.X_OK):
+            notify(title, text)
+            return None
+        try:
+            proc = subprocess.Popen([NOTIFIER_BIN, "--title", title, "--body", text, "--timeout", str(REVEAL_S)],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    universal_newlines=True, bufsize=1)
+        except Exception as e:
+            log("notifier failed to start (%s); osascript fallback" % e)
+            notify(title, text)
+            return None
+        self.notices[target] = proc
+        threading.Thread(target=self._notice_reader, args=(proc, target, title, text), daemon=True).start()
+        return proc
+
+    def _notice_reader(self, proc, target, title, text):
+        for line in proc.stdout:
+            self.on_notifier_line(line, target, proc, title, text)
+
+    def on_notifier_line(self, line, target, proc, title="", text=""):
+        line = line.strip()
+        if line.startswith("error"):
+            log("notifier: %s; osascript fallback (allow notifications for Hermes Touch ID in System Settings)"
+                % line)
+            notify(title, text)
+        elif line in ("action default", "action show"):
+            log("notifier: %s clicked for target %s" % ("notification" if line.endswith("default") else "Show",
+                                                         target))
+            self.reveal(target, proc)
+        elif line:
+            log("notifier: " + line)
+
+    def reveal(self, target, proc=None):
+        """The human clicked the passkey notification: put the window holding `target` on the main display,
+        select that tab, bring Chrome forward, and keep re-homing off it until the request settles."""
+        c = self.cdp
+        chrome_pid = self.chrome.pid if self.chrome else None
+        wid = None
+        if c and target and self.main:
+            try:
+                w = c.call("Browser.getWindowForTarget", {"targetId": target})
+                wid = w["windowId"]
+                self.passkey = {"target": target, "until": time.time() + REVEAL_S, "wid": wid}
+                self.place(wid, w["bounds"], self.main_rect())
+                c.call("Target.activateTarget", {"targetId": target})
+                log("passkey: window %d -> main display, tab %s selected" % (wid, target))
+            except CDPError as e:
+                log("passkey reveal failed: %s" % e)
+        if chrome_pid:
+            if proc and proc.poll() is None:
+                try:
+                    proc.stdin.write("activate %d\n" % chrome_pid)
+                    proc.stdin.write("exit\n")
+                    proc.stdin.flush()
+                except (OSError, ValueError):
+                    pass
+            activate_pid(chrome_pid)
+        return wid
+
+    def settled(self, target, ok=True):
+        """WebAuthn request finished. A hidden tab's request usually fails at once (NotAllowedError: the page
+        is not focused), and sites retry or show "Try again": keep the notification and any revealed window
+        so the human can finish in front. Only success withdraws the notification and sends the window home
+        after a short grace."""
+        if not ok:
+            if self.passkey and self.passkey.get("target") == target and self.passkey.get("wid") is None:
+                self.passkey = None   # auto-show (SHOW_ON_PASSKEY) of a failed request: nothing to look at
+            return
+        p = self.notices.pop(target, None)
+        if p and p.poll() is None:
+            p.terminate()
+        pk = self.passkey
+        if pk and pk.get("target") == target:
+            if pk.get("wid") is not None:
+                pk["until"] = min(pk["until"], time.time() + SETTLE_GRACE_S)
+            else:
+                self.passkey = None
 
     def windows(self):
         c = self.cdp
@@ -489,6 +598,7 @@ class Supervisor:
         if pk and time.time() > pk["until"]:
             self.passkey = pk = None
         for wid, (b, t) in self.windows().items():
+            pk = self.passkey or pk  # a notification click may have revealed a window meanwhile
             if pk and self.main and (wid == pk["wid"] or (pk["wid"] is None and t.get("targetId") == pk["target"])):
                 if pk["wid"] is None:
                     pk["wid"] = wid
@@ -569,6 +679,10 @@ def cmd_status():
                                                        time.time() - st.get("updated", 0)))
     print("virtual display: %s   main display: %s" % (st.get("vdisplay_bounds"), st.get("main_bounds")))
     print("mode: %s" % ("SHOW (windows on main display)" if os.path.exists(SHOW_FLAG) else "hidden"))
+    ns = notifier_status()
+    print("passkey notifier: %s%s" % (ns, "  (System Settings > Notifications > Hermes Touch ID > Allow; until then"
+                                          " alerts fall back to an unclickable osascript one)"
+                                          if ns.startswith("denied") else ""))
     v = cdp_version()
     print("cdp: http://127.0.0.1:%d %s" % (PORT, v["Browser"] if v else "NOT answering"))
     if v:
@@ -608,11 +722,74 @@ def plist_text():
 """ % {"label": LABEL, "py": py, "script": script, "home": HERMES_HOME, "env": env, "log": LOG}
 
 
+NOTIFIER_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>%s</string>
+  <key>CFBundleName</key><string>Hermes Touch ID</string>
+  <key>CFBundleDisplayName</key><string>Hermes Touch ID</string>
+  <key>CFBundleExecutable</key><string>hermes-touchid-notify</string>
+  <key>CFBundleIconFile</key><string>app</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSUIElement</key><true/>
+  <key>NSUserNotificationAlertStyle</key><string>alert</string>
+</dict></plist>
+""" % NOTIFIER_BUNDLE_ID
+
+
+def build_notifier():
+    """Build "Hermes Touch ID.app" (clickable passkey notifications). Signed with a Developer ID when the
+    keychain has one (notification permission sticks to the signature), else ad-hoc."""
+    macos = os.path.join(NOTIFIER_APP, "Contents", "MacOS")
+    res = os.path.join(NOTIFIER_APP, "Contents", "Resources")
+    os.makedirs(macos, exist_ok=True)
+    os.makedirs(res, exist_ok=True)
+    subprocess.check_call(["swiftc", "-O", os.path.join(SRC_DIR, "notifier.swift"), "-o", NOTIFIER_BIN])
+    with open(os.path.join(NOTIFIER_APP, "Contents", "Info.plist"), "w") as f:
+        f.write(NOTIFIER_PLIST)
+    icon = os.path.join(os.path.dirname(os.path.dirname(CHROME)), "Resources", "app.icns")
+    if os.path.exists(icon):
+        subprocess.call(["cp", icon, os.path.join(res, "app.icns")])
+    ident = "-"
+    try:
+        ids = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True,
+                             text=True).stdout
+        for ln in ids.splitlines():
+            if '"Developer ID Application:' in ln:
+                ident = ln.split('"')[1]
+                break
+    except Exception:
+        pass
+    subprocess.check_call(["codesign", "--force", "--options", "runtime", "-s", ident, NOTIFIER_APP])
+    subprocess.call(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/"
+                     "Support/lsregister", "-f", NOTIFIER_APP])
+    return ident
+
+
+def notifier_status():
+    if not os.access(NOTIFIER_BIN, os.X_OK):
+        return "not built"
+    try:
+        return subprocess.run([NOTIFIER_BIN, "--status"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception as e:
+        return "error %s" % e
+
+
 def cmd_install():
     os.makedirs(TOOLS, exist_ok=True)
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     subprocess.check_call(["swiftc", "-O", "-import-objc-header", os.path.join(SRC_DIR, "CGVirtualDisplay.h"),
                            os.path.join(SRC_DIR, "vdisplay.swift"), "-o", VDISPLAY])
+    print("notifier signed with %s; notifications: %s" % (build_notifier(), notifier_status()))
+    if notifier_status().startswith("notDetermined"):
+        # Ask for notification permission now (macOS asks once per app); the helper waits for the answer.
+        subprocess.Popen([NOTIFIER_BIN, "--title", "Hermes Touch ID is ready",
+                          "--body", "Passkey requests from the hidden Chrome show up here. Click one to see the page.",
+                          "--timeout", "600"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        print("click Allow on the 'Hermes Touch ID' notification prompt")
     link = os.path.join(TOOLS, "hermes-chrome-agent")
     me = os.path.realpath(__file__)
     if os.path.realpath(link) != me:
