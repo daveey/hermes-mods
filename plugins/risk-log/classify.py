@@ -22,7 +22,7 @@ BRIDGE_TOOLS = {"tool_call", "mcp__tool_call"}
 
 CRED_PATH = re.compile(
     r"(?:~|\$HOME|/Users/[^/\s]+|/home/[^/\s]+|/root)?/\.ssh(?:/|\b)"
-    r"|(?:^|[\s'\"/=:])\.env(?:\.[\w-]+)?(?=$|[\s'\";|&)])"
+    r"|(?:^|[\s'\"/=:])\.env(?!\.(?:example|sample|template|dist)\b)(?:\.[\w-]+)?(?=$|[\s'\";|&)])"
     r"|\bauth\.json\b|\bauth-profiles\.json\b"
     r"|\bsecurity\s+(?:find|dump|export)-[\w-]*(?:password|keychain|certificate|identity)"
     r"|/Keychains?/|\.keychain(?:-db)?\b"
@@ -35,7 +35,9 @@ SCOPE = re.compile(r"--scope[=\s]+['\"]?([\w./:$-]+)")
 SCOPE_NAME = re.compile(r"^[a-z0-9][\w.-]*(/[a-z0-9][\w-]*)?$")
 BROWSER = re.compile(r"chrome[-_]?devtools", re.I)
 MESSAGE_NAME = re.compile(r"(whatsapp|slack|discord|signal|imessage|telegram|sms)", re.I)
-MESSAGE_VERB = re.compile(r"(send|post|reply|engage|react|upload)", re.I)
+MESSAGE_VERB = re.compile(r"(?:^|_)(send|post|reply|engage|react|upload)(?:_|$)", re.I)
+# `ssh -i ~/.ssh/key host` hands the key to ssh; the agent never reads it. Logged as a medium `ssh-key-use`.
+SSH_KEY_USE = re.compile(r"(?:\s-i\s*|IdentityFile[=\s]+)['\"]?\S*\.ssh/[^\s'\"]+['\"]?")
 SPEND = re.compile(r"autoresearch.*?(run_command|sandbox_exec|buy_credits|set_auto_topup)$", re.I)
 SEND_CORE = {"send_message"}
 BROWSER_WRITE = re.compile(r"(click|fill|type|press|navigate|evaluate|drag|upload|handle_dialog|new_page|"
@@ -83,10 +85,13 @@ def _broker(text: str) -> list[Finding]:
 
 
 def _cred(text: str, source: str) -> list[Finding]:
-    match = CRED_PATH.search(text)
-    if not match:
-        return []
-    return [Finding("credential-read", "high", {"via": source, "match": match.group(0).strip(" '\"=:")[:40]}, text)]
+    match = CRED_PATH.search(SSH_KEY_USE.sub(" ", text) if source == "shell" else text)
+    if match:
+        return [Finding("credential-read", "high", {"via": source, "match": match.group(0).strip(" '\"=:")[:40]},
+                        text)]
+    if source == "shell" and SSH_KEY_USE.search(text):
+        return [Finding("credential-read", "medium", {"via": "ssh-key-use", "match": "ssh -i"}, text)]
+    return []
 
 
 def classify(tool_name: str, args: Any, detector: Optional[Callable[[str], tuple]] = None) -> list[Finding]:

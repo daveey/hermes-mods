@@ -81,6 +81,11 @@ def test_credential_reads():
     assert classes("execute_code", {"code": "open(os.path.expanduser('~/.ssh/id_ed25519')).read()"}) == \
         ["credential-read"]
     assert classes("terminal", {"command": "ls ~/code; git status"}) == []
+    assert classes("terminal", {"command": "cp .env.example .env.local.sample"}) == []
+    use = classify.classify("terminal", {"command": "ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes me@h ls"})
+    assert [(f.risk_class, f.level, f.detail["via"]) for f in use] == [("credential-read", "medium", "ssh-key-use")]
+    both = classify.classify("terminal", {"command": "ssh -i ~/.ssh/k h 'cat ~/.ssh/authorized_keys'"})
+    assert [(f.level, f.detail["via"]) for f in both] == [("high", "shell")]
     assert classes("read_file", {"path": "/Users/me/code/app/environment.py"}) == []
 
 
@@ -113,6 +118,9 @@ def test_tool_name_classes():
     assert classify.classify("mcp__chrome_devtools__take_snapshot", {})[0].level == "medium"
     assert classes("mcp__whatsapp_personal__send_message", {"recipient": "x", "message": "hi"}) == ["message-send"]
     assert classes("mcp__whatsapp_personal__list_chats", {}) == []
+    assert classes("slack_engagements", {}) == []
+    assert classes("slack_engage", {"channel": "C1"}) == ["message-send"]
+    assert classes("mcp__whatsapp_bb__send_audio_message", {}) == ["message-send"]
     assert classes("send_message", {"target": "discord:123", "message": "hi"}) == ["message-send"]
     assert classes("mcp_autoresearch_buy_credits", {"amount": 5}) == ["spend-remote-exec"]
     assert classes("mcp_autoresearch_set_auto_topup", {}) == ["spend-remote-exec"]
