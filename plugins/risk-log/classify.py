@@ -31,7 +31,8 @@ CRED_PATH = re.compile(
     r"|\bgh\s+auth\s+token\b|\bgcloud\s+auth\s+print-access-token\b",
 )
 BROKER = re.compile(r"token[-_]broker(?:_client\.py)?\b[^|;&]*?\b(exec|request)\b")
-SCOPE = re.compile(r"--scope[=\s]+['\"]?([\w./:-]+)")
+SCOPE = re.compile(r"--scope[=\s]+['\"]?([\w./:$-]+)")
+SCOPE_NAME = re.compile(r"^[a-z0-9][\w.-]*(/[a-z0-9][\w-]*)?$")
 BROWSER = re.compile(r"chrome[-_]?devtools", re.I)
 MESSAGE_NAME = re.compile(r"(whatsapp|slack|discord|signal|imessage|telegram|sms)", re.I)
 MESSAGE_VERB = re.compile(r"(send|post|reply|engage|react|upload)", re.I)
@@ -70,8 +71,9 @@ def _broker(text: str) -> list[Finding]:
     for match in BROKER.finditer(text):
         tail = text[match.start():match.start() + 400]
         scope = SCOPE.search(tail)
+        name = scope.group(1)[:80] if scope else ""
         out.append(Finding("broker-vend", "high", {"verb": match.group(1),
-                                                   "scope": scope.group(1)[:80] if scope else None}, text))
+                                                   "scope": name if SCOPE_NAME.match(name) else None}, text))
     return out
 
 

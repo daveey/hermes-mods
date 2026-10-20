@@ -97,6 +97,8 @@ def test_broker_scope_is_kept():
                                                       "--reason 'x' -- gh api user"}, fake_detector)
     assert [(f.risk_class, f.detail["scope"]) for f in found] == [("broker-vend", "user/github")]
     assert classes("terminal", {"command": "token-broker scopes"}) == []
+    dynamic = classify.classify("terminal", {"command": "token-broker exec --scope user/$NAME -- x"}, None)
+    assert [(f.risk_class, f.detail["scope"]) for f in dynamic] == [("broker-vend", None)]
 
 
 def test_tool_name_classes():
