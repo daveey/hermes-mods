@@ -237,3 +237,11 @@ def test_long_random_runs_redacted_but_paths_and_shas_kept():
     assert redact.prefix(path, limit=500) == path
     sha = "git show 0389fb99ee864b65e39e6d241c82d42cc56573ed"
     assert redact.prefix(sha, limit=500) == sha
+
+
+def test_host_label_is_stable_and_overridable(monkeypatch):
+    monkeypatch.setattr(store, "_HOST", [])
+    monkeypatch.setenv("HERMES_RISK_HOST", "laptop")
+    assert store.host_name() == "laptop"
+    monkeypatch.setattr(store.socket, "gethostname", lambda: "Mac.localdomain")
+    assert store.host_name() == "laptop"  # cached: a DHCP rename mid-process changes nothing

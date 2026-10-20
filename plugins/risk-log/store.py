@@ -13,6 +13,7 @@ import os
 import queue
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -43,6 +44,23 @@ CREATE TABLE IF NOT EXISTS risk_events(
 CREATE INDEX IF NOT EXISTS risk_events_at ON risk_events(at);
 """
 QUEUE_MAX = 2000
+_HOST: list = []
+
+
+def host_name() -> str:
+    """Stable host label. gethostname() follows DHCP/VPN on macOS (a MacBook flips between its name and "Mac"),
+    so prefer $HERMES_RISK_HOST, then the macOS LocalHostName, then gethostname()."""
+    if not _HOST:
+        name = os.environ.get("HERMES_RISK_HOST", "").strip()
+        if not name and sys.platform == "darwin":
+            try:
+                import subprocess
+                name = subprocess.run(["/usr/sbin/scutil", "--get", "LocalHostName"], capture_output=True,
+                                      text=True, timeout=2).stdout.strip()
+            except Exception:  # noqa: BLE001
+                name = ""
+        _HOST.append(name or socket.gethostname().split(".")[0])
+    return _HOST[0]
 
 
 def default_path() -> Path:
@@ -85,7 +103,7 @@ def rows_for(event: dict, detector=None) -> list[dict]:
         text = f.text or ""
         out.append({
             "id": "%s:%s:%d" % (event.get("call_id") or "%s-%f" % (event["tool"], event["at"]), f.risk_class, n),
-            "at": event["at"], "host": event.get("host") or socket.gethostname().split(".")[0],
+            "at": event["at"], "host": event.get("host") or host_name(),
             "profile": event.get("profile"), "session_id": event.get("session_id"), "task_id": event.get("task_id"),
             "tool": event["tool"][:120], "risk_class": f.risk_class, "level": f.level,
             "origin": event.get("origin") or "unknown", "platform": event.get("platform"),

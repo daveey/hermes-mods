@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import socket
 import time
 from typing import Any
 
@@ -39,7 +38,6 @@ _NAME_HINTS = ("chrome", "devtools", "whatsapp", "slack", "discord", "signal", "
                "autoresearch")
 _UNATTENDED = {"api_server", "webhook", "msgraph_webhook"}
 _LOCAL = {"", "cli", "tui", "desktop", "local", "codex", "tool", "gateway", "kanban"}
-_HOST = socket.gethostname().split(".")[0]
 
 WRITER = store.Writer()
 
@@ -101,7 +99,7 @@ def _post_tool_call(tool_name: str = "", args: Any = None, session_id: str = "",
             return None
         where, platform = origin()
         WRITER.submit({
-            "at": time.time(), "host": _HOST, "tool": name, "args": dict(args) if isinstance(args, dict) else {},
+            "at": time.time(), "host": store.host_name(), "tool": name, "args": dict(args) if isinstance(args, dict) else {},
             "call_id": tool_call_id or None, "session_id": session_id or _session_env("HERMES_SESSION_ID") or None,
             "task_id": os.environ.get("HERMES_KANBAN_TASK") or None, "origin": where, "platform": platform or None,
             "profile": _profile(), "status": str(status) if status else None,
@@ -114,4 +112,5 @@ def _post_tool_call(tool_name: str = "", args: Any = None, session_id: str = "",
 
 def register(ctx) -> None:
     _session_env("HERMES_SESSION_ID")  # resolve the session-context getter now, not on the first tool call
+    store.host_name()  # and the host label (one scutil call)
     ctx.register_hook("post_tool_call", _post_tool_call)
