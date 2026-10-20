@@ -98,6 +98,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [productivity/quiet-mode](skills/productivity/quiet-mode/) | You want Hermes off the screen and speakers (goes with the quiet-mode plugin). |
 | [social-media/messaging-bridges](skills/social-media/messaging-bridges/) | WhatsApp/Signal bridges: QR-pair once, the session persists. |
 | [social-media/slack-workspace-bot](skills/social-media/slack-workspace-bot/) | Acting as a team Slack bot: use observed context, join channels, call the Slack API, handle approvals; participation rules for the follower in engaged channels (goes with the slack-workspace plugin). |
+| [software-development/five-whys](skills/software-development/five-whys/) | Any failure analysis (bug, incident, failed task, red CI, bad agent output, "not a bug" verdict): an evidence-backed why-chain that stops at a process gap you control, plus a "why wasn't it caught" chain, recurrence check and proportional countermeasures. |
 | [software-development/repo-security-audit](skills/software-development/repo-security-audit/) | Auditing a repo for security flaws and fixing them. |
 | [software-development/skill-audit](skills/software-development/skill-audit/) | Auditing skills: size cap, notes lost to failed `skill_manage` writes, orphan references, overlaps, rules without evidence behind them; daily guard + weekly refactor cron recipe. |
 
