@@ -51,4 +51,7 @@ the private repo `daveey/hermes` (`~/code/hermes`, branch `state`).
 - Commit secrets, tokens, `auth.json`/`.env` content, or anything matched by the private denylist.
   Do not bypass the hook with `--no-verify`.
 - Commit runtime churn (`status-cache.json`, logs, `__pycache__`, `node_modules`). See `.gitignore`.
-- Force-push `main`. History is public, so a leaked value needs rotating, not just deleting.
+- Force-push `main`. History is public, so a leaked value needs rotating, not just deleting. A GitHub ruleset
+  (`protect-main-history`) refuses force-pushes and deletion of `main`; normal fast-forward pushes need no PR
+  or review. Each host's `hermes-sync` records the hermes-mods commit it loads, and the BB hub files a
+  report-only Issue if a host loads a commit not on `main` or `main` is rewritten.
