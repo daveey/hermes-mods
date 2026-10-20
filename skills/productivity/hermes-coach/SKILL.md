@@ -85,12 +85,17 @@ The cloud Bot can't read Mac paths: ship any doc that SOUL.md points at (e.g. th
 and reference it by that cloud path. Re-ship whenever the source changes.
 
 After changing a script: commit to hermes-mods (the Macs fast-forward through sync), then re-ship the changed files
-to the cloud profile's `scripts/` (`bash <administering-remote-hermes-gateways>/scripts/nx.sh <ship.sh>`), compare byte
-counts, and rerun the feed on every host so all digests share one version (`DIGEST_V`). The cloud profile has no
-`coach_apply.py`: guard any import of it from a shipped script with `try/except ImportError`, or that path crashes there.
-To re-render an OPEN Inbox card in a new format, `hermes inbox archive <sid>` then post again (a same-key re-post onto
-an open card appends an update under the old message); rename the archived copy first, or the new card's title gets a
-` (2)` suffix.
+to nous-1 `/opt/data/profiles/coach/scripts/` (skills there sync from git on their own; `nous-push` ships plugins only).
+Recipe: one local script per ship, each file as `base64 -d > <name>.new <<'B64' … B64`, then print `wc -c` and
+`diff <name> <name>.new | grep -c '^[<>]'`; run it with the gateways skill's `nx.sh`; if the diff is only your change,
+`mv` the `.new` files in a second nx.sh call and rerun the script against `/opt/data/profiles/coach/work/hermes-coach-data`.
+A new `coach_weekly.py` section is ignored by the Bot until `coach_sunday.py` (`~/code/hermes/hosts/nous-1/coach/`,
+commit to `state`) gets a matching numbered instruction: edit and re-ship both. A digest change also needs every
+host's feed rerun so all digests share one version (`DIGEST_V`).
+The cloud profile has no `coach_apply.py`: guard any import of it from a shipped script with `try/except ImportError`,
+or that path crashes there. To re-render an OPEN Inbox card in a new format, `hermes inbox archive <sid>` then post
+again (a same-key re-post onto an open card appends an update under the old message); rename the archived copy first,
+or the new card's title gets a ` (2)` suffix.
 
 ## Pitfalls
 
