@@ -92,6 +92,13 @@ def test_dangerous_command_uses_the_detector():
     assert classify.classify("terminal", {"command": "rm -rf x"}, None) == []  # no detector, no class
 
 
+def test_detector_sees_a_bounded_head():
+    seen = []
+    classify.classify("terminal", {"command": "rm -rf x; " + "y" * 100000}, lambda c: seen.append(len(c)) or
+                      (False, None, None))
+    assert seen == [classify.DETECT_MAX]
+
+
 def test_broker_scope_is_kept():
     found = classify.classify("terminal", {"command": "~/.local/bin/token-broker exec --scope user/github "
                                                       "--reason 'x' -- gh api user"}, fake_detector)

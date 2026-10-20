@@ -56,11 +56,16 @@ def _shell_text(args: dict) -> str:
     return " ".join(str(args.get(k) or "") for k in ("command", "input", "data", "cmd") if args.get(k))
 
 
+# Hermes' detector is superlinear on long input (10 KB heredoc ~0.4 s, 50 KB ~2 s). Its patterns key on the
+# command head, so the background writer checks only the first DETECT_MAX chars.
+DETECT_MAX = 4000
+
+
 def _dangerous(command: str, detector: Optional[Callable[[str], tuple]]) -> Optional[str]:
     if not detector or not command.strip():
         return None
     try:
-        hit, key, _desc = detector(command)
+        hit, key, _desc = detector(command[:DETECT_MAX])
     except Exception:  # noqa: BLE001 - observability only
         return None
     return str(key) if hit else None
