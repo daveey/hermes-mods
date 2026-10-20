@@ -10,7 +10,7 @@ export async function resolve(spec, ctx, next) {
     'export const atom = v => { let x = v; return { get: () => x, set: n => { x = n } } };' +
     'export const COMPOSER_AREAS = { top: "composer.top" }; export const SIDEBAR_SECTIONS_AREA = "sidebar.sections";' +
     'export const SidebarSection = () => null; export const SidebarSectionRow = () => null; export const useValue = a => a.get();'), shortCircuit: true }
-  if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useState=v=>[v,()=>{}];export const jsx=()=>null;export const jsxs=()=>null', shortCircuit: true }
+  if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useState=v=>(globalThis.__useState?globalThis.__useState(v):[v,()=>{}]);export const jsx=(type,props,key)=>({type,props,key});export const jsxs=(type,props,key)=>({type,props,key})', shortCircuit: true }
   return next(spec, ctx)
 }`))
 const m = await import('../plugin.js')
@@ -205,4 +205,181 @@ test('register hooks the archive hotkey when the core offers it, and tolerates o
   assert.equal(handlers.length, 1)
   assert.equal(handlers[0]({ sessionId: 'nope', isFocused: true, openNextSession() {} }), false)
   m.default.register(base)
+})
+
+// ── card types ──────────────────────────────────────────────────────────────
+
+const XPOST = {
+  session_id: 'x1', gateway: 'local', type: 'x-post', type_label: 'X post', poster: 'cron · x',
+  fields: { id: 'Q1', text: 'Cells are agents.' },
+  actions: [
+    { id: 'approve', label: 'Approve', icon: 'check', style: 'primary', kind: 'resolve', row: true },
+    { id: 'edit', label: 'Edit', icon: 'edit', kind: 'resolve', input: { field: 'text', multiline: true, max: 280 } },
+    { id: 'skip', label: 'Skip', icon: 'close', kind: 'resolve' },
+    { id: 'rewrite', label: 'Rewrite…', kind: 'prompt', input: { placeholder: 'What to change' } }
+  ]
+}
+
+/** Depth-first search of a jsx tree for nodes matching `pred`. */
+function find(node, pred, out = []) {
+  if (!node || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const n of node) find(n, pred, out)
+    return out
+  }
+  if (pred(node)) out.push(node)
+  if (node.props) find(node.props.children, pred, out)
+  return out
+}
+
+test('barActions: type actions with primary first and Archive last; api<3 items keep Do it / Archive', () => {
+  const ids = m.barActions({ actions: [{ id: 'skip', kind: 'resolve' }, { id: 'ok', kind: 'resolve', style: 'primary' }] }).map(a => a.id)
+  assert.deepEqual(ids, ['ok', 'skip', 'archive'])
+  assert.deepEqual(m.barActions({ session_id: 'old' }).map(a => [a.id, a.kind]), [['do_it', 'accept'], ['archive', 'archive']])
+  assert.deepEqual(m.barActions({ actions: [{ id: 'archive', kind: 'resolve' }] }).map(a => a.id), ['archive'])
+})
+
+test('Bar renders the focused card type actions in order', () => {
+  host.state.focusedStoredSessionId = { get: () => 'x1', listen: () => () => {} }
+  const store = m.createStore(fakeCtx(() => ({ items: [] })))
+  store.$items.set([XPOST])
+  const tree = m.Bar({ store })
+  const buttons = find(tree, n => n.props && n.props.action).map(n => n.props.action.id)
+  assert.deepEqual(buttons, ['approve', 'edit', 'skip', 'rewrite', 'archive'])
+  assert.match(JSON.stringify(find(tree, n => n.type === 'span' && typeof n.props.children === 'string')), /X post from cron · x/)
+})
+
+test('Bar on an api<3 item renders exactly Do it / Archive', () => {
+  host.state.focusedStoredSessionId = { get: () => 'old1', listen: () => () => {} }
+  const store = m.createStore(fakeCtx(() => ({ items: [] })))
+  store.$items.set([{ session_id: 'old1', gateway: 'local', accept_prompt: 'go' }])
+  const tree = m.Bar({ store })
+  const btns = find(tree, n => n.props && n.props.action)
+  assert.deepEqual(btns.map(n => n.props.action.label), ['Do it', 'Archive'])
+  assert.equal(btns[0].props.title, 'go')
+})
+
+test('Bar: an input action opens the editor prefilled from its field; Save runs act with the text', async () => {
+  host.state.focusedStoredSessionId = { get: () => 'x1', listen: () => () => {} }
+  let state = null
+  globalThis.__useState = v => [state ?? v, n => { state = n }]
+  const ctx = fakeCtx(() => ({ ok: true, items: [] }))
+  const store = m.createStore(ctx)
+  store.$items.set([XPOST])
+  const edit = find(m.Bar({ store }), n => n.props && n.props.action && n.props.action.id === 'edit')[0]
+  edit.props.onClick()
+  assert.equal(state.value, 'Cells are agents.')
+  const editor = m.Bar({ store })
+  assert.equal(editor.type, m.Editor)
+  editor.props.onChange('Cells are agents. So are you.')
+  const tree = m.Editor(m.Bar({ store }).props)
+  const input = find(tree, n => n.type === 'textarea')[0]
+  assert.equal(input.props.value, 'Cells are agents. So are you.')
+  assert.equal(find(tree, n => n.props && n.props['data-slot'] === 'inbox-editor-count')[0].props.children, '29/280')
+  find(tree, n => n.props && n.props.action && n.props.action.id === 'save')[0].props.onClick()
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(ctx.calls[0], ['/items/x1/act', { method: 'POST', body: { action: 'edit', input: 'Cells are agents. So are you.' } }])
+  globalThis.__useState = null
+})
+
+test('Editor: Esc cancels, ⌘Enter saves, over-max disables Save', () => {
+  const calls = []
+  const props = {
+    item: XPOST, action: XPOST.actions[1], value: 'x'.repeat(281), disabled: false,
+    onChange() {}, onSave: v => calls.push(['save', v]), onCancel: () => calls.push(['cancel'])
+  }
+  let tree = m.Editor(props)
+  const save = () => find(tree, n => n.props && n.props.action && n.props.action.id === 'save')[0]
+  assert.equal(save().props.disabled, true)
+  const ta = () => find(tree, n => n.type === 'textarea')[0]
+  ta().props.onKeyDown({ key: 'Enter', metaKey: true, preventDefault() {} })
+  assert.deepEqual(calls, [])
+  tree = m.Editor({ ...props, value: 'short' })
+  ta().props.onKeyDown({ key: 'Enter', metaKey: false, preventDefault() {} })  // plain Enter = newline
+  ta().props.onKeyDown({ key: 'Enter', metaKey: true, preventDefault() {} })
+  ta().props.onKeyDown({ key: 'Escape', preventDefault() {} })
+  assert.deepEqual(calls, [['save', 'short'], ['cancel']])
+})
+
+test('act(resolve) posts {action} to the owning gateway/profile, drops the card and opens the next one', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [{ id: 'local', kind: 'local' }, { id: 'mini', kind: 'ssh' }] }
+  host.state.focusedStoredSessionId = { get: () => 'x1', listen: () => () => {} }
+  const opened = []
+  host.openSession = async (sid, opts) => { opened.push(sid) }
+  const ctx = fakeCtx(() => ({ ok: true, items: [] }))
+  const store = m.createStore(ctx)
+  const item = { ...XPOST, gateway: 'mini', profile: 'bb' }
+  store.$items.set([item, { session_id: 'n2', gateway: 'local' }])
+  assert.equal(await store.act(item, XPOST.actions[0]), true)
+  assert.deepEqual(ctx.calls[0], ['/items/x1/act?profile=bb', { method: 'POST', body: { action: 'approve' }, connectionId: 'mini' }])
+  assert.deepEqual(opened, ['n2'])
+})
+
+test('act(prompt) submits the returned prompt into the chat', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  const submitted = []
+  host.composer = { submit: (sid, text) => (submitted.push([sid, text]), true) }
+  const ctx = fakeCtx(path => (path.includes('/act') ? { prompt: 'Rewrite X draft Q1: shorter' } : { items: [] }))
+  const store = m.createStore(ctx)
+  store.$items.set([XPOST])
+  await store.act(XPOST, XPOST.actions[3], 'shorter')
+  assert.deepEqual(ctx.calls[0][1].body, { action: 'rewrite', input: 'shorter' })
+  assert.deepEqual(submitted, [['x1', 'Rewrite X draft Q1: shorter']])
+})
+
+test('act with confirm: cancelling sends nothing', async () => {
+  const ctx = fakeCtx(() => ({ ok: true, items: [] }))
+  const store = m.createStore(ctx)
+  globalThis.confirm = () => false
+  assert.equal(await store.act(XPOST, { id: 'nuke', label: 'Nuke', kind: 'resolve', confirm: 'Sure?' }), false)
+  assert.equal(ctx.calls.length, 0)
+  globalThis.confirm = () => true
+  assert.equal(await store.act(XPOST, { id: 'nuke', label: 'Nuke', kind: 'resolve', confirm: 'Sure?' }), true)
+  assert.equal(ctx.calls[0][1].body.action, 'nuke')
+  delete globalThis.confirm
+})
+
+test('row actions: row:true actions without input sit next to Archive in the sidebar row', () => {
+  assert.deepEqual(m.rowActions(XPOST).map(a => a.id), ['approve'])
+  assert.deepEqual(m.rowActions({ session_id: 'old' }), [])
+  assert.deepEqual(m.rowActions({ actions: [{ id: 'e', row: true, input: {} }] }), [])
+  assert.equal(m.inputDefault(XPOST, XPOST.actions[1]), 'Cells are agents.')
+  assert.equal(m.inputDefault(XPOST, XPOST.actions[3]), '')
+  assert.equal(m.counterText('abc', 280), '3/280')
+})
+
+test('sidebar row: RowActions renders the row action buttons before Archive and runs act', async () => {
+  const ctx = fakeCtx(() => ({ ok: true, items: [] }))
+  const store = m.createStore(ctx)
+  store.$items.set([XPOST])
+  const tree = m.RowActions({ store, item: XPOST })
+  const kids = tree.props.children
+  assert.equal(kids.length, 2)
+  assert.equal(kids[0].props.action.id, 'approve')
+  kids[0].props.onClick()
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(ctx.calls[0][1].body, { action: 'approve' })
+  assert.equal(m.RowActions({ store, item: { session_id: 'old' } }).props.onClick != null, true)  // plain Archive
+})
+
+test('review fixes: prompt actions never become row buttons; counter counts code points; tooltip shows the template', () => {
+  assert.deepEqual(m.rowActions({ actions: [{ id: 'p', kind: 'prompt', row: true, prompt: 'x' }] }), [])
+  assert.equal(m.counterText('ab😀', 280), '3/280')
+  host.state.focusedStoredSessionId = { get: () => 'x1', listen: () => () => {} }
+  const store = m.createStore(fakeCtx(() => ({ items: [] })))
+  store.$items.set([{ ...XPOST, actions: [{ id: 'rewrite', label: 'Rewrite', kind: 'prompt', prompt: 'Rewrite {{id}}' }] }])
+  const btn = find(m.Bar({ store }), n => n.props && n.props.action && n.props.action.id === 'rewrite')[0]
+  assert.equal(btn.props.title, 'Rewrite {{id}}')
+})
+
+test('Editor: Enter while an IME composition is open does not save', () => {
+  const calls = []
+  const tree = m.Editor({ item: XPOST, action: { id: 'e', label: 'E', kind: 'resolve', input: {} }, value: 'x',
+    onChange() {}, onSave: v => calls.push(v), onCancel() {} })
+  const input = find(tree, n => n.type === 'input')[0]
+  input.props.onKeyDown({ key: 'Enter', isComposing: true, preventDefault() {} })
+  input.props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  assert.deepEqual(calls, ['x'])
 })

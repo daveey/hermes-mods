@@ -1,11 +1,19 @@
-"""/api/plugins/inbox — REST for the Desktop Inbox section (see ../store.py).
+"""/api/plugins/inbox — REST for the Desktop Inbox section (see ../store.py, ../card_types.py).
 
-GET  /ping                      {ok, api}
-GET  /items                     {items:[...], profile}  (root + every profile with an inbox; item.profile)
-POST /items                     {title, body, accept_prompt, key?, poster?, cwd?, prompt_label?} -> {session_id, updated}
+GET  /ping                      {ok, api}   (api 3 = card types)
+GET  /items                     {items:[...], profile}  (root + every profile with an inbox; item.profile,
+                                 item.type/type_label/fields/field_specs/actions)
+POST /items                     {title, body, accept_prompt?, key?, poster?, cwd?, prompt_label?, type?, fields?}
+                                 -> {session_id, updated}
 GET  /items/{sid}[?profile=p]    item (any state) or 404
-POST /items/{sid}/accept[?profile=p]   un-hide -> Recents; returns {accept_prompt, ...}
-POST /items/{sid}/archive[?profile=p]  archive the session
+POST /items/{sid}/act[?profile=p]      {action, input?} run a card action; prompt actions return {prompt}
+POST /items/{sid}/accept[?profile=p]   alias for act(first prompt action); returns {accept_prompt, ...};
+                                 409 on a card with resolve actions (an older Desktop's Do it)
+POST /items/{sid}/archive[?profile=p]  archive the session (outcome 'archived')
+GET  /outcome?key=K[&profile=p]  {found, state, outcome, value, fields, at, session_id, type}
+GET  /types[?profile=p]          {types:[...]}
+GET  /types/{name}[?profile=p]   the resolved type (with source) or 404
+PUT  /types/{name}[?profile=p]   {spec} or the spec itself -> define an ad-hoc local type
 """
 from __future__ import annotations
 
@@ -28,7 +36,7 @@ def _store():
         spec = importlib.util.spec_from_file_location(key, _STORE)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        sys.modules[key] = mod
+        mod = sys.modules.setdefault(key, mod)
     return mod
 
 
@@ -40,9 +48,14 @@ def _profile() -> str:
         return "default"
 
 
+_KEEP = ("session_id", "key", "title", "poster", "accept_prompt", "created_at", "updated_at", "state", "unread",
+         "type", "type_label", "fields", "field_specs", "actions", "outcome", "outcome_value", "resolved_at",
+         "prompt", "action", "kind")
+
+
 def _public(item: Dict[str, Any]) -> Dict[str, Any]:
-    keep = ("session_id", "key", "title", "poster", "accept_prompt", "created_at", "updated_at", "state", "unread")
-    return {k: item.get(k) for k in keep if k in item}
+    full = _store().public_item(item)
+    return {k: full.get(k) for k in _KEEP if k in full}
 
 
 def _inbox(profile: Optional[str] = None):
@@ -68,9 +81,16 @@ def _all_items() -> list:
     return out
 
 
+async def _run(fn):
+    try:
+        return await asyncio.to_thread(fn)
+    except ValueError as exc:  # bad type / field / input
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.get("/ping")
 async def ping() -> Dict[str, Any]:
-    return {"ok": True, "api": 2}
+    return {"ok": True, "api": 3}
 
 
 @router.get("/items")
@@ -81,13 +101,10 @@ async def items() -> Dict[str, Any]:
 
 @router.post("/items")
 async def post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    try:
-        return await asyncio.to_thread(lambda: _store().Inbox().post(
-            payload.get("title", ""), payload.get("body", ""), payload.get("accept_prompt", ""),
-            key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd"),
-            prompt_label=payload.get("prompt_label")))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    return await _run(lambda: _store().Inbox().post(
+        payload.get("title", ""), payload.get("body", ""), payload.get("accept_prompt", ""),
+        key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd"),
+        prompt_label=payload.get("prompt_label"), type=payload.get("type"), fields=payload.get("fields")))
 
 
 @router.get("/items/{session_id}")
@@ -99,13 +116,50 @@ async def get(session_id: str, profile: Optional[str] = None) -> Dict[str, Any]:
     return _public(item)
 
 
+@router.post("/items/{session_id}/act")
+async def act(session_id: str, payload: Dict[str, Any] = Body(...), profile: Optional[str] = None) -> Dict[str, Any]:
+    inbox = _inbox(profile)
+    action = payload.get("action")
+    if not isinstance(action, str) or not action:
+        raise HTTPException(status_code=400, detail="action is required")
+    value = payload.get("input")
+    if value is not None and not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="input must be a string")
+    item = await _run(lambda: inbox.act(session_id, action, value))
+    if not item:
+        _not_open(inbox, session_id)
+    return _public(item)
+
+
+def _not_open(inbox, session_id: str):
+    """404 for an unknown id, 409 for a card that is no longer open (acted on / archived)."""
+    if inbox.get(session_id):
+        raise HTTPException(status_code=409, detail="inbox message is no longer open")
+    raise HTTPException(status_code=404, detail="not an open inbox message")
+
+
 @router.post("/items/{session_id}/accept")
 async def accept(session_id: str, profile: Optional[str] = None) -> Dict[str, Any]:
     inbox = _inbox(profile)
-    item = await asyncio.to_thread(lambda: inbox.accept(session_id))
+    st = _store()
+
+    def run():
+        cur = inbox.get(session_id)
+        # An older Desktop shows Do it on every card: never let it run a decision card's prompt action.
+        if cur and any(a["kind"] == "resolve" for a in st.item_type(cur)["actions"]):
+            raise _Conflict("this card has its own actions; update Hermes Desktop to use them")
+        return inbox.act(session_id, None)
+    try:
+        item = await _run(run)
+    except _Conflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if not item:
-        raise HTTPException(status_code=404, detail="not an open inbox message")
+        _not_open(inbox, session_id)
     return _public(item)
+
+
+class _Conflict(Exception):
+    pass
 
 
 @router.post("/items/{session_id}/archive")
@@ -115,3 +169,35 @@ async def archive(session_id: str, profile: Optional[str] = None) -> Dict[str, A
     if not ok:
         raise HTTPException(status_code=404, detail="not an inbox message")
     return {"ok": True}
+
+
+@router.get("/outcome")
+async def outcome(key: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    inbox = _inbox(profile)
+    out = await asyncio.to_thread(lambda: inbox.outcome(key))
+    return dict(out, found=True) if out else {"found": False, "key": key}
+
+
+@router.get("/types")
+async def types(profile: Optional[str] = None) -> Dict[str, Any]:
+    inbox = _inbox(profile)
+    return {"types": await asyncio.to_thread(lambda: inbox.types.list())}
+
+
+@router.get("/types/{name}")
+async def get_type(name: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    inbox = _inbox(profile)
+    unknown = _store().types_module().UnknownType
+    try:
+        return await asyncio.to_thread(lambda: inbox.types.get(name))
+    except unknown as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.put("/types/{name}")
+async def put_type(name: str, payload: Any = Body(...), profile: Optional[str] = None) -> Dict[str, Any]:
+    inbox = _inbox(profile)
+    spec = payload.get("spec", payload) if isinstance(payload, dict) and "spec" in payload else payload
+    return await _run(lambda: inbox.types.define(name, spec))

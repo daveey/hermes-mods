@@ -9,12 +9,20 @@ Lifecycle, all derived from the session row so other doors (sidebar archive, res
   open      sidecar state 'open', session hidden, not archived  -> listed in the Inbox
   accepted  the user ran it (Do it / typed a reply): session un-hidden -> a normal chat in Recents
   archived  session archived (restorable from the archived view)
+  resolved  a ``resolve`` action of the card's type ran: outcome recorded, session archived
 Unread = the session's ``last_read_at`` watermark predates the message's last post.
+
+Card types (card_types.py): each item snapshots its type's fields + actions (``actions_json``) at
+post time. ``act()`` runs an action; ``outcome(key)`` reads the decision back for the poster. Rows
+from before types have ``type`` NULL and behave as the built-in ``default`` type (Do it / Archive).
 """
 from __future__ import annotations
 
+import importlib.util
+import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -40,6 +48,23 @@ CREATE TABLE IF NOT EXISTS items (
 );
 CREATE INDEX IF NOT EXISTS items_key ON items(key);
 """
+# Added with card types; ALTERed into older sidecars on open (idempotent).
+_COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
+            ("outcome_value", "TEXT"), ("resolved_at", "REAL"))
+# Not "types.py": a sibling named like the stdlib module shadows it whenever this dir is on sys.path.
+_TYPES = Path(__file__).resolve().parent / "card_types.py"
+
+
+def types_module():
+    """card_types.py loaded by path (this module itself is loaded without a package)."""
+    key = f"_hermes_inbox_card_types_{int(_TYPES.stat().st_mtime_ns)}"
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, _TYPES)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod = sys.modules.setdefault(key, mod)
+    return mod
 
 
 def _home() -> Path:
@@ -50,7 +75,7 @@ def _home() -> Path:
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
-_PROFILE_NAME = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_PROFILE_NAME = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 
 
 def profile_homes(root: Path) -> list[tuple[str, Path]]:
@@ -78,11 +103,19 @@ class Inbox:
     """``db_factory`` returns a SessionDB (injectable for tests); ``home`` holds the sidecar."""
 
     def __init__(self, home: Optional[Path] = None, db_factory: Optional[Callable[[], Any]] = None,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, types: Any = None):
         self.home = Path(home) if home else _home()
         self.path = self.home / "inbox" / "inbox.db"
         self._db_factory = db_factory
         self.clock = clock
+        self._types = types
+
+    @property
+    def types(self):
+        """The card-type Registry for this home (injectable for tests)."""
+        if self._types is None:
+            self._types = types_module().Registry(self.home)
+        return self._types
 
     @classmethod
     def for_home(cls, home: Path, **kw) -> "Inbox":
@@ -100,6 +133,14 @@ class Inbox:
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        have = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+        for col, decl in _COLUMNS:
+            if col not in have:
+                try:
+                    conn.execute(f"ALTER TABLE items ADD COLUMN {col} {decl}")
+                except sqlite3.OperationalError as exc:  # a concurrent opener added it first
+                    if "duplicate column" not in str(exc):
+                        raise
         return conn
 
     def _sessions(self):
@@ -120,9 +161,11 @@ class Inbox:
         return self.path.exists()
 
     # ── posting ─────────────────────────────────────────────────────────────
-    def post(self, title: str, body: str, accept_prompt: str, *, key: Optional[str] = None,
+    def post(self, title: str, body: str, accept_prompt: str = "", *, key: Optional[str] = None,
              poster: Optional[str] = None, cwd: Optional[str] = None,
-             model: Optional[str] = None, prompt_label: Optional[str] = None) -> dict[str, Any]:
+             model: Optional[str] = None, prompt_label: Optional[str] = None,
+             type: Optional[str] = None, fields: Optional[dict] = None) -> dict[str, Any]:
+        ct = types_module()
         title = " ".join(str(title or "").split())[:MAX_TITLE]
         prompt_label = " ".join(str(prompt_label or "").split())[:200] or None
         body = str(body or "").strip()[:MAX_BODY]
@@ -131,8 +174,16 @@ class Inbox:
         poster = (" ".join(str(poster).split())[:80] or None) if poster else None
         if not title:
             raise ValueError("title is required")
-        if not accept_prompt:
+        tdef = self.types.get(type or "default")
+        fvals = ct.check_fields(tdef, fields)
+        if not accept_prompt and ct.needs_accept_prompt(tdef):
             raise ValueError("accept_prompt is required (the instruction 'Do it' sends)")
+        snap = ct.snapshot(tdef)
+        tname, fjson, ajson = snap["name"], json.dumps(fvals), json.dumps(snap)
+        legacy = ct.is_builtin_default(snap)  # by content: a look-alike type can't borrow the legacy text
+        # A type with resolve actions is a decision card: after the user acted on it, a re-post is a
+        # new card with buttons, never a follow-up note in the old chat.
+        decision = any(x["kind"] == "resolve" for x in snap["actions"])
         now = self.clock()
         with _lock:
             side = self._side()
@@ -141,16 +192,20 @@ class Inbox:
                 existing = self._open_by_key(side, db, key) if key else None
                 if existing:
                     sid = existing
-                    db.append_message(sid, "assistant", _update_text(body, accept_prompt, now, prompt_label))
+                    text = (_update_text(body, accept_prompt, now, prompt_label) if legacy
+                            else _typed_update_text(body, snap, fvals, now))
+                    db.append_message(sid, "assistant", text)
                     side.execute("UPDATE items SET title=?, poster=COALESCE(?, poster), accept_prompt=?, "
-                                 "updated_at=? WHERE session_id=?", (title, poster, accept_prompt, now, sid))
+                                 "updated_at=?, type=?, fields_json=?, actions_json=? WHERE session_id=?",
+                                 (title, poster, accept_prompt, now, tname, fjson, ajson, sid))
                     side.commit()
                     _set_title(db, sid, title)
                     db.set_session_read(sid, False)
                     return {"session_id": sid, "updated": True}
-                talking = self._accepted_by_key(side, db, key) if key else None
+                talking = self._accepted_by_key(side, db, key) if key and not decision else None
                 if talking:  # the user replied to this card: the follow-up joins that conversation
-                    db.append_message(talking, "assistant", _update_text(body, accept_prompt, now, prompt_label))
+                    db.append_message(talking, "assistant", _update_text(body, accept_prompt, now, prompt_label)
+                                      if legacy else _typed_update_text(body, snap, fvals, now))
                     side.execute("UPDATE items SET updated_at=? WHERE session_id=?", (now, talking))
                     side.commit()
                     db.set_session_read(talking, False)
@@ -159,11 +214,14 @@ class Inbox:
                 sid = new_session_id()
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
                 db.set_session_hidden(sid, True)
-                db.append_message(sid, "assistant", _post_text(title, body, accept_prompt, poster, prompt_label))
+                text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy
+                        else _typed_post_text(title, body, poster, snap, fvals))
+                db.append_message(sid, "assistant", text)
                 _set_title(db, sid, title)
                 db.set_session_read(sid, False)
-                side.execute("INSERT INTO items(session_id,key,title,poster,accept_prompt,created_at,updated_at,state) "
-                             "VALUES (?,?,?,?,?,?,?, 'open')", (sid, key, title, poster, accept_prompt, now, now))
+                side.execute("INSERT INTO items(session_id,key,title,poster,accept_prompt,created_at,updated_at,state,"
+                             "type,fields_json,actions_json) VALUES (?,?,?,?,?,?,?, 'open',?,?,?)",
+                             (sid, key, title, poster, accept_prompt, now, now, tname, fjson, ajson))
                 side.commit()
                 self._enforce_cap(side, db)
                 return {"session_id": sid, "updated": False}
@@ -195,7 +253,8 @@ class Inbox:
         read = sorted((i for i in items if not i["unread"]), key=lambda i: i["updated_at"])
         for item in read[:extra]:
             db.set_session_archived(item["session_id"], True)
-            side.execute("UPDATE items SET state='archived' WHERE session_id=?", (item["session_id"],))
+            side.execute("UPDATE items SET state='archived', outcome=COALESCE(outcome, 'archived') "
+                         "WHERE session_id=?", (item["session_id"],))
         side.commit()
 
     # ── reading ─────────────────────────────────────────────────────────────
@@ -245,14 +304,21 @@ class Inbox:
             item = self.get(session_id)
             if not item or item["state"] != "open":
                 return None
-            db = self._sessions()
             side = self._side()
             try:
-                db.set_session_hidden(session_id, False)
-                side.execute("UPDATE items SET state='accepted' WHERE session_id=?", (session_id,))
+                # Claim the transition in the sidecar first (state='open' guard): another process (the
+                # dashboard, the CLI, an agent's accept hook) may be acting on the same card.
+                won = side.execute("UPDATE items SET state='accepted' WHERE session_id=? AND state='open'",
+                                   (session_id,)).rowcount == 1
                 side.commit()
             finally:
                 side.close()
+            if not won:
+                return None
+            db = self._sessions()
+            try:
+                db.set_session_hidden(session_id, False)
+            finally:
                 self._close(db)
             item["state"] = "accepted"
             return item
@@ -266,12 +332,123 @@ class Inbox:
             side = self._side()
             try:
                 db.set_session_archived(session_id, True)
-                side.execute("UPDATE items SET state='archived' WHERE session_id=?", (session_id,))
+                # Archive = dismissed with no decision; an already-resolved card keeps its outcome.
+                side.execute("UPDATE items SET state=CASE WHEN state='resolved' THEN state ELSE 'archived' END, "
+                             "outcome=COALESCE(outcome, 'archived'), resolved_at=COALESCE(resolved_at, ?) "
+                             "WHERE session_id=?", (self.clock(), session_id))
                 side.commit()
             finally:
                 side.close()
                 self._close(db)
             return True
+
+    def act(self, session_id: str, action_id: Optional[str] = None, input: Optional[str] = None
+            ) -> Optional[dict[str, Any]]:
+        """Run one of the card's actions. ``action_id`` None = its first ``prompt`` action (the old
+        Do it). Returns the item plus ``action``/``kind`` and, for prompt actions, the rendered
+        ``prompt`` (also in ``accept_prompt``); None when *session_id* is not an open card.
+        Raises ValueError for an unknown action or bad input."""
+        ct = types_module()
+        with _lock:
+            item = self.get(session_id)
+            if not item or item["state"] != "open":
+                return None
+            if action_id == "archive":
+                self.archive(session_id)
+                return dict(self.get(session_id) or item, action="archive", kind="archive")
+            snap = item_type(item)
+            actions = snap["actions"]
+            if action_id is None:
+                act = next((a for a in actions if a["kind"] == "prompt"), None)
+                if not act:
+                    raise ValueError(f"card type {snap['name']} has no prompt action to accept")
+            else:
+                act = next((a for a in actions if a["id"] == action_id), None)
+                if not act:
+                    raise ValueError(f"card type {snap['name']} has no action {action_id!r} "
+                                     f"(actions: {', '.join([a['id'] for a in actions] + ['archive'])})")
+            spec = act.get("input")
+            value = None if input is None else str(input)
+            if spec is None:
+                value = None
+            else:
+                if spec.get("required", True) and not (value or "").strip():
+                    raise ValueError(f"action {act['id']} needs an input value")
+                mx = spec.get("max") or ct.MAX_FIELD_VALUE
+                if value is not None and len(value) > mx:
+                    raise ValueError(f"input is {len(value)} chars, over the max of {mx}")
+            fields = item_fields(item)
+            if spec and spec.get("field") and value is not None:
+                fields[spec["field"]] = value
+                ct.check_fields(dict(snap, fields=snap.get("fields")), fields)  # re-check max lengths
+            now = self.clock()
+            prompt = None
+            if act["kind"] == "prompt":
+                prompt = ct.render(act["prompt"], dict(fields, input=value or "", key=item.get("key") or "",
+                                                       title=item.get("title") or "",
+                                                       accept_prompt=item.get("accept_prompt") or ""))
+                if len(prompt) > ct.MAX_RENDERED:
+                    raise ValueError(f"rendered prompt is {len(prompt)} chars, over {ct.MAX_RENDERED}")
+            state = "accepted" if prompt is not None else "resolved"
+            side = self._side()
+            try:
+                # Claim the transition first (state='open' guard, atomic across processes), then
+                # touch the session row only if this caller won.
+                won = side.execute("UPDATE items SET state=?, outcome=?, outcome_value=?, fields_json=?, "
+                                   "resolved_at=? WHERE session_id=? AND state='open'",
+                                   (state, act["id"], value, json.dumps(fields), now, session_id)).rowcount == 1
+                side.commit()
+            finally:
+                side.close()
+            if not won:
+                return None
+            db = self._sessions()
+            try:
+                if prompt is not None:
+                    db.set_session_hidden(session_id, False)
+                    item.update(prompt=prompt, accept_prompt=prompt)
+                else:
+                    db.set_session_archived(session_id, True)
+            finally:
+                self._close(db)
+            item.update(state=state, resolved_at=now)
+            item.update(outcome=act["id"], outcome_value=value, fields_json=json.dumps(fields),
+                        action=act["id"], kind=act["kind"])
+            return item
+
+    def outcome(self, key: str) -> Optional[dict[str, Any]]:
+        """What happened to the newest card with *key*: {key, state, outcome, value, fields, at,
+        session_id, type}. state is open / accepted / resolved / archived, derived from the session
+        too (archived from the sidebar = archived). None when no card ever had that key."""
+        if not key or not self.exists():
+            return None
+        side = self._side()
+        try:
+            row = side.execute("SELECT * FROM items WHERE key=? ORDER BY updated_at DESC, created_at DESC, "
+                               "rowid DESC LIMIT 1",
+                               (str(key),)).fetchone()
+        finally:
+            side.close()
+        if not row:
+            return None
+        item = dict(row)
+        state, outcome = item["state"], item.get("outcome")
+        if state in ("open", "accepted"):
+            db = self._sessions()
+            try:
+                s = db.get_session(item["session_id"])
+            finally:
+                self._close(db)
+            if not s or s.get("archived"):  # archived through another door, or the session is gone
+                state, outcome = "archived", outcome or "archived"
+            elif state == "open" and not s.get("hidden"):
+                state = "accepted"
+        elif state == "archived":
+            outcome = outcome or "archived"  # archived before outcomes were recorded
+        return {"key": item["key"], "state": state, "outcome": outcome, "value": item.get("outcome_value"),
+                "fields": item_fields(item), "at": item.get("resolved_at") or item["updated_at"],
+                "session_id": item["session_id"], "type": item.get("type") or "default",
+                "title": item["title"]}
 
     def on_user_turn(self, session_id: str) -> bool:
         """A user turn started in *session_id*: if it is an open message, accept it."""
@@ -318,4 +495,78 @@ def _update_text(body: str, accept_prompt: str, now: float, prompt_label: Option
     if body:
         parts.append(body)
     parts.append(_do_it_line(accept_prompt, prompt_label))
+    return "\n\n".join(parts)
+
+
+# ── typed cards ─────────────────────────────────────────────────────────────
+def item_type(item: dict[str, Any]) -> dict[str, Any]:
+    """The card's type snapshot; legacy rows (no snapshot) are the built-in default type."""
+    raw = item.get("actions_json")
+    if raw:
+        try:
+            snap = json.loads(raw)
+            if isinstance(snap, dict) and isinstance(snap.get("actions"), list):
+                return snap
+        except ValueError:
+            pass
+    ct = types_module()
+    return ct.snapshot(ct.validate(dict(ct.DEFAULT)))
+
+
+def item_fields(item: dict[str, Any]) -> dict[str, str]:
+    try:
+        f = json.loads(item.get("fields_json") or "{}")
+        return f if isinstance(f, dict) else {}
+    except ValueError:
+        return {}
+
+
+def public_item(item: dict[str, Any]) -> dict[str, Any]:
+    """REST/tool view: adds ``type``, ``type_label``, ``fields``, ``actions`` (Archive excluded:
+    every card has it) and ``field_specs``; drops the raw json columns."""
+    out = {k: v for k, v in item.items() if k not in ("fields_json", "actions_json")}
+    snap = item_type(item)
+    out["type"] = item.get("type") or "default"
+    out["type_label"] = snap.get("label") or out["type"]
+    out["fields"] = item_fields(item)
+    out["field_specs"] = snap.get("fields") or {}
+    out["actions"] = snap["actions"]
+    return out
+
+
+def _previews(snap: dict[str, Any], fields: dict[str, str]) -> list[str]:
+    out = []
+    for name, spec in (snap.get("fields") or {}).items():
+        if not spec.get("preview") or name not in fields:
+            continue
+        val = fields[name]
+        quoted = "\n".join("> " + ln if ln else ">" for ln in val.splitlines() or [""])
+        mx = spec.get("max")
+        count = f"{len(val)}/{mx} chars" if mx else f"{len(val)} chars"
+        out.append(f"{quoted}\n\n_{spec.get('label') or name}: {count}_")
+    return out
+
+
+def _actions_line(snap: dict[str, Any], poster: Optional[str]) -> str:
+    labels = [f"**{a['label']}**" for a in snap["actions"]] + ["**Archive**"]
+    return (f"_{snap.get('label') or snap['name']}{f' from {poster}' if poster else ''}. "
+            f"Actions: {', '.join(labels)}._")
+
+
+def _typed_post_text(title: str, body: str, poster: Optional[str], snap: dict[str, Any],
+                     fields: dict[str, str]) -> str:
+    parts = [f"**{title}**"]
+    if body:
+        parts.append(body)
+    parts += _previews(snap, fields)
+    parts.append(_actions_line(snap, poster))
+    return "\n\n".join(parts)
+
+
+def _typed_update_text(body: str, snap: dict[str, Any], fields: dict[str, str], now: float) -> str:
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+    parts = [f"**Update {stamp}**"]
+    if body:
+        parts.append(body)
+    parts += _previews(snap, fields)
     return "\n\n".join(parts)

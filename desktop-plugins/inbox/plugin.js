@@ -13,6 +13,15 @@
  * ⌘⇧A on a message archives it and opens the next message; on the last one it
  * steps to the next session like core's ⌘⇧A (ctx.registerArchiveHotkeyHandler).
  * An empty inbox shows one muted "Nothing to review" row.
+ *
+ * Card types (gateway api 3): an item carries its type's `actions`; the bar
+ * renders them (primary first, Archive last) and runs them via POST …/act
+ * {action, input}. `prompt` actions submit the returned prompt into the chat
+ * (like Do it); `resolve` actions close the card and open the next message.
+ * Actions with `input` open an inline editor (prefilled from input.field,
+ * char counter vs max, Esc cancels, ⌘Enter saves); `confirm` asks first;
+ * `row: true` actions (without input) also show as row-hover buttons. Items
+ * from older gateways (no `actions`) keep Do it / Archive.
  */
 import {
   atom,
@@ -106,6 +115,39 @@ export function nextItemAfter(items, item) {
   return (at >= 0 && items[at + 1]) || rest[0]
 }
 
+const ARCHIVE = { id: 'archive', label: 'Archive', icon: 'archive', kind: 'archive' }
+const LEGACY_DO_IT = { id: 'do_it', label: 'Do it', icon: 'play', style: 'primary', kind: 'accept' }
+
+/** The bar's buttons for an item: the type's actions (primary first), then Archive.
+ *  Items from gateways without card types (no `actions`) get Do it / Archive. */
+export function barActions(item) {
+  const acts = Array.isArray(item && item.actions) ? item.actions.filter(a => a && a.id && a.id !== 'archive') : null
+  if (!acts) return [LEGACY_DO_IT, ARCHIVE]
+  const primary = acts.filter(a => a.style === 'primary')
+  return [...primary, ...acts.filter(a => a.style !== 'primary'), ARCHIVE]
+}
+
+/** Row-hover buttons besides Archive: `row: true` actions that need no input. */
+export function rowActions(item) {
+  return Array.isArray(item && item.actions)
+    ? item.actions.filter(a => a && a.row && a.kind === 'resolve' && !a.input && a.id !== 'archive')
+    : []
+}
+
+/** Initial editor text for an input action: the field it edits, else empty. */
+export function inputDefault(item, action) {
+  const f = action && action.input && action.input.field
+  return f ? str(item && item.fields && item.fields[f]) : ''
+}
+
+/** Length in code points (what the server's len() counts; emoji are 1, not 2). */
+export const charCount = v => [...str(v)].length
+
+export function counterText(value, max) {
+  const n = charCount(value)
+  return max ? `${n}/${max}` : `${n}`
+}
+
 // ── store ───────────────────────────────────────────────────────────────────
 
 const routedGateway = () => {
@@ -196,13 +238,48 @@ export function createStore(ctx) {
       const r = await ctx.rest(itemPath(item, 'accept'), restOpts(item, routedGateway(), { method: 'POST' }))
       const prompt = str((r && r.accept_prompt) || item.accept_prompt)
       $items.set($items.get().filter(i => i !== item))
-      const sent = prompt && host.composer?.submit?.(item.session_id, prompt)
-      if (!sent) {
-        await host.composer?.setDraft?.(item.session_id, prompt)
-        host.notify?.({ kind: 'info', message: 'Proposal placed in the composer — press Enter to run it.' })
-      }
+      await submitPrompt(item, prompt)
     } catch (e) {
       host.notifyError?.(e, 'Could not start inbox proposal')
+    } finally {
+      $busy.set('')
+      void refresh()
+    }
+  }
+
+  const submitPrompt = async (item, prompt) => {
+    if (!prompt) return
+    const sent = prompt && host.composer?.submit?.(item.session_id, prompt)
+    if (!sent) {
+      await host.composer?.setDraft?.(item.session_id, prompt)
+      host.notify?.({ kind: 'info', message: 'Proposal placed in the composer — press Enter to run it.' })
+    }
+  }
+
+  const confirmFn = msg => {
+    const c = typeof globalThis.confirm === 'function' ? globalThis.confirm : null
+    return c ? c(msg) : true
+  }
+
+  // Run one of the item's card-type actions. Returns false when cancelled.
+  const act = async (item, action, input) => {
+    if (!action || action.kind === 'archive') return archive(item).then(() => true)
+    if (action.kind === 'accept') return accept(item).then(() => true)
+    if (action.confirm && !confirmFn(str(action.confirm))) return false
+    const items = $items.get()
+    const next = nextItemAfter(items, item)
+    const wasFocused = host.state.focusedStoredSessionId?.get?.() === item.session_id
+    $busy.set(item.session_id)
+    try {
+      const body = input == null ? { action: action.id } : { action: action.id, input: str(input) }
+      const r = await ctx.rest(itemPath(item, 'act'), restOpts(item, routedGateway(), { method: 'POST', body }))
+      $items.set($items.get().filter(i => i !== item))
+      if (action.kind === 'prompt') await submitPrompt(item, str(r && r.prompt))
+      else if (wasFocused && next) open(next)
+      return true
+    } catch (e) {
+      host.notifyError?.(e, `Could not ${str(action.label || action.id).toLowerCase()} inbox message`)
+      return false
     } finally {
       $busy.set('')
       void refresh()
@@ -230,7 +307,7 @@ export function createStore(ctx) {
     ctx.storage?.set?.('open', v)
   }
 
-  return { $items, $open, $busy, refresh, open, markRead, archive, archiveHotkey, accept, setOpen }
+  return { $items, $open, $busy, refresh, open, markRead, archive, archiveHotkey, accept, act, setOpen }
 }
 
 // ── UI ──────────────────────────────────────────────────────────────────────
@@ -246,6 +323,34 @@ function ArchiveButton({ onClick }) {
       onClick()
     },
     children: jsx('span', { className: 'codicon codicon-archive', style: { fontSize: '0.75rem' }, 'aria-hidden': true })
+  })
+}
+
+function RowActionButton({ action, onClick }) {
+  return jsx('button', {
+    type: 'button',
+    'aria-label': action.label,
+    title: action.label,
+    'data-inbox-action': action.id,
+    className: 'grid size-5 place-items-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+    onClick: e => {
+      e.stopPropagation()
+      onClick()
+    },
+    children: jsx('span', { className: `codicon codicon-${action.icon || 'check'}`, style: { fontSize: '0.75rem' }, 'aria-hidden': true })
+  })
+}
+
+export function RowActions({ store, item }) {
+  const extra = rowActions(item)
+  const archive = jsx(ArchiveButton, { onClick: () => void store.archive(item) })
+  if (!extra.length) return archive
+  return jsxs('span', {
+    className: 'flex items-center gap-0.5',
+    children: [
+      ...extra.map(a => jsx(RowActionButton, { action: a, onClick: () => void store.act(item, a) }, a.id)),
+      archive
+    ]
   })
 }
 
@@ -288,7 +393,7 @@ function Section({ store }) {
           strong: !!item.unread,
           active: focused === item.session_id,
           meta: [ago(item.updated_at), who].filter(Boolean).join(' · '),
-          actions: jsx(ArchiveButton, { onClick: () => void store.archive(item) }),
+          actions: jsx(RowActions, { store, item }),
           onSelect: () => store.open(item)
         },
         `${item.gateway}:${item.session_id}`
@@ -300,13 +405,120 @@ function Section({ store }) {
 const BTN =
   'inline-flex h-6 items-center gap-1 rounded-md border border-(--border) px-2 text-[0.75rem] transition-colors hover:bg-(--chrome-action-hover) disabled:opacity-50'
 
-function Bar({ store }) {
+const ACCENT = { background: 'var(--accent)', color: 'var(--accent-foreground, white)', borderColor: 'var(--accent)' }
+const DANGER = { color: 'var(--destructive, #e5484d)', borderColor: 'var(--destructive, #e5484d)' }
+
+function ActionButton({ action, disabled, title, onClick }) {
+  return jsxs('button', {
+    type: 'button',
+    className: BTN,
+    'data-inbox-action': action.id,
+    style: action.style === 'primary' ? ACCENT : action.style === 'danger' ? DANGER : undefined,
+    disabled,
+    title: title || action.label,
+    onClick,
+    children: [
+      action.icon ? jsx('span', { className: `codicon codicon-${action.icon}`, 'aria-hidden': true }) : null,
+      action.label
+    ]
+  })
+}
+
+/** Inline editor for an action with `input` (controlled; Bar owns the text). */
+export function Editor({ item, action, value, disabled, onChange, onSave, onCancel }) {
+  const spec = action.input || {}
+  const max = spec.max || 0
+  const over = max && charCount(value) > max
+  const empty = spec.required !== false && !str(value).trim()
+  const save = () => {
+    if (!over && !empty && !disabled) onSave(str(value))
+  }
+  const onKeyDown = e => {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      onCancel()
+    } else if (e.key === 'Enter' && !e.isComposing && (e.metaKey || e.ctrlKey || !spec.multiline)) {
+      e.preventDefault()
+      save()
+    }
+  }
+  const field = spec.multiline
+    ? jsx('textarea', {
+        autoFocus: true,
+        rows: 4,
+        value: str(value),
+        placeholder: spec.placeholder || '',
+        'data-slot': 'inbox-editor-input',
+        className: 'w-full resize-y rounded-md border border-(--border) bg-transparent px-2 py-1 text-[0.8125rem] leading-snug outline-none focus:border-(--accent)',
+        onChange: e => onChange(e.target.value),
+        onKeyDown
+      })
+    : jsx('input', {
+        autoFocus: true,
+        type: 'text',
+        value: str(value),
+        placeholder: spec.placeholder || '',
+        'data-slot': 'inbox-editor-input',
+        className: 'h-6 min-w-0 flex-1 rounded-md border border-(--border) bg-transparent px-2 text-[0.8125rem] outline-none focus:border-(--accent)',
+        onChange: e => onChange(e.target.value),
+        onKeyDown
+      })
+  return jsxs('div', {
+    'data-slot': 'inbox-editor',
+    className: 'flex w-full flex-col gap-1 px-2 pb-1.5 pt-1 text-[0.75rem]',
+    children: [
+      jsx('span', { className: 'text-(--ui-text-tertiary)', children: `${action.label}${item.type_label ? ` · ${item.type_label}` : ''}` }),
+      field,
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        children: [
+          jsx('span', {
+            'data-slot': 'inbox-editor-count',
+            className: 'flex-1 tabular-nums',
+            style: { color: over ? 'var(--destructive, #e5484d)' : 'var(--ui-text-tertiary)' },
+            children: counterText(value, max)
+          }),
+          jsx('span', { className: 'text-(--ui-text-tertiary)', children: spec.multiline ? '⌘↵ save · esc cancel' : '↵ save · esc cancel' }),
+          jsx(ActionButton, { action: { id: 'cancel', label: 'Cancel' }, onClick: onCancel }),
+          jsx(ActionButton, {
+            action: { id: 'save', label: 'Save', style: 'primary', icon: 'check' },
+            disabled: disabled || over || empty,
+            onClick: save
+          })
+        ]
+      })
+    ]
+  })
+}
+
+export function Bar({ store }) {
   const items = useValue(store.$items)
   const busy = useValue(store.$busy)
   const focused = useValue(host.state.focusedStoredSessionId)
+  const [editing, setEditing] = useState(null)
   const item = itemFor(items, focused)
   if (!item) return null
   const disabled = busy === item.session_id
+  const edit = editing && editing.sid === item.session_id ? editing : null
+  if (edit) {
+    return jsx(Editor, {
+      item,
+      action: edit.action,
+      value: edit.value,
+      disabled,
+      onChange: value => setEditing({ ...edit, value }),
+      onCancel: () => setEditing(null),
+      onSave: value =>
+        void store.act(item, edit.action, value).then(ok => {
+          if (ok) setEditing(null)
+        })
+    })
+  }
+  const run = action => {
+    if (action.input) setEditing({ sid: item.session_id, action, value: inputDefault(item, action) })
+    else void store.act(item, action)
+  }
+  const label = item.type_label && item.type !== 'default' ? item.type_label : 'Inbox proposal'
   return jsxs('div', {
     'data-slot': 'inbox-bar',
     className: 'flex w-full items-center gap-2 px-2 pb-1.5 pt-1 text-[0.75rem]',
@@ -315,24 +527,17 @@ function Bar({ store }) {
       jsx('span', {
         className: 'min-w-0 flex-1 truncate text-(--ui-text-tertiary)',
         title: item.accept_prompt,
-        children: `Inbox proposal${item.poster ? ` from ${item.poster}` : ''}`
+        children: `${label}${item.poster ? ` from ${item.poster}` : ''}`
       }),
-      jsxs('button', {
-        type: 'button',
-        className: BTN,
-        style: { background: 'var(--accent)', color: 'var(--accent-foreground, white)', borderColor: 'var(--accent)' },
-        disabled,
-        title: item.accept_prompt,
-        onClick: () => void store.accept(item),
-        children: [jsx('span', { className: 'codicon codicon-play', 'aria-hidden': true }), 'Do it']
-      }),
-      jsxs('button', {
-        type: 'button',
-        className: BTN,
-        disabled,
-        onClick: () => void store.archive(item),
-        children: [jsx('span', { className: 'codicon codicon-archive', 'aria-hidden': true }), 'Archive']
-      })
+      ...barActions(item).map(action =>
+        jsx(ActionButton, {
+          action,
+          disabled,
+          // Prompt actions show what they will send (the template), so nothing runs unseen.
+          title: action.kind === 'accept' || action.id === 'do_it' ? item.accept_prompt : action.kind === 'prompt' ? str(action.prompt) || action.label : action.label,
+          onClick: () => run(action)
+        }, action.id)
+      )
     ]
   })
 }
