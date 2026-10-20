@@ -182,3 +182,20 @@ test('xai-oauth status-only row: blocked reads billing (red), ok reads ready, ne
  const [claude]=plugin.summarize({providers:[{slug:'anthropic',usage:{windows:[{label:'Session (5h)',used_percent:100,scope:'account'}]}}]})
  assert.equal(claude.accounts[0].reason,'quota_window')
 })
+
+test('gemini status-only row: rejected key reads "key rejected", never out of quota; valid reads ready', async () => {
+ const {plugin}=await setup()
+ const acct=(id,p)=>({id,label:id,state:p>=100?'limited':'ready',limit_kind:p>=100?'quota':null,selectable:false,windows:[{label:'API key',used_percent:p,scope:'account'}]})
+ const payload={providers:[{slug:'gemini',name:'Gemini',usage:{accounts:[acct('GOOGLE_API_KEY',0),acct('GEMINI_API_KEY',100)]}}]}
+ const [g]=plugin.summarize(payload)
+ assert.equal(g.slug,'gemini'); assert.equal(g.title,'Gemini (AI Studio key)'); assert.equal(g.statusOnly,true)
+ assert.equal(g.ready,1); assert.equal(g.total,2); assert.equal(g.limited,1)
+ assert.equal(plugin.describe(g.accounts[1]),'key rejected')
+ assert.doesNotMatch(plugin.describe(g.accounts[1]),/quota/)
+ assert.equal(plugin.describe(g.accounts[0]),'')
+ // legacy single-gauge shape
+ const [one]=plugin.summarize({providers:[{slug:'gemini',usage:{windows:[{label:'API key',used_percent:100,scope:'account'}]}}]})
+ assert.equal(one.accounts[0].reason,'auth'); assert.equal(plugin.describe(one.accounts[0]),'key rejected')
+ // no gemini row -> no chip
+ assert.equal(plugin.summarize({providers:[]}).length,0)
+})

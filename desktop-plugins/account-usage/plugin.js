@@ -43,7 +43,10 @@ const PROVIDERS = [
   { slug: 'anthropic', name: 'Claude', title: 'Claude Max' },
   { slug: 'openai-codex', name: 'GPT', title: 'ChatGPT (Codex)' },
   // xAI publishes no subscription-usage API; the backend reports API access (team_blocked) only.
-  { slug: 'xai-oauth', name: 'Grok', title: 'Grok (xAI)', statusOnly: true }
+  { slug: 'xai-oauth', name: 'Grok', title: 'Grok (xAI)', statusOnly: true },
+  // Gemini AI Studio API keys: status only (key valid / rejected). A future Gemini subscription
+  // provider gets its own entry here (e.g. slug 'gemini-oauth'), not a change to this one.
+  { slug: 'gemini', name: 'Gemini', title: 'Gemini (AI Studio key)', statusOnly: true, statusOk: 'API key valid · no usage windows (AI Studio has no usage API)', statusBad: 'key rejected', statusBadHint: 'key rejected · check the key at aistudio.google.com/apikey' }
 ]
 
 const COLORS = { ready: '#3fb950', warn: '#d29922', cooldown: '#e3b341', limited: '#f85149', unknown: 'var(--ui-text-tertiary, #888)', unavailable: 'var(--ui-text-tertiary, #888)' }
@@ -86,7 +89,9 @@ export function fmtReset(iso, now = Date.now()) {
 export function describe(account, now = Date.now()) {
   if (!account) return ''
   const parts = []
-  if (account.state === 'limited') {
+  if (account.state === 'limited' && account.status_bad) {
+    parts.push(account.status_bad)
+  } else if (account.state === 'limited') {
     parts.push(account.limit_kind === 'cooldown' ? 'cooling down' : 'out of quota')
     const why = REASONS[account.reason]
     if (why && why !== parts[0]) parts.push(why)
@@ -109,10 +114,12 @@ export function summarize(payload, last = {}, now = Date.now()) {
     if (!accounts && row && row.usage && Array.isArray(row.usage.windows)) {
       const limited = row.usage.windows.some(w => w.scope !== 'model' && Number(w.used_percent) >= 100)
       // Status-only providers (xAI): 100% means "API blocked (no credits)", not a spent quota window.
-      const reason = limited ? (p.statusOnly ? 'billing' : 'quota_window') : null
-      accounts = [{ id: p.slug, selectable: false, label: row.name || p.title, windows: row.usage.windows, state: limited ? 'limited' : 'ready', resets_at: null, limit_kind: limited ? 'quota' : null, reason }]
+      const reason = limited ? (p.statusBad ? 'auth' : p.statusOnly ? 'billing' : 'quota_window') : null
+      accounts = [{ id: p.slug, selectable: false, label: row.name || p.title, windows: row.usage.windows, state: limited ? 'limited' : 'ready', resets_at: null, limit_kind: limited ? 'quota' : null, reason, ...(limited && p.statusBad ? { status_bad: p.statusBad } : {}) }]
     }
     if (!accounts || !accounts.length) return null
+    // Status-only providers with their own wording (Gemini): a rejected key is not "out of quota".
+    if (p.statusBad) accounts = accounts.map(a => (a.state === 'limited' ? { ...a, reason: 'auth', status_bad: p.statusBad } : a))
     const ready = accounts.filter(a => a.state === 'ready').length
     const cooling = accounts.filter(a => tone(a) === 'cooldown').length
     const limited = accounts.filter(a => tone(a) === 'limited').length
@@ -349,7 +356,7 @@ function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
 function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconnectState }) {
   const limited = g.limited, cooling = g.cooling
   const unknown = g.total - g.ready - limited - cooling
-  const parts = [`${g.ready} ready`, limited && `${limited} out of quota`, cooling && `${cooling} cooling down`, unknown && `${unknown} unknown`].filter(Boolean)
+  const parts = [`${g.ready} ready`, limited && `${limited} ${g.statusBad || 'out of quota'}`, cooling && `${cooling} cooling down`, unknown && `${unknown} unknown`].filter(Boolean)
   return jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 7 }, children: [
     jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }, children: [
       jsx('b', { style: { fontSize: 12 }, children: `${g.title} · ${g.total} account${g.total === 1 ? '' : 's'}` }),
@@ -368,7 +375,7 @@ function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconne
         describe(a) ? jsx('span', { className: 'hermes-au-why', 'data-tone': tone(a), style: { display: 'block', fontSize: 10, color: COLORS[tone(a)] || undefined, opacity: 0.9 }, children: describe(a) }) : null] }),
       ...(g.statusOnly
         ? [jsx('span', { style: { gridColumn: 'span 2', fontSize: 10.5, opacity: 0.8 }, children:
-            a.state === 'ready' ? 'API access ok · no usage windows (xAI has no usage API)' : 'API blocked · add credits at console.x.ai' })]
+            a.state === 'ready' && g.statusOk ? g.statusOk : a.state !== 'ready' && g.statusBadHint ? g.statusBadHint : a.state === 'ready' ? 'API access ok · no usage windows (xAI has no usage API)' : 'API blocked · add credits at console.x.ai' })]
         : [jsx(Meter, { win: pickWindow(a.windows, 'session') }), jsx(Meter, { win: pickWindow(a.windows, 'week') })])
     ] }), jsx(ReconnectLine, { g, a, reconnectStore, reconnectState })] }))
   ] })
@@ -400,7 +407,7 @@ function UsageBar({ store, selectionStore, reconnectStore }) {
   return jsxs(Popover, { open, onOpenChange: v => { setOpen(v); if (v) store.refresh() }, children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage', children:
       groups.map(g => jsxs('span', { key: g.slug, style: { display: 'inline-flex', alignItems: 'center', gap: 5, marginRight: 6 },
-        title: `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} out of quota` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
+        title: `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
           jsx('b', { style: { fontWeight: 600 }, children: g.name }),
           jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
           jsx('span', { style: { color: g.ready === 0 ? (!g.limited && g.cooling ? COLORS.cooldown : COLORS.limited) : undefined }, children: `${g.ready}/${g.total}` })

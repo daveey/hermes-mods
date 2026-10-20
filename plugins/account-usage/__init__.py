@@ -213,6 +213,10 @@ def register(ctx):
         _load_sibling("xai_status").install()
     except Exception:
         log.debug("account-usage: xai status fetcher not installed", exc_info=True)
+    try:  # Gemini AI Studio API keys: status-only fetcher (key valid / rejected), fail-open.
+        _load_sibling("gemini_status").install()
+    except Exception:
+        log.debug("account-usage: gemini status fetcher not installed", exc_info=True)
     selection = _load_selection()
     if not hasattr(selection, 'ExecutionIntegration'):
         # The earlier API-only version may already be cached in this gateway.
