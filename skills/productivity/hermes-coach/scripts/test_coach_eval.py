@@ -4,7 +4,7 @@ kind trial):  python3 test_coach_eval.py
 
 Detector tests run on a synthetic labeled set (always) and on the real labeled sets under ~/.hermes/coach when they
 exist (skipped elsewhere). Behavior tests use a fake model runner: no model calls, no cost."""
-import json, os, random, sys, tempfile, time, unittest
+import json, os, random, sys, tempfile, threading, time, unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -132,9 +132,16 @@ class FakeRunner:
 
     def __init__(self, hurt=False, cost=0.01):
         self.hurt, self.cost, self.calls, self.homes = hurt, cost, 0, set()
+        self._lock = threading.Lock()
+
+    def tick(self):
+        # Runs on run_behavior's worker threads: a bare `self.calls += 1` loses increments when the GIL switches
+        # between its read and its write (seen as runner.calls 2-3 != 4 in test_reviewer_cost_1_2_cap_5).
+        with self._lock:
+            self.calls += 1
 
     def __call__(self, prompt, home=None, cwd=None, model=None, toolsets="todo", ignore_rules=False):
-        self.calls += 1
+        self.tick()
         usage = {"estimated_cost_usd": self.cost}
         if ignore_rules:  # judge
             items = []
@@ -339,7 +346,7 @@ class Behavior(unittest.TestCase):
         ep = ce.load_jsonl(self.bench)[0]
         class Bad(FakeRunner):
             def __call__(self, *args, **kwargs):
-                self.calls += 1
+                self.tick()
                 return json.dumps(grades), {"estimated_cost_usd": self.cost}
         for grades in ([{"id": "id", "pass": x, "why": "x"}] for x in (True, "1", 2, -1, None)):
             runner = Bad(cost=1.2)
@@ -405,7 +412,7 @@ class Behavior(unittest.TestCase):
         self.assertEqual(len(ce.load_jsonl(ledger)), 1)
         class Invalid(FakeRunner):
             def __call__(self, *args, **kwargs):
-                self.calls += 1
+                self.tick()
                 return "invalid JSON", {"estimated_cost_usd": self.cost}
         runner = Invalid(cost=1.2)
         ep = ce.load_jsonl(self.bench)[0]
@@ -506,6 +513,7 @@ class Direct(unittest.TestCase):
 
     def test_cap_is_hard_with_concurrency_and_failures_keep_reservation(self):
         from concurrent.futures import ThreadPoolExecutor
+        from decimal import Decimal
         ledger = self.tmp / "spend.jsonl"
         bound = float(self.runner.prepare("x" * 2000, home=self.home, cwd=self.cwd, model="m").bound_usd)
         cap = bound * 3.5
@@ -521,7 +529,13 @@ class Direct(unittest.TestCase):
         self.assertTrue(budget.stopped)
         rows = ce.load_jsonl(ledger)
         self.assertLessEqual(sum(r["usd"] for r in rows), cap + 1e-9)
-        self.assertGreater(sum(1 for r in res if r not in (None, "failed")), 3)  # settlements free headroom
+        # The first 3 reservations always fit. How many of the other 17 land depends on whether a settle beats them,
+        # which is scheduling (a loaded box refuses all 17 while 3 calls are in flight), so it isn't asserted here.
+        self.assertGreaterEqual(sum(1 for r in res if r not in (None, "failed")), 3)
+        # settlements free headroom: once the burst has drained, a further call fits again
+        self.assertLessEqual(budget.reserved + Decimal(str(bound)), Decimal(str(cap)))
+        self.assertIsNotNone(budget.call(self.runner, "x" * 2000, home=self.home, cwd=self.cwd, model="m"))
+        self.assertLessEqual(sum(r["usd"] for r in ce.load_jsonl(ledger)), cap + 1e-9)
         # a failed request keeps its full worst case
         before = budget.spent
         with self.assertRaises(RuntimeError):
