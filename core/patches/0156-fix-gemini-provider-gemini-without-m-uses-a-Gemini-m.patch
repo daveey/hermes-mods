@@ -1,0 +1,273 @@
+From 18a454b0db4520b79d720059cd572cbcc2f3e572 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:35:10 -0700
+Subject: [PATCH] fix(gemini): --provider gemini without -m uses a Gemini
+ model; aux default gemini-3.8-flash [daveey]
+
+--provider X without -m kept the config's model, so a claude-* default went to Gemini and
+404'd on every call. A model that clearly belongs to another vendor on a single-vendor
+provider (gemini, anthropic) now falls back to that provider's default; explicit -m and
+unknown ids are untouched. Gemini's aux default (title generation etc.) and the native
+adapter's default model move to gemini-3.8-flash, the id Google points new keys at
+(gemini-2.5-* 404s 'no longer available to new users').
+---
+ agent/auxiliary_client.py                     |  2 +-
+ agent/gemini_native_adapter.py                |  4 +-
+ hermes_cli/cli_agent_setup_mixin.py           | 18 +++++++
+ hermes_cli/cli_init_mixin.py                  |  6 +++
+ hermes_cli/model_normalize.py                 | 23 +++++++++
+ plugins/model-providers/gemini/__init__.py    |  2 +-
+ tests/agent/test_gemini_aux_default_model.py  | 20 ++++++++
+ .../test_cli_provider_resolution.py           | 49 +++++++++++++++++++
+ tests/hermes_cli/test_model_normalize.py      | 19 +++++++
+ 9 files changed, 139 insertions(+), 4 deletions(-)
+ create mode 100644 tests/agent/test_gemini_aux_default_model.py
+
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index e5ad10047d..a249b9a235 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -815,7 +815,7 @@ def _get_aux_model_for_provider(provider_id: str, *, prefer_fast: bool = False)
+ # Fallback for providers without ProviderProfile.default_aux_model (plus some pinned here).
+ # New providers should set default_aux_model instead.
+ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: dict[str, str] = {
+-    "gemini": "gemini-3.6-flash", "zai": "glm-4.5-flash", "kimi-coding": "kimi-k2-turbo-preview",
++    "gemini": "gemini-3.8-flash", "zai": "glm-4.5-flash", "kimi-coding": "kimi-k2-turbo-preview",
+     "stepfun": "step-3.5-flash", "kimi-coding-cn": "kimi-k2-turbo-preview",
+     "gmi": "google/gemini-3.1-flash-lite-preview", "anthropic": "claude-haiku-4-5-20251001",
+     "ai-gateway": "google/gemini-3-flash", "opencode-zen": "gemini-3-flash", "opencode-go": "glm-5",
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 1fc678700b..14582fd129 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -194,7 +194,7 @@ def gemini_accepts_parameters_json_schema(base_url: str) -> bool:
+ 
+ 
+ def probe_gemini_tier(
+-    api_key: str, base_url: str = DEFAULT_GEMINI_BASE_URL, *, model: str = "gemini-3.7-flash", timeout: float = 10.0
++    api_key: str, base_url: str = DEFAULT_GEMINI_BASE_URL, *, model: str = "gemini-3.8-flash", timeout: float = 10.0
+ ) -> str:
+     """Probe a Google AI Studio key → ``"free"`` | ``"paid"`` | ``"unknown"`` (probe failed; callers proceed without blocking)."""
+     key = (api_key or "").strip()
+@@ -914,7 +914,7 @@ class GeminiNativeClient:
+         return (True, None) if chunk is _END else (False, chunk)
+ 
+     def _create_chat_completion(
+-        self, *, model: str = "gemini-3.7-flash", messages: Optional[list[dict[str, Any]]] = None, stream: bool = False,
++        self, *, model: str = "gemini-3.8-flash", messages: Optional[list[dict[str, Any]]] = None, stream: bool = False,
+         tools: Any = None, tool_choice: Any = None, temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+         top_p: Optional[float] = None, stop: Any = None, response_format: Any = None, extra_body: Optional[dict[str, Any]] = None,
+         timeout: Any = None, **_: Any,
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index f9a74812d7..6ab10e581a 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -327,6 +327,24 @@ class CLIAgentSetupMixin:
+             except Exception:
+                 pass
+ 
++        # [daveey] `--provider gemini` without `-m` must not send the config's claude-* model to Gemini
++        # (404 on every call): a model that clearly belongs to another vendor falls back to the
++        # provider's default. Unknown/ambiguous ids pass through untouched.
++        if getattr(self, "_provider_flag_without_model", False) and resolved_provider and isinstance(self.model, str):
++            try:
++                from hermes_cli.model_normalize import model_conflicts_with_provider
++                if model_conflicts_with_provider(self.model, resolved_provider):
++                    from hermes_cli.models import get_default_model_for_provider
++                    _default = get_default_model_for_provider(resolved_provider)
++                    if _default:
++                        logger.info(
++                            "--provider %s without -m: configured model %s belongs to another vendor; "
++                            "using %s", resolved_provider, self.model, _default)
++                        self.model = _default
++                        self._model_is_default = True
++            except Exception:
++                logger.debug("provider-default model swap failed", exc_info=True)
++
+         # Normalize model for the resolved provider (e.g. swap non-Codex models on openai-codex).
+         # Fixes #651.
+         model_changed = self._normalize_model_for_provider(resolved_provider)
+diff --git a/hermes_cli/cli_init_mixin.py b/hermes_cli/cli_init_mixin.py
+index 254f2e864a..86e03844a9 100644
+--- a/hermes_cli/cli_init_mixin.py
++++ b/hermes_cli/cli_init_mixin.py
+@@ -162,6 +162,7 @@ class CLIInitMixin:
+         # `--provider <custom>` without `-m` uses that entry's default_model, else the global
+         # default goes to the custom endpoint and the compressor gets the wrong context length.
+         # Explicit `-m` still wins. See #86978.
++        _custom_default_applied = False
+         if not model and provider:
+             try:
+                 from hermes_cli.runtime_provider import _get_named_custom_provider
+@@ -177,6 +178,11 @@ class CLIInitMixin:
+             if _provider_default:
+                 self.model = _provider_default
+                 self._model_is_default = False
++                _custom_default_applied = True
++        # [daveey] `--provider X` without `-m` (and no custom default above): the config's model belongs
++        # to the config's provider, so _ensure_runtime_credentials swaps it for X's default when it
++        # clearly belongs to another vendor (claude-* on gemini 404s on every call).
++        self._provider_flag_without_model = bool(provider) and not model and not _custom_default_applied
+         self._provider_source: Optional[str] = None
+         self.provider = self.requested_provider
+         self.api_mode = "chat_completions"
+diff --git a/hermes_cli/model_normalize.py b/hermes_cli/model_normalize.py
+index 395c536ab5..dfbc0a04c6 100644
+--- a/hermes_cli/model_normalize.py
++++ b/hermes_cli/model_normalize.py
+@@ -159,6 +159,29 @@ def detect_vendor(model_name: str) -> Optional[str]:
+     return next((vendor for prefix, vendor in _VENDOR_PREFIXES.items() if name_lower.startswith(prefix)), None)
+ 
+ 
++# [daveey] Direct providers that serve only their own vendor's models. A model whose detected vendor is
++# another one (``claude-opus-5-5`` on ``gemini``) can never work there: the API 404s on every call.
++_SINGLE_VENDOR_PROVIDERS: dict[str, str] = {
++    "gemini": "google",
++    "anthropic": "anthropic"}
++
++
++def model_conflicts_with_provider(model_name: object, provider: str) -> bool:
++    """True only when ``model_name`` clearly belongs to another vendor than single-vendor ``provider``.
++
++    Unknown vendors, aggregators and every other provider return False: this is a "certainly wrong"
++    check (used when ``--provider`` is given without ``-m``), never a guess about an unfamiliar id."""
++    if not isinstance(model_name, str) or not model_name.strip():
++        return False
++    expected = _SINGLE_VENDOR_PROVIDERS.get(_normalize_provider_alias(provider or ""))
++    if not expected:
++        return False
++    vendor = detect_vendor(_strip_matching_provider_prefix(model_name.strip(), provider))
++    # Only vendors from the known table count: ``models/gemini-…`` (Gemini's own resource form) or a
++    # custom ``org/model`` prefix is no evidence of a mismatch.
++    return vendor in set(_VENDOR_PREFIXES.values()) and vendor != expected
++
++
+ def _prepend_vendor(model_name: str) -> str:
+     """Prepend the detected ``vendor/`` for aggregators; names with ``/`` or no detectable vendor
+     pass through (the aggregator may still accept them)."""
+diff --git a/plugins/model-providers/gemini/__init__.py b/plugins/model-providers/gemini/__init__.py
+index aa0c229437..2659e9a20b 100644
+--- a/plugins/model-providers/gemini/__init__.py
++++ b/plugins/model-providers/gemini/__init__.py
+@@ -41,7 +41,7 @@ gemini = GeminiProfile(
+     name="gemini", aliases=("google", "google-gemini", "google-ai-studio"), api_mode="chat_completions",
+     env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+     base_url="https://generativelanguage.googleapis.com/v1beta", auth_type="api_key",
+-    default_aux_model="gemini-3.6-flash",
++    default_aux_model="gemini-3.8-flash",  # [daveey] 3.8 is the id Google points new keys at
+ )
+ 
+ register_provider(gemini)
+diff --git a/tests/agent/test_gemini_aux_default_model.py b/tests/agent/test_gemini_aux_default_model.py
+new file mode 100644
+index 0000000000..98c7625bd0
+--- /dev/null
++++ b/tests/agent/test_gemini_aux_default_model.py
+@@ -0,0 +1,20 @@
++"""[daveey] Gemini's auxiliary default (title generation etc.) must be a model new AI Studio keys can
++use: gemini-2.5-* returns 404 "no longer available to new users"."""
++
++from agent.auxiliary_client import _get_aux_model_for_provider, resolve_provider_client
++from agent.gemini_native_adapter import GeminiNativeClient
++
++
++def test_gemini_aux_default_is_current_flash():
++    assert _get_aux_model_for_provider("gemini") == "gemini-3.8-flash"
++
++
++def test_title_generation_on_gemini_without_model_uses_current_flash(monkeypatch):
++    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
++    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
++    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
++
++    client, model = resolve_provider_client("gemini", None, task="title_generation")
++
++    assert isinstance(client, GeminiNativeClient)
++    assert model == "gemini-3.8-flash"
+diff --git a/tests/hermes_cli/test_cli_provider_resolution.py b/tests/hermes_cli/test_cli_provider_resolution.py
+index 6e197b98b1..98237a4cb1 100644
+--- a/tests/hermes_cli/test_cli_provider_resolution.py
++++ b/tests/hermes_cli/test_cli_provider_resolution.py
+@@ -875,3 +875,52 @@ def test_custom_endpoint_key_env_is_a_valid_posix_name_for_ip_endpoints():
+     for identity in ("127.0.0.1_8080", "0.0.0.0", "10.0.0.7:11434", "", "-–-"):
+         assert _ENV_VAR_NAME_RE.match(custom_endpoint_key_env(identity)), identity
+ 
++
++
++# [daveey] `--provider gemini` without `-m` used to send the config's claude-* model to Gemini (404).
++def _gemini_runtime(**kwargs):
++    return {
++        "provider": "gemini",
++        "api_mode": "chat_completions",
++        "base_url": "https://generativelanguage.googleapis.com/v1beta",
++        "api_key": "test-gemini-key",
++        "source": "env",
++    }
++
++
++def _claude_config(monkeypatch, cli, default="claude-opus-5-5"):
++    monkeypatch.setitem(cli.CLI_CONFIG, "model", {"default": default, "provider": "anthropic"})
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _gemini_runtime)
++
++
++def test_provider_switch_without_model_drops_foreign_vendor_model(monkeypatch):
++    cli = _import_cli()
++    _claude_config(monkeypatch, cli)
++    from hermes_cli.models import get_default_model_for_provider
++
++    shell = cli.HermesCLI(provider="gemini", compact=True, max_turns=1)
++    assert shell._ensure_runtime_credentials() is True
++
++    assert shell.provider == "gemini"
++    assert shell.model == get_default_model_for_provider("gemini") == "gemini-3.8-flash"
++
++
++def test_provider_switch_with_explicit_model_keeps_it(monkeypatch):
++    """An explicit -m is the user's call, even a foreign-vendor one."""
++    cli = _import_cli()
++    _claude_config(monkeypatch, cli)
++
++    for explicit in ("gemini-3.6-flash", "claude-opus-5-5"):
++        shell = cli.HermesCLI(provider="gemini", model=explicit, compact=True, max_turns=1)
++        assert shell._ensure_runtime_credentials() is True
++        assert shell.model == explicit
++
++
++@pytest.mark.parametrize("configured", ["gemini-3.7-flash", "models/gemini-3.7-flash", "my-private-finetune"])
++def test_provider_switch_without_model_keeps_same_vendor_or_unknown_model(monkeypatch, configured):
++    cli = _import_cli()
++    _claude_config(monkeypatch, cli, default=configured)
++
++    shell = cli.HermesCLI(provider="gemini", compact=True, max_turns=1)
++    assert shell._ensure_runtime_credentials() is True
++    assert shell.model == configured
+diff --git a/tests/hermes_cli/test_model_normalize.py b/tests/hermes_cli/test_model_normalize.py
+index 3b368d0ee7..57899704c6 100644
+--- a/tests/hermes_cli/test_model_normalize.py
++++ b/tests/hermes_cli/test_model_normalize.py
+@@ -201,3 +201,22 @@ class TestColonProviderPrefixIsStrippedLikeSlash:
+     ])
+     def test_non_matching_colon_untouched(self, model, provider):
+         assert normalize_model_for_provider(model, provider) == model
++
++
++class TestModelConflictsWithProvider:
++    """[daveey] Only certain cross-vendor mismatches on single-vendor providers count."""
++
++    @pytest.mark.parametrize(("model", "provider"), [
++        ("claude-opus-5-5", "gemini"), ("gpt-5.5", "gemini"), ("anthropic/claude-sonnet-5", "google"),
++        ("gemini-3.8-flash", "anthropic")])
++    def test_conflicts(self, model, provider):
++        from hermes_cli.model_normalize import model_conflicts_with_provider
++        assert model_conflicts_with_provider(model, provider)
++
++    @pytest.mark.parametrize(("model", "provider"), [
++        ("gemini-3.8-flash", "gemini"), ("google/gemini-3.8-flash", "gemini"), ("models/gemini-3.8-flash", "gemini"),
++        ("gemma-4-27b", "gemini"), ("my-finetune", "gemini"), ("", "gemini"), (None, "gemini"),
++        ("claude-opus-5-5", "openrouter"), ("claude-opus-5-5", "custom"), ("claude-opus-5-5", "anthropic")])
++    def test_no_conflict(self, model, provider):
++        from hermes_cli.model_normalize import model_conflicts_with_provider
++        assert not model_conflicts_with_provider(model, provider)
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,6 +1,6 @@
 # Multi-gateway projects (Desktop)
 
-Patches: `0023`, `0024`, `0025`, `0028`, `0029`, `0054`, `0101` in `core/patches/`. All touch `apps/desktop` only.
+Patches: `0023`, `0024`, `0025`, `0028`, `0029`, `0054`, `0101`, `0149`, `0150` in `core/patches/`. All touch `apps/desktop` only.
 
 If the connections registry has more than one gateway (for example a laptop plus a `mac-mini`),
 the Desktop sidebar already lists sessions from all of them. Upstream, though, the actions on
@@ -19,6 +19,8 @@ each action runs on the gateway that owns the session.
 | 0029 | fix | A gateway-qualified `@session` ref is never parsed as a profile name |
 | 0054 | fix | Clicking a `@session` ref opens it on the gateway that owns the session, not the active one |
 | 0101 | fix | Active-gateway session placement wins over remote copies; emptied remote projects disappear |
+| 0149 | fix | The overview reads each remote's all-profiles tree, not only its default profile |
+| 0150 | fix | This device's rows are never resumed on a selected remote gateway |
 
 Terms:
 - **owning gateway**: the registry connection a session row came from (`session.connection_id`).
@@ -150,6 +152,27 @@ The `SessionView` context moved to the store-free `app/chat/session-view-context
 chips can then read their enclosing chat without importing the session store graph, which broke
 other tests' `vi.mock('@/store/session-states')`.
 
+### 0149: every remote profile's projects, not just `default`
+The overview folded in only each remote's default-profile `projects.tree`. A gateway whose sessions live in
+other profiles (a cloud gateway running several named profiles, a second Mac with per-app profiles) showed
+nothing from the laptop.
+- `refreshRemoteProjectTree` now goes through `fetchRemoteProjectTree`, which calls the remote's REST
+  `GET /api/profiles/projects/tree?preview_limit=…` (the all-profiles tree) via `hermesApi({ connectionId })`. Every row carries its own `profile`, and with the connection
+  stamp a click resumes on (connection, profile).
+- Any error from that call (an older gateway without the route) falls back to the single-profile
+  `projects.tree` RPC, as before.
+
+### 0150: This device's chats never resume on a selected remote
+With a remote registry gateway selected, the unified session list's base is still the primary's own aggregate,
+returned with bare rows. The renderer stamped them with the selected remote, so opening a local chat sent
+`session.resume` to the remote, which created empty ghost rows there. The project overview had the same hole:
+This device's tree, folded in as a remote tree, stayed bare because the stamper skips `local`.
+- Electron main tags the primary base rows of a registry-pinned aggregate with the primary id
+  (`primaryRowsOwnerTag` in `electron/profile-session-routing.ts`); rows that already name an owner keep it.
+  Requests not pinned to another gateway leave rows bare (unchanged).
+- `mergeGatewayProjectTrees` stamps `local` explicitly on This device's rows when they arrive as another
+  gateway's tree.
+
 ## How it works
 
 No RPC contract or Python changes. Everything is renderer state plus one Electron-main guard. The
@@ -184,6 +207,10 @@ backend methods used all exist upstream in `tui_gateway/`: `projects.tree`, `pro
   `moveToProjectTargets` accepts `gw:` lanes.
 - **0023**: `setSessionArchived` in `src/api/sessions.ts` accepts an object owner. The callers in
   `src/app/session/hooks/use-session-actions/index.ts` build that owner from the row.
+- **0149** (`src/store/projects.ts`): `fetchRemoteProjectTree` → REST all-profiles tree on the connection,
+  falling back to `requestGatewayForAgent(..., 'projects.tree', ...)` on any error.
+- **0150**: `electron/profile-session-routing.ts` (`primaryRowsOwnerTag`), `electron/main.ts` (applies it to the
+  pinned aggregate), `src/store/gateway-project-merge.ts` (explicit `local` stamp).
 - **0029**: `src/lib/session-refs.ts` (parser), `electron/main.ts` (`ensureRegistryBackend`
   guard and pool-key skip), `src/store/session.ts` (owner hints), `src/store/session-states.ts`
   (persisted tile owner routes).
@@ -426,6 +453,8 @@ New or changed vitest files, all under `apps/desktop/src/`:
 | 0029 | `lib/session-refs.test.ts`, `store/session-owner-hint-qualified.test.ts` (new) |
 | 0054 | `app/chat/session-ref-owner.test.ts` (new), `app/open-session.test.ts` |
 | 0101 | `store/gateway-project-merge.test.ts` |
+| 0149 | `store/projects-remote-profiles.test.ts` (new): reads each remote's all-profiles tree keeping every row's profile + connection; falls back to `projects.tree` when the remote lacks the REST tree |
+| 0150 | `electron/profile-session-routing.test.ts` (pinned aggregate tags primary rows, keeps explicit owners; unpinned rows stay bare), `app/session/hooks/use-session-actions.owner-gateway.test.tsx` (a local row opened while a remote is selected resumes ONLY on local), `store/gateway-project-merge.test.ts` (This device's rows stamped `local` in another gateway's tree) |
 
 `0101` adds “drops a remote copy of a session the active gateway already places (no duplicate row)”
 and “drops a remote-only project whose every row the active gateway already has”. The first
@@ -465,6 +494,7 @@ The full series through `0105` applied cleanly; no isolated apply check is claim
 
 Dependency landmarks (not a validated minimal subset): `0025` uses `0024`'s remote-tree state,
 `0028` rewrites `0025`'s move behavior, and `0054` uses `0029`'s parsed gateway qualifier.
+`0149` and `0150` change `0024`'s remote-tree fetch and merge; apply them after it.
 `0004` and `0018` also modify the project-move code, while `0031` supplies `0024`'s translations.
 
 To re-implement on a newer upstream instead, work from the Code section. It relies only on these
@@ -498,6 +528,9 @@ upstream pieces:
   gateways merge into one lane, and a move reuses the same-named project on the destination.
 - **No code is copied.** A cross-gateway move creates the folder empty; it never clones or syncs.
   If you want the code on the other machine, clone it there yourself.
+- **All-profiles trees can be large.** Since `0149` every profile on a remote shows up, including profiles
+  that only serve machine traffic; such a profile hides itself with `sessions.sidebar_exclude_sources`
+  ([sidebar-exclude-sources.md](sidebar-exclude-sources.md), `0154`).
 - **Remote trees are snapshots** up to 30 s old. A move expires the target gateway's cache right
   away. Other changes show up on the next throttled fetch.
 - **Remote-only lanes have no local path.** Open-folder, theming and cwd actions don't apply to

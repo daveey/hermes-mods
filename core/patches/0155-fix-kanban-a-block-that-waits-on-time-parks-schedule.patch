@@ -1,0 +1,706 @@
+From 3d6d22167823f30419140f058cdaed49b3f7bdd0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:09:08 -0700
+Subject: [PATCH] fix(kanban): a block that waits on time parks scheduled with
+ a wake, not as a human block [daveey]
+
+Goal-mode cards may not call kanban_schedule, so workers waiting on a clock
+(a nightly run, a soak, a release) used kanban_block(kind=dependency).
+With no open parent the kernel re-kinded that to needs_input, the card sat
+in blocked, and the Desktop sidebar painted its chat red as needing a human.
+
+- block_task: kind='time' (new), a parent-less dependency, or a reason with
+  SCHEDULED_UNTIL=<ISO8601> parks the card 'scheduled' with a wake time on
+  its scheduled event (default 24h, clamp 14d) via hermes_cli/kanban_timed_park.
+  A parent-less dependency behind a shared blocker_id keeps the sticky
+  needs_input rekind.
+- wake_due_continuations honours scheduled events that carry wake_at, so a
+  kanban_schedule SCHEDULED_UNTIL marker is now a real timer.
+- Sidebar counts (kanban_session_activity): kanban_blocked counts only
+  human blocks (needs_input/capability/untyped); transient/time blocks count
+  as in-progress work.
+- kanban_block schema + KANBAN_GUIDANCE name kind='time' for goal-mode cards.
+---
+ agent/prompt_builder.py                      |   5 +-
+ hermes_cli/kanban_continuation.py            |   5 +-
+ hermes_cli/kanban_db.py                      |  35 +++--
+ hermes_cli/kanban_session_activity.py        |  33 +++-
+ hermes_cli/kanban_timed_park.py              |  93 ++++++++++++
+ tests/agent/test_system_prompt.py            |   7 +-
+ tests/hermes_cli/test_kanban_block_kinds.py  |  35 ++---
+ tests/hermes_cli/test_kanban_continuation.py |   6 +-
+ tests/hermes_cli/test_kanban_timed_park.py   | 149 +++++++++++++++++++
+ tests/tools/test_kanban_tools.py             |  14 +-
+ tools/kanban_tools.py                        |  16 +-
+ tools/kanban_tools_schemas.py                |  19 ++-
+ 12 files changed, 343 insertions(+), 74 deletions(-)
+ create mode 100644 hermes_cli/kanban_timed_park.py
+ create mode 100644 tests/hermes_cli/test_kanban_timed_park.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 1869f67428..44df54887b 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -292,8 +292,9 @@ KANBAN_GUIDANCE = (
+     "paywalled source, peer output you need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. The "
+     "user will unblock with context and the dispatcher will respawn you "
+     "Waiting on time is not a block: when the next step must wait for a clock or an external event (a run cap, a soak, "
+-    "a release window), call `kanban_schedule(reason=\"SCHEDULED_UNTIL=<ISO8601> — what you're waiting for\")` and "
+-    "say what wakes the card. A blocked card marks its chat red as needing a human. When the wall is outside "
++    "a release window), call `kanban_schedule(reason=\"SCHEDULED_UNTIL=<ISO8601> — what you're waiting for\")` "
++    "(goal-mode cards: `kanban_block(kind=\"time\", reason=\"SCHEDULED_UNTIL=…\")`); the card wakes at that time; "
++    "say what else wakes the card. A blocked card marks its chat red as needing a human. When the wall is outside "
+     "your card and would stop other cards too (CI billing/quota refused, a service outage), also pass "
+     "`blocker_id=\"<short-slug>\"` to `kanban_block`/`kanban_continue`, reusing an id from \"Open shared "
+     "blockers\" in your context: the dispatcher then probes that wall with one card instead of every card.\n"
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 4a7391e568..6d3bc20b38 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -168,10 +168,11 @@ OVERDUE_WAKE_GRACE_SECONDS = 600
+ 
+ 
+ def pending_wake_payload(kind: Optional[str], payload: Any) -> Optional[dict]:
+-    """The ``continued`` payload when the event that parked the card is a timed wait, else None."""
++    """The parking payload when the event that parked the card is a timed wait, else None: a
++    ``continued`` wait, or a ``scheduled`` timed park from ``kanban_timed_park``. [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
+-    if kind != CONTINUED_OUTCOME:
++    if kind not in SCHEDULED_ENTRY_EVENTS:
+         return None
+     data = payload if isinstance(payload, dict) else kb._json_dict(payload)
+     return data if isinstance(data.get("wake_at"), (int, float)) else None
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 924b51a835..2be318866b 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -108,7 +108,7 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
+ VALID_INITIAL_STATUSES = {"running", "blocked"}
+ 
+ # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
+-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
++VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "time"}
+ 
+ # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+ # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
+@@ -3161,15 +3161,12 @@ def block_task(
+     blocker_id: Optional[str] = None,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
+-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
+-    promote it into a context-free respawn. ``transient`` still counts
+-    toward the loop breaker so a forever-flaky task escalates. True on any
+-    transition.
+-
+-    ``blocker_id`` names a shared external blocker (``kanban_shared_blockers``):
+-    it is stored on the closed run's metadata and the event payload, so other
+-    cards stopped by the same wall are held behind one probe. [daveey]
++    :func:`_route_block`). A wait on time -- ``kind='time'``, a ``dependency``
++    with no open parent, or a ``SCHEDULED_UNTIL=`` reason -- parks ``scheduled``
++    with a wake time instead (``kanban_timed_park``). ``transient`` still counts
++    toward the loop breaker. True on any transition. ``blocker_id`` names a
++    shared external blocker (``kanban_shared_blockers``), stored on the closed
++    run's metadata and the event payload. [daveey]
+ 
+     An already-``blocked`` card that the failure breaker parked UNTYPED
+     (``block_kind IS NULL``, no live run) is classified in place when *kind*
+@@ -3209,13 +3206,14 @@ def block_task(
+             })
+             return True
+         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+-        requested_kind = kind
+-        rekind_reason = None
+-        # ``dependency`` only waits on incomplete parents. A worker filing that
+-        # kind with none open would park in ``todo`` and ``recompute_ready``
+-        # would promote+respawn it context-free on the next tick. Re-kind to
+-        # ``needs_input`` so it is sticky until a human unblocks.
+-        if kind == "dependency" and _parents_satisfied(conn, task_id):
++        requested_kind, rekind_reason = kind, None
++        no_open_parent = _parents_satisfied(conn, task_id)
++        from hermes_cli import kanban_timed_park as ktp
++        if not blocker_id and ktp.is_timed_park(kind, reason, parents_satisfied=no_open_parent):
++            return ktp.park(conn, task_id, reason=reason, requested_kind=kind,
++                            source_status=source_status, expected_run_id=expected_run_id)
++        # Parent-less ``dependency`` behind a shared blocker: sticky ``needs_input`` (todo would respawn it).
++        if kind == "dependency" and no_open_parent:
+             kind = "needs_input"
+             rekind_reason = "no_open_parent"
+         new_status, event_kind, set_sql, params, payload = _route_block(
+@@ -4057,7 +4055,8 @@ def schedule_task(
+         run_id = _end_or_synthesize_run(
+             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+         )
+-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
++        from hermes_cli.kanban_timed_park import scheduled_payload  # SCHEDULED_UNTIL= wakes it [daveey]
++        _append_event(conn, task_id, "scheduled", scheduled_payload(reason), run_id=run_id)
+         return True
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index c71ffa304c..88dcdb38d0 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -28,8 +28,13 @@ _log = logging.getLogger(__name__)
+ # creating session busy.
+ ACTIVE_STATUSES = ("todo", "ready", "running", "scheduled")
+ # Waiting on a human. These don't keep the session busy, but the sidebar row
+-# shows how many there are next to the open count (``kanban_blocked``). [daveey]
++# shows how many there are next to the open count (``kanban_blocked``) and the
++# row paints red. [daveey]
+ BLOCKED_STATUSES = ("blocked",)
++# A ``blocked`` card only waits on a human for these kinds (NULL = generic human
++# blocker). A ``transient``/``time`` block waits on a retry or a clock, so it
++# counts as in-progress work instead, like ``scheduled``. [daveey]
++HUMAN_BLOCK_KINDS = ("needs_input", "capability")
+ 
+ _CACHE_TTL_S = 3.0
+ _cache_lock = threading.Lock()
+@@ -53,27 +58,41 @@ def _board_db_paths() -> list[Path]:
+     return paths
+ 
+ 
++def _status_filter(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> tuple[str, tuple]:
++    """SQL predicate on ``t`` for "in ``statuses``", splitting ``blocked`` by its kind:
++    the human set (``BLOCKED_STATUSES``) keeps only human-kind blocks, the active set
++    gains the ``transient``/``time`` ones. A board without ``block_kind`` is unchanged."""
++    ph = ",".join("?" for _ in statuses)
++    if not {r[1] for r in conn.execute("PRAGMA table_info(tasks)")} >= {"block_kind"}:
++        return f"t.status IN ({ph})", statuses
++    kinds = ",".join("?" for _ in HUMAN_BLOCK_KINDS)
++    human = f"(t.block_kind IS NULL OR t.block_kind IN ({kinds}))"
++    if statuses == BLOCKED_STATUSES:
++        return f"(t.status = 'blocked' AND {human})", HUMAN_BLOCK_KINDS
++    return f"(t.status IN ({ph}) OR (t.status = 'blocked' AND NOT {human}))", (*statuses, *HUMAN_BLOCK_KINDS)
++
++
+ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dict[str, int]:
+     """Tasks per session in ``statuses``: tasks the session created, plus tasks
+     it is a ``tui`` notify subscriber of (a session asked to shepherd someone
+     else's card subscribes to it, and is just as "still working" until it
+     lands). Each (session, task) pair counts once."""
+-    placeholders = ",".join("?" for _ in statuses)
+     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+     try:
++        match, params = _status_filter(conn, statuses)
+         pairs: set[tuple[str, str]] = {
+             (str(sid), str(tid)) for sid, tid in conn.execute(
+-                f"SELECT session_id, id FROM tasks WHERE session_id IS NOT NULL "
+-                f"AND session_id != '' AND status IN ({placeholders})",
+-                statuses,
++                f"SELECT session_id, id FROM tasks t WHERE session_id IS NOT NULL "
++                f"AND session_id != '' AND {match}",
++                params,
+             )
+         }
+         try:
+             pairs.update(
+                 (str(sid), str(tid)) for sid, tid in conn.execute(
+                     f"SELECT s.chat_id, t.id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+-                    f"WHERE s.platform = 'tui' AND s.chat_id != '' AND t.status IN ({placeholders})",
+-                    statuses,
++                    f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {match}",
++                    params,
+                 )
+             )
+         except sqlite3.Error:  # board predates notify subscriptions
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+new file mode 100644
+index 0000000000..f51c2bab53
+--- /dev/null
++++ b/hermes_cli/kanban_timed_park.py
+@@ -0,0 +1,93 @@
++"""Timed parks: a block that waits on a clock or an outside event, not a person.
++
++Workers park cards that wait on time (a soak, a nightly run, a release window, a
++cron that re-checks) with ``kanban_block``, because goal-mode cards may not call
++``kanban_schedule``. ``block_task`` used to re-kind a parent-less ``dependency``
++wait to ``needs_input``, so the card sat in ``blocked`` and the Desktop sidebar
++painted its chat red as "needs a human" although nobody had anything to do.
++
++``block_task`` now routes such a wait here instead: the card lands in
++``scheduled`` (not dispatchable, counted as in-progress, never red) with a wake
++time on its ``scheduled`` event, which ``wake_due_continuations`` honours like a
++``kanban_continue`` wait. A ``hermes kanban unblock`` (a wake cron) still wakes it
++earlier. A timed park is one of:
++
++* ``kind='time'``;
++* ``kind='dependency'`` with no open parent (the wait is on something off the board);
++* any kind whose reason carries ``SCHEDULED_UNTIL=<ISO8601>``.
++
++Without an explicit time the card wakes after ``DEFAULT_WAKE_SECONDS`` so a park
++can never sit forgotten: the next run re-checks and parks again. [daveey]
++"""
++from __future__ import annotations
++
++import re
++import sqlite3
++import time
++from datetime import datetime
++from typing import Optional
++
++TIME_KIND = "time"
++DEFAULT_WAKE_SECONDS = 24 * 3600
++# An explicit SCHEDULED_UNTIL may park longer than a continuation wait, but not forever.
++MAX_WAKE_SECONDS = 14 * 24 * 3600
++MIN_WAKE_SECONDS = 60
++_MARKER = re.compile(r"SCHEDULED_UNTIL=(\S+)")
++
++
++def scheduled_until(reason: Optional[str], *, now: Optional[int] = None) -> Optional[int]:
++    """Epoch seconds named by a ``SCHEDULED_UNTIL=<ISO8601>`` marker, clamped to
++    ``[now + MIN_WAKE_SECONDS, now + MAX_WAKE_SECONDS]``; None when absent or unparseable.
++    A naive timestamp is local time."""
++    match = _MARKER.search(reason or "")
++    if not match:
++        return None
++    raw = match.group(1).rstrip(".,;:)]}'\"")
++    try:
++        when = datetime.fromisoformat(raw)
++    except ValueError:
++        return None
++    now = int(time.time()) if now is None else int(now)
++    epoch = int(when.timestamp())
++    return max(now + MIN_WAKE_SECONDS, min(epoch, now + MAX_WAKE_SECONDS))
++
++
++def scheduled_payload(reason: Optional[str]) -> dict:
++    """``scheduled`` event payload for ``kanban_schedule``: a ``SCHEDULED_UNTIL=`` marker is a
++    real timer (``wake_due_continuations``); without one the card waits for a cron/human."""
++    wake_at = scheduled_until(reason)
++    return {"reason": reason, "wake_at": wake_at} if wake_at else {"reason": reason}
++
++
++def is_timed_park(kind: Optional[str], reason: Optional[str], *, parents_satisfied: bool) -> bool:
++    """Whether a ``block_task`` call is really a wait on time, not on a human."""
++    if kind == TIME_KIND or (kind == "dependency" and parents_satisfied):
++        return True
++    return _MARKER.search(reason or "") is not None
++
++
++def park(
++    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str], requested_kind: Optional[str],
++    source_status: str = "ready", expected_run_id: Optional[int] = None,
++) -> bool:
++    """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn."""
++    from hermes_cli import kanban_db as kb
++
++    now = int(time.time())
++    wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
++    sql = ("UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
++           "worker_pid = NULL WHERE id = ? AND status IN ('running', 'ready')")
++    params: tuple = (task_id,)
++    if expected_run_id is not None:
++        sql += " AND current_run_id = ?"
++        params = (task_id, int(expected_run_id))
++    if conn.execute(sql, params).rowcount != 1:
++        return False
++    run_id = kb._end_or_synthesize_run(
++        conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
++    )
++    kb._append_event(conn, task_id, "scheduled", {
++        "reason": reason, "timed_park": True, "requested_kind": requested_kind,
++        "wake_at": wake_at, "resume_status": source_status,
++    }, run_id=run_id)
++    return True
+diff --git a/tests/agent/test_system_prompt.py b/tests/agent/test_system_prompt.py
+index 0704a505cf..e7c660d1e4 100644
+--- a/tests/agent/test_system_prompt.py
++++ b/tests/agent/test_system_prompt.py
+@@ -960,10 +960,13 @@ class TestConversationStartedTwoLine:
+ 
+ def test_kanban_guidance_routes_timed_waits_to_schedule_not_block():
+     """A worker waiting on a clock (a cap, a soak, a release window) must park
+-    with kanban_schedule: a blocked card paints its chat red as needing a human. [daveey]"""
++    with kanban_schedule, or kanban_block(kind='time') on a goal-mode card: a blocked
++    card paints its chat red as needing a human. [daveey]"""
+     from agent.prompt_builder import KANBAN_GUIDANCE
+     from tools.kanban_tools_schemas import KANBAN_BLOCK_SCHEMA
+ 
+     assert "kanban_schedule(" in KANBAN_GUIDANCE
+     assert "SCHEDULED_UNTIL=" in KANBAN_GUIDANCE
+-    assert "kanban_schedule" in KANBAN_BLOCK_SCHEMA["description"]
++    assert 'kind=\\"time\\"' in repr(KANBAN_GUIDANCE) or 'kind="time"' in KANBAN_GUIDANCE
++    assert "time" in KANBAN_BLOCK_SCHEMA["parameters"]["properties"]["kind"]["enum"]
++    assert "kind='time'" in KANBAN_BLOCK_SCHEMA["description"]
+diff --git a/tests/hermes_cli/test_kanban_block_kinds.py b/tests/hermes_cli/test_kanban_block_kinds.py
+index 66cd7579cf..b8423ff1c8 100644
+--- a/tests/hermes_cli/test_kanban_block_kinds.py
++++ b/tests/hermes_cli/test_kanban_block_kinds.py
+@@ -7,8 +7,8 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
+ 
+ * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
+   never enter the human ``blocked`` bucket a cron would keep unblocking —
+-  unless no parent is open, in which case the wait can never be satisfied
+-  and the block is recorded as ``needs_input`` (sticky, loop-counted).
++  with no open parent the wait is on something off the board, so it is a
++  timed park (``scheduled`` with a wake time, ``kanban_timed_park``).
+ * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
+   each same-cause re-block after an unblock increments ``block_recurrences``,
+   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+@@ -113,14 +113,13 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
+         assert kb.get_task(conn, child).status == "ready"
+ 
+ 
+-def test_dependency_block_with_terminal_parents_parks_then_escalates(
++def test_dependency_block_with_terminal_parents_is_a_timed_park(
+     kanban_home: Path, capsys: pytest.CaptureFixture[str],
+ ) -> None:
+-    """A ``dependency`` block whose parents are all terminal can never be
+-    satisfied by ``recompute_ready``: it must park in ``blocked`` as
+-    ``needs_input`` (no ``dependency_wait``, no re-promotion), say so on the
+-    CLI, and count toward the loop breaker so a re-block after an unblock
+-    reaches ``triage``."""
++    """A ``dependency`` block whose parents are all terminal waits on something off
++    the board (a nightly run, a release), not on a human: it parks ``scheduled`` with
++    a wake time -- no ``dependency_wait``, no ``blocked`` bucket, no re-promotion by
++    ``recompute_ready`` -- and a cron/human unblock still wakes it. [daveey]"""
+     with kbc.connect_closing() as conn:
+         parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
+         with kb.write_txn(conn):
+@@ -131,23 +130,17 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
+         # `hermes kanban block <child> --kind dependency waiting on upstream`
+         args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"], kind="dependency")
+         assert kanban_cli._cmd_block(args) == 0
+-        assert "needs_input" in capsys.readouterr().out
++        capsys.readouterr()
+         parked = kb.get_task(conn, child)
+-        assert (parked.status, parked.block_kind, parked.block_recurrences) == ("blocked", "needs_input", 1)
++        assert (parked.status, parked.block_kind) == ("scheduled", None)
+         events = kb.list_events(conn, child)
+-        assert not [e for e in events if e.kind == "dependency_wait"]
+-        blocked = [e for e in events if e.kind == "blocked"][-1].payload
+-        assert (blocked["requested_kind"], blocked["rekind_reason"]) == ("dependency", "no_open_parent")
++        assert not [e for e in events if e.kind in ("dependency_wait", "blocked")]
++        park = [e for e in events if e.kind == "scheduled"][-1].payload
++        assert park["timed_park"] and park["requested_kind"] == "dependency" and park["wake_at"]
+         assert kb.recompute_ready(conn) == 0
+-        assert kb.get_task(conn, child).status == "blocked"
+-
+-        # A cron/human unblocks; the worker re-declares the same impossible wait.
++        assert kb.get_task(conn, child).status == "scheduled"
+         assert kb.unblock_task(conn, child)
+-        assert kb.claim_task(conn, child, claimer="worker") is not None
+-        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
+-        assert kb.get_task(conn, child).status == "triage"
+-        loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
+-        assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
++        assert kb.get_task(conn, child).status == "ready"
+ 
+ 
+ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
+diff --git a/tests/hermes_cli/test_kanban_continuation.py b/tests/hermes_cli/test_kanban_continuation.py
+index e1f23da6e6..e3f9f09824 100644
+--- a/tests/hermes_cli/test_kanban_continuation.py
++++ b/tests/hermes_cli/test_kanban_continuation.py
+@@ -203,10 +203,10 @@ def test_wait_handoff_wakes_on_dispatcher_tick(home, monkeypatch):
+         task = kb.get_task(conn, tid)
+         assert (task.status, task.consecutive_failures) == ("ready", 0)
+         assert "waiting for CI run 9" in kb.build_worker_context(conn, tid)
+-        # A plain kanban_schedule park is never auto-woken.
++        # A kanban_schedule park without a SCHEDULED_UNTIL marker is never auto-woken.
+         tid2 = kb.create_task(conn, title="parked", assignee="default")
+         kb.claim_task(conn, tid2)
+-        kb.schedule_task(conn, tid2, reason="SCHEDULED_UNTIL=2030-01-01")
++        kb.schedule_task(conn, tid2, reason="waiting on the cron that unblocks it")
+         assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == []
+ 
+ 
+@@ -241,7 +241,7 @@ def test_kanban_schedule_after_wait_and_comment_still_stays_put(home, monkeypatc
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="parked", assignee="default")
+         kb.claim_task(conn, tid)
+-        kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2030-01-01")
++        kb.schedule_task(conn, tid, reason="waiting on the cron that unblocks it")
+         kb.add_comment(conn, tid, "t_other", "FYI")
+         assert kc.pending_wake(conn, tid) is None
+         assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == []
+diff --git a/tests/hermes_cli/test_kanban_timed_park.py b/tests/hermes_cli/test_kanban_timed_park.py
+new file mode 100644
+index 0000000000..0fee76542c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_timed_park.py
+@@ -0,0 +1,149 @@
++"""Timed parks: a block that waits on a clock is ``scheduled``, never a human block.
++
++Regression for cards that parked on a timer with ``kanban_block`` (goal-mode cards
++may not ``kanban_schedule``): a parent-less ``dependency`` was re-kinded to
++``needs_input``, so the Desktop sidebar painted the chat red. [daveey]
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from datetime import UTC, datetime
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_timed_park as ktp
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    ksa._reset_cache_for_tests()
++    yield home
++    ksa._reset_cache_for_tests()
++
++
++def _running(conn, session_id: str | None = None) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready', session_id=? WHERE id=?", (session_id, tid))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return tid
++
++
++def _last(conn, tid, kind):
++    return [e for e in kb.list_events(conn, tid) if e.kind == kind][-1].payload
++
++
++def test_parentless_dependency_block_parks_scheduled_not_needs_input(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        before = int(time.time())
++        assert kb.block_task(conn, tid, reason="waiting for tonight's 04:30 run; cron wakes it", kind="dependency")
++        task = kb.get_task(conn, tid)
++        assert task.status == "scheduled"
++        assert task.block_kind is None
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
++        park = _last(conn, tid, "scheduled")
++        assert park["timed_park"] and park["requested_kind"] == "dependency"
++        assert before + ktp.DEFAULT_WAKE_SECONDS <= park["wake_at"] <= int(time.time()) + ktp.DEFAULT_WAKE_SECONDS
++        assert kb.latest_run(conn, tid).outcome == "scheduled"
++
++
++def test_scheduled_until_marker_sets_the_wake_and_the_dispatcher_wakes_it(kanban_home: Path) -> None:
++    wake = int(time.time()) + 3 * 3600
++    stamp = datetime.fromtimestamp(wake, tz=UTC).isoformat().replace("+00:00", "Z")
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.block_task(conn, tid, reason=f"SCHEDULED_UNTIL={stamp} — soak ends", kind="needs_input")
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert _last(conn, tid, "scheduled")["wake_at"] == wake
++        assert kc.wake_due_continuations(conn, now=wake - 1) == []
++        assert kc.wake_due_continuations(conn, now=wake) == [tid]
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_time_kind_parks_and_unblock_still_wakes_early(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.block_task(conn, tid, reason="re-check after the nightly index", kind="time")
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert kb.unblock_task(conn, tid)
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_kanban_schedule_marker_becomes_a_real_timer(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2000-01-01T00:00:00Z")
++        due = _last(conn, tid, "scheduled")["wake_at"]
++        assert kc.wake_due_continuations(conn, now=due) == [tid]
++        # No marker -> no timer (left for a cron/human, as before).
++        tid2 = _running(conn)
++        assert kb.schedule_task(conn, tid2, reason="waiting on Rose")
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10**7) == []
++
++
++def test_needs_input_without_marker_still_blocks_for_a_human(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.block_task(conn, tid, reason="1) tap Approve on the iPhone", kind="needs_input")
++        assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).block_kind) == ("blocked", "needs_input")
++
++
++def test_shared_blocker_dependency_keeps_sticky_needs_input(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.block_task(conn, tid, reason="CI billing", kind="dependency", blocker_id="gh-billing")
++        assert kb.get_task(conn, tid).block_kind == "needs_input"
++
++
++def test_kanban_block_tool_time_kind_on_goal_mode_card(kanban_home: Path, monkeypatch) -> None:
++    from tools import kanban_tools as kt
++
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (tid,))
++        run_id = kb.get_task(conn, tid).current_run_id
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    out = json.loads(kt._handle_block({"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z nightly run", "kind": "time"}))
++    assert out.get("status") == "scheduled", out
++    assert out.get("wake_at")
++
++
++def _sidebar_counts(home: Path):
++    db = home / "kanban.db"
++    with sqlite3.connect(db):
++        pass
++    ksa._reset_cache_for_tests()
++    return ksa.active_task_counts(), ksa.blocked_task_counts()
++
++
++def test_sidebar_counts_only_human_blocks_as_blocked(kanban_home: Path, monkeypatch) -> None:
++    """The row paints red (``kanban_blocked``) for needs_input/capability/untyped blocks
++    only; a timed park or a transient block counts as in-progress work."""
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
++    with kbc.connect_closing() as conn:
++        human = _running(conn, "s_human")
++        kb.block_task(conn, human, reason="1) tap Approve", kind="needs_input")
++        timed = _running(conn, "s_timed")
++        kb.block_task(conn, timed, reason="nightly run; cron wakes", kind="dependency")
++        flaky = _running(conn, "s_flaky")
++        kb.block_task(conn, flaky, reason="429s", kind="transient")
++        untyped = _running(conn, "s_untyped")
++        kb.block_task(conn, untyped, reason="??")
++    active, blocked = _sidebar_counts(kanban_home)
++    assert blocked == {"s_human": 1, "s_untyped": 1}
++    assert active.get("s_timed") == 1 and active.get("s_flaky") == 1
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 5cb8e4a11b..affe3b08e2 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -467,7 +467,8 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
+         run = kb.latest_run(conn, worker_env)
+         assert (run.outcome, run.summary) == ("scheduled", reason)
+         assert any(
+-            event.kind == "scheduled" and event.payload == {"reason": reason}
++            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": event.payload.get("wake_at")}
++            and event.payload["wake_at"]  # SCHEDULED_UNTIL= sets a real wake time
+             for event in kb.list_events(conn, worker_env)
+         )
+ 
+@@ -593,15 +594,14 @@ def test_schedule_exposed_to_codex_runtime_workers():
+     assert "kanban_schedule" in EXPOSED_TOOLS
+ 
+ 
+-def test_block_dependency_without_open_parent_is_rekinded(worker_env):
+-    """kind=dependency with no incomplete parent must not park in todo; the
+-    tool reports the landed kind and tells the worker why."""
++def test_block_dependency_without_open_parent_is_a_timed_park(worker_env):
++    """kind=dependency with no incomplete parent must not park in todo, nor in the
++    human ``blocked`` bucket: it is a timed wait, and the tool says when it wakes."""
+     from tools import kanban_tools as kt
+ 
+     d = json.loads(kt._handle_block({"reason": "upstream input is missing", "kind": "dependency"}))
+-    assert (d["ok"], d["status"], d["block_kind"]) == (True, "blocked", "needs_input")
+-    assert d["requested_kind"] == "dependency"
+-    assert "no parent is open" in d["note"]
++    assert (d["ok"], d["status"], d["requested_kind"]) == (True, "scheduled", "dependency")
++    assert d["wake_at"] and "not a human block" in d["note"]
+ 
+ 
+ def test_heartbeat_extends_claim_expires(worker_env):
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 0e96f82768..59d32bdf48 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -492,7 +492,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
+ 
+ # --- Goal-mode judge gate ---
+ 
+-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
++_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "time"})
+ 
+ 
+ def _goal_judge_available() -> bool:
+@@ -959,6 +959,14 @@ def _handle_block(args: dict, **kw) -> str:
+         extra: dict = {"block_kind": landed_kind}
+         if blocker_id:
+             extra["blocker_id"] = blocker_id
++        landed_status = kb.get_task(conn, tid).status
++        if landed_status == "scheduled":
++            # A wait on time, not on a human: parked with a wake time (kanban_timed_park). [daveey]
++            from hermes_cli.kanban_continuation import pending_wake
++            wake = pending_wake(conn, tid) or {}
++            return _ok_landed(kb, conn, tid, "scheduled", requested_kind=kind, wake_at=wake.get("wake_at"),
++                              note=("Parked as a timed wait (scheduled), not a human block: it wakes at "
++                                    "wake_at, or earlier on `hermes kanban unblock`."))
+         if kind == "dependency" and landed_kind != kind:
+             # block_task re-kinds a dependency wait that no open parent can satisfy.
+             extra["requested_kind"] = kind
+@@ -982,9 +990,9 @@ def _handle_schedule(args: dict, **kw) -> str:
+         # parking would bypass the completion judge (see kanban_block, #38696).
+         task = kb.get_task(conn, tid)
+         _check(not (task and task.goal_mode),
+-               "goal_mode tasks cannot be scheduled: use kanban_block with kind "
+-               f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
+-               "blocker, or kanban_complete so the completion judge can evaluate it.")
++               "goal_mode tasks cannot be scheduled: for a wait on time or a cron use "
++               "kanban_block with kind='time' (SCHEDULED_UNTIL=<ISO8601> in the reason sets "
++               "the wake), or kanban_complete so the completion judge can evaluate it.")
+         ok = kb.schedule_task(
+             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+         _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 5ef197dbed..f0375c96f9 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -175,7 +175,9 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "goes to todo and auto-resumes when that task finishes, no human "
+         "needed), 'needs_input' (you need a human decision/answer), "
+         "'capability' (a hard wall: no access, missing credentials, an action "
+-        "no agent can do), or 'transient' (a flaky failure that may clear). "
++        "no agent can do), 'transient' (a flaky failure that may clear), or "
++        "'time' (waiting on a clock, a cron, a soak or a release, not a person: "
++        "parks the card 'scheduled' with a wake time, never as a human block). "
+         "``reason`` is shown to the human on the board and, in Desktop, in a "
+         "panel above the managing chat's composer as the steps to unblock it. "
+         "If a task keeps "
+@@ -183,7 +185,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "auto-escalated to triage. Use for genuine blockers only — don't "
+         "block on things you can resolve yourself. Waiting on time or an "
+         "external event (a cap, a soak, a release window) is not a block: use "
+-        "kanban_schedule, since a blocked card marks its chat as needing a human."
++        "kind='time' (put SCHEDULED_UNTIL=<ISO8601> in the reason to set the wake; "
++        "default 24h), since a blocked card marks its chat as needing a human."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+@@ -199,12 +202,13 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         )),
+         "kind": {
+             "type": "string",
+-            "enum": ["dependency", "needs_input", "capability", "transient"],
++            "enum": ["dependency", "needs_input", "capability", "transient", "time"],
+             "description": (
+                 "Why you're blocked. 'dependency' waits in todo and "
+                 "resumes automatically when an incomplete parent finishes; "
+-                "if no parent is open it is recorded as needs_input instead. "
+-                "The others surface to a human. Omit only if none apply."
++                "if no parent is open it is a timed wait (scheduled). 'time' "
++                "parks scheduled until SCHEDULED_UNTIL=<ISO8601> in the reason "
++                "(default 24h). The others surface to a human. Omit only if none apply."
+             ),
+         },
+         "blocker_id": _prop("string", (
+@@ -224,9 +228,8 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+     (
+         "Park your current task in the 'scheduled' state while it waits for "
+         "time or an external event. This ends the current run and makes the "
+-        "task non-dispatchable until an orchestrator unblocks it; it does not "
+-        "create a timer. Put any wake-up marker such as "
+-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
++        "task non-dispatchable until an orchestrator unblocks it, or until the "
++        "time named by a ``SCHEDULED_UNTIL=<ISO8601>`` marker in ``reason``."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+-- 
+2.54.0 (Apple Git-157)
+

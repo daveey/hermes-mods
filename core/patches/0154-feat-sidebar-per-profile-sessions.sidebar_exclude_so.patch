@@ -1,0 +1,128 @@
+From b4af424ab981f3d1c8c7f8e4b5636750e837ac78 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:23:22 -0700
+Subject: [PATCH] feat(sidebar): per-profile sessions.sidebar_exclude_sources
+ keeps machine traffic out of the project tree [daveey]
+
+A profile serving another app's LLM calls over api_server (the Baby Bear hub's
+bb-aux/bb-worker on the mini) wrote hundreds of sessions a day; once the
+cross-gateway sidebar read every remote profile's tree they flooded it. The
+profile now declares those sources out, read from its own config like
+sessions.show_subagents.
+---
+ hermes_cli/config_defaults.py                 |  4 ++++
+ hermes_cli/session_listing.py                 | 24 +++++++++++++++++++
+ .../hermes_cli/test_profiles_sidebar_scope.py | 17 +++++++++++++
+ tui_gateway/methods_projects.py               | 11 ++++++++-
+ 4 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 0ab7090197..c26bd53c94 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2330,6 +2330,10 @@ DEFAULT_CONFIG = {
+         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
+         # nested under their parent. Off by default: they are machinery, not conversations.
+         "show_subagents": False,
++        # Extra session sources this profile keeps out of the desktop sidebar's project tree
++        # (cron/kanban/oneshot are always out). For machine profiles whose sessions are app
++        # traffic, e.g. ["api_server"] on a profile serving another app's LLM calls. [daveey]
++        "sidebar_exclude_sources": [],
+         # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
+         # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
+         # deleted AND freelist/page_count > 25%.
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index a204f56e30..a00b1fc381 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -30,6 +30,30 @@ def show_subagent_sessions(hermes_home: str | Path) -> bool:
+     return isinstance(sessions_cfg, dict) and is_truthy_value(sessions_cfg.get("show_subagents"))
+ 
+ 
++def sidebar_excluded_sources(hermes_home: str | Path) -> list[str]:
++    """``sessions.sidebar_exclude_sources`` from *hermes_home*'s own config.yaml: extra session
++    sources this profile keeps out of the desktop sidebar (machine traffic such as an
++    OpenAI-compatible ``api_server`` backend serving another app). Like ``show_subagents`` the
++    store's home decides, so a machine profile hides its own rows wherever it is listed. ``[]``
++    when unset or unreadable."""
++    from hermes_cli.config import load_config_readonly
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++    token = set_hermes_home_override(str(hermes_home))
++    try:
++        sessions_cfg = load_config_readonly().get("sessions") or {}
++    except Exception:
++        return []
++    finally:
++        reset_hermes_home_override(token)
++    raw = sessions_cfg.get("sidebar_exclude_sources") if isinstance(sessions_cfg, dict) else None
++    if isinstance(raw, str):
++        raw = raw.split(",")
++    if not isinstance(raw, (list, tuple)):
++        return []
++    return [str(s).strip() for s in raw if str(s).strip()]
++
++
+ def subagent_listing_scope(
+     hermes_home: str | Path, *, source: str | None = None, sources: list[str] | None = None,
+     exclude_sources: list[str] | None = None,
+diff --git a/tests/hermes_cli/test_profiles_sidebar_scope.py b/tests/hermes_cli/test_profiles_sidebar_scope.py
+index 2c059257bd..a3203fa916 100644
+--- a/tests/hermes_cli/test_profiles_sidebar_scope.py
++++ b/tests/hermes_cli/test_profiles_sidebar_scope.py
+@@ -144,6 +144,23 @@ class TestSidebarScope:
+ 
+ class TestCrossProfileProjectTree:
+ 
++    def test_profile_sidebar_exclude_sources_hides_its_machine_sessions(self, client, profiles_on_disk):
++        # A machine profile (an api_server backing another app) declares its traffic out of the
++        # sidebar; the list applies to that profile's own rows only.
++        (profiles_on_disk["worker"] / "config.yaml").write_text(
++            "sessions:\n  sidebar_exclude_sources: [api_server]\n", encoding="utf-8")
++        _seed_session(profiles_on_disk["worker"], "worker-api", source="api_server")
++        _seed_session(profiles_on_disk["worker"], "worker-chat", source="cli")
++        _seed_session(profiles_on_disk["default"], "default-api", source="api_server")
++
++        payload = client.get("/api/profiles/projects/tree", params={"preview_limit": 50}).json()
++
++        assert payload["errors"] == []
++        ids = set(payload["scoped_session_ids"]) | {
++            s["id"] for p in payload["projects"] for s in p.get("previewSessions") or []}
++        assert "worker-api" not in ids
++        assert {"worker-chat", "default-api"} <= ids
++
+     def test_one_folder_worked_in_by_two_profiles_is_one_project(self, client, profiles_on_disk, tmp_path):
+         # A folder is a folder no matter who opened it. Two profiles working the
+         # same checkout is the normal case (that's the point of profiles), so it
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index 5daf48cae7..84c43e8295 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -319,6 +319,15 @@ def _discover_repos_payload(
+ _PROJECT_TREE_EXCLUDED_SOURCES = ["cron", "kanban", "oneshot"]
+ 
+ 
++def _project_tree_excluded_sources() -> list[str]:
++    """The built-in exclusions plus this store's ``sessions.sidebar_exclude_sources`` [daveey].
++    Read under the caller's home scope, so the all-profiles tree applies each profile's own list."""
++    from hermes_cli.session_listing import sidebar_excluded_sources
++    from hermes_constants import get_hermes_home
++    extra = sidebar_excluded_sources(get_hermes_home())
++    return _PROJECT_TREE_EXCLUDED_SOURCES + [s for s in extra if s not in _PROJECT_TREE_EXCLUDED_SOURCES]
++
++
+ def _project_tree_row(r: dict) -> dict:
+     """Project a SessionDB row to the minimal shape the sidebar renders (grouping fields +
+     what ``SidebarSessionRow`` reads), minus the heavy columns."""
+@@ -365,7 +374,7 @@ def _project_tree_inputs(
+     # compact_rows: selecting the system-prompt blob only to drop it costs tens of MB of reads.
+     rows = db.list_sessions_rich(
+         limit=session_limit, offset=0, order_by_last_active=True, min_message_count=1,
+-        include_children=False, exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
++        include_children=False, exclude_sources=_project_tree_excluded_sources(),
+         include_archived=False, compact_rows=True)
+     sessions = _annotate_tree_activity([_project_tree_row(r) for r in rows])
+     # Parallel-warm the git cache so build_tree's resolver doesn't cold-probe each cwd in turn.
+-- 
+2.54.0 (Apple Git-157)
+

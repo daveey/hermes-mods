@@ -1,0 +1,237 @@
+From 86d0af7e5ba8e1c954382d058fd268997fcd6bc6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 16:05:39 -0700
+Subject: [PATCH] fix(kanban): wake continued waits even when a
+ comment/heartbeat lands after them [daveey]
+
+wake_due_continuations only looked at a scheduled card's latest event, so any
+later comment, heartbeat, notification or edit masked a due wake forever (10
+cards stuck up to 40h on 2026-10-19). Look up the parking event among the kinds
+that actually move a card into scheduled (continued, scheduled) instead, and
+add an overdue_wake diagnostic for scheduled cards >10 min past wake_at.
+---
+ hermes_cli/kanban_continuation.py            | 47 +++++++++++++++-----
+ hermes_cli/kanban_diagnostics.py             | 40 +++++++++++++++++
+ tests/hermes_cli/test_kanban_continuation.py | 46 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_diagnostics.py  | 25 +++++++++++
+ 4 files changed, 148 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 43916fd412..4a7391e568 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -159,11 +159,41 @@ def continue_task(
+             "continuation": streak + 1, "wake_at": wake_at}
+ 
+ 
++# The only event kinds that put a card INTO ``scheduled`` (``continue_task`` with a wait, and
++# ``schedule_task``). Every other kind -- comments, heartbeats, notifications, edits, links,
++# attachments -- is an annotation on the parked card and must not mask a due wake. [daveey]
++SCHEDULED_ENTRY_EVENTS = (CONTINUED_OUTCOME, "scheduled")
++# ``wake_due_continuations`` runs every dispatcher tick; a wake this late means it is stuck.
++OVERDUE_WAKE_GRACE_SECONDS = 600
++
++
++def pending_wake_payload(kind: Optional[str], payload: Any) -> Optional[dict]:
++    """The ``continued`` payload when the event that parked the card is a timed wait, else None."""
++    from hermes_cli import kanban_db as kb
++
++    if kind != CONTINUED_OUTCOME:
++        return None
++    data = payload if isinstance(payload, dict) else kb._json_dict(payload)
++    return data if isinstance(data.get("wake_at"), (int, float)) else None
++
++
++def pending_wake(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """``continued`` payload (with ``wake_at``) of the event that parked ``task_id`` in ``scheduled``."""
++    marks = ",".join("?" for _ in SCHEDULED_ENTRY_EVENTS)
++    event = conn.execute(
++        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++        "ORDER BY id DESC LIMIT 1", (task_id, *SCHEDULED_ENTRY_EVENTS),
++    ).fetchone()
++    return pending_wake_payload(event[0], event[1]) if event else None
++
++
+ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+-    """Promote ``scheduled`` cards whose latest event is a due ``continued`` wait.
++    """Promote ``scheduled`` cards parked by a ``continued`` wait whose wake time has passed.
+ 
+-    Cards scheduled by ``kanban_schedule`` (no wake time) are left for a human/cron unblock.
+-    Counters are untouched (``unblock_task`` would reset ``consecutive_failures``).
++    The parking event is the latest ``SCHEDULED_ENTRY_EVENTS`` row, so a comment or heartbeat
++    landing after it does not hide the wake. Cards scheduled by ``kanban_schedule`` (no wake
++    time) are left for a human/cron unblock. Counters are untouched (``unblock_task`` would
++    reset ``consecutive_failures``).
+     """
+     from hermes_cli import kanban_db as kb
+ 
+@@ -171,14 +201,11 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     woken: list[str] = []
+     for row in conn.execute("SELECT id FROM tasks WHERE status = 'scheduled'").fetchall():
+         tid = row[0]
+-        event = conn.execute(
+-            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
+-        ).fetchone()
+-        if not event or event[0] != CONTINUED_OUTCOME:
++        payload = pending_wake(conn, tid)
++        if payload is None:
+             continue
+-        payload = kb._json_dict(event[1])
+-        wake_at = payload.get("wake_at")
+-        if not isinstance(wake_at, (int, float)) or wake_at > now:
++        wake_at = payload["wake_at"]
++        if wake_at > now:
+             continue
+         resume = payload.get("resume_status") if payload.get("resume_status") in ("ready", "review") else "ready"
+         with kb.write_txn(conn):
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index b1941f7dd7..63558f13d4 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -736,6 +736,45 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     )]
+ 
+ 
++def _rule_overdue_wake(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """A ``scheduled`` card parked by a timed ``kanban_continue`` wait is still parked more than
++    cfg["overdue_wake_grace_seconds"] (default 10 min) after its ``wake_at``: the dispatcher's
++    wake pass is not reaching it (dispatcher down, or a wake bug). [daveey]"""
++    from hermes_cli import kanban_continuation as kc
++
++    if _task_field(task, "status") != "scheduled":
++        return []
++    grace = float(cfg.get("overdue_wake_grace_seconds", kc.OVERDUE_WAKE_GRACE_SECONDS))
++    parking = None
++    for idx, ev in enumerate(events or []):
++        if _event_kind(ev) not in kc.SCHEDULED_ENTRY_EVENTS:
++            continue
++        key = (_event_ts(ev), int(_task_field(ev, "id", default=0) or 0), idx)
++        if parking is None or key >= parking[0]:
++            parking = (key, ev)
++    if parking is None:
++        return []
++    payload = kc.pending_wake_payload(_event_kind(parking[1]), _parse_payload(parking[1]))
++    if payload is None:
++        return []
++    wake_at = int(payload["wake_at"])
++    late = now - wake_at
++    if late <= grace:
++        return []
++    late_str = f"{late / 3600:.1f}h" if late >= 3600 else f"{int(late / 60)}m"
++    return [Diagnostic(
++        kind="overdue_wake", severity="critical" if late >= 3600 else "error",
++        title=f"Scheduled wake is {late_str} overdue",
++        detail=f"This task handed off a wait with kanban_continue and should have woken {late_str} "
++               f"ago, but it is still scheduled. Check that the dispatcher is running; unblock the "
++               f"task to resume it now.",
++        actions=[DiagnosticAction(kind="unblock", label="Resume the task now", suggested=True),
++                 _cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
++        first_seen_at=wake_at, last_seen_at=wake_at, count=1,
++        data={"wake_at": wake_at, "late_seconds": int(late)},
++    )]
++
++
+ # Order matters: earlier rules render first on severity ties.
+ _RULES: list[RuleFn] = [
+     _rule_hallucinated_cards,
+@@ -748,6 +787,7 @@ _RULES: list[RuleFn] = [
+     _rule_stuck_in_blocked,
+     _rule_block_unblock_cycling,
+     _rule_stranded_in_ready,
++    _rule_overdue_wake,
+ ]
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_continuation.py b/tests/hermes_cli/test_kanban_continuation.py
+index 59ccbad28b..e1f23da6e6 100644
+--- a/tests/hermes_cli/test_kanban_continuation.py
++++ b/tests/hermes_cli/test_kanban_continuation.py
+@@ -210,6 +210,52 @@ def test_wait_handoff_wakes_on_dispatcher_tick(home, monkeypatch):
+         assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == []
+ 
+ 
++def _park_with_wait(monkeypatch, title: str) -> tuple[str, int]:
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title=title, assignee="default", max_runtime_seconds=600)
++    _start_run(monkeypatch, tid, started_ago=60)
++    out = json.loads(kt._handle_continue({"checkpoint": "waiting on CI", "resume_after_seconds": 900}))
++    assert out["status"] == "scheduled"
++    return tid, out["wake_at"]
++
++
++@pytest.mark.parametrize("kind", ["commented", "heartbeat", "notified", "edited"])
++def test_due_wake_is_not_masked_by_later_annotation(home, monkeypatch, kind):
++    """A comment (another card's FYI), heartbeat or other non-transition event landing after
++    the ``continued`` wait used to hide the wake forever."""
++    tid, wake_at = _park_with_wait(monkeypatch, f"masked by {kind}")
++    with kbc.connect_closing() as conn:
++        if kind == "commented":
++            kb.add_comment(conn, tid, "t_other", "FYI: parent landed")
++        else:
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, kind, {"note": "x"})
++        assert kc.wake_due_continuations(conn, now=wake_at - 1) == []
++        assert kc.wake_due_continuations(conn, now=wake_at) == [tid]
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_kanban_schedule_after_wait_and_comment_still_stays_put(home, monkeypatch):
++    """Re-parked with kanban_schedule (no wake time) after a timed wait: never auto-woken,
++    even when a comment lands afterwards."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="parked", assignee="default")
++        kb.claim_task(conn, tid)
++        kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2030-01-01")
++        kb.add_comment(conn, tid, "t_other", "FYI")
++        assert kc.pending_wake(conn, tid) is None
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++    tid2, wake_at = _park_with_wait(monkeypatch, "wait then park")
++    with kbc.connect_closing() as conn:
++        kb.unblock_task(conn, tid2)
++        kb.claim_task(conn, tid2)
++        kb.schedule_task(conn, tid2, reason="until release")
++        kb.add_comment(conn, tid2, "t_other", "FYI")
++        assert kc.wake_due_continuations(conn, now=wake_at + 10 ** 6) == []
++        assert kb.get_task(conn, tid2).status == "scheduled"
++
++
+ def test_continue_refuses_stale_run_and_bad_args(home, monkeypatch):
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="x", assignee="default", max_runtime_seconds=600)
+diff --git a/tests/hermes_cli/test_kanban_diagnostics.py b/tests/hermes_cli/test_kanban_diagnostics.py
+index 1eff208168..b4922ced03 100644
+--- a/tests/hermes_cli/test_kanban_diagnostics.py
++++ b/tests/hermes_cli/test_kanban_diagnostics.py
+@@ -221,3 +221,28 @@ def test_severity_at_or_above_uses_threshold_semantics():
+     assert kd.severity_at_or_above("error", "critical") is False
+     assert kd.severity_at_or_above("mystery", "warning") is False
+     assert kd.severity_at_or_above("warning", None) is True
++
++
++# ---------------------------------------------------------------------------
++# overdue_wake
++# ---------------------------------------------------------------------------
++
++
++def test_overdue_wake_flags_scheduled_card_past_wake_at():
++    now = 1_000_000
++    events = [_event("continued", ts=now - 5000, wake_at=now - 4000, status="scheduled"),
++              _event("commented", ts=now - 100)]
++    diags = kd.compute_task_diagnostics(_task(status="scheduled"), events, [], now=now)
++    assert [d.kind for d in diags] == ["overdue_wake"]
++    assert diags[0].severity == "critical" and diags[0].data["late_seconds"] == 4000
++    # Within the 10 min grace: quiet.
++    assert kd.compute_task_diagnostics(_task(status="scheduled"), events, [], now=now - 4000 + 600) == []
++    # Woken (no longer scheduled): clears.
++    assert kd.compute_task_diagnostics(_task(status="ready"), events, [], now=now) == []
++
++
++def test_overdue_wake_ignores_kanban_schedule_parks():
++    now = 1_000_000
++    events = [_event("continued", ts=now - 5000, wake_at=now - 4000),
++              _event("scheduled", ts=now - 3000, reason="SCHEDULED_UNTIL=2030")]
++    assert kd.compute_task_diagnostics(_task(status="scheduled"), events, [], now=now) == []
+-- 
+2.54.0 (Apple Git-157)
+
