@@ -15,7 +15,8 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 4            # v4: `features` (content-free feature-use counts for curriculum adoption checks)
+DIGEST_V = 5            # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
+                        # v4: `features` (content-free feature-use counts for curriculum adoption checks)
 MAX_TURNS = 60          # keep the first 10 and the last 50 user turns
 TURN_CHARS = 500
 LAST_REPLY_CHARS = 800
@@ -130,9 +131,16 @@ def redact(s: str) -> str:
 # User-role messages Hermes writes itself (not typed by the user): counted, not kept as turns.
 SYNTHETIC = re.compile(
     r"^\s*(\[(IMPORTANT:|STILL IN PROGRESS|Note: model was|Recent Summary|CONTEXT COMPACTION|Background task|Continuing toward your"
-    r" standing goal|ASYNC DELEGATION|Message from another Hermes session|From the [^\]]{0,80}session|System: )"
+    r" standing goal|ASYNC DELEGATION|Message from another Hermes session|From the [^\]]{0,80}session|System: "
+    r"|Cronjob \"|Continuing toward this kanban task|Your active task list was preserved"
+    r"|Current user objective preserved|Turn stopped by Desktop)"
+    # Kanban gateway notices: "<glyph> [board] @assignee Kanban t_…" (tui_gateway/session_notifications.py)
+    r"|[✔✖✘⏸⏱🔄]\ufe0f?\s+(\[[^\]\n]{1,80}\]\s+)?(@\S+\s+)?Kanban\s+t_"
     r"|You've reached the maximum number of tool-calling)", re.I)
-SYNTH_KIND = [("bg_notify", "Background"), ("goal_continue", "standing goal"), ("delegation", "ASYNC DELEGATION"),
+SYNTH_KIND = [("cron", "[Cronjob"), ("kanban", " Kanban t_"), ("kanban_continue", "kanban task"),
+              ("todo_preserved", "task list was preserved"), ("objective_preserved", "objective preserved"),
+              ("turn_stopped", "Turn stopped by Desktop"),
+              ("bg_notify", "Background"), ("goal_continue", "standing goal"), ("delegation", "ASYNC DELEGATION"),
               ("cross_session", "session"), ("turn_cap", "maximum number of tool-calling"), ("system", "System:")]
 
 

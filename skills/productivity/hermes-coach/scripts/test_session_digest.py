@@ -103,5 +103,46 @@ class DigestFeatures(unittest.TestCase):
         self.assertEqual(dg["digest_v"], sd.DIGEST_V)
 
 
+class DigestSynthetic(unittest.TestCase):
+    def test_kanban_notices_cron_prompts_and_continuation_notes_are_not_user_turns(self):
+        t = time.time() - 100
+        texts = [
+            "✔ [default] @default Kanban t_x done — still failing",
+            "⏸ [default] @default Kanban t_x blocked: stuck waiting on the hub, same error again",
+            "✖ [default] @default Kanban t_x worker crashed (pid gone); dispatcher will retry",
+            "⏱ Kanban t_x timed out (max_runtime=60s); will retry",
+            '[Cronjob "[bot:coach] Daily mine" output — scheduled job, not the user.] still broken, stuck again',
+            "[Continuing toward this kanban task — judge says it is not done yet]\nReason: still broken",
+            "[Your active task list was preserved across context compression]\n- [>] fix the stuck thing again",
+            "[Current user objective preserved from compacted history]\nit still doesn't work",
+            "[Turn stopped by Desktop before it finished.]",
+        ]
+        rows = [("user", s, t + i, 1, 0, None, None, f"u{i}") for i, s in enumerate(texts)]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        self.assertEqual(dg["user_turns"], [])
+        self.assertEqual(dg["user_turns_total"], 0)
+        s = dg["signals"]
+        self.assertNotIn("repeat_fix", s)
+        self.assertNotIn("stuck", s)
+        self.assertEqual(s.get("synthetic_kanban"), 4)
+        self.assertEqual(s.get("synthetic_cron"), 1)
+        self.assertEqual((s.get("synthetic_kanban_continue"), s.get("synthetic_todo_preserved"),
+                          s.get("synthetic_objective_preserved"), s.get("synthetic_turn_stopped")), (1, 1, 1, 1))
+
+    def test_user_turn_mentioning_kanban_is_kept(self):
+        t = time.time() - 100
+        rows = [("user", "Kanban t_x is still broken", t, 1, 0, None, None, "u1"),
+                ("user", "✔ looks good, ship it", t + 1, 1, 0, None, None, "u2")]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        self.assertEqual(dg["user_turns_total"], 2)
+        self.assertEqual(dg["signals"].get("repeat_fix"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
