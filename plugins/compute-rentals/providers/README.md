@@ -61,6 +61,12 @@ core's normal provider/inventory poll cache for the other services too.
   subprocess (`python -m providers.<id> --worker`), optionally wrapped by
   `broker.command` so a secrets manager injects the key. Missing key reports
   **unconfigured**/**error**, never an empty success.
+- Lambda Cloud (id `lambda`, module `lambdacloud.py` because `lambda` is a
+  Python keyword; `{provider}` in `broker.command` still expands to `lambda`):
+  same worker pattern with `LAMBDA_API_KEY`. Only paginated
+  `GET https://cloud.lambda.ai/api/v1/instances` is allowlisted. The rate is the
+  instance type's `price_cents_per_hour / 100` USD for booting/active/unhealthy
+  instances; SSH is `ssh ubuntu@<ip>` for active ones.
 - Slurm: fixed read-only `scontrol`/`squeue` commands over SSH
   (`BatchMode=yes`, `StrictHostKeyChecking=yes`) to the hosts in `slurm.hosts`
   only; bounded by time and bytes. No hosts configured = **unconfigured**.

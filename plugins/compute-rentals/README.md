@@ -12,6 +12,7 @@ Desktop half: [desktop-plugins/compute-rentals](../../desktop-plugins/compute-re
 |---|---|---|
 | `vast` | Vast.ai instances | `VAST_API_KEY`, else `~/.config/vastai/vast_api_key` |
 | `runpod` | RunPod pods | `RUNPOD_API_KEY` (or vended by `broker.command`) |
+| `lambda` | Lambda Cloud on-demand instances (USD list price from the instance type; `ssh ubuntu@<ip>`) | `LAMBDA_API_KEY` (or vended by `broker.command`; worker module `providers/lambdacloud.py`) |
 | `modal` | Modal apps, tasks and sandboxes | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` (or vended by `broker.command`); needs the `modal` package |
 | `primeintellect` | Prime Intellect pods | `PRIME_API_KEY` (or vended by `broker.command`) |
 | `sfcompute` | SF Compute marketplace instances | `SF_API_TOKEN` / `SF_API_KEY`; reports `unconfigured` without one |
@@ -40,7 +41,7 @@ slurm:
   control_host: gpu0         # where scontrol/squeue run; must be one of hosts
 
 broker:
-  # Optional argv prefix that runs the runpod/modal/primeintellect worker with its API key
+  # Optional argv prefix that runs the runpod/lambda/modal/primeintellect worker with its API key
   # injected, e.g. a secrets manager. "{provider}" is replaced with the provider id.
   command: [op, run, --env-file, "~/.config/{provider}.env", --]
   python: null               # interpreter for that worker (default: .extra-runtime/bin/python, else Hermes's)

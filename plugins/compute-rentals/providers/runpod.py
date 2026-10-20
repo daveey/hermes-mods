@@ -64,13 +64,14 @@ class ReadHTTP:
 class BrokerCollector:
     """Credentials live only in a worker subprocess; bounded run and 60-second cache.
 
-    The worker is `<python> -m providers.<provider> --worker` (cwd = plugin dir),
+    The worker is `<python> -m providers.<module or provider> --worker` (cwd = plugin dir),
     optionally wrapped by `broker.command` from compute-rentals.yaml, an argv
     prefix such as a secrets manager's `exec ... --` that injects the provider
     API key into the worker's environment ('{provider}' is substituted). With no
     wrapper the worker inherits this process's environment.
     """
     provider = ''
+    module = ''  # worker module under providers/ when it differs from the provider id
     scope = ''
 
     def __init__(self, config=None):
@@ -81,7 +82,7 @@ class BrokerCollector:
         from .config import load_config, worker_python
         cfg = self.config if self.config is not None else load_config()
         prefix = [part.replace('{provider}', self.provider) for part in (cfg.get('broker') or {}).get('command') or []]
-        return prefix + [worker_python(cfg), '-m', 'providers.' + self.provider, '--worker']
+        return prefix + [worker_python(cfg), '-m', 'providers.' + (self.module or self.provider), '--worker']
 
     def broker_collect(self):
         if self._cached is not None and time.monotonic() - self._at < 60:

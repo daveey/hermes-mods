@@ -147,7 +147,7 @@ class FactoryTests(unittest.TestCase):
             config = load_config(Path(empty) / 'absent.yaml')
             config['extra_providers_dir'] = empty
             collectors = build_collectors(config)
-        self.assertEqual(set(collectors), {'vast', 'sfcompute', 'ec2', 'runpod', 'modal', 'primeintellect', 'slurm'})
+        self.assertEqual(set(collectors), {'vast', 'sfcompute', 'ec2', 'runpod', 'lambda', 'modal', 'primeintellect', 'slurm'})
         self.assertTrue(all(callable(c) for c in collectors.values()))
 
 class EdgeTests(unittest.TestCase):

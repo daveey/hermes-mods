@@ -1124,6 +1124,7 @@ const PROVIDER_LABELS = {
   sfcompute: 'SF Compute',
   ec2: 'EC2',
   runpod: 'RunPod',
+  lambda: 'Lambda',
   modal: 'Modal',
   primeintellect: 'Prime Intellect',
   slurm: 'Slurm',

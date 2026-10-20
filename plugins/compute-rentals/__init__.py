@@ -197,7 +197,7 @@ def register(ctx):
             properties['refresh'] = dict(type='boolean', default=False)
         else:
             properties['machine_key'] = dict(type='string', description='Canonical inventory key; optional when provider_id is given.')
-            properties['provider'] = dict(type='string', description='Provider id as listed by compute_rentals_list (e.g. vast, runpod, ec2, sfcompute, modal, primeintellect).')
+            properties['provider'] = dict(type='string', description='Provider id as listed by compute_rentals_list (e.g. vast, runpod, lambda, ec2, sfcompute, modal, primeintellect).')
             properties['provider_id'] = dict(type='string', description='Provider instance/pod/node id as returned by the rent call (e.g. Vast new_contract, RunPod pod id, EC2 i-...).')
         name = 'compute_rentals_' + operation
         if operation == 'list':

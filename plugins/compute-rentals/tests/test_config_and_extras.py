@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from providers import build_collectors, load_extra_providers  # noqa: E402
 from providers.config import ENV_PATH, load_config  # noqa: E402
 
-BUILTINS = {'vast', 'sfcompute', 'ec2', 'runpod', 'modal', 'primeintellect', 'slurm'}
+BUILTINS = {'vast', 'sfcompute', 'ec2', 'runpod', 'lambda', 'modal', 'primeintellect', 'slurm'}
 
 GOOD = '''
 from .common import result

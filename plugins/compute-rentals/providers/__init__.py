@@ -25,7 +25,7 @@ from .sfcompute import MarketplaceCollector
 from .ec2 import EC2Collector
 from .slurm import SlurmCollector
 from .common import result
-from . import runpod, modal, primeintellect
+from . import runpod, modal, primeintellect, lambdacloud
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ LABELS = {
     'sfcompute': 'SF Compute',
     'ec2': 'EC2',
     'runpod': 'RunPod',
+    'lambda': 'Lambda',
     'modal': 'Modal',
     'primeintellect': 'Prime Intellect',
     'slurm': 'Slurm',
@@ -104,6 +105,7 @@ def build_collectors(config=None):
         'sfcompute': MarketplaceCollector().collect,
         'ec2': EC2Collector(profiles=cfg['ec2']['profiles'], cache_seconds=cfg['ec2']['cache_seconds']).collect,
         'runpod': runpod.build_collector(cfg),
+        'lambda': lambdacloud.build_collector(cfg),
         'modal': modal.build_collector(cfg),
         'primeintellect': primeintellect.build_collector(cfg),
         'slurm': SlurmCollector(config=cfg['slurm']).collect,
