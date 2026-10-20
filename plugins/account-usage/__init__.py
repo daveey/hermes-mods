@@ -183,6 +183,20 @@ def _load_selection():
     return sys.modules[name]
 
 
+def _load_sibling(stem: str):
+    """Load ``<plugin>/<stem>.py`` by path (hyphenated plugin dir has no importable package).
+    Registered in sys.modules only after exec, so another thread never sees a half-loaded module."""
+    import importlib.util
+    from pathlib import Path
+    name = f"account_usage_{stem}"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / f"{stem}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return sys.modules.setdefault(name, module)
+
+
 def register(ctx):
     import logging
     log = logging.getLogger(__name__)
@@ -195,6 +209,10 @@ def register(ctx):
         since[0] = now
 
     ctx.register_hook("post_api_request", _on_api)
+    try:  # xAI Grok sign-in has no core usage fetcher; add a status-only one (fail-open).
+        _load_sibling("xai_status").install()
+    except Exception:
+        log.debug("account-usage: xai status fetcher not installed", exc_info=True)
     selection = _load_selection()
     if not hasattr(selection, 'ExecutionIntegration'):
         # The earlier API-only version may already be cached in this gateway.

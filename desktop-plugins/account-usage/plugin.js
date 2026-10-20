@@ -41,7 +41,9 @@ const CSS = `
 
 const PROVIDERS = [
   { slug: 'anthropic', name: 'Claude', title: 'Claude Max' },
-  { slug: 'openai-codex', name: 'GPT', title: 'ChatGPT (Codex)' }
+  { slug: 'openai-codex', name: 'GPT', title: 'ChatGPT (Codex)' },
+  // xAI publishes no subscription-usage API; the backend reports API access (team_blocked) only.
+  { slug: 'xai-oauth', name: 'Grok', title: 'Grok (xAI)', statusOnly: true }
 ]
 
 const COLORS = { ready: '#3fb950', warn: '#d29922', cooldown: '#e3b341', limited: '#f85149', unknown: 'var(--ui-text-tertiary, #888)', unavailable: 'var(--ui-text-tertiary, #888)' }
@@ -106,7 +108,9 @@ export function summarize(payload, last = {}, now = Date.now()) {
     // Single-account provider: legacy gauge shape `usage.windows`.
     if (!accounts && row && row.usage && Array.isArray(row.usage.windows)) {
       const limited = row.usage.windows.some(w => w.scope !== 'model' && Number(w.used_percent) >= 100)
-      accounts = [{ id: p.slug, selectable: false, label: row.name || p.title, windows: row.usage.windows, state: limited ? 'limited' : 'ready', resets_at: null, limit_kind: limited ? 'quota' : null, reason: limited ? 'quota_window' : null }]
+      // Status-only providers (xAI): 100% means "API blocked (no credits)", not a spent quota window.
+      const reason = limited ? (p.statusOnly ? 'billing' : 'quota_window') : null
+      accounts = [{ id: p.slug, selectable: false, label: row.name || p.title, windows: row.usage.windows, state: limited ? 'limited' : 'ready', resets_at: null, limit_kind: limited ? 'quota' : null, reason }]
     }
     if (!accounts || !accounts.length) return null
     const ready = accounts.filter(a => a.state === 'ready').length
@@ -362,8 +366,10 @@ function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconne
         selectionState.selection?.state === 'pending' && selectionState.selection.provider === g.slug && selectionState.selection.account_id === a.id
           ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null,
         describe(a) ? jsx('span', { className: 'hermes-au-why', 'data-tone': tone(a), style: { display: 'block', fontSize: 10, color: COLORS[tone(a)] || undefined, opacity: 0.9 }, children: describe(a) }) : null] }),
-      jsx(Meter, { win: pickWindow(a.windows, 'session') }),
-      jsx(Meter, { win: pickWindow(a.windows, 'week') })
+      ...(g.statusOnly
+        ? [jsx('span', { style: { gridColumn: 'span 2', fontSize: 10.5, opacity: 0.8 }, children:
+            a.state === 'ready' ? 'API access ok · no usage windows (xAI has no usage API)' : 'API blocked · add credits at console.x.ai' })]
+        : [jsx(Meter, { win: pickWindow(a.windows, 'session') }), jsx(Meter, { win: pickWindow(a.windows, 'week') })])
     ] }), jsx(ReconnectLine, { g, a, reconnectStore, reconnectState })] }))
   ] })
 }
@@ -424,7 +430,7 @@ function UsageBar({ store, selectionStore, reconnectStore }) {
 export default {
   id: ID,
   name: 'Account Usage',
-  description: 'Status-bar chips with per-account Claude / ChatGPT subscription usage.',
+  description: 'Status-bar chips with per-account Claude / ChatGPT subscription usage, plus Grok (xAI) API status.',
   register(ctx) {
     const style = document.createElement('style')
     style.textContent = CSS

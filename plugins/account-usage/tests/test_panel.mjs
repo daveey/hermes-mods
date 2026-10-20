@@ -167,3 +167,18 @@ test('fmtReset rounds to the minute so a reset at 6:59:59.6 reads 7 AM, not 6 AM
  assert.equal(plugin.fmtReset('2026-10-25T14:00:00.022215+00:00',now), fmt(Date.parse('2026-10-25T14:00:00Z')))
  assert.equal(plugin.fmtReset('2026-10-24T15:29:00Z',now), fmt(Date.parse('2026-10-24T15:29:00Z')))
 })
+
+test('xai-oauth status-only row: blocked reads billing (red), ok reads ready, never quota_window', async () => {
+ const {plugin}=await setup()
+ const win=p=>({providers:[{slug:'xai-oauth',name:'Grok',usage:{windows:[{label:'API access',used_percent:p,resets_at:null,scope:'account'}]}}]})
+ const [blocked]=plugin.summarize(win(100))
+ assert.equal(blocked.slug,'xai-oauth'); assert.equal(blocked.name,'Grok'); assert.equal(blocked.statusOnly,true)
+ assert.equal(blocked.accounts[0].state,'limited'); assert.equal(blocked.accounts[0].reason,'billing')
+ assert.equal(plugin.tone(blocked.accounts[0]),'limited')
+ assert.match(plugin.describe(blocked.accounts[0]),/billing/)
+ const [ok]=plugin.summarize(win(0))
+ assert.equal(ok.accounts[0].state,'ready'); assert.equal(ok.ready,1)
+ // Claude legacy gauges keep the quota wording.
+ const [claude]=plugin.summarize({providers:[{slug:'anthropic',usage:{windows:[{label:'Session (5h)',used_percent:100,scope:'account'}]}}]})
+ assert.equal(claude.accounts[0].reason,'quota_window')
+})
