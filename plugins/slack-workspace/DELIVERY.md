@@ -44,5 +44,15 @@ How the two share the queue without double delivery:
 - Courier outcome unknown (`status: unknown`, or claimed with no result): the row becomes
   `uncertain` and is never resent by either path.
 
+Live (2026-10-19 PDT, nous-1 policy set to `courier`, gateway-default restarted; it multiplexes alpha):
+- Courier: a queued request for `@session:default@this-device/<throwaway MBP session>` was rewritten to
+  `@david-mbp`, claimed by the MacBook's courier (now `macbook`, alias `david-mbp`) and landed ~50 s
+  after queueing (one bot tick). The reply was "courier ok", the row was `delivered` after 1 attempt, and
+  the pull cron never saw it.
+- Fallback: a request whose target was a Kanban worker transcript was refused by core through the
+  courier ("Resuming it here would create a writer the Kanban board cannot observe"). The refusal was
+  clean, so the row was due for the puller at once, and the pull cron ran it 2 min later. The same
+  run shows pull's weak spot: its CLI `--resume` went through on a session the Desktop path refuses.
+
 Tests: `tests_follow.py` (route stamp, this-device rewrite, courier then pull fallback with no double
 claim, grace, `courier_only`, unknown outcome not resent).
