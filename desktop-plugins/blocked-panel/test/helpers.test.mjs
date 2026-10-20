@@ -156,3 +156,17 @@ test('parked chats get numbered steps too', () => {
   assert.equal(m.PARKED_STEPS.length, 2)
   assert.match(m.PARKED_STEPS[1], /⌘B/)
 })
+
+test('linkSegments: web URLs and local paths become links; fractions, and/or and trailing punctuation do not', () => {
+  const t = 'On your MacBook, open /Users/me/.hermes/kanban/evidence/blind-sheet-v2.html in the browser. See https://example.com/x?a=1. Score 7/10 and/or ~/notes/a.md, then done.'
+  const links = m.linkSegments(t).filter(s => s.kind !== 'text')
+  assert.deepEqual(links, [
+    { kind: 'path', value: '/Users/me/.hermes/kanban/evidence/blind-sheet-v2.html' },
+    { kind: 'url', value: 'https://example.com/x?a=1' },
+    { kind: 'path', value: '~/notes/a.md' }
+  ])
+  assert.equal(m.linkSegments(t).map(s => s.value).join(''), t)
+  assert.deepEqual(m.linkSegments('(see `/tmp/x.log`)').filter(s => s.kind !== 'text'), [{ kind: 'path', value: '/tmp/x.log' }])
+  assert.deepEqual(m.linkSegments('no links here, 1/2 done'), [{ kind: 'text', value: 'no links here, 1/2 done' }])
+  assert.deepEqual(m.linkSegments(''), [])
+})

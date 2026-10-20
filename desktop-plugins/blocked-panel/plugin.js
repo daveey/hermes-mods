@@ -42,6 +42,30 @@ const log = (...a) => console.info(`[${ID}]`, ...a)
 
 // ── pure helpers (exported for tests) ───────────────────────────────────────
 
+// Web URLs, and absolute / home-relative local paths that start a word (so
+// "7/10" or "and/or" never match). Trailing sentence punctuation is not part of the link.
+const LINK_RE = /(https?:\/\/[^\s<>"'`]+)|(?:^|(?<=[\s("'`]))(~?\/[A-Za-z0-9._~-][^\s<>"'`()]*)/g
+const TRAIL_RE = /[.,;:!?)\]}]+$/
+
+/** text → [{ kind: 'text'|'url'|'path', value }] for rendering clickable links. */
+export function linkSegments(text) {
+  const s = str(text)
+  const out = []
+  let last = 0
+  for (const m of s.matchAll(LINK_RE)) {
+    let value = m[0]
+    const trail = value.match(TRAIL_RE)?.[0] || ''
+    if (trail) value = value.slice(0, -trail.length)
+    const kind = m[1] ? 'url' : 'path'
+    if (kind === 'path' && !/[A-Za-z]/.test(value)) continue
+    if (m.index > last) out.push({ kind: 'text', value: s.slice(last, m.index) })
+    out.push({ kind, value })
+    last = m.index + value.length
+  }
+  if (last < s.length) out.push({ kind: 'text', value: s.slice(last) })
+  return out
+}
+
 /** core's persisted ⌘B list (JSON string array) → string[]; junk → []. */
 export function parseParkedIds(raw) {
   try {
@@ -445,6 +469,39 @@ function notify(kind, message) {
   }
 }
 
+let osApi = null // ctx.os, set in register()
+
+async function openLink(value) {
+  try {
+    if (await osApi?.openExternal?.(value)) return
+  } catch {
+    /* fall through */
+  }
+  notify('error', `Couldn't open ${value}`)
+}
+
+/** Text with its URLs and local paths as clickable links (paths open with the OS handler). */
+function Linked({ text }) {
+  const segs = linkSegments(text)
+  if (!segs.some(x => x.kind !== 'text')) return str(text)
+  return segs.map((x, i) =>
+    x.kind === 'text'
+      ? x.value
+      : jsx('a', {
+          href: x.kind === 'url' ? x.value : `file://${x.value}`,
+          'data-blocked-link': x.kind,
+          title: x.kind === 'url' ? x.value : `Open ${x.value}`,
+          onClick: e => {
+            e.preventDefault()
+            e.stopPropagation()
+            void openLink(x.value)
+          },
+          style: { color: 'var(--accent-foreground, var(--primary, #58a6ff))', textDecoration: 'underline', textUnderlineOffset: 2, cursor: 'pointer', wordBreak: 'break-all' },
+          children: x.value
+        }, i)
+  )
+}
+
 function Item({ item }) {
   const [open, setOpen] = useState(false)
   const [replying, setReplying] = useState(false)
@@ -498,18 +555,18 @@ function Item({ item }) {
                     ? 'No block reason recorded; from the card description. To unblock:'
                     : 'To unblock:'
             }),
-          item.loaded && list.intro && jsx('div', { style: { whiteSpace: 'pre-wrap' }, children: list.intro }),
+          item.loaded && list.intro && jsx('div', { style: { whiteSpace: 'pre-wrap' }, children: jsx(Linked, { text: list.intro }) }),
           item.loaded &&
             jsx('ol', {
               'data-blocked-steps': list.source,
               start: list.start,
               style: { margin: '2px 0 0', paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 3 },
-              children: steps.map((s, i) => jsx('li', { style: { paddingLeft: 2 }, children: s }, i))
+              children: steps.map((s, i) => jsx('li', { style: { paddingLeft: 2 }, children: jsx(Linked, { text: s }) }, i))
             }),
           showNote &&
             jsx('div', {
               style: { marginTop: 4, padding: '4px 8px', borderLeft: `2px solid color-mix(in srgb, ${AMBER} 50%, transparent)`, fontSize: 11.5, opacity: 0.8, whiteSpace: 'pre-wrap' },
-              children: item.text
+              children: jsx(Linked, { text: item.text })
             })
         ]
       }),
@@ -618,7 +675,7 @@ function Panel() {
         jsx('ol', {
           'data-blocked-steps': 'parked',
           style: { margin: '2px 0 0', paddingLeft: 20, fontSize: 12.5, lineHeight: 1.45, display: 'flex', flexDirection: 'column', gap: 3 },
-          children: PARKED_STEPS.map((s, i) => jsx('li', { children: s }, i))
+          children: PARKED_STEPS.map((s, i) => jsx('li', { children: jsx(Linked, { text: s }) }, i))
         }),
       !collapsed && items.map(item => jsx(Item, { item }, item.id))
     ]
@@ -629,10 +686,11 @@ export default {
   id: ID,
   name: 'Blocked Panel',
   register(ctx) {
+    osApi = ctx.os || null
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -20, render: () => jsx(Panel, {}) })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__blockedPanel = { version: 2, get snapshot() { return snapshot }, refresh, checklist }
+    window.__blockedPanel = { version: 3, get snapshot() { return snapshot }, refresh, checklist }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel
