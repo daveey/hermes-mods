@@ -199,6 +199,8 @@ def _route_event(state: State, ev: dict) -> bool:
         lag = time.time() - float(ev.get("ts") or time.time())
         logger.info("slack-follow: %s ts=%s -> follower (event lag %.1fs)", r.engagement["id"], ev.get("ts"), lag)
         state.engs.update(r.engagement["id"], last_activity=time.time())
+        threading.Thread(target=follow.ack_if_addressed, daemon=True, name="slack-follow-ack",
+                         args=(state.store, lambda m, p=None: core.call(state.token(), m, p), ev, state.bot_user_id())).start()
         if state.runner is not None:
             state.runner.kick(r.engagement["id"])
     return True
@@ -259,13 +261,34 @@ def _make_runner(state: State):
         root_home = state.store.root.parent
     fcfg = state.store.policy().get("follower") or {}
 
-    def inbox_post(title, body, accept_prompt, key=None, profile=None, **_):
-        home = root_home / "profiles" / profile if profile else root_home
-        return _inbox_for(home).post(title, body, accept_prompt, key=key, poster="slack follower")
+    def _home(profile):
+        return root_home / "profiles" / profile if profile else root_home
+
+    def inbox_post(title, body, accept_prompt, key=None, profile=None, type=None, fields=None, **_):
+        return _post_typed(_inbox_for(_home(profile)), title, body, accept_prompt, key=key, poster="slack follower",
+                           type=type, fields=fields)
+
+    def inbox_outcome(key, profile=None):
+        return _inbox_for(_home(profile)).outcome(key)
 
     return follow.Runner(state.store, state.engs, token=state.token, bot_user_id=state.bot_user_id,
                          name=state.user_name, root_home=root_home, inbox_post=inbox_post,
-                         self_gateway=fcfg.get("self_gateway") or "")
+                         inbox_outcome=inbox_outcome, self_gateway=fcfg.get("self_gateway") or "")
+
+
+def _post_typed(inbox, title, body, accept_prompt, *, key=None, poster=None, type=None, fields=None):
+    """Post an Inbox card of card type *type* (the slack-workspace-bot skill's inbox-types/). A host whose inbox
+    plugin predates card types, or whose skills dir lacks the type, gets the plain Do it / Archive card."""
+    if type:
+        try:
+            return inbox.post(title, body, accept_prompt, key=key, poster=poster, type=type, fields=fields)
+        except TypeError:  # an inbox store without card types
+            pass
+        except ValueError as exc:  # unknown/invalid type on this host; any other ValueError is a real error
+            if "type" not in str(exc).lower():
+                raise
+            logger.info("slack-workspace: card type %s unavailable (%s); posting a plain card", type, exc)
+    return inbox.post(title, body, accept_prompt, key=key, poster=poster)
 
 
 def _inbox_for(home: Path):
@@ -776,9 +799,11 @@ def ftool_read(peer, args: dict, **_) -> str:
 
 
 def ftool_escalate(peer, args: dict, **_) -> str:
-    def post(title, body, accept_prompt, key=None, poster=None):
-        return _inbox_for(peer.home).post(title, body, accept_prompt, key=key, poster=poster)
-    return _out(follow.escalate(peer.engs(), post, channel=args.get("channel", ""),
+    inbox = _inbox_for(peer.home)
+
+    def post(title, body, accept_prompt, key=None, poster=None, type=None, fields=None):
+        return _post_typed(inbox, title, body, accept_prompt, key=key, poster=poster, type=type, fields=fields)
+    return _out(follow.escalate(peer.engs(), post, inbox_outcome=inbox.outcome, channel=args.get("channel", ""),
                                 thread_ts=args.get("thread_ts") or "", topic=args.get("topic") or "",
                                 title=args.get("title") or "", body=args.get("body") or "",
                                 reply_text=args.get("reply_text") or "", reply_to=args.get("reply_to") or "",

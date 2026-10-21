@@ -122,12 +122,13 @@ def batch_prompt(e: dict, batch: dict, context_rows: list[dict], name: Callable[
     esc = [x for x in (escalations or []) if not e["thread"] or x.get("thread") == e["thread"]]
     if esc:
         lines += ["", "Inbox cards you already posted here (reuse the SAME topic to update one):"]
-        lines += [f"- topic '{x['topic']}' (thread {x['thread'] or '-'}): {x['title']}  [{x['key']}]" for x in esc[-10:]]
+        lines += [f"- topic '{x['topic']}' (thread {x['thread'] or '-'}): {x['title']}  [{x['key']}]"
+                  + (f"  — owner pressed {x['decision']}" if x.get("decision") else "") for x in esc[-10:]]
     lines += ["", "Follow the participation rules (skill slack-workspace-bot, 'Engaged channels'). "
               "Reply with slack_post(channel, thread_ts, reply_to=<ts>, text); one reply per message. "
-              "Be quick: answer simple things right away; if a good answer needs more than ~30 s of research, "
-              "first slack_react 'eyes' on the message, then reply when you have it. "
-              "React with slack_react. Anything needing the owner → slack_escalate (nothing posted in the "
+              "Be quick: answer simple things right away with ONE slack_post, no preamble. The gateway already "
+              "added :eyes: to messages addressed to us and swaps it for :white_check_mark: when you post; "
+              "do not react for that. Use slack_react only for other reactions. Anything needing the owner → slack_escalate (nothing posted in the "
               "channel). Work needing the Mac → slack_defer_to_mbp. If nothing needs you, post nothing. "
               "End with a one-line note of what you did (your chat is the activity log)."]
     return "\n".join(lines)
@@ -302,12 +303,14 @@ def parse_session_id(output: str) -> str:
 class Runner:
     def __init__(self, store, engs, *, token: Callable[[], str], bot_user_id: Callable[[], str],
                  name: Callable[[str], str], root_home: Path, spawn: Optional[Callable] = None,
-                 inbox_post: Optional[Callable] = None, self_gateway: str = ""):
+                 inbox_post: Optional[Callable] = None, self_gateway: str = "",
+                 inbox_outcome: Optional[Callable] = None):
         self.store, self.engs = store, engs
         self.token, self.bot_user_id, self.name = token, bot_user_id, name
         self.root_home = Path(root_home)
         self.spawn = spawn or self._spawn
         self.inbox_post = inbox_post
+        self.inbox_outcome = inbox_outcome  # (key, profile) -> inbox outcome dict | None
         self.self_gateway = self_gateway
         self._busy: set[str] = set()
         self._again: set[str] = set()
@@ -385,9 +388,9 @@ class Runner:
         ctx = [r for r in self.store.recent(e["channel"], first - 7 * 86400, limit=40)
                if self.engs.in_scope(e, r) and float(r["ts"]) < first][-15:]
         t0 = time.time()
-        rc, out = self.spawn(e, batch_prompt(e, batch, ctx, self.name, bot, self.engs.escalations(e["channel"])))
-        logger.info("slack-follow: %s turn for %d message(s) rc=%s in %.0fs", eid, len(batch["trigger"]), rc,
-                    time.time() - t0)
+        rc, out = self.spawn(e, batch_prompt(e, batch, ctx, self.name, bot, self._escalations(e)))
+        logger.info("slack-follow: %s turn for %d message(s) rc=%s in %.0fs (waited %.1fs from message to spawn)",
+                    eid, len(batch["trigger"]), rc, time.time() - t0, t0 - first)
         sid = parse_session_id(out)
         if sid and sid != e.get("follower_session"):
             self.engs.update(eid, follower_session=sid)
@@ -396,6 +399,14 @@ class Runner:
             return False
         self.engs.mark_handled(eid, batch["newest"])
         return True
+
+    def _escalations(self, e: dict) -> list[dict]:
+        """This channel's Inbox cards, each tagged with the owner's resolved decision on it (e.g. ignore)."""
+        out = []
+        for x in self.engs.escalations(e["channel"]):
+            d = decided(lambda k: self.inbox_outcome(k, e.get("follower_profile")), x["key"]) if self.inbox_outcome else {}
+            out.append(dict(x, decision=d.get("outcome")) if d else x)
+        return out
 
     def _join_if_public(self, e: dict) -> None:
         if e.get("private"):
@@ -459,6 +470,8 @@ class Runner:
             if quiet >= QUIET_END_S:
                 self.engs.set_state(e["id"], "ended")
                 continue
+            if quiet >= QUIET_WARN_S and e.get("warned_quiet") and self._quiet_decision(e, now):
+                continue
             if quiet >= QUIET_WARN_S and not e.get("warned_quiet") and self.inbox_post:
                 try:
                     self.inbox_post(
@@ -466,13 +479,35 @@ class Runner:
                         body=f"Engagement `{e['id']}` has had no activity for 6 days. It auto-ends in 24 h.",
                         accept_prompt=f"Keep following: call slack_engagements(action='update', id='{e['id']}') "
                                       f"after resetting activity with action='resume', id='{e['id']}'.",
-                        key=engage.inbox_key(e["channel"], e["thread"], "quiet-end"), profile=e.get("follower_profile"))
+                        key=engage.inbox_key(e["channel"], e["thread"], "quiet-end"), profile=e.get("follower_profile"),
+                        type="slack-quiet-end", fields={"engagement": e["id"]})
                 except Exception:
                     logger.warning("slack-follow quiet card failed", exc_info=True)
                 self.engs.update(e["id"], warned_quiet=now)
             if e.get("kickoff") or self.engs.notes(e["id"]) or self.engs.unhandled(e["id"], bot_user_id=bot)["trigger"]:
                 self.kick(e["id"])
         self.deliver_mbp(now)
+
+    def _quiet_decision(self, e: dict, now: float) -> bool:
+        """Honour the owner's press on the quiet-end card: Keep following restarts the quiet clock (and re-arms the
+        warning), Let it end ends the engagement now. True when the engagement was ended."""
+        if not self.inbox_outcome:
+            return False
+        key = engage.inbox_key(e["channel"], e["thread"], "quiet-end")
+        try:
+            o = self.inbox_outcome(key, e.get("follower_profile"))
+        except Exception:
+            logger.warning("slack-follow quiet outcome read failed", exc_info=True)
+            return False
+        act = (o or {}).get("outcome") if (o or {}).get("state") == "resolved" else None
+        warned = float(e.get("warned_quiet") or 0)
+        if act not in ("keep", "let_end") or float(o.get("at") or 0) < warned:  # an older card's decision
+            return False
+        if act == "let_end":
+            self.engs.set_state(e["id"], "ended")
+            return True
+        self.engs.update(e["id"], last_activity=now, warned_quiet=0)
+        return False
 
     # ---- queue to another machine's session (session-mentions courier) ------------------------
     def deliver_mbp(self, now: Optional[float] = None) -> None:
@@ -603,14 +638,61 @@ class Poster:
             if to_bot:
                 self.engs.bump_bot_turns(channel, thread_ts or reply_to)
         self.engs.update(e["id"], last_activity=time.time())
+        if reply_to:  # done: swap the instant :eyes: for :white_check_mark: (best effort)
+            for method, name in (("reactions.remove", ACK_EMOJI), ("reactions.add", DONE_EMOJI)):
+                try:
+                    self.api(method, {"channel": channel, "timestamp": reply_to, "name": name})
+                except Exception:
+                    pass
         return {"ok": True, "ts": ts, "thread_ts": thread_ts or ts, "verified": verified, "engagement": e["id"]}
 
 
+ACK_EMOJI, DONE_EMOJI = "eyes", "white_check_mark"
+
+
+def ack_if_addressed(store, api: Callable[[str, Optional[dict]], dict], event: dict, bot_user_id: str) -> bool:
+    """Deterministic :eyes: (no LLM) on a message addressed to the bot: an @-mention, a DM, or a reply in a
+    thread the bot already posted in. Unaddressed chatter gets nothing. Never raises."""
+    try:
+        if not engage.is_trigger(event, bot_user_id) or event.get("subtype"):
+            return False
+        ch, ts = event.get("channel") or "", event.get("ts") or ""
+        thread = event.get("thread_ts") or ""
+        addressed = engage.mentions(event.get("text") or "", bot_user_id) or ch.startswith("D")
+        if not addressed and thread and thread != ts:
+            addressed = any(r.get("user") == bot_user_id and r.get("thread_ts") == thread
+                            for r in store.recent(ch, float(thread) - 0.0001, limit=200))
+        if not addressed:
+            return False
+        api("reactions.add", {"channel": ch, "timestamp": ts, "name": ACK_EMOJI})
+        return True
+    except Exception as exc:
+        if "already_reacted" not in str(exc):
+            logger.info("slack-follow ack failed: %s", exc)
+        return False
+
+
+def decided(inbox_outcome: Optional[Callable], key: str) -> dict:
+    """The owner's resolved decision on the newest card with this key ({} when open, archived, none, or no reader).
+    Never raises: an unreadable card is simply undecided."""
+    try:
+        o = inbox_outcome(key) if inbox_outcome else None
+    except Exception:
+        return {}
+    return o if o and o.get("state") == "resolved" and o.get("outcome") else {}
+
+
 def escalate(engs, inbox_post: Callable, *, channel: str, thread_ts: str, topic: str, title: str, body: str,
-             reply_text: str = "", reply_to: str = "", action: str = "", permalink: str = "") -> dict:
-    """One Inbox card per (channel, thread, topic); a repeat updates the open card."""
+             reply_text: str = "", reply_to: str = "", action: str = "", permalink: str = "",
+             inbox_outcome: Optional[Callable] = None) -> dict:
+    """One Inbox card per (channel, thread, topic); a repeat updates the open card. A topic the owner pressed
+    Ignore on is not raised again (``ignored``): a follow-up on it would only re-open the card he dismissed."""
     e = engs.active_for(channel, thread_ts or reply_to or "") or {}
     key = engage.inbox_key(channel, thread_ts, topic)
+    if decided(inbox_outcome, key).get("outcome") == "ignore":
+        return {"ok": True, "key": key, "ignored": True,
+                "note": "the owner pressed Ignore on this topic's card; nothing was posted anywhere. Do not raise "
+                        "this topic again unless he asks."}
     where = f"<#{channel}>" + (f" thread {thread_ts}" if thread_ts else "")
     if reply_text:
         accept = (f"Post this reply as the bot with slack_post(channel='{channel}', thread_ts='{thread_ts}'"
@@ -630,8 +712,11 @@ def escalate(engs, inbox_post: Callable, *, channel: str, thread_ts: str, topic:
                         "Post nothing in the channel, as for a real escalation."}
     full_body = (f"**Where:** {where}" + (f" ({permalink})" if permalink else "")
                  + (f" · engagement `{e['id']}`" if e else "") + f"\n\n{body}")
+    typed = ({"type": "slack-reply", "fields": {"channel": channel, "thread": thread_ts or "",
+                                                "reply_to": reply_to or "", "reply": reply_text}}
+             if reply_text else {"type": "slack-action", "fields": {}})
     res = inbox_post(title=title, body=full_body, accept_prompt=accept, key=key,
-                     poster=f"slack · {('#' + e['name']) if e.get('name') else channel}")
+                     poster=f"slack · {('#' + e['name']) if e.get('name') else channel}", **typed)
     engs.record_escalation(key, channel=channel, thread=thread_ts, topic=topic, title=title,
                            session_id=(res or {}).get("session_id") or "")
     return {"ok": True, "key": key, **res}
