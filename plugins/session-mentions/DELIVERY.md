@@ -117,3 +117,11 @@ Live results (2026-10-19 PDT):
   `@macbook/...` was served by the mini through its `macbook` SSH connection. The MacBook answers it itself once
   its backend restarts and reports `device: macbook`.
 
+
+## run_in_user_terminal relay (action `user_terminal`)
+
+A gateway with no screen relays `run_in_user_terminal` jobs to the owner's Mac through this courier: the request
+is routed to the Mac's device name, so only that Mac's courier claims it, and `performUserTerminal` calls the
+user-terminal plugin's routes on the courier's OWN backend (`/api/plugins/user-terminal/start`, `/status/<job>`).
+The origin gateway shown in the confirm window is this courier's key for the drained connection. Full design,
+invariants and tests: `plugins/user-terminal/REMOTE.md`; courier tests `tests/user-terminal.test.mjs`.
