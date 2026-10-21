@@ -176,6 +176,9 @@ def initial_reason(body: str) -> str:
     m = re.search(r"(?im)^\s*(?:\*\*)?blocked until(?:\*\*)?\s*:\s*(.+)$", body)
     if m:
         return m.group(1).strip()
+    m = re.search(r"(?im)^\s*(?:\*\*)?reason(?:\*\*)?\s*:\s*(.+(?:\n(?!\s*$|\s*\w[\w ]{0,20}:\s).+)*)", body)
+    if m:   # escalation cards: a generic first line, the actual question on "Reason:"
+        return m.group(1).strip()
     steps = re.search(r"(?ims)^.*(?:human|your|\w+'s) steps[^\n]*:\s*\n(.*?)(?=\n\s*(?:Agent steps|Done when|Acceptance)\b|\Z)", body)
     if steps:
         return steps.group(1).strip()
