@@ -26,13 +26,13 @@ SKIP = re.compile(
     r"^\s*(\[(Slack engagement|IMPORTANT:|OUT-OF-BAND)|\{\s*\"(?:person|kind)\"|Without any other tools:|[✔✖✘⏸⏱🔄]\ufe0f?\s+\[)", re.I)
 OOB = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
 
-_V = r"(?:do|did|doing|check|checked|merge|nudge|listen|investigate|investigating|figure|fix|run|handle|try|test|verify|find|look|ssh|read|open|search|review|update|click|sign|log)"
+_V = r"(?:do|did|doing|check|checked|merge|nudge|investigate|investigating|figure|fix|run|handle|try|test|verify|find|look|ssh|read|open|search|review|update|click|sign|log)"
 PATTERNS = [
     ("why-asking-me", r"\bwhy\b.{0,40}\b(?:ask|asking|asked)\w*\s+me\b"),
     ("stop-asking", r"\b(?:stop|quit)\s+asking\b|(?<!\bi )\bkeep\s+asking\b|\bdon.?t\s+(?:ask|keep asking)\s+me\b|\bto stop asking\b"),
     ("do-it-yourself", r"\b" + _V + r"\b(?:\s+\S+){0,5}?\s+yourself\b"),
     ("why-not-yourself", r"\bwhy\s+(?:did|didn.?t|don.?t|can.?t|couldn.?t|would|wouldn.?t)\w*\s+(?:you|the agent|it)\b.{0,40}\byourself\b"),
-    ("why-didnt-check", r"\bwhy\s+(?:did|didn.?t)\w*\s+(?:you|the agent|it)\s+(?:just\s+)?(?:figure|check|look|find|verify|list|search)"),
+    ("why-didnt-check", r"\bwhy\s+(?:did|didn.?t)\w*\s+you\s+(?:just\s+)?(?:figure|check|look|find|verify|list|search)"),
     ("instead-of-doing", r"\binstead of (?:doing|checking|running|trying)\b.{0,30}\b(?:yourself|it)\b"),
     ("already-done", r"\bi(?:.?ve|\s+have)?\s+(?:already|just)\s+(?:did|done|told|said|answered|completed|handled)\b"
                      r"|\bi\s+keep\s+(?:completing|doing|telling|answering|saying|handling)\b"
@@ -78,13 +78,17 @@ def collect(data, since_ts, until_ts):
         st = d.get("started_at")
         if st and (first_ts is None or st < first_ts):
             first_ts = st
-        for u in d.get("user_turns") or []:
+        for i, u in enumerate(d.get("user_turns") or []):
             t, text = u.get("t", 0), clean(u.get("text") or "")
             if not (since_ts <= t < until_ts) or not text:
                 continue
             ws = week_start(t)
             scanned[ws] = scanned.get(ws, 0) + 1
-            kind = classify(text)
+            # A session that opens with a screenshot and "stop asking me" is about an OS/app popup, not an agent ask
+            # (nothing preceded it). Text-only openers still count: they often answer an ask carried over from another
+            # session (e.g. a CLI chat replying to a bb-tuner question).
+            opener_popup = i == 0 and re.search(r"\[(?:screenshot|Image attached)", text, re.I)
+            kind = None if opener_popup else classify(text)
             if not kind:
                 continue
             key = (d.get("id"), int(t), text[:80])
