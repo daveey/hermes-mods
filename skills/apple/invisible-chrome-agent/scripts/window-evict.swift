@@ -22,6 +22,13 @@ while i + 1 < args.count {
   i += 1
 }
 let vd = CGRect(x: vx, y: vy, width: vw, height: vh)
+// Target = a real display that doesn't overlap the virtual one (main first). With the lid closed and no monitor,
+// the virtual display is the only screen (bounds 0,0): there is nowhere to move to, so leave every window alone.
+var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+CGGetActiveDisplayList(16, &ids, &n)
+let others = ids.prefix(Int(n)).map { CGDisplayBounds($0) }.filter { !$0.intersects(vd) }
+guard !others.isEmpty else { exit(0) }
+let target = others.first { $0.origin == .zero } ?? others[0]
 let ownBundles: Set<String> = ["com.hermes.chrome-agent.notify"]
 
 guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { exit(0) }
@@ -41,11 +48,15 @@ for w in infos {
 if stuck.isEmpty { exit(0) }
 if !AXIsProcessTrusted() { print("untrusted"); exit(0) }
 
-// Main display visible frame in CG (top-left origin) coordinates.
-let primary = NSScreen.screens[0]
-let vf = primary.visibleFrame
-let mainTop = primary.frame.height - vf.maxY
-let main = CGRect(x: vf.minX, y: mainTop, width: vf.width, height: vf.height)
+// Target display's visible frame in CG (top-left origin) coordinates; NSScreen frames are bottom-left based on
+// the primary screen's height. Fall back to the raw bounds minus a menu-bar strip.
+let primaryH = NSScreen.screens.first?.frame.height ?? target.height
+let main = NSScreen.screens.lazy.map { s -> (CGRect, CGRect) in
+  let f = s.frame, v = s.visibleFrame
+  return (CGRect(x: f.minX, y: primaryH - f.maxY, width: f.width, height: f.height),
+          CGRect(x: v.minX, y: primaryH - v.maxY, width: v.width, height: v.height))
+}.first { abs($0.0.minX - target.minX) < 1 && abs($0.0.minY - target.minY) < 1 }?.1
+  ?? CGRect(x: target.minX, y: target.minY + 40, width: target.width, height: target.height - 40)
 
 for s in stuck {
   let bundle = NSRunningApplication(processIdentifier: s.pid)?.bundleIdentifier ?? "pid\(s.pid)"
