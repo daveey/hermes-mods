@@ -1,0 +1,255 @@
+From 4a3036b388469d4d7324c49f6d166ab81c05e7b4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:24:45 -0700
+Subject: [PATCH] fix(session-context): a nested re-bind of the same session
+ restores the turn's binding on clear [daveey]
+
+A queued model switch refreshes the stored system prompt on the Desktop turn
+thread (_persist_live_session_system_prompt), which re-binds the turn's own
+session and clears it in a finally. clear_session_vars wiped every var to "",
+so the rest of the turn ran with no HERMES_SESSION_KEY/ID: kanban_create
+cards landed with session_id empty and no tui subscription (sidebar never
+counted them, the chat never heard they landed).
+
+clear_session_vars now restores the prior values (incl. the session cwd) when
+the tokens re-bound the session key that was already bound; any other clear
+still wipes, so a task that inherited another session's vars never falls back
+to that identity.
+---
+ gateway/session_context.py                    | 44 ++++++++--
+ tests/gateway/test_session_env.py             | 49 +++++++++++
+ .../test_turn_session_context_nesting.py      | 88 +++++++++++++++++++
+ 3 files changed, 176 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tui_gateway/test_turn_session_context_nesting.py
+
+diff --git a/gateway/session_context.py b/gateway/session_context.py
+index 38af24a205..d2be517be1 100644
+--- a/gateway/session_context.py
++++ b/gateway/session_context.py
+@@ -7,7 +7,7 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
+ 
+ import os
+ from contextlib import contextmanager
+-from contextvars import ContextVar
++from contextvars import ContextVar, Token
+ from typing import Any, Iterator
+ 
+ # "Never set here" (falls back to os.environ for CLI/cron) vs "" = explicitly cleared (no fallback).
+@@ -122,8 +122,9 @@ def set_session_vars(
+     session_history_delivery: str | None = None,
+ ) -> list:
+     """Set all session context variables and return reset tokens.  Call
+-    ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
+-    to ``""`` rather than restoring prior values (tokens are accepted only for API compat).
++    ``clear_session_vars(tokens)`` in a ``finally``.  Clearing resets every var to ``""``
++    rather than restoring prior values, EXCEPT a nested re-bind of the session already bound
++    here (same non-empty session key), which restores the outer binding. [daveey]
+ 
+     ``session_history_delivery`` declares whether the bound chat id is one the client can address again:
+     ``"1"`` (audited producers — explicit session-id header, native API sessions, /v1/runs) or
+@@ -140,16 +141,49 @@ def set_session_vars(
+     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
+     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
+     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+-    _runtime_cwd("set_session_cwd", cwd)
++    try:
++        from agent import runtime_cwd
++        tokens.append(runtime_cwd.set_session_cwd(cwd))
++    except Exception:
++        pass
+     return tokens
+ 
+ 
++def _nested_rebind_tokens(tokens: list) -> dict | None:
++    """``{var: token}`` when *tokens* re-bound the session key that was already bound (a
++    helper re-binding the turn's own session, e.g. the system-prompt refresh a queued model
++    switch runs on the turn thread), else None.  Only that case restores prior values: a
++    clear after binding a DIFFERENT session must still wipe, so an asyncio task that inherited
++    another session's vars never falls back to that identity. [daveey]"""
++    by_var = {tok.var: tok for tok in tokens or () if isinstance(tok, Token)}
++    key_tok = by_var.get(_SESSION_KEY)
++    if key_tok is None:
++        return None
++    prior = key_tok.old_value
++    if prior is Token.MISSING or prior is _UNSET or not prior or prior != _SESSION_KEY.get():
++        return None
++    return by_var
++
++
+ def clear_session_vars(tokens: list) -> None:
+     """Mark session context variables as explicitly cleared (``""``, not ``_UNSET``), so
+     ``get_session_env`` returns empty instead of stale ``os.environ`` values.  Async-delivery
+     goes back to ``_UNSET``: a cleared context is default-supported, not opted-out.  Wake
+     capability goes back to ``_UNSET`` too — but for the opposite reason: a cleared context has
+-    declared nothing, and an undeclared capability FAILS CLOSED (#98619)."""
++    declared nothing, and an undeclared capability FAILS CLOSED (#98619).
++
++    A nested re-bind of the same session restores the outer binding instead: wiping it
++    left the rest of a Desktop turn with no ``HERMES_SESSION_KEY``/``ID``, so its
++    ``kanban_create`` cards were neither stamped nor subscribed. [daveey]"""
++    nested = _nested_rebind_tokens(tokens)
++    if nested is not None:
++        for var, tok in nested.items():
++            prior = tok.old_value
++            if prior is Token.MISSING:  # never bound in this context: own module's "unset"
++                prior = _UNSET if var.name in _VAR_MAP or var in (
++                    _SESSION_ASYNC_DELIVERY, _SESSION_HISTORY_DELIVERY) else ""
++            var.set(prior)
++        return
+     for var in _SESSION_VARS:
+         var.set("")
+     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+diff --git a/tests/gateway/test_session_env.py b/tests/gateway/test_session_env.py
+index 7d33f7730c..548afad25c 100644
+--- a/tests/gateway/test_session_env.py
++++ b/tests/gateway/test_session_env.py
+@@ -316,3 +316,52 @@ async def test_plugin_slash_command_sees_session_env(monkeypatch):
+     # Bound only for the handler call, not leaked past dispatch
+     assert get_session_env("HERMES_SESSION_KEY") == ""
+ 
++
++
++def test_nested_rebind_of_same_session_restores_outer_binding(monkeypatch):
++    """A helper that re-binds the turn's OWN session (the system-prompt refresh a queued
++    model switch runs on the Desktop turn thread) must hand the outer binding back on clear.
++    Wiping it left the rest of the turn without HERMES_SESSION_KEY/ID, so kanban_create
++    cards were neither stamped with session_id nor subscribed. [daveey]"""
++    from agent.runtime_cwd import scoped_session_cwd
++
++    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    outer = set_session_vars(session_key="s1", session_id="s1", source="desktop",
++                             profile="default", ui_session_id="ui1", cwd="/tmp/a")
++    try:
++        inner = set_session_vars(session_key="s1", session_id="s1", source="desktop",
++                                 profile="default", cwd="/tmp/a")
++        clear_session_vars(inner)
++        assert get_session_env("HERMES_SESSION_KEY") == "s1"
++        assert get_session_env("HERMES_SESSION_ID") == "s1"
++        assert get_session_env("HERMES_SESSION_SOURCE") == "desktop"
++        assert get_session_env("HERMES_UI_SESSION_ID") == "ui1"  # outer-only value survives
++        assert scoped_session_cwd() == "/tmp/a"
++    finally:
++        clear_session_vars(outer)
++    # The outermost clear still wipes (no os.environ fallback).
++    assert get_session_env("HERMES_SESSION_KEY") == ""
++    assert get_session_env("HERMES_SESSION_ID") == ""
++    assert scoped_session_cwd() == ""
++
++
++def test_bind_of_other_session_then_clear_still_wipes(monkeypatch):
++    """Control: clearing a binding of a DIFFERENT session never falls back to the session
++    bound before it (an asyncio task inheriting A's vars must not read A after B clears)."""
++    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
++    outer = set_session_vars(session_key="A", session_id="A")
++    try:
++        inner = set_session_vars(session_key="B", session_id="B")
++        clear_session_vars(inner)
++        assert get_session_env("HERMES_SESSION_KEY") == ""
++        assert get_session_env("HERMES_SESSION_ID") == ""
++    finally:
++        clear_session_vars(outer)
++
++
++def test_clear_without_tokens_still_wipes(monkeypatch):
++    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
++    set_session_vars(session_key="s1")
++    clear_session_vars([])
++    assert get_session_env("HERMES_SESSION_KEY") == ""
+diff --git a/tests/tui_gateway/test_turn_session_context_nesting.py b/tests/tui_gateway/test_turn_session_context_nesting.py
+new file mode 100644
+index 0000000000..faa472a974
+--- /dev/null
++++ b/tests/tui_gateway/test_turn_session_context_nesting.py
+@@ -0,0 +1,88 @@
++"""A queued model switch refreshes the stored system prompt on the TURN thread, after the turn
++bound its session context. That refresh re-binds the same session and clears it in a
++``finally``; the clear used to wipe the turn's binding, so every later tool call in the turn
++saw no ``HERMES_SESSION_KEY``/``HERMES_SESSION_ID`` and ``kanban_create`` cards landed with
++``session_id`` empty and no tui subscription (t_2cd33dfc). [daveey]"""
++
++from gateway.session_context import _UNSET, _VAR_MAP, get_session_env
++from tui_gateway import server
++
++
++def _reset_vars():
++    for var in _VAR_MAP.values():
++        var.set(_UNSET)
++
++
++def test_turn_session_context_survives_system_prompt_refresh(monkeypatch):
++    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    built = []
++
++    class FakeAgent:
++        session_id = "sess-1"
++        _cached_system_prompt = None
++
++        def _build_system_prompt(self, system_message=None):
++            built.append(get_session_env("HERMES_SESSION_KEY"))
++            return "prompt"
++
++    class FakeDB:
++        def update_system_prompt(self, key, prompt):
++            pass
++
++    agent = FakeAgent()
++    agent._session_db = FakeDB()
++    session = {"agent": agent, "session_key": "sess-1", "cwd": ""}
++    sid = "ui-test-nesting"
++    server._sessions[sid] = session
++    try:
++        tokens = server._set_session_context("sess-1", ui_session_id=sid)
++        try:
++            server._persist_live_session_system_prompt(session)
++            assert built == ["sess-1"]
++            # The turn's own binding is back for the rest of the turn.
++            assert get_session_env("HERMES_SESSION_KEY") == "sess-1"
++            assert get_session_env("HERMES_SESSION_ID") == "sess-1"
++            assert get_session_env("HERMES_UI_SESSION_ID") == sid
++        finally:
++            server._clear_session_context(tokens)
++        assert get_session_env("HERMES_SESSION_KEY") == ""
++    finally:
++        server._sessions.pop(sid, None)
++        _reset_vars()
++
++
++def test_kanban_create_target_resolves_after_refresh(monkeypatch):
++    """End to end on the kanban side: the auto-subscribe target is still the turn's session."""
++    from tools.kanban_tools import _resolve_notify_target
++
++    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
++    monkeypatch.setattr("tools.kanban_tools._live_tui_session_key", lambda key, profile: key)
++
++    class FakeAgent:
++        session_id = "sess-2"
++
++        def _build_system_prompt(self, system_message=None):
++            return "prompt"
++
++    class FakeDB:
++        def update_system_prompt(self, key, prompt):
++            pass
++
++    agent = FakeAgent()
++    agent._session_db = FakeDB()
++    session = {"agent": agent, "session_key": "sess-2", "cwd": ""}
++    sid = "ui-test-nesting-2"
++    server._sessions[sid] = session
++    try:
++        tokens = server._set_session_context("sess-2", ui_session_id=sid)
++        try:
++            server._persist_live_session_system_prompt(session)
++            target = _resolve_notify_target()
++            assert target is not None
++            assert (target["platform"], target["chat_id"]) == ("tui", "sess-2")
++        finally:
++            server._clear_session_context(tokens)
++    finally:
++        server._sessions.pop(sid, None)
++        _reset_vars()
+-- 
+2.54.0 (Apple Git-157)
+
