@@ -161,9 +161,16 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   CDP calls into a non-selected tab were seen to hang for ~20-60s at a time (also in a fresh Chrome without this
   supervisor), then recover. If a session keeps timing out on `Runtime.evaluate`/`Page.navigate`, a
   `Target.activateTarget` sent through the harness may not help: the harness stays attached to its own (stalled)
-  tab. What works: `curl 127.0.0.1:9333/json/close/<id>` the stalled tabs, `curl -X PUT
-  '127.0.0.1:9333/json/new?<url>'`, `curl 127.0.0.1:9333/json/activate/<new id>`, then in the harness
-  `switch_tab("<new id>")` before any `js()`.
+  tab. What works: `curl 127.0.0.1:9333/json/close/<id>` the stalled tabs, then open the page in its own background
+  window, `cdp('Target.createTarget', url=<url>, newWindow=True, background=True)` (a tab alone in its window is
+  `visible`), then `switch_tab("<new id>")` before any `js()`. Add `cdp('Emulation.setFocusEmulationEnabled',
+  enabled=True)` if the page needs `document.hasFocus()`.
+- **Never raise the agent Chrome unless the user asked to see it.** `Target.activateTarget`, `activate_tab`,
+  `switch_tab(activate=True)`, `/json/activate`, `PUT /json/new` and any `Target.createTarget` without
+  `background: true` make macOS bring Chrome to the front and take the user's keyboard focus (measured with
+  NSWorkspace activation logs: background create → no activation; foreground create or activateTarget → Chrome
+  frontmost within ~0.1 s). Only the "Showing the user a page" flow below may activate. On 2026-10-21 a test suite
+  pointed at port 9333, a skill's `activateTarget` advice and core's own-tab preamble produced ~50 steals an hour.
 - **Security:** anything running as the user can drive port 9333: read and act as every account logged in to the agent
   profile, and trigger passkey requests (which still need a Touch ID tap). The port binds to loopback only; nothing
   stops other local processes.
