@@ -527,6 +527,21 @@ def test_reply_in_a_thread_alpha_posted_in_gets_eyes_but_other_threads_do_not(en
     assert api.reactions == [("add", "eyes", "8.0")]
 
 
+def test_plain_text_alpha_address_gets_eyes(env):
+    store, engs, api, _ = env
+    for i, txt in enumerate(["alpha -- status?", "Alpha, status?", "hey alpha what now", "ALPHA: ping", "alpha"]):
+        assert follow.ack_if_addressed(store, api, ev("C1", f"{20 + i}.0", txt), BOTSELF), txt
+    assert len(api.reactions) == 5
+
+
+def test_alpha_inside_other_words_gets_no_eyes(env):
+    store, engs, api, _ = env
+    for i, txt in enumerate(["alphashot is down", "see alpha-punch-fleece", "the alpha version is out",
+                             "<#C9|alpha-punch-fleece> broke", "alphabet soup"]):
+        assert not follow.ack_if_addressed(store, api, ev("C1", f"{40 + i}.0", txt), BOTSELF), txt
+    assert api.reactions == []
+
+
 def test_dm_channel_message_gets_eyes(env):
     store, engs, api, _ = env
     assert follow.ack_if_addressed(store, api, ev("D123", "5.0", "hey"), BOTSELF)

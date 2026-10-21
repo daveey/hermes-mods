@@ -690,6 +690,14 @@ class Poster:
 
 
 ACK_EMOJI, DONE_EMOJI = "eyes", "white_check_mark"
+# Plain-text address: "alpha -- ...", "alpha, ...", "hey alpha ...". Not "alphashot", "alpha-punch-fleece".
+_ALPHA_NAME = re.compile(r"^\W{0,3}(?:(?:hey|hi|hello|yo|ok|okay|thanks|thx)[ ,]+)?alpha(?![\w-])(?!\s*[-\u2013\u2014]\w)",
+                         re.I)
+
+
+def names_alpha(text: str) -> bool:
+    return bool(_ALPHA_NAME.match(text or ""))
+
 
 
 def ack_if_addressed(store, api: Callable[[str, Optional[dict]], dict], event: dict, bot_user_id: str) -> bool:
@@ -700,7 +708,8 @@ def ack_if_addressed(store, api: Callable[[str, Optional[dict]], dict], event: d
             return False
         ch, ts = event.get("channel") or "", event.get("ts") or ""
         thread = event.get("thread_ts") or ""
-        addressed = engage.mentions(event.get("text") or "", bot_user_id) or ch.startswith("D")
+        addressed = engage.mentions(event.get("text") or "", bot_user_id) or ch.startswith("D") \
+            or names_alpha(event.get("text") or "")
         if not addressed and thread and thread != ts:
             addressed = any(r.get("user") == bot_user_id and r.get("thread_ts") == thread
                             for r in store.recent(ch, float(thread) - 0.0001, limit=200))
