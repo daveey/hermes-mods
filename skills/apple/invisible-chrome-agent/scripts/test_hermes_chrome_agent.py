@@ -260,6 +260,9 @@ class FocusGuardTest(unittest.TestCase):
     IDLE = 30.0   # seconds since the last click / modifier press
 
     def setUp(self):
+        p = mock.patch.object(hca, "pid_alive", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
         self.g = hca.FocusGuard()
         self.g.step(self.HERMES, self.CHROME, 100.0, self.IDLE, float("inf"))   # user is in Hermes
 
@@ -291,6 +294,16 @@ class FocusGuardTest(unittest.TestCase):
     def test_no_previous_app_means_no_action(self):
         g = hca.FocusGuard()
         self.assertIsNone(g.step(self.CHROME, self.CHROME, 1.0, self.IDLE, float("inf")))
+
+    def test_dead_previous_app_is_not_retried(self):
+        with mock.patch.object(hca, "pid_alive", return_value=False):
+            self.assertIsNone(self.g.step(self.CHROME, self.CHROME, 101.0, self.IDLE, float("inf")))
+
+    def test_gives_up_after_max_tries(self):
+        with mock.patch.object(hca, "pid_alive", return_value=True):
+            got = [self.g.step(self.CHROME, self.CHROME, 101.0 + 1.5 * i, self.IDLE, float("inf"))
+                   for i in range(hca.FOCUS_MAX_TRIES + 2)]
+        self.assertEqual(got, [self.HERMES] * hca.FOCUS_MAX_TRIES + [None, None])
 
     def test_reveal_grants_focus(self):
         sup = hca.Supervisor()
