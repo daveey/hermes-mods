@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for rollout tiers, coach-apply auto, revert and stale handling:  python3 test_coach_apply.py
 Uses temp git repos and a fake `hermes` binary (config get/set/unset + kanban create); never pushes."""
+from types import SimpleNamespace
 import json, os, subprocess, sys, tempfile, textwrap, time, unittest
 from pathlib import Path
 
@@ -21,6 +22,9 @@ elif a[:2] == ["config", "set"]:
     cfg[a[2]] = a[3]
 elif a[:2] == ["config", "unset"]:
     cfg.pop(a[2], None)
+elif a[:2] == ["inbox", "outcome"]:
+    oc = json.load(open(f + ".outcomes")) if os.path.exists(f + ".outcomes") else {}
+    print(json.dumps(oc.get(a[2], {"found": False, "key": a[2]})))
 elif a[0] == "inbox":
     if os.environ.get("FAKE_INBOX_FAIL"): sys.exit(3)
     open(f + ".inbox", "a").write(json.dumps(a) + "\n")
@@ -93,6 +97,196 @@ class Base(unittest.TestCase):
 
     def run_auto(self, now=None):
         return ca.auto(self.env, now=now, out=lambda *_: None)
+
+
+class InboxOutcomes(Base):
+    """Keep / Not now / Never pressed on a coach-improvement card are read back and honoured."""
+
+    RULE = {"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+            "new_string": "- Verify end to end.\n- Then check the device.\n"}
+
+    def _rows(self):
+        f = Path(os.environ["FAKE_CFG"] + ".inbox")
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def posts(self):
+        return [(r[2], r[r.index("--key") + 1]) for r in self._rows()]
+
+    def row(self, i=0):
+        return self._rows()[i]
+
+    def outcome(self, pid, action, at="2026-10-20T20:00:00Z", value=None):
+        f = Path(os.environ["FAKE_CFG"] + ".outcomes")
+        oc = json.loads(f.read_text()) if f.exists() else {}
+        oc[f"coach-improvement:{pid}"] = {"found": True, "state": "resolved", "outcome": action, "at": at,
+                                          "value": value}
+        f.write_text(json.dumps(oc))
+
+    def applied(self, **kw):
+        pid = self.add(kind="skill_patch", target="demo-skill", title="Check the device", change=self.RULE, **kw)
+        self.run_auto()
+        self.assertEqual(self.st(pid)["status"], "applied")
+        return pid
+
+    def test_not_now_suppresses_the_kind_and_target_for_two_weeks(self):
+        pid = self.applied()
+        self.outcome(pid, "not_now")
+        self.run_auto()
+        sup = cp.suppressed(self.env.data, {"kind": "skill_patch", "target": "demo-skill"})
+        self.assertEqual(sup["mode"], "not_now")
+        self.assertIsNotNone(cp.suppressed(self.env.data, {"kind": "skill_patch", "target": "demo-skill"},
+                                           time.time() + 13 * 86400))
+        self.assertIsNone(cp.suppressed(self.env.data, {"kind": "skill_patch", "target": "demo-skill"},
+                                        time.time() + 15 * 86400))
+        self.assertEqual(self.st(pid)["status"], "applied")  # Not now leaves the live change alone
+
+    def test_never_reverts_and_stops_proposals_for_good(self):
+        pid = self.applied()
+        self.outcome(pid, "never")
+        self.run_auto()
+        self.assertEqual(self.st(pid)["status"], "reverted")
+        self.assertIsNone(cp.suppressed(self.env.data, {"kind": "skill_patch", "target": "other"}))
+        sup = cp.suppressed(self.env.data, {"kind": "skill_patch", "target": "demo-skill"}, time.time() + 900 * 86400)
+        self.assertEqual(sup["mode"], "never")
+        # a later pending proposal for that target is dropped, not applied
+        pid2 = self.add(kind="skill_patch", target="demo-skill", title="Again",
+                        change={**self.RULE, "new_string": "- Verify end to end.\n- Again.\n"})
+        self.run_auto()
+        self.assertEqual(self.st(pid2)["status"], "dropped")
+        self.assertIn("never from the Inbox", self.st(pid2)["note"])
+
+    def test_add_skips_a_suppressed_target(self):
+        pid = self.applied()
+        self.outcome(pid, "never")
+        self.run_auto()
+        report = self.env.data / "reports" / "weekly-2026-10-21.md"
+        report.write_text("```coach-proposal\n" + json.dumps({
+            "kind": "skill_patch", "target": "demo-skill", "title": "t", "evidence": "e", "risk": "low",
+            "change": {**self.RULE, "new_string": "- Verify end to end.\n- Third.\n"}}) + "\n```\n")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cp.main(["add", "--data", str(self.env.data), "--report", str(report)])
+        self.assertIn("never from the Inbox", buf.getvalue())
+
+    def test_each_outcome_is_acted_on_once(self):
+        pid = self.applied()
+        self.outcome(pid, "not_now")
+        self.run_auto(); self.run_auto()
+        self.assertEqual(len(cp.suppressions(self.env.data)), 1)
+        self.assertEqual(len(ca.inbox_decisions(self.env.data)), 1)
+        self.outcome(pid, "not_now", at="2026-10-21T01:00:00Z")  # pressed again on a re-posted card
+        self.run_auto()
+        self.assertEqual(len(ca.inbox_decisions(self.env.data)), 2)
+        self.assertEqual(len(cp.suppressions(self.env.data)), 1)  # the suppression is idempotent
+
+    def test_keep_promotes_a_canary(self):
+        pid = self.add(kind="config", target="coach.demo_threshold", tier="canary", title="t", signal="repeat_fix",
+                       change={"value": 3})
+        self.run_auto()
+        self.assertEqual(self.st(pid)["status"], "canary")
+        self.outcome(pid, "keep")
+        self.run_auto()
+        st = self.st(pid)
+        self.assertEqual(st["status"], "applied")
+        self.assertEqual(st["note"], "kept from the Inbox")
+
+    def test_never_whose_revert_fails_is_recorded_once_and_does_not_stop_the_pass(self):
+        pid = self.applied()
+        pid_b = self.applied()
+        self.outcome(pid, "never")
+        self.outcome(pid_b, "not_now")
+        orig = ca.revert_event
+        ca.revert_event = lambda env, p: (_ for _ in ()).throw(ca.ApplyError("conflict"))
+        try:
+            self.run_auto(); self.run_auto()
+        finally:
+            ca.revert_event = orig
+        rows = ca.inbox_decisions(self.env.data)
+        self.assertEqual(sorted(r["outcome"] for r in rows), ["never", "not_now"])  # the later card was still read
+        self.assertIn("FAILED", next(r for r in rows if r["outcome"] == "never")["detail"])
+        self.assertEqual(len([r for r in cp.suppressions(self.env.data) if r["mode"] == "never"]), 1)
+        self.assertEqual(self.st(pid)["status"], "applied")  # not reverted; the failure is in the log
+
+    def test_decide_cli_is_the_same_as_pressing_the_button(self):
+        pid = self.applied()
+        ca.cmd_decide(self.env, SimpleNamespace(id=pid, choice="not_now"))
+        self.assertEqual(cp.suppressed(self.env.data, {"kind": "skill_patch", "target": "demo-skill"})["mode"], "not_now")
+        self.assertEqual(ca.inbox_decisions(self.env.data)[0]["source"], "cli")
+
+    def test_suppression_can_be_listed_and_cleared(self):
+        pid = self.applied()
+        self.outcome(pid, "never")
+        self.run_auto()
+        probe = {"kind": "skill_patch", "target": "demo-skill"}
+        self.assertEqual(cp.suppressed(self.env.data, probe)["mode"], "never")
+        cp.main(["suppressions", "--data", str(self.env.data), "--clear", "skill_patch", "demo-skill"])
+        self.assertIsNone(cp.suppressed(self.env.data, probe))
+        cp.add_suppression(self.env.data, {**probe, "id": "x"}, "never")  # a new Never after the clear counts
+        self.assertEqual(cp.suppressed(self.env.data, probe)["mode"], "never")
+
+    def test_decided_improvements_are_not_reposted_by_inbox_backfill(self):
+        pid = self.applied()
+        self.outcome(pid, "keep")
+        self.run_auto()
+        n = len(self.posts())
+        ca.cmd_inbox(self.env, SimpleNamespace(days=7))
+        self.assertEqual(len(self.posts()), n)
+
+    def test_never_posts_no_new_card_and_an_undone_notice_is_untyped(self):
+        pid = self.applied()
+        self.outcome(pid, "never")
+        n = len(self.posts())
+        self.run_auto()
+        self.assertEqual(len(self.posts()), n)  # no fresh 'Undone' card asking again
+        ca.notify_inbox(self.env, self.st(pid), "reverted", "x")
+        self.assertNotIn("--type", self.row(-1))
+
+    def test_shipped_types_validate_and_carry_the_ids_the_engine_reads(self):
+        ct_path = Path(__file__).resolve().parents[4] / "plugins/inbox/card_types.py"
+        if not ct_path.exists():
+            self.skipTest("inbox plugin not in this checkout")
+        import importlib.util, yaml
+        spec = importlib.util.spec_from_file_location("_ct", ct_path)
+        ct = importlib.util.module_from_spec(spec); sys.modules["_ct"] = ct; spec.loader.exec_module(ct)
+        tdir = Path(__file__).resolve().parents[1] / "inbox-types"
+        want = {"coach-improvement": {"review", "keep", "undo", "not_now", "never"},
+                "engine-budget": {"raise", "leave"}}
+        for name, ids in want.items():
+            spec_ = ct.validate(yaml.safe_load((tdir / f"{name}.yaml").read_text()))
+            self.assertEqual({a["id"] for a in spec_["actions"]}, ids)
+            kinds = {a["id"]: a["kind"] for a in spec_["actions"]}
+            self.assertTrue(all(kinds[i] == "resolve" for i in ("keep", "not_now", "never", "leave") if i in kinds))
+
+    def test_a_host_without_the_type_still_gets_a_plain_card(self):
+        fake = Path(self.env.hermes)
+        fake.write_text(FAKE_HERMES.replace('elif a[0] == "inbox":',
+                                            'elif a[0] == "inbox" and "--type" in a:\n'
+                                            '    sys.stderr.write("error: unknown inbox card type coach-improvement"); sys.exit(1)\n'
+                                            'elif a[0] == "inbox":'))
+        pid = self.applied()
+        self.assertEqual(self.posts(), [("Rule: Check the device", f"coach-improvement:{pid}")])
+        self.assertNotIn("--type", self.row())
+
+    def test_open_archived_and_undo_outcomes_change_nothing(self):
+        pid = self.applied()
+        for state, act in (("open", None), ("archived", "archived"), ("resolved", "undo")):
+            f = Path(os.environ["FAKE_CFG"] + ".outcomes")
+            f.write_text(json.dumps({f"coach-improvement:{pid}": {"found": True, "state": state, "outcome": act,
+                                                                  "at": "2026-10-20T21:00:00Z"}}))
+            self.run_auto()
+        self.assertEqual(cp.suppressions(self.env.data), [])
+        self.assertEqual(self.st(pid)["status"], "applied")
+
+    def test_opt_out_reads_nothing(self):
+        pid = self.applied()
+        self.outcome(pid, "never")
+        os.environ["COACH_INBOX"] = "0"
+        try:
+            self.run_auto()
+        finally:
+            os.environ["COACH_INBOX"] = "1"
+        self.assertEqual(cp.suppressions(self.env.data), [])
 
 
 class TierDefaults(unittest.TestCase):
@@ -257,6 +451,29 @@ class Inbox(Base):
                                "new_string": "- Verify end to end.\n- X.\n"})
         self.run_auto()
         self.assertEqual(self.posts(), [("Rule: Check the device", f"coach-improvement:{pid}")])
+
+    def test_card_is_typed_with_the_proposal_id(self):
+        pid = self.add(kind="skill_patch", target="demo-skill", title="Check the device",
+                       change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+                               "new_string": "- Verify end to end.\n- X.\n"})
+        self.run_auto()
+        row = self.row()
+        self.assertEqual(row[row.index("--type") + 1], "coach-improvement")
+        self.assertEqual(row[row.index("--field") + 1], f"id={pid}")
+
+    def test_old_plugin_without_card_types_still_posts(self):
+        fake = Path(self.env.hermes)
+        fake.write_text(FAKE_HERMES.replace('elif a[0] == "inbox":',
+                                            'elif a[0] == "inbox" and "--type" in a:\n'
+                                            '    sys.stderr.write("unrecognized arguments: --type"); sys.exit(2)\n'
+                                            'elif a[0] == "inbox":'))
+        pid = self.add(kind="skill_patch", target="demo-skill", title="Check the device",
+                       change={"file_path": "SKILL.md", "old_string": "- Verify end to end.\n",
+                               "new_string": "- Verify end to end.\n- X.\n"})
+        self.run_auto()
+        row = self.row()
+        self.assertNotIn("--type", row)
+        self.assertIn("--prompt-label", row)
 
     def test_opt_out(self):
         os.environ["COACH_INBOX"] = "0"

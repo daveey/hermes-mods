@@ -327,6 +327,14 @@ def test_quiet_end_ignores_open_archived_and_an_older_cards_decision(env):
         engs.set_state(eid, "ended")
 
 
+def test_keep_following_beats_the_auto_end_when_the_tick_is_late(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    engs.update(e["id"], kickoff=0, last_activity=time.time() - 8 * 86400, warned_quiet=time.time() - 2 * 86400)
+    _runner_with(store, engs, {"state": "resolved", "outcome": "keep", "at": time.time() - 3600}).tick()
+    assert engs.get(e["id"])["state"] == "active"
+
+
 def test_quiet_card_is_posted_typed_once(env):
     store, engs, _, _ = env
     e = engs.create("C1", "x", private=True)

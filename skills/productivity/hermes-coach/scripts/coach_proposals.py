@@ -44,6 +44,8 @@ Rollout tier (sets the autonomy; `tier` in the block may only RAISE the default 
 reports/proposals.jsonl is an append-only event log: one `status: pending` line per new proposal, then one
 line per decision (applied | canary | carded | rejected | dropped | reverted). The current state of a proposal is its last line. A proposal whose
 fingerprint (kind + target + change) was ever rejected is dropped by `add`, so it is never proposed again.
+reports/suppressions.jsonl holds the Inbox card decisions (`coach-improvement` type, written by coach_apply):
+Not now = no proposal for that kind + target for 14 days, Never = no proposal for it ever. `add` honours both.
 """
 import argparse, calendar, hashlib, json, os, re, sys, time
 from pathlib import Path
@@ -136,6 +138,54 @@ def rejected(data):
     return [p for p in state(data).values() if p.get("status") == "rejected"]
 
 
+def suppress_path(data):
+    return Path(data) / "reports" / "suppressions.jsonl"
+
+
+def suppressions(data):
+    f = suppress_path(data)
+    out = []
+    for line in (f.read_text().splitlines() if f.exists() else []):
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def add_suppression(data, p, mode, days=None, now=None, source="inbox"):
+    """Record a Not-now (days) or Never (until null) decision for a proposal's kind + target."""
+    now = now or time.time()
+    rec = {"kind": p.get("kind"), "target": p.get("target"), "mode": mode, "id": p.get("id"), "source": source,
+           "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+           "until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + days * 86400)) if days else None}
+    f = suppress_path(data)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    return rec
+
+
+def suppressed(data, p, now=None):
+    """The suppression row that blocks a proposal of the same kind + target (never, or not-now still running).
+    A later ``clear`` row for that kind + target lifts everything before it."""
+    now = now or time.time()
+    rows = [r for r in suppressions(data) if r.get("kind") == p.get("kind") and r.get("target") == p.get("target")]
+    for i in range(len(rows) - 1, -1, -1):
+        if rows[i].get("mode") == "clear":
+            rows = rows[i + 1:]
+            break
+    for r in rows:
+        if not r.get("until"):
+            return r
+        try:
+            if calendar.timegm(time.strptime(r["until"], "%Y-%m-%dT%H:%M:%SZ")) > now:
+                return r
+        except ValueError:
+            continue
+    return None
+
+
 def append(data, rec):
     f = log_path(data)
     f.parent.mkdir(parents=True, exist_ok=True)
@@ -204,6 +254,11 @@ def cmd_add(a):
         if dup:
             msgs.append(f"skipped {p['kind']}:{p['target']}: slug already {dup.get('status')} as {dup['id']}")
             continue
+        sup = suppressed(a.data, p)
+        if sup:
+            msgs.append(f"skipped {p['kind']}:{p['target']}: {sup['mode'].replace('_', ' ')} from the Inbox"
+                        + (f" until {sup['until'][:10]}" if sup.get("until") else ""))
+            continue
         if fp in seen:
             msgs.append(f"skipped {p['kind']}:{p['target']}: same as {seen[fp]['id']} ({seen[fp].get('status')})")
             continue
@@ -243,6 +298,20 @@ def cmd_rejected(a):
     return 0
 
 
+def cmd_suppressions(a):
+    """List the Not now / Never decisions, or lift one (--clear KIND TARGET)."""
+    if a.clear:
+        kind, target = a.clear
+        add_suppression(a.data, {"kind": kind, "target": target, "id": "manual"}, "clear", source="cli")
+        print(f"lifted: {kind}:{target} can be proposed again")
+        return 0
+    for r in suppressions(a.data):
+        if r.get("mode") != "clear" and suppressed(a.data, r):
+            print(f"{r['mode']:<8} {r['kind']}:{r['target']}  since {r['at'][:10]}"
+                  + (f" until {r['until'][:10]}" if r.get("until") else "") + f"  ({r.get('id')})")
+    return 0
+
+
 def cmd_mark(a):
     st = state(a.data)
     if a.id not in st:
@@ -259,11 +328,13 @@ def cmd_mark(a):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("add", "list", "rejected", "mark"):
+    for name in ("add", "list", "rejected", "mark", "suppressions"):
         s = sub.add_parser(name)
         s.add_argument("--data", required=True)
         if name == "add":
             s.add_argument("--report", required=True)
+        if name == "suppressions":
+            s.add_argument("--clear", nargs=2, metavar=("KIND", "TARGET"))
         if name == "list":
             s.add_argument("--status", default="pending")
             s.add_argument("--json", action="store_true")
@@ -274,7 +345,8 @@ def main(argv=None):
             s.add_argument("--result", default="")
             s.add_argument("--by", default="coach-apply")
     a = ap.parse_args(argv)
-    rc = {"add": cmd_add, "list": cmd_list, "rejected": cmd_rejected, "mark": cmd_mark}[a.cmd](a)
+    rc = {"add": cmd_add, "list": cmd_list, "rejected": cmd_rejected, "mark": cmd_mark,
+          "suppressions": cmd_suppressions}[a.cmd](a)
     if a.cmd == "mark" and rc == 0 and a.status in ("applied", "reverted"):
         # A card that lands a review-tier proposal marks it here, not through coach-apply: post it to the Inbox too.
         try:

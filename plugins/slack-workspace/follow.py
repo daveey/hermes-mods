@@ -467,10 +467,13 @@ class Runner:
                 self.engs.set_state(e["id"], "ended")
                 continue
             quiet = now - float(e.get("last_activity") or e.get("created") or now)
+            if quiet >= QUIET_WARN_S and e.get("warned_quiet"):
+                # the owner's press on the quiet-end card wins over the auto-end, even when this tick is late
+                if self._quiet_decision(e, now):
+                    continue
+                quiet = now - float(self.engs.get(e["id"]).get("last_activity") or now)
             if quiet >= QUIET_END_S:
                 self.engs.set_state(e["id"], "ended")
-                continue
-            if quiet >= QUIET_WARN_S and e.get("warned_quiet") and self._quiet_decision(e, now):
                 continue
             if quiet >= QUIET_WARN_S and not e.get("warned_quiet") and self.inbox_post:
                 try:

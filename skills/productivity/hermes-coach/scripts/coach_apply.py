@@ -358,6 +358,8 @@ def mark(env, pid, status, by="coach-apply", note="", result="", **extra):
 INBOX_HEAD = {"applied": "", "canary": "Trying", "kept": "Kept", "promoted": "Kept", "reverted": "Undone"}
 KIND_LABEL = {"curriculum": "Tip", "skill_patch": "Rule", "plugin_rule": "Rule", "config": "Setting",
               "shared_config": "Setting", "core": "Code", "fix": "Fix", "trial": "Trial"}
+INBOX_TYPE = "coach-improvement"
+NOT_NOW_DAYS = 14
 PROMPT_LABEL = "check whether this is helping, then keep or undo it"
 
 
@@ -521,13 +523,21 @@ def notify_inbox(env, p, action, detail="", out=print):
               "~/code/hermes-coach-data/reports/proposals.jsonl). Show me exactly what changed, then check whether "
               "it is helping using the coach's before/after KPI (coach_weekly check for this proposal, or the latest "
               "reports/weekly-*.md) and recent sessions. Give a one-line verdict: keep or revert. If it is clearly "
-              f"hurting, run `coach-apply revert {pid} \"<why>\"` and tell me.")
+              f"hurting, run `coach-apply revert {pid} \"<why>\"` and tell me. If I answer keep / not now / never, record it "
+              f"with `coach-apply decide {pid} keep|not_now|never`.")
     try:
-        args = [env.hermes, "inbox", "post", title, "--body", body, "--prompt", prompt,
+        base = [env.hermes, "inbox", "post", title, "--body", body, "--prompt", prompt,
                 "--key", f"coach-improvement:{pid}", "--poster", "coach · improvements", "--cwd", str(env.data)]
-        r = sh(args + ["--prompt-label", PROMPT_LABEL], check=False)
-        if r.returncode and "--prompt-label" in (r.stderr or ""):  # an inbox plugin older than prompt_label
-            r = sh(args, check=False)
+        typed = ["--type", INBOX_TYPE, "--field", f"id={pid}"]
+        r = None
+        # richest first; an older inbox plugin lacks --type / --prompt-label, and a host without the type installed
+        # rejects it ("unknown inbox card type"): any failure falls back to the plainer card
+        for extra in (typed + ["--prompt-label", PROMPT_LABEL], ["--prompt-label", PROMPT_LABEL], []):
+            if action == "reverted":  # an Undone notice has nothing to decide: the plain Do it / Archive card
+                extra = [x for x in extra if x not in ("--type", "--field", INBOX_TYPE, f"id={pid}")]
+            r = sh(base + extra, check=False)
+            if not r.returncode:
+                break
         if r.returncode:
             out(f"inbox post failed for {pid}: {(r.stderr or r.stdout).strip()[-200:]}")
             return None
@@ -535,6 +545,97 @@ def notify_inbox(env, p, action, detail="", out=print):
     except Exception as e:  # noqa: BLE001 — the inbox is a notification, not part of the apply
         out(f"inbox post failed for {pid}: {e}")
         return None
+
+
+def decisions_path(data):
+    return Path(data) / "reports" / "inbox-decisions.jsonl"
+
+
+def inbox_decisions(data):
+    f = decisions_path(data)
+    rows = []
+    for line in (f.read_text().splitlines() if f.exists() else []):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows
+
+
+def apply_decision(env, p, act, now=None, dry=False, out=print):
+    """Do what Keep / Not now / Never means for proposal *p*. Returns a one-line detail. Idempotent: a repeat adds
+    no second suppression row."""
+    now = now or time.time()
+    pid = p["id"]
+    if act == "keep":
+        if p.get("status") != "canary":
+            return "kept"
+        if not dry:
+            ev = {}
+            if p["kind"] == "shared_config":
+                ev = share_config(env, p["target"], p["change"]["value"], p)
+                ev.pop("_msg", None)
+            mark(env, pid, "applied", by="inbox", note="kept from the Inbox",
+                 result="promoted to shared-config" if ev else "kept", **ev)
+        return "canary kept from the Inbox"
+    if act == "not_now":
+        if not dry and not _has_suppression(env, p, "not_now", now):
+            cp.add_suppression(env.data, p, "not_now", NOT_NOW_DAYS, now)
+        return f"no {p['kind']}:{p['target']} proposals for {NOT_NOW_DAYS} days"
+    detail = f"{p['kind']}:{p['target']} is never proposed again"
+    if not dry:
+        if not _has_suppression(env, p, "never", now):
+            cp.add_suppression(env.data, p, "never", None, now)
+        if p.get("status") in ("applied", "canary"):
+            res = revert_event(env, p)
+            mark(env, pid, "reverted", by="inbox", note="Never, from the Inbox", result=res)
+            detail += f"; reverted ({res})"
+    return detail
+
+
+def _has_suppression(env, p, mode, now):
+    return any(r.get("kind") == p.get("kind") and r.get("target") == p.get("target") and r.get("mode") == mode
+               and (not r.get("until") or cp.suppressed(env.data, p, now)) for r in cp.suppressions(env.data))
+
+
+def sync_inbox(env, dry=False, now=None, out=print, days=14, limit=40):
+    """Read the outcome of each recent improvement card (`hermes inbox outcome coach-improvement:<id>`) and honour it:
+    Keep = a canary is promoted now (no auto-revert), Not now = nothing of that kind + target is proposed for
+    NOT_NOW_DAYS, Never = never proposed again and undone if live. Each outcome is acted on once (it is recorded in
+    reports/inbox-decisions.jsonl). Undo is a Kanban task that already ran `revert`; it needs nothing here.
+    Returns [(id, outcome, detail)]."""
+    if os.environ.get("COACH_INBOX", "1") == "0":
+        return []
+    now = now or time.time()
+    seen = {(r.get("id"), r.get("outcome_at")) for r in inbox_decisions(env.data)}
+    live = [p for p in cp.state(env.data).values() if p.get("status") in ("applied", "canary", "reverted")
+            and p.get("kind") not in ("fix", "trial") and cp.age_days(p, now) <= days]
+    done = []
+    for p in sorted(live, key=lambda q: q.get("at", ""), reverse=True)[:limit]:
+        pid = p["id"]
+        try:
+            r = sh([env.hermes, "inbox", "outcome", f"coach-improvement:{pid}"], check=False)
+            o = json.loads(r.stdout or "{}")
+        except Exception:  # noqa: BLE001 — an unreadable card never blocks the rollout pass
+            continue
+        if not o.get("found") or o.get("state") != "resolved" or (pid, o.get("at")) in seen:
+            continue
+        act = o.get("outcome")
+        if act not in ("keep", "not_now", "never"):  # undo (a task already reverted it), archived, unknown
+            continue
+        try:
+            detail = apply_decision(env, p, act, now, dry, out)
+        except Exception as e:  # noqa: BLE001 — a failed revert is recorded, never repeated or allowed to stop the pass
+            detail = f"FAILED: {type(e).__name__}: {str(e)[:200]}"
+            out(f"inbox decision {act} on {pid} failed: {detail}")
+        if not dry:
+            f = decisions_path(env.data)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            with open(f, "a") as fh:
+                fh.write(json.dumps({"id": pid, "outcome": act, "outcome_at": o.get("at"), "value": o.get("value"),
+                                     "at": now_iso(), "detail": detail}) + "\n")
+        done.append((pid, "inbox " + act, detail))
+    return done
 
 
 def check_spec(p, at=None):
@@ -633,11 +734,21 @@ def auto(env, dry=False, now=None, out=print):
         done += [(c["id"], "budget stop", f"{why} -> {res}") for c, _u, _b, why, res in wd["stops"]]
     except Exception as e:  # noqa: BLE001 — never block the rollout pass on the watchdog
         out(f"budget watchdog failed: {type(e).__name__}: {e}")
+    try:  # honour Keep / Not now / Never pressed on improvement cards since the last pass
+        done += sync_inbox(env, dry, now, out)
+    except Exception as e:  # noqa: BLE001
+        out(f"inbox sync failed: {type(e).__name__}: {e}")
     for p in sorted(cp.state(env.data).values(),
                     key=lambda q: (q.get("kind") not in ("fix", "trial"), q.get("at", ""))):
         st, pid = p.get("status"), p["id"]
         try:
             if st == "pending":
+                sup = cp.suppressed(env.data, p, now)
+                if sup:
+                    dry or mark(env, pid, "dropped", by="coach-apply auto",
+                                note=f"{sup['mode'].replace('_', ' ')} from the Inbox ({sup.get('id')})")
+                    done.append((pid, "dropped", f"{sup['mode']} from the Inbox"))
+                    continue
                 tier = cp.effective_tier(p)
                 stale = cp.age_days(p, now) > cp.STALE_DAYS
                 if p.get("kind") == "fix":
@@ -772,9 +883,10 @@ def cmd_inbox(env, a):
     """Re-post applied/canary improvements from the last N days to the Inbox (same keys: no duplicates)."""
     pull_data(env)
     cut = time.time() - a.days * 86400
+    decided = {r.get("id") for r in inbox_decisions(env.data)}
     n = 0
     for p in cp.state(env.data).values():
-        if p.get("status") not in ("applied", "canary"):
+        if p.get("status") not in ("applied", "canary") or p["id"] in decided:
             continue
         try:
             at = calendar.timegm(time.strptime(str(p.get("at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
@@ -784,6 +896,21 @@ def cmd_inbox(env, a):
             n += 1
             print(f"{p['id']:<13} {p['status']:<8} {p.get('title') or p['target']}")
     print(f"{n} improvement(s) posted to the Inbox")
+
+
+def cmd_decide(env, a):
+    """Same as pressing Keep / Not now / Never on the improvement's Inbox card (for after Review, which closes the
+    card's buttons)."""
+    pull_data(env)
+    p = get(env, a.id)
+    detail = apply_decision(env, p, a.choice)
+    f = decisions_path(env.data)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "a") as fh:
+        fh.write(json.dumps({"id": a.id, "outcome": a.choice, "outcome_at": None, "source": "cli", "at": now_iso(),
+                             "detail": detail}) + "\n")
+    print(detail)
+    print("data " + push_data(env, f"coach-apply: {a.id} {a.choice}"))
 
 
 def cmd_reject(env, a):
@@ -816,6 +943,7 @@ def main(argv=None):
     s.add_argument("--force", action="store_true")
     s = sub.add_parser("reject"); s.add_argument("id"); s.add_argument("note", nargs="?", default="")
     s = sub.add_parser("revert"); s.add_argument("id"); s.add_argument("note", nargs="?", default="")
+    s = sub.add_parser("decide"); s.add_argument("id"); s.add_argument("choice", choices=("keep", "not_now", "never"))
     s = sub.add_parser("auto"); s.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("inbox"); s.add_argument("--days", type=int, default=7)
     a = ap.parse_args(argv)
@@ -828,7 +956,7 @@ def main(argv=None):
             auto(env, dry=a.dry_run)
             return 0
         {"list": cmd_list, "show": cmd_show, "apply": cmd_apply, "reject": cmd_reject, "revert": cmd_revert,
-         "inbox": cmd_inbox}[a.cmd](env, a)
+         "inbox": cmd_inbox, "decide": cmd_decide}[a.cmd](env, a)
     except ApplyError as e:
         raise SystemExit(str(e))
     return 0

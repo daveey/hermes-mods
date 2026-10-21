@@ -97,6 +97,23 @@ or that path crashes there. To re-render an OPEN Inbox card in a new format, `he
 again (a same-key re-post onto an open card appends an update under the old message); rename the archived copy first,
 or the new card's title gets a ` (2)` suffix.
 
+## Inbox card types
+
+Improvement cards are `coach-improvement` typed (`inbox-types/coach-improvement.yaml`, fields `id`): **Review** (the
+check-whether-it-helps prompt), **Keep** (resolve; a canary is promoted at once), **Undo** (`task`: runs
+`coach-apply revert`), **Not now** (resolve; nothing of that kind + target is proposed for 14 days), **Never**
+(resolve; never proposed again, and undone if live). `coach-apply auto` begins with `sync_inbox`: it reads each recent
+card's `hermes inbox outcome coach-improvement:<id>` and acts once per outcome, logging it to
+`reports/inbox-decisions.jsonl`; Not now / Never are rows in `reports/suppressions.jsonl` (`coach_proposals.suppressed`),
+which `coach_proposals.py add` (the cloud Bot too, once it pulls the data repo) and the auto pass honour. A pending
+proposal that is suppressed is dropped with the reason. `coach_apply.py decide <id> keep|not_now|never` does the same
+from a chat (Review closes the card's buttons); `coach_proposals.py suppressions [--clear KIND TARGET]` lists or lifts
+them. A failed revert on Never is logged in `inbox-decisions.jsonl` (detail `FAILED: …`) and not retried. `engine-budget` cards (field `day`): **Raise cap…** (`task`,
+input = the new total in USD; the card's agent writes `budget-overrides.jsonl` and unblocks the stopped cards) and
+**Leave paused**; the watchdog does not re-post a card for a day whose card got Leave paused (after Raise cap it posts again if the new cap is hit). An inbox plugin
+without card types, or a host without these type files, gets the old plain card (the post retries without `--type`).
+Undone notices are always plain cards.
+
 ## Pitfalls
 
 - xAI `x_search` via the Responses API (outside research scout): send `"tool_choice": "required"` and use

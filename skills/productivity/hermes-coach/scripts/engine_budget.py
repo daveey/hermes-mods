@@ -334,13 +334,32 @@ def inbox_post(hermes, snap, stops, data, run=subprocess.run):
               "`python3 ~/code/hermes-mods/skills/productivity/hermes-coach/scripts/engine_budget.py status` and unblock "
               "today's stopped cards listed in research/state/budget-stops.jsonl (`hermes kanban --board hermes unblock "
               "<id>`). Report the new caps.")
-    args = [hermes, "inbox", "post", title, "--body", body, "--prompt", prompt, "--key", f"engine-budget:{snap['day']}",
-            "--poster", "coach · engine budget", "--cwd", str(data), "--prompt-label", "Raise today's engine cap"]
+    base = [hermes, "inbox", "post", title, "--body", body, "--prompt", prompt, "--key", f"engine-budget:{snap['day']}",
+            "--poster", "coach · engine budget", "--cwd", str(data)]
+    label = ["--prompt-label", "Raise today's engine cap"]
     try:
-        r = run(args, capture_output=True, text=True)
+        r = None
+        # richest first; an older inbox plugin lacks --type / --prompt-label, and a host without the type installed
+        # rejects it: any failure falls back to the plainer card
+        for extra in (["--type", "engine-budget", "--field", f"day={snap['day']}"] + label, label, []):
+            r = run(base + extra, capture_output=True, text=True)
+            if r.returncode == 0:
+                break
         return r.returncode == 0
     except Exception:
         return None
+
+
+def card_decided(hermes, day, run=subprocess.run):
+    """True when David pressed Leave paused on today's engine-budget card: don't re-post it (a decision card re-opens
+    as a new card on a re-post, which would nag after he said 'leave'). Raise cap is not final: if the raised cap is
+    hit again the state key changes and a new card is posted."""
+    try:
+        r = run([hermes, "inbox", "outcome", f"engine-budget:{day}"], capture_output=True, text=True)
+        o = json.loads(r.stdout or "{}")
+    except Exception:
+        return False
+    return bool(o.get("found")) and o.get("state") == "resolved" and o.get("outcome") == "leave"
 
 
 def _seen_path(home):
@@ -384,7 +403,11 @@ def watchdog(home=None, board=None, data=None, hermes=None, now=None, dry=False,
         key = json.dumps([snap["day"], sorted(k for k in snap["caps"] if snap["lanes"][k] >= snap["caps"][k]),
                           snap["total"] >= snap["total_cap"], sorted(c["id"] for c, *_ in todo)])
         prev = seen.read_text() if seen.exists() else ""
-        if (over or todo) and key != prev:
+        if (over or todo) and key != prev and card_decided(hermes, snap["day"], run):
+            out(f"  inbox engine-budget:{snap['day']}: already decided, not re-posted")
+            seen.parent.mkdir(parents=True, exist_ok=True)
+            seen.write_text(key)
+        elif (over or todo) and key != prev:
             ok = inbox_post(hermes, snap, [(c, u, b, w) for c, u, b, w, _r in stops], data, run)
             out(f"  inbox engine-budget:{snap['day']}: {'posted' if ok else 'post failed'}")
             if ok:

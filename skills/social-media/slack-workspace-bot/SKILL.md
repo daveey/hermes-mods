@@ -92,6 +92,13 @@ Speak only when it adds something:
 - Engagements end at `until`, by `slack_engagements action=end`, or after 7 quiet days (an Inbox card
   warns a day before). After that `slack_post` refuses and the ambient bot is back.
 
+Escalation cards are typed (`inbox-types/`): `slack-reply` (a drafted reply: **Post reply**, **Edit & post…**, **Ignore**),
+`slack-action` (**Do it**, **Ignore**) and `slack-quiet-end` (**Keep following**, **Let it end**). Post reply / Do it /
+Edit & post run in the card's chat, so the owner-approved bot-cap bypass still applies. **Ignore** is read back:
+`slack_escalate` on that topic returns `ignored` and posts nothing, and your prompt marks the card "owner pressed
+ignore". Keep following / Let it end are applied by the runner (no agent turn). A host without the types gets plain
+Do it cards.
+
 Your own chat is the activity log: end each turn with one line on what you did.
 
 Operator side: `slack_engage(channel, brief, context?, thread?, until?, kanban_ids?, budget?)` from

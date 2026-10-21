@@ -258,3 +258,27 @@ def test_middleware_swallows_engaged_channel_and_kicks_follower_once(env):
             assert getattr(out, "status", None) == 200
     assert called == [1]  # only the unengaged channel reaches the ambient bot
     assert Runner.kicked == [e["id"]]
+
+
+# ---- typed inbox cards fall back to plain ones ------------------------------------------------------
+def test_post_typed_falls_back_when_the_inbox_has_no_such_type_or_no_card_types():
+    calls = []
+
+    class Old:  # an inbox store from before card types
+        def post(self, title, body, accept_prompt, key=None, poster=None):
+            calls.append(("old", key)); return {"session_id": "s"}
+
+    class NoType:  # a host whose skills dir lacks the type
+        def post(self, title, body, accept_prompt, key=None, poster=None, type=None, fields=None):
+            if type:
+                raise ValueError("unknown card type 'slack-reply'")
+            calls.append(("plain", key)); return {"session_id": "s"}
+
+    class Bad:
+        def post(self, *a, **k):
+            raise ValueError("title is required")
+    assert sw._post_typed(Old(), "t", "b", "a", key="k", type="slack-reply", fields={})["session_id"] == "s"
+    assert sw._post_typed(NoType(), "t", "b", "a", key="k", type="slack-reply", fields={})["session_id"] == "s"
+    assert calls == [("old", "k"), ("plain", "k")]
+    with pytest.raises(ValueError):
+        sw._post_typed(Bad(), "", "b", "a", type="slack-reply")

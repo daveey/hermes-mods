@@ -225,6 +225,60 @@ class Engine(unittest.TestCase):
         self.assertIn(f"engine-budget:{fx.utc_day(self.now)}", posts[0])
         self.assertIn("budget-overrides.jsonl", posts[0][posts[0].index("--prompt") + 1])
 
+    def test_card_is_typed_engine_budget(self):
+        os.environ["COACH_INBOX"] = "1"
+        self.over_total()
+        eb.watchdog(self.home, "hermes", self.data, "hermes", self.now, out=lambda m: None,
+                    kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=self.run_)
+        post = next(c for c in self.calls if c[1:3] == ["inbox", "post"])
+        self.assertEqual(post[post.index("--type") + 1], "engine-budget")
+        self.assertEqual(post[post.index("--field") + 1], f"day={fx.utc_day(self.now)}")
+
+    def test_decided_card_is_not_reposted(self):
+        os.environ["COACH_INBOX"] = "1"
+        self.over_total()
+        day = fx.utc_day(self.now)
+
+        def run_(args, **kw):
+            self.calls.append(list(map(str, args)))
+            out = json.dumps({"found": True, "state": "resolved", "outcome": "leave", "at": "x"}) \
+                if args[1:3] == ["inbox", "outcome"] and args[3] == f"engine-budget:{day}" else ""
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+        eb.watchdog(self.home, "hermes", self.data, "hermes", self.now, out=lambda m: None,
+                    kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=run_)
+        self.assertEqual([c for c in self.calls if c[1:3] == ["inbox", "post"]], [])
+
+    def test_a_raise_does_not_silence_the_card_but_leave_does(self):
+        os.environ["COACH_INBOX"] = "1"
+        day = fx.utc_day(self.now)
+        for outcome, want in (("raise", False), ("leave", True), ("archived", False)):
+            def run_(args, **kw):
+                out = json.dumps({"found": True, "state": "resolved", "outcome": outcome}) \
+                    if args[1:3] == ["inbox", "outcome"] else ""
+                return SimpleNamespace(returncode=0, stdout=out, stderr="")
+            self.assertEqual(eb.card_decided("hermes", day, run_), want, outcome)
+
+    def test_a_host_without_the_type_still_gets_a_plain_card(self):
+        os.environ["COACH_INBOX"] = "1"
+        self.over_total()
+        def run_(args, **kw):
+            self.calls.append(list(map(str, args)))
+            bad = "--type" in args
+            return SimpleNamespace(returncode=1 if bad else 0, stdout="",
+                                   stderr="error: unknown inbox card type 'engine-budget'" if bad else "")
+        eb.watchdog(self.home, "hermes", self.data, "hermes", self.now, out=lambda m: None,
+                    kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=run_)
+        posts = [c for c in self.calls if c[1:3] == ["inbox", "post"]]
+        self.assertEqual(len(posts), 2)
+        self.assertNotIn("--type", posts[-1])
+
+    def test_open_card_is_reposted_on_state_change(self):
+        os.environ["COACH_INBOX"] = "1"
+        self.over_total()
+        eb.watchdog(self.home, "hermes", self.data, "hermes", self.now, out=lambda m: None,
+                    kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=self.run_)
+        self.assertEqual(len([c for c in self.calls if c[1:3] == ["inbox", "post"]]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
