@@ -25,6 +25,7 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
 |---|---|
 | `vdisplay.swift` + `CGVirtualDisplay.h` | `hermes-vdisplay`: creates a 1440x900 `CGVirtualDisplay` (override with `HERMES_VDISPLAY_SIZE=WxH`) that lives while the process runs. Parks it at the bottom-right corner of the desktop arrangement (corner contact only, so the cursor rarely wanders in), re-parks it if a monitor change makes it share an edge, and prints `display <id> bounds x,y WxH main x,y WxH` at start and on every change. |
 | `hermes-chrome-agent` | Stdlib-only Python supervisor + CLI (runs under `/usr/bin/python3`, ships its own minimal CDP websocket client). |
+| `window-evict.swift` | `hermes-window-evict X Y W H [--skip-pid N]...`: moves every layer-0 window of a non-Chrome app that sits on the virtual display (bounds X Y W H) to the main display's visible frame via Accessibility (match by frame, set position, shrink if larger), printing `evict <bundle> <title> from x,y to x,y`. `untrusted` (exit 0) when the calling process lacks Accessibility; `--check` prints `trusted`/`untrusted`. Skips `Hermes Touch ID.app`. |
 | `notifier.swift` | `Hermes Touch ID.app` (bundle `com.hermes.chrome-agent.notify`, LSUIElement, Developer-ID signed when the keychain has one), built by `install`: posts the passkey notification with UNUserNotificationCenter and reports clicks back to the supervisor over stdout. |
 | `test_hermes_chrome_agent.py` | Unit tests for the click-through path (`/usr/bin/python3 -m unittest -v test_hermes_chrome_agent` in `scripts/`). |
 
@@ -36,6 +37,12 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
 - every second: `Target.getTargets` → `Browser.getWindowForTarget` for every page, and `Browser.setWindowBounds` for
   any window not inside the virtual display (new windows, popups, OAuth windows land there within ~1s).
   `--window-position` alone is ignored by macOS, so this loop is what actually keeps windows hidden;
+- every ~2 s runs `hermes-window-evict` so other apps' windows that land on the virtual display (macOS treats it as a
+  monitor) are moved back to the main display; each move is logged as `evict <bundle> <title> from … to …`. This needs
+  Accessibility for the supervisor's interpreter (TCC charges the helper to the LaunchAgent's program): install with
+  `HERMES_CHROME_AGENT_PYTHON=<an interpreter that holds Accessibility>` (default `/usr/bin/python3`, which usually
+  holds none). Without the grant the log says `evict: untrusted` once per run and `status` prints it too; Chrome
+  re-homing is unaffected;
 - restarts only the child that died: Chrome crash → relaunch (with backoff; its tabs are lost); vdisplay crash →
   new display, windows re-homed. A stale Chrome left on the profile (SingletonLock pid) is stopped first, since a
   second launch on the same profile would just hand off to it;
@@ -129,7 +136,8 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   monitor and the re-home loop only touches Chrome. Symptom: the user "can't switch to" an app that is frontmost
   (`lsappinfo front`) and idle (`sample` shows the main thread in the event loop), and force-quit/relaunch doesn't
   help because it reopens there. Diagnose with CGWindowList bounds for the app's pid: its main window sits inside the
-  "Hermes Agent Display" rect (`system_profiler SPDisplaysDataType`). Fix: compile `scripts/move-app-windows.swift`
+  "Hermes Agent Display" rect (`system_profiler SPDisplaysDataType`). Fixed automatically by the supervisor's evict loop when Accessibility is granted (see above; check `status`). One-off
+  manual fix: compile `scripts/move-app-windows.swift`
   and run it once from a no-agent gateway cron (`hermes cron create 1m --script <x>.sh --no-agent --repeat 1
   --deliver local`), since only the gateway holds Accessibility; check the log says `trusted true` and re-read the
   bounds. Killing `hermes-vdisplay` doesn't evict them: the supervisor recreates the display at the same spot within

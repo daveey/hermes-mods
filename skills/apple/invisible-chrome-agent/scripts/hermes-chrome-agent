@@ -30,6 +30,7 @@ osascript fallback: an osascript notification belongs to Script Editor and canno
 import base64
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -47,6 +48,8 @@ TOOLS = os.environ.get("HERMES_CHROME_AGENT_TOOLS") or os.path.join(HERMES_HOME,
 CHROME = os.environ.get("HERMES_CHROME_AGENT_CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 LABEL = os.environ.get("HERMES_CHROME_AGENT_LABEL") or "com.hermes.chrome-agent"
 VDISPLAY = os.path.join(TOOLS, "hermes-vdisplay")
+EVICT = os.path.join(TOOLS, "hermes-window-evict")
+EVICT_EVERY_S = 2.0   # how often non-Chrome windows are checked for sitting on the virtual display
 STATE_DIR = os.path.join(HERMES_HOME, "cache", "chrome-agent")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 SHOW_FLAG = os.path.join(STATE_DIR, "show")
@@ -292,6 +295,8 @@ class Supervisor:
         self.stop = False
         self.chrome_fails = 0
         self.shown = False
+        self.evict_next = 0.0
+        self.evict_untrusted_logged = False
         self.notices = {}   # targetId -> running notifier Popen (its notification is still on screen)
 
     # -- children
@@ -621,6 +626,36 @@ class Supervisor:
             log("rehome: window %d %s -> %s (%s)" % (wid, {k: b.get(k) for k in ("left", "top", "width", "height", "windowState")},
                                                   nb, t.get("url", "")[:80]))
 
+    def evict(self, now=None):
+        """Every EVICT_EVERY_S: move windows of apps other than the agent Chrome off the virtual display.
+
+        Runs the hermes-window-evict helper (needs Accessibility for this process's interpreter). It prints one
+        `evict ...` line per move, or `untrusted` (logged once per supervisor run) when the grant is missing."""
+        now = time.time() if now is None else now
+        if now < self.evict_next or not self.vbounds or not os.path.exists(EVICT):
+            return
+        self.evict_next = now + EVICT_EVERY_S
+        cmd = [EVICT] + [str(n) for n in self.vbounds]
+        for p in (self.chrome, self.vd):
+            if p is not None:
+                cmd += ["--skip-pid", str(p.pid)]
+        try:
+            out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 universal_newlines=True, timeout=5).stdout
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log("evict: helper failed: %s" % e)
+            return
+        for line in out.splitlines():
+            line = line.strip()
+            if line == "untrusted":
+                if not self.evict_untrusted_logged:
+                    self.evict_untrusted_logged = True
+                    log("evict: untrusted: this interpreter lacks Accessibility, so other apps' windows on the "
+                        "virtual display are not moved. Install with HERMES_CHROME_AGENT_PYTHON=<an interpreter "
+                        "that holds Accessibility>")
+            elif line:
+                log(line)
+
     def write_state(self):
         st = {"pid": os.getpid(), "port": PORT, "profile": PROFILE, "vdisplay_bounds": self.vbounds,
               "main_bounds": self.main, "chrome_pid": self.chrome.pid if self.chrome else None,
@@ -662,6 +697,7 @@ class Supervisor:
                 try:
                     if self.connect():
                         self.rehome()
+                    self.evict()
                 except (CDPError, OSError) as e:
                     log("cdp: %s" % e)
                     if self.cdp:
@@ -698,6 +734,7 @@ def cmd_status():
     if not notifier_ok(ns):
         print("  notifications not allowed for Hermes Touch ID: passkey requests reveal the window plus a floating"
               " alert instead.\n  Allow them: open '%s'" % NOTIFIER_SETTINGS_URL)
+    print("window eviction (other apps off the virtual display): %s" % evict_status())
     v = cdp_version()
     print("cdp: http://127.0.0.1:%d %s" % (PORT, v["Browser"] if v else "NOT answering"))
     if v:
@@ -713,8 +750,32 @@ def cmd_status():
     return 0 if alive and v else 1
 
 
+def evict_status():
+    """Trust is per responsible process, so ask from the LaunchAgent's own interpreter via the helper."""
+    if not os.path.exists(EVICT):
+        return "helper missing (run: hermes-chrome-agent install)"
+    plist = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
+    try:
+        with open(plist) as f:
+            m = re.search(r"<key>ProgramArguments</key><array><string>([^<]*)</string>", f.read())
+        py = m.group(1) if m else "/usr/bin/python3"
+    except OSError:
+        py = "/usr/bin/python3"
+    try:
+        r = subprocess.run([py, "-c", "import subprocess,sys;print(subprocess.run([sys.argv[1],'--check'],"
+                            "stdout=subprocess.PIPE,universal_newlines=True).stdout.strip())", EVICT],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10)
+        res = r.stdout.strip() or "unknown"
+    except (subprocess.TimeoutExpired, OSError):
+        res = "unknown"
+    if res == "untrusted":
+        return ("untrusted: %s lacks Accessibility; reinstall with HERMES_CHROME_AGENT_PYTHON=<interpreter that "
+                "holds Accessibility>, or grant it in System Settings > Privacy & Security > Accessibility" % py)
+    return "%s (interpreter %s)" % (res, py)
+
+
 def plist_text():
-    py = "/usr/bin/python3"
+    py = os.environ.get("HERMES_CHROME_AGENT_PYTHON") or "/usr/bin/python3"
     script = os.path.join(TOOLS, "hermes-chrome-agent")
     env = "".join("<key>%s</key><string>%s</string>" % (k, os.environ[k]) for k in
                   ("HERMES_CHROME_AGENT_PORT", "HERMES_CHROME_AGENT_PROFILE", "HERMES_CHROME_AGENT_CHROME")
@@ -801,6 +862,7 @@ def cmd_install():
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     subprocess.check_call(["swiftc", "-O", "-import-objc-header", os.path.join(SRC_DIR, "CGVirtualDisplay.h"),
                            os.path.join(SRC_DIR, "vdisplay.swift"), "-o", VDISPLAY])
+    subprocess.check_call(["swiftc", "-O", os.path.join(SRC_DIR, "window-evict.swift"), "-o", EVICT])
     print("notifier signed with %s; notifications: %s" % (build_notifier(), notifier_status()))
     if notifier_status().startswith("notDetermined"):
         # Ask for notification permission now (macOS asks once per app); the helper waits for the answer.

@@ -201,5 +201,58 @@ class ClickThrough(unittest.TestCase):
         self.assertEqual(hca.NOTIFIER_SETTINGS_URL, "x-apple.systempreferences:com.apple.Notifications-Settings."
                                                     "extension?id=com.hermes.chrome-agent.notify")
 
+class Evict(unittest.TestCase):
+    """Supervisor scheduling of the hermes-window-evict helper (helper mocked)."""
+
+    def setUp(self):
+        self.sup = hca.Supervisor()
+        self.sup.vbounds = VD
+        self.sup.chrome = mock.Mock(pid=111)
+        self.sup.vd = mock.Mock(pid=222)
+        self.logs = []
+        patches = [mock.patch.object(hca, "log", self.logs.append),
+                   mock.patch.object(hca.os.path, "exists", lambda p: True if p == hca.EVICT else os.path.lexists(p))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_helper(self, out, now):
+        with mock.patch.object(hca.subprocess, "run", return_value=mock.Mock(stdout=out)) as r:
+            self.sup.evict(now)
+        return r
+
+    def test_runs_every_two_seconds_with_bounds_and_skip_pids(self):
+        r = self.run_helper("", 100.0)
+        self.assertEqual(r.call_args[0][0], [hca.EVICT, "1728", "1117", "1440", "900",
+                                             "--skip-pid", "111", "--skip-pid", "222"])
+        self.assertEqual(self.run_helper("", 101.0).call_count, 0)   # too soon
+        self.assertEqual(self.run_helper("", 102.1).call_count, 1)
+
+    def test_moves_are_logged(self):
+        self.run_helper("evict com.apple.TextEdit Untitled from 1800,-800 to 200,80\n", 10.0)
+        self.assertEqual(self.logs, ["evict com.apple.TextEdit Untitled from 1800,-800 to 200,80"])
+
+    def test_untrusted_logged_once_per_run(self):
+        self.run_helper("untrusted\n", 10.0)
+        self.run_helper("untrusted\n", 20.0)
+        self.run_helper("untrusted\n", 30.0)
+        self.assertEqual(len([l for l in self.logs if l.startswith("evict: untrusted")]), 1)
+
+    def test_no_run_without_virtual_display_or_helper(self):
+        self.sup.vbounds = None
+        self.assertEqual(self.run_helper("", 10.0).call_count, 0)
+        self.sup.vbounds = VD
+        with mock.patch.object(hca.os.path, "exists", return_value=False):
+            with mock.patch.object(hca.subprocess, "run") as r:
+                self.sup.evict(50.0)
+        self.assertEqual(r.call_count, 0)
+
+    def test_helper_timeout_does_not_raise(self):
+        with mock.patch.object(hca.subprocess, "run", side_effect=hca.subprocess.TimeoutExpired("x", 5)):
+            self.sup.evict(10.0)
+        self.assertTrue(self.logs[0].startswith("evict: helper failed"))
+
+
+
 if __name__ == "__main__":
     unittest.main()
