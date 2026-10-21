@@ -52,6 +52,8 @@ How to run it from an agent:
 
 ## Notes
 
+- `--repo` is a LOCAL checkout path (the script runs `git -C <repo> fetch`). An `owner/name` slug resolves to `~/code/<name>` only when that checkout's origin is the same repo; anything else exits with "not a local checkout". Run it from inside the checkout or pass the path.
+
 - Workflows with `paths:` filters don't run for every commit. Without `--workflow`, the script waits on the
   workflows that have a run on a commit containing yours. With `--workflow X`, when X never runs it reports a
   stall after the 3-minute startup grace period plus two idle polls.
@@ -60,6 +62,11 @@ How to run it from an agent:
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
   maps to) takes precedence; check the repo's AGENTS.md first.
 - Tests: `python3 -B -m unittest discover -s tests` from this skill's dir.
+- Self-hosted runners keep files between jobs. `gitleaks/gitleaks-action@v2` downloads to the fixed path
+  `os.tmpdir()/gitleaks.tmp`, so one interrupted run makes every later install fail with "Destination file path
+  ... already exists" on that runner. Fix in the workflow, not on the hosts: set `TMPDIR: ${{ runner.temp }}` in the
+  step's `env` (emptied per job). Check every runner's failure first (`runner_name` per job) to tell a systemic
+  cause from one dirty host.
 
 ## CI refused for billing (account-wide outage)
 
@@ -100,6 +107,18 @@ workers to stop chasing tests.
      declined GitHub authorization at the bank, re-save the card on the Payment information page (that triggers a
      new authorization), and otherwise open a support ticket asking for a billing-lock review.
    - Keep the probe running throughout; it ends the wait the moment any of these clears it.
+5. **When the user says billing can't be fixed, move the repo to self-hosted runners instead of waiting.** On a
+   personal account runners are registered per repo, so a new repo has none even when a sibling repo already has
+   self-hosted machines. Reuse the sibling's install scripts with the repo name substituted (runner dir, service
+   label, `--url`), get a token with `gh api -X POST repos/OWNER/REPO/actions/runners/registration-token -q .token`,
+   and use repo-specific labels (e.g. `<prefix>-mac`, `<prefix>-linux`) so the two repos' jobs don't take each
+   other's machines. Linux installs need no sudo (user systemd unit). A macOS LaunchDaemon needs sudo on that
+   host, so run it through `run_in_user_terminal` with `ssh -t host 'sudo bash …'`. Then change every `runs-on`
+   to the new labels, push, and confirm with the run's jobs' `runner_name` before telling running workers that
+   CI counts as a gate again.
+6. **PRs refused during the outage:** `gh run rerun` replays the workflow file from the PR's head commit. If main
+   changed `runs-on` meanwhile (e.g. moved to self-hosted runners to escape billing), the rerun is refused again.
+   Rebase the branch onto `origin/main` and force-push (`--force-with-lease`) so the new workflow runs.
 
 ## Rescuing a session already stuck on a hand-rolled watcher
 

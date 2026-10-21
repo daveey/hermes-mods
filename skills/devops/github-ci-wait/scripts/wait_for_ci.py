@@ -120,6 +120,22 @@ def list_runs(repo: Path, branch: str, workflows: list[str]) -> list[dict]:
     return runs
 
 
+def resolve_repo(repo: Path) -> Path:
+    """--repo is a local checkout. An `owner/name` slug (a common mix-up) maps to ~/code/<name> when that checkout's
+    origin is the same GitHub repo; otherwise fail with a clear message instead of a git traceback."""
+    if repo.is_dir():
+        return repo
+    parts = str(repo).strip("/").split("/")
+    if len(parts) == 2 and all(parts):
+        guess = Path.home() / "code" / parts[1]
+        if guess.is_dir():
+            out = subprocess.run(["git", "-C", str(guess), "remote", "get-url", "origin"], capture_output=True, text=True)
+            url = out.stdout.strip().removesuffix(".git").lower()
+            if out.returncode == 0 and url.endswith("/".join(parts).lower()):
+                return guess
+    raise SystemExit(f"--repo {repo}: not a local checkout. Pass the checkout path (e.g. ~/code/<name>), not owner/name.")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("shas", nargs="+")
@@ -132,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--once", action="store_true")
     p.add_argument("--dispatch", action="store_true")
     a = p.parse_args(argv)
-    repo = a.repo
+    repo = resolve_repo(a.repo)
 
     def fetch():
         git(repo, "fetch", "-q", "--tags", "--force", "origin", a.branch)

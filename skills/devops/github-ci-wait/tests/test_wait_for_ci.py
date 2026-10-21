@@ -55,3 +55,40 @@ class EvaluateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveRepoTests(unittest.TestCase):
+    """--repo is a checkout path; an owner/name slug used to die with a git traceback."""
+
+    def setUp(self):
+        import os
+        import subprocess
+        import tempfile
+        self.home = Path(tempfile.mkdtemp())
+        self.old_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        repo = self.home / "code" / "proj"
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:me/proj.git"], check=True)
+        self.repo = repo
+
+    def tearDown(self):
+        import os
+        import shutil
+        if self.old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.old_home
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_checkout_path_is_used_as_is(self):
+        self.assertEqual(w.resolve_repo(self.repo), self.repo)
+
+    def test_owner_name_slug_maps_to_matching_checkout(self):
+        self.assertEqual(w.resolve_repo(Path("me/proj")), self.repo)
+
+    def test_slug_for_another_owner_fails_clearly(self):
+        with self.assertRaises(SystemExit) as e:
+            w.resolve_repo(Path("someone/proj"))
+        self.assertIn("not a local checkout", str(e.exception))
