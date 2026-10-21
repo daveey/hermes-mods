@@ -130,7 +130,7 @@ export function barActions(item) {
 /** Row-hover buttons besides Archive: `row: true` actions that need no input. */
 export function rowActions(item) {
   return Array.isArray(item && item.actions)
-    ? item.actions.filter(a => a && a.row && a.kind === 'resolve' && !a.input && a.id !== 'archive')
+    ? item.actions.filter(a => a && a.row && (a.kind === 'resolve' || a.kind === 'task') && !a.input && a.id !== 'archive')
     : []
 }
 
@@ -276,6 +276,7 @@ export function createStore(ctx) {
       $items.set($items.get().filter(i => i !== item))
       if (action.kind === 'prompt') await submitPrompt(item, str(r && r.prompt))
       else if (wasFocused && next) open(next)
+      if (action.kind === 'task' && r && r.outcome_task) host.notify?.({ kind: 'success', message: `Queued ${str(r.outcome_task)}` })
       return true
     } catch (e) {
       host.notifyError?.(e, `Could not ${str(action.label || action.id).toLowerCase()} inbox message`)
@@ -534,7 +535,7 @@ export function Bar({ store }) {
           action,
           disabled,
           // Prompt actions show what they will send (the template), so nothing runs unseen.
-          title: action.kind === 'accept' || action.id === 'do_it' ? item.accept_prompt : action.kind === 'prompt' ? str(action.prompt) || action.label : action.label,
+          title: action.kind === 'accept' || action.id === 'do_it' ? item.accept_prompt : action.kind === 'prompt' || action.kind === 'task' ? str(action.prompt) || action.label : action.label,
           onClick: () => run(action)
         }, action.id)
       )

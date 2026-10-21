@@ -383,3 +383,78 @@ test('Editor: Enter while an IME composition is open does not save', () => {
   input.props.onKeyDown({ key: 'Enter', preventDefault() {} })
   assert.deepEqual(calls, ['x'])
 })
+
+// ── task actions ────────────────────────────────────────────────────────────
+
+const TASK_ITEM = {
+  session_id: 't1', gateway: 'local', type: 'x-post', type_label: 'X post', fields: { id: 'Q9', text: 'hi' },
+  actions: [
+    { id: 'approve', label: 'Approve', kind: 'resolve', style: 'primary' },
+    { id: 'skip', label: 'Skip', icon: 'close', kind: 'task', row: true, prompt: 'Mark {{id}} skipped in QUEUE.md' },
+    { id: 'later', label: 'Later', kind: 'task', prompt: 'p', input: { placeholder: 'when' } }
+  ]
+}
+
+test('task act: closes the card like resolve, opens the next one and toasts the queued task id', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  host.state.focusedStoredSessionId = { get: () => 't1', listen: () => () => {} }
+  const opened = []
+  const notes = []
+  host.openSession = async sid => { opened.push(sid) }
+  host.notify = n => notes.push(n)
+  const submitted = []
+  host.composer = { submit: (sid, text) => (submitted.push([sid, text]), true) }
+  const ctx = fakeCtx(path => (path.includes('/act') ? { state: 'resolved', outcome: 'skip', outcome_task: 't_abc123' } : { items: [] }))
+  const store = m.createStore(ctx)
+  store.$items.set([TASK_ITEM, { session_id: 'n2', gateway: 'local' }])
+  assert.equal(await store.act(TASK_ITEM, TASK_ITEM.actions[1]), true)
+  assert.equal(ctx.calls[0][0], '/items/t1/act')
+  assert.deepEqual(ctx.calls[0][1].body, { action: 'skip' })
+  assert.deepEqual(opened, ['n2'])
+  assert.deepEqual(submitted, [])  // no agent turn in the card's chat
+  assert.deepEqual(notes.map(n => n.message), ['Queued t_abc123'])
+  assert.equal(store.$items.get().some(i => i.session_id === 't1'), false)
+})
+
+test('task act failure keeps the card in the list after refresh and shows the error, no toast', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  const notes = []
+  const errors = []
+  host.notify = n => notes.push(n)
+  host.notifyError = (e, msg) => errors.push(msg)
+  const ctx = {
+    calls: [],
+    rest: async (path, opts) => {
+      ctx.calls.push([path, opts])
+      if (path.includes('/act')) throw new Error('500 could not queue')
+      return { items: [TASK_ITEM] }
+    },
+    setInterval() {}, storage: { get: () => true, set() {} }
+  }
+  const store = m.createStore(ctx)
+  store.$items.set([TASK_ITEM])
+  assert.equal(await store.act(TASK_ITEM, TASK_ITEM.actions[1]), false)
+  assert.deepEqual(notes, [])
+  assert.equal(errors.length, 1)
+  assert.deepEqual(store.$items.get().map(i => i.session_id), ['t1'])
+})
+
+test('task buttons: in the bar with the template as tooltip; row button only without input', () => {
+  assert.deepEqual(m.barActions(TASK_ITEM).map(a => a.id), ['approve', 'skip', 'later', 'archive'])
+  assert.deepEqual(m.rowActions(TASK_ITEM).map(a => a.id), ['skip'])
+  assert.deepEqual(m.rowActions({ actions: [{ id: 'l', kind: 'task', row: true, input: {} }] }), [])
+})
+
+test('task act without a returned task id shows no toast', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  host.state.focusedStoredSessionId = { get: () => 'zz', listen: () => () => {} }
+  const notes = []
+  host.notify = n => notes.push(n)
+  const store = m.createStore(fakeCtx(path => (path.includes('/act') ? { state: 'resolved' } : { items: [] })))
+  store.$items.set([TASK_ITEM])
+  assert.equal(await store.act(TASK_ITEM, TASK_ITEM.actions[1]), true)
+  assert.deepEqual(notes, [])
+})

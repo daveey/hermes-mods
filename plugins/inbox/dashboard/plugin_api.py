@@ -10,7 +10,7 @@ POST /items/{sid}/act[?profile=p]      {action, input?} run a card action; promp
 POST /items/{sid}/accept[?profile=p]   alias for act(first prompt action); returns {accept_prompt, ...};
                                  409 on a card with resolve actions (an older Desktop's Do it)
 POST /items/{sid}/archive[?profile=p]  archive the session (outcome 'archived')
-GET  /outcome?key=K[&profile=p]  {found, state, outcome, value, fields, at, session_id, type}
+GET  /outcome?key=K[&profile=p]  {found, state, outcome, value, fields, at, session_id, type, task}
 GET  /types[?profile=p]          {types:[...]}
 GET  /types/{name}[?profile=p]   the resolved type (with source) or 404
 PUT  /types/{name}[?profile=p]   {spec} or the spec itself -> define an ad-hoc local type
@@ -50,7 +50,7 @@ def _profile() -> str:
 
 _KEEP = ("session_id", "key", "title", "poster", "accept_prompt", "created_at", "updated_at", "state", "unread",
          "type", "type_label", "fields", "field_specs", "actions", "outcome", "outcome_value", "resolved_at",
-         "prompt", "action", "kind")
+         "prompt", "action", "kind", "outcome_task")
 
 
 def _public(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -86,6 +86,12 @@ async def _run(fn):
         return await asyncio.to_thread(fn)
     except ValueError as exc:  # bad type / field / input
         raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        # A task action could not queue its Kanban card (the card stays open). Matched by name: a
+        # store.py reload (mtime change) between building the Inbox and here changes the class.
+        if type(exc).__name__ == "TaskError":
+            raise HTTPException(status_code=500, detail=str(exc))
+        raise
 
 
 @router.get("/ping")
@@ -146,7 +152,7 @@ async def accept(session_id: str, profile: Optional[str] = None) -> Dict[str, An
     def run():
         cur = inbox.get(session_id)
         # An older Desktop shows Do it on every card: never let it run a decision card's prompt action.
-        if cur and any(a["kind"] == "resolve" for a in st.item_type(cur)["actions"]):
+        if cur and any(a["kind"] in ("resolve", "task") for a in st.item_type(cur)["actions"]):
             raise _Conflict("this card has its own actions; update Hermes Desktop to use them")
         return inbox.act(session_id, None)
     try:

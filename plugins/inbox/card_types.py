@@ -16,6 +16,9 @@ Action kinds:
   prompt   render ``prompt`` ({{field}}, {{input}}, {{key}}, {{title}}, {{accept_prompt}}; one plain
            substitution pass, no expressions) and run it in the card's chat (= the old "Do it").
   resolve  record outcome=<action id> (+ the input value), close the card, no agent turn.
+  task     resolve + queue a Kanban card whose body is the rendered ``prompt`` (options: assignee
+           (default ``default``), board, title template, skills). Atomic: if the card can't be
+           created the action fails and the inbox card stays open.
 Archive is implicit on every type (outcome ``archived``) and may not be redeclared.
 
 Sources, first wins: ``<home>/inbox/types/<name>.yaml`` (ad-hoc, written by ``define``), then
@@ -37,7 +40,11 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
 ACTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}\Z")
 FIELD_RE = re.compile(r"^[a-z_][a-z0-9_]{0,31}\Z")
 ICON_RE = re.compile(r"^[a-z0-9-]{1,40}\Z")
-KINDS = ("prompt", "resolve")
+KINDS = ("prompt", "resolve", "task")
+TASK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+CORE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
+MAX_SKILLS = 8
+MAX_TITLE = 200
 STYLES = ("primary", "secondary", "danger")
 RESERVED_ACTIONS = ("archive",)
 RESERVED_FIELDS = ("input", "key", "title", "accept_prompt")
@@ -251,7 +258,8 @@ def validate(spec: Any, name: Optional[str] = None) -> dict[str, Any]:
         if aid in seen:
             raise TypeError_(f"duplicate action id {aid!r}")
         seen.add(aid)
-        bad = set(a) - {"id", "label", "kind", "prompt", "input", "confirm", "style", "icon", "row"}
+        bad = set(a) - {"id", "label", "kind", "prompt", "input", "confirm", "style", "icon", "row",
+                        "assignee", "board", "title", "skills"}
         if bad:
             raise TypeError_(f"action {aid}: unknown options {[_r(k) for k in bad]}")
         kind = a.get("kind")
@@ -259,16 +267,44 @@ def validate(spec: Any, name: Optional[str] = None) -> dict[str, Any]:
             raise TypeError_(f"action {aid}: unknown kind {_r(kind)} (supported: {', '.join(KINDS)})")
         act: dict[str, Any] = {"id": aid, "label": _label(a.get("label"), aid.replace("_", " ").title(),
                                                            f"action {aid}.label"), "kind": kind}
-        if kind == "prompt":
+        if kind in ("prompt", "task"):
             p = a.get("prompt")
             if not isinstance(p, str) or not p.strip():
-                raise TypeError_(f"action {aid}: kind prompt needs a prompt template")
+                raise TypeError_(f"action {aid}: kind {kind} needs a prompt template")
             act["prompt"] = p.strip()[:MAX_PROMPT]
             unknown_vars = template_vars(p) - set(fields or {}) - set(RESERVED_FIELDS)
             if fields is not None and unknown_vars:
                 raise TypeError_(f"action {aid}: prompt uses undeclared fields {sorted(unknown_vars)}")
         elif a.get("prompt") is not None:
-            raise TypeError_(f"action {aid}: only kind prompt takes a prompt")
+            raise TypeError_(f"action {aid}: only kinds prompt and task take a prompt")
+        if kind == "task":
+            for opt in ("assignee", "board"):
+                v = a.get(opt)
+                if v is not None:
+                    # Kanban lowercases assignees and its profile/board slugs have no dots.
+                    if (not isinstance(v, str) or not TASK_NAME_RE.match(v)
+                            or not CORE_SLUG_RE.match(v.lower())):
+                        raise TypeError_(f"action {aid}.{opt} must match {TASK_NAME_RE.pattern} "
+                                         f"(no dots: Kanban profile and board names are [a-z0-9_-])")
+                    act[opt] = v
+            act.setdefault("assignee", "default")
+            t = a.get("title")
+            if t is not None:
+                if not isinstance(t, str) or not t.strip():
+                    raise TypeError_(f"action {aid}.title must be a non-empty template string")
+                act["title"] = t.strip()[:MAX_TITLE]
+                tv = template_vars(t) - set(fields or {}) - set(RESERVED_FIELDS)
+                if fields is not None and tv:
+                    raise TypeError_(f"action {aid}: title uses undeclared fields {sorted(tv)}")
+            sk = a.get("skills")
+            if sk is not None:
+                if (not isinstance(sk, list) or len(sk) > MAX_SKILLS
+                        or not all(isinstance(x, str) and TASK_NAME_RE.match(x) for x in sk)):
+                    raise TypeError_(f"action {aid}.skills must be a list (max {MAX_SKILLS}) of names "
+                                     f"matching {TASK_NAME_RE.pattern}")
+                act["skills"] = list(dict.fromkeys(sk))
+        elif any(a.get(o) is not None for o in ("assignee", "board", "title", "skills")):
+            raise TypeError_(f"action {aid}: assignee/board/title/skills are only for kind task")
         inp = a.get("input")
         if inp is not None:
             if inp is True:
@@ -315,8 +351,8 @@ def validate(spec: Any, name: Optional[str] = None) -> dict[str, Any]:
                 raise TypeError_(f"action {aid}.icon must be a codicon name")
             act["icon"] = icon
         if _bool(a.get("row"), f"action {aid}.row"):
-            if kind != "resolve" or "input" in act:
-                raise TypeError_(f"action {aid}: row buttons are for resolve actions without input")
+            if kind not in ("resolve", "task") or "input" in act:
+                raise TypeError_(f"action {aid}: row buttons are for resolve/task actions without input")
             act["row"] = True
         actions.append(act)
     out["actions"] = actions
@@ -355,7 +391,7 @@ def check_fields(tdef: dict[str, Any], fields: Any) -> dict[str, str]:
 
 
 def needs_accept_prompt(tdef: dict[str, Any]) -> bool:
-    return any(a["kind"] == "prompt" and "accept_prompt" in template_vars(a.get("prompt", ""))
+    return any(a["kind"] in ("prompt", "task") and "accept_prompt" in template_vars(a.get("prompt", ""))
                for a in tdef["actions"])
 
 

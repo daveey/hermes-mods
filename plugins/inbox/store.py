@@ -32,8 +32,28 @@ MAX_OPEN = 20          # past this, the oldest READ open messages are archived
 MAX_TITLE = 120
 MAX_BODY = 20_000
 MAX_PROMPT = 4_000
+STALE_QUEUING_S = 300  # a task claim older than this had a crashed claimant; act() may retry it
 
 _lock = threading.RLock()
+
+
+class TaskError(RuntimeError):
+    """A ``task`` action could not queue its Kanban card (the inbox card stays open)."""
+
+
+def kanban_task_creator(*, title: str, body: str, assignee: str, board=None, skills=None,
+                        idempotency_key=None) -> str:
+    """Create a Kanban card through the core API (the one ``kanban_create`` uses); returns its id.
+    The kanban home is shared by every profile, so a card posted on another profile's inbox lands
+    on the same board; ``assignee`` names the profile that runs it."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    if board and not kb.board_exists(board):
+        raise TaskError(f"kanban board {board!r} does not exist")
+    with kbc.connect_closing(board=board) as conn:
+        return kb.create_task(conn, title=title, body=body, assignee=assignee, board=board,
+                              skills=list(skills or []) or None, idempotency_key=idempotency_key,
+                              created_by="inbox")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -50,7 +70,7 @@ CREATE INDEX IF NOT EXISTS items_key ON items(key);
 """
 # Added with card types; ALTERed into older sidecars on open (idempotent).
 _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
-            ("outcome_value", "TEXT"), ("resolved_at", "REAL"))
+            ("outcome_value", "TEXT"), ("resolved_at", "REAL"), ("outcome_task", "TEXT"))
 # Not "types.py": a sibling named like the stdlib module shadows it whenever this dir is on sys.path.
 _TYPES = Path(__file__).resolve().parent / "card_types.py"
 
@@ -103,12 +123,14 @@ class Inbox:
     """``db_factory`` returns a SessionDB (injectable for tests); ``home`` holds the sidecar."""
 
     def __init__(self, home: Optional[Path] = None, db_factory: Optional[Callable[[], Any]] = None,
-                 clock: Callable[[], float] = time.time, types: Any = None):
+                 clock: Callable[[], float] = time.time, types: Any = None,
+                 task_creator: Optional[Callable[..., str]] = None):
         self.home = Path(home) if home else _home()
         self.path = self.home / "inbox" / "inbox.db"
         self._db_factory = db_factory
         self.clock = clock
         self._types = types
+        self._task_creator = task_creator
 
     @property
     def types(self):
@@ -183,7 +205,7 @@ class Inbox:
         legacy = ct.is_builtin_default(snap)  # by content: a look-alike type can't borrow the legacy text
         # A type with resolve actions is a decision card: after the user acted on it, a re-post is a
         # new card with buttons, never a follow-up note in the old chat.
-        decision = any(x["kind"] == "resolve" for x in snap["actions"])
+        decision = any(x["kind"] in ("resolve", "task") for x in snap["actions"])
         now = self.clock()
         with _lock:
             side = self._side()
@@ -333,7 +355,7 @@ class Inbox:
             try:
                 db.set_session_archived(session_id, True)
                 # Archive = dismissed with no decision; an already-resolved card keeps its outcome.
-                side.execute("UPDATE items SET state=CASE WHEN state='resolved' THEN state ELSE 'archived' END, "
+                side.execute("UPDATE items SET state=CASE WHEN state IN ('resolved','queuing') THEN state ELSE 'archived' END, "
                              "outcome=COALESCE(outcome, 'archived'), resolved_at=COALESCE(resolved_at, ?) "
                              "WHERE session_id=?", (self.clock(), session_id))
                 side.commit()
@@ -351,8 +373,14 @@ class Inbox:
         ct = types_module()
         with _lock:
             item = self.get(session_id)
-            if not item or item["state"] != "open":
+            if not item:
                 return None
+            stale_claim = (item["state"] == "queuing"
+                           and self.clock() - float(item.get("resolved_at") or 0) > STALE_QUEUING_S)
+            if item["state"] != "open" and not stale_claim:
+                return None
+            claim_from = ("state='queuing' AND resolved_at=?", item.get("resolved_at")) if stale_claim else (
+                "state='open'", None)
             if action_id == "archive":
                 self.archive(session_id)
                 return dict(self.get(session_id) or item, action="archive", kind="archive")
@@ -390,18 +418,75 @@ class Inbox:
                 if len(prompt) > ct.MAX_RENDERED:
                     raise ValueError(f"rendered prompt is {len(prompt)} chars, over {ct.MAX_RENDERED}")
             state = "accepted" if prompt is not None else "resolved"
+            task_args = None
+            if act["kind"] == "task":
+                ctx = dict(fields, input=value or "", key=item.get("key") or "", title=item.get("title") or "",
+                           accept_prompt=item.get("accept_prompt") or "")
+                body = ct.render(act["prompt"], ctx)
+                if len(body) > ct.MAX_RENDERED:
+                    raise ValueError(f"rendered task prompt is {len(body)} chars, over {ct.MAX_RENDERED}")
+                ttl = " ".join(ct.render(act["title"], ctx).split()) if act.get("title") else (
+                    f"{snap.get('label') or snap['name']}: {act['label']} \u2014 {item.get('title') or ''}")
+                task_args = dict(title=ttl[:ct.MAX_TITLE].strip() or act["label"], body=body,
+                                 assignee=act.get("assignee") or "default", board=act.get("board"),
+                                 skills=act.get("skills"), idempotency_key=f"inbox:{session_id}:{act['id']}")
+            old_fields = item.get("fields_json")
+            # A task action is claimed as 'queuing' (readers still see an open card, no decision) until
+            # its Kanban card exists; only then does it become 'resolved'.
+            claim_state = "queuing" if task_args is not None else state
             side = self._side()
             try:
-                # Claim the transition first (state='open' guard, atomic across processes), then
-                # touch the session row only if this caller won.
+                # Claim the transition first (state guard, atomic across processes), then touch the
+                # session row only if this caller won.
                 won = side.execute("UPDATE items SET state=?, outcome=?, outcome_value=?, fields_json=?, "
-                                   "resolved_at=? WHERE session_id=? AND state='open'",
-                                   (state, act["id"], value, json.dumps(fields), now, session_id)).rowcount == 1
+                                   f"resolved_at=? WHERE session_id=? AND {claim_from[0]}",
+                                   (claim_state, act["id"], value, json.dumps(fields), now, session_id,
+                                    *([claim_from[1]] if claim_from[1] is not None else []))).rowcount == 1
                 side.commit()
             finally:
                 side.close()
             if not won:
                 return None
+            if task_args is not None:
+                # The decision is claimed; queue the work. If that fails, reopen the card so a decision
+                # is never recorded for work that was not queued. The idempotency key makes a retry
+                # (or a crash between create and record) reuse the card instead of duplicating it.
+                try:
+                    tid = (self._task_creator or kanban_task_creator)(**task_args)
+                    if not tid:
+                        raise TaskError("kanban returned no task id")
+                except Exception as exc:
+                    side = self._side()
+                    try:  # only our own claim is reverted (state + stamp), never a later decision
+                        side.execute("UPDATE items SET state='open', outcome=NULL, outcome_value=NULL, "
+                                     "fields_json=?, resolved_at=NULL, outcome_task=NULL "
+                                     "WHERE session_id=? AND state='queuing' AND resolved_at=?",
+                                     (old_fields, session_id, now))
+                        side.commit()
+                    finally:
+                        side.close()
+                    if type(exc).__name__ == "TaskError":
+                        raise
+                    raise TaskError(f"could not queue the Kanban task: {type(exc).__name__}: {exc}") from exc
+                # The work is queued: the decision stands even if recording the id fails (a stale
+                # 'queuing' claim is retried with the same idempotency key and finds this card).
+                for attempt in (1, 2):
+                    try:
+                        side = self._side()
+                        try:
+                            side.execute("UPDATE items SET state='resolved', outcome_task=? "
+                                         "WHERE session_id=? AND state='queuing' AND resolved_at=?",
+                                         (str(tid), session_id, now))
+                            side.commit()
+                        finally:
+                            side.close()
+                        break
+                    except sqlite3.Error:
+                        if attempt == 2:
+                            import logging
+                            logging.getLogger(__name__).warning("inbox: queued %s for %s but could not record it",
+                                                                tid, session_id)
+                item["outcome_task"] = str(tid)
             db = self._sessions()
             try:
                 if prompt is not None:
@@ -433,6 +518,10 @@ class Inbox:
             return None
         item = dict(row)
         state, outcome = item["state"], item.get("outcome")
+        if state == "queuing":  # a task action is still creating its Kanban card: no decision yet
+            return {"key": item["key"], "state": "open", "outcome": None, "value": None,
+                    "fields": item_fields(item), "at": item["updated_at"], "session_id": item["session_id"],
+                    "type": item.get("type") or "default", "title": item["title"], "task": None}
         if state in ("open", "accepted"):
             db = self._sessions()
             try:
@@ -448,7 +537,7 @@ class Inbox:
         return {"key": item["key"], "state": state, "outcome": outcome, "value": item.get("outcome_value"),
                 "fields": item_fields(item), "at": item.get("resolved_at") or item["updated_at"],
                 "session_id": item["session_id"], "type": item.get("type") or "default",
-                "title": item["title"]}
+                "title": item["title"], "task": item.get("outcome_task")}
 
     def on_user_turn(self, session_id: str) -> bool:
         """A user turn started in *session_id*: if it is an open message, accept it."""

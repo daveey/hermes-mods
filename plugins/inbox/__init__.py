@@ -80,7 +80,7 @@ OUTCOME_SCHEMA = {
     "name": "inbox_outcome",
     "description": (
         "Read back what David decided on the newest Inbox card with `key` (the key you passed to "
-        "inbox_post). Returns {state, outcome, value, fields, at, session_id, type}: state is open "
+        "inbox_post). Returns {state, outcome, value, fields, at, session_id, type, task}: state is open "
         "(no decision yet), accepted (he ran a prompt action or replied), resolved (he pressed a "
         "resolve action) or archived (dismissed, no decision); outcome is the action id he pressed "
         "(e.g. approve / edit / skip, 'archived' for Archive); value is the text he typed for an input "
@@ -103,7 +103,9 @@ TYPES_SCHEMA = {
         "    - {id: rewrite, label: Rewrite, kind: prompt, input: {placeholder: What to change},\n"
         "       prompt: 'Rewrite draft {{id}}: {{input}}'}\n"
         "Action kinds: resolve (records outcome=<id> and value=<input>, closes the card; input.field also "
-        "writes the value into that field) and prompt (renders the template with {{field}}, {{input}}, "
+        "writes the value into that field), task (resolve + queues a background Kanban card whose body is the "
+        "rendered `prompt`; options assignee (default 'default'), board, title template, skills list; the "
+        "card id is returned as `task` by inbox_outcome; if queueing fails the card stays open) and prompt (renders the template with {{field}}, {{input}}, "
         "{{key}}, {{title}}, {{accept_prompt}} in one plain substitution pass and runs it in the card's "
         "chat; the template shows as the button's tooltip). Options: input "
         "{field, multiline, max, placeholder, required}, confirm (true or a message), style "
@@ -260,13 +262,15 @@ def _run_cli(args) -> int:
         value = sys.stdin.read() if args.input == "-" else args.input
         try:
             item = inbox.act(args.session_id, args.action, value)
-        except ValueError as exc:
+        except Exception as exc:
+            if not isinstance(exc, ValueError) and type(exc).__name__ != "TaskError":
+                raise
             print(f"error: {exc}", file=sys.stderr)
             return 1
         if not item:
             print("not an open inbox message")
             return 1
-        print(json.dumps({k: item.get(k) for k in ("session_id", "state", "outcome", "outcome_value", "prompt")
+        print(json.dumps({k: item.get(k) for k in ("session_id", "state", "outcome", "outcome_value", "outcome_task", "prompt")
                           if item.get(k) is not None}))
         return 0
     if cmd == "list":
