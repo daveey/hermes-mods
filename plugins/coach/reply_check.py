@@ -27,7 +27,15 @@ HANDOFF_RE = re.compile(
     r"approve|grant|enable|allow)\b[^.\n]{0,120}\b(then|and) (?:tell|let) me\b"
     r"|\b(let me know|tell me|ping me|reply|say \"?\w+\"?) (?:when|once|after) (?:you(?:'ve| have)?|it'?s|that'?s)\b"
     r"|\b(?:once|after|when) you(?:'ve| have)? (?:clicked|signed|logged|run|opened|approved|granted|enabled|dropped|pasted|added|installed|plugged|restarted|done)\b"
-    r"|^\s*(?:\d+[.)]|[-*])\s*(?:click|open|go to|tap|sign in|log in|paste|drag|press|select|choose|enable|grant)\b)",
+    r"|^\s*(?:\d+[.)]|[-*])\s*(?:click|open|go to|tap|sign in|log in|paste|drag|press|select|choose|enable|grant)\b"
+    # Statement-shaped handoffs with no "then tell me" tail (missed 6/6 in a real Alpha + coordinator transcript):
+    # "What you need to do:", "Cleanup for you:", "That's yours to do", "may still need you", "/invite @bot first",
+    # "someone in #chan runs ...", "needs your AWS SSO session", "one I can't run".
+    r"|\bwhat you(?:'ll)? need to do\b|\b(?:cleanup|left|steps?|actions?|to-?dos?|homework) for you\b"
+    r"|\b(?:that'?s|it'?s|this is) yours to do\b|\b(?:may|might|will|would) (?:still )?need you\b"
+    r"|\bneeds? you to\b|(?:^|\s)`?/invite\b|\bsomeone (?:in|on|with) \S+ (?:runs?|types?|clicks?|invites?|sends?)\b"
+    r"|\bneeds? your (?:\w+ ){0,2}(?:session|login|password|approval|click|terminal)\b"
+    r"|\b(?:one|command|step|something) I can'?t (?:run|do)\b)",
     re.I | re.M)
 CONFIRM_RE = re.compile(
     r"(\b(?:want me to|should i|shall i|do you want me to|would you like me to|ok(?:ay)? (?:if|to) i|"
@@ -157,6 +165,8 @@ probabilities (0-1):
   automation, saved credentials, a password vault, a token broker, ssh, or background desktop control. Physical
   actions (plugging hardware, being at a device), the user's own judgment/taste, money/legal decisions, secrets
   only the user knows, and macOS privacy permission grants are NOT handoffs (score low).
+  A CONDITIONAL ask ("if X isn't set up, you'll need to...", "may still need you if...") counts as a handoff when
+  the agent could have checked X itself (membership, login state, a config value) and didn't: score it high.
 - confirm: the message ends by asking permission for a next step that is reversible and clearly within what the
   user already asked for (e.g. "Want me to run the tests / apply the fix / commit it?"). Asking before something
   irreversible, external-facing (sending messages/emails, spending money, deleting data, force-push, publishing),

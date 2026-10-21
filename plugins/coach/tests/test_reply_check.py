@@ -32,6 +32,30 @@ def _judge(verdict):
     return llm, calls
 
 
+REAL_MISSED_HANDOFFS = [  # verbatim from replies the old prefilter passed straight through (2026-10-21)
+    "**What you need to do:** in #quakes, send:",
+    "If I'm not in #quakes yet, `/invite @Alpha` first, since it's a private channel.",
+    "**Cleanup for you:** revoke the dead clients `alpha-slack-bot` and `alpha-hermes`.",
+    "That's yours to do, because my sandbox has no AWS access.",
+    "**To unblock:** someone in #quakes runs `/invite @softmaxbot`.",
+    "One thing may still need you: if Alpha isn't a member of the private #quakes channel, only a channel member can invite it.",
+    "That's an owner command that needs AWS SSO, so it's one I can't run: `token_broker_client.py revoke`.",
+    "Revoking is an owner command and needs your AWS SSO session.",
+]
+
+
+def test_prefilter_catches_statement_shaped_handoffs():
+    for s in REAL_MISSED_HANDOFFS:
+        assert "handoff" in rc.prefilter(s), s
+
+
+def test_prefilter_statement_patterns_skip_plain_reports():
+    for s in ["I revoked both clients and posted to #quakes (permalink below).",
+              "Alpha is already in #quakes, so I posted directly.",
+              "The worker needs your-org's token scope, which the broker grants."]:
+        assert "handoff" not in rc.prefilter(s), s
+
+
 def test_check_fires_only_over_threshold_and_on_prefiltered_rules():
     llm, calls = _judge({"handoff": 0.95, "confirm": 0.1, "unverified": 0.9, "evidence": "asks user to click Allow"})
     hit = rc.check("Click Allow, then let me know when you've done it.", "set up slack", ["-> terminal(ls)"], llm)
