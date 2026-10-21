@@ -383,7 +383,8 @@ def test_message_op_wakes_the_follower_with_the_note_once(env):
     store, engs, _, _ = env
     e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
     engs.update(e["id"], kickoff=0)
-    r = follow.engagement_op(engs, "message", {"id": e["id"], "text": "result: 42", "sender": "@session:default@mac/s1"})
+    r = follow.engagement_op(engs, "message", {"id": e["id"], "text": "result: 42", "sender": "@session:default@mac/s1",
+                                                         "final": True})
     assert r["ok"] and r["queued"] == 1
     spawned = []
     runner = make_runner(store, engs, spawned)
@@ -633,3 +634,88 @@ def test_spawn_adds_model_flag(tmp_path, env, monkeypatch):
     assert "-m" not in seen["cmd"]
     r._spawn(e, "hi", model="claude-opus-5-5")
     assert seen["cmd"][seen["cmd"].index("-m") + 1] == "claude-opus-5-5"
+
+
+def _note(engs, eid, text, **kw):
+    return follow.engagement_op(engs, "message", {"id": eid, "text": text, **kw})
+
+
+def test_results_are_held_then_posted_as_one_batch_turn_on_final(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    engs.update(e["id"], kickoff=0)
+    spawned = []
+    runner = make_runner(store, engs, spawned)
+    for i in range(3):
+        _note(engs, e["id"], f"run {i} done")
+        assert not runner.run_once(e["id"])  # held: no per-result turn
+    assert spawned == []
+    _note(engs, e["id"], "run 3 done, batch complete", final=True)
+    assert runner.run_once(e["id"])
+    assert len(spawned) == 1  # ONE turn, hence one summary post
+    p = spawned[0][1]
+    assert all(f"run {i} done" in p for i in range(3)) and "ONE short summary" in p and "6 lines" in p
+    assert not runner.run_once(e["id"]) and len(spawned) == 1
+
+
+def test_quiet_window_flushes_held_results(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    engs.update(e["id"], kickoff=0)
+    spawned = []
+    runner = make_runner(store, engs, spawned)
+    _note(engs, e["id"], "run A")
+    assert not runner.notes_due(engs.notes(e["id"]), time.time() + 3600)
+    assert runner.notes_due(engs.notes(e["id"]), time.time() + follow.RESULT_QUIET_S + 5)
+    # a new result restarts the window
+    notes = engs.notes(e["id"])
+    notes[0]["at"] -= follow.RESULT_QUIET_S + 10
+    store.kv_set("notes:" + e["id"], notes)
+    assert runner.run_once(e["id"]) and len(spawned) == 1 and "run A" in spawned[0][1]
+
+
+def test_tick_does_not_wake_follower_for_held_results(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    engs.update(e["id"], kickoff=0)
+    runner = make_runner(store, engs, [])
+    kicked = []
+    runner.kick = lambda eid: kicked.append(eid)
+    _note(engs, e["id"], "run A")
+    runner.tick()
+    assert kicked == []
+    _note(engs, e["id"], "run B", final=True)
+    runner.tick()
+    assert kicked == [e["id"]]
+
+
+def test_questions_about_our_own_posts_carry_the_real_recent_posts(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    engs.update(e["id"], kickoff=0)
+    rec(store, "C1", "2.0", "topology 3 result: 0.91", user=BOTSELF)
+    rec(store, "C1", "3.0", "alpha -- who is this for and why is it being posted here?", user="UEMMETT")
+    spawned = []
+    runner = make_runner(store, engs, spawned)
+    assert runner.run_once(e["id"])
+    p = spawned[0][1]
+    assert "Your recent posts here" in p and "ts=2.0" in p and "topology 3 result: 0.91" in p
+    assert "conversations.replies" in p
+
+
+def test_ordinary_questions_do_not_get_the_own_posts_block(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    engs.update(e["id"], kickoff=0)
+    rec(store, "C1", "2.0", "old post", user=BOTSELF)
+    rec(store, "C1", "3.0", "ok, thanks alpha", user="UEMMETT")
+    spawned = []
+    assert make_runner(store, engs, spawned).run_once(e["id"])
+    assert "Your recent posts here" not in spawned[0][1]
+
+
+def test_kickoff_carries_batch_and_grounding_rules(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    p = follow.kickoff_prompt(e)
+    assert "ONE short batch summary" in p and "conversations.replies" in p and "Posting for <owner>" in p

@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 DEBOUNCE_S = 2.0
 TURN_TIMEOUT_S = 900
 QUIET_WARN_S = 6 * 86400
+# Results coming back as notes are HELD and posted as ONE summary per finished batch: when a sender marks the
+# note final (final=true: "this was the last card of the batch"), or when no new result arrived for
+# RESULT_QUIET_S (policy.json follower.result_quiet_s). Never one post per result.
+RESULT_QUIET_S = 2 * 3600
 QUIET_END_S = engage.QUIET_END_DAYS * 86400
 MBP_RETRY_S = 300
 PICKUP_WAIT_S = 25
@@ -107,8 +111,29 @@ def scope_label(e: dict) -> str:
     return f"#{e.get('name') or e['channel']} ({e['channel']})" + (f", thread {e['thread']}" if e["thread"] else "")
 
 
+META_RE = re.compile(
+    r"(?:who(?:'s| is| was)? (?:this|that|it) for|what(?:'s| is| was) (?:this|that)\b|why (?:is|was|are|were|did|do)\b[^.?]{0,40}"
+    r"\b(?:post|posted|posting|here)\b|why (?:are )?you (?:post|posting|posted)|who (?:posted|asked)|"
+    r"your (?:last|latest|previous) (?:post|message|reply)|last thing you (?:posted|said)|"
+    r"why (?:did )?(?:alpha|you) (?:post|say|send))", re.IGNORECASE)
+
+
+def asks_about_our_posts(rows: list[dict], bot_user_id: str) -> bool:
+    return any(r.get("user") != bot_user_id and META_RE.search(r.get("text") or "") for r in rows)
+
+
+GROUNDING_RULE = ("If anyone asks about YOUR OWN posts (who is this for, what was that, why did you post, what was "
+                  "your last post): first read the real thread (slack_read, i.e. conversations.replies) and answer by "
+                  "quoting the post by its ts and content. Never answer from memory or assumption; the posts are "
+                  "listed under 'Your recent posts' when this prompt has them.")
+
+RESULTS_RULE = ("Results: ONE short batch summary (at most 6 lines, link the PRs), never one post per run; "
+                "detail lives in the PR/README.")
+
+
 def batch_prompt(e: dict, batch: dict, context_rows: list[dict], name: Callable[[str], str],
-                 bot_user_id: str, escalations: Optional[list[dict]] = None) -> str:
+                 bot_user_id: str, escalations: Optional[list[dict]] = None,
+                 own_posts: Optional[list[dict]] = None) -> str:
     lines = [f"[Slack engagement {e['id']} · {scope_label(e)}]",
              "New messages since you last looked (oldest first; ts = reply_to id):"]
     lines += _fmt(batch["trigger"], name, bot_user_id)
@@ -119,12 +144,17 @@ def batch_prompt(e: dict, batch: dict, context_rows: list[dict], name: Callable[
     if context_rows:
         lines += ["", "Earlier in scope (already handled, context only):"]
         lines += _fmt(context_rows, name, bot_user_id)
+    if own_posts and asks_about_our_posts(batch["trigger"], bot_user_id):
+        lines += ["", "Your recent posts here (someone is asking about them; quote the matching ts/text, and re-read "
+                      "the thread with slack_read before answering):"]
+        lines += _fmt(own_posts, name, bot_user_id)
+        lines += [GROUNDING_RULE]
     esc = [x for x in (escalations or []) if not e["thread"] or x.get("thread") == e["thread"]]
     if esc:
         lines += ["", "Inbox cards you already posted here (reuse the SAME topic to update one):"]
         lines += [f"- topic '{x['topic']}' (thread {x['thread'] or '-'}): {x['title']}  [{x['key']}]"
                   + (f"  — owner pressed {x['decision']}" if x.get("decision") else "") for x in esc[-10:]]
-    lines += ["", "Follow the participation rules (skill slack-workspace-bot, 'Engaged channels'). "
+    lines += ["", "Follow the participation rules (skill slack-workspace-bot, 'Engaged channels'). " + GROUNDING_RULE + " "
               "Reply with slack_post(channel, thread_ts, reply_to=<ts>, text); one reply per message. "
               "Be quick: answer simple things right away with ONE slack_post, no preamble. The gateway already "
               "added :eyes: to messages addressed to us and swaps it for :white_check_mark: when you post; "
@@ -155,6 +185,7 @@ def kickoff_prompt(e: dict, self_ref: str = "") -> str:
         meta.append(f"- Your own session (for others to message you): {self_ref}")
     if meta:
         parts += ["", "## Links"] + meta
+    parts += ["", "## Standing rules", "- " + RESULTS_RULE, "- " + GROUNDING_RULE]
     parts += ["", "## Now",
               f"1. Read the recent history (slack_read channel={e['channel']}"
               + (f" thread_ts={e['thread']}" if e["thread"] else "") + ").",
@@ -262,10 +293,14 @@ def engagement_op(engs: "engage.Engagements", op: str, args: dict) -> dict:
         return {"ok": False, "error": f"no engagement {eid}"}
     if op == "message":
         # A result/answer for the follower from another session (e.g. the Mac session it deferred to).
+        # Results are held and posted as one batch summary (see notes_due); final=true releases the batch now.
         if not (args.get("text") or "").strip():
             return {"ok": False, "error": "message needs text"}
-        return {"ok": True, "queued": engs.add_note(eid, args["text"], args.get("sender") or ""),
-                "note": "the follower gets it within ~1 minute and posts what the channel needs"}
+        final = bool(args.get("final"))
+        return {"ok": True, "queued": engs.add_note(eid, args["text"], args.get("sender") or "", final=final),
+                "note": ("the follower gets the batch within ~1 minute and posts ONE summary" if final else
+                         "held with the other results of this batch; the follower posts ONE summary when a note "
+                         "with final=true arrives or no result comes for 2 h")}
     if op == "get":
         e = engs.get(eid)
         return {"ok": True, "engagement": pub(e) | {"brief": e.get("brief"), "context": e.get("context")},
@@ -398,12 +433,15 @@ class Runner:
                 return False
             return True
         notes = self.engs.notes(eid)
-        if notes:
-            lines = [f"[Slack engagement {eid} · {scope_label(e)} · message for you]"]
+        if notes and self.notes_due(notes):
+            lines = [f"[Slack engagement {eid} · {scope_label(e)} · {len(notes)} result note(s) for you]"]
             for n in notes:
                 lines += [f"From {n.get('sender') or 'another session'}:", n["text"], ""]
-            lines += ["Act on it per the participation rules: usually post the headline in the thread that was "
-                      "waiting (slack_post), then end with a one-line activity note."]
+            lines += ["This is one finished batch. Post ONE short summary in the waiting thread with a single "
+                      "slack_post: at most 6 lines, headline first, link the PRs, no per-run posts, no 'Posting for' "
+                      "prefix; detail stays in the PR/README. If a note is not a result (a question, an answer for "
+                      "someone), handle it per the participation rules. " + GROUNDING_RULE,
+                      "End with a one-line activity note."]
             rc, out = self.spawn(e, "\n".join(lines))
             if rc != 0:
                 logger.warning("slack-follow %s note turn failed rc=%s: %s", eid, rc, out[-500:])
@@ -425,7 +463,8 @@ class Runner:
         except Exception as exc:  # routing must never block a reply
             logger.warning("slack-follow %s model routing failed: %s", eid, exc)
             model = ""
-        prompt = batch_prompt(e, batch, ctx, self.name, bot, self._escalations(e))
+        own = self._own_posts(e, bot, first) if asks_about_our_posts(batch["trigger"], bot) else None
+        prompt = batch_prompt(e, batch, ctx, self.name, bot, self._escalations(e), own_posts=own)
         rc, out = self.spawn(e, prompt, model=model) if model else self.spawn(e, prompt)
         logger.info("slack-follow: %s turn for %d message(s) rc=%s in %.0fs (waited %.1fs from message to spawn)%s",
                     eid, len(batch["trigger"]), rc, time.time() - t0, t0 - first,
@@ -438,6 +477,21 @@ class Runner:
             return False
         self.engs.mark_handled(eid, batch["newest"])
         return True
+
+    def notes_due(self, notes: list[dict], now: Optional[float] = None) -> bool:
+        """Release held result notes? Yes when one is marked final or the newest is RESULT_QUIET_S old."""
+        if not notes:
+            return False
+        if any(n.get("final") for n in notes):
+            return True
+        now = time.time() if now is None else now
+        quiet = float((self.policy().get("follower") or {}).get("result_quiet_s") or RESULT_QUIET_S)
+        return now - max(float(n.get("at") or 0) for n in notes) >= quiet
+
+    def _own_posts(self, e: dict, bot: str, since: float) -> list[dict]:
+        rows = [r for r in self.store.recent(e["channel"], since - 2 * 86400, limit=200)
+                if r.get("user") == bot and self.engs.in_scope(e, r)]
+        return rows[-8:]
 
     def _escalations(self, e: dict) -> list[dict]:
         """This channel's Inbox cards, each tagged with the owner's resolved decision on it (e.g. ignore)."""
@@ -526,7 +580,7 @@ class Runner:
                 except Exception:
                     logger.warning("slack-follow quiet card failed", exc_info=True)
                 self.engs.update(e["id"], warned_quiet=now)
-            if e.get("kickoff") or self.engs.notes(e["id"]) or self.engs.unhandled(e["id"], bot_user_id=bot)["trigger"]:
+            if e.get("kickoff") or self.notes_due(self.engs.notes(e["id"]), now) or self.engs.unhandled(e["id"], bot_user_id=bot)["trigger"]:
                 self.kick(e["id"])
         self.deliver_mbp(now)
 

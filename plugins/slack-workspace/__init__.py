@@ -900,13 +900,15 @@ FSCHEMAS = {
                                                    "the owner's Inbox unless the test_inbox toggle is on"}},
         ["channel", "brief"], "any"),
     "slack_engagements": ("List / get / pause / resume / end / update Slack engagements. action=message (id, text) "
-                          "sends a result to the engagement's follower, which posts what the channel needs. "
+                          "holds a result for the engagement's follower, which posts ONE summary per finished batch "
+                          "(final=true on the last result releases it; else after 2 h quiet). Never post results to the channel yourself. "
                           "update test=true|false "
                           "marks a test engagement; action=test_inbox (enabled=true|false, omit to read) is the "
                           "global toggle for whether test engagements' escalations reach the Inbox (default off).", {
         "action": {"type": "string", "enum": ["list", "get", "pause", "resume", "end", "update", "message",
                                               "test_inbox"]},
         "text": {"type": "string", "description": "message: result/answer for the follower"},
+        "final": {"type": "boolean", "description": "message: this completes the batch; post the summary now"},
         "id": {"type": "string"}, "brief": {"type": "string"}, "context": {"type": "string"},
         "kanban_ids": {"type": "array", "items": {"type": "string"}}, "budget": {"type": "string"},
         "until": {"type": "string"}, "test": {"type": "boolean"}, "enabled": {"type": "boolean"}}, [], "any"),

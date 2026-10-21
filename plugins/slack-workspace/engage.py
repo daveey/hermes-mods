@@ -210,9 +210,9 @@ class Engagements:
         return bool(self.store.policy().get("test_inbox"))
 
     # ---- notes for the follower (results coming back from another machine's session) --------
-    def add_note(self, eid: str, text: str, sender: str = "") -> int:
+    def add_note(self, eid: str, text: str, sender: str = "", final: bool = False) -> int:
         notes = self.store.kv_get("notes:" + eid) or []
-        notes.append({"text": text, "sender": sender, "at": time.time()})
+        notes.append({"text": text, "sender": sender, "at": time.time(), "final": bool(final)})
         self.store.kv_set("notes:" + eid, notes)
         return len(notes)
 
