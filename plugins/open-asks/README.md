@@ -29,7 +29,7 @@ behind later completion notices until the user asked why the session wasn't mark
 
 Skipped: Kanban workers (`HERMES_KANBAN_TASK`), subagents, cron/webhook platforms, asks that name a card already
 `blocked`, hypotheticals ("if you ever want…", "no action needed"), code blocks and quotes. At most 4 cards per
-chat per hour. Off switch: `HERMES_OPEN_ASKS_OFF=1`.
+chat per hour. If the `ask-gate` plugin held or could not verify the ask (`cache/ask-gate/verdicts.json`, under 5 minutes old), no card is filed: a card would publish the unverified premise. Off switch: `HERMES_OPEN_ASKS_OFF=1`.
 
 The card is created through the agent's own `kanban_create` tool in-process, which links it to the chat. If that
 tool isn't loaded, it falls back to `hermes kanban create` + `notify-subscribe --platform tui`.
