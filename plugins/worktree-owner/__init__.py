@@ -12,7 +12,9 @@ Two hooks, both ``post_tool_call`` (never block or change a tool call):
 2. Teardown. When a Kanban worker calls ``kanban_complete`` for its own card, every worktree registered to that
    card, plus the card's own ``dir:`` workspace if that is a linked worktree no other open card uses, is removed
    with ``git worktree remove`` when it is clean and its HEAD is on a remote (nothing can be lost; the branch is
-   kept). Dirty or unpushed trees are left for mac-worktree-gc, which archives then deletes them after 7 idle days.
+   kept). Dirty or unpushed trees are left for mac-worktree-gc, which archives then deletes them after 7 idle days,
+   except trees nested in the card's scratch workspace (deleted by the dispatcher right after completion): those are
+   archived to ~/.hermes/archive/worktrees/<name>-<date>/ first, then force-removed.
 
 Log: ~/.hermes/logs/worktree-owner.log.
 """
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 H = Path.home()
 MARKER = "hermes-owner.json"
 LOG = H / ".hermes" / "logs" / "worktree-owner.log"
+ARCHIVE = H / ".hermes" / "archive" / "worktrees"
 REPO_GLOBS = [str(H / "code" / "*" / ".git"), str(H / "code" / "*" / "*" / ".git"), str(H / ".hermes" / "hermes-agent" / ".git")]
 CREATE_TOOLS = {"terminal", "execute_code"}
 SLACK_S = 5.0  # clock slack around the tool call window
@@ -106,20 +109,26 @@ def owner_from_env(env) -> dict:
                                     profile=env.get("HERMES_PROFILE") or None).items() if v}
 
 
-def _ours(path: str | None, text: str) -> bool:
-    """Attribution guard: the new tree's dir name is in the command, or the command builds paths from variables
-    (for-loops, $W/$b). A tree born in the same seconds by another agent and not named here is not claimed."""
+def _ours(path: str | None, text: str, tool: str = "terminal") -> bool:
+    """Attribution guard: the new tree's dir name is in the command, or (terminal only) a shell loop builds the paths
+    from variables (`for b in ...; do git worktree add ... $W/$b`). A tree another agent creates in the same seconds
+    and that this call does not name is not claimed. execute_code must name the path: Python code is full of `{`."""
     if not path:
         return False
-    return os.path.basename(path.rstrip("/")) in text or "$" in text or "{" in text
+    if os.path.basename(path.rstrip("/")) in text:
+        return True
+    if tool != "terminal" or "$" not in text:
+        return False
+    return any(k in text for k in ("for ", "while ", "xargs", "parallel "))
 
 
-def register_markers(since: float, env, extra_dirs: list[str] | None = None, text: str | None = None) -> list[dict]:
+def register_markers(since: float, env, extra_dirs: list[str] | None = None, text: str | None = None,
+                     tool: str = "terminal") -> list[dict]:
     owner = owner_from_env(env)
     out = []
     for gd in new_gitdirs(since, extra_dirs):
         path = _wt_path(gd)
-        if text is not None and not _ours(path, text):
+        if text is not None and not _ours(path, text, tool):
             _log(f"SKIP {path}: born during a 'worktree add' call but not named by it")
             continue
         rec = dict(owner, path=path, registered_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), host=os.uname().nodename.split(".")[0])
@@ -163,23 +172,77 @@ def live_cwds() -> list[str]:
     return [l[1:] for l in r.stdout.splitlines() if l.startswith("n")]
 
 
-def _remove(path: str, why_owned: str) -> dict:
+def _archive(path: str) -> str:
+    """Save unpushed commits (bundle + patches), tracked changes (binary diff) and untracked files (tar) of *path*
+    under ARCHIVE/<name>-<YYYYMMDD>[-N]/. Returns the archive dir; raises on any failure."""
+    stamp = time.strftime("%Y%m%d")
+    dst = ARCHIVE / f"{os.path.basename(path.rstrip('/'))}-{stamp}"
+    i = 1
+    while dst.exists():
+        i += 1
+        dst = ARCHIVE / f"{os.path.basename(path.rstrip('/'))}-{stamp}-{i}"
+    dst.mkdir(parents=True)
+    head = _git(path, "rev-parse", "HEAD").stdout.strip()
+    meta = dict(path=path, head=head, branch=_git(path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+                archived_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), by="worktree-owner")
+    if _git(path, "rev-list", "-1", "HEAD", "--not", "--remotes").stdout.strip():
+        b = _git(path, "bundle", "create", str(dst / "unpushed.bundle"), "HEAD", "--not", "--remotes", timeout=600)
+        if b.returncode != 0 or _git(path, "bundle", "verify", str(dst / "unpushed.bundle")).returncode != 0:
+            raise RuntimeError(f"bundle failed: {b.stderr.strip()[:150]}")
+        _git(path, "format-patch", "-q", "-o", str(dst / "commits"), "HEAD", "--not", "--remotes", timeout=600)
+    d = subprocess.run(["git", "-C", path, "diff", "HEAD", "--binary"], capture_output=True, timeout=600)
+    if d.returncode != 0:
+        raise RuntimeError("diff failed")
+    if d.stdout.strip():
+        (dst / "uncommitted.diff").write_bytes(d.stdout)
+    un = [f for f in _git(path, "ls-files", "-o", "--exclude-standard", "-z", timeout=600).stdout.split("\0") if f]
+    if un:
+        lst = dst / "untracked.list"
+        lst.write_text("\0".join(un) + "\0")
+        t = subprocess.run(["tar", "-czf", str(dst / "untracked.tar.gz"), "-C", path, "--null", "-T", str(lst)],
+                           capture_output=True, timeout=900)
+        if t.returncode != 0:
+            raise RuntimeError(f"tar failed: {t.stderr[:150]!r}")
+        lst.unlink()
+        meta["untracked_files"] = len(un)
+    (dst / "meta.json").write_text(json.dumps(meta, indent=1))
+    return str(dst)
+
+
+def _in_scratch(path: str, ws: str) -> bool:
+    """Inside the card's own scratch workspace, which the dispatcher deletes after completion."""
+    if not ws or "/kanban/workspaces/" not in ws:
+        return False
+    rp, rw = os.path.realpath(path), os.path.realpath(ws)
+    return rp.startswith(rw + "/")
+
+
+def _remove(path: str, why_owned: str, ws: str = "") -> dict:
     rp = os.path.realpath(path)
     if any(c == rp or c.startswith(rp + "/") or c == path or c.startswith(path + "/") for c in live_cwds()):
         _log(f"KEEP {path} ({why_owned}): a live process works in it")
         return dict(path=path, action="kept: live process")
     keep = _removable(path)
-    if keep:
+    archived = None
+    if keep and _in_scratch(path, ws) and keep != "git status failed":
+        # the dispatcher will rmtree this scratch dir right after completion: save the work, then remove properly
+        try:
+            archived = _archive(path)
+            _log(f"ARCHIVED {path} -> {archived} ({keep})")
+        except Exception as e:  # noqa: BLE001
+            _log(f"WARN archive of {path} failed: {e}")
+            return dict(path=path, action=f"kept: {keep}; archive failed: {e}")
+    elif keep:
         _log(f"KEEP {path} ({why_owned}): {keep}; mac-worktree-gc archives it after 7 idle days")
         return dict(path=path, action=f"kept: {keep}")
     common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
     main = os.path.dirname(common) if common else path
-    r = _git(main, "worktree", "remove", path, timeout=600)
+    r = _git(main, "worktree", "remove", *(["--force", "--force"] if archived else []), path, timeout=600)
     if r.returncode != 0:
         _log(f"WARN remove {path} failed: {r.stderr.strip()[:200]}")
         return dict(path=path, action=f"kept: remove failed: {r.stderr.strip()[:120]}")
     _log(f"REMOVED {path} ({why_owned})")
-    return dict(path=path, action="removed")
+    return dict(path=path, action="archived+removed" if archived else "removed", archive=archived)
 
 
 def teardown(task_id: str, env) -> list[dict]:
@@ -193,7 +256,7 @@ def teardown(task_id: str, env) -> list[dict]:
                 continue
             path = rec.get("path") or _wt_path(gd)
             if rec.get("task_id") == task_id and path and os.path.isdir(path):
-                results.append(_remove(path, f"registered to {task_id}"))
+                results.append(_remove(path, f"registered to {task_id}", ws))
     # the card's own dir: workspace, when it is a linked worktree (a .git FILE) that no other open card uses
     if ws and os.path.isfile(os.path.join(ws, ".git")) and \
             not any(os.path.realpath(r["path"]) == os.path.realpath(ws) for r in results):
@@ -222,7 +285,8 @@ def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None) -> l
             dur = float(duration_ms) / 1000 if isinstance(duration_ms, (int, float)) and duration_ms else 600.0
             since = time.time() - dur - SLACK_S
             text = str(a.get("command") or a.get("code") or "")
-            return register_markers(since, env, [a.get("workdir") or "", env.get("HERMES_KANBAN_WORKSPACE") or "", os.getcwd()], text)
+            return register_markers(since, env, [a.get("workdir") or "", env.get("HERMES_KANBAN_WORKSPACE") or "", os.getcwd()],
+                                    text, name)
         if name == "kanban_complete" and env.get("HERMES_KANBAN_TASK"):
             task = str(a.get("task_id") or env["HERMES_KANBAN_TASK"])
             if task != env["HERMES_KANBAN_TASK"]:

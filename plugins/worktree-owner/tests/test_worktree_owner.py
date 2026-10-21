@@ -123,6 +123,25 @@ class Owner(unittest.TestCase):
         res = self.m.on_tool_call("kanban_complete", {}, env=env)
         self.assertTrue(p.exists()); self.assertIn("live process", res[0]["action"])
 
+    def test_dirty_tree_nested_in_scratch_is_archived_before_the_scratch_is_deleted(self):
+        # the dispatcher rmtrees a scratch workspace on completion; a dirty nested tree must be saved first
+        ws = self.tmp / "kanban" / "workspaces" / "t_hhhh8888"; ws.mkdir(parents=True)
+        env = {"HERMES_KANBAN_TASK": "t_hhhh8888", "HERMES_KANBAN_WORKSPACE": str(ws)}
+        p = self.make(ws / "repo", "bnest", env); (p / "wip.txt").write_text("unsaved\n")
+        self.m.ARCHIVE = self.tmp / "archive"
+        res = self.m.on_tool_call("kanban_complete", {}, env=env)
+        self.assertEqual(res[0]["action"], "archived+removed")
+        arch = list(self.m.ARCHIVE.iterdir())[0]
+        self.assertTrue((arch / "untracked.tar.gz").exists())
+        self.assertNotIn(str(p), git(self.repo, "worktree", "list"))
+
+    def test_execute_code_with_braces_does_not_claim_unnamed_trees(self):
+        t0 = time.time()
+        git(self.repo, "worktree", "add", "-q", "-b", "bxx", str(self.code / "proj-unnamed"), "origin/main")
+        self.m.on_tool_call("execute_code", {"code": "d = {'a': 1}\nsubprocess.run(['git', 'worktree', 'add', path])"},
+                            duration_ms=int((time.time() - t0) * 1000) + 50, env={"HERMES_KANBAN_TASK": "t_iiii9999"})
+        self.assertIsNone(self.marker(self.code / "proj-unnamed"))
+
     def test_hook_never_raises(self):
         self.m.REPO_GLOBS = ["/nonexistent/*/.git"]
         self.assertEqual(self.m.on_tool_call("terminal", {"command": "git worktree add x"}, duration_ms=5, env={}), [])
