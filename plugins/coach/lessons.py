@@ -82,7 +82,7 @@ def aux_judge(system: str, prompt: str) -> str:
     from agent.auxiliary_client import call_llm  # type: ignore
     resp = call_llm(task="coach_lessons", messages=[{"role": "system", "content": system},
                                                    {"role": "user", "content": prompt}],
-                    max_tokens=200, temperature=0, timeout=20)
+                    max_tokens=1500, temperature=0, timeout=30)
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 
