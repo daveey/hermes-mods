@@ -282,3 +282,46 @@ def test_post_typed_falls_back_when_the_inbox_has_no_such_type_or_no_card_types(
     assert calls == [("old", "k"), ("plain", "k")]
     with pytest.raises(ValueError):
         sw._post_typed(Bad(), "", "b", "a", type="slack-reply")
+
+
+# ---- standalone (no Slack adapter: Desktop/CLI chats of a Slack bot profile) ----------------------
+def test_standalone_token_from_env_file_and_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    root = tmp_path / "slack-workspace"
+    st = sw.State(root)
+    assert st.adapter is None and not st.available()
+    with pytest.raises(RuntimeError):
+        st.token()
+    (tmp_path / ".env").write_text("OTHER=1\nSLACK_BOT_TOKEN=xoxb-alpha\n")
+    assert st.available() and st.token() == "xoxb-alpha"
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fromenv")
+    assert st.token() == "xoxb-fromenv"
+
+
+def test_standalone_rejects_non_bot_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xapp-1-nope")
+    assert not sw.State(tmp_path / "slack-workspace").available()
+
+
+def test_standalone_reads_history_as_trusted_operator(tmp_path, monkeypatch):
+    fake = FakeSlack()
+    seen = {}
+    def call(token, method, params=None, **kw):
+        seen["token"] = token
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UBOT"}
+        return fake(token, method, params, **kw)
+    monkeypatch.setattr(core, "call", call)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-alpha")
+    monkeypatch.setattr(sw, "_session", lambda n: {"PLATFORM": "desktop"}.get(n, ""))
+    st = sw.State(tmp_path / "slack-workspace")
+    out = json.loads(sw.tool_api(st, {"method": "conversations.history", "params": {"channel": "G9"}}))
+    assert "error" not in out and seen["token"] == "xoxb-alpha"   # private channel ok: operator is trusted
+    assert st.bot_user_id() == "UBOT"
+
+
+def test_adapter_path_unchanged_and_wins(env, monkeypatch):
+    st, fake, session = env
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-other")
+    assert st.token() == "xoxb-test" and st.available()
+    assert st.bot_user_id() == "UBOT"

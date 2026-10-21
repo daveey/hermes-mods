@@ -10,6 +10,9 @@
   admin, or an approval request that DMs the admins one message with checkboxes and
   Approve selected / Approve all + always allow / Deny buttons.
 
+Outside the Slack gateway process (Desktop/CLI/cron chats of a Slack bot profile) there is no adapter: the tools
+then use the profile's own ``SLACK_BOT_TOKEN`` (env, else ``<HERMES_HOME>/.env``) and the operator is trusted.
+
 Admins = ``platforms.slack.extra.allow_admin_from`` (plus ``admins`` in policy.json). Turns from
 non-Slack surfaces (desktop, CLI, cron) are the operator and are trusted.
 State: ``<HERMES_HOME>/slack-workspace/{observed.sqlite,policy.json}``.
@@ -75,6 +78,9 @@ class State:
     def token(self, team: str = "") -> str:
         a = self.adapter
         if a is None:
+            tok = self.standalone_token()
+            if tok:
+                return tok
             raise RuntimeError("Slack is not connected in this profile yet")
         clients = getattr(a, "_team_clients", None) or {}
         client = clients.get(team) if team else None
@@ -87,10 +93,29 @@ class State:
             raise RuntimeError("no Slack bot token available on the adapter")
         return tok
 
+    def standalone_token(self) -> str:
+        """Bot token for processes without the Slack adapter (Desktop/CLI/cron chats of a Slack bot profile):
+        this profile's own ``SLACK_BOT_TOKEN`` (env, else ``<HERMES_HOME>/.env``). Empty if none."""
+        import os
+        tok = (os.environ.get("SLACK_BOT_TOKEN") or "").strip()
+        if not tok:
+            tok = follow.read_env_value(self.store.root.parent / ".env", "SLACK_BOT_TOKEN")
+        return tok if tok.startswith("xoxb-") else ""
+
+    def available(self) -> bool:
+        return self.adapter is not None or bool(self.standalone_token())
+
     def api(self, method: str, params: Optional[dict] = None) -> dict:
         return core.call(self.token(_session("SCOPE_ID")), method, params)
 
     def bot_user_id(self) -> str:
+        if self.adapter is None:
+            if not getattr(self, "_standalone_uid", ""):
+                try:
+                    self._standalone_uid = str(self.api("auth.test").get("user_id") or "")
+                except Exception:
+                    return ""
+            return self._standalone_uid
         return str(getattr(self.adapter, "_bot_user_id", "") or "")
 
     def admins(self) -> set[str]:
@@ -946,7 +971,7 @@ def register(ctx):
         schema = {"name": name, "description": desc, "parameters": {
             "type": "object", "properties": props, "required": required}}
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler, description=desc,
-                          check_fn=lambda: state.adapter is not None)
+                          check_fn=state.available)
 
     peer = follow.Peer(root.parent)
     for name, (desc, props, required, where) in FSCHEMAS.items():
