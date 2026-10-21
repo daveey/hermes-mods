@@ -114,11 +114,21 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
 
 ## Pitfalls
 
-- **Closing the lid strands other apps' windows on the virtual display.** In clamshell sleep the built-in screen
-  goes away, the virtual display becomes the only screen (log: `bounds 0,0 1440x900 main 0,0 1440x900`) and macOS
-  moves every window onto it. On wake the display is re-parked in its corner and the windows stay there, invisible;
-  apps that autosave frames (SwiftUI `Window`) then reopen there even after a relaunch. `hermes-window-evict` moves
-  them back once a real display exists again, and does nothing while the virtual display is the only screen.
+- **Other apps' windows get stranded on the virtual display, mostly after the lid closes.** In clamshell sleep the
+  built-in screen goes away, the virtual display becomes the only screen (log: `bounds 0,0 1440x900 main 0,0
+  1440x900`) and macOS moves every window onto it; on wake the display is re-parked in its corner and the windows
+  stay there. Apps that autosave frames (SwiftUI `Window`) then reopen there after a relaunch, so force-quit/relaunch
+  never helps. Symptom: the user "can't switch to" an app that is frontmost (`lsappinfo front`) and idle (`sample`
+  shows the main thread in the event loop). Diagnose with CGWindowList bounds for the app's pid inside the "Hermes
+  Agent Display" rect (`system_profiler SPDisplaysDataType`), and check the log for `evict` lines. The supervisor's
+  evict loop fixes it within ~2 s when Accessibility is granted; it must no-op while the virtual display is the only
+  screen, or it re-centers every window each pass. One-off manual fix: compile `scripts/move-app-windows.swift` and
+  run it once from a no-agent gateway cron (`hermes cron create 1m --script <x>.sh --no-agent --repeat 1 --deliver
+  local`), since only the gateway holds Accessibility; check `trusted true` and re-read the bounds. Dead ends:
+  killing `hermes-vdisplay` (recreated at the same spot within ~1 s) and rewriting the app's `NSWindow Frame` default.
+- **`status`'s eviction trust line reflects the calling shell, not the running supervisor.** From an untrusted
+  terminal it prints `untrusted` while the LaunchAgent is evicting fine; judge the grant by `evict` / `evict:
+  untrusted` lines in `chrome-agent.log`.
 
 - **Chrome's tab-modal dialogs don't follow a window to another display.** "Use a saved passkey for <site>" is
   a child window; after `Browser.setWindowBounds` moves its window to the main display it stays clamped to the
@@ -138,16 +148,6 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   tab. What works: `curl 127.0.0.1:9333/json/close/<id>` the stalled tabs, `curl -X PUT
   '127.0.0.1:9333/json/new?<url>'`, `curl 127.0.0.1:9333/json/activate/<new id>`, then in the harness
   `switch_tab("<new id>")` before any `js()`.
-- **Other apps' windows can land on the virtual display, and nothing moves them back.** macOS treats it as a real
-  monitor and the re-home loop only touches Chrome. Symptom: the user "can't switch to" an app that is frontmost
-  (`lsappinfo front`) and idle (`sample` shows the main thread in the event loop), and force-quit/relaunch doesn't
-  help because it reopens there. Diagnose with CGWindowList bounds for the app's pid: its main window sits inside the
-  "Hermes Agent Display" rect (`system_profiler SPDisplaysDataType`). Fixed automatically by the supervisor's evict loop when Accessibility is granted (see above; check `status`). One-off
-  manual fix: compile `scripts/move-app-windows.swift`
-  and run it once from a no-agent gateway cron (`hermes cron create 1m --script <x>.sh --no-agent --repeat 1
-  --deliver local`), since only the gateway holds Accessibility; check the log says `trusted true` and re-read the
-  bounds. Killing `hermes-vdisplay` doesn't evict them: the supervisor recreates the display at the same spot within
-  ~1 s. Rewriting the app's `NSWindow Frame` default doesn't either.
 - **Security:** anything running as the user can drive port 9333: read and act as every account logged in to the agent
   profile, and trigger passkey requests (which still need a Touch ID tap). The port binds to loopback only; nothing
   stops other local processes.
