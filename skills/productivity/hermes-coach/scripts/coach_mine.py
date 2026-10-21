@@ -18,6 +18,34 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MACHINE = ("cron", "kanban", "oneshot", "api_server")
+# Allow list, not a deny list: new bot sources (bb-reviewer, bb-judge, taxprep-*) appear all the time and are
+# mostly 2-message sessions that would drag msgs_p50/p90 and per-host rows down. They show up in other_sources.
+INTERACTIVE_SOURCES = ("desktop", "tui", "cli", "slack", "telegram", "discord", "whatsapp", "signal")
+
+
+def is_interactive(d):
+    """A human typed into this session: a human-facing source and at least one user turn."""
+    return d.get("source") in INTERACTIVE_SOURCES and (d.get("user_turns_total") or 0) > 0
+
+
+def other_sources(ds):
+    """{source: {sessions, cost_usd}} for sources that are neither human-facing nor known machine lanes,
+    so a new bot source stays visible instead of silently dropping out of the KPIs."""
+    out = {}
+    for d in ds:
+        s = d.get("source") or "(none)"
+        if s in INTERACTIVE_SOURCES or s in MACHINE:
+            continue
+        r = out.setdefault(s, {"sessions": 0, "cost_usd": 0.0})
+        r["sessions"] += 1
+        r["cost_usd"] += total_cost(d)
+    return {s: {"sessions": r["sessions"], "cost_usd": round(r["cost_usd"], 2)}
+            for s, r in sorted(out.items(), key=lambda kv: (-kv[1]["sessions"], kv[0]))}
+
+
+def fmt_other_sources(o):
+    return "other_sources: " + (", ".join(f"{s}={r['sessions']} (${r['cost_usd']:g})" for s, r in o.items())
+                                or "none") + " (excluded from interactive KPIs)"
 
 
 def load(data: Path):
@@ -63,9 +91,8 @@ def is_meta(d):
 
 
 def kpis(ds):
-    """Interactive sessions only (cron/kanban/oneshot are machine-driven)."""
-    inter = [d for d in ds if d.get("source") not in ("cron", "kanban", "oneshot", "api_server")
-             and d.get("user_turns_total", 0) > 0]
+    """Interactive sessions only: human sources (INTERACTIVE_SOURCES) with a user turn."""
+    inter = [d for d in ds if is_interactive(d)]
     n = len(inter)
     if not n:
         return {"sessions": 0}
@@ -177,7 +204,7 @@ def adoption_test(t, ds, now):
     for d in ds:
         if (d.get("last_activity_at") or d.get("started_at") or 0) < lo:
             continue
-        if src == "interactive" and (d.get("source") in MACHINE or not d.get("user_turns_total")):
+        if src == "interactive" and not is_interactive(d):
             continue
         if isinstance(src, list) and d.get("source") not in src:
             continue
@@ -283,7 +310,8 @@ def main():
     overall = kpis(cur)
     out = [f"# Coach data — last {a.days:g} days ({time.strftime('%Y-%m-%d')})",
            f"Digests loaded: {len(ds)} across hosts {sorted({d['host'] for d in ds})}.", "",
-           "## KPIs, all hosts (interactive sessions)", fmt_kpis(overall, kpis(prev)), ""]
+           "## KPIs, all hosts (interactive sessions)", fmt_kpis(overall, kpis(prev)), "",
+           fmt_other_sources(other_sources(cur)), ""]
     for h in sorted(by_host):
         k = kpis(by_host[h])
         out.append(f"- **{h}**: " + ", ".join(f"{x}={k[x]}" for x in
@@ -295,7 +323,7 @@ def main():
         today = time.strftime("%Y-%m-%d")
         rows = [l for l in (kf.read_text().splitlines() if kf.exists() else [])
                 if l.strip() and not l.startswith('{"date": "%s"' % today)]
-        rows.append(json.dumps({"date": today, "days": a.days, "overall": overall,
+        rows.append(json.dumps({"date": today, "days": a.days, "overall": overall, "other_sources": other_sources(cur),
                                 "by_host": {h: kpis(v) for h, v in by_host.items()}}))
         kf.write_text("\n".join(rows) + "\n")
 
