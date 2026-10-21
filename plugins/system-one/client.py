@@ -43,12 +43,19 @@ def api_key() -> Optional[str]:
     k = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if k:
         return k
-    try:
-        for line in (hermes_home() / ".env").read_text().splitlines():
-            if line.startswith("TYPESAFE_API_KEY="):
-                return line.split("=", 1)[1].strip().strip("'\"") or None
-    except OSError:
-        pass
+    home = hermes_home()
+    envs = [home / ".env"]
+    if home.parent.name == "profiles":  # a profile without its own copy uses the root home's key
+        envs.append(home.parent.parent / ".env")
+    for env in envs:
+        try:
+            for line in env.read_text().splitlines():
+                if line.startswith("TYPESAFE_API_KEY="):
+                    v = line.split("=", 1)[1].strip().strip("'\"")
+                    if v:
+                        return v
+        except OSError:
+            pass
     return None
 
 

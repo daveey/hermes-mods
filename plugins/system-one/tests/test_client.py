@@ -78,3 +78,13 @@ def test_question_builders():
     assert c.score("how bad?", ["fine", "bad"]) == {"type": "score", "instructions": "how bad?", "criteria": ["fine", "bad"]}
     assert c.choice("which?", {"a": "A"})["criteria"] == {"a": "A"}
     assert "criteria" not in c.noul("plain?")
+
+
+def test_profile_falls_back_to_root_env(monkeypatch, tmp_path):
+    prof = tmp_path / "profiles" / "worker"
+    prof.mkdir(parents=True)
+    setup(monkeypatch, prof, key="")
+    (tmp_path / ".env").write_text("TYPESAFE_API_KEY=rootkey\n")
+    assert c.api_key() == "rootkey"
+    (prof / ".env").write_text("TYPESAFE_API_KEY=profkey\n")
+    assert c.api_key() == "profkey"
