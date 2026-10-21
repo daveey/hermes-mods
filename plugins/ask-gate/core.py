@@ -53,7 +53,7 @@ _NOT_ASK = re.compile(
     r"you (already|have already)|you (said|answered|approved|asked|told)|no (more|further) (input|action)|"
     r"(isn'?t|is not|aren'?t|are not) waiting on you|not waiting on you|the card asks|it asked|"
     r"i'?ll stop asking|nothing from this work is waiting|nothing\b[^.]{0,60}\bneeds? (you|david)|"
-    r"no\b[^.]{0,40}\bwaiting on you|never (create|say|tell|ask|put))\b",
+    r"no\b[^.]{0,40}\bwaiting on you|(was|were|had been|had) (waiting|blocked) (on|for) (you|david)|never (create|say|tell|ask|put))\b",
     re.I)
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 # worker handoff leftovers that point at David

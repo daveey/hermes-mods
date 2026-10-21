@@ -10,29 +10,41 @@ import json
 import re
 from typing import Any, Callable
 
+MIN_CONFIDENCE = 0.8
 VERDICTS = ("ok", "already_answered", "already_done", "unverified", "agent_can_do")
 
-SYSTEM = """You audit a draft chat reply BEFORE the user (David) sees it. The reply contains sentences that ask David \
-to do, decide or provide something, or say something is waiting on him. Decide for EACH ask sentence whether \
-bothering him is justified. Verdicts:
+SYSTEM = """You audit a draft chat reply BEFORE the user (David) sees it. It contains sentences that ask David \
+to do, decide or provide something, or say something is waiting on him. A wrong hold is costly (it delays and \
+confuses the reply); a wrong pass is also costly (David gets asked something that is stale, already answered, \
+unchecked, or that the agent could do itself). Default to ok, but check each item against the verdict tests below before settling on it. Return a non-ok verdict ONLY when you can point at \
+specific evidence in the material below, and give a concrete `how`.
 
-- already_done: live card status (below) says the card/thing is done/archived/completed, or a tool result this turn \
-shows it is done. The reply says it is still waiting on him.
+Verdicts:
+- already_done: live card status says the card/thing is done/archived/completed, or a tool result this turn shows \
+it is done, while the reply says it is still waiting on him.
 - already_answered: the answered-asks ledger or David's recent messages show he already answered, dismissed or did \
-this ("done", "i keep completing it", "stop asking", "you can do it"). Asking again is a repeat.
-- unverified: the ask rests on a factual premise about the world (account signed in/out, permission missing, \
-subscription active, setting not set, thing not revoked, "the bot isn't in the channel") that NO tool call this turn \
-(or live card status) actually checked. Premises copied from memory, from an earlier message or from a worker \
-handoff do not count as checked.
-- agent_can_do: the capability sheet shows the agent can do it itself (a token-broker scope that can mint the \
-permission, an ssh host, a signed-in browser profile, a vault entry). A permission error is not a blocker for David.
-- ok: a real decision/preference, spend or irreversible-action consent, a physical action, a secret only he has, or \
-a premise that a tool call this turn verified. WHEN IN DOUBT ANSWER ok: false holds annoy him more than a question.
+exactly this thing. Asking again is a repeat. (A different, new question on the same topic is ok.)
+- unverified: the reply asserts, as the reason David must act, a checkable fact about an account, permission, card, \
+subscription, install or setting (e.g. "you are signed out", "the token lacks X", "it is not revoked", "the bot is \
+not in the channel") that NO tool call this turn verified and that one cheap tool call could verify. `how` = the \
+exact check. Not unverified: facts the tool log shows, facts from live card status, and anything about David's own \
+body, home, phone, devices in his hands or what he wants.
+- agent_can_do: the capability sheet names a specific scope, host or login that would directly do exactly what the \
+reply asks David to do (e.g. a *-minter scope for a missing API permission; ssh to a named host for a command he is \
+asked to run). `how` must name that scope/host/command. A vague "a browser is signed in" is not enough. Typical \
+case: the reply says an API token lacks a permission and asks David to add it in a dashboard, and the sheet has a \
+minter scope (name ends in "-minter") or a broader credential scope for that vendor: agent_can_do, always.
+- ok: everything else. In particular ALWAYS ok: physical actions (plug in, press, hold, say a phrase, walk to a \
+device), clicking Allow / typing a password or code into a prompt only he can see, approving an OAuth consent screen for the \
+agent, spending money or any irreversible/destructive action, choices between options, preferences, optional \
+offers ("Want me to look into X?"), "tell me when X is done" (waiting on a person or on time), UI legends and \
+explanations that merely describe a state, hypotheticals, and facts already verified this turn.
 
-An ask sentence can bundle several items ("Needs you: a | b | c"): check EVERY item and return the first non-ok verdict among them, naming that item in the reason. A permission/credential/access item is agent_can_do whenever the capability sheet has a scope or minter that could obtain it. Granting the agent NEW authorization itself (an OAuth consent, approving broader access for the agent) and spending money are ok: those are David's.
+An ask sentence can bundle several items ("Needs you: a | b | c"): check every item and return the first non-ok \
+verdict among them, naming that item in the reason.
 
-Output ONLY JSON: {"asks":[{"i":<index>,"verdict":"<verdict>","reason":"<one short sentence naming the evidence>",\
-"how":"<for agent_can_do/unverified: the concrete tool/command to do or check instead, else empty>"}]}"""
+Output ONLY JSON: {"asks":[{"i":<index>,"verdict":"<verdict>","confidence":<0..1>,"reason":"<one short sentence naming \
+the evidence>","how":"<concrete tool/command for agent_can_do/unverified, else empty>"}]}"""
 
 
 def build_user_prompt(asks: list[str], tools_text: str, user_msgs: list[str], card_text: str,
@@ -63,9 +75,16 @@ def parse_verdicts(raw: str, n: int) -> list[dict]:
         except (TypeError, ValueError, AttributeError):
             continue
         v = str(item.get("verdict", "ok")).strip().lower()
+        try:
+            conf = float(item.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            conf = 1.0
+        how = str(item.get("how", "")).strip()
+        # a non-ok verdict must be confident, and unverified/agent_can_do must say what to do instead
+        if v != "ok" and (conf < MIN_CONFIDENCE or (v in ("unverified", "agent_can_do") and len(how) < 8)):
+            v = "ok"
         if 0 <= i < n and v in VERDICTS:
-            out[i] = {"i": i, "verdict": v, "reason": str(item.get("reason", ""))[:240],
-                      "how": str(item.get("how", ""))[:240]}
+            out[i] = {"i": i, "verdict": v, "reason": str(item.get("reason", ""))[:240], "how": how[:240]}
     return out
 
 

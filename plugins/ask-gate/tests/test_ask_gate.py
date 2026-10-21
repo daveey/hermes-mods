@@ -94,7 +94,7 @@ def test_I4_repeat_of_answered_ask_sees_ledger_and_user_message(gate):
 
 def test_I0_first_summary_is_held(gate):
     asks = gate.core.find_asks(FIX["I0"]["reply"])
-    gate.LLM = llm_returning([("unverified", "x")] * len(asks))
+    gate.LLM = llm_returning([("unverified", "x", "kanban_show the card")] * len(asks))
     assert gate.pre_final_gate(session_id="s1", platform="tui", final_response=FIX["I0"]["reply"], attempt=0)["hold"]
 
 
@@ -112,7 +112,7 @@ def test_ok_verdict_delivers_and_records_for_open_asks(gate):
 
 
 def test_nudge_budget_then_append_note(gate):
-    gate.LLM = llm_returning([("unverified", "unchecked premise")])
+    gate.LLM = llm_returning([("unverified", "unchecked premise", "run the check")])
     text = "Can you confirm the token was revoked?"
     assert gate.pre_final_gate(session_id="s1", platform="tui", final_response=text, attempt=0)["hold"]
     assert gate.pre_final_gate(session_id="s1", platform="tui", final_response=text, attempt=1)["hold"]
@@ -353,3 +353,19 @@ def test_capability_sheet_is_generated_from_runtime_sources():
     sheet = c.capability_sheet(force=True)
     assert "cf-token-minter (auto)" in sheet and "mini-host" in sheet and "a@example.com" in sheet
     assert "vault entries: none" in sheet
+
+
+def test_low_confidence_or_how_less_verdicts_fail_open(gate):
+    j = gate.judge_mod
+    raw = json.dumps({"asks": [{"i": 0, "verdict": "agent_can_do", "confidence": 0.5, "reason": "r", "how": "token-broker exec x"},
+                               {"i": 1, "verdict": "unverified", "confidence": 0.95, "reason": "r", "how": ""},
+                               {"i": 2, "verdict": "already_answered", "confidence": 0.9, "reason": "he said so"},
+                               {"i": 3, "verdict": "unverified", "confidence": 0.9, "reason": "r", "how": "kanban_show t_1"}]})
+    v = [x["verdict"] for x in j.parse_verdicts(raw, 4)]
+    assert v == ["ok", "ok", "already_answered", "unverified"]
+
+
+@pytest.mark.parametrize("text", ["It was waiting on you to sleep the Mac, and it already had.",
+                                  "That card had been blocked on you until this morning."])
+def test_retrospective_waiting_is_not_an_ask(gate, text):
+    assert gate.core.find_asks(text) == []
