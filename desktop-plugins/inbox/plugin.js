@@ -22,6 +22,15 @@
  * char counter vs max, Esc cancels, ⌘Enter saves); `confirm` asks first;
  * `row: true` actions (without input) also show as row-hover buttons. Items
  * from older gateways (no `actions`) keep Do it / Archive.
+ *
+ * Keys: on an open card, ⌥1…⌥9 (Alt+1…9 off macOS) run the bar's buttons in
+ * order (Archive stays ⌘⇧A); each button shows its hint. Matched on
+ * `event.code` (⌥digit types ¡™£… on macOS), from the composer too, never
+ * while the inline editor is open, during IME composition, or from another
+ * editable outside the chat (dialogs, terminals). Archive / resolve / task on
+ * the open card step to the next message, and on the last one to the session
+ * core's ⌘⇧A would open (`ctx.openNextSession`, fork core; older cores open a
+ * fresh draft).
  */
 import {
   atom,
@@ -116,6 +125,7 @@ export function nextItemAfter(items, item) {
 }
 
 const ARCHIVE = { id: 'archive', label: 'Archive', icon: 'archive', kind: 'archive' }
+const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(str(navigator.platform || navigator.userAgent))
 const LEGACY_DO_IT = { id: 'do_it', label: 'Do it', icon: 'play', style: 'primary', kind: 'accept' }
 
 /** The bar's buttons for an item: the type's actions (primary first), then Archive.
@@ -133,6 +143,57 @@ export function rowActions(item) {
     ? item.actions.filter(a => a && a.row && (a.kind === 'resolve' || a.kind === 'task') && !a.input && a.id !== 'archive')
     : []
 }
+
+/** The buttons ⌥1…⌥9 run, in bar order: every bar action but Archive (⌘⇧A). */
+export function keyActions(item) {
+  return barActions(item).filter(a => a.kind !== 'archive').slice(0, 9)
+}
+
+/** Key hint shown on a bar button; '' for buttons without one. */
+export function keyHint(item, action, mac = IS_MAC) {
+  if (action.kind === 'archive') return mac ? '⌘⇧A' : 'Ctrl+Shift+A'
+  const n = keyActions(item).indexOf(action) + 1
+  return n ? (mac ? `⌥${n}` : `Alt+${n}`) : ''
+}
+
+/** Digit 1–9 of a bare ⌥/Alt+digit chord (by physical key), else 0. */
+export function actionKeyDigit(e) {
+  if (!e || !e.altKey || e.metaKey || e.ctrlKey || e.shiftKey || e.repeat) return 0
+  if (e.isComposing || e.key === 'Process' || e.keyCode === 229) return 0
+  const m = /^Digit([1-9])$/.exec(str(e.code))  // not Numpad: Windows Alt-codes
+  return m ? Number(m[1]) : 0
+}
+
+const isEditable = el =>
+  !!el && (!!el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(str(el.tagName)))
+
+/** Whether a keydown may run a card action: not already claimed, not typed
+ *  into an editable outside the chat surface (the composer is inside it), not
+ *  in a dialog or terminal. */
+export function keyTargetAllowed(e) {
+  if (!e || e.defaultPrevented) return false
+  const t = e.target
+  const closest = sel => (t && typeof t.closest === 'function' ? t.closest(sel) : null)
+  if (closest('[role="dialog"], [role="alertdialog"], [data-terminal], [data-interactive-terminal], [data-slot="inbox-editor"]')) return false
+  return !isEditable(t) || !!closest('[data-chat-surface]')
+}
+
+// What ⌥1…⌥9 type on a US Mac layout; Alt+digit elsewhere reports the digit.
+const US_OPTION_DIGITS = '¡™£¢∞§¶•ª'
+
+/** In an editable (the composer), claim ⌥n only when it would type the US
+ *  Option character or the digit itself: on German/French/Nordic layouts ⌥5…⌥9
+ *  type [ ] | { } @ ~, which must keep reaching the composer. */
+export function keyCharAllowed(e, n) {
+  if (!isEditable(e && e.target)) return true
+  const k = str(e.key)
+  return k === String(n) || k === US_OPTION_DIGITS[n - 1]
+}
+
+// The card bar is on screen (not on Settings or another non-chat route).
+// Without a DOM (tests) there is nothing to check.
+const barShown = () =>
+  typeof document === 'undefined' || typeof document.querySelector !== 'function' || !!document.querySelector('[data-slot="inbox-bar"]')
 
 /** Initial editor text for an input action: the field it edits, else empty. */
 export function inputDefault(item, action) {
@@ -168,6 +229,9 @@ export function createStore(ctx) {
   const $items = atom([])
   const $open = atom(ctx.storage?.get?.('open', true) ?? true)
   const $busy = atom('')
+  // The inline editor ({sid, action, value}); in the store so the action keys
+  // can open it and stay off while it is open.
+  const $editing = atom(null)
   let inflight = null
   let again = false
 
@@ -256,6 +320,14 @@ export function createStore(ctx) {
     }
   }
 
+  // The open card just closed: the next message, else the session core's ⌘⇧A
+  // would open (fork core), else a fresh draft (older cores).
+  const leave = (item, next) => {
+    if (next) return open(next)
+    if (ctx.openNextSession?.(item.session_id)) return
+    void ctx.runAction?.('session.new')
+  }
+
   const confirmFn = msg => {
     const c = typeof globalThis.confirm === 'function' ? globalThis.confirm : null
     return c ? c(msg) : true
@@ -263,19 +335,28 @@ export function createStore(ctx) {
 
   // Run one of the item's card-type actions. Returns false when cancelled.
   const act = async (item, action, input) => {
-    if (!action || action.kind === 'archive') return archive(item).then(() => true)
-    if (action.kind === 'accept') return accept(item).then(() => true)
-    if (action.confirm && !confirmFn(str(action.confirm))) return false
-    const items = $items.get()
-    const next = nextItemAfter(items, item)
+    if (action && action.kind === 'accept') return accept(item).then(() => true)
+    const next = nextItemAfter($items.get(), item)
     const wasFocused = host.state.focusedStoredSessionId?.get?.() === item.session_id
+    if (!action || action.kind === 'archive') {
+      const done = archive(item)
+      if (wasFocused) leave(item, next)
+      return done.then(() => true)
+    }
+    if (action.confirm && !confirmFn(str(action.confirm))) return false
     $busy.set(item.session_id)
     try {
       const body = input == null ? { action: action.id } : { action: action.id, input: str(input) }
       const r = await ctx.rest(itemPath(item, 'act'), restOpts(item, routedGateway(), { method: 'POST', body }))
       $items.set($items.get().filter(i => i !== item))
+      // Only navigate if the card is still the open chat after the request
+      // (the user may have moved on meanwhile); pick the next from now.
+      const stillFocused = wasFocused && host.state.focusedStoredSessionId?.get?.() === item.session_id
       if (action.kind === 'prompt') await submitPrompt(item, str(r && r.prompt))
-      else if (wasFocused && next) open(next)
+      else if (stillFocused) {
+        const now = $items.get().filter(i => i.session_id !== item.session_id)
+        leave(item, (next && now.find(i => i.session_id === next.session_id)) || now[0] || null)
+      }
       if (action.kind === 'task' && r && r.outcome_task) host.notify?.({ kind: 'success', message: `Queued ${str(r.outcome_task)}` })
       return true
     } catch (e) {
@@ -308,7 +389,33 @@ export function createStore(ctx) {
     ctx.storage?.set?.('open', v)
   }
 
-  return { $items, $open, $busy, refresh, open, markRead, archive, archiveHotkey, accept, act, setOpen }
+  // Run (or open the editor for) a bar button.
+  const run = (item, action) => {
+    if (action.input) $editing.set({ sid: item.session_id, action, value: inputDefault(item, action) })
+    else void store.act(item, action)
+  }
+
+  // ⌥1…⌥9 on the open card. Returns true when it ran something.
+  const onKeyDown = e => {
+    const n = actionKeyDigit(e)
+    if (!n || !keyTargetAllowed(e) || !keyCharAllowed(e, n)) return false
+    const item = itemFor($items.get(), host.state.focusedStoredSessionId?.get?.())
+    if (!item || !barShown()) return false
+    const edit = $editing.get()
+    if ((edit && edit.sid === item.session_id) || $busy.get() === item.session_id) {
+      e.preventDefault()
+      return false
+    }
+    const action = keyActions(item)[n - 1]
+    if (!action) return false
+    e.preventDefault()
+    e.stopImmediatePropagation?.()
+    run(item, action)
+    return true
+  }
+
+  const store = { $items, $open, $busy, $editing, refresh, open, markRead, archive, archiveHotkey, accept, act, run, onKeyDown, setOpen }
+  return store
 }
 
 // ── UI ──────────────────────────────────────────────────────────────────────
@@ -344,7 +451,7 @@ function RowActionButton({ action, onClick }) {
 
 export function RowActions({ store, item }) {
   const extra = rowActions(item)
-  const archive = jsx(ArchiveButton, { onClick: () => void store.archive(item) })
+  const archive = jsx(ArchiveButton, { onClick: () => void store.act(item, ARCHIVE) })
   if (!extra.length) return archive
   return jsxs('span', {
     className: 'flex items-center gap-0.5',
@@ -409,7 +516,7 @@ const BTN =
 const ACCENT = { background: 'var(--accent)', color: 'var(--accent-foreground, white)', borderColor: 'var(--accent)' }
 const DANGER = { color: 'var(--destructive, #e5484d)', borderColor: 'var(--destructive, #e5484d)' }
 
-function ActionButton({ action, disabled, title, onClick }) {
+function ActionButton({ action, disabled, title, hint, onClick }) {
   return jsxs('button', {
     type: 'button',
     className: BTN,
@@ -417,13 +524,17 @@ function ActionButton({ action, disabled, title, onClick }) {
     style: action.style === 'primary' ? ACCENT : action.style === 'danger' ? DANGER : undefined,
     disabled,
     title: title || action.label,
+    'aria-keyshortcuts': hint ? hintAria(hint) : undefined,
     onClick,
     children: [
       action.icon ? jsx('span', { className: `codicon codicon-${action.icon}`, 'aria-hidden': true }) : null,
-      action.label
+      action.label,
+      hint ? jsx('kbd', { 'data-slot': 'inbox-key-hint', className: 'ml-0.5 font-sans text-[0.6875rem] opacity-60', children: hint }) : null
     ]
   })
 }
+
+export const hintAria = h => h.replace('⌥', 'Alt+').replace('⌘⇧', 'Meta+Shift+').replace('Ctrl+', 'Control+')
 
 /** Inline editor for an action with `input` (controlled; Bar owns the text). */
 export function Editor({ item, action, value, disabled, onChange, onSave, onCancel }) {
@@ -496,7 +607,8 @@ export function Bar({ store }) {
   const items = useValue(store.$items)
   const busy = useValue(store.$busy)
   const focused = useValue(host.state.focusedStoredSessionId)
-  const [editing, setEditing] = useState(null)
+  const editing = useValue(store.$editing)
+  const setEditing = v => store.$editing.set(v)
   const item = itemFor(items, focused)
   if (!item) return null
   const disabled = busy === item.session_id
@@ -515,10 +627,7 @@ export function Bar({ store }) {
         })
     })
   }
-  const run = action => {
-    if (action.input) setEditing({ sid: item.session_id, action, value: inputDefault(item, action) })
-    else void store.act(item, action)
-  }
+  const run = action => store.run(item, action)
   const label = item.type_label && item.type !== 'default' ? item.type_label : 'Inbox proposal'
   return jsxs('div', {
     'data-slot': 'inbox-bar',
@@ -536,6 +645,7 @@ export function Bar({ store }) {
           disabled,
           // Prompt actions show what they will send (the template), so nothing runs unseen.
           title: action.kind === 'accept' || action.id === 'do_it' ? item.accept_prompt : action.kind === 'prompt' || action.kind === 'task' ? str(action.prompt) || action.label : action.label,
+          hint: keyHint(item, action),
           onClick: () => run(action)
         }, action.id)
       )
@@ -559,6 +669,17 @@ export default {
     if (unsub) ctx.onDispose?.(unsub)
     // ⌘⇧A: archive + next inbox message (fork core; older cores archive via core).
     ctx.registerArchiveHotkeyHandler?.(store.archiveHotkey)
+    // ⌥1…⌥9: card actions. Capture phase, so the composer never types ¡™£ for them.
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      // A reload without onDispose (older cores) must not stack listeners.
+      if (window.__inboxKeyDown) window.removeEventListener('keydown', window.__inboxKeyDown, true)
+      window.__inboxKeyDown = store.onKeyDown
+      window.addEventListener('keydown', store.onKeyDown, true)
+      ctx.onDispose?.(() => {
+        window.removeEventListener('keydown', store.onKeyDown, true)
+        if (window.__inboxKeyDown === store.onKeyDown) window.__inboxKeyDown = null
+      })
+    }
     ctx.register({ id: 'section', area: SIDEBAR_SECTIONS_AREA, order: 5, render: () => jsx(Section, { store }) })
     ctx.register({ id: 'bar', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Bar, { store }) })
     log('registered')

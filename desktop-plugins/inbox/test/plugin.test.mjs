@@ -261,14 +261,12 @@ test('Bar on an api<3 item renders exactly Do it / Archive', () => {
 
 test('Bar: an input action opens the editor prefilled from its field; Save runs act with the text', async () => {
   host.state.focusedStoredSessionId = { get: () => 'x1', listen: () => () => {} }
-  let state = null
-  globalThis.__useState = v => [state ?? v, n => { state = n }]
   const ctx = fakeCtx(() => ({ ok: true, items: [] }))
   const store = m.createStore(ctx)
   store.$items.set([XPOST])
   const edit = find(m.Bar({ store }), n => n.props && n.props.action && n.props.action.id === 'edit')[0]
   edit.props.onClick()
-  assert.equal(state.value, 'Cells are agents.')
+  assert.equal(store.$editing.get().value, 'Cells are agents.')
   const editor = m.Bar({ store })
   assert.equal(editor.type, m.Editor)
   editor.props.onChange('Cells are agents. So are you.')
@@ -279,7 +277,7 @@ test('Bar: an input action opens the editor prefilled from its field; Save runs 
   find(tree, n => n.props && n.props.action && n.props.action.id === 'save')[0].props.onClick()
   await new Promise(r => setTimeout(r, 0))
   assert.deepEqual(ctx.calls[0], ['/items/x1/act', { method: 'POST', body: { action: 'edit', input: 'Cells are agents. So are you.' } }])
-  globalThis.__useState = null
+  assert.equal(store.$editing.get(), null)  // a successful save closes the editor
 })
 
 test('Editor: Esc cancels, ⌘Enter saves, over-max disables Save', () => {
@@ -457,4 +455,274 @@ test('task act without a returned task id shows no toast', async () => {
   store.$items.set([TASK_ITEM])
   assert.equal(await store.act(TASK_ITEM, TASK_ITEM.actions[1]), true)
   assert.deepEqual(notes, [])
+})
+
+// ── action keys (⌥1…⌥9) and leaving a closed card ──────────────────────────
+
+const OPT = '¡™£¢∞§¶•ª'
+const key = (code, extra = {}) => {
+  const d = /^Digit([1-9])$/.exec(code)
+  const ev = { type: 'keydown', code, key: d ? OPT[d[1] - 1] : '¡', altKey: true, metaKey: false, ctrlKey: false, shiftKey: false,
+    target: null, defaultPrevented: false, prevented: 0, stopped: 0, ...extra }
+  ev.preventDefault = () => { ev.prevented++; ev.defaultPrevented = true }
+  ev.stopImmediatePropagation = () => { ev.stopped++ }
+  return ev
+}
+// Minimal element: tagName / isContentEditable / closest(selector) over a fixed ancestor list.
+const el = (tagName, ancestors = [], editable = false) => ({
+  tagName, isContentEditable: editable,
+  closest: sel => (sel.split(',').some(p => ancestors.some(a => a === p.trim())) ? {} : null)
+})
+const COMPOSER = el('DIV', ['[data-chat-surface]'], true)
+
+test('actionKeyDigit: bare ⌥/Alt + digit by physical key; anything else is 0', () => {
+  assert.equal(m.actionKeyDigit(key('Digit1')), 1)
+  assert.equal(m.actionKeyDigit(key('Digit9')), 9)
+  assert.equal(m.actionKeyDigit(key('Numpad3')), 0)  // Windows Alt+numpad codes type characters
+  assert.equal(m.actionKeyDigit(key('Digit0')), 0)
+  assert.equal(m.actionKeyDigit(key('KeyA')), 0)
+  assert.equal(m.actionKeyDigit(key('Digit1', { altKey: false, key: '1' })), 0)  // bare digit types
+  assert.equal(m.actionKeyDigit(key('Digit1', { metaKey: true })), 0)  // ⌘⌥1 = tab slot 10
+  assert.equal(m.actionKeyDigit(key('Digit1', { ctrlKey: true })), 0)  // ^1 / AltGr
+  assert.equal(m.actionKeyDigit(key('Digit1', { shiftKey: true })), 0)
+  assert.equal(m.actionKeyDigit(key('Digit1', { repeat: true })), 0)
+  assert.equal(m.actionKeyDigit(key('Digit1', { isComposing: true })), 0)
+  assert.equal(m.actionKeyDigit(key('Digit1', { key: 'Process' })), 0)
+  assert.equal(m.actionKeyDigit(key('Digit1', { keyCode: 229 })), 0)
+})
+
+test('keyTargetAllowed: composer and non-editables yes; other editables, dialogs, terminals, editor, claimed keys no', () => {
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: COMPOSER })), true)
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: el('BUTTON') })), true)
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: null })), true)
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: el('INPUT') })), false)  // e.g. sidebar search
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: el('TEXTAREA', ['[data-chat-surface]', '[data-slot="inbox-editor"]']) })), false)
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: el('INPUT', ['[data-chat-surface]', '[role="dialog"]']) })), false)
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: el('TEXTAREA', ['[data-chat-surface]', '[data-terminal]']) })), false)
+  assert.equal(m.keyTargetAllowed(key('Digit1', { target: COMPOSER, defaultPrevented: true })), false)
+})
+
+test('keyActions / keyHint: bar order minus Archive; Archive keeps ⌘⇧A', () => {
+  assert.deepEqual(m.keyActions(XPOST).map(a => a.id), ['approve', 'edit', 'skip', 'rewrite'])
+  assert.deepEqual(m.keyActions({ session_id: 'old' }).map(a => a.id), ['do_it'])
+  const acts = m.barActions(XPOST)
+  assert.deepEqual(acts.map(a => m.keyHint(XPOST, a, true)), ['⌥1', '⌥2', '⌥3', '⌥4', '⌘⇧A'])
+  assert.deepEqual(acts.map(a => m.keyHint(XPOST, a, false)), ['Alt+1', 'Alt+2', 'Alt+3', 'Alt+4', 'Ctrl+Shift+A'])
+  const many = { actions: Array.from({ length: 11 }, (_, i) => ({ id: `a${i}`, kind: 'resolve' })) }
+  assert.equal(m.keyActions(many).length, 9)
+  assert.equal(m.keyHint(many, m.barActions(many)[9], true), '')
+})
+
+test('Bar buttons carry their key hint', () => {
+  host.state.focusedStoredSessionId = { get: () => 'x1', listen: () => () => {} }
+  const store = m.createStore(fakeCtx(() => ({ items: [] })))
+  store.$items.set([XPOST])
+  const btns = find(m.Bar({ store }), n => n.props && n.props.action)
+  assert.deepEqual(btns.map(n => n.props.hint.replace('Alt+', '⌥').replace('Ctrl+Shift+A', '⌘⇧A')), ['⌥1', '⌥2', '⌥3', '⌥4', '⌘⇧A'])
+})
+
+function keyStore(focused = 'x1', answers = () => ({ ok: true, items: [] })) {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  host.state.focusedStoredSessionId = { get: () => focused, listen: () => () => {} }
+  const ctx = fakeCtx(answers)
+  const store = m.createStore(ctx)
+  store.$items.set([XPOST, { session_id: 'n2', gateway: 'local' }])
+  return { ctx, store }
+}
+
+test('⌥1 in the composer on an open card runs the first button and swallows the key (no ¡ typed)', async () => {
+  host.openSession = async () => {}
+  const { ctx, store } = keyStore()
+  const ev = key('Digit1', { target: COMPOSER })
+  assert.equal(store.onKeyDown(ev), true)
+  assert.equal(ev.prevented, 1)
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(ctx.calls[0], ['/items/x1/act', { method: 'POST', body: { action: 'approve' } }])
+})
+
+test('⌥3 runs the third button; ⌥2 on an input action opens the editor instead of posting', () => {
+  const { ctx, store } = keyStore()
+  assert.equal(store.onKeyDown(key('Digit2', { target: COMPOSER })), true)
+  assert.equal(ctx.calls.length, 0)
+  assert.equal(store.$editing.get().action.id, 'edit')
+  assert.equal(store.$editing.get().value, 'Cells are agents.')
+})
+
+test('action keys are off while the editor is open (swallowed, nothing runs) and off a non-inbox chat', () => {
+  const { ctx, store } = keyStore()
+  store.$editing.set({ sid: 'x1', action: XPOST.actions[1], value: 'x' })
+  const ev = key('Digit1', { target: COMPOSER })
+  assert.equal(store.onKeyDown(ev), false)
+  assert.equal(ev.prevented, 1)  // swallowed, so no ¡ lands in the composer either
+  assert.equal(ctx.calls.length, 0)
+  const other = keyStore('not-inbox')
+  const ev2 = key('Digit1', { target: COMPOSER })
+  assert.equal(other.store.onKeyDown(ev2), false)
+  assert.equal(ev2.prevented, 0)  // ⌥1 still types its character elsewhere
+  assert.equal(other.ctx.calls.length, 0)
+})
+
+test('action keys ignore IME composition, other editables and digits with no button', () => {
+  const { ctx, store } = keyStore()
+  for (const ev of [
+    key('Digit1', { target: COMPOSER, isComposing: true }),
+    key('Digit1', { target: el('INPUT') }),
+    key('Digit5', { target: COMPOSER }),  // XPOST has 4 keyed buttons
+    key('Digit1', { target: COMPOSER, altKey: false, key: '1' })
+  ]) {
+    assert.equal(store.onKeyDown(ev), false)
+    assert.equal(ev.prevented, 0)
+  }
+  assert.equal(ctx.calls.length, 0)
+  assert.equal(store.$editing.get(), null)
+})
+
+test('action keys are swallowed and run nothing while the card is busy', () => {
+  const { ctx, store } = keyStore()
+  store.$busy.set('x1')
+  const ev = key('Digit1', { target: COMPOSER })
+  assert.equal(store.onKeyDown(ev), false)
+  assert.equal(ev.prevented, 1)
+  assert.equal(ctx.calls.length, 0)
+})
+
+test('non-US layouts: ⌥digit that types another character ([ @ ~ …) in the composer is left alone', () => {
+  const { ctx, store } = keyStore()
+  for (const k of ['[', '@', '~', '{']) {
+    const ev = key('Digit1', { target: COMPOSER, key: k })
+    assert.equal(store.onKeyDown(ev), false)
+    assert.equal(ev.prevented, 0)
+  }
+  assert.equal(m.keyCharAllowed(key('Digit1', { target: COMPOSER, key: '1' }), 1), true)  // Alt+1 off macOS
+  assert.equal(m.keyCharAllowed(key('Digit5', { target: COMPOSER }), 5), true)  // US ⌥5 = ∞
+  assert.equal(m.keyCharAllowed(key('Digit5', { target: el('BUTTON'), key: '[' }), 5), true)  // not typing anywhere
+  assert.equal(ctx.calls.length, 0)
+})
+
+test('action keys need the card bar on screen (not on Settings with the card still focused)', () => {
+  const { ctx, store } = keyStore()
+  globalThis.document = { querySelector: () => null }
+  try {
+    const ev = key('Digit1', { target: null })
+    assert.equal(store.onKeyDown(ev), false)
+    assert.equal(ev.prevented, 0)
+    globalThis.document = { querySelector: sel => (sel === '[data-slot="inbox-bar"]' ? {} : null) }
+    assert.equal(store.onKeyDown(key('Digit1', { target: null })), true)
+  } finally {
+    delete globalThis.document
+  }
+  assert.equal(ctx.calls.length, 1)  // only the key with the bar on screen ran
+})
+
+test('a reload without onDispose (older core) replaces the keydown listener instead of stacking it', () => {
+  const live = new Set()
+  globalThis.window = { addEventListener: (t, fn) => live.add(fn), removeEventListener: (t, fn) => live.delete(fn) }
+  try {
+    host.state.focusedStoredSessionId = { get: () => null, listen: () => () => {} }
+    const ctx = { storage: { get: (k, f) => f, set() {} }, rest: async () => ({ items: [] }), setInterval() {}, register() {} }
+    m.default.register(ctx)
+    m.default.register(ctx)
+    assert.equal(live.size, 1)
+  } finally {
+    delete globalThis.window
+  }
+})
+
+test('aria-keyshortcuts uses ARIA key names', () => {
+  assert.equal(m.hintAria('⌥3'), 'Alt+3')
+  assert.equal(m.hintAria('⌘⇧A'), 'Meta+Shift+A')
+  assert.equal(m.hintAria('Ctrl+Shift+A'), 'Control+Shift+A')
+})
+
+test('a card closed after the user moved to another chat does not navigate', async () => {
+  let focused = 'x1'
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  host.state.focusedStoredSessionId = { get: () => focused, listen: () => () => {} }
+  const opened = []
+  host.openSession = async sid => { opened.push(sid) }
+  const ctx = fakeCtx(path => { if (path.includes('/act')) focused = 'elsewhere'; return { state: 'resolved', items: [] } })
+  ctx.openNextSession = () => assert.fail('moved on')
+  ctx.runAction = () => assert.fail('moved on')
+  const store = m.createStore(ctx)
+  store.$items.set([XPOST, { session_id: 'n2', gateway: 'local' }])
+  assert.equal(await store.act(XPOST, XPOST.actions[0]), true)
+  assert.deepEqual(opened, [])
+})
+
+test('register installs the keydown listener in capture phase and removes it on dispose', () => {
+  const added = []
+  const removed = []
+  const disposers = []
+  globalThis.window = { addEventListener: (...a) => added.push(a), removeEventListener: (...a) => removed.push(a) }
+  try {
+    host.state.focusedStoredSessionId = { get: () => null, listen: () => () => {} }
+    m.default.register({ storage: { get: (k, f) => f, set() {} }, rest: async () => ({ items: [] }), setInterval() {},
+      register() {}, onDispose: fn => disposers.push(fn) })
+    assert.equal(added.length, 1)
+    assert.equal(added[0][0], 'keydown')
+    assert.equal(added[0][2], true)
+    disposers.forEach(fn => fn())
+    assert.deepEqual(removed, [added[0]])
+  } finally {
+    delete globalThis.window
+  }
+})
+
+test('last card: resolve steps to the session core ⌘⇧A would open (ctx.openNextSession)', async () => {
+  const { ctx, store } = keyStore()
+  store.$items.set([XPOST])
+  const stepped = []
+  ctx.openNextSession = sid => (stepped.push(sid), true)
+  ctx.runAction = () => assert.fail('no fallback when core stepped')
+  assert.equal(await store.act(XPOST, XPOST.actions[0]), true)
+  assert.deepEqual(stepped, ['x1'])
+})
+
+test('last card: task and archive step too; no next session or an older core opens a fresh draft', async () => {
+  const { ctx, store } = keyStore()
+  store.$items.set([TASK_ITEM])
+  host.state.focusedStoredSessionId = { get: () => 't1', listen: () => () => {} }
+  const ran = []
+  ctx.openNextSession = () => false
+  ctx.runAction = id => ran.push(id)
+  assert.equal(await store.act(TASK_ITEM, TASK_ITEM.actions[1]), true)
+  assert.deepEqual(ran, ['session.new'])
+  const older = keyStore()
+  older.store.$items.set([XPOST])
+  const ran2 = []
+  older.ctx.runAction = id => ran2.push(id)
+  assert.equal(await older.store.act(XPOST, { id: 'archive', kind: 'archive' }), true)
+  assert.deepEqual(ran2, ['session.new'])
+})
+
+test('closing a card that is not the open chat never navigates; archive of the open card opens the next message', async () => {
+  const opened = []
+  host.openSession = async sid => { opened.push(sid) }
+  const { ctx, store } = keyStore('elsewhere')
+  ctx.openNextSession = () => assert.fail('not focused')
+  ctx.runAction = () => assert.fail('not focused')
+  assert.equal(await store.act(XPOST, XPOST.actions[0]), true)
+  assert.deepEqual(opened, [])
+  const b = keyStore('x1')
+  b.ctx.openNextSession = () => assert.fail('a next message exists')
+  assert.equal(await b.store.act(XPOST, { id: 'archive', kind: 'archive' }), true)
+  assert.deepEqual(opened, ['n2'])
+})
+
+test('sidebar row Archive goes through act (steps when the row is the open chat)', async () => {
+  const opened = []
+  host.openSession = async sid => { opened.push(sid) }
+  const { ctx, store } = keyStore('x1')
+  const only = { session_id: 'n2', gateway: 'local' }
+  store.$items.set([only])
+  const archive = m.RowActions({ store, item: only })
+  host.state.focusedStoredSessionId = { get: () => 'n2', listen: () => () => {} }
+  const stepped = []
+  ctx.openNextSession = sid => (stepped.push(sid), true)
+  archive.props.onClick()
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(ctx.calls[0][0], '/items/n2/archive')
+  assert.deepEqual(stepped, ['n2'])
 })
