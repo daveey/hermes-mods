@@ -1,6 +1,6 @@
 ---
 name: invisible-chrome-agent
-description: "Use when Hermes should drive a real Chrome the user never sees. Virtual display + CDP supervisor."
+description: "Use when driving the hidden agent Chrome, or a Mac app won't come to the front. Virtual display + CDP supervisor."
 version: 1.0.0
 author: Claude Code
 license: MIT
@@ -120,8 +120,20 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   settings read `denied` while that first prompt is still pending, so status can't tell "pending" apart.
 - **Hidden tabs can stall.** Background tabs in a headed Chrome get throttled; even with the flags and savers off,
   CDP calls into a non-selected tab were seen to hang for ~20-60s at a time (also in a fresh Chrome without this
-  supervisor), then recover. Upstream: NousResearch/hermes-agent#135435. If a session times out on
-  `Runtime.evaluate`, `Target.activateTarget` on its tab unsticks it.
+  supervisor), then recover. If a session keeps timing out on `Runtime.evaluate`/`Page.navigate`, a
+  `Target.activateTarget` sent through the harness may not help: the harness stays attached to its own (stalled)
+  tab. What works: `curl 127.0.0.1:9333/json/close/<id>` the stalled tabs, `curl -X PUT
+  '127.0.0.1:9333/json/new?<url>'`, `curl 127.0.0.1:9333/json/activate/<new id>`, then in the harness
+  `switch_tab("<new id>")` before any `js()`.
+- **Other apps' windows can land on the virtual display, and nothing moves them back.** macOS treats it as a real
+  monitor and the re-home loop only touches Chrome. Symptom: the user "can't switch to" an app that is frontmost
+  (`lsappinfo front`) and idle (`sample` shows the main thread in the event loop), and force-quit/relaunch doesn't
+  help because it reopens there. Diagnose with CGWindowList bounds for the app's pid: its main window sits inside the
+  "Hermes Agent Display" rect (`system_profiler SPDisplaysDataType`). Fix: compile `scripts/move-app-windows.swift`
+  and run it once from a no-agent gateway cron (`hermes cron create 1m --script <x>.sh --no-agent --repeat 1
+  --deliver local`), since only the gateway holds Accessibility; check the log says `trusted true` and re-read the
+  bounds. Killing `hermes-vdisplay` doesn't evict them: the supervisor recreates the display at the same spot within
+  ~1 s. Rewriting the app's `NSWindow Frame` default doesn't either.
 - **Security:** anything running as the user can drive port 9333: read and act as every account logged in to the agent
   profile, and trigger passkey requests (which still need a Touch ID tap). The port binds to loopback only; nothing
   stops other local processes.
