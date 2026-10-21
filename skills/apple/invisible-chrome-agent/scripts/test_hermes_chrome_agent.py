@@ -254,5 +254,57 @@ class Evict(unittest.TestCase):
 
 
 
+class FocusGuardTest(unittest.TestCase):
+    """Unrequested focus grabs by the agent Chrome are handed back; asked-for ones are left alone."""
+    CHROME, HERMES = 500, 42
+    IDLE = 30.0   # seconds since the last click / modifier press
+
+    def setUp(self):
+        self.g = hca.FocusGuard()
+        self.g.step(self.HERMES, self.CHROME, 100.0, self.IDLE, float("inf"))   # user is in Hermes
+
+    def test_unrequested_grab_returns_focus_to_previous_app(self):
+        self.assertEqual(self.g.step(self.CHROME, self.CHROME, 101.0, self.IDLE, float("inf")), self.HERMES)
+
+    def test_hand_back_is_not_resent_while_landing(self):
+        self.g.step(self.CHROME, self.CHROME, 101.0, self.IDLE, float("inf"))
+        self.assertIsNone(self.g.step(self.CHROME, self.CHROME, 101.25, self.IDLE, float("inf")))
+        self.assertEqual(self.g.step(self.CHROME, self.CHROME, 102.5, self.IDLE, float("inf")), self.HERMES)
+
+    def test_recent_show_allows_focus_and_grant_persists(self):
+        self.assertIsNone(self.g.step(self.CHROME, self.CHROME, 101.0, self.IDLE, 2.0))   # browser_focus ran show
+        # still frontmost 5 min later, show long ago: the user is working there, leave it
+        self.assertIsNone(self.g.step(self.CHROME, self.CHROME, 400.0, self.IDLE, 300.0))
+
+    def test_user_click_allows_focus(self):
+        self.assertIsNone(self.g.step(self.CHROME, self.CHROME, 101.0, 0.2, float("inf")))
+
+    def test_passkey_reveal_allows_focus(self):
+        self.g.allow(now=100.5)
+        self.assertIsNone(self.g.step(self.CHROME, self.CHROME, 101.0, self.IDLE, float("inf")))
+
+    def test_grant_ends_when_chrome_loses_focus(self):
+        self.g.step(self.CHROME, self.CHROME, 101.0, 0.2, float("inf"))
+        self.g.step(self.HERMES, self.CHROME, 102.0, self.IDLE, float("inf"))
+        self.assertEqual(self.g.step(self.CHROME, self.CHROME, 200.0, self.IDLE, float("inf")), self.HERMES)
+
+    def test_no_previous_app_means_no_action(self):
+        g = hca.FocusGuard()
+        self.assertIsNone(g.step(self.CHROME, self.CHROME, 1.0, self.IDLE, float("inf")))
+
+    def test_reveal_grants_focus(self):
+        sup = hca.Supervisor()
+        sup.reveal(None, activate=False)
+        self.assertGreater(sup.focus.allow_until, time.time() + hca.FOCUS_ALLOW_S - 2)
+
+    def test_show_age_follows_show_flag_mtime(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        with mock.patch.object(hca, "SHOW_FLAG", os.path.join(d, "show")):
+            self.assertEqual(hca.show_age(), float("inf"))
+            open(hca.SHOW_FLAG, "w").close()
+            self.assertLess(hca.show_age(), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

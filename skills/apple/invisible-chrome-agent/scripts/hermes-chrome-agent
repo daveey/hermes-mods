@@ -19,6 +19,14 @@ Stdlib only (runs under /usr/bin/python3). Configuration via environment:
   HERMES_CHROME_AGENT_CHROME     Chrome binary (default /Applications/Google Chrome.app/Contents/MacOS/Google Chrome)
   HERMES_CHROME_AGENT_LABEL      LaunchAgent label (default com.hermes.chrome-agent)
   HERMES_CHROME_AGENT_SHOW_ON_PASSKEY=1  bring the passkey-requesting window to the main display until it settles
+  HERMES_CHROME_AGENT_FOCUS_GUARD=0      let the agent Chrome take keyboard focus whenever a CDP client asks
+
+Focus guard: a CDP client that opens a foreground tab (Target.createTarget without background=true),
+activates a target or calls Page.bringToFront makes macOS hand the agent Chrome keyboard focus, even while its
+windows sit on the virtual display. The supervisor polls the frontmost app every 0.25s and gives focus back
+to the app the user had in front, unless the activation was asked for: `show` ran in the last 10s
+(browser_focus, the status-bar toggle), a passkey notification was clicked, or the user just clicked or
+pressed a modifier (Dock, window click, Cmd-Tab). Each hand-back is logged as `focus-guard: ...`.
 
 Passkey notifications come from "Hermes Touch ID.app" (notifier.swift, built by `install`): clicking the
 notification or its Show button moves the window holding the asking tab onto the main display, selects that
@@ -67,6 +75,11 @@ NOTIFIER_SETTINGS_URL = ("x-apple.systempreferences:com.apple.Notifications-Sett
                          + NOTIFIER_BUNDLE_ID)
 REVEAL_S = 180      # a clicked-through passkey window stays on the main display at most this long
 SETTLE_GRACE_S = 3  # after the request settles, keep it shown briefly (sites often retry right away)
+FOCUS_GUARD = os.environ.get("HERMES_CHROME_AGENT_FOCUS_GUARD", "1") not in ("", "0", "false")
+FOCUS_POLL_S = 0.25   # frontmost-app poll interval of the focus guard
+FOCUS_ALLOW_S = 10    # after `show` or a passkey reveal, the agent Chrome may take focus this long
+USER_INPUT_S = 1.0    # a click / modifier press this recent means the user brought Chrome forward
+FOCUS_RETRY_S = 1.0   # don't re-send the hand-back while the previous one is still landing
 
 # Wraps navigator.credentials.get/create and reports the request through a CDP binding. Conditional
 # mediation (passkey autofill, fired on page load without user intent) is not reported.
@@ -281,6 +294,91 @@ def activate_pid(pid):
         log("activate failed: %s" % e)
 
 
+def front_pid():
+    """Pid of the frontmost app (lsappinfo: no Accessibility or Screen Recording grant needed)."""
+    try:
+        asn = subprocess.run(["/usr/bin/lsappinfo", "front"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=2).stdout.strip()
+        if not asn:
+            return None
+        out = subprocess.run(["/usr/bin/lsappinfo", "info", "-only", "pid", asn], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"=\s*(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def app_name(pid):
+    try:
+        asn = subprocess.run(["/usr/bin/lsappinfo", "find", "pid=%d" % pid], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2).stdout.strip()
+        out = subprocess.run(["/usr/bin/lsappinfo", "info", "-only", "name", asn], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "?"
+    m = re.search(r'="([^"]*)"', out)
+    return m.group(1) if m else "?"
+
+
+_CG = []
+
+
+def user_input_age():
+    """Seconds since the user's last mouse click or modifier press (Cmd-Tab), HID-wide. Plain key presses
+    are left out on purpose: the user typing in another app is exactly when a stolen focus hurts."""
+    try:
+        if not _CG:
+            import ctypes
+            cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            f = cg.CGEventSourceSecondsSinceLastEventType
+            f.restype, f.argtypes = ctypes.c_double, [ctypes.c_int, ctypes.c_uint32]
+            _CG.append(f)
+        f = _CG[0]
+        # 1 = kCGEventSourceStateHIDSystemState; 1/3/25 = left/right/other mouse down, 12 = flagsChanged
+        return min(f(1, 1), f(1, 3), f(1, 25), f(1, 12))
+    except Exception:
+        return float("inf")
+
+
+def show_age(now=None):
+    try:
+        return (now or time.time()) - os.path.getmtime(SHOW_FLAG)
+    except OSError:
+        return float("inf")
+
+
+class FocusGuard:
+    """Decides, one poll at a time, whether the agent Chrome's turn as frontmost app was asked for. A grant
+    lasts until Chrome loses focus, so the user can keep working in a shown window."""
+
+    def __init__(self):
+        self.prev = None          # last frontmost app that is not the agent Chrome
+        self.granted = False
+        self.allow_until = 0.0
+        self.returned_at = 0.0
+
+    def allow(self, seconds=FOCUS_ALLOW_S, now=None):
+        self.allow_until = (now or time.time()) + seconds
+
+    def step(self, front, chrome_pid, now, input_age, shown_age):
+        """Returns the pid to hand focus back to, or None."""
+        if front is None or chrome_pid is None:
+            return None
+        if front != chrome_pid:
+            self.prev, self.granted = front, False
+            return None
+        if self.granted:
+            return None
+        if now < self.allow_until or shown_age < FOCUS_ALLOW_S or input_age < USER_INPUT_S:
+            self.granted = True
+            return None
+        if not self.prev or now - self.returned_at < FOCUS_RETRY_S:
+            return None
+        self.returned_at = now
+        return self.prev
+
+
 class Supervisor:
     def __init__(self):
         self.vd = None
@@ -298,6 +396,7 @@ class Supervisor:
         self.evict_next = 0.0
         self.evict_untrusted_logged = False
         self.notices = {}   # targetId -> running notifier Popen (its notification is still on screen)
+        self.focus = FocusGuard()
 
     # -- children
     def start_vdisplay(self):
@@ -519,6 +618,7 @@ class Supervisor:
         c = self.cdp
         chrome_pid = self.chrome.pid if self.chrome else None
         wid = None
+        self.focus.allow()
         if c and target and self.main:
             try:
                 w = c.call("Browser.getWindowForTarget", {"targetId": target})
@@ -656,6 +756,26 @@ class Supervisor:
             elif line:
                 log(line)
 
+    def focus_loop(self):
+        """Give keyboard focus back when a CDP client raised the agent Chrome without anyone asking."""
+        last_err = 0.0
+        while not self.stop:
+            try:
+                chrome_pid = self.chrome.pid if self.chrome and self.chrome.poll() is None else None
+                front = front_pid() if chrome_pid else None
+                now = time.time()
+                back = self.focus.step(front, chrome_pid, now, user_input_age() if front == chrome_pid else 1e9,
+                                       show_age(now))
+                if back:
+                    log("focus-guard: agent Chrome took focus with no show/passkey/user click; returned it to "
+                        "pid %d (%s)" % (back, app_name(back)))
+                    activate_pid(back)
+            except Exception as e:
+                if time.time() - last_err > 60:
+                    last_err = time.time()
+                    log("focus-guard: %s" % e)
+            time.sleep(FOCUS_POLL_S)
+
     def write_state(self):
         st = {"pid": os.getpid(), "port": PORT, "profile": PROFILE, "vdisplay_bounds": self.vbounds,
               "main_bounds": self.main, "chrome_pid": self.chrome.pid if self.chrome else None,
@@ -678,6 +798,9 @@ class Supervisor:
                 "floating alert instead. Allow them: open '%s'" % (ns, NOTIFIER_SETTINGS_URL))
         self.start_vdisplay()
         self.start_chrome()
+        if FOCUS_GUARD:
+            threading.Thread(target=self.focus_loop, daemon=True).start()
+            log("focus-guard: on")
         backoff_until = 0
         try:
             while not self.stop:
@@ -735,6 +858,8 @@ def cmd_status():
         print("  notifications not allowed for Hermes Touch ID: passkey requests reveal the window plus a floating"
               " alert instead.\n  Allow them: open '%s'" % NOTIFIER_SETTINGS_URL)
     print("window eviction (other apps off the virtual display): %s" % evict_status())
+    print("focus guard: %s" % ("on (unrequested focus grabs are handed back; see `focus-guard:` log lines)"
+                                if FOCUS_GUARD else "off (HERMES_CHROME_AGENT_FOCUS_GUARD=0)"))
     v = cdp_version()
     print("cdp: http://127.0.0.1:%d %s" % (PORT, v["Browser"] if v else "NOT answering"))
     if v:

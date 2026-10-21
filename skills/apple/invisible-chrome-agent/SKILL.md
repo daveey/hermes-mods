@@ -46,6 +46,14 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
 - restarts only the child that died: Chrome crash → relaunch (with backoff; its tabs are lost); vdisplay crash →
   new display, windows re-homed. A stale Chrome left on the profile (SingletonLock pid) is stopped first, since a
   second launch on the same profile would just hand off to it;
+- runs a **focus guard** (thread, every 0.25 s, `lsappinfo front`): when the agent Chrome becomes frontmost without
+  being asked, it hands focus back to the app the user had in front and logs `focus-guard: agent Chrome took focus
+  ... returned it to pid N (App)`. A CDP client causes this with a foreground `Target.createTarget` (no
+  `background: true`), `Target.activateTarget` or `Page.bringToFront`: macOS gives Chrome keyboard focus even while
+  its windows are on the virtual display, so the user's typing lands in an invisible window. Allowed grabs: `show`
+  ran in the last 10 s (browser_focus, status-bar toggle; judged by the show flag's mtime), a passkey reveal, or a
+  user click / modifier press (Dock, Cmd-Tab) within 1 s. A grant lasts until Chrome loses focus. Off with
+  `HERMES_CHROME_AGENT_FOCUS_GUARD=0`;
 - auto-attaches to every page target and injects a wrapper around `navigator.credentials.get/create`
   (`Page.addScriptToEvaluateOnNewDocument` + `Runtime.addBinding`). A non-conditional WebAuthn request posts a macOS
   notification "Hermes needs Touch ID — Tap Touch ID to sign in with a passkey for <rpId>" from
@@ -113,6 +121,14 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   just means the screen was locked).
 
 ## Pitfalls
+
+- **"Something keeps selecting Chrome."** Find who: `grep focus-guard ~/.hermes/logs/chrome-agent.log` (each
+  hand-back is a culprit event), and WindowServer's view: `log show --start '<t>' --style compact --predicate
+  'process == "WindowServer" AND eventMessage CONTAINS "SetFrontProcessWithInfo"' | grep Chrome`. Reproduce a
+  suspect CDP call with Finder in front, then `lsappinfo front`. Any CDP client must open tabs with
+  `background: true` (the harness's `new_tab()` does; Hermes' own-tab preamble in `tools/browser_use_cli.py` does
+  since fork commit ca8e9575ff). Agent code calling `switch_tab(..., activate=True)` / `Target.activateTarget`
+  also grabs focus; the guard hands it back.
 
 - **Other apps' windows get stranded on the virtual display, mostly after the lid closes.** In clamshell sleep the
   built-in screen goes away, the virtual display becomes the only screen (log: `bounds 0,0 1440x900 main 0,0
