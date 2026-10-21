@@ -53,7 +53,7 @@ samples are small (n=120), so treat these numbers as early. `unverified` showed 
 `unwatched` checks wake sources deterministically before the judge runs, so a reply with a live watcher costs no LLM call. Of 3,260 recent Desktop replies, 299 matched the prefilter. On three real cases the judge scored the orphaned "once the runs finish, I'll…" reply 0.85 and scored the user-owned next step and the reply that armed a watcher below threshold. Watchers die when their backend restarts, so a promise made before a restart can become orphaned later; the rule only catches this at turn end.
 Settings: `COACH_REPLY_RULES` (comma list or `none`) and `COACH_REPLY_THRESHOLD`. Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
-file edits. Nudges are logged as `reply_nudge` in `log.jsonl`.
+file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
 
 ### Fix loops across turns (`pre_llm_call` + `post_llm_call`)
 

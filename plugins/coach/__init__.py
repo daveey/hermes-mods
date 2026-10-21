@@ -241,6 +241,8 @@ def build(store=None, checkout=None):
                         hit = {"rule": r, "p": v[r], "evidence": v["evidence"],
                                "nudge": rc.NUDGES[r].format(evidence=v["evidence"] or "see your last message")}
             if not hit:
+                store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
+                           "candidates": rc.prefilter(final_response)})
                 return None
             store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
                        "p": hit["p"], "evidence": hit["evidence"]})
