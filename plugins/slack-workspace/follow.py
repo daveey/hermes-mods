@@ -290,6 +290,37 @@ def engagement_op(engs: "engage.Engagements", op: str, args: dict) -> dict:
 # Runner (bot gateway side)
 # =================================================================================================
 
+# Model routing: the follower profile defaults to a fast model (Sonnet). Turns that must look things up or
+# reason over evidence (repo / kanban / numbers, long or multi-message batches) run on RESEARCH_MODEL instead, so
+# speed on quick replies never costs grounding on research ones. policy.json: follower.research_model
+# ("" turns routing off), follower.research_min_chars, follower.research_min_messages.
+RESEARCH_MODEL = "claude-opus-5-5"
+RESEARCH_MIN_CHARS = 400
+RESEARCH_MIN_MESSAGES = 3
+_RESEARCH_RE = re.compile(
+    r"(?:\bt_[0-9a-f]{6,}\b|\bkanban\b|\bgithub\b|\brepo\b|\bcommits?\b|\bpull request\b|\bPR\s*#?\d+|\bbranch(?:es)?\b"
+    r"|\w+/\w+\.\w{1,4}\b|\w+\.(?:py|md|ts|rs|yaml|json)\b|`[^`]+`|\bhow many\b|\bhow does\b|\bhow did\b"
+    r"|\bexplain\b|\binvestigat|\bsummari[sz]e|\bcompare\b|\bbenchmark|\bresults?\b|\bnumbers?\b|\bmeasure"
+    r"|\bexperiment|\bscor(?:e|ing)\b|\bdata\b|\bwhy did\b|\bwhat(?:'s| is| are) the\b|\blook (?:into|at|up)\b)",
+    re.IGNORECASE)
+
+
+def research_model(policy: dict, batch: dict) -> str:
+    """Model for a batch turn: the research model when the triggering messages look like lookups, else '' (the
+    follower profile's default). Pure; the policy's follower.research_model='' disables routing."""
+    fcfg = (policy or {}).get("follower") or {}
+    model = fcfg.get("research_model", RESEARCH_MODEL)
+    if not model:
+        return ""
+    trig = batch.get("trigger") or []
+    min_chars = int(fcfg.get("research_min_chars") or RESEARCH_MIN_CHARS)
+    min_msgs = int(fcfg.get("research_min_messages") or RESEARCH_MIN_MESSAGES)
+    texts = [(r.get("text") or "") for r in trig]
+    if len(trig) >= min_msgs or sum(len(t) for t in texts) >= min_chars:
+        return model
+    return model if any(_RESEARCH_RE.search(t) for t in texts) else ""
+
+
 def hermes_bin() -> list[str]:
     exe = shutil.which("hermes") or str(Path(sys.executable).with_name("hermes"))
     return [exe]
@@ -304,8 +335,9 @@ class Runner:
     def __init__(self, store, engs, *, token: Callable[[], str], bot_user_id: Callable[[], str],
                  name: Callable[[str], str], root_home: Path, spawn: Optional[Callable] = None,
                  inbox_post: Optional[Callable] = None, self_gateway: str = "",
-                 inbox_outcome: Optional[Callable] = None):
+                 inbox_outcome: Optional[Callable] = None, policy: Optional[Callable[[], dict]] = None):
         self.store, self.engs = store, engs
+        self.policy = policy or (lambda: {})
         self.token, self.bot_user_id, self.name = token, bot_user_id, name
         self.root_home = Path(root_home)
         self.spawn = spawn or self._spawn
@@ -322,7 +354,7 @@ class Runner:
     def session_title(self, e: dict) -> str:
         return f"Slack {('#' + e['name']) if e.get('name') else e['channel']} · {e['id']}"
 
-    def _spawn(self, e: dict, prompt: str) -> tuple[int, str]:
+    def _spawn(self, e: dict, prompt: str, model: str = "") -> tuple[int, str]:
         qdir = self.root_home / "cache" / "slack-follow"
         qdir.mkdir(parents=True, exist_ok=True)
         qf = qdir / f"{e['id']}-{uuid.uuid4().hex[:6]}.txt"
@@ -333,7 +365,7 @@ class Runner:
         env["HERMES_HOME"] = str(self.root_home)
         cmd = hermes_bin() + ["-p", e.get("follower_profile") or DEFAULT_FOLLOWER, "chat", "-Q",
                               "--query-file", str(qf), "-c", self.session_title(e), "--create-if-missing",
-                              "--yolo", "--pass-session-id"]
+                              "--yolo", "--pass-session-id"] + (["-m", model] if model else [])
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=TURN_TIMEOUT_S, env=env,
                                cwd=str(self.root_home))
@@ -388,9 +420,16 @@ class Runner:
         ctx = [r for r in self.store.recent(e["channel"], first - 7 * 86400, limit=40)
                if self.engs.in_scope(e, r) and float(r["ts"]) < first][-15:]
         t0 = time.time()
-        rc, out = self.spawn(e, batch_prompt(e, batch, ctx, self.name, bot, self._escalations(e)))
-        logger.info("slack-follow: %s turn for %d message(s) rc=%s in %.0fs (waited %.1fs from message to spawn)",
-                    eid, len(batch["trigger"]), rc, time.time() - t0, t0 - first)
+        try:
+            model = research_model(self.policy(), batch)
+        except Exception as exc:  # routing must never block a reply
+            logger.warning("slack-follow %s model routing failed: %s", eid, exc)
+            model = ""
+        prompt = batch_prompt(e, batch, ctx, self.name, bot, self._escalations(e))
+        rc, out = self.spawn(e, prompt, model=model) if model else self.spawn(e, prompt)
+        logger.info("slack-follow: %s turn for %d message(s) rc=%s in %.0fs (waited %.1fs from message to spawn)%s",
+                    eid, len(batch["trigger"]), rc, time.time() - t0, t0 - first,
+                    f" model={model}" if model else "")
         sid = parse_session_id(out)
         if sid and sid != e.get("follower_session"):
             self.engs.update(eid, follower_session=sid)

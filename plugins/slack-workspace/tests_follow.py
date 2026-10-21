@@ -559,3 +559,62 @@ def test_reaction_trouble_does_not_fail_the_post(env):
             return orig(method, params)
     p2 = follow.Poster(engs, Bad(), lambda: BOTSELF)
     assert p2.post("C1", "answer", thread_ts="5.0", reply_to="5.0")["ok"]
+
+
+# ---- model routing: research turns go to the research model, quick ones stay on the profile default ----
+def _batch(*texts):
+    rows = [{"ts": f"{i}.0", "text": t} for i, t in enumerate(texts, 1)]
+    return {"trigger": rows, "all": rows, "newest": rows[-1]["ts"]}
+
+
+def test_research_model_quick_vs_research():
+    assert follow.research_model({}, _batch("thanks!")) == ""
+    assert follow.research_model({}, _batch("who is this for?")) == ""
+    for t in ("what does kanban t_891a93ae say?", "can you check the repo for that", "see fabric/nn/atom.py",
+              "how many atoms are there now", "please summarize the results"):
+        assert follow.research_model({}, _batch(t)) == follow.RESEARCH_MODEL, t
+    assert follow.research_model({}, _batch("ok", "sure", "hm")) == follow.RESEARCH_MODEL  # 3 messages
+    assert follow.research_model({}, _batch("x" * 450)) == follow.RESEARCH_MODEL            # long
+
+
+def test_research_model_policy_overrides():
+    pol = {"follower": {"research_model": "m-x", "research_min_chars": 50}}
+    assert follow.research_model(pol, _batch("y" * 60)) == "m-x"
+    assert follow.research_model({"follower": {"research_model": ""}}, _batch("check the repo")) == ""
+
+
+def test_runner_passes_model_only_for_research_turns(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    engs.update(e["id"], kickoff=0)
+    seen = []
+
+    def spawn(ev, prompt, model=""):
+        seen.append(model)
+        return 0, "session_id: s1\n"
+    r = follow.Runner(store, engs, token=lambda: "x", bot_user_id=lambda: BOTSELF, name=str,
+                      root_home=store.root, spawn=spawn)
+    rec(store, "C1", f"{time.time() + 5:.6f}", "what does kanban t_891a93ae say?")
+    assert r.run_once(e["id"])
+    rec(store, "C1", f"{time.time() + 6:.6f}", "thanks")
+    assert r.run_once(e["id"])
+    assert seen == [follow.RESEARCH_MODEL, ""]
+
+
+def test_spawn_adds_model_flag(tmp_path, env, monkeypatch):
+    store, engs, _, _ = env
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+
+        class R:
+            returncode, stdout, stderr = 0, "session_id: s1\n", ""
+        return R()
+    monkeypatch.setattr(follow.subprocess, "run", fake_run)
+    r = follow.Runner(store, engs, token=lambda: "x", bot_user_id=lambda: BOTSELF, name=str, root_home=tmp_path)
+    e = engs.create("C1", "x", private=True)
+    r._spawn(e, "hi")
+    assert "-m" not in seen["cmd"]
+    r._spawn(e, "hi", model="claude-opus-5-5")
+    assert seen["cmd"][seen["cmd"].index("-m") + 1] == "claude-opus-5-5"

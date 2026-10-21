@@ -273,7 +273,8 @@ def _make_runner(state: State):
 
     return follow.Runner(state.store, state.engs, token=state.token, bot_user_id=state.bot_user_id,
                          name=state.user_name, root_home=root_home, inbox_post=inbox_post,
-                         inbox_outcome=inbox_outcome, self_gateway=fcfg.get("self_gateway") or "")
+                         inbox_outcome=inbox_outcome, self_gateway=fcfg.get("self_gateway") or "",
+                         policy=state.store.policy)
 
 
 def _post_typed(inbox, title, body, accept_prompt, *, key=None, poster=None, type=None, fields=None):
