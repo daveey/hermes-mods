@@ -321,7 +321,10 @@ def _install(owner, mark, own=None):
                     function = getattr(importlib.import_module(module_name), name)
                     if key == 'agent.agent_runtime_helpers:recover_with_credential_pool' and hasattr(function, '__wrapped__'):
                         function = _audited_recovery_base(function, cache)
-                    if hasattr(function, '__wrapped__') or _fingerprint(function, cache) != digest:
+                    # A pin is one audited digest, or a list when more than one core lineage has been
+                    # audited (fork core vs. the unpatched upstream /opt/hermes on nous-1).
+                    audited = [digest] if isinstance(digest, str) else list(digest)
+                    if hasattr(function, '__wrapped__') or _fingerprint(function, cache) not in audited:
                         raise ValueError(key + ' changed; re-audit before updating compatibility.json')
                 if RETRY_AFTER_CAP_S != 600:
                     raise ValueError('retry cutoff changed')
