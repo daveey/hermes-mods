@@ -14,8 +14,21 @@ Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
   output.log  everything printed while the command ran (via script(1))
   status.json {"status": "running"|"ran"|"declined", "exit_code": n}
 
+  origin.txt  who asked, for a request relayed from another gateway (shown by the runner)
+
 Terminal choice: iTerm > Terminal.app > cmux; env HERMES_USER_TERMINAL = iterm | terminal | cmux tries that one first.
 (cmux is last: its control socket only accepts processes started inside cmux by default.)
+
+Remote mode (a gateway with no screen: Linux/cloud). The same tool is registered, but the handler relays
+the job to the owner's Mac through the session-mentions courier: it writes a ``user_terminal`` request into
+``<root>/session_mentions/outbox/`` addressed (``route``) to the Mac's device name (config
+``user_terminal.device``, env ``HERMES_USER_TERMINAL_DEVICE``, else the only live courier). That Mac's
+Desktop courier claims it and calls this plugin's own dashboard routes on the Mac's backend
+(``dashboard/plugin_api.py``: ``POST /start``, ``GET /status/<job>``), which run the local path above
+(``create_job`` + ``open_window`` + ``wait_for``). The confirm window names the originating
+gateway/profile/session. Only the owner's own sessions (desktop/cli/tui/api_server) may call it; a session
+on a messaging platform (e.g. Slack on a shared bot) is refused. No live courier for that Mac -> an
+immediate error, never a silent wait.
 """
 
 from __future__ import annotations
@@ -83,17 +96,18 @@ RUNNER = r"""#!/bin/bash
 JOB="$1"
 B=$'\e[1m'; D=$'\e[2m'; Y=$'\e[33m'; G=$'\e[32m'; R=$'\e[31m'; C=$'\e[36m'; N=$'\e[0m'
 status() { printf '%s' "$1" > "$JOB/status.json.tmp" && mv "$JOB/status.json.tmp" "$JOB/status.json"; }
-printf '\e]0;Hermes wants to run a command\a'
+if [ -s "$JOB/origin.txt" ]; then printf '\e]0;Hermes (%s) wants to run a command\a' "$(head -n1 "$JOB/origin_short.txt" 2>/dev/null)"; else printf '\e]0;Hermes wants to run a command\a'; fi
 clear
 W=$(tput cols 2>/dev/null || echo 100); W=$(( W > 120 ? 120 : W )); W=$(( W < 40 ? 40 : W ))
 wrap() { fold -s -w $((W - 2)) | sed -e 's/[[:space:]]*$//' -e 's/^/  /'; }
 echo "${B}${C}━━━ Hermes wants to run a command ━━━${N}"
 echo
-if [ -s "$JOB/reason.txt" ]; then echo "${B}Why:${N}"; tr -s ' \n' ' ' < "$JOB/reason.txt" | wrap; echo; echo; fi
-echo "${B}Where:${N} $(cat "$JOB/cwd.txt")"
+if [ -s "$JOB/origin.txt" ]; then echo "${B}${R}From another machine:${N}"; wrap < "$JOB/origin.txt"; echo; fi
+if [ -s "$JOB/reason.txt" ]; then echo "${B}Why:${N}"; tr -s ' \n' ' ' < "$JOB/reason_display.txt" | wrap; echo; echo; fi
+echo "${B}Where:${N} $(cat "$JOB/cwd_display.txt")"
 echo
 echo "${B}Command:${N}"
-printf '%s' "${Y}"; wrap < "$JOB/cmd.sh"; printf '%s' "${N}"
+printf '%s' "${Y}"; wrap < "$JOB/cmd_display.txt"; printf '%s' "${N}"
 echo
 while true; do
   read -r -p "${B}Run it? [y/N]${N} " ans
@@ -232,17 +246,57 @@ def clean_output(raw: str) -> str:
     return text.strip("\n")
 
 
-def create_job(command: str, reason: str, cwd: str) -> Path:
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x80-\x9f]")
+
+
+def visible(text: str) -> str:
+    """Control characters (ESC, CR, BEL, C1...) shown as ^X / <U+..> so a relayed command, reason or origin
+    cannot redraw the confirm window (hide part of the command, fake a prompt). Newlines and tabs stay."""
+    def sub(m: re.Match) -> str:
+        c = ord(m.group(0))
+        return f"^{chr(c + 64)}" if c < 32 else ("^?" if c == 127 else f"<U+{c:04X}>")
+    return _CTRL.sub(sub, str(text or ""))
+
+
+def origin_lines(origin: dict | None) -> tuple[str, str]:
+    """(full text for the window, short label for its title) for a relayed request's origin."""
+    if not isinstance(origin, dict) or not origin.get("gateway"):
+        return "", ""
+    one = lambda k: visible(str(origin.get(k) or "")).replace("\n", " ").strip()[:200]  # noqa: E731
+    gw, profile, sid, title = one("gateway"), one("profile") or "default", one("session_id"), one("title")
+    text = f"Gateway {gw} · profile {profile}"
+    if sid:
+        text += f" · session {sid}"
+    if title:
+        text += f' ("{title}")'
+    return text + "\n", f"{gw}/{profile}"
+
+
+def create_job(command: str, reason: str, cwd: str, origin: dict | None = None) -> Path:
     job = jobs_dir() / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
     job.mkdir(parents=True)
     (job / "cmd.sh").write_text(command.rstrip("\n") + "\n")
+    (job / "cmd_display.txt").write_text(visible(command.rstrip("\n")) + "\n")
     (job / "reason.txt").write_text(reason.strip() + "\n" if reason.strip() else "")
+    (job / "reason_display.txt").write_text(visible(reason.strip()) + "\n" if reason.strip() else "")
     (job / "cwd.txt").write_text(cwd)
+    (job / "cwd_display.txt").write_text(visible(cwd))
+    full, short = origin_lines(origin)
+    if full:
+        (job / "origin.txt").write_text(full)
+        (job / "origin_short.txt").write_text(short + "\n")
     (job / "runner.sh").write_text(RUNNER)
     (job / "status.json").write_text(json.dumps({"status": "waiting_for_user"}))
     (job / "meta.json").write_text(json.dumps({"command": command, "reason": reason, "cwd": cwd,
-                                                "created": time.time()}))
+                                                "origin": origin if full else None, "created": time.time()}))
     return job
+
+
+def job_origin_gateway(job: Path) -> str:
+    try:
+        return str((json.loads((job / "meta.json").read_text()).get("origin") or {}).get("gateway") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
 
 
 def read_status(job: Path) -> dict:
@@ -330,9 +384,250 @@ def transform_terminal_output(command: str = "", output: str = "", **_: Any) -> 
     return _CORE_SUDO_TIP.sub("", output).rstrip() + HINT
 
 
+# ---------------------------------------------------------------- relayed jobs (Mac side)
+
+def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
+    """Open the confirm window for a job relayed from another gateway (dashboard ``POST /start``)."""
+    command = str(command or "").strip()
+    if not command:
+        return {"ok": False, "error": "command is required"}
+    if not isinstance(origin, dict) or not str(origin.get("gateway") or "").strip():
+        return {"ok": False, "error": "a relayed job must name its origin gateway"}
+    cwd = os.path.expanduser(str(cwd or "").strip() or "~")
+    if not os.path.isdir(cwd):
+        return {"ok": False, "error": f"cwd does not exist on the Mac: {cwd}"}
+    job = create_job(command, str(reason or ""), cwd, origin)
+    try:
+        where = open_window(job)
+    except Exception as e:
+        return {"ok": False, "error": f"could not open a terminal window on the Mac: {e}"}
+    return {"ok": True, "job_id": job.name, "status": "waiting_for_user", "terminal": where}
+
+
+def relayed_status(job_id: str, gateway: str, wait_s: float) -> dict:
+    """Wait on a relayed job. Only the gateway that started it may read it (output can be private)."""
+    job = jobs_dir() / Path(str(job_id or "")).name
+    if not job_id or not job.is_dir() or not gateway or job_origin_gateway(job) != gateway:
+        return {"ok": False, "error": f"unknown job_id {job_id}"}
+    return wait_for(job, max(0.0, min(float(wait_s or 0), 25.0)))
+
+
+# ---------------------------------------------------------------- remote mode (gateway with no screen)
+
+# Surfaces where the session's user is the owner. Anything else (slack, telegram, discord, cron, ...)
+# may be another person or nobody, so the tool refuses rather than open a window on the owner's Mac.
+OWNER_SURFACES = frozenset({"desktop", "api_server", "tui", "cli", "local"})
+COURIER_FRESH_S = 20.0
+PICKUP_S = 15.0       # couriers drain every ~3 s
+START_RESULT_S = 60.0  # the Mac opens the window and answers
+POLL_S = 20            # each status request waits this long on the Mac
+
+
+def _session_env(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env  # type: ignore
+
+        return str(get_session_env(name, "") or "")
+    except Exception:
+        return os.environ.get(name, "")
+
+
+def caller_surfaces(session_id: str | None) -> list[str]:
+    """Every identity this turn has: process platform, session platform/source, the session row's source."""
+    ids = [os.environ.get("HERMES_PLATFORM", ""), _session_env("HERMES_SESSION_PLATFORM"),
+           _session_env("HERMES_SESSION_SOURCE")]
+    if session_id:
+        try:
+            from hermes_state import SessionDB  # type: ignore
+
+            row = SessionDB().get_session(session_id) or {}
+            ids.append(str(row.get("source") or ""))
+        except Exception:
+            pass
+    return sorted({str(i).strip().lower() for i in ids if str(i or "").strip()})
+
+
+def owner_refusal(session_id: str | None) -> str | None:
+    """None when the caller is the owner's own session; else the refusal text. Default-deny."""
+    surfaces = caller_surfaces(session_id)
+    others = [x for x in surfaces if x not in OWNER_SURFACES]
+    if surfaces and not others:
+        return None
+    where = ", ".join(others) or "an unknown surface"
+    return (f"run_in_user_terminal is refused here: it opens a confirm window on the owner's Mac and is only "
+            f"available in the owner's own chats (Desktop, CLI, TUI, API). This session is on {where}, so the "
+            f"person asking may not be the owner. Do not run the command another way and do not hand it over "
+            f"as something to paste: tell them it needs the owner to ask for it from their own Hermes chat.")
+
+
+def _root() -> Path:
+    base = _home()
+    if base.parent.name == "profiles":  # profiles share the gateway root's courier outbox
+        base = base.parent.parent
+    path = base / "session_mentions"
+    for sub in ("outbox", "claimed", "results"):
+        (path / sub).mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _slug(raw: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(raw or "").strip().lower()).strip("-")
+
+
+def live_couriers(base: Path) -> list[dict]:
+    out = []
+    d = base / "couriers"
+    for path in sorted(d.glob("*.json")) if d.is_dir() else ():
+        try:
+            if time.time() - path.stat().st_mtime < COURIER_FRESH_S:
+                out.append(json.loads(path.read_text()))
+        except Exception:
+            continue
+    return out
+
+
+def configured_device() -> str:
+    dev = os.environ.get("HERMES_USER_TERMINAL_DEVICE", "")
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        dev = str(((load_config() or {}).get("user_terminal") or {}).get("device") or dev)
+    except Exception:
+        pass
+    return _slug(dev)
+
+
+def pick_courier(base: Path) -> tuple[str, str]:
+    """(device, error). The configured Mac must have a live courier; unconfigured -> the only live one."""
+    couriers = [c for c in live_couriers(base) if c.get("device")]
+    seen = ", ".join(sorted(c["device"] for c in couriers)) or "none"
+    want = configured_device()
+    if want:
+        for c in couriers:
+            if want == c.get("device") or want in (c.get("aliases") or []):
+                return str(c["device"]), ""
+        return "", (f"The owner's Mac (`{want}`) has no Hermes Desktop connected to this gateway right now "
+                    f"(live Desktops: {seen}), so no terminal can be opened there. Tell the owner that; do not "
+                    f"hand them the command to run themselves.")
+    if len(couriers) == 1:
+        return str(couriers[0]["device"]), ""
+    if not couriers:
+        return "", ("No Hermes Desktop is connected to this gateway right now, so no terminal can be opened on "
+                    "the owner's Mac. Tell the owner that; do not hand them the command to run themselves.")
+    return "", (f"Several Desktops drain this gateway ({seen}); set `user_terminal.device` in this gateway's "
+                f"config to the owner's Mac.")
+
+
+def _sender(session_id: str | None) -> dict:
+    info: dict[str, Any] = {"session_id": session_id or "", "title": ""}
+    if session_id:
+        try:
+            from hermes_state import SessionDB  # type: ignore
+
+            info["title"] = SessionDB().get_session_title(session_id) or ""
+        except Exception:
+            pass
+    try:
+        from hermes_cli.profiles import get_active_profile_name  # type: ignore
+
+        info["profile"] = get_active_profile_name() or "default"
+    except Exception:
+        info["profile"] = "default"
+    info["platform"] = ",".join(caller_surfaces(session_id))
+    return info
+
+
+def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: float) -> dict:
+    """One request to the Mac's courier. Errors (never a hang) when nobody claims it within PICKUP_S."""
+    rid = uuid.uuid4().hex
+    outbox, result = base / "outbox" / f"{rid}.json", base / "results" / f"{rid}.json"
+    req = {"id": rid, "action": "user_terminal", "route": device, "args": args, "sender": sender,
+           "created_at": time.time(), "ttl": PICKUP_S + 5}
+    tmp = outbox.with_name(f".{rid}.tmp")
+    tmp.write_text(json.dumps(req))
+    os.replace(tmp, outbox)
+    pickup = time.time() + PICKUP_S
+    deadline = pickup + result_wait
+    while time.time() < deadline:
+        if result.exists():
+            try:
+                data = json.loads(result.read_text())
+            except ValueError:
+                time.sleep(0.2)
+                continue
+            result.unlink(missing_ok=True)
+            return data if isinstance(data, dict) else {"ok": False, "error": "courier posted no result"}
+        if outbox.exists() and time.time() > pickup:
+            outbox.unlink(missing_ok=True)
+            return {"ok": False, "error": (f"The Hermes Desktop on `{device}` did not pick up the request (it may "
+                                           f"be quitting, asleep, or running an older session-mentions plugin). "
+                                           f"Tell the owner; do not hand them the command.")}
+        if _interrupted():
+            return {"ok": False, "error": "interrupted"}
+        time.sleep(0.3)
+    return {"ok": False, "error": f"`{device}` claimed the request but sent no answer in time"}
+
+
+def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
+    try:
+        refusal = owner_refusal(session_id)
+        if refusal:
+            return _err(refusal)
+        wait_s = max(1.0, min(float(args.get("wait_s") or DEFAULT_WAIT), MAX_WAIT))
+        job_id = str(args.get("job_id") or "").strip()
+        command = str(args.get("command") or "").strip()
+        if not job_id and not command:
+            return _err("command is required (or job_id to resume waiting)")
+        base = _root()
+        device, err = pick_courier(base)
+        if err:
+            return _err(err)
+        sender = _sender(session_id)
+        deadline = time.time() + wait_s
+        if not job_id:
+            res = relay_once(base, device, {"command": command, "reason": str(args.get("reason") or ""),
+                                            "cwd": str(args.get("cwd") or "")}, sender, START_RESULT_S)
+            if not res.get("ok") or not res.get("job_id"):
+                return json.dumps({**res, "ok": False, "device": device})
+            job_id, terminal = str(res["job_id"]), res.get("terminal")
+        else:
+            terminal = None
+        res: dict = {}
+        while True:
+            left = deadline - time.time()
+            res = relay_once(base, device, {"job_id": job_id, "wait_s": int(max(0, min(POLL_S, left)))}, sender,
+                             POLL_S + 30)
+            if not res.get("ok") or res.get("status") in ("ran", "declined") or time.time() >= deadline:
+                break
+            if _interrupted():
+                break
+        res = {**res, "job_id": job_id, "device": device}
+        if terminal:
+            res["terminal"] = terminal
+        if res.get("ok") and res.get("status") not in ("ran", "declined"):
+            res["note"] = (f"Still waiting on `{device}` (the owner hasn't answered, or the command is still "
+                           f"running). Call run_in_user_terminal with this job_id to keep waiting.")
+        return json.dumps(res)
+    except Exception as e:  # never crash the agent loop
+        return _err(f"{type(e).__name__}: {e}")
+
+
+REMOTE_SCHEMA = {**SCHEMA, "description": SCHEMA["description"] + (
+    " On this gateway (no screen) the window opens on the owner's Mac through its Hermes Desktop; the "
+    "window names this gateway, profile and session. If it errors that no Desktop is connected, say so; "
+    "never hand the command over to be pasted instead.")}
+
+
+def has_screen() -> bool:
+    return shutil.which("osascript") is not None or CMUX_BIN.exists()
+
+
 def register(ctx) -> None:
-    if shutil.which("osascript") is None and not CMUX_BIN.exists():
-        return  # no screen to open a terminal on (Linux/cloud gateway)
+    if not has_screen():  # Linux/cloud gateway: relay to the owner's Mac (see module docstring)
+        ctx.register_tool(name="run_in_user_terminal", toolset=TOOLSET, schema=REMOTE_SCHEMA, handler=handle_remote,
+                          emoji="🖥️", description="Open a terminal on the owner's Mac (via its Desktop), confirm there, run, return output")
+        ctx.register_hook("transform_terminal_output", transform_terminal_output)
+        return
     ctx.register_tool(name="run_in_user_terminal", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🖥️",
                       description="Open a terminal on the user's screen, confirm there, run, return output")
     ctx.register_hook("transform_terminal_output", transform_terminal_output)

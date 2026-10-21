@@ -881,6 +881,7 @@ export async function performRequest(req, origin, conns) {
   const action = req?.action
 
   if (String(action || '').startsWith('task_')) return performTaskRequest(req, origin, conns)
+  if (action === 'user_terminal') return performUserTerminal(req, origin, conns)
 
   if (action === 'list') {
     let rows = await allRows(true)
@@ -942,6 +943,59 @@ export async function performRequest(req, origin, conns) {
   }
 
   return { ok: false, error: `unknown action ${action}` }
+}
+
+// ── run_in_user_terminal relayed from a gateway with no screen ───────────────
+// The remote tool addresses the request to this Mac (route = its device name), so only this courier
+// claims it. The job runs on THIS Mac's own backend (user-terminal plugin routes), which opens the
+// confirm window; nothing runs until the owner types y there.
+
+// Surfaces whose user is the owner. The remote tool already refuses the rest; this is the second gate.
+const OWNER_SURFACES = new Set(['desktop', 'api_server', 'tui', 'cli', 'local'])
+const UT_BASE = '/api/plugins/user-terminal'
+
+export function ownerSurface(platform) {
+  const ids = String(platform || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+  return ids.length > 0 && ids.every(id => OWNER_SURFACES.has(id))
+}
+
+export async function performUserTerminal(req, origin, conns) {
+  const home = conns.find(isHome)
+  if (!home) return { ok: false, error: 'this Desktop has no local backend to open a terminal on' }
+  const sender = req?.sender || {}
+  if (!ownerSurface(sender.platform)) {
+    return { ok: false, error: `refused: the request came from a ${sender.platform || 'unknown'} session, not the owner's own chat. Ask the owner to request it from their Hermes chat.` }
+  }
+  const args = req?.args || {}
+  // Named by THIS Desktop (the connection it drained), never by the remote agent.
+  const gw = conns.find(c => c.id === origin)
+  const gateway = gw?.key || origin
+  const device = conns.find(isHome)?.device || home.key
+  try {
+    if (args.job_id) {
+      const wait = Math.max(0, Math.min(25, Number(args.wait_s) || 0))
+      const res = await api(home.id, `${UT_BASE}/status/${enc(args.job_id)}?gateway=${enc(gateway)}&wait_s=${wait}`, { timeoutMs: (wait + 20) * 1000 })
+      return { ...res, device }
+    }
+    const res = await api(home.id, `${UT_BASE}/start`, {
+      method: 'POST',
+      body: {
+        command: String(args.command || ''),
+        reason: String(args.reason || ''),
+        cwd: String(args.cwd || ''),
+        origin: { gateway, gateway_label: gw?.label || '', profile: sender.profile || 'default', session_id: sender.session_id || '', title: sender.title || '' }
+      },
+      timeoutMs: 40_000
+    })
+    return { ...res, device }
+  } catch (error) {
+    const msg = String(error?.message || error)
+    const hint = /404|not found/i.test(msg) ? ' (this Mac\'s backend has no user-terminal routes: enable the user-terminal plugin and update it)' : ''
+    return { ok: false, error: `could not reach the user-terminal plugin on ${device}: ${msg}${hint}`, device }
+  }
 }
 
 const relay = (connectionId, path, opts) => api(connectionId, `/api/plugins/${PLUGIN_ID}${path}`, opts)
