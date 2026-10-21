@@ -114,6 +114,12 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
 
 ## Pitfalls
 
+- **Closing the lid strands other apps' windows on the virtual display.** In clamshell sleep the built-in screen
+  goes away, the virtual display becomes the only screen (log: `bounds 0,0 1440x900 main 0,0 1440x900`) and macOS
+  moves every window onto it. On wake the display is re-parked in its corner and the windows stay there, invisible;
+  apps that autosave frames (SwiftUI `Window`) then reopen there even after a relaunch. `hermes-window-evict` moves
+  them back once a real display exists again, and does nothing while the virtual display is the only screen.
+
 - **Chrome's tab-modal dialogs don't follow a window to another display.** "Use a saved passkey for <site>" is
   a child window; after `Browser.setWindowBounds` moves its window to the main display it stays clamped to the
   virtual one, so the revealed page shows dimmed with no dialog. `place()` therefore nudges the width (-1, then
