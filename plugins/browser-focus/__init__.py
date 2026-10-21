@@ -163,25 +163,40 @@ def _watch_login(port: int, target_id: str) -> None:
                      start_new_session=True)
 
 
-def focus(match: str | None = None) -> dict:
+def _unattended(session_id: str = "") -> bool:
+    """Kanban workers and cron jobs have no human watching the session, so an automatic raise there is always a
+    focus steal (2026-10-21 audit: a worker's final reply raised Chrome over David's app for 50 s)."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) or str(session_id or "").startswith("cron_")
+
+
+def focus(match: str | None = None, require_login: bool = False) -> dict:
+    """Show the agent Chrome and raise it. require_login (the automatic tool-result path): only when a tab is
+    actually on a sign-in page (matching `match` if given); otherwise do nothing, never fall back to another tab."""
     if _quiet():
         return {"focused": False, "error": "quiet mode is on; not raising windows"}
     chromes = agent_chromes()
     if not chromes:
         return {"focused": False, "error": "no agent-driven Chrome is running"}
-    shown = _chrome_agent(["show", "--minutes", str(SHOW_MINUTES)])
     pid, port, tab = chromes[0][0], chromes[0][1], None
     for c_pid, c_port in chromes:   # several visible agent Chromes: take the one holding the wanted tab
         try:
-            t = pick_tab(_get(f"http://127.0.0.1:{c_port}/json/list"), match)
+            tabs = _get(f"http://127.0.0.1:{c_port}/json/list")
         except Exception as e:
             log.debug("browser-focus: CDP list failed on %s: %s", c_port, e)
             continue
+        if require_login:
+            tabs = [t for t in tabs if _LOGIN_URL.search(str(t.get("url", "")))]
+        t = pick_tab(tabs, match)
         hit = t and (not match or match.lower() in (str(t.get("url", "")) + str(t.get("title", ""))).lower())
+        if require_login and not hit:
+            continue
         if t and (tab is None or hit):
             pid, port, tab = c_pid, c_port, t
             if hit:
                 break
+    if require_login and tab is None:
+        return {"focused": False, "error": "no tab is on a sign-in page"}
+    shown = _chrome_agent(["show", "--minutes", str(SHOW_MINUTES)])
     try:
         if tab:
             _get(f"http://127.0.0.1:{port}/json/activate/{tab['id']}")
@@ -215,7 +230,7 @@ NOTE = ("\n\n[browser-focus] The Chrome window is now in front of the user, on t
 
 
 def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "", **_):
-    if tool_name != "browser_exec" or not isinstance(result, str):
+    if tool_name != "browser_exec" or not isinstance(result, str) or _unattended(session_id):
         return None
     with _lock:
         _browser_sessions[session_id or ""] = time.time()
@@ -227,7 +242,7 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
     host = re.sub(r"^https?://([^/]+).*", r"\1", url or "")
     if _throttled(f"{session_id}|{host}"):
         return None
-    res = focus(host or None)
+    res = focus(host or None, require_login=True)
     if not res.get("focused"):
         return None
     return result + NOTE.format(title=(res.get("tab") or {}).get("title") or "?")
@@ -249,7 +264,7 @@ def asks_user_in_browser(text: str) -> bool:
 
 
 def transform_llm_output(response_text: str = "", session_id: str = "", **_):
-    if not isinstance(response_text, str) or not asks_user_in_browser(response_text):
+    if not isinstance(response_text, str) or _unattended(session_id) or not asks_user_in_browser(response_text):
         return None
     with _lock:
         used = time.time() - _browser_sessions.get(session_id or "", 0) < SESSION_TTL_S

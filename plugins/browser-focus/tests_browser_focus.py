@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import pathlib
 import unittest
 from unittest import mock
@@ -40,7 +41,7 @@ class T(unittest.TestCase):
         with mock.patch.object(bf, "focus", return_value={"focused": True, "tab": {"title": "Sign in"}}) as f:
             r = bf.transform_tool_result("browser_exec", {}, out, session_id="s")
             self.assertIn("[browser-focus]", r)
-            f.assert_called_once_with("accounts.google.com")
+            f.assert_called_once_with("accounts.google.com", require_login=True)
             self.assertIsNone(bf.transform_tool_result("browser_exec", {}, out, session_id="s"))  # throttled
             self.assertIsNone(bf.transform_tool_result("browser_exec", {}, r, session_id="t"))    # idempotent
 
@@ -72,6 +73,40 @@ class T(unittest.TestCase):
         self.assertEqual(calls, [["show", "--minutes", str(bf.SHOW_MINUTES)], "activate", ("watch", 9333, "b")])
         self.assertEqual(r["tab"]["title"], "Sign in - Google Accounts")
         self.assertTrue(r["shown_on_main_display"])
+
+    # 2026-10-21 focus-steal audit: two unasked raises came from these hooks.
+    def test_hooks_never_raise_in_kanban_workers_or_cron(self):
+        out = '{"output": "https://accounts.google.com/v3/signin/identifier?q | Sign in"}'
+        text = "Please sign in to Google in the Chrome window, then say done."
+        with mock.patch.object(bf, "focus", return_value={"focused": True, "tab": None}) as f:
+            with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_1"}):
+                self.assertIsNone(bf.transform_tool_result("browser_exec", {}, out, session_id="w"))
+                self.assertIsNone(bf.transform_llm_output(text, session_id="w"))
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("HERMES_KANBAN_TASK", None)
+                self.assertIsNone(bf.transform_tool_result("browser_exec", {}, out, session_id="cron_b23d_20261021"))
+                self.assertIsNone(bf.transform_llm_output(text, session_id="cron_b23d_20261021"))
+            f.assert_not_called()
+
+    def test_auto_focus_needs_a_live_login_tab_never_falls_back(self):
+        """A login-looking URL in a result (e.g. an asset list) raised Chrome on about:blank. The automatic path
+        must only raise when a tab is actually on a sign-in page."""
+        calls = []
+        blank = [{"id": "z", "type": "page", "title": "about:blank", "url": "about:blank"}]
+        with mock.patch.object(bf, "_quiet", return_value=False), \
+             mock.patch.object(bf, "agent_chromes", return_value=[(101, 9333)]), \
+             mock.patch.object(bf, "_chrome_agent", side_effect=lambda c: calls.append(c) or True), \
+             mock.patch.object(bf, "_get", side_effect=lambda u: blank if u.endswith("/json/list") else "ok"), \
+             mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True):
+            r = bf.focus("x.com", require_login=True)
+        self.assertFalse(r["focused"])
+        self.assertEqual(calls, [])   # no show, no activate
+
+    def test_tool_result_hook_requires_login_tab(self):
+        out = '{"output": "https://x.com/i/flow/login?x | ok"}'
+        with mock.patch.object(bf, "focus", return_value={"focused": False}) as f:
+            self.assertIsNone(bf.transform_tool_result("browser_exec", {}, out, session_id="s2"))
+            f.assert_called_once_with("x.com", require_login=True)
 
     def test_login_watcher_done_when_tab_leaves_sign_in(self):
         _s = importlib.util.spec_from_file_location("wl", pathlib.Path(__file__).with_name("watch_login.py"))
