@@ -512,10 +512,10 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #   investigation     card `selfheal:<fp>` (`selfheal:<fp>:r<n>` for a recurrence), created_by self-heal, model
 #                     claude-opus-5-5, 1 h. Investigates LIVE (kanban.db, logs, processes, git log), writes the
 #                     five-whys chain, posts Inbox type `selfheal` (Do it / Not now / Never) under key selfheal:<fp>.
-#   Do it             runs `self_heal.py fix <fp>`: fix card `selfheal:<fp>:fix` (red-then-green regression test, ship,
+#   Do it             -> file_fix (hub cron sync, or `self_heal.py fix <fp>`): fix card `selfheal:<fp>:fix` (red-then-green regression test, ship,
 #                     verify live, re-post the same key as `selfheal-result` "Fixed: …").
-#   sync (cron)       reads Inbox outcomes: Never suppresses the fingerprint, Not now snoozes it 14 days, a Do it whose
-#                     task never ran gets its fix card (backstop).
+#   sync (cron)       reads Inbox outcomes every 5 min: Do it (a resolve) files the fix card, Not now snoozes the
+#                     fingerprint 14 days, Never suppresses it.
 #   backstop (cron)   runs the complaint detector over new user turns in the coach digests (chats where the
 #                     in-process hook did not fire).
 #   budget            engine_budget lane `selfheal`: $25/UTC day (its own cap, outside the $20 engine total), <= 3
@@ -1196,22 +1196,37 @@ def drain(store=None, m: Optional[str] = None, filer: Optional[Callable] = None)
     return out
 
 
-def cron(data: Path, store=None) -> list:
-    """The hub's 30-min pass (no agent): queue -> backstop -> Inbox outcomes. Prints only what it did."""
+def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: float = 25 * 60,
+         backstop_fn: Optional[Callable] = None) -> list:
+    """The hub's pass (no agent, hermes cron every 5 min): Inbox outcomes (Do it -> fix card within 5 min), queue
+    drain, and the digest backstop at most every `backstop_every` seconds. Prints only what it did.
+
+    Do it is a plain resolve on the Inbox card and THIS pass files the fix card: a Kanban worker (the Inbox's task
+    action would run one) is fenced from creating cards through the CLI, the cron scheduler is not."""
     lines = []
     if mode() == "off":
         return lines
+    store = _store(store)
+    now = now or time.time()
+    for fp, what in sync(store, now=now):
+        lines.append(f"inbox: {fp} {what}")
     for r in drain(store):
         if r.get("action") not in ("skip",):
             lines.append(f"queue: {json.dumps(r)[:300]}")
+    stamp = Path(store.root) / "selfheal_backstop.last"
     try:
-        for r in backstop(data, store):
-            if r.get("action") not in ("skip",):
-                lines.append(f"backstop: {r.get('action')} {r.get('fingerprint') or r.get('card') or ''}")
-    except Exception as exc:
-        lines.append(f"backstop failed: {exc}")
-    for fp, what in sync(store):
-        lines.append(f"inbox: {fp} {what}")
+        last = float(stamp.read_text().strip() or 0)
+    except Exception:
+        last = 0.0
+    if now - last >= backstop_every:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(str(now))
+        try:
+            for r in (backstop_fn or backstop)(data, store):
+                if r.get("action") not in ("skip",):
+                    lines.append(f"backstop: {r.get('action')} {r.get('fingerprint') or r.get('card') or ''}")
+        except Exception as exc:
+            lines.append(f"backstop failed: {exc}")
     return lines
 
 

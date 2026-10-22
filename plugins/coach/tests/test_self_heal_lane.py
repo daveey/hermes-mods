@@ -366,13 +366,30 @@ def test_do_it_creates_the_fix_card_with_red_green_acceptance(store, monkeypatch
     assert len(r.creates()) == 2
 
 
-def test_inbox_type_do_it_runs_the_fix_command():
-    import yaml  # noqa: F401  (pyyaml is in the test env; Hermes itself uses its own loader)
+def test_inbox_type_do_it_is_a_resolve_the_hub_cron_acts_on():
+    """Do it must not be a Kanban `task` action: a worker is fenced from creating cards via the CLI, so the hub
+    cron's sync (outside any worker) files the fix card from the resolved outcome."""
+    import yaml
     t = yaml.safe_load((REPO / "skills/productivity/hermes-coach/inbox-types/selfheal.yaml").read_text())
     acts = {a["id"]: a for a in t["actions"]}
-    assert set(acts) == {"do_it", "not_now", "never"} and acts["do_it"]["kind"] == "task"
-    assert "self_heal.py fix {{fp}}" in acts["do_it"]["prompt"]
-    assert acts["never"]["kind"] == acts["not_now"]["kind"] == "resolve"
+    assert set(acts) == {"do_it", "not_now", "never"}
+    assert {a["kind"] for a in acts.values()} == {"resolve"}
+    r = yaml.safe_load((REPO / "skills/productivity/hermes-coach/inbox-types/selfheal-result.yaml").read_text())
+    assert {a["id"] for a in r["actions"]} == {"ok", "undo"}
+
+
+def test_cron_syncs_every_pass_and_backstops_at_most_every_25_minutes(store, monkeypatch, tmp_path):
+    monkeypatch.setenv("COACH_SELFHEAL", "shadow")
+    synced, scans = [], []
+    monkeypatch.setattr(sh, "sync", lambda store=None, now=None, **kw: synced.append(now) or [("fp", "do_it -> t_1")])
+    bfn = lambda data, store=None: scans.append(1) or [{"action": "would_file", "fingerprint": "agent-0123456789"}]
+    out = sh.cron(tmp_path, store, now=NOW, backstop_fn=bfn)
+    assert out == ["inbox: fp do_it -> t_1", "backstop: would_file agent-0123456789"]
+    sh.cron(tmp_path, store, now=NOW + 300, backstop_fn=bfn)
+    sh.cron(tmp_path, store, now=NOW + 25 * 60, backstop_fn=bfn)
+    assert len(synced) == 3 and len(scans) == 2
+    monkeypatch.setenv("COACH_SELFHEAL", "off")
+    assert sh.cron(tmp_path, store, now=NOW + 3600, backstop_fn=bfn) == [] and len(synced) == 3
 
 
 def test_sync_do_it_backstop_not_now_and_never(store):
