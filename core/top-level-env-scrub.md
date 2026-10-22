@@ -6,6 +6,8 @@ Patches:
   delegate-child identity env only.
 - `patches/0171-fix-env-top-level-launches-strip-the-whole-agent-sco.patch`: the whole agent-scope family, one shared
   list.
+- `patches/0172-fix-kanban-refusals-and-backend-startup-name-a-leake.patch`: detection (refusals and the startup
+  scrub name a leaked env), plus `TERMINAL_CWD`, `HERMES_UI_SESSION_ID`, `HERMES_BROWSER_CONTROL_*` in the list.
 
 ## Behavior
 
@@ -15,6 +17,11 @@ this, that Hermes.app carried `HERMES_DELEGATED_CHILD_CONTEXT` + `HERMES_KANBAN_
 `HERMES_SESSION_ID/SOURCE`, `HERMES_SINGLE_QUERY_SESSION`, `HERMES_SUPERVISED_CHILD`), so every Desktop chat was
 fenced as a delegate child and its kanban tools refused, and session identity leaked into every backend.
 
+A process that still carries a leaked marker (one started before the fix) gets a Kanban refusal that says so:
+"leaked worker env: this process inherited HERMES_DELEGATED_CHILD_CONTEXT from kanban card t_… but no parent agent is
+alive (its worker card t_… is done) … Quit and reopen it", instead of the bare "delegate_task child contexts cannot
+mutate Kanban". The startup scrub's warning carries the same text (0172).
+
 Stripping is gated on a worker marker: `HERMES_DELEGATED_CHILD_CONTEXT`, `HERMES_KANBAN_TASK`, `_WORKSPACE`, `_RUN_ID`
 or `_CLAIM_LOCK`. Without one nothing is stripped, so a deliberate board pin (`HERMES_KANBAN_BOARD`) in an
 operator's shell is untouched.
@@ -22,18 +29,27 @@ operator's shell is untouched.
 ## How it works
 
 - `agent/delegation_context.py` `strip_agent_scope_env`: removes exact keys `HERMES_DELEGATED_CHILD_CONTEXT`,
-  `HERMES_SINGLE_QUERY_SESSION`, `HERMES_SPAWN`, `HERMES_SUPERVISED_CHILD` and the prefixes `HERMES_KANBAN_`,
-  `HERMES_SESSION_`, `HERMES_CRON_`, `HERMES_PARENT_`, `HERMES_RPC_`, `HERMES_KERNEL_`. Operator tunables
+  `HERMES_SINGLE_QUERY_SESSION`, `HERMES_SPAWN`, `HERMES_SUPERVISED_CHILD`, `TERMINAL_CWD` (the dispatcher's workspace
+  pin), `HERMES_UI_SESSION_ID` and the prefixes `HERMES_KANBAN_`, `HERMES_SESSION_`, `HERMES_CRON_`, `HERMES_PARENT_`,
+  `HERMES_RPC_`, `HERMES_KERNEL_`, `HERMES_BROWSER_CONTROL_` (0172 added the last three groups; a test pins the list
+  to every `gateway.session_context._VAR_MAP` key). Operator tunables
   (`*_TIMEOUT`, `*_SECONDS`, `*_MAX_PARALLEL`) are kept. It sits next to `scrub_kanban_env`.
 - `hermes_cli/top_level_env.py` (new): applied at CLI entry for the top-level subcommands, and `clean_launch_env()`
   builds the env for `main_desktop._relaunch_stopped_desktops` (the post-update `open`). `hermes_cli/main.py` calls it.
+- `hermes_cli/top_level_env.py` `leaked_worker_env_diagnosis()` (0172): reads the lineage card (`HERMES_KANBAN_TASK`,
+  else the workspace dir name) from the pinned board and calls the marker leaked when that card is not `running`, its
+  worker pid is gone, or this process does not descend from it. Silent when the lineage or board can't be read. The
+  db fence (`kanban_db._assert_not_delegated_child_mutation`), the CLI fast-fail (`kanban.py`) and the tool refusal
+  (`tools/kanban_tools._reject_delegated_child_mutation`) append it when the fence comes from env, not an in-process
+  delegate child.
 - `apps/desktop/electron/leaked-worker-env.ts`, run at Electron main startup (`main.ts`): the same list in
   TypeScript, logging the keys it dropped. A drift test pins it to the Python list.
 
 ## Code
 
 `agent/delegation_context.py`, `hermes_cli/top_level_env.py`, `hermes_cli/main.py`, `hermes_cli/main_desktop.py`,
-`apps/desktop/electron/leaked-worker-env.ts`, `apps/desktop/electron/main.ts`.
+`apps/desktop/electron/leaked-worker-env.ts`, `apps/desktop/electron/main.ts`, `hermes_cli/kanban_db.py`,
+`hermes_cli/kanban.py`, `tools/kanban_tools.py` (0172).
 
 ## Tests
 
@@ -44,12 +60,17 @@ operator's shell is untouched.
 - `tests/hermes_cli/test_kanban_park_invariants.py` (0169): `test_scrub_removes_leaked_worker_env`,
   `test_scrub_keeps_deliberate_board_pin_without_worker_marker`, `test_main_scrubs_for_top_level_surfaces`,
   `test_desktop_relaunch_after_update_gets_scrubbed_env`.
+- `tests/hermes_cli/test_leaked_worker_env.py` (0172): every identity key pid 59331 carried is dropped;
+  `test_agent_scope_covers_gateway_session_context`; the post-update relaunch Popen env; a real subprocess per
+  surface (`serve`/`dashboard`/`desktop`/`gateway`/`gui`); diagnosis for a done card, a dead worker pid, a live worker
+  this process doesn't descend from, silence for a real child and for unknown lineage / unreadable board; the startup
+  warning; and the leak named by the db fence, the `kanban_comment` tool and `hermes kanban archive`.
 - `apps/desktop/electron/leaked-worker-env.test.ts`: drops a worker identity env; drops the whole family keeping
   tunables (0171); keeps a board pin without a marker.
 
 ## Applying
 
-Apply 0169 then 0171 (0171 rewrites the helper 0169 added). Rebuild Desktop for the Electron half.
+Apply 0169, 0171, then 0172 (0171 rewrites the helper 0169 added). Rebuild Desktop for the Electron half.
 
 ## Gotchas
 
