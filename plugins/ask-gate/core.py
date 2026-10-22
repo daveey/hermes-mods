@@ -273,21 +273,30 @@ def _ro(p: Path) -> sqlite3.Connection:
 
 
 def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None = None) -> list[dict]:
-    """Cards whose ``tasks.session_id`` is this chat, newest first."""
+    """Cards created by this chat or notifying it (kanban_notify_subs), newest first."""
     out: list[dict] = []
     if not session_id:
         return out
     for p in db_paths if db_paths is not None else boards():
         try:
             c = _ro(p)
-            for r in c.execute("select id, title, status, assignee, created_at, completed_at from tasks "
-                               "where session_id=? order by created_at desc limit ?", (session_id, limit)):
+            rows = c.execute("select id, title, status, assignee, created_at, completed_at from tasks "
+                             "where session_id=? order by created_at desc limit ?", (session_id, limit)).fetchall()
+            try:  # cards created elsewhere but notifying this chat count too (matches the sidebar count)
+                rows += c.execute("select t.id, t.title, t.status, t.assignee, t.created_at, t.completed_at "
+                                  "from tasks t where t.id in (select task_id from kanban_notify_subs "
+                                  "where chat_id=?) order by t.created_at desc limit ?", (session_id, limit)).fetchall()
+            except sqlite3.Error:
+                pass
+            for r in rows:
                 out.append({"id": r[0], "title": r[1], "status": r[2], "assignee": r[3],
                             "created": r[4], "completed": r[5]})
             c.close()
         except sqlite3.Error:
             continue
-    out.sort(key=lambda x: x.get("created") or 0, reverse=True)
+    seen: set[str] = set()
+    out = [x for x in sorted(out, key=lambda x: x.get("created") or 0, reverse=True)
+           if not (x["id"] in seen or seen.add(x["id"]))]
     return out[:limit]
 
 

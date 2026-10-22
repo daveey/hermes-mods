@@ -579,3 +579,19 @@ def test_parse_verdicts_accepts_a_bare_list_and_fenced_output(gate):
     items = [{"i": 0, "verdict": "unverified", "confidence": 0.9, "reason": "r", "how": "gh api billing"}]
     for raw in (json.dumps(items), "```json\n" + json.dumps({"asks": items}) + "\n```", "Here:\n" + json.dumps(items)):
         assert gate.judge_mod.parse_verdicts(raw, 1)[0]["verdict"] == "unverified", raw
+
+
+def test_linked_cards_include_cards_subscribed_to_the_chat(tmp_path, gate):
+    import sqlite3
+    db = tmp_path / "k.db"
+    c = sqlite3.connect(db)
+    c.executescript("""create table tasks(id text, title text, status text, assignee text, created_at int, completed_at int, session_id text);
+        create table kanban_notify_subs(task_id text, platform text, chat_id text);
+        insert into tasks values('t_own','own','running','a',2,null,'chat');
+        insert into tasks values('t_sub','sub','running','a',3,null,'other');
+        insert into tasks values('t_no','no','running','a',4,null,'other');
+        insert into kanban_notify_subs values('t_sub','tui','chat'),('t_own','tui','chat');""")
+    c.commit(); c.close()
+    core = gate.core
+    ids = [x["id"] for x in core.linked_cards("chat", db_paths=[db])]
+    assert ids == ["t_sub", "t_own"]
