@@ -516,13 +516,16 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #                     decides locally; elsewhere (live) it pipes `d` to `self_heal.py file` on the hub over ssh, so
 #                     dedupe, recurrence, suppression and budget are decided in one place. Shadow logs
 #                     `selfheal_would_file` with the full card args and creates nothing.
-#   investigation     card `selfheal:<fp>` (`selfheal:<fp>:r<n>` for a recurrence), created_by self-heal, model
+#   investigation     card `selfheal:<fp>` for generation 1, `selfheal:<fp>:r<gen>` after (one monotonic counter per
+#                     fingerprint over refiles AND recurrences; kanban idempotency returns done cards too), model
 #                     claude-opus-5-5, 1 h. Investigates LIVE (kanban.db, logs, processes, git log), writes the
 #                     five-whys chain, posts Inbox type `selfheal` (Do it / Not now / Never) under key selfheal:<fp>.
-#   Do it             -> file_fix (hub cron sync, or `self_heal.py fix <fp>`): fix card `selfheal:<fp>:fix` (red-then-green regression test, ship,
+#   Do it             -> file_fix (hub cron sync, or `self_heal.py fix <fp>`): fix card `selfheal:<fp>[:r<gen>]:fix` (red-then-green regression test, ship,
 #                     verify live, re-post the same key as `selfheal-result` "Fixed: …").
 #   sync (cron)       reads Inbox outcomes every 5 min: Do it (a resolve) files the fix card, Not now snoozes the
-#                     fingerprint 14 days, Never suppresses it.
+#                     fingerprint 14 days, Never suppresses it. It also reconciles against the board: a `filed`/`approved`
+#                     fingerprint whose card is done/archived/gone with no proposed/fixed event becomes `stale`
+#                     (selfheal_stale), so the next detection refiles it under a new generation.
 #   backstop (cron)   runs the complaint detector over new user turns in the coach digests (chats where the
 #                     in-process hook did not fire).
 #   budget            engine_budget lane `selfheal`: $25/UTC day (its own cap, outside the $20 engine total), <= 3
@@ -763,8 +766,8 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
 
 class LaneState:
     """<coach>/selfheal_lane.json: fingerprint -> {status, card, fix_card, component, symptom, filed_day, snooze_until,
-    suppressed, fixed_at, recurrences, history}. Statuses: filed, proposed, approved, fixed, not_defect, declined,
-    suppressed, reverted."""
+    suppressed, fixed_at, recurrences, refiles, gen, cards, history}. Statuses: filed, proposed, approved, fixed,
+    not_defect, declined, suppressed, reverted, stale."""
 
     def __init__(self, root: Path):
         self.path = Path(root) / "selfheal_lane.json"
@@ -844,6 +847,28 @@ def budget(board: Optional[str] = None, now: Optional[float] = None) -> dict:
     return out
 
 
+def generation(st: dict) -> int:
+    """Generations used so far for a fingerprint (0 = never filed). Lane files written before `gen` existed derive it
+    from the old counters; a collision with an earlier card is caught in file_defect anyway."""
+    if st.get("gen") is not None:
+        return int(st["gen"])
+    if not st.get("card"):
+        return 0
+    return 1 + int(st.get("recurrences") or 0) + int(st.get("refiles") or 0)
+
+
+def inv_key(fp: str, gen: int) -> str:
+    return f"selfheal:{fp}" if gen <= 1 else f"selfheal:{fp}:r{gen}"
+
+
+def fix_key(fp: str, gen: int) -> str:
+    return f"selfheal:{fp}:fix" if gen <= 1 else f"selfheal:{fp}:r{gen}:fix"
+
+
+def known_cards(st: dict) -> set:
+    return {c for c in (st.get("cards") or []) + [st.get("card"), st.get("fix_card")] if c}
+
+
 def decide(d: dict, st: dict, now: float) -> dict:
     """Pure dedupe / suppression / recurrence decision for one defect against its lane state.
     -> {"action": "file"|"skip", "why", "key", "previous"}"""
@@ -859,13 +884,12 @@ def decide(d: dict, st: dict, now: float) -> dict:
         return {"action": "skip", "why": f"open: {status} {st.get('fix_card') or st.get('card') or ''}".strip()}
     if status == "not_defect" and now - (st.get("closed_at") or 0) < NOT_DEFECT_DAYS * 86400:
         return {"action": "skip", "why": f"closed as not a defect within {NOT_DEFECT_DAYS} days"}
+    g = generation(st) + 1  # every filing gets a fresh generation, so its keys never name an earlier card
     if status == "fixed":
-        n = int(st.get("recurrences") or 0) + 2
-        return {"action": "file", "why": "recurrence", "key": f"selfheal:{fp}:r{n}", "previous": st}
-    if st.get("card"):  # an earlier card closed without a fix (declined/reverted/not_defect long ago): new key
-        n = int(st.get("refiles") or 0) + 2
-        return {"action": "file", "why": "refile", "key": f"selfheal:{fp}:r{n}", "previous": None}
-    return {"action": "file", "why": "new", "key": f"selfheal:{fp}", "previous": None}
+        return {"action": "file", "why": "recurrence", "key": inv_key(fp, g), "gen": g, "previous": st}
+    if st.get("card"):  # an earlier card closed without a fix (declined/reverted/not_defect/stale): new key
+        return {"action": "file", "why": "refile", "key": inv_key(fp, g), "gen": g, "previous": None}
+    return {"action": "file", "why": "new", "key": inv_key(fp, g), "gen": g, "previous": None}
 
 
 def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> dict:
@@ -954,18 +978,28 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
                "schedule": sched, "args": args, "host": d.get("host")}
         store.log(rec)
         return {"action": "would_file", **rec}
-    rc, out, err = _run(kanban_argv(args), runner)
-    tid = _task_id(out) if rc == 0 else None
-    if not tid:
-        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": (err or out).strip()[-300:]})
-        return {"action": "error", "why": (err or out).strip()[-300:]}
+    known, gen = known_cards(st), dec["gen"]
+    tid, out, err = None, "", ""
+    for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
+        rc, out, err = _run(kanban_argv(args), runner)
+        tid = _task_id(out) if rc == 0 else None
+        if not tid or tid not in known:
+            break
+        store.log({"event": "selfheal_key_collision", "fingerprint": fp, "key": args["idempotency_key"], "card": tid})
+        gen += 1
+        args = card_args(d, inv_key(fp, gen), dec.get("previous"), cfg)
+    if not tid or tid in known:
+        why = (err or out).strip()[-300:] if not tid else f"idempotency keys keep returning earlier card {tid}"
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
+        return {"action": "error", "why": why}
     if sched:
         bargs = ["hermes", "kanban"] + (["--board", args["board"]] if args.get("board") else [])
         _run(bargs + ["schedule", tid, f"SCHEDULED_UNTIL={sched[0]} — {sched[1]}"], runner)
     prev = dec.get("previous")
-    kw = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
+    kw: dict = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
               filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
-              fix_card=None if not prev else st.get("fix_card"))
+              fix_card=None if not prev else st.get("fix_card"), gen=gen,
+              cards=sorted(known | {tid}), proposed_at=None)
     if prev:
         kw["recurrences"] = int(st.get("recurrences") or 0) + 1
     elif dec["why"] == "refile":
@@ -982,7 +1016,8 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
 
 def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budget_fn=None,
              trigger: str = "do_it") -> dict:
-    """Do it: the fix card `selfheal:<fp>:fix` on the hub (idempotent)."""
+    """Do it: the fix card `selfheal:<fp>[:r<gen>]:fix` on the hub, keyed to the current generation (idempotent
+    within it; a key that returns an earlier card of this fingerprint is an error, never an approval)."""
     store = _store(store)
     now = now or time.time()
     lane = LaneState(store.root)
@@ -992,8 +1027,7 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
     if st.get("fix_card") and st.get("status") in ("approved", "fixed"):
         return {"action": "skip", "why": f"fix card exists: {st['fix_card']}", "card": st["fix_card"]}
     r = route({"component": st.get("component")})
-    n = int(st.get("recurrences") or 0)
-    key = f"selfheal:{fp}:fix" if not n else f"selfheal:{fp}:r{n + 1}:fix"
+    key = fix_key(fp, generation(st) or 1)
     args = {"title": f"self-heal fix: {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
             "idempotency_key": key, "model": MODEL, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
@@ -1003,6 +1037,10 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
     tid = _task_id(out) if rc == 0 else None
     if not tid:
         return {"action": "error", "why": (err or out).strip()[-300:]}
+    if tid in known_cards(st):
+        why = f"fix key {key} returned earlier card {tid}"
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
+        return {"action": "error", "why": why}
     sched = None
     if not b["ok_usd"]:
         sched = _next_utc_midnight(now)
@@ -1011,7 +1049,7 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
     if sched:
         bargs = ["hermes", "kanban"] + (["--board", args["board"]] if args.get("board") else [])
         _run(bargs + ["schedule", tid, f"SCHEDULED_UNTIL={sched} — self-heal lane budget/concurrency"], runner)
-    lane.update(fp, status="approved", fix_card=tid, approved_at=now)
+    lane.update(fp, status="approved", fix_card=tid, approved_at=now, cards=sorted(known_cards(st) | {tid}))
     store.log({"event": "selfheal_approved", "fingerprint": fp, "card": tid, "component": st.get("component"),
                "trigger": trigger, "scheduled": sched})
     return {"action": "filed", "card": tid, "key": key, "scheduled": sched}
@@ -1052,18 +1090,61 @@ def inbox_outcome(fp: str, runner=None) -> Optional[dict]:
         return None
 
 
+def card_status(card: str, board: Optional[str] = None, runner=None) -> Optional[str]:
+    """Kanban status of a card, "missing" when the board has no such card, None when unknown (read failed)."""
+    argv = ["hermes", "kanban"] + (["--board", board] if board else []) + ["show", card, "--json"]
+    try:
+        rc, out, err = _run(argv, runner)
+    except Exception:
+        return None
+    if rc != 0:
+        return "missing" if "no such task" in (err + out).lower() else None
+    try:
+        return json.loads(out)["task"]["status"]
+    except Exception:
+        return None
+
+
+ENDED = ("done", "archived", "missing")
+
+
+def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
+    """A `filed` (investigation) or `approved` (fix) fingerprint whose card ended without reporting proposed / fixed
+    (crashed, timed out, archived) would stay open forever and block every later filing: mark it `stale` so the next
+    detection refiles it under a new generation. Returns [(fp, what)]."""
+    store = _store(store)
+    now = now or time.time()
+    lane = LaneState(store.root)
+    done = []
+    for fp, st in lane.read().items():
+        status = st.get("status")
+        card = st.get("card") if status == "filed" else st.get("fix_card") if status == "approved" else None
+        if not card:
+            continue
+        ks = card_status(card, st.get("board"), runner)
+        if ks not in ENDED:
+            continue
+        lane.update(fp, status="stale", closed_at=now)
+        store.log({"event": "selfheal_stale", "fingerprint": fp, "card": card, "was": status, "kanban": ks,
+                   "component": st.get("component")})
+        done.append((fp, f"stale ({status}, card {card} {ks})"))
+    return done
+
+
 def sync(store=None, runner=None, now: Optional[float] = None, fixer: Optional[Callable] = None) -> list:
     """Act once on each proposal's Inbox outcome: do_it (backstop for the Do-it task), not_now (snooze), never
     (suppress). Returns [(fp, what)]."""
     store = _store(store)
     now = now or time.time()
     lane = LaneState(store.root)
-    done = []
+    done = reconcile(store, runner, now)
     for fp, st in lane.read().items():
         if st.get("status") != "proposed":
             continue
         o = inbox_outcome(fp, runner)
         if not o or o.get("state") == "open":
+            continue
+        if (o.get("at") or now) < (st.get("filed_at") or 0):  # an earlier generation's decision on the same key
             continue
         what = o.get("outcome")
         if what == "do_it":

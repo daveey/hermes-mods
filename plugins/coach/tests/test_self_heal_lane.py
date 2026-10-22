@@ -468,3 +468,150 @@ def test_investigation_brief_carries_live_replay_lessons():
     assert "HERMES_DELEGATED_CHILD_CONTEXT" in b and "reapers" in b
     assert "kanban_notify_subs" in sh.investigation_brief({**d, "component": "kanban"})
     assert "code path that WROTE it" in sh.investigation_brief({**d, "component": "desktop"})
+
+
+# ── card keys across lifecycles (review round 1) ──
+class Board(Runner):
+    """Fake board with kanban_db.create_task's idempotency rule: a create whose key matches ANY non-archived card
+    (done included) returns that card. `show --json` reports each card's status."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.keys, self.status = {}, {}
+
+    def __call__(self, argv, capture_output=True, text=True, input=None, timeout=None):
+        argv = list(argv)
+        if "create" in argv:
+            self.calls.append((argv, input))
+            k = opt(argv, "--idempotency-key")
+            tid = self.keys.get(k)
+            if not tid or self.status.get(tid) == "archived":
+                self.n += 1
+                tid = self.keys[k] = f"t_{self.n:08x}"
+                self.status[tid] = "ready"
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"id": tid}), stderr="")
+        if "show" in argv:
+            self.calls.append((argv, input))
+            tid = argv[argv.index("show") + 1]
+            if tid not in self.status:
+                return SimpleNamespace(returncode=1, stdout="", stderr=f"no such task: {tid}")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"task": {"id": tid, "status": self.status[tid]}}),
+                                   stderr="")
+        return super().__call__(argv, capture_output, text, input, timeout)
+
+    def finish(self, tid, status="done"):
+        self.status[tid] = status
+
+
+def lifecycle(store, board, steps, d=None):
+    """Run file / fix / <event> steps 9 days apart (past every dedupe/snooze window); finish each card when its
+    lifecycle step is reported. Returns the card id of every file/fix step."""
+    d = d or defect()
+    fp, t, ids = d["fingerprint"], NOW, []
+    for s in steps:
+        t += 9 * 86400 if s == "file" else 600
+        if s == "file":
+            r = sh.file_defect(d, store=store, m="live", runner=board, now=t, cfg=HUB, budget_fn=OPEN)
+        elif s == "fix":
+            r = sh.file_fix(fp, store=store, runner=board, now=t, budget_fn=OPEN)
+        else:
+            st = sh.LaneState(store.root).get(fp)
+            sh.record_event(s, fp, store=store, now=t)
+            board.finish(st["fix_card"] if s in ("fixed", "reverted") else st["card"])
+            continue
+        assert r["action"] == "filed", (s, r)
+        ids.append(r["card"])
+    return fp, ids
+
+
+def test_refile_after_a_reverted_fix_gets_a_new_fix_card_on_do_it(store):
+    """file -> proposed -> Do it -> reverted -> refile -> proposed -> Do it used to get the DONE first fix card back
+    from `selfheal:<fp>:fix`, log selfheal_approved, and run no fix."""
+    b = Board()
+    fp, ids = lifecycle(store, b, ["file", "proposed", "fix", "reverted", "file", "proposed", "fix"])
+    assert len(set(ids)) == 4 and len(b.creates()) == 4, ids
+    keys = [opt(a, "--idempotency-key") for a in b.creates()]
+    assert keys == [f"selfheal:{fp}", f"selfheal:{fp}:fix", f"selfheal:{fp}:r2", f"selfheal:{fp}:r2:fix"]
+    assert sh.LaneState(store.root).get(fp)["fix_card"] == ids[-1]
+
+
+def test_recurrence_after_a_refile_runs_a_new_previous_fix_didnt_hold_investigation(store):
+    """file -> declined -> refile (:r2) -> Do it -> fixed -> recurrence used to reuse `:r2`, get the done refile card
+    back, and leave the fingerprint stuck in `filed`."""
+    b = Board()
+    fp, ids = lifecycle(store, b, ["file", "proposed", "declined", "file", "proposed", "fix", "fixed", "file"])
+    assert len(set(ids)) == 4, ids
+    last = b.creates()[-1]
+    assert opt(last, "--idempotency-key") == f"selfheal:{fp}:r3"
+    assert f"previous fix {ids[2]} didn't hold" in opt(last, "--body")
+    st = sh.LaneState(store.root).get(fp)
+    assert st["status"] == "filed" and st["card"] == ids[3] and st["gen"] == 3
+    # and its own Do it gets a fresh fix card too
+    sh.record_event("proposed", fp, store=store, now=NOW + 40 * 86400)
+    fx = sh.file_fix(fp, store=store, runner=b, now=NOW + 40 * 86400 + 10, budget_fn=OPEN)
+    assert fx["key"] == f"selfheal:{fp}:r3:fix" and fx["card"] not in ids
+    weekly = load("coach_weekly_gen_test", REPO / "skills/productivity/hermes-coach/scripts/coach_weekly.py")
+    assert {weekly.selfheal_fp(opt(a, "--idempotency-key")) for a in b.creates()} == {fp}
+
+
+def test_a_key_that_returns_an_earlier_card_moves_to_the_next_generation(store):
+    """Lane files from before `gen` (or any drift) can name a key whose card exists: never accept it as new."""
+    b = Board()
+    d = defect()
+    fp = d["fingerprint"]
+    b.keys[f"selfheal:{fp}:r2"] = "t_0000beef"
+    b.status["t_0000beef"] = "done"
+    sh.LaneState(store.root).update(fp, status="declined", card="t_0000beef", closed_at=NOW - 30 * 86400)
+    out = sh.file_defect(d, store=store, m="live", runner=b, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and out["card"] != "t_0000beef" and out["key"] == f"selfheal:{fp}:r3"
+    assert ev(store, "selfheal_key_collision")[0]["card"] == "t_0000beef"
+    # a fix key that hands back a known card is an error, never an approval
+    sh.record_event("proposed", fp, store=store, now=NOW + 10)
+    b.keys[f"selfheal:{fp}:r3:fix"] = "t_0000beef"
+    fx = sh.file_fix(fp, store=store, runner=b, now=NOW + 20, budget_fn=OPEN)
+    assert fx["action"] == "error" and not ev(store, "selfheal_approved")
+    assert sh.LaneState(store.root).get(fp)["status"] == "proposed"
+
+
+def test_sync_ignores_an_earlier_generations_decision_on_the_same_inbox_key(store):
+    b = Board()
+    fp, ids = lifecycle(store, b, ["file", "proposed", "declined", "file", "proposed"])
+    b.outcomes = {f"selfheal:{fp}": {"state": "resolved", "outcome": "do_it", "at": NOW + 600}}  # gen 1's card
+    assert sh.sync(store, runner=b, now=NOW + 30 * 86400) == []
+    assert len(b.creates()) == 2
+
+
+# ── a card that ends without reporting (review round 1) ──
+@pytest.mark.parametrize("ending", ["done", "archived", "missing"])
+def test_sync_marks_a_card_that_ended_without_posting_stale_and_the_next_detection_refiles(store, ending):
+    b = Board()
+    d = defect()
+    fp = d["fingerprint"]
+    first = sh.file_defect(d, store=store, m="live", runner=b, now=NOW, cfg=HUB, budget_fn=OPEN)["card"]
+    assert sh.sync(store, runner=b, now=NOW + 300) == []  # still running: left alone
+    if ending == "missing":
+        del b.status[first]
+    else:
+        b.finish(first, ending)
+    done = dict(sh.sync(store, runner=b, now=NOW + 600))
+    assert done[fp].startswith("stale (filed")
+    (s,) = ev(store, "selfheal_stale")
+    assert s["card"] == first and s["was"] == "filed" and s["kanban"] == ending
+    again = sh.file_defect(d, store=store, m="live", runner=b, now=NOW + 86400, cfg=HUB, budget_fn=OPEN)
+    assert again["action"] == "filed" and again["card"] != first and again["key"] == f"selfheal:{fp}:r2"
+
+
+def test_an_approved_fix_card_that_ended_without_fixed_goes_stale_and_refiles(store):
+    b = Board()
+    fp, ids = lifecycle(store, b, ["file", "proposed", "fix"])
+    b.finish(ids[1], "archived")
+    assert dict(sh.sync(store, runner=b, now=NOW + 20 * 86400))[fp].startswith("stale (approved")
+    out = sh.file_defect(defect(), store=store, m="live", runner=b, now=NOW + 21 * 86400, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and out["card"] not in ids
+
+
+def test_unreadable_card_status_never_marks_stale(store):
+    r = Runner()  # `show` output is not JSON: status unknown
+    sh.file_defect(defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert sh.reconcile(store, runner=r, now=NOW + 600) == []
+    assert sh.reconcile(store, runner=Runner(fail=True), now=NOW + 600) == []
