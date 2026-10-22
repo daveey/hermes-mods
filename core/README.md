@@ -90,6 +90,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [fork-ci-hardening.md](fork-ci-hardening.md) | 0173 0176 0177 0179 0181 0182 0183 | Fork CI runs its Linux jobs on self-hosted runners; PM-locked Node for python tests; load/container-tolerant test fixes |
 | [portability-and-provider-fixes.md](portability-and-provider-fixes.md) | 0174 0175 0178 | Contributor email map, commandcode keeps `COMMANDCODE_API_KEY`, utf-8 subprocess decoding and psutil pid check |
 | [sidebar-background-process-badge.md](sidebar-background-process-badge.md) | 0184 | Sidebar row lists the background processes holding it off green, with a Stop button |
+| [kanban-unloaded-session-delivery.md](kanban-unloaded-session-delivery.md) | 0185 0186 | Card results are written into chats no backend holds (sweeper); `kanban_unseen` paints the row green |
 
 ## Applying
 
