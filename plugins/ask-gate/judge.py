@@ -195,7 +195,7 @@ def delivery_note(asks: list[str], verdicts: list[dict]) -> str:
 
 # ---- the real model call (Hermes auxiliary client; rotating Claude pool, no new keys) -----------------
 
-def aux_llm(system: str, user: str, *, task: str = "ask_gate", timeout: float = 25.0, max_tokens: int = 700,
+def aux_llm(system: str, user: str, *, task: str = "ask_gate", timeout: float = 18.0, max_tokens: int = 700,
             provider: str | None = None, model: str | None = None) -> str:
     from agent.auxiliary_client import call_llm  # type: ignore
     kw: dict[str, Any] = {}

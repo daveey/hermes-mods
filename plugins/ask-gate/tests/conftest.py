@@ -28,6 +28,7 @@ def gate(tmp_path, monkeypatch):
     monkeypatch.setenv("ASK_GATE_LEDGER", str(tmp_path / "state" / "ask-ledger.sqlite"))
     for k in ("HERMES_KANBAN_TASK", "ASK_GATE_OFF"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("ASK_GATE_NO_PREWARM", "1")
     mod = _load()
     monkeypatch.setattr(mod.core, "capability_sheet", lambda *a, **k: SHEET)
 

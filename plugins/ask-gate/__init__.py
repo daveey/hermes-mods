@@ -334,6 +334,22 @@ def _worker_complete(session_id: str, args: dict) -> dict | None:
     return {"action": "modify", "args": {key: out}}
 
 
+def _prewarm() -> None:
+    """The first aux call of a process can take 20+ s (client + credential-pool setup); core gives a gate hook 30 s.
+    Pay that cost once in the background so the first real ask is judged within a couple of seconds."""
+    if _off() or _is_worker() or os.environ.get("ASK_GATE_NO_PREWARM"):
+        return
+
+    def go():
+        try:
+            prov, model = _model_cfg()
+            judge_mod.aux_llm("Reply with the single word ok.", "ok", timeout=40.0, max_tokens=5, provider=prov, model=model)
+        except Exception as e:
+            core.log_event("prewarm_error", error=repr(e))
+    import threading
+    threading.Thread(target=go, name="ask-gate-prewarm", daemon=True).start()
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
@@ -342,3 +358,4 @@ def register(ctx) -> None:
         ctx.register_hook("pre_final_gate", pre_final_gate)
     except Exception:  # older core without the hook: L1/L3/L4 still work
         core.log_event("no_pre_final_gate")
+    _prewarm()

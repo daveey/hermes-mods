@@ -421,3 +421,26 @@ def test_ledger_match_needs_two_distinctive_words(gate):
     assert j.ledger_match(["Should I rotate the GitHub token?"], led) == {}
     assert j.ledger_match(["Want me to rotate the Superhuman token?"], led) == {}   # one shared word only
     assert 0 in j.ledger_match(["Cancelling the Superhuman subscription is up to you."], led)
+
+
+def test_register_wires_all_hooks_and_declares_buffering(gate):
+    calls = {}
+
+    class Ctx:
+        def register_hook(self, name, fn):
+            calls[name] = fn
+    gate.register(Ctx())
+    assert set(calls) == {"pre_llm_call", "post_tool_call", "pre_tool_call", "pre_final_gate"}
+    assert calls["pre_final_gate"].needs_buffer is True
+
+
+def test_hook_works_when_called_exactly_like_core_does(gate):
+    """core.pre_final_gate._call: keyword args only, from a worker thread, turn_messages = this turn's rows."""
+    import concurrent.futures
+    gate.LLM = llm_returning([("unverified", "never checked", "run kanban_show on it")])
+    kwargs = dict(session_id="s1", platform="desktop", model="m", attempt=0,
+                  final_response="Still waiting on you: the Superhuman card.",
+                  turn_messages=[{"role": "user", "content": "status?"}])
+    with concurrent.futures.ThreadPoolExecutor(1) as ex:
+        r = ex.submit(gate.pre_final_gate, **kwargs).result(timeout=10)
+    assert r["hold"] is True and r["nudge"].strip()
