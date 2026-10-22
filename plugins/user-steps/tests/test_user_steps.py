@@ -384,3 +384,14 @@ def test_transform_fails_open(home, monkeypatch):
 
     monkeypatch.setattr(plugin.core, "process_reply", explode)
     assert plugin.transform_llm_output(response_text=APPROVE, session_id="S1", platform="tui") is None
+
+
+def test_imperative_after_a_comma_or_or_reaches_the_model(home):
+    # A real reply that skipped the model: no "you", no question, verbs after ", " and "or ".
+    add_session(home, "S1")
+    llm = fake_llm({"steps": []})
+    reply = ('The new connection bar is in iPhone build 530. To get it, tap the green "Update available" bar '
+             'at the top of the app, or go to Settings → This phone → Install update.')
+    out = run(home, reply, llm=llm)
+    assert out["source"] != "skip" and len(llm.calls) == 1
+    assert core._worth_asking("Shipped it. Logs are clean, and the release is green.") is False

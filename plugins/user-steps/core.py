@@ -570,7 +570,9 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
 
 _WORTH = re.compile(
     r"\?|\byou(r|'ll|'d)?\b|\bplease\b|\b(let|tell) me\b|\bneeds? (your|you)\b"
-    r"|(^|[.!:]\s+|\n\s*(?:[-*•]|\d+[.)])?\s*)(plug|open|click|tap|sign|log|run|check|install|restart|reboot|reply|"
+    # Imperative verbs also count after a comma or "or/and/then": "To get it, tap the bar, or go to Settings"
+    # names no "you" and starts no sentence with the verb, and a skip here never reaches the model.
+    r"|(^|[.!:,;]\s+|\b(?:or|and|then)\s+|\n\s*(?:[-*•]|\d+[.)])?\s*)(plug|open|click|tap|sign|log|run|check|install|restart|reboot|reply|"
     r"send|grant|allow|approve|confirm|pick|choose|decide|test|try|buy|enter|paste|scan|unlock|turn|press|hold|"
     r"connect|charge|go to|update|add|remove|delete|upload|share|accept)\b", re.I | re.M)
 
