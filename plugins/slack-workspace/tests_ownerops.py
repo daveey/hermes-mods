@@ -175,3 +175,25 @@ def test_owner_settings_come_from_the_bot_profile_not_the_root_config(tmp_path, 
     assert oo.home_cfg(tmp_path / "missing") == {}
     src = (HERE / "__init__.py").read_text()
     assert "ownerops.owner_ids()" not in src  # every caller passes the bot profile's config
+
+
+def test_spawn_runs_the_ops_turn_as_a_tool_session(tmp_path, monkeypatch):
+    """The real _spawn tags the Mac-ops thread --source tool, so it never shows as a user chat."""
+    seen = {}
+
+    class R:
+        returncode, stdout, stderr = 0, "ok", ""
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw.get("env", {})
+        return R()
+
+    monkeypatch.setattr(oo.subprocess, "run", fake_run)
+    o = oo.OwnerOps(tmp_path / "slack-workspace", owners=lambda: frozenset({OWNER}),
+                    bot_home=tmp_path / "profiles" / "alpha", profile=lambda: "mac-ops")
+    assert o._spawn("D1", "10.0", OWNER, "my MBP display is weird") == (0, "ok")
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-c") + 1] == "Mac-ops D1 10.0"
+    assert "--create-if-missing" in cmd
+    assert cmd[cmd.index("--source") + 1] == "tool"
+    assert not any(k.startswith("HERMES_SESSION_") for k in seen["env"])

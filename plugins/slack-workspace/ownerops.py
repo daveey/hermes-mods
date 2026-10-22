@@ -203,7 +203,8 @@ class OwnerOps:
                     "MAC_OPS_OWNER": user, "MAC_OPS_BOT_HOME": str(self.bot_home)})
         exe = shutil.which("hermes") or "hermes"
         cmd = [exe, "-p", self.profile(), "chat", "-Q", "--query-file", str(qf), "-c", f"Mac-ops {channel} {thread}",
-               "--create-if-missing", "--yolo", "--pass-session-id"]
+               "--create-if-missing", "--source", "tool", "--yolo", "--pass-session-id"]
+        # --source tool: an integration thread, not a user chat, so Desktop's "automated" filter hides it.
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=TURN_TIMEOUT_S, env=env,
                                cwd=str(self.root_home))
