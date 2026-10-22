@@ -19,6 +19,16 @@ The run that actually builds your commit is often one started by someone else's 
 watchers miss it and wait for hours while the session looks idle. Ask instead whether any successful run, or
 any release tag, *contains* your commit.
 
+## Fixing the CI you wait on: use a worktree
+
+A CI fix (or any branch work) goes in its own worktree: `git worktree add <dir> -b <fix-branch> origin/main`, then
+push from there. Never `git checkout`/`switch` a branch in a shared checkout that something runs from (a sync
+mirror, a deploy checkout, the live app checkout): the scripts and services in it vanish with the old branch. That
+happened when CI-fix workers switched a sync mirror to fork branches and its launchd job failed for 4 hours.
+[branch-pin-guard](../../../plugins/branch-pin-guard/) blocks this for checkouts listed in
+`$HERMES_HOME/branch-pins.json`. A checkout you find off its branch: commit or stash the stray work onto its own
+branch, check the pinned branch back out, and carry on in a worktree.
+
 ## Use the script
 
 `scripts/wait_for_ci.py` (in this skill's dir). Run it from inside the repo checkout; it needs `git` and an authenticated `gh`.
