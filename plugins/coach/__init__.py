@@ -14,6 +14,19 @@ log = logging.getLogger("coach")
 _HERE = Path(__file__).resolve().parent
 
 
+def _last_assistant(history) -> str:
+    """The latest assistant message with text in the hook's conversation_history (fallback when the coach's own
+    per-session state has no last reply yet, e.g. the first turn after a backend restart)."""
+    for m in reversed(history or []):
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(str(p.get("text") or "") for p in c if isinstance(p, dict))
+            if isinstance(c, str) and c.strip():
+                return c
+    return ""
+
+
 def _load(name: str):
     """Load a sibling module once; re-exec it when the file changed, so a plugin reload
     (activate / discover_and_load(force=True)) picks up edits instead of the cached copy."""
@@ -33,13 +46,15 @@ def _load(name: str):
     return mod
 
 
-def build(store=None, checkout=None):
-    """The three hook callbacks around one AgentCoach (exposed for tests)."""
+def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None):
+    """The three hook callbacks around one AgentCoach (exposed for tests). `selfheal_sync` runs the self-heal
+    detectors inline (tests); in production they run in a daemon thread so a judge call never delays a turn."""
     core, rules = _load("core"), _load("agent_rules")
     store = store or core.Store()
     coach = rules.AgentCoach(checkout if checkout is not None else rules.default_live_checkout(), signals=store)
 
-    def pre_llm_call(session_id="", user_message=None, **_):
+    def pre_llm_call(session_id="", user_message=None, platform="", parent_session_id="", conversation_history=None,
+                     **_):
         try:
             if not session_id:
                 return None
@@ -56,6 +71,8 @@ def build(store=None, checkout=None):
             # so it stays inline.
             prev = coach.loop_state(session_id).get("last_reply") or ""
             threading.Thread(target=_lesson_bg, args=(session_id, user_message, prev), daemon=True).start()
+            _selfheal_run(_selfheal_complaint, session_id, user_message,
+                          prev or _last_assistant(conversation_history), platform, parent_session_id)
             loop_hint = _fix_loop(session_id, user_message, turn)
             hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "") if h)
             return {"context": hint} if hint else None
@@ -188,9 +205,42 @@ def build(store=None, checkout=None):
             log.debug("coach lessons: %s", exc)
             return None
 
-    def post_llm_call(session_id="", assistant_response=None, **_):
+    def _selfheal_run(fn, *args):
+        """Self-heal detectors: fail-open, off the critical path unless selfheal_sync."""
+        try:
+            if _load("self_heal").mode() == "off":
+                return
+            if selfheal_sync:
+                fn(*args)
+            else:
+                threading.Thread(target=fn, args=args, daemon=True).start()
+        except Exception as exc:
+            log.debug("coach self_heal: %s", exc)
+
+    def _selfheal_complaint(session_id, user_message, prev, platform="", parent_session_id=""):
+        try:
+            sh = _load("self_heal")
+            if not sh.user_facing(platform, parent_session_id):
+                return
+            hit = sh.detect_complaint(prev or "", user_message, llm=selfheal_llm, threshold=sh.threshold())
+            sh.handle(hit, session_id, store, evidence=sh.clean_user(user_message))
+        except Exception as exc:
+            log.debug("coach self_heal complaint: %s", exc)
+
+    def _selfheal_admission(session_id, reply, platform="", parent_session_id=""):
+        try:
+            sh = _load("self_heal")
+            if not sh.user_facing(platform, parent_session_id):
+                return
+            hit = sh.detect_admission(reply, llm=selfheal_llm, threshold=sh.threshold())
+            sh.handle(hit, session_id, store, evidence=reply[-300:])
+        except Exception as exc:
+            log.debug("coach self_heal admission: %s", exc)
+
+    def post_llm_call(session_id="", assistant_response=None, platform="", parent_session_id="", **_):
         try:
             if session_id and isinstance(assistant_response, str) and assistant_response.strip():
+                _selfheal_run(_selfheal_admission, session_id, assistant_response, platform, parent_session_id)
                 coach.turn_end(session_id, assistant_response)
                 coach.loop_state(session_id)["last_ask"] = coach.turn_context(session_id)[0][:1500]
                 loop = {k: v for k, v in coach.loop_state(session_id).items() if k != "diff_reviewed"}

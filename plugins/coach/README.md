@@ -133,6 +133,31 @@ restated rule reuses the existing slug instead of starting a new candidate. Each
 A rejected slug stays rejected. A `saved` rule (already in memory) only produces a reminder. The agent gets the rule as a hint right away. Once a rule is promoted, the hint
 also tells it to save the rule with the memory tool unless memory already has it. `COACH_LESSONS=0` turns this off.
 
+### Self-heal detectors (`self_heal.py`, shadow by default)
+
+Spots the FIRST time you report that Hermes did something wrong, so a fix can be filed without you asking.
+Two entry paths, one result `{p_defect, component, symptom, fingerprint, source}`:
+
+- **Complaint** (`pre_llm_call`): a recall-oriented regex on your message (bare acks, slash commands and
+  Hermes-written notices are skipped), then the aux judge `coach_defect` on (previous reply, your message).
+  It fires on "the sort is broken", "why are you asking me to open a terminal?", "i fixed this once, but now it's
+  broken again", "fix this [screenshot]" after the agent's work, and similar.
+- **Self-admission** (`post_llm_call`): a regex on the agent's final reply ("my mistake", "I missed", "a bug in X",
+  "workaround", "sorry, I'll stop asking"), then the same judge with an admission prompt. A bug the reply says it
+  already fixed as the task scores low.
+
+Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
+workers. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
+`coach/log.jsonl`; live also appends the defect to `coach/selfheal_queue.jsonl` for the self-heal lane, once per
+fingerprint per UTC day (`coach/selfheal.json` holds the fingerprints). The fingerprint is a hash of the component
+and the symptom's stemmed content words, so "sidebar sessions reshuffle" and "session sidebar reshuffles" match.
+`COACH_SELFHEAL_THRESHOLD` (default 0.65). Set the judge model with `auxiliary.coach_defect.provider` / `.model`
+(evaluated on `gemini-3.8-flash`).
+
+Replay eval: `eval/selfheal_replay.py` runs the production prefilter + judge over a hand-labeled set (the real set
+holds your own words, so it lives in the private coach data repo) and writes catch rate, precision, every miss with
+its quote and every false positive, per dev/test split. `--mode admission` evaluates the self-admission path.
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.
@@ -201,6 +226,8 @@ Both calls fail open when coach isn't loaded.
 ## Files
 
 - `__init__.py`: the hooks (`pre_llm_call`, `post_tool_call`, `transform_tool_result`).
+- `self_heal.py`: the complaint and self-admission detectors, fingerprints and shadow/live handling;
+  `eval/selfheal_replay.py` replays them over a labeled set.
 - `agent_rules.py`: the agent-channel rules, plus the signals the user channel needs (subagents, long jobs, bug signatures).
 - `core.py`: the file store under `<HERMES_HOME>/coach/` (`sessions/<id>.json`, `bugs.jsonl`, `log.jsonl`), the gate, the user-rule evaluation, the briefs (spin-out's transcript reader + aux task `coach`) and stats.
 - `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the
