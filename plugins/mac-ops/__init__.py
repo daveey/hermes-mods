@@ -7,7 +7,9 @@ enable this plugin, so they never have these tools or any use of the key):
 * ``mac_fix(host, playbook)``   a named, vetted repair; logout/reboot run only after the owner replies yes in
                                 the Slack thread (enforced here by reading the thread, not by trusting the model)
 * ``mac_screen(host, op)``      look at / drive that Mac's screen through the OTHER Mac (works with a dead mouse
-                                or a dead app); a screenshot is posted into the thread
+                                or a dead app); a screenshot is posted into the thread. Driving it (click/key/type)
+                                is full control of that Mac, so it needs the owner's yes in the thread first (one
+                                grant per thread and host, 15 minutes)
 * ``mac_reply(text)``           the only way this profile talks to the owner: posts into the owner's DM thread
 
 Transport: ``ssh -i <key> <user>@<addr> <action...>`` into a forced-command shim that enforces policy and prints
@@ -30,7 +32,6 @@ import base64
 import json
 import os
 import re
-import shlex
 import subprocess
 import tempfile
 import time
@@ -51,6 +52,13 @@ YES = re.compile(r"^\s*(yes|y|yep|yeah|yup|confirm|confirmed|do it|go ahead|go f
 NO = re.compile(r"^\s*(no|n|nope|cancel|stop|don'?t|abort|never mind|nevermind)\W*$", re.I)
 KEY_RE = re.compile(r"^[A-Za-z0-9+_\-]{1,40}$")
 PEER_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
+# The shim's own token alphabet. sshd hands the shim the raw request string (SSH_ORIGINAL_COMMAND, no shell), and
+# the shim refuses quotes, so tokens go unquoted and anything outside this set is refused here, before ssh.
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_.,:@/+=-]{1,200}$")
+# Driving a screen (click/key/type) is full control of that Mac (it can open Terminal and type a command), so it
+# needs the owner's yes in the thread, like reboot; the grant then covers that host for GRANT_TTL_S.
+SCREEN_CONTROL = "screen-control"
+GRANT_TTL_S = 15 * 60
 
 
 # ---------------------------------------------------------------- config / context
@@ -163,7 +171,10 @@ def ssh_argv(host: str, action: list) -> list:
     h = hosts().get(host)
     s = settings()
     key = os.path.expanduser(str(s.get("key") or "~/.ssh/id_mac_fixer"))
-    remote = " ".join(shlex.quote(str(a)) for a in action)
+    bad = [a for a in action if not TOKEN_RE.match(str(a))]
+    if bad:
+        raise ValueError(f"argument outside the shim's allowed characters: {str(bad[0])[:40]!r}")
+    remote = " ".join(str(a) for a in action)
     return [str(s.get("ssh") or "ssh"), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
             f"{h.get('user') or 'root'}@{h['addr']}", remote]
@@ -173,7 +184,11 @@ def run_shim(host: str, action: list, timeout: int = SSH_TIMEOUT_S) -> dict:
     if host not in hosts():
         return {"ok": False, "error": f"unknown host {host!r}; known: {', '.join(sorted(hosts())) or 'none'}"}
     try:
-        r = subprocess.run(ssh_argv(host, action), capture_output=True, text=True, timeout=timeout)
+        argv = ssh_argv(host, action)
+    except ValueError as exc:
+        return {"ok": False, "exit": 2, "error": f"refused before ssh: {exc}"}
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": f"{host}: no answer in {timeout}s (asleep, offline, or hung)"}
     except OSError as exc:
@@ -199,7 +214,12 @@ def _host(args: dict) -> tuple:
     return host, ""
 
 
+NO_TURN = "no owner DM bound to this turn; mac tools run only for the owner's own Slack DM"
+
+
 def tool_diag(args: dict, **_: Any) -> str:
+    if not turn_context()["ok"]:
+        return _jerr(NO_TURN)
     host, err = _host(args)
     if err:
         return err
@@ -220,10 +240,16 @@ def _confirmed_by_owner(ctx: dict, host: str, playbook: str) -> tuple:
     p = pending.get(key)
     fresh = p and p.get("host") == host and p.get("playbook") == playbook and time.time() - p["at"] < PENDING_TTL_S
     if not fresh:
-        text = (f"Run `{playbook}` on {host}? This {'logs you out' if playbook == 'logout' else 'reboots the Mac'} "
-                f"and ends anything open there. Reply *yes* in this thread to go ahead.")
+        if playbook == SCREEN_CONTROL:
+            text = (f"Let me control {host}'s screen (clicks, keys, typing) for the next {GRANT_TTL_S // 60} minutes? "
+                    "Reply *yes* in this thread to allow it.")
+        else:
+            text = (f"Run `{playbook}` on {host}? This {'logs you out' if playbook == 'logout' else 'reboots the Mac'} "
+                    f"and ends anything open there. Reply *yes* in this thread to go ahead.")
         res = API(ctx, "chat.postMessage", {"channel": ctx["channel"], "thread_ts": ctx["thread"], "text": text})
-        pending[key] = {"host": host, "playbook": playbook, "ask_ts": res.get("ts") or "0", "at": time.time()}
+        # No ts back means we cannot tell later replies from earlier ones: count only replies from now on.
+        pending[key] = {"host": host, "playbook": playbook, "ask_ts": res.get("ts") or f"{time.time():.6f}",
+                        "at": time.time()}
         pf.parent.mkdir(parents=True, exist_ok=True)
         pf.write_text(json.dumps(pending))
         return "asked", "Asked the owner to confirm in the thread. Stop now; do not run it until they answer yes."
@@ -244,8 +270,42 @@ def _confirmed_by_owner(ctx: dict, host: str, playbook: str) -> tuple:
     return "waiting", "Still waiting for the owner's yes in the thread. Do not run it."
 
 
+def _grants_path() -> Path:
+    return _home() / "mac-ops" / "grants.json"
+
+
+def _granted(ctx: dict, host: str) -> bool:
+    try:
+        at = json.loads(_grants_path().read_text()).get(f"{ctx['channel']}:{ctx['thread']}:{host}")
+    except (OSError, ValueError):
+        return False
+    return bool(at) and time.time() - float(at) < GRANT_TTL_S
+
+
+def _grant(ctx: dict, host: str) -> None:
+    pf = _grants_path()
+    try:
+        g = json.loads(pf.read_text())
+    except (OSError, ValueError):
+        g = {}
+    g = {k: v for k, v in g.items() if time.time() - float(v) < GRANT_TTL_S}
+    g[f"{ctx['channel']}:{ctx['thread']}:{host}"] = time.time()
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(json.dumps(g))
+
+
+def _announce(ctx: dict, text: str) -> None:
+    """Audit line in the owner's thread for every mutating call, whatever the model chooses to say."""
+    try:
+        API(ctx, "chat.postMessage", {"channel": ctx["channel"], "thread_ts": ctx["thread"], "text": text[:500]})
+    except Exception:
+        pass
+
+
 def tool_fix(args: dict, **_: Any) -> str:
     ctx = turn_context()
+    if not ctx["ok"]:
+        return _jerr(NO_TURN)
     host, err = _host(args)
     if err:
         return err
@@ -261,6 +321,8 @@ def tool_fix(args: dict, **_: Any) -> str:
             return json.dumps({"ok": False, "status": status, "ran": False, "message": msg})
         action.append("--confirmed")
     out = run_shim(host, action)
+    _announce(ctx, f"mac-ops: ran `fix {playbook}` on {host}: {'ok' if out.get('ok') else 'failed'}"
+                   f" (shim log {out.get('log_id') or '-'})")
     return json.dumps(dict(out, ran=bool(out.get("ok"))))
 
 
@@ -281,15 +343,20 @@ def _screen_argv(peer: str, op: str, args: dict) -> tuple:
         a.append(combo)
     elif op == "type":
         text = str(args.get("text") or "")
-        if not text or len(text) > 200 or "\n" in text:
+        words = text.split()
+        if not words or len(text) > 200 or "\n" in text:
             return [], "type needs one line of text, at most 200 chars"
-        a.append(text)
+        if not all(TOKEN_RE.match(w) for w in words):
+            return [], "type text may use only letters, digits, spaces and _ . , : @ / + = -"
+        a += words  # the shim re-joins with single spaces
     return a, ""
 
 
 def tool_screen(args: dict, **_: Any) -> str:
     """Look at `host` through the other Mac (the viewer), so it works with a dead mouse or a dead Hermes app."""
     ctx = turn_context()
+    if not ctx["ok"]:
+        return _jerr(NO_TURN)
     target, err = _host(args)
     if err:
         return err
@@ -304,6 +371,13 @@ def tool_screen(args: dict, **_: Any) -> str:
     action, perr = _screen_argv(peer, args.get("op"), args)
     if perr:
         return _jerr(perr)
+    if action[2] != "shot" and not _granted(ctx, target):
+        status, msg = _confirmed_by_owner(ctx, target, SCREEN_CONTROL)
+        if status != "yes":
+            if status == "asked":
+                msg = "Asked the owner to allow screen control in the thread. Stop now; do not retry until they answer yes."
+            return json.dumps({"ok": False, "status": status, "ran": False, "message": msg})
+        _grant(ctx, target)
     out = run_shim(viewer, action, timeout=150)
     res = out.get("result") if isinstance(out.get("result"), dict) else {}
     b64 = res.get("png_base64")
@@ -340,7 +414,8 @@ SCHEMAS = {
                 {"host": {"type": "string"}, "playbook": {"type": "string", "enum": list(PLAYBOOKS)}},
                 ["host", "playbook"], tool_fix),
     "mac_screen": ("See or drive host's screen through the other Mac. op=shot posts a screenshot in the owner's "
-                   "thread; click(x,y), key(combo), type(text) act on it.",
+                   "thread; click(x,y), key(combo), type(text) act on it, after the owner allows screen control in the "
+                   "thread (the tool asks; stop and wait for the yes).",
                    {"host": {"type": "string", "description": "the Mac to look at"},
                     "op": {"type": "string", "enum": list(SCREEN_OPS)}, "x": {"type": "integer"},
                     "y": {"type": "integer"}, "combo": {"type": "string"}, "text": {"type": "string"}},

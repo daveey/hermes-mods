@@ -974,10 +974,12 @@ def _register_handoff(ctx, state: State) -> None:
             def env(name):
                 return _session(name[len("HERMES_SESSION_"):])
 
-            def last_ts(ch):
-                rows = [r for r in state.store.recent(ch, time.time() - 3600, limit=20) if r.get("user")]
-                return str(rows[-1]["ts"]) if rows else ""
-            return ownerops.handoff_tool(_owner_ops(state), dict(args or {}), env=env, last_ts=last_ts)
+            def last_owner_msg(ch, owner):
+                # The owner's own latest human message in this DM (Slack-verified store), not the model's text.
+                rows = [r for r in state.store.recent(ch, time.time() - 3600, limit=50)
+                        if r.get("user") == owner and not r.get("bot") and (r.get("text") or "").strip()]
+                return rows[-1] if rows else None
+            return ownerops.handoff_tool(_owner_ops(state), dict(args or {}), env=env, last_owner_msg=last_owner_msg)
         except Exception as exc:
             logger.warning("mac_ops_handoff failed: %s", exc, exc_info=True)
             return _out({"ok": False, "error": str(exc)})
