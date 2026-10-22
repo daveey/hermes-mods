@@ -114,4 +114,6 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 ## Contributing / my own workflow
 
 See [AGENTS.md](AGENTS.md). Every commit is scanned for secrets (`.githooks/pre-commit`, plus
-gitleaks in CI).
+gitleaks in CI). The hook refuses to commit when gitleaks or the private denylist is missing;
+`./install.sh --tools` installs gitleaks (brew on macOS, the pinned release into `~/.local/bin` on Linux).
+Tests: `python3 -m unittest tests/test_precommit_hook.py tests/test_sqlite_ro_guard.py`.
