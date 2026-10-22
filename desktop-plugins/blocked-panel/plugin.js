@@ -23,6 +23,9 @@
  * 10 s while visible; card details are cached 60 s or until the blocked set changes.
  * Only the FOCUSED session is known to a composer plugin, so every tile's composer
  * renders the focused chat's panel only when that tile is the focused one.
+ *
+ * Retired as a composer panel when user-steps is loaded (window.__userSteps.ownsComposer): its "For you"
+ * strip shows these cards via window.__blockedPanel.{snapshot,subscribe,unblockCard,openCard,checklist}.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
@@ -631,6 +634,9 @@ function Panel() {
   }, [])
 
   if (snap.stored !== focused) return null
+  // user-steps' "For you" strip lists these cards (with the same Done → unblock / Reply & unblock buttons);
+  // this panel only renders when that plugin is absent.
+  if (typeof window !== 'undefined' && window.__userSteps?.ownsComposer) return null
   const { items, parked } = snap
   if (!items.length && !parked) return null
 
@@ -690,7 +696,8 @@ export default {
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -20, render: () => jsx(Panel, {}) })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__blockedPanel = { version: 3, get snapshot() { return snapshot }, refresh, checklist }
+    // version 4: subscribe/unblockCard/openCard for user-steps' "For you" strip (it reuses this poller + actions)
+    window.__blockedPanel = { version: 4, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel

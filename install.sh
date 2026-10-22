@@ -36,6 +36,9 @@ place() { # src dst
 echo "agent plugins -> $H/plugins"
 for d in "$M"/plugins/*/; do
   n="$(basename "$d")"
+  if grep -q '^retired:' "$d/plugin.yaml" 2>/dev/null; then
+    echo "  $n: retired ($(sed -n 's/^retired: *//p' "$d/plugin.yaml")), not installed"; continue
+  fi
   if place "${d%/}" "$H/plugins/$n"; then
     echo "  $n"; hermes plugins enable "$n" >/dev/null 2>&1 || echo "  (enable $n by hand: hermes plugins enable $n)"
   fi

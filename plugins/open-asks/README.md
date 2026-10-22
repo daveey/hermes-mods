@@ -1,5 +1,11 @@
 # open-asks
 
+> **Retired: replaced by [user-steps](../user-steps/).** user-steps finds asks with a model instead of a regex
+> (this plugin's regex is its fallback), frames them in Desktop replies with one-click buttons, lists them in a
+> "For you" strip above the composer, and keeps ONE rolling blocked card per chat instead of one per ask.
+> `install.sh` skips this plugin (`retired:` in `plugin.yaml`); disable it where it is enabled:
+> `hermes plugins disable open-asks`. The code stays for reference.
+
 Every question a chat reply leaves for the user becomes a blocked Kanban card linked to that chat.
 
 ## Why (five whys)
