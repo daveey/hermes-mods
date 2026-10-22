@@ -12,6 +12,11 @@ enable this plugin, so they never have these tools or any use of the key):
                                 grant per thread and host, 15 minutes)
 * ``mac_reply(text)``           the only way this profile talks to the owner: posts into the owner's DM thread
 
+The yes is ALSO checked on the Mac (the hub is not trusted for it): the tool posts a canonical question
+(``approval_question``, the shim renders the same text), and passes ``--approval <dm>:<thread>:<yes ts>`` to the
+shim, which reads that thread from Slack itself and refuses unless the owner typed that yes after exactly that
+question less than 15 minutes ago.
+
 Transport: ``ssh -i <key> <user>@<addr> <action...>`` into a forced-command shim that enforces policy and prints
 one JSON object ``{ok, action, result|error, log_id}`` (exit 0 ok / 2 refused / 1 failed). Config (profile
 config.yaml)::
@@ -44,6 +49,10 @@ TOOLSET = "mac_ops"
 PLAYBOOKS = ("kill-virtual-display", "restart-hermes-desktop", "restart-gateway", "reset-display-config",
              "restart-dock-finder", "logout", "reboot")
 CONFIRM = frozenset({"logout", "reboot"})
+# Displays that are supposed to exist. "Hermes Agent Display" is the agent Chrome's invisible virtual display
+# (skill invisible-chrome-agent): informational only, never a cause, never something kill-virtual-display touches.
+EXPECTED_DISPLAYS = {"Hermes Agent Display": "intentional virtual display for the agent Chrome (invisible-chrome-agent)"}
+EXPECTED_TAG = "[EXPECTED, intentional: agent Chrome's invisible virtual display; informational, not a fault]"
 SCREEN_OPS = ("shot", "click", "key", "type")
 PENDING_TTL_S = 15 * 60
 SSH_TIMEOUT_S = 120
@@ -154,6 +163,32 @@ API: Callable[[dict, str, dict], dict] = slack_api
 UPLOAD: Callable[[dict, bytes, str, str], dict] = slack_upload
 
 
+def approval_question(kind: str, me: str, target: str) -> str:
+    """The question the owner answers; the Mac shim requires this exact text before his yes (keep in sync with
+    mac-fixer's approval_question; both repos' tests pin it). me/target are the names the shims use for the
+    Macs (``peer`` in config): for logout/reboot both are the Mac itself; for screen, me is the viewer Mac."""
+    if kind in CONFIRM:
+        what = "logs you out" if kind == "logout" else "reboots the Mac"
+        return (f"Run `{kind}` on {me}? This {what} and ends anything open there. Reply *yes* in this thread to "
+                f"go ahead. [mac-fixer {me} fix {kind}]")
+    if kind == "screen":
+        return (f"Let me control {target}'s screen (clicks, keys, typing) through {me} for the next "
+                f"{GRANT_TTL_S // 60} minutes? Reply *yes* in this thread to allow it. [mac-fixer {me} screen {target}]")
+    raise ValueError(kind)
+
+
+def shim_name(host: str) -> str:
+    """The name the Macs' shims use for `host` (remote-screen.yaml key), e.g. the hub's "mbp" is "macbook"."""
+    return str((hosts().get(host) or {}).get("peer") or host).strip()
+
+
+def _human_owner(m: dict, owner: str) -> bool:
+    """Typed by the owner in a Slack client (what the Mac shim accepts): no bot/app attribution, no subtype,
+    a client_msg_id."""
+    return (m.get("user") == owner and not m.get("bot_id") and not m.get("app_id") and not m.get("bot_profile")
+            and not m.get("subtype") and bool(m.get("client_msg_id")))
+
+
 def _jerr(msg: str, **kw: Any) -> str:
     return json.dumps({"ok": False, "error": msg, **kw})
 
@@ -217,6 +252,24 @@ def _host(args: dict) -> tuple:
 NO_TURN = "no owner DM bound to this turn; mac tools run only for the owner's own Slack DM"
 
 
+def annotate_expected(result: Any) -> Any:
+    """Mark expected displays in a diag result as informational so they are never read as a cause. Idempotent."""
+    if not isinstance(result, dict):
+        return result
+    found = []
+    disp = result.get("displays")
+    if isinstance(disp, dict) and isinstance(disp.get("out"), str):
+        text = disp["out"]
+        for name, why in EXPECTED_DISPLAYS.items():
+            if name in text:
+                found.append({"name": name, "status": "informational", "note": why + "; not a fault, never a cause"})
+                text = re.sub(re.escape(name) + r"(?! \[EXPECTED)", name + " " + EXPECTED_TAG, text)
+        disp["out"] = text
+    if found and not result.get("expected"):
+        result["expected"] = found
+    return result
+
+
 def tool_diag(args: dict, **_: Any) -> str:
     if not turn_context()["ok"]:
         return _jerr(NO_TURN)
@@ -225,12 +278,13 @@ def tool_diag(args: dict, **_: Any) -> str:
         return err
     out = run_shim(host, ["diag"])
     if "result" in out:
-        out["result"] = _clip(out["result"])
+        out["result"] = _clip(annotate_expected(out["result"]))
     return json.dumps(out)
 
 
-def _confirmed_by_owner(ctx: dict, host: str, playbook: str) -> tuple:
-    """(status, message). Reads the DM thread: a yes from the owner AFTER our question is the only way through."""
+def _confirmed_by_owner(ctx: dict, host: str, playbook: str, question: str) -> tuple:
+    """(status, message, yes_ts). Reads the DM thread: a yes from the owner AFTER our question is the only way
+    through. `question` is posted verbatim (the Mac shim checks it again, from Slack, before running anything)."""
     pf = _home() / "mac-ops" / "pending.json"
     key = f"{ctx['channel']}:{ctx['thread']}"
     try:
@@ -238,60 +292,72 @@ def _confirmed_by_owner(ctx: dict, host: str, playbook: str) -> tuple:
     except (OSError, ValueError):
         pending = {}
     p = pending.get(key)
-    fresh = p and p.get("host") == host and p.get("playbook") == playbook and time.time() - p["at"] < PENDING_TTL_S
+    fresh = (p and p.get("host") == host and p.get("playbook") == playbook and p.get("question") == question
+             and time.time() - p["at"] < PENDING_TTL_S)
     if not fresh:
-        if playbook == SCREEN_CONTROL:
-            text = (f"Let me control {host}'s screen (clicks, keys, typing) for the next {GRANT_TTL_S // 60} minutes? "
-                    "Reply *yes* in this thread to allow it.")
-        else:
-            text = (f"Run `{playbook}` on {host}? This {'logs you out' if playbook == 'logout' else 'reboots the Mac'} "
-                    f"and ends anything open there. Reply *yes* in this thread to go ahead.")
-        res = API(ctx, "chat.postMessage", {"channel": ctx["channel"], "thread_ts": ctx["thread"], "text": text})
+        res = API(ctx, "chat.postMessage", {"channel": ctx["channel"], "thread_ts": ctx["thread"], "text": question})
         # No ts back means we cannot tell later replies from earlier ones: count only replies from now on.
-        pending[key] = {"host": host, "playbook": playbook, "ask_ts": res.get("ts") or f"{time.time():.6f}",
-                        "at": time.time()}
+        pending[key] = {"host": host, "playbook": playbook, "question": question,
+                        "ask_ts": res.get("ts") or f"{time.time():.6f}", "at": time.time()}
         pf.parent.mkdir(parents=True, exist_ok=True)
         pf.write_text(json.dumps(pending))
-        return "asked", "Asked the owner to confirm in the thread. Stop now; do not run it until they answer yes."
+        return "asked", "Asked the owner to confirm in the thread. Stop now; do not run it until they answer yes.", ""
     rep = API(ctx, "conversations.replies", {"channel": ctx["channel"], "ts": ctx["thread"], "oldest": p["ask_ts"],
                                              "limit": 50})
-    answers = [m for m in rep.get("messages", [])
-               if m.get("user") == ctx["owner"] and not m.get("bot_id") and float(m.get("ts") or 0) > float(p["ask_ts"])]
+    answers = sorted((m for m in rep.get("messages", [])
+                      if _human_owner(m, ctx["owner"]) and float(m.get("ts") or 0) > float(p["ask_ts"])),
+                     key=lambda m: float(m.get("ts") or 0))
     for m in answers:
         if NO.match(m.get("text") or ""):
             pending.pop(key, None)
             pf.write_text(json.dumps(pending))
-            return "declined", "The owner said no. Nothing was run."
+            return "declined", "The owner said no. Nothing was run.", ""
     for m in answers:
         if YES.match(m.get("text") or ""):
             pending.pop(key, None)
             pf.write_text(json.dumps(pending))
-            return "yes", ""
-    return "waiting", "Still waiting for the owner's yes in the thread. Do not run it."
+            return "yes", "", str(m.get("ts"))
+    return "waiting", "Still waiting for the owner's yes in the thread. Do not run it.", ""
+
+
+def _approval_ref(ctx: dict, yes_ts: str) -> str:
+    return f"{ctx['channel']}:{ctx['thread']}:{yes_ts}"
 
 
 def _grants_path() -> Path:
     return _home() / "mac-ops" / "grants.json"
 
 
-def _granted(ctx: dict, host: str) -> bool:
+# A grant is the owner's yes (its approval ref): the viewer Mac's shim honours it for GRANT_TTL_S after the yes
+# itself, so the hub stops using it a little earlier rather than send one the Mac will refuse.
+GRANT_MARGIN_S = 30
+
+
+def _grant_live(v: Any) -> bool:
+    return isinstance(v, dict) and time.time() - float(v.get("yes") or 0) < GRANT_TTL_S - GRANT_MARGIN_S
+
+
+def _granted(ctx: dict, host: str, viewer: str) -> str:
+    """The approval ref of a live screen-control grant for host (driven through viewer) in this thread, or ''."""
     try:
-        at = json.loads(_grants_path().read_text()).get(f"{ctx['channel']}:{ctx['thread']}:{host}")
+        v = json.loads(_grants_path().read_text()).get(f"{ctx['channel']}:{ctx['thread']}:{host}:{viewer}")
     except (OSError, ValueError):
-        return False
-    return bool(at) and time.time() - float(at) < GRANT_TTL_S
+        return ""
+    return str(v["ref"]) if _grant_live(v) else ""
 
 
-def _grant(ctx: dict, host: str) -> None:
+def _grant(ctx: dict, host: str, viewer: str, yes_ts: str) -> str:
     pf = _grants_path()
     try:
         g = json.loads(pf.read_text())
     except (OSError, ValueError):
         g = {}
-    g = {k: v for k, v in g.items() if time.time() - float(v) < GRANT_TTL_S}
-    g[f"{ctx['channel']}:{ctx['thread']}:{host}"] = time.time()
+    g = {k: v for k, v in g.items() if _grant_live(v)}  # old float-only grants (pre Mac-side check) drop out
+    ref = _approval_ref(ctx, yes_ts)
+    g[f"{ctx['channel']}:{ctx['thread']}:{host}:{viewer}"] = {"ref": ref, "yes": float(yes_ts)}
     pf.parent.mkdir(parents=True, exist_ok=True)
     pf.write_text(json.dumps(g))
+    return ref
 
 
 def _announce(ctx: dict, text: str) -> None:
@@ -316,10 +382,11 @@ def tool_fix(args: dict, **_: Any) -> str:
     if playbook in CONFIRM:
         if not ctx["ok"]:
             return _jerr("logout/reboot need the owner's yes in their Slack DM; this turn is not one")
-        status, msg = _confirmed_by_owner(ctx, host, playbook)
+        name = shim_name(host)
+        status, msg, yes_ts = _confirmed_by_owner(ctx, host, playbook, approval_question(playbook, name, name))
         if status != "yes":
             return json.dumps({"ok": False, "status": status, "ran": False, "message": msg})
-        action.append("--confirmed")
+        action += ["--confirmed", "--approval", _approval_ref(ctx, yes_ts)]
     out = run_shim(host, action)
     _announce(ctx, f"mac-ops: ran `fix {playbook}` on {host}: {'ok' if out.get('ok') else 'failed'}"
                    f" (shim log {out.get('log_id') or '-'})")
@@ -371,13 +438,18 @@ def tool_screen(args: dict, **_: Any) -> str:
     action, perr = _screen_argv(peer, args.get("op"), args)
     if perr:
         return _jerr(perr)
-    if action[2] != "shot" and not _granted(ctx, target):
-        status, msg = _confirmed_by_owner(ctx, target, SCREEN_CONTROL)
-        if status != "yes":
-            if status == "asked":
-                msg = "Asked the owner to allow screen control in the thread. Stop now; do not retry until they answer yes."
-            return json.dumps({"ok": False, "status": status, "ran": False, "message": msg})
-        _grant(ctx, target)
+    if action[2] != "shot":
+        ref = _granted(ctx, target, viewer)
+        if not ref:
+            question = approval_question("screen", shim_name(viewer), peer)
+            status, msg, yes_ts = _confirmed_by_owner(ctx, target, SCREEN_CONTROL, question)
+            if status != "yes":
+                if status == "asked":
+                    msg = ("Asked the owner to allow screen control in the thread. Stop now; do not retry until they "
+                           "answer yes.")
+                return json.dumps({"ok": False, "status": status, "ran": False, "message": msg})
+            ref = _grant(ctx, target, viewer, yes_ts)
+        action += ["--approval", ref]
     out = run_shim(viewer, action, timeout=150)
     res = out.get("result") if isinstance(out.get("result"), dict) else {}
     b64 = res.get("png_base64")
@@ -407,10 +479,12 @@ def tool_reply(args: dict, **_: Any) -> str:
 
 SCHEMAS = {
     "mac_diag": ("Read-only health report of one of the owner's Macs (processes, displays, HID, power, load, "
-                 "crash reports, WindowServer log) from its fixer shim.",
+                 "crash reports, WindowServer log) from its fixer shim. The 'Hermes Agent Display' virtual display is "
+                 "intentional (agent Chrome); it is informational only, never report it as a cause.",
                  {"host": {"type": "string", "description": "mbp or mini"}}, ["host"], tool_diag),
     "mac_fix": ("Run a vetted repair playbook on a Mac: " + ", ".join(PLAYBOOKS) + ". logout and reboot first ask the "
-                "owner in the Slack thread and run only after they reply yes; call again after the owner answers.",
+                "owner in the Slack thread and run only after they reply yes; call again after the owner answers. "
+                "kill-virtual-display never touches the intentional 'Hermes Agent Display'.",
                 {"host": {"type": "string"}, "playbook": {"type": "string", "enum": list(PLAYBOOKS)}},
                 ["host", "playbook"], tool_fix),
     "mac_screen": ("See or drive host's screen through the other Mac. op=shot posts a screenshot in the owner's "

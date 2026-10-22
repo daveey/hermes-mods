@@ -61,7 +61,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("MAC_OPS_THREAD", "100.0")
     monkeypatch.setenv("MAC_OPS_OWNER", OWNER)
     monkeypatch.setenv("MAC_OPS_BOT_HOME", str(tmp_path))
-    thread = {"msgs": [{"user": OWNER, "ts": "100.0", "text": "reboot the mbp"}], "posts": [], "uploads": []}
+    thread = {"msgs": [{"user": OWNER, "ts": "100.0", "text": "reboot the mbp", "client_msg_id": "c0"}], "posts": [],
+              "uploads": []}
 
     def api(ctx, method, params):
         if method == "chat.postMessage":
@@ -76,7 +77,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(mo, "API", api)
     monkeypatch.setattr(mo, "UPLOAD", lambda ctx, png, name, c: thread["uploads"].append((name, png)) or {"ok": True})
     thread["log"] = log
-    thread["say"] = lambda user, text, ts: thread["msgs"].append({"user": user, "ts": ts, "text": text})
+    thread["say"] = lambda user, text, ts, **kw: thread["msgs"].append(
+        dict({"user": user, "ts": ts, "text": text, "client_msg_id": "c-" + ts}, **kw))
     thread["calls"] = lambda: [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
     return thread
 
@@ -127,7 +129,7 @@ def test_reboot_runs_with_confirmed_only_after_owner_yes(env):
     env["say"](OWNER, "Yes", "110.0")
     out = json.loads(mo.tool_fix({"host": "mbp", "playbook": "reboot"}))
     assert out["ok"] and out["ran"]
-    assert env["calls"]()[0]["cmd"] == ["fix", "reboot", "--confirmed"]
+    assert env["calls"]()[0]["cmd"] == ["fix", "reboot", "--confirmed", "--approval", "D1:100.0:110.0"]
     # the yes is spent: a second reboot asks again
     assert json.loads(mo.tool_fix({"host": "mbp", "playbook": "reboot"}))["status"] == "asked"
 
@@ -180,7 +182,8 @@ def test_screen_sends_the_peer_name_the_viewer_shim_knows(env, monkeypatch):
     assert len(env["calls"]()) == 1
 
 
-def _allow_screen_control(env, host="mini", ts="150.0"):
+def _allow_screen_control(env, host="mini", ts=None):
+    ts = ts or f"{time.time():.6f}"  # grants run from the yes's own Slack ts, so it must be "now"
     out = json.loads(mo.tool_screen({"host": host, "op": "key", "combo": "Escape"}))
     assert out["status"] == "asked" and not out["ran"]
     env["say"](OWNER, "yes", ts)
@@ -189,7 +192,8 @@ def _allow_screen_control(env, host="mini", ts="150.0"):
 def test_screen_click_validates_and_passes_ints(env):
     _allow_screen_control(env)
     assert json.loads(mo.tool_screen({"host": "mini", "op": "click", "x": 10, "y": 20}))["ok"]
-    assert env["calls"]()[-1]["cmd"] == ["screen", "mini", "click", "10", "20"]
+    assert env["calls"]()[-1]["cmd"][:5] == ["screen", "mini", "click", "10", "20"]
+    assert env["calls"]()[-1]["cmd"][5] == "--approval"
     n = len(env["calls"]())
     assert not json.loads(mo.tool_screen({"host": "mini", "op": "click", "x": "1;id", "y": 2}))["ok"]
     assert len(env["calls"]()) == n
@@ -209,7 +213,7 @@ def test_screen_input_needs_owner_yes_first(env):
     env["say"]("UOTHER", "yes", "120.0")  # not the owner
     assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["status"] == "waiting"
     assert env["calls"]() == []
-    env["say"](OWNER, "yes", "121.0")
+    env["say"](OWNER, "yes", f"{time.time():.6f}")
     assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["ok"]
     # the grant covers further input on that host for a while, not the other host
     assert json.loads(mo.tool_screen({"host": "mini", "op": "click", "x": 3, "y": 4}))["ok"]
@@ -235,7 +239,8 @@ def test_type_with_spaces_reaches_the_shim_unquoted(env):
     _allow_screen_control(env)
     assert json.loads(mo.tool_screen({"host": "mini", "op": "type", "text": "hello world"}))["ok"]
     call = env["calls"]()[-1]
-    assert call["argv"][-1] == "screen mini type hello world" and "'" not in call["argv"][-1]
+    assert call["argv"][-1].startswith("screen mini type hello world --approval D1:100.0:")
+    assert "'" not in call["argv"][-1]
     n = len(env["calls"]())
     for text in ("a'b", "$(id)", "a;b", "x|sh", "`id`", "a\\b"):
         assert not json.loads(mo.tool_screen({"host": "mini", "op": "type", "text": text}))["ok"], text
@@ -324,3 +329,101 @@ def test_slack_api_is_form_encoded(tmp_path, monkeypatch):
     monkeypatch.setattr(mo.json, "load", lambda r: {"ok": True, "messages": []})
     mo.slack_api({"bot_home": str(tmp_path)}, "conversations.replies", {"channel": "D1", "ts": "1.0", "limit": 5})
     assert seen["ctype"] == "application/x-www-form-urlencoded" and "channel=D1" in seen["body"]
+
+
+# ---- Mac-side approval check (t_69156fa3) ------------------------------------------------------------------
+
+def test_question_text_is_pinned_and_matches_the_shim_contract():
+    """The Mac shim refuses unless this exact text preceded the yes; mac-fixer's tests pin the same strings."""
+    assert mo.approval_question("reboot", "mini", "mini") == (
+        "Run `reboot` on mini? This reboots the Mac and ends anything open there. Reply *yes* in this thread to go "
+        "ahead. [mac-fixer mini fix reboot]")
+    assert mo.approval_question("screen", "mini", "macbook") == (
+        "Let me control macbook's screen (clicks, keys, typing) through mini for the next 15 minutes? Reply *yes* in "
+        "this thread to allow it. [mac-fixer mini screen macbook]")
+    assert "logs you out" in mo.approval_question("logout", "macbook", "macbook")
+
+
+def test_reboot_question_uses_the_shim_name_and_passes_the_yes_as_approval(env, monkeypatch):
+    cfg = mo._config()
+    cfg["mac_ops"]["hosts"]["mbp"]["peer"] = "macbook"
+    monkeypatch.setattr(mo, "_config", lambda: cfg)
+    mo.tool_fix({"host": "mbp", "playbook": "reboot"})
+    assert env["posts"][0]["text"] == mo.approval_question("reboot", "macbook", "macbook")
+    env["say"](OWNER, "what does that do?", "105.0")
+    env["say"](OWNER, "ok", "106.5")
+    out = json.loads(mo.tool_fix({"host": "mbp", "playbook": "reboot"}))
+    assert out["ok"], out
+    assert env["calls"]()[0]["cmd"][-2:] == ["--approval", "D1:100.0:106.5"]
+
+
+def test_api_posted_yes_does_not_count(env):
+    """A yes without a Slack-client client_msg_id (an API/app post) is not the owner typing; the Mac would refuse
+    it too, so the hub does not even try."""
+    mo.tool_fix({"host": "mbp", "playbook": "reboot"})
+    env["say"](OWNER, "yes", "110.0", client_msg_id=None)
+    env["say"](OWNER, "yes", "111.0", app_id="A9")
+    assert json.loads(mo.tool_fix({"host": "mbp", "playbook": "reboot"}))["status"] == "waiting"
+    assert env["calls"]() == []
+
+
+def test_screen_input_passes_the_grant_approval_and_question_names_viewer_and_target(env, monkeypatch):
+    cfg = mo._config()
+    cfg["mac_ops"]["hosts"]["mbp"]["peer"] = "macbook"
+    monkeypatch.setattr(mo, "_config", lambda: cfg)
+    out = json.loads(mo.tool_screen({"host": "mbp", "op": "key", "combo": "Escape"}))  # viewer = mini
+    assert out["status"] == "asked"
+    assert env["posts"][0]["text"] == mo.approval_question("screen", "mini", "macbook")
+    yes = f"{time.time():.6f}"
+    env["say"](OWNER, "yes", yes)
+    assert json.loads(mo.tool_screen({"host": "mbp", "op": "type", "text": "hello world"}))["ok"]
+    assert json.loads(mo.tool_screen({"host": "mbp", "op": "click", "x": 1, "y": 2}))["ok"]
+    cmds = [c["cmd"] for c in env["calls"]()]
+    assert cmds[0] == ["screen", "macbook", "type", "hello", "world", "--approval", f"D1:100.0:{yes}"]
+    assert cmds[1][-2:] == ["--approval", f"D1:100.0:{yes}"]
+    assert env["calls"]()[0]["to"] == "you@mini.example.com"
+
+
+def test_screen_grant_expires_from_the_yes_not_from_first_use(env, monkeypatch):
+    _allow_screen_control(env, ts=f"{time.time():.6f}")
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["ok"]
+    real = time.time
+    monkeypatch.setattr(mo.time, "time", lambda: real() + mo.GRANT_TTL_S - mo.GRANT_MARGIN_S + 1)
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["status"] == "asked"
+
+
+def test_old_float_grants_are_not_honoured(env):
+    """Grants written before the Mac-side check have no approval ref; the hub must ask again, not send none."""
+    pf = mo._grants_path()
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(json.dumps({"D1:100.0:mini": time.time(), "D1:100.0:mini:mbp": time.time()}))
+    assert json.loads(mo.tool_screen({"host": "mini", "op": "key", "combo": "Return"}))["status"] == "asked"
+    assert env["calls"]() == []
+
+
+DISPLAYS = ("Graphics/Displays:\n  Apple M3:\n    Displays:\n      Color LCD:\n        Resolution: 3456 x 2234\n"
+            "      Hermes Agent Display:\n        Resolution: 1440 x 900\n        Virtual Device: Yes\n")
+
+
+def test_diag_marks_hermes_agent_display_as_expected_and_informational(env, monkeypatch):
+    monkeypatch.setattr(mo, "run_shim", lambda host, a: {"ok": True, "result": {"displays": {"rc": 0, "out": DISPLAYS}}})
+    out = json.loads(mo.tool_diag({"host": "mbp"}))["result"]
+    assert out["expected"] == [{"name": "Hermes Agent Display", "status": "informational",
+                                "note": out["expected"][0]["note"]}]
+    assert "never a cause" in out["expected"][0]["note"]
+    assert "Hermes Agent Display [EXPECTED" in out["displays"]["out"]
+    assert "Color LCD:" in out["displays"]["out"] and "[EXPECTED" not in out["displays"]["out"].split("Hermes Agent")[0]
+
+
+def test_annotate_is_idempotent_and_ignores_other_displays():
+    r = {"displays": {"out": "Color LCD:\n Virtual Device: Yes\n DeskPad Display"}}
+    assert mo.annotate_expected(r) == {"displays": {"out": "Color LCD:\n Virtual Device: Yes\n DeskPad Display"}}
+    r = {"displays": {"out": DISPLAYS}}
+    once = json.dumps(mo.annotate_expected(r))
+    assert json.dumps(mo.annotate_expected(json.loads(once))) == once
+    assert mo.annotate_expected({"displays": 2}) == {"displays": 2}
+
+
+def test_tool_text_says_agent_display_is_not_a_cause():
+    assert "Hermes Agent Display" in mo.SCHEMAS["mac_diag"][0] and "never" in mo.SCHEMAS["mac_diag"][0]
+    assert "Hermes Agent Display" in mo.SCHEMAS["mac_fix"][0]
