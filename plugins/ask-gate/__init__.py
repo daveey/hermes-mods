@@ -139,7 +139,7 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
     ledger_text = "\n".join(f"- {a['topic']} -> {a['answer']} ({core.fmt_ts(a['ts'])})" for a in led)
     return judge_mod.judge(asks, tools_text=core.render_tools(tools), user_msgs=_user_msgs(session_id),
                            card_status=statuses, ledger_text=ledger_text, caps=core.capability_sheet(),
-                           reply=reply, llm=_llm())
+                           reply=reply, llm=_llm(), ledger=led)
 
 
 # ---- L1 + L4 ------------------------------------------------------------------------------------------

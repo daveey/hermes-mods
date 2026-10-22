@@ -10,7 +10,9 @@ import json
 import re
 from typing import Any, Callable
 
-MIN_CONFIDENCE = 0.8
+MIN_CONFIDENCE = 0.75      # unverified / already_* verdicts
+MIN_CONFIDENCE_GROUNDED = 0.6  # agent_can_do whose `how` names something that is on the capability sheet
+_GENERIC = {"token-broker", "browser_exec", "terminal", "https", "http", "ssh", "chrome", "browser", "token", "scope"}
 VERDICTS = ("ok", "already_answered", "already_done", "unverified", "agent_can_do")
 
 SYSTEM = """You audit a draft chat reply BEFORE the user (David) sees it. It contains sentences that ask David \
@@ -38,7 +40,9 @@ minter scope (name ends in "-minter") or a broader credential scope for that ven
 device), clicking Allow / typing a password or code into a prompt only he can see, approving an OAuth consent screen for the \
 agent, spending money or any irreversible/destructive action, choices between options, preferences, optional \
 offers ("Want me to look into X?"), "tell me when X is done" (waiting on a person or on time), UI legends and \
-explanations that merely describe a state, hypotheticals, and facts already verified this turn.
+explanations that merely describe a state, hypotheticals, and facts already verified this turn. Approval-tier \
+token-broker scopes (tier "approval") exist so that only David approves them: never agent_can_do. A statement \
+about the past, or one that only reports what happened this turn, is not an ask.
 
 An ask sentence can bundle several items ("Needs you: a | b | c"): check every item and return the first non-ok \
 verdict among them, naming that item in the reason.
@@ -57,7 +61,13 @@ def build_user_prompt(asks: list[str], tools_text: str, user_msgs: list[str], ca
             f"DAVID'S LAST MESSAGES (oldest first):\n{users_t}\n\n{caps}")
 
 
-def parse_verdicts(raw: str, n: int) -> list[dict]:
+def _grounded(how: str, caps: str) -> bool:
+    """`how` names a scope/host/account that really is on the capability sheet (not just generic words)."""
+    low = caps.lower()
+    return any(t not in _GENERIC and t in low for t in re.findall(r"[a-z0-9_./@-]{5,}", how.lower()))
+
+
+def parse_verdicts(raw: str, n: int, caps: str = "") -> list[dict]:
     """Parse the model output into exactly ``n`` verdict dicts; anything unparsable becomes ok (fail open)."""
     out = [{"i": i, "verdict": "ok", "reason": "", "how": ""} for i in range(n)]
     if not raw:
@@ -81,7 +91,10 @@ def parse_verdicts(raw: str, n: int) -> list[dict]:
             conf = 1.0
         how = str(item.get("how", "")).strip()
         # a non-ok verdict must be confident, and unverified/agent_can_do must say what to do instead
-        if v != "ok" and (conf < MIN_CONFIDENCE or (v in ("unverified", "agent_can_do") and len(how) < 8)):
+        floor = MIN_CONFIDENCE_GROUNDED if (v == "agent_can_do" and _grounded(how, caps)) else MIN_CONFIDENCE
+        if v == "agent_can_do" and not _grounded(how, caps):
+            v = "ok"  # "the agent could" without naming a real capability is speculation
+        if v != "ok" and (conf < floor or (v == "unverified" and len(how) < 8)):
             v = "ok"
         if 0 <= i < n and v in VERDICTS:
             out[i] = {"i": i, "verdict": v, "reason": str(item.get("reason", ""))[:240], "how": how[:240]}
@@ -104,17 +117,47 @@ def deterministic(asks: list[str], card_status: dict[str, dict]) -> dict[int, di
     return res
 
 
+_STOPW = {"about", "which", "would", "could", "should", "their", "there", "these", "those", "again", "still", "other",
+          "waiting", "needs", "needed", "item", "items", "thing", "things", "after", "before", "while", "where", "being",
+          "David", "yours", "wants", "using", "doing", "going"}
+
+
+def _topic_tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z][a-z0-9]{4,}", text.lower()) if w not in _STOPW}
+
+
+def ledger_match(asks: list[str], ledger: list[dict]) -> dict[int, dict]:
+    """An ask that shares two distinctive words with a topic David already answered is a repeat (no model needed)."""
+    res: dict[int, dict] = {}
+    for i, a in enumerate(asks):
+        toks = _topic_tokens(a)
+        for e in ledger or []:
+            common = toks & _topic_tokens(e.get("topic", ""))
+            if len(common) >= 2:
+                res[i] = {"i": i, "verdict": "already_answered", "how": "",
+                          "reason": f"David already answered this ({e.get('topic', '')[:80]!r}: {e.get('answer', '')[:80]!r}); "
+                                    f"matched on {sorted(common)[:3]}."}
+                break
+    return res
+
+
 def judge(asks: list[str], *, tools_text: str, user_msgs: list[str], card_status: dict[str, dict],
-          ledger_text: str, caps: str, reply: str = "", llm: Callable[[str, str], str] | None = None) -> list[dict]:
+          ledger_text: str, caps: str, reply: str = "", llm: Callable[[str, str], str] | None = None,
+          ledger: list[dict] | None = None) -> list[dict]:
     """Verdict per ask. ``llm(system, user) -> raw text``. Raises nothing the caller must handle except llm errors."""
     res = deterministic(asks, card_status)
+    for i, v in ledger_match(asks, ledger or []).items():
+        res.setdefault(i, v)
     todo = [i for i in range(len(asks)) if i not in res]
     if todo and llm is not None:
         sub = [asks[i] for i in todo]
         card_text = "\n".join(f"{c['id']}: {c['status']}" + (f" (result: {c['result'][:150]})" if c.get("result") else "")
                               for c in card_status.values())
         raw = llm(SYSTEM, build_user_prompt(sub, tools_text, user_msgs, card_text, ledger_text, caps, reply))
-        for j, v in enumerate(parse_verdicts(raw, len(sub))):
+        any_done = any(c["status"] in _DONE for c in card_status.values())
+        for j, v in enumerate(parse_verdicts(raw, len(sub), caps)):
+            if v["verdict"] == "already_done" and not any_done:
+                v = {**v, "verdict": "ok"}  # the model said "done" but no mentioned card is done in the database
             res[todo[j]] = {**v, "i": todo[j]}
     return [res.get(i, {"i": i, "verdict": "ok", "reason": "", "how": ""}) for i in range(len(asks))]
 

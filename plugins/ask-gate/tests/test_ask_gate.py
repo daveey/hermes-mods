@@ -355,17 +355,69 @@ def test_capability_sheet_is_generated_from_runtime_sources():
     assert "vault entries: none" in sheet
 
 
-def test_low_confidence_or_how_less_verdicts_fail_open(gate):
+def test_low_confidence_or_ungrounded_verdicts_fail_open(gate):
     j = gate.judge_mod
-    raw = json.dumps({"asks": [{"i": 0, "verdict": "agent_can_do", "confidence": 0.5, "reason": "r", "how": "token-broker exec x"},
-                               {"i": 1, "verdict": "unverified", "confidence": 0.95, "reason": "r", "how": ""},
-                               {"i": 2, "verdict": "already_answered", "confidence": 0.9, "reason": "he said so"},
-                               {"i": 3, "verdict": "unverified", "confidence": 0.9, "reason": "r", "how": "kanban_show t_1"}]})
-    v = [x["verdict"] for x in j.parse_verdicts(raw, 4)]
-    assert v == ["ok", "ok", "already_answered", "unverified"]
+    caps = "token-broker scopes: cf-token-minter (auto); ssh hosts: mini-host"
+    raw = json.dumps({"asks": [
+        {"i": 0, "verdict": "agent_can_do", "confidence": 0.3, "reason": "r", "how": "token-broker exec --scope cf-token-minter"},
+        {"i": 1, "verdict": "unverified", "confidence": 0.95, "reason": "r", "how": ""},
+        {"i": 2, "verdict": "already_answered", "confidence": 0.9, "reason": "he said so"},
+        {"i": 3, "verdict": "unverified", "confidence": 0.9, "reason": "r", "how": "kanban_show t_1"},
+        {"i": 4, "verdict": "agent_can_do", "confidence": 0.65, "reason": "r", "how": "use cf-token-minter to mint it"},
+        {"i": 5, "verdict": "agent_can_do", "confidence": 0.95, "reason": "r", "how": "just use a browser"},
+        {"i": 6, "verdict": "unverified", "confidence": 0.7, "reason": "r", "how": "kanban_show t_1"}]})
+    v = [x["verdict"] for x in j.parse_verdicts(raw, 7, caps)]
+    assert v == ["ok", "ok", "already_answered", "unverified", "agent_can_do", "ok", "ok"]
 
 
 @pytest.mark.parametrize("text", ["It was waiting on you to sleep the Mac, and it already had.",
                                   "That card had been blocked on you until this morning."])
 def test_retrospective_waiting_is_not_an_ask(gate, text):
     assert gate.core.find_asks(text) == []
+
+
+def test_llm_already_done_needs_a_done_card_in_the_database(gate, board):
+    board("t_aaaaaaaa", "blocked")
+    gate.LLM = llm_returning([("already_done", "it looks finished", "")])
+    assert gate.pre_final_gate(session_id="s1", platform="tui",
+                               final_response="Card t_aaaaaaaa is still blocked; want me to unblock it?", attempt=0) is None
+    board("t_bbbbbbbb", "done", completed=5.0)
+    gate.LLM = llm_returning([("already_done", "same card", "")])
+    r = gate.pre_final_gate(session_id="s1", platform="tui",
+                            final_response="Card t_bbbbbbbb finished earlier. Can you confirm the result?", attempt=0)
+    assert r and r["hold"]
+
+
+# ---- incident cards (verbatim kanban_create args from the transcript) and the deterministic ledger match ----
+CARDS = json.loads((__import__("pathlib").Path(__file__).parent / "fixtures" / "incident_cards.json").read_text())
+
+
+@pytest.mark.parametrize("i", [0, 1])
+def test_I1_I2_cards_are_refused_without_a_checked_line(gate, i):
+    r = gate.pre_tool_call(tool_name="kanban_create", args=CARDS[i], session_id="s1")
+    assert r["action"] == "block" and "No `Checked:` line" in r["message"]
+
+
+def test_I1_I2_cards_pass_the_checked_gate_only_with_real_evidence(gate):
+    card = {**CARDS[0], "body": CARDS[0]["body"] + "\nChecked: browser_exec myaccount connections page — Superhuman not in the 18 connected apps"}
+    gate.LOG.add("s1", "browser_exec", "open myaccount connections page", "18 apps with account access, no Superhuman")
+    gate.LLM = llm_returning([("already_done", "not connected any more", "none")] * 6)
+    r = gate.pre_tool_call(tool_name="kanban_create", args=card, session_id="s1")
+    # evidence matched, so the refusal now comes from the judge reading the card, not from the missing line
+    assert r is None or "refused after the judge" in r["message"]
+
+
+def test_I4_repeat_is_caught_by_the_ledger_without_any_model_call(gate):
+    gate.ledger().add("cancel the Superhuman subscription", "already handled, i keep completing it", session="old")
+    stub = llm_returning([("ok", "")])
+    gate.LLM = stub
+    r = gate.pre_final_gate(session_id="s1", platform="tui", final_response=FIX["I4"]["reply"], attempt=0)
+    assert r["hold"] and "already_answered" in r["nudge"] and "Superhuman" in r["nudge"]
+
+
+def test_ledger_match_needs_two_distinctive_words(gate):
+    j = gate.judge_mod
+    led = [{"topic": "cancel the Superhuman subscription", "answer": "handled"}]
+    assert j.ledger_match(["Should I rotate the GitHub token?"], led) == {}
+    assert j.ledger_match(["Want me to rotate the Superhuman token?"], led) == {}   # one shared word only
+    assert 0 in j.ledger_match(["Cancelling the Superhuman subscription is up to you."], led)
