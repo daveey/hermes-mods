@@ -84,8 +84,16 @@ SCREENSHOT = re.compile(r"\[(?:screenshot|Image attached)[^\]]*\]", re.I)
 SCREENSHOT_FIX = re.compile(r"\b(?:fix|broken|wtf|why)\b", re.I)
 # Instructions Hermes wrote (Inbox Do-it prompts, hand-off briefs, card bodies pasted back: David does not type
 # Markdown bold), and a quoted button label.
+# Also not a fix request (week of 2026-10-12 review): a status question about past fixes ("do we expect that we fixed
+# the root causes"), a conditional plan ("make babybear do it, and if it fails figure out why"), and a spec for a
+# mechanism that files cards itself ("a process that ... should create a kanban task to fix", "modify bb-tuner to
+# measure X and then file issues to investigate").
 FIX_NEGATIVE = re.compile(r"^\s*(?:work kanban task|Investigate this [\w-]+ cron output|Review (?:these|this week)|"
-                          r"Self-heal|Context carried over|\{)|\*\*\w|\bno need to (?:root|fix)\b|[\"'“]still broken[\"'”]",
+                          r"Self-heal|Context carried over|\{)|\*\*\w|\bno need to (?:root|fix)\b|[\"'“]still broken[\"'”]"
+                          r"|\bfixed the root.?causes?\b"
+                          r"|\bif (?:it|that|this|they) (?:fails?|breaks?|doesn.?t work|don.?t work)\b"
+                          r"|\b(?:it|that|which|then)\s+(?:should\s+|would\s+|will\s+|can\s+)?(?:automatically\s+)?"
+                          r"(?:file|create|open|make)s?\s+(?:a\s+|an\s+)?(?:new\s+)?(?:kanban\s+)?(?:card|task|ticket|issue)s?\b",
                           re.I)
 INTERACTIVE_SOURCES = {"desktop", "tui", "cli", "slack", "telegram", "discord", "whatsapp", "signal"}
 

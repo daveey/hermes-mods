@@ -198,7 +198,10 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   and scheduled to the next UTC midnight; at 3 running, 1 h out. Each card body carries a `Budget for this card` line
   ($8 investigation, $15 fix) for the engine watchdog.
 - **Hub cron** (`~/.hermes/scripts/selfheal_lane.py` → `self_heal.cron`, every 5 min, no agent): Inbox sync, queue drain, and every 25+ min the digest backstop (the complaint detector over
-  new user turns of interactive sessions in the coach digests, per-session cursor), Inbox sync.
+  new user turns of interactive sessions in the coach digests, per-session cursor; the judge gets each turn's `prev`
+  agent reply from digest v6 plus the session title and the 3 earlier user turns, since without them the strict stage
+  scored context-free reports like "why didnt this work [screenshot]" as new issues), Inbox sync. In the cascade a
+  stage whose answer is empty or unparseable is retried once and then left out of the mean, not counted as a 0.
 - Events (coach `log.jsonl`, read by `coach_weekly.py`): `selfheal_would_file`, `_filed`, `_recurrence`, `_skip`,
   `_proposed`, `_approved`, `_fixed`, `_reverted`, `_not_defect`, `_declined`. Cards report theirs with
   `self_heal.py event <kind> <fp> --card <id>`. `self_heal.py status` prints the lane state and budget.

@@ -39,7 +39,8 @@ which finds anti-patterns and proposes improvements. Phase 1 of a measure → de
 The private repo layout is `<host>/<profile>/<session_id>.json`. Each host writes only its own subtree, so pushes never conflict.
 
 Digest = session stats (msgs counted from `messages`, since `sessions.message_count` goes stale), cost,
-subagent children folded into the root, user turns (first 10 + last 50, ≤500 chars), tool counts, tool-error
+subagent children folded into the root, user turns (first 10 + last 50, ≤500 chars; each with `prev`, the agent reply before it clipped to its
+first 150 + last 450 chars, v6, for the self-heal backstop judge), tool counts, tool-error
 counts, pattern signals, `features` (content-free feature-use counts from tool-call args: kanban_create options,
 todo, cron/profile/board creation, worktrees; v4), and the last reply (≤800 chars). Removed: injected blocks (`<memory-context>`,
 system notes, pasted content), Hermes-written user-role messages (background-process notices, compression
@@ -160,6 +161,12 @@ Undone notices are always plain cards.
   stale capability claim such as a too-narrow token scope, produces the asks, and cron runs bypass the ask-gate.
   After narrowing a detector, diff the old and new hit lists and explain every dropped hit. Structural rules like
   "skip a session's first turn" drop real hits, because a new session can open by answering an ask from another session.
+- Reviewing the weekly `had_to_ask_fix` hits: replay them through `self_heal.complaint_verdict` the way the backstop
+  sees them (digest text, `prev`, `backstop_context`) and through the in-process path, then read the per-stage scores:
+  `[0.9, 0.0]` with a `product_bug` strict stage is the cascade's product-bug scoping (a policy question, not a
+  detector bug), an empty strict answer is a judge failure. On the hub, run any replay under the cron interpreter
+  (`cron.scheduler_script._posix_cron_script_argv`); a bare `python3` lacks ruamel, `aux_judge` raises, and the
+  fail-open detector silently scores every turn "no defect".
 - Exclude shared team-bot profiles with a glob (`coach_feed --exclude-profile 'alpha*'`): they hold other people's
   conversations, and a Slack follower runs as `source=cli`, so each teammate message counts as a user turn and its
   frustration/stuck/repeat_fix signals inflate the host's KPIs. An exact name (`alpha`) missed the sibling

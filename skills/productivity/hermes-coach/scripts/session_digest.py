@@ -15,11 +15,14 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, fnmatch, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 5            # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
+DIGEST_V = 6            # v6: each user turn carries `prev`, the agent reply before it (head+tail clip), for the
+                        #     self-heal backstop judge (without it \"why didnt this work\" reads as a new issue)
+                        # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
                         # v4: `features` (content-free feature-use counts for curriculum adoption checks)
 MAX_TURNS = 60          # keep the first 10 and the last 50 user turns
 TURN_CHARS = 500
 LAST_REPLY_CHARS = 800
+PREV_HEAD, PREV_TAIL = 150, 450  # `prev` per user turn: a reply's ending (\"Done.\", \"Want me to…?\") is what a correction answers
 
 # Blocks Hermes injects into user messages; they are not the user's words.
 INJECTED = [
@@ -183,6 +186,11 @@ def trunc(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 15] + " …[truncated]"
 
 
+def clip_ends(s: str, head: int = PREV_HEAD, tail: int = PREV_TAIL) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= head + tail + 20 else s[:head] + " …[clipped]… " + s[-tail:]
+
+
 def discover_dbs(home: Path):
     out = []
     if (home / "state.db").exists():
@@ -283,7 +291,10 @@ def digest_db(profile, db, host, since):
                 n_real += 1
                 if users and users[-1]["text"] == trunc(text, TURN_CHARS):
                     continue  # the same turn persisted twice (retry / steer echo)
-                users.append({"t": round(m["timestamp"]), "text": trunc(text, TURN_CHARS)})
+                turn = {"t": round(m["timestamp"]), "text": trunc(text, TURN_CHARS)}
+                if last_reply.strip():
+                    turn["prev"] = clip_ends(redact(_home_rel(last_reply) or ""))
+                users.append(turn)
             elif role == "assistant":
                 if content.strip():
                     last_reply = content

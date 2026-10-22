@@ -339,6 +339,32 @@ def test_digest_backstop_scans_only_new_turns_of_interactive_sessions(store, tmp
     assert len(got) == 2 and "draft" in got[1]["quote"]
 
 
+def test_backstop_gives_the_judge_the_prev_reply_and_session_context(store, tmp_path):
+    """Digest v6 `prev` (the agent reply before the turn) and the title + earlier user turns reach the judge; without
+    them the strict stage read 'why didnt this work [screenshot]' as a new issue (week of 2026-10-12 replay)."""
+    data = tmp_path / "data"
+    now = time.time()
+    p = data / "macbook" / "default" / "s9.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"id": "s9", "host": "macbook", "profile": "default", "source": "desktop",
+                             "title": "Fix sidebar drag", "user_turns": [
+                                 {"t": now - 600, "text": "dragging sessions into projects does nothing"},
+                                 {"t": now - 300, "text": "why didnt this work [screenshot]",
+                                  "prev": "Fixed: drag now moves the session. Reload Desktop to pick it up."}]}))
+    prompts = []
+
+    def llm(system, prompt):
+        prompts.append(prompt)
+        return json.dumps({"p_defect": 0.9, "kind": "agent_fault", "component": "desktop", "symptom": "drag fix failed"})
+    sh.backstop(data, store=store, judge=llm, now=now, filer=lambda d, store=None, m=None: {"action": "would_file"},
+                m="shadow")
+    last = [x for x in prompts if "why didnt this work" in x][0]
+    assert "Fixed: drag now moves the session" in last and "Session title: Fix sidebar drag" in last
+    assert "dragging sessions into projects does nothing" in last
+    first = [x for x in prompts if "USER'S NEW MESSAGE:\ndragging" in x][0]
+    assert "first user message of the session" in first
+
+
 def test_queue_drain_files_each_queued_detection_once(store):
     q = Path(store.root) / "selfheal_queue.jsonl"
     q.parent.mkdir(parents=True, exist_ok=True)

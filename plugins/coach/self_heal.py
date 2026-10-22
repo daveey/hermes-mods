@@ -277,8 +277,12 @@ def _log_text(tool_log, n=25, chars=2500) -> str:
     return "\n".join(str(x)[:200] for x in (tool_log or [])[-n:])[:chars] or "(no tool calls)"
 
 
-def complaint_prompt(prev_reply: str, user_text, tool_log=None) -> str:
-    return (f"AGENT'S PREVIOUS FINAL MESSAGE:\n{(prev_reply or '(none: first turn)')[-3000:]}\n\n"
+def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "") -> str:
+    """`context` (digest backstop only): the session title and earlier user messages, for turns whose previous agent
+    reply is unknown. Without it a context-free report (\"why didnt this work [screenshot]\") reads as a new issue."""
+    ctx = f"SESSION CONTEXT (from a digest; agent replies are not available):\n{context[:1500]}\n\n" if context else ""
+    prev = prev_reply or ("(not available)" if context else "(none: first turn)")
+    return (f"{ctx}AGENT'S PREVIOUS FINAL MESSAGE:\n{prev[-3000:]}\n\n"
             f"TOOL LOG OF THE AGENT'S PREVIOUS TURN:\n{_log_text(tool_log)}\n\n"
             f"USER'S NEW MESSAGE:\n{clean_user(user_text)[:2000]}")
 
@@ -304,23 +308,38 @@ def _score(v: Optional[dict]) -> float:
     return 0.0 if not v or v.get("kind") in ("external", "product_bug", "none") else v["p_defect"]
 
 
+def _ask(llm: Callable[[str, str], str], system: str, prompt: str, tries: int = 2) -> Optional[dict]:
+    """One judge stage, retried once when the call fails or the answer does not parse (an empty flash answer is
+    common). None = no opinion, which the cascade leaves out; it is never a 'no' vote."""
+    for _ in range(tries):
+        try:
+            v = parse(llm(system, prompt))
+        except Exception:
+            v = None
+        if v:
+            return v
+    return None
+
+
 def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str], tool_log=None,
-                      confirm: Optional[Callable[[str, str], str]] = None) -> Optional[dict]:
+                      confirm: Optional[Callable[[str, str], str]] = None, context: str = "") -> Optional[dict]:
     """The complaint cascade, before the threshold: judge (COMPLAINT_SYS); below GATE stop there. Otherwise a second
     flash opinion (COMPLAINT_STRICT_SYS) and, when configured, the confirm model on COMPLAINT_SYS; p_defect = the mean
-    of the stage scores (a non-defect kind scores 0). Component/symptom come from the strongest stage."""
-    prompt = complaint_prompt(prev_reply, user_text, tool_log)
-    v1 = parse(llm(_with_profile(COMPLAINT_SYS), prompt))
+    of the stage scores (a non-defect kind scores 0; a stage with no answer after a retry is left out, since counting
+    it as 0 halved real catches). Component/symptom come from the strongest stage."""
+    prompt = complaint_prompt(prev_reply, user_text, tool_log, context)
+    v1 = _ask(llm, _with_profile(COMPLAINT_SYS), prompt)
     if not v1:
         return None
     s1 = _score(v1)
     if s1 < GATE:
         return {**v1, "p_defect": s1, "stages": [s1]}
-    v2 = parse(llm(_with_profile(COMPLAINT_STRICT_SYS), prompt))
-    stages, best = [s1, _score(v2)], v1
+    v2 = _ask(llm, _with_profile(COMPLAINT_STRICT_SYS), prompt)
+    stages, best = [s1] + ([_score(v2)] if v2 else []), v1
     if confirm:
-        v3 = parse(confirm(_with_profile(COMPLAINT_SYS), prompt))
-        stages.append(_score(v3))
+        v3 = _ask(confirm, _with_profile(COMPLAINT_SYS), prompt)
+        if v3:
+            stages.append(_score(v3))
         best = v3 if v3 and _score(v3) > 0 else best
     p = round(sum(stages) / len(stages), 3)
     return {**best, "kind": best.get("kind") if _score(best) > 0 else v1.get("kind"), "p_defect": p,
@@ -329,13 +348,13 @@ def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str]
 
 def detect_complaint(prev_reply: str, user_text, llm: Optional[Callable[[str, str], str]] = None,
                      threshold: float = THRESHOLD, tool_log=None,
-                     confirm: Optional[Callable[[str, str], str]] = None) -> Optional[dict]:
+                     confirm: Optional[Callable[[str, str], str]] = None, context: str = "") -> Optional[dict]:
     """pre_llm_call path: prefilter, then the cascade (complaint_verdict) on (previous reply + its turn's tool log,
     user message). Returns {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open."""
     try:
         if not prefilter(user_text):
             return None
-        return _verdict(complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm),
+        return _verdict(complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context),
                         "complaint", threshold)
     except Exception:
         return None
@@ -1187,13 +1206,24 @@ def sync(store=None, runner=None, now: Optional[float] = None, fixer: Optional[C
 INTERACTIVE = ("desktop", "tui", "cli", "slack", "telegram", "discord", "whatsapp", "signal")
 
 
+def backstop_context(dg: dict, turns: list, t: dict, n: int = 3, chars: int = 300) -> str:
+    """Session title plus the `n` user turns before `t` (each clipped), for the backstop judge."""
+    i = next((k for k, x in enumerate(turns) if x is t), len(turns))
+    earlier = [str(x.get("text") or "")[:chars].replace("\n", " ") for x in turns[max(0, i - n):i]]
+    lines = [f"Session title: {dg.get('title') or '(untitled)'}"]
+    lines += ([f"Earlier user messages, oldest first:"] + [f"- {e}" for e in earlier] if earlier
+              else ["This is the first user message of the session."])
+    return "\n".join(lines)
+
+
 def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Optional[float] = None,
              lookback: float = 3 * 3600, filer: Optional[Callable] = None, m: Optional[str] = None,
              limit: int = 200) -> list:
     """Run the complaint detector over user turns newer than the per-session cursor in the coach digests
-    (<data>/<host>/<profile>/<sid>.json). A session seen for the first time is scanned only `lookback` back. Turn
-    pairs carry no per-turn previous reply in digests, so prev_reply is empty except for the last turn (last_reply).
-    Returns the filings."""
+    (<data>/<host>/<profile>/<sid>.json). A session seen for the first time is scanned only `lookback` back. The judge
+    gets the agent reply before each turn (digest v6 `prev`) and always the session context (title + the earlier user
+    turns, `backstop_context`): with neither, the strict stage read \"why didnt this work\" or \"the camera stream is
+    broken\" as a new issue and scored 0. Returns the filings."""
     store = _store(store)
     now = now or time.time()
     m = m or mode()
@@ -1229,7 +1259,8 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
             if not prefilter(text):
                 continue
             n += 1
-            hit = detect_complaint("", text, llm=judge, threshold=threshold())
+            hit = detect_complaint(t.get("prev") or "", text, llm=judge, threshold=threshold(),
+                                   context=backstop_context(dg, turns, t))
             if not hit:
                 continue
             sid = dg.get("id") or f.stem

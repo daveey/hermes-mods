@@ -113,6 +113,31 @@ def test_product_bug_kind_is_not_a_self_heal_defect():
     assert sh.detect_complaint("", "the vendor login page is down", llm) is None
 
 
+def test_complaint_stage_without_an_answer_is_retried_then_left_out_not_a_zero_vote():
+    """Week of 2026-10-12 replay: 'why did you think you were done? create a task to investigate and fix' scored
+    [1.0, 0.0] because the strict stage's answer did not parse; counted as 0 it halved a sure catch to 0.5."""
+    answers = iter([json.dumps({"p_defect": 1.0, "kind": "agent_fault", "component": "agent",
+                                "symptom": "claimed done prematurely"}), "", ""])
+    calls = []
+
+    def llm(system, prompt):
+        calls.append(system)
+        return next(answers)
+    hit = sh.detect_complaint("", "why did you think you were done? create a task to investigate and fix", llm)
+    assert hit and hit["stages"] == [1.0] and hit["p_defect"] == 1.0
+    assert len(calls) == 3 and calls[1].startswith(sh.COMPLAINT_STRICT_SYS)  # strict stage asked twice
+    # a strict stage that ANSWERS 0 still votes
+    answers2 = iter([json.dumps({"p_defect": 0.9, "kind": "hermes_bug", "component": "bb", "symptom": "x"}),
+                     json.dumps({"p_defect": 0.05, "kind": "product_bug", "component": "bb", "symptom": "x"})])
+    assert sh.detect_complaint("", "the camera stream is broken", lambda s, p: next(answers2)) is None
+
+
+def test_complaint_prompt_carries_backstop_context():
+    p = sh.complaint_prompt("", "why didnt this work [screenshot]", context="Session title: Fix sidebar drag")
+    assert p.startswith("SESSION CONTEXT") and "Fix sidebar drag" in p and "(not available)" in p
+    assert "SESSION CONTEXT" not in sh.complaint_prompt("", "x") and "(none: first turn)" in sh.complaint_prompt("", "x")
+
+
 def test_audit_files_only_self_admissions():
     llm, _ = judge(0.95, kind="needless_handoff")
     assert sh.detect_admission("Please run this in your terminal: make", llm) is None

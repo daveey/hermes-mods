@@ -62,6 +62,13 @@ FIX_HITS = {"make a card to fix": "card-to-fix",
             "fix [screenshot]": "screenshot-fix",
             "fix this [Image attached: a.png]": "screenshot-fix"}
 FIX_MISSES = ["fix the typo in the README",                      # an ordinary task, not a defect report
+              # week of 2026-10-12 review: a status question, a conditional plan, two specs for card-filing mechanisms
+              "hows the mini perf doing now, do we expect that we fixed the root causes",
+              "dont build it from scratch, make babybear do it, and if it fails figure out why and fix it",
+              "can we modify bb-tuner to measure the relevant timing and quality of watch coms, and then file issues to "
+              "investigate and optimize?",
+              "i want a process that looks at all sessions every 10 minutes, and makes sure their status (green|red) and "
+              "linked tasks are correct. if not, it should create a kanban task to fix",
               "what is the root of this repo?",
               "[screenshot] here is the design i want",
               "work kanban task t_abc123",
