@@ -116,8 +116,10 @@ class Fix(unittest.TestCase):
             self.assertIsNone(g.posted_elsewhere(d, w, "hub"))
             p = g.marker_path(d, w)
             p.parent.mkdir(parents=True)
-            p.write_text(json.dumps({"host": "hub"}))
+            p.write_text(json.dumps({"posted_by": "hub"}))
             self.assertIsNone(g.posted_elsewhere(d, w, "hub"))       # our own marker: re-post updates the same card
+            self.assertEqual(g.posted_elsewhere(d, w, "laptop"), "hub")
+            p.write_text(json.dumps({"host": "hub"}))                # marker written before the rename
             self.assertEqual(g.posted_elsewhere(d, w, "laptop"), "hub")
 
 

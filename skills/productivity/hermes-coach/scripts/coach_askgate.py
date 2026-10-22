@@ -132,6 +132,8 @@ def collect(data, since_ts, until_ts):
             d = json.load(open(f))
         except Exception:
             continue
+        if not isinstance(d, dict) or not d.get("id"):  # reports/askgate markers, eval files: not digests
+            continue
         st = d.get("started_at")
         if st and (first_ts is None or st < first_ts):
             first_ts = st
@@ -228,7 +230,8 @@ def posted_elsewhere(data, week, me):
         m = json.loads(p.read_text())
     except Exception:
         return None
-    return m.get("host") if m.get("host") and m.get("host") != me else None
+    who = m.get("posted_by") or m.get("host")  # "host" = markers written before the rename
+    return who if who and who != me else None
 
 
 def post_body(hits, week, extra=None):
@@ -325,7 +328,7 @@ def main():
             sys.exit(r.returncode)
         p = marker_path(data, weeks[0])
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"host": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix),
+        p.write_text(json.dumps({"posted_by": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix),
                                  "fix_sessions": len({h["session"] for h in fix})}) + "\n")
 
 

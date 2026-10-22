@@ -48,16 +48,24 @@ def fmt_other_sources(o):
                                 or "none") + " (excluded from interactive KPIs)"
 
 
+NON_DIGEST_DIRS = {"reports", "findings", "research", "eval"}
+
+
 def load(data: Path):
     out = []
     for f in glob.glob(str(data / "*" / "*" / "*.json")):
-        if "/reports/" in f or "/findings/" in f or "/research/" in f:
+        # By top-level path component, so a relative --data ("reports/askgate/x.json") is skipped too.
+        try:
+            top = Path(f).relative_to(data).parts[0]
+        except ValueError:
+            top = Path(f).parts[-3]
+        if top in NON_DIGEST_DIRS:
             continue
         try:
             d = json.load(open(f))
         except Exception:
             continue
-        if isinstance(d, dict) and d.get("host"):  # research/state/seen.json etc. are not digests
+        if isinstance(d, dict) and d.get("host") and d.get("id"):  # research/state/seen.json etc. are not digests
             out.append(d)
     return out
 

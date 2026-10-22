@@ -54,5 +54,27 @@ class InteractiveSources(unittest.TestCase):
         self.assertEqual(ev, ["mini/p/desktop-9"])
 
 
+class LoadSkipsNonDigests(unittest.TestCase):
+    def test_relative_data_skips_reports_marker_and_idless_files(self):
+        import json, os, tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for rel, body in [("mini/default/s1.json", {"id": "s1", "host": "mini"}),
+                              ("reports/askgate/2026-10-12.json", {"host": "hub", "posted_at": 1}),
+                              ("eval/reports/x.json", {"host": "hub", "id": "e"}),
+                              ("mini/default/noid.json", {"host": "mini"})]:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(json.dumps(body))
+            cwd = os.getcwd()
+            try:
+                os.chdir(d)
+                rel_ids = sorted(x["id"] for x in coach_mine.load(Path(".")))
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(rel_ids, ["s1"])
+            self.assertEqual(sorted(x["id"] for x in coach_mine.load(root)), ["s1"])
+
+
 if __name__ == "__main__":
     unittest.main()
