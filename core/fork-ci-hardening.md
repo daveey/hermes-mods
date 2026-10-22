@@ -9,6 +9,8 @@ Patches:
 - `patches/0181-ci-python-test-job-provisions-PM-locked-Node-de-flak.patch`: python test job gets the locked Node; two flakes fixed.
 - `patches/0182-tests-doctor-isolate-vercel-backend-and-gh-auth-test.patch`: doctor tests no longer depend on the runner.
 - `patches/0183-tests-isolate-gateway-service-tests-from-container-r.patch`: gateway service tests no longer depend on the runner.
+- `patches/0188-test-make-3-env-sensitive-tests-independent-of-the-C.patch`: orphan-readopt (TUI) and termux-api detection tests no longer depend on the runner env.
+- `patches/0189-lint-fix-12-ruff-errors-blocking-CI-daveey-11.patch`: 12 ruff errors (update_cmd_git, startup_resume and their tests) that kept the lint job red.
 
 What you see: the private fork's CI runs (and passes) without GitHub-hosted minutes. None of this changes runtime
 behavior; it is workflow wiring and test isolation.

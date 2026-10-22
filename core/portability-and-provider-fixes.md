@@ -5,6 +5,7 @@ Patches:
 - `patches/0174-chore-map-fork-owner-contributor-email.patch`: maps the fork owner's commit email for the contributor check.
 - `patches/0175-fix-providers-commandcode-overlay-keeps-COMMANDCODE_.patch`: commandcode keeps `COMMANDCODE_API_KEY`.
 - `patches/0178-fix-subprocess-text-True-needs-encoding-utf-8-errors.patch`: utf-8 subprocess decoding and a psutil pid check.
+- `patches/0187-fix-windows-clear-remaining-footguns-utf-8-sig-read-.patch`: more Windows footguns.
 
 ## Behavior
 
@@ -17,6 +18,9 @@ Patches:
   the ANSI codepage and raise on non-ASCII): `kanban_host_identity.boot_prefix`, `review_session_activity._fetch_pr`,
   `top_level_env._parent_pid`, `update_cmd_git._synthesize_upstream_merge`. `top_level_env._pid_alive` uses
   `psutil.pid_exists` when available, falling back to `os.kill(pid, 0)` (marked `# windows-footgun: ok`).
+- 0187: `cron_session_activity._read_owners` reads `jobs.json` as `utf-8-sig` (a BOM no longer breaks it),
+  `tools/process_registry_checkpoint.py` opens its flock file in binary mode, and the dead duplicate `return` in
+  `_pid_alive` is gone.
 
 ## How it works
 
@@ -38,7 +42,7 @@ check in CI.
 
 ## Gotchas
 
-- 0178's `_pid_alive` has a stray duplicate `return True` after the fallback; harmless.
+- 0187 removes the stray duplicate `return True` 0178 left in `_pid_alive`.
 
 ## Plugin?
 
