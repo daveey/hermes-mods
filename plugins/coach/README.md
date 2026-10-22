@@ -179,7 +179,7 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
 - **Where it decides.** On the hub (`coach/selfheal-config.json`: `hub_host`, `hub_ssh`, `board`, `bb_board`; no hub
   configured = this host) it decides locally; on any other host, live mode pipes `d` to `self_heal.py file --mode live`
   on the hub over ssh, so dedupe, recurrence, suppression and budget live in one place (`coach/selfheal_lane.json`).
-- **Shadow** (`COACH_SELFHEAL=shadow`, the default) logs `selfheal_would_file` with the full card args and creates
+- **Shadow** (`COACH_SELFHEAL=shadow`, else `mode` in `coach/selfheal-config.json`, default shadow) logs `selfheal_would_file` with the full card args and creates
   nothing. **Live** creates the investigation card.
 - **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
   hermes-mods-repo (Baby Bear: board `bb`, five-whys + bb-self-fix). Its brief makes it investigate live, with a

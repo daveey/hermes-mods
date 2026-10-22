@@ -441,3 +441,15 @@ def test_file_errors_are_logged_and_fail_open(store):
 def test_tests_never_exec_for_real(store):
     with pytest.raises(RuntimeError):
         sh._run(["hermes", "kanban", "create", "x"])
+
+
+def test_mode_from_env_then_config_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(sh, "coach_root", lambda: tmp_path / "coach")
+    monkeypatch.delenv("COACH_SELFHEAL", raising=False)
+    assert sh.mode() == "shadow"
+    (tmp_path / "coach").mkdir()
+    (tmp_path / "coach" / "selfheal-config.json").write_text(json.dumps({"mode": "live"}))
+    assert sh.mode() == "live"
+    monkeypatch.setenv("COACH_SELFHEAL", "off")
+    assert sh.mode() == "off"

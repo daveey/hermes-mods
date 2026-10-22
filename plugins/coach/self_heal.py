@@ -412,7 +412,14 @@ def user_facing(platform: str = "", parent_session_id: str = "") -> bool:
 
 
 def mode() -> str:
-    m = os.environ.get("COACH_SELFHEAL", "shadow").strip().lower()
+    """COACH_SELFHEAL env, else `mode` in <coach>/selfheal-config.json (so a cron scheduler or gateway needs no env
+    change), else shadow."""
+    m = os.environ.get("COACH_SELFHEAL", "").strip().lower()
+    if not m:
+        try:
+            m = str(json.loads((coach_root() / "selfheal-config.json").read_text()).get("mode") or "").lower()
+        except Exception:
+            m = ""
     return m if m in ("off", "shadow", "live") else "shadow"
 
 
