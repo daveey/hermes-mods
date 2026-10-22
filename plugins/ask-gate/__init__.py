@@ -161,6 +161,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", conversation_hist
                  platform: str = "", parent_session_id: str = "", **_: Any) -> dict | None:
     if not _chat_eligible(session_id, platform) or parent_session_id:
         return None
+    _prewarm()
     try:
         LOG.reset(session_id)
         hist = [m.get("content") for m in (conversation_history or []) if isinstance(m, dict) and m.get("role") == "user"
@@ -334,20 +335,27 @@ def _worker_complete(session_id: str, args: dict) -> dict | None:
     return {"action": "modify", "args": {key: out}}
 
 
+_PREWARMED = {"done": False}
+
+
 def _prewarm() -> None:
     """The first aux call of a process can take 20+ s (client + credential-pool setup); core gives a gate hook 30 s.
-    Pay that cost once in the background so the first real ask is judged within a couple of seconds."""
-    if _off() or _is_worker() or os.environ.get("ASK_GATE_NO_PREWARM"):
+    Pay that cost once, in the background, from the first chat turn: it must run inside the agent's context
+    (profile-scoped secrets are context-bound), so the thread runs a copy of the caller's contextvars."""
+    if _PREWARMED["done"] or _off() or _is_worker() or os.environ.get("ASK_GATE_NO_PREWARM"):
         return
+    _PREWARMED["done"] = True
+    import contextvars
+    import threading
 
     def go():
         try:
             prov, model = _model_cfg()
             judge_mod.aux_llm("Reply with the single word ok.", "ok", timeout=40.0, max_tokens=5, provider=prov, model=model)
         except Exception as e:
-            core.log_event("prewarm_error", error=repr(e))
-    import threading
-    threading.Thread(target=go, name="ask-gate-prewarm", daemon=True).start()
+            core.log_event("prewarm_error", error=repr(e)[:300])
+    ctx = contextvars.copy_context()
+    threading.Thread(target=ctx.run, args=(go,), name="ask-gate-prewarm", daemon=True).start()
 
 
 def register(ctx) -> None:
@@ -358,4 +366,3 @@ def register(ctx) -> None:
         ctx.register_hook("pre_final_gate", pre_final_gate)
     except Exception:  # older core without the hook: L1/L3/L4 still work
         core.log_event("no_pre_final_gate")
-    _prewarm()
