@@ -453,3 +453,18 @@ def test_mode_from_env_then_config_file(tmp_path, monkeypatch):
     assert sh.mode() == "live"
     monkeypatch.setenv("COACH_SELFHEAL", "off")
     assert sh.mode() == "off"
+
+
+def test_investigation_brief_carries_live_replay_lessons():
+    """The live-investigator replay (42 incidents) missed roots by stopping at the surface that showed the bad state,
+    by trusting the detector's trigger over the user's complaint, and by not naming what the incident host's state
+    it could not read. The brief must keep those rules, and the C11/C12/C10 checklists the writer-side checks."""
+    d = {"fingerprint": "fp1", "component": "gateway", "symptom": "status chip stuck", "session_id": "s1", "at": NOW}
+    b = sh.investigation_brief(d)
+    assert "name 2-3 candidate roots" in b
+    assert "not the surface that displayed it" in b
+    assert "only readable ON that host" in b
+    assert "Only after you\n   checked the user's complaint itself" in b
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in b and "reapers" in b
+    assert "kanban_notify_subs" in sh.investigation_brief({**d, "component": "kanban"})
+    assert "code path that WROTE it" in sh.investigation_brief({**d, "component": "desktop"})

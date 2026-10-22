@@ -614,6 +614,10 @@ CHECKLIST = {
                "`task_runs` (outcome, error, worker pid, session_id).\n"
                "- Compare what the user was told (quote) with the event log at that minute: which writer moved the "
                "state, and which session/board it routed to.\n"
+               "- Cross-session leaks: is the card/notice the chat talked about OWNED by this chat (tasks.session_id, "
+               "created_by) or did it arrive via a subscription (kanban_notify_subs) or a board-wide query? "
+               "Duplicate cards (same title, no idempotency_key)? A worker that parked David-facing steps in a "
+               "comment or a timer instead of a needs_input block?\n"
                "- `git log -S'<event kind or state>' -- hermes_cli/kanban*` in ~/.hermes/hermes-agent for the code "
                "that writes it; the dispatcher log `~/.hermes/logs/kanban*.log` / `agent.log` at that time."),
     "desktop": ("C10 surface provenance / duplicated state",
@@ -622,6 +626,9 @@ CHECKLIST = {
                 "~/code/hermes-mods/desktop-plugins; `git log --since` on that file.\n"
                 "- The backing state: the REST endpoint or db row the surface renders (state.db sessions row, inbox "
                 "items, kanban task) at the reported time; two writers or a stale cache = provenance gap.\n"
+                "- Do not stop at the renderer: the wrong row/badge/card is usually right for the data it got. Follow "
+                "the field it keys on (source, owner, status, origin/test flag) back to the code path that WROTE it "
+                "(e.g. a create path that hardcodes `source`, test traffic with no origin tag) and cite that file:line.\n"
                 "- On a Mac, the Desktop log (`~/Library/Logs/Hermes/` / `~/.hermes/logs/desktop.log`) via the "
                 "mac diag command if configured; else the coach digest of the session."),
     "plugin": ("C10/C12 plugin behaviour",
@@ -636,7 +643,13 @@ CHECKLIST = {
                 "- `~/.hermes/logs/{gateway,agent,errors}.log` and `hermes-sync.log` (a `hermes update` at that "
                 "minute stops servers) in a +-10 min window.\n"
                 "- Environment: HERMES_HOME, profile, interpreter/venv of each process (`/proc/<pid>/environ` or "
-                "`ps -E`)."),
+                "`ps -E`). Guards keyed on inherited env vars (HERMES_DELEGATED_CHILD_CONTEXT, HERMES_SESSION_*, "
+                "HERMES_KANBAN_*) misfire when a launcher (update/relaunch/sync, execute_code's env scrub) passes or "
+                "drops the parent env: grep the guard, then every spawn path that sets or strips the var.\n"
+                "- Who ended or orphaned it: session reapers / LRU eviction and agent close tearing down owned "
+                "background processes; checkpoints (processes.json) written before the notify/watch flags, so a "
+                "restart re-adopts the job without them. A wrong status chip is the symptom; the lifecycle writer is "
+                "the root."),
     "cron": ("C12/C15 scheduled jobs",
              "- `hermes cron list` and `~/.hermes/cron/output/<job>/` for the failing run; its script under "
              "~/.hermes/scripts; the delivery target; `errors.log` at run time."),
@@ -682,14 +695,21 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
 {('- Extra: ' + str(d.get('details'))[:1500]) if d.get('details') else ''}
 {rec}
 ## Do this
-1. Reproduce or confirm it LIVE, not from the transcript alone. Checklist for {title}:
+1. Reproduce or confirm it LIVE, not from the transcript alone. Scope it from the user's own words and the session's
+   open work (its cards, background processes, earlier turns), not only the detector's symptom: the trigger can point
+   at a different event than the one that hurt him. Checklist for {title}:
 {checks}{extra}
    Other hosts: the coach digests in ~/code/hermes-coach-data/<host>/ (git pull first) carry every session's user
-   turns, tool counts and last reply.
-2. Write the five-whys chain from evidence (five-whys skill): one causal step per why, each with a file:line, log
-   line, db row or quote; label guesses `(hypothesis)`; branch "why it happened" and "why nothing caught it"; stop at
-   a process/guard/design gap Hermes controls. Post the chain as a comment on this card.
-3. Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Run
+   turns, tool counts and last reply. A host's state.db / kanban.db / logs are only readable ON that host: if the
+   incident ran elsewhere, use what reaches it (ssh diag, digests, git) and list in the proposal what you could not
+   read.
+2. Before writing the chain, name 2-3 candidate roots and run the one check that tells them apart. The root is the
+   writer of the wrong state (code path, env, config, skill rule), not the surface that displayed it or the turn the
+   detector fired on. Then write the five-whys chain from evidence (five-whys skill): one causal step per why, each
+   with a file:line, log line, db row or quote; label guesses `(hypothesis)`; branch "why it happened" and "why
+   nothing caught it"; stop at a process/guard/design gap Hermes controls. Post the chain as a comment on this card.
+3. Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Only after you
+   checked the user's complaint itself, not just the detector's trigger. Run
    `python3 {SELF} event not_defect {fp} --card $HERMES_KANBAN_TASK --note "<why>"` and complete this card with a
    result that starts with "not a defect:". Post nothing to the Inbox.
 4. Otherwise write the proposal to {proposal} (markdown, <= 3500 chars, plain words, no jargon) with exactly these
