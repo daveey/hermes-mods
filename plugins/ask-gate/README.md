@@ -78,5 +78,12 @@ Unit tests use a stub judge; `scripts/replay.py` runs the same fixtures through 
 runtime interpreter, command in the script header) and `scripts/fp_report.py` runs the detector + judge over the last N
 days of Desktop sessions in `state.db` to measure how many final replies would be held.
 
+False-positive run (2026-10-21, last 14 days of Desktop sessions: 7,092 final replies, 1,388 with an ask-shaped
+sentence): the gate would hold 93 replies = **1.31%** (target < 3%). Eyeballed: 21 clear catches, 40 debatable
+(offers the agent could just do), 32 false positives (0.45% of all replies). Every hold is listed in
+`~/.hermes/kanban/evidence/ask-gate/fp-report.md` (private: it quotes real chats). The judge is a model and
+varies a little run to run; the deterministic backstops (live card status, ledger word match, the `Checked:` rule)
+do not.
+
 Known borderline: "Steps 3 and 5 need you to approve broader access once in Chrome." is judged `agent_can_do` when a
 signed-in Chrome profile exists. The hold only asks the agent to verify or try first.

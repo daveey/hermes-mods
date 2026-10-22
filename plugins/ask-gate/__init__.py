@@ -250,6 +250,10 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
         return None
 
 
+# core may buffer streamed final text while this hook is registered, so a held draft never reaches the screen
+pre_final_gate.needs_buffer = True  # type: ignore[attr-defined]
+
+
 # ---- L3 -----------------------------------------------------------------------------------------------
 CHECK_MSG = (
     "ask-gate: refused. This {what} says David has to act or decide, but it has no verified `Checked:` line. "
