@@ -395,3 +395,42 @@ def test_imperative_after_a_comma_or_or_reaches_the_model(home):
     out = run(home, reply, llm=llm)
     assert out["source"] != "skip" and len(llm.calls) == 1
     assert core._worth_asking("Shipped it. Logs are clean, and the release is green.") is False
+
+
+# ---- terminal hand-offs never become For-you steps --------------------------------------------------------
+
+HANDOFF_REPLY = ("The app on her desktop is quit and I couldn't reopen it.\n\n"
+                 "If you'd rather I SSH in, add `~/.ssh/id_ed25519.pub` to her account's `~/.ssh/authorized_keys`.\n\n"
+                 "Plug the USB drive into the box and tell me when it's in.")
+
+
+def test_terminal_doable_step_is_dropped_physical_kept(home):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    llm = fake_llm({"steps": [
+        {"text": "Add the ssh key to her authorized_keys", "kind": "do",
+         "verbatim_span": "add `~/.ssh/id_ed25519.pub` to her account's `~/.ssh/authorized_keys`"},
+        {"text": "Plug the USB drive into the box", "kind": "do",
+         "verbatim_span": "Plug the USB drive into the box and tell me when it's in."}]})
+    out = run(home, HANDOFF_REPLY, llm=llm, cards=board)
+    assert [s["text"] for s in out["steps"]] == ["Plug the USB drive into the box"]
+    assert out["dropped"] == ["Add the ssh key to her authorized_keys"]
+    assert "authorized_keys" not in (board.rows()[0][1] + board.rows()[0][2])
+
+
+def test_run_this_fence_step_is_dropped(home):
+    add_session(home, "S1")
+    reply = "Spotlight is the biggest cost.\n\nTo clear it, run this on the box:\n```\nsudo killall fseventsd\n```"
+    llm = fake_llm({"steps": [{"text": "Run sudo killall fseventsd on the box", "kind": "do",
+                               "verbatim_span": "To clear it, run this on the box:"}]})
+    out = run(home, reply, llm=llm)
+    assert out["steps"] == [] and out["dropped"]
+
+
+def test_approval_to_run_a_command_is_kept(home):
+    add_session(home, "S1")
+    reply = "Sleep is on.\n\nWant me to run `sudo pmset -a sleep 0` on the box?"
+    llm = fake_llm({"steps": [{"text": "Approve turning off sleep on the box", "kind": "approve",
+                               "verbatim_span": "Want me to run `sudo pmset -a sleep 0` on the box?"}]})
+    out = run(home, reply, llm=llm)
+    assert [s["kind"] for s in out["steps"]] == ["approve"] and out["dropped"] == []

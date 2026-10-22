@@ -133,9 +133,12 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
             session_ref=f"@session:{_profile()}/{session_id}")
         if out.get("error"):
             log.warning("user-steps extractor fell back to regex: %s", out["error"])
+        if out.get("dropped"):
+            log.info("user-steps dropped %d terminal-doable step(s): %s", len(out["dropped"]), out["dropped"])
         _trace(hook="transform", session=session_id, platform=platform, source=out.get("source"),
                new=[s["id"] for s in out.get("steps", [])], resolved=out.get("resolved"),
-               framed=out.get("text") is not None, error=out.get("error"))
+               framed=out.get("text") is not None, error=out.get("error"),
+               dropped_terminal=out.get("dropped") or None)
         return out.get("text")
     except Exception as exc:
         _trace(hook="transform", session=session_id, platform=platform, exception=repr(exc)[:300])

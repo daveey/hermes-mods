@@ -36,6 +36,19 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 | L3 | `pre_tool_call` | `kanban_create` with `initial_status=blocked` or a title/body saying the user must act, and `kanban_block` (not `dependency`/`time`/`transient`): refused unless the text has a `Checked: <tool or command> — <one line of output>` line that matches a tool call made earlier in the same turn (card tools never count as evidence). The judge then reads the body too. Kanban workers: `kanban_complete` handoffs with "David's call / David should / needs David" sentences are judged; any that is not judge-ok **and** backed by a matching `Checked:` line becomes `FYI (unverified, not an ask for David): …`. |
 | L4 | ledger | `~/.hermes/state/ask-ledger.sqlite` (not synced). When the user's message answers or dismisses an open ask ("done", "i keep completing it", "stop asking", "you can do it") the aux model classifies it and the topic/answer is stored. L1 shows it in every chat (cross-session); L2's judge treats a repeat as `already_answered`. A cheap regex gates the classifier call, so unrelated messages cost nothing. |
 
+**Terminal hand-offs (L2, no model call).** Before the judge, `handoff.py` looks for a sentence that hands the user a
+step a shell could do: an imperative (run / paste / type / enter / add / install…, after a sentence start, a comma,
+"please", "you need to", "I'd rather you") aimed at something only a shell does (`sudo`, `ssh`, `authorized_keys`,
+a key `.pub`, "terminal", `launchctl`, a `hermes update`…), or a "run this:" line followed by a shell fence, or a
+"For you / still open" heading over a `sudo`/`ssh` fence. Unless this turn already put a terminal in front of the user
+(`run_in_user_terminal`, or an osascript/`open -a Terminal` window), the reply is held with: *Do it yourself: call
+run_in_user_terminal; the user types any password there. Hand back only truly physical steps.* Two nudges, then it
+goes to the normal judge. Skipped when the user asked how to do something. Not matched: physical steps (taps, GUI and
+web sign-ins, System Settings, hardware), codes pasted into the chat, approvals ("want me to run …?"), past-tense
+reports, reversal how-tos ("To take it down, run …") and quoted speech. user-steps loads the same file to drop such
+steps. Replay on real replies (private set): 19/19 hand-offs caught, 0/73 false alarms; 2 of ~2,000 recent replies
+match, both in turns that had opened a terminal (exempt).
+
 Deterministic first: an ask naming a card that is `done`/`archived` in the database is `already_done` without any model call.
 
 The judge sees: the ask sentences, this turn's tool calls and results, the last 30 user messages, live status of every

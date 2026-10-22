@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import core, judge as judge_mod
+    from . import core, handoff, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -31,7 +31,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
         mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return _sys.modules.setdefault(key, mod)
-    core, judge_mod = _sib("core"), _sib("judge")
+    core, judge_mod, handoff = _sib("core"), _sib("judge"), _sib("handoff")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -269,7 +269,11 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
         return None
     try:
         users = _user_msgs(session_id)
-        asks = core.find_asks(final_response, howto=bool(users) and core.asked_how_to(users[-1]))
+        howto = bool(users) and core.asked_how_to(users[-1])
+        held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
+        if held is not None:
+            return held
+        asks = core.find_asks(final_response, howto=howto)
         if not asks:
             return None
         tools = core.merge_tool_logs(core.tools_from_messages(turn_messages or []), LOG.get(session_id))
@@ -296,6 +300,24 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
     except Exception as e:  # judge down: deliver, log, never break a chat
         core.log_event("gate_error", session=session_id, error=repr(e))
         return None
+
+
+def _handoff_gate(session_id: str, final_response: str, turn_messages: list | None, attempt: int) -> dict | None:
+    """A reply that hands a terminal/password step to David (\"run `sudo ...` on the mini\", \"add the key to
+    authorized_keys\") is refused unless this turn already opened a terminal for him: the agent must call
+    run_in_user_terminal itself. Deterministic (no model call), so it holds even when the judge is down."""
+    hits = handoff.find_handoffs(final_response)
+    if not hits:
+        return None
+    tools = core.merge_tool_logs(core.tools_from_messages(turn_messages or []), LOG.get(session_id))
+    if handoff.opened_terminal(tools):
+        core.log_event("handoff_ok", session=session_id, hits=hits[:3])
+        return None
+    core.log_event("handoff_held", session=session_id, attempt=attempt, hits=hits[:3])
+    if attempt < MAX_NUDGES:
+        record_verdict(session_id, "held", final_response)
+        return {"hold": True, "nudge": handoff.gate_nudge(hits)}
+    return None  # nudged twice already: deliver (the normal ask judge still runs) rather than loop
 
 
 # core may buffer streamed final text while this hook is registered, so a held draft never reaches the screen

@@ -325,7 +325,40 @@ def locate(reply: str, span: str) -> Optional[dict]:
     return None
 
 
-def validate(raw_steps: Any, reply: str, open_steps: list[dict]) -> list[dict]:
+_HANDOFF: dict[str, Any] = {}
+
+
+def _handoff():
+    """ask-gate's shared hand-off detector (plugins/ask-gate/handoff.py), loaded by file path. None if absent."""
+    if "mod" not in _HANDOFF:
+        _HANDOFF["mod"] = None
+        for base in (Path(__file__).resolve().parent.parent, Path(__file__).parent.parent):
+            f = base / "ask-gate" / "handoff.py"
+            if f.is_file():
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("user_steps_handoff", f)
+                    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                    _HANDOFF["mod"] = mod
+                    break
+                except Exception:
+                    pass
+    return _HANDOFF["mod"]
+
+
+def is_terminal_handoff(text: str, span: str, reply: str = "") -> bool:
+    """A step a shell could do (run/paste a command, add an ssh key, sudo, type a password at a prompt) is never a
+    For-you step: the agent must call run_in_user_terminal instead. Physical steps (taps, GUI logins, hardware) stay."""
+    h = _handoff()
+    if h is None:
+        return False
+    i = reply.find(span) if span else -1
+    ctx = reply[i:i + len(span) + 400] if i >= 0 else span
+    return bool(h.find_handoffs(text) or h.find_handoffs(span) or h.find_handoffs(ctx))
+
+
+def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None) -> list[dict]:
     out: list[dict] = []
     seen = {_norm(s.get("text", "")) for s in open_steps}
     for s in raw_steps if isinstance(raw_steps, list) else []:
@@ -349,6 +382,10 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict]) -> list[dict]:
             continue  # not in the reply's prose (hallucinated, or inside code/quote)
         if _norm(text) in seen:
             continue
+        if is_terminal_handoff(text, span, reply):
+            if dropped is not None:
+                dropped.append(text)
+            continue  # terminal-doable: the agent runs it via run_in_user_terminal, no For-you card
         seen.add(_norm(text))
         out.append({"text": text, "kind": kind, "verbatim_span": span, "options": opts})
     return out[:MAX_NEW_PER_REPLY]
@@ -360,16 +397,20 @@ LLM = Callable[[str, str], str]
 def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM]) -> dict:
     """{steps, resolved, source: 'model'|'regex', error?}."""
     ids = {s["id"] for s in open_steps}
+    dropped: list[str] = []
     if llm is not None:
         try:
             d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg)))
             resolved = [str(x) for x in (d.get("resolved") or []) if str(x) in ids]
-            return {"steps": validate(d.get("steps"), reply, open_steps), "resolved": resolved, "source": "model"}
+            return {"steps": validate(d.get("steps"), reply, open_steps, dropped), "resolved": resolved,
+                    "source": "model", "dropped": dropped}
         except Exception as exc:  # fall back to the regex detector; resolution then only comes from buttons
             err = f"{type(exc).__name__}: {exc}"[:200]
-            return {"steps": validate(regex_steps(reply), reply, open_steps), "resolved": [], "source": "regex",
-                    "error": err}
-    return {"steps": validate(regex_steps(reply), reply, open_steps), "resolved": [], "source": "regex"}
+            dropped.clear()
+            return {"steps": validate(regex_steps(reply), reply, open_steps, dropped), "resolved": [], "source": "regex",
+                    "error": err, "dropped": dropped}
+    return {"steps": validate(regex_steps(reply), reply, open_steps, dropped), "resolved": [], "source": "regex",
+            "dropped": dropped}
 
 
 # ---- in-message frame ----------------------------------------------------------------------------------
@@ -565,7 +606,7 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
     if new or resolved:
         sync_card(ledger, root, session_id, session_ref or f"@session:default/{session_id}", cards)
     return {"text": text if text != reply else None, "steps": new, "resolved": resolved, "source": res["source"],
-            **({"error": res["error"]} if res.get("error") else {})}
+            "dropped": res.get("dropped") or [], **({"error": res["error"]} if res.get("error") else {})}
 
 
 _WORTH = re.compile(

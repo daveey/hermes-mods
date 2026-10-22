@@ -21,7 +21,9 @@ _spec.loader.exec_module(ut)
 
 
 def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
-    """Run runner.sh in a pty, typing each answer once its prompt shows up."""
+    """Run runner.sh in a pty, typing each answer once its prompt shows up. With a confirm file the first
+    answer goes to ``Run it?``; without one every answer goes to ``Press Enter``."""
+    asks = (job / "confirm").exists()
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["SHELL"] = "/bin/bash"
@@ -37,15 +39,50 @@ def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
             if not chunk:
                 break
             buf += chunk
-        if pending and (b"Run it?" in buf if len(pending) == len(answers) else b"Press Enter" in buf):
+        if pending and (b"Run it?" in buf if asks and len(pending) == len(answers) else b"Press Enter" in buf):
             os.write(fd, pending.pop(0).encode())
     os.waitpid(pid, 0)
     return buf
 
 
+@pytest.fixture(autouse=True)
+def _confirm_env(monkeypatch):
+    monkeypatch.delenv("HERMES_USER_TERMINAL_CONFIRM", raising=False)
+    monkeypatch.setattr(ut, "confirm_mode", ut.confirm_mode)  # restored after tests that stub it
+
+
+def test_default_runs_without_asking(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setattr(ut, "confirm_mode", lambda: "off")
+    job = ut.create_job("echo hello-from-job; exit 3", "testing", str(tmp_path))
+    assert not (job / "confirm").exists()
+    screen = _drive(job, ["\n"])
+    assert b"Run it?" not in screen and b"Ctrl-C cancels" in screen
+    res = ut.wait_for(job, 1)
+    assert res["status"] == "ran" and res["exit_code"] == 3
+    assert "hello-from-job" in res["output"]
+
+
+@pytest.mark.parametrize("env,mode", [("", "off"), ("off", "off"), ("remote", "remote"), ("all", "all"),
+                                      ("1", "all"), ("bogus", "off")])
+def test_confirm_mode_env(monkeypatch, env, mode):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_CONFIRM", env)
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)  # no config -> env only
+    assert ut.confirm_mode() == mode
+
+
+@pytest.mark.parametrize("mode,origin,asks", [("off", None, False), ("off", {"gateway": "g"}, False),
+                                              ("remote", None, False), ("remote", {"gateway": "g"}, True),
+                                              ("all", None, True)])
+def test_confirm_file_follows_mode(tmp_path, monkeypatch, mode, origin, asks):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setattr(ut, "confirm_mode", lambda: mode)
+    assert (ut.create_job("true", "", str(tmp_path), origin) / "confirm").exists() is asks
+
+
 def test_confirm_runs_and_captures(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
-    job = ut.create_job("echo hello-from-job; exit 3", "testing", str(tmp_path))
+    job = ut.create_job("echo hello-from-job; exit 3", "testing", str(tmp_path), confirm=True)
     _drive(job, ["y\n", "\n"])
     res = ut.wait_for(job, 1)
     assert res["status"] == "ran" and res["exit_code"] == 3
@@ -54,7 +91,7 @@ def test_confirm_runs_and_captures(tmp_path, monkeypatch):
 
 def test_decline(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
-    job = ut.create_job("touch SHOULD_NOT_EXIST", "", str(tmp_path))
+    job = ut.create_job("touch SHOULD_NOT_EXIST", "", str(tmp_path), confirm=True)
     _drive(job, ["n\n"])
     res = ut.wait_for(job, 1)
     assert res["status"] == "declined"
@@ -130,10 +167,11 @@ def _outbox(base: Path) -> list:
     return list((base / "outbox").glob("*.json")) if (base / "outbox").is_dir() else []
 
 
-# Invariant 1: nothing runs without the owner typing y in the Mac window.
+# Invariant 1 (confirm=remote|all): nothing relayed runs without the owner typing y in the Mac window.
 @pytest.mark.parametrize("answer", ["\n", "n\n", "no\n"])
 def test_relayed_job_runs_only_after_y(remote, monkeypatch, tmp_path, answer):
     monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    monkeypatch.setattr(ut, "confirm_mode", lambda: "remote")
     marker = tmp_path / "RAN"
     res = ut.start_relayed(f"touch {marker}", "why", str(tmp_path), ORIGIN)
     assert res["ok"] and res["status"] == "waiting_for_user"

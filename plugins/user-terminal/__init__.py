@@ -1,16 +1,19 @@
-"""user-terminal — run a command in a real terminal window, after the user confirms it there.
+"""user-terminal — run a command in a real terminal window on the user's screen.
 
 Instead of telling the user "please run X in your terminal", the agent calls ``run_in_user_terminal``.
 The plugin opens a terminal window (iTerm if installed, else Terminal.app, else cmux), shows why the agent
-wants to run the command, the working directory and the exact command, and asks ``Run it? [y/N]``.
-On ``y`` the command runs right there, in a real TTY (so sudo passwords, OAuth device codes, interactive
+wants to run the command, the working directory and the exact command, and runs it right away (the user
+asked for no y/N step: they always said yes). Ctrl-C in the window cancels it. Config
+``user_terminal.confirm`` (env ``HERMES_USER_TERMINAL_CONFIRM``) = ``off`` (default) | ``remote`` (ask
+``Run it? [y/N]`` only for jobs relayed from another gateway) | ``all``. The command runs in a real TTY (so sudo passwords, OAuth device codes, interactive
 logins and TCC prompts all work, with the terminal's permissions). The tool waits for the outcome and
 returns the exit code plus the captured output to the agent.
 
 Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
   meta.json   reason / cwd / command (shown by the runner)
   cmd.sh      the command, verbatim
-  runner.sh   the confirm-and-run script the window executes
+  runner.sh   the show-and-run script the window executes
+  confirm     present -> the runner asks y/N first (see confirm_mode)
   output.log  everything printed while the command ran (via script(1))
   status.json {"status": "running"|"ran"|"declined", "exit_code": n}
 
@@ -25,7 +28,7 @@ the job to the owner's Mac through the session-mentions courier: it writes a ``u
 ``user_terminal.device``, env ``HERMES_USER_TERMINAL_DEVICE``, else the only live courier). That Mac's
 Desktop courier claims it and calls this plugin's own dashboard routes on the Mac's backend
 (``dashboard/plugin_api.py``: ``POST /start``, ``GET /status/<job>``), which run the local path above
-(``create_job`` + ``open_window`` + ``wait_for``). The confirm window names the originating
+(``create_job`` + ``open_window`` + ``wait_for``). The window names the originating
 gateway/profile/session. Only the owner's own sessions (desktop/cli/tui/api_server) may call it; a session
 on a messaging platform (e.g. Slack on a shared bot) is refused. No live courier for that Mac -> an
 immediate error, never a silent wait.
@@ -70,12 +73,12 @@ def jobs_dir() -> Path:
 SCHEMA = {
     "name": "run_in_user_terminal",
     "description": (
-        "Run a shell command in a terminal window on the user's screen, after the user confirms it IN "
-        "THAT TERMINAL. Use this whenever you would otherwise ask the user to run a command themselves "
+        "Run a shell command in a terminal window on the user's screen, where they can type passwords "
+        "and answer prompts. Use this whenever you would otherwise ask the user to run a command themselves "
         "— anything needing their password (sudo), an interactive login/OAuth/device code, a TTY prompt, "
         "their terminal's macOS permissions, or that you are not allowed to run unattended. Never tell "
         "the user to copy/paste a command; call this instead. The window shows `reason`, `cwd` and the "
-        "exact `command`, asks 'Run it? [y/N]', runs it on 'y', and this tool returns status "
+        "exact `command`, runs it right away (no y/N step; the user can Ctrl-C it), and this tool returns status "
         "(ran/declined/pending), exit_code and the output. The user can type into the window if the "
         "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting."
     ),
@@ -109,13 +112,17 @@ echo
 echo "${B}Command:${N}"
 printf '%s' "${Y}"; wrap < "$JOB/cmd_display.txt"; printf '%s' "${N}"
 echo
-while true; do
-  read -r -p "${B}Run it? [y/N]${N} " ans
-  case "$ans" in
-    y|Y|yes|YES) break ;;
-    ""|n|N|no|NO) status '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
-  esac
-done
+if [ -f "$JOB/confirm" ]; then
+  while true; do
+    read -r -p "${B}Run it? [y/N]${N} " ans
+    case "$ans" in
+      y|Y|yes|YES) break ;;
+      ""|n|N|no|NO) status '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
+    esac
+  done
+else
+  echo "${D}Running now. Ctrl-C cancels.${N}"
+fi
 echo "${D}──────────────────────────────────────────${N}"
 status '{"status":"running"}'
 cd "$(cat "$JOB/cwd.txt")" || { status '{"status":"ran","exit_code":1,"error":"cwd not found"}'; read -r -p "cwd not found. Enter to close. "; exit 1; }
@@ -272,7 +279,24 @@ def origin_lines(origin: dict | None) -> tuple[str, str]:
     return text + "\n", f"{gw}/{profile}"
 
 
-def create_job(command: str, reason: str, cwd: str, origin: dict | None = None) -> Path:
+def confirm_mode() -> str:
+    """off (default) | remote | all — when the runner asks ``Run it? [y/N]`` before running."""
+    mode = os.environ.get("HERMES_USER_TERMINAL_CONFIRM", "")
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        v = ((load_config() or {}).get("user_terminal") or {}).get("confirm")
+        if v is not None and str(v).strip():
+            mode = "all" if v is True else "off" if v is False else str(v)
+    except Exception:
+        pass
+    mode = mode.strip().lower()
+    return {"1": "all", "true": "all", "yes": "all", "on": "all", "0": "off", "false": "off", "no": "off"}.get(
+        mode, mode if mode in ("off", "remote", "all") else "off")
+
+
+def create_job(command: str, reason: str, cwd: str, origin: dict | None = None,
+               confirm: bool | None = None) -> Path:
     job = jobs_dir() / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
     job.mkdir(parents=True)
     (job / "cmd.sh").write_text(command.rstrip("\n") + "\n")
@@ -285,6 +309,11 @@ def create_job(command: str, reason: str, cwd: str, origin: dict | None = None) 
     if full:
         (job / "origin.txt").write_text(full)
         (job / "origin_short.txt").write_text(short + "\n")
+    if confirm is None:
+        mode = confirm_mode()
+        confirm = mode == "all" or (mode == "remote" and bool(full))
+    if confirm:
+        (job / "confirm").write_text("1\n")
     (job / "runner.sh").write_text(RUNNER)
     (job / "status.json").write_text(json.dumps({"status": "waiting_for_user"}))
     (job / "meta.json").write_text(json.dumps({"command": command, "reason": reason, "cwd": cwd,
@@ -416,7 +445,7 @@ def transform_terminal_output(command: str = "", output: str = "", **_: Any) -> 
 # ---------------------------------------------------------------- relayed jobs (Mac side)
 
 def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
-    """Open the confirm window for a job relayed from another gateway (dashboard ``POST /start``)."""
+    """Open the run window for a job relayed from another gateway (dashboard ``POST /start``)."""
     command = str(command or "").strip()
     if not command:
         return {"ok": False, "error": "command is required"}
