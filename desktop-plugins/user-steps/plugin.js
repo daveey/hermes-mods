@@ -28,6 +28,35 @@ const log = (...a) => console.info(`[${ID}]`, ...a)
 
 // ── pure helpers (exported for tests) ───────────────────────────────────────
 
+// Same link rules as blocked-panel (kept in sync by both test files).
+// Web URLs, and absolute / home-relative local paths that start a word (so
+// "7/10" or "and/or" never match). Trailing sentence punctuation is not part of the link.
+// Scheme-less web addresses ("github.com/settings/billing", "www.x.io") link too, but only on a common TLD so
+// file names like plugin.js / README.md never do; "user@host.com" doesn't (no word start).
+const LINK_RE = /(https?:\/\/[^\s<>"'`]+)|(?:^|(?<=[\s("'`]))(~?\/[A-Za-z0-9._~-][^\s<>"'`()]*)|(?:^|(?<=[\s("'`]))((?:[A-Za-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|in|gov|edu|me|sh|so|gg|tv|us|uk|xyz)(?=[\/\s.,;:!?)\]}"'`]|$)(?:\/[^\s<>"'`]*)?)/g
+/** href for a link segment: bare web addresses get https://, paths file://. */
+export const linkHref = x => (x.kind === 'path' ? `file://${x.value}` : /^https?:\/\//i.test(x.value) ? x.value : `https://${x.value}`)
+const TRAIL_RE = /[.,;:!?)\]}]+$/
+
+/** text → [{ kind: 'text'|'url'|'path', value }] for rendering clickable links. */
+export function linkSegments(text) {
+  const s = str(text)
+  const out = []
+  let last = 0
+  for (const m of s.matchAll(LINK_RE)) {
+    let value = m[0]
+    const trail = value.match(TRAIL_RE)?.[0] || ''
+    if (trail) value = value.slice(0, -trail.length)
+    const kind = m[2] ? 'path' : 'url'
+    if (kind === 'path' && !/[A-Za-z]/.test(value)) continue
+    if (m.index > last) out.push({ kind: 'text', value: s.slice(last, m.index) })
+    out.push({ kind, value })
+    last = m.index + value.length
+  }
+  if (last < s.length) out.push({ kind: 'text', value: s.slice(last) })
+  return out
+}
+
 /** Inverse of the agent plugin's core.enc (attr-safe escapes). */
 export function decodeAttr(s) {
   const map = { '\\': '\\', n: '\n', q: '"', '(': '{', ')': '}' }
@@ -256,6 +285,44 @@ const btn = (primary = false) => ({
 })
 const KIND_ICON = { approve: 'codicon-question', do: 'codicon-checklist', choose: 'codicon-list-selection', input: 'codicon-comment' }
 
+let osApi = null // ctx.os, set in register()
+
+async function openLink(value) {
+  try {
+    if (await osApi?.openExternal?.(value)) return
+  } catch {
+    /* fall through */
+  }
+  try {
+    if (typeof window !== 'undefined' && window.open?.(value, '_blank')) return
+  } catch {
+    /* fall through */
+  }
+  notify('error', `Couldn\u2019t open ${value}`)
+}
+
+/** Text with its URLs and local paths as clickable links (paths open with the OS handler). */
+export function Linked({ text }) {
+  const segs = linkSegments(text)
+  if (!segs.some(x => x.kind !== 'text')) return str(text)
+  return segs.map((x, i) =>
+    x.kind === 'text'
+      ? x.value
+      : jsx('a', {
+          href: linkHref(x),
+          'data-user-steps-link': x.kind,
+          title: x.kind === 'url' ? linkHref(x) : `Open ${x.value}`,
+          onClick: e => {
+            e.preventDefault()
+            e.stopPropagation()
+            void openLink(x.kind === 'url' ? linkHref(x) : x.value)
+          },
+          style: { color: 'var(--accent-foreground, var(--primary, #58a6ff))', textDecoration: 'underline', textUnderlineOffset: 2, cursor: 'pointer', wordBreak: 'break-all' },
+          children: x.value
+        }, i)
+  )
+}
+
 function notify(kind, message) {
   try {
     host.notify?.({ kind, message })
@@ -323,7 +390,7 @@ export function StepBox({ attrs, streaming, deps }) {
   }, [key, tick])
   if (!ids.length || state.failed) {
     // ledger unreachable / unknown ids: the paragraph as plain text (empty t = the text is already above)
-    return fallback ? jsx('div', { 'data-user-step-fallback': '', style: { whiteSpace: 'pre-wrap' }, children: fallback }) : null
+    return fallback ? jsx('div', { 'data-user-step-fallback': '', style: { whiteSpace: 'pre-wrap' }, children: jsx(Linked, { text: fallback }) }) : null
   }
   const text = fallback || state.steps.map(s => s.text).join('\n')
   return jsxs('div', {
@@ -344,14 +411,14 @@ export function StepBox({ attrs, streaming, deps }) {
         style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: AMBER, fontWeight: 600 },
         children: [jsx('i', { 'aria-hidden': true, className: 'codicon codicon-account' }), 'For you']
       }),
-      jsx('div', { key: 't', 'data-user-step-text': '', style: { whiteSpace: 'pre-wrap', lineHeight: 1.5 }, children: text }),
+      jsx('div', { key: 't', 'data-user-step-text': '', style: { whiteSpace: 'pre-wrap', lineHeight: 1.5 }, children: jsx(Linked, { text }) }),
       state.loading && jsx('div', { key: 'l', style: { fontSize: 11, opacity: 0.6 }, children: 'Loading\u2026' }),
       ...state.steps.map(s =>
         (s.status || 'open') === 'open'
           ? jsxs('div', {
               style: { display: 'flex', flexDirection: 'column', gap: 4 },
               children: [
-                state.steps.length > 1 && jsx('div', { style: { fontSize: 12, opacity: 0.85 }, children: s.text }),
+                state.steps.length > 1 && jsx('div', { style: { fontSize: 12, opacity: 0.85 }, children: jsx(Linked, { text: s.text }) }),
                 !streaming && jsx(StepButtons, { step: s, deps, onDone: a => setState(st => ({ ...st, steps: st.steps.map(x => (x.id === s.id ? { ...x, status: 'resolved', resolution: a.resolution } : x)) })) })
               ]
             }, s.id)
@@ -395,7 +462,7 @@ function CardRow({ item }) {
           jsx('span', { style: { marginLeft: 'auto', flex: 'none', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', opacity: 0.6 }, children: item.id })
         ]
       }),
-      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: cardSummary(item, bp?.checklist) }),
+      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: jsx(Linked, { text: cardSummary(item, bp?.checklist) }) }),
       jsxs('div', {
         style: { display: 'flex', flexWrap: 'wrap', gap: 6 },
         children: [
@@ -439,7 +506,7 @@ function StepRow({ step, sessionId }) {
         style: { display: 'flex', gap: 6, alignItems: 'baseline' },
         children: [
           jsx('i', { 'aria-hidden': true, className: `codicon ${KIND_ICON[step.kind] || 'codicon-comment'}`, style: { color: AMBER, flex: 'none' } }),
-          jsx('span', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: step.text })
+          jsx('span', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: jsx(Linked, { text: step.text }) })
         ]
       }),
       jsx(StepButtons, { step, deps: { sessionId } })
@@ -496,6 +563,7 @@ export default {
   id: ID,
   name: 'User Steps',
   register(ctx) {
+    osApi = ctx?.os || null
     ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => jsx(Strip, {}) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
     const onVis = () => (typeof document !== 'undefined' && document.hidden) || void refresh()

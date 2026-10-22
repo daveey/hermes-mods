@@ -202,6 +202,44 @@ test('a click in the strip also flips the in-message box to resolved', async () 
   delete window.hermesDesktop
 })
 
+test('linkSegments/linkHref: https, bare web addresses and paths link; file names, emails and fractions do not', () => {
+  const t = 'Open github.com/settings/billing while signed in. See https://x.io/a?b=1, www.example.org. Edit plugin.js and README.md; mail someone@example.com; 7/10; ~/notes/a.md.'
+  const links = m.linkSegments(t).filter(x => x.kind !== 'text')
+  assert.deepEqual(links, [
+    { kind: 'url', value: 'github.com/settings/billing' },
+    { kind: 'url', value: 'https://x.io/a?b=1' },
+    { kind: 'url', value: 'www.example.org' },
+    { kind: 'path', value: '~/notes/a.md' }
+  ])
+  assert.equal(m.linkSegments(t).map(x => x.value).join(''), t)
+  assert.deepEqual(links.map(m.linkHref), ['https://github.com/settings/billing', 'https://x.io/a?b=1', 'https://www.example.org', 'file://~/notes/a.md'])
+  assert.deepEqual(m.linkSegments('example.company and foo.community').filter(x => x.kind !== 'text'), [])
+})
+
+test('strip: URLs in a blocked card summary and in a step are clickable and open via ctx.os.openExternal', async () => {
+  const opened = []
+  const dispose = m.default.register({ register: () => {}, os: { openExternal: async u => (opened.push(u), true) } })
+  const steps = [step('us_eeeeee77', 'do', { text: 'Visit https://example.com/step now' })]
+  const call = fakeRest(steps)
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_billing1', board: 'default', title: 'Fix CI', text: 'Open github.com/settings/billing while signed in as you.', at: 2 }] } }
+  focused.set('S1')
+  await m.refresh(call)
+  await show(React.createElement(m.Strip, { key: 's-links' }))
+  const card = el().querySelector('[data-user-steps-card="t_billing1"] a[data-user-steps-link="url"]')
+  assert.ok(card, el().innerHTML)
+  assert.equal(card.textContent, 'github.com/settings/billing')
+  assert.equal(card.getAttribute('href'), 'https://github.com/settings/billing')
+  const stepLink = el().querySelector('[data-user-steps-step="us_eeeeee77"] a[data-user-steps-link="url"]')
+  assert.ok(stepLink, el().innerHTML)
+  await React.act(async () => { card.click(); stepLink.click(); await flush() })
+  assert.deepEqual(opened, ['https://github.com/settings/billing', 'https://example.com/step'])
+  steps[0].status = 'resolved'
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [] } }
+  await React.act(async () => { await m.refresh(call); await flush() })
+  delete window.__blockedPanel
+  dispose()
+})
+
 test('register: strip in composer.top and the user-step directive', () => {
   const got = []
   const dispose = m.default.register({ register: c => got.push(c) })
