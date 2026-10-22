@@ -76,5 +76,42 @@ class LoadSkipsNonDigests(unittest.TestCase):
             self.assertEqual(sorted(x["id"] for x in coach_mine.load(root)), ["s1"])
 
 
+class ExcludedTeamBotProfiles(unittest.TestCase):
+    """A shared Slack follower bot runs as source='cli'; every teammate message is a 'user turn', so its
+    frustration/stuck/repeat_fix signals inflated the host's KPIs and topped the labeling queue."""
+
+    def write(self, root, host, profile, sid, **kw):
+        import json
+        d = {"host": host, "profile": profile, "id": sid, "source": "cli", "msgs": 241, "user_turns_total": 37,
+             "user_turns": [{"text": "chat"}], "cost_usd": 5.0, "children": {"n": 0, "cost_usd": 0},
+             "signals": {"frustration": 31, "stuck": 20, "repeat_fix": 4}, "started_at": 1, **kw}
+        f = root / host / profile / f"{sid}.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(d))
+
+    def test_alpha_profiles_excluded_from_kpis_and_queue(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.write(root, "hermes-hub", "alpha-follow", "af1")
+            self.write(root, "hermes-hub", "alpha", "a1")
+            self.write(root, "hermes-hub", "default", "h1", signals={}, cost_usd=0.1, msgs=20)
+            self.write(root, "macbook", "alpha", "m1", signals={}, cost_usd=0.1, msgs=20)  # other host: kept
+            (root / coach_mine.EXCLUDE_FILE).write_text("# shared team bots\nhermes-hub/alpha*\n")
+            ds = coach_mine.load(root)
+            self.assertEqual(sorted(x["id"] for x in ds), ["h1", "m1"])
+            hub = [x for x in ds if x["host"] == "hermes-hub"]
+            k = coach_mine.kpis(hub)
+            self.assertEqual(k["sessions"], 1)
+            self.assertEqual(k["repeat_fix_rate"], 0.0)
+            q = coach_mine.labeling_queue(ds, set(), 10)
+            self.assertNotIn("af1", [x["id"] for x in q])
+            self.assertNotIn("a1", [x["id"] for x in q])
+            # explicit override list (CLI --exclude-profile path) and no exclusions at all
+            self.assertEqual(len(coach_mine.load(root, [])), 4)
+            self.assertEqual(sorted(x["id"] for x in coach_mine.load(root, ["*/alpha-follow"])), ["a1", "h1", "m1"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ What goes in: session stats, the user's turns (injected context stripped, secret
 truncated), tool counts and tool-error counts, pattern signals, and the tail of the last
 assistant reply. What never goes in: tool output, system prompts, reasoning, file contents.
 """
-import argparse, collections, json, os, re, sqlite3, sys, time
+import argparse, collections, fnmatch, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
 DIGEST_V = 5            # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
@@ -350,6 +350,11 @@ def _home_rel(s):
     return re.sub(r"/Users/[^/\s]+/|/home/[^/\s]+/", "~/", s) if isinstance(s, str) else s
 
 
+def excluded_profile(profile, patterns):
+    """fnmatch, so 'alpha*' also drops 'alpha-follow' (a plain 'alpha' missed it and leaked Slack chat)."""
+    return any(fnmatch.fnmatchcase(profile, p) for p in patterns)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
@@ -358,7 +363,7 @@ def main():
     ap.add_argument("--home", default=os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
     ap.add_argument("--since-days", type=float, default=45)
     ap.add_argument("--exclude-profile", action="append", default=[],
-                    help="skip a discovered profile (e.g. a shared team bot holding other people's chats)")
+                    help="skip a discovered profile; glob ok, e.g. 'alpha*' (shared team bots holding other people's chats)")
     a = ap.parse_args()
 
     dbs = []
@@ -366,7 +371,7 @@ def main():
         prof, _, path = d.rpartition("=")
         dbs.append((prof or Path(path).parent.name, Path(path)))
     dbs = dbs or discover_dbs(Path(a.home).resolve())
-    dbs = [(p, d) for p, d in dbs if p not in a.exclude_profile]
+    dbs = [(p, d) for p, d in dbs if not excluded_profile(p, a.exclude_profile)]
     since = time.time() - a.since_days * 86400
     out = Path(a.out) / a.host
     written = unchanged = 0

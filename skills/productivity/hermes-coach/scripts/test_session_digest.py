@@ -144,5 +144,14 @@ class DigestSynthetic(unittest.TestCase):
         self.assertEqual(dg["signals"].get("repeat_fix"), 1)
 
 
+class ExcludeProfileGlob(unittest.TestCase):
+    def test_glob_drops_follower_profile(self):
+        self.assertTrue(sd.excluded_profile("alpha-follow", ["alpha*"]))
+        self.assertTrue(sd.excluded_profile("alpha", ["alpha*"]))
+        self.assertFalse(sd.excluded_profile("default", ["alpha*"]))
+        self.assertTrue(sd.excluded_profile("alpha", ["alpha"]))  # exact names still work
+        self.assertFalse(sd.excluded_profile("alpha-follow", ["alpha"]))
+
+
 if __name__ == "__main__":
     unittest.main()
