@@ -48,7 +48,6 @@ def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
 @pytest.fixture(autouse=True)
 def _confirm_env(monkeypatch):
     monkeypatch.delenv("HERMES_USER_TERMINAL_CONFIRM", raising=False)
-    monkeypatch.setattr(ut, "confirm_mode", ut.confirm_mode)  # restored after tests that stub it
 
 
 def test_default_runs_without_asking(tmp_path, monkeypatch):
@@ -243,6 +242,7 @@ def test_owner_dm_refusal_routes_to_ops_not_paste_it(remote, monkeypatch):
 # Invariant 3: the window names the originating gateway, profile and session; control chars can't hide text.
 def test_window_shows_origin_and_neutralises_escapes(remote, monkeypatch, tmp_path):
     monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    monkeypatch.setattr(ut, "confirm_mode", lambda: "all")  # decline so the escape-laden command never runs
     res = ut.start_relayed("echo visible\x1b[2K\rhidden", "reason\x1b]0;x\x07", str(tmp_path),
                            {**ORIGIN, "title": "evil\x1b[31m"})
     job = ut.jobs_dir() / res["job_id"]
@@ -338,8 +338,8 @@ def test_round_trip_remote_to_mac_and_back(remote, monkeypatch, tmp_path):
     monkeypatch.setattr(ut, "POLL_S", 1)
     screens = []
 
-    def fake_window(job):  # the owner reads the window and types y
-        threading.Thread(target=lambda: screens.append(_drive(job, ["y\n", "\n"])), daemon=True).start()
+    def fake_window(job):  # default confirm=off: it runs at once, the owner only closes the window
+        threading.Thread(target=lambda: screens.append(_drive(job, ["\n"])), daemon=True).start()
         return "fake"
 
     monkeypatch.setattr(ut, "open_window", fake_window)

@@ -3,12 +3,14 @@
 ## Behavior
 
 On a Linux/cloud gateway (no `osascript`, no cmux) `run_in_user_terminal` is still registered with the same
-schema. Calling it opens the usual y/N confirm window on the owner's Mac, runs the command there after `y`, and
+schema. Calling it opens the usual window on the owner's Mac, runs the command there (right away by default; after `y` when
+`user_terminal.confirm` is `remote` or `all`), and
 returns status / exit code / output to the remote agent, with the same `pending` + `job_id` resume semantics.
 
 Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/tests/user-terminal.test.mjs`):
 
-1. Nothing runs without the owner typing `y` in the Mac window. The relayed path only ever calls
+1. With `user_terminal.confirm: remote|all`, nothing runs without the owner typing `y` in the Mac window
+   (default `off`: it runs at once, by the owner's choice). The relayed path only ever calls
    `create_job` + `open_window`; `runner.sh` declines on Enter / `n`.
 2. Only the owner's own sessions may call it: every identity the turn has (`HERMES_PLATFORM`,
    session platform/source, the session row's `source`) must be one of `desktop`, `api_server`, `tui`, `cli`,
