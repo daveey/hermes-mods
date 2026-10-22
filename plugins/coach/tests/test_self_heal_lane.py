@@ -126,6 +126,23 @@ def test_live_off_hub_forwards_to_the_hub_over_ssh(store):
     assert not r.creates() and not sh.LaneState(store.root).read()  # the hub decides, not this host
 
 
+def test_hub_ssh_pins_the_key_with_identities_only(store, tmp_path, monkeypatch):
+    # launchd jobs offer different default identities than the shell, and the hub refuses them preauth.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert "-i" not in sh.hub_ssh_argv({})  # no default key on disk: plain ssh
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "id_ed25519").write_text("x")
+    argv = sh.hub_ssh_argv({})
+    assert argv[argv.index("-i") + 1] == str(tmp_path / ".ssh" / "id_ed25519") and "IdentitiesOnly=yes" in argv
+    argv = sh.hub_ssh_argv({"hub_ssh_key": "~/.ssh/hub_key"})
+    assert argv[argv.index("-i") + 1] == str(tmp_path / ".ssh" / "hub_key")
+    r = Runner()
+    sh.file_defect(defect(), store=store, m="live", runner=r, now=NOW,
+                   cfg={"hub_ssh": "user@hub.example", "hub_host": "the-hub"}, budget_fn=OPEN)
+    ((argv, _),) = r.calls
+    assert "IdentitiesOnly=yes" in argv and argv.index("-i") < argv.index("user@hub.example")
+
+
 def test_hub_cli_file_reads_stdin(store, monkeypatch, capsys):
     monkeypatch.setattr(sh, "file_defect", lambda d, m=None: {"action": "would_file", "fp": d["fingerprint"],
                                                               "m": m})

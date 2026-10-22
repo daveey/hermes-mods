@@ -201,6 +201,24 @@ def test_forward_moves_cursor_only_on_success(home):
     assert r_count(sent[-1]) == 1  # nothing new: the heartbeat still goes, so the hub sees the forwarder alive
 
 
+def test_forward_pins_the_hub_key(home, tmp_path, monkeypatch):
+    # The mini's launchd forward was refused preauth while its shell ssh to the hub worked: pin -i + IdentitiesOnly.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ssh").mkdir(exist_ok=True)
+    (tmp_path / ".ssh" / "id_ed25519").write_text("x")
+    calls = []
+
+    def good(argv, stdin):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout='{"ingested": 1}', stderr="")
+    sg.forward(home, "mini", "you@hub.example.com", runner=good, now=NOW, cfg={})
+    argv = calls[0]
+    assert argv[argv.index("-i") + 1] == str(tmp_path / ".ssh" / "id_ed25519")
+    assert "IdentitiesOnly=yes" in argv and argv[-2:] == ["you@hub.example.com", sg.HUB_CMD]
+    sg.forward(home, "mini", "you@hub.example.com", runner=good, now=NOW, cfg={"hub_ssh_key": "/k/hub"})
+    assert calls[1][calls[1].index("-i") + 1] == "/k/hub"
+
+
 def test_hub_flags_a_silent_forwarder(tmp_path):
     hub = tmp_path / "hub"
     beat = json.dumps({"kind": "heartbeat", "host": "macbook", "n": 0})

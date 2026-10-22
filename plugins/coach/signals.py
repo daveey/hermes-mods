@@ -463,7 +463,18 @@ def sweep(home: Path, host: str, m: Optional[str] = None, filer: Optional[Callab
     return out
 
 
-def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, now: Optional[float] = None) -> dict:
+def ssh_argv(cfg: dict) -> List[str]:
+    """Same as self_heal.hub_ssh_argv (kept local so the Mac forwarder needs only this file): pin the hub key with
+    IdentitiesOnly, since launchd's default identities are not the shell's and the hub refuses them preauth."""
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    kp = Path(os.path.expanduser(cfg.get("hub_ssh_key") or "~/.ssh/id_ed25519"))
+    if cfg.get("hub_ssh_key") or kp.exists():
+        argv += ["-i", str(kp), "-o", "IdentitiesOnly=yes"]
+    return argv
+
+
+def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, now: Optional[float] = None,
+            cfg: Optional[dict] = None) -> dict:
     """Mac/mini: ship new raw signals to the hub. The cursor only moves when the hub accepted them. Every pass sends
     a heartbeat line first (even with no signals), so the hub knows the forwarder is alive (signals/hosts.json) and
     its sweep flags a host whose forwarder went silent."""
@@ -473,7 +484,7 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
     payload = "".join(json.dumps(s) + "\n" for s in [beat] + sigs)
     run = runner or (lambda argv, stdin: subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=90))
     try:
-        r = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", hub, HUB_CMD], payload)
+        r = run(ssh_argv(cfg if cfg is not None else config(home)) + [hub, HUB_CMD], payload)
         ok, detail = r.returncode == 0, (r.stdout or r.stderr or "").strip()[-200:]
     except Exception as exc:
         ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
@@ -629,7 +640,7 @@ def main(argv=None) -> int:
         if not hub:
             print(f"signals: no hub configured (<home>/coach/selfheal-config.json missing or has no hub_ssh)")
             return 0
-        r = forward(home, host, hub)
+        r = forward(home, host, hub, cfg=cfg)
         if not r["ok"]:
             print(f"signals forward to {hub} failed ({r['pending']} pending): {r['detail']}", file=sys.stderr)
             return 1

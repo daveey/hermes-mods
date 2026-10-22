@@ -57,8 +57,11 @@ def forward_signals(host, home=None, runner=subprocess.run):
     crons, twice-failed cards, gateway crashes, coach handoff events) to the hub, which files them. Rides on this
     launchd job (every 30 min). A no-op unless <home>/coach/selfheal-config.json names a hub that is not this host;
     a failure never stops the digest feed, and the forwarder's cursor only moves when the hub accepted the batch."""
-    script = HERE.parents[3] / "plugins" / "coach" / "signals.py"
-    if not script.exists():
+    # A skills-only (sparse) hermes-mods clone has no plugins/: fall back to the full clone.
+    cands = [HERE.parents[3] / "plugins" / "coach" / "signals.py",
+             Path.home() / "code" / "hermes-mods" / "plugins" / "coach" / "signals.py"]
+    script = next((c for c in cands if c.exists()), None)
+    if script is None:
         return "no signals.py"
     cmd = [sys.executable, str(script), "--host", host] + (["--home", home] if home else []) + ["forward"]
     try:

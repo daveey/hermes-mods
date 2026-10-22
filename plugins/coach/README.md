@@ -232,7 +232,9 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
   no signals), recorded in the hub's `coach/signals/hosts.json`; the hub sweep files a `plugin` defect for a host
   whose forwarder has been silent > 6 h. It rides on the existing launchd coach feed
   (`hermes-coach/scripts/coach_feed.py`, every 30 min) and is a no-op without a `hub_ssh` in
-  `coach/selfheal-config.json` or on the hub itself. Each outcome prints one line, which the feed records as
+  `coach/selfheal-config.json` or on the hub itself. The ssh to the hub pins the key (`hub_ssh_key` in that file,
+  default `~/.ssh/id_ed25519`) with `IdentitiesOnly=yes`, because launchd jobs offer different default identities
+  than a shell and the hub refuses them preauth. Each outcome prints one line, which the feed records as
   `<host>/feed-status.json` in the coach data repo (`signals`: ok / no-hub / hub / error, plus the error text and
   `since`; rewritten only when that state changes). That file is the hub's view of a forwarder that has never
   reached it, which the silent-host check can't see.

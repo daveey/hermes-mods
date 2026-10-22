@@ -580,6 +580,17 @@ def lane_config() -> dict:
     return cfg
 
 
+def hub_ssh_argv(cfg: dict) -> list:
+    """ssh argv prefix to the hub. Pins the key (`hub_ssh_key` in the config, default ~/.ssh/id_ed25519 when it
+    exists) with IdentitiesOnly: a launchd job's default identities differ from the shell's (no agent, other keys
+    offered first), and the hub then refuses it preauth while the same host's interactive ssh works."""
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    kp = Path(os.path.expanduser(cfg.get("hub_ssh_key") or "~/.ssh/id_ed25519"))
+    if cfg.get("hub_ssh_key") or kp.exists():
+        argv += ["-i", str(kp), "-o", "IdentitiesOnly=yes"]
+    return argv
+
+
 def is_hub(cfg: Optional[dict] = None) -> bool:
     cfg = lane_config() if cfg is None else cfg
     if os.environ.get("COACH_SELFHEAL_IS_HUB") in ("1", "true"):
@@ -953,7 +964,7 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
         return {"action": "skip", "why": "COACH_SELFHEAL=off"}
     hub = is_hub(cfg)
     if m == "live" and not hub:
-        rc, out, err = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub_ssh"],
+        rc, out, err = _run(hub_ssh_argv(cfg) + [cfg["hub_ssh"],
                              f"python3 {SELF} file --mode live"], runner, stdin=json.dumps(d))
         res = {"action": "forwarded" if rc == 0 else "error", "hub": cfg["hub_ssh"],
                "out": (out or err).strip()[-300:]}
