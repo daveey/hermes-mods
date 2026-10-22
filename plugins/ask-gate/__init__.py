@@ -123,7 +123,7 @@ def _user_msgs(session_id: str) -> list[str]:
         return msgs
     try:
         import sqlite3
-        c = sqlite3.connect(f"file:{core.home() / 'state.db'}?mode=ro", uri=True, timeout=2)
+        c = core._ro_connect(core.home() / 'state.db', timeout=2)
         rows = c.execute("select content from messages where session_id=? and role='user' order by id desc limit 30",
                          (session_id,)).fetchall()
         c.close()

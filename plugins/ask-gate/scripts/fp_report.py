@@ -27,7 +27,7 @@ tmp = Path(tempfile.mkdtemp())
 os.environ["ASK_GATE_LEDGER"] = str(tmp / "l.sqlite")
 gate._LEDGER.update(path=str(tmp / "l.sqlite"), obj=core.Ledger(tmp / "l.sqlite"))
 
-state = sqlite3.connect(f"file:{Path.home() / '.hermes/state.db'}?mode=ro", uri=True)
+state = core._ro_connect(Path.home() / '.hermes/state.db', timeout=5)
 cutoff = time.time() - days * 86400
 sessions = [r[0] for r in state.execute(
     "select id from sessions where source='desktop' and started_at>=? order by started_at", (cutoff,))]
@@ -36,7 +36,7 @@ sessions = [r[0] for r in state.execute(
 done_at = {}
 for p in core.boards():
     try:
-        c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        c = core._ro_connect(p, timeout=5)
         for tid, st, ca in c.execute("select id, status, completed_at from tasks"):
             done_at[tid] = (st, ca)
         c.close()

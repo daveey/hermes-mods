@@ -42,9 +42,22 @@ def _state_db(h: Optional[Path] = None) -> Path:
     return (h or home()) / "state.db"
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def _row(db: Path, sid: str) -> Optional[tuple]:
     try:
-        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        c = _ro_connect(db, timeout=2)
         try:
             return c.execute("select id, parent_session_id, end_reason, source from sessions where id=?",
                              (sid,)).fetchone()

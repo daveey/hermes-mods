@@ -26,10 +26,23 @@ def boards(h: Optional[Path] = None) -> list[tuple[str, Path]]:
     return [(b, p) for b, p in out if p.is_file()]
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def board_of(task_id: str, h: Optional[Path] = None) -> Optional[str]:
     for slug, p in boards(h):
         try:
-            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+            c = _ro_connect(p, timeout=2)
             try:
                 if c.execute("select 1 from tasks where id=?", (task_id,)).fetchone():
                     return slug
@@ -44,7 +57,7 @@ def subscriptions(task_id: str, h: Optional[Path] = None) -> set[tuple[str, str]
     out: set[tuple[str, str]] = set()
     for _, p in boards(h):
         try:
-            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+            c = _ro_connect(p, timeout=2)
             try:
                 out |= {(r[0], r[1]) for r in c.execute(
                     "select platform, chat_id from kanban_notify_subs where task_id=?", (task_id,))}
