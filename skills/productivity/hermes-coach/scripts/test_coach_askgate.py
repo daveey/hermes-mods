@@ -45,5 +45,81 @@ class T(unittest.TestCase):
                              ["why are you asking me to run things", "i dont plan to review. you should merge it yourself"])
 
 
+
+# had_to_ask_fix: paraphrased from real asks (no private names); each must land in the fix class, not ask-me.
+FIX_HITS = {"make a card to fix": "card-to-fix",
+            "and make a card to rootcause and fix the log shipper": "card-to-fix",
+            "create a task to investigate why you did not do that, and fix it": "card-to-fix",
+            "root cause it, and fix the plugin": "root-cause",
+            "ROOT CAUSE WHY YOU KEPT GETTING THIS WRONG": "root-cause",
+            "figure out why the plugin stopped working after the update": "figure-out-why",
+            "dont just start working, do an analysis and fix for the problem": "analyze-and-fix",
+            "i fixed this once, but now it's broken again": "broken-again",
+            "i thought we mostly fixed it but it still shows up": "broken-again",
+            "i hit do it, why did you not?": "why-did-you-not",
+            "why are all the dots red? [screenshot]": "why-did-you-not",
+            "the sessions keep getting re-shuffled, i think the sort is broken": "is-broken",
+            "fix [screenshot]": "screenshot-fix",
+            "fix this [Image attached: a.png]": "screenshot-fix"}
+FIX_MISSES = ["fix the typo in the README",                      # an ordinary task, not a defect report
+              "what is the root of this repo?",
+              "[screenshot] here is the design i want",
+              "work kanban task t_abc123",
+              "Investigate this hermes-hub cron output and fix whatever it reports: x",
+              "**Background:** find out why the service returns 403",   # a Hermes-written brief
+              "some cards say \"still broken\" as a button",
+              "why didnt you do this yourself, without me telling you"]  # ask-me class wins
+
+
+class Fix(unittest.TestCase):
+    def test_fix_hits(self):
+        for t, want in FIX_HITS.items():
+            self.assertIsNone(g.classify(g.clean(t)), t)
+            self.assertEqual(g.classify_fix(g.clean(t)), want, t)
+
+    def test_fix_misses(self):
+        for t in FIX_MISSES:
+            self.assertIsNone(g.classify_fix(g.clean(t)), t)
+
+    def _data(self, d):
+        import json, os
+        os.makedirs(f"{d}/macbook/default")
+        turns = [{"t": 2000, "text": "fix [screenshot]"},                       # opener: counts for the fix class
+                 {"t": 2100, "text": "why are you asking me to run things"},     # ask-me
+                 {"t": 2200, "text": "root cause and fix"}]
+        json.dump({"id": "s1", "host": "macbook", "source": "desktop", "user_turns": turns},
+                  open(f"{d}/macbook/default/s1.json", "w"))
+        # a cron prompt that says "root cause" is not David asking
+        json.dump({"id": "c1", "host": "macbook", "source": "cron", "user_turns": [{"t": 2300, "text": "root cause it"}]},
+                  open(f"{d}/macbook/default/c1.json", "w"))
+
+    def test_collect_classes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self._data(d)
+            hits, _ = g.collect(d, 0, 10**10)
+            self.assertEqual([(h["class"], h["pattern"]) for h in hits],
+                             [(g.FIX_CLASS, "screenshot-fix"), (g.ASK_CLASS, "why-asking-me"), (g.FIX_CLASS, "root-cause")])
+            body = g.post_body(hits, g.week_start(2000), ["## Self-heal lane", "none"])
+            self.assertIn("**2** times David had to ask for a Hermes fix", body)
+            self.assertIn("in 1 session,", body)
+            self.assertIn("**1** correction where", body)
+            self.assertIn("## Self-heal lane", body)
+            md = g.render(hits, [g.week_start(2000)], {g.week_start(2000): 4}, "t")
+            self.assertIn("| 1 | 2 (1) | 4 |", md)
+
+    def test_marker_one_post_per_week(self):
+        import json, tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            w = g.week_start(2000)
+            self.assertIsNone(g.posted_elsewhere(d, w, "hub"))
+            p = g.marker_path(d, w)
+            p.parent.mkdir(parents=True)
+            p.write_text(json.dumps({"host": "hub"}))
+            self.assertIsNone(g.posted_elsewhere(d, w, "hub"))       # our own marker: re-post updates the same card
+            self.assertEqual(g.posted_elsewhere(d, w, "laptop"), "hub")
+
+
 if __name__ == "__main__":
     unittest.main()
