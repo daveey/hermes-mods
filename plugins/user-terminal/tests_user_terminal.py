@@ -382,3 +382,39 @@ def test_dashboard_routes_start_and_status(remote, monkeypatch, tmp_path):
     assert st["status"] == "pending"
     assert c.get(f"/api/plugins/user-terminal/status/{r['job_id']}?gateway=other").json()["ok"] is False
     assert c.post("/api/plugins/user-terminal/start", json={"command": "x"}).json()["ok"] is False  # no origin
+
+
+@pytest.mark.parametrize("out", [
+    "daveey@desk.local: Permission denied (publickey,password,keyboard-interactive).",
+    "Permission denied (publickey,keyboard-interactive).",
+    # nested: laptop -> hop -> host, the inner ssh's failure arrives on its own line
+    "Warning: Permanently added 'desk.local' (ED25519) to the list of known hosts.\r\n"
+    "you@desk.local: Permission denied (publickey,password,keyboard-interactive).\nexit 255",
+    "Enter passphrase for key '/Users/you/.ssh/id_ed25519':",
+    "you@desk.local's password: ",
+    "/usr/bin/ssh-copy-id: ERROR: Permission denied (publickey).",
+])
+def test_ssh_password_auth_gets_ssh_copy_id_hint(out):
+    new = ut.transform_terminal_output(command="ssh -o BatchMode=yes desk.local true", output=out)
+    assert new and "run_in_user_terminal" in new and "ssh-copy-id -i ~/.ssh/id_ed25519.pub" in new
+    assert "hand it back" in new
+    assert ut.transform_terminal_output(command="ssh x", output=new) is None  # idempotent
+
+
+@pytest.mark.parametrize("out", [
+    "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+    "security: SecKeychainUnlock: User interaction is not allowed.",
+])
+def test_git_https_and_keychain_get_hint(out):
+    new = ut.transform_terminal_output(command="git pull", output=out)
+    assert new and "run_in_user_terminal" in new and "ssh-copy-id" not in new
+
+
+@pytest.mark.parametrize("out", [
+    "Permission denied (publickey).",                         # key-only server: a password can't help
+    "73 sudo: a password is required",                        # a log/grep that mentions it, not sudo itself
+    "grep: Permission denied (publickey,password) appears in auth.log",
+    "ok",
+])
+def test_no_hint_for_mentions_or_key_only_servers(out):
+    assert ut.transform_terminal_output(command="x", output=out) is None

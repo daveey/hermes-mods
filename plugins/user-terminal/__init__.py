@@ -366,22 +366,51 @@ def handle(args: dict, **_kw: Any) -> str:
 
 
 # Output shapes that mean "this needs the user's TTY/password". Core appends a SUDO_PASSWORD tip to the
-# sudo ones, which steers the agent to tell the user to paste the command themselves. Plugin tools are
-# always deferred behind tool_search, so the agent may not even see run_in_user_terminal at that moment.
-_NEEDS_USER = (
-    "sudo: a password is required", "sudo: no tty present", "sudo: a terminal is required",
-)
+# sudo ones, which steers the agent to tell the user to paste the command themselves. Plugin tools may be
+# deferred behind tool_search, so the agent may not even see run_in_user_terminal at that moment.
+# Line-anchored so a log or a grep that merely contains the text doesn't fire. Nested ssh (laptop -> mini ->
+# host) prints the inner failure on its own line too, so it matches the same way.
+_NEEDS_SUDO = re.compile(r"^(?:sudo: (?:a password is required|no tty present|a terminal is required)|"
+                         r"sorry, you must have a tty to run sudo)", re.M)
+_NEEDS_SSH = re.compile(
+    r"^(?:[\w.-]+@[\w.\[\]:-]+: )?Permission denied \([^)\n]*(?:password|keyboard-interactive)[^)\n]*\)\.?\r?$|"
+    r"^Enter passphrase for key\b|^[\w.-]+@[\w.-]+'s password: ?$|^\(?[\w.-]+@[\w.-]+\)? ?Password: ?$|"
+    r"^(?:/usr/bin/)?ssh-copy-id: ERROR\b|^Too many authentication failures\b", re.M)
+_NEEDS_OTHER = re.compile(r"could not read (?:Username|Password) for 'https?://|User interaction is not allowed", re.M)
+_NEEDS_USER = ("sudo: a password is required", "sudo: no tty present", "sudo: a terminal is required")  # compat
 _CORE_SUDO_TIP = re.compile(r"\n*💡 Tip: (?:To enable sudo over messaging|This session cannot prompt for a sudo password)[^\n]*")
-HINT = ("\n\n💡 This needs the user's password/TTY. Do NOT ask the user to run it themselves and do NOT suggest "
-        "SUDO_PASSWORD. Call run_in_user_terminal instead (deferred tool: tool_call name=\"run_in_user_terminal\", "
-        "arguments {command, reason}). It opens a terminal on their screen, they confirm and type the password "
-        "there, and you get the exit code + output back. For a remote host, wrap it: ssh -t <host> 'sudo ...'.")
+_MARK = "💡 This needs the user's password/TTY."
+_HEAD = ("\n\n" + _MARK + " Do NOT ask the user to run it themselves, do NOT hand it back as a step for them, and do "
+         "NOT suggest SUDO_PASSWORD. Call run_in_user_terminal instead (tool_call name=\"run_in_user_terminal\", "
+         "arguments {command, reason}). It opens a terminal on their screen, they confirm and type the password "
+         "there, and you get the exit code + output back. ")
+HINT = _HEAD + "For a remote host, wrap it: ssh -t <host> 'sudo ...'."
+SSH_HINT = (_HEAD + "SSH refused key auth. Call run_in_user_terminal with `ssh-copy-id -i ~/.ssh/id_ed25519.pub "
+            "<user>@<host>` (or the ssh command itself); the user types the password there; then continue with key "
+            "auth. If the ssh ran on another host (a hop through the mini), wrap it: ssh -t <hop> 'ssh-copy-id "
+            "<user>@<host>' so the key that gets installed is the hop's.")
+OTHER_HINT = (_HEAD + "For git over HTTPS or a locked keychain, run the same command there (e.g. `git pull`, "
+              "`security unlock-keychain`) so the user can type the credential.")
+
+
+def needs_user(output: str) -> str | None:
+    """Which hint fits this terminal output, or None."""
+    if not isinstance(output, str) or _MARK in output:
+        return None
+    if _NEEDS_SUDO.search(output):
+        return HINT
+    if _NEEDS_SSH.search(output):
+        return SSH_HINT
+    if _NEEDS_OTHER.search(output):
+        return OTHER_HINT
+    return None
 
 
 def transform_terminal_output(command: str = "", output: str = "", **_: Any) -> str | None:
-    if not isinstance(output, str) or not any(s in output for s in _NEEDS_USER) or HINT in output:
+    hint = needs_user(output)
+    if hint is None:
         return None
-    return _CORE_SUDO_TIP.sub("", output).rstrip() + HINT
+    return _CORE_SUDO_TIP.sub("", output).rstrip() + hint
 
 
 # ---------------------------------------------------------------- relayed jobs (Mac side)
