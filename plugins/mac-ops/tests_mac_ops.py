@@ -164,6 +164,22 @@ def test_screen_shot_goes_through_the_other_mac_and_is_posted(env):
     assert env["uploads"][0][1] == b"\x89PNG fake"
 
 
+def test_screen_sends_the_peer_name_the_viewer_shim_knows(env, monkeypatch):
+    # The hub calls the MBP "mbp"; the mini's shim knows it as "macbook". The name comes from config.
+    cfg = mo._config()
+    cfg["mac_ops"]["hosts"]["mbp"]["peer"] = "macbook"
+    monkeypatch.setattr(mo, "_config", lambda: cfg)
+    out = json.loads(mo.tool_screen({"host": "mbp", "op": "shot"}))
+    assert out["ok"] and out["result"]["posted_to_thread"]
+    call = env["calls"]()[0]
+    assert call["to"] == "you@mini.example.com" and call["cmd"] == ["screen", "macbook", "shot"]
+    assert env["uploads"][0][0].startswith("mbp-")  # still labelled with the hub's name
+    # a peer name with shell metachars is refused before ssh
+    cfg["mac_ops"]["hosts"]["mbp"]["peer"] = "macbook;id"
+    assert not json.loads(mo.tool_screen({"host": "mbp", "op": "shot"}))["ok"]
+    assert len(env["calls"]()) == 1
+
+
 def test_screen_click_validates_and_passes_ints(env):
     assert json.loads(mo.tool_screen({"host": "mini", "op": "click", "x": 10, "y": 20}))["ok"]
     assert env["calls"]()[0]["cmd"] == ["screen", "mini", "click", "10", "20"]

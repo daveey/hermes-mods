@@ -17,7 +17,8 @@ config.yaml)::
     mac_ops:
       enabled: true
       key: ~/.ssh/id_mac_fixer
-      hosts: {mbp: {addr: <tailscale ip>, user: <login>}, mini: {addr: ..., user: ...}}
+      hosts: {mbp: {addr: <tailscale ip>, user: <login>, peer: <name the OTHER Mac's shim uses for it>},
+              mini: {addr: ..., user: ..., peer: ...}}    # peer defaults to the key (mbp, mini)
 
 The gateway sets MAC_OPS_CHANNEL / MAC_OPS_THREAD / MAC_OPS_OWNER / MAC_OPS_BOT_HOME for the turn (from a
 Slack-verified owner DM); the tools post only there.
@@ -49,6 +50,7 @@ MAX_OUT = 7000
 YES = re.compile(r"^\s*(yes|y|yep|yeah|yup|confirm|confirmed|do it|go ahead|go for it|ok|okay|sure)\W*$", re.I)
 NO = re.compile(r"^\s*(no|n|nope|cancel|stop|don'?t|abort|never mind|nevermind)\W*$", re.I)
 KEY_RE = re.compile(r"^[A-Za-z0-9+_\-]{1,40}$")
+PEER_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
 
 
 # ---------------------------------------------------------------- config / context
@@ -295,7 +297,11 @@ def tool_screen(args: dict, **_: Any) -> str:
     viewer = str(args.get("via") or "").strip().lower() or (others[0] if others else "")
     if viewer not in hosts() or viewer == target:
         return _jerr(f"no other Mac to look from; configured: {', '.join(sorted(hosts()))}")
-    action, perr = _screen_argv(target, args.get("op"), args)
+    # The viewer's shim names its peer in its own terms (e.g. the hub's "mbp" is the mini's "macbook").
+    peer = str(hosts()[target].get("peer") or target).strip()
+    if not PEER_RE.match(peer):
+        return _jerr(f"bad peer name {peer!r} in mac_ops.hosts.{target}.peer")
+    action, perr = _screen_argv(peer, args.get("op"), args)
     if perr:
         return _jerr(perr)
     out = run_shim(viewer, action, timeout=150)
