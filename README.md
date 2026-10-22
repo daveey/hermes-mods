@@ -90,7 +90,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | Skill | Use when |
 |---|---|
 | [creative/animated-explainer](skills/creative/animated-explainer/) | Illustrated, animated, narrated explainers ("make an explainer about X for a 6-year-old, in Russian"): one self-contained responsive HTML with Gemini TTS, karaoke captions and chapter sync. Template + `tts.py` + `build.py` + a full example. |
-| [apple/invisible-chrome-agent](skills/apple/invisible-chrome-agent/) | A real Chrome on an invisible virtual display, kept there by a launchd CDP supervisor; clickable Touch ID notifications for passkeys (click/Show brings the asking tab to the front); a focus guard hands back keyboard focus the hidden Chrome grabs unasked. |
+| [apple/invisible-chrome-agent](skills/apple/invisible-chrome-agent/) | A real Chrome on an invisible virtual display, kept there by a launchd CDP supervisor; clickable Touch ID notifications for passkeys (click/Show brings the asking tab to the front); a CDP focus-filter proxy on 9333 (Chrome itself on 9334) rewrites raising calls (foreground createTarget, activateTarget, bringToFront, /json/activate, PUT /json/new) unless the user asked to see it; a focus guard hands back any focus that still slips through. |
 | [apple/local-chrome-remote-debugging](skills/apple/local-chrome-remote-debugging/) | Driving Chrome with remote debugging on macOS. |
 | [apple/macos-disk-space-cleanup](skills/apple/macos-disk-space-cleanup/) | A Mac is low on disk: find, clean, ask first. |
 | [apple/macos-dock-management](skills/apple/macos-dock-management/) | The Dock shows dead `?` icons or stale pins. |
