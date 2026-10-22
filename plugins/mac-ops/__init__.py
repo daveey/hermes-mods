@@ -113,8 +113,11 @@ def slack_api(ctx: dict, method: str, params: dict) -> dict:
     tok = _bot_token(ctx["bot_home"])
     if not tok:
         raise RuntimeError("no Slack bot token available")
-    req = urllib.request.Request("https://slack.com/api/" + method, data=json.dumps(params).encode(), headers={
-        "Authorization": "Bearer " + tok, "Content-Type": "application/json; charset=utf-8"})
+    # Form-encoded: read methods such as conversations.replies reject a JSON body (invalid_arguments).
+    form = urllib.parse.urlencode({k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
+                                   for k, v in params.items() if v is not None}).encode()
+    req = urllib.request.Request("https://slack.com/api/" + method, data=form, headers={
+        "Authorization": "Bearer " + tok, "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=30) as r:
         out = json.load(r)
     if not out.get("ok"):

@@ -198,3 +198,28 @@ def test_plugin_registers_nothing_unless_enabled(env, monkeypatch):
     c = Ctx()
     mo.register(c)
     assert c.tools == []
+
+
+def test_slack_api_is_form_encoded(tmp_path, monkeypatch):
+    """conversations.replies (the confirm check) rejects JSON bodies; every call is form-encoded."""
+    (tmp_path / ".env").write_text("SLACK_BOT_TOKEN=xoxb-test\n")
+    seen = {}
+
+    class R:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"ok": true, "messages": []}'
+
+    def fake_urlopen(req, timeout=0):
+        seen["ctype"], seen["body"] = req.get_header("Content-type"), req.data.decode()
+        return R()
+
+    monkeypatch.setattr(mo.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mo.json, "load", lambda r: {"ok": True, "messages": []})
+    mo.slack_api({"bot_home": str(tmp_path)}, "conversations.replies", {"channel": "D1", "ts": "1.0", "limit": 5})
+    assert seen["ctype"] == "application/x-www-form-urlencoded" and "channel=D1" in seen["body"]
