@@ -52,18 +52,21 @@ Output ONLY JSON: {"asks":[{"i":<index>,"verdict":"<verdict>","confidence":<0..1
 the evidence>","how":"<concrete tool/command for agent_can_do/unverified, else empty>"}]}"""
 
 
-SOFT_SYSTEM = SYSTEM + "\n\n" + """EVERY item in this batch is an instruction telling David to open/check/change/run something, or a claim that the agent cannot do something. Judge them by these rules, which refine the ones above. They are not physical acts, so they are never ok by default:
-- An instruction to open, check, change, enable, install or run something in an app, dashboard, account, settings \
-page, repo, billing page, service or networked device (an "open X -> History" step, "check the spending limit", "please \
-change the digest", "is the pod online?") is work the agent can often do or verify itself. Looking something up in an app's history/log/settings view is a data read, not a physical act (the vendor \
-API, Home Assistant history, a database or a signed-in browser shows the same thing). Return unverified (`how` = \
-the cheap check or the change itself: API, ssh, gh, browser) unless this turn's tool output shows the agent tried and \
-could not, or it truly needs his hands, eyes, or credentials. A conditional or fallback instruction ("In that case, check X", "If it still fails, open Y") is still an \
-instruction to him: the condition does not make it ok, and neither does the fact that the agent could do it later. \
-ALWAYS ok even here: anything that needs his sudo or \
-account password, a macOS permission prompt or System Settings > Privacy toggle that only the logged-in user can \
-grant, pressing a physical button, an action on his phone or another person's device, signing in to his own account, \
-and a command he is asked to run in his own terminal because it prompts him.
+SOFT_SYSTEM = SYSTEM + "\n\n" + """EVERY item in this batch is an instruction telling David to open/check/change/run something, or a claim that the agent cannot do something. Judge them by these rules, which refine the ones above. Decide in this order:
+1. Return ok when the step is an ACTION only he can perform, whatever the app: pressing a physical button; tapping, clicking or toggling \
+something on his phone, watch, tablet or another person's device; clicking Allow/Authorize/Install on a prompt; signing in to \
+his own account or entering a password/code; anything needing his sudo; a macOS permission prompt or System Settings > Privacy \
+toggle; a command he is asked to run in his own terminal because it prompts him; a settings change in a third-party \
+portal that needs his login (App Store Connect, Slack app config, Apple developer, GitHub billing changes); an optional \
+"if you want X, run Y" or a fallback "if that doesn't work, do Z" for his own machine; a test or check that is only meaningful \
+on his own hardware ("raise your wrist", "check the watch shows it", "open BB Pod on the phone and see"). Setup walkthroughs he can follow later are ok.
+2. Otherwise it is a READ or a change the agent could do itself, which is not ok: opening an app's History/log/settings view \
+just to see data ("open Upstairs -> History"), checking a limit, balance, status, plan or setting ("check the Actions \
+spending limit", "please check it"), changing a bot, cron, digest or config on a machine the agent can reach \
+("please change the digest"), or "is the pod online?". That data is available via the vendor API, Home Assistant history, \
+a database, gh, ssh or a signed-in browser. Return unverified (`how` = the cheap check or the change itself) unless this turn's \
+tool output shows the agent tried and could not. A conditional or fallback instruction ("In that case, check X") that is a \
+read is still not ok: the condition does not make it ok.
 - An incapability claim ("I can't change it myself", "Limitation: ... would need details X doesn't have") is ok ONLY if \
 this turn's tool output shows the attempt failing. With no failed attempt in the tool log, return agent_can_do when the \
 capability sheet names the way, otherwise unverified with `how` = the attempt to make first. A sentence that \
