@@ -74,6 +74,20 @@ try {
   evidence.A.says_waiting_on_david = /(waiting on you|still needs you|needs your|blocked on you|waiting for you|waiting on david)/i.test(final) && !/(nothing|isn't|not|no longer|already|done|completed)/i.test(final.slice(0, 400))
   const log = (await fs.readFile(home + '/logs/ask-gate.jsonl', 'utf8').catch(() => '')).split('\n').filter(l => l.includes(key))
   evidence.A.gate_log = log.slice(-6).map(l => l.slice(0, 500))
+  // every ask sentence the gate judged non-ok must be absent from everything persisted in the chat
+  const heldAsks = log.flatMap(l => { try { const j = JSON.parse(l); return j.kind === 'verdict' ? j.asks.filter((_, i) => j.verdicts[i]?.[0] !== 'ok') : [] } catch { return [] } })
+  const allTexts = (await rest(`/api/sessions/${key}/messages?profile=default&limit=500&order=latest`)).messages.filter(m => m.role === 'assistant' && m.content).map(m => m.content)
+  evidence.A.persisted_assistant_texts = allTexts.map(t => t.slice(0, 300))
+  evidence.A.held_asks = heldAsks
+  evidence.A.held_ask_ever_persisted = heldAsks.some(h => allTexts.some(t => t.includes(h)))
+  // (c) the hold path itself: force the stale ask and show the first draft is never shown or saved
+  const heldText = `Still waiting on you: ${cardId}.`
+  const cPrompt = `ask-gate proof C. Reply with exactly this one sentence and nothing else, no tools: "${heldText}"`
+  const c = await turn(sid, key, cPrompt, 'C')
+  const shown = c.tail.filter(m => m.role === 'assistant' && m.content).map(m => m.content)
+  const log2 = (await fs.readFile(home + '/logs/ask-gate.jsonl', 'utf8').catch(() => '')).split('\n').filter(l => l.includes(key) && l.includes('already_done'))
+  evidence.C = { persisted_assistant_texts: shown.map(t => t.slice(0, 400)), held_text_ever_persisted: shown.some(t => t.includes(heldText)),
+                 gate_holds_logged: log2.length, gate_log: log2.slice(-3).map(l => l.slice(0, 400)) }
   console.log(JSON.stringify(evidence, null, 2))
   if (process.argv[2]) await fs.writeFile(process.argv[2], JSON.stringify(evidence, null, 2))
 } finally {
