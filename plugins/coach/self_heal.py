@@ -957,6 +957,10 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
                              f"python3 {SELF} file --mode live"], runner, stdin=json.dumps(d))
         res = {"action": "forwarded" if rc == 0 else "error", "hub": cfg["hub_ssh"],
                "out": (out or err).strip()[-300:]}
+        try:  # the hub prints its own file_defect result as the last line: callers (monitors) need its action
+            res["hub_result"] = json.loads((out or "").strip().splitlines()[-1])
+        except Exception:
+            pass
         store.log({"event": "selfheal_forward", "fingerprint": fp, "ok": rc == 0, "detail": res["out"]})
         return res
     lane = LaneState(store.root)

@@ -67,5 +67,31 @@ class ConflictTest(unittest.TestCase):
         self.assertIn("ERROR", r.stderr)
 
 
+class ForwardSignalsTest(unittest.TestCase):
+    def test_runs_the_forwarder_with_host_and_home(self):
+        seen = []
+
+        def runner(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "signals: forwarded 3 to you@hub.example.com", "")
+        out = coach_feed.forward_signals("macbook", "/tmp/h", runner=runner)
+        self.assertIn("forwarded 3", out)
+        cmd = seen[0]
+        self.assertTrue(cmd[1].endswith("plugins/coach/signals.py"))
+        self.assertEqual(cmd[2:], ["--host", "macbook", "--home", "/tmp/h", "forward"])
+
+    def test_failure_is_reported_not_raised(self):
+        def boom(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 150)
+        self.assertEqual(coach_feed.forward_signals("mini", None, runner=boom), "error: TimeoutExpired")
+        bad = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "ssh failed")
+        self.assertEqual(coach_feed.forward_signals("mini", None, runner=bad), "error: ssh failed")
+
+    def test_no_hub_configured_is_a_silent_noop(self):
+        h = Path(tempfile.mkdtemp())
+        self.assertEqual(coach_feed.forward_signals("macbook", str(h)), "ok")
+        self.assertFalse((h / "coach" / "signals-cursor.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

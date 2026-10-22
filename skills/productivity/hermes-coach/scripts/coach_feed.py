@@ -52,6 +52,23 @@ def resolve_unmerged(repo):
     return resolved, unresolved
 
 
+def forward_signals(host, home=None, runner=subprocess.run):
+    """Self-heal machine-signal forwarder (no agent, no LLM): ship this host's new raw signals (tracebacks, failed
+    crons, twice-failed cards, gateway crashes, coach handoff events) to the hub, which files them. Rides on this
+    launchd job (every 30 min). A no-op unless <home>/coach/selfheal-config.json names a hub that is not this host;
+    a failure never stops the digest feed, and the forwarder's cursor only moves when the hub accepted the batch."""
+    script = HERE.parents[3] / "plugins" / "coach" / "signals.py"
+    if not script.exists():
+        return "no signals.py"
+    cmd = [sys.executable, str(script), "--host", host] + (["--home", home] if home else []) + ["forward"]
+    try:
+        r = runner(cmd, capture_output=True, text=True, timeout=150)
+    except Exception as exc:
+        return f"error: {type(exc).__name__}"
+    out = (r.stdout or r.stderr or "").strip()[-200:]
+    return out or "ok" if r.returncode == 0 else f"error: {out}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
@@ -63,6 +80,7 @@ def main():
     a = ap.parse_args()
     repo = Path(a.repo_dir)
     status = {"host": a.host, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    status["signals"] = forward_signals(a.host, a.home)
 
     def heal(when):
         resolved, unresolved = resolve_unmerged(repo)

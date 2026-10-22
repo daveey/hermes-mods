@@ -265,6 +265,73 @@ def selfheal_lines(data, homes):
         return [f"Self-heal lane section unavailable: {type(e).__name__}: {e}"]
 
 
+def _coach_mod(name):
+    import importlib.util
+    p = Path(__file__).resolve().parents[4] / "plugins" / "coach" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"_askgate_{name}", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def lane_sessions(home):
+    """Session ids the self-heal lane already has a filing for (any status)."""
+    try:
+        st = json.loads((Path(home) / "coach" / "selfheal_lane.json").read_text())
+    except Exception:
+        return set()
+    return {v.get("session_id") for v in st.values() if isinstance(v, dict) and v.get("session_id")}
+
+
+def hit_defect(h):
+    """One ask-gate hit -> a monitor finding for the self-heal lane. A fix request the lane never filed is a detector
+    miss (the review used to ask for exactly that); an ask-me correction is the agent's needless handoff."""
+    q = quote(h, 160)
+    if h["class"] == FIX_CLASS:
+        title = f"self-heal detector missed a fix request: \"{q[:90]}\""
+        comp = "plugin"
+        body = (f"Ask-gate weekly: David had to ask for a Hermes fix ({h['pattern']}) on {fmt_ts(h['t'])}, "
+                f"host {h.get('host')}, session {h['session']}, and the self-heal lane has no filing for that session. "
+                f"Quote: \"{q}\"")
+        prompt = ("Check whether the self-heal detector (plugins/coach/self_heal.py complaint judge or the digest "
+                  "backstop) saw this turn; find why it missed it and fix the detector. Also file the underlying defect.")
+    else:
+        title = f"agent asked David to do it himself: \"{q[:90]}\""
+        comp = "agent"
+        body = (f"Ask-gate weekly: ask-me correction ({h['pattern']}) on {fmt_ts(h['t'])}, host {h.get('host')}, "
+                f"session {h['session']}. Quote: \"{q}\"")
+        prompt = "Find the root cause and fix the ask-gate or the skill that should have prevented it."
+    return {"monitor": "ask-gate", "key": f"ask-gate:{h['session']}:{h['class']}", "title": title, "body": body,
+            "prompt": prompt, "component": comp, "session_id": h["session"], "quote": q}
+
+
+def route_hits(hits, home, filer=None, signals=None):
+    """File every hit the lane does not already own. -> (owned hits, not-owned hits). In shadow mode nothing is
+    owned (file_defect only logs), so the card keeps its review prompt until the lane goes live."""
+    signals = signals or _coach_mod("signals")
+    known = lane_sessions(home)
+    owned, rest = [], []
+    for h in hits:
+        if h["session"] in known:
+            owned.append(h)
+            continue
+        m = hit_defect(h)
+        d = signals.monitor_defect(m, host=h.get("host"))
+        d.update(session_id=m["session_id"], quote=m["quote"])
+        try:
+            res = (filer or _coach_mod("self_heal").file_defect)(d)
+        except Exception as e:
+            res = {"action": "error", "why": str(e)[:200]}
+        (owned if signals.lane_owns(res) else rest).append(h)
+    return owned, rest
+
+
+REVIEW_PROMPT = ("Review this week's ask-gate KPI. Fix requests (had_to_ask_fix): for each, check whether the self-heal "
+                 "lane filed it (a `selfheal:` card or Inbox proposal); if not, find why the detector missed it and fix "
+                 "the detector. Ask-me corrections: find the root cause and fix the ask-gate or the skill that should "
+                 "have prevented it.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="~/code/hermes-coach-data")
@@ -312,16 +379,23 @@ def main():
             return
         extra = selfheal_lines(data, [Path(h).expanduser() for h in a.home] or None) if a.selfheal else None
         ask, fix = by_class(hits, ASK_CLASS), by_class(hits, FIX_CLASS)
+        rest = hits
+        if a.selfheal:  # every hit goes to the self-heal lane; the card only asks to review what it didn't take
+            home = Path(a.home[0] if a.home else os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+            try:
+                owned, rest = route_hits(hits, home)
+            except Exception as e:
+                owned, rest = [], hits
+                sys.stderr.write(f"self-heal routing failed: {e}\n")
+            extra = (extra or []) + ["", f"Self-heal lane took {len(owned)} of {len(hits)} hits (filed or already "
+                                         "open)." + (f" {len(rest)} still need a review (Do it)." if rest else "")]
         cmd = ["hermes", "inbox", "post",
                f"Ask-gate: {len(fix)} fix request{'s' if len(fix) != 1 else ''}, {len(ask)} ask-me, "
                f"week of {weeks[0]:%b %-d}",
                "--body", post_body(hits, weeks[0], extra), "--key", f"ask-gate-weekly:{weeks[0]:%Y-%m-%d}",
-               "--poster", "coach", "--prompt",
-               "Review this week's ask-gate KPI. Fix requests (had_to_ask_fix): for each, check whether the self-heal "
-               "lane filed it (a `selfheal:` card or Inbox proposal); if not, find why the detector missed it and fix "
-               "the detector. Ask-me corrections: find the root cause and fix the ask-gate or the skill that should "
-               "have prevented it.",
-               "--prompt-label", "Review this week's ask-gate KPI"]
+               "--poster", "coach"]
+        if rest:
+            cmd += ["--prompt", REVIEW_PROMPT, "--prompt-label", "Review this week's ask-gate KPI"]
         r = subprocess.run(cmd, capture_output=True, text=True)
         sys.stderr.write(r.stdout + r.stderr)
         if r.returncode:

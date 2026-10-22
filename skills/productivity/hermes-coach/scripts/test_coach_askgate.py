@@ -123,5 +123,42 @@ class Fix(unittest.TestCase):
             self.assertEqual(g.posted_elsewhere(d, w, "laptop"), "hub")
 
 
+class RouteToLane(unittest.TestCase):
+    """The weekly review's Do-it work goes to the self-heal lane: each hit is filed as a monitor finding unless the
+    lane already has that session; the card keeps its review prompt only for hits the lane did not take."""
+
+    def hits(self):
+        return [{"t": 1792600000, "session": "s_fix", "host": "macbook", "source": "cli", "class": g.FIX_CLASS,
+                 "pattern": "root_cause", "quote": "root cause and fix this please"},
+                {"t": 1792600100, "session": "s_ask", "host": "mini", "source": "cli", "class": g.ASK_CLASS,
+                 "pattern": "do_it_yourself", "quote": "why are you asking me, do it yourself"},
+                {"t": 1792600200, "session": "s_known", "host": "macbook", "source": "cli", "class": g.FIX_CLASS,
+                 "pattern": "make_card", "quote": "make a card to fix"}]
+
+    def home(self, lane):
+        import json, tempfile
+        h = Path(tempfile.mkdtemp())
+        (h / "coach").mkdir()
+        (h / "coach" / "selfheal_lane.json").write_text(json.dumps(lane))
+        return h
+
+    def test_live_lane_owns_all(self):
+        filed = []
+        home = self.home({"agent-0123456789": {"status": "filed", "session_id": "s_known"}})
+        owned, rest = g.route_hits(self.hits(), home, filer=lambda d: filed.append(d) or {"action": "filed"})
+        self.assertEqual(rest, [])
+        self.assertEqual(len(owned), 3)
+        self.assertEqual([d["session_id"] for d in filed], ["s_fix", "s_ask"])  # the known session is not re-filed
+        self.assertEqual(filed[0]["component"], "plugin")
+        self.assertIn("detector missed a fix request", filed[0]["symptom"])
+        self.assertEqual(filed[1]["component"], "agent")
+        self.assertTrue(all(d["source"] == "signal" and d["kind"] == "monitor" for d in filed))
+
+    def test_shadow_keeps_the_review(self):
+        owned, rest = g.route_hits(self.hits(), self.home({}), filer=lambda d: {"action": "would_file"})
+        self.assertEqual(owned, [])
+        self.assertEqual(len(rest), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

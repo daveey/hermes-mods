@@ -206,6 +206,41 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   Do it → fix card, Not now / Never). `COACH_SELFHEAL_NO_EXEC=1` (set by the test conftest) refuses any real
   `hermes`/ssh call.
 
+### Machine-signal sweeper (`signals.py`, no agent, no LLM)
+
+Raw machine signals become `file_defect` calls with `source: signal` and stable fingerprints:
+
+| kind | source | fingerprint (host in it?) |
+|---|---|---|
+| `errors` | new tracebacks in `<home>/logs/errors.log` (any level), minus tool output (`agent.tool_executor`) and provider transients (429/529/overloaded/timeouts) | exception type + innermost 4 frames as `file:function`, no line numbers (no) |
+| `hook` | `Hook '<hook>' callback <cb> raised: …` (plugin hook exceptions) | hook + callback + exception type (no) |
+| `cron` | a job whose sticky `last_failure.at` is new (`cron/jobs.json`), even if it has recovered since | job name (yes) |
+| `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped | board + card id (yes) |
+| `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash) | tag + exception type (yes) |
+| `coach` | coach `fixloop_card` (2nd confirmed failure of a fix) and `reply_nudge` with rule `handoff` | session (+ issue) (no) |
+| `monitor` | a propose-only monitor's finding (`route-monitor`, below) | the monitor's own dedupe key |
+
+Profiles (`<home>/profiles/*`) are swept too. Cursor `<home>/coach/signals-cursor.json` (offset + inode per log, last
+run id per board, last failure per job); first sight looks back 7 days; a rotated log is re-read; ≤ 25 signals per
+kind per pass, same fingerprint folded into one (`seen Nx`).
+
+- **Hub**: cron `self-heal signals (hub)` (`~/.hermes/scripts/selfheal_signals.py` → `signals.py --host hermes-hub
+  sweep`, every 30 min, from the scheduler since a Kanban worker can't create cards). It also drains
+  `<home>/coach/signals/spool.jsonl`, where the other hosts' signals land.
+- **Macs / mini**: `signals.py forward` ships new raw signals over ssh to the hub's `signals.py ingest` (the hub
+  files them); the cursor only moves when the hub accepted the batch. It rides on the existing launchd coach feed
+  (`hermes-coach/scripts/coach_feed.py`, every 30 min) and is a no-op without a `hub_ssh` in
+  `coach/selfheal-config.json` or on the hub itself.
+- **Monitors**: `signals.py route-monitor` (JSON `{monitor, key, title, body, prompt, component}` on stdin) files the
+  finding and prints `{"owned": …}`. `owned` = the lane filed it or already has it open; then the monitor posts no
+  Do-it card and the investigation posts the What happened / Why / Plan proposal. In shadow mode (or on any error)
+  it is not owned and the monitor posts its old card. Callers: mac-worktree-gc (leaks, GC abort, stale report),
+  guard-conformance, and `coach_askgate.py --post --selfheal` (each hit the lane has no filing for; the weekly card
+  keeps its review prompt only for hits the lane did not take).
+- Tests: `tests/test_signals.py` (one per source with fixtures in `tests/fixtures/signals/`, cursor, rotation, hub
+  sweep in shadow, forwarder success/failure, ingest, monitor routing and `lane_owns`; also passes under Python 3.9,
+  the Macs' `/usr/bin/python3`).
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.
@@ -276,6 +311,7 @@ Both calls fail open when coach isn't loaded.
 - `__init__.py`: the hooks (`pre_llm_call`, `post_tool_call`, `transform_tool_result`).
 - `self_heal.py`: the complaint and self-admission detectors, fingerprints and shadow/live handling;
   `eval/selfheal_replay.py` replays them over a labeled set.
+- `signals.py`: the machine-signal sweeper, forwarder and monitor router (stdlib, Python 3.9+).
 - `agent_rules.py`: the agent-channel rules, plus the signals the user channel needs (subagents, long jobs, bug signatures).
 - `core.py`: the file store under `<HERMES_HOME>/coach/` (`sessions/<id>.json`, `bugs.jsonl`, `log.jsonl`), the gate, the user-rule evaluation, the briefs (spin-out's transcript reader + aux task `coach`) and stats.
 - `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the
