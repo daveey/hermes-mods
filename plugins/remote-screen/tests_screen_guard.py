@@ -20,7 +20,24 @@ CMDS = [
     "open -b com.apple.ScreenSharing",
     "open -a 'Screen Sharing.app'",
     "cd /tmp && open -g 'vnc://192.0.2.10'",
+    "open -n -a /System/Applications/Utilities/Screen\\ Sharing.app",
+    "open -a Screen\\ Sharing --args vnc://192.0.2.10",
 ]
+
+
+@pytest.mark.parametrize("code", [
+    "import webbrowser\nwebbrowser.open('vnc://you@192.0.2.10')",
+    "import webbrowser; webbrowser.open_new_tab(\"vnc://192.0.2.10\")",
+    "import os; os.startfile('vnc://192.0.2.10')",
+    "from AppKit import NSWorkspace, NSURL\nNSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_('vnc://192.0.2.10'))",
+])
+def test_execute_code_python_openers_blocked(code):
+    r = _call("execute_code", {"code": code})
+    assert r and r["action"] == "block"
+
+
+def test_execute_code_printing_vnc_allowed():
+    assert _call("execute_code", {"code": "print('host: vnc://192.0.2.10')"}) is None
 
 
 @pytest.fixture(autouse=True)

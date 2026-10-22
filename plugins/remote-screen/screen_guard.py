@@ -16,10 +16,13 @@ SHELL_TOOLS = {"terminal", "process_manage", "process", "mcp__terminal", "mcp__p
 PY_TOOLS = {"execute_code", "mcp__execute_code"}
 WRAP_TOOLS = {"tool_call", "mcp__tool_call"}
 
-_TARGET = r"(?:vnc://|screen\s*sharing|com\.apple\.screensharing)"
+# [\\\s]* also matches shell-escaped spaces: /System/Applications/Utilities/Screen\ Sharing.app
+_TARGET = r"(?:vnc://|screen[\\\s]*sharing|com\.apple\.screensharing)"
 _SHELL_RE = re.compile(r"\bopen\b[^\n;|&]*?" + _TARGET, re.I)
 _OSA_RE = re.compile(r"\bosascript\b.*" + _TARGET, re.I | re.S)
-_PY_OPEN_RE = re.compile(r"""(?:["'\s,\[]open["'\s,\]])""", re.I)
+# any Python URL/app opener: subprocess 'open' argv, webbrowser.open*/obj.open(, os.startfile, NSWorkspace openURL*
+_PY_OPEN_RE = re.compile(
+    r"""(?:["'\s,\[]open["'\s,\]]|\.open\w*\s*\(|\bstartfile\b|\bopenURL\w*|\blaunchApplication\w*)""", re.I)
 _PY_TARGET_RE = re.compile(_TARGET, re.I)
 
 # explicit request: an imperative / polite opener right before "open ... screen sharing", no negation anywhere
