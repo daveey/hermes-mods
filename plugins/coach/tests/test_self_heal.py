@@ -22,12 +22,13 @@ core = load("coach_core_test_sh", ROOT / "core.py")
 plugin = load("coach_plugin_test_sh", ROOT / "__init__.py")
 
 
-def judge(p=0.9, component="desktop", symptom="sidebar sessions reshuffle"):
+def judge(p=0.9, component="desktop", symptom="sidebar sessions reshuffle", kind="admission"):
+    """Fake judge. kind 'admission' counts on both paths (the audit only files self-admissions)."""
     calls = []
 
     def llm(system, prompt):
         calls.append((system, prompt))
-        return json.dumps({"p_defect": p, "component": component, "symptom": symptom})
+        return json.dumps({"p_defect": p, "kind": kind, "component": component, "symptom": symptom})
     return llm, calls
 
 
@@ -53,16 +54,17 @@ def events(tmp_path, name="selfheal_detect"):
     "fix this [screenshot]",
     "[OUT-OF-BAND USER MESSAGE — x]\nYOU JUST SAID IT WAS CANCELED, WHY DO YOU KEEP ASKING ME\n[/OUT-OF-BAND USER MESSAGE]",
     "it's speaking spanish to me for some reason",
+    "you buy the credits",          # a correction with no complaint words (missed by the v1 regex)
+    "resume", "whats going on",     # nudges: the judge decides from the previous turn
 ])
 def test_complaint_prefilter_hits(text):
     assert sh.prefilter(text)
 
 
 @pytest.mark.parametrize("text", [
-    "do it", "resume", "go", "/goal ship it",
+    "do it", "go", "yes, do it", "thanks!", "/goal ship it",
     "[IMPORTANT: Background process proc_1 exited (exit code 0).]",
     "✔ [default] Kanban t_1 done — shipped",
-    "make a graph of my steps and sleep",
 ])
 def test_complaint_prefilter_skips(text):
     assert not sh.prefilter(text)
@@ -77,23 +79,90 @@ def test_multimodal_message_and_trailers_are_cleaned():
 def test_admission_prefilter():
     assert sh.admission_prefilter("You're right, and that was my mistake. I skipped the check.")
     assert sh.admission_prefilter("The root cause is a bug in the fallback plugin's import lock.")
-    assert not sh.admission_prefilter("Shipped. Tests pass and the page is live.")
+    assert sh.admission_prefilter("Run this in your terminal: sudo foo")  # handoff
+    assert sh.admission_prefilter("Shipped.", ["-> terminal(make)", "   <- ERROR exit 2"])  # errors in the log
+    assert not sh.admission_prefilter("Shipped. Tests pass and the page is live.", ["-> terminal(make)"])
+
+
+def test_machine_signals_need_no_judge():
+    api = sh.machine_signal("Sorry — this message was not processed (API call failed).")
+    assert api["source"] == "signal" and api["kind"] == "api_error" and api["component"] == "provider"
+    assert sh.machine_signal("ok", ["-> terminal(x)", "Operation interrupted"])["kind"] == "interrupted"
+    rep = ["-> terminal(npm test)", "   <- ERROR exit 1: ENOENT"] * 3
+    assert sh.machine_signal("done", rep)["kind"] == "repeat_failure"
+    assert sh.machine_signal("done", rep[:4]) is None  # two identical errors are not a loop
+    llm, calls = judge(0.0)
+    assert sh.detect_admission("Sorry, not processed.", llm)["source"] == "signal" and not calls
 
 
 # ── detect_complaint / detect_admission ──
-def test_detect_complaint_returns_schema_and_passes_prev_reply():
+def test_detect_complaint_returns_schema_and_passes_prev_reply_and_tool_log():
     llm, calls = judge(0.92)
-    hit = sh.detect_complaint("Done: sessions are sorted by creation time.", "i think the sort is broken", llm)
-    assert set(hit) >= {"p_defect", "component", "symptom", "fingerprint", "source"}
+    hit = sh.detect_complaint("Done: sessions are sorted by creation time.", "i think the sort is broken", llm,
+                              tool_log=["-> terminal(npm run build)", "   <- ERROR tsc failed"])
+    assert set(hit) >= {"p_defect", "component", "symptom", "fingerprint", "source", "kind"}
     assert hit["source"] == "complaint" and hit["component"] == "desktop" and hit["p_defect"] == 0.92
     assert "sorted by creation time" in calls[0][1] and "sort is broken" in calls[0][1]
+    assert "ERROR tsc failed" in calls[0][1]
+    assert calls[0][0].startswith(sh.COMPLAINT_SYS)
+
+
+def test_product_bug_kind_is_not_a_self_heal_defect():
+    def llm(system, prompt):
+        return json.dumps({"p_defect": 0.9, "kind": "external", "component": "other", "symptom": "vendor site down"})
+    assert sh.detect_complaint("", "the vendor login page is down", llm) is None
+
+
+def test_audit_files_only_self_admissions():
+    llm, _ = judge(0.95, kind="needless_handoff")
+    assert sh.detect_admission("Please run this in your terminal: make", llm) is None
+    llm2, _ = judge(0.95, kind="admission")
+    assert sh.detect_admission("That was my mistake, I skipped the test.", llm2)["kind"] == "admission"
+
+
+def test_complaint_cascade_gate_second_opinion_and_confirm():
+    first, c1 = judge(0.8, kind="agent_fault")
+    no, c2 = judge(0.2, kind="none")
+    # >= GATE: a second flash opinion (strict prompt) and the confirm model; p = mean(0.8, 0.8, 0) < 0.6
+    assert sh.detect_complaint("Done.", "that's not what i asked", first, confirm=no) is None
+    assert len(c1) == 2 and c1[1][0].startswith(sh.COMPLAINT_STRICT_SYS) and len(c2) == 1
+    assert c2[0] == c1[0]  # the confirm model sees the identical prompt
+    yes, c3 = judge(0.85, kind="agent_fault", symptom="ignored instruction")
+    hit = sh.detect_complaint("Done.", "that's not what i asked", first, confirm=yes)
+    assert hit["p_defect"] == round((0.8 + 0.8 + 0.85) / 3, 3) and hit["symptom"] == "ignored instruction"
+    assert hit["stages"] == [0.8, 0.8, 0.85]
+    low, c4 = judge(0.1, kind="none")
+    assert sh.detect_complaint("Done.", "add a toggle", low, confirm=yes) is None
+    assert len(c4) == 1 and len(c3) == 1  # below GATE: one cheap call, no escalation
+    adm, _ = judge(0.95, kind="admission")
+    assert sh.detect_admission("my mistake, I skipped it", adm, confirm=no) is None  # confirm overrules the audit
+    assert sh.detect_admission("my mistake, I skipped it", adm, confirm=yes) is None  # confirm kind not admission
+
+
+def test_confirm_judge_from_env(monkeypatch):
+    monkeypatch.delenv("COACH_DEFECT_CONFIRM_MODEL", raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", None)  # no Hermes config importable -> off
+    assert sh.confirm_judge() is None
+    monkeypatch.setenv("COACH_DEFECT_CONFIRM_MODEL", "m")
+    assert callable(sh.confirm_judge())
+
+
+def test_profile_overlay_is_appended(tmp_path, monkeypatch):
+    prof = tmp_path / "reply_profile.md"
+    prof.write_text("- Never ask me to run a shell command myself.")
+    monkeypatch.setenv("COACH_REPLY_PROFILE", str(prof))
+    llm, calls = judge(0.9)
+    sh.detect_complaint("Run: sudo x", "you have ssh, do it", llm)
+    assert "Never ask me to run a shell command" in calls[0][0]
+    monkeypatch.setenv("COACH_REPLY_PROFILE", str(tmp_path / "missing.md"))
+    assert sh._with_profile("SYS") == "SYS"
 
 
 def test_detect_complaint_below_threshold_prefilter_miss_and_judge_error():
     llm, calls = judge(0.4)
     assert sh.detect_complaint("prev", "why did you stop?", llm) is None
     llm2, calls2 = judge(0.99)
-    assert sh.detect_complaint("prev", "make a graph of my steps", llm2) is None and not calls2
+    assert sh.detect_complaint("prev", "do it", llm2) is None and not calls2
 
     def boom(system, prompt):
         raise RuntimeError("provider down")
@@ -102,10 +171,11 @@ def test_detect_complaint_below_threshold_prefilter_miss_and_judge_error():
 
 
 def test_detect_admission():
-    llm, calls = judge(0.85, "agent", "asked user for a finished step")
-    hit = sh.detect_admission("That was my mistake: I asked you to do something already done.", llm)
+    llm, calls = judge(0.95, "agent", "asked user for a finished step")
+    hit = sh.detect_admission("That was my mistake: I asked you to do something already done.", llm,
+                              tool_log=["-> terminal(ls)"], ask="clean up the cards")
     assert hit["source"] == "admission" and hit["component"] == "agent"
-    assert calls[0][0] == sh.ADMIT_SYS
+    assert calls[0][0].startswith(sh.AUDIT_SYS) and "clean up the cards" in calls[0][1]
     llm2, calls2 = judge(0.99)
     assert sh.detect_admission("All green, deployed.", llm2) is None and not calls2
 
@@ -153,7 +223,7 @@ def test_pre_llm_call_complaint_path_logs_shadow_and_dedupes(tmp_path, on):
 
 
 def test_post_llm_call_admission_path(tmp_path, on):
-    llm, calls = judge(0.88, "agent", "claimed cards scheduled when none were")
+    llm, calls = judge(0.95, "agent", "claimed cards scheduled when none were")
     store = core.Store(tmp_path / "coach")
     _, hooks = plugin.build(store=store, checkout=None, selfheal_sync=True, selfheal_llm=llm)
     hooks["post_llm_call"](session_id="s1", assistant_response="You're right, that was my mistake: no cards were scheduled.")
@@ -186,6 +256,21 @@ def test_off_mode_subagents_cron_and_kanban_workers_are_skipped(tmp_path, on, mo
     assert not calls and events(tmp_path) == []
 
 
+def test_tool_log_flows_through_hooks_to_both_paths(tmp_path, on):
+    llm, calls = judge(0.9)
+    store = core.Store(tmp_path / "coach")
+    _, hooks = plugin.build(store=store, checkout=None, selfheal_sync=True, selfheal_llm=llm)
+    hooks["pre_llm_call"](session_id="s1", user_message="deploy the site")
+    hooks["post_tool_call"](tool_name="terminal", args={"command": "wrangler deploy"}, result='{"exit_code": 1}',
+                            session_id="s1", status="error", error_message="auth failed")
+    n = len(calls)
+    hooks["post_llm_call"](session_id="s1", assistant_response="Deployed, the site is live.")
+    assert len(calls) == n + 1 and "wrangler deploy" in calls[-1][1] and "deploy the site" in calls[-1][1]
+    hooks["pre_llm_call"](session_id="s1", user_message="its not live, you said it was")
+    assert "wrangler deploy" in calls[-1][1] and "Deployed, the site is live." in calls[-1][1]
+    assert {e["source"] for e in events(tmp_path)} == {"admission", "complaint"}
+
+
 def test_hook_judge_crash_is_fail_open(tmp_path, on):
     def boom(system, prompt):
         raise RuntimeError("x")
@@ -196,6 +281,55 @@ def test_hook_judge_crash_is_fail_open(tmp_path, on):
 
 
 # ── replay eval (synthetic fixture; the real labeled set is private) ──
+def test_incident_replay_scores_like_score3(tmp_path):
+    """Episode E1: flagged turns 1-2, explicit fix ask at turn 2 -> only a complaint at turn 1 or an audit before it
+    counts unasked. E2: no explicit ask. E3: not a real incident (its turns are negatives). Turn x/0 is a normal turn."""
+    ir = load("selfheal_incident_replay_test", ROOT / "eval" / "selfheal_incident_replay.py")
+    d = tmp_path / "data"
+    d.mkdir()
+    turns = [("a", 0, "build it", ""), ("a", 1, "that's not what i asked", "Built X."), ("a", 2, "fix your process", "ok"),
+             ("b", 0, "resume", "(error)"), ("c", 0, "why did you do that", "Did Y."), ("x", 0, "add a toggle", "Hi")]
+    (d / "turns.jsonl").write_text("".join(json.dumps({"sid": s, "idx": i, "text": t, "prev_reply": p}) + "\n"
+                                           for s, i, t, p in turns))
+    (d / "turns2.jsonl").write_text("".join(json.dumps({"sid": s, "idx": i, "prev_log": []}) + "\n"
+                                            for s, i, _, _ in turns))
+    eps = [{"eid": "E1", "sid": "a", "first": 1, "last": 2, "turns": [{"sid": "a", "idx": 1}, {"sid": "a", "idx": 2}]},
+           {"eid": "E2", "sid": "b", "first": 0, "last": 0, "turns": [{"sid": "b", "idx": 0}]},
+           {"eid": "E3", "sid": "c", "first": 0, "last": 0, "turns": [{"sid": "c", "idx": 0}]}]
+    (d / "episodes.json").write_text(json.dumps(eps))
+    (d / "fivewhys.jsonl").write_text(json.dumps({"eid": "E1", "real_incident": True, "explicit_fix_ask_turn": 2}) + "\n"
+                                      + json.dumps({"eid": "E2", "real_incident": True, "explicit_fix_ask_turn": None})
+                                      + "\n" + json.dumps({"eid": "E3", "real_incident": False}) + "\n")
+    (d / "fpcheck.jsonl").write_text(json.dumps({"sid": "c", "idx": 0, "real_incident": True}) + "\n")
+    hot = {"that's not what i asked": 0.9, "fix your process": 0.95, "why did you do that": 0.8, "add a toggle": 0.7}
+
+    def llm(system, prompt):
+        msg = prompt.split("USER'S NEW MESSAGE:\n", 1)[-1]
+        p = next((v for k, v in hot.items() if k in msg), 0.1)
+        return json.dumps({"p_defect": p, "kind": "agent_fault", "component": "agent", "symptom": msg[:20]})
+    out = tmp_path / "out"
+    ir.run(type("A", (), {"hermes_root": "", "data": str(d), "out": str(out), "limit": 0, "workers": 2,
+                          "tag": "t"})(), llm=llm)
+    v = ir.jl(out / "verdicts.jsonl")
+    res = ir.score(d, v, 0.65, 0.65, False, relabel=True)
+    by = {r["eid"]: r for r in res["episodes"]}
+    assert by["E1"]["mode"] == "reactive" and by["E1"]["cut"] == 1  # caught before the fix ask
+    assert by["E2"]["mode"] is None and by["E2"]["mode_with_ask"] is None  # "resume" judged 0.1
+    assert res["n"] == 2 and res["caught"] == 1 and res["neg_turns"] == 3
+    fps = {(f["sid"], f["idx"]): f for f in res["fps"]}
+    assert set(fps) == {("c", 0), ("x", 0)} and res["fp_relabeled_real"] == 1 and res["fp_true"] == 1
+    # with the fix ask counted, E1 still counts once; an ask-only episode counts only in with_ask
+    hot.pop("that's not what i asked")
+    ir.run(type("A", (), {"hermes_root": "", "data": str(d), "out": str(tmp_path / "o2"), "limit": 0,
+                          "workers": 2, "tag": "t2"})(), llm=llm)
+    r2 = ir.score(d, ir.jl(tmp_path / "o2" / "verdicts.jsonl"), 0.65, 0.65, False, relabel=True)
+    e1 = next(r for r in r2["episodes"] if r["eid"] == "E1")
+    assert e1["mode"] is None and e1["mode_with_ask"] == "fix_ask" and r2["caught_with_ask"] == 1
+    ir.write_report(res, d, tmp_path / "r.md", "| baseline | x | y | z |")
+    md = (tmp_path / "r.md").read_text()
+    assert "Misses (1)" in md and '"resume"' in md and "fpcheck=real" in md and "| baseline |" in md
+
+
 def test_replay_reports_catch_rate_precision_misses_and_fps(tmp_path):
     replay = load("selfheal_replay_test", ROOT / "eval" / "selfheal_replay.py")
     defects = {"i think the sort is broken": 0.9, "why are you asking me to open a terminal": 0.95,

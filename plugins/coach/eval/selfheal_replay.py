@@ -114,11 +114,13 @@ def main(argv=None, llm=None):
     def one(r):
         prev = "" if a.no_prev else r.get("prev_reply") or ""
         if a.mode == "admission":
-            r["prefilter"] = sh.admission_prefilter(r["text"])
-            system, prompt = sh.ADMIT_SYS, sh.admission_prompt(r["text"])
+            r["prefilter"] = sh.admission_prefilter(r["text"], r.get("tool_log"))
+            system, prompt = sh._with_profile(sh.AUDIT_SYS), sh.admission_prompt(r["text"], r.get("tool_log"),
+                                                                                  r.get("ask") or "")
         else:
             r["prefilter"] = sh.prefilter(r["text"])
-            system, prompt = sh.JUDGE_SYS, sh.complaint_prompt(prev, r["text"])
+            system, prompt = sh._with_profile(sh.COMPLAINT_SYS), sh.complaint_prompt(prev, r["text"],
+                                                                                      r.get("tool_log"))
         v = None
         if r["prefilter"]:
             for _ in range(2):  # one retry on a transient provider error
@@ -130,7 +132,7 @@ def main(argv=None, llm=None):
         r["p"] = v["p_defect"] if v else None
         r["pred_component"] = v["component"] if v else ""
         r["symptom"] = v["symptom"] if v else ""
-        r["pred"] = bool(v and v["p_defect"] >= th)
+        r["pred"] = bool(v and v["p_defect"] >= th and v.get("kind") not in ("product_bug", "external", "none"))
         return r
 
     with ThreadPoolExecutor(a.workers) as ex:

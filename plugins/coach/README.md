@@ -135,28 +135,40 @@ also tells it to save the rule with the memory tool unless memory already has it
 
 ### Self-heal detectors (`self_heal.py`, shadow by default)
 
-Spots the FIRST time you report that Hermes did something wrong, so a fix can be filed without you asking.
-Two entry paths, one result `{p_defect, component, symptom, fingerprint, source}`:
+Spots an agent/Hermes defect as early as possible, so a fix can be filed without you asking.
+Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, source}`:
 
-- **Complaint** (`pre_llm_call`): a recall-oriented regex on your message (bare acks, slash commands and
-  Hermes-written notices are skipped), then the aux judge `coach_defect` on (previous reply, your message).
-  It fires on "the sort is broken", "why are you asking me to open a terminal?", "i fixed this once, but now it's
-  broken again", "fix this [screenshot]" after the agent's work, and similar.
-- **Self-admission** (`post_llm_call`): a regex on the agent's final reply ("my mistake", "I missed", "a bug in X",
-  "workaround", "sorry, I'll stop asking"), then the same judge with an admission prompt. A bug the reply says it
-  already fixed as the task scores low.
+- **Complaint** (`pre_llm_call`): every real message except bare acks, slash commands and Hermes-written notices
+  goes to the aux judge `coach_defect`, with the agent's previous reply and that turn's tool log. It counts
+  corrections ("you buy the credits"), failed fixes ("nope, still broken"), needless handoffs ("you have ssh"),
+  frustration, Hermes or product misbehaviour, and nudges ("resume", "what's going on") after a stalled turn.
+  A first-stage score >= 0.6 escalates: a second flash opinion on a stricter prompt and, when
+  `auxiliary.coach_defect_confirm` (or `COACH_DEFECT_CONFIRM_MODEL`) is set, a stronger model on the same prompt;
+  `p_defect` is the mean of the stage scores. Outside-world problems (`kind: external`) never count.
+- **Turn end** (`post_llm_call`): machine signals first, no judge (a provider-error reply, an interrupted turn, one
+  tool error repeated 3×). Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
+  errors, a turn-end audit by the same judge; only self-admissions file (the other audit kinds cost more false alarms
+  than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set).
+
+Both judges append the private overlay `COACH_REPLY_PROFILE` / `<HERMES_HOME>/coach/reply_profile.md` (shared with
+the reply check), so they know your standing rules.
 
 Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
 workers. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
 `coach/log.jsonl`; live also appends the defect to `coach/selfheal_queue.jsonl` for the self-heal lane, once per
 fingerprint per UTC day (`coach/selfheal.json` holds the fingerprints). The fingerprint is a hash of the component
 and the symptom's stemmed content words, so "sidebar sessions reshuffle" and "session sidebar reshuffles" match.
-`COACH_SELFHEAL_THRESHOLD` (default 0.65). Set the judge model with `auxiliary.coach_defect.provider` / `.model`
-(evaluated on `gemini-3.8-flash`).
+`COACH_SELFHEAL_THRESHOLD` (default 0.6). Set the judge model with `auxiliary.coach_defect.provider` / `.model`
+(evaluated on `gemini-3.8-flash`) and the confirm model with `auxiliary.coach_defect_confirm` (evaluated on
+`claude-sonnet-5-5`).
 
-Replay eval: `eval/selfheal_replay.py` runs the production prefilter + judge over a hand-labeled set (the real set
-holds your own words, so it lives in the private coach data repo) and writes catch rate, precision, every miss with
-its quote and every false positive, per dev/test split. `--mode admission` evaluates the self-admission path.
+Replay evals:
+- `eval/selfheal_incident_replay.py` (`run`, then `score --relabel --report`): the production code over an
+  incident-labeled turn set (episodes + five-whys verdicts + every normal turn), scored like the self-correct replay:
+  caught before any fix ask, caught counting the fix ask, false positives per normal turn, every miss with its quote,
+  every false positive, catch per root-cause cluster.
+- `eval/selfheal_replay.py`: per-turn catch rate / precision on a hand-labeled set (`--mode admission` for the audit).
+The real sets hold your own words, so they live in the private coach data repo.
 
 ## User channel (Desktop panel above the composer)
 
