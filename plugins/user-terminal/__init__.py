@@ -412,7 +412,7 @@ _CORE_SUDO_TIP = re.compile(r"\n*💡 Tip: (?:To enable sudo over messaging|This
 _MARK = "💡 This needs the user's password/TTY."
 _HEAD = ("\n\n" + _MARK + " Do NOT ask the user to run it themselves, do NOT hand it back as a step for them, and do "
          "NOT suggest SUDO_PASSWORD. Call run_in_user_terminal instead (tool_call name=\"run_in_user_terminal\", "
-         "arguments {command, reason}). It opens a terminal on their screen, they confirm and type the password "
+         "arguments {command, reason}). It opens a terminal on their screen, they type any password "
          "there, and you get the exit code + output back. ")
 HINT = _HEAD + "For a remote host, wrap it: ssh -t <host> 'sudo ...'."
 SSH_HINT = (_HEAD + "SSH refused key auth. Call run_in_user_terminal with `ssh-copy-id -i ~/.ssh/id_ed25519.pub "
