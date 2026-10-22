@@ -58,11 +58,22 @@ def _cfg() -> dict:
 def home_cfg(home: Path) -> dict:
     """The config.yaml of one profile home. A multiplexed gateway serves several profiles in one process, so
     load_config() there is the ROOT config, not the bot profile's; the owner settings live in the profile's."""
+    path = Path(home) / "config.yaml"
+    try:  # Hermes's own reader: the bundled runtime has no top-level `yaml` module
+        from utils import load_yaml_file_readonly  # type: ignore
+
+        return dict(load_yaml_file_readonly(path) or {})
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning("ownerops: cannot read %s: %s", path, exc)
+        return {}
     try:
         import yaml  # type: ignore
 
-        return yaml.safe_load((Path(home) / "config.yaml").read_text()) or {}
-    except Exception:
+        return yaml.safe_load(path.read_text()) or {}
+    except Exception as exc:
+        logger.warning("ownerops: cannot read %s: %s", path, exc)
         return {}
 
 
