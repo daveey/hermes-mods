@@ -621,14 +621,19 @@ def main(argv=None) -> int:
     elif a.cmd == "forward":
         cfg = config(home)
         hub = a.hub or cfg.get("hub_ssh")
-        if not hub or (cfg.get("hub_host") and cfg.get("hub_host") == short_host()):
-            return 0  # no hub configured, or this is the hub: its own cron sweeps locally
+        # Every outcome prints one line: the feed records it (<host>/feed-status.json in the coach data repo), so
+        # the hub can tell "no config yet" from "ssh failing" from "working" without a shell on this host.
+        if cfg.get("hub_host") and cfg.get("hub_host") == short_host():
+            print("signals: this host is the hub (its own cron sweeps locally)")
+            return 0
+        if not hub:
+            print(f"signals: no hub configured (<home>/coach/selfheal-config.json missing or has no hub_ssh)")
+            return 0
         r = forward(home, host, hub)
         if not r["ok"]:
             print(f"signals forward to {hub} failed ({r['pending']} pending): {r['detail']}", file=sys.stderr)
             return 1
-        if r["sent"]:
-            print(f"signals: forwarded {r['sent']} to {hub}")
+        print(f"signals: forwarded {r['sent']} to {hub}" if r["sent"] else f"signals: heartbeat ok to {hub}")
     elif a.cmd == "ingest":
         print(json.dumps({"ingested": ingest(home, sys.stdin.read())}))
     elif a.cmd == "route-monitor":

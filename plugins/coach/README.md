@@ -232,7 +232,10 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
   no signals), recorded in the hub's `coach/signals/hosts.json`; the hub sweep files a `plugin` defect for a host
   whose forwarder has been silent > 6 h. It rides on the existing launchd coach feed
   (`hermes-coach/scripts/coach_feed.py`, every 30 min) and is a no-op without a `hub_ssh` in
-  `coach/selfheal-config.json` or on the hub itself.
+  `coach/selfheal-config.json` or on the hub itself. Each outcome prints one line, which the feed records as
+  `<host>/feed-status.json` in the coach data repo (`signals`: ok / no-hub / hub / error, plus the error text and
+  `since`; rewritten only when that state changes). That file is the hub's view of a forwarder that has never
+  reached it, which the silent-host check can't see.
 - **Monitors**: `signals.py route-monitor` (JSON `{monitor, key, title, body, prompt, component}` on stdin) files the
   finding and prints `{"owned": …}`. `owned` = the lane filed it or already has it open; then the monitor posts no
   Do-it card and the investigation posts the What happened / Why / Plan proposal. In shadow mode (or on any error)
