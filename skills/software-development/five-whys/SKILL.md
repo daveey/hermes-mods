@@ -43,6 +43,22 @@ Specific, observable, and measured: what happened, where, when, how often, impac
 job id or metric. "Login is broken" is not a problem statement. "Since 14:05 PDT, 38% of `/login` POSTs return 502
 from the edge; 0% before the 14:02 deploy of a1b2c3" is.
 
+**When the trigger is an alert, card or Inbox message, first prove that the production path raised it.** Test
+fixtures, dry runs and other copies of a job can post the same alert with the same title. Do these checks before
+you debug the reported failure:
+- Match the alert's creation time against the real job log and journal
+  (`journalctl --user -u <svc>`). Did a real run fail at that moment?
+- Compare the alert's error text with what the code would really print. A path-less `cannot read board`, where
+  production prints `cannot read {db}: …`, is a hard-coded fixture string. Grep the tests for it.
+- Read the alert store directly for the post time; for the Hermes Inbox that is `~/.hermes/inbox/inbox.db`,
+  table `items`, field `created_at`. Then check git history around that time for test work and fixes already
+  committed.
+
+If a test raised the alert, the problem becomes "a test reached a live side effect". Fix and prove it at that
+level: snapshot the alert store's row count, run the suite, and confirm the count did not change. Then trigger
+one real run (for example `systemctl --user start <svc>`) and confirm its success line, instead of waiting
+for the next scheduled run.
+
 ### 2. Ask why, one causal step at a time
 
 For each answer:
@@ -169,6 +185,8 @@ Countermeasures:
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
+- Debugging the failure an alert describes before checking whether a real run raised it. A test or dry run can post
+  a lookalike alert while production stays healthy (see step 1).
 - Closing a "not a bug" verdict with no why-chain. If the same false alarm keeps getting filed, the filer, tagger or
   classifier is the bug.
 
