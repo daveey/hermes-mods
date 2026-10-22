@@ -58,3 +58,8 @@ test('openCard falls back to the board page on a core without the hook', async (
   assert.equal(await m.openCard('t_1a2b3c4d', { board: 'bb', conn: 'local' }, {}, nav), false)
   assert.deepEqual(seen, ['/kanban', 'info'])
 })
+
+test('scheduled (timer-blocked) status pill is yellow', () => {
+  assert.equal(m.statusColor('scheduled'), '#e3b341')
+  assert.equal(m.statusColor('blocked'), '#f85149')
+})

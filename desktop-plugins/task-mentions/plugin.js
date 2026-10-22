@@ -60,7 +60,7 @@ const STATUS_COLORS = {
   ready: '#a371f7',
   todo: '#8b949e',
   triage: '#d29922',
-  scheduled: '#8b949e',
+  scheduled: '#e3b341', // waiting on a timer
   blocked: '#f85149',
   review: '#db61a2',
   done: '#3fb950',
