@@ -444,3 +444,138 @@ def test_hook_works_when_called_exactly_like_core_does(gate):
     with concurrent.futures.ThreadPoolExecutor(1) as ex:
         r = ex.submit(gate.pre_final_gate, **kwargs).result(timeout=10)
     assert r["hold"] is True and r["nudge"].strip()
+
+
+# ---- week of 10-12 corrections: imperatives, user-named checklists, "I can't" claims, bot crons ----------------
+WK = json.loads((__import__("pathlib").Path(__file__).parent / "fixtures" / "week_1012.json").read_text())
+
+
+@pytest.mark.parametrize("key", sorted(WK))
+def test_wk1012_every_reply_has_an_ask_with_the_named_sentence(gate, key):
+    e = WK[key]
+    asks = gate.core.find_asks(e["reply"])
+    assert asks, key
+    for needle in (e["find"], e.get("find2")):
+        if needle:
+            assert any(needle in a for a in asks), (key, needle, asks)
+
+
+def test_wk1012_S2_checklist_steps_are_separate_asks(gate):
+    asks = gate.core.find_asks(WK["S2_iphone8"]["reply"])
+    step = [a for a in asks if "iPhone 8" in a]
+    assert len(step) == 1 and "Not Now" in step[0] and "Install update" not in step[0]
+
+
+@pytest.mark.parametrize("text", [
+    "To confirm: in the Nest app, open Upstairs → History.", "In that case, check the Actions spending limit.",
+    "Please check the Echo Dot.", "Open Settings, then tap Wi-Fi.", "Echo Dot pod: please check it.",
+    "Sign in to Chrome, then click Allow.", "I can't change it myself.",
+    "Limitation: only this Mac is covered.", "Reaching it would need a token the plugin doesn't have."])
+def test_new_ask_shapes(gate, text):
+    assert gate.core.find_asks(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "Open items: none.", "Checked: gh run list returned 3 runs.", "I'll check the logs and run the tests.",
+    "Changes are pushed and the run passed.", "Run 4 of the suite passed.", "Nothing to check; it is done.",
+    "I can't believe how clean that came out.", "I couldn't open the page, the host was down.", "Open the file you want."])
+def test_new_shapes_do_not_fire_on_narration(gate, text):
+    assert gate.core.find_asks(text) == [], text
+
+
+def test_imperatives_are_the_answer_when_the_user_asked_how(gate):
+    text = "Open Settings, then tap Wi-Fi. Click Join."
+    assert gate.core.find_asks(text)
+    assert gate.core.find_asks(text, howto=True) == []
+    assert gate.core.asked_how_to("how do I join the wifi?") and not gate.core.asked_how_to("fix the wifi")
+
+
+def test_user_heading_items_are_each_an_ask(gate):
+    asks = gate.core.find_asks("Done.\n\n**What I need from you:**\n- the Blue one\n- the red one\n\nBye.")
+    assert asks == ["the Blue one", "the red one"]
+
+
+def test_gate_howto_message_suppresses_imperative_only_replies(gate):
+    gate.LOG.set_users("s1", ["how do I install it?"])
+    assert gate.pre_final_gate(session_id="s1", platform="tui", final_response="Open Terminal and run the installer.") is None
+
+
+# ---- bot crons --------------------------------------------------------------------------------------------
+def _cron(gate, monkeypatch, profile, worker=False):
+    monkeypatch.setenv("ASK_GATE_PROFILE", profile)
+    monkeypatch.delenv("ASK_GATE_BOT_PROFILES", raising=False)
+    if worker:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+    stub = llm_returning([("ok", "fine")] * 6)
+    gate.LLM = stub
+    return stub
+
+
+def test_bb_tuner_cron_run_reaches_the_judge(gate, monkeypatch):
+    stub = _cron(gate, monkeypatch, "bb-tuner")
+    r = gate.pre_final_gate(session_id="c1", platform="cron", final_response=WK["S1_bbtuner_1020"]["reply"])
+    assert r is None and len(stub.seen) == 1
+    assert "please check it" in stub.seen[0][1] and "please change the mini" in stub.seen[0][1]
+
+
+def test_bb_tuner_cron_hold_when_judge_says_agent_can_do(gate, monkeypatch):
+    stub = _cron(gate, monkeypatch, "bb-tuner")
+    gate.LLM = llm_returning([("unverified", "no failed attempt in the tool log", "ssh the mini and look")] * 2)
+    r = gate.pre_final_gate(session_id="c1", platform="cron", final_response=WK["S1_bbtuner_1017"]["reply"])
+    assert r["hold"] is True and "unverified" in r["nudge"]
+
+
+def test_kanban_worker_cron_does_not_reach_the_judge(gate, monkeypatch):
+    stub = _cron(gate, monkeypatch, "bb-tuner", worker=True)
+    assert gate.pre_final_gate(session_id="c1", platform="cron", final_response=WK["S1_bbtuner_1020"]["reply"]) is None
+    assert stub.seen == []
+
+
+def test_cron_of_an_unlisted_profile_does_not_reach_the_judge(gate, monkeypatch):
+    stub = _cron(gate, monkeypatch, "default")
+    assert gate.pre_final_gate(session_id="c1", platform="cron", final_response=WK["S1_bbtuner_1020"]["reply"]) is None
+    assert stub.seen == []
+
+
+def test_bot_profiles_come_from_config_env_and_default(gate, monkeypatch):
+    monkeypatch.delenv("ASK_GATE_BOT_PROFILES", raising=False)
+    assert gate._bot_profiles() == ("bb-tuner", "coach")
+    monkeypatch.setenv("ASK_GATE_BOT_PROFILES", "a, b")
+    assert gate._bot_profiles() == ("a", "b")
+
+
+def test_subagent_sessions_stay_skipped(gate, monkeypatch):
+    stub = _cron(gate, monkeypatch, "default")
+    gate.pre_llm_call(session_id="sub1", user_message="x", platform="tui", parent_session_id="s1")
+    assert gate.pre_final_gate(session_id="sub1", platform="tui", final_response="Want me to deploy it?") is None
+    assert stub.seen == []
+
+
+def test_hook_opts_in_to_background_runs(gate):
+    assert gate.pre_final_gate.include_background is True
+
+
+def test_incapability_claim_without_a_failed_attempt_is_unverified_without_a_model_call(gate):
+    r = gate.judge_mod.judge(["The digest runs on the mini, so I can't change it myself."], tools_text="(no tool calls this turn)",
+                             user_msgs=[], card_status={}, ledger_text="", caps="", llm=None)
+    assert r[0]["verdict"] == "unverified" and "attempt" in r[0]["reason"]
+
+
+def test_incapability_claim_stands_when_the_tool_log_shows_it_failing(gate):
+    stub = llm_returning([("ok", "the push was refused")])
+    r = gate.judge_mod.judge(["I can't change it myself."], tools_text="- terminal(git push) -> remote: Permission denied (403)",
+                             user_msgs=[], card_status={}, ledger_text="", caps="", llm=stub)
+    assert r[0]["verdict"] == "ok" and stub.seen
+
+
+def test_ungrounded_agent_can_do_on_an_instruction_is_unverified_but_on_a_question_stays_ok(gate):
+    raw = json.dumps({"asks": [{"i": 0, "verdict": "agent_can_do", "confidence": 0.8, "reason": "r", "how": "gh api billing"},
+                               {"i": 1, "verdict": "agent_can_do", "confidence": 0.8, "reason": "r", "how": "gh api billing"}]})
+    v = gate.judge_mod.parse_verdicts(raw, 2, caps="none", soft=[True, False])
+    assert [x["verdict"] for x in v] == ["unverified", "ok"]
+
+
+def test_parse_verdicts_accepts_a_bare_list_and_fenced_output(gate):
+    items = [{"i": 0, "verdict": "unverified", "confidence": 0.9, "reason": "r", "how": "gh api billing"}]
+    for raw in (json.dumps(items), "```json\n" + json.dumps({"asks": items}) + "\n```", "Here:\n" + json.dumps(items)):
+        assert gate.judge_mod.parse_verdicts(raw, 1)[0]["verdict"] == "unverified", raw

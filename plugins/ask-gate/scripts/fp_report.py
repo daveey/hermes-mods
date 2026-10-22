@@ -55,7 +55,9 @@ for sid in sessions:
         if role != "assistant" or not content or not content.strip() or tcalls:
             continue
         total += 1
-        asks = core.find_asks(content)
+        prev_users = [x[2] for x in rows[:idx] if x[1] == "user" and isinstance(x[2], str)
+                      and not x[2].startswith("[IMPORTANT")]
+        asks = core.find_asks(content, howto=bool(prev_users) and core.asked_how_to(prev_users[-1]))
         if not asks:
             continue
         calls, tools = {}, []
@@ -96,7 +98,8 @@ def run(it):
         try:
             v = gate.judge_mod.judge(it["asks"], tools_text=core.render_tools(it["tools"]), user_msgs=it["users"],
                                      card_status=hist_status(ids, it["ts"]), ledger_text="", caps=caps,
-                                     reply=it["reply"], llm=gate.default_llm)
+                                     reply=it["reply"], llm=gate.default_llm,
+                                     soft=[core.is_soft_ask(x) for x in it["asks"]])
             break
         except Exception as e:
             err = repr(e)

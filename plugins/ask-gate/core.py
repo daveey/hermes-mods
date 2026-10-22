@@ -55,6 +55,27 @@ _NOT_ASK = re.compile(
     r"i'?ll stop asking|nothing from this work is waiting|nothing\b[^.]{0,60}\bneeds? (you|david)|"
     r"no\b[^.]{0,40}\bwaiting on you|(was|were|had been|had) (waiting|blocked) (on|for) (you|david)|never (create|say|tell|ask|put))\b",
     re.I)
+# --- shapes added after the week-of-10-12 corrections (imperatives, user-named headings, "I can't" claims) ---
+_VERB = (r"(?:open|check|tap|click|press|sign in|log in|go to|change|enable|disable|raise|switch (?:off|on)|"
+         r"turn (?:off|on)|install|run|delete)")
+# "Open items", "Run log" and the like are nouns, not instructions
+_VERB_NOT_NOUN = r"(?!\s+(?:\d|items?|questions?|issues?|prs?|cards?|loops?|logs?|times?|counts?|results?|ids?)\b)"
+_IMPERATIVE = re.compile(
+    r"^(?:[^.!?:]{1,70}:\s+)?"                                                    # "To confirm: " / "Echo Dot pod: "
+    r"(?:(?:in|on|if|once|when|after|then|otherwise|from|at|before|for)\b[^,.!?]{0,80},\s+)?"   # "On the iPhone 8, "
+    r"(?:(?:and|then|also|just)\s+)*(?:please\s+)?" + _VERB + r"\b" + _VERB_NOT_NOUN, re.I)
+_PLEASE_VERB = re.compile(r"\bplease\s+" + _VERB + r"\b" + _VERB_NOT_NOUN, re.I)
+# headings that hand the reader steps: "Your checklist", "What I need from you:", "To confirm:", "@user", "For you"
+_USER_HEAD = re.compile(
+    r"^\W*(?:your (?:checklist|steps|turn|action items?|to-?dos?)|what i need from you|to confirm|to clear it|"
+    r"@user|for you|needs you|on you)\b[^:\n]{0,40}(?::|$)", re.I)
+# "I can't" claims: the gap stays with the reader unless this turn's tool output shows the attempt failing
+_CANT = re.compile(
+    r"\bI (?:can['\u2019]?t|cannot) (?:change|check|do|open|fix|reach)\b"
+    r"|^\W*Limitation:|\bwould need\b[^.]*\b(?:doesn['\u2019]?t|don['\u2019]?t) have\b", re.I)
+_HOWTO_ASKED = re.compile(
+    r"\bhow (?:do|can|would|should|could|to|am i supposed)\b|\bwalk me through\b|\bsteps?\b|\binstructions?\b|"
+    r"\bshow me how\b|\bteach me\b|\bwhat should i do\b", re.I)
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 # worker handoff leftovers that point at David
 _LEFTOVER = re.compile(
@@ -74,35 +95,107 @@ def _strip_noise(text: str) -> str:
 
 
 _LIST_ITEM = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+_BOLD_SUB = re.compile(r"^\s*(?:\*\*[^*\n]+\*\*|#+\s+.+)\s*:?\s*$")
 
 
-def sentences(text: str) -> list[str]:
-    """Sentences of ``text``; a heading line ending in ':' absorbs the list items under it (so "Needs you:"
-    carries what it needs)."""
+def _clean(x: str) -> str:
+    return x.strip(" -*•#|_").replace("**", "").replace("__", "")
+
+
+def _units(text: str) -> list[tuple[str, bool]]:
+    """(unit, forced) pairs. A heading line ending in ':' that is ask-shaped absorbs the list items under it into one
+    unit ("Needs you:" carries what it needs). A heading that names the reader ("Your checklist", "@user") makes
+    each item under it its own *forced* unit: it is a step for the reader whatever its wording."""
     lines = _strip_noise(text or "").split("\n")
-    units: list[str] = []
+    units: list[tuple[str, bool]] = []
     i = 0
     while i < len(lines):
         ln = lines[i].strip()
-        if ln.rstrip("*_ ").endswith(":") and _ASK.search(ln) and i + 1 < len(lines) and _LIST_ITEM.match(lines[i + 1]):
+        bare = ln.rstrip("*_ ").lstrip("*_# ")
+        if bare.endswith(":") and _ASK.search(ln) and i + 1 < len(lines) and _LIST_ITEM.match(lines[i + 1]):
             items = []
             j = i + 1
             while j < len(lines) and _LIST_ITEM.match(lines[j]) and len(items) < 5:
                 items.append(_LIST_ITEM.sub("", lines[j]).strip())
                 j += 1
-            units.append((ln + " " + " | ".join(items)).strip(" -*•#|_"))
+            units.append((_clean(ln + " " + " | ".join(items)), False))
             i = j
             continue
-        units.extend(x.strip(" -*•#|_") for x in re.split(r"(?<=[.!?])\s+", ln) if x.strip(" -*•#|_"))
+        if _USER_HEAD.match(bare):
+            tail = re.sub(r"^[^:]*:\s*", "", bare) if ":" in bare else ""
+            if len(tail.strip()) >= 15:          # "To confirm: in the Nest app, open Upstairs -> History."
+                first, *rest = [x for x in (_clean(y) for y in re.split(r"(?<=[.!?])\s+", ln)) if x]
+                units.append((first, True))
+                units.extend((x, False) for x in rest)
+                i += 1
+                continue
+            j, n, intro = i + 1, 0, False
+            while j < len(lines) and n < 12:
+                nxt = lines[j].strip()
+                if not nxt:
+                    j += 1
+                elif _LIST_ITEM.match(lines[j]):
+                    units.append((_clean(_LIST_ITEM.sub("", lines[j])), True))
+                    n += 1
+                    j += 1
+                elif _BOLD_SUB.match(nxt):       # a sub-heading inside the checklist
+                    j += 1
+                elif n == 0 and not intro and len(nxt) < 200:   # one intro line before the first step
+                    intro = True
+                    j += 1
+                else:
+                    break
+            if n:
+                i = j
+                continue
+        units.extend((x2, False) for x2 in (_clean(x) for x in re.split(r"(?<=[.!?])\s+", ln)) if x2)
         i += 1
     return units
 
 
-def find_asks(text: str) -> list[str]:
+def sentences(text: str) -> list[str]:
+    return [u for u, _ in _units(text)]
+
+
+_COND_LEAD = re.compile(r"^(?:[^.!?:]{1,70}:\s+)?(?:if|in that case|otherwise|then|once|when|after)\b", re.I)
+_CHAIN = re.compile(r",\s*(?:and\s+|then\s+)?" + _VERB + r"\b", re.I)
+
+
+def is_imperative(s: str) -> bool:
+    """A sentence that tells the reader to do something. ``please <verb>`` always counts; a bare leading verb
+    counts only when it is a fallback/conditional step ("In that case, check ...") or a
+    chain of steps ("Click A, open B, then click C"), so plain narration and one-word labels stay out."""
+    if _PLEASE_VERB.search(s):
+        return True
+    if not _IMPERATIVE.match(s):
+        return False
+    return bool(_COND_LEAD.match(s) or _CHAIN.search(s))
+
+
+def is_soft_ask(s: str) -> bool:
+    """Asks judged with the stricter instruction/claim prompt: any imperative to the reader or "I can't" claim."""
+    return bool(_IMPERATIVE.match(s) or _PLEASE_VERB.search(s) or _CANT.search(s))
+
+
+def asked_how_to(user_msg: str) -> bool:
+    return bool(_HOWTO_ASKED.search(user_msg or ""))
+
+
+def find_asks(text: str, howto: bool = False) -> list[str]:
+    """Sentences that hand David something to do, decide or provide. ``howto``: he asked how to do something,
+    so imperative steps are the answer, not an ask."""
     out: list[str] = []
-    for s in sentences(_strip_quotes(text)):
-        if _ASK.search(s) and not _NOT_ASK.search(s) and s not in out:
-            out.append(s[:600])
+    n_imp = 0
+    for s, forced in _units(_strip_quotes(text)):
+        if _NOT_ASK.search(s) or s in out:
+            continue
+        hit = bool(_ASK.search(s)) or bool(_CANT.search(s))
+        if not hit and forced:
+            hit = not howto
+        if not hit and not howto and n_imp < 8 and is_imperative(s):
+            hit, n_imp = True, n_imp + 1
+        if hit:
+            out.append(s[:1200] if forced else s[:600])
     return out
 
 

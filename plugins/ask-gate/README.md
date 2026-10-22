@@ -63,7 +63,28 @@ it rides the rotating Claude pool and needs no new key. Override with `auxiliary
 start can take ~20 s); replies with no ask-shaped sentence never touch the model.
 
 Off switch: `ASK_GATE_OFF=1`. Log of every verdict, hold and gate failure: `~/.hermes/logs/ask-gate.jsonl`.
-Skipped: Kanban workers (for L1/L2), subagents, cron/webhook platforms.
+Skipped: Kanban workers (for L1/L2), subagents, webhook platforms, and cron runs, except cron runs of a bot profile:
+`ask_gate.bot_profiles` in `config.yaml` (default `[bb-tuner, coach]`; env `ASK_GATE_BOT_PROFILES=a,b`) names the
+profiles whose scheduled reports go to the user, and L2 judges those like a chat reply. The hook registers with
+`include_background = True` (otherwise core never calls it for cron), and `_gate_eligible` then lets through only
+`platform == 'cron'` + a listed profile + not a Kanban worker + not a delegate_task child.
+
+## Ask shapes (what `find_asks` catches)
+
+Beyond "Want me to...?" and "Needs you:": (a) an imperative to the reader, i.e. a sentence/line/list item that starts
+with open, check, tap, click, press, sign in, log in, go to, change, enable, disable, raise, switch/turn on/off,
+install, run, delete (after an optional "Label:" and a leading "On the phone," clause), or `please <verb>`; skipped
+when the user's last message asked how to do something (steps are then the answer) and capped at 8 per reply;
+(b) a heading that names the reader (Your checklist, What I need from you, To confirm, To clear it, @user, For you)
+makes every item under it its own ask; (c) incapability claims (`I can't|cannot change|check|do|open|fix|reach`,
+`Limitation:`, `would need ... doesn't have`), which stand only if this turn's tool log shows the attempt failing,
+otherwise the verdict is `unverified` with no model call. An ungrounded `agent_can_do` on an imperative or "I can't"
+ask is downgraded to `unverified` rather than `ok`, with a lower confidence floor (0.6).
+
+Why (five whys, week of 2026-10-12: 6 corrections, 6 of the 8 causing replies had no detected ask): the user saw asks
+that were not question-shaped; the detector keyed on question/"needs you" wording; that wording was copied from the first
+incidents; nothing measured misses against the corrections the coach counted; so each new phrasing escaped. The 8 replies
+are now fixtures (`tests/fixtures/week_1012.json`) and `scripts/replay.py` fails loudly if one stops being caught.
 
 ## Tests
 

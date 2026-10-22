@@ -34,6 +34,8 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     core, judge_mod = _sib("core"), _sib("judge")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
+DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
+_SUBAGENTS: set[str] = set()                  # sessions seen with a parent_session_id (delegate_task children)
 MAX_NUDGES = 2
 LOG = core.TurnLog()
 _LEDGER: dict[str, Any] = {}
@@ -50,6 +52,47 @@ def _is_worker() -> bool:
 
 def _chat_eligible(session_id: str, platform: str = "") -> bool:
     return bool(session_id) and not _off() and not _is_worker() and (platform or "").lower() not in SKIP_PLATFORMS
+
+
+def _bot_profiles() -> tuple[str, ...]:
+    """Profiles whose cron runs are gated: ASK_GATE_BOT_PROFILES (comma list), else config ``ask_gate.bot_profiles``."""
+    env = os.environ.get("ASK_GATE_BOT_PROFILES")
+    if env is not None:
+        return tuple(x.strip() for x in env.split(",") if x.strip())
+    try:
+        from hermes_cli.config import load_config_readonly  # type: ignore
+        got = (load_config_readonly().get("ask_gate") or {}).get("bot_profiles")
+        if isinstance(got, (list, tuple)):
+            return tuple(str(x) for x in got)
+    except Exception:
+        pass
+    return DEFAULT_BOT_PROFILES
+
+
+def _profile() -> str:
+    env = os.environ.get("ASK_GATE_PROFILE")
+    if env:
+        return env
+    try:
+        from hermes_cli.profiles import current_profile_name  # type: ignore
+        return current_profile_name("default") or "default"
+    except Exception:
+        pass
+    for k in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        if os.environ.get(k):
+            return os.environ[k]
+    parts = core.home().parts
+    return parts[parts.index("profiles") + 1] if "profiles" in parts and parts.index("profiles") + 1 < len(parts) else "default"
+
+
+def _gate_eligible(session_id: str, platform: str = "") -> bool:
+    """L2 runs for chats, and for platform-cron runs of a listed bot profile. Kanban workers, subagents and every
+    other cron job stay skipped (core also runs this hook for them because it is registered include_background)."""
+    if not session_id or _off() or _is_worker() or session_id in _SUBAGENTS:
+        return False
+    if (platform or "").lower() == "cron":
+        return _profile() in _bot_profiles()
+    return _chat_eligible(session_id, platform)
 
 
 def ledger() -> "core.Ledger":
@@ -139,7 +182,8 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
     ledger_text = "\n".join(f"- {a['topic']} -> {a['answer']} ({core.fmt_ts(a['ts'])})" for a in led)
     return judge_mod.judge(asks, tools_text=core.render_tools(tools), user_msgs=_user_msgs(session_id),
                            card_status=statuses, ledger_text=ledger_text, caps=core.capability_sheet(),
-                           reply=reply, llm=_llm(), ledger=led)
+                           reply=reply, llm=_llm(), ledger=led,
+                           soft=[core.is_soft_ask(a) for a in asks])
 
 
 # ---- L1 + L4 ------------------------------------------------------------------------------------------
@@ -159,6 +203,8 @@ def _human_text(msg: str) -> str | None:
 
 def pre_llm_call(session_id: str = "", user_message: str = "", conversation_history: list | None = None,
                  platform: str = "", parent_session_id: str = "", **_: Any) -> dict | None:
+    if parent_session_id and session_id:
+        _SUBAGENTS.add(session_id)
     if not _chat_eligible(session_id, platform) or parent_session_id:
         return None
     _prewarm()
@@ -219,10 +265,11 @@ def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, se
 # ---- L2 -----------------------------------------------------------------------------------------------
 def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", final_response: str = "",
                    turn_messages: list | None = None, attempt: int = 0, **_: Any) -> dict | None:
-    if not _chat_eligible(session_id, platform) or not isinstance(final_response, str):
+    if not _gate_eligible(session_id, platform) or not isinstance(final_response, str):
         return None
     try:
-        asks = core.find_asks(final_response)
+        users = _user_msgs(session_id)
+        asks = core.find_asks(final_response, howto=bool(users) and core.asked_how_to(users[-1]))
         if not asks:
             return None
         tools = core.merge_tool_logs(core.tools_from_messages(turn_messages or []), LOG.get(session_id))
@@ -253,6 +300,8 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
 
 # core may buffer streamed final text while this hook is registered, so a held draft never reaches the screen
 pre_final_gate.needs_buffer = True  # type: ignore[attr-defined]
+# core skips gate hooks in cron/kanban/subagent runs unless they opt in; _gate_eligible then lets only bot crons through
+pre_final_gate.include_background = True  # type: ignore[attr-defined]
 
 
 # ---- L3 -----------------------------------------------------------------------------------------------

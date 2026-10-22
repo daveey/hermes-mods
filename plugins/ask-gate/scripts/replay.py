@@ -44,3 +44,24 @@ for k in ("I0", "I1_I2", "I3", "I4"):
     run(k, FIX[k])
 for k, e in {**FIX["good"], **FIX["borderline"]}.items():
     run("good/" + k, e)
+
+
+# ---- week of 10-12 corrections (tests/fixtures/week_1012.json): expectations are checked and printed ----
+WK = json.loads((HERE / "tests/fixtures/week_1012.json").read_text())
+bad = 0
+for k, e in WK.items():
+    lp = tmp / f"wk_{k}.sqlite"
+    gate._LEDGER.update(path=str(lp), obj=gate.core.Ledger(lp))
+    os.environ["ASK_GATE_LEDGER"] = str(lp)
+    entry = {"reply": e["reply"], "users": e["users"], "tools": e["tools"], "ledger": e.get("ledger", []), "cards": {}}
+    v = run("week1012/" + k, entry)
+    asks = gate.core.find_asks(e["reply"])
+    for exp in e.get("judge", []):
+        idx = [i for i, a in enumerate(asks) if exp["contains"] in a]
+        got = [v[i]["verdict"] for i in idx]
+        ok = bool(got) and all((g != "ok") if exp["verdict"] == "not_ok" else (g == exp["verdict"]) for g in got)
+        print(f"   EXPECT {exp['contains']!r} -> {exp['verdict']}: {'PASS' if ok else 'FAIL'} (got {got})")
+        bad += not ok
+    if e.get("ledger"):
+        print("   ledger rows:", [(r["topic"], r["answer"]) for r in gate.ledger().recent(86400)])
+print("week1012 expectations failed:", bad)

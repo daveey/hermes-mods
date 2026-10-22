@@ -11,6 +11,7 @@ import re
 from typing import Any, Callable
 
 MIN_CONFIDENCE = 0.75      # unverified / already_* verdicts
+MIN_CONFIDENCE_SOFT = 0.6     # instructions to check/change something and "I can't" claims: the cheap check is the point
 MIN_CONFIDENCE_GROUNDED = 0.6  # agent_can_do whose `how` names something that is on the capability sheet
 _GENERIC = {"token-broker", "browser_exec", "terminal", "https", "http", "ssh", "chrome", "browser", "token", "scope"}
 VERDICTS = ("ok", "already_answered", "already_done", "unverified", "agent_can_do")
@@ -51,6 +52,26 @@ Output ONLY JSON: {"asks":[{"i":<index>,"verdict":"<verdict>","confidence":<0..1
 the evidence>","how":"<concrete tool/command for agent_can_do/unverified, else empty>"}]}"""
 
 
+SOFT_SYSTEM = SYSTEM + "\n\n" + """EVERY item in this batch is an instruction telling David to open/check/change/run something, or a claim that the agent cannot do something. Judge them by these rules, which refine the ones above. They are not physical acts, so they are never ok by default:
+- An instruction to open, check, change, enable, install or run something in an app, dashboard, account, settings \
+page, repo, billing page, service or networked device (an "open X -> History" step, "check the spending limit", "please \
+change the digest", "is the pod online?") is work the agent can often do or verify itself. Looking something up in an app's history/log/settings view is a data read, not a physical act (the vendor \
+API, Home Assistant history, a database or a signed-in browser shows the same thing). Return unverified (`how` = \
+the cheap check or the change itself: API, ssh, gh, browser) unless this turn's tool output shows the agent tried and \
+could not, or it truly needs his hands, eyes, or credentials. A conditional or fallback instruction ("In that case, check X", "If it still fails, open Y") is still an \
+instruction to him: the condition does not make it ok, and neither does the fact that the agent could do it later. \
+ALWAYS ok even here: anything that needs his sudo or \
+account password, a macOS permission prompt or System Settings > Privacy toggle that only the logged-in user can \
+grant, pressing a physical button, an action on his phone or another person's device, signing in to his own account, \
+and a command he is asked to run in his own terminal because it prompts him.
+- An incapability claim ("I can't change it myself", "Limitation: ... would need details X doesn't have") is ok ONLY if \
+this turn's tool output shows the attempt failing. With no failed attempt in the tool log, return agent_can_do when the \
+capability sheet names the way, otherwise unverified with `how` = the attempt to make first. A sentence that \
+starts "Limitation:" or says a feature "would need X that it doesn't have" IS such a claim: it leaves the gap unfixed \
+and is not just an explanation. Do not return ok because it merely describes a limit; ask whether this turn's tool \
+output shows someone trying to close that gap (e.g. reading how the rest of the codebase already solves it)."""
+
+
 def build_user_prompt(asks: list[str], tools_text: str, user_msgs: list[str], card_text: str,
                       ledger_text: str, caps: str, reply: str = "") -> str:
     asks_t = "\n".join(f"[{i}] {a}" for i, a in enumerate(asks))
@@ -67,17 +88,30 @@ def _grounded(how: str, caps: str) -> bool:
     return any(t not in _GENERIC and t in low for t in re.findall(r"[a-z0-9_./@-]{5,}", how.lower()))
 
 
-def parse_verdicts(raw: str, n: int, caps: str = "") -> list[dict]:
+def parse_verdicts(raw: str, n: int, caps: str = "", soft: list[bool] | None = None) -> list[dict]:
     """Parse the model output into exactly ``n`` verdict dicts; anything unparsable becomes ok (fail open)."""
     out = [{"i": i, "verdict": "ok", "reason": "", "how": ""} for i in range(n)]
     if not raw:
         return out
     s = raw.strip()
     s = re.sub(r"^```(?:json)?|```$", "", s, flags=re.M).strip()
-    m = re.search(r"\{.*\}", s, re.S)
-    try:
-        data = json.loads(m.group(0) if m else s)
-    except ValueError:
+    data: Any = None
+    cands = [s]
+    for pat in (r"\{.*\}", r"\[.*\]"):
+        m = re.search(pat, s, re.S)
+        if m:
+            cands.append(m.group(0))
+    for cand in cands:
+        try:
+            got = json.loads(cand)
+        except ValueError:
+            continue
+        if isinstance(got, list):  # the model sometimes returns the bare list of verdicts
+            got = {"asks": got}
+        if isinstance(got, dict) and isinstance(got.get("asks"), list):
+            data = got
+            break
+    if data is None:
         return out
     for item in data.get("asks", []) if isinstance(data, dict) else []:
         try:
@@ -91,9 +125,13 @@ def parse_verdicts(raw: str, n: int, caps: str = "") -> list[dict]:
             conf = 1.0
         how = str(item.get("how", "")).strip()
         # a non-ok verdict must be confident, and unverified/agent_can_do must say what to do instead
-        floor = MIN_CONFIDENCE_GROUNDED if (v == "agent_can_do" and _grounded(how, caps)) else MIN_CONFIDENCE
+        soft_ask = bool(soft and 0 <= i < len(soft) and soft[i])
+        floor = MIN_CONFIDENCE_GROUNDED if (v == "agent_can_do" and _grounded(how, caps)) else (
+            MIN_CONFIDENCE_SOFT if soft_ask else MIN_CONFIDENCE)
         if v == "agent_can_do" and not _grounded(how, caps):
-            v = "ok"  # "the agent could" without naming a real capability is speculation
+            # "the agent could" without naming a real capability is speculation, except for an instruction to
+            # check/change something or an "I can't" claim: there the cheap check itself is the missing step
+            v = "unverified" if (soft_ask and conf >= MIN_CONFIDENCE_SOFT and len(how) >= 8) else "ok"
         if v != "ok" and (conf < floor or (v == "unverified" and len(how) < 8)):
             v = "ok"
         if 0 <= i < n and v in VERDICTS:
@@ -141,24 +179,54 @@ def ledger_match(asks: list[str], ledger: list[dict]) -> dict[int, dict]:
     return res
 
 
+# "I can't ..." / "Limitation: ..." claims (same shapes as core._CANT). They stand only if this turn's tool output shows
+# the attempt failing; with no failure in the log the verdict is mechanical, not up to the model.
+_CANT_CLAIM = re.compile(
+    r"\bI (?:can['\u2019]?t|cannot) (?:change|check|do|open|fix|reach)\b"
+    r"|^\W*Limitation:|\bwould need\b[^.]*\b(?:doesn['\u2019]?t|don['\u2019]?t) have\b", re.I)
+_FAILURE = re.compile(r"\b(error|errno|denied|forbidden|unauthori[sz]ed|refused|failed|failure|not permitted|"
+                      r"permission|timed? ?out|traceback|exception|not found|no such|40[1-4]|50\d)\b", re.I)
+
+
+def incapability(asks: list[str], tools_text: str) -> dict[int, dict]:
+    res: dict[int, dict] = {}
+    if _FAILURE.search(tools_text or ""):
+        return res
+    for i, a in enumerate(asks):
+        if _CANT_CLAIM.search(a):
+            res[i] = {"i": i, "verdict": "unverified", "reason": "claims the agent cannot do this, but no tool call this "
+                      "turn shows the attempt failing.", "how": "Make the attempt (read the code, ssh, gh api, open a PR) "
+                      "and report the actual error, or do it."}
+    return res
+
+
 def judge(asks: list[str], *, tools_text: str, user_msgs: list[str], card_status: dict[str, dict],
           ledger_text: str, caps: str, reply: str = "", llm: Callable[[str, str], str] | None = None,
-          ledger: list[dict] | None = None) -> list[dict]:
+          ledger: list[dict] | None = None, soft: list[bool] | None = None) -> list[dict]:
     """Verdict per ask. ``llm(system, user) -> raw text``. Raises nothing the caller must handle except llm errors."""
     res = deterministic(asks, card_status)
     for i, v in ledger_match(asks, ledger or []).items():
         res.setdefault(i, v)
+    for i, v in incapability(asks, tools_text).items():
+        res.setdefault(i, v)
     todo = [i for i in range(len(asks)) if i not in res]
     if todo and llm is not None:
-        sub = [asks[i] for i in todo]
         card_text = "\n".join(f"{c['id']}: {c['status']}" + (f" (result: {c['result'][:150]})" if c.get("result") else "")
                               for c in card_status.values())
-        raw = llm(SYSTEM, build_user_prompt(sub, tools_text, user_msgs, card_text, ledger_text, caps, reply))
         any_done = any(c["status"] in _DONE for c in card_status.values())
-        for j, v in enumerate(parse_verdicts(raw, len(sub), caps)):
-            if v["verdict"] == "already_done" and not any_done:
-                v = {**v, "verdict": "ok"}  # the model said "done" but no mentioned card is done in the database
-            res[todo[j]] = {**v, "i": todo[j]}
+        # Instructions / "I can't" claims get their own call with the refined prompt, so the stricter rules cannot
+        # leak into the verdicts for ordinary questions (that doubled the false-positive rate when they shared one).
+        groups = [([i for i in todo if not (soft and i < len(soft) and soft[i])], SYSTEM, False),
+                  ([i for i in todo if soft and i < len(soft) and soft[i]], SOFT_SYSTEM, True)]
+        for idx, system, is_soft in groups:
+            if not idx:
+                continue
+            sub = [asks[i] for i in idx]
+            raw = llm(system, build_user_prompt(sub, tools_text, user_msgs, card_text, ledger_text, caps, reply))
+            for j, v in enumerate(parse_verdicts(raw, len(sub), caps, [True] * len(sub) if is_soft else None)):
+                if v["verdict"] == "already_done" and not any_done:
+                    v = {**v, "verdict": "ok"}  # the model said "done" but no mentioned card is done in the database
+                res[idx[j]] = {**v, "i": idx[j]}
     return [res.get(i, {"i": i, "verdict": "ok", "reason": "", "how": ""}) for i in range(len(asks))]
 
 
