@@ -71,12 +71,14 @@ profiles whose scheduled reports go to the user, and L2 judges those like a chat
 
 ## Ask shapes (what `find_asks` catches)
 
-Beyond "Want me to...?" and "Needs you:": (a) an imperative to the reader, i.e. a sentence/line/list item that starts
+Beyond "Want me to...?" and "Needs you:": (a) an imperative to the reader: `please <verb>` always, and a bare leading verb only as a fallback/conditional
+step ("In that case, check ...") or a chain of steps; plain imperatives that merely mention "you" are not asks (they
+held 4.2% of replies). A line/sentence that starts
 with open, check, tap, click, press, sign in, log in, go to, change, enable, disable, raise, switch/turn on/off,
 install, run, delete (after an optional "Label:" and a leading "On the phone," clause), or `please <verb>`; skipped
 when the user's last message asked how to do something (steps are then the answer) and capped at 8 per reply;
 (b) a heading that names the reader (Your checklist, What I need from you, To confirm, To clear it, @user, For you)
-makes every item under it its own ask; (c) incapability claims (`I can't|cannot change|check|do|open|fix|reach`,
+makes every item under it its own ask; (c) incapability claims ("couldn't" is not matched: past-tense reports describe an attempt) (`I can't|cannot change|check|do|open|fix|reach`,
 `Limitation:`, `would need ... doesn't have`), which stand only if this turn's tool log shows the attempt failing,
 otherwise the verdict is `unverified` with no model call. An ungrounded `agent_can_do` on an imperative or "I can't"
 ask is downgraded to `unverified` rather than `ok`, with a lower confidence floor (0.6).
