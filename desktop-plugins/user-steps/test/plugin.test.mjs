@@ -128,6 +128,7 @@ test('directive renders a framed box from the ledger, and the click resolves it 
   await show(React.createElement(m.StepBox, { attrs: { id: 'us_cccccc01', s: 'S1', t: 'Want me to deploy build \\q412\\q?' }, streaming: false, deps: { call, composer, sessionId: 'S1' } }))
   const box = el().querySelector('[data-user-step="us_cccccc01"]')
   assert.ok(box, el().innerHTML)
+  assert.equal(box.style.userSelect || box.style.webkitUserSelect, 'text')
   assert.equal(box.querySelector('[data-user-step-text]').textContent, 'Want me to deploy build "412"?')
   const buttons = [...box.querySelectorAll('[data-user-step-action]')].map(b => b.textContent)
   assert.deepEqual(buttons, ['Do it', 'No'])
@@ -159,6 +160,8 @@ test('strip: lists open steps + other blocked cards for the focused chat, hides 
   await show(React.createElement(m.Strip, { key: 's1' }))
   const strip = el().querySelector('[data-slot="user-steps"]')
   assert.ok(strip, el().innerHTML)
+  // the composer chrome is user-select:none; the strip must opt back in so its text can be copied
+  assert.equal(strip.style.userSelect || strip.style.webkitUserSelect, 'text')
   assert.match(strip.textContent, /For you \(2\)/)
   assert.ok(strip.querySelector('[data-user-steps-step="us_eeeeee01"]'))
   assert.ok(strip.querySelector('[data-user-steps-card="t_human001"]'))

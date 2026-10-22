@@ -19,7 +19,9 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 3
+const VERSION = 4
+// The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
+const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
 const BASE = '/api/plugins/user-steps'
 
@@ -396,6 +398,7 @@ export function StepBox({ attrs, streaming, deps }) {
   return jsxs('div', {
     'data-user-step': key,
     style: {
+      ...SELECTABLE,
       margin: '6px 0',
       padding: '8px 10px',
       borderRadius: 8,
@@ -527,6 +530,7 @@ export function Strip() {
     'data-slot': 'user-steps',
     role: 'status',
     style: {
+      ...SELECTABLE,
       width: '100%',
       boxSizing: 'border-box',
       marginBottom: 6,
