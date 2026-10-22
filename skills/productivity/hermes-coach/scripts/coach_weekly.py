@@ -395,7 +395,7 @@ DEFECT_FP_RX = re.compile(r"-[0-9a-f]{8,}$")
 def selfheal_fp(key):
     """Fingerprint of a `selfheal:` idempotency key (investigation and fix cards share it)."""
     k = re.sub(r"^selfheal(?:-fix)?:", "", key or "")
-    return re.sub(r":fix$", "", k)
+    return re.sub(r"(?::r\d+)?(?::fix)?$", "", k)  # `:r<n>` = a recurrence's investigation (self_heal.file_defect)
 
 
 def selfheal_homes(homes=None):

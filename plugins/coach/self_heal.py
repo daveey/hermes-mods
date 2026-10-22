@@ -15,8 +15,9 @@ Both return {p_defect, kind, component, symptom, fingerprint, source} when p_def
 The fingerprint is a stable hash of component + the symptom's content words, so one defect reported several ways
 in one day is filed once (`Fingerprints.record`). Eval: eval/selfheal_incident_replay.py.
 
-Mode: COACH_SELFHEAL=off|shadow|live (default shadow). shadow logs `selfheal_detect` to coach log.jsonl only;
-live also appends the defect to <coach>/selfheal_queue.jsonl for the self-heal lane to file. Fail-open everywhere.
+Mode: COACH_SELFHEAL=off|shadow|live (default shadow). shadow logs `selfheal_detect` and `selfheal_would_file` (the
+full card it would file) to coach log.jsonl; live files the investigation card on the hub (see "Lane" below; the
+README's "Self-heal lane" section). Fail-open everywhere.
 """
 from __future__ import annotations
 
@@ -475,8 +476,10 @@ class Fingerprints:
         return new
 
 
-def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: Optional[str] = None) -> Optional[dict]:
-    """Log a detection (shadow) and, in live mode, enqueue it for the lane once per fingerprint per day."""
+def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: Optional[str] = None,
+           filer: Optional[Callable] = None, platform: str = "") -> Optional[dict]:
+    """Log a detection and hand a new fingerprint (first time today) to the lane: `file_defect` logs
+    `selfheal_would_file` in shadow mode and files the investigation card on the hub in live mode."""
     if not hit:
         return None
     m = m or mode()
@@ -489,4 +492,728 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
         q = Path(store.root) / "selfheal_queue.jsonl"
         with open(q, "a") as fh:
             fh.write(json.dumps({**rec, "ts": time.time()}) + "\n")
+    if new and m in ("shadow", "live"):
+        d = {**hit, "session_id": session_id, "quote": (evidence or "")[:500], "host": host_name(),
+             "platform": platform, "at": time.time(), "kind": hit.get("kind") or hit["source"]}
+        try:
+            (filer or file_defect)(d, store=store, m=m)
+        except Exception as exc:  # fail-open: a filing problem never breaks a turn
+            store.log({"event": "selfheal_file_error", "fingerprint": hit["fingerprint"], "error": str(exc)[:300]})
     return rec
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# Lane: defect -> investigation card (hub) -> ONE Inbox proposal (What happened / Why / Plan) -> Do it -> fix card
+#
+#   file_defect(d)    any entry path (complaint, admission, machine signal, digest backstop, monitors). On the hub it
+#                     decides locally; elsewhere (live) it pipes `d` to `self_heal.py file` on the hub over ssh, so
+#                     dedupe, recurrence, suppression and budget are decided in one place. Shadow logs
+#                     `selfheal_would_file` with the full card args and creates nothing.
+#   investigation     card `selfheal:<fp>` (`selfheal:<fp>:r<n>` for a recurrence), created_by self-heal, model
+#                     claude-opus-5-5, 1 h. Investigates LIVE (kanban.db, logs, processes, git log), writes the
+#                     five-whys chain, posts Inbox type `selfheal` (Do it / Not now / Never) under key selfheal:<fp>.
+#   Do it             runs `self_heal.py fix <fp>`: fix card `selfheal:<fp>:fix` (red-then-green regression test, ship,
+#                     verify live, re-post the same key as `selfheal-result` "Fixed: …").
+#   sync (cron)       reads Inbox outcomes: Never suppresses the fingerprint, Not now snoozes it 14 days, a Do it whose
+#                     task never ran gets its fix card (backstop).
+#   backstop (cron)   runs the complaint detector over new user turns in the coach digests (chats where the
+#                     in-process hook did not fire).
+#   budget            engine_budget lane `selfheal`: $25/UTC day (its own cap, outside the $20 engine total), <= 3
+#                     running cards, <= 1 filing per fingerprint per UTC day. Over the $ cap the card is created and
+#                     scheduled to the next UTC midnight; at 3 running it is scheduled 1 h out.
+# Events (coach log.jsonl, read by coach_weekly's self-heal section): selfheal_would_file, selfheal_filed,
+# selfheal_recurrence, selfheal_skip, selfheal_proposed, selfheal_approved, selfheal_fixed, selfheal_reverted,
+# selfheal_not_defect, selfheal_declined.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+MODEL = "claude-opus-5-5"
+INVESTIGATION_RUNTIME = 3600
+FIX_RUNTIME = 7200
+INVESTIGATION_BUDGET = 8
+FIX_BUDGET = 15
+USD_DAY = 25.0
+MAX_RUNNING = 3
+SNOOZE_DAYS = 14
+NOT_DEFECT_DAYS = 7
+SKILLS = ("five-whys", "hermes-mods-repo")
+BB_SKILLS = ("five-whys", "bb-self-fix")
+FIX_SKILLS = ("five-whys", "hermes-mods-repo", "systematic-debugging")
+CREATED_BY = "self-heal"
+INBOX_TYPE = "selfheal"
+RESULT_TYPE = "selfheal-result"
+SELF = "~/code/hermes-mods/plugins/coach/self_heal.py"  # how cards and Inbox actions call this file on the hub
+FP_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,}$")
+
+
+def host_name() -> str:
+    return os.uname().nodename.split(".")[0]
+
+
+def coach_root() -> Path:
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return Path(get_hermes_home()) / "coach"
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "coach"
+
+
+def lane_config() -> dict:
+    """<coach>/selfheal-config.json (private, per host): {"hub_host": "<hostname of the hub>", "hub_ssh":
+    "<user@addr>", "board": "<hub board>", "bb_board": "bb"}. Env overrides: COACH_SELFHEAL_HUB (ssh target),
+    COACH_SELFHEAL_IS_HUB=1. With no hub configured every host files locally."""
+    try:
+        cfg = json.loads((coach_root() / "selfheal-config.json").read_text())
+    except Exception:
+        cfg = {}
+    if os.environ.get("COACH_SELFHEAL_HUB"):
+        cfg["hub_ssh"] = os.environ["COACH_SELFHEAL_HUB"]
+    return cfg
+
+
+def is_hub(cfg: Optional[dict] = None) -> bool:
+    cfg = lane_config() if cfg is None else cfg
+    if os.environ.get("COACH_SELFHEAL_IS_HUB") in ("1", "true"):
+        return True
+    if not cfg.get("hub_ssh"):
+        return True  # no hub configured: file locally
+    return bool(cfg.get("hub_host")) and host_name() == cfg["hub_host"]
+
+
+def route(d: dict, cfg: Optional[dict] = None) -> dict:
+    """Board + skills. Baby Bear product defects go to the bb board with bb-self-fix; everything else to the hub's
+    default board (Hermes / harness)."""
+    cfg = lane_config() if cfg is None else cfg
+    if d.get("component") == "bb":
+        return {"board": cfg.get("bb_board") or "bb", "skills": list(BB_SKILLS), "bb": True}
+    return {"board": cfg.get("board") or None, "skills": list(SKILLS), "bb": False}
+
+
+def _pt(ts: float) -> str:
+    import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.fromtimestamp(ts or 0, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts or 0))
+
+
+# Where to look, per component. The replay of 202 incidents showed a transcript-only investigator almost never fixes
+# surface provenance (C10), Kanban state/routing (C11) or process lifecycle (C12): those need the live systems.
+CHECKLIST = {
+    "kanban": ("C11 Kanban state machine / routing",
+               "- `sqlite3 -readonly ~/.hermes/kanban.db` (and `~/.hermes/kanban/boards/*/kanban.db`): the card's "
+               "`tasks` row (status, assignee, board, idempotency_key, created_by), `task_events` in order "
+               "(kind + payload: claimed/blocked/scheduled/unblocked/reclaimed/timed_out and their reasons), "
+               "`task_runs` (outcome, error, worker pid, session_id).\n"
+               "- Compare what the user was told (quote) with the event log at that minute: which writer moved the "
+               "state, and which session/board it routed to.\n"
+               "- `git log -S'<event kind or state>' -- hermes_cli/kanban*` in ~/.hermes/hermes-agent for the code "
+               "that writes it; the dispatcher log `~/.hermes/logs/kanban*.log` / `agent.log` at that time."),
+    "desktop": ("C10 surface provenance / duplicated state",
+                "- Which surface showed it (sidebar row, Inbox card, toast, panel, status chip) and which writer "
+                "produced it: grep the exact string in ~/.hermes/hermes-agent/apps/desktop and "
+                "~/code/hermes-mods/desktop-plugins; `git log --since` on that file.\n"
+                "- The backing state: the REST endpoint or db row the surface renders (state.db sessions row, inbox "
+                "items, kanban task) at the reported time; two writers or a stale cache = provenance gap.\n"
+                "- On a Mac, the Desktop log (`~/Library/Logs/Hermes/` / `~/.hermes/logs/desktop.log`) via the "
+                "mac diag command if configured; else the coach digest of the session."),
+    "plugin": ("C10/C12 plugin behaviour",
+               "- `git -C ~/code/hermes-mods log --since=7.days -- plugins/<name> desktop-plugins/<name>`: what "
+               "changed just before the report.\n"
+               "- `grep -n '<plugin>' ~/.hermes/logs/errors.log` around the time; hook exceptions; the plugin's "
+               "own log/state under ~/.hermes/<plugin>/ or ~/.hermes/cache/<plugin>/.\n"
+               "- Reproduce by calling the plugin function directly under the Hermes interpreter."),
+    "gateway": ("C12 process lifecycle / environment isolation",
+                "- `ps -eo pid,lstart,command | grep -i hermes`, `systemctl --user status` / `launchctl print "
+                "gui/$UID/<label>`: what was running, who started it, restarts (`journalctl --user -u ...`).\n"
+                "- `~/.hermes/logs/{gateway,agent,errors}.log` and `hermes-sync.log` (a `hermes update` at that "
+                "minute stops servers) in a +-10 min window.\n"
+                "- Environment: HERMES_HOME, profile, interpreter/venv of each process (`/proc/<pid>/environ` or "
+                "`ps -E`)."),
+    "cron": ("C12/C15 scheduled jobs",
+             "- `hermes cron list` and `~/.hermes/cron/output/<job>/` for the failing run; its script under "
+             "~/.hermes/scripts; the delivery target; `errors.log` at run time."),
+    "agent": ("agent behaviour (C03-C09)",
+              "- The session transcript: `sqlite3 -readonly ~/.hermes/state.db \"select role, substr(content,1,800) "
+              "from messages where session_id='<sid>' order by id\"` on the host that ran it, else the coach digest "
+              "`~/code/hermes-coach-data/<host>/<profile>/<sid>.json`.\n"
+              "- What instruction pointed the agent there: the skill(s) loaded, ~/AGENTS.md rules, tool descriptions; "
+              "`git log` of the skill. The fix is usually a skill/tool/AGENTS.md change plus a check that fires at "
+              "the failure point (a coach rule or a tool-result hint), not more prose."),
+}
+CHECKLIST["bot"] = CHECKLIST["gateway"]
+CHECKLIST["provider"] = ("provider / model calls",
+                         "- `~/.hermes/logs/agent.log` + `errors.log` at the time: provider, status code, retries, "
+                         "fallback chain; `hermes config get model` and the fallback plugin's state.")
+CHECKLIST["browser"] = CHECKLIST["plugin"]
+
+
+def investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> str:
+    fp = d["fingerprint"]
+    comp = d.get("component") or "other"
+    when = _pt(d.get("at") or time.time())
+    sid = d.get("session_id") or ""
+    title, checks = CHECKLIST.get(comp, CHECKLIST["agent"])
+    extra = "" if comp == "agent" else "\n" + CHECKLIST["agent"][1]
+    rec = ""
+    if previous:
+        rec = (f"\n## Recurrence\nThis fingerprint was fixed before by card {previous.get('fix_card') or '?'} "
+               f"({_pt(previous.get('fixed_at') or 0)}). The previous fix {previous.get('fix_card') or ''} didn't "
+               "hold. Say so in the Inbox card's first line, find why the earlier fix and its test didn't catch the "
+               "return (five-whys step 5), and the Plan MUST add a detection-level guard (test, assertion, alert or "
+               "gate) that fails if it comes back.\n")
+    proposal = f"~/.hermes/coach/selfheal/{fp}/proposal.md"
+    return f"""Self-heal investigation for defect `{fp}`. Nothing here needs a human; David's approval of this lane
+covers the investigation. You do NOT ship the fix: you post ONE Inbox proposal, and his Do it starts the fix card.
+Budget for this card <= ${INVESTIGATION_BUDGET}.
+
+## Evidence (from the detector)
+- Symptom: {d.get('symptom') or '?'}
+- Component: {comp} · detector: {d.get('source') or '?'} ({d.get('kind') or '?'}, p={d.get('p_defect', '?')})
+- When: {when} · host: {d.get('host') or '?'} · session: @session:{d.get('profile') or 'default'}/{sid}
+- Quote: "{(d.get('quote') or '').strip()[:500]}"
+{('- Extra: ' + str(d.get('details'))[:1500]) if d.get('details') else ''}
+{rec}
+## Do this
+1. Reproduce or confirm it LIVE, not from the transcript alone. Checklist for {title}:
+{checks}{extra}
+   Other hosts: the coach digests in ~/code/hermes-coach-data/<host>/ (git pull first) carry every session's user
+   turns, tool counts and last reply.
+2. Write the five-whys chain from evidence (five-whys skill): one causal step per why, each with a file:line, log
+   line, db row or quote; label guesses `(hypothesis)`; branch "why it happened" and "why nothing caught it"; stop at
+   a process/guard/design gap Hermes controls. Post the chain as a comment on this card.
+3. Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Run
+   `python3 {SELF} event not_defect {fp} --card $HERMES_KANBAN_TASK --note "<why>"` and complete this card with a
+   result that starts with "not a defect:". Post nothing to the Inbox.
+4. Otherwise write the proposal to {proposal} (markdown, <= 3500 chars, plain words, no jargon) with exactly these
+   sections:
+   **What happened**: the symptom, when (PT), the `@session:<profile>/<id>` link, his quote.
+   **Why**: the five-whys chain, one line per why, each with its evidence.
+   **Plan**: the exact changes (files/skills/config), the regression test (fails before, passes after), the
+   detection guard, and what gets verified live after shipping.
+   **Cost / risk**, then **Undo**: how to revert.
+   Then post it (one card; a re-post of the same key updates it):
+   `hermes inbox post --type {INBOX_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "<one-line title: what is broken>" < {proposal}`
+   and record it: `python3 {SELF} event proposed {fp} --card $HERMES_KANBAN_TASK`.
+5. Complete this card with the proposal's first line as the summary. Do not start the fix.
+"""
+
+
+def fix_brief(fp: str, st: dict) -> str:
+    proposal = coach_root() / "selfheal" / fp / "proposal.md"
+    try:
+        text = proposal.read_text()[:6000]
+    except Exception:
+        text = f"(proposal file {proposal} missing: read the investigation card {st.get('card') or '?'} comments)"
+    bb = st.get("component") == "bb"
+    ship = ("Ship it through the bb-self-fix procedure (PR, merge, deploy) under David's standing approval."
+            if bb else
+            "Ship it under David's standing merge/deploy approval: hermes-mods commit + push (pre-commit hook, never "
+            "--no-verify), core changes through a hermes-core-wt worktree + ship, settings through shared-config.json "
+            "(hermes-mods-repo skill).")
+    return f"""Self-heal FIX for defect `{fp}`. David pressed Do it on the Inbox proposal below: that is the approval.
+Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGET}.
+
+## Approved proposal
+{text}
+
+## Acceptance (all of it, in order)
+1. Re-check the defect still reproduces on the current code (it may have been fixed meanwhile: then say so, run
+   `python3 {SELF} event not_defect {fp} --card $HERMES_KANBAN_TASK --note "already fixed by <sha>"` and stop).
+2. Write the regression test FIRST and show it FAILING on the current code (paste the failing output in a card
+   comment).
+3. Make the fix from the plan (root level, not just the symptom) and the detection guard. Show the same test
+   PASSING, plus the module's existing tests.
+4. {ship}
+5. Verify live on the real path (the surface/command/session type where it happened), and capture the proof.
+6. Post the result on the SAME Inbox key:
+   `hermes inbox post --type {RESULT_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "Fixed: <what>" < <result.md>`
+   with what changed (commits), the red/green test output, the live proof, and the undo command.
+   Then `python3 {SELF} event fixed {fp} --card $HERMES_KANBAN_TASK --note "<commit sha>"`.
+7. Complete the card. If something irreversible or external blocks the fix, kanban_block with the exact ask instead.
+"""
+
+
+class LaneState:
+    """<coach>/selfheal_lane.json: fingerprint -> {status, card, fix_card, component, symptom, filed_day, snooze_until,
+    suppressed, fixed_at, recurrences, history}. Statuses: filed, proposed, approved, fixed, not_defect, declined,
+    suppressed, reverted."""
+
+    def __init__(self, root: Path):
+        self.path = Path(root) / "selfheal_lane.json"
+
+    def read(self) -> dict:
+        try:
+            return json.loads(self.path.read_text())
+        except Exception:
+            return {}
+
+    def get(self, fp: str) -> dict:
+        return dict(self.read().get(fp) or {})
+
+    def update(self, fp: str, **kw) -> dict:
+        d = self.read()
+        e = d.get(fp) or {}
+        hist = e.get("history") or []
+        if "status" in kw and kw["status"] != e.get("status"):
+            hist = (hist + [[round(time.time()), kw["status"]]])[-30:]
+        e.update(kw, history=hist)
+        d[fp] = e
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1))
+        os.replace(tmp, self.path)
+        return e
+
+
+def _utc_day(ts: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def _next_utc_midnight(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT00:00:00Z", time.gmtime((int(ts) // 86400 + 1) * 86400))
+
+
+def _iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _budget_mod():
+    """engine_budget from the hermes-coach skill (same repo), or None."""
+    import importlib.util
+    import sys
+    p = Path(__file__).resolve().parents[2] / "skills" / "productivity" / "hermes-coach" / "scripts" / "engine_budget.py"
+    if not p.exists():
+        return None
+    name = "_selfheal_engine_budget"
+    mod = sys.modules.get(name)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(name, p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod = sys.modules.setdefault(name, mod)
+    return mod
+
+
+def budget(board: Optional[str] = None, now: Optional[float] = None) -> dict:
+    """{"usd", "cap", "running", "ok_usd", "ok_running", "why"} for the selfheal lane today (UTC)."""
+    now = now or time.time()
+    out = {"usd": 0.0, "cap": USD_DAY, "running": 0, "ok_usd": True, "ok_running": True, "why": ""}
+    eb = _budget_mod()
+    if eb is None:
+        return out
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    b = board or os.environ.get("COACH_KANBAN_BOARD") or "default"
+    try:
+        snap = eb.snapshot(home=home, board=b, now=now)
+        out["usd"] = snap["lanes"].get("selfheal", 0.0)
+        out["cap"] = snap["caps"].get("selfheal", USD_DAY)
+        ok, why = eb.check(snap, "selfheal")
+        out["ok_usd"], out["why"] = ok, why
+        out["running"] = sum(1 for c in eb.engine_cards(home, b, ("running",)) if c["lane"] == "selfheal")
+    except Exception as exc:
+        out["why"] = f"budget read failed: {exc}"
+    out["ok_running"] = out["running"] < MAX_RUNNING
+    return out
+
+
+def decide(d: dict, st: dict, now: float) -> dict:
+    """Pure dedupe / suppression / recurrence decision for one defect against its lane state.
+    -> {"action": "file"|"skip", "why", "key", "previous"}"""
+    fp = d["fingerprint"]
+    status = st.get("status")
+    if st.get("suppressed"):
+        return {"action": "skip", "why": "suppressed (Never)"}
+    if (st.get("snooze_until") or 0) > now:
+        return {"action": "skip", "why": f"snoozed until {_iso(st['snooze_until'])} (Not now)"}
+    if st.get("filed_day") == _utc_day(now):
+        return {"action": "skip", "why": "already filed today (<= 1 per fingerprint per UTC day)"}
+    if status in ("filed", "proposed", "approved"):
+        return {"action": "skip", "why": f"open: {status} {st.get('fix_card') or st.get('card') or ''}".strip()}
+    if status == "not_defect" and now - (st.get("closed_at") or 0) < NOT_DEFECT_DAYS * 86400:
+        return {"action": "skip", "why": f"closed as not a defect within {NOT_DEFECT_DAYS} days"}
+    if status == "fixed":
+        n = int(st.get("recurrences") or 0) + 2
+        return {"action": "file", "why": "recurrence", "key": f"selfheal:{fp}:r{n}", "previous": st}
+    if st.get("card"):  # an earlier card closed without a fix (declined/reverted/not_defect long ago): new key
+        n = int(st.get("refiles") or 0) + 2
+        return {"action": "file", "why": "refile", "key": f"selfheal:{fp}:r{n}", "previous": None}
+    return {"action": "file", "why": "new", "key": f"selfheal:{fp}", "previous": None}
+
+
+def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> dict:
+    r = route(d, cfg)
+    sym = re.sub(r"\s+", " ", d.get("symptom") or "defect").strip()[:90]
+    return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
+            "body": investigation_brief(d, previous, cfg), "idempotency_key": key, "model": MODEL,
+            "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
+            "assignee": "default", "created_by": CREATED_BY}
+
+
+def kanban_argv(args: dict, hermes: str = "hermes") -> list:
+    argv = [hermes, "kanban"] + (["--board", args["board"]] if args.get("board") else []) + [
+        "create", args["title"], "--body", args["body"], "--assignee", args["assignee"],
+        "--idempotency-key", args["idempotency_key"], "--model", args["model"],
+        "--max-runtime", str(args["max_runtime"]), "--created-by", args["created_by"], "--json"]
+    for s in args.get("skills") or []:
+        argv += ["--skill", s]
+    return argv
+
+
+def _run(argv, runner=None, stdin=None):
+    import subprocess
+    if runner is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":  # tests: never touch the real board/hub
+        raise RuntimeError(f"COACH_SELFHEAL_NO_EXEC: refused {argv[:3]}")
+    r = (runner or subprocess.run)(argv, capture_output=True, text=True, input=stdin, timeout=120)
+    return r.returncode, (r.stdout or ""), (r.stderr or "")
+
+
+def _task_id(out: str) -> Optional[str]:
+    m = re.search(r'"id"\s*:\s*"(t_[0-9a-f]+)"', out) or re.search(r"\b(t_[0-9a-f]{6,})\b", out)
+    return m.group(1) if m else None
+
+
+def _store(store=None):
+    if store is not None:
+        return store
+
+    class _S:
+        root = coach_root()
+
+        def log(self, rec):
+            self.root.mkdir(parents=True, exist_ok=True)
+            with (self.root / "log.jsonl").open("a") as f:
+                f.write(json.dumps({"ts": time.time(), **rec}) + "\n")
+    return _S()
+
+
+def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
+                cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None) -> dict:
+    """File one defect: {fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at,
+    details}. Returns {"action": would_file|filed|skip|forwarded|error, ...}."""
+    store = _store(store)
+    m = m or mode()
+    now = now or time.time()
+    cfg = lane_config() if cfg is None else cfg
+    if not d.get("fingerprint"):
+        d = {**d, "fingerprint": fingerprint(d.get("component") or "other", d.get("symptom") or "")}
+    fp = d["fingerprint"]
+    if m == "off":
+        return {"action": "skip", "why": "COACH_SELFHEAL=off"}
+    hub = is_hub(cfg)
+    if m == "live" and not hub:
+        rc, out, err = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub_ssh"],
+                             f"python3 {SELF} file --mode live"], runner, stdin=json.dumps(d))
+        res = {"action": "forwarded" if rc == 0 else "error", "hub": cfg["hub_ssh"],
+               "out": (out or err).strip()[-300:]}
+        store.log({"event": "selfheal_forward", "fingerprint": fp, "ok": rc == 0, "detail": res["out"]})
+        return res
+    lane = LaneState(store.root)
+    st = lane.get(fp)
+    dec = decide(d, st, now)
+    if dec["action"] == "skip":
+        store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
+        return {"action": "skip", "why": dec["why"]}
+    args = card_args(d, dec["key"], dec.get("previous"), cfg)
+    b = (budget_fn or budget)(args.get("board"), now)
+    sched = None
+    if not b["ok_usd"]:
+        sched = (_next_utc_midnight(now), f"self-heal lane budget: {b['why'] or 'cap reached'}")
+    elif not b["ok_running"]:
+        sched = (_iso(now + 3600), f"self-heal lane: {b['running']} cards running (max {MAX_RUNNING})")
+    if m != "live" or not hub:
+        rec = {"event": "selfheal_would_file", "mode": m, "fingerprint": fp, "component": d.get("component"),
+               "source": d.get("source"), "why": dec["why"], "recurrence": bool(dec.get("previous")),
+               "schedule": sched, "args": args, "host": d.get("host")}
+        store.log(rec)
+        return {"action": "would_file", **rec}
+    rc, out, err = _run(kanban_argv(args), runner)
+    tid = _task_id(out) if rc == 0 else None
+    if not tid:
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": (err or out).strip()[-300:]})
+        return {"action": "error", "why": (err or out).strip()[-300:]}
+    if sched:
+        bargs = ["hermes", "kanban"] + (["--board", args["board"]] if args.get("board") else [])
+        _run(bargs + ["schedule", tid, f"SCHEDULED_UNTIL={sched[0]} — {sched[1]}"], runner)
+    prev = dec.get("previous")
+    kw = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
+              filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
+              fix_card=None if not prev else st.get("fix_card"))
+    if prev:
+        kw["recurrences"] = int(st.get("recurrences") or 0) + 1
+    elif dec["why"] == "refile":
+        kw["refiles"] = int(st.get("refiles") or 0) + 1
+    lane.update(fp, **kw)
+    store.log({"event": "selfheal_filed", "fingerprint": fp, "card": tid, "component": d.get("component"),
+               "board": args.get("board"), "recurrence": bool(prev), "scheduled": sched[0] if sched else None,
+               "source": d.get("source")})
+    if prev:
+        store.log({"event": "selfheal_recurrence", "fingerprint": fp, "card": tid,
+                   "previous": prev.get("fix_card"), "component": d.get("component")})
+    return {"action": "filed", "card": tid, "key": args["idempotency_key"], "scheduled": sched}
+
+
+def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budget_fn=None,
+             trigger: str = "do_it") -> dict:
+    """Do it: the fix card `selfheal:<fp>:fix` on the hub (idempotent)."""
+    store = _store(store)
+    now = now or time.time()
+    lane = LaneState(store.root)
+    st = lane.get(fp)
+    if not FP_RE.match(fp or ""):
+        return {"action": "error", "why": f"not a fingerprint: {fp!r}"}
+    if st.get("fix_card") and st.get("status") in ("approved", "fixed"):
+        return {"action": "skip", "why": f"fix card exists: {st['fix_card']}", "card": st["fix_card"]}
+    r = route({"component": st.get("component")})
+    n = int(st.get("recurrences") or 0)
+    key = f"selfheal:{fp}:fix" if not n else f"selfheal:{fp}:r{n + 1}:fix"
+    args = {"title": f"self-heal fix: {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
+            "idempotency_key": key, "model": MODEL, "max_runtime": FIX_RUNTIME,
+            "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
+            "assignee": "default", "created_by": CREATED_BY}
+    b = (budget_fn or budget)(args.get("board"), now)
+    rc, out, err = _run(kanban_argv(args), runner)
+    tid = _task_id(out) if rc == 0 else None
+    if not tid:
+        return {"action": "error", "why": (err or out).strip()[-300:]}
+    sched = None
+    if not b["ok_usd"]:
+        sched = _next_utc_midnight(now)
+    elif not b["ok_running"]:
+        sched = _iso(now + 3600)
+    if sched:
+        bargs = ["hermes", "kanban"] + (["--board", args["board"]] if args.get("board") else [])
+        _run(bargs + ["schedule", tid, f"SCHEDULED_UNTIL={sched} — self-heal lane budget/concurrency"], runner)
+    lane.update(fp, status="approved", fix_card=tid, approved_at=now)
+    store.log({"event": "selfheal_approved", "fingerprint": fp, "card": tid, "component": st.get("component"),
+               "trigger": trigger, "scheduled": sched})
+    return {"action": "filed", "card": tid, "key": key, "scheduled": sched}
+
+
+EVENT_STATUS = {"proposed": "proposed", "fixed": "fixed", "not_defect": "not_defect", "reverted": "reverted",
+                "declined": "declined"}
+
+
+def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None) -> dict:
+    """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>."""
+    store = _store(store)
+    now = now or time.time()
+    if kind not in EVENT_STATUS:
+        raise ValueError(f"unknown event {kind}; one of {sorted(EVENT_STATUS)}")
+    lane = LaneState(store.root)
+    st = lane.get(fp)
+    kw = {"status": EVENT_STATUS[kind]}
+    if kind == "proposed":
+        kw["proposed_at"] = now
+    if kind == "fixed":
+        kw.update(fixed_at=now, fix_card=card or st.get("fix_card"))
+    if kind in ("not_defect", "declined"):
+        kw["closed_at"] = now
+    e = lane.update(fp, **kw)
+    store.log({"event": f"selfheal_{kind}", "fingerprint": fp, "card": card or e.get("card"),
+               "component": e.get("component"), "note": note[:300], "recurrence": bool(e.get("recurrences"))})
+    return e
+
+
+def inbox_outcome(fp: str, runner=None) -> Optional[dict]:
+    rc, out, _ = _run(["hermes", "inbox", "outcome", f"selfheal:{fp}"], runner)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except Exception:
+        return None
+
+
+def sync(store=None, runner=None, now: Optional[float] = None, fixer: Optional[Callable] = None) -> list:
+    """Act once on each proposal's Inbox outcome: do_it (backstop for the Do-it task), not_now (snooze), never
+    (suppress). Returns [(fp, what)]."""
+    store = _store(store)
+    now = now or time.time()
+    lane = LaneState(store.root)
+    done = []
+    for fp, st in lane.read().items():
+        if st.get("status") != "proposed":
+            continue
+        o = inbox_outcome(fp, runner)
+        if not o or o.get("state") == "open":
+            continue
+        what = o.get("outcome")
+        if what == "do_it":
+            r = (fixer or file_fix)(fp, store=store, runner=runner, now=now, trigger="sync")
+            done.append((fp, f"do_it -> {r.get('card') or r.get('why')}"))
+        elif what in ("not_now", "never"):
+            kw = {"status": "suppressed" if what == "never" else "declined", "closed_at": now}
+            if what == "never":
+                kw["suppressed"] = True
+            else:
+                kw["snooze_until"] = now + SNOOZE_DAYS * 86400
+            lane.update(fp, **kw)
+            store.log({"event": "selfheal_declined", "fingerprint": fp, "card": st.get("card"), "how": what,
+                       "component": st.get("component")})
+            done.append((fp, what))
+        elif o.get("state") == "archived":
+            lane.update(fp, status="declined", closed_at=now)
+            store.log({"event": "selfheal_declined", "fingerprint": fp, "card": st.get("card"), "how": "archived",
+                       "component": st.get("component")})
+            done.append((fp, "archived"))
+    return done
+
+
+# ── digest backstop ──
+INTERACTIVE = ("desktop", "tui", "cli", "slack", "telegram", "discord", "whatsapp", "signal")
+
+
+def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Optional[float] = None,
+             lookback: float = 3 * 3600, filer: Optional[Callable] = None, m: Optional[str] = None,
+             limit: int = 200) -> list:
+    """Run the complaint detector over user turns newer than the per-session cursor in the coach digests
+    (<data>/<host>/<profile>/<sid>.json). A session seen for the first time is scanned only `lookback` back. Turn
+    pairs carry no per-turn previous reply in digests, so prev_reply is empty except for the last turn (last_reply).
+    Returns the filings."""
+    store = _store(store)
+    now = now or time.time()
+    m = m or mode()
+    cur_p = Path(store.root) / "selfheal_backstop.json"
+    try:
+        cursor = json.loads(cur_p.read_text())
+    except Exception:
+        cursor = {}
+    judge = judge or aux_judge
+    out, n = [], 0
+    for f in sorted(Path(data).glob("*/*/*.json")):
+        if f.parts[-3] in ("reports", "findings", "research", "eval", "curriculum"):
+            continue
+        rel = "/".join(f.parts[-3:])
+        try:
+            if f.stat().st_mtime < now - 14 * 86400:
+                continue
+            dg = json.loads(f.read_text())
+        except Exception:
+            continue
+        if dg.get("source") not in INTERACTIVE or dg.get("parent_session_id"):
+            continue
+        turns = [t for t in dg.get("user_turns") or [] if isinstance(t, dict) and t.get("t")]
+        since = cursor.get(rel, now - lookback)
+        new = [t for t in turns if t["t"] > since]
+        if not new:
+            continue
+        cursor[rel] = max(t["t"] for t in turns)
+        for t in new:
+            if n >= limit:
+                break
+            text = t.get("text") or ""
+            if not prefilter(text):
+                continue
+            n += 1
+            hit = detect_complaint("", text, llm=judge, threshold=threshold())
+            if not hit:
+                continue
+            sid = dg.get("id") or f.stem
+            new_fp = Fingerprints(store.root).record(hit, sid)
+            d = {**hit, "session_id": sid, "quote": clean_user(text)[:500], "host": dg.get("host") or f.parts[-3],
+                 "profile": dg.get("profile") or f.parts[-2], "at": t["t"], "source": "backstop",
+                 "kind": hit.get("kind") or "complaint"}
+            store.log({"event": "selfheal_detect", "mode": m, "session_id": sid, "source": "backstop",
+                       "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
+                       "fingerprint": hit["fingerprint"], "new": new_fp, "evidence": d["quote"][:300]})
+            if new_fp:
+                out.append((filer or file_defect)(d, store=store, m=m))
+    cur_p.parent.mkdir(parents=True, exist_ok=True)
+    cur_p.write_text(json.dumps(cursor))
+    return out
+
+
+def main(argv=None) -> int:
+    import argparse
+    import sys
+    ap = argparse.ArgumentParser(prog="self_heal.py", description="self-heal lane (see the Lane comment)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("file", help="file one defect JSON from stdin (hub side of an ssh forward)")
+    f.add_argument("--mode", choices=("shadow", "live"))
+    x = sub.add_parser("fix", help="Do it: create the fix card for a fingerprint")
+    x.add_argument("fp")
+    e = sub.add_parser("event", help="record a lifecycle event from a card")
+    e.add_argument("kind", choices=sorted(EVENT_STATUS))
+    e.add_argument("fp")
+    e.add_argument("--card", default="")
+    e.add_argument("--note", default="")
+    sub.add_parser("sync", help="act on Inbox outcomes (Do it / Not now / Never)")
+    b = sub.add_parser("backstop", help="detector over new user turns in the coach digests")
+    b.add_argument("--data", default=os.environ.get("COACH_DATA") or str(Path.home() / "code/hermes-coach-data"))
+    b.add_argument("--mode", choices=("shadow", "live"))
+    c = sub.add_parser("cron", help="hub pass every 30 min: drain queue, backstop, sync")
+    c.add_argument("--data", default=os.environ.get("COACH_DATA") or str(Path.home() / "code/hermes-coach-data"))
+    sub.add_parser("status", help="lane state + budget")
+    a = ap.parse_args(argv)
+    if a.cmd == "file":
+        d = json.loads(sys.stdin.read())
+        print(json.dumps(file_defect(d, m=a.mode)))
+    elif a.cmd == "fix":
+        print(json.dumps(file_fix(a.fp)))
+    elif a.cmd == "event":
+        e = record_event(a.kind, a.fp, a.card, a.note)
+        print(json.dumps({"fingerprint": a.fp, "status": e.get("status")}))
+    elif a.cmd == "sync":
+        for fp, what in sync():
+            print(f"{fp}: {what}")
+    elif a.cmd == "backstop":
+        for r in backstop(Path(a.data), m=a.mode):
+            print(json.dumps(r)[:400])
+    elif a.cmd == "cron":
+        for line in cron(Path(a.data)):
+            print(line)
+    elif a.cmd == "status":
+        st = LaneState(coach_root()).read()
+        print(json.dumps({"mode": mode(), "hub": is_hub(), "budget": budget(),
+                          "fingerprints": {k: {kk: v.get(kk) for kk in ("status", "card", "fix_card", "filed_day")}
+                                           for k, v in st.items()}}, indent=1))
+    return 0
+
+
+def drain(store=None, m: Optional[str] = None, filer: Optional[Callable] = None) -> list:
+    """File queued live detections that were not filed in-process (e.g. the hub was unreachable)."""
+    store = _store(store)
+    q = Path(store.root) / "selfheal_queue.jsonl"
+    done_p = Path(store.root) / "selfheal_queue.offset"
+    if not q.exists():
+        return []
+    lines = q.read_text().splitlines()
+    try:
+        off = int(done_p.read_text().strip() or 0)
+    except Exception:
+        off = 0
+    out = []
+    for line in lines[off:]:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        d = {k: r.get(k) for k in ("fingerprint", "component", "symptom", "source", "session_id")}
+        d.update(quote=r.get("evidence") or "", at=r.get("ts"), p_defect=r.get("p"), host=host_name())
+        out.append((filer or file_defect)(d, store=store, m=m))
+    done_p.write_text(str(len(lines)))
+    return out
+
+
+def cron(data: Path, store=None) -> list:
+    """The hub's 30-min pass (no agent): queue -> backstop -> Inbox outcomes. Prints only what it did."""
+    lines = []
+    if mode() == "off":
+        return lines
+    for r in drain(store):
+        if r.get("action") not in ("skip",):
+            lines.append(f"queue: {json.dumps(r)[:300]}")
+    try:
+        for r in backstop(data, store):
+            if r.get("action") not in ("skip",):
+                lines.append(f"backstop: {r.get('action')} {r.get('fingerprint') or r.get('card') or ''}")
+    except Exception as exc:
+        lines.append(f"backstop failed: {exc}")
+    for fp, what in sync(store):
+        lines.append(f"inbox: {fp} {what}")
+    return lines
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

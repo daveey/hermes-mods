@@ -233,7 +233,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             hit = sh.detect_complaint(prev or "", user_message, llm=selfheal_llm, threshold=sh.threshold(),
                                       confirm=_confirm(sh),
                                       tool_log=tool_log)
-            sh.handle(hit, session_id, store, evidence=sh.clean_user(user_message))
+            sh.handle(hit, session_id, store, evidence=sh.clean_user(user_message), platform=platform)
         except Exception as exc:
             log.debug("coach self_heal complaint: %s", exc)
 
@@ -245,7 +245,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             hit = sh.detect_admission(reply, llm=selfheal_llm, threshold=sh.audit_threshold(), tool_log=tool_log,
                                       ask=ask,
                                       confirm=_confirm(sh))
-            sh.handle(hit, session_id, store, evidence=reply[-300:])
+            sh.handle(hit, session_id, store, evidence=reply[-300:], platform=platform)
         except Exception as exc:
             log.debug("coach self_heal admission: %s", exc)
 

@@ -170,6 +170,42 @@ Replay evals:
 - `eval/selfheal_replay.py`: per-turn catch rate / precision on a hand-labeled set (`--mode admission` for the audit).
 The real sets hold your own words, so they live in the private coach data repo.
 
+### Self-heal lane (`self_heal.py file_defect` → investigation → Inbox proposal → Do it → fix)
+
+Every new fingerprint (first time that UTC day) goes to `file_defect(d)`, from any entry path: the two hooks above
+(complaint, admission, turn-end machine signal), the digest backstop, and direct callers (machine-signal sweepers,
+monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at, details}`.
+
+- **Where it decides.** On the hub (`coach/selfheal-config.json`: `hub_host`, `hub_ssh`, `board`, `bb_board`; no hub
+  configured = this host) it decides locally; on any other host, live mode pipes `d` to `self_heal.py file --mode live`
+  on the hub over ssh, so dedupe, recurrence, suppression and budget live in one place (`coach/selfheal_lane.json`).
+- **Shadow** (`COACH_SELFHEAL=shadow`, the default) logs `selfheal_would_file` with the full card args and creates
+  nothing. **Live** creates the investigation card.
+- **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
+  hermes-mods-repo (Baby Bear: board `bb`, five-whys + bb-self-fix). Its brief makes it investigate live, with a
+  per-component checklist (Kanban events/runs, surface writer + backing state, processes/launchd/logs, git log), write
+  the five-whys chain, and post ONE Inbox card of type `selfheal` (key `selfheal:<fp>`): **What happened** (symptom,
+  PT time, `@session` link, quote), **Why** (the chain with evidence), **Plan** (changes, regression test, detection
+  guard, live check), cost/risk, undo. It never ships the fix. Not a defect → `event not_defect`, no Inbox card.
+- **Do it** (a task action) runs `self_heal.py fix <fp>`: fix card `selfheal:<fp>:fix` whose acceptance is the
+  regression test red before / green after, ship under the standing approval, verify live, and re-post the same key
+  as a `selfheal-result` card "Fixed: …" with the proof (OK / Undo). **Not now** snoozes the fingerprint 14 days,
+  **Never** suppresses it; the hub cron's `sync` reads the outcomes (and files the fix card if the Do-it task didn't).
+- **Recurrence**: a fixed fingerprint that comes back files `selfheal:<fp>:r<n>`, whose brief says "previous fix <id>
+  didn't hold" and requires a detection-level guard.
+- **Budget**: engine_budget lane `selfheal` ($25/UTC day, its own cap outside the $20 engine total; spend = these
+  cards' worker sessions), ≤ 3 running, ≤ 1 filing per fingerprint per UTC day. Over the $ cap the card is created
+  and scheduled to the next UTC midnight; at 3 running, 1 h out. Each card body carries a `Budget for this card` line
+  ($8 investigation, $15 fix) for the engine watchdog.
+- **Hub cron** (`self_heal.py cron`, every 30 min, no agent): queue drain, digest backstop (the complaint detector over
+  new user turns of interactive sessions in the coach digests, per-session cursor), Inbox sync.
+- Events (coach `log.jsonl`, read by `coach_weekly.py`): `selfheal_would_file`, `_filed`, `_recurrence`, `_skip`,
+  `_proposed`, `_approved`, `_fixed`, `_reverted`, `_not_defect`, `_declined`. Cards report theirs with
+  `self_heal.py event <kind> <fp> --card <id>`. `self_heal.py status` prints the lane state and budget.
+- Tests: `tests/test_self_heal_lane.py` (each entry path, dedupe, recurrence, budget, bb routing, shadow vs live,
+  Do it → fix card, Not now / Never). `COACH_SELFHEAL_NO_EXEC=1` (set by the test conftest) refuses any real
+  `hermes`/ssh call.
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.
