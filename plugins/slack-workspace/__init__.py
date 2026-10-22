@@ -221,7 +221,8 @@ def _owner_ops(state: State):
     if state.ownerops is None:
         home = state.store.root.parent
         state.ownerops = ownerops.OwnerOps(
-            state.store.root, owners=lambda: ownerops.owner_ids(), bot_home=home,
+            state.store.root, owners=lambda: ownerops.owner_ids(ownerops.home_cfg(home)), bot_home=home,
+            profile=lambda: ownerops.ops_profile(ownerops.home_cfg(home)),
             api=lambda m, p=None: core.call(state.token(), m, p))
     return state.ownerops
 
@@ -988,7 +989,7 @@ def _register_handoff(ctx, state: State) -> None:
         "type": "object", "properties": {"request": {"type": "string", "description": "the owner's request, in their words"}},
         "required": ["request"]}}
     ctx.register_tool(name="mac_ops_handoff", toolset=TOOLSET, schema=schema, handler=handler, description=HANDOFF_DESC,
-                      check_fn=lambda: bool(ownerops.owner_ids()))
+                      check_fn=lambda: bool(ownerops.owner_ids(ownerops.home_cfg(state.store.root.parent))))
 
 
 def register(ctx):

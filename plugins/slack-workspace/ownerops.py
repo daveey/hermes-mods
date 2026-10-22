@@ -55,6 +55,17 @@ def _cfg() -> dict:
         return {}
 
 
+def home_cfg(home: Path) -> dict:
+    """The config.yaml of one profile home. A multiplexed gateway serves several profiles in one process, so
+    load_config() there is the ROOT config, not the bot profile's; the owner settings live in the profile's."""
+    try:
+        import yaml  # type: ignore
+
+        return yaml.safe_load((Path(home) / "config.yaml").read_text()) or {}
+    except Exception:
+        return {}
+
+
 def owner_ids(cfg: Optional[dict] = None) -> frozenset[str]:
     """``owner.slack_user_ids`` from config.yaml (or the dict passed in)."""
     cfg = _cfg() if cfg is None else cfg

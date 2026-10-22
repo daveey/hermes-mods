@@ -160,3 +160,18 @@ def test_handoff_wiring_reads_only_the_owners_human_messages(tmp_path, monkeypat
     """The plugin's last_owner_msg must skip the bot's and other users' rows."""
     src = (HERE / "__init__.py").read_text()
     assert 'r.get("user") == owner and not r.get("bot")' in src
+
+
+def test_owner_settings_come_from_the_bot_profile_not_the_root_config(tmp_path, monkeypatch):
+    """Live miss 2026-10-21: the hub gateway multiplexes profiles, so load_config() in the Slack middleware is the
+    ROOT config (no owner key). owners was empty, nothing routed, and mac_ops_handoff was hidden by its check_fn."""
+    monkeypatch.setattr(oo, "_cfg", lambda: {})  # the root config of a multiplexed gateway
+    home = tmp_path / "profiles" / "alpha"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("owner: {slack_user_ids: [U0OWNER], ops_profile: mac-ops}\n")
+    assert oo.owner_ids() == frozenset()
+    assert oo.owner_ids(oo.home_cfg(home)) == {OWNER}
+    assert oo.ops_profile(oo.home_cfg(home)) == "mac-ops"
+    assert oo.home_cfg(tmp_path / "missing") == {}
+    src = (HERE / "__init__.py").read_text()
+    assert "ownerops.owner_ids()" not in src  # every caller passes the bot profile's config
