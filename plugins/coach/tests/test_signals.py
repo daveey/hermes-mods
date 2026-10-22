@@ -89,6 +89,20 @@ def test_errors_log_tracebacks(home):
     assert "/home/you" not in db[0]["details"] and "~/.hermes/hermes-agent" in db[0]["details"]
 
 
+def test_library_warning_traceback_is_not_a_defect_but_ours_is():
+    def rec(level, logger, path):
+        return [f"2026-10-22 08:00:00,000 {level} {logger}: Failed to clean up child process",
+                "Traceback (most recent call last):",
+                f'  File "{path}", line 10, in terminate_tree',
+                "    os.killpg(pgid, sig)",
+                "PermissionError: [Errno 1] Operation not permitted"]
+    lib = "/home/you/.hermes/hermes-agent/venv/lib/python3.11/site-packages/mcp/os/posix/utilities.py"
+    own = "/home/you/.hermes/hermes-agent/tools/mcp_tool.py"
+    assert sg.parse_errors(rec("WARNING", "mcp.os.posix.utilities", lib)) == []
+    assert len(sg.parse_errors(rec("WARNING", "tools.mcp_tool", own))) == 1
+    assert len(sg.parse_errors(rec("ERROR", "mcp.os.posix.utilities", lib))) == 1
+
+
 def test_plugin_hook_exception(home):
     hooks = kinds(sg.collect(home, {}, "hubhost", NOW), "hook")
     assert len(hooks) == 1
@@ -246,6 +260,21 @@ def test_ingest_then_hub_sweep_files_forwarded_signals(home, tmp_path):
     res = sg.sweep(hub, "hermes-hub", filer=lambda d: got.append(d) or {"action": "would_file"}, now=NOW)
     assert len(res) == n and {d["host"] for d in got} == {"macbook"}
     assert sg.sweep(hub, "hermes-hub", filer=lambda d: {"action": "would_file"}, now=NOW) == []  # spool drained
+
+
+def test_drain_spool_leaves_a_half_written_last_line_for_the_next_sweep(tmp_path):
+    hub = tmp_path / "hub"
+    spool = hub / "coach" / "signals" / "spool.jsonl"
+    spool.parent.mkdir(parents=True)
+    a = {"kind": "cron", "fp": "cron-aaaaaaaaaa", "host": "macbook"}
+    b = {"kind": "errors", "fp": "agent-bbbbbbbbbb", "host": "macbook"}
+    whole_b = json.dumps(b) + "\n"
+    spool.write_text(json.dumps(a) + "\n" + whole_b[:15])  # `ingest` is mid-write of b
+    assert [s["fp"] for s in sg.drain_spool(hub)] == ["cron-aaaaaaaaaa"]
+    with spool.open("a") as f:  # the write finishes
+        f.write(whole_b[15:])
+    assert [s["fp"] for s in sg.drain_spool(hub)] == ["agent-bbbbbbbbbb"]
+    assert sg.drain_spool(hub) == []
 
 
 # ── monitors re-routed to the lane ───────────────────────────────────────────────────────────────────────────

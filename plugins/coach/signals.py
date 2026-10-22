@@ -130,6 +130,11 @@ def read_new(path: Path, cur: dict, key: str, now: float) -> List[str]:
 
 # ── collectors: each returns raw signals {kind, key, component, symptom, details, at, session_id?, quote?, fp} ─
 
+def _own_frame(path: str) -> bool:
+    q = path.replace("\\", "/")
+    return "site-packages" not in q and "/lib/python" not in q
+
+
 def component_of(paths: List[str]) -> Tuple[str, str]:
     """(component, plugin name) from traceback frame paths, innermost first."""
     for p in reversed(paths):
@@ -185,6 +190,8 @@ def parse_errors(lines: List[str]) -> List[dict]:
         if TRANSIENT_RE.search(text):
             continue
         comp, plug = component_of([f[0] for f in frames])
+        if r["level"] == "WARNING" and not any(_own_frame(p) for p, _fn in frames):
+            continue  # a library logging a handled exception (e.g. mcp's PermissionError); nothing of ours to fix
         inner = [(os.path.basename(p), fn) for p, fn in frames[-4:]]
         where = f"{inner[-1][1]} ({inner[-1][0]})" if inner else r["logger"]
         sym = f"{exc_type.split('.')[-1]} in {where}" + (f" [{plug}]" if plug else "") + f": {r['msg'][:90]}"
@@ -424,7 +431,11 @@ def drain_spool(home: Path) -> List[dict]:
     offp = coach_dir(home) / "signals" / "spool.offset"
     if not spool.exists():
         return []
-    lines = spool.read_text().splitlines()
+    data = spool.read_bytes()
+    # Only newline-terminated lines are complete: a concurrent `ingest` may be
+    # mid-write, and a partial last line must be left for the next sweep, not
+    # dropped and skipped by the offset (the forwarder's cursor already moved).
+    lines = data[:data.rfind(b"\n") + 1].decode("utf-8", "replace").split("\n")[:-1]
     try:
         off = int(offp.read_text().strip() or 0)
     except Exception:
