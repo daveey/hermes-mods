@@ -3,6 +3,7 @@
 Patches:
 
 - `patches/0165-feat-agent-pre_final_gate-hook-silent-stop-gate-hold.patch`: the hook, the silent hold, the stream buffer and the config keys.
+- `patches/0167-fix-agent-reset-pre_final_gate-attempts-outside-_PER.patch`: fix-up for 0165, moves one counter reset (see How it works).
 
 What you see: a plugin can stop a final answer before it reaches the screen and make the agent try again. The user never sees the first answer, and it is not stored in the transcript. A plugin can also add a note to the end of an answer.
 
@@ -22,6 +23,7 @@ What you see: a plugin can stop a final answer before it reaches the screen and 
 - `agent/turn_stop_gates.py::apply_stop_gates`: on a hold, the candidate row and the nudge row are both flagged `_pre_final_gate_synthetic`. The buffer is discarded and the turn continues with the candidate as `pending_verification_response`. On deliver it flushes the buffer, and on append it rewrites the row and streams the suffix.
 - `_pre_final_gate_synthetic` is listed in `session_persistence._EPHEMERAL_SCAFFOLDING_FLAGS` (never persisted), `turn_finalizer._VERIFICATION_CONTINUATION_FLAGS` (stripped from returned/live history) and `conversation_compression._SYNTHETIC_USER_FLAGS`.
 - `agent/stream_delivery.py`: `_fire_stream_delta` and the scrubber-tail flush route through `_buffer_final_gate_text` while `_final_gate_buffer` is a list. `_emit_interim_assistant_message` and `turn_tool_round` flush first. `turn_context._reset_per_turn_agent_state` arms the buffer, and `finalize_turn` flushes and disarms it.
+- `_pre_final_gate_attempts` is reset in `_reset_per_turn_agent_state` next to the buffer arm, not in the `_PER_TURN_RESET_STATE` tuple, which upstream edits (0167).
 - `turn_final_response` now takes `final_response` from the stop-gate verdict, so an append reaches the stored row.
 
 ## Code
