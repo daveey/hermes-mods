@@ -123,8 +123,8 @@ def _ours(path: str | None, text: str, tool: str = "terminal") -> bool:
 
 
 def register_markers(since: float, env, extra_dirs: list[str] | None = None, text: str | None = None,
-                     tool: str = "terminal") -> list[dict]:
-    owner = owner_from_env(env)
+                     tool: str = "terminal", owner: dict | None = None) -> list[dict]:
+    owner = owner_from_env(env) if owner is None else owner
     out = []
     for gd in new_gitdirs(since, extra_dirs):
         path = _wt_path(gd)
