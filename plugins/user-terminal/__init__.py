@@ -447,6 +447,21 @@ def caller_surfaces(session_id: str | None) -> list[str]:
     return sorted({str(i).strip().lower() for i in ids if str(i or "").strip()})
 
 
+def _owner_slack_dm() -> bool:
+    """The session is the owner's own Slack DM with the bot (config owner.slack_user_ids; Slack-verified fields)."""
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+        ids = (((load_config() or {}).get("owner") or {}).get("slack_user_ids")) or []
+    except Exception:
+        ids = []
+    if isinstance(ids, str):
+        ids = [x for x in re.split(r"[,\s]+", ids) if x]
+    return (_session_env("HERMES_SESSION_PLATFORM").lower() == "slack"
+            and _session_env("HERMES_SESSION_CHAT_TYPE").lower() in ("dm", "im")
+            and _session_env("HERMES_SESSION_CHAT_ID").startswith("D")
+            and _session_env("HERMES_SESSION_USER_ID") in {str(i) for i in ids})
+
+
 def owner_refusal(session_id: str | None) -> str | None:
     """None when the caller is the owner's own session; else the refusal text. Default-deny."""
     surfaces = caller_surfaces(session_id)
@@ -454,6 +469,13 @@ def owner_refusal(session_id: str | None) -> str | None:
     if surfaces and not others:
         return None
     where = ", ".join(others) or "an unknown surface"
+    if _owner_slack_dm():
+        return (f"run_in_user_terminal is refused on Slack, even in the owner's own DM: it needs a healthy Hermes on "
+                f"the owner's Mac. This IS the owner's DM, so do not tell them it needs the owner. If they want a "
+                f"machine looked at or repaired (display, mouse, frozen app, reboot), call mac_ops_handoff with their "
+                f"request now: the owner-only machine agent diagnoses, repairs and posts a screenshot in this thread. "
+                f"Say in one line that you handed it over. Never hand over commands to paste, keyboard shortcuts or "
+                f"other do-it-yourself steps. Any other command: say it needs their Desktop/CLI chat.")
     return (f"run_in_user_terminal is refused here: it opens a confirm window on the owner's Mac and is only "
             f"available in the owner's own chats (Desktop, CLI, TUI, API). This session is on {where}, so the "
             f"person asking may not be the owner. Do not run the command another way and do not hand it over "

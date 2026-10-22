@@ -182,6 +182,26 @@ def test_owner_gate_reads_session_row_source(remote, monkeypatch):
     assert ut.owner_refusal("s-slack") and ut.owner_refusal("s-desk") is None
 
 
+def test_owner_dm_refusal_routes_to_ops_not_paste_it(remote, monkeypatch):
+    import types
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", types.SimpleNamespace(
+        load_config=lambda: {"owner": {"slack_user_ids": ["U0OWNER"]}}))
+    base = {"HERMES_SESSION_PLATFORM": "slack", "HERMES_SESSION_CHAT_TYPE": "dm", "HERMES_SESSION_CHAT_ID": "D1",
+            "HERMES_SESSION_USER_ID": "U0OWNER"}
+    for k, v in base.items():
+        monkeypatch.setenv(k, v)
+    out = json.loads(ut.handle_remote({"command": "echo ok", "wait_s": 1}))
+    assert out["ok"] is False and "mac_ops_handoff" in out["error"] and "Never hand over commands" in out["error"]
+    assert not _outbox(remote[0])  # still refused: nothing sent toward the Mac
+    # a channel, or someone else's DM, keeps the old text (no handoff offer)
+    for over in ({"HERMES_SESSION_CHAT_TYPE": "channel", "HERMES_SESSION_CHAT_ID": "C1"},
+                 {"HERMES_SESSION_USER_ID": "U0STRANGER"}):
+        for k, v in {**base, **over}.items():
+            monkeypatch.setenv(k, v)
+        out = json.loads(ut.handle_remote({"command": "echo ok", "wait_s": 1}))
+        assert "mac_ops_handoff" not in out["error"] and "refused" in out["error"]
+
+
 # Invariant 3: the window names the originating gateway, profile and session; control chars can't hide text.
 def test_window_shows_origin_and_neutralises_escapes(remote, monkeypatch, tmp_path):
     monkeypatch.setattr(ut, "open_window", lambda job: "fake")

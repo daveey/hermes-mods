@@ -19,6 +19,12 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
    ("<title>")`, and the window title is `Hermes (<gw>/<p>) wants to run a command`. The gateway name is the
    courier's own name for the connection it drained, not a value the remote agent chose. Control characters in the
    command, reason, cwd and origin are shown as `^[`-style text, so a relayed command cannot redraw the window.
+   The refusal is by surface, not by person, and stays for the owner's own Slack DM too (arbitrary shell still needs
+   the y-window). For that one case, detected from Slack-verified session fields (`owner.slack_user_ids` +
+   DM), the refusal text changes: it tells the agent to call `mac_ops_handoff`, which passes a machine problem to
+   the owner-only `mac-ops` profile (plugins `slack-workspace` `ownerops.py` + `mac-ops`), and never to hand over
+   commands, paste-it steps or keyboard shortcuts. Channels and other users get the old text. Test:
+   `test_owner_dm_refusal_routes_to_ops_not_paste_it`.
 4. No Desktop courier for that Mac online -> the tool errors at once (no outbox write). A live courier that does
    not claim the request within 15 s -> error and the request is withdrawn.
 
@@ -52,6 +58,8 @@ remote agent polls results/<id>.json; one start request, then status requests of
 
 ```
 cd plugins/user-terminal && uv run --with pytest --with fastapi --with httpx python -m pytest -q -p no:cacheprovider tests_user_terminal.py
+cd plugins/slack-workspace && uv run --with pytest python -m pytest -q -p no:cacheprovider tests_ownerops.py
+cd plugins/mac-ops && uv run --with pytest python -m pytest -q -p no:cacheprovider tests_mac_ops.py
 cd plugins/session-mentions && node --test --test-reporter=tap tests/user-terminal.test.mjs
 ```
 
