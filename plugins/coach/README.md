@@ -228,7 +228,9 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
   sweep`, every 30 min, from the scheduler since a Kanban worker can't create cards). It also drains
   `<home>/coach/signals/spool.jsonl`, where the other hosts' signals land.
 - **Macs / mini**: `signals.py forward` ships new raw signals over ssh to the hub's `signals.py ingest` (the hub
-  files them); the cursor only moves when the hub accepted the batch. It rides on the existing launchd coach feed
+  files them); the cursor only moves when the hub accepted the batch. Every pass sends a heartbeat first (even with
+  no signals), recorded in the hub's `coach/signals/hosts.json`; the hub sweep files a `plugin` defect for a host
+  whose forwarder has been silent > 6 h. It rides on the existing launchd coach feed
   (`hermes-coach/scripts/coach_feed.py`, every 30 min) and is a no-op without a `hub_ssh` in
   `coach/selfheal-config.json` or on the hub itself.
 - **Monitors**: `signals.py route-monitor` (JSON `{monitor, key, title, body, prompt, component}` on stdin) files the

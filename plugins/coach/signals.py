@@ -448,7 +448,7 @@ def sweep(home: Path, host: str, m: Optional[str] = None, filer: Optional[Callab
     """Hub pass: local signals + forwarded ones -> file_defect. Returns [{signal, result}]."""
     now = now or time.time()
     cur = load_cursor(home)
-    sigs = collect(home, cur, host, now) + drain_spool(home)
+    sigs = collect(home, cur, host, now) + drain_spool(home) + silent_forwarders(home, now)
     if filer is None:
         sh = _self_heal()
         filer = lambda d: sh.file_defect(d, m=m)  # noqa: E731
@@ -464,13 +464,13 @@ def sweep(home: Path, host: str, m: Optional[str] = None, filer: Optional[Callab
 
 
 def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, now: Optional[float] = None) -> dict:
-    """Mac/mini: ship new raw signals to the hub. The cursor only moves when the hub accepted them."""
+    """Mac/mini: ship new raw signals to the hub. The cursor only moves when the hub accepted them. Every pass sends
+    a heartbeat line first (even with no signals), so the hub knows the forwarder is alive (signals/hosts.json) and
+    its sweep flags a host whose forwarder went silent."""
     cur = load_cursor(home)
     sigs = collect(home, cur, host, now)
-    if not sigs:
-        save_cursor(home, cur)
-        return {"ok": True, "sent": 0}
-    payload = "".join(json.dumps(s) + "\n" for s in sigs)
+    beat = {"kind": "heartbeat", "host": host, "at": now or time.time(), "n": len(sigs)}
+    payload = "".join(json.dumps(s) + "\n" for s in [beat] + sigs)
     run = runner or (lambda argv, stdin: subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=90))
     try:
         r = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", hub, HUB_CMD], payload)
@@ -482,22 +482,60 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
     return {"ok": ok, "sent": len(sigs) if ok else 0, "pending": 0 if ok else len(sigs), "detail": detail}
 
 
+SILENT_S = 6 * 3600              # a forwarder (launchd, every 30 min) quiet this long is itself a defect
+
+
 def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
     spool = coach_dir(home) / "signals" / "spool.jsonl"
     spool.parent.mkdir(parents=True, exist_ok=True)
+    now = now or time.time()
     n = 0
+    beats = {}
     with spool.open("a") as f:
         for ln in text.splitlines():
             try:
                 s = json.loads(ln)
             except Exception:
                 continue
+            if isinstance(s, dict) and s.get("kind") == "heartbeat" and s.get("host"):
+                beats[str(s["host"])[:40]] = {"at": now, "n": s.get("n")}
+                continue
             if not isinstance(s, dict) or not s.get("fp") or s.get("kind") not in KINDS + ("collector",):
                 continue
-            s["received_at"] = now or time.time()
+            s["received_at"] = now
             f.write(json.dumps(s) + "\n")
             n += 1
+    if beats:
+        hp = coach_dir(home) / "signals" / "hosts.json"
+        try:
+            hosts = json.loads(hp.read_text())
+        except Exception:
+            hosts = {}
+        hosts.update(beats)
+        tmp = hp.with_suffix(".tmp")
+        tmp.write_text(json.dumps(hosts, indent=1))
+        tmp.replace(hp)
     return n
+
+
+def silent_forwarders(home: Path, now: Optional[float] = None) -> List[dict]:
+    """Hosts that forwarded before but not in SILENT_S: the forwarder (or the host's feed job / ssh) broke."""
+    now = now or time.time()
+    try:
+        hosts = json.loads((coach_dir(home) / "signals" / "hosts.json").read_text())
+    except Exception:
+        return []
+    out = []
+    for h, v in sorted(hosts.items()):
+        age = now - float(v.get("at") or 0)
+        if age > SILENT_S:
+            out.append({"kind": "collector", "component": "plugin", "at": now, "host": h,
+                        "symptom": f"self-heal signal forwarder on {h} has not reported for {age / 3600:.0f} h",
+                        "details": f"last heartbeat {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(v.get('at') or 0))}"
+                                   f"; the forwarder rides on that host's launchd coach feed (coach_feed.py, every "
+                                   f"30 min) and ssh to the hub",
+                        "fp": fp("plugin", "forwarder-silent", h)})
+    return out
 
 
 # ── monitors: a propose-only monitor files its finding to the lane instead of posting a bare Do-it card ──────

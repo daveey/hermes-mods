@@ -194,9 +194,23 @@ def test_forward_moves_cursor_only_on_success(home):
         sent.append(stdin)
         return SimpleNamespace(returncode=0, stdout='{"ingested": 9}', stderr="")
     r = sg.forward(home, "macbook", "you@hub.example.com", runner=good, now=NOW)
-    assert r["ok"] and r["sent"] == r_count(sent[0])
+    assert r["ok"] and r["sent"] == r_count(sent[0]) - 1  # + the heartbeat line
+    assert json.loads(sent[0].splitlines()[0])["kind"] == "heartbeat"
     assert calls[0][:3] == ["ssh", "-o", "BatchMode=yes"] and calls[0][-1] == sg.HUB_CMD
     assert sg.forward(home, "macbook", "you@hub.example.com", runner=good, now=NOW)["sent"] == 0
+    assert r_count(sent[-1]) == 1  # nothing new: the heartbeat still goes, so the hub sees the forwarder alive
+
+
+def test_hub_flags_a_silent_forwarder(tmp_path):
+    hub = tmp_path / "hub"
+    beat = json.dumps({"kind": "heartbeat", "host": "macbook", "n": 0})
+    assert sg.ingest(hub, beat + "\n", now=NOW) == 0  # heartbeats are not spooled
+    assert sg.silent_forwarders(hub, now=NOW + 3600) == []
+    late = sg.silent_forwarders(hub, now=NOW + 7 * 3600)
+    assert [s["host"] for s in late] == ["macbook"] and "has not reported for 7 h" in late[0]["symptom"]
+    got = []
+    sg.sweep(hub, "hermes-hub", filer=lambda d: got.append(d) or {"action": "would_file"}, now=NOW + 7 * 3600)
+    assert [d["host"] for d in got] == ["macbook"] and got[0]["component"] == "plugin"
 
 
 def r_count(payload):
