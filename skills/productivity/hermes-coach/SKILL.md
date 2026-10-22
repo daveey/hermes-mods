@@ -144,6 +144,22 @@ Undone notices are always plain cards.
 - A new curriculum `adopted` test that needs a fact the digest lacks: add a counter to `call_features()` /
   `CMD_FEATURES` in `session_digest.py` (names only, never argument text), bump `DIGEST_V`, re-ship, rerun every feed.
   Sanity-check new adoption counts against real sessions before trusting them (agent-run commands count too).
+- Verify a regex detector's hits (e.g. `coach_askgate.py`) against what the agent said just before, not the quote alone,
+  because quotes like "why didnt the agent…" or "…yourself" fire on third-party bots and on handoffs nobody asked for.
+  Local sessions: the previous assistant row in `state.db` `messages`. Other hosts: the digest
+  `~/code/hermes-coach-data/<host>/<profile>/<sid>.json` has `title`, user turns and `last_reply` only, never the reply
+  before a mid-session correction. Read that with `cross_session` action=read, target `@session:<profile>@<host>/<sid>`
+  (profile from the findings row or the digest path); a bare `<host>:<sid>` reads the default profile, and the same id
+  can exist under several profiles. A compacted session returns only its tail; later replies there often show the
+  pattern still recurring, which is stronger evidence than the old quote.
+- Reviewing a week's ask-gate hits (the Inbox Do-it): per hit, pull the reply before the correction and grep the skills
+  for a symptom fix that already landed. Then run the ask-gate plugin's `core.find_asks` over all those replies: the
+  ones it finds no ask in are the root gap, fixed in the plugin with the replies as test fixtures (a card behind any
+  in-flight ask-gate branch, not an edit to its worktree). For bot-profile hits, read the bot's `SOUL.md` and prerun
+  prompt in `~/code/hermes/hosts/<host>/<bot>/` (branch `state`): a report template that demands an asks section, or a
+  stale capability claim such as a too-narrow token scope, produces the asks, and cron runs bypass the ask-gate.
+  After narrowing a detector, diff the old and new hit lists and explain every dropped hit. Structural rules like
+  "skip a session's first turn" drop real hits, because a new session can open by answering an ask from another session.
 - Exclude shared team-bot profiles (`--exclude-profile`): they hold other people's conversations.
 - `[REDACTED]` inside ordinary prose usually means the `token|password …` rule caught a word. That rule requires
   a digit and ≥12 chars to keep false positives down.

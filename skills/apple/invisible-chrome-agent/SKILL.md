@@ -141,7 +141,7 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
   filter (only the supervisor and browser_focus, which reads Chrome's port from `ps`, should). Only the "Showing the user a
   page" flow below may activate. Test suites must launch their own headless Chrome, never use port 9333: a suite
   run against it raised Chrome once per test.
-- **"Something keeps selecting Chrome."** Find the caller, don't guess: `grep -E 'focus-(guard|filter)'
+- **"Something keeps selecting Chrome" / "I lost my cursor or window."** Find the caller, don't guess: `grep -E 'focus-(guard|filter)'
   ~/.hermes/logs/chrome-agent.log` (a `focus-guard` hand-back with no `focus-filter` line just before it means the
   raise did not come through 9333: a direct 9334 client, the show flag, or a non-CDP activation), then follow `references/focus-steal-diagnosis.md` (persisted WindowServer
   history, live requester attribution, osascript ancestry, matching steal bursts to agent tool calls in `state.db`).

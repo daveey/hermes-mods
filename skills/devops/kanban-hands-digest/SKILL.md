@@ -21,7 +21,16 @@ machine can verify.
 
 "What's blocked?" / "what do you need from me?" means **this chat's cards** (the ones it created or is
 subscribed to — its task strip), not every board. Find them from this session's own `kanban_create` results /
-task strip, then `kanban_show` each and report the blocked ones. Go global (the digest script below, all
+task strip, then `kanban_show` each and report the blocked ones. Also report two states that wait silently:
+- `triage` with a human `block_kind` (`needs_input`/`capability`): block-loop detection moved a repeatedly
+  re-blocked card there. It still waits on the user, and the latest `block_loop_detected` event holds the ask.
+  Filtering on `status='blocked'` alone (as the digest script does) misses these.
+- `scheduled` cards whose wake time has passed, or that have no wake time at all (no `wake_at` on the
+  latest `continued`/`scheduled` event, or a wake cron that no longer exists): they sit unrun
+  indefinitely. Re-queue with `hermes kanban unblock <id>` (it accepts scheduled cards). A `needs_input`
+  card parked in scheduled is an ask of the user; report it.
+When the user's step is done, re-queue the card yourself (`kanban_unblock`, or the CLI for triage) after a
+comment saying what changed. Don't wait for the card to notice. Go global (the digest script below, all
 boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
 say it's a global view.
 

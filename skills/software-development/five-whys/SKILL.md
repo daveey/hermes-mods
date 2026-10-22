@@ -98,6 +98,11 @@ Each countermeasure is concrete and verifiable: a regression test that fails bef
 can trigger, a doc or skill change with its path. "Be more careful" is not a countermeasure. If a root-level fix is
 too big for now, file it (card or issue with the chain) and say so in the report; don't drop it silently.
 
+After the countermeasures ship, verify each one against live data before calling the chain closed: the guard's own
+telemetry (did it fire, how often, what did it fall back to), not the worker's "done" summary. A guard that "works"
+often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
+the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
+
 ### 7. Write it down
 
 Put the chain where the fix lives: PR body, issue resolution, card comment, or postmortem doc. Use this shape:
