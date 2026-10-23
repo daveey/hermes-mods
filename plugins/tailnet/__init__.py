@@ -1,0 +1,550 @@
+"""tailnet — run commands on the owner's reachable tailnet machines, with credentials only from the token broker.
+
+Tools (gateway-side: they run in the gateway process, never inside an agent sandbox):
+
+* ``tailnet_hosts()``                         the inventory (name, os, notes, reachability); no credentials
+* ``tailnet_exec(host, command, reason)``     run a shell command on a host over ssh
+* ``tailnet_copy(host, direction, ...)``      scp a file to/from a staging dir on the gateway
+
+Credentials: every call is ``token-broker exec --scope <scope> -- python runner.py``. The broker puts the ssh key
+in the *runner's* environment only; the runner writes it to a 0600 tmpfs file, runs ssh with a scrubbed
+environment, deletes the file, and returns capped, scrubbed JSON. The key never enters the model context, the
+agent sandbox, a log, or a tool result.
+
+Gate (decided by the gateway-bound session identity, not by anything the model passes): the owner's own Slack DM
+turn uses the auto-tier scope and runs now. Any other turn (channel thread, another user, cron, CLI) opens an
+approval-tier broker request (grant=once) that DMs the owner host + command + requester; the command runs only
+when the model calls the tool again with that request_id after the owner approved, and it runs the command
+stored with the request, not new model text. This plugin never approves anything.
+
+Config (profile config.yaml)::
+
+    tailnet:
+      enabled: true
+      hosts_file: ~/.hermes/tailnet/hosts.yaml     # default: <hermes home>/tailnet/hosts.yaml
+      broker: ~/.local/bin/token-broker
+
+hosts.yaml::
+
+    owners: [U0EXAMPLE1]                  # Slack user ids whose own DM turns are "owner" turns
+    scope: user/tailnet-ssh-key            # auto tier (owner turns)
+    approval_scope: user/tailnet-ssh-key-approval   # approval tier, grant=once (everyone else)
+    hosts:
+      mini: {addr: 192.0.2.10, user: me, os: macOS, notes: "..."}
+      den: {addr: den.local, user: me, via: mini}   # reached by hopping through `mini`
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+TOOLSET = "tailnet"
+HERE = Path(__file__).parent
+RUNNER = HERE / "runner.py"
+MAX_OUT = 8000            # chars of stdout / stderr returned per call
+MAX_CMD = 4000
+MAX_COPY_BYTES = 25 * 1024 * 1024
+EXEC_TIMEOUT_S = 120
+MAX_TIMEOUT_S = 600
+PENDING_TTL_S = 3600
+HOST_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,40}$")
+ADDR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,100}$")
+USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,40}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,100}$")
+REQ_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f-]{27}|req_[A-Za-z0-9_-]{6,60}|[A-Za-z0-9_-]{8,64}")
+KEY_BLOCK = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S)
+
+
+# ---------------------------------------------------------------- config / inventory
+
+def _home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _config() -> dict:
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+        return load_config() or {}
+    except Exception:
+        return {}
+
+
+def settings() -> dict:
+    return _config().get("tailnet") or {}
+
+
+def _read_yaml(path: Path) -> dict:
+    if path.suffix == ".json":
+        return json.loads(path.read_text())
+    try:
+        from utils import load_yaml_file_readonly  # type: ignore
+        return dict(load_yaml_file_readonly(path) or {})
+    except ImportError:
+        pass
+    import yaml  # type: ignore
+    return yaml.safe_load(path.read_text()) or {}
+
+
+def hosts_file() -> Path:
+    s = settings()
+    p = os.environ.get("TAILNET_HOSTS_FILE") or s.get("hosts_file")
+    if p:
+        return Path(os.path.expanduser(str(p)))
+    return _home() / "tailnet" / "hosts.yaml"
+
+
+class Inventory:
+    def __init__(self, raw: dict):
+        self.raw = raw or {}
+        self.scope = str(self.raw.get("scope") or "user/tailnet-ssh-key")
+        self.approval_scope = str(self.raw.get("approval_scope") or "user/tailnet-ssh-key-approval")
+        o = self.raw.get("owners") or []
+        if isinstance(o, str):
+            o = [x for x in re.split(r"[,\s]+", o) if x]
+        self.owners = frozenset(str(x).strip() for x in o if str(x).strip())
+        self.hosts: dict = {}
+        for name, h in (self.raw.get("hosts") or {}).items():
+            n = str(name).strip().lower()
+            if not (HOST_RE.match(n) and isinstance(h, dict)):
+                continue
+            addr, user = str(h.get("addr") or ""), str(h.get("user") or "")
+            if not (ADDR_RE.match(addr) and USER_RE.match(user)):
+                continue
+            self.hosts[n] = {"addr": addr, "user": user, "os": str(h.get("os") or ""),
+                             "notes": str(h.get("notes") or ""), "via": str(h.get("via") or "").lower() or None}
+        for n, h in self.hosts.items():  # a hop must exist, be direct, and not loop
+            v = h["via"]
+            if v and (v not in self.hosts or self.hosts[v]["via"] or v == n):
+                h["via"] = "!invalid"
+
+    def get(self, name: str) -> Optional[dict]:
+        h = self.hosts.get(str(name or "").strip().lower())
+        return h if h and h["via"] != "!invalid" else None
+
+
+def load_inventory() -> Inventory:
+    return Inventory(_read_yaml(hosts_file()))
+
+
+# ---------------------------------------------------------------- who is asking
+
+def _session(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env  # type: ignore
+        return get_session_env("HERMES_SESSION_" + name, "") or ""
+    except Exception:
+        return os.environ.get("HERMES_SESSION_" + name, "")
+
+
+def requester(inv: Inventory, extra_owners: frozenset = frozenset()) -> dict:
+    """Who this turn is, from gateway-bound identity. owner=True only for the owner's own Slack DM."""
+    owners = inv.owners | extra_owners
+    # The owner-only mac-ops profile gets its turn from the gateway via MAC_OPS_* (a Slack-verified owner DM).
+    ch, th, ow = (os.environ.get("MAC_OPS_CHANNEL", ""), os.environ.get("MAC_OPS_THREAD", ""),
+                  os.environ.get("MAC_OPS_OWNER", ""))
+    if ch.startswith("D") and th and ow and ow in owners:
+        return {"owner": True, "user": ow, "channel": ch, "thread": th, "via": "mac-ops",
+                "bot_home": os.environ.get("MAC_OPS_BOT_HOME", "")}
+    platform, ctype = _session("PLATFORM"), _session("CHAT_TYPE")
+    user, chat, thread = _session("USER_ID"), _session("CHAT_ID"), _session("THREAD_ID")
+    is_owner = (platform.lower() == "slack" and ctype.lower() in ("dm", "im") and user in owners
+                and chat.startswith("D"))
+    return {"owner": bool(is_owner), "user": user or "", "channel": chat, "thread": thread,
+            "platform": platform, "via": "session", "bot_home": ""}
+
+
+def who(req: dict) -> str:
+    if req.get("user"):
+        return f"slack:{req['user']} in {req.get('channel') or '?'}"
+    return "no slack session (cron/cli/other)"
+
+
+# ---------------------------------------------------------------- scrubbing, audit, thread line
+
+def scrub(text: str) -> str:
+    """Remove private-key material (and any literal secret in the env of this process) from text."""
+    text = KEY_BLOCK.sub("[redacted key]", text or "")
+    for k in ("TAILNET_SSH_KEY",):
+        v = os.environ.get(k)
+        if v and len(v) > 20:
+            text = text.replace(v, "[redacted]")
+    return text
+
+
+def cap(text: str, n: int = MAX_OUT) -> tuple:
+    text = scrub(text)
+    return (text[:n], True) if len(text) > n else (text, False)
+
+
+def audit_path() -> Path:
+    return _home() / "tailnet" / "audit.jsonl"
+
+
+def audit(rec: dict) -> None:
+    rec = dict(rec, ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    for k in ("command", "reason"):
+        if k in rec:
+            rec[k] = scrub(str(rec[k]))[:600]
+    try:
+        p = audit_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as exc:
+        logger.warning("tailnet audit write failed: %s", exc)
+
+
+def _bot_token(req: dict) -> str:
+    for home in (req.get("bot_home"), str(_home())):
+        if not home:
+            continue
+        try:
+            for line in (Path(home) / ".env").read_text().splitlines():
+                if line.startswith("SLACK_BOT_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+        except OSError:
+            continue
+    return ""
+
+
+def slack_post(req: dict, text: str) -> None:
+    tok = _bot_token(req)
+    if not (tok and req.get("channel")):
+        return
+    params = {"channel": req["channel"], "text": text[:500]}
+    if req.get("thread"):
+        params["thread_ts"] = req["thread"]
+    r = urllib.request.Request("https://slack.com/api/chat.postMessage", data=urllib.parse.urlencode(params).encode(),
+                               headers={"Authorization": "Bearer " + tok})
+    urllib.request.urlopen(r, timeout=15).read()
+
+
+POST: Callable[[dict, str], None] = slack_post
+
+
+def thread_line(req: dict, text: str) -> None:
+    try:
+        POST(req, text)
+    except Exception as exc:  # the audit jsonl is the record; the thread line is a courtesy
+        logger.info("tailnet thread audit not posted: %s", exc)
+
+
+# ---------------------------------------------------------------- broker
+
+def broker_bin() -> str:
+    b = settings().get("broker")
+    if b:
+        return os.path.expanduser(str(b))
+    return shutil.which("token-broker") or os.path.expanduser("~/.local/bin/token-broker")
+
+
+def _reason(kind: str, host: str, what: str, req: dict, why: str) -> str:
+    r = f"tailnet {kind} on {host}: {what} | requester {who(req)} | why: {why}"
+    return re.sub(r"\s+", " ", r)[:480]
+
+
+def run_via_broker(scope: str, reason: str, job: dict, *, request_id: str = "", timeout: int) -> dict:
+    """token-broker exec --scope S -- runner. The job (no credentials) goes in on stdin; JSON comes back."""
+    argv = [broker_bin(), "exec", "--scope", scope, "--reason", reason]
+    if request_id:
+        argv += ["--request-id", request_id]
+    argv += ["--", sys.executable, str(RUNNER)]
+    env = {k: v for k, v in os.environ.items() if k != "TAILNET_SSH_KEY"}
+    try:
+        p = subprocess.run(argv, input=json.dumps(job), capture_output=True, text=True, timeout=timeout + 45, env=env)
+    except subprocess.TimeoutExpired:
+        return {"ran": False, "error": "broker/ssh call timed out"}
+    except OSError as exc:
+        return {"ran": False, "error": f"cannot start token-broker: {exc}"}
+    lines = [ln for ln in (p.stdout or "").strip().splitlines() if ln.strip().startswith("{")]
+    if lines:
+        try:
+            out = json.loads(lines[-1])
+            if isinstance(out, dict) and "rc" in out:
+                out["ran"] = True
+                return out
+        except ValueError:
+            pass
+    return {"ran": False, "error": "no result from runner (broker refused or not approved yet)",
+            "detail": scrub((p.stderr or p.stdout or "")[-400:]), "broker_rc": p.returncode}
+
+
+def open_request(scope: str, reason: str) -> dict:
+    """Non-blocking approval request. Returns {request_id} or {error}. Never approves."""
+    try:
+        p = subprocess.run([broker_bin(), "request", "--scope", scope, "--reason", reason],
+                           capture_output=True, text=True, timeout=60, env={k: v for k, v in os.environ.items()
+                                                                           if k != "TAILNET_SSH_KEY"})
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"error": f"cannot open approval request: {exc}"}
+    text = (p.stdout or "") + "\n" + (p.stderr or "")
+    rid = ""
+    for src in (p.stdout or "", p.stderr or ""):
+        try:
+            j = json.loads(src)
+            rid = str(j.get("request_id") or j.get("id") or "")
+        except ValueError:
+            m = re.search(r"request[_ ]id\W+([A-Za-z0-9_-]{6,64})", src, re.I)
+            rid = m.group(1) if m else ""
+        if rid:
+            break
+    if p.returncode != 0 or not rid:
+        return {"error": "approval request failed: " + scrub(text)[-300:]}
+    return {"request_id": rid}
+
+
+# ---------------------------------------------------------------- pending approvals
+
+def _pending_path() -> Path:
+    return _home() / "tailnet" / "pending.json"
+
+
+def _pending_load() -> dict:
+    try:
+        d = json.loads(_pending_path().read_text())
+    except (OSError, ValueError):
+        d = {}
+    now = time.time()
+    return {k: v for k, v in d.items() if isinstance(v, dict) and now - v.get("at", 0) < PENDING_TTL_S}
+
+
+def _pending_save(d: dict) -> None:
+    p = _pending_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(d))
+    p.chmod(0o600)
+
+
+# ---------------------------------------------------------------- tools
+
+def _jerr(msg: str, **kw: Any) -> str:
+    return json.dumps({"ok": False, "error": msg, **kw})
+
+
+def staging_dir() -> Path:
+    d = _home() / "tailnet" / "files"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _job_base(inv: Inventory, host: str, timeout: int) -> dict:
+    h = inv.get(host) or {}
+    job: dict = {"target": {"addr": h["addr"], "user": h["user"]}, "timeout": timeout, "cap": MAX_OUT,
+           "known_hosts": str(_home() / "tailnet" / "known_hosts")}
+    if h["via"]:
+        v = inv.hosts[h["via"]]
+        job["via"] = {"addr": v["addr"], "user": v["user"]}
+    return job
+
+
+def _finish(kind: str, host: str, what: str, req: dict, why: str, scope: str, res: dict, approval: str = "") -> str:
+    rc = res.get("rc")
+    out, t1 = cap(str(res.get("stdout") or ""))
+    err, t2 = cap(str(res.get("stderr") or ""))
+    rec = {"kind": kind, "host": host, "command": what, "requester": who(req), "owner_turn": req["owner"],
+           "scope": scope, "rc": rc, "ran": bool(res.get("ran")), "reason": why, "approval": approval or None}
+    if not res.get("ran"):
+        rec["error"] = scrub(str(res.get("error") or ""))[:300]
+    audit(rec)
+    status = "rc=%s" % rc if res.get("ran") else "did not run"
+    thread_line(req, f"tailnet {kind} on {host}: `{what[:160]}` -> {status} "
+                     f"({'owner DM' if req['owner'] else 'approved'}; scope {scope})")
+    if not res.get("ran"):
+        return json.dumps({"ok": False, "ran": False, "error": res.get("error"), "detail": res.get("detail")})
+    return json.dumps({"ok": rc == 0, "ran": True, "host": host, "rc": rc, "stdout": out, "stderr": err,
+                       "truncated": t1 or t2, "seconds": res.get("seconds")})
+
+
+def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, payload: dict,
+          args: dict, timeout: int) -> str:
+    """Owner DM turn -> run now on the auto scope. Otherwise open (or collect) a per-command approval."""
+    if req["owner"]:
+        res = run_via_broker(inv.scope, _reason(kind, host, what, req, why), payload, timeout=timeout)
+        return _finish(kind, host, what, req, why, inv.scope, res)
+    rid = str(args.get("request_id") or "").strip()
+    pending = _pending_load()
+    if rid:
+        p = pending.get(rid)
+        if not p:
+            return _jerr("unknown or expired request_id; make a new request")
+        # run exactly what was requested, for the requester that asked for it
+        res = run_via_broker(inv.approval_scope, p["reason"], p["payload"], request_id=rid, timeout=p["timeout"])
+        if res.get("ran"):
+            pending.pop(rid, None)
+            _pending_save(pending)
+        else:
+            audit({"kind": kind, "host": p["host"], "command": p["what"], "requester": p["requester"],
+                   "owner_turn": False, "scope": inv.approval_scope, "ran": False, "approval": rid,
+                   "error": "not approved yet or denied"})
+            return json.dumps({"ok": False, "ran": False, "status": "waiting_for_approval", "request_id": rid,
+                               "message": "Not approved yet (or denied). Nothing was run. Tell the requester it is "
+                                          "waiting on the owner, and do not retry in a loop.",
+                               "detail": res.get("detail")})
+        return _finish(p["kind"], p["host"], p["what"], {"owner": False, "user": req["user"], "channel": req["channel"],
+                                                         "thread": req["thread"]}, p["why"], inv.approval_scope, res,
+                       approval=rid)
+    reason = _reason(kind, host, what, req, why)
+    r = open_request(inv.approval_scope, reason)
+    if r.get("error"):
+        audit({"kind": kind, "host": host, "command": what, "requester": who(req), "owner_turn": False,
+               "ran": False, "error": r["error"]})
+        return _jerr(r["error"], ran=False)
+    rid = r["request_id"]
+    pending[rid] = {"kind": kind, "host": host, "what": what, "why": why, "payload": payload, "timeout": timeout,
+                    "reason": reason, "requester": who(req), "at": time.time()}
+    _pending_save(pending)
+    audit({"kind": kind, "host": host, "command": what, "requester": who(req), "owner_turn": False,
+           "scope": inv.approval_scope, "ran": False, "approval": rid, "status": "approval requested"})
+    thread_line(req, f"tailnet {kind} on {host}: `{what[:160]}` needs the owner's approval (request {rid}); "
+                     f"nothing has run.")
+    return json.dumps({"ok": False, "ran": False, "status": "approval_requested", "request_id": rid,
+                       "message": "The owner got a Slack DM with the host, command and requester. Nothing has run. "
+                                  "Tell the requester it is waiting for approval; after the owner approves, call "
+                                  "this tool again with this request_id (and nothing else changed)."})
+
+
+def _common(args: dict) -> tuple:
+    try:
+        inv = load_inventory()
+    except Exception as exc:
+        return None, None, "", _jerr(f"tailnet inventory unavailable: {type(exc).__name__}")
+    host = str(args.get("host") or "").strip().lower()
+    if not inv.get(host):
+        return None, None, host, _jerr(f"unknown host {host!r}; known: {', '.join(sorted(inv.hosts)) or 'none'}")
+    return inv, requester(inv), host, ""
+
+
+def tool_hosts(args: dict, **_: Any) -> str:
+    try:
+        inv = load_inventory()
+    except Exception as exc:
+        return _jerr(f"tailnet inventory unavailable: {type(exc).__name__}")
+    rows = [{"host": n, "os": h["os"], "via": h["via"], "notes": h["notes"]} for n, h in sorted(inv.hosts.items())
+            if h["via"] != "!invalid"]
+    return json.dumps({"ok": True, "hosts": rows})
+
+
+def _timeout(args: dict) -> int:
+    try:
+        return max(5, min(int(args.get("timeout") or EXEC_TIMEOUT_S), MAX_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return EXEC_TIMEOUT_S
+
+
+def tool_exec(args: dict, **_: Any) -> str:
+    inv, req, host, err = _common(args)
+    if err:
+        return err
+    rid = str(args.get("request_id") or "").strip()
+    command = str(args.get("command") or "")
+    why = str(args.get("reason") or "").strip()
+    if not rid:
+        if not command.strip() or len(command) > MAX_CMD or "\x00" in command:
+            return _jerr(f"command is required (at most {MAX_CMD} chars)")
+        if len(why) < 5:
+            return _jerr("reason is required (at least 5 characters): why this is being run")
+    if req["owner"] and not command.strip():
+        return _jerr("command is required")
+    timeout = _timeout(args)
+    payload = dict(_job_base(inv, host, timeout), mode="exec", command=command)
+    return _gate(inv, req, "exec", host, command, why, payload, args, timeout)
+
+
+def tool_copy(args: dict, **_: Any) -> str:
+    inv, req, host, err = _common(args)
+    if err:
+        return err
+    rid = str(args.get("request_id") or "").strip()
+    direction = str(args.get("direction") or "").strip().lower()
+    remote = str(args.get("remote_path") or "")
+    name = str(args.get("local_name") or "")
+    why = str(args.get("reason") or "").strip()
+    content = args.get("content")
+    if not rid:
+        if direction not in ("put", "get"):
+            return _jerr("direction must be put or get")
+        if not remote or len(remote) > 500 or "\x00" in remote or "\n" in remote:
+            return _jerr("remote_path is required (one line)")
+        if not NAME_RE.match(name) or name in (".", ".."):
+            return _jerr("local_name must be a plain file name in the gateway staging dir (no slashes)")
+        if len(why) < 5:
+            return _jerr("reason is required (at least 5 characters)")
+    local = staging_dir() / (name or "unnamed")
+    if not rid and direction == "put":
+        if content is not None:
+            data = str(content).encode()
+            if len(data) > 1024 * 1024:
+                return _jerr("content over 1 MB; stage large files on the gateway host instead")
+            local.write_bytes(data)
+        if not local.is_file():
+            return _jerr("put needs content, or a file already in the staging dir named local_name")
+        if local.stat().st_size > MAX_COPY_BYTES:
+            return _jerr("file over 25 MB")
+    timeout = _timeout(args)
+    payload: dict = dict(_job_base(inv, host, timeout), mode=direction, remote=remote, local=str(local),
+                         max_bytes=MAX_COPY_BYTES)
+    what = f"{direction} {remote} {'<-' if direction == 'put' else '->'} staging/{name}"
+    out = _gate(inv, req, "copy", host, what, why, payload, args, timeout)
+    return out
+
+
+SCHEMAS = {
+    "tailnet_hosts": ("List the owner's machines reachable over the tailnet (name, OS, notes). Use before "
+                      "tailnet_exec. Lists names only; no credentials.", {}, [], tool_hosts),
+    "tailnet_exec": ("Run a shell command on one of the owner's tailnet machines over ssh. Credentials come from the "
+                     "token broker per call and never reach you. In the owner's own Slack DM it runs now. For anyone "
+                     "else, or any other context, it opens an approval request that DMs the owner the host, command "
+                     "and requester and returns a request_id; nothing runs until the owner approves, then call again "
+                     "with request_id. Use this instead of refusing or handing someone a command to paste.",
+                     {"host": {"type": "string"}, "command": {"type": "string"},
+                      "reason": {"type": "string", "description": "why this is being run (shown to the owner)"},
+                      "timeout": {"type": "integer", "description": "seconds, default 120, max 600"},
+                      "request_id": {"type": "string", "description": "approved request to collect; omit otherwise"}},
+                     ["host"], tool_exec),
+    "tailnet_copy": ("Copy a file to (put) or from (get) a tailnet machine. Local side is the gateway's staging "
+                     "dir (local_name, a plain file name; or content= for a small text put). Same gate as "
+                     "tailnet_exec.",
+                     {"host": {"type": "string"}, "direction": {"type": "string", "enum": ["put", "get"]},
+                      "remote_path": {"type": "string"}, "local_name": {"type": "string"},
+                      "content": {"type": "string", "description": "put only: small text to write first"},
+                      "reason": {"type": "string"}, "timeout": {"type": "integer"},
+                      "request_id": {"type": "string"}}, ["host"], tool_copy),
+}
+
+
+def enabled() -> bool:
+    return bool(settings().get("enabled", True))
+
+
+def register(ctx) -> None:
+    if not enabled():
+        return
+    for name, (desc, props, required, fn) in SCHEMAS.items():
+        def handler(args, _fn=fn, **kw):
+            try:
+                return _fn(dict(args or {}), **kw)
+            except Exception as exc:
+                logger.warning("tailnet tool failed: %s", exc, exc_info=True)
+                return _jerr(f"{type(exc).__name__}: {scrub(str(exc))[:200]}")
+        schema = {"name": name, "description": desc,
+                  "parameters": {"type": "object", "properties": props, "required": required}}
+        ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler, description=desc,
+                          check_fn=lambda: hosts_file().is_file())

