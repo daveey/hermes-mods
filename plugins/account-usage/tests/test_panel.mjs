@@ -199,3 +199,22 @@ test('gemini status-only row: rejected key reads "key rejected", never out of qu
  // no gemini row -> no chip
  assert.equal(plugin.summarize({providers:[]}).length,0)
 })
+test('status-only unchecked key (state unknown, no windows) reads "not checked yet", never "key rejected"', async () => {
+ const {plugin}=await setup()
+ // Live backend shape on a cold/stale cache: the recheck has not landed yet.
+ const payload={providers:[{slug:'gemini',name:'Gemini',usage:{accounts:[{id:'fp:x',label:'GOOGLE_API_KEY',windows:[],state:'unknown',resets_at:null,limit_kind:null,reason:null,cooldown_until:null,model_cooldowns:[]}]}}]}
+ const [g]=plugin.summarize(payload)
+ assert.equal(g.ready,0); assert.equal(g.limited,0)
+ const hint=plugin.statusHint(g,g.accounts[0])
+ assert.doesNotMatch(hint,/rejected|blocked/i); assert.match(hint,/not checked yet/)
+ assert.notEqual(plugin.countColor(g),'#f85149')
+ // a real rejection still reads rejected, in red
+ const [bad]=plugin.summarize({providers:[{slug:'gemini',usage:{accounts:[{id:'k',label:'k',state:'limited',limit_kind:'quota',windows:[{label:'API key',used_percent:100,scope:'account'}]}]}}]})
+ assert.match(plugin.statusHint(bad,bad.accounts[0]),/key rejected/); assert.equal(plugin.countColor(bad),'#f85149')
+ // valid key
+ const [ok]=plugin.summarize({providers:[{slug:'gemini',usage:{accounts:[{id:'k',label:'k',state:'ready',windows:[{label:'API key',used_percent:0,scope:'account'}]}]}}]})
+ assert.match(plugin.statusHint(ok,ok.accounts[0]),/API key valid/); assert.equal(plugin.countColor(ok),undefined)
+ // xAI unchecked is not "API blocked" either
+ const [x]=plugin.summarize({providers:[{slug:'xai-oauth',usage:{accounts:[{id:'a',label:'a',state:'unknown',windows:[]}]}}]})
+ assert.doesNotMatch(plugin.statusHint(x,x.accounts[0]),/blocked/)
+})

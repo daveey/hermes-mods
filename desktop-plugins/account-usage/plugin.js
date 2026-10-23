@@ -105,6 +105,24 @@ export function describe(account, now = Date.now()) {
   return parts.join(' · ')
 }
 
+// Status-only providers (Grok, Gemini) say "rejected"/"blocked" ONLY for a real failed check (state limited).
+// An account with no fresh check yet (state unknown: cold start, or the 15-min snapshot went stale and the
+// background recheck hasn't landed) is "not checked yet", never "key rejected".
+// Chip count colour: red only when something is actually limited; all-unchecked stays grey.
+export function countColor(g) {
+  if (g.ready > 0) return undefined
+  if (g.limited) return COLORS.limited
+  if (g.cooling) return COLORS.cooldown
+  return COLORS.unknown
+}
+
+export function statusHint(g, a) {
+  if (a.state === 'ready') return g.statusOk || 'API access ok · no usage windows (xAI has no usage API)'
+  if (a.state === 'limited') return g.statusBadHint || 'API blocked · add credits at console.x.ai'
+  if (a.state === 'unavailable') return 'credential unavailable · sign in again'
+  return 'not checked yet · rechecks in a few seconds'
+}
+
 export function summarize(payload, last = {}, now = Date.now()) {
   const rows = (payload && payload.providers) || []
   return PROVIDERS.map(p => {
@@ -374,8 +392,7 @@ function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconne
           ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null,
         describe(a) ? jsx('span', { className: 'hermes-au-why', 'data-tone': tone(a), style: { display: 'block', fontSize: 10, color: COLORS[tone(a)] || undefined, opacity: 0.9 }, children: describe(a) }) : null] }),
       ...(g.statusOnly
-        ? [jsx('span', { style: { gridColumn: 'span 2', fontSize: 10.5, opacity: 0.8 }, children:
-            a.state === 'ready' && g.statusOk ? g.statusOk : a.state !== 'ready' && g.statusBadHint ? g.statusBadHint : a.state === 'ready' ? 'API access ok · no usage windows (xAI has no usage API)' : 'API blocked · add credits at console.x.ai' })]
+        ? [jsx('span', { style: { gridColumn: 'span 2', fontSize: 10.5, opacity: 0.8 }, children: statusHint(g, a) })]
         : [jsx(Meter, { win: pickWindow(a.windows, 'session') }), jsx(Meter, { win: pickWindow(a.windows, 'week') })])
     ] }), jsx(ReconnectLine, { g, a, reconnectStore, reconnectState })] }))
   ] })
@@ -410,7 +427,7 @@ function UsageBar({ store, selectionStore, reconnectStore }) {
         title: `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
           jsx('b', { style: { fontWeight: 600 }, children: g.name }),
           jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
-          jsx('span', { style: { color: g.ready === 0 ? (!g.limited && g.cooling ? COLORS.cooldown : COLORS.limited) : undefined }, children: `${g.ready}/${g.total}` })
+          jsx('span', { style: { color: countColor(g) }, children: `${g.ready}/${g.total}` })
         ] }))
     }) }),
     jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[460px]', style: PANEL_STYLE, children:
