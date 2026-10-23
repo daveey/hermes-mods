@@ -11,6 +11,7 @@ Patches:
 - `patches/0183-tests-isolate-gateway-service-tests-from-container-r.patch`: gateway service tests no longer depend on the runner.
 - `patches/0188-test-make-3-env-sensitive-tests-independent-of-the-C.patch`: orphan-readopt (TUI) and termux-api detection tests no longer depend on the runner env.
 - `patches/0189-lint-fix-12-ruff-errors-blocking-CI-daveey-11.patch`: 12 ruff errors (update_cmd_git, startup_resume and their tests) that kept the lint job red.
+- `patches/0193-ci-run-CI-review-comment-on-self-hosted-hermes-hub-r.patch`: the PR review-comment poller (`ci-review-comment.yml`) runs on the self-hosted runner too; hosted jobs were refused for billing, so it failed before starting.
 
 What you see: the private fork's CI runs (and passes) without GitHub-hosted minutes. None of this changes runtime
 behavior; it is workflow wiring and test isolation.
