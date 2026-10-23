@@ -33,8 +33,16 @@ MAX_TITLE = 120
 MAX_BODY = 20_000
 MAX_PROMPT = 4_000
 STALE_QUEUING_S = 300  # a task claim older than this had a crashed claimant; act() may retry it
+# Noise breaker: a poster whose last MUTE_AFTER closed cards (within MUTE_WINDOW_S) were all archived
+# with no action is refused, and one Kanban card is filed to fix that poster. David's Archive is the signal.
+MUTE_AFTER = 3
+MUTE_WINDOW_S = 7 * 86400
 
 _lock = threading.RLock()
+
+
+class PosterMuted(ValueError):
+    """The poster's recent cards were all dismissed; its posts are refused until it is fixed + unmuted."""
 
 
 class TaskError(RuntimeError):
@@ -67,6 +75,10 @@ CREATE TABLE IF NOT EXISTS items (
   state         TEXT NOT NULL DEFAULT 'open'
 );
 CREATE INDEX IF NOT EXISTS items_key ON items(key);
+CREATE TABLE IF NOT EXISTS unmutes (
+  poster     TEXT PRIMARY KEY,
+  unmuted_at REAL NOT NULL
+);
 """
 # Added with card types; ALTERed into older sidecars on open (idempotent).
 _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
@@ -232,6 +244,14 @@ class Inbox:
                     side.commit()
                     db.set_session_read(talking, False)
                     return {"session_id": talking, "updated": True, "conversation": True}
+                ignored = self._ignored_streak(side, db, poster, now) if poster else 0
+                if poster and ignored >= MUTE_AFTER:
+                    self._file_mute_card(poster, title, body)
+                    raise PosterMuted(
+                        f"poster {poster!r} is muted: its last {ignored} inbox cards were archived with no "
+                        f"action, so its posts are noise to David. Route what it reports to a Kanban card "
+                        f"(an agent fixes it) and post to the Inbox only a decision David alone can make. "
+                        f"Unmute after fixing the poster: `hermes inbox unmute {poster!r}`.")
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
@@ -250,6 +270,51 @@ class Inbox:
             finally:
                 side.close()
                 self._close(db)
+
+    def _ignored_streak(self, side, db, poster: str, now: float) -> int:
+        """How many of *poster*'s most recent closed cards (inside MUTE_WINDOW_S, after its last unmute)
+        in a row were archived with no action. Accepted (Do it / a reply) or resolved breaks the streak;
+        cards still open don't count either way."""
+        row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=?", (poster,)).fetchone()
+        since = max(now - MUTE_WINDOW_S, float(row["unmuted_at"]) if row else 0.0)
+        streak = 0
+        for r in side.execute("SELECT session_id, state FROM items WHERE poster=? AND created_at>=? "
+                              "ORDER BY created_at DESC LIMIT 50", (poster, since)):
+            if r["state"] in ("accepted", "resolved", "queuing"):
+                break
+            s = db.get_session(r["session_id"])
+            if s and not s.get("archived") and not s.get("hidden"):
+                break  # un-hidden through another door = David engaged with it
+            if r["state"] == "archived" or not s or s.get("archived"):
+                streak += 1
+                if streak >= MUTE_AFTER:
+                    break
+        return streak
+
+    def _file_mute_card(self, poster: str, title: str, body: str) -> None:
+        """One Kanban card per muted poster (idempotent): an agent fixes the poster's signal."""
+        try:
+            (self._task_creator or kanban_task_creator)(
+                title=f"Inbox poster muted as noise: {poster}"[:120],
+                body=(f"David archived the last {MUTE_AFTER} Hermes Inbox cards from `{poster}` with no "
+                      f"action, so the inbox now refuses its posts. Find the code that posts as this poster "
+                      f"and change it: problems an agent can fix go to a Kanban card (assignee default), "
+                      f"routine status goes nowhere, and only a decision David alone can make goes to the "
+                      f"Inbox. Then run `hermes inbox unmute '{poster}'` on the gateway that refused it.\n\n"
+                      f"Refused post:\n\n**{title}**\n\n{body[:3000]}"),
+                assignee="default", idempotency_key=f"inbox-muted:{poster}")
+        except Exception:
+            pass  # the refusal itself is the guard; the card is best-effort
+
+    def unmute(self, poster: str) -> None:
+        with _lock:
+            side = self._side()
+            try:
+                side.execute("INSERT INTO unmutes(poster, unmuted_at) VALUES (?, ?) ON CONFLICT(poster) "
+                             "DO UPDATE SET unmuted_at=excluded.unmuted_at", (poster, self.clock()))
+                side.commit()
+            finally:
+                side.close()
 
     def _open_by_key(self, side, db, key) -> Optional[str]:
         for row in side.execute("SELECT session_id FROM items WHERE key=? AND state='open' "

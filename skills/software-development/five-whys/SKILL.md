@@ -115,6 +115,10 @@ problem gets small fixes at every level, not a rewrite. Usually:
 - **Symptom level:** fix the immediate defect (the fuse). Necessary, never sufficient.
 - **Root level:** fix the process, guard or design (the strainer, a check that flags any pump without one).
 - **Detection level:** make the "why wasn't it caught" chain end in a test, assertion, alert, lint or gate.
+  An alert goes to whoever fixes it: if an agent can fix it, the detector opens a Kanban card (one per incident,
+  later occurrences as comments), never an Inbox card or message to David. "David noticed first" is fixed by
+  agents noticing and fixing first, not by telling David faster. A human-facing alert is only for a decision only
+  he can make.
 
 Each countermeasure is concrete and verifiable: a regression test that fails before and passes after, a guard you
 can trigger, a doc or skill change with its path. "Be more careful" is not a countermeasure. If a root-level fix is

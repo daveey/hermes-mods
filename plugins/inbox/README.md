@@ -16,6 +16,20 @@ The card ends with the full **Proposed:** prompt, or, when the poster passes `pr
 
 Re-posting with the same `key` updates the open message (new assistant note, title, prompt; marked unread again) instead of adding a duplicate. Once you replied to it (accepted, not archived), a re-post with that key lands in that chat as an unread update instead of opening a second card; after Archive the next post is a new card. At most 20 open messages are kept. Past that, the oldest read ones are archived.
 
+## What belongs in the Inbox (and the noise breaker)
+
+The Inbox is for **decisions only David can make**: spend, an irreversible action, a judgment call. A failure an
+agent can fix (red CI, a broken job, a stuck card) goes to a **Kanban card** (assignee `default`), not here, and a
+card never duplicates a Kanban card that is already doing the work. Routine status goes nowhere.
+
+**Noise breaker** (`store.py`, `MUTE_AFTER` = 3, `MUTE_WINDOW_S` = 7 days): when a poster's last 3 closed cards in
+the window were all archived with no action (Archive, sidebar archive, or the open-cap auto-archive; an accepted or
+resolved card resets the streak), a new card from that poster is refused with `PosterMuted` (a `ValueError`: CLI
+exit 1, tool `posted: false`, REST 400) and one Kanban card `inbox-muted:<poster>` is filed to fix that poster.
+Updates to an already-open card with the same key still go through. After fixing the poster:
+`hermes inbox unmute '<poster>'`. Posts with no poster are not tracked.
+Tests: `tests/test_store.py` (streak, reset, sidebar archive, window, re-key), `tests/test_mute_paths.py` (CLI, tool, REST).
+
 ## Card types
 
 A plain card has **Do it** + **Archive**. A *typed* card has its type's own buttons, and the poster reads the decision back later by key, so "archive" never doubles as "approve".

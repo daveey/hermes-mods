@@ -231,3 +231,82 @@ def test_tool_and_cli_pass_prompt_label(env, monkeypatch):
     assert plugin._run_cli(args) == 0
     sid = [i for i in inbox.list() if i["title"] == "t2"][0]["session_id"]
     assert "**Do it:** do the thing" in db.get_messages(sid)[0]["content"]
+
+
+# ── noise breaker: a poster David keeps archiving is refused ───────────────────
+def _env_with_tasks(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db._inbox_keep_open = True
+    clock = {"t": 1_000_000.0}
+    tasks = []
+    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"],
+                        task_creator=lambda **kw: tasks.append(kw) or "t_mute1")
+    return inbox, db, clock, tasks
+
+
+def _post_and_archive(inbox, clock, poster, n):
+    for i in range(n):
+        clock["t"] += 60
+        r = inbox.post(f"Main CI red @ {i}", "red", "fix it", key=f"ci:{i}", poster=poster)
+        inbox.archive(r["session_id"])
+
+
+def test_poster_muted_after_three_ignored_cards(tmp_path, monkeypatch):
+    inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
+    _post_and_archive(inbox, clock, "cron · ci-main-watch", 3)
+    with pytest.raises(store.PosterMuted):
+        inbox.post("Main CI red @ 4", "red", "fix it", key="ci:4", poster="cron · ci-main-watch")
+    assert not [i for i in inbox.list() if i["key"] == "ci:4"]
+    # one fix card for the poster, idempotent across repeated refusals
+    with pytest.raises(store.PosterMuted):
+        inbox.post("Main CI red @ 5", "red", "fix it", key="ci:5", poster="cron · ci-main-watch")
+    assert {t["idempotency_key"] for t in tasks} == {"inbox-muted:cron · ci-main-watch"}
+    assert tasks[0]["assignee"] == "default"
+    # other posters are unaffected
+    assert inbox.post("Approve spend", "b", "go", poster="cron · audit")["updated"] is False
+    db.close()
+
+
+def test_accepted_card_breaks_the_streak(tmp_path, monkeypatch):
+    inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
+    _post_and_archive(inbox, clock, "coach", 2)
+    clock["t"] += 60
+    r = inbox.post("useful", "b", "go", key="u", poster="coach")
+    inbox.accept(r["session_id"])
+    _post_and_archive(inbox, clock, "coach", 2)
+    assert inbox.post("still allowed", "b", "go", poster="coach")["updated"] is False
+    assert tasks == []
+    db.close()
+
+
+def test_sidebar_archive_counts_and_unmute_and_window(tmp_path, monkeypatch):
+    inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
+    for i in range(3):  # archived through the session door, not inbox.archive
+        clock["t"] += 60
+        r = inbox.post(f"x{i}", "b", "go", key=f"x{i}", poster="p")
+        db.set_session_archived(r["session_id"], True)
+    with pytest.raises(store.PosterMuted):
+        inbox.post("x3", "b", "go", poster="p")
+    clock["t"] += 60
+    inbox.unmute("p")
+    assert inbox.post("after unmute", "b", "go", poster="p")["updated"] is False
+    db.close()
+
+
+def test_mute_expires_after_window(tmp_path, monkeypatch):
+    inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
+    _post_and_archive(inbox, clock, "p", 3)
+    clock["t"] += store.MUTE_WINDOW_S + 1
+    assert inbox.post("a week later", "b", "go", poster="p")["updated"] is False
+    db.close()
+
+
+def test_rekey_update_of_open_card_is_not_refused(tmp_path, monkeypatch):
+    inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
+    clock["t"] += 60
+    inbox.post("open one", "b", "go", key="keep", poster="p")
+    _post_and_archive(inbox, clock, "p", 3)
+    assert inbox.post("open one v2", "b2", "go", key="keep", poster="p")["updated"] is True
+    db.close()

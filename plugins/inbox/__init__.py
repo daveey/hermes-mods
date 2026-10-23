@@ -41,7 +41,10 @@ SCHEMA = {
         "runs when he presses Do it, written so a fresh agent can execute it with no other context. "
         "Pass a stable `key` for recurring findings (e.g. 'vast-idle:2481930') so a re-post updates "
         "the open message instead of adding a duplicate. Do not post routine status or completed "
-        "work; post only actionable proposals.\n"
+        "work; post only actionable proposals. Never post what an agent can do without David: a "
+        "failure, red CI or broken job goes to a Kanban card (assignee default), not the Inbox, and "
+        "never post an Inbox card next to a Kanban card for the same work. A poster whose last 3 "
+        "cards were archived with no action is refused (PosterMuted) until fixed and unmuted.\n"
         "CARD TYPES: pass `type` (+ `fields`) to get a decision card with that type's own buttons "
         "instead of Do it. A type is a YAML spec (see inbox_types) declaring `fields` (required / max "
         "length / preview) and `actions`, each of kind `resolve` (records the decision, closes the card, "
@@ -210,6 +213,8 @@ def _setup_cli(parser) -> None:
     p.add_argument("--type", help="card type (see `hermes inbox types`)")
     p.add_argument("--field", action="append", default=[], metavar="K=V", help="a type field (repeatable)")
     sub.add_parser("list", help="list open messages")
+    u = sub.add_parser("unmute", help="let a poster muted as noise post again (after fixing it)")
+    u.add_argument("poster")
     a = sub.add_parser("archive", help="archive a message")
     a.add_argument("session_id")
     t = sub.add_parser("types", help="list card types, or show one")
@@ -281,7 +286,11 @@ def _run_cli(args) -> int:
         ok = inbox.archive(args.session_id)
         print("archived" if ok else "not an inbox message")
         return 0 if ok else 1
-    print("usage: hermes inbox {post,list,archive,act,outcome,types}")
+    if cmd == "unmute":
+        inbox.unmute(args.poster)
+        print(f"unmuted {args.poster!r}")
+        return 0
+    print("usage: hermes inbox {post,list,archive,act,outcome,types,unmute}")
     return 2
 
 
