@@ -78,7 +78,9 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 - Once the batch PR exists, cancel only the superseded runs of the constituent PRs. Leave runs on `main` and in
   other repos alone.
 - The batch is done only when the post-landing `main` suite has completed green (`wait_for_ci.py <sha>`). Waiting
-  cards get the run URLs so they don't relaunch suites.
+  cards get the run URLs so they don't relaunch suites. If that run fails in a test outside the batch diff and
+  `main` has since fixed it, a later fully green `main` suite (every workflow) on a descendant of the landed sha
+  counts; record the failed run, the fix commits and the green runs in the manifest.
 
 ## Notes
 
