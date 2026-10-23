@@ -1,0 +1,321 @@
+From db2962fd3ea8dc873101449514ed4f7ccd0d3464 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 20:19:20 -0700
+Subject: [PATCH] fix(kanban): bind the delegate-child env marker to its owner
+ process; orphans heal [daveey]
+
+Five whys (Desktop chats refused board writes 10-21 18:53-21:40 PT):
+1. Hermes.app carried HERMES_DELEGATED_CHILD_CONTEXT.
+2. A kanban worker's `hermes update` reopened it, and the env came with it.
+3. Every worker subprocess carries the marker by design, and env vars are inherited by every
+   descendant, including processes that leave the lineage (`open`, detached launches, ppid 1).
+4. is_delegated_child_process_context() trusted the variable alone. Correctness depended on every
+   launch site scrubbing it, and four scrub fixes landed within 80 minutes (4eff2691da, 9778500b6b,
+   d5f8a69c87, f26e75a136). The next day a detached BabyBear (ppid 1) still carried the marker.
+5. Root cause: the fence's authority was an ambient capability with no binding to the lineage it stood for.
+
+Fix: scrub_kanban_env stamps HERMES_DELEGATED_CHILD_OWNER="<pid>:<start fingerprint>" of the agent
+process that first fences a lineage (inherited owners are kept). The env marker counts only while
+that exact process incarnation is alive AND an ancestor of the reader (cached 10 s). A process
+outside the lineage drops the agent-scope family from its own env once (logged), so neither it nor
+its children are fenced. An unbound legacy marker still fences (fail closed). The in-process
+delegate_task contextvar is unchanged. Launch-site scrubbing stays as defence in depth.
+
+Trade-off: a worker's background process orphaned after the worker exits is no longer fenced. It has
+no live owner to protect.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/delegation_context.py                   | 125 +++++++++++++++++-
+ apps/desktop/electron/leaked-worker-env.ts    |   1 +
+ .../test_delegate_marker_owner_binding.py     |  86 ++++++++++++
+ 3 files changed, 208 insertions(+), 4 deletions(-)
+ create mode 100644 tests/agent/test_delegate_marker_owner_binding.py
+
+diff --git a/agent/delegation_context.py b/agent/delegation_context.py
+index 4413bc9d4a..b2217a1f27 100644
+--- a/agent/delegation_context.py
++++ b/agent/delegation_context.py
+@@ -7,8 +7,10 @@ closed for them without mutating the process-global environment.
+ """
+ from __future__ import annotations
+ 
++import logging
+ import os
+ import re
++import time
+ from contextlib import contextmanager
+ from contextvars import ContextVar, Token
+ from typing import Iterator, Mapping, MutableMapping, overload
+@@ -19,6 +21,10 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
+ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
+ 
+ DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
++# "<pid>:<start fingerprint>" of the agent process that first fenced the lineage. [daveey]
++DELEGATED_CHILD_OWNER_ENV = "HERMES_DELEGATED_CHILD_OWNER"
++
++_log = logging.getLogger(__name__)
+ 
+ KANBAN_ENV_KEYS: tuple[str, ...] = (
+     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+@@ -44,6 +50,7 @@ AGENT_SCOPE_MARKER_KEYS: tuple[str, ...] = (
+ )
+ AGENT_SCOPE_EXACT_KEYS: tuple[str, ...] = (
+     DELEGATED_CHILD_ENV_MARKER,
++    DELEGATED_CHILD_OWNER_ENV,
+     "HERMES_SINGLE_QUERY_SESSION",
+     "HERMES_SPAWN",
+     "HERMES_SUPERVISED_CHILD",
+@@ -166,9 +173,111 @@ def owned_kanban_task() -> str:
+     return (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+ 
+ 
++# --- Lineage binding for the env marker. [daveey] ---------------------------------------------
++# An env var is inherited by EVERY descendant, including processes that leave the lineage: an app a
++# worker reopens with ``open`` (Hermes.app pid 59331, 2026-10-21) or launches detached (BabyBear,
++# ppid 1, 2026-10-22). Scrubbing at each launch site kept missing one, so the marker now names
++# the agent process that fenced the lineage, and only counts in a process that still descends
++# from that exact process incarnation. A marker with no owner (pre-binding) still fences.
++_LIVE_TTL_S = 10.0
++_live_cache: dict[tuple[int, str, str], tuple[float, bool]] = {}
++
++
++def _start_fingerprint(pid: int) -> int | None:
++    try:
++        from gateway.status import _get_process_start_time
++        return _get_process_start_time(pid)
++    except Exception:
++        return None
++
++
++def _owner_token() -> str:
++    pid = os.getpid()
++    fp = _start_fingerprint(pid)
++    return f"{pid}:{fp}" if fp is not None else str(pid)
++
++
++def _parent_pid(pid: int) -> int | None:
++    try:
++        import psutil
++        return int(psutil.Process(pid).ppid())
++    except Exception:
++        return None
++
++
++def _descends_from(owner: int) -> bool:
++    current = os.getpid()
++    for _ in range(64):
++        if current == owner:
++            return True
++        parent = _parent_pid(current)
++        if not parent or parent == current:
++            return False
++        current = parent
++    return False
++
++
++def _owner_is_live_ancestor(owner: str) -> bool:
++    pid_s, _, fp_s = owner.partition(":")
++    try:
++        pid = int(pid_s)
++    except ValueError:
++        return True  # unreadable owner: fail closed (keep the fence)
++    if fp_s:
++        current = _start_fingerprint(pid)
++        if current is None:
++            return False  # owner pid is gone
++        try:
++            from gateway.status import start_time_fingerprints_match
++            if not start_time_fingerprints_match(int(fp_s), current):
++                return False  # pid recycled by another process
++        except (ImportError, ValueError):
++            pass
++    return _descends_from(pid)
++
++
++def env_marker_is_live(environ: Mapping[str, str] | None = None) -> bool:
++    """Whether this process's inherited delegate marker is real: present, and either unbound
++    (legacy, fails closed) or bound to an owner process this process still descends from."""
++    env = os.environ if environ is None else environ
++    marker = env.get(DELEGATED_CHILD_ENV_MARKER, "")
++    if not marker:
++        return False
++    owner = (env.get(DELEGATED_CHILD_OWNER_ENV) or "").strip()
++    if not owner:
++        return True
++    key = (os.getpid(), marker, owner)
++    now = time.monotonic()
++    hit = _live_cache.get(key)
++    if hit and now < hit[0]:
++        return hit[1]
++    live = _owner_is_live_ancestor(owner)
++    _live_cache[key] = (now + _LIVE_TTL_S, live)
++    return live
++
++
++def _heal_leaked_marker() -> None:
++    """Drop an orphaned marker (and the worker identity riding with it) from this process, so
++    neither it nor anything it spawns is fenced as a delegate child of a lineage it left."""
++    owner = os.environ.get(DELEGATED_CHILD_OWNER_ENV, "")
++    removed = strip_agent_scope_env(os.environ)
++    if removed:
++        _log.warning("dropped leaked delegate-child env %s: pid %d does not descend from owner %s",
++                     ", ".join(sorted(removed)), os.getpid(), owner)
++
++
++def _live_env_marker() -> str:
++    """The env marker if it is live; a leaked one is healed away and reads as absent."""
++    marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "")
++    if marker and not env_marker_is_live():
++        _heal_leaked_marker()
++        return ""
++    return marker
++
++
+ def is_delegated_child_process_context() -> bool:
+     """Return True in this process or a subprocess spawned by a child."""
+-    return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
++    return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(_live_env_marker())
+ 
+ 
+ def _fenced_kanban_root() -> str:
+@@ -197,6 +306,8 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
+     cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
+     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
+     cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
++    if not (cleaned.get(DELEGATED_CHILD_OWNER_ENV) or "").strip():
++        cleaned[DELEGATED_CHILD_OWNER_ENV] = _owner_token()
+     return cleaned
+ 
+ 
+@@ -207,7 +318,7 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
+     fenced root the marker carries. A legacy ``"1"`` marker fences everything."""
+     if _DELEGATED_CHILD_CONTEXT.get():
+         return True
+-    marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "")
++    marker = _live_env_marker()
+     if not marker:
+         return False
+     if marker == "1":
+@@ -241,6 +352,12 @@ def delegated_child_subprocess_env(
+     Dispatcher workers and supervised tool transports grant their own explicit scope.
+     """
+     if not (is_delegated_child_process_context() or os.environ.get("HERMES_KANBAN_TASK")
+-            or (env and (env.get("HERMES_KANBAN_TASK") or env.get(DELEGATED_CHILD_ENV_MARKER)))):
+-        return None if env is None else dict(env)
++            or (env and (env.get("HERMES_KANBAN_TASK")
++                         or (env.get(DELEGATED_CHILD_ENV_MARKER) and env_marker_is_live(env))))):
++        if env is None:
++            return None
++        out = dict(env)
++        if out.get(DELEGATED_CHILD_ENV_MARKER):  # leaked into a caller-built env: don't pass it on
++            strip_agent_scope_env(out)
++        return out
+     return scrub_kanban_env(os.environ if env is None else env)
+diff --git a/apps/desktop/electron/leaked-worker-env.ts b/apps/desktop/electron/leaked-worker-env.ts
+index d3aebe3e29..f05c282362 100644
+--- a/apps/desktop/electron/leaked-worker-env.ts
++++ b/apps/desktop/electron/leaked-worker-env.ts
+@@ -17,6 +17,7 @@ export const WORKER_MARKER_KEYS = [
+ 
+ export const AGENT_SCOPE_EXACT_KEYS = [
+   'HERMES_DELEGATED_CHILD_CONTEXT',
++  'HERMES_DELEGATED_CHILD_OWNER',
+   'HERMES_SINGLE_QUERY_SESSION',
+   'HERMES_SPAWN',
+   'HERMES_SUPERVISED_CHILD',
+diff --git a/tests/agent/test_delegate_marker_owner_binding.py b/tests/agent/test_delegate_marker_owner_binding.py
+new file mode 100644
+index 0000000000..9bf9a30857
+--- /dev/null
++++ b/tests/agent/test_delegate_marker_owner_binding.py
+@@ -0,0 +1,86 @@
++"""The delegate-child env marker is bound to the agent process that fenced the lineage. [daveey]
++
++Root cause of the 2026-10-21 Desktop fence (Hermes.app pid 59331): HERMES_DELEGATED_CHILD_CONTEXT
++is inherited by every descendant, including an app a worker reopened with ``open`` (ppid 1), so the
++whole Desktop believed it was a delegate child. Scrubbing at launch sites kept missing one (a
++detached BabyBear carried it the next day). The marker now only counts in a process that still
++descends from its owner; anything that left the lineage heals itself.
++"""
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from agent import delegation_context as dc
++
++REPO = Path(__file__).resolve().parents[2]
++
++PROBE = (
++    "import json,os,sys;sys.path.insert(0,%r);"
++    "from agent import delegation_context as dc;"
++    "fenced=dc.is_delegated_child_process_context();"
++    "print(json.dumps({'fenced':fenced,'marker':os.environ.get(dc.DELEGATED_CHILD_ENV_MARKER),"
++    "'owner':os.environ.get(dc.DELEGATED_CHILD_OWNER_ENV)}))" % str(REPO)
++)
++
++
++def _probe(env):
++    out = subprocess.run([sys.executable, "-c", PROBE], env=env, capture_output=True, text=True, timeout=60)
++    assert out.returncode == 0, out.stderr
++    return json.loads(out.stdout.strip().splitlines()[-1])
++
++
++@pytest.fixture
++def worker_env(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc12345")
++    monkeypatch.delenv(dc.DELEGATED_CHILD_ENV_MARKER, raising=False)
++    monkeypatch.delenv(dc.DELEGATED_CHILD_OWNER_ENV, raising=False)
++    dc._live_cache.clear()
++    return dc.delegated_child_subprocess_env(dict(os.environ))
++
++
++def test_spawned_descendant_is_still_fenced(worker_env):
++    assert worker_env[dc.DELEGATED_CHILD_OWNER_ENV].startswith(f"{os.getpid()}:")
++    assert _probe(worker_env)["fenced"] is True
++
++
++def test_process_outside_the_lineage_is_not_fenced_and_heals(worker_env):
++    # A process that does not descend from the owner (what `open` / a detached launch produces):
++    # owner = an unrelated live process.
++    sibling = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"])
++    try:
++        fp = dc._start_fingerprint(sibling.pid)
++        env = dict(worker_env, **{dc.DELEGATED_CHILD_OWNER_ENV: f"{sibling.pid}:{fp}"})
++        got = _probe(env)
++    finally:
++        sibling.kill()
++        sibling.wait()
++    assert got == {"fenced": False, "marker": None, "owner": None}
++
++
++def test_dead_owner_unfences(worker_env):
++    gone = subprocess.Popen([sys.executable, "-c", "pass"])
++    gone.wait()
++    env = dict(worker_env, **{dc.DELEGATED_CHILD_OWNER_ENV: f"{gone.pid}:1"})
++    assert _probe(env)["fenced"] is False
++
++
++def test_unbound_legacy_marker_still_fences(worker_env):
++    env = dict(worker_env)
++    env.pop(dc.DELEGATED_CHILD_OWNER_ENV)
++    assert _probe(env)["fenced"] is True
++
++
++def test_inherited_owner_is_kept_through_nested_spawns(worker_env, monkeypatch):
++    monkeypatch.setenv(dc.DELEGATED_CHILD_ENV_MARKER, worker_env[dc.DELEGATED_CHILD_ENV_MARKER])
++    monkeypatch.setenv(dc.DELEGATED_CHILD_OWNER_ENV, worker_env[dc.DELEGATED_CHILD_OWNER_ENV])
++    again = dc.scrub_kanban_env(dict(os.environ))
++    assert again[dc.DELEGATED_CHILD_OWNER_ENV] == worker_env[dc.DELEGATED_CHILD_OWNER_ENV]
++
++
++def test_owner_key_is_agent_scope():
++    assert dc.is_agent_scope_env_key(dc.DELEGATED_CHILD_OWNER_ENV)
+-- 
+2.54.0 (Apple Git-157)
+

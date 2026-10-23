@@ -12,6 +12,19 @@ Patches:
 - `patches/0188-test-make-3-env-sensitive-tests-independent-of-the-C.patch`: orphan-readopt (TUI) and termux-api detection tests no longer depend on the runner env.
 - `patches/0189-lint-fix-12-ruff-errors-blocking-CI-daveey-11.patch`: 12 ruff errors (update_cmd_git, startup_resume and their tests) that kept the lint job red.
 - `patches/0193-ci-run-CI-review-comment-on-self-hosted-hermes-hub-r.patch`: the PR review-comment poller (`ci-review-comment.yml`) runs on the self-hosted runner too; hosted jobs were refused for billing, so it failed before starting.
+- `patches/0196-ci-tests-raise-Run-tests-timeout-to-120-min-shared-1.patch`: raises the `Run tests` timeout to 120 min for the shared 16-core hub runner.
+- `patches/0197-ci-tests-size-test-workers-from-nproc-instead-of-fix.patch`: sizes pytest workers from `nproc` (2x) instead of a fixed 32.
+- `patches/0198-ci-shorten-artifact-retention-14d-3d-and-make-lockfi.patch`: shortens artifact retention 14d -> 3d and makes the lockfile-diff upload non-fatal.
+- `patches/0199-ci-rootless-docker-CI-lane-on-hermes-hub-docker-ci-r.patch`: adds a rootless-docker lane on dedicated `docker-ci` runners (amd64 image builds only, 120 min timeout), skips the mac/Windows lanes on the fork, makes artifact uploads `continue-on-error` (step-aware insert, no duplicate keys), and reports `tests-os`/`desktop_updater` lane assertions as fork skips.
+- `patches/0200-tests-don-t-let-an-ambient-container-signal-self-hos.patch`: `tests/conftest.py` pins container detection so the runner's `/.dockerenv` does not leak into host-permission tests.
+- `patches/0201-tests-mark-macOS-faking-hermes_cli-tests-check_os_ma.patch`: marks macOS-faking `hermes_cli` tests with `platforms("macos")` (`check_os_marker_fakes`).
+- `patches/0202-test-tolerate-loaded-shared-runners-in-desktop-JS-te.patch`: desktop JS tests tolerate loaded runners: vitest timeout 5 s -> 30 s, PM source-backend port wait 150 s, checkout-source handoff claim 20 s; the spawn mock stamps the Desktop's `HERMES_UPDATE_STARTED_AT` so the claim matches.
+- `patches/0203-tests-e2e-alias-describe-accepts-canonical-key-scale.patch`: e2e: the alias-describe test accepts the canonical key; the heartbeat floor scales with turn length.
+- `patches/0204-ci-fix-deterministic-failures-on-hub-runners-contain.patch`: deterministic hub-runner failures: container detection pinned False at both seams (`hermes_constants`, `hermes_platform.host.runtime`) so owner-only mode tests see 0600/0700; refreshed prompt-surface snapshot, docs-drift baseline and `locales/_keys.desktop.json`; `classify_changes` routes `hermes_cli/top_level_env.py` to the update suites; `NODE_OPTIONS=--max-old-space-size=4096` for JS workspace checks (desktop `tsc` OOMs at 2 GB).
+- `patches/0205-ci-give-pushes-to-main-their-own-concurrency-group-s.patch`: pushes to `main` get their own concurrency group, so a newer push never cancels or replaces a run in flight.
+- `patches/0206-ci-drop-duplicate-continue-on-error-in-lockfile-diff.patch`: drops a duplicate `continue-on-error` in `lockfile-diff.yml` (the invalid file made `ci.yaml` fail to start).
+- `patches/0207-ci-unbreak-main-on-hub-runners-container-test-seam-d.patch`: unbreaks main on hub runners: `TestIsContainer` restores the real `_detect_container`; documents `sessions.automated_sources` / `interactive_sources` / `sidebar_profiles` (docs-drift ratchet); js-tests timeout 30 -> 60 min; `termux-verify` jobs move to `[self-hosted, hermes-hub]`.
+- `patches/0209-ci-nix-add-workflow_dispatch-so-the-flake-check-can-.patch`: `nix.yml` gets `workflow_dispatch`, so the flake check can be re-run on demand (the workflow had been disabled, so it never re-ran on main).
 
 What you see: the private fork's CI runs (and passes) without GitHub-hosted minutes. None of this changes runtime
 behavior; it is workflow wiring and test isolation.

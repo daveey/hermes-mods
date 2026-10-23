@@ -1,0 +1,124 @@
+From def4a662e1779e05623fe6e2e4cc8f172471dd30 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 01:08:56 +0000
+Subject: [PATCH] test: tolerate loaded shared runners in desktop JS tests
+ (#14)
+
+* test: tolerate loaded shared runners in desktop JS tests (git probe, PM source backend, checkout handoff)
+
+Hub runners share 16 cores across concurrent jobs (load avg 40-90), so
+process-spawning tests that pass on idle hosts time out:
+- tests-js: vitest 5s default -> 30s
+- source-backend: PM backend port wait 45s -> 150s, test budget 400s
+- checkout-source: handoff claim timeout 2s -> 20s, test budget 120s, assertion prints the refusal
+
+* test(desktop): checkout-source spawn mock stamps the Desktop's HERMES_UPDATE_STARTED_AT
+
+The protocol-1 claim only counts when marker startedAt === updateStartedAt.
+The mock re-read Date.now() at spawn time, so an event-loop stall across a
+second boundary on a loaded runner made the claim never match (ok:false,
+updater-spawn-failed). Write the startedAt the Desktop passes, as
+posix.sh/marker.sh do. The earlier 2s->20s handoffClaimTimeoutMs bump is not
+the fix (the claim check is deterministic); it is kept only to match
+production HANDOFF_CLAIM_TIMEOUT_MS.
+---
+ apps/desktop/electron/source-backend.test.ts    |  8 +++++---
+ .../electron/updater/checkout-source.test.ts    | 17 ++++++++++++-----
+ tests-js/vitest.config.ts                       |  3 +++
+ 3 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/apps/desktop/electron/source-backend.test.ts b/apps/desktop/electron/source-backend.test.ts
+index 5c2fb0fad1..edd43f4f9d 100644
+--- a/apps/desktop/electron/source-backend.test.ts
++++ b/apps/desktop/electron/source-backend.test.ts
+@@ -102,7 +102,7 @@ test.skipIf(process.platform === 'win32')(
+           cwd: temp,
+           env,
+           encoding: 'utf8',
+-          timeout: 90_000
++          timeout: 180_000
+         })
+       ) as Fixture
+ 
+@@ -158,7 +158,7 @@ test.skipIf(process.platform === 'win32')(
+         })
+ 
+         try {
+-          const port: number = (await waitForDashboardPort(child, 45_000)) as number
++          const port: number = (await waitForDashboardPort(child, 150_000)) as number
+ 
+           const response: Response = await fetch(`http://127.0.0.1:${port}/api/health`, {
+             headers: { 'X-Hermes-Session-Token': token }
+@@ -207,7 +207,9 @@ test.skipIf(process.platform === 'win32')(
+       vi.unstubAllEnvs()
+     }
+   },
+-  150_000
++  // Two cold Python backend starts; on a loaded shared runner each can take
++  // minutes of wall time.
++  400_000
+ )
+ 
+ test('Windows console selection uses only the selected interpreter directory', (): void => {
+diff --git a/apps/desktop/electron/updater/checkout-source.test.ts b/apps/desktop/electron/updater/checkout-source.test.ts
+index 1c06f6b11a..2bd65a8ece 100644
+--- a/apps/desktop/electron/updater/checkout-source.test.ts
++++ b/apps/desktop/electron/updater/checkout-source.test.ts
+@@ -363,7 +363,8 @@ if not getattr(urllib.request, '_hermes_loopback', False):
+       isMac: process.platform === 'darwin',
+       defaultUpdateBranch: 'main',
+       updateHandoffDwellMs: 0,
+-      handoffClaimTimeoutMs: 2000,
++      // The claim is polled through a real Python helper; 2s starves on a loaded runner.
++      handoffClaimTimeoutMs: 20_000,
+       resolveUpdateRoot: (): string => root,
+       readSourceUpdate: (install: string, opts: { force?: boolean }): Promise<SourceUpdate | null> =>
+         readSourceUpdate({
+@@ -394,8 +395,13 @@ if not getattr(urllib.request, '_hermes_loopback', False):
+       (command: string, args: string[], options: SpawnOptions): updaterProcess.UpdaterChild => {
+         spawned.push({ command, args, options })
+         // C2: a hand-off has started only once the script takes the Desktop's
+-        // bridge marker in its own (live, foreign) name — do that here.
+-        fs.writeFileSync(markerPath(home), `${process.ppid}\n${Math.floor(Date.now() / 1000)}\n`)
++        // bridge marker in its own (live, foreign) name — do that here. Like
++        // posix.sh/marker.sh, stamp the startedAt the Desktop handed us, not a
++        // fresh clock read: a stall across a second boundary on a loaded
++        // runner would otherwise make the protocol-1 claim never match.
++        const startedAt: string | undefined = options.env?.HERMES_UPDATE_STARTED_AT
++        expect(startedAt).toMatch(/^\d+$/)
++        fs.writeFileSync(markerPath(home), `${process.ppid}\n${startedAt}\n`)
+ 
+         return { unref: (): void => {} }
+       }
+@@ -425,7 +431,8 @@ if not getattr(urllib.request, '_hermes_loopback', False):
+       expect(spawned).toHaveLength(0)
+       fs.mkdirSync(scriptDirectory, { recursive: true })
+       fs.writeFileSync(script, '')
+-      expect(await strategy.apply()).toMatchObject({ ok: true, handedOff: true })
++      const applied: unknown = await strategy.apply()
++      expect(applied, JSON.stringify(applied)).toMatchObject({ ok: true, handedOff: true })
+       const handoff: (typeof spawned)[number] | undefined = spawned.pop()
+       // The update ran and released its claim; the next apply starts clean.
+       fs.rmSync(markerPath(home), { force: true })
+@@ -486,4 +493,4 @@ if not getattr(urllib.request, '_hermes_loopback', False):
+     })
+     fs.rmSync(temporary, { recursive: true, force: true })
+   }
+-}, 30000)
++}, 120_000)
+diff --git a/tests-js/vitest.config.ts b/tests-js/vitest.config.ts
+index ffc666f654..a794f19a0b 100644
+--- a/tests-js/vitest.config.ts
++++ b/tests-js/vitest.config.ts
+@@ -4,5 +4,8 @@ export default defineConfig({
+   test: {
+     environment: 'node',
+     include: ['**/*.test.ts', '**/*.test.mjs'],
++    // Several files shell out to real git/python/npm. vitest's 5s default
++    // times them out on a loaded shared runner; match the electron project.
++    testTimeout: 30_000,
+   },
+ })
+-- 
+2.54.0 (Apple Git-157)
+

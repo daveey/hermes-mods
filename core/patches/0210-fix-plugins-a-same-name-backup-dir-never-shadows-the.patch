@@ -1,0 +1,472 @@
+From fca7545a028bcf98a9a6cdfb38961afe9a7e5ed0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 20:31:00 -0700
+Subject: [PATCH] fix(plugins): a same-name backup dir never shadows the live
+ plugin [daveey]
+
+Two plugin dirs in one scope declaring the same manifest name were resolved by
+scan order (later sorted dir wins, silently), so a slack-workspace.bak-premacops/
+backup next to slack-workspace/ loaded instead of the live plugin.
+
+- discovery skips backup-named dirs (*.bak*, *.orig, *.old) with a WARNING
+- same-name dirs in one level: the dir whose basename == name wins, WARNING names both paths
+- hermes plugins list prints ignored/shadowed copies (stderr in --plain/--json)
+- hermes doctor: new 'Plugin Directories' check
+---
+ hermes_cli/doctor.py                          |   4 +-
+ hermes_cli/doctor_state.py                    |  20 +++
+ hermes_cli/plugins_cmd.py                     |   8 +
+ hermes_cli/plugins_cmd_listing.py             |  21 +++
+ hermes_cli/plugins_discovery.py               |  94 +++++++++-
+ tests/hermes_cli/test_plugin_dir_conflicts.py | 169 ++++++++++++++++++
+ 6 files changed, 310 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_plugin_dir_conflicts.py
+
+diff --git a/hermes_cli/doctor.py b/hermes_cli/doctor.py
+index 337df2e1f8..b2d06a56e9 100644
+--- a/hermes_cli/doctor.py
++++ b/hermes_cli/doctor.py
+@@ -54,6 +54,7 @@ from hermes_cli.doctor_state import (
+     _check_cron_store,
+     _check_directory_structure,
+     _check_memory_provider,
++    _check_plugin_dir_conflicts,
+     _check_profiles,
+     _check_skills_hub,
+     _check_state_db,
+@@ -124,7 +125,8 @@ DOCTOR_CHECKS = (
+     ('External Tools', _check_git_and_rg), (None, _check_terminal_backend), (None, _check_node_and_browser),
+     (None, _check_npm_audit), ('API Connectivity', _check_api_connectivity),
+     ('Tool Availability', _check_tool_availability), ('Skills Hub', _check_skills_hub),
+-    ('Memory Provider', _check_memory_provider), ('NeMo Relay Plugins', _check_relay_plugins),
++    ('Memory Provider', _check_memory_provider), ('Plugin Directories', _check_plugin_dir_conflicts),
++    ('NeMo Relay Plugins', _check_relay_plugins),
+     (None, _check_profiles),
+ )
+ 
+diff --git a/hermes_cli/doctor_state.py b/hermes_cli/doctor_state.py
+index 7e34f19c3b..191ec75177 100644
+--- a/hermes_cli/doctor_state.py
++++ b/hermes_cli/doctor_state.py
+@@ -543,6 +543,26 @@ def _plugin_provenance_rows(plugins_dir) -> list:
+     return rows or [("info", "No provenanced plugins found", "")]
+ 
+ 
++@doctor_check("Plugin directory conflict check failed: {e}")
++def _check_plugin_dir_conflicts(should_fix: bool, f: Finding) -> None:
++    """[daveey] Warn about plugin dirs discovery ignores: backup-named copies (``*.bak*``/``.orig``/``.old``) and
++    same-name copies shadowed by the basename match. A backup once silently replaced a live plugin."""
++    from hermes_constants import get_hermes_home
++    from hermes_cli.plugins_discovery import plugin_dir_conflicts
++
++    plugins_dir = get_hermes_home() / "plugins"
++    conflicts = plugin_dir_conflicts(plugins_dir) if plugins_dir.is_dir() else []
++    if not conflicts:
++        check_ok("No backup or same-name duplicate plugin directories")
++        return
++    for c in conflicts:
++        if c.kind == "backup":
++            check_warn(f"Backup plugin dir inside plugins/: {c.ignored}", "(never loads; move it to plugin-backups/)")
++        else:
++            check_warn(f"Plugin '{c.name}' has a shadowed copy: {c.ignored}", f"(loading {c.kept})")
++    f.manual_issues.append(f"Move ignored plugin copies out of {plugins_dir} (e.g. to {get_hermes_home() / 'plugin-backups'})")
++
++
+ @doctor_check("")
+ def _check_update_provenance(should_fix: bool, f: Finding) -> None:
+     """Inspect local plugin update provenance without network or writes."""
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index ad061ca677..870af13772 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -844,10 +844,14 @@ def _scan_level(base: Path, source: str, skip_names: set, prefix: str, depth: in
+     except OSError as exc:
+         logger.warning("Skipping unreadable plugin directory %s: %s", base, exc)
+         return
++    from hermes_cli.plugins_discovery import is_backup_plugin_dir
++    level_keys: set = set()
+     for d in children:
+         try:
+             if not d.is_dir() or (depth == 0 and skip_names and d.name in skip_names):
+                 continue
++            if is_backup_plugin_dir(d.name):  # [daveey] never loaded; `plugins list` reports it below the table
++                continue
+             info = _read_manifest_info(d, prefix)
+         except (OSError, PluginOperationError) as exc:
+             # The PM declaration reader wraps unreadable manifests for install callers;
+@@ -861,6 +865,10 @@ def _scan_level(base: Path, source: str, skip_names: set, prefix: str, depth: in
+         name, version, description, key = info
+         if key in seen and source == "bundled":
+             continue
++        # [daveey] Same-name dirs in one level: the basename match wins, as in discovery (_dedupe_same_name).
++        if key in level_keys and (Path(seen[key][4]).name == key.rsplit("/", 1)[-1] or d.name != key.rsplit("/", 1)[-1]):
++            continue
++        level_keys.add(key)
+         src_label = "git" if source == "user" and (d / ".git").exists() else source
+         seen[key] = (name, version, description, src_label, d, key)
+ 
+diff --git a/hermes_cli/plugins_cmd_listing.py b/hermes_cli/plugins_cmd_listing.py
+index ac7fa0d929..4e2659b979 100644
+--- a/hermes_cli/plugins_cmd_listing.py
++++ b/hermes_cli/plugins_cmd_listing.py
+@@ -7,6 +7,7 @@ imported late here, never at module level).
+ from __future__ import annotations
+ 
+ import json
++import sys
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -37,6 +38,25 @@ def _entry_status(entry: tuple, enabled: set, disabled: set, active: set) -> str
+ _STATUS_MARKUP = {"disabled": "[red]disabled[/red]", "enabled": "[green]enabled[/green]"}
+ 
+ 
++def _print_dir_conflicts(console: Any, *, plain: bool) -> None:
++    """[daveey] Name every backup-named or same-name shadowed plugin dir (they never load). Plain/JSON
++    modes write to stderr so stdout stays machine-readable."""
++    from hermes_cli.plugins_discovery import plugin_dir_conflicts
++    try:
++        conflicts = plugin_dir_conflicts(_pc()._plugins_dir())
++    except OSError:
++        return
++    for c in conflicts:
++        if c.kind == "backup":
++            msg = f"ignored backup plugin dir {c.ignored} (move it to <hermes home>/plugin-backups/)"
++        else:
++            msg = f"plugin '{c.name}': ignored shadowed copy {c.ignored} (loading {c.kept})"
++        if plain:
++            print(f"warning: {msg}", file=sys.stderr)
++        else:
++            console.print(f"[yellow]⚠ {msg}[/yellow]")
++
++
+ def cmd_list(args: Any | None = None) -> None:
+     """List all plugins (bundled + user) with enabled/disabled state."""
+     console = _pc()._console()
+@@ -65,6 +85,7 @@ def cmd_list(args: Any | None = None) -> None:
+         for name, version, description, source, _dir, key in entries
+     ]
+ 
++    _print_dir_conflicts(console, plain=getattr(args, "json", False) or getattr(args, "plain", False))
+     if getattr(args, "json", False):
+         keys = ("name", "status", "version", "description", "source", "removed")
+         print(json.dumps([dict(zip(keys, row)) for row in rows], indent=2))
+diff --git a/hermes_cli/plugins_discovery.py b/hermes_cli/plugins_discovery.py
+index a7d4aafc4a..a0f10bcbc2 100644
+--- a/hermes_cli/plugins_discovery.py
++++ b/hermes_cli/plugins_discovery.py
+@@ -10,6 +10,7 @@ import contextlib
+ import contextvars
+ import importlib.metadata
+ import logging
++import re
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Set
+@@ -131,14 +132,64 @@ def _get_enabled_plugins() -> Optional[set]:
+         return None
+ 
+ 
++# [daveey] Backup copies left inside a plugins dir (``foo.bak-premacops/``, ``foo.orig/``, ``foo.old/``) are never
++# plugins: one with the live plugin's manifest name sorted after it and silently won discovery, so fixes to the
++# live copy never ran. They are skipped with a warning; move them to ``<home>/plugin-backups/``.
++_BACKUP_DIR_RE = re.compile(r"\.(bak[^/]*|orig|old)$", re.IGNORECASE)
++
++
++def is_backup_plugin_dir(name: str) -> bool:
++    """True for a backup-named directory (``*.bak*``, ``*.orig``, ``*.old``) that discovery must skip."""
++    return bool(_BACKUP_DIR_RE.search(name))
++
++
++@dataclass(frozen=True)
++class PluginDirConflict:
++    """A plugin directory discovery ignored: a backup-named dir, or a same-name copy that lost to *kept*."""
++
++    kind: str  # "backup" | "duplicate"
++    name: str  # manifest key the ignored dir declares ("" when its manifest was not read)
++    ignored: str
++    kept: str = ""
++
++
++def _dedupe_same_name(
++    level: list[PluginManifest], path: Path, conflicts: Optional[list[PluginDirConflict]],
++) -> list[PluginManifest]:
++    """[daveey] Collapse manifests from ONE directory level that share a key: the dir whose basename equals the
++    manifest name wins (else the first in scan order), and every loser is warned about by path. Without this the
++    later sorted dir won silently (``slack-workspace.bak-x`` over ``slack-workspace``)."""
++    groups: dict[str, list[PluginManifest]] = {}
++    for manifest in level:
++        groups.setdefault(manifest_key(manifest), []).append(manifest)
++    keep: dict[str, PluginManifest] = {}
++    for key, group in groups.items():
++        winner = next((m for m in group if m.path and Path(m.path).name == key.rsplit("/", 1)[-1]), group[0])
++        keep[key] = winner
++        for loser in group:
++            if loser is winner:
++                continue
++            if conflicts is not None:
++                conflicts.append(PluginDirConflict("duplicate", key, str(loser.path), str(winner.path)))
++            logger.log(
++                logging.DEBUG if conflicts is not None else logging.WARNING,
++                "Plugin '%s' is declared by two directories in %s: loading %s, ignoring %s (same name; move or "
++                "rename the extra copy)", key, path, winner.path, loser.path,
++            )
++    return [m for m in level if keep.get(manifest_key(m)) is m]
++
++
+ def scan_directory(
+-    path: Path, source: str, *, skip_names: Optional[set[str]] = None, prefix: str = "", depth: int = 0
++    path: Path, source: str, *, skip_names: Optional[set[str]] = None, prefix: str = "", depth: int = 0,
++    conflicts: Optional[list[PluginDirConflict]] = None,
+ ) -> list[PluginManifest]:
+     """Read manifests under *path*: flat ``<root>/<name>/plugin.yaml`` (key ``name``) or category
+     ``<root>/<cat>/<name>/plugin.yaml`` (key ``cat/name``; a manifest-less directory recurses one level, depth
+     capped at two). *skip_names* ignores top-level names; portable ``plugin.json`` packages are accepted
+-    alongside YAML manifests."""
++    alongside YAML manifests. Backup-named dirs are skipped and same-name dirs collapse to the basename match
++    (see :func:`_dedupe_same_name`); pass *conflicts* to collect those records (logged at DEBUG instead)."""
+     manifests: list[PluginManifest] = []
++    level: list[PluginManifest] = []
+     if not path.is_dir():
+         return manifests
+     try:
+@@ -156,6 +207,13 @@ def scan_directory(
+         if child.name in _FOREIGN_HARNESS_MANIFEST_DIRS:
+             logger.debug("Skipping %s (foreign-harness manifest convention)", child)
+             continue
++        if is_backup_plugin_dir(child.name):
++            if conflicts is not None:
++                conflicts.append(PluginDirConflict("backup", _peek_manifest_name(child), str(child)))
++            logger.log(logging.DEBUG if conflicts is not None else logging.WARNING,
++                       "Skipping backup plugin directory %s (backup-named dirs never load; move it to "
++                       "<hermes home>/plugin-backups/)", child)
++            continue
+         # pathlib.Path.is_dir() swallows OSError, but injected Path-likes
+         # and test doubles can still raise. Fail closed per child.
+         try:
+@@ -172,18 +230,44 @@ def scan_directory(
+         if manifest_file is not None:
+             manifest = parse_manifest_file(manifest_file, child, source, prefix)
+             if manifest is not None:
++                level.append(manifest)
+                 manifests.append(manifest)
+         elif has_portable:
+             try:
+-                manifests.append(portable_plugin_manifest(child, source, prefix))
++                level.append(portable_plugin_manifest(child, source, prefix))
++                manifests.append(level[-1])
+             except Exception as exc:
+                 logger.warning("Failed to parse %s: %s", portable_file, exc)
+         elif depth >= 1:
+             logger.debug("Skipping %s (no plugin.yaml, depth cap reached)", child)
+         else:
+             sub_prefix = f"{prefix}/{child.name}" if prefix else child.name
+-            manifests.extend(scan_directory(child, source, prefix=sub_prefix, depth=depth + 1))
+-    return manifests
++            manifests.extend(scan_directory(child, source, prefix=sub_prefix, depth=depth + 1, conflicts=conflicts))
++    if len({manifest_key(m) for m in level}) == len(level):
++        return manifests
++    dropped = {id(m) for m in level} - {id(m) for m in _dedupe_same_name(level, path, conflicts)}
++    return [m for m in manifests if id(m) not in dropped]
++
++
++def _peek_manifest_name(plugin_dir: Path) -> str:
++    """Best-effort ``name:`` of a dir's plugin.yaml without full parsing (for conflict reports only)."""
++    for fname in ("plugin.yaml", "plugin.yml"):
++        try:
++            for line in (plugin_dir / fname).read_text(encoding="utf-8", errors="replace").splitlines():
++                m = re.match(r"\s*name\s*:\s*['\"]?([^'\"#\s]+)", line)
++                if m and not line.startswith((" ", "\t")):
++                    return m.group(1)
++        except OSError:
++            continue
++    return ""
++
++
++def plugin_dir_conflicts(path: Path) -> list[PluginDirConflict]:
++    """[daveey] Backup-named and same-name shadowed plugin dirs under *path*, for ``hermes plugins list`` and
++    ``hermes doctor`` (reads manifests only, loads nothing, logs nothing above DEBUG)."""
++    conflicts: list[PluginDirConflict] = []
++    scan_directory(Path(path), "user", conflicts=conflicts)
++    return conflicts
+ 
+ 
+ def collect_directory_manifests() -> list[PluginManifest]:
+diff --git a/tests/hermes_cli/test_plugin_dir_conflicts.py b/tests/hermes_cli/test_plugin_dir_conflicts.py
+new file mode 100644
+index 0000000000..aec8768580
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_dir_conflicts.py
+@@ -0,0 +1,169 @@
++"""Two plugin dirs in one scope declaring the same manifest ``name`` (#daveey).
++
++A ``slack-workspace.bak-premacops/`` backup (``name: slack-workspace``) left next to the live
++``slack-workspace/`` silently won discovery because the scan is sorted and later manifests win, so
++every fix to the live plugin never ran. Discovery now skips backup-named dirs (``*.bak*``,
++``*.orig``, ``*.old``) and, for any remaining same-name pair, loads the dir whose basename equals the
++name, warning with both paths. ``hermes plugins list`` and ``hermes doctor`` surface the ignored copy.
++"""
++
++import logging
++import sys
++
++import hermes_yaml as yaml
++import pytest
++
++from hermes_cli.plugins import PluginManager
++
++
++def _write_plugin(base, dirname, name=None, probe=None):
++    plugin_dir = base / dirname
++    plugin_dir.mkdir(parents=True, exist_ok=True)
++    name = name or dirname
++    (plugin_dir / "plugin.yaml").write_text(
++        yaml.safe_dump({"name": name, "version": "0.1.0", "description": f"{dirname} copy"}))
++    body = f"import sys; sys._dup_probe = {probe or dirname!r}"
++    (plugin_dir / "__init__.py").write_text(f"def register(ctx):\n    {body}\n")
++    return plugin_dir
++
++
++def _enable(home, names):
++    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": list(names)}}))
++
++
++@pytest.fixture
++def hermes_home(tmp_path, monkeypatch):
++    home = tmp_path / "hermes_home"
++    (home / "plugins").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "0")
++    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "empty-bundled"))
++    (tmp_path / "empty-bundled").mkdir()
++    yield home
++    if hasattr(sys, "_dup_probe"):
++        del sys._dup_probe
++
++
++def _load(home, caplog):
++    with caplog.at_level(logging.INFO, logger="hermes_cli.plugins"):
++        mgr = PluginManager()
++        mgr.discover_and_load()
++    return mgr
++
++
++class TestSameNameDirsInOneScope:
++    def test_backup_dir_never_shadows_the_live_plugin(self, hermes_home, caplog):
++        plugins = hermes_home / "plugins"
++        live = _write_plugin(plugins, "slack-workspace", probe="live")
++        backup = _write_plugin(plugins, "slack-workspace.bak-premacops", name="slack-workspace", probe="backup")
++        _enable(hermes_home, ["slack-workspace"])
++        mgr = _load(hermes_home, caplog)
++        assert mgr._plugins["slack-workspace"].manifest.path == str(live)
++        assert sys._dup_probe == "live"
++        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
++        assert any(str(backup) in w and "backup" in w for w in warnings), warnings
++
++    @pytest.mark.parametrize("suffix", [".bak", ".bak2", ".BAK-old", ".orig", ".old"])
++    def test_backup_suffixes_are_skipped_even_when_unique(self, hermes_home, caplog, suffix):
++        _write_plugin(hermes_home / "plugins", f"solo{suffix}", name="solo")
++        _enable(hermes_home, ["solo"])
++        mgr = _load(hermes_home, caplog)
++        assert "solo" not in mgr._plugins
++        assert not hasattr(sys, "_dup_probe")
++        assert any(f"solo{suffix}" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
++
++    def test_non_backup_copy_loses_to_basename_match_and_both_paths_are_named(self, hermes_home, caplog):
++        plugins = hermes_home / "plugins"
++        live = _write_plugin(plugins, "thing", probe="live")
++        copy = _write_plugin(plugins, "thing-copy", name="thing", probe="copy")  # sorts after "thing"
++        _enable(hermes_home, ["thing"])
++        mgr = _load(hermes_home, caplog)
++        assert mgr._plugins["thing"].manifest.path == str(live)
++        assert sys._dup_probe == "live"
++        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
++        assert any(str(live) in w and str(copy) in w for w in warnings), warnings
++
++    def test_basename_match_wins_regardless_of_scan_order(self, hermes_home, caplog):
++        plugins = hermes_home / "plugins"
++        copy = _write_plugin(plugins, "a-zeta-copy", name="zeta", probe="copy")  # sorts before "zeta"
++        live = _write_plugin(plugins, "zeta", probe="live")
++        _enable(hermes_home, ["zeta"])
++        mgr = _load(hermes_home, caplog)
++        assert mgr._plugins["zeta"].manifest.path == str(live)
++        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
++        assert any(str(live) in w and str(copy) in w for w in warnings), warnings
++
++    def test_no_basename_match_keeps_first_and_warns(self, hermes_home, caplog):
++        plugins = hermes_home / "plugins"
++        first = _write_plugin(plugins, "x1", name="thing", probe="x1")
++        second = _write_plugin(plugins, "x2", name="thing", probe="x2")
++        _enable(hermes_home, ["thing"])
++        mgr = _load(hermes_home, caplog)
++        assert mgr._plugins["thing"].manifest.path == str(first)
++        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
++        assert any(str(first) in w and str(second) in w for w in warnings), warnings
++
++    def test_unrelated_plugins_raise_no_conflict(self, hermes_home, caplog):
++        from hermes_cli.plugins_discovery import plugin_dir_conflicts
++        _write_plugin(hermes_home / "plugins", "alpha")
++        _write_plugin(hermes_home / "plugins", "beta")
++        _enable(hermes_home, ["alpha", "beta"])
++        _load(hermes_home, caplog)
++        assert not [r for r in caplog.records if r.levelno >= logging.WARNING and "plugin" in r.getMessage().lower()
++                    and ("backup" in r.getMessage() or "same name" in r.getMessage())]
++        assert plugin_dir_conflicts(hermes_home / "plugins") == []
++
++
++class TestConflictsAreSurfaced:
++    def _setup(self, home):
++        plugins = home / "plugins"
++        live = _write_plugin(plugins, "slack-workspace")
++        backup = _write_plugin(plugins, "slack-workspace.bak-premacops", name="slack-workspace")
++        dup = _write_plugin(plugins, "slack-copy", name="slack-workspace")
++        return live, backup, dup
++
++    def test_plugin_dir_conflicts_lists_backup_and_shadowed_copy(self, hermes_home):
++        from hermes_cli.plugins_discovery import plugin_dir_conflicts
++        live, backup, dup = self._setup(hermes_home)
++        conflicts = plugin_dir_conflicts(hermes_home / "plugins")
++        by_path = {c.ignored: c for c in conflicts}
++        assert set(by_path) == {str(backup), str(dup)}
++        assert by_path[str(backup)].kind == "backup"
++        assert by_path[str(dup)].kind == "duplicate"
++        assert by_path[str(dup)].kept == str(live)
++        assert by_path[str(dup)].name == "slack-workspace"
++
++    def test_listing_shows_the_live_copy(self, hermes_home):
++        from hermes_cli.plugins_cmd import _discover_all_plugins
++        live, _backup, _dup = self._setup(hermes_home)
++        rows = {r[5]: r for r in _discover_all_plugins()}
++        assert str(rows["slack-workspace"][4]) == str(live)
++
++    def test_plugins_list_prints_the_shadowed_copies(self, hermes_home, capsys):
++        from types import SimpleNamespace
++        from hermes_cli.plugins_cmd_listing import cmd_list
++        _live, backup, dup = self._setup(hermes_home)
++        cmd_list(SimpleNamespace(plain=True, json=False))
++        out = capsys.readouterr()
++        text = out.out + out.err
++        assert str(backup) in text and str(dup) in text
++
++    def test_doctor_warns_about_shadowed_copies(self, hermes_home, monkeypatch):
++        from hermes_cli import doctor_state as ds
++        _live, backup, dup = self._setup(hermes_home)
++        warned = []
++        monkeypatch.setattr(ds, "check_warn", lambda text, detail="": warned.append(f"{text} {detail}"))
++        monkeypatch.setattr(ds, "check_ok", lambda *a, **k: None)
++        finding = ds._check_plugin_dir_conflicts(False)
++        joined = "\n".join(warned)
++        assert str(backup) in joined and str(dup) in joined
++        assert finding.manual_issues
++
++    def test_doctor_is_quiet_when_clean(self, hermes_home, monkeypatch):
++        from hermes_cli import doctor_state as ds
++        _write_plugin(hermes_home / "plugins", "alpha")
++        warned = []
++        monkeypatch.setattr(ds, "check_warn", lambda text, detail="": warned.append(text))
++        monkeypatch.setattr(ds, "check_ok", lambda *a, **k: None)
++        finding = ds._check_plugin_dir_conflicts(False)
++        assert warned == [] and not finding.manual_issues
+-- 
+2.54.0 (Apple Git-157)
+
