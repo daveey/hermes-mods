@@ -43,6 +43,20 @@ test('kanbanChips filters by session lineage and active status, running first', 
   assert.deepEqual(chips.map(c => c.id), ['t_2', 't_1'])
 })
 
+test('triage remains visible locally, through lineage fallback, and on remote gateways', () => {
+  for (const block_kind of ['transient', null, 'needs_input', 'capability']) {
+    const task = { id: 't_triage', status: 'triage', block_kind, session_id: 's_root' }
+    const local = m.sessionTaskChips([task])
+    assert.equal(local.length, 1)
+    assert.equal(local[0].state, 'triage')
+    assert.match(local[0].title, /triage/)
+    assert.doesNotMatch(local[0].title, /needs input|waiting on you/i)
+    assert.equal(m.kanbanChips({ columns: [{ name: 'triage', tasks: [task] }] }, new Set(['s_leaf', 's_root'])).length, 1)
+    assert.equal(m.hubLinkChips([{ ...task, gateway: 'remote', local: false }]).length, 1)
+  }
+  assert.equal(m.chipColor('triage'), '#f85149')
+})
+
 test('elapsed formats', () => {
   const now = 1_000_000_000
   assert.equal(m.elapsed(now / 1000 - 5, now), '5s')

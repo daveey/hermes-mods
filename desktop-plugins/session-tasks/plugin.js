@@ -5,7 +5,7 @@
  *   ⟳ bg   background processes   (gateway RPC `process.list`, status != exited)
  *   ⟳ sub  delegate_task subagents (gateway RPC `subagent.list`, non-terminal status)
  *   ⟳ t_…  kanban tasks this session created or shepherds (tui subscription),
- *          across every board, in todo / ready / running / scheduled / blocked / review
+ *          across every board, in todo / ready / running / scheduled / blocked / review / triage
  *          — the same cards the sidebar row's kanban counts cover
  *          (`/api/session-kanban-tasks?ids=<lineage>`; older backends: a scan of the
  *          current `/api/plugins/kanban/board` for cards the lineage created),
@@ -31,7 +31,7 @@ const KANBAN_POLL_MS = 10_000
 const MACHINE_POLL_MS = 30_000
 const LINEAGE_TTL_MS = 5 * 60_000
 const MAX_LABEL = 38
-const KANBAN_ACTIVE = new Set(['todo', 'ready', 'running', 'scheduled', 'blocked', 'review'])
+const KANBAN_ACTIVE = new Set(['todo', 'ready', 'running', 'scheduled', 'blocked', 'review', 'triage'])
 const SUBAGENT_DONE = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'timeout', 'error'])
 
 const STATE_COLOR = {
@@ -43,7 +43,8 @@ const STATE_COLOR = {
   todo: '#8b949e',
   scheduled: '#e3b341', // waiting on a timer
   blocked: '#f85149',
-  review: '#db61a2'
+  review: '#db61a2',
+  triage: '#f85149' // unfinished agent triage, not an implied human ask
 }
 
 // States whose whole pill (border + fill) takes the state colour, not just the dot/label.
@@ -106,7 +107,7 @@ export function subagentChips(subagents) {
     })
 }
 
-const KANBAN_RANK = { running: 0, blocked: 1, review: 2, ready: 3, scheduled: 4, todo: 5 }
+const KANBAN_RANK = { running: 0, blocked: 1, review: 2, triage: 2, ready: 3, scheduled: 4, todo: 5 }
 
 function taskChip(t, status) {
   const watching = t.via === 'subscribed'
@@ -562,7 +563,7 @@ export default {
     ctx.registerArchiveGuard?.(archiveGuard)
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { get snapshot() { return snapshot }, refresh }
+    window.__sessionTasks = { version: 'triage-visible-v1', get snapshot() { return snapshot }, refresh }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       document.getElementById(`${ID}-style`)?.remove()
