@@ -231,11 +231,19 @@ def _route_event(state: State, ev: dict) -> bool:
     """Record + route one event. True = it belongs to an engagement or to the owner's ops profile
     (ambient bot must not see it)."""
     try:
-        if _owner_ops(state).route(ev):
+        oo = _owner_ops(state)
+        if oo.route(ev):
             logger.info("mac-ops: owner DM %s ts=%s -> ops profile", ev.get("channel"), ev.get("ts"))
             return True
+        if isinstance(ev, dict) and str(ev.get("channel") or "").startswith("D") and not ev.get("bot_id"):
+            # Why a human DM stayed with ambient Alpha (silent misses cost three live retries).
+            owners = oo.owners()
+            logger.info("mac-ops: DM %s ts=%s stays ambient: type=%s channel_type=%r subtype=%r owner=%s owners=%d machine=%s home=%s",
+                        ev.get("channel"), ev.get("ts"), ev.get("type"), ev.get("channel_type"), ev.get("subtype"),
+                        (ev.get("user") or "") in owners, len(owners),
+                        ownerops.wants_machine_ops(ev.get("text") or ""), oo.bot_home)
     except Exception as exc:  # routing must never break dispatch
-        logger.warning("mac-ops routing failed: %s", exc)
+        logger.warning("mac-ops routing failed: %s", exc, exc_info=True)
     r = engage.route(ev, state.engs, bot_user_id=state.bot_user_id())
     if r.decision != "engaged":
         return False
@@ -280,7 +288,7 @@ def _make_factory(state: State):
                         logger.info("slack-follow: event %s (%s) swallowed in %.3fs", body.get("event_id"),
                                     ev.get("type"), time.time() - t0)
             except Exception as exc:  # never break dispatch
-                logger.debug("slack-workspace observe failed: %s", exc)
+                logger.warning("slack-workspace observe failed: %s", exc, exc_info=True)
             if engaged:  # the follower owns this channel/thread: ack (200) and stop here
                 return _ack_response()
             await next()
