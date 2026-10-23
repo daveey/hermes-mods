@@ -13,13 +13,19 @@ import uuid
 
 if __package__:
     from . import relay_files as rf
+    from . import shepherd as _shepherd
 else:  # pytest imports this hyphen-named plugin dir without a parent package
     import importlib.util as _ilu
     from pathlib import Path as _Path
 
-    _spec = _ilu.spec_from_file_location("_session_mentions_relay_files", _Path(__file__).with_name("relay_files.py"))
-    rf = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
-    _spec.loader.exec_module(rf)  # type: ignore[union-attr]
+    def _load_sibling(name):
+        spec = _ilu.spec_from_file_location(f"_session_mentions_{name}", _Path(__file__).with_name(f"{name}.py"))
+        mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
+
+    rf = _load_sibling("relay_files")
+    _shepherd = _load_sibling("shepherd")
 
 TOOLSET = "session_mentions"
 PICKUP_TIMEOUT = 30.0  # Desktop drains every ~3s; no claim by then = Desktop not running
@@ -141,6 +147,8 @@ TASK_SCHEMA = {
         "which is searched on every gateway): body, status, latest summary, runs, links, "
         "last `limit` comments/events (default 10).\n"
         "- action=comment: add `message` as a comment on `target`, attributed to this session.\n"
+        "Reading or commenting on a task on another gateway also links it to this session (hermes-hub "
+        "shepherd), so this session's sidebar row stays busy while that card runs.\n"
         "Requires the Hermes Desktop app to be running (it relays the request)."
     ),
     "parameters": {
@@ -177,7 +185,21 @@ def handle_task(args: dict, session_id: str | None = None, **_kw) -> str:
                     "(e.g. target=\"@task:default@nous-1/t_1a2b3c4d\"); got keys: " + (", ".join(got) or "none"))
     if action == "comment" and not str(args.get("message") or "").strip():
         return _err("message is required for comment — pass the text as `message`")
-    return _relay(f"task_{action}", args, session_id, 0)
+    out = _relay(f"task_{action}", args, session_id, 0)
+    if action in ("read", "comment"):
+        _adopt_remote_task(args.get("target"), session_id)
+    return out
+
+
+def _adopt_remote_task(target, session_id) -> None:
+    """A session that reads or comments on a card on another gateway shepherds it: queue a hermes-hub
+    ``shepherd`` request so this gateway's sidebar counts it as the session's work. Fire-and-forget."""
+    try:
+        if not session_id:
+            return
+        _shepherd.maybe_shepherd(target, session_id, _sender_info(session_id).get("profile") or "default", rf.root())
+    except Exception:
+        pass
 
 
 def _devices_note(base) -> str:
