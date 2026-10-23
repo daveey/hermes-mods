@@ -6,9 +6,9 @@ Classify each blocked card by the event that stopped it (`select kind,payload fr
 |---|---|
 | `gave_up` with a provider 429 / "usage limit resets in ~Nh" tail | Repin to a working subscription model (`hermes kanban set-model <id> <model> --provider <p>`), after a one-line live check of that model (`hermes chat -q "Reply with exactly: OK" -m <model> --provider <p> --quiet`). Also repin queued `todo`/`scheduled` cards pinned to the walled provider, or they fail on dispatch. If the gateway's root model has an empty fallback chain, add one: `hermes config set fallback_providers '[{"provider":"openai-codex","model":"gpt-6-astra"}]'`, then `hermes fallback list`. |
 | `needs_input` saying "continuation limit reached" | `hermes kanban unblock`; the blocked run breaks the consecutive-continuation streak. |
-| `gave_up` "exited cleanly without kanban_complete" (protocol violation) | Unblock; the worker re-verifies its prior work. |
+| `gave_up` "exited cleanly without kanban_complete" (protocol violation) | Read the tail of `~/.hermes/kanban/logs/<id>.log`. If runs die at ~60 s on a heavy test command (`[exit -15]`), comment: run heavy tests backgrounded or memory-capped, single fork, never broad `pkill`/`kill 0`, checkpoint by comment after heavy steps, and always end with a terminal kanban call. Then unblock; the worker re-verifies its prior work. |
 | `capability`: the profile can't write that code | `hermes kanban reassign <id> default --reason …`, then unblock. |
-| Needs a host the gateway can't SSH to | Comment the route (cross_session to a session on that host's gateway), then unblock. |
+| Needs a host the gateway can't SSH to, or "reconnect Desktop so session X can receive" | `cross_session read` the target session first; if it answers, the relay works. Comment the route (cross_session to a session on that host's gateway, e.g. the one already running `bb land` merges), then unblock. |
 | Part of the card waits on an owner decision | Comment "finish everything else; record item X as waiting on decision Y", then unblock. |
 | Owner decision / scope choice | Ask inline with `clarify` (see SKILL.md), then record and complete. |
 
