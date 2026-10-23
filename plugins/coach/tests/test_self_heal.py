@@ -421,3 +421,86 @@ def test_backstop_context_carries_the_agents_reply_to_the_turn():
     mid = {"title": "t", "last_reply": turns[1]["prev"]}                  # digest written mid-turn
     assert "reply to this message" not in sh.backstop_context(mid, turns, turns[1])
     assert "Found the cooldown bug" in sh.complaint_prompt("", turns[1]["text"], context=sh.backstop_context(dg, turns, turns[1]))
+
+
+# ---- t_a871080a: flash variance + strict-stage misses (ask-gate week of 10-12 follow-up) ---------------------------
+def seq(*answers):
+    """Fake judge answering in order; records (system, prompt)."""
+    it, calls = iter(answers), []
+
+    def llm(system, prompt):
+        calls.append((system, prompt))
+        p, kind = next(it)
+        return json.dumps({"p_defect": p, "kind": kind, "component": "plugin", "symptom": "s"})
+    return llm, calls
+
+
+def test_borderline_stage1_is_resampled_and_the_max_counts(monkeypatch):
+    """'why are all the dots red? [screenshot]' scored 0.7, 0.6 and 0.05 on three identical temp-0 flash calls."""
+    monkeypatch.setattr(sh, "RESAMPLE_LO", 0.3)
+    llm, calls = seq((0.45, "hermes_bug"), (0.8, "hermes_bug"), (0.8, "hermes_bug"))
+    hit = sh.detect_complaint("", "the sidebar looks odd", llm)
+    assert hit and hit["stages"] == [0.8, 0.8] and len(calls) == 3
+    assert calls[0] == calls[1]                                # the resample is the identical stage-1 call
+    llm, calls = seq((0.45, "hermes_bug"), (0.2, "none"))      # a lower resample never lowers the score
+    v = sh.complaint_verdict("", "the sidebar looks odd", llm)
+    assert v["stages"] == [0.45] and len(calls) == 2
+    llm, calls = seq((0.1, "none"))                            # clear no, no fix word: one cheap call
+    assert sh.detect_complaint("", "add a dark mode toggle", llm) is None and len(calls) == 1
+
+
+def test_fix_request_below_gate_gets_one_more_stage1_sample(monkeypatch):
+    monkeypatch.setattr(sh, "RESAMPLE_LO", None)
+    monkeypatch.setattr(sh, "FIX_RESAMPLE", True)
+    for text in ("root cause it, and fix the pluggin", "why are all the dots red? [screenshot]",
+                 "figure ut why the plugin fails", "seems broken, still in meeting"):
+        assert sh.resample_stage1(0.0, text), text
+    assert not sh.resample_stage1(0.0, "make a card to do the nest investigation please")
+    assert not sh.resample_stage1(0.7, "fix it")               # at/above GATE: no resample
+    llm, calls = seq((0.05, "none"), (0.7, "hermes_bug"), (0.9, "hermes_bug"))
+    hit = sh.detect_complaint("The account_usage plugin conflates quota with cooldown.", "root cause it, and fix the pluggin", llm)
+    assert hit and hit["stages"] == [0.7, 0.9] and len(calls) == 3
+    monkeypatch.setattr(sh, "FIX_RESAMPLE", False)
+    llm, calls = seq((0.05, "none"))
+    assert sh.detect_complaint("", "root cause it, and fix the pluggin", llm) is None and len(calls) == 1
+
+
+def test_strict_prompt_counts_fix_requests_for_described_defects_and_never_calls_hermes_a_product():
+    s = sh.COMPLAINT_STRICT_SYS
+    assert "{strict" not in s and s.rstrip().endswith('"symptom": "..."}')
+    assert "previous message (or its reply to this\n  message) describes" in s       # candidate 2
+    assert "agent's own earlier work in this session caused" in s                    # candidate 2
+    assert "is never a product_bug" in s                                             # candidate A
+    bare = sh.strict_sys(False, False)
+    assert "describes" not in bare and "never a product_bug" not in bare and "{strict" not in bare
+    llm, calls = judge(0.9, kind="hermes_bug")
+    sh.detect_complaint("Done.", "still broken", llm)
+    assert calls[1][0].startswith(sh.COMPLAINT_STRICT_SYS)
+
+
+def _digest(tmp_path, now):
+    p = tmp_path / "data" / "hub" / "default" / "s1.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"id": "s1", "host": "hub", "profile": "default", "source": "desktop", "title": "x",
+                             "user_turns": [{"t": now - 60, "text": "that's not what i asked", "prev": "Done."}]}))
+    return tmp_path / "data"
+
+
+def test_backstop_passes_the_confirm_model(tmp_path, monkeypatch):
+    """The backstop called detect_complaint(..., confirm=None): the confirm model never ran on digests."""
+    import time as _t
+    now = _t.time()
+    data = _digest(tmp_path, now)
+    store = core.Store(tmp_path / "coach")
+    first, _ = judge(0.8, kind="agent_fault")
+    no, cno = judge(0.0, kind="none")
+    monkeypatch.setattr(sh, "confirm_judge", lambda: no)
+    filed = []
+    sh.backstop(data, store=store, judge=first, now=now, m="shadow",
+                filer=lambda d, store=None, m=None: filed.append(d) or d)
+    assert len(cno) == 1 and not filed                         # mean(0.8, 0.8, 0) < 0.6: confirm vetoed it
+    yes, cyes = judge(0.9, kind="agent_fault")
+    (tmp_path / "coach" / "selfheal_backstop.json").unlink(missing_ok=True)
+    sh.backstop(data, store=store, judge=first, now=now, m="shadow", confirm=yes,
+                filer=lambda d, store=None, m=None: filed.append(d) or d)
+    assert len(cyes) == 1 and len(filed) == 1 and filed[0]["stages"] == [0.8, 0.8, 0.9]

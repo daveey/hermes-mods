@@ -95,7 +95,7 @@ Return ONLY JSON: {"p_defect": p, "kind": "...", "component": "...", "symptom": 
 
 # Second first-stage opinion: the narrower wording (only Hermes itself, product bugs reported as new issues score low).
 # Averaging it with COMPLAINT_SYS cuts false alarms on product bug reports without losing the agent-fault catches.
-COMPLAINT_STRICT_SYS = """You watch a power user's chats with his AI agent system "Hermes" (the coding/ops agent, its Desktop
+_STRICT_TEMPLATE = """You watch a power user's chats with his AI agent system "Hermes" (the coding/ops agent, its Desktop
 app, plugins, skills, cron jobs, Kanban task cards and workers, chat bots, gateways, model providers) and the products
 Hermes builds and runs for him (e.g. a home assistant). You see the agent's previous final message, the tool log of
 its previous turn, and the user's new message.
@@ -112,13 +112,13 @@ to do something it should have known to do, so a self-correcting system should r
 - reports that Hermes itself (Desktop app, sidebar, panels, plugin, tool, cron, Kanban card state, session status,
   gateway, bot) misbehaved, lost data or shows wrong state,
 - requests to fix or root-cause the agent's or Hermes's own behavior,
-- a bare nudge ("resume", "what's going on", "are you stuck", "status?") when the previous turn did not end in a real
+{strict_extra}- a bare nudge ("resume", "what's going on", "are you stuck", "status?") when the previous turn did not end in a real
   answer: it was interrupted, errored, stopped mid-work, went silent after many tool calls, or promised work that never
   came. A nudge after a complete answer is low.
 Do NOT count (low, <0.3): brand-new requests or feature asks; design taste or wording preferences the agent could not
 have predicted; answers to the agent's legitimate questions; approvals; status questions with no sign of a problem;
 bugs in his products or the outside world that he reports as a NEW issue with no sign the agent's or Hermes's own work
-caused them or should have prevented them (score those p_defect low and set kind "product_bug").
+caused them or should have prevented them (score those p_defect low and set kind "product_bug").{strict_product}
 
 kind: agent_fault (how the agent worked: claims, asks, verification, instruction-following, scope), hermes_bug
 (Hermes software/infra misbehaved), product_bug (see above), none.
@@ -127,6 +127,27 @@ product), other.
 symptom: <=10 words naming what is wrong, neutral words, no names (e.g. "asked user to run terminal command").
 
 Return ONLY JSON: {"p_defect": p, "kind": "...", "component": "...", "symptom": "..."}"""
+
+# Candidate 2 (ask-gate wk 10-12): "root cause it, and fix the pluggin" after a reply that described the account_usage
+# plugin bug scored 0 on 3/3 strict runs (read as a new request); the Alpha rename that left the bot named Hermes was
+# called product_bug although the agent's own rename caused it.
+STRICT_FIX_REQUEST = """- a request to fix or root-cause a Hermes defect that the agent's previous message (or its reply to this
+  message) describes, even when worded as a new task ("root cause it, and fix the plugin"),
+- a problem in his product that the agent's own earlier work in this session caused or left half-done (e.g. a rename
+  it made that missed a place),
+"""
+# Candidate A (t_eedc20dc): the strict stage labelled red-mark sessions and 'fix the pluggin' product_bug.
+STRICT_NEVER_PRODUCT = """
+Hermes itself (Desktop app, sidebar, panels, plugins, Kanban, gateway, bots, cron) is never a product_bug: a report
+that it misbehaves is hermes_bug."""
+
+
+def strict_sys(fix_request: bool = True, never_product: bool = True) -> str:
+    return (_STRICT_TEMPLATE.replace("{strict_extra}", STRICT_FIX_REQUEST if fix_request else "")
+            .replace("{strict_product}", STRICT_NEVER_PRODUCT if never_product else ""))
+
+
+COMPLAINT_STRICT_SYS = strict_sys()
 
 AUDIT_SYS = """You audit an AI agent's turn right as it ends, for a demanding power user who wants the agent to
 self-serve, verify on his real path, and fix its own mistakes. You see his request, the turn's tool log (errors marked
@@ -336,6 +357,18 @@ def _score(v: Optional[dict]) -> float:
     return 0.0 if not v or v.get("kind") in ("external", "product_bug", "none") else v["p_defect"]
 
 
+RESAMPLE_LO = 0.3     # a stage-1 score in [RESAMPLE_LO, GATE) gets one more sample (candidate 1)
+FIX_RESAMPLE = True   # so does any stage-1 miss whose message asks to fix / root-cause something (candidate B)
+FIX_RE = re.compile(r"\b(?:fix(?:ed)?|root[- ]?caus\w*|figure (?:it )?(?:ou?t|ut) (?:why|what)|investigate|debug|"
+                    r"broken|why (?:is|are|did|didn'?t|does|doesn'?t|isn'?t|aren'?t))\b", re.I)
+
+
+def resample_stage1(s1: float, user_text) -> bool:
+    if RESAMPLE_LO is not None and RESAMPLE_LO <= s1 < GATE:
+        return True
+    return bool(FIX_RESAMPLE and s1 < GATE and FIX_RE.search(clean_user(user_text)))
+
+
 def _ask(llm: Callable[[str, str], str], system: str, prompt: str, tries: int = 2) -> Optional[dict]:
     """One judge stage, retried once when the call fails or the answer does not parse (an empty flash answer is
     common). None = no opinion, which the cascade leaves out; it is never a 'no' vote."""
@@ -356,10 +389,17 @@ def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str]
     of the stage scores (a non-defect kind scores 0; a stage with no answer after a retry is left out, since counting
     it as 0 halved real catches). Component/symptom come from the strongest stage."""
     prompt = complaint_prompt(prev_reply, user_text, tool_log, context)
-    v1 = _ask(llm, _with_profile(COMPLAINT_SYS), prompt)
+    system = _with_profile(COMPLAINT_SYS)
+    v1 = _ask(llm, system, prompt)
     if not v1:
         return None
     s1 = _score(v1)
+    if s1 < GATE and resample_stage1(s1, user_text):
+        # Flash at temp 0 is not deterministic: "why are all the dots red? [screenshot]" scored 0.7, 0.6 and 0.05 on
+        # three identical calls. One more sample on a borderline score or an explicit fix request; the max counts.
+        v1b = _ask(llm, system, prompt)
+        if v1b and _score(v1b) > s1:
+            v1, s1 = v1b, _score(v1b)
     if s1 < GATE:
         return {**v1, "p_defect": s1, "stages": [s1]}
     v2 = _ask(llm, _with_profile(COMPLAINT_STRICT_SYS), prompt)
@@ -1251,9 +1291,12 @@ def backstop_context(dg: dict, turns: list, t: dict, n: int = 3, chars: int = 30
     return "\n".join(lines)
 
 
+_UNSET = object()
+
+
 def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Optional[float] = None,
              lookback: float = 3 * 3600, filer: Optional[Callable] = None, m: Optional[str] = None,
-             limit: int = 200) -> list:
+             limit: int = 200, confirm=_UNSET) -> list:
     """Run the complaint detector over user turns newer than the per-session cursor in the coach digests
     (<data>/<host>/<profile>/<sid>.json). A session seen for the first time is scanned only `lookback` back. The judge
     gets the agent reply before each turn (digest v6 `prev`) and always the session context (title + the earlier user
@@ -1268,6 +1311,8 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
     except Exception:
         cursor = {}
     judge = judge or aux_judge
+    # The confirm model (auxiliary.coach_defect_confirm) joins the cascade here as on the hook path; None when unset.
+    confirm = confirm_judge() if confirm is _UNSET else confirm
     out, n = [], 0
     for f in sorted(Path(data).glob("*/*/*.json")):
         if f.parts[-3] in ("reports", "findings", "research", "eval", "curriculum"):
@@ -1295,7 +1340,7 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
                 continue
             n += 1
             hit = detect_complaint(t.get("prev") or "", text, llm=judge, threshold=threshold(),
-                                   context=backstop_context(dg, turns, t))
+                                   context=backstop_context(dg, turns, t), confirm=confirm)
             if not hit:
                 continue
             sid = dg.get("id") or f.stem

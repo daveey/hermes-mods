@@ -142,9 +142,13 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   goes to the aux judge `coach_defect`, with the agent's previous reply and that turn's tool log. It counts
   corrections ("you buy the credits"), failed fixes ("nope, still broken"), needless handoffs ("you have ssh"),
   frustration, Hermes or product misbehaviour, and nudges ("resume", "what's going on") after a stalled turn.
+  A first-stage score below 0.6 is sampled once more when it is borderline (>= 0.3) or the message asks to fix /
+  root-cause something (flash at temp 0 scored one identical turn 0.7, 0.6 and 0.05); the higher sample counts.
   A first-stage score >= 0.6 escalates: a second flash opinion on a stricter prompt and, when
-  `auxiliary.coach_defect_confirm` (or `COACH_DEFECT_CONFIRM_MODEL`) is set, a stronger model on the same prompt;
-  `p_defect` is the mean of the stage scores. Outside-world problems (`kind: external`) never count.
+  `auxiliary.coach_defect_confirm` (or `COACH_DEFECT_CONFIRM_MODEL`) is set, a stronger model on the same prompt
+  (on the hook path and the digest backstop alike); `p_defect` is the mean of the stage scores. The strict prompt
+  counts a fix/root-cause request for a Hermes defect the agent's own message described, and a product problem the
+  agent's own work caused; Hermes itself is never a `product_bug`. Outside-world problems (`kind: external`) never count.
 - **Turn end** (`post_llm_call`): machine signals first, no judge (a provider-error reply, an interrupted turn, one
   tool error repeated 3×). Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
   errors, a turn-end audit by the same judge; only self-admissions file (the other audit kinds cost more false alarms
@@ -156,7 +160,8 @@ the reply check), so they know your standing rules. The overlay is rules and env
 answer in the wrong keys, and `parse` takes only an object with `p_defect` (another schema = no vote, never 0). The
 digest backstop also shows the judge the agent's reply to the turn, so a screenshot-only report reads as what it was.
 Replay of the week-of-10-12 Hermes fix requests: 6/25 -> 12/25 caught; a 150-turn control fired on 33, nearly all
-real complaints.
+real complaints. With the resample, the strict-prompt changes and the confirm model (`claude-sonnet-5`) also on
+the backstop: 19/25 and 16/25 on two runs (13/13 without), control 28 and 30 (32 without).
 
 Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
 workers. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
@@ -165,7 +170,7 @@ fingerprint per UTC day (`coach/selfheal.json` holds the fingerprints). The fing
 and the symptom's stemmed content words, so "sidebar sessions reshuffle" and "session sidebar reshuffles" match.
 `COACH_SELFHEAL_THRESHOLD` (default 0.6). Set the judge model with `auxiliary.coach_defect.provider` / `.model`
 (evaluated on `gemini-3.8-flash`) and the confirm model with `auxiliary.coach_defect_confirm` (evaluated on
-`claude-sonnet-5-5`).
+`claude-sonnet-5`).
 
 Replay evals:
 - `eval/selfheal_incident_replay.py` (`run`, then `score --relabel --report`): the production code over an
