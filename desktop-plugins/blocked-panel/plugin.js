@@ -15,6 +15,8 @@
  *     resumed worker reads it).
  *     Skipped: `transient` blocks (they clear on their own) and reasons that say
  *     "no human action needed" (time waits that should have been kanban_schedule).
+ *   - Cards parked by an operational failure (newest event gave_up/crashed/timed_out/spawn_failed, no later
+ *     `blocked`) are agent issues, not asks: snapshot.issues, "No action required from you", Open card only.
  *   - you parked it with ⌘B (core's `hermes.desktop.blockedSessionIds`). With no
  *     blocked cards that shows one line: parked by you, ⌘B to unblock.
  *
@@ -129,6 +131,65 @@ export function needsHuman(block) {
   return !NO_HUMAN_RE.test(block.reason || '')
 }
 
+const FAILURE_KINDS = new Set(['gave_up', 'crashed', 'timed_out', 'spawn_failed'])
+const REFUSAL_RE = /safety refusal|declined to respond|safety filter/i
+
+const oneLine = (v, max = 220) => {
+  const t = unescapeText(v).replace(/\s+/g, ' ').trim()
+  return t.length > max ? `${t.slice(0, max - 1)}\u2026` : t
+}
+
+/** Human-readable, short reason for a dispatcher/worker failure event (never the raw worker transcript). */
+export function failureSummary(kind, payload) {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const raw = `${str(p.error)} ${str(p.worker_output)} ${str(p.reason)}`
+  if (REFUSAL_RE.test(raw)) return 'The model declined to respond (safety refusal).'
+  const code = p.exit_code != null && p.exit_code !== '' ? ` (exit code ${str(p.exit_code)})` : ''
+  const n = Number(p.failures) > 0 ? ` after ${Number(p.failures)} failed attempt${Number(p.failures) === 1 ? '' : 's'}` : ''
+  const detail = oneLine(p.error || p.reason || '', 160)
+  switch (kind) {
+    case 'gave_up':
+      return `The dispatcher gave up${n}${code}.${detail ? ` ${detail}` : ''}`
+    case 'timed_out':
+      return `The worker timed out${code}.${detail ? ` ${detail}` : ''}`
+    case 'spawn_failed':
+      return `The worker could not be started.${detail ? ` ${detail}` : ''}`
+    default:
+      return `The worker crashed${code}.${detail ? ` ${detail}` : ''}`
+  }
+}
+
+/** Why is this card blocked? Walks events oldest→newest and keeps whichever came last since the newest
+ *  `unblocked`: a worker/human `blocked` event (origin 'human' — `initial` when the card was created blocked,
+ *  `recorded` when the worker wrote a reason, `unrecorded` when the reason is empty) or an operational
+ *  failure (`gave_up`/`crashed`/`timed_out`/`spawn_failed`, origin 'agent': the dispatcher parked it, nobody asked
+ *  you for anything). No such event at all → origin 'unknown' (legacy cards: treated as human). */
+export function blockState(events) {
+  const list = (Array.isArray(events) ? events : []).slice().sort((a, b) => (Number(a?.id) || 0) - (Number(b?.id) || 0))
+  let state = { origin: 'unknown', block: null, failure: null }
+  for (const e of list) {
+    if (e?.kind === 'unblocked') state = { origin: 'unknown', block: null, failure: null }
+    else if (e?.kind === 'blocked') {
+      const p = payloadOf(e)
+      const reason = str(p.reason).trim()
+      const initial = reason === 'initial_status'
+      state = {
+        origin: 'human',
+        failure: null,
+        block: { reason: initial ? '' : reason, kind: str(p.kind) || null, at: Number(e.created_at) || 0, source: initial ? 'initial' : reason ? 'recorded' : 'unrecorded' }
+      }
+    } else if (FAILURE_KINDS.has(e?.kind)) {
+      const p = payloadOf(e)
+      state = {
+        origin: 'agent',
+        block: null,
+        failure: { kind: e.kind, reason: failureSummary(e.kind, p), refusal: REFUSAL_RE.test(`${str(p.error)} ${str(p.worker_output)}`), at: Number(e.created_at) || 0 }
+      }
+    }
+  }
+  return state
+}
+
 /** Split instructions into { intro, steps[] }. Steps come from line-leading
  *  markers ("1) ", "2. ", "- ") or, on one line, from inline "1) … 2) …" runs
  *  that count up from 0 or 1. Anything else → intro only. */
@@ -167,7 +228,9 @@ export function stepsOf(text) {
 
 const KIND_LABEL = { needs_input: 'Needs your input', capability: 'Needs access you have' }
 
-/** Session tasks + fetched details → panel items (human-blocked cards only). */
+/** Session tasks + fetched details → panel items that need YOU (human-blocked cards only).
+ *  Cards parked by a worker failure are NOT here: see agentIssues(). An unloaded card is kept as a
+ *  `loaded:false` placeholder (no unblock buttons until we know why it is blocked). */
 export function blockedItems(tasks, details) {
   const out = []
   const seen = new Set()
@@ -175,8 +238,10 @@ export function blockedItems(tasks, details) {
     if (!t?.id || str(t.status) !== 'blocked' || seen.has(t.id)) continue
     seen.add(t.id)
     const d = details?.get ? details.get(detailKey(t)) : details?.[detailKey(t)]
-    const block = d ? latestBlock(d.events) : null
-    if (!needsHuman(block)) continue
+    const st = d ? blockState(d.events) : { origin: 'unknown', block: null, failure: null }
+    if (st.origin === 'agent') continue
+    const block = st.block
+    if (!needsHuman(block) && d) continue
     const fromBody = !block?.reason
     const text = unescapeText(block?.reason || str(d?.task?.body).trim())
     out.push({
@@ -187,12 +252,48 @@ export function blockedItems(tasks, details) {
       kindLabel: KIND_LABEL[block?.kind] || 'Waiting on you',
       text,
       fromBody,
+      // 'initial': created blocked, its description IS the ask; 'recorded': the worker wrote a reason;
+      // otherwise the description is only a guess at what is wanted.
+      reasonSource: !d ? 'loading' : block?.source || 'legacy',
       loaded: Boolean(d),
       at: block?.at || 0,
       ...stepsOf(text)
     })
   }
   return out.sort((a, b) => b.at - a.at)
+}
+
+/** Blocked cards whose newest signal is an operational failure (dispatcher gave up, worker crashed,
+ *  model refusal…). They are agent/system issues: shown, but never as something you must do. */
+export function agentIssues(tasks, details) {
+  const out = []
+  const seen = new Set()
+  for (const t of Array.isArray(tasks) ? tasks : []) {
+    if (!t?.id || str(t.status) !== 'blocked' || seen.has(t.id)) continue
+    seen.add(t.id)
+    const d = details?.get ? details.get(detailKey(t)) : details?.[detailKey(t)]
+    const f = d ? blockState(d.events).failure : null
+    if (!f) continue
+    out.push({
+      id: str(t.id),
+      board: str(t.board) || 'default',
+      title: unescapeText(t.title) || str(t.id),
+      failureKind: f.kind,
+      refusal: f.refusal,
+      reason: f.reason,
+      noAction: true,
+      at: f.at
+    })
+  }
+  return out.sort((a, b) => b.at - a.at)
+}
+
+/** The one-line headline a strip shows for a human item. A description is only quoted when it IS the ask
+ *  (created blocked) or the worker wrote a reason; otherwise say so instead of quoting an unrelated line. */
+export function askSummary(item, rewritten) {
+  if (!item?.loaded) return 'Loading what this card needs\u2026'
+  if (item.fromBody && item.reasonSource !== 'initial') return 'No block reason was recorded. Open the card to see what it needs.'
+  return checklist(item, rewritten).steps[0]
 }
 
 export const detailKey = t => `${str(t?.board) || 'default'}:${str(t?.id)}`
@@ -313,7 +414,7 @@ function readParked() {
 }
 
 // One shared poller for every mounted composer.
-let snapshot = { stored: null, items: [], parked: false }
+let snapshot = { stored: null, items: [], issues: [], parked: false }
 const subs = new Set()
 const details = new Map() // detailKey → { at, data }
 let timer = null
@@ -408,7 +509,7 @@ export async function refresh(force = false) {
   try {
     const stored = host.state.focusedStoredSessionId.get()
     if (!stored) {
-      snapshot = { stored, items: [], parked: false }
+      snapshot = { stored, items: [], issues: [], parked: false }
       return emit()
     }
     if (force) details.clear()
@@ -418,11 +519,13 @@ export async function refresh(force = false) {
     if (tasks) await loadDetails(tasks)
     if (host.state.focusedStoredSessionId.get() !== stored) return
     const flat = new Map([...details].map(([k, v]) => [k, v.data]))
-    const items = tasks ? blockedItems(tasks, flat) : snapshot.stored === stored ? snapshot.items : []
+    const same = snapshot.stored === stored
+    const items = tasks ? blockedItems(tasks, flat) : same ? snapshot.items : []
     snapshot = {
       stored,
       // fetch failed: keep this chat's last list, never another chat's
       items: withRewrites(items),
+      issues: tasks ? agentIssues(tasks, flat) : same ? snapshot.issues || [] : [],
       parked: isParked(ids, readParked())
     }
     emit()
@@ -575,8 +678,10 @@ function Item({ item }) {
                 ? 'Writing clearer steps…'
                 : !item.text
                   ? 'No instructions were recorded.'
+                  : item.fromBody && item.reasonSource === 'initial'
+                    ? 'From the card description. To unblock:'
                   : item.fromBody
-                    ? 'No block reason recorded; from the card description. To unblock:'
+                    ? 'No block reason recorded; this is the card description, which may not be what it is waiting for:'
                     : 'To unblock:'
             }),
           item.loaded && list.intro && jsx('div', { style: { whiteSpace: 'pre-wrap' }, children: jsx(Linked, { text: list.intro }) }),
@@ -601,8 +706,8 @@ function Item({ item }) {
           item.text && list.source !== 'parsed' && jsx('button', { type: 'button', style: { ...btn(), border: 'none', padding: '2px 4px', opacity: 0.75 }, onClick: () => setShowNote(!showNote), children: showNote ? 'Hide agent\u2019s note' : 'Agent\u2019s note' }),
           jsx('span', { style: { flex: 1 } }),
           jsx('button', { type: 'button', style: btn(), onClick: () => openCard(item), children: 'Open card' }),
-          jsx('button', { type: 'button', style: btn(), disabled: busy, onClick: () => setReplying(!replying), children: 'Reply & unblock' }),
-          jsx('button', { type: 'button', style: btn(true), disabled: busy, onClick: () => act(false), title: 'I did it — move the card back to ready so the worker resumes', children: busy ? 'Unblocking…' : 'Done → unblock' })
+          item.loaded && jsx('button', { type: 'button', style: btn(), disabled: busy, onClick: () => setReplying(!replying), children: 'Reply & unblock' }),
+          item.loaded && jsx('button', { type: 'button', style: btn(true), disabled: busy, onClick: () => act(false), title: 'I did it — move the card back to ready so the worker resumes', children: busy ? 'Unblocking…' : 'Done → unblock' })
         ]
       }),
       replying &&
@@ -641,6 +746,34 @@ function Item({ item }) {
   })
 }
 
+/** An operational failure parked this card. Nothing is asked of you, so no unblock buttons. */
+function IssueItem({ issue }) {
+  return jsxs('div', {
+    'data-blocked-issue': issue.id,
+    style: { display: 'flex', flexDirection: 'column', gap: 4, padding: '6px 0', borderTop: '1px solid color-mix(in srgb, var(--border, #8884) 60%, transparent)' },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0 },
+        children: [
+          jsx('span', { style: { fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 10.5, opacity: 0.65, flex: 'none' }, children: issue.id }),
+          jsx('span', { title: issue.title, style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }, children: issue.title }),
+          jsx('span', { style: { marginLeft: 'auto', flex: 'none', fontSize: 10.5, opacity: 0.7 }, children: 'Agent issue' })
+        ]
+      }),
+      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45, userSelect: 'text' }, children: issue.reason }),
+      jsxs('div', {
+        style: { display: 'flex', gap: 6, alignItems: 'center' },
+        children: [
+          jsx('span', { style: { fontSize: 11.5, opacity: 0.75 }, children: 'No action required from you.' }),
+          jsx('span', { style: { flex: 1 } }),
+          jsx('button', { type: 'button', style: btn(), onClick: () => openCard(issue), children: 'Open card' })
+        ]
+      })
+    ]
+  })
+}
+export { IssueItem }
+
 function Panel() {
   const [snap, setSnap] = useState(snapshot)
   const [collapsed, setCollapsed] = useState(false)
@@ -659,11 +792,14 @@ function Panel() {
   // this panel only renders when that plugin is absent.
   if (typeof window !== 'undefined' && window.__userSteps?.ownsComposer) return null
   const { items, parked } = snap
-  if (!items.length && !parked) return null
+  const issues = snap.issues || []
+  if (!items.length && !parked && !issues.length) return null
 
   const header = items.length
     ? `Blocked: waiting on you${items.length > 1 ? ` (${items.length} cards)` : ''}`
-    : 'Blocked: parked by you'
+    : parked
+      ? 'Blocked: parked by you'
+      : `Agent issue${issues.length > 1 ? `s (${issues.length} cards)` : ''}: no action required from you`
 
   return jsxs('div', {
     'data-slot': 'blocked-panel',
@@ -686,7 +822,7 @@ function Panel() {
         children: [
           jsx('i', { 'aria-hidden': true, className: 'codicon codicon-debug-pause', style: { color: AMBER, fontSize: 13 } }),
           jsx('span', { style: { fontWeight: 600 }, children: header }),
-          !items.length && jsx('span', { style: { opacity: 0.6, fontSize: 11 }, children: 'To unblock:' }),
+          !items.length && parked && jsx('span', { style: { opacity: 0.6, fontSize: 11 }, children: 'To unblock:' }),
           parked && items.length > 0 && jsx('span', { style: { opacity: 0.6, fontSize: 11 }, children: '· also parked with ⌘B' }),
           items.length > 0 &&
             jsx('button', {
@@ -698,13 +834,14 @@ function Panel() {
             })
         ]
       }),
-      !items.length &&
+      !items.length && parked &&
         jsx('ol', {
           'data-blocked-steps': 'parked',
           style: { margin: '2px 0 0', paddingLeft: 20, fontSize: 12.5, lineHeight: 1.45, display: 'flex', flexDirection: 'column', gap: 3 },
           children: PARKED_STEPS.map((s, i) => jsx('li', { children: jsx(Linked, { text: s }) }, i))
         }),
-      !collapsed && items.map(item => jsx(Item, { item }, item.id))
+      !collapsed && items.map(item => jsx(Item, { item }, item.id)),
+      !collapsed && issues.map(issue => jsx(IssueItem, { issue }, issue.id))
     ]
   })
 }
@@ -718,7 +855,7 @@ export default {
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
     // version 4: subscribe/unblockCard/openCard for user-steps' "For you" strip (it reuses this poller + actions)
-    window.__blockedPanel = { version: 4, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
+    window.__blockedPanel = { version: 5, askSummary, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel

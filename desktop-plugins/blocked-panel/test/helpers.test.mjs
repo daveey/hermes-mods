@@ -199,3 +199,88 @@ test('openLink: .md paths open in the preview pane; other paths, URLs and a fail
   assert.deepEqual(external, ['/Users/you/design/plan.md'])
   m.bindLinkApis(null)
 })
+
+// ── worker failures vs genuine human blockers ───────────────────────────────
+const REFUSAL_ERR = 'pid 4242 exited with code 1 Worker\'s last output: "Model declined to respond (safety refusal) \u2014 trying fallback... Anthropic\'s safety filter refused this request"'
+const failureEvents = [
+  ev(1, 'created', {}),
+  ev(2, 'claimed', {}),
+  ev(3, 'crashed', { exit_kind: 'nonzero_exit', exit_code: 1, worker_output: 'Model declined to respond (safety refusal)' }),
+  ev(4, 'gave_up', { failures: 2, effective_limit: 2, limit_source: 'dispatcher', error: REFUSAL_ERR })
+]
+const T = (id, board = 'default') => ({ id, title: `Task ${id}`, status: 'blocked', board })
+
+test('blockState: gave_up/refusal/crash with no blocked event is an agent failure, not a human block', () => {
+  const st = m.blockState(failureEvents)
+  assert.equal(st.origin, 'agent')
+  assert.equal(st.block, null)
+  assert.equal(st.failure.kind, 'gave_up')
+  assert.equal(st.failure.refusal, true)
+  assert.equal(st.failure.reason, 'The model declined to respond (safety refusal).')
+  const crash = m.blockState([ev(1, 'crashed', { exit_kind: 'nonzero_exit', exit_code: 137, error: 'oom' })])
+  assert.equal(crash.origin, 'agent')
+  assert.match(crash.failure.reason, /crashed \(exit code 137\)/)
+  assert.match(m.blockState([ev(1, 'gave_up', { failures: 3, error: 'spawn failed twice' })]).failure.reason, /gave up after 3 failed attempts.*spawn failed twice/)
+  // raw worker transcript never leaks into the headline
+  assert.doesNotMatch(st.failure.reason, /pid|last output/)
+})
+
+test('blockedItems excludes failure-parked cards; agentIssues lists them with no-action wording', () => {
+  const details = new Map([['default:t_fail', { task: { body: 'Remaining after the sweep: three things.' }, events: failureEvents }]])
+  assert.deepEqual(m.blockedItems([T('t_fail')], details), [])
+  const issues = m.agentIssues([T('t_fail'), T('t_fail')], details)
+  assert.equal(issues.length, 1)
+  assert.equal(issues[0].id, 't_fail')
+  assert.equal(issues[0].noAction, true)
+  assert.equal(issues[0].refusal, true)
+  assert.match(issues[0].reason, /safety refusal/)
+  assert.doesNotMatch(issues[0].reason, /Remaining after/) // never the unrelated body line
+})
+
+test('explicit human block stays a human item with its reason, even after an earlier failure', () => {
+  const events = [...failureEvents, ev(5, 'blocked', { reason: 'Approve the migration plan.', kind: 'needs_input' })]
+  const details = new Map([['default:t_h', { task: { body: 'unrelated body' }, events }]])
+  const items = m.blockedItems([T('t_h')], details)
+  assert.equal(items.length, 1)
+  assert.equal(items[0].text, 'Approve the migration plan.')
+  assert.equal(items[0].reasonSource, 'recorded')
+  assert.deepEqual(m.agentIssues([T('t_h')], details), [])
+  // a failure AFTER the human block wins (the dispatcher parked it); unblock resets everything
+  const later = [...events, ev(6, 'gave_up', { failures: 1, error: 'boom' })]
+  assert.equal(m.blockedItems([T('t_h')], new Map([['default:t_h', { events: later }]])).length, 0)
+  assert.equal(m.blockState([...later, ev(7, 'unblocked', {})]).origin, 'unknown')
+})
+
+test('legacy and initial-blocked cards stay human; body is only quoted as the ask for initial_status', () => {
+  const d = new Map([
+    ['default:t_init', { task: { body: 'Rotate the key, then say done.' }, events: [ev(1, 'blocked', { reason: 'initial_status' })] }],
+    ['default:t_noev', { task: { body: 'Remaining after the sweep: three things.' }, events: [] }],
+    ['default:t_empty', { task: { body: 'Remaining after the sweep: three things.' }, events: [ev(1, 'blocked', { kind: 'needs_input' })] }]
+  ])
+  const items = m.blockedItems([T('t_init'), T('t_noev'), T('t_empty')], d)
+  assert.deepEqual(items.map(i => i.id).sort(), ['t_empty', 't_init', 't_noev'])
+  const by = Object.fromEntries(items.map(i => [i.id, i]))
+  assert.equal(by.t_init.reasonSource, 'initial')
+  assert.equal(m.askSummary(by.t_init), 'Rotate the key, then say done.')
+  for (const id of ['t_noev', 't_empty']) {
+    assert.match(m.askSummary(by[id]), /No block reason was recorded/)
+    assert.doesNotMatch(m.askSummary(by[id]), /Remaining after/)
+  }
+})
+
+test('missing detail (loading) keeps a placeholder without claiming a reason', () => {
+  const [it] = m.blockedItems([T('t_load')], new Map())
+  assert.equal(it.loaded, false)
+  assert.equal(it.reasonSource, 'loading')
+  assert.match(m.askSummary(it), /Loading/)
+  assert.deepEqual(m.agentIssues([T('t_load')], new Map()), [])
+})
+
+test('actionable multi-step human ask: askSummary is the first explicit step, not the body', () => {
+  const reason = 'Do these: 1) Open Settings \u2192 Privacy. 2) Enable Automation for the app. 3) Click Done.'
+  const d = new Map([['default:t_m', { task: { body: 'Unrelated first sentence.' }, events: [ev(1, 'blocked', { reason, kind: 'capability' })] }]])
+  const [it] = m.blockedItems([T('t_m')], d)
+  assert.deepEqual(it.steps.slice(0, 2), ['Open Settings \u2192 Privacy.', 'Enable Automation for the app.'])
+  assert.equal(m.askSummary(it), 'Open Settings \u2192 Privacy.')
+  assert.equal(it.kindLabel, 'Needs access you have')
+})

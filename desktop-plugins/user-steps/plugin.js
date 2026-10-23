@@ -19,7 +19,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 4
+const VERSION = 5
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -141,8 +141,10 @@ export function projectStrip(ledger, kanbanItems) {
 }
 
 /** First line of what a blocked card wants (blocked-panel's checklist when available). */
-export function cardSummary(item, checklist) {
+export function cardSummary(item, checklist, askSummary) {
   try {
+    // blocked-panel >= v5 decides when a card description may be quoted as the ask (created blocked / worker reason)
+    if (typeof askSummary === 'function') return short(askSummary(item, item.rewritten), 160)
     const list = typeof checklist === 'function' ? checklist(item, item.rewritten) : null
     if (list?.steps?.length) return short(list.steps[0], 160)
   } catch {
@@ -176,7 +178,7 @@ const focusedId = () => {
   }
 }
 
-let snapshot = { stored: null, ledger: { steps: [], card: null }, kanban: [], ok: null }
+let snapshot = { stored: null, ledger: { steps: [], card: null }, kanban: [], issues: [], ok: null }
 const subs = new Set()
 let timer = null
 let running = false
@@ -195,7 +197,7 @@ function attachKanban() {
   const bp = blockedPanel()
   if (typeof bp?.subscribe !== 'function') return
   unsubKanban = bp.subscribe(s => {
-    snapshot = { ...snapshot, kanban: s?.stored === snapshot.stored ? s.items || [] : [] }
+    snapshot = { ...snapshot, kanban: s?.stored === snapshot.stored ? s.items || [] : [], issues: s?.stored === snapshot.stored ? s.issues || [] : [] }
     emit()
   })
 }
@@ -231,7 +233,13 @@ export async function refresh(call = api) {
       return
     }
     const bp = blockedPanel()?.snapshot
-    snapshot = { stored, ledger, kanban: bp?.stored === stored ? bp.items || [] : snapshot.stored === stored ? snapshot.kanban : [], ok }
+    snapshot = {
+      stored,
+      ledger,
+      kanban: bp?.stored === stored ? bp.items || [] : snapshot.stored === stored ? snapshot.kanban : [],
+      issues: bp?.stored === stored ? bp.issues || [] : snapshot.stored === stored ? snapshot.issues || [] : [],
+      ok
+    }
     emit()
   } finally {
     running = false
@@ -476,12 +484,12 @@ function CardRow({ item }) {
           jsx('span', { style: { marginLeft: 'auto', flex: 'none', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', opacity: 0.6 }, children: item.id })
         ]
       }),
-      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: jsx(Linked, { text: cardSummary(item, bp?.checklist) }) }),
+      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: jsx(Linked, { text: cardSummary(item, bp?.checklist, bp?.askSummary) }) }),
       jsxs('div', {
         style: { display: 'flex', flexWrap: 'wrap', gap: 6 },
         children: [
-          jsx('button', { type: 'button', style: btn(true), disabled: busy, onClick: () => unblock(false), children: busy ? 'Unblocking\u2026' : 'Done \u2192 unblock' }),
-          jsx('button', { type: 'button', style: btn(), disabled: busy, onClick: () => setReplying(!replying), children: 'Reply & unblock' }),
+          item.loaded !== false && jsx('button', { type: 'button', style: btn(true), disabled: busy, onClick: () => unblock(false), children: busy ? 'Unblocking\u2026' : 'Done \u2192 unblock' }),
+          item.loaded !== false && jsx('button', { type: 'button', style: btn(), disabled: busy, onClick: () => setReplying(!replying), children: 'Reply & unblock' }),
           typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: btn(), onClick: () => bp.openCard(item), children: 'Open card' })
         ]
       }),
@@ -511,6 +519,33 @@ function CardRow({ item }) {
   })
 }
 
+/** A card parked by a worker/dispatcher failure: an agent issue, never a task for the user. */
+export function IssueRow({ issue }) {
+  const bp = blockedPanel()
+  return jsxs('div', {
+    'data-user-steps-issue': issue.id,
+    style: rowStyle,
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', gap: 6, alignItems: 'baseline', minWidth: 0 },
+        children: [
+          jsx('i', { 'aria-hidden': true, className: 'codicon codicon-warning', style: { opacity: 0.7, flex: 'none' } }),
+          jsx('span', { style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }, title: issue.title, children: issue.title }),
+          jsx('span', { style: { marginLeft: 'auto', flex: 'none', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', opacity: 0.6 }, children: issue.id })
+        ]
+      }),
+      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: issue.reason }),
+      jsxs('div', {
+        style: { display: 'flex', gap: 6, alignItems: 'center' },
+        children: [
+          jsx('span', { style: { fontSize: 11.5, opacity: 0.75 }, children: 'No action required from you.' }),
+          typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: { ...btn(), marginLeft: 'auto' }, onClick: () => bp.openCard(issue), children: 'Open card' })
+        ]
+      })
+    ]
+  })
+}
+
 function StepRow({ step, sessionId }) {
   return jsxs('div', {
     'data-user-steps-step': step.id,
@@ -536,7 +571,8 @@ export function Strip() {
   useEffect(() => void refresh(), [focused])
   if (!focused || snap.stored !== focused) return null
   const rows = projectStrip(snap.ledger, snap.kanban)
-  if (!rows.length) return null
+  const issues = Array.isArray(snap.issues) ? snap.issues : []
+  if (!rows.length && !issues.length) return null
   return jsxs('div', {
     'data-slot': 'user-steps',
     role: 'status',
@@ -558,8 +594,8 @@ export function Strip() {
         key: 'h',
         style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, paddingBottom: collapsed ? 0 : 4 },
         children: [
-          jsx('i', { 'aria-hidden': true, className: 'codicon codicon-account', style: { color: AMBER } }),
-          jsx('span', { style: { fontWeight: 600 }, children: `For you${rows.length > 1 ? ` (${rows.length})` : ''}` }),
+          jsx('i', { 'aria-hidden': true, className: `codicon ${rows.length ? 'codicon-account' : 'codicon-warning'}`, style: { color: AMBER } }),
+          jsx('span', { style: { fontWeight: 600 }, children: rows.length ? `For you${rows.length > 1 ? ` (${rows.length})` : ''}` : `Agent issue${issues.length > 1 ? `s (${issues.length})` : ''} \u2014 no action required from you` }),
           jsx('button', {
             type: 'button',
             style: { ...btn(), marginLeft: 'auto', border: 'none', padding: '0 4px' },
@@ -569,7 +605,8 @@ export function Strip() {
           })
         ]
       }),
-      ...(collapsed ? [] : rows.map(r => (r.type === 'step' ? jsx(StepRow, { step: r.step, sessionId: focused }, r.key) : jsx(CardRow, { item: r.item }, r.key))))
+      ...(collapsed ? [] : rows.map(r => (r.type === 'step' ? jsx(StepRow, { step: r.step, sessionId: focused }, r.key) : jsx(CardRow, { item: r.item }, r.key)))),
+      ...(collapsed ? [] : issues.map(i => jsx(IssueRow, { issue: i }, `i:${i.board}:${i.id}`)))
     ]
   })
 }

@@ -272,4 +272,61 @@ test('register: strip in composer.top and the user-step directive', () => {
   assert.equal(window.__userSteps, undefined)
 })
 
+const bpm = await import('../../blocked-panel/plugin.js')
+
+test('strip: a worker failure shows as an agent issue with no unblock buttons; human asks keep theirs', async () => {
+  const ev = (id, kind, payload) => ({ id, kind, payload, created_at: 1000 + id })
+  const tasks = [
+    { id: 't_failed01', title: 'Sweep leftovers', status: 'blocked', board: 'default' },
+    { id: 't_human002', title: 'Approve plan', status: 'blocked', board: 'default' },
+    { id: 't_loading03', title: 'Not loaded yet', status: 'blocked', board: 'default' },
+    { id: 't_nodesc004', title: 'Legacy card', status: 'blocked', board: 'default' }
+  ]
+  const details = new Map([
+    ['default:t_failed01', { task: { body: 'Remaining after the sweep: three things.' }, events: [ev(1, 'crashed', { exit_code: 1, worker_output: 'Model declined to respond (safety refusal)' }), ev(2, 'gave_up', { failures: 2, error: 'safety refusal' })] }],
+    ['default:t_human002', { task: { body: 'Unrelated.' }, events: [ev(3, 'blocked', { reason: 'Approve the plan in the doc.', kind: 'needs_input' })] }],
+    ['default:t_nodesc004', { task: { body: 'Remaining after the sweep: three things.' }, events: [] }]
+  ])
+  const opened = []
+  window.__blockedPanel = {
+    snapshot: { stored: 'S1', items: bpm.blockedItems(tasks, details), issues: bpm.agentIssues(tasks, details) },
+    askSummary: bpm.askSummary,
+    checklist: bpm.checklist,
+    unblockCard: async () => {},
+    openCard: it => opened.push(it.id)
+  }
+  focused.set('S1')
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'issues' }))
+  const strip = el().querySelector('[data-slot="user-steps"]')
+  assert.ok(strip, el().innerHTML)
+  assert.match(strip.textContent, /For you \(3\)/) // human, loading, legacy: the failure is not counted
+  const issue = strip.querySelector('[data-user-steps-issue="t_failed01"]')
+  assert.ok(issue)
+  assert.match(issue.textContent, /safety refusal/)
+  assert.match(issue.textContent, /No action required from you/)
+  assert.doesNotMatch(issue.textContent, /Remaining after/)
+  assert.deepEqual([...issue.querySelectorAll('button')].map(b => b.textContent), ['Open card'])
+  assert.equal(strip.querySelector('[data-user-steps-card="t_failed01"]'), null)
+  const human = strip.querySelector('[data-user-steps-card="t_human002"]')
+  assert.match(human.textContent, /Approve the plan in the doc/)
+  assert.ok([...human.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
+  const loading = strip.querySelector('[data-user-steps-card="t_loading03"]')
+  assert.match(loading.textContent, /Loading/)
+  assert.deepEqual([...loading.querySelectorAll('button')].map(b => b.textContent), ['Open card'])
+  const legacy = strip.querySelector('[data-user-steps-card="t_nodesc004"]')
+  assert.match(legacy.textContent, /No block reason was recorded/)
+  assert.doesNotMatch(legacy.textContent, /Remaining after/)
+  await React.act(async () => { issue.querySelector('button').click(); await flush() })
+  assert.deepEqual(opened, ['t_failed01'])
+  // only a failure left: header says agent issue / no action, not "For you"
+  window.__blockedPanel.snapshot = { stored: 'S1', items: [], issues: bpm.agentIssues(tasks, details) }
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'issues2' }))
+  const only = el().querySelector('[data-slot="user-steps"]')
+  assert.match(only.textContent, /Agent issue .* no action required from you/)
+  assert.doesNotMatch(only.textContent, /For you/)
+  delete window.__blockedPanel
+})
+
 test('done', () => { root.unmount() })
