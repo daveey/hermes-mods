@@ -102,6 +102,12 @@ Search the history (issues, git log, earlier cards, session memory) for the same
 the earlier countermeasure didn't hold, and *that* is the next why. Ries's rule applies: tolerate a mistake the
 first time, never the second. The second occurrence needs a systemic fix.
 
+Also search the skills and runbooks for the error text. A workaround written up there but not in the code ("if you
+see X, open a background window and re-run") is a recurrence waiting to happen, because automated paths (cron, ticks)
+never read the skill. The countermeasure moves the workaround into the code with a regression test. Then edit the
+skill so it says the code now handles this, and replace the manual recipe with how to verify it (for example a
+dry-run field to check).
+
 ### 6. Countermeasures in proportion
 
 Pick a fix for each level of the chain, sized to the damage (Eric Ries's "proportional investment"): a small
@@ -185,6 +191,10 @@ Countermeasures:
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
+- Fixing the copy you can reach when another copy is the source of truth (a mirrored dir, a synced host, a vendored
+  file). The next sync silently reverts the fix. Before editing, check what syncs into the file (rsync jobs, mtimes
+  with whole-second precision, a "mirror" note). Land the fix at the source, or hand it to whoever owns the source.
+  Report it as not done until it's there.
 - Debugging the failure an alert describes before checking whether a real run raised it. A test or dry run can post
   a lookalike alert while production stays healthy (see step 1).
 - Closing a "not a bug" verdict with no why-chain. If the same false alarm keeps getting filed, the filer, tagger or
