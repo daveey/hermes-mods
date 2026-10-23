@@ -1,0 +1,126 @@
+From 6c907f6a6815d47c24c3a819491abee642dbc765 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 01:15:48 -0700
+Subject: [PATCH] fix(sidebar): count nonhuman triage as unfinished
+ work [daveey]
+
+---
+ hermes_cli/kanban_session_activity.py         | 23 ++++++-----
+ .../test_kanban_session_activity_triage.py    | 40 +++++++++++++++++++
+ 2 files changed, 54 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 5066a20bf0..f4b06cc1fe 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -25,9 +25,8 @@ from typing import Any, Callable, Iterable
+ 
+ _log = logging.getLogger(__name__)
+ 
+-# Statuses that mean "work is still queued or running". ``blocked``/``review``
+-# wait on a human and ``done``/``archived`` are finished, so neither keeps the
+-# creating session busy.
++# Base queued/running statuses. _status_filter also counts nonhuman blocked
++# and triage work as active; only explicit human-kind triage paints red.
+ ACTIVE_STATUSES = ("todo", "ready", "running", "scheduled")
+ # Waiting on a human. These don't keep the session busy, but the sidebar row
+ # shows how many there are next to the open count (``kanban_blocked``) and the
+@@ -64,20 +63,25 @@ def _board_db_paths() -> list[Path]:
+ 
+ 
+ def _status_filter(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> tuple[str, tuple]:
+-    """SQL predicate on ``t`` for "in ``statuses``", splitting ``blocked`` by its kind:
+-    the human set (``BLOCKED_STATUSES``) keeps only human-kind blocks, the active set
+-    gains the ``transient``/``time`` ones. A board without ``block_kind`` is unchanged."""
++    """Split open work by human responsibility, including escalated triage.
++
++    Legacy boards have no explicit human triage kinds, so triage stays active.
++    """
+     ph = ",".join("?" for _ in statuses)
+     if not {r[1] for r in conn.execute("PRAGMA table_info(tasks)")} >= {"block_kind"}:
+         if statuses == BLOCKED_STATUSES:
+             return "t.status = 'blocked'", ()
+-        return f"t.status IN ({ph})", statuses
++        return f"(t.status IN ({ph}) OR t.status = 'triage')", statuses
+     kinds = ",".join("?" for _ in HUMAN_BLOCK_KINDS)
+     human = f"(t.block_kind IS NULL OR t.block_kind IN ({kinds}))"
+     if statuses == BLOCKED_STATUSES:
+         escalated = f"(t.status = 'triage' AND t.block_kind IN ({kinds}))"
+         return f"((t.status = 'blocked' AND {human}) OR {escalated})", (*HUMAN_BLOCK_KINDS, *HUMAN_BLOCK_KINDS)
+-    return f"(t.status IN ({ph}) OR (t.status = 'blocked' AND NOT {human}))", (*statuses, *HUMAN_BLOCK_KINDS)
++    # Triage is unfinished even without a worker. Only explicit human kinds
++    # belong to the blocked bucket; NULL triage awaits an agent specifier.
++    triage = f"(t.status = 'triage' AND (t.block_kind IS NULL OR t.block_kind NOT IN ({kinds})))"
++    return (f"(t.status IN ({ph}) OR (t.status = 'blocked' AND NOT {human}) OR {triage})",
++            (*statuses, *HUMAN_BLOCK_KINDS, *HUMAN_BLOCK_KINDS))
+ 
+ 
+ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dict[str, int]:
+@@ -177,7 +181,8 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+     """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards."""
+     status, kind = task.get("status"), task.get("block_kind")
+     human = kind is None or kind in HUMAN_BLOCK_KINDS
+-    if status in ACTIVE_STATUSES or (status == "blocked" and not human):
++    if (status in ACTIVE_STATUSES or (status == "blocked" and not human)
++            or (status == "triage" and kind not in HUMAN_BLOCK_KINDS)):
+         return "active"
+     if (status == "blocked" and human) or (status == "triage" and kind in HUMAN_BLOCK_KINDS):
+         return "blocked"
+diff --git a/tests/hermes_cli/test_kanban_session_activity_triage.py b/tests/hermes_cli/test_kanban_session_activity_triage.py
+index 02a9c954ac..5f4003c688 100644
+--- a/tests/hermes_cli/test_kanban_session_activity_triage.py
++++ b/tests/hermes_cli/test_kanban_session_activity_triage.py
+@@ -11,6 +11,7 @@ from hermes_cli import kanban_session_activity as ksa
+ @pytest.fixture
+ def kanban_root(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
+     ksa._reset_cache_for_tests()
+     conn = sqlite3.connect(tmp_path / "kanban.db")
+     conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT, block_kind TEXT)")
+@@ -32,3 +33,42 @@ def test_escalated_triage_card_counts_as_waiting_on_the_user(kanban_root):
+ 
+ def test_escalated_triage_card_is_listed_on_its_session(kanban_root):
+     assert [t["id"] for t in ksa.session_tasks(["s_esc"])] == ["t_esc"]
++
++
++@pytest.mark.parametrize("kind,bucket", [
++    ("transient", "active"), (None, "active"),
++    ("needs_input", "blocked"), ("capability", "blocked"),
++])
++def test_triage_is_unfinished_and_visible_for_owner_and_subscriber(tmp_path, monkeypatch, kind, bucket):
++    path = tmp_path / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, session_id TEXT, block_kind TEXT)")
++        conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT)")
++        conn.execute("INSERT INTO tasks VALUES ('card', 'triage', 'ancestor', ?)", (kind,))
++        conn.execute("INSERT INTO kanban_notify_subs VALUES ('card', 'tui', 'watcher')")
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [path])
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
++    ksa._reset_cache_for_tests()
++    rows = [{"id": "leaf", "_lineage_ids": ["ancestor", "leaf"]}, {"id": "watcher"}]
++    try:
++        ksa.annotate_kanban_activity(rows)
++        for row in rows:
++            assert row.get("kanban_active", 0) == (1 if bucket == "active" else 0)
++            assert row.get("kanban_blocked", 0) == (1 if bucket == "blocked" else 0)
++    finally:
++        ksa._reset_cache_for_tests()
++    expected = {"ancestor": 1, "watcher": 1}
++    assert ksa._read_counts(path) == (expected if bucket == "active" else {})
++    assert ksa._read_counts(path, ksa.BLOCKED_STATUSES) == (expected if bucket == "blocked" else {})
++    assert ksa._replica_bucket({"status": "triage", "block_kind": kind}) == bucket
++    assert [t["id"] for t in ksa._read_session_tasks(path, ["leaf", "ancestor"], ksa.LISTED_STATUSES)] == ["card"]
++    assert [t["id"] for t in ksa._read_session_tasks(path, ["watcher"], ksa.LISTED_STATUSES)] == ["card"]
++
++
++def test_legacy_triage_remains_open_without_block_kind(tmp_path):
++    path = tmp_path / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, session_id TEXT)")
++        conn.execute("INSERT INTO tasks VALUES ('card', 'triage', 'owner')")
++    assert ksa._read_counts(path) == {"owner": 1}
++    assert ksa._read_counts(path, ksa.BLOCKED_STATUSES) == {}
+-- 
+2.54.0 (Apple Git-157)
+

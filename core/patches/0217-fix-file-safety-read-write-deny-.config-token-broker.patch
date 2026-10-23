@@ -1,0 +1,154 @@
+From ced2f98b7a7014d71c22c5a1e70524d8c53f4cec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:42:38 -0700
+Subject: [PATCH] fix(file-safety): read+write-deny
+ ~/.config/token-broker (broker client token) [daveey]
+
+The enrolled token-broker client token lets its holder exec auto-tier scopes
+(e.g. tailnet SSH key) with no approval. Add .config/token-broker to
+HOME_CREDENTIAL_DIRS (write deny, profile export, @file refs) and a new
+HOME_READ_DENIED_DIRS so read_file / search / vision / raise_if_read_blocked
+refuse it (token + token.expired-*), across every guard home.
+---
+ agent/file_safety.py                         | 19 +++-
+ tests/agent/test_file_safety_token_broker.py | 91 ++++++++++++++++++++
+ 2 files changed, 109 insertions(+), 1 deletion(-)
+ create mode 100644 tests/agent/test_file_safety_token_broker.py
+
+diff --git a/agent/file_safety.py b/agent/file_safety.py
+index 31bd2c8f0f..da5489b62b 100644
+--- a/agent/file_safety.py
++++ b/agent/file_safety.py
+@@ -207,7 +207,15 @@ def build_write_denied_paths(home: str) -> set[str]:
+ 
+ 
+ # Home-relative credential directories (POSIX paths). Also dropped from profile exports (hermes_cli.profiles).
+-HOME_CREDENTIAL_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh", ".config/gcloud")
++HOME_CREDENTIAL_DIRS = (
++    ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh", ".config/gcloud", ".config/token-broker",
++)
++
++# Home-relative directories that are READ-denied too (a subset of HOME_CREDENTIAL_DIRS): pure secret
++# stores with nothing an agent needs to read. ~/.config/token-broker holds the enrolled broker client
++# token (+ rotated token.expired-*); holding it lets anyone `token-broker exec` auto-tier scopes with no
++# approval. The token-broker CLI reads it itself. [daveey]
++HOME_READ_DENIED_DIRS = (".config/token-broker",)
+ 
+ 
+ def build_write_denied_prefixes(home: str) -> list[str]:
+@@ -406,6 +414,15 @@ def get_read_block_error(path: str) -> Optional[str]:
+                     break
+             if reason:
+                 break
++        if reason is None:
++            for home in _guard_homes(path):
++                for rel in HOME_READ_DENIED_DIRS:
++                    blocked_dir = Path(os.path.realpath(os.path.join(home, *rel.split("/"))))
++                    if _is_under(resolved, blocked_dir):
++                        reason = f"is inside ~/{rel} (a credential store) and cannot be read directly." + _DID_SUFFIX
++                        break
++                if reason:
++                    break
+         if reason is None and resolved.name.lower() in _BLOCKED_PROJECT_ENV_BASENAMES:
+             reason = (
+                 "is a secret-bearing environment file and cannot be read to prevent credential "
+diff --git a/tests/agent/test_file_safety_token_broker.py b/tests/agent/test_file_safety_token_broker.py
+new file mode 100644
+index 0000000000..57c72fcd09
+--- /dev/null
++++ b/tests/agent/test_file_safety_token_broker.py
+@@ -0,0 +1,91 @@
++"""~/.config/token-broker holds the enrolled token-broker client token.
++
++With it, anyone can ``token-broker exec`` auto-tier scopes (e.g. a tailnet SSH key)
++with no approval, so it is the same credential class as ``~/.ssh``: write-denied,
++and — unlike the other HOME_CREDENTIAL_DIRS — read-denied too, because nothing an
++agent does needs the raw token (the ``token-broker`` CLI reads it itself).
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import pytest
++
++import agent.file_safety as fs
++
++
++@pytest.fixture()
++def home(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setattr(fs, "_guard_homes", lambda path="": {str(home)})
++    return home
++
++
++def _touch(base: Path, rel: str) -> Path:
++    p = base / rel
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text("dummy", encoding="utf-8")
++    return p
++
++
++@pytest.mark.parametrize("rel", ["token", "token.expired-20261022T050000Z", "nested/anything"])
++def test_token_broker_files_are_read_denied(home, rel):
++    path = _touch(home, f".config/token-broker/{rel}")
++    for candidate in (str(path), f"~/.config/token-broker/{rel}"):
++        err = fs.get_read_block_error(candidate)
++        assert err and "token-broker" in err, candidate
++        with pytest.raises(ValueError):
++            fs.raise_if_read_blocked(candidate)
++
++
++def test_token_broker_dir_itself_is_read_denied(home):
++    (home / ".config" / "token-broker").mkdir(parents=True)
++    assert fs.get_read_block_error(str(home / ".config" / "token-broker"))
++
++
++def test_symlink_into_token_broker_is_read_denied(home, tmp_path):
++    target = _touch(home, ".config/token-broker/token")
++    link = tmp_path / "innocent.txt"
++    os.symlink(target, link)
++    assert fs.get_read_block_error(str(link))
++
++
++def test_token_broker_is_write_denied(home):
++    path = _touch(home, ".config/token-broker/token")
++    assert fs.is_write_denied(str(path))
++    assert ".config/token-broker" in fs.HOME_CREDENTIAL_DIRS
++
++
++def test_neighbours_stay_readable(home):
++    for rel in (".config/token-broker-notes.txt", ".config/other/token", "token-broker/token"):
++        assert fs.get_read_block_error(str(_touch(home, rel))) is None, rel
++
++
++@pytest.mark.asyncio
++async def test_vision_analyze_refuses_token_broker_token(home):
++    import json
++    from unittest.mock import AsyncMock, patch
++
++    from tools.vision_tools import vision_analyze_tool
++
++    path = _touch(home, ".config/token-broker/token")
++    with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
++        result = json.loads(await vision_analyze_tool(str(path), "extract text"))
++    assert result["success"] is False
++    assert "token-broker" in result["error"]
++    mock_llm.assert_not_awaited()
++
++
++def test_read_file_tool_refuses_token_broker_token(home):
++    import json
++
++    from tools.file_tools import read_file_tool
++
++    path = _touch(home, ".config/token-broker/token")
++    result = json.loads(read_file_tool(str(path)))
++    assert "token-broker" in (result.get("error") or ""), result
++    assert "dummy" not in json.dumps(result)
+-- 
+2.54.0 (Apple Git-157)
+

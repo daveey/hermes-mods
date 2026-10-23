@@ -81,7 +81,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [sidebar-created-sort.md](sidebar-created-sort.md) | 0158 | Sidebar 'created' sort orders, clusters and date-buckets by `started_at`, so a reply in an old chat no longer lifts it to the top |
 | [session-context-nested-rebind.md](session-context-nested-rebind.md) | 0159 | A nested re-bind of the turn's own session restores the binding on clear, so cards created after a queued model switch keep their session id |
 | [credential-pool-norefresh-adopt.md](credential-pool-norefresh-adopt.md) | 0160 | A live credential pool adopts tokens pushed to disk for no-refresh OAuth rows instead of keeping the expired copy |
-| [kanban-escalated-triage-red.md](kanban-escalated-triage-red.md) | 0161 | A block-loop-escalated triage card counts as waiting on you, so its chat paints red |
+| [kanban-escalated-triage-red.md](kanban-escalated-triage-red.md) | 0161 0218 | A block-loop-escalated triage card counts as waiting on you, so its chat paints red; 0218: non-human/NULL triage counts as unfinished work, so its chat is not green |
 | [kanban-worker-worktree-cleanup.md](kanban-worker-worktree-cleanup.md) | 0162 | Worker guidance: `git worktree remove` every worktree you add before `kanban_complete` |
 | [browser-background-tab.md](browser-background-tab.md) | 0163 0164 | `browser_exec`'s own tab and the CDP supervisor's fallback page open with `background=True`, so a new browser session stops stealing keyboard focus on macOS |
 | [pre-final-gate.md](pre-final-gate.md) | 0165 0167 | `pre_final_gate` plugin hook: hold a final answer silently (never shown or stored) or append to it; `needs_buffer` keeps a held answer from streaming |
@@ -97,6 +97,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [plugin-dir-conflicts.md](plugin-dir-conflicts.md) | 0210 | Plugin discovery skips backup-named dirs (`*.bak*`, `*.orig`, `*.old`) and resolves same-name manifests deterministically (basename match wins); `plugins list` and `doctor` show ignored/shadowed copies |
 | [kanban-worker-session-id.md](kanban-worker-session-id.md) | 0211 | Task detail API gives each run its `worker_session_id`, so clients open the worker's transcript, not the creating chat |
 | [kanban-failure-notices.md](kanban-failure-notices.md) | 0213 0214 | Kanban `gave_up` / `crashed` / `timed_out` notices (Desktop and messaging gateway) name the real cause (model refusal, provider configuration, no result reported, launch failure, time limit, process exit), promise a retry only when the event records one, and make no unsupported fallback claims |
+| [file-safety-token-broker.md](file-safety-token-broker.md) | 0217 | Read- and write-deny `~/.config/token-broker` (broker client token) in file tools, search, vision and `@file` refs |
 | [hub-sync-replica.md](hub-sync-replica.md) | 0215 0216 | Desktop reads the hermes-hub replica (hub-sync plugin): owner lookup without probing, Kanban falls back to the replica for an unreachable gateway, and a "Synced from other gateways" sidebar section whose archive/pin/rename queue hub requests (pending marker) |
 
 ## Applying
