@@ -60,6 +60,26 @@ How to run it from an agent:
 - Don't cancel another session's queued run to get yours through: the queued run will contain your
   commit too.
 
+## Batch acceptance: several PRs, one suite
+
+When the user approves batching several PRs through ONE full suite, a constituent PR does not need its own green run.
+Its acceptance is the batch's evidence, but only when all of the following hold:
+- One owner card builds the batch branch from fresh `main` and merges each PR's exact head with `--no-ff`, so every
+  source commit is an ancestor. That card records base sha, PR heads, integration head and tree, and run URLs in a
+  manifest. Fix-ups the merged tree needs (lint, code-health) go on the batch branch as their own commits.
+- Before pushing, run the repo's local lint gate (e.g. `scripts/check --base origin/main`) and focused tests. A
+  ratchet that only fails on the combined diff costs a full suite otherwise.
+- Every necessary workflow completed green on the exact batch head: one run per workflow, never "queued" or
+  "in progress", never one job standing in for the others. A PR head or `main` that moves invalidates the
+  evidence: rebuild and rerun.
+- Land with one fast-forward of `main` to the tested head, after checking `git merge-base --is-ancestor
+  origin/main <head>` immediately before the push. Never force-push `main`. Close each source PR only after the
+  landing, with the batch PR link and main sha. Never fake check statuses on the source heads.
+- Once the batch PR exists, cancel only the superseded runs of the constituent PRs. Leave runs on `main` and in
+  other repos alone.
+- The batch is done only when the post-landing `main` suite has completed green (`wait_for_ci.py <sha>`). Waiting
+  cards get the run URLs so they don't relaunch suites.
+
 ## Notes
 
 - `--repo` is a LOCAL checkout path (the script runs `git -C <repo> fetch`). An `owner/name` slug resolves to `~/code/<name>` only when that checkout's origin is the same repo; anything else exits with "not a local checkout". Run it from inside the checkout or pass the path.
