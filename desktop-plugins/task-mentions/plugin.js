@@ -608,7 +608,9 @@ function createUI(host) {
         setTimeout(() => (btn.textContent = old), 1000)
       })
     }
-    const sess = sessionTarget(d, host.state?.focusedSessionId?.get?.())
+    // Stored id (state.db `20261022_…`), the same id space as task/run session ids. focusedSessionId is
+    // the gateway's runtime id and never equals them, so the "already in this chat" hide never fired.
+    const sess = sessionTarget(d, host.state?.focusedStoredSessionId?.get?.() ?? host.state?.focusedSessionId?.get?.())
     const foot = h(
       'div',
       { class: 'tm-foot' },
