@@ -1,0 +1,204 @@
+From a96ad466c58da2c0b7210c0e32f849b428b9ce1b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 01:14:33 -0700
+Subject: [PATCH 237/248] refactor(auth): isolate Codex entitlement policy and
+ keep facade budgets [daveey]
+
+---
+ agent/codex_entitlements.py                   | 28 ++++++++++++++++
+ agent/credential_pool.py                      | 33 +++----------------
+ hermes_cli/codex_models.py                    | 11 ++++---
+ hermes_cli/models.py                          | 20 ++---------
+ hermes_cli/runtime_provider.py                |  2 +-
+ .../test_codex_subscription_routing.py        |  4 +--
+ 6 files changed, 44 insertions(+), 54 deletions(-)
+ create mode 100644 agent/codex_entitlements.py
+
+diff --git a/agent/codex_entitlements.py b/agent/codex_entitlements.py
+new file mode 100644
+index 0000000000..b6bddb1c8c
+--- /dev/null
++++ b/agent/codex_entitlements.py
+@@ -0,0 +1,28 @@
++"""Account-plan eligibility shared by Codex discovery and runtime selection."""
++from typing import Any, Optional
++
++# ChatGPT plan tiers that cannot run account-gated Codex models (Astra). Unknown/missing plan claims
++# are NOT excluded: only a positively-identified free tier is skipped.
++_CODEX_NON_ENTITLED_PLANS = frozenset({"free", "go", "guest"})
++
++
++def codex_plan_type(access_token: Any) -> Optional[str]:
++    """Lower-cased ``chatgpt_plan_type`` claim of a Codex access token, or None when absent."""
++    from agent.credential_pool import _decode_jwt_claims
++
++    claims = _decode_jwt_claims(access_token)
++    auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
++    plan = auth_claims.get("chatgpt_plan_type") if isinstance(auth_claims, dict) else None
++    return plan.strip().lower() if isinstance(plan, str) and plan.strip() else None
++
++
++def codex_entry_entitled_for_model(access_token: Any, model: Optional[str]) -> bool:
++    """False when *model* is account-gated (Astra) and the token's plan is a known non-entitled tier.
++    A request for it must never rotate onto such an account: it would 4xx or, worse, silently reroute."""
++    from agent.reasoning_effort import is_astra_model
++
++    if not model or not is_astra_model(model):
++        return True
++    return codex_plan_type(access_token) not in _CODEX_NON_ENTITLED_PLANS
++
++
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index e4e872a362..7b5eb5620e 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -344,29 +344,6 @@ def _codex_principal_identity(access_token: Any) -> Optional[tuple[str, str]]:
+     return account_id.strip(), subject.strip()
+ 
+ 
+-# ChatGPT plan tiers that cannot run account-gated Codex models (Astra). Unknown/missing plan claims
+-# are NOT excluded: only a positively-identified free tier is skipped.
+-_CODEX_NON_ENTITLED_PLANS = frozenset({"free", "go", "guest"})
+-
+-
+-def codex_plan_type(access_token: Any) -> Optional[str]:
+-    """Lower-cased ``chatgpt_plan_type`` claim of a Codex access token, or None when absent."""
+-    claims = _decode_jwt_claims(access_token)
+-    auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
+-    plan = auth_claims.get("chatgpt_plan_type") if isinstance(auth_claims, dict) else None
+-    return plan.strip().lower() if isinstance(plan, str) and plan.strip() else None
+-
+-
+-def codex_entry_entitled_for_model(access_token: Any, model: Optional[str]) -> bool:
+-    """False when *model* is account-gated (Astra) and the token's plan is a known non-entitled tier.
+-    A request for it must never rotate onto such an account: it would 4xx or, worse, silently reroute."""
+-    from agent.reasoning_effort import is_astra_model
+-
+-    if not model or not is_astra_model(model):
+-        return True
+-    return codex_plan_type(access_token) not in _CODEX_NON_ENTITLED_PLANS
+-
+-
+ def _codex_entry_tracks_singleton(entry: PooledCredential, singleton_tokens: dict[str, Any]) -> bool:
+     """Whether a Codex pool entry may adopt the auth.json singleton's token pair.
+ 
+@@ -2140,13 +2117,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+     ) -> tuple[list[PooledCredential], list[PooledCredential]]:
+         """Return (available, pending_refresh) for entries not in cooldown.
+ 
+-        *clear_expired* resets elapsed cooldowns to STATUS_OK and persists.
+-        *refresh* refreshes entries needing a token refresh (skipped on
+-        failure) — except single-use-token providers (openai-codex,
+-        xai-oauth), which are returned as *pending_refresh* so the caller
+-        refreshes them outside the lock instead of stalling every pool
+-        consumer during cross-process flock acquisition + OAuth network I/O.
++        *clear_expired* persists elapsed cooldown resets. *refresh* refreshes tokens, skipping failures.
++        Single-use providers (Codex/xAI) return *pending_refresh* for out-of-lock refresh,
++        so cross-process flock acquisition and OAuth I/O cannot stall every pool consumer.
+         """
++        from agent.codex_entitlements import codex_entry_entitled_for_model
+         now = time.time()
+         cleared_any = False
+         entries_to_prune: list[str] = []
+diff --git a/hermes_cli/codex_models.py b/hermes_cli/codex_models.py
+index c003366db9..b6e7eafacb 100644
+--- a/hermes_cli/codex_models.py
++++ b/hermes_cli/codex_models.py
+@@ -112,7 +112,8 @@ def codex_catalog_credentials() -> list[tuple[str, Optional[str]]]:
+     account lists no Astra, so a catalog built from it hides models the pro account in the same pool
+     can run (and the picker then offers them only under the metered OpenAI API). Read-only: nothing
+     here refreshes, imports or persists a credential; expired tokens are skipped."""
+-    from agent.credential_pool import STATUS_DEAD, codex_plan_type
++    from agent.credential_pool import STATUS_DEAD
++    from agent.codex_entitlements import codex_plan_type
+     from hermes_cli.auth import _codex_access_token_is_expiring, read_credential_pool, resolve_codex_runtime_credentials
+     from hermes_cli.auth_codex import _codex_pool_dicts, _codex_pool_route_base_url
+ 
+@@ -130,7 +131,7 @@ def codex_catalog_credentials() -> list[tuple[str, Optional[str]]]:
+         creds = resolve_codex_runtime_credentials(read_only=True)
+         _add(creds.get("api_key"), creds.get("base_url"))
+     except Exception:  # no/exhausted singleton creds: the pool below may still hold usable rows
+-        pass
++        logger.debug("Codex singleton discovery unavailable", exc_info=True)
+     try:
+         for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
+             if entry.get("last_status") == STATUS_DEAD:
+@@ -155,11 +156,13 @@ def codex_catalog_credential_identity() -> str:
+     fallback must not outlive the refresh under the healthy principal's key. Opaque non-JWT tokens
+     fall back to the token itself (the caller hashes every part before anything is persisted).
+     """
+-    from agent.credential_pool import _codex_principal_identity, codex_plan_type
++    from agent.credential_pool import _codex_principal_identity
++    from agent.codex_entitlements import codex_plan_type
+ 
+     try:
+         creds = codex_catalog_credentials()
+-    except Exception:  # AuthError (no/exhausted creds) or the pytest seat belt: no live catalog either way
++    except Exception:
++        logger.debug("Codex catalog identity unavailable", exc_info=True)
+         creds = []
+     if not creds:
+         return "missing"
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index c0d4854e3b..ce02df01f7 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1409,25 +1409,9 @@ def _openai_discovery_base_url(provider: str) -> str:
+ 
+ 
+ def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
+-    from hermes_cli.codex_models import get_codex_model_ids
+-
+-    # Live OAuth token so the picker matches what ChatGPT lists for this account; hardcoded
+-    # catalog without a token / when unreachable. Read-only (#68004): a picker never imports,
+-    # refreshes or persists a credential, so an expired stored token means the hardcoded catalog
+-    # until the runtime lease refreshes it.
+-    # The token and the host it is routed to come from the same resolution (#121486): a pooled
+-    # gateway key is only ever sent to that gateway, never to the chatgpt.com default.
+-    # Discovery spans EVERY usable pool entry, not the round-robin cursor: a free-plan account lists
+-    # no Astra, and a catalog built from it left Astra offered only under the metered OpenAI API.
++    # Account union discovery is read-only and keeps each token bound to its own host.
+     from hermes_cli.codex_models import codex_catalog_credentials, get_codex_model_ids_for_credentials
+-
+-    try:
+-        credentials = codex_catalog_credentials()
+-    except Exception:
+-        credentials = []
+-    if credentials:
+-        return get_codex_model_ids_for_credentials(credentials)
+-    return get_codex_model_ids(access_token=None, base_url=None)
++    return get_codex_model_ids_for_credentials(codex_catalog_credentials())
+ 
+ 
+ _COPILOT_ACP_SESSION_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index d4e52bb1b6..2cba53eb07 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -1022,7 +1022,7 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
+     _raise_for_credentialless_bare_custom(requested_provider, runtime)
+     # Pool exhaustion must not fall through to a free singleton for an account-gated model.
+     if runtime.get("provider") == "openai-codex":
+-        from agent.credential_pool import codex_entry_entitled_for_model
++        from agent.codex_entitlements import codex_entry_entitled_for_model
+         if not codex_entry_entitled_for_model(runtime.get("api_key"), _effective_model(_get_model_config(), target_model)):
+             raise AuthError("No entitled Codex account is available for this model",
+                             provider="openai-codex", code="model_not_entitled")
+diff --git a/tests/hermes_cli/test_codex_subscription_routing.py b/tests/hermes_cli/test_codex_subscription_routing.py
+index d5e7dc62d6..9f95ed5668 100644
+--- a/tests/hermes_cli/test_codex_subscription_routing.py
++++ b/tests/hermes_cli/test_codex_subscription_routing.py
+@@ -14,8 +14,8 @@ import pytest
+ 
+ import hermes_cli.auth as auth_mod
+ from hermes_cli import codex_models
+-from agent.credential_pool import (
+-    codex_entry_entitled_for_model, codex_plan_type, load_pool)
++from agent.credential_pool import load_pool
++from agent.codex_entitlements import codex_entry_entitled_for_model, codex_plan_type
+ from hermes_cli.inventory import _prefer_subscription_rows
+ 
+ ASTRA = "gpt-6-astra"
+-- 
+2.54.0 (Apple Git-157)
+

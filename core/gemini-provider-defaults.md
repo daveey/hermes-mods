@@ -11,7 +11,11 @@ times with `Gemini HTTP 404: models/claude-opus-… is not found`. It now answer
 session title is generated on Gemini too. Title generation and other auxiliary calls on the `gemini` provider no
 longer default to an older flash id.
 
+- `patches/0247-daveey-gemini-list-native-v1beta-models-with-x-goog-.patch`: model listing on the native AI Studio base uses `x-goog-api-key` (Bearer returned 401) and parses the native response shape.
+
 ## Behavior
+
+- `fetch_models` on the `gemini` profile (0247): the native `/v1beta/models` endpoint is called with the `x-goog-api-key` header and its native payload shape is parsed. An OpenAI-compatible base keeps Bearer auth, a custom proxy base uses its own `/models`, and a 401 returns `None` without logging the key.
 
 - `--provider X` without `-m`: if the configured model clearly belongs to another vendor and X serves only its
   own vendor's models (`gemini` → Google, `anthropic` → Anthropic), the CLI uses X's default model
@@ -65,6 +69,8 @@ Studio keys. On 2026-10-20 such a key served `gemini-3-flash-preview`, `3.5`–`
   predicate table only.
 - Live check (2026-10-20): `hermes chat -q 'Reply with exactly: ok' --provider gemini` with a `claude-opus-*`
   default replied `ok`; main and title calls both ran on `gemini-3.8-flash` with no 404.
+
+- 0247: `tests/plugins/model_providers/test_gemini_profile.py` (native header and shape, OpenAI-compat keeps Bearer, proxy base, 401 returns None without logging the key). Not re-run when this doc was written (untested here).
 
 ## Applying
 

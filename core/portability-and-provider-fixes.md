@@ -7,6 +7,8 @@ Patches:
 - `patches/0178-fix-subprocess-text-True-needs-encoding-utf-8-errors.patch`: utf-8 subprocess decoding and a psutil pid check.
 - `patches/0187-fix-windows-clear-remaining-footguns-utf-8-sig-read-.patch`: more Windows footguns.
 
+- `patches/0230-chore-map-integration-hub-contributor-identity-davee.patch`: maps the integration host's commit identity for the same contributor check.
+
 ## Behavior
 
 - 0174: adds `contributors/emails/<email>` (author handle + comment) so `check-attribution` accepts the fork owner's

@@ -1,0 +1,428 @@
+From d67bafef05bcb96e1a5867f82d3d11e835182971 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:36:40 -0700
+Subject: [PATCH 233/248] =?UTF-8?q?fix(models):=20Astra=20routes=20via=20C?=
+ =?UTF-8?q?odex=20subscription=20=E2=80=94=20catalog=20spans=20all=20pool?=
+ =?UTF-8?q?=20entries,=20plan-gated=20lease,=20metered=20rows=20labeled=20?=
+ =?UTF-8?q?[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ agent/credential_pool.py                      |  25 ++++
+ hermes_cli/codex_models.py                    |  86 ++++++++++---
+ hermes_cli/inventory.py                       |  36 ++++++
+ hermes_cli/models.py                          |  18 +--
+ .../test_codex_subscription_routing.py        | 113 ++++++++++++++++++
+ tui_gateway/methods_session_model_guard.py    |  26 ++++
+ 6 files changed, 278 insertions(+), 26 deletions(-)
+ create mode 100644 tests/hermes_cli/test_codex_subscription_routing.py
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 6cd0eae43f..fb5e3bfa28 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -344,6 +344,29 @@ def _codex_principal_identity(access_token: Any) -> Optional[tuple[str, str]]:
+     return account_id.strip(), subject.strip()
+ 
+ 
++# ChatGPT plan tiers that cannot run account-gated Codex models (Astra). Unknown/missing plan claims
++# are NOT excluded: only a positively-identified free tier is skipped.
++_CODEX_NON_ENTITLED_PLANS = frozenset({"free", "go", "guest"})
++
++
++def codex_plan_type(access_token: Any) -> Optional[str]:
++    """Lower-cased ``chatgpt_plan_type`` claim of a Codex access token, or None when absent."""
++    claims = _decode_jwt_claims(access_token)
++    auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
++    plan = auth_claims.get("chatgpt_plan_type") if isinstance(auth_claims, dict) else None
++    return plan.strip().lower() if isinstance(plan, str) and plan.strip() else None
++
++
++def codex_entry_entitled_for_model(access_token: Any, model: Optional[str]) -> bool:
++    """False when *model* is account-gated (Astra) and the token's plan is a known non-entitled tier.
++    A request for it must never rotate onto such an account: it would 4xx or, worse, silently reroute."""
++    from agent.reasoning_effort import is_astra_model
++
++    if not model or not is_astra_model(model):
++        return True
++    return codex_plan_type(access_token) not in _CODEX_NON_ENTITLED_PLANS
++
++
+ def _codex_entry_tracks_singleton(entry: PooledCredential, singleton_tokens: dict[str, Any]) -> bool:
+     """Whether a Codex pool entry may adopt the auth.json singleton's token pair.
+ 
+@@ -2161,6 +2184,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 continue
+             if model_cooldown_until(entry, model) is not None:
+                 continue
++            if self.provider == "openai-codex" and not codex_entry_entitled_for_model(entry.access_token, model):
++                continue
+             if entry.last_status == STATUS_EXHAUSTED:
+                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
+                 # Codex quota windows can reopen EARLY; a throttled live probe
+diff --git a/hermes_cli/codex_models.py b/hermes_cli/codex_models.py
+index e5cc3f21d0..c003366db9 100644
+--- a/hermes_cli/codex_models.py
++++ b/hermes_cli/codex_models.py
+@@ -105,32 +105,70 @@ def _drop_undiscovered_astra(model_ids: list[str]) -> list[str]:
+     return [model for model in model_ids if not is_astra_model(model)]
+ 
+ 
++def codex_catalog_credentials() -> list[tuple[str, Optional[str]]]:
++    """``[(access_token, base_url)]`` for every usable Codex credential, strongest plan first.
++
++    Discovery must not depend on which pool entry round-robin happens to point at: a free-plan
++    account lists no Astra, so a catalog built from it hides models the pro account in the same pool
++    can run (and the picker then offers them only under the metered OpenAI API). Read-only: nothing
++    here refreshes, imports or persists a credential; expired tokens are skipped."""
++    from agent.credential_pool import STATUS_DEAD, codex_plan_type
++    from hermes_cli.auth import _codex_access_token_is_expiring, read_credential_pool, resolve_codex_runtime_credentials
++    from hermes_cli.auth_codex import _codex_pool_dicts, _codex_pool_route_base_url
++
++    found: list[tuple[str, Optional[str]]] = []
++    seen: set[str] = set()
++
++    def _add(token: object, base_url: object) -> None:
++        tok = str(token or "").strip()
++        if not tok or tok in seen or _codex_access_token_is_expiring(tok, 0):
++            return
++        seen.add(tok)
++        found.append((tok, (str(base_url).strip() if base_url else "") or _codex_pool_route_base_url("") or None))
++
++    try:
++        creds = resolve_codex_runtime_credentials(read_only=True)
++        _add(creds.get("api_key"), creds.get("base_url"))
++    except Exception:  # no/exhausted singleton creds: the pool below may still hold usable rows
++        pass
++    try:
++        for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
++            if entry.get("last_status") == STATUS_DEAD:
++                continue
++            _add(entry.get("access_token"), _codex_pool_route_base_url(entry.get("base_url")))
++    except Exception:
++        logger.debug("Codex pool catalog credential scan failed", exc_info=True)
++
++    _plan_rank = {"pro": 0, "prolite": 1, "team": 2, "business": 2, "enterprise": 2, "plus": 3}
++    found.sort(key=lambda item: _plan_rank.get(codex_plan_type(item[0]) or "", 4))  # stable
++    return found
++
++
+ def codex_catalog_credential_identity() -> str:
+-    """Identity of the credential live discovery would use right now, for the catalog cache key.
++    """Identity of the credential SET live discovery would use right now, for the catalog cache key.
+ 
+     Access/refresh tokens rotate in place while the account-scoped catalog stays authoritative for
+-    the same ChatGPT principal and route, so the key includes the principal and resolved base URL,
+-    not the rotating token. An expired token is its own state (per route): ``_codex_catalog`` serves
+-    the static fallback for it, and that fallback must not outlive the refresh under the healthy
+-    principal's key. Opaque non-JWT tokens
++    the same ChatGPT principal and route, so the key includes the principals and resolved base URLs,
++    not the rotating tokens. The key covers every usable pool entry (not the round-robin cursor), so
++    moving the cursor never changes it while adding/removing/upgrading an account does. An expired
++    token is its own state (per route): ``_codex_catalog`` serves the static fallback for it, and that
++    fallback must not outlive the refresh under the healthy principal's key. Opaque non-JWT tokens
+     fall back to the token itself (the caller hashes every part before anything is persisted).
+     """
+-    from hermes_cli.auth import _codex_access_token_is_expiring, resolve_codex_runtime_credentials
++    from agent.credential_pool import _codex_principal_identity, codex_plan_type
+ 
+     try:
+-        creds = resolve_codex_runtime_credentials(read_only=True)
+-        token = str(creds.get("api_key") or "")
+-        route = normalize_route_base_url(str(creds.get("base_url") or "").strip())
++        creds = codex_catalog_credentials()
+     except Exception:  # AuthError (no/exhausted creds) or the pytest seat belt: no live catalog either way
+-        token = ""
+-    if not token:
++        creds = []
++    if not creds:
+         return "missing"
+-    if _codex_access_token_is_expiring(token, 0):
+-        return "expired\n" + route
+-    from agent.credential_pool import _codex_principal_identity
+-
+-    principal = _codex_principal_identity(token)
+-    return ("/".join(principal) if principal else token) + "\n" + route
++    parts = []
++    for token, base_url in creds:
++        principal = _codex_principal_identity(token)
++        ident = ("/".join(principal) if principal else token) + "#" + (codex_plan_type(token) or "")
++        parts.append(ident + "\n" + normalize_route_base_url(str(base_url or "").strip()))
++    return "\n".join(sorted(parts))
+ 
+ 
+ def _ranked_slugs(entries: object) -> list[str]:
+@@ -211,6 +249,20 @@ def _read_cache_models(codex_home: Path) -> list[str]:
+     return _ranked_slugs(entries if isinstance(entries, list) else [])
+ 
+ 
++def get_codex_model_ids_for_credentials(credentials: list[tuple[str, Optional[str]]]) -> list[str]:
++    """Union of the live catalogs of every credential (strongest plan first), so an entitled account's
++    models are listed whichever account is current. With no live answer from any, falls back to the
++    offline hints exactly like :func:`get_codex_model_ids`."""
++    merged: list[str] = []
++    for token, base_url in credentials:
++        api_models = _fetch_models_from_api(token, base_url=base_url)
++        if api_models:
++            merged.extend(m for m in _finalize_codex_models(api_models) if m not in merged)
++    if merged:
++        return merged
++    return get_codex_model_ids()
++
++
+ def get_codex_model_ids(access_token: Optional[str] = None, base_url: Optional[str] = None) -> list[str]:
+     """Available Codex model IDs: live API (if token) > config.toml default > local cache > defaults.
+ 
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index ca15d9c2f4..56956897b7 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -144,6 +144,7 @@ def build_models_payload(
+         _apply_picker_hints(rows)
+     if canonical_order:
+         rows = _reorder_canonical(rows)
++    rows = _prefer_subscription_rows(rows)
+     if pricing:
+         _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier, cached_only=pricing_cache_only)
+     # Both metadata decorators consult ``model_overrides``.  Snapshot the
+@@ -912,6 +913,41 @@ def _apply_picker_hints(rows: list[dict]) -> None:
+                           else f"run `hermes model` to configure ({auth_type})")
+ 
+ 
++SUBSCRIPTION_PROVIDERS = frozenset({"openai-codex"})
++METERED_OPENAI_PROVIDERS = frozenset({"openai", "openai-api"})
++
++
++def _prefer_subscription_rows(rows: list[dict]) -> list[dict]:
++    """Label billing and put the ChatGPT/Codex subscription ahead of the metered OpenAI API.
++
++    A model both can run (gpt-6-astra) must default to the subscription: the metered row stays
++    selectable but is marked ``billing="metered"`` and lists ``subscription_overlap_models`` (the
++    ids the subscription also serves) so a client can show "billed per token" next to them and never
++    pick it by accident. Rows are only labelled/reordered, never dropped."""
++    {_slug(r): r for r in rows}
++    sub_rows = [r for r in rows if _slug(r) in SUBSCRIPTION_PROVIDERS]
++    if not sub_rows:
++        return rows
++    for r in sub_rows:
++        r["billing"] = "subscription"
++    sub_models = {str(m).lower() for r in sub_rows for m in (r.get("models") or [])}
++    for r in rows:
++        if _slug(r) in METERED_OPENAI_PROVIDERS:
++            r["billing"] = "metered"
++            r["subscription_overlap_models"] = [m for m in (r.get("models") or []) if str(m).lower() in sub_models]
++    metered_idx = [i for i, r in enumerate(rows) if _slug(r) in METERED_OPENAI_PROVIDERS]
++    if not metered_idx:
++        return rows
++    first_metered = min(metered_idx)
++    codex_idx = [i for i, r in enumerate(rows) if _slug(r) in SUBSCRIPTION_PROVIDERS]
++    if all(i < first_metered for i in codex_idx):
++        return rows
++    moved = [rows[i] for i in codex_idx]
++    rest = [r for i, r in enumerate(rows) if i not in set(codex_idx)]
++    insert_at = min(i for i, r in enumerate(rest) if _slug(r) in METERED_OPENAI_PROVIDERS)
++    return rest[:insert_at] + moved + rest[insert_at:]
++
++
+ def _reorder_canonical(rows: list[dict]) -> list[dict]:
+     """Canonical slugs in ``CANONICAL_PROVIDERS`` order, truly-custom rows last. Keys on slug membership,
+     NOT ``is_user_defined`` — ``providers:`` config rows carry that flag even for canonical slugs."""
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 5b900144ae..d01a44bc32 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1410,17 +1410,17 @@ def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
+     # until the runtime lease refreshes it.
+     # The token and the host it is routed to come from the same resolution (#121486): a pooled
+     # gateway key is only ever sent to that gateway, never to the chatgpt.com default.
+-    base_url = None
+-    try:
+-        from hermes_cli.auth import _codex_access_token_is_expiring, resolve_codex_runtime_credentials
++    # Discovery spans EVERY usable pool entry, not the round-robin cursor: a free-plan account lists
++    # no Astra, and a catalog built from it left Astra offered only under the metered OpenAI API.
++    from hermes_cli.codex_models import codex_catalog_credentials, get_codex_model_ids_for_credentials
+ 
+-        creds = resolve_codex_runtime_credentials(read_only=True)
+-        access_token, base_url = creds.get("api_key"), creds.get("base_url")
+-        if _codex_access_token_is_expiring(access_token, 0):
+-            access_token = None
++    try:
++        credentials = codex_catalog_credentials()
+     except Exception:
+-        access_token = None
+-    return get_codex_model_ids(access_token=access_token, base_url=base_url)
++        credentials = []
++    if credentials:
++        return get_codex_model_ids_for_credentials(credentials)
++    return get_codex_model_ids(access_token=None, base_url=None)
+ 
+ 
+ _COPILOT_ACP_SESSION_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
+diff --git a/tests/hermes_cli/test_codex_subscription_routing.py b/tests/hermes_cli/test_codex_subscription_routing.py
+new file mode 100644
+index 0000000000..f7a238d3a7
+--- /dev/null
++++ b/tests/hermes_cli/test_codex_subscription_routing.py
+@@ -0,0 +1,113 @@
++"""Astra must route via the ChatGPT/Codex subscription, never silently via the metered OpenAI API.
++
++Regression: the Codex catalog was discovered with whichever pool entry round-robin pointed at; a
++free-plan entry lists no Astra, so the picker offered it only under the billed OpenAI API row.
++"""
++from __future__ import annotations
++
++import base64
++import json
++import time
++from unittest.mock import patch
++
++import pytest
++
++import hermes_cli.auth as auth_mod
++from hermes_cli import codex_models
++from agent.credential_pool import (
++    codex_entry_entitled_for_model, codex_plan_type, load_pool)
++from hermes_cli.inventory import _prefer_subscription_rows
++
++ASTRA = "gpt-6-astra"
++
++
++def _jwt(account: str, plan: str) -> str:
++    def seg(obj: dict) -> str:
++        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
++
++    payload = {"exp": int(time.time()) + 3600, "sub": account,
++               "https://api.openai.com/auth": {"chatgpt_account_id": account, "chatgpt_plan_type": plan}}
++    return f"{seg({'alg': 'none'})}.{seg(payload)}.sig"
++
++
++FREE, PRO = _jwt("acct-free", "free"), _jwt("acct-pro", "pro")
++
++
++@pytest.fixture
++def pool_home(tmp_path, monkeypatch):
++    home = tmp_path / "hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
++    (home / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": [
++        {"id": "free1", "label": "free", "auth_type": "oauth", "priority": 0, "source": "manual:device_code",
++         "access_token": FREE, "refresh_token": "r1"},
++        {"id": "pro1", "label": "pro", "auth_type": "oauth", "priority": 1, "source": "manual:device_code",
++         "access_token": PRO, "refresh_token": "r2"}]}}), encoding="utf-8")
++    return home
++
++
++def test_plan_claim_and_entitlement():
++    assert codex_plan_type(FREE) == "free" and codex_plan_type(PRO) == "pro"
++    assert not codex_entry_entitled_for_model(FREE, ASTRA)
++    assert codex_entry_entitled_for_model(PRO, ASTRA)
++    assert codex_entry_entitled_for_model(FREE, "gpt-5.5")  # only gated models are plan-checked
++    assert codex_entry_entitled_for_model("opaque-token", ASTRA)  # unknown plan is not excluded
++
++
++def test_pool_selection_for_astra_skips_free_entries(pool_home):
++    pool = load_pool("openai-codex")
++    for _ in range(4):  # the free head entry is never leased for Astra
++        assert pool.select(model=ASTRA).label == "pro"
++    assert pool.select(model="gpt-5.5").label == "free"  # ungated models still use the head entry
++
++
++def test_codex_catalog_unions_all_pool_entries_when_current_is_free(pool_home):
++    def fake_fetch(token, base_url=None):
++        return ["gpt-5.5", ASTRA] if token == PRO else ["gpt-5.5", "luna"]
++
++    # the read-only singleton resolver points at the FREE entry (the round-robin cursor)
++    with patch.object(auth_mod, "resolve_codex_runtime_credentials",
++                      return_value={"api_key": FREE, "base_url": None}), \
++         patch.object(codex_models, "_fetch_models_from_api", side_effect=fake_fetch):
++        from hermes_cli.models import _codex_catalog
++
++        models = _codex_catalog("openai-codex", False)
++        creds = codex_models.codex_catalog_credentials()
++    assert ASTRA in models and "luna" in models
++    assert codex_plan_type(creds[0][0]) == "pro"  # strongest plan first
++
++
++def test_catalog_cache_identity_ignores_cursor(pool_home):
++    def ident(current):
++        with patch.object(auth_mod, "resolve_codex_runtime_credentials",
++                          return_value={"api_key": current, "base_url": None}):
++            return codex_models.codex_catalog_credential_identity()
++
++    assert ident(FREE) == ident(PRO)
++
++
++def _row(slug, models):
++    return {"slug": slug, "name": slug, "models": list(models), "total_models": len(models)}
++
++
++def test_picker_defaults_to_subscription_and_labels_metered():
++    rows = [_row("openai-api", [ASTRA, "gpt-5.5"]), _row("anthropic", ["claude"]),
++            _row("openai-codex", [ASTRA])]
++    out = _prefer_subscription_rows(rows)
++    slugs = [r["slug"] for r in out]
++    assert slugs.index("openai-codex") < slugs.index("openai-api")
++    codex, metered = (next(r for r in out if r["slug"] == s) for s in ("openai-codex", "openai-api"))
++    assert codex["billing"] == "subscription"
++    assert metered["billing"] == "metered" and metered["subscription_overlap_models"] == [ASTRA]
++    assert ASTRA in metered["models"]  # still explicitly selectable
++
++
++def test_session_create_reroutes_metered_pick_unless_allowed():
++    from tui_gateway.methods_session_model_guard import create_overrides
++
++    with patch("hermes_cli.models.cached_provider_model_ids", return_value=[ASTRA]):
++        assert create_overrides({"model": ASTRA, "provider": "openai-api"})[0]["provider"] == "openai-codex"
++        assert create_overrides({"model": ASTRA, "provider": "openai-api",
++                                 "allow_metered": True})[0]["provider"] == "openai-api"
++        assert create_overrides({"model": "gpt-5.5", "provider": "openai-api"})[0]["provider"] == "openai-api"
+diff --git a/tui_gateway/methods_session_model_guard.py b/tui_gateway/methods_session_model_guard.py
+index 6951012616..a62127c307 100644
+--- a/tui_gateway/methods_session_model_guard.py
++++ b/tui_gateway/methods_session_model_guard.py
+@@ -29,6 +29,30 @@ def model_override_conflict(params: dict, build_scope) -> dict | None:
+     return static_model_provider_conflict(model, provider)
+ 
+ 
++def _prefer_subscription_route(override: dict, params: dict) -> dict:
++    """Re-route a metered OpenAI API pick to the ChatGPT/Codex subscription when it serves the same
++    model, unless the client says the metered route was a deliberate choice (``allow_metered``).
++    A picker that only offered the metered row once billed ~$330 for chats meant for the subscription."""
++    from utils import is_truthy_value
++
++    provider = (override.get("provider") or "").strip().lower()
++    if provider not in {"openai", "openai-api"} or is_truthy_value(params.get("allow_metered")):
++        return override
++    try:
++        from hermes_cli.models import cached_provider_model_ids
++
++        served = {m.lower() for m in cached_provider_model_ids("openai-codex", non_blocking=True)}
++    except Exception:
++        return override
++    if override["model"].lower() not in served:
++        return override
++    import logging
++    logging.getLogger(__name__).warning(
++        "session.create: %s requested on metered provider %s; subscription provider openai-codex serves it — "
++        "routing there (pass allow_metered to force the billed API)", override["model"], provider)
++    return {**override, "provider": "openai-codex"}
++
++
+ def create_overrides(params: dict) -> tuple:
+     """PER-SESSION (model, reasoning, service_tier) overrides from the composer — never a global config
+     write. An explicit ``service_tier`` wins over legacy ``fast`` (an unknown word raises ``ValueError``);
+@@ -37,6 +61,8 @@ def create_overrides(params: dict) -> tuple:
+ 
+     model = str(params.get("model") or "").strip()
+     model_override = {"model": model, "provider": str(params.get("provider") or "").strip() or None} if model else None
++    if model_override:
++        model_override = _prefer_subscription_route(model_override, params)
+     reasoning_override = None
+     if effort := str(params.get("reasoning_effort") or "").strip():
+         with contextlib.suppress(Exception):
+-- 
+2.54.0 (Apple Git-157)
+

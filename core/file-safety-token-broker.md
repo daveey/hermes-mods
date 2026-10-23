@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/0217-fix-file-safety-read-write-deny-.config-token-broker.patch`: `~/.config/token-broker` joins the credential dirs and a new read-deny list.
+- `patches/0221-fix-file-safety-read-write-deny-.config-token-broker.patch`: `~/.config/token-broker` joins the credential dirs and a new read-deny list.
 
 What you see: the agent can no longer read, search, attach or overwrite the enrolled token-broker client token (`token`, `token.expired-*`).
 

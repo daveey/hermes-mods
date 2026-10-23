@@ -2,11 +2,13 @@
 
 Patches:
 
-- `patches/0215-feat-desktop-hermes-hub-replica-reads-owner-lookup-v.patch`: `apps/desktop/src/store/hub-sync.ts` (the
+- `patches/0219-feat-desktop-hermes-hub-replica-reads-owner-lookup-v.patch`: `apps/desktop/src/store/hub-sync.ts` (the
   Desktop's door to the `hub-sync` backend plugin), owner lookup consulting the replica, Kanban board fallback to
   the replica for a gateway whose live read fails.
-- `patches/0216-feat-desktop-sidebar-shows-offline-gateways-sessions.patch`: bundled Desktop plugin
+- `patches/0220-feat-desktop-sidebar-shows-offline-gateways-sessions.patch`: bundled Desktop plugin
   `apps/desktop/src/plugins/hub-sync/` — the left-pane "Synced from other gateways" section.
+- `patches/0229-fix-desktop-use-themed-synced-session-tooltips-and-S.patch`: the synced-sessions section uses the themed tooltip and SDK session rows (`sdk/sessions.ts`) instead of bespoke markup.
+- `patches/0232-fix-desktop-route-hub-sync-plugin-imports-through-th.patch`: the hub-sync and kanban plugins import gateways and hub-sync state through the plugin SDK (`sdk/gateways.ts`: `$gateways`, `PluginGateway`; `sdk/hub-sync.ts`) rather than core stores; `desktop-plugin-sdk.md` documents them.
 
 Needs the public `plugins/hub-sync` backend plugin (this repo) on the window's primary gateway and hermes-hub
 syncing there. Without either, every read answers `null`/`[]` and the Desktop behaves exactly as before.
@@ -20,7 +22,7 @@ syncing there. Without either, every read answers `null`/`[]` and the Desktop be
 - **Kanban board.** When one gateway's live board read fails, its cards come from the replica (`/tasks`), marked
   "from hub" with their sync age; a gateway that answers is read live only. A gateway whose hub name is unknown
   stays missing (no guessing). A comment on a replica card is queued as a hub request.
-- **Sidebar section (0216).** Sessions of gateways that are not live right now — no successful hub-sync `/status`
+- **Sidebar section (0220).** Sessions of gateways that are not live right now — no successful hub-sync `/status`
   probe and no rows in the live sidebar list, or not registered on this Desktop at all — appear in a "Synced from
   other gateways" section between Pinned and Projects: greyed label, cloud glyph, `synced Xm ago` (tooltip says the
   gateway isn't reachable). Live data stays primary: the window's own gateway, any reachable gateway and any
@@ -70,6 +72,8 @@ Run in `apps/desktop` (vitest, Oct 23, 2026; `npx tsc -p . --noEmit` clean):
 
 Untested: a real Desktop window (no live render or click was exercised), the backend side of an applied request
 (that is hermes-hub's), and strings are English only (no locale overlays; the section is plugin chrome).
+
+- 0229/0232 touch `plugins/hub-sync/sessions-section.test.tsx`, `sessions-section.tsx`, `api.ts`, `model.ts`, `plugins/kanban/api.ts` and the SDK barrel `sdk/index.ts`; no new test files. Not re-run when this doc was written (untested here).
 
 ## Applying
 

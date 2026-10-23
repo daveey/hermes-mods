@@ -1,0 +1,214 @@
+From 962810bda38812ea58d1f6e8ab2b37a14e7dea0f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 00:53:32 -0700
+Subject: [PATCH 234/248] fix(models): honor explicit billed picks and guard
+ subscription defaults end to end [daveey]
+
+---
+ hermes_cli/inventory.py                       |  5 +-
+ hermes_cli/models.py                          |  7 +++
+ hermes_cli/models_detect.py                   | 10 ++++
+ hermes_cli/runtime_provider.py                |  8 +++-
+ .../test_codex_subscription_routing.py        | 47 +++++++++++++++++--
+ tui_gateway/methods_session_model_guard.py    | 30 ++++--------
+ 6 files changed, 80 insertions(+), 27 deletions(-)
+
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 56956897b7..bc4ee3e834 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -924,11 +924,14 @@ def _prefer_subscription_rows(rows: list[dict]) -> list[dict]:
+     selectable but is marked ``billing="metered"`` and lists ``subscription_overlap_models`` (the
+     ids the subscription also serves) so a client can show "billed per token" next to them and never
+     pick it by accident. Rows are only labelled/reordered, never dropped."""
+-    {_slug(r): r for r in rows}
+     sub_rows = [r for r in rows if _slug(r) in SUBSCRIPTION_PROVIDERS]
++    for r in rows:
++        if _slug(r) in METERED_OPENAI_PROVIDERS:
++            r["name"] = "OpenAI API (billed per token)"
+     if not sub_rows:
+         return rows
+     for r in sub_rows:
++        r["name"] = "ChatGPT subscription (Codex)"
+         r["billing"] = "subscription"
+     sub_models = {str(m).lower() for r in sub_rows for m in (r.get("models") or [])}
+     for r in rows:
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index d01a44bc32..c0d4854e3b 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1130,6 +1130,13 @@ def detect_provider_for_model(
+     if not name:
+         return None
+ 
++    # An unqualified choice prefers the subscription over the billed first-party API.
++    # Explicit provider choices bypass this detector in switch_model.
++    from hermes_cli.models_detect import preferred_subscription_model
++    if current_provider in {"", "auto", "openai", "openai-api", "anthropic", "openrouter"}:
++        if subscription_model := preferred_subscription_model(name):
++            return ("openai-codex", subscription_model)
++
+     # The current provider's LIVE catalog outranks every static guess: a model it already serves
+     # (Codex early-access ids, Portal-only slugs, Ollama Cloud models absent from _PROVIDER_MODELS)
+     # must never re-route the session to another vendor or to metered OpenRouter.
+diff --git a/hermes_cli/models_detect.py b/hermes_cli/models_detect.py
+index a0fd288e7b..81182c8033 100644
+--- a/hermes_cli/models_detect.py
++++ b/hermes_cli/models_detect.py
+@@ -71,6 +71,16 @@ def current_provider_owns_vendor(model_name: str, current_provider: str) -> bool
+     return native == {vendor}
+ 
+ 
++def preferred_subscription_model(model: str) -> Optional[str]:
++    """Exact account-discovered match for an unqualified model choice; never guess entitlement."""
++    name = (model or "").strip()
++    if not name or "/" in name or not name.lower().startswith(("gpt-", "o1", "o3", "o4")):
++        return None
++    if not provider_has_credentials("openai-codex"):
++        return None
++    return current_provider_catalog_match(name, "openai-codex")
++
++
+ def provider_has_credentials(provider: str) -> bool:
+     """Whether *provider* can be switched to without the user typing a key: env/.env key, auth
+     store login, or a usable credential-pool entry. ``custom``/``custom:*`` targets only come out
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 07936db273..d4e52bb1b6 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -655,7 +655,7 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: dict[s
+         pool = None
+     if not (pool and pool.has_credentials()):
+         return None
+-    entry = pool.select(model=target_model or None)
++    entry = pool.select(model=_effective_model(model_cfg, target_model) or None)
+     if entry is None:
+         return None
+     pool_api_key = _pool_entry_api_key(entry)
+@@ -1020,6 +1020,12 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
+     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
+     runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+     _raise_for_credentialless_bare_custom(requested_provider, runtime)
++    # Pool exhaustion must not fall through to a free singleton for an account-gated model.
++    if runtime.get("provider") == "openai-codex":
++        from agent.credential_pool import codex_entry_entitled_for_model
++        if not codex_entry_entitled_for_model(runtime.get("api_key"), _effective_model(_get_model_config(), target_model)):
++            raise AuthError("No entitled Codex account is available for this model",
++                            provider="openai-codex", code="model_not_entitled")
+     # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
+     # explicit --api-key/--base-url, env key) hardcodes the wire api_mode for openai/openai-codex,
+     # so applying the opt-in inside one rung left the others on codex_responses (#115169).
+diff --git a/tests/hermes_cli/test_codex_subscription_routing.py b/tests/hermes_cli/test_codex_subscription_routing.py
+index f7a238d3a7..22d1146608 100644
+--- a/tests/hermes_cli/test_codex_subscription_routing.py
++++ b/tests/hermes_cli/test_codex_subscription_routing.py
+@@ -101,13 +101,50 @@ def test_picker_defaults_to_subscription_and_labels_metered():
+     assert codex["billing"] == "subscription"
+     assert metered["billing"] == "metered" and metered["subscription_overlap_models"] == [ASTRA]
+     assert ASTRA in metered["models"]  # still explicitly selectable
++    assert "billed per token" in metered["name"]
+ 
+ 
+-def test_session_create_reroutes_metered_pick_unless_allowed():
++@pytest.mark.parametrize("current", ["openai-api", "anthropic", "auto"])
++def test_unqualified_model_switch_prefers_subscription(current):
++    from hermes_cli.models import detect_provider_for_model
++
++    with patch("hermes_cli.models.cached_provider_model_ids", return_value=[ASTRA]), \
++         patch("hermes_cli.models_detect.provider_has_credentials", return_value=True):
++        assert detect_provider_for_model(ASTRA, current) == ("openai-codex", ASTRA)
++
++
++def test_runtime_uses_pro_token_and_rejects_free_fallback(pool_home):
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    from hermes_cli.auth import AuthError
++
++    runtime = resolve_runtime_provider(requested="openai-codex", target_model=ASTRA)
++    assert runtime["api_key"] == PRO
++    # An explicit token (and the singleton fallback) must pass the same final guard.
++    with pytest.raises(AuthError, match="entitled"):
++        resolve_runtime_provider(requested="openai-codex", target_model=ASTRA, explicit_api_key=FREE)
++
++
++def test_model_options_rpc_prefers_subscription(monkeypatch):
++    from tui_gateway import server
++    from hermes_cli.inventory import load_picker_context
++
++    rows = [_row("openai-api", [ASTRA]), _row("openai-codex", [ASTRA])]
++    monkeypatch.setattr(server, "_model_picker_context", lambda agent: load_picker_context())
++    monkeypatch.setattr("hermes_cli.model_switch.list_authenticated_providers", lambda **kw: rows)
++    monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *a, **kw: None)
++    monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *a, **kw: None)
++    monkeypatch.setattr("hermes_cli.inventory._apply_featured", lambda *a, **kw: None)
++    response = server._methods["model.options"](1, {})
++    offered = [r for r in response["result"]["providers"] if ASTRA in r["models"]]
++    assert offered[0]["slug"] == "openai-codex"
++    assert "billed per token" in next(r for r in offered if r["slug"] == "openai-api")["name"]
++
++
++def test_session_create_prefers_subscription_but_honors_explicit_provider():
+     from tui_gateway.methods_session_model_guard import create_overrides
+ 
+-    with patch("hermes_cli.models.cached_provider_model_ids", return_value=[ASTRA]):
+-        assert create_overrides({"model": ASTRA, "provider": "openai-api"})[0]["provider"] == "openai-codex"
+-        assert create_overrides({"model": ASTRA, "provider": "openai-api",
+-                                 "allow_metered": True})[0]["provider"] == "openai-api"
++    with patch("hermes_cli.models.cached_provider_model_ids", return_value=[ASTRA]), \
++         patch("hermes_cli.models_detect.provider_has_credentials", return_value=True):
++        assert create_overrides({"model": ASTRA})[0]["provider"] == "openai-codex"
++        assert create_overrides({"model": ASTRA, "provider": "openai-api"})[0]["provider"] == "openai-api"
+         assert create_overrides({"model": "gpt-5.5", "provider": "openai-api"})[0]["provider"] == "openai-api"
+diff --git a/tui_gateway/methods_session_model_guard.py b/tui_gateway/methods_session_model_guard.py
+index a62127c307..ba2fa63627 100644
+--- a/tui_gateway/methods_session_model_guard.py
++++ b/tui_gateway/methods_session_model_guard.py
+@@ -29,28 +29,18 @@ def model_override_conflict(params: dict, build_scope) -> dict | None:
+     return static_model_provider_conflict(model, provider)
+ 
+ 
+-def _prefer_subscription_route(override: dict, params: dict) -> dict:
+-    """Re-route a metered OpenAI API pick to the ChatGPT/Codex subscription when it serves the same
+-    model, unless the client says the metered route was a deliberate choice (``allow_metered``).
+-    A picker that only offered the metered row once billed ~$330 for chats meant for the subscription."""
+-    from utils import is_truthy_value
++def _prefer_subscription_route(override: dict) -> dict:
++    """An unqualified model choice prefers the subscription; an explicit provider is honored.
+ 
+-    provider = (override.get("provider") or "").strip().lower()
+-    if provider not in {"openai", "openai-api"} or is_truthy_value(params.get("allow_metered")):
+-        return override
+-    try:
+-        from hermes_cli.models import cached_provider_model_ids
++    The picker labels the API row as billed. No extra, undeclared RPC flag is needed to choose it.
++    """
++    from hermes_cli.models_detect import preferred_subscription_model
+ 
+-        served = {m.lower() for m in cached_provider_model_ids("openai-codex", non_blocking=True)}
+-    except Exception:
+-        return override
+-    if override["model"].lower() not in served:
++    if (override.get("provider") or "").strip().lower() not in {"", "auto"}:
+         return override
+-    import logging
+-    logging.getLogger(__name__).warning(
+-        "session.create: %s requested on metered provider %s; subscription provider openai-codex serves it — "
+-        "routing there (pass allow_metered to force the billed API)", override["model"], provider)
+-    return {**override, "provider": "openai-codex"}
++    if model := preferred_subscription_model(override["model"]):
++        return {**override, "model": model, "provider": "openai-codex"}
++    return override
+ 
+ 
+ def create_overrides(params: dict) -> tuple:
+@@ -62,7 +52,7 @@ def create_overrides(params: dict) -> tuple:
+     model = str(params.get("model") or "").strip()
+     model_override = {"model": model, "provider": str(params.get("provider") or "").strip() or None} if model else None
+     if model_override:
+-        model_override = _prefer_subscription_route(model_override, params)
++        model_override = _prefer_subscription_route(model_override)
+     reasoning_override = None
+     if effort := str(params.get("reasoning_effort") or "").strip():
+         with contextlib.suppress(Exception):
+-- 
+2.54.0 (Apple Git-157)
+
