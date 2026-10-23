@@ -205,5 +205,31 @@ class RouteToLane(unittest.TestCase):
         self.assertEqual(len(rest), 3)
 
 
+class Deliver(unittest.TestCase):
+    """The weekly report never goes to the Inbox: unrouted hits -> one Kanban card, none -> nothing."""
+    def run_(self, rest):
+        import datetime as dt, types
+        calls = []
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        hit = {"class": g.FIX_CLASS, "session": "s1", "quote": "why didnt you do this yourself", "t": 1_760_000_000,
+               "pattern": "do it yourself"}
+        out = g.deliver([hit], dt.date(2026, 10, 12), None, rest, 1, 0, 0, run=run)
+        return out, calls
+
+    def test_unrouted_hits_become_one_kanban_card(self):
+        out, calls = self.run_([{"class": g.FIX_CLASS}])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:3], ["hermes", "kanban", "create"])
+        self.assertIn("ask-gate-weekly:2026-10-12", calls[0])
+        self.assertNotIn("inbox", calls[0])
+
+    def test_all_routed_posts_nothing(self):
+        out, calls = self.run_([])
+        self.assertIsNone(out)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

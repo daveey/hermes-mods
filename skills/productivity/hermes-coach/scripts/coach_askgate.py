@@ -404,6 +404,24 @@ REVIEW_PROMPT = ("Review this week's ask-gate KPI. Fix requests (had_to_ask_fix)
                  "have prevented it.")
 
 
+def deliver(hits, week, extra, rest, n_fix, n_bb, n_ask, run=subprocess.run):
+    """The weekly report is status, not a decision for David: it never goes to the Inbox. Hits nothing else took
+    (``rest``) are agent work, so they become ONE Kanban review card per week (idempotent); with no such hits the
+    report only lands in the marker/baseline files. Returns the command run, or None."""
+    if not rest:
+        return None
+    cmd = ["hermes", "kanban", "create",
+           f"Ask-gate review: {len(rest)} unrouted hit{'s' if len(rest) != 1 else ''}, week of {week:%b %-d} "
+           f"({n_fix} fix, {n_bb} Baby Bear, {n_ask} ask-me)",
+           "--assignee", "default", "--idempotency-key", f"ask-gate-weekly:{week:%Y-%m-%d}",
+           "--created-by", "coach", "--body", REVIEW_PROMPT + "\n\n" + post_body(hits, week, extra)]
+    r = run(cmd, capture_output=True, text=True)
+    sys.stderr.write(r.stdout + r.stderr)
+    if r.returncode:
+        sys.exit(r.returncode)
+    return cmd
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="~/code/hermes-coach-data")
@@ -474,17 +492,7 @@ def main():
             extra = (extra or []) + ["", f"Self-heal lane took {len(owned)} of {len(lane_hits)} Hermes/agent hits (filed or "
                                          "already open)." + (f" {len(rest_lane)} still need a review (Do it)."
                                                              if rest_lane else "")]
-        cmd = ["hermes", "inbox", "post",
-               f"Ask-gate: {len(fix)} Hermes fix request{'s' if len(fix) != 1 else ''}, {len(bb)} Baby Bear, "
-               f"{len(ask)} ask-me, week of {weeks[0]:%b %-d}",
-               "--body", post_body(hits, weeks[0], extra), "--key", f"ask-gate-weekly:{weeks[0]:%Y-%m-%d}",
-               "--poster", "coach"]
-        if rest:
-            cmd += ["--prompt", REVIEW_PROMPT, "--prompt-label", "Review this week's ask-gate KPI"]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        sys.stderr.write(r.stdout + r.stderr)
-        if r.returncode:
-            sys.exit(r.returncode)
+        deliver(hits, weeks[0], extra, rest, len(fix), len(bb), len(ask))
         p = marker_path(data, weeks[0])
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"posted_by": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix), BB_CLASS: len(bb),
