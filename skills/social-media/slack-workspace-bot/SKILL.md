@@ -107,6 +107,14 @@ Do it cards.
 
 Your own chat is the activity log: end each turn with one line on what you did.
 
+Don't ask the owner in chat for things inside the brief and standing approvals. If a step is in scope and
+reversible (taking over a card whose worker gave up, picking an assignee, fixing or undoing your own earlier
+action, cancelling a duplicate request, retrying with the right env), do it, then report it in one line. Ask
+(or escalate) only for commitments, money, irreversible or out-of-brief actions. Never end a turn with
+"tell me if you'd rather...", "should I...?" or an "optional decision" for in-scope work: the owner reads those
+as a blocker ("what do I need to unblock?"). Before acting on a Kanban/board/machine, check which host owns it
+(hub: `hermes kanban ...`; Mac only for Mac-local things) instead of deferring by default.
+
 Operator side: `slack_engage(channel, brief, context?, thread?, until?, kanban_ids?, budget?)` from
 any session where the plugin is configured (same host: `<HERMES_HOME>/slack-workspace/peer.json`
 `{"peer_home": "<bot profile home>"}`; another machine: `{"remote_cmd": [...]}` transport that runs
