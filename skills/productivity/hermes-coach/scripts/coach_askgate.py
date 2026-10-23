@@ -72,21 +72,45 @@ CLASS_LABEL = {ASK_CLASS: "Ask-me corrections (\"why are you asking me / I alrea
 # session title only breaks a tie when the turn names neither BB nor Hermes.
 BB_WORDS = re.compile(r"\b(?:bb(?!-tuner)|baby ?bear|pods?|echo[- ]?(?:dot|ear)|echoear|nanit|cameras?|camera stream|"
                       r"home assistant|triptych|mishear\w*|(?:my|the|apple) watch|watch app|room listening|wake word|"
-                      r"volume)\b", re.I)
+                      r"volume|main room|soundscapes?)\b", re.I)
 BB_HA = re.compile(r"\bHA\b")
 HERMES_WORDS = re.compile(r"\b(?:hermes|desktop|sidebar|sessions?|kanban|cards?|plugins?|pluggin|gateway|skills?|cron|"
                           r"subagents?|bottom-bar|status bar|left pane|panel)\b", re.I)
 
 
-def is_bb(text, title="", profile=""):
-    """True when a fix request is about the Baby Bear product rather than Hermes or the agent."""
+def _bb_hermes_counts(text):
+    return len(BB_WORDS.findall(text)) + len(BB_HA.findall(text)), len(HERMES_WORDS.findall(text))
+
+
+def session_text(d):
+    """A digest's user turns, the agent replies before them and its last reply, joined: the last-resort tie-break."""
+    turns = [u for u in d.get("user_turns") or [] if isinstance(u, dict)]
+    return " ".join([f"{u.get('text') or ''} {u.get('prev') or ''}" for u in turns] + [d.get("last_reply") or ""])
+
+
+# "[Image attached at: ~/Library/Application Support/Hermes/composer-images/…]": the path names Hermes on every
+# Desktop screenshot, which made every screenshot fix request a Hermes one.
+ATTACH_PATH = re.compile(r"\[Image attached at:[^\]\n]*\]?", re.I)
+
+
+def is_bb(text, title="", profile="", session=""):
+    """True when a fix request is about the Baby Bear product rather than Hermes or the agent. The turn's own words
+    decide, then the title; when neither names BB or Hermes, the rest of the session does (BB words outnumber Hermes
+    words). Week of 2026-10-12: "why didnt this work [screenshot]" and "can we figure out why this happen" were BB
+    music/watch sessions whose later turns and replies said so, and counted as Hermes misses."""
     if (profile or "").startswith("bb-") and profile != "bb-tuner":
         return True
+    text = ATTACH_PATH.sub("[screenshot]", text or "")
     if BB_WORDS.search(text) or BB_HA.search(text):
         return True
     if HERMES_WORDS.search(text):
         return False
-    return bool(BB_WORDS.search(title or "") or BB_HA.search(title or ""))
+    if BB_WORDS.search(title or "") or BB_HA.search(title or ""):
+        return True
+    if HERMES_WORDS.search(title or ""):
+        return False
+    bb, hermes = _bb_hermes_counts(session or "")
+    return bb > hermes
 _FIXV = r"(?:fix|investigat\w*|root.?caus\w*|figure out|debug|look into|find out)"
 FIX_PATTERNS = [
     ("card-to-fix", r"\b(?:make|create|file|open|start|spin up|add)\s+(?:a\s+|an\s+|another\s+)?(?:new\s+)?(?:kanban\s+)?"
@@ -119,7 +143,11 @@ FIX_NEGATIVE = re.compile(r"^\s*(?:work kanban task|Investigate this [\w-]+ cron
                           r"|\bfixed the root.?causes?\b"
                           r"|\bif (?:it|that|this|they) (?:fails?|breaks?|doesn.?t work|don.?t work)\b"
                           r"|\b(?:it|that|which|then)\s+(?:should\s+|would\s+|will\s+|can\s+)?(?:automatically\s+)?"
-                          r"(?:file|create|open|make)s?\s+(?:a\s+|an\s+)?(?:new\s+)?(?:kanban\s+)?(?:card|task|ticket|issue)s?\b",
+                          r"(?:file|create|open|make)s?\s+(?:a\s+|an\s+)?(?:new\s+)?(?:kanban\s+)?(?:card|task|ticket|issue)s?\b"
+                          # approving numbered items from the agent's own list ("make cards to fix 3, 4, 5"): the
+                          # agent proposed them, so it is a go, not a defect report (week of 2026-10-12)
+                          r"|\b(?:make|create|open|file)\s+(?:kanban\s+)?(?:cards?|tasks?|tickets?|issues?)\s+(?:to fix|for)\s+"
+                          r"(?:items?\s+|#)?\d+(?:\s*(?:,|and|&|-)\s*#?\d+)+\b",
                           re.I)
 INTERACTIVE_SOURCES = {"desktop", "tui", "cli", "slack", "telegram", "discord", "whatsapp", "signal"}
 
@@ -171,7 +199,8 @@ def collect(data, since_ts, until_ts):
         st = d.get("started_at")
         if st and (first_ts is None or st < first_ts):
             first_ts = st
-        for i, u in enumerate(d.get("user_turns") or []):
+        turns = d.get("user_turns") or []
+        for i, u in enumerate(turns):
             t, text = u.get("t", 0), clean(u.get("text") or "")
             if not (since_ts <= t < until_ts) or not text:
                 continue
@@ -185,7 +214,8 @@ def collect(data, since_ts, until_ts):
             if not kind and d.get("source") in INTERACTIVE_SOURCES:
                 # a fix request often opens a session ("fix [screenshot]"), so the opener rule does not apply here
                 kind, cls = classify_fix(text), FIX_CLASS
-                if kind and is_bb(text, d.get("title") or "", d.get("profile") or Path(f).parent.name):
+                if kind and is_bb(text, d.get("title") or "", d.get("profile") or Path(f).parent.name,
+                                  session_text(d)):
                     cls = BB_CLASS
             if not kind:
                 continue

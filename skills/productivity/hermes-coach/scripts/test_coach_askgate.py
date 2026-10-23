@@ -62,6 +62,8 @@ FIX_HITS = {"make a card to fix": "card-to-fix",
             "fix [screenshot]": "screenshot-fix",
             "fix this [Image attached: a.png]": "screenshot-fix"}
 FIX_MISSES = ["fix the typo in the README",                      # an ordinary task, not a defect report
+              "make cards to fix 3, 4, 5, 6, 7, 8, 9",             # a go on the agent's own numbered list
+              "create tasks for 2 and 3",
               # week of 2026-10-12 review: a status question, a conditional plan, two specs for card-filing mechanisms
               "hows the mini perf doing now, do we expect that we fixed the root causes",
               "dont build it from scratch, make babybear do it, and if it fails figure out why and fix it",
@@ -145,6 +147,25 @@ class BabyBearSplit(unittest.TestCase):
         self.assertTrue(g.is_bb("can we rootcause it?", title="Babybear client not responding"))
         self.assertFalse(g.is_bb("the sidebar is broken", title="Babybear client not responding"))  # own words win
         self.assertTrue(g.is_bb("still broken", profile="bb-sms"))
+
+    def test_is_bb_screenshot_path_and_session_tiebreak(self):
+        # week of 2026-10-12: the Desktop attachment path names Hermes, and the BB-ness was only in the session
+        shot = ("why didnt this work\n\n[Image attached at: ~/Library/Application Support/Hermes/composer-images/"
+                "Screenshot_2026-10-14_at_12.28.29_AM_584695.png]\n[screenshot]")
+        bb_session = "make all the fixes Give the end-of-turn detection more patience after Baby Bear; ask on the Dot pods"
+        self.assertTrue(g.is_bb(shot, title="Debug failure shown in screenshot", session=bb_session))
+        self.assertFalse(g.is_bb(shot, title="Debug failure shown in screenshot", session="the sidebar and kanban cards"))
+        self.assertFalse(g.is_bb(shot, title="Debug failure shown in screenshot"))      # no evidence: stays Hermes
+        self.assertTrue(g.is_bb("can we figure out why this happen and how to avoid it?",
+                                title="Watch not updating and voice input cutting off",
+                                session="my watch is not updating; Baby Bear watch app 269"))
+        # the turn's own words and the title still win over the session
+        self.assertFalse(g.is_bb("root cause it, and fix the pluggin", title="x", session="bb bb bb pods camera"))
+        self.assertFalse(g.is_bb("why is this broken", title="Fix the desktop sidebar", session="bb bb bb pods"))
+
+    def test_session_text(self):
+        d = {"user_turns": [{"text": "a", "prev": "b"}, "junk", {"text": "c"}], "last_reply": "d"}
+        self.assertEqual(g.session_text(d).split(), ["a", "b", "c", "d"])
 
     def test_collect_splits_and_handoff_is_idempotent(self):
         import json, tempfile
