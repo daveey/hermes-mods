@@ -179,3 +179,23 @@ test('linkSegments: scheme-less web addresses link with an https href; file name
   assert.equal(m.linkHref({ kind: 'url', value: 'https://a.io' }), 'https://a.io')
   assert.equal(m.linkSegments(t).map(s => s.value).join(''), t)
 })
+
+test('openLink: .md paths open in the preview pane; other paths, URLs and a failed preview use the OS handler', async () => {
+  const previewed = [], external = []
+  let previewOk = true
+  m.bindLinkApis({ os: { openExternal: async u => (external.push(u), true) }, openPreview: async p => (previewed.push(p), previewOk) })
+  await m.openLink('/Users/you/design/plan.md', 'path')
+  await m.openLink('~/notes/A.Markdown', 'path')
+  await m.openLink('/tmp/x.log', 'path')
+  await m.openLink('https://example.com/README.md', 'url')
+  previewOk = false
+  await m.openLink('/gone.md', 'path')
+  assert.deepEqual(previewed, ['/Users/you/design/plan.md', '~/notes/A.Markdown', '/gone.md'])
+  assert.deepEqual(external, ['/tmp/x.log', 'https://example.com/README.md', '/gone.md'])
+  // Older core without ctx.openPreview: everything goes to the OS handler.
+  external.length = 0
+  m.bindLinkApis({ os: { openExternal: async u => (external.push(u), true) } })
+  await m.openLink('/Users/you/design/plan.md', 'path')
+  assert.deepEqual(external, ['/Users/you/design/plan.md'])
+  m.bindLinkApis(null)
+})

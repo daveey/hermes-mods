@@ -1,0 +1,145 @@
+From b64fbd45b1d86fe861d32ff21e9804642c81c999 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 17:39:06 -0700
+Subject: [PATCH] =?UTF-8?q?[daveey]=20desktop:=20ctx.openPreview=20?=
+ =?UTF-8?q?=E2=80=94=20plugins=20open=20a=20file=20in=20the=20preview=20pa?=
+ =?UTF-8?q?ne?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ apps/desktop/src/contrib/plugin.test.ts | 46 +++++++++++++++++++++++++
+ apps/desktop/src/contrib/plugin.ts      | 35 +++++++++++++++++++
+ 2 files changed, 81 insertions(+)
+
+diff --git a/apps/desktop/src/contrib/plugin.test.ts b/apps/desktop/src/contrib/plugin.test.ts
+index 9e46b3c986..83eb89c744 100644
+--- a/apps/desktop/src/contrib/plugin.test.ts
++++ b/apps/desktop/src/contrib/plugin.test.ts
+@@ -123,3 +123,49 @@ describe('createPluginContext.os', () => {
+     }
+   })
+ })
++
++describe('createPluginContext.openPreview', () => {
++  it('opens a resolvable file in the preview pane via the shared normalizer', async () => {
++    const preview = await import('@/store/preview')
++    const spy = vi.spyOn(preview, 'openPreview').mockImplementation(() => undefined as never)
++    const target = { kind: 'file', label: 'plan.md', path: '/tmp/plan.md', previewKind: 'text', source: '/tmp/plan.md', url: 'file:///tmp/plan.md' }
++    const normalizePreviewTarget = vi.fn().mockResolvedValue(target)
++    const prev = window.hermesDesktop
++    window.hermesDesktop = { ...(prev ?? {}), normalizePreviewTarget } as never
++
++    try {
++      const ctx = createPluginContext('demo')
++      await expect(ctx.openPreview('~/design/plan.md', { cwd: '/work' })).resolves.toBe(true)
++      expect(normalizePreviewTarget).toHaveBeenCalledWith('~/design/plan.md', '/work')
++      expect(spy).toHaveBeenCalledTimes(1)
++      expect(spy.mock.calls[0][0]).toMatchObject({ path: '/tmp/plan.md' })
++    } finally {
++      window.hermesDesktop = prev
++      spy.mockRestore()
++    }
++  })
++
++  it('resolves false (no tab) for a missing file, a directory, or an empty target', async () => {
++    const preview = await import('@/store/preview')
++    const spy = vi.spyOn(preview, 'openPreview').mockImplementation(() => undefined as never)
++
++    const normalizePreviewTarget = vi
++      .fn()
++      .mockResolvedValueOnce(null)
++      .mockResolvedValueOnce({ kind: 'file', previewKind: 'directory', path: '/tmp', source: '/tmp', url: 'file:///tmp', label: 'tmp' })
++
++    const prev = window.hermesDesktop
++    window.hermesDesktop = { ...(prev ?? {}), normalizePreviewTarget } as never
++
++    try {
++      const ctx = createPluginContext('demo')
++      await expect(ctx.openPreview('/nope.md')).resolves.toBe(false)
++      await expect(ctx.openPreview('/tmp')).resolves.toBe(false)
++      await expect(ctx.openPreview('   ')).resolves.toBe(false)
++      expect(spy).not.toHaveBeenCalled()
++    } finally {
++      window.hermesDesktop = prev
++      spy.mockRestore()
++    }
++  })
++})
+diff --git a/apps/desktop/src/contrib/plugin.ts b/apps/desktop/src/contrib/plugin.ts
+index ce760dca4f..6f844a239c 100644
+--- a/apps/desktop/src/contrib/plugin.ts
++++ b/apps/desktop/src/contrib/plugin.ts
+@@ -23,12 +23,15 @@ import {
+   type PluginRunActionResult,
+   runPluginAppAction
+ } from '@/lib/keybinds/plugin-actions'
++import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+ import { readKey, writeKey } from '@/lib/storage'
+ import { type ArchiveGuard, registerArchiveGuard } from '@/store/archive-guards'
+ import { type ArchiveHotkeyHandler, openNextSessionFrom, registerArchiveHotkeyHandler } from '@/store/archive-hotkey'
+ import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
+ import { $petActive } from '@/store/pet'
+ import { clearPetMessages, type PetSayOptions, sayPetMessage } from '@/store/pet-plugin-messages'
++import { openPreview } from '@/store/preview'
++import { $focusedWorkspaceCwd } from '@/store/session-states'
+ 
+ import { type GatewayEventListener, onGatewayEvent } from './events'
+ import { $pluginRecords } from './plugins-store'
+@@ -140,6 +143,13 @@ export interface PluginContext {
+    *  neighbour). For plugins that close their own session from a button.
+    *  False when there is none. Feature-detect: `ctx.openNextSession?.(id)`. */
+   openNextSession: (fromId: string) => boolean
++  /** [daveey] Open a local file path (or http(s) URL) in the app's preview
++   *  pane — the right-rail tab where Markdown renders, same pipeline as the
++   *  file tree. `~` and relative paths resolve against `cwd`, else the focused
++   *  workspace. Resolves false when the target can't be previewed (missing
++   *  file, directory, no Electron shell) so the caller can fall back to
++   *  `os.openExternal`. Feature-detect: `ctx.openPreview?.(path)`. */
++  openPreview: (target: string, options?: { cwd?: string }) => Promise<boolean>
+   /** Register an arbitrary cleanup to run on unload/disable — for side effects
+    *  that aren't contributions or sockets (store subscriptions, timers). Runs
+    *  alongside every other disposer when the plugin deactivates. */
+@@ -364,6 +374,30 @@ function createPluginLifetime(track: (dispose: () => void) => () => void) {
+   }
+ }
+ 
++// [daveey] The preview door: resolve through the same main-process normalizer
++// the file tree uses, then open the tab. Never throws; false = not previewable.
++async function openPluginPreview(target: string, cwd?: string): Promise<boolean> {
++  try {
++    const raw = String(target || '').trim()
++
++    if (!raw) {
++      return false
++    }
++
++    const preview = await normalizeOrLocalPreviewTarget(raw, cwd || $focusedWorkspaceCwd.get() || undefined)
++
++    if (!preview) {
++      return false
++    }
++
++    openPreview(preview)
++
++    return true
++  } catch {
++    return false
++  }
++}
++
+ /** Build the scoped context handed to a plugin's `register`. `onDispose`
+  *  receives every registration's disposer (the loader's unload/reload hook). */
+ export function createPluginContext(pluginId: string, onDispose?: (dispose: () => void) => void): PluginContext {
+@@ -384,6 +418,7 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
+     registerArchiveGuard: guard => track(registerArchiveGuard(source, guard)),
+     registerArchiveHotkeyHandler: handler => track(registerArchiveHotkeyHandler(source, handler)),
+     openNextSession: fromId => openNextSessionFrom(fromId),
++    openPreview: (target, options) => openPluginPreview(target, options?.cwd),
+     onDispose: fn => void track(fn),
+     onEvent: (type, listener) => track(onGatewayEvent(type, listener)),
+     ...createPluginLifetime(track),
+-- 
+2.55.0
+

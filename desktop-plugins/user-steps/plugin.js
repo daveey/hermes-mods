@@ -288,8 +288,19 @@ const btn = (primary = false) => ({
 const KIND_ICON = { approve: 'codicon-question', do: 'codicon-checklist', choose: 'codicon-list-selection', input: 'codicon-comment' }
 
 let osApi = null // ctx.os, set in register()
+let previewApi = null // ctx.openPreview (fork core), set in register()
 
-async function openLink(value) {
+/** Markdown files open rendered in the app's preview pane instead of the OS handler. */
+export const isMarkdownPath = p => /\.(md|markdown|mdx)$/i.test(String(p || ''))
+
+async function openLink(value, kind) {
+  if (kind === 'path' && isMarkdownPath(value) && previewApi) {
+    try {
+      if (await previewApi(value)) return
+    } catch {
+      /* fall through to the OS handler */
+    }
+  }
   try {
     if (await osApi?.openExternal?.(value)) return
   } catch {
@@ -317,7 +328,7 @@ export function Linked({ text }) {
           onClick: e => {
             e.preventDefault()
             e.stopPropagation()
-            void openLink(x.kind === 'url' ? linkHref(x) : x.value)
+            void openLink(x.kind === 'url' ? linkHref(x) : x.value, x.kind)
           },
           style: { color: 'var(--accent-foreground, var(--primary, #58a6ff))', textDecoration: 'underline', textUnderlineOffset: 2, cursor: 'pointer', wordBreak: 'break-all' },
           children: x.value
@@ -568,6 +579,7 @@ export default {
   name: 'User Steps',
   register(ctx) {
     osApi = ctx?.os || null
+    previewApi = typeof ctx?.openPreview === 'function' ? (t => ctx.openPreview(t)) : null
     ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => jsx(Strip, {}) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
     const onVis = () => (typeof document !== 'undefined' && document.hidden) || void refresh()

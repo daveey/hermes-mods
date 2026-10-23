@@ -243,6 +243,25 @@ test('strip: URLs in a blocked card summary and in a step are clickable and open
   dispose()
 })
 
+test('strip: a .md path in a blocked card opens in the preview pane via ctx.openPreview; other paths use the OS', async () => {
+  const opened = [], previewed = []
+  const dispose = m.default.register({ register: () => {}, os: { openExternal: async u => (opened.push(u), true) }, openPreview: async p => (previewed.push(p), true) })
+  const call = fakeRest([])
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_mdplan1', board: 'default', title: 'Go/no-go', text: 'Open /Users/you/design/plan.md and /tmp/run.log then decide.', at: 3 }] } }
+  focused.set('S1')
+  await m.refresh(call)
+  await show(React.createElement(m.Strip, { key: 's-md' }))
+  const links = [...el().querySelectorAll('[data-user-steps-card="t_mdplan1"] a[data-user-steps-link="path"]')]
+  assert.deepEqual(links.map(a => a.textContent), ['/Users/you/design/plan.md', '/tmp/run.log'], el().innerHTML)
+  await React.act(async () => { links[0].click(); links[1].click(); await flush() })
+  assert.deepEqual(previewed, ['/Users/you/design/plan.md'])
+  assert.deepEqual(opened, ['/tmp/run.log'])
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [] } }
+  await React.act(async () => { await m.refresh(call); await flush() })
+  delete window.__blockedPanel
+  dispose()
+})
+
 test('register: strip in composer.top and the user-step directive', () => {
   const got = []
   const dispose = m.default.register({ register: c => got.push(c) })

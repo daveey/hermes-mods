@@ -477,8 +477,25 @@ function notify(kind, message) {
 }
 
 let osApi = null // ctx.os, set in register()
+let previewApi = null // ctx.openPreview (fork core), set in register()
 
-async function openLink(value) {
+/** Keep ctx's OS + preview doors for link clicks (exported for tests). */
+export function bindLinkApis(ctx) {
+  osApi = ctx?.os || null
+  previewApi = typeof ctx?.openPreview === 'function' ? (t => ctx.openPreview(t)) : null
+}
+
+/** Markdown files open rendered in the app's preview pane instead of the OS handler. */
+export const isMarkdownPath = p => /\.(md|markdown|mdx)$/i.test(String(p || ''))
+
+export async function openLink(value, kind) {
+  if (kind === 'path' && isMarkdownPath(value) && previewApi) {
+    try {
+      if (await previewApi(value)) return
+    } catch {
+      /* fall through to the OS handler */
+    }
+  }
   try {
     if (await osApi?.openExternal?.(value)) return
   } catch {
@@ -501,7 +518,7 @@ function Linked({ text }) {
           onClick: e => {
             e.preventDefault()
             e.stopPropagation()
-            void openLink(x.kind === 'url' ? linkHref(x) : x.value)
+            void openLink(x.kind === 'url' ? linkHref(x) : x.value, x.kind)
           },
           style: { color: 'var(--accent-foreground, var(--primary, #58a6ff))', textDecoration: 'underline', textUnderlineOffset: 2, cursor: 'pointer', wordBreak: 'break-all' },
           children: x.value
@@ -696,7 +713,7 @@ export default {
   id: ID,
   name: 'Blocked Panel',
   register(ctx) {
-    osApi = ctx.os || null
+    bindLinkApis(ctx)
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -20, render: () => jsx(Panel, {}) })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
