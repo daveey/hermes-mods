@@ -115,6 +115,16 @@ action, cancelling a duplicate request, retrying with the right env), do it, the
 as a blocker ("what do I need to unblock?"). Before acting on a Kanban/board/machine, check which host owns it
 (hub: `hermes kanban ...`; Mac only for Mac-local things) instead of deferring by default.
 
+Cards the follower creates: the Kanban board is on the hub host (this gateway), so create cards there with
+`hermes kanban create "<title>" --body-file <f> --idempotency-key <key> --json`; use `slack_defer_to_mbp` only for
+Mac-local work. A hub card made by CLI is not tied to the engagement: add its id to the engagement with
+`slack_engagements action=update id=<eng> kanban_ids=[<full existing list> + new id]` (the list is replaced, so
+`action=get` first and resend all ids). Tell the thread a card exists only after it does. A card created with an
+assignee (even in triage) is auto-decomposed and dispatched within about a minute, so write the body as the full spec.
+If you deferred the same request to the Mac earlier, queue a cancel message so it doesn't create a duplicate.
+The Desktop "Agent issue" banners are Kanban diagnostics, not Inbox items: they can't be dismissed from here and
+clear when the card completes.
+
 Operator side: `slack_engage(channel, brief, context?, thread?, until?, kanban_ids?, budget?)` from
 any session where the plugin is configured (same host: `<HERMES_HOME>/slack-workspace/peer.json`
 `{"peer_home": "<bot profile home>"}`; another machine: `{"remote_cmd": [...]}` transport that runs
