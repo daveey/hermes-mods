@@ -210,8 +210,20 @@ def ssh_argv(host: str, action: list) -> list:
     if bad:
         raise ValueError(f"argument outside the shim's allowed characters: {str(bad[0])[:40]!r}")
     remote = " ".join(str(a) for a in action)
+    proxy: list = []
+    jump = str(h.get("jump") or "").strip()
+    if jump:
+        # LAN-only Mac (no tailnet): hop through `jump` (user@addr) with a separate, forwarding-only key
+        # (`jump_key`, default ~/.ssh/id_mac_hop) that the jump host pins to this one destination.
+        if not re.fullmatch(r"[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+", jump):
+            raise ValueError(f"bad jump {jump!r} in mac_ops.hosts")
+        jkey = os.path.expanduser(str(s.get("jump_key") or "~/.ssh/id_mac_hop"))
+        if re.search(r"[\s'\"]", jkey):
+            raise ValueError("bad jump_key path")
+        proxy = ["-o", f"ProxyCommand={s.get('ssh') or 'ssh'} -i {jkey} -o IdentitiesOnly=yes -o BatchMode=yes "
+                       f"-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -W %h:%p {jump}"]
     return [str(s.get("ssh") or "ssh"), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new", *proxy,
             f"{h.get('user') or 'root'}@{h['addr']}", remote]
 
 

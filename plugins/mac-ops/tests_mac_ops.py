@@ -427,3 +427,17 @@ def test_annotate_is_idempotent_and_ignores_other_displays():
 def test_tool_text_says_agent_display_is_not_a_cause():
     assert "Hermes Agent Display" in mo.SCHEMAS["mac_diag"][0] and "never" in mo.SCHEMAS["mac_diag"][0]
     assert "Hermes Agent Display" in mo.SCHEMAS["mac_fix"][0]
+
+
+def test_jump_host_uses_proxycommand_with_separate_key(env, monkeypatch):
+    cfg = mo._config()
+    cfg["mac_ops"]["hosts"]["lan"] = {"addr": "lan.local", "user": "you", "jump": "you@mini.example.com"}
+    argv = mo.ssh_argv("lan", ["diag"])
+    pc = [a for a in argv if a.startswith("ProxyCommand=")]
+    assert len(pc) == 1 and "id_mac_hop" in pc[0] and "-W %h:%p you@mini.example.com" in pc[0]
+    assert argv[argv.index("-i") + 1] == "/nonexistent/key"  # the fixer key still authenticates to the target
+    assert argv[-2:] == ["you@lan.local", "diag"]
+    cfg["mac_ops"]["hosts"]["lan"]["jump"] = "x y@z;rm"
+    with pytest.raises(ValueError):
+        mo.ssh_argv("lan", ["diag"])
+    assert not any(a.startswith("ProxyCommand=") for a in mo.ssh_argv("mbp", ["diag"]))
