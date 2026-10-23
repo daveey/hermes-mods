@@ -134,29 +134,41 @@ export function needsHuman(block) {
 const FAILURE_KINDS = new Set(['gave_up', 'crashed', 'timed_out', 'spawn_failed'])
 const REFUSAL_RE = /safety refusal|declined to respond|safety filter/i
 
+const ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*\u0007|[\u0000-\u0008\u000b-\u001f\u007f]/g
 const oneLine = (v, max = 220) => {
-  const t = unescapeText(v).replace(/\s+/g, ' ').trim()
+  const t = unescapeText(v).replace(ANSI_RE, ' ').replace(/\s+/g, ' ').trim()
   return t.length > max ? `${t.slice(0, max - 1)}\u2026` : t
 }
 
-/** Human-readable, short reason for a dispatcher/worker failure event (never the raw worker transcript). */
+/** Plain, fixed-wording cause of a dispatcher/worker failure event. Built only from structured fields
+ *  (kind, attempt count, exit code); the raw `error` / worker transcript is never shown (it can hold
+ *  paths, tokens and terminal escapes). A model refusal is the one cause recognised from the text. */
 export function failureSummary(kind, payload) {
   const p = payload && typeof payload === 'object' ? payload : {}
   const raw = `${str(p.error)} ${str(p.worker_output)} ${str(p.reason)}`
   if (REFUSAL_RE.test(raw)) return 'The model declined to respond (safety refusal).'
-  const code = p.exit_code != null && p.exit_code !== '' ? ` (exit code ${str(p.exit_code)})` : ''
+  const code = p.exit_code != null && p.exit_code !== '' ? ` (exit code ${oneLine(str(p.exit_code), 12)})` : ''
   const n = Number(p.failures) > 0 ? ` after ${Number(p.failures)} failed attempt${Number(p.failures) === 1 ? '' : 's'}` : ''
-  const detail = oneLine(p.error || p.reason || '', 160)
   switch (kind) {
     case 'gave_up':
-      return `The dispatcher gave up${n}${code}.${detail ? ` ${detail}` : ''}`
+      return `The dispatcher gave up${n}${code}.`
     case 'timed_out':
-      return `The worker timed out${code}.${detail ? ` ${detail}` : ''}`
+      return `The worker timed out${code}.`
     case 'spawn_failed':
-      return `The worker could not be started.${detail ? ` ${detail}` : ''}`
+      return `The worker could not be started.`
     default:
-      return `The worker crashed${code}.${detail ? ` ${detail}` : ''}`
+      return `The worker crashed${code}.`
   }
+}
+
+const PAUSE_WORDS_RE = /paused|refus|gave up|give up|failed|failure|crash|timed out|time out|recovery/i
+
+/** An explicit non-human `blocked` event (kind transient, or "no human action needed") is an operational
+ *  pause when it is transient or its own text says recovery/failure; dependency and time waits are benign. */
+function pauseFailure(block) {
+  if (block.kind !== 'transient' && !PAUSE_WORDS_RE.test(block.reason)) return null
+  const reason = oneLine(block.reason, 300)
+  return { kind: 'paused', reason: reason || 'Paused automatically; no reason was recorded.', refusal: /refus|safety filter|declined/i.test(reason), at: block.at }
 }
 
 /** Why is this card blocked? Walks events oldest→newest and keeps whichever came last since the newest
@@ -173,11 +185,9 @@ export function blockState(events) {
       const p = payloadOf(e)
       const reason = str(p.reason).trim()
       const initial = reason === 'initial_status'
-      state = {
-        origin: 'human',
-        failure: null,
-        block: { reason: initial ? '' : reason, kind: str(p.kind) || null, at: Number(e.created_at) || 0, source: initial ? 'initial' : reason ? 'recorded' : 'unrecorded' }
-      }
+      const block = { reason: initial ? '' : reason, kind: str(p.kind) || null, at: Number(e.created_at) || 0, source: initial ? 'initial' : reason ? 'recorded' : 'unrecorded' }
+      if (needsHuman(block)) state = { origin: 'human', failure: null, block }
+      else state = { origin: 'agent', block: null, failure: pauseFailure(block) }
     } else if (FAILURE_KINDS.has(e?.kind)) {
       const p = payloadOf(e)
       state = {
@@ -854,8 +864,9 @@ export default {
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -20, render: () => jsx(Panel, {}) })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
+    // version 6: explicit non-human pauses (transient) surface as agent issues; failure reasons are plain (no raw error)
     // version 4: subscribe/unblockCard/openCard for user-steps' "For you" strip (it reuses this poller + actions)
-    window.__blockedPanel = { version: 5, askSummary, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
+    window.__blockedPanel = { version: 6, askSummary, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel

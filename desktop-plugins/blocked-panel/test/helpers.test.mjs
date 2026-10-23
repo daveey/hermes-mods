@@ -220,7 +220,7 @@ test('blockState: gave_up/refusal/crash with no blocked event is an agent failur
   const crash = m.blockState([ev(1, 'crashed', { exit_kind: 'nonzero_exit', exit_code: 137, error: 'oom' })])
   assert.equal(crash.origin, 'agent')
   assert.match(crash.failure.reason, /crashed \(exit code 137\)/)
-  assert.match(m.blockState([ev(1, 'gave_up', { failures: 3, error: 'spawn failed twice' })]).failure.reason, /gave up after 3 failed attempts.*spawn failed twice/)
+  assert.match(m.blockState([ev(1, 'gave_up', { failures: 3, error: 'spawn failed twice' })]).failure.reason, /gave up after 3 failed attempts\.$/)
   // raw worker transcript never leaks into the headline
   assert.doesNotMatch(st.failure.reason, /pid|last output/)
 })
@@ -283,4 +283,61 @@ test('actionable multi-step human ask: askSummary is the first explicit step, no
   assert.deepEqual(it.steps.slice(0, 2), ['Open Settings \u2192 Privacy.', 'Enable Automation for the app.'])
   assert.equal(m.askSummary(it), 'Open Settings \u2192 Privacy.')
   assert.equal(it.kindLabel, 'Needs access you have')
+})
+
+// ── explicit non-human pause (kanban_block kind=transient) ──────────────────
+const PAUSE_REASON = 'No human action is needed. Automated recovery is paused after repeated model refusals. Hermes must \u001b[31mreview\u001b[0m the card.'
+const pauseEvents = [...failureEvents, ev(5, 'blocked', { reason: PAUSE_REASON, kind: 'transient' })]
+const mapOf = (id, events) => new Map([[`default:${id}`, { task: { body: 'unrelated body line.' }, events }]])
+
+test('newer transient pause after gave_up stays visible as an agent issue (no ask, no buttons), reason ANSI-free', () => {
+  const d = mapOf('t_p', pauseEvents)
+  assert.deepEqual(m.blockedItems([T('t_p')], d), [])
+  const issues = m.agentIssues([T('t_p')], d)
+  assert.equal(issues.length, 1)
+  assert.equal(issues[0].noAction, true)
+  assert.equal(issues[0].refusal, true)
+  assert.equal(issues[0].at, 1005)
+  assert.equal(issues[0].reason, 'No human action is needed. Automated recovery is paused after repeated model refusals. Hermes must review the card.')
+  assert.doesNotMatch(issues[0].reason, /\u001b|\[31m/)
+  assert.doesNotMatch(issues[0].reason, /unrelated body/)
+})
+
+test('pause with no recorded reason says so instead of inventing one; benign dependency/time waits stay hidden', () => {
+  const [i] = m.agentIssues([T('t_e')], mapOf('t_e', [ev(1, 'blocked', { kind: 'transient' })]))
+  assert.equal(i.reason, 'Paused automatically; no reason was recorded.')
+  assert.equal(i.refusal, false)
+  for (const p of [{ kind: 'dependency', reason: 'Waiting for t_other.' }, { kind: 'needs_input', reason: 'No human action needed. Waiting on time: nightly run.' }]) {
+    const d = mapOf('t_w', [ev(1, 'blocked', p)])
+    assert.deepEqual(m.blockedItems([T('t_w')], d), [])
+    assert.deepEqual(m.agentIssues([T('t_w')], d), [])
+  }
+})
+
+test('an actual human block after the pause overrides it; a later failure overrides the human block', () => {
+  const human = [...pauseEvents, ev(6, 'blocked', { reason: 'Approve the retry.', kind: 'needs_input' })]
+  const d = mapOf('t_o', human)
+  const items = m.blockedItems([T('t_o')], d)
+  assert.equal(items.length, 1)
+  assert.equal(items[0].text, 'Approve the retry.')
+  assert.deepEqual(m.agentIssues([T('t_o')], d), [])
+  assert.equal(m.agentIssues([T('t_o')], mapOf('t_o', [...human, ev(7, 'crashed', { exit_code: 1 })])).length, 1)
+})
+
+test('mixed board: counts split asks vs issues, issues carry no unblock fields', () => {
+  const d = new Map([...mapOf('t_a', failureEvents), ...mapOf('t_b', pauseEvents), ...mapOf('t_c', [ev(1, 'blocked', { reason: 'Plug in the phone.', kind: 'capability' })])])
+  const tasks = [T('t_a'), T('t_b'), T('t_c')]
+  assert.deepEqual(m.blockedItems(tasks, d).map(i => i.id), ['t_c'])
+  const issues = m.agentIssues(tasks, d)
+  assert.deepEqual(issues.map(i => i.id).sort(), ['t_a', 't_b'])
+  for (const i of issues) assert.deepEqual([i.noAction, 'steps' in i, 'text' in i], [true, false, false])
+})
+
+test('failure summary never leaks the raw error or worker output, and strips ANSI', () => {
+  const raw = '\u001b[31mTraceback\u001b[0m in /Users/you/x.py token=abc123 secret'
+  for (const kind of ['gave_up', 'crashed', 'timed_out', 'spawn_failed']) {
+    const r = m.failureSummary(kind, { error: raw, worker_output: raw, reason: raw, failures: 2, exit_code: 1 })
+    assert.doesNotMatch(r, /Traceback|token|abc123|\/Users|\u001b|\[31m/, kind)
+  }
+  assert.match(m.failureSummary('gave_up', { error: raw, failures: 2 }), /^The dispatcher gave up after 2 failed attempts\.$/)
 })
