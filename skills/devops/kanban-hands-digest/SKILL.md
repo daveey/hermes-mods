@@ -31,6 +31,14 @@ task strip, then `kanban_show` each and report the blocked ones. Also report two
   card parked in scheduled is an ask of the user; report it.
 Before treating a blocked card as a human ask, inspect the event that caused the current stop. `gave_up`, `crashed`, `spawn_failed`, model refusal and timeout are operational failures, not evidence of a user obligation. Never turn the task body's first sentence into an unblock instruction. Report the actual cause, whether retries remain, and who owns recovery; say no user action is identified when none is verified. A model refusal should not be repeatedly requeued unchanged or routed around by switching providers. Preserve a paused failure visibly as an agent issue, without a Done button. For genuine human blockers, state the exact action, device, reason, and observable completion condition.
 
+## This user: clear it yourself, never hand him cards
+
+He wants blockers cleared, not reported. "What are these, you do it" / "you run things for me" means:
+1. Sweep every blocked card and clear each one that is not a genuine human step yourself, in the same turn (recipe by stop cause: `references/clearing-blockers-yourself.md`).
+2. Bring genuine decisions to him INLINE as a `clarify` form. Use one question per decision in plain words, recommended option first, and batch the low-stakes defaults into one "accept all recommended" question. Never answer with card ids or links, or with "answer in a comment on t_x". Then record his answers on the cards yourself (comment the decision on the card and on every card waiting on it, then `hermes kanban complete` the decision card).
+3. Do sign-in/OAuth blockers yourself through the hub's agent browser before asking him for anything (same reference). Only a step that truly needs his hand or device (a password not in the vault, Touch ID, a physical action) goes to him, and only after you have tried the self-service route.
+4. A "walk me through it" request still means doing everything automatable yourself; the walk-through covers only what remains.
+
 When the user's step is done, re-queue the card yourself (`kanban_unblock`, or the CLI for triage) after a
 comment saying what changed. Don't wait for the card to notice. Go global (the digest script below, all
 boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
