@@ -15,7 +15,8 @@ Gate (decided by the gateway-bound session identity, not by anything the model p
 turn uses the auto-tier scope and runs now. Any other turn (channel thread, another user, cron, CLI) opens an
 approval-tier broker request (grant=once) that DMs the owner host + command + requester; the command runs only
 when the model calls the tool again with that request_id after the owner approved, and it runs the command
-stored with the request, not new model text. This plugin never approves anything.
+stored with the request, not new model text. Only the same Slack user + channel (or the owner's DM) can collect
+it. MAC_OPS_* identity is honoured only outside a gateway process. This plugin never approves anything.
 
 Approval text (shown in full, never cut; refused if over the broker's 1000-char limit): gateway-bound requester,
 host and a sha256 of the exact job first, then the model-written reason/command JSON-quoted so they can't fake a
@@ -160,26 +161,43 @@ def _session(name: str) -> str:
         return os.environ.get("HERMES_SESSION_" + name, "")
 
 
+def _gateway_session_bound() -> bool:
+    """True in a gateway process (it binds per-message session vars) or when this turn has a session platform."""
+    try:
+        from gateway.session_context import session_context_engaged  # type: ignore
+        if session_context_engaged():
+            return True
+    except Exception:
+        pass
+    return bool(_session("PLATFORM"))
+
+
 def requester(inv: Inventory, extra_owners: frozenset = frozenset()) -> dict:
     """Who this turn is, from gateway-bound identity. owner=True only for the owner's own Slack DM."""
     owners = inv.owners | extra_owners
-    # The owner-only mac-ops profile gets its turn from the gateway via MAC_OPS_* (a Slack-verified owner DM).
+    # The owner-only mac-ops profile gets its turn from the gateway via MAC_OPS_* (a Slack-verified owner DM),
+    # set on the `hermes chat` subprocess it spawns. Never honour it inside a gateway process that binds
+    # per-message sessions: there os.environ is shared by every concurrent turn, so a stray MAC_OPS_* would make
+    # a stranger's channel turn an owner turn.
     ch, th, ow = (os.environ.get("MAC_OPS_CHANNEL", ""), os.environ.get("MAC_OPS_THREAD", ""),
                   os.environ.get("MAC_OPS_OWNER", ""))
-    if ch.startswith("D") and th and ow and ow in owners:
+    if ch.startswith("D") and th and ow and ow in owners and not _gateway_session_bound():
         return {"owner": True, "user": ow, "channel": ch, "thread": th, "via": "mac-ops",
                 "bot_home": os.environ.get("MAC_OPS_BOT_HOME", "")}
     platform, ctype = _session("PLATFORM"), _session("CHAT_TYPE")
     user, chat, thread = _session("USER_ID"), _session("CHAT_ID"), _session("THREAD_ID")
+    name = _session("USER_NAME")
     is_owner = (platform.lower() == "slack" and ctype.lower() in ("dm", "im") and user in owners
                 and chat.startswith("D"))
-    return {"owner": bool(is_owner), "user": user or "", "channel": chat, "thread": thread,
+    return {"owner": bool(is_owner), "user": user or "", "channel": chat, "thread": thread, "name": name,
             "platform": platform, "via": "session", "bot_home": ""}
 
 
 def who(req: dict) -> str:
     if req.get("user"):
-        return f"slack:{req['user']} in {req.get('channel') or '?'}"
+        # the id is the gateway-bound identity; the display name is self-set, so it is quoted and comes second
+        name = f" (name {_q(req['name'][:40])})" if req.get("name") else ""
+        return f"slack:{req['user']}{name} in {req.get('channel') or '?'}"
     return "no slack session (cron/cli/other)"
 
 
@@ -231,6 +249,11 @@ def _bot_token(req: dict) -> str:
     return ""
 
 
+def mrkdwn_escape(text: str) -> str:
+    """Slack treats only & < > as markup: escaped, agent text can't @channel, mention or hide a link."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def slack_post(req: dict, text: str) -> None:
     tok = _bot_token(req)
     if not (tok and req.get("channel")):
@@ -248,7 +271,7 @@ POST: Callable[[dict, str], None] = slack_post
 
 def thread_line(req: dict, text: str) -> None:
     try:
-        POST(req, text)
+        POST(req, mrkdwn_escape(text))
     except Exception as exc:  # the audit jsonl is the record; the thread line is a courtesy
         logger.info("tailnet thread audit not posted: %s", exc)
 
@@ -348,8 +371,22 @@ def _pending_load() -> dict:
 def _pending_save(d: dict) -> None:
     p = _pending_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(d))
-    p.chmod(0o600)
+    tmp = p.with_name(f".pending.{uuid.uuid4().hex}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(d))
+    os.replace(tmp, p)
+
+
+def _same_requester(stored: dict, req: dict) -> bool:
+    """An approved request's output goes back only to the turn that asked for it (same Slack user + channel), or
+    to the owner's own DM. Anyone else who learns the request_id (it is posted in the requester's thread) gets
+    nothing."""
+    if req.get("owner"):
+        return True
+    ident = stored.get("ident") or {}
+    # (cron/CLI turns have no Slack identity: they match only each other, and no Slack turn has an empty one)
+    return "ident" in stored and all((ident.get(k) or "") == (req.get(k) or "") for k in ("user", "channel", "platform"))
 
 
 # ---------------------------------------------------------------- tools
@@ -409,6 +446,12 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
         p = pending.get(rid)
         if not p:
             return _jerr("unknown or expired request_id; make a new request")
+        if not _same_requester(p, req):
+            audit({"kind": p.get("kind"), "host": p.get("host"), "command": p.get("what"), "requester": who(req),
+                   "owner_turn": req["owner"], "ran": False, "approval": rid,
+                   "error": f"collect refused: request belongs to {p.get('requester')}"})
+            return _jerr("this request_id belongs to another requester or conversation; nothing ran. Only the "
+                         "turn that asked for it can collect it.", ran=False)
         if p.get("fp") != fingerprint(p.get("payload") or {}) or f"sha256 {p.get('fp')} " not in p.get("reason", ""):
             audit({"kind": p.get("kind"), "host": p.get("host"), "command": p.get("what"), "requester": who(req),
                    "owner_turn": req["owner"], "ran": False, "approval": rid,
@@ -451,7 +494,9 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
         return _jerr(r["error"], ran=False)
     rid = r["request_id"]
     pending[rid] = {"kind": kind, "host": host, "what": what, "why": why, "payload": payload, "timeout": timeout,
-                    "reason": reason, "fp": fp, "requester": who(req), "at": time.time()}
+                    "reason": reason, "fp": fp, "requester": who(req), "at": time.time(),
+                    "ident": {"user": req.get("user") or "", "channel": req.get("channel") or "",
+                              "platform": req.get("platform") or ""}}
     _pending_save(pending)
     audit({"kind": kind, "host": host, "command": what, "requester": who(req), "owner_turn": False,
            "scope": inv.approval_scope, "ran": False, "approval": rid, "status": "approval requested"})
@@ -461,6 +506,17 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
                        "message": "The owner got a Slack DM with the host, command and requester. Nothing has run. "
                                   "Tell the requester it is waiting for approval; after the owner approves, call "
                                   "this tool again with this request_id (and nothing else changed)."})
+
+
+def _gc_pinned(d: Path) -> None:
+    """Drop pinned upload copies no pending request can still use (older than the request TTL)."""
+    cutoff = time.time() - PENDING_TTL_S - 60
+    for f in d.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
 
 
 def _common(args: dict) -> tuple:
@@ -503,8 +559,6 @@ def tool_exec(args: dict, **_: Any) -> str:
             return _jerr(f"command is required (at most {MAX_CMD} chars)")
         if len(why) < 5:
             return _jerr("reason is required (at least 5 characters): why this is being run")
-    if req["owner"] and not command.strip():
-        return _jerr("command is required")
     timeout = _timeout(args)
     payload = dict(_job_base(inv, host, timeout), mode="exec", command=command)
     return _gate(inv, req, "exec", host, command, why, payload, args, timeout)
@@ -530,23 +584,30 @@ def tool_copy(args: dict, **_: Any) -> str:
         if len(why) < 5:
             return _jerr("reason is required (at least 5 characters)")
     local = staging_dir() / (name or "unnamed")
+    data = None
     if not rid and direction == "put":
         if content is not None:
             data = str(content).encode()
             if len(data) > 1024 * 1024:
                 return _jerr("content over 1 MB; stage large files on the gateway host instead")
-            local.write_bytes(data)
-        if not local.is_file():
-            return _jerr("put needs content, or a file already in the staging dir named local_name")
-        if local.stat().st_size > MAX_COPY_BYTES:
-            return _jerr("file over 25 MB")
+            # Only the owner's own turn writes the shared staging file. A non-owner's content goes only into its
+            # pinned per-request copy: otherwise a stranger could replace staging/<name> and a later owner-DM
+            # put of that name (auto, no approval DM) would ship the stranger's bytes.
+            if req["owner"]:
+                local.write_bytes(data)
+        if data is None:
+            if not local.is_file():
+                return _jerr("put needs content, or a file already in the staging dir named local_name")
+            if local.stat().st_size > MAX_COPY_BYTES:
+                return _jerr("file over 25 MB")
     timeout = _timeout(args)
     payload: dict = dict(_job_base(inv, host, timeout), mode=direction, remote=remote, local=str(local),
                          max_bytes=MAX_COPY_BYTES)
     what = f"{direction} {remote} {'<-' if direction == 'put' else '->'} staging/{name}"
     extra, prepare = "", None
     if not rid and direction == "put":
-        data = local.read_bytes()
+        if data is None:
+            data = local.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         payload["sha256"] = digest  # the runner refuses to upload anything else
         extra = f"content sha256 {digest[:16]} size {len(data)} bytes"
@@ -560,8 +621,11 @@ def tool_copy(args: dict, **_: Any) -> str:
             # per-request, content-addressed, read-only copy: a later call reusing local_name can't swap it
             d = staging_dir() / ".pending"
             d.mkdir(mode=0o700, exist_ok=True)
+            _gc_pinned(d)
             pinned = d / _digest
-            if not pinned.exists():
+            if pinned.exists():
+                os.utime(pinned)  # reused by a new request: keep it past that request's TTL
+            else:
                 tmp = d / f".{_digest}.{uuid.uuid4().hex}"
                 tmp.write_bytes(_data)
                 tmp.chmod(0o400)
