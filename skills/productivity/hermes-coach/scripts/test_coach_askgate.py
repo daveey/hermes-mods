@@ -1,4 +1,4 @@
-import sys, unittest
+import os, sys, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import coach_askgate as g
@@ -108,12 +108,12 @@ class Fix(unittest.TestCase):
             self.assertEqual([(h["class"], h["pattern"]) for h in hits],
                              [(g.FIX_CLASS, "screenshot-fix"), (g.ASK_CLASS, "why-asking-me"), (g.FIX_CLASS, "root-cause")])
             body = g.post_body(hits, g.week_start(2000), ["## Self-heal lane", "none"])
-            self.assertIn("**2** times David had to ask for a Hermes fix", body)
+            self.assertIn("**2** times David had to ask for a Hermes/agent fix", body)
             self.assertIn("in 1 session,", body)
             self.assertIn("**1** correction where", body)
             self.assertIn("## Self-heal lane", body)
             md = g.render(hits, [g.week_start(2000)], {g.week_start(2000): 4}, "t")
-            self.assertIn("| 1 | 2 (1) | 4 |", md)
+            self.assertIn("| 1 | 2 (1) | 0 | 4 |", md)
 
     def test_marker_one_post_per_week(self):
         import json, tempfile
@@ -128,6 +128,44 @@ class Fix(unittest.TestCase):
             self.assertEqual(g.posted_elsewhere(d, w, "laptop"), "hub")
             p.write_text(json.dumps({"host": "hub"}))                # marker written before the rename
             self.assertEqual(g.posted_elsewhere(d, w, "laptop"), "hub")
+
+
+class BabyBearSplit(unittest.TestCase):
+    """Baby Bear product fix requests count as their own class and go to bb-tuner, not the self-heal lane."""
+
+    def test_is_bb(self):
+        for t in ["the camera stream is broken [screenshot]", "look at recent bb feed. HA seems broken. root cause and fix",
+                  "my watch didnt show me the controls. figure out why", "the echo-ear has been responding to random sounds",
+                  "why did it take so long to turn volume down?"]:
+            self.assertTrue(g.is_bb(t), t)
+        for t in ["the task-switch detection pluggin is still not working", "nope, dragging still broken",
+                  "why did you think you were done? create a task to investigate and fix for hermes",
+                  "ask bb-tuner why it stopped"]:
+            self.assertFalse(g.is_bb(t), t)
+        self.assertTrue(g.is_bb("can we rootcause it?", title="Babybear client not responding"))
+        self.assertFalse(g.is_bb("the sidebar is broken", title="Babybear client not responding"))  # own words win
+        self.assertTrue(g.is_bb("still broken", profile="bb-sms"))
+
+    def test_collect_splits_and_handoff_is_idempotent(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/macbook/default")
+            json.dump({"id": "s1", "host": "macbook", "source": "desktop", "title": "x", "user_turns": [
+                {"t": 2000, "text": "the camera stream is broken, fix it"}, {"t": 2100, "text": "root cause the sidebar bug"}]},
+                open(f"{d}/macbook/default/s1.json", "w"))
+            hits, _ = g.collect(d, 0, 10**10)
+            self.assertEqual([h["class"] for h in hits], [g.BB_CLASS, g.FIX_CLASS])
+            self.assertIn("**1** Baby Bear fix request (handed to bb-tuner)", g.post_body(hits, g.week_start(2000)))
+            md = g.render(hits, [g.week_start(2000)], {g.week_start(2000): 2}, "t")
+            self.assertIn("| 0 | 1 (1) | 1 | 2 |", md)
+            out = Path(d) / "bbt" / "askgate-bb-misses.jsonl"
+            self.assertEqual(g.hand_to_bb_tuner(hits[:1], out), (None, 0))  # bb-tuner not on this host
+            out.parent.mkdir()
+            self.assertEqual(g.hand_to_bb_tuner(hits[:1], out), (1, 0))
+            self.assertEqual(g.hand_to_bb_tuner(hits[:1], out), (0, 1))
+            row = json.loads(out.read_text())
+            self.assertEqual(row["id"], "askgate-bb:s1:2000")
+            self.assertIn("camera stream", row["quote"])
 
 
 class RouteToLane(unittest.TestCase):

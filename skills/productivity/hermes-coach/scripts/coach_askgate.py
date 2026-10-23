@@ -3,7 +3,8 @@
   ask_me          David's corrections of the form "why are you asking me / I already did it / do it yourself".
   had_to_ask_fix  David asking for a Hermes defect to be fixed or root-caused ("make a card to fix", "root cause",
                   "figure out why", "fixed this once / broken again", "why did you not…", a screenshot + "fix"):
-                  the work the self-heal lane should have started unasked.
+                  the work the self-heal lane should have started unasked. Baby Bear product fix requests count
+                  separately as `had_to_ask_fix_bb` and go to bb-tuner's handoff file (--bb-handoff), not the lane.
 
     coach_askgate.py --data ~/code/hermes-coach-data --weeks 6 --baseline OUT.md     # baseline, 6 weeks
     coach_askgate.py --data ... --last-week --post --selfheal                         # Monday: previous Mon-Sun, to the Inbox
@@ -58,9 +59,34 @@ NEGATIVE = re.compile(r"\brights? to\b|\b(?:intro|introduce|rename|describe|iden
 # only when the turn is not already an ask-me correction (that class wins, so no turn counts twice). Like the ask-me
 # class, a regex: it cannot tell a Hermes defect from a bug in the project David is building, so the weekly post lists
 # every hit with its quote. The self-heal lane exists to drive this to 0.
-ASK_CLASS, FIX_CLASS = "ask_me", "had_to_ask_fix"
+ASK_CLASS, FIX_CLASS, BB_CLASS = "ask_me", "had_to_ask_fix", "had_to_ask_fix_bb"
 CLASS_LABEL = {ASK_CLASS: "Ask-me corrections (\"why are you asking me / I already did it / do it yourself\")",
-               FIX_CLASS: "Had to ask for a fix (\"make a card to fix / root cause / figure out why / broken again\")"}
+               FIX_CLASS: "Had to ask for a Hermes/agent fix (\"make a card to fix / root cause / figure out why / "
+                          "broken again\")",
+               BB_CLASS: "Had to ask for a Baby Bear fix (handed to bb-tuner: why didn't BB's own monitoring catch it?)"}
+
+# Baby Bear product fix requests count separately (`had_to_ask_fix_bb`): the self-heal complaint cascade scopes product
+# bugs reported as new issues out by design, and catching them before David notices is BB's own monitoring (bb-tuner:
+# logs, digest flags, burn-down), so each one goes to bb-tuner as a "why didn't we catch this first" finding instead of
+# to the self-heal lane. Decided 2026-10-22 (ask-gate review, week of 2026-10-12). The turn's own words decide; the
+# session title only breaks a tie when the turn names neither BB nor Hermes.
+BB_WORDS = re.compile(r"\b(?:bb(?!-tuner)|baby ?bear|pods?|echo[- ]?(?:dot|ear)|echoear|nanit|cameras?|camera stream|"
+                      r"home assistant|triptych|mishear\w*|(?:my|the|apple) watch|watch app|room listening|wake word|"
+                      r"volume)\b", re.I)
+BB_HA = re.compile(r"\bHA\b")
+HERMES_WORDS = re.compile(r"\b(?:hermes|desktop|sidebar|sessions?|kanban|cards?|plugins?|pluggin|gateway|skills?|cron|"
+                          r"subagents?|bottom-bar|status bar|left pane|panel)\b", re.I)
+
+
+def is_bb(text, title="", profile=""):
+    """True when a fix request is about the Baby Bear product rather than Hermes or the agent."""
+    if (profile or "").startswith("bb-") and profile != "bb-tuner":
+        return True
+    if BB_WORDS.search(text) or BB_HA.search(text):
+        return True
+    if HERMES_WORDS.search(text):
+        return False
+    return bool(BB_WORDS.search(title or "") or BB_HA.search(title or ""))
 _FIXV = r"(?:fix|investigat\w*|root.?caus\w*|figure out|debug|look into|find out)"
 FIX_PATTERNS = [
     ("card-to-fix", r"\b(?:make|create|file|open|start|spin up|add)\s+(?:a\s+|an\s+|another\s+)?(?:new\s+)?(?:kanban\s+)?"
@@ -159,6 +185,8 @@ def collect(data, since_ts, until_ts):
             if not kind and d.get("source") in INTERACTIVE_SOURCES:
                 # a fix request often opens a session ("fix [screenshot]"), so the opener rule does not apply here
                 kind, cls = classify_fix(text), FIX_CLASS
+                if kind and is_bb(text, d.get("title") or "", d.get("profile") or Path(f).parent.name):
+                    cls = BB_CLASS
             if not kind:
                 continue
             key = (d.get("id"), int(t), text[:80])
@@ -189,7 +217,8 @@ def week_counts(hits, weeks):
     for w in weeks:
         a = [h for h in by_class(hits, ASK_CLASS) if week_start(h["t"]) == w]
         f = [h for h in by_class(hits, FIX_CLASS) if week_start(h["t"]) == w]
-        out[w] = {ASK_CLASS: len(a), FIX_CLASS: len(f), "fix_sessions": len({h["session"] for h in f})}
+        b = [h for h in by_class(hits, BB_CLASS) if week_start(h["t"]) == w]
+        out[w] = {ASK_CLASS: len(a), FIX_CLASS: len(f), "fix_sessions": len({h["session"] for h in f}), BB_CLASS: len(b)}
     return out
 
 
@@ -200,18 +229,20 @@ def render(hits, weeks, scanned, title):
            f"(regex over cross-host coach digests). Two classes, target 0 each: `{ASK_CLASS}` once the ask-gate ships, "
            f"`{FIX_CLASS}` once the self-heal lane is live. A turn counts in one class only (ask-me wins); fix requests "
            "are counted in interactive chats only.", "",
-           "| Week (Mon, PT) | Ask-me | Had to ask for a fix (sessions) | User turns scanned |", "|---|---|---|---|"]
+           "| Week (Mon, PT) | Ask-me | Had to ask for a Hermes/agent fix (sessions) | Baby Bear fix requests | "
+           "User turns scanned |", "|---|---|---|---|---|"]
     now = datetime.now(PT)
     for w in weeks:
         tag = " (partial)" if w + timedelta(days=7) > now else ""
         n, c = scanned.get(w, 0), counts[w]
         fix_cell = f"{c[FIX_CLASS]} ({c['fix_sessions']})" if n else "n/a"
-        out.append(f"| {w:%Y-%m-%d}{tag} | {c[ASK_CLASS] if n else 'n/a'} | {fix_cell} | {n} |")
+        out.append(f"| {w:%Y-%m-%d}{tag} | {c[ASK_CLASS] if n else 'n/a'} | {fix_cell} | {c[BB_CLASS] if n else 'n/a'} | "
+                   f"{n} |")
     fx = by_class(hits, FIX_CLASS)
     out.append(f"| **Total** | **{len(by_class(hits, ASK_CLASS))}** | **{len(fx)}** ({len({h['session'] for h in fx})}) | "
-               f"{sum(scanned.values())} |")
+               f"**{len(by_class(hits, BB_CLASS))}** | {sum(scanned.values())} |")
     out.append("")
-    for cls in (FIX_CLASS, ASK_CLASS):
+    for cls in (FIX_CLASS, BB_CLASS, ASK_CLASS):
         out += [f"## {CLASS_LABEL[cls]}", ""]
         for w in weeks:
             hs = [h for h in by_class(hits, cls) if week_start(h["t"]) == w]
@@ -243,13 +274,14 @@ def posted_elsewhere(data, week, me):
 
 
 def post_body(hits, week, extra=None):
-    ask, fix = by_class(hits, ASK_CLASS), by_class(hits, FIX_CLASS)
+    ask, fix, bb = by_class(hits, ASK_CLASS), by_class(hits, FIX_CLASS), by_class(hits, BB_CLASS)
     fs = len({h["session"] for h in fix})
-    lines = [f"**{len(fix)}** time{'s' if len(fix) != 1 else ''} David had to ask for a Hermes fix (\"make a card to fix / "
-             f"root cause / figure out why / broken again\") in {fs} session{'s' if fs != 1 else ''}, and "
+    lines = [f"**{len(fix)}** time{'s' if len(fix) != 1 else ''} David had to ask for a Hermes/agent fix (\"make a card to "
+             f"fix / root cause / figure out why / broken again\") in {fs} session{'s' if fs != 1 else ''}, "
+             f"**{len(bb)}** Baby Bear fix request{'s' if len(bb) != 1 else ''} (handed to bb-tuner), and "
              f"**{len(ask)}** correction{'s' if len(ask) != 1 else ''} where he had to say \"why are you asking me / I "
-             f"already did it / do it yourself\", in the week of {week:%Y-%m-%d}. Target: 0 for both.", ""]
-    for cls, hs in ((FIX_CLASS, fix), (ASK_CLASS, ask)):
+             f"already did it / do it yourself\", in the week of {week:%Y-%m-%d}. Target: 0 for all three.", ""]
+    for cls, hs in ((FIX_CLASS, fix), (BB_CLASS, bb), (ASK_CLASS, ask)):
         lines += [f"### {CLASS_LABEL[cls]}: {len(hs)}", ""]
         for h in hs[:15]:
             lines.append(f"- {fmt_ts(h['t'])} · session `{h['session']}` · {h['pattern']}: \"{quote(h, 160)}\"")
@@ -334,6 +366,38 @@ def route_hits(hits, home, filer=None, signals=None):
     return owned, rest
 
 
+BB_HANDOFF = "~/.hermes/profiles/bb-tuner/work/askgate-bb-misses.jsonl"
+
+
+def hand_to_bb_tuner(hits, path):
+    """Append each Baby Bear fix request bb-tuner has not been handed yet to its handoff file (bb-tuner's daily pre-run
+    prints the rows it has not closed; SOUL.md 'Ask-gate misses'). -> (rows written, rows already there). The file's
+    parent must exist (= bb-tuner runs on this host); otherwise nothing is written and (None, 0) comes back."""
+    p = Path(path).expanduser()
+    if not p.parent.is_dir():
+        return None, 0
+    have = set()
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                have.add(json.loads(line)["id"])
+            except Exception:
+                pass
+    new = []
+    for h in hits:
+        rid = f"askgate-bb:{h['session']}:{int(h['t'])}"
+        if rid in have:
+            continue
+        have.add(rid)
+        new.append({"id": rid, "t": int(h["t"]), "when": fmt_ts(h["t"]), "week": f"{week_start(h['t']):%Y-%m-%d}",
+                    "host": h.get("host"), "session": h["session"], "pattern": h["pattern"], "quote": quote(h, 400)})
+    if new:
+        with open(p, "a") as fh:
+            for r in new:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return len(new), len(hits) - len(new)
+
+
 REVIEW_PROMPT = ("Review this week's ask-gate KPI. Fix requests (had_to_ask_fix): for each, check whether the self-heal "
                  "lane filed it (a `selfheal:` card or Inbox proposal); if not, find why the detector missed it and fix "
                  "the detector. Ask-me corrections: find the root cause and fix the ask-gate or the skill that should "
@@ -351,6 +415,8 @@ def main():
     ap.add_argument("--selfheal", action="store_true", help="append the self-heal lane section to the Inbox post")
     ap.add_argument("--home", action="append", default=[], help="Hermes home(s) for --selfheal (default ~/.hermes)")
     ap.add_argument("--pull", action="store_true", help="git pull the data repo first")
+    ap.add_argument("--bb-handoff", default=BB_HANDOFF,
+                    help="bb-tuner's handoff file for Baby Bear fix requests (written with --post when its dir exists)")
     a = ap.parse_args()
     data = Path(a.data).expanduser()
     if a.pull:
@@ -386,20 +452,31 @@ def main():
             sys.stderr.write(f"week of {weeks[0]:%Y-%m-%d} already posted by {other}; not posting a second card\n")
             return
         extra = selfheal_lines(data, [Path(h).expanduser() for h in a.home] or None) if a.selfheal else None
-        ask, fix = by_class(hits, ASK_CLASS), by_class(hits, FIX_CLASS)
-        rest = hits
-        if a.selfheal:  # every hit goes to the self-heal lane; the card only asks to review what it didn't take
+        ask, fix, bb = by_class(hits, ASK_CLASS), by_class(hits, FIX_CLASS), by_class(hits, BB_CLASS)
+        lane_hits = [h for h in hits if h["class"] != BB_CLASS]  # Baby Bear fix requests go to bb-tuner, not the lane
+        rest = lane_hits
+        if bb:
+            n_new, n_had = hand_to_bb_tuner(bb, a.bb_handoff)
+            note = (f"Handed {n_new} Baby Bear fix request{'s' if n_new != 1 else ''} to bb-tuner ({n_had} already "
+                    f"there): it checks why BB's own monitoring didn't catch each one first." if n_new is not None else
+                    f"bb-tuner handoff {a.bb_handoff} not on this host: the {len(bb)} Baby Bear fix requests need a review.")
+            if n_new is None:
+                rest = rest + bb
+            extra = (extra or []) + ["", note]
+        if a.selfheal:  # every other hit goes to the self-heal lane; the card only asks to review what it didn't take
             home = Path(a.home[0] if a.home else os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
             try:
-                owned, rest = route_hits(hits, home)
+                owned, rest_lane = route_hits(lane_hits, home)
             except Exception as e:
-                owned, rest = [], hits
+                owned, rest_lane = [], lane_hits
                 sys.stderr.write(f"self-heal routing failed: {e}\n")
-            extra = (extra or []) + ["", f"Self-heal lane took {len(owned)} of {len(hits)} hits (filed or already "
-                                         "open)." + (f" {len(rest)} still need a review (Do it)." if rest else "")]
+            rest = rest_lane + [h for h in rest if h["class"] == BB_CLASS]
+            extra = (extra or []) + ["", f"Self-heal lane took {len(owned)} of {len(lane_hits)} Hermes/agent hits (filed or "
+                                         "already open)." + (f" {len(rest_lane)} still need a review (Do it)."
+                                                             if rest_lane else "")]
         cmd = ["hermes", "inbox", "post",
-               f"Ask-gate: {len(fix)} fix request{'s' if len(fix) != 1 else ''}, {len(ask)} ask-me, "
-               f"week of {weeks[0]:%b %-d}",
+               f"Ask-gate: {len(fix)} Hermes fix request{'s' if len(fix) != 1 else ''}, {len(bb)} Baby Bear, "
+               f"{len(ask)} ask-me, week of {weeks[0]:%b %-d}",
                "--body", post_body(hits, weeks[0], extra), "--key", f"ask-gate-weekly:{weeks[0]:%Y-%m-%d}",
                "--poster", "coach"]
         if rest:
@@ -410,7 +487,7 @@ def main():
             sys.exit(r.returncode)
         p = marker_path(data, weeks[0])
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"posted_by": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix),
+        p.write_text(json.dumps({"posted_by": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix), BB_CLASS: len(bb),
                                  "fix_sessions": len({h["session"] for h in fix})}) + "\n")
 
 
