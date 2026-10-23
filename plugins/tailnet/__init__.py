@@ -17,6 +17,10 @@ approval-tier broker request (grant=once) that DMs the owner host + command + re
 when the model calls the tool again with that request_id after the owner approved, and it runs the command
 stored with the request, not new model text. This plugin never approves anything.
 
+Approval text (shown in full, never cut; refused if over the broker's 1000-char limit): gateway-bound requester,
+host and a sha256 of the exact job first, then the model-written reason/command JSON-quoted so they can't fake a
+field. Non-owner uploads are pinned to a read-only content-addressed copy whose hash the runner re-checks.
+
 Config (profile config.yaml)::
 
     tailnet:
@@ -36,6 +40,7 @@ hosts.yaml::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -57,6 +62,7 @@ HERE = Path(__file__).parent
 RUNNER = HERE / "runner.py"
 MAX_OUT = 8000            # chars of stdout / stderr returned per call
 MAX_CMD = 4000
+MAX_REASON = 1000         # token broker VendRequest.reason max_length; the approval DM shows it in full
 MAX_COPY_BYTES = 25 * 1024 * 1024
 EXEC_TIMEOUT_S = 120
 MAX_TIMEOUT_S = 600
@@ -256,9 +262,22 @@ def broker_bin() -> str:
     return shutil.which("token-broker") or os.path.expanduser("~/.local/bin/token-broker")
 
 
-def _reason(kind: str, host: str, what: str, req: dict, why: str) -> str:
-    r = f"tailnet {kind} on {host}: {what} | requester {who(req)} | why: {why}"
-    return re.sub(r"\s+", " ", r)[:480]
+def _q(text: str) -> str:
+    """JSON-quote agent-written text: newlines, quotes and non-ASCII (bidi overrides etc.) come out escaped,
+    so it can't fake another field of the approval text."""
+    return json.dumps(str(text), ensure_ascii=True)
+
+
+def fingerprint(payload: dict) -> str:
+    """sha256 prefix of the exact job that will run (target, mode, command / paths / content hash)."""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _reason(kind: str, host: str, what: str, req: dict, why: str, fp: str, extra: str = "") -> str:
+    """Approval/vend text. Gateway-bound fields (requester, host, fingerprint) come first and unquoted; everything
+    the model wrote is JSON-quoted after them. Callers must check the length; it is never silently cut."""
+    r = f"tailnet {kind} | requester {who(req)} | host {host} | sha256 {fp} | why {_q(why)} | command {_q(what)}"
+    return r + (f" | {extra}" if extra else "")
 
 
 def run_via_broker(scope: str, reason: str, job: dict, *, request_id: str = "", timeout: int) -> dict:
@@ -374,17 +393,30 @@ def _finish(kind: str, host: str, what: str, req: dict, why: str, scope: str, re
 
 
 def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, payload: dict,
-          args: dict, timeout: int) -> str:
-    """Owner DM turn -> run now on the auto scope. Otherwise open (or collect) a per-command approval."""
-    if req["owner"]:
-        res = run_via_broker(inv.scope, _reason(kind, host, what, req, why), payload, timeout=timeout)
-        return _finish(kind, host, what, req, why, inv.scope, res)
+          args: dict, timeout: int, extra: str = "", prepare: Optional[Callable[[dict], dict]] = None) -> str:
+    """Owner DM turn -> run now on the auto scope. Otherwise open (or collect) a per-command approval.
+
+    ``prepare`` (non-owner new requests only) may pin request-specific state into the payload, e.g. a
+    content-addressed copy of a file to upload, before it is fingerprinted and shown to the owner."""
     rid = str(args.get("request_id") or "").strip()
+    if req["owner"] and not rid:
+        fp = fingerprint(payload)
+        res = run_via_broker(inv.scope, _reason(kind, host, what, req, why, fp, extra)[:MAX_REASON], payload,
+                             timeout=timeout)
+        return _finish(kind, host, what, req, why, inv.scope, res)
     pending = _pending_load()
     if rid:
         p = pending.get(rid)
         if not p:
             return _jerr("unknown or expired request_id; make a new request")
+        if p.get("fp") != fingerprint(p.get("payload") or {}) or f"sha256 {p.get('fp')} " not in p.get("reason", ""):
+            audit({"kind": p.get("kind"), "host": p.get("host"), "command": p.get("what"), "requester": who(req),
+                   "owner_turn": req["owner"], "ran": False, "approval": rid,
+                   "error": "stored request does not match what was approved"})
+            pending.pop(rid, None)
+            _pending_save(pending)
+            return _jerr("stored request no longer matches what the owner was shown; nothing ran. Make a new request.",
+                         ran=False)
         # run exactly what was requested, for the requester that asked for it
         res = run_via_broker(inv.approval_scope, p["reason"], p["payload"], request_id=rid, timeout=p["timeout"])
         if res.get("ran"):
@@ -401,7 +433,17 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
         return _finish(p["kind"], p["host"], p["what"], {"owner": False, "user": req["user"], "channel": req["channel"],
                                                          "thread": req["thread"]}, p["why"], inv.approval_scope, res,
                        approval=rid)
-    reason = _reason(kind, host, what, req, why)
+    if prepare:
+        try:
+            payload = prepare(payload)
+        except Exception as exc:
+            return _jerr(f"cannot stage the request: {type(exc).__name__}", ran=False)
+    fp = fingerprint(payload)
+    reason = _reason(kind, host, what, req, why, fp, extra)
+    if len(reason) > MAX_REASON:
+        return _jerr(f"command too long to show the owner in full ({len(reason)} chars of approval text, max "
+                     f"{MAX_REASON}); nothing was requested. Shorten it (e.g. put a script on the host with "
+                     f"tailnet_copy first, then run that).", ran=False)
     r = open_request(inv.approval_scope, reason)
     if r.get("error"):
         audit({"kind": kind, "host": host, "command": what, "requester": who(req), "owner_turn": False,
@@ -409,7 +451,7 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
         return _jerr(r["error"], ran=False)
     rid = r["request_id"]
     pending[rid] = {"kind": kind, "host": host, "what": what, "why": why, "payload": payload, "timeout": timeout,
-                    "reason": reason, "requester": who(req), "at": time.time()}
+                    "reason": reason, "fp": fp, "requester": who(req), "at": time.time()}
     _pending_save(pending)
     audit({"kind": kind, "host": host, "command": what, "requester": who(req), "owner_turn": False,
            "scope": inv.approval_scope, "ran": False, "approval": rid, "status": "approval requested"})
@@ -502,8 +544,32 @@ def tool_copy(args: dict, **_: Any) -> str:
     payload: dict = dict(_job_base(inv, host, timeout), mode=direction, remote=remote, local=str(local),
                          max_bytes=MAX_COPY_BYTES)
     what = f"{direction} {remote} {'<-' if direction == 'put' else '->'} staging/{name}"
-    out = _gate(inv, req, "copy", host, what, why, payload, args, timeout)
-    return out
+    extra, prepare = "", None
+    if not rid and direction == "put":
+        data = local.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        payload["sha256"] = digest  # the runner refuses to upload anything else
+        extra = f"content sha256 {digest[:16]} size {len(data)} bytes"
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        extra += f" content {_q(text)}" if text is not None and len(_q(text)) <= 400 else " (content not shown)"
+
+        def prepare(pl: dict, _data=data, _digest=digest) -> dict:
+            # per-request, content-addressed, read-only copy: a later call reusing local_name can't swap it
+            d = staging_dir() / ".pending"
+            d.mkdir(mode=0o700, exist_ok=True)
+            pinned = d / _digest
+            if not pinned.exists():
+                tmp = d / f".{_digest}.{uuid.uuid4().hex}"
+                tmp.write_bytes(_data)
+                tmp.chmod(0o400)
+                tmp.replace(pinned)
+            if hashlib.sha256(pinned.read_bytes()).hexdigest() != _digest:
+                raise ValueError("pinned copy does not match")
+            return dict(pl, local=str(pinned))
+    return _gate(inv, req, "copy", host, what, why, payload, args, timeout, extra=extra, prepare=prepare)
 
 
 SCHEMAS = {

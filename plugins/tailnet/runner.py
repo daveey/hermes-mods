@@ -4,6 +4,7 @@ Reads a credential-free job (JSON on stdin), writes the key to a 0600 file in a 
 with a scrubbed environment, deletes the key, prints ONE JSON line {rc, stdout, stderr, seconds}. Output is capped
 and any key material is redacted. Stdlib only.
 """
+import hashlib
 import json
 import os
 import re
@@ -71,6 +72,10 @@ def main():
         if job["mode"] == "put" and os.path.getsize(job["local"]) > int(job.get("max_bytes") or 0):
             raise ValueError("file too large")
         try:
+            if job["mode"] == "put" and job.get("sha256"):
+                with open(job["local"], "rb") as f:
+                    if hashlib.sha256(f.read()).hexdigest() != job["sha256"]:
+                        raise ValueError("staged file changed since it was requested/approved; not uploaded")
             p = subprocess.run(build(job, kf), capture_output=True, text=True, errors="replace",
                                timeout=int(job.get("timeout") or 120), env=env, stdin=subprocess.DEVNULL)
             rc, out, err = p.returncode, p.stdout, p.stderr
