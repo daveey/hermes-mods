@@ -326,6 +326,29 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   const only = el().querySelector('[data-slot="user-steps"]')
   assert.match(only.textContent, /Agent issue .* no action required from you/)
   assert.doesNotMatch(only.textContent, /For you/)
+  // A coordinator explicitly pauses recovery after the failure. It remains an issue, not an ask.
+  details.get('default:t_failed01').events.push(ev(4, 'blocked', {
+    kind: 'transient', reason: 'No human action is needed. Recovery is paused after a model refusal.'
+  }))
+  const failedTask = tasks.filter(t => t.id === 't_failed01')
+  window.__blockedPanel.snapshot = { stored: 'S1', items: bpm.blockedItems(failedTask, details), issues: bpm.agentIssues(failedTask, details) }
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'paused-issue' }))
+  const paused = el().querySelector('[data-user-steps-issue="t_failed01"]')
+  assert.ok(paused)
+  assert.match(paused.textContent, /Recovery is paused/)
+  assert.deepEqual([...paused.querySelectorAll('button')].map(b => b.textContent), ['Open card'])
+  assert.doesNotMatch(el().textContent, /For you|Done → unblock|Retry/)
+  // A later, explicit user request replaces the issue and gets the normal human-action buttons.
+  details.get('default:t_failed01').events.push(ev(5, 'blocked', {
+    kind: 'needs_input', reason: 'Approve the plan in the doc.'
+  }))
+  window.__blockedPanel.snapshot = { stored: 'S1', items: bpm.blockedItems(failedTask, details), issues: bpm.agentIssues(failedTask, details) }
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'human-after-pause' }))
+  assert.equal(el().querySelector('[data-user-steps-issue="t_failed01"]'), null)
+  const actionable = el().querySelector('[data-user-steps-card="t_failed01"]')
+  assert.ok([...actionable.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
   delete window.__blockedPanel
 })
 
