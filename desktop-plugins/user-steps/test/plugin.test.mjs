@@ -306,7 +306,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   assert.match(issue.textContent, /safety refusal/)
   assert.match(issue.textContent, /No action required from you/)
   assert.doesNotMatch(issue.textContent, /Remaining after/)
-  assert.deepEqual([...issue.querySelectorAll('button')].map(b => b.textContent), ['Open card'])
+  assert.deepEqual([...issue.querySelectorAll('button')].map(b => b.textContent), ['Open card', 'Dismiss'])
   assert.equal(strip.querySelector('[data-user-steps-card="t_failed01"]'), null)
   const human = strip.querySelector('[data-user-steps-card="t_human002"]')
   assert.match(human.textContent, /Approve the plan in the doc/)
@@ -326,6 +326,29 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   const only = el().querySelector('[data-slot="user-steps"]')
   assert.match(only.textContent, /Agent issue .* no action required from you/)
   assert.doesNotMatch(only.textContent, /For you/)
+  // The user can dismiss an issue they can't act on; it stays hidden until a NEW failure lands on the card.
+  const onlyIssues = bpm.agentIssues(tasks, details)
+  await React.act(async () => { only.querySelector('[data-user-steps-dismiss-all]').click(); await flush() })
+  assert.equal(el().querySelector('[data-slot="user-steps"]'), null, 'dismissed issue strip should be gone')
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'issues3' }))
+  assert.equal(el().querySelector('[data-slot="user-steps"]'), null, 'dismissal survives a refresh/remount')
+  window.__blockedPanel.snapshot = { stored: 'S1', items: [], issues: onlyIssues.map(i => ({ ...i, at: i.at + 1 })) }
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'issues4' }))
+  const again = el().querySelector('[data-slot="user-steps"]')
+  assert.ok(again, 'a new failure on the same card shows again')
+  // per-row Dismiss hides just that issue
+  await React.act(async () => { again.querySelector('[data-user-steps-dismiss]').click(); await flush() })
+  assert.equal(el().querySelector('[data-slot="user-steps"]'), null)
+  // with an open ask (For you) present, the header has no dismiss-all: asks can't be dismissed
+  window.__blockedPanel.snapshot = { stored: 'S1', items: bpm.blockedItems(tasks, details), issues: onlyIssues.map(i => ({ ...i, at: i.at + 2 })) }
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'issues5' }))
+  const mixed = el().querySelector('[data-slot="user-steps"]')
+  assert.match(mixed.textContent, /For you/)
+  assert.equal(mixed.querySelector('[data-user-steps-dismiss-all]'), null)
+  window.__blockedPanel.snapshot = { stored: 'S1', items: [], issues: onlyIssues }
   // A coordinator explicitly pauses recovery after the failure. It remains an issue, not an ask.
   details.get('default:t_failed01').events.push(ev(4, 'blocked', {
     kind: 'transient', reason: 'No human action is needed. Recovery is paused after a model refusal.'
@@ -337,7 +360,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   const paused = el().querySelector('[data-user-steps-issue="t_failed01"]')
   assert.ok(paused)
   assert.match(paused.textContent, /Recovery is paused/)
-  assert.deepEqual([...paused.querySelectorAll('button')].map(b => b.textContent), ['Open card'])
+  assert.deepEqual([...paused.querySelectorAll('button')].map(b => b.textContent), ['Open card', 'Dismiss'])
   assert.doesNotMatch(el().textContent, /For you|Done → unblock|Retry/)
   // A later, explicit user request replaces the issue and gets the normal human-action buttons.
   details.get('default:t_failed01').events.push(ev(5, 'blocked', {

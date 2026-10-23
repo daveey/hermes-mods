@@ -19,7 +19,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 5
+const VERSION = 6
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -187,6 +187,37 @@ let unsubKanban = null
 const stepCache = new Map() // id → { at, step }
 
 const emit = () => subs.forEach(fn => fn(snapshot))
+
+// Agent issues need nothing from the user, so the user may dismiss them. The key includes the failure time, so a
+// NEW failure on the same card shows again; a dismissed one stays hidden across reloads (localStorage).
+const DISMISS_KEY = 'hermes.userSteps.dismissedIssues.v1'
+const DISMISS_CAP = 300
+let dismissed = null
+export const issueKey = i => `${i?.board || 'default'}:${i?.id}:${i?.at ?? ''}`
+function dismissedSet() {
+  if (dismissed) return dismissed
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(DISMISS_KEY) : null
+    dismissed = new Set(Array.isArray(JSON.parse(raw || '[]')) ? JSON.parse(raw || '[]') : [])
+  } catch {
+    dismissed = new Set()
+  }
+  return dismissed
+}
+export function isDismissed(issue) {
+  return dismissedSet().has(issueKey(issue))
+}
+export function dismissIssues(list) {
+  const set = dismissedSet()
+  for (const i of list || []) set.add(issueKey(i))
+  const keep = [...set].slice(-DISMISS_CAP)
+  dismissed = new Set(keep)
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(DISMISS_KEY, JSON.stringify(keep))
+  } catch {}
+  snapshot = { ...snapshot }
+  emit()
+}
 
 function blockedPanel() {
   return typeof window !== 'undefined' ? window.__blockedPanel : null
@@ -539,7 +570,8 @@ export function IssueRow({ issue }) {
         style: { display: 'flex', gap: 6, alignItems: 'center' },
         children: [
           jsx('span', { style: { fontSize: 11.5, opacity: 0.75 }, children: 'No action required from you.' }),
-          typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: { ...btn(), marginLeft: 'auto' }, onClick: () => bp.openCard(issue), children: 'Open card' })
+          typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: { ...btn(), marginLeft: 'auto' }, onClick: () => bp.openCard(issue), children: 'Open card' }),
+          jsx('button', { type: 'button', 'data-user-steps-dismiss': issue.id, style: { ...btn(), ...(typeof bp?.openCard === 'function' ? {} : { marginLeft: 'auto' }) }, title: 'Hide this agent issue (a new failure on this card shows again)', onClick: () => dismissIssues([issue]), children: 'Dismiss' })
         ]
       })
     ]
@@ -571,7 +603,7 @@ export function Strip() {
   useEffect(() => void refresh(), [focused])
   if (!focused || snap.stored !== focused) return null
   const rows = projectStrip(snap.ledger, snap.kanban)
-  const issues = Array.isArray(snap.issues) ? snap.issues : []
+  const issues = (Array.isArray(snap.issues) ? snap.issues : []).filter(i => !isDismissed(i))
   if (!rows.length && !issues.length) return null
   return jsxs('div', {
     'data-slot': 'user-steps',
@@ -596,9 +628,18 @@ export function Strip() {
         children: [
           jsx('i', { 'aria-hidden': true, className: `codicon ${rows.length ? 'codicon-account' : 'codicon-warning'}`, style: { color: AMBER } }),
           jsx('span', { style: { fontWeight: 600 }, children: rows.length ? `For you${rows.length > 1 ? ` (${rows.length})` : ''}` : `Agent issue${issues.length > 1 ? `s (${issues.length})` : ''} \u2014 no action required from you` }),
+          !rows.length && jsx('button', {
+            type: 'button',
+            'data-user-steps-dismiss-all': true,
+            style: { ...btn(), marginLeft: 'auto', border: 'none', padding: '0 4px' },
+            onClick: () => dismissIssues(issues),
+            title: issues.length > 1 ? 'Dismiss all agent issues' : 'Dismiss',
+            'aria-label': 'Dismiss',
+            children: jsx('i', { className: 'codicon codicon-close' })
+          }),
           jsx('button', {
             type: 'button',
-            style: { ...btn(), marginLeft: 'auto', border: 'none', padding: '0 4px' },
+            style: { ...btn(), ...(rows.length ? { marginLeft: 'auto' } : {}), border: 'none', padding: '0 4px' },
             onClick: () => setCollapsed(!collapsed),
             'aria-label': collapsed ? 'Expand' : 'Collapse',
             children: jsx('i', { className: `codicon codicon-chevron-${collapsed ? 'down' : 'up'}` })
