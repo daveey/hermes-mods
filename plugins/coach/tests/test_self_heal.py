@@ -380,3 +380,44 @@ def test_replay_reports_catch_rate_precision_misses_and_fps(tmp_path):
     replay.main(["--data", str(ROOT / "tests" / "fixtures" / "selfheal_sample.jsonl"), "--out", str(out)],
                 llm=lambda s, p: calls.append(1) or "{}")
     assert not calls
+
+
+# ---- week-of-10-12 replay: overlay schema leak (stray reply-check output line in reply_profile.md) ----------------
+def test_parse_skips_another_judges_schema_and_takes_the_p_defect_object():
+    two = ('{"p_defect": 1.0, "kind": "agent_fault", "component": "agent", "symptom": "stopped mid-work"} '
+           '{"unverified_done":0.0,"needless_handoff":0.0,"evidence":"x"}')
+    assert sh.parse(two)["p_defect"] == 1.0
+    other = '{"unverified_done":0.0,"needless_handoff":1.0,"rule_violation":1.0,"evidence":"Told user to run it"}'
+    assert sh.parse(other) is None          # no opinion, not a 0 vote
+    fenced = '```json\n{"p_defect": 0.7, "kind": "hermes_bug", "component": "desktop", "symptom": "s"}\n```'
+    assert sh.parse(fenced)["p_defect"] == 0.7
+
+
+def test_other_schema_stage_is_left_out_of_the_cascade_mean():
+    answers = iter(['{"p_defect": 0.9, "kind": "agent_fault", "component": "agent", "symptom": "s"}',
+                    '{"unverified_done":0.0,"needless_handoff":1.0,"evidence":"e"}',
+                    '{"unverified_done":0.0,"needless_handoff":1.0,"evidence":"e"}'])
+    v = sh.complaint_verdict("prev", "why did you stop", lambda s, p: next(answers))
+    assert v["stages"] == [0.9] and v["p_defect"] == 0.9
+
+
+def test_overlay_output_spec_line_is_stripped(tmp_path, monkeypatch):
+    prof = tmp_path / "reply_profile.md"
+    prof.write_text("- Rule: self-serve.\n- Reply in plain English to the user.\n\n"
+                    'Return ONLY JSON {"unverified_done":p,"needless_handoff":p,"evidence":"<=25 words"}\n')
+    monkeypatch.setenv("COACH_REPLY_PROFILE", str(prof))
+    t = sh.profile_text()
+    assert "self-serve" in t and "plain English" in t and "unverified_done" not in t
+    assert "unverified_done" not in sh._with_profile(sh.COMPLAINT_SYS)
+
+
+def test_backstop_context_carries_the_agents_reply_to_the_turn():
+    turns = [{"t": 1, "text": "why are all the dots red? [screenshot]", "prev": ""},
+             {"t": 2, "text": "root cause it", "prev": "The panel conflates quota exhausted with cooling down."}]
+    dg = {"title": "Explain why all dots are red", "last_reply": "Found the cooldown bug."}
+    c0 = sh.backstop_context(dg, turns, turns[0])
+    assert "reply to this message" in c0 and "conflates" in c0       # next turn's prev
+    assert "Found the cooldown bug" in sh.backstop_context(dg, turns, turns[1])   # newest turn: last_reply
+    mid = {"title": "t", "last_reply": turns[1]["prev"]}                  # digest written mid-turn
+    assert "reply to this message" not in sh.backstop_context(mid, turns, turns[1])
+    assert "Found the cooldown bug" in sh.complaint_prompt("", turns[1]["text"], context=sh.backstop_context(dg, turns, turns[1]))

@@ -234,12 +234,30 @@ def fingerprint(component: str, symptom: str) -> str:
     return comp + "-" + hashlib.sha1(key.encode()).hexdigest()[:10]
 
 
+def _json_objects(raw: str):
+    """Every top-level JSON object in `raw`, in order (a flash answer can carry two, or wrap one in a fence)."""
+    dec, i, s = json.JSONDecoder(), 0, raw or ""
+    while True:
+        i = s.find("{", i)
+        if i < 0:
+            return
+        try:
+            obj, end = dec.raw_decode(s, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(obj, dict):
+            yield obj
+        i = end
+
+
 def parse(raw: str) -> Optional[dict]:
-    m = re.search(r"\{.*\}", raw or "", re.S)
-    if not m:
+    """The first JSON object in the answer that carries `p_defect`. An answer in another judge's schema (e.g. the
+    reply-check keys) is no opinion (None), never a 0 vote: counting it as 0 sank real catches to the cascade mean."""
+    d = next((o for o in _json_objects(raw) if "p_defect" in o), None)
+    if d is None:
         return None
     try:
-        d = json.loads(m.group(0))
         comp = str(d.get("component") or "other").strip().lower()
         return {"p_defect": max(0.0, min(1.0, float(d.get("p_defect") or 0))),
                 "component": comp if comp in COMPONENTS else "other",
@@ -262,9 +280,19 @@ def profile_text() -> str:
             home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
         p = str(home / "coach" / "reply_profile.md")
     try:
-        return Path(p).read_text()[:6000]
+        return strip_output_spec(Path(p).read_text())[:6000]
     except Exception:
         return ""
+
+
+_OUTPUT_SPEC = re.compile(r"(?im)^[ \t]*(?:return|respond|reply|answer|output)\b[^\n]*\bjson\b[^\n]*(?:\n|$)")
+
+
+def strip_output_spec(text: str) -> str:
+    """The overlay holds rules and environment only. An output-format line in it ("Return ONLY JSON {...}" left over
+    from another judge) is appended after the judge's own schema and wins: the self-heal judge answered in the
+    reply-check keys and its stages parsed as 0."""
+    return _OUTPUT_SPEC.sub("", text or "")
 
 
 def _with_profile(system: str) -> str:
@@ -280,7 +308,7 @@ def _log_text(tool_log, n=25, chars=2500) -> str:
 def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "") -> str:
     """`context` (digest backstop only): the session title and earlier user messages, for turns whose previous agent
     reply is unknown. Without it a context-free report (\"why didnt this work [screenshot]\") reads as a new issue."""
-    ctx = f"SESSION CONTEXT (from a digest; agent replies are not available):\n{context[:1500]}\n\n" if context else ""
+    ctx = f"SESSION CONTEXT (from a digest):\n{context[:2200]}\n\n" if context else ""
     prev = prev_reply or ("(not available)" if context else "(none: first turn)")
     return (f"{ctx}AGENT'S PREVIOUS FINAL MESSAGE:\n{prev[-3000:]}\n\n"
             f"TOOL LOG OF THE AGENT'S PREVIOUS TURN:\n{_log_text(tool_log)}\n\n"
@@ -1206,13 +1234,20 @@ def sync(store=None, runner=None, now: Optional[float] = None, fixer: Optional[C
 INTERACTIVE = ("desktop", "tui", "cli", "slack", "telegram", "discord", "whatsapp", "signal")
 
 
-def backstop_context(dg: dict, turns: list, t: dict, n: int = 3, chars: int = 300) -> str:
-    """Session title plus the `n` user turns before `t` (each clipped), for the backstop judge."""
+def backstop_context(dg: dict, turns: list, t: dict, n: int = 3, chars: int = 300, reply_chars: int = 600) -> str:
+    """Session title, the `n` user turns before `t` (each clipped) and the agent's reply to `t`, for the backstop judge."""
     i = next((k for k, x in enumerate(turns) if x is t), len(turns))
     earlier = [str(x.get("text") or "")[:chars].replace("\n", " ") for x in turns[max(0, i - n):i]]
     lines = [f"Session title: {dg.get('title') or '(untitled)'}"]
     lines += ([f"Earlier user messages, oldest first:"] + [f"- {e}" for e in earlier] if earlier
               else ["This is the first user message of the session."])
+    # The agent's answer to this message (the next turn's `prev`, or the digest's last reply for the newest turn): the
+    # judge cannot see a screenshot, and "why are all the dots red? [screenshot]" only reads as a plugin bug once the
+    # reply says what the dots are. A digest written mid-turn has last_reply == this turn's prev: left out.
+    reply = (turns[i + 1].get("prev") if i + 1 < len(turns) else dg.get("last_reply")) or ""
+    if reply.strip() and reply != (t.get("prev") or ""):
+        lines.append("The agent's reply to this message (written after it; use it only to learn what the message and "
+                     "any screenshot were about, not as proof of a defect): " + reply[:reply_chars].replace("\n", " "))
     return "\n".join(lines)
 
 

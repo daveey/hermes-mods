@@ -72,7 +72,11 @@ _USER_HEAD = re.compile(
 # "I can't" claims: the gap stays with the reader unless this turn's tool output shows the attempt failing
 _CANT = re.compile(
     r"\bI (?:can['\u2019]?t|cannot) (?:change|check|do|open|fix|reach)\b"
-    r"|^\W*Limitation:|\bwould need\b[^.]*\b(?:doesn['\u2019]?t|don['\u2019]?t) have\b", re.I)
+    r"|^\W*Limitation:|\bwould need\b[^.]*\b(?:doesn['\u2019]?t|don['\u2019]?t) have\b"
+    # "it's a settings change only you can make" (bb-tuner, week of 10-12: David answered "merge it yourself")
+    r"|\bonly (?:you|david) (?:can|could) (?:make|do|fix|change|approve|grant|add|enable|set|flip|merge|review|run|unlock|"
+    r"create|sign|register)\b"
+    r"|\bonly (?:you|david) (?:have|has) (?:the )?(?:access|admin|rights|permission)\b", re.I)
 _HOWTO_ASKED = re.compile(
     r"\bhow (?:do|can|would|should|could|to|am i supposed)\b|\bwalk me through\b|\bsteps?\b|\binstructions?\b|"
     r"\bshow me how\b|\bteach me\b|\bwhat should i do\b", re.I)

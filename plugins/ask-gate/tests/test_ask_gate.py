@@ -470,7 +470,11 @@ def test_wk1012_S2_checklist_steps_are_separate_asks(gate):
     "To confirm: in the Nest app, open Upstairs → History.", "In that case, check the Actions spending limit.",
     "Please check the Echo Dot.", "Open Settings, then tap Wi-Fi.", "Echo Dot pod: please check it.",
     "Sign in to Chrome, then click Allow.", "I can't change it myself.",
-    "Limitation: only this Mac is covered.", "Reaching it would need a token the plugin doesn't have."])
+    "Limitation: only this Mac is covered.", "Reaching it would need a token the plugin doesn't have.",
+    # bb-tuner Bot Chat 2026-10-13 (quoted back by David; his reply: "merge it yourself ... make yourself a skill")
+    "Add the bb-tuner token to main's bypass list. I recommend this; it's a settings change only you can make.",
+    "Only David has admin on that repo.",
+    "Only you can fix it, at github.com/settings/billing."])
 def test_new_ask_shapes(gate, text):
     assert gate.core.find_asks(text), text
 
@@ -478,7 +482,8 @@ def test_new_ask_shapes(gate, text):
 @pytest.mark.parametrize("text", [
     "Open items: none.", "Checked: gh run list returned 3 runs.", "I'll check the logs and run the tests.",
     "Changes are pushed and the run passed.", "Run 4 of the suite passed.", "Nothing to check; it is done.",
-    "I can't believe how clean that came out.", "I couldn't open the page, the host was down.", "Open the file you want."])
+    "I can't believe how clean that came out.", "I couldn't open the page, the host was down.", "Open the file you want.",
+    "Only you can see private rooms.", "Only you have been using the new panel."])
 def test_new_shapes_do_not_fire_on_narration(gate, text):
     assert gate.core.find_asks(text) == [], text
 

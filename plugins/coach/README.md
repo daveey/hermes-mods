@@ -151,7 +151,12 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set).
 
 Both judges append the private overlay `COACH_REPLY_PROFILE` / `<HERMES_HOME>/coach/reply_profile.md` (shared with
-the reply check), so they know your standing rules.
+the reply check), so they know your standing rules. The overlay is rules and environment only: output-format lines
+("Return ONLY JSON …") are stripped on load, because a stray reply-check schema line at its end made the self-heal judge
+answer in the wrong keys, and `parse` takes only an object with `p_defect` (another schema = no vote, never 0). The
+digest backstop also shows the judge the agent's reply to the turn, so a screenshot-only report reads as what it was.
+Replay of the week-of-10-12 Hermes fix requests: 6/25 -> 12/25 caught; a 150-turn control fired on 33, nearly all
+real complaints.
 
 Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
 workers. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to

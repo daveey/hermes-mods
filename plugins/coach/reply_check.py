@@ -216,7 +216,9 @@ def profile_text() -> str:
     from pathlib import Path
     p = Path(os.environ.get("COACH_REPLY_PROFILE") or (_hermes_home() / "coach" / "reply_profile.md"))
     try:
-        return p.read_text()[:4000]
+        # an output-format line in the overlay ("Return ONLY JSON {...}") would override JUDGE_SYS's own schema
+        return re.sub(r"(?im)^[ \t]*(?:return|respond|reply|answer|output)\b[^\n]*\bjson\b[^\n]*(?:\n|$)", "",
+                      p.read_text())[:4000]
     except Exception:
         return ""
 
