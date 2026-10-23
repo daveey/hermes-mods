@@ -30,6 +30,12 @@ Updates to an already-open card with the same key still go through. After fixing
 `hermes inbox unmute '<poster>'`. Posts with no poster are not tracked.
 Tests: `tests/test_store.py` (streak, reset, sidebar archive, window, re-key), `tests/test_mute_paths.py` (CLI, tool, REST).
 
+**Agent-fixable refusal** (`store.agent_fixable_reason`): before any card exists, a post from an agent-fixable
+poster (`AGENT_FIXABLE_POSTERS`, today `kanban-dispatcher`) or whose Do-it prompt tells an agent to fix and unblock a
+Kanban card is refused with `AgentFixablePost` (a `ValueError`, same CLI/tool/REST handling). Such state goes on the
+Kanban board (comment or fix card). The noise breaker only fires after David archived 3 cards; this needs none.
+Tests: `tests/test_mute_paths.py::test_agent_fixable_posts_refused_before_any_card_exists`.
+
 ## Card types
 
 A plain card has **Do it** + **Archive**. A *typed* card has its type's own buttons, and the poster reads the decision back later by key, so "archive" never doubles as "approve".

@@ -68,3 +68,37 @@ def test_rest_post_refused(monkeypatch, tmp_path):
     r = TestClient(app).post("/items", json={"title": "again", "body": "b", "accept_prompt": "do",
                                              "poster": "rest-poster"})
     assert r.status_code == 400 and "muted" in r.text
+
+
+# The exact post 1e6f307c7e (hermes core) made for every respawn-guard hold.
+_GUARD_HOLD_PROMPT = ("Look at kanban card t_x: it is held by the respawn guard. Read its latest "
+                      "[respawn-guard] comment, fix the cause (failing PR checks, binding) and unblock it.")
+
+
+def test_agent_fixable_posts_refused_before_any_card_exists(monkeypatch, tmp_path, capsys):
+    """Detection-level guard: no 3-archive noise breaker needed; nothing reaches David. [daveey]"""
+    mod, store = _load_plugin(monkeypatch, tmp_path)
+    inbox = store.Inbox()
+    with pytest.raises(store.AgentFixablePost):
+        inbox.post("Kanban t_x held by respawn guard (active_pr)", "b", _GUARD_HOLD_PROMPT,
+                   key="guard-hold:t_x", poster="kanban-dispatcher")
+    with pytest.raises(store.AgentFixablePost):  # same prompt, any poster
+        inbox.post("held", "b", _GUARD_HOLD_PROMPT, poster="cron · something")
+    with pytest.raises(store.AgentFixablePost):  # the dispatcher poster, any prompt
+        inbox.post("held", "b", "Approve?", poster="Kanban-Dispatcher")
+    assert inbox.list() == []
+    assert _cli(mod, ["post", "held", "--body", "b", "--prompt", _GUARD_HOLD_PROMPT,
+                      "--key", "guard-hold:t_x", "--poster", "kanban-dispatcher"]) == 1
+    assert "kanban" in capsys.readouterr().err.lower()
+    monkeypatch.setattr(mod, "_poster_for", lambda sid: ("kanban-dispatcher", None))
+    out = json.loads(mod.handle_post({"title": "held", "body": "b", "accept_prompt": "do"}, session_id="s"))
+    assert out["posted"] is False and "AgentFixablePost" in out["error"]
+
+
+def test_owner_decisions_still_post(monkeypatch, tmp_path):
+    mod, store = _load_plugin(monkeypatch, tmp_path)
+    inbox = store.Inbox()
+    inbox.post("Approve the Q3 budget?", "b", "Approve it and tell finance.", poster="cron · finance")
+    inbox.post("Unblock t_y?", "Which DB?", "Unblock kanban card t_y with answer: use Postgres.",
+               poster="kanban · hands digest")
+    assert len(inbox.list()) == 2
