@@ -177,6 +177,16 @@ Undone notices are always plain cards.
      read the extra hits before calling them false positives: many random turns are real complaints.
   4. On the hub, run any replay under the cron interpreter (`cron.scheduler_script._posix_cron_script_argv`). A bare
      `python3` lacks ruamel, so `aux_judge` raises and the fail-open detector silently scores every turn "no defect".
+     In practice: the project venv python (`pm.environments.project_python(~/.hermes/hermes-agent)`) from a bash
+     wrapper with `HERMES_DISABLE_LAZY_INSTALLS=1`, no `PYTHONPATH`, and `sys.path.insert` of hermes-agent in the
+     script. Without the env var the first `agent.*` import re-execs onto the store python and loses ruamel. Start every
+     replay with one `aux_judge` call that must return text. All-`None` stages mean a broken judge, not misses.
+  4b. When stage scores look wrong, print the raw judge answers before tuning prompts. A judge answering in another
+     judge's keys means the private overlay (`coach/reply_profile.md`) carries an output-format line. That line is
+     stripped on load since 818e453; on another host, check its overlay too. Flash at temp 0 still varies by up to
+     0.65 on the same prompt, so compare variants over ≥2 runs.
+  4c. Before starting, check `hermes kanban list | grep -i ask-gate`: the weekly job also opens a review card for
+     the same hits. Split the files with it via a card comment, so two runners don't edit one working tree.
   5. Long replays (>5 min) go to a background terminal with notify. A foreground call past the tool timeout dies
      without output.
 - Changing bb-tuner's pre-run or SOUL (it runs on the hub, profile `bb-tuner`): the source is
