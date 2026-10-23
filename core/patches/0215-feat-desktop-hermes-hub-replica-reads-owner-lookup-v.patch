@@ -1,0 +1,1224 @@
+From 662710b38c63eebed68db9b61560a1edb6e7e4ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 05:10:23 +0000
+Subject: [PATCH] =?UTF-8?q?feat(desktop):=20hermes-hub=20replica=20reads?=
+ =?UTF-8?q?=20=E2=80=94=20owner=20lookup=20via=20hub-sync=20where,=20Kanba?=
+ =?UTF-8?q?n=20falls=20back=20to=20the=20replica=20for=20an=20unreachable?=
+ =?UTF-8?q?=20gateway=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../owner-follow.hub.test.ts                  |  99 +++++
+ .../hooks/use-session-actions/owner-follow.ts |  18 +-
+ .../plugins/kanban/api.hub-fallback.test.ts   | 199 ++++++++++
+ apps/desktop/src/plugins/kanban/api.ts        | 165 ++++++++-
+ apps/desktop/src/plugins/kanban/board.tsx     |   6 +
+ apps/desktop/src/plugins/kanban/i18n.ts       |  11 +
+ apps/desktop/src/plugins/kanban/types.ts      |   8 +
+ apps/desktop/src/store/hub-sync.test.ts       | 156 ++++++++
+ apps/desktop/src/store/hub-sync.ts            | 343 ++++++++++++++++++
+ 9 files changed, 993 insertions(+), 12 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.hub.test.ts
+ create mode 100644 apps/desktop/src/plugins/kanban/api.hub-fallback.test.ts
+ create mode 100644 apps/desktop/src/store/hub-sync.test.ts
+ create mode 100644 apps/desktop/src/store/hub-sync.ts
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.hub.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.hub.test.ts
+new file mode 100644
+index 0000000000..6196445ccb
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.hub.test.ts
+@@ -0,0 +1,99 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] findForeignSessionOwner consults the hermes-hub replica (one local
++// read on the primary gateway) BEFORE dialing every connection with a by-id
++// probe; the probe stays the fallback when the replica misses.
++
++const hub = vi.hoisted(() => ({ hits: [] as unknown[], calls: 0 }))
++
++vi.mock('@/api/plugins', () => ({
++  pluginRest: vi.fn(async (plugin: string, path: string) => {
++    if (plugin === 'hub-sync' && path.startsWith('/where/')) {
++      hub.calls += 1
++
++      return { available: true, gateway: 'laptop', hits: hub.hits }
++    }
++
++    throw new Error('404')
++  })
++}))
++
++vi.mock('@/hermes', async importActual => ({
++  ...(await importActual<Record<string, unknown>>()),
++  getSession: vi.fn()
++}))
++
++const { getSession } = await import('@/hermes')
++const { $connectionsRegistry } = await import('@/store/connection-registry-state')
++const { _resetHubSyncForTests, rememberHubGatewayName } = await import('@/store/hub-sync')
++const { _resetSessionOwnerHintsForTests, setSessions } = await import('@/store/session')
++const { findForeignSessionOwner, _resetSessionOwnerFollowForTests } = await import('./owner-follow')
++
++const SID = '20261023_120000_abcdef'
++
++function registry(...ids: string[]) {
++  $connectionsRegistry.set({
++    connections: ids.map(id => ({ id, kind: id === 'local' ? 'local' : 'ssh', label: id })),
++    primary: 'local'
++  } as never)
++}
++
++beforeEach(() => {
++  _resetHubSyncForTests()
++  _resetSessionOwnerFollowForTests()
++  _resetSessionOwnerHintsForTests({ storage: true })
++  setSessions([])
++  hub.hits = []
++  hub.calls = 0
++  vi.mocked(getSession).mockReset()
++})
++
++afterEach(() => {
++  $connectionsRegistry.set(null)
++})
++
++describe('findForeignSessionOwner + hub replica', () => {
++  it('answers from the replica without probing any connection', async () => {
++    registry('local', 'conn-mini', 'cloud')
++    rememberHubGatewayName('conn-mini', 'mini')
++    hub.hits = [{ gateway: 'mini', local: false, profile: 'bb', session: SID }]
++
++    expect(await findForeignSessionOwner(SID, ['local'])).toEqual({ connectionId: 'conn-mini', profile: 'bb' })
++    expect(getSession).not.toHaveBeenCalled()
++  })
++
++  it('works for an owner that is asleep: no probe, so no wait on a dead connection', async () => {
++    registry('local', 'conn-mini')
++    rememberHubGatewayName('conn-mini', 'mini')
++    vi.mocked(getSession).mockImplementation(() => new Promise(() => undefined)) // a hung gateway
++    hub.hits = [{ gateway: 'mini', profile: 'default' }]
++
++    expect(await findForeignSessionOwner(SID, ['local'])).toEqual({ connectionId: 'conn-mini', profile: 'default' })
++  })
++
++  it('falls back to the by-id probe when the replica does not know the id', async () => {
++    registry('local', 'cloud')
++    vi.mocked(getSession).mockResolvedValue({ id: SID, profile: 'alpha' } as never)
++
++    expect(await findForeignSessionOwner(SID, ['local'])).toEqual({ connectionId: 'cloud', profile: 'alpha' })
++    expect(hub.calls).toBe(1)
++    expect(getSession).toHaveBeenCalledTimes(1)
++  })
++
++  it('never names an excluded connection (the 4007 sender), and probe:false still asks only the replica', async () => {
++    registry('local', 'conn-mini')
++    rememberHubGatewayName('conn-mini', 'mini')
++    hub.hits = [{ gateway: 'mini', profile: 'default' }]
++
++    expect(await findForeignSessionOwner(SID, ['conn-mini'], { probe: false })).toBeUndefined()
++    expect(getSession).not.toHaveBeenCalled()
++  })
++
++  it('is inert on a single-gateway Desktop', async () => {
++    registry('local')
++    hub.hits = [{ gateway: 'laptop', local: true, profile: 'default' }]
++
++    expect(await findForeignSessionOwner(SID, ['local'])).toBeUndefined()
++    expect(hub.calls).toBe(0)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
+index 06347b4389..21832369f1 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/owner-follow.ts
+@@ -2,6 +2,7 @@ import type { JsonRpcGatewayError } from '@hermes/shared'
+ 
+ import { getSession } from '@/hermes'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { hubSessionOwner } from '@/store/hub-sync'
+ import {
+   $connection,
+   forgetSessionOwnerHintsForSession,
+@@ -76,8 +77,9 @@ function registryConnectionIds(): string[] {
+ /**
+  * The owner of `storedSessionId` on a connection OTHER than `excluded`, from
+  * the unified session list (every connection's connection-tagged rows), then
+- * the persisted owner hints, then a read-only by-id probe of each remaining
+- * registry connection. Undefined when no other connection has it — or when
++ * the persisted owner hints, then the hermes-hub replica's session → gateway
++ * map (one local read on the primary gateway, [daveey]), then a read-only by-id
++ * probe of each remaining registry connection. Undefined when no other connection has it — or when
+  * there is no other connection at all (single-gateway installs never probe).
+  */
+ export async function findForeignSessionOwner(
+@@ -111,6 +113,18 @@ export async function findForeignSessionOwner(
+     return hinted
+   }
+ 
++  // [daveey] The hub replica knows which gateway owns every synced session,
++  // with the owner asleep or the hub down; the probe below is the fallback for
++  // ids the replica hasn't seen. Cheap enough for the 4001 path too (one cached
++  // local read), and it can only name a connection outside `skip`.
++  if (registryConnectionIds().length >= 2) {
++    const viaHub = await hubSessionOwner(id, skip)
++
++    if (viaHub) {
++      return viaHub
++    }
++  }
++
+   const candidates = registryConnectionIds().filter(connectionId => !skip.has(connectionId))
+ 
+   if (!probe || candidates.length === 0 || registryConnectionIds().length < 2) {
+diff --git a/apps/desktop/src/plugins/kanban/api.hub-fallback.test.ts b/apps/desktop/src/plugins/kanban/api.hub-fallback.test.ts
+new file mode 100644
+index 0000000000..9016194b87
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/api.hub-fallback.test.ts
+@@ -0,0 +1,199 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] A gateway whose live board read fails still shows its cards from
++// the window gateway's hermes-hub replica, marked `from_hub`; live reads stay
++// the primary source, and a comment on a replica card becomes a hub request.
++
++const routed = vi.hoisted(() => ({ id: null as null | string }))
++const hub = vi.hoisted(() => ({ calls: [] as Array<{ path: string; opts: Record<string, unknown> }>, tasks: [] as unknown[] }))
++
++vi.mock('@/hermes', () => ({ setApiRequestProfile: vi.fn() }))
++vi.mock('@/store/gateway', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  activeGatewayConnectionId: () => routed.id
++}))
++vi.mock('@/api/plugins', () => ({
++  pluginRest: vi.fn(async (plugin: string, path: string, opts: Record<string, unknown>) => {
++    if (plugin !== 'hub-sync') {
++      throw new Error('unexpected plugin')
++    }
++
++    hub.calls.push({ opts, path })
++
++    if (path.startsWith('/tasks?')) {
++      return { available: true, gateway: 'laptop', tasks: hub.tasks }
++    }
++
++    if (path === '/request') {
++      return { id: 'hr-1', queued_locally: true, state: 'local' }
++    }
++
++    throw new Error('404')
++  })
++}))
++
++const api = await import('./api')
++const { $connectionsRegistry } = await import('@/store/connection-registry-state')
++const { queryClient } = await import('@/lib/query-client')
++const { _resetHubSyncForTests, rememberHubGatewayName } = await import('@/store/hub-sync')
++const { addComment, bindApi, fetchBoard, hubBoardFromTasks, resetGatewayCooldowns } = api
++
++type Call = { opts?: { connectionId?: string; method?: string; body?: unknown }; path: string }
++
++const board = (columns: Record<string, Array<Record<string, unknown>>>) => ({
++  assignees: [],
++  columns: Object.entries(columns).map(([name, tasks]) => ({ name, tasks })),
++  latest_event_id: 0,
++  now: 0,
++  tenants: []
++})
++
++const hubTask = (id: string, extra: Record<string, unknown> = {}) => ({
++  board: 'default',
++  gateway: 'mini',
++  id,
++  key: `default/${id}`,
++  local: false,
++  stale: false,
++  status: 'running',
++  synced_at: 1000,
++  title: id,
++  version: 3,
++  ...extra
++})
++
++const storage = { get: <T>(_key: string, fallback: T) => fallback, remove: vi.fn(), set: vi.fn() }
++let calls: Call[] = []
++let dispose: () => void = () => undefined
++
++async function bind(respond: (call: Call) => unknown) {
++  const socket = vi.fn(() => vi.fn())
++  dispose = bindApi(
++    (async (path: string, opts?: Call['opts']) => {
++      calls.push({ opts, path })
++      const out = respond({ opts, path })
++
++      if (out instanceof Error) {
++        throw out
++      }
++
++      return out
++    }) as never,
++    storage,
++    socket
++  )
++  await vi.waitFor(() => expect(socket).toHaveBeenCalled())
++  calls = []
++}
++
++beforeEach(() => {
++  routed.id = 'local'
++  hub.calls = []
++  hub.tasks = []
++  _resetHubSyncForTests()
++  $connectionsRegistry.set({
++    connections: ['local', 'conn-mini'].map(id => ({ id, kind: id === 'local' ? 'local' : 'ssh', label: id })),
++    primary: 'local'
++  } as never)
++})
++
++afterEach(() => {
++  dispose()
++  $connectionsRegistry.set(null)
++  resetGatewayCooldowns()
++  queryClient.clear()
++})
++
++const liveOrDown = (miniUp: boolean) => (call: Call) => {
++  if (call.path.startsWith('/board')) {
++    if (call.opts?.connectionId === 'conn-mini') {
++      return miniUp ? board({ ready: [{ id: 'live-mini', status: 'ready', title: 'live' }] }) : new Error('timed out')
++    }
++
++    return board({ ready: [{ id: 'own', status: 'ready', title: 'own' }] })
++  }
++
++  if (call.path.startsWith('/boards')) {
++    return { boards: [{ slug: 'default' }], current: 'default' }
++  }
++
++  return {}
++}
++
++describe('Kanban hub replica fallback', () => {
++  it('fills a gateway whose live read failed from the replica, marked from hub', async () => {
++    rememberHubGatewayName('conn-mini', 'mini')
++    hub.tasks = [hubTask('t_run'), hubTask('t_blk', { status: 'blocked', synced_at: 900 })]
++    await bind(liveOrDown(false))
++
++    const result = await fetchBoard(false)
++    const all = result.columns.flatMap(col => col.tasks)
++
++    expect(all.map(t => [t.id, t.gateway, Boolean(t.from_hub)])).toEqual([
++      ['own', 'local', false],
++      ['t_run', 'conn-mini', true],
++      ['t_blk', 'conn-mini', true]
++    ])
++    expect(result.hub_gateways).toEqual({ 'conn-mini': 900 })
++    expect(result.gateway_errors).toEqual({ 'conn-mini': 'timed out' }) // still flagged as unreachable
++    const read = hub.calls.find(call => call.path.startsWith('/tasks?'))!
++    expect(read.opts.connectionId).toBe('local') // the replica lives on the window's own gateway
++    expect(new URLSearchParams(read.path.split('?')[1]).get('gateway')).toBe('mini')
++  })
++
++  it('keeps the live read as the source when the gateway answers (no replica read)', async () => {
++    rememberHubGatewayName('conn-mini', 'mini')
++    hub.tasks = [hubTask('stale-copy')]
++    await bind(liveOrDown(true))
++
++    const result = await fetchBoard(false)
++
++    expect(result.columns.flatMap(col => col.tasks).map(t => t.id)).toEqual(['own', 'live-mini'])
++    expect(result.hub_gateways).toBeUndefined()
++    expect(hub.calls.some(call => call.path.startsWith('/tasks?'))).toBe(false)
++  })
++
++  it('a gateway with no known hub name stays missing (no guessing)', async () => {
++    hub.tasks = [hubTask('t')]
++    await bind(liveOrDown(false))
++
++    const result = await fetchBoard(false)
++
++    expect(result.columns.flatMap(col => col.tasks).map(t => t.id)).toEqual(['own'])
++    expect(hub.calls.some(call => call.path.startsWith('/tasks?'))).toBe(false)
++  })
++
++  it('a comment on a replica card is queued as a hub request; live cards use the kanban API', async () => {
++    rememberHubGatewayName('conn-mini', 'mini')
++    hub.tasks = [hubTask('t_run')]
++    await bind(liveOrDown(false))
++    await fetchBoard(false)
++
++    await addComment('t_run', 'ping')
++    expect(hub.calls.at(-1)).toMatchObject({
++      opts: { body: { action: 'comment', args: { text: 'ping' }, coll: 'tasks', gateway: 'mini', key: 'default/t_run' } },
++      path: '/request'
++    })
++
++    calls = []
++    await addComment('own', 'hi')
++    expect(calls.map(c => c.path)).toEqual(['/tasks/own/comments'])
++  })
++})
++
++describe('hubBoardFromTasks', () => {
++  it('orders lanes like the board and maps run/summary fields', () => {
++    const b = hubBoardFromTasks(
++      [
++        hubTask('d', { status: 'done' }),
++        hubTask('r', { assignee: 'w', run: { started_at: 50, status: 'running', summary: 'going' } }),
++        hubTask('t', { status: 'triage' })
++      ] as never,
++      100
++    )
++
++    expect(b.columns.map(c => c.name)).toEqual(['triage', 'running', 'done'])
++    expect(b.columns[1].tasks[0]).toMatchObject({ current_run_started_at: 50, from_hub: true, latest_summary: 'going' })
++    expect(b.assignees).toEqual(['w'])
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 9a593f70e0..5f91b20788 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -27,6 +27,14 @@ import {
+   useValue
+ } from '@hermes/plugin-sdk'
+ 
++import {
++  hubGatewayForConnection,
++  hubGatewayTasks,
++  hubRequest,
++  type HubTask,
++  learnHubGatewayName
++} from '@/store/hub-sync'
++
+ // Native completion notification.
+ import {
+   bindCompletionNotify,
+@@ -471,6 +479,11 @@ interface TaskOwner {
+ 
+ const taskOwners = new Map<string, TaskOwner>()
+ 
++/** [daveey] Cards read from the hermes-hub replica, by id: their hub gateway
++ *  name and board, so a comment on one becomes a hub request instead of a
++ *  call to a gateway that just failed to answer. */
++const hubTaskRefs = new Map<string, { board: string; hubGateway: string }>()
++
+ /** [daveey] Record where a task lives before the board has read it (the
+  *  open-task hook: a card opened from a chat on another gateway), so the
+  *  drawer's first fetch goes to the owning gateway + board. */
+@@ -556,6 +569,9 @@ export interface GatewayBoardPart {
+   gateway: string
+   board?: KanbanBoard
+   error?: unknown
++  /** [daveey] Set when `board` is the hermes-hub replica's copy (the live
++   *  read failed): epoch seconds it is current for, or null when unknown. */
++  hubSyncedAt?: null | number
+ }
+ 
+ const TERMINAL_ORDER = new Set(['done', 'archived'])
+@@ -580,16 +596,23 @@ export function mergeBoards(parts: GatewayBoardPart[]): KanbanBoard {
+   const tenants = new Set<string>()
+   const assignees = new Set<string>()
+   const gatewayErrors: Record<string, string> = {}
++  const hubGateways: Record<string, null | number> = {}
+ 
+   for (const part of parts) {
+-    if (!part.board) {
+-      if (part.error && !isMissingBoard(part.error)) {
+-        gatewayErrors[part.gateway] = part.error instanceof Error ? part.error.message : String(part.error)
+-      }
++    // A replica-filled part still failed live: keep its error on the board
++    // (the header chip says the gateway is down) next to its hub cards.
++    if (part.error && !isMissingBoard(part.error)) {
++      gatewayErrors[part.gateway] = part.error instanceof Error ? part.error.message : String(part.error)
++    }
+ 
++    if (!part.board) {
+       continue
+     }
+ 
++    if (part.hubSyncedAt !== undefined) {
++      hubGateways[part.gateway] = part.hubSyncedAt
++    }
++
+     for (const col of part.board.columns ?? []) {
+       const merged = columns.get(col.name) ?? { name: col.name, tasks: [] }
+       merged.tasks.push(...col.tasks.map(task => ({ ...task, gateway: part.gateway })))
+@@ -621,6 +644,7 @@ export function mergeBoards(parts: GatewayBoardPart[]): KanbanBoard {
+     assignees: [...assignees].sort(),
+     columns: [...columns.values()],
+     gateway_errors: Object.keys(gatewayErrors).length ? gatewayErrors : undefined,
++    ...(Object.keys(hubGateways).length ? { hub_gateways: hubGateways } : {}),
+     latest_event_id: primary?.latest_event_id ?? 0,
+     now: primary?.now ?? answered[0].board!.now,
+     tenants: [...tenants].sort()
+@@ -633,12 +657,115 @@ function rememberOwners(board: KanbanBoard, slug: string): KanbanBoard {
+       if (task.gateway) {
+         taskOwners.set(task.id, { board: slug, gateway: task.gateway })
+       }
++
++      if (task.from_hub && task.gateway) {
++        const hubGateway = hubGatewayForConnection(task.gateway)
++
++        if (hubGateway) {
++          hubTaskRefs.set(task.id, { board: slug || 'default', hubGateway })
++        }
++      } else {
++        hubTaskRefs.delete(task.id)
++      }
+     }
+   }
+ 
+   return board
+ }
+ 
++// ── hermes-hub replica fallback [daveey] ──────────────────────────────────────
++//
++// A registered gateway whose live board read fails (asleep, tunnel down,
++// waiting on a login) still shows its cards: the window's own gateway serves
++// its hermes-hub replica (`/api/plugins/hub-sync/tasks`), and those cards carry
++// `from_hub` so the board marks them. The live read stays the primary source;
++// the replica is only consulted for gateways that didn't answer.
++
++const HUB_COLUMN_ORDER = ['triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review', 'done', 'archived']
++
++/** One gateway's replica cards as a board (columns in the board's lane order). */
++export function hubBoardFromTasks(tasks: HubTask[], now: number): KanbanBoard {
++  const columns = new Map<string, KanbanColumn>()
++  const assignees = new Set<string>()
++
++  for (const task of tasks) {
++    const status = task.status || 'todo'
++    const run = task.run ?? null
++    const column = columns.get(status) ?? { name: status, tasks: [] }
++
++    column.tasks.push({
++      assignee: task.assignee ?? null,
++      body: task.body ?? null,
++      comment_count: typeof task.comments === 'number' ? task.comments : undefined,
++      completed_at: task.completed_at ?? null,
++      created_at: task.created_at,
++      current_run_started_at: run?.status === 'running' ? (run.started_at ?? null) : null,
++      from_hub: true,
++      hub_synced_at: task.synced_at,
++      id: task.id,
++      latest_summary: run?.summary ?? null,
++      priority: task.priority,
++      started_at: task.started_at ?? null,
++      status,
++      title: task.title ?? task.id
++    })
++    columns.set(status, column)
++
++    if (task.assignee) {
++      assignees.add(task.assignee)
++    }
++  }
++
++  const rank = (name: string) => {
++    const at = HUB_COLUMN_ORDER.indexOf(name)
++
++    return at < 0 ? HUB_COLUMN_ORDER.length : at
++  }
++
++  return {
++    assignees: [...assignees].sort(),
++    columns: [...columns.values()].sort((a, b) => rank(a.name) - rank(b.name)),
++    latest_event_id: 0,
++    now,
++    tenants: []
++  }
++}
++
++/** Fill failed remote parts from the replica (in place). Parts that answered,
++ *  a missing board, and gateways with no known hub name are left alone. */
++export async function withHubFallback(
++  parts: GatewayBoardPart[],
++  slug: string,
++  archived: boolean
++): Promise<GatewayBoardPart[]> {
++  await Promise.all(
++    parts.map(async (part, index) => {
++      if (index === 0 || part.board || !part.error || isMissingBoard(part.error)) {
++        return
++      }
++
++      const hubGateway = hubGatewayForConnection(part.gateway)
++
++      if (!hubGateway) {
++        return
++      }
++
++      const tasks = await hubGatewayTasks(hubGateway, slug || 'default', archived)
++
++      if (!tasks) {
++        return
++      }
++
++      const synced = tasks.map(task => task.synced_at).filter((at): at is number => typeof at === 'number')
++
++      part.board = hubBoardFromTasks(tasks, Math.floor(Date.now() / 1000))
++      part.hubSyncedAt = synced.length ? Math.min(...synced) : null
++    })
++  )
++
++  return parts
++}
++
+ // ── reads ─────────────────────────────────────────────────────────────────────
+ 
+ export async function fetchBoard(archived: boolean): Promise<KanbanBoard> {
+@@ -659,12 +786,16 @@ export async function fetchBoard(archived: boolean): Promise<KanbanBoard> {
+     )
+   )
+ 
+-  const board = mergeBoards(
+-    settled.map((result, index) => ({
+-      gateway: gateways[index],
+-      ...(result.status === 'fulfilled' ? { board: result.value } : { error: result.reason })
+-    }))
+-  )
++  const parts: GatewayBoardPart[] = settled.map((result, index) => ({
++    gateway: gateways[index],
++    ...(result.status === 'fulfilled' ? { board: result.value } : { error: result.reason })
++  }))
++
++  // [daveey] Each gateway that answered says which hub gateway it is (cached
++  // for minutes), so its cards can come from the replica when it is down later.
++  parts.forEach(part => part.board && void learnHubGatewayName(part.gateway))
++
++  const board = mergeBoards(await withHubFallback(parts, slug, archived))
+ 
+   return rememberOwners(board, slug)
+ }
+@@ -953,6 +1084,20 @@ export async function bulkTasks(ids: string[], patch: Record<string, unknown>):
+ }
+ 
+ export const addComment = (id: string, body: string) => {
++  const hubRef = hubTaskRefs.get(id)
++
++  // [daveey] A replica card's owner is unreachable: queue the comment as a
++  // hermes-hub owner request (applied when that gateway syncs again).
++  if (hubRef) {
++    return hubRequest({
++      action: 'comment',
++      args: { text: body },
++      coll: 'tasks',
++      gateway: hubRef.hubGateway,
++      key: `${hubRef.board}/${id}`
++    })
++  }
++
+   const [path, opts] = forTask(id, `/tasks/${id}/comments`)
+ 
+   return call(path, { ...opts, method: 'POST', body: { author: 'desktop', body } })
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index 18f0ffeecf..5c850d263a 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -250,6 +250,12 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+         <span className="min-w-0 truncate font-mono text-(--ui-text-quaternary)">{shortId(task.id)}</span>
+         {/* [daveey] Which gateway owns the card — the sidebar session row's glyph. */}
+         {task.gateway && <GatewayDeviceIcon gatewayId={task.gateway} />}
++        {/* [daveey] The owner didn't answer: this is the hermes-hub replica's copy. */}
++        {task.from_hub && (
++          <Tip label={k.fromHubTip(ago(task.hub_synced_at) ?? '?')}>
++            <span className="shrink-0 cursor-help text-(--ui-text-quaternary) italic">{k.fromHub}</span>
++          </Tip>
++        )}
+       </div>
+     </div>
+   )
+diff --git a/apps/desktop/src/plugins/kanban/i18n.ts b/apps/desktop/src/plugins/kanban/i18n.ts
+index 24897a2302..cfef8037fe 100644
+--- a/apps/desktop/src/plugins/kanban/i18n.ts
++++ b/apps/desktop/src/plugins/kanban/i18n.ts
+@@ -51,6 +51,9 @@ type KanbanMessages = {
+   allGateways: string
+   createOn: (gateway: string) => string
+   gatewayUnreachable: (gateway: string, error: string) => string
++  /** [daveey] Card marker when the owner was unreachable and the card is the hub replica's copy. */
++  fromHub: string
++  fromHubTip: (ago: string) => string
+   allTenants: string
+   showArchived: string
+   groupRunning: string
+@@ -290,6 +293,8 @@ export const en: KanbanMessages = {
+   allGateways: 'All gateways',
+   createOn: gateway => `On ${gateway}`,
+   gatewayUnreachable: (gateway, error) => `${gateway} didn't answer, so its cards are missing: ${error}`,
++  fromHub: 'from hub',
++  fromHubTip: ago => `Its gateway didn't answer; this is the hermes-hub copy, synced ${ago}`,
+   allTenants: 'All tenants',
+   showArchived: 'Show archived',
+   groupRunning: 'Group Running by profile',
+@@ -530,6 +535,8 @@ const ja: KanbanMessages = {
+   allGateways: 'すべてのゲートウェイ',
+   createOn: gateway => `${gateway} に作成`,
+   gatewayUnreachable: (gateway, error) => `${gateway} が応答しないため、そのカードは表示されていません: ${error}`,
++  fromHub: 'ハブより',
++  fromHubTip: ago => `ゲートウェイが応答しないため、hermes-hub のコピーを表示しています（同期: ${ago}）`,
+   allTenants: 'すべてのテナント',
+   showArchived: 'アーカイブを表示',
+   groupRunning: '実行中をプロフィールでグループ化',
+@@ -768,6 +775,8 @@ const zh: KanbanMessages = {
+   allGateways: '所有网关',
+   createOn: gateway => `创建于 ${gateway}`,
+   gatewayUnreachable: (gateway, error) => `${gateway} 未响应，其卡片未显示：${error}`,
++  fromHub: '来自 hub',
++  fromHubTip: ago => `其网关未响应；这是 hermes-hub 的副本，同步于 ${ago}`,
+   allTenants: '所有租户',
+   showArchived: '显示已归档',
+   groupRunning: '按配置档分组运行中',
+@@ -1004,6 +1013,8 @@ const zhHant: KanbanMessages = {
+   allGateways: '所有閘道',
+   createOn: gateway => `建立於 ${gateway}`,
+   gatewayUnreachable: (gateway, error) => `${gateway} 未回應，其卡片未顯示：${error}`,
++  fromHub: '來自 hub',
++  fromHubTip: ago => `其閘道未回應；這是 hermes-hub 的副本，同步於 ${ago}`,
+   allTenants: '所有租戶',
+   showArchived: '顯示已封存',
+   groupRunning: '依設定檔分組執行中',
+diff --git a/apps/desktop/src/plugins/kanban/types.ts b/apps/desktop/src/plugins/kanban/types.ts
+index 42f4d5dc2d..c555787c35 100644
+--- a/apps/desktop/src/plugins/kanban/types.ts
++++ b/apps/desktop/src/plugins/kanban/types.ts
+@@ -44,6 +44,11 @@ export interface KanbanTask {
+   /** [daveey] Chat managing the card: its latest `tui` notify subscriber,
+    *  else `session_id`. Absent on older backends. */
+   managing_session_id?: null | string
++  /** [daveey] The owner didn't answer the live read: this card is its
++   *  hermes-hub replica copy (read-only snapshot as of `hub_synced_at`). */
++  from_hub?: boolean
++  /** [daveey] Epoch seconds the replica copy is known current for. */
++  hub_synced_at?: null | number
+ }
+ 
+ export interface KanbanColumn {
+@@ -59,6 +64,9 @@ export interface KanbanBoard {
+   now: number
+   /** [daveey] Gateways that failed to answer the merged read (id → message). */
+   gateway_errors?: Record<string, string>
++  /** [daveey] Gateways whose cards came from the hermes-hub replica because
++   *  their live read failed (id → epoch seconds the copy is current for). */
++  hub_gateways?: Record<string, null | number>
+ }
+ 
+ /** A structured recovery action attached to a diagnostic. */
+diff --git a/apps/desktop/src/store/hub-sync.test.ts b/apps/desktop/src/store/hub-sync.test.ts
+new file mode 100644
+index 0000000000..32ece311d8
+--- /dev/null
++++ b/apps/desktop/src/store/hub-sync.test.ts
+@@ -0,0 +1,156 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] hermes-hub replica door: gateway-name mapping, session owner lookup,
++// requests. pluginRest is mocked per (path, connection) so a call that goes to
++// the wrong gateway is visible.
++
++const rest = vi.hoisted(() => ({ handler: null as null | ((path: string, opts: Record<string, unknown>) => unknown) }))
++
++vi.mock('@/api/plugins', () => ({
++  pluginRest: vi.fn(async (plugin: string, path: string, opts: Record<string, unknown>) => {
++    if (plugin !== 'hub-sync' || !rest.handler) {
++      throw new Error('unexpected')
++    }
++
++    const out = rest.handler(path, opts)
++
++    if (out instanceof Error) {
++      throw out
++    }
++
++    return out
++  })
++}))
++
++const { pluginRest } = await import('@/api/plugins')
++const { $connectionsRegistry } = await import('@/store/connection-registry-state')
++
++const {
++  _resetHubSyncForTests,
++  connectionForHubGateway,
++  HUB_GATEWAY_NAMES_KEY,
++  hubGatewayForConnection,
++  hubRequest,
++  hubSessionOwner,
++  learnHubGatewayName,
++  rememberHubGatewayName
++} = await import('./hub-sync')
++
++function registry(...connections: Array<{ id: string; label?: string; host?: string }>) {
++  $connectionsRegistry.set({
++    connections: connections.map(c => ({ kind: c.id === 'local' ? 'local' : 'ssh', label: c.id, ...c })),
++    primary: 'local'
++  } as never)
++}
++
++beforeEach(() => {
++  _resetHubSyncForTests()
++  vi.mocked(pluginRest).mockClear()
++  rest.handler = null
++})
++
++afterEach(() => {
++  $connectionsRegistry.set(null)
++})
++
++describe('gateway names', () => {
++  it('learns a connection\'s hub name from its own /status and persists it', async () => {
++    registry({ id: 'local' }, { id: 'conn-7', label: 'Studio' })
++    rest.handler = (path, opts) => (path === '/status' && opts.connectionId === 'conn-7' ? { available: true, gateway: 'mini' } : new Error('x'))
++
++    expect(await learnHubGatewayName('conn-7')).toBe(true)
++    expect(hubGatewayForConnection('conn-7')).toBe('mini')
++    expect(connectionForHubGateway('mini')).toBe('conn-7')
++    expect(JSON.parse(localStorage.getItem(HUB_GATEWAY_NAMES_KEY) ?? '{}')).toEqual({ 'conn-7': 'mini' })
++    // cached: no second /status within the TTL
++    await learnHubGatewayName('conn-7')
++    expect(pluginRest).toHaveBeenCalledTimes(1)
++  })
++
++  it('a gateway without hub-sync (or hermes-hub) maps to nothing', async () => {
++    registry({ id: 'local' }, { id: 'cloud' })
++    rest.handler = () => ({ available: false, gateway: null })
++
++    expect(await learnHubGatewayName('cloud')).toBe(false)
++    expect(hubGatewayForConnection('cloud')).toBeUndefined()
++  })
++
++  it('falls back to an id / label / host match, never to a connection that proved another name', () => {
++    registry({ id: 'local' }, { id: 'a1', label: 'Mac mini', host: 'mini.example.com' }, { id: 'macbook' })
++    expect(connectionForHubGateway('mini')).toBe('a1')
++    expect(connectionForHubGateway('macbook')).toBe('macbook')
++    expect(connectionForHubGateway('nowhere')).toBeUndefined()
++    rememberHubGatewayName('a1', 'studio')
++    expect(connectionForHubGateway('mini')).toBeUndefined()
++    expect(connectionForHubGateway('studio')).toBe('a1')
++  })
++
++  it('a re-added connection takes the hub name over', () => {
++    registry({ id: 'local' }, { id: 'new' })
++    rememberHubGatewayName('old', 'mini')
++    rememberHubGatewayName('new', 'mini')
++    expect(connectionForHubGateway('mini')).toBe('new')
++    expect(hubGatewayForConnection('old')).toBeUndefined()
++  })
++})
++
++describe('hubSessionOwner', () => {
++  it('maps the replica owner to its registry connection; own records map to the primary', async () => {
++    registry({ id: 'local' }, { id: 'conn-mini', label: 'mini' })
++    rest.handler = (path, opts) => {
++      expect(opts.connectionId).toBe('local') // reads always go to the window's own gateway
++
++      if (path === '/where/s_remote') {
++        return { available: true, gateway: 'macbook', hits: [{ gateway: 'mini', local: false, profile: 'bb' }] }
++      }
++
++      if (path === '/where/s_own') {
++        return { available: true, gateway: 'macbook', hits: [{ gateway: 'macbook', local: true, profile: 'default' }] }
++      }
++
++      return { available: true, gateway: 'macbook', hits: [] }
++    }
++
++    expect(await hubSessionOwner('s_remote')).toEqual({ connectionId: 'conn-mini', profile: 'bb' })
++    expect(await hubSessionOwner('s_own')).toEqual({ connectionId: 'local', profile: 'default' })
++    expect(await hubSessionOwner('s_unknown')).toBeUndefined()
++    expect(hubGatewayForConnection('local')).toBe('macbook') // every answer names its gateway
++  })
++
++  it('skips excluded connections, prefers live rows over archived copies, caches lookups', async () => {
++    registry({ id: 'local' }, { id: 'mini' }, { id: 'cloud' })
++    rest.handler = () => ({
++      available: true,
++      gateway: 'laptop',
++      hits: [
++        { archived: true, gateway: 'cloud', profile: 'old' },
++        { gateway: 'mini', profile: 'default' }
++      ]
++    })
++
++    expect(await hubSessionOwner('s')).toEqual({ connectionId: 'mini', profile: 'default' })
++    expect(await hubSessionOwner('s', ['mini'])).toEqual({ connectionId: 'cloud', profile: 'old' })
++    expect(pluginRest).toHaveBeenCalledTimes(1)
++  })
++
++  it('an unregistered owner, a missing plugin or an error yields undefined', async () => {
++    registry({ id: 'local' }, { id: 'mini' })
++    rest.handler = () => ({ available: true, gateway: 'laptop', hits: [{ gateway: 'elsewhere', profile: 'x' }] })
++    expect(await hubSessionOwner('a')).toBeUndefined()
++    rest.handler = () => new Error('404 Not Found')
++    expect(await hubSessionOwner('b')).toBeUndefined()
++  })
++})
++
++describe('hubRequest', () => {
++  it('posts to the primary gateway\'s hub-sync', async () => {
++    registry({ id: 'local' }, { id: 'mini' })
++    rest.handler = (path, opts) => ({ id: 'hr-1', path, opts, queued_locally: true, state: 'local' })
++
++    const body = { action: 'archive', coll: 'sessions', gateway: 'mini', key: 'default/s' } as const
++    const res = (await hubRequest(body)) as unknown as { path: string; opts: Record<string, unknown> }
++
++    expect(res.path).toBe('/request')
++    expect(res.opts).toMatchObject({ body, connectionId: 'local', method: 'POST' })
++  })
++})
+diff --git a/apps/desktop/src/store/hub-sync.ts b/apps/desktop/src/store/hub-sync.ts
+new file mode 100644
+index 0000000000..1f16d58cf2
+--- /dev/null
++++ b/apps/desktop/src/store/hub-sync.ts
+@@ -0,0 +1,343 @@
++/**
++ * hermes-hub replica access for the Desktop [daveey].
++ *
++ * Every gateway that runs hermes-hub keeps a local replica (hub.db) of every
++ * gateway's sessions, Inbox cards and Kanban cards, served read-only by the
++ * `hub-sync` backend plugin at `/api/plugins/hub-sync/*` (hermes-mods). This
++ * module is the Desktop's door to it:
++ *
++ *  - reads go to the window's PRIMARY connection (its own gateway, which keeps
++ *    answering while the hub or the other gateways are down);
++ *  - hub gateway names ("mini", "macbook") are mapped to registry connection
++ *    ids by asking each reachable connection's own `/status` (persisted, so a
++ *    gateway that is offline now still maps), with an id/label/host match as
++ *    the fallback;
++ *  - every call is best-effort: a gateway without the plugin, without
++ *    hermes-hub, or unreachable answers `null`, and callers keep their live
++ *    paths. Nothing here ever throws into a caller.
++ */
++import { pluginRest } from '@/api/plugins'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import type { SessionOwnerRoute } from '@/store/session-request-router'
++
++export const HUB_SYNC_PLUGIN = 'hub-sync'
++export const HUB_GATEWAY_NAMES_KEY = 'hermes.desktop.hubGatewayNames.v1'
++const READ_TIMEOUT_MS = 4_000
++const STATUS_TTL_MS = 5 * 60_000
++const WHERE_TTL_MS = 30_000
++
++export interface HubPending {
++  id: string
++  action: string
++  state: string
++  created_at?: number
++}
++
++/** One replica record as hub-sync serves it: the owner's data plus where it
++ *  lives and how fresh it is. `local` = this (primary) gateway's own record. */
++export interface HubRecord {
++  gateway: string
++  key: string
++  version: null | number
++  local: boolean
++  stale: boolean
++  /** Epoch seconds: the newest moment the owner's state is known for. */
++  synced_at: null | number
++  pending?: HubPending[]
++  [field: string]: unknown
++}
++
++export interface HubTask extends HubRecord {
++  id: string
++  board?: string
++  title?: string
++  body?: null | string
++  status?: string
++  priority?: number
++  assignee?: null | string
++  created_at?: number
++  started_at?: null | number
++  completed_at?: null | number
++  comments?: number
++  run?: null | { status?: string; started_at?: number; summary?: string }
++}
++
++export interface HubWhereHit {
++  gateway: string
++  profile?: string
++  session?: string
++  local?: boolean
++  stale?: boolean
++  synced_at?: null | number
++  archived?: boolean
++}
++
++export interface HubRequestBody {
++  gateway: string
++  coll: 'inbox' | 'sessions' | 'tasks'
++  key: string
++  action: string
++  args?: Record<string, unknown>
++  base_version?: null | number
++}
++
++export interface HubRequestResult {
++  id: string
++  queued_locally: boolean
++  state: string
++}
++
++/** The connection whose replica the Desktop reads: the window's own gateway. */
++export function hubReplicaConnectionId(): string {
++  return $connectionsRegistry.get()?.primary?.trim() || 'local'
++}
++
++function registryConnections() {
++  return $connectionsRegistry.get()?.connections ?? []
++}
++
++// ── gateway name ↔ connection id ────────────────────────────────────────────
++
++// In-memory copy for when localStorage is unavailable; storage is re-read on
++// every lookup because the hub-sync desktop plugin learns names too.
++let memoryNames: Record<string, string> = {}
++
++function loadNames(): Record<string, string> {
++  const out: Record<string, string> = { ...memoryNames }
++
++  try {
++    const raw = globalThis.localStorage?.getItem(HUB_GATEWAY_NAMES_KEY)
++    const parsed: unknown = raw ? JSON.parse(raw) : null
++
++    if (parsed && typeof parsed === 'object') {
++      for (const [connectionId, gateway] of Object.entries(parsed as Record<string, unknown>)) {
++        if (typeof gateway === 'string' && gateway.trim()) {
++          out[connectionId] = gateway.trim()
++        }
++      }
++    }
++  } catch {
++    // Corrupt or unavailable storage: the in-memory copy serves.
++  }
++
++  return out
++}
++
++/** Remember that `connectionId` is hub gateway `gateway` (its own /status said so). */
++export function rememberHubGatewayName(connectionId: string, gateway: string): void {
++  const map = loadNames()
++  const id = connectionId.trim()
++  const name = gateway.trim()
++
++  if (!id || !name || map[id] === name) {
++    return
++  }
++
++  // One connection per hub name: a re-added connection takes the name over.
++  for (const [other, value] of Object.entries(map)) {
++    if (value === name) {
++      delete map[other]
++    }
++  }
++
++  map[id] = name
++  memoryNames = map
++
++  try {
++    globalThis.localStorage?.setItem(HUB_GATEWAY_NAMES_KEY, JSON.stringify(map))
++  } catch {
++    // Quota/private mode: the in-memory map still serves this window.
++  }
++}
++
++const norm = (value: unknown): string =>
++  String(value ?? '')
++    .toLowerCase()
++    .replace(/[^a-z0-9]/g, '')
++
++function guessConnection(gateway: string): string | undefined {
++  const want = norm(gateway)
++
++  if (!want) {
++    return undefined
++  }
++
++  const taken = new Set(Object.keys(loadNames()))
++
++  const hit = registryConnections().find(connection => {
++    if (taken.has(connection.id)) {
++      return false // this connection already proved another hub name
++    }
++
++    const host = String((connection as { host?: string }).host ?? '').split('.')[0]
++
++    return [connection.id, connection.label, host].some(candidate => norm(candidate) === want)
++  })
++
++  return hit?.id
++}
++
++/** Registry connection id of hub gateway `gateway`, or undefined when this
++ *  Desktop has no connection for it (an unregistered gateway). */
++export function connectionForHubGateway(gateway: string): string | undefined {
++  const name = gateway.trim()
++  const registered = new Set(registryConnections().map(connection => connection.id))
++  const known = Object.entries(loadNames()).find(([id, value]) => value === name && registered.has(id))
++
++  return known?.[0] ?? guessConnection(name)
++}
++
++/** Hub gateway name of registry connection `connectionId`, when known. */
++export function hubGatewayForConnection(connectionId: string): string | undefined {
++  return loadNames()[connectionId.trim()]
++}
++
++// ── REST ────────────────────────────────────────────────────────────────────
++
++/** GET a hub-sync path; null when unavailable (no plugin, no hermes-hub, error). */
++export async function hubGet<T extends object>(
++  path: string,
++  connectionId: string = hubReplicaConnectionId()
++): Promise<null | T> {
++  try {
++    const result = await pluginRest<T & { available?: boolean }>(HUB_SYNC_PLUGIN, path, {
++      connectionId,
++      timeoutMs: READ_TIMEOUT_MS
++    })
++
++    if (!result || typeof result !== 'object' || result.available === false) {
++      return null
++    }
++
++    // Every hub-sync answer names the gateway that served it.
++    const served = (result as { gateway?: unknown }).gateway
++
++    if (typeof served === 'string') {
++      rememberHubGatewayName(connectionId, served)
++    }
++
++    return result
++  } catch {
++    return null
++  }
++}
++
++const statusChecked = new Map<string, number>()
++
++/** Ask `connectionId` which hub gateway it is (cached STATUS_TTL_MS). True
++ *  when it answered — which also proves the gateway is reachable now. */
++export async function learnHubGatewayName(connectionId: string): Promise<boolean> {
++  const at = statusChecked.get(connectionId)
++
++  if (at && Date.now() - at < STATUS_TTL_MS) {
++    return true
++  }
++
++  const status = await hubGet<{ gateway?: string }>('/status', connectionId)
++
++  if (status?.gateway) {
++    statusChecked.set(connectionId, Date.now())
++
++    return true
++  }
++
++  return false
++}
++
++/** Queue an owner request on the primary gateway (works with the hub down). */
++export async function hubRequest(body: HubRequestBody): Promise<HubRequestResult> {
++  return pluginRest<HubRequestResult>(HUB_SYNC_PLUGIN, '/request', {
++    body,
++    connectionId: hubReplicaConnectionId(),
++    method: 'POST',
++    timeoutMs: 10_000
++  })
++}
++
++// ── session → owner ─────────────────────────────────────────────────────────
++
++const whereCache = new Map<string, { at: number; hits: HubWhereHit[] }>()
++const whereInFlight = new Map<string, Promise<HubWhereHit[]>>()
++
++async function whereHits(id: string): Promise<HubWhereHit[]> {
++  const cached = whereCache.get(id)
++
++  if (cached && Date.now() - cached.at < WHERE_TTL_MS) {
++    return cached.hits
++  }
++
++  let pending = whereInFlight.get(id)
++
++  if (!pending) {
++    pending = hubGet<{ hits?: HubWhereHit[] }>(`/where/${encodeURIComponent(id)}`)
++      .then(result => {
++        const hits = Array.isArray(result?.hits) ? result.hits : []
++        whereCache.set(id, { at: Date.now(), hits })
++
++        return hits
++      })
++      .finally(() => whereInFlight.delete(id))
++    whereInFlight.set(id, pending)
++  }
++
++  return pending
++}
++
++/**
++ * The owner of a stored session id according to the hub replica, as a
++ * registry route, skipping `excluded` connections. Undefined when the replica
++ * doesn't know the id, names a gateway this Desktop has no connection for, or
++ * hub-sync isn't there. Live (non-archived) rows win over archived copies.
++ */
++export async function hubSessionOwner(
++  storedSessionId: string,
++  excluded: Iterable<string> = []
++): Promise<SessionOwnerRoute | undefined> {
++  const id = storedSessionId.trim()
++
++  if (!id) {
++    return undefined
++  }
++
++  const skip = new Set([...excluded].map(connection => connection.trim()))
++  const hits = [...(await whereHits(id))].sort((a, b) => Number(Boolean(a.archived)) - Number(Boolean(b.archived)))
++  const replica = hubReplicaConnectionId()
++
++  for (const hit of hits) {
++    const connectionId = hit.local ? replica : connectionForHubGateway(hit.gateway)
++
++    if (connectionId && !skip.has(connectionId)) {
++      return { connectionId, profile: hit.profile?.trim() || 'default' }
++    }
++  }
++
++  return undefined
++}
++
++/** Kanban cards the replica holds for hub gateway `gateway` on `board`. */
++export async function hubGatewayTasks(gateway: string, board: string, includeClosed = false): Promise<HubTask[] | null> {
++  const params = new URLSearchParams({ board: board || 'default', gateway })
++
++  if (includeClosed) {
++    params.set('all', '1')
++  }
++
++  const result = await hubGet<{ tasks?: HubTask[] }>(`/tasks?${params.toString()}`)
++
++  return Array.isArray(result?.tasks) ? result.tasks : null
++}
++
++/** Test seam: forget every cache (names, status, where). */
++export function _resetHubSyncForTests(): void {
++  memoryNames = {}
++
++  try {
++    globalThis.localStorage?.removeItem(HUB_GATEWAY_NAMES_KEY)
++  } catch {
++    // no storage in this environment
++  }
++
++  statusChecked.clear()
++  whereCache.clear()
++  whereInFlight.clear()
++}
+-- 
+2.55.0
+

@@ -1,0 +1,781 @@
+From ad2b99b2333f0123696e807bbacc7b4fe6c1ee91 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 05:17:38 +0000
+Subject: [PATCH] feat(desktop): sidebar shows offline gateways' sessions from
+ the hermes-hub replica; archive/pin/rename become hub requests [daveey]
+
+---
+ apps/desktop/src/plugins/hub-sync/api.ts      | 110 ++++++++++
+ .../src/plugins/hub-sync/model.test.ts        |  93 ++++++++
+ apps/desktop/src/plugins/hub-sync/model.ts    | 110 ++++++++++
+ apps/desktop/src/plugins/hub-sync/plugin.tsx  |  33 +++
+ .../hub-sync/sessions-section.test.tsx        | 205 ++++++++++++++++++
+ .../src/plugins/hub-sync/sessions-section.tsx | 170 +++++++++++++++
+ 6 files changed, 721 insertions(+)
+ create mode 100644 apps/desktop/src/plugins/hub-sync/api.ts
+ create mode 100644 apps/desktop/src/plugins/hub-sync/model.test.ts
+ create mode 100644 apps/desktop/src/plugins/hub-sync/model.ts
+ create mode 100644 apps/desktop/src/plugins/hub-sync/plugin.tsx
+ create mode 100644 apps/desktop/src/plugins/hub-sync/sessions-section.test.tsx
+ create mode 100644 apps/desktop/src/plugins/hub-sync/sessions-section.tsx
+
+diff --git a/apps/desktop/src/plugins/hub-sync/api.ts b/apps/desktop/src/plugins/hub-sync/api.ts
+new file mode 100644
+index 0000000000..66e322d3cb
+--- /dev/null
++++ b/apps/desktop/src/plugins/hub-sync/api.ts
+@@ -0,0 +1,110 @@
++/**
++ * [daveey] Data side of the hub-sync sidebar section: replica session rows for
++ * gateways that are not live right now, and the owner requests their actions
++ * send. Best-effort throughout: with hub-sync/hermes-hub missing or the hub
++ * down every read answers [] and the live sidebar is untouched.
++ */
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import {
++  connectionForHubGateway,
++  hubGatewayForConnection,
++  hubGet,
++  hubReplicaConnectionId,
++  hubRequest,
++  type HubRequestResult,
++  learnHubGatewayName
++} from '@/store/hub-sync'
++import type { SessionInfo } from '@/types/hermes'
++
++import {
++  type HubSessionAction,
++  type HubSessionRow,
++  type LiveSessionKey,
++  replicaSessionsToShow,
++  sessionRequestBody
++} from './model'
++
++const REPLICA_LIMIT = 300
++
++type LiveRow = Pick<SessionInfo, 'connection_id' | 'id'>
++
++/** Hub gateway name of a live row (untagged rows belong to the primary). */
++function liveRowGateway(row: LiveRow, primary: string): string {
++  const connectionId = row.connection_id?.trim() || primary
++
++  return hubGatewayForConnection(connectionId) ?? connectionId
++}
++
++export function liveSessionKeys(live: readonly LiveRow[]): LiveSessionKey[] {
++  const primary = hubReplicaConnectionId()
++
++  return live.filter(row => row?.id).map(row => ({ gateway: liveRowGateway(row, primary), id: row.id }))
++}
++
++/** Registered non-primary connections that answer hub-sync `/status` now. */
++export async function reachableConnections(): Promise<Set<string>> {
++  const primary = hubReplicaConnectionId()
++  const ids = ($connectionsRegistry.get()?.connections ?? []).map(c => c.id).filter(id => id && id !== primary)
++  const answers = await Promise.all(ids.map(async id => ((await learnHubGatewayName(id)) ? id : null)))
++
++  return new Set(answers.filter((id): id is string => Boolean(id)))
++}
++
++/**
++ * Replica rows the sidebar should add: gateways that neither answered a
++ * status probe nor contributed rows to the live list (unreachable or not
++ * registered on this Desktop), deduped against the live list by (gateway, id).
++ */
++export async function loadReplicaSidebarRows(live: readonly LiveRow[]): Promise<HubSessionRow[]> {
++  const primary = hubReplicaConnectionId()
++  const [result, reachable] = await Promise.all([
++    hubGet<{ sessions?: HubSessionRow[] }>(`/sessions?limit=${REPLICA_LIMIT}`, primary),
++    reachableConnections()
++  ])
++
++  const rows = Array.isArray(result?.sessions) ? result.sessions : []
++
++  if (!rows.length) {
++    return []
++  }
++
++  const liveConnections = new Set(live.map(row => row.connection_id?.trim() || primary))
++  const primaryName = hubGatewayForConnection(primary)
++
++  const isGatewayLive = (gateway: string) => {
++    if (gateway === primaryName) {
++      return true
++    }
++
++    const connectionId = connectionForHubGateway(gateway)
++
++    return Boolean(connectionId && (reachable.has(connectionId) || liveConnections.has(connectionId)))
++  }
++
++  return replicaSessionsToShow(rows, liveSessionKeys(live), isGatewayLive)
++}
++
++/** Queue `action` on the row's owning gateway (offline-safe on the primary). */
++export function sendSessionAction(
++  row: HubSessionRow,
++  action: HubSessionAction,
++  args?: Record<string, unknown>
++): Promise<HubRequestResult> {
++  return hubRequest(sessionRequestBody(row, action, args))
++}
++
++/** Owner route for opening a replica row; null when this Desktop has no
++ *  connection for the row's gateway. */
++export function replicaRowRoute(row: HubSessionRow) {
++  const connectionId = connectionForHubGateway(row.gateway)
++
++  if (!connectionId) {
++    return null
++  }
++
++  const profile = row.profile?.trim() || 'default'
++  const kind = ($connectionsRegistry.get()?.connections ?? []).find(c => c.id === connectionId)?.kind
++  const mode = kind === 'local' ? ('local' as const) : ('remote' as const)
++
++  return { connectionId, mode, profile, targetProfile: profile }
++}
+diff --git a/apps/desktop/src/plugins/hub-sync/model.test.ts b/apps/desktop/src/plugins/hub-sync/model.test.ts
+new file mode 100644
+index 0000000000..4d88f40cd6
+--- /dev/null
++++ b/apps/desktop/src/plugins/hub-sync/model.test.ts
+@@ -0,0 +1,93 @@
++import { describe, expect, it } from 'vitest'
++
++import {
++  type HubSessionRow,
++  isRowPending,
++  markRowPending,
++  replicaSessionsToShow,
++  sessionRequestBody,
++  syncedAgo
++} from './model'
++
++// [daveey] Sidebar rows for sessions on gateways that aren't live right now,
++// read from the window gateway's hermes-hub replica (hub-sync plugin REST).
++
++const row = (gateway: string, id: string, extra: Partial<HubSessionRow> = {}): HubSessionRow => ({
++  gateway,
++  id,
++  key: `default/${id}`,
++  local: false,
++  profile: 'default',
++  stale: false,
++  synced_at: 1_000,
++  title: id,
++  version: 3,
++  ...extra
++})
++
++describe('replicaSessionsToShow', () => {
++  it('shows only gateways that are not live, never the local gateway', () => {
++    const hub = [row('mac', 's_local', { local: true }), row('mini', 's_mini'), row('cloud', 's_cloud')]
++    const shown = replicaSessionsToShow(hub, [], gw => gw === 'cloud')
++
++    expect(shown.map(r => r.id)).toEqual(['s_mini'])
++  })
++
++  it('keeps live data primary: a row the live list already has for that gateway is dropped', () => {
++    const hub = [row('mini', 's_a'), row('mini', 's_b')]
++    const live = [{ gateway: 'mini', id: 's_a' }]
++
++    expect(replicaSessionsToShow(hub, live, () => false).map(r => r.id)).toEqual(['s_b'])
++  })
++
++  it('dedupes by (gateway, session id): same id on another gateway is a different row', () => {
++    const hub = [row('mini', 's_x'), row('mini', 's_x', { key: 'bb/s_x' }), row('cloud', 's_x')]
++    const live = [{ gateway: 'laptop', id: 's_x' }]
++
++    expect(replicaSessionsToShow(hub, live, () => false).map(r => `${r.gateway}:${r.id}`)).toEqual([
++      'mini:s_x',
++      'cloud:s_x'
++    ])
++  })
++
++  it('drops archived and hidden replica rows', () => {
++    const hub = [row('mini', 's_a', { archived: true }), row('mini', 's_b', { hidden: true }), row('mini', 's_c')]
++
++    expect(replicaSessionsToShow(hub, [], () => false).map(r => r.id)).toEqual(['s_c'])
++  })
++})
++
++describe('syncedAgo', () => {
++  it('formats the replica age', () => {
++    const now = 10_000_000
++
++    expect(syncedAgo(now / 1000 - 20, now)).toBe('synced just now')
++    expect(syncedAgo(now / 1000 - 5 * 60, now)).toBe('synced 5m ago')
++    expect(syncedAgo(now / 1000 - 3 * 3600, now)).toBe('synced 3h ago')
++    expect(syncedAgo(now / 1000 - 2 * 86_400, now)).toBe('synced 2d ago')
++    expect(syncedAgo(null, now)).toBe('never synced')
++  })
++})
++
++describe('owner requests', () => {
++  it('builds a sessions request for the owning gateway with the record version', () => {
++    expect(sessionRequestBody(row('mini', 's_a'), 'rename', { title: 'New' })).toEqual({
++      action: 'rename',
++      args: { title: 'New' },
++      base_version: 3,
++      coll: 'sessions',
++      gateway: 'mini',
++      key: 'default/s_a'
++    })
++  })
++
++  it('marks a row pending optimistically and reads the marker back', () => {
++    const rows = [row('mini', 's_a'), row('mini', 's_b')]
++    const next = markRowPending(rows, rows[1], { action: 'archive', id: 'r1', state: 'local' })
++
++    expect(isRowPending(next[0])).toBe(false)
++    expect(isRowPending(next[1])).toBe(true)
++    expect(next[1].pending?.[0].action).toBe('archive')
++    expect(rows[1].pending).toBeUndefined()
++  })
++})
+diff --git a/apps/desktop/src/plugins/hub-sync/model.ts b/apps/desktop/src/plugins/hub-sync/model.ts
+new file mode 100644
+index 0000000000..b7fd34601f
+--- /dev/null
++++ b/apps/desktop/src/plugins/hub-sync/model.ts
+@@ -0,0 +1,110 @@
++/**
++ * [daveey] Pure model for the hub-sync sidebar section: which replica session
++ * rows to show, how old they are, and the owner requests their actions send.
++ * See ./plugin.tsx and ../../store/hub-sync.ts.
++ */
++import type { HubPending, HubRecord, HubRequestBody } from '@/store/hub-sync'
++
++export interface HubSessionRow extends HubRecord {
++  id: string
++  profile?: string
++  title?: null | string
++  source?: null | string
++  activity?: null | number
++  archived?: boolean
++  hidden?: boolean
++  pinned?: boolean
++  running?: boolean
++}
++
++/** A live sidebar row reduced to what dedupe needs: its hub gateway + id. */
++export interface LiveSessionKey {
++  gateway: string
++  id: string
++}
++
++/**
++ * Replica rows worth a sidebar row: other gateways only, never one that is
++ * live right now (its live rows are primary), never a (gateway, id) the live
++ * list already has, archived/hidden dropped, first copy per (gateway, id).
++ */
++export function replicaSessionsToShow(
++  hub: readonly HubSessionRow[],
++  live: readonly LiveSessionKey[],
++  isGatewayLive: (gateway: string) => boolean
++): HubSessionRow[] {
++  const seen = new Set(live.map(entry => `${entry.gateway}\u0000${entry.id}`))
++  const out: HubSessionRow[] = []
++
++  for (const record of hub) {
++    if (!record?.id || record.local || record.archived || record.hidden || isGatewayLive(record.gateway)) {
++      continue
++    }
++
++    const key = `${record.gateway}\u0000${record.id}`
++
++    if (seen.has(key)) {
++      continue
++    }
++
++    seen.add(key)
++    out.push(record)
++  }
++
++  return out
++}
++
++/** "synced 5m ago" from an epoch-seconds stamp. */
++export function syncedAgo(syncedAt: null | number | undefined, nowMs: number = Date.now()): string {
++  if (!syncedAt) {
++    return 'never synced'
++  }
++
++  const seconds = Math.max(0, nowMs / 1000 - syncedAt)
++
++  if (seconds < 60) {
++    return 'synced just now'
++  }
++
++  if (seconds < 3600) {
++    return `synced ${Math.floor(seconds / 60)}m ago`
++  }
++
++  if (seconds < 86_400) {
++    return `synced ${Math.floor(seconds / 3600)}h ago`
++  }
++
++  return `synced ${Math.floor(seconds / 86_400)}d ago`
++}
++
++export type HubSessionAction = 'archive' | 'pin' | 'rename' | 'unpin'
++
++/** The owner request for an action on a replica row (optimistic-concurrency
++ *  checked against the record version the row was read at). */
++export function sessionRequestBody(
++  row: HubSessionRow,
++  action: HubSessionAction,
++  args?: Record<string, unknown>
++): HubRequestBody {
++  return {
++    action,
++    ...(args ? { args } : {}),
++    base_version: row.version,
++    coll: 'sessions',
++    gateway: row.gateway,
++    key: row.key
++  }
++}
++
++/** Copy of `rows` with `target` carrying a pending marker (immutable). */
++export function markRowPending<T extends HubRecord>(rows: readonly T[], target: T, pending: HubPending): T[] {
++  return rows.map(record =>
++    record.gateway === target.gateway && record.key === target.key
++      ? { ...record, pending: [...(record.pending ?? []), pending] }
++      : record
++  )
++}
++
++export function isRowPending(record: Pick<HubRecord, 'pending'>): boolean {
++  return Boolean(record.pending?.some(entry => entry.state === 'local' || entry.state === 'queued'))
++}
+diff --git a/apps/desktop/src/plugins/hub-sync/plugin.tsx b/apps/desktop/src/plugins/hub-sync/plugin.tsx
+new file mode 100644
+index 0000000000..c8d45d5da5
+--- /dev/null
++++ b/apps/desktop/src/plugins/hub-sync/plugin.tsx
+@@ -0,0 +1,33 @@
++/**
++ * [daveey] hub-sync — the Desktop half of the hermes-mods `hub-sync` backend
++ * plugin (REST over this gateway's hermes-hub replica). Contributes the
++ * left-pane "Synced from other gateways" section: sessions of gateways that
++ * are not reachable or not registered right now, with archive / pin / rename
++ * sent as hub owner requests. Renders nothing when hub-sync or hermes-hub is
++ * absent, so it is on by default.
++ */
++import { type HermesPlugin, SIDEBAR_SECTIONS_AREA } from '@hermes/plugin-sdk'
++
++import { $hubSessionsOpen, HubSessionsSection } from './sessions-section'
++
++const plugin: HermesPlugin = {
++  id: 'hub-sync',
++  name: 'Hub Sync',
++  description: "Sessions of gateways that are offline right now, from this gateway's hermes-hub replica.",
++  defaultEnabled: true,
++  register(ctx) {
++    $hubSessionsOpen.set(ctx.storage.get('sessionsOpen', true))
++    ctx.onDispose($hubSessionsOpen.listen(value => ctx.storage.set('sessionsOpen', value)))
++
++    ctx.registerMany([
++      {
++        id: 'sessions',
++        area: SIDEBAR_SECTIONS_AREA,
++        order: 20,
++        render: () => <HubSessionsSection />
++      }
++    ])
++  }
++}
++
++export default plugin
+diff --git a/apps/desktop/src/plugins/hub-sync/sessions-section.test.tsx b/apps/desktop/src/plugins/hub-sync/sessions-section.test.tsx
+new file mode 100644
+index 0000000000..fed31c2268
+--- /dev/null
++++ b/apps/desktop/src/plugins/hub-sync/sessions-section.test.tsx
+@@ -0,0 +1,205 @@
++import { QueryClientProvider } from '@tanstack/react-query'
++import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react'
++import type { ReactElement } from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] Sidebar "Synced" section: sessions of gateways that aren't live
++// right now, read from the window gateway's hermes-hub replica, greyed with a
++// "synced Xm ago" hint; archive/pin/rename become hub owner requests that show
++// a pending marker. Live rows stay primary.
++
++const hub = vi.hoisted(() => ({
++  calls: [] as Array<{ connectionId?: string; body?: unknown; method?: string; path: string }>,
++  reachable: new Set<string>(),
++  sessions: [] as unknown[]
++}))
++
++vi.mock('@/api/plugins', () => ({
++  pluginRest: vi.fn(
++    async (plugin: string, path: string, opts: { body?: unknown; connectionId?: string; method?: string }) => {
++      if (plugin !== 'hub-sync') {
++        throw new Error('unexpected plugin')
++      }
++
++      hub.calls.push({ body: opts.body, connectionId: opts.connectionId, method: opts.method, path })
++
++      if (path === '/status') {
++        if (opts.connectionId === 'local') {
++          return { available: true, gateway: 'laptop' }
++        }
++
++        if (hub.reachable.has(opts.connectionId ?? '')) {
++          return { available: true, gateway: opts.connectionId === 'conn-cloud' ? 'cloud' : 'mini' }
++        }
++
++        throw new Error('unreachable')
++      }
++
++      if (path.startsWith('/sessions')) {
++        return { available: true, gateway: 'laptop', sessions: hub.sessions }
++      }
++
++      if (path === '/request') {
++        return { id: 'hr-9', queued_locally: true, state: 'local' }
++      }
++
++      throw new Error('404')
++    }
++  )
++}))
++
++const openSession = vi.hoisted(() => vi.fn(async () => undefined))
++
++vi.mock('@hermes/plugin-sdk', async importOriginal => {
++  const real = await importOriginal<Record<string, unknown>>()
++
++  return { ...real, host: { ...(real.host as object), openSession } }
++})
++
++const { $connectionsRegistry } = await import('@/store/connection-registry-state')
++const { $sessions } = await import('@/store/session')
++const { queryClient } = await import('@/lib/query-client')
++const { _resetHubSyncForTests, rememberHubGatewayName } = await import('@/store/hub-sync')
++const api = await import('./api')
++const { HubSessionsSection } = await import('./sessions-section')
++
++const render = (ui: ReactElement) => rtlRender(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>)
++
++const now = Math.floor(Date.now() / 1000)
++
++const rec = (gateway: string, id: string, extra: Record<string, unknown> = {}) => ({
++  gateway,
++  id,
++  key: `default/${id}`,
++  local: false,
++  profile: 'default',
++  stale: false,
++  synced_at: now - 5 * 60,
++  title: `Title ${id}`,
++  version: 4,
++  ...extra
++})
++
++beforeEach(() => {
++  _resetHubSyncForTests()
++  hub.calls = []
++  hub.reachable = new Set()
++  hub.sessions = []
++  openSession.mockClear()
++  $connectionsRegistry.set({
++    connections: [
++      { id: 'local', kind: 'local', label: 'Laptop' },
++      { id: 'conn-mini', kind: 'ssh', label: 'Mini' },
++      { id: 'conn-cloud', kind: 'remote', label: 'Cloud' }
++    ],
++    primary: 'local'
++  } as never)
++  rememberHubGatewayName('local', 'laptop')
++  rememberHubGatewayName('conn-mini', 'mini')
++  rememberHubGatewayName('conn-cloud', 'cloud')
++  $sessions.set([])
++})
++
++afterEach(() => {
++  cleanup()
++  queryClient.clear()
++  $connectionsRegistry.set(null)
++  $sessions.set([])
++})
++
++describe('loadReplicaSidebarRows', () => {
++  it('reads the replica on the window gateway and keeps only gateways that are not live', async () => {
++    hub.reachable = new Set(['conn-cloud'])
++    hub.sessions = [rec('laptop', 's_own', { local: true }), rec('mini', 's_mini'), rec('cloud', 's_cloud'), rec('nas', 's_nas')]
++
++    const rows = await api.loadReplicaSidebarRows([])
++
++    expect(rows.map((r: { gateway: string; id: string }) => `${r.gateway}:${r.id}`)).toEqual(['mini:s_mini', 'nas:s_nas'])
++    expect(hub.calls.find(c => c.path.startsWith('/sessions'))?.connectionId).toBe('local')
++  })
++
++  it('treats a gateway whose rows are in the live list as live even when its status probe fails', async () => {
++    hub.sessions = [rec('mini', 's_mini'), rec('mini', 's_mini2')]
++    const live = [{ connection_id: 'conn-mini', id: 's_mini' }] as never
++
++    expect(await api.loadReplicaSidebarRows(live)).toEqual([])
++  })
++
++  it('answers no rows when hub-sync is unavailable (hub down never breaks the sidebar)', async () => {
++    hub.sessions = []
++
++    expect(await api.loadReplicaSidebarRows([])).toEqual([])
++  })
++})
++
++describe('HubSessionsSection', () => {
++  it('renders greyed replica rows with the synced hint and nothing when empty', async () => {
++    const { container } = render(<HubSessionsSection />)
++
++    await waitFor(() => expect(hub.calls.some(c => c.path.startsWith('/sessions'))).toBe(true))
++    expect(container.textContent).toBe('')
++    cleanup()
++
++    hub.sessions = [rec('mini', 's_mini')]
++    queryClient.clear()
++    render(<HubSessionsSection />)
++
++    expect(await screen.findByText('Title s_mini')).toBeTruthy()
++    expect(screen.getByText('synced 5m ago')).toBeTruthy()
++  })
++
++  it('archive sends a hub request with base_version and marks the row pending', async () => {
++    hub.sessions = [rec('mini', 's_mini')]
++    render(<HubSessionsSection />)
++
++    await screen.findByText('Title s_mini')
++    fireEvent.click(screen.getByLabelText('Archive on mini (via hub)'))
++
++    await waitFor(() => expect(hub.calls.some(c => c.path === '/request')).toBe(true))
++    const request = hub.calls.find(c => c.path === '/request')
++
++    expect(request).toMatchObject({
++      body: { action: 'archive', base_version: 4, coll: 'sessions', gateway: 'mini', key: 'default/s_mini' },
++      connectionId: 'local',
++      method: 'POST'
++    })
++    expect(await screen.findByText('pending')).toBeTruthy()
++  })
++
++  it('rename edits inline and sends the new title', async () => {
++    hub.sessions = [rec('mini', 's_mini')]
++    render(<HubSessionsSection />)
++
++    await screen.findByText('Title s_mini')
++    fireEvent.click(screen.getByLabelText('Rename on mini (via hub)'))
++    const input = screen.getByDisplayValue('Title s_mini')
++    fireEvent.change(input, { target: { value: 'Renamed' } })
++    fireEvent.keyDown(input, { key: 'Enter' })
++
++    await waitFor(() => expect(hub.calls.some(c => c.path === '/request')).toBe(true))
++    expect(hub.calls.find(c => c.path === '/request')?.body).toMatchObject({ action: 'rename', args: { title: 'Renamed' } })
++  })
++
++  it('pin on an unpinned row asks for pin; a pinned row asks for unpin', async () => {
++    hub.sessions = [rec('mini', 's_a'), rec('mini', 's_b', { pinned: true })]
++    render(<HubSessionsSection />)
++
++    await screen.findByText('Title s_a')
++    const pins = screen.getAllByLabelText(/^(Pin|Unpin) on mini/)
++    fireEvent.click(pins[1])
++
++    await waitFor(() => expect(hub.calls.some(c => c.path === '/request')).toBe(true))
++    expect(hub.calls.find(c => c.path === '/request')?.body).toMatchObject({ action: 'unpin', key: 'default/s_b' })
++  })
++
++  it('opens a row on its own gateway through the owner route', async () => {
++    hub.sessions = [rec('mini', 's_mini', { profile: 'bb', key: 'bb/s_mini' })]
++    render(<HubSessionsSection />)
++
++    fireEvent.click(await screen.findByText('Title s_mini'))
++
++    expect(openSession).toHaveBeenCalledWith('s_mini', {
++      route: { connectionId: 'conn-mini', mode: 'remote', profile: 'bb', targetProfile: 'bb' }
++    })
++  })
++})
+diff --git a/apps/desktop/src/plugins/hub-sync/sessions-section.tsx b/apps/desktop/src/plugins/hub-sync/sessions-section.tsx
+new file mode 100644
+index 0000000000..c578cfaa96
+--- /dev/null
++++ b/apps/desktop/src/plugins/hub-sync/sessions-section.tsx
+@@ -0,0 +1,170 @@
++/**
++ * [daveey] Left-pane "Synced" section: sessions on gateways that are not live
++ * right now (unreachable, or not registered on this Desktop), read from the
++ * window gateway's hermes-hub replica. Rows are greyed with a "synced Xm ago"
++ * hint; archive / pin / rename queue an owner request through hub-sync (works
++ * with the hub down, sent when it's back) and show a pending marker until the
++ * owner applies it. Live rows stay primary: a gateway whose rows are in the
++ * live sidebar never appears here. Hidden when there is nothing to show.
++ */
++import {
++  atom,
++  Codicon,
++  host,
++  SidebarSection,
++  SidebarSectionRow,
++  useQuery,
++  useValue
++} from '@hermes/plugin-sdk'
++import { type KeyboardEvent, type MouseEvent, useState } from 'react'
++
++import { $sessions } from '@/store/session'
++
++import { loadReplicaSidebarRows, replicaRowRoute, sendSessionAction } from './api'
++import { type HubSessionAction, type HubSessionRow, isRowPending, markRowPending, syncedAgo } from './model'
++
++export const $hubSessionsOpen = atom<boolean>(true)
++
++const INITIAL_ROWS = 8
++const LOAD_STEP = 10
++const POLL_MS = 60_000
++
++const rowKey = (row: HubSessionRow) => `${row.gateway}\u0000${row.key}`
++
++function ActionButton({ icon, label, onClick }: { icon: string; label: string; onClick: () => void }) {
++  return (
++    <button
++      aria-label={label}
++      className="flex size-5 items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
++      onClick={(event: MouseEvent) => {
++        event.stopPropagation()
++        onClick()
++      }}
++      title={label}
++      type="button"
++    >
++      <Codicon name={icon} size="0.75rem" />
++    </button>
++  )
++}
++
++export function HubSessionsSection() {
++  const live = useValue($sessions)
++  const open = useValue($hubSessionsOpen)
++  const [visible, setVisible] = useState(INITIAL_ROWS)
++  const [optimistic, setOptimistic] = useState<Record<string, HubSessionRow>>({})
++  const [renaming, setRenaming] = useState<null | string>(null)
++  const [draft, setDraft] = useState('')
++
++  const liveIds = live.map(row => `${row.connection_id ?? ''}:${row.id}`).join(',')
++
++  const { data: rows } = useQuery({
++    queryFn: () => loadReplicaSidebarRows(live),
++    queryKey: ['hub-sync', 'sidebar-sessions', liveIds],
++    refetchInterval: POLL_MS
++  })
++
++  if (!rows?.length) {
++    return null
++  }
++
++  const shown = rows.map(row => optimistic[rowKey(row)] ?? row)
++
++  const act = async (row: HubSessionRow, action: HubSessionAction, args?: Record<string, unknown>) => {
++    try {
++      const result = await sendSessionAction(row, action, args)
++      const [next] = markRowPending([row], row, { action, id: result.id, state: result.state })
++      setOptimistic(prev => ({ ...prev, [rowKey(row)]: { ...next, ...(action === 'rename' ? { title: String(args?.title ?? '') } : {}) } }))
++    } catch (error) {
++      console.warn('[hub-sync] owner request failed', error)
++    }
++  }
++
++  const commitRename = (row: HubSessionRow) => {
++    const title = draft.trim()
++    setRenaming(null)
++
++    if (title && title !== (row.title ?? '')) {
++      void act(row, 'rename', { title })
++    }
++  }
++
++  return (
++    <SidebarSection
++      count={shown.length}
++      hiddenCount={Math.max(0, shown.length - visible)}
++      label="Synced from other gateways"
++      loadMoreStep={LOAD_STEP}
++      onLoadMore={() => setVisible(n => n + LOAD_STEP)}
++      onToggle={() => $hubSessionsOpen.set(!open)}
++      open={open}
++    >
++      {shown.slice(0, visible).map(row => {
++        const key = rowKey(row)
++        const label = row.title?.trim() || row.id
++        const pending = isRowPending(row)
++        const age = syncedAgo(row.synced_at)
++        const route = replicaRowRoute(row)
++
++        if (renaming === key) {
++          return (
++            <input
++              aria-label={`New title for ${label}`}
++              autoFocus
++              className="mx-2 my-px h-6 rounded border border-(--ui-border) bg-transparent px-1.5 text-xs"
++              key={key}
++              onBlur={() => commitRename(row)}
++              onChange={event => setDraft(event.target.value)}
++              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
++                if (event.key === 'Enter') {
++                  commitRename(row)
++                } else if (event.key === 'Escape') {
++                  setRenaming(null)
++                }
++              }}
++              value={draft}
++            />
++          )
++        }
++
++        return (
++          <SidebarSectionRow
++            actions={
++              <>
++                <ActionButton
++                  icon={row.pinned ? 'pinned' : 'pin'}
++                  label={`${row.pinned ? 'Unpin' : 'Pin'} on ${row.gateway} (via hub)`}
++                  onClick={() => void act(row, row.pinned ? 'unpin' : 'pin')}
++                />
++                <ActionButton
++                  icon="edit"
++                  label={`Rename on ${row.gateway} (via hub)`}
++                  onClick={() => {
++                    setDraft(label)
++                    setRenaming(key)
++                  }}
++                />
++                <ActionButton
++                  icon="archive"
++                  label={`Archive on ${row.gateway} (via hub)`}
++                  onClick={() => void act(row, 'archive')}
++                />
++              </>
++            }
++            icon={pending ? 'sync' : 'cloud'}
++            key={key}
++            label={label}
++            meta={pending ? 'pending' : age}
++            muted
++            onSelect={() => {
++              if (route) {
++                void host.openSession(row.id, { route })
++              }
++            }}
++            tip={`${label} — ${row.gateway} is not reachable; ${age}${pending ? ' · change pending' : ''}${route ? '' : ' · not registered on this Desktop'}`}
++          />
++        )
++      })}
++    </SidebarSection>
++  )
++}
+-- 
+2.55.0
+

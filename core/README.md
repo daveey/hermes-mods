@@ -97,6 +97,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [plugin-dir-conflicts.md](plugin-dir-conflicts.md) | 0210 | Plugin discovery skips backup-named dirs (`*.bak*`, `*.orig`, `*.old`) and resolves same-name manifests deterministically (basename match wins); `plugins list` and `doctor` show ignored/shadowed copies |
 | [kanban-worker-session-id.md](kanban-worker-session-id.md) | 0211 | Task detail API gives each run its `worker_session_id`, so clients open the worker's transcript, not the creating chat |
 | [kanban-failure-notices.md](kanban-failure-notices.md) | 0213 0214 | Kanban `gave_up` / `crashed` / `timed_out` notices (Desktop and messaging gateway) name the real cause (model refusal, provider configuration, no result reported, launch failure, time limit, process exit), promise a retry only when the event records one, and make no unsupported fallback claims |
+| [hub-sync-replica.md](hub-sync-replica.md) | 0215 0216 | Desktop reads the hermes-hub replica (hub-sync plugin): owner lookup without probing, Kanban falls back to the replica for an unreachable gateway, and a "Synced from other gateways" sidebar section whose archive/pin/rename queue hub requests (pending marker) |
 
 ## Applying
 
