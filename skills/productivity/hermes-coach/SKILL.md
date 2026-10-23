@@ -164,12 +164,27 @@ Undone notices are always plain cards.
   stale capability claim such as a too-narrow token scope, produces the asks, and cron runs bypass the ask-gate.
   After narrowing a detector, diff the old and new hit lists and explain every dropped hit. Structural rules like
   "skip a session's first turn" drop real hits, because a new session can open by answering an ask from another session.
-- Reviewing the weekly `had_to_ask_fix` hits: replay them through `self_heal.complaint_verdict` the way the backstop
-  sees them (digest text, `prev`, `backstop_context`) and through the in-process path, then read the per-stage scores:
-  `[0.9, 0.0]` with a `product_bug` strict stage is the cascade's product-bug scoping (a policy question, not a
-  detector bug), an empty strict answer is a judge failure. On the hub, run any replay under the cron interpreter
-  (`cron.scheduler_script._posix_cron_script_argv`); a bare `python3` lacks ruamel, `aux_judge` raises, and the
-  fail-open detector silently scores every turn "no defect".
+- Reviewing the weekly `had_to_ask_fix` hits, in order:
+  1. Compare the week with the ship dates (`git log --reverse -- plugins/coach/self_heal.py plugins/ask-gate`) and the
+     lane mode (`coach/selfheal-config.json`, `coach/log.jsonl` events): hits from before a mechanism shipped, or while
+     it was in shadow, are not detector misses. Say so, then judge today's detector by replaying them.
+  2. For ask-me hits, look for an earlier review first (`plugins/ask-gate/tests/fixtures/week_<monday>.json`). If its
+     tests pass, the root-cause work is already done; don't redo it.
+  3. Replay through `self_heal.complaint_verdict` the way the backstop sees them (digest text, `prev`,
+     `backstop_context`) and read the per-stage scores. A `[0.9, 0.0]` with a `product_bug` strict stage is the
+     product-bug scoping (Baby Bear hits are `had_to_ask_fix_bb` and go to bb-tuner, not the lane). An empty strict
+     answer is a judge failure. Run the same variants over ~150 random real turns from that week as a control, and
+     read the extra hits before calling them false positives: many random turns are real complaints.
+  4. On the hub, run any replay under the cron interpreter (`cron.scheduler_script._posix_cron_script_argv`). A bare
+     `python3` lacks ruamel, so `aux_judge` raises and the fail-open detector silently scores every turn "no defect".
+  5. Long replays (>5 min) go to a background terminal with notify. A foreground call past the tool timeout dies
+     without output.
+- Changing bb-tuner's pre-run or SOUL (it runs on the hub, profile `bb-tuner`): the source is
+  `hosts/hermes-hub/bb-tuner/` in daveey/hermes@state. The hub's `repos/hermes-state` clone is sparse to skills only,
+  so make a scratch `--filter=blob:none` sparse clone of that path. Auth it with the bb-tuner `.env` `GITHUB_TOKEN`
+  as `-c http.extraHeader="Authorization: Basic <b64 x-access-token:TOK>"` (the same as `scripts/skills_sync.sh`).
+  Diff it against the live `profiles/bb-tuner/{SOUL.md,scripts/}` first, add a `tests/` case, then commit, push, and
+  copy the files into the live profile.
 - Exclude shared team-bot profiles with a glob (`coach_feed --exclude-profile 'alpha*'`): they hold other people's
   conversations, and a Slack follower runs as `source=cli`, so each teammate message counts as a user turn and its
   frustration/stuck/repeat_fix signals inflate the host's KPIs. An exact name (`alpha`) missed the sibling
