@@ -1,0 +1,281 @@
+From 8d58a86237f061e86490151362369977a3598fbd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:21:01 -0700
+Subject: [PATCH] fix(kanban): gateway failure notices share the classifier;
+ retry/refusal claims only when recorded [daveey]
+
+Messaging-gateway gave_up/crashed/timed_out now use describe_failure; retry is promised only
+when retry_status is ready/review; removed the unsupported 'no alternate provider' claim;
+terminal_provider no longer names a credential.
+---
+ gateway/kanban_watchers_notifier.py           | 24 ++++++-----
+ hermes_cli/kanban_failure_summary.py          | 27 ++++++++----
+ .../test_kanban_failure_notice_gateway.py     | 42 +++++++++++++++++++
+ tests/gateway/test_kanban_notifier.py         |  4 +-
+ .../test_kanban_failure_notice_text.py        | 29 ++++++++++---
+ tui_gateway/session_notifications.py          |  7 +++-
+ 6 files changed, 106 insertions(+), 27 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_failure_notice_gateway.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index c8b852b675..f62e7e8800 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -449,20 +449,24 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
+     return msg, None, None
+ 
+ 
+-def _fmt_gave_up(ev, n) -> tuple:
+-    # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
+-    # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
+-    failures = _payload(ev, "failures")
+-    count = (t("gateway.kanban.ping.failed_n_times", count=int(failures)) if failures
+-             else t("gateway.kanban.ping.kept_failing"))
+-    last = _clip(ev, "error", "gateway.kanban.ping.last_error", 160)
+-    return t("gateway.kanban.ping.gave_up", head=n.head, count=count, last=last, task_id=n.task_id), None, None
++def _fmt_failure(kind: str):
++    """gave_up / crashed notice via the shared classifier: real cause, recorded retry state, no
++    unsupported promises. [daveey]"""
++    def fmt(ev, n) -> tuple:
++        from hermes_cli.kanban_failure_summary import describe_failure
++        body = describe_failure(kind, n.title, ev.payload or {})
++        return f"✖ {n.head}{body}\nLogs: `hermes kanban log {n.task_id}`.", None, None
++    return fmt
+ 
+ 
+ def _fmt_timed_out(ev, n) -> tuple:
+     limit = int(_payload(ev, "limit_seconds") or 0)
+     minutes = max(1, round(limit / 60)) if limit else 0
+     span = t("gateway.kanban.ping.limit_minutes", minutes=minutes) if minutes else t("gateway.kanban.ping.limit_generic")
++    from hermes_cli.kanban_failure_summary import retry_promised
++    if not retry_promised(ev.payload or {}):
++        # The localized notice promises an automatic retry; only the recorded retry policy may.
++        return f"⏱ {n.head} ran past {span} and was stopped; retry state was not recorded.", None, None
+     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
+ 
+ 
+@@ -475,8 +479,8 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+         t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
+         None, None,
+     ),
+-    "gave_up": _fmt_gave_up,
+-    "crashed": lambda ev, n: (t("gateway.kanban.ping.crashed", head=n.head), None, None),
++    "gave_up": _fmt_failure("gave_up"),
++    "crashed": _fmt_failure("crashed"),
+     "timed_out": _fmt_timed_out,
+     "status": lambda ev, n: (t("gateway.kanban.ping.status", head=n.head, status=_payload(ev, "status") or ""), None, None),
+     "review_requested": _fmt_review_requested,
+diff --git a/hermes_cli/kanban_failure_summary.py b/hermes_cli/kanban_failure_summary.py
+index b4b94ac420..55356222fd 100644
+--- a/hermes_cli/kanban_failure_summary.py
++++ b/hermes_cli/kanban_failure_summary.py
+@@ -63,7 +63,7 @@ def classify_failure(kind: str, payload: Mapping[str, Any]) -> str:
+ 
+ _CAUSE = {
+     "provider_refusal": "the model refused the request (provider safety refusal), not a launch failure",
+-    "provider_config": "the provider rejected this profile's credential or model",
++    "provider_config": "the provider reported an unrecoverable configuration problem for this profile",
+     "protocol_violation": "the worker finished without reporting a result to the board",
+     "spawn_failed": "the worker could not be launched",
+     "timed_out": "the worker hit its time limit",
+@@ -86,6 +86,11 @@ def _details(payload: Mapping[str, Any]) -> str:
+     return "; ".join(parts)
+ 
+ 
++def retry_promised(payload: Mapping[str, Any]) -> bool:
++    """True only when the event records that the task went back to a dispatchable phase."""
++    return str(payload.get("retry_status") or "") in ("ready", "review")
++
++
+ def describe_failure(kind: str, title: str, payload: Mapping[str, Any]) -> str:
+     """Notice body (everything after ``Kanban <id>``) for a ``gave_up`` or ``crashed`` event."""
+     cls = classify_failure(kind, payload)
+@@ -96,18 +101,24 @@ def describe_failure(kind: str, title: str, payload: Mapping[str, Any]) -> str:
+     if failures:
+         attempts = f"{failures} of {limit}" if limit else str(failures)
+ 
++    retry = str(payload.get("retry_status") or "")
+     if kind == "gave_up":
+-        state = f"stopped after {attempts} failed attempt(s); task is Blocked, no automatic retries left" \
+-            if attempts else "stopped after repeated failed attempts; task is Blocked, no automatic retries left"
++        state = (f"stopped after {attempts} failed attempt(s); task is Blocked" if attempts
++                 else "stopped after repeated failed attempts; task is Blocked")
++    elif retry == "blocked" or cls == "provider_config":
++        state = "task is Blocked"
++    elif retry_promised(payload):
++        # Only the recorded retry policy may promise a retry.
++        state = f"task returned to {retry}; the dispatcher's normal retry policy applies"
+     else:
+-        retry = str(payload.get("retry_status") or "")
+-        state = ("dispatcher will retry automatically" if retry != "blocked"
+-                 else "task is Blocked")
++        state = "retry state was not recorded"
+ 
+     if cls == "provider_config":
+-        who = "Fix the provider credential/model in this profile's config, then unblock the task."
++        # Exit 78 is raised for several provider reasons (auth, model not found, TLS, upstream
++        # block) and the event does not record which one, so do not name a specific cause.
++        who = "Check this profile's provider configuration (the worker log has the exact reason), then unblock the task."
+     elif cls == "provider_refusal":
+-        who = (f"{NO_USER_ACTION} The refusal is kept as-is; no alternate provider is tried automatically.")
++        who = "The model's refusal needs review before this task is retried; it is reported as-is."
+     else:
+         who = NO_USER_ACTION
+ 
+diff --git a/tests/gateway/test_kanban_failure_notice_gateway.py b/tests/gateway/test_kanban_failure_notice_gateway.py
+new file mode 100644
+index 0000000000..7e552e6e52
+--- /dev/null
++++ b/tests/gateway/test_kanban_failure_notice_gateway.py
+@@ -0,0 +1,42 @@
++"""Gateway (messaging) gave_up/crashed/timed_out notices share the classifier and make no unsupported promises."""
++
++from types import SimpleNamespace
++
++from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
++
++REFUSAL = "Model declined this request (safety refusal)."
++
++
++def _note(kind, payload):
++    n = SimpleNamespace(head="[Kanban t_x]", title="Do the thing", task_id="t_x")
++    return _EVENT_FORMATTERS[kind](SimpleNamespace(kind=kind, payload=payload), n)[0]
++
++
++def test_gave_up_refusal_is_named_and_not_a_generic_failure():
++    text = _note("gave_up", {"failures": 3, "effective_limit": 3, "error": REFUSAL,
++                             "trigger_outcome": "crashed", "retry_status": "ready"})
++    assert "model refused the request" in text and "refusal needs review" in text
++    assert "3 of 3" in text and "alternate provider" not in text
++    assert "hermes kanban log t_x" in text
++
++
++def test_crashed_without_retry_status_makes_no_retry_promise():
++    text = _note("crashed", {"pid": 5, "exit_code": 1})
++    assert "retry state was not recorded" in text
++    assert "retried automatically" not in text and "will retry" not in text
++
++
++def test_crashed_with_ready_retry_status_defers_to_policy():
++    text = _note("crashed", {"pid": 5, "retry_status": "ready"})
++    assert "retry policy applies" in text
++
++
++def test_connection_refused_crash_is_not_a_model_refusal():
++    text = _note("gave_up", {"failures": 3, "error": "connect: Connection refused"})
++    assert "model refused" not in text
++
++
++def test_timed_out_retry_claim_only_when_recorded():
++    assert "retried automatically" in _note("timed_out", {"limit_seconds": 600, "retry_status": "ready"})
++    text = _note("timed_out", {"limit_seconds": 600})
++    assert "retried automatically" not in text and "not recorded" in text
+diff --git a/tests/gateway/test_kanban_notifier.py b/tests/gateway/test_kanban_notifier.py
+index 81dd385a6c..6cb9054057 100644
+--- a/tests/gateway/test_kanban_notifier.py
++++ b/tests/gateway/test_kanban_notifier.py
+@@ -324,7 +324,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
+ 
+     # First crash delivered.
+     assert len(adapter.sent) == 1
+-    assert "stopped unexpectedly" in adapter.sent[0]["text"].lower()
++    assert "exited unexpectedly" in adapter.sent[0]["text"].lower()
+ 
+     # Subscription survives — the cursor advanced past event #1, but the
+     # row is still there.
+@@ -352,7 +352,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
+         f"Second crashed event should also notify; got {len(adapter.sent)} "
+         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
+     )
+-    assert "stopped unexpectedly" in adapter.sent[1]["text"].lower()
++    assert "exited unexpectedly" in adapter.sent[1]["text"].lower()
+ 
+ 
+ def test_notifier_subscription_survives_done_reopen_until_archive(
+diff --git a/tests/tui_gateway/test_kanban_failure_notice_text.py b/tests/tui_gateway/test_kanban_failure_notice_text.py
+index 6d69329762..4793a465fb 100644
+--- a/tests/tui_gateway/test_kanban_failure_notice_text.py
++++ b/tests/tui_gateway/test_kanban_failure_notice_text.py
+@@ -28,8 +28,8 @@ def test_gave_up_after_refusal_is_a_refusal_not_a_spawn_failure():
+     assert "refused" in head and "refusal" in head
+     assert "spawn" not in head.lower()
+     assert "3 of 3" in head and "Blocked" in head
+-    assert "Hermes needs to recover; no user action identified." in head
+-    assert "no alternate provider is tried automatically" in head
++    assert "refusal needs review" in head
++    assert "alternate provider" not in text and "no user action" not in head
+     # raw material lives only under Details, with ANSI stripped
+     assert "pid" not in head and "\x1b" not in text and "pid 4242" in text.split("Details:")[1]
+ 
+@@ -38,7 +38,7 @@ def test_generic_crash_event_names_title_retry_and_owner():
+     text = _text("crashed", {"pid": 99, "exit_kind": "nonzero_exit", "exit_code": 137, "retry_status": "ready"})
+     head = _headline(text)
+     assert "Fix notification wording" in head and "exited unexpectedly" in head
+-    assert "dispatcher will retry automatically" in head
++    assert "retry policy applies" in head
+     assert "pid gone" not in text and "pid" not in head
+     assert "no user action identified" in head
+     assert "pid 99" in text.split("Details:")[1]
+@@ -46,7 +46,7 @@ def test_generic_crash_event_names_title_retry_and_owner():
+ 
+ def test_crash_with_refusal_output_is_classified_as_refusal_and_retry_stated():
+     text = _text("crashed", {"pid": 7, "worker_output": "Model declined: safety refusal", "retry_status": "ready"})
+-    assert "refused" in _headline(text) and "will retry" in _headline(text)
++    assert "refused" in _headline(text) and "retry policy applies" in _headline(text)
+ 
+ 
+ def test_true_spawn_failure_still_says_spawn():
+@@ -68,7 +68,8 @@ def test_terminal_provider_config_is_the_one_actionable_ask():
+     text = _text("gave_up", {"failures": 1, "terminal_provider": True, "trigger_outcome": "crashed",
+                              "error": "pid 5 exited on a terminal provider error"})
+     head = _headline(text)
+-    assert "credential or model" in head and "Fix the provider credential/model" in head
++    assert "provider configuration" in head and "task is Blocked" in head
++    assert "credential" not in head  # exit 78 does not record which provider reason fired
+     assert "no user action" not in head
+ 
+ 
+@@ -83,3 +84,21 @@ def test_poller_marks_failure_notices_diagnostic():
+ 
+     for kind in ("gave_up", "crashed"):
+         assert diagnostic_event(SimpleNamespace(kind=kind, payload={}))
++
++
++def test_missing_or_todo_retry_status_makes_no_retry_promise():
++    for payload in ({"pid": 1}, {"pid": 1, "retry_status": "todo"}):
++        head = _headline(_text("crashed", payload))
++        assert "retry state was not recorded" in head and "will retry" not in head
++        assert "retry policy applies" not in head
++
++
++def test_blocked_retry_status_says_blocked():
++    assert "task is Blocked" in _headline(_text("crashed", {"retry_status": "blocked"}))
++
++
++def test_timed_out_promises_retry_only_when_recorded():
++    assert "will retry" in _text("timed_out", {"limit_seconds": 60, "retry_status": "ready"})
++    for payload in ({"limit_seconds": 60}, {"limit_seconds": 60, "retry_status": "todo"}):
++        text = _text("timed_out", payload)
++        assert "will retry" not in text and "not recorded" in text
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 9300879878..05e0b5433e 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -339,9 +339,12 @@ def _kb_completed(task, payload: dict, title: str) -> str:
+ 
+ 
+ def _kb_timed_out(task, payload: dict, title: str) -> str:
++    from hermes_cli.kanban_failure_summary import retry_promised
++    limit = 0
+     with contextlib.suppress(TypeError, ValueError):
+-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
+-    return " timed out (max_runtime=0s); will retry"
++        limit = int(payload.get("limit_seconds") or 0)
++    tail = "; will retry" if retry_promised(payload) else "; retry state was not recorded"
++    return f" timed out (max_runtime={limit}s){tail}"
+ 
+ 
+ def _kb_failure(kind: str, payload: dict, title: str) -> str:
+-- 
+2.55.0
+

@@ -96,6 +96,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-delegate-marker-owner.md](kanban-delegate-marker-owner.md) | 0208 | The delegate-child env marker counts only while its owner process is alive and an ancestor of the reader; a process outside the lineage drops the leaked agent-scope env once instead of being fenced |
 | [plugin-dir-conflicts.md](plugin-dir-conflicts.md) | 0210 | Plugin discovery skips backup-named dirs (`*.bak*`, `*.orig`, `*.old`) and resolves same-name manifests deterministically (basename match wins); `plugins list` and `doctor` show ignored/shadowed copies |
 | [kanban-worker-session-id.md](kanban-worker-session-id.md) | 0211 | Task detail API gives each run its `worker_session_id`, so clients open the worker's transcript, not the creating chat |
+| [kanban-failure-notices.md](kanban-failure-notices.md) | 0213 0214 | Kanban `gave_up` / `crashed` / `timed_out` notices (Desktop and messaging gateway) name the real cause (model refusal, provider configuration, no result reported, launch failure, time limit, process exit), promise a retry only when the event records one, and make no unsupported fallback claims |
 
 ## Applying
 

@@ -1,0 +1,261 @@
+From 7df80b4cf12cee8c1793331d6afce86659cf8936 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:13:32 -0700
+Subject: [PATCH] fix(kanban): gave_up/crashed notices name the real cause,
+ retry state and owner [daveey]
+
+A model safety refusal after minutes of work was shown as 'gave up after
+repeated spawn failures' / 'worker crashed (pid gone)'. Classify refusal vs
+crash vs real spawn failure vs provider config; pid/exit/raw output go under
+Details only. No retry or provider-routing behaviour changes.
+---
+ hermes_cli/kanban_failure_summary.py          | 117 ++++++++++++++++++
+ .../test_kanban_failure_notice_text.py        |  85 +++++++++++++
+ tui_gateway/session_notifications.py          |  11 +-
+ 3 files changed, 210 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_failure_summary.py
+ create mode 100644 tests/tui_gateway/test_kanban_failure_notice_text.py
+
+diff --git a/hermes_cli/kanban_failure_summary.py b/hermes_cli/kanban_failure_summary.py
+new file mode 100644
+index 0000000000..b4b94ac420
+--- /dev/null
++++ b/hermes_cli/kanban_failure_summary.py
+@@ -0,0 +1,117 @@
++"""Plain-language classification of kanban ``gave_up`` / ``crashed`` events for user-facing notices.
++
++The dispatcher records every non-success worker outcome as ``crashed`` (process died, any exit code) or
++``spawn_failed`` (the launch itself failed) and then, after the failure budget, ``gave_up``. A worker that
++ran for minutes and then exited because the model refused the request is a ``crashed`` outcome with the
++refusal text in ``error`` / ``worker_output`` — it is NOT a spawn failure and the user can do nothing about it.
++
++This module only reads event payloads and words them. It never retries, re-routes providers, or touches
++safety refusals: a refusal is reported as a refusal and left to the dispatcher's normal bounded policy.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import Any, Mapping
++
++_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
++_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
++
++# Provider/model refusals. Deliberately specific: a bare "refused" also matches "connection refused".
++_REFUSAL_RE = re.compile(
++    r"model declined|safety refusal|declined (?:to|the) (?:assist|help|comply|answer|request)"
++    r"|refus(?:ed|al) (?:to|by the model)|(?:model|assistant) refus|stop_reason\W+refusal"
++    r"|cannot (?:assist|help) with (?:that|this)|can'?t (?:assist|help) with (?:that|this)"
++    r"|violates? (?:our )?(?:usage|safety) polic",
++    re.IGNORECASE,
++)
++
++NO_USER_ACTION = "Hermes needs to recover; no user action identified."
++
++
++def clean_text(value: Any, limit: int) -> str:
++    """Strip ANSI/control bytes, collapse whitespace, clip."""
++    text = _CTRL_RE.sub(" ", _ANSI_RE.sub("", str(value or "")))
++    text = " ".join(text.split())
++    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
++
++
++def _as_int(value: Any) -> int | None:
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def classify_failure(kind: str, payload: Mapping[str, Any]) -> str:
++    """One of: ``provider_refusal``, ``provider_config``, ``protocol_violation``, ``spawn_failed``,
++    ``timed_out``, ``crash``."""
++    haystack = " ".join(str(payload.get(k) or "") for k in ("error", "worker_output", "reason"))
++    trigger = str(payload.get("trigger_outcome") or ("crashed" if kind == "crashed" else ""))
++    if payload.get("terminal_provider"):
++        return "provider_config"
++    if trigger == "spawn_failed":
++        return "spawn_failed"
++    if _REFUSAL_RE.search(_ANSI_RE.sub("", haystack)):
++        return "provider_refusal"
++    if payload.get("protocol_violation") or payload.get("protocol_violations"):
++        return "protocol_violation"
++    if trigger == "timed_out":
++        return "timed_out"
++    return "crash"
++
++
++_CAUSE = {
++    "provider_refusal": "the model refused the request (provider safety refusal), not a launch failure",
++    "provider_config": "the provider rejected this profile's credential or model",
++    "protocol_violation": "the worker finished without reporting a result to the board",
++    "spawn_failed": "the worker could not be launched",
++    "timed_out": "the worker hit its time limit",
++    "crash": "the worker process exited unexpectedly",
++}
++
++
++def _details(payload: Mapping[str, Any]) -> str:
++    parts = []
++    if payload.get("pid") is not None:
++        parts.append(f"pid {payload['pid']}")
++    if payload.get("exit_code") is not None:
++        parts.append(f"exit {payload['exit_code']}")
++    if payload.get("exit_kind"):
++        parts.append(str(payload["exit_kind"]))
++    for key in ("error", "worker_output"):
++        if payload.get(key):
++            parts.append(clean_text(payload[key], 300))
++            break
++    return "; ".join(parts)
++
++
++def describe_failure(kind: str, title: str, payload: Mapping[str, Any]) -> str:
++    """Notice body (everything after ``Kanban <id>``) for a ``gave_up`` or ``crashed`` event."""
++    cls = classify_failure(kind, payload)
++    cause = _CAUSE[cls]
++    failures = _as_int(payload.get("failures"))
++    limit = _as_int(payload.get("effective_limit"))
++    attempts = ""
++    if failures:
++        attempts = f"{failures} of {limit}" if limit else str(failures)
++
++    if kind == "gave_up":
++        state = f"stopped after {attempts} failed attempt(s); task is Blocked, no automatic retries left" \
++            if attempts else "stopped after repeated failed attempts; task is Blocked, no automatic retries left"
++    else:
++        retry = str(payload.get("retry_status") or "")
++        state = ("dispatcher will retry automatically" if retry != "blocked"
++                 else "task is Blocked")
++
++    if cls == "provider_config":
++        who = "Fix the provider credential/model in this profile's config, then unblock the task."
++    elif cls == "provider_refusal":
++        who = (f"{NO_USER_ACTION} The refusal is kept as-is; no alternate provider is tried automatically.")
++    else:
++        who = NO_USER_ACTION
++
++    head = f' "{title}" failed: {cause}; {state}. {who}'
++    if details := _details(payload):
++        head += f"\nDetails: {details}"
++    return head
+diff --git a/tests/tui_gateway/test_kanban_failure_notice_text.py b/tests/tui_gateway/test_kanban_failure_notice_text.py
+new file mode 100644
+index 0000000000..6d69329762
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_failure_notice_text.py
+@@ -0,0 +1,85 @@
++"""User-facing wording for kanban ``gave_up`` / ``crashed`` events: accurate cause, retry state, owner."""
++
++from types import SimpleNamespace
++
++from tui_gateway.server import _format_kanban_event_text
++
++SUB = {"task_id": "t_1418b643"}
++TASK = SimpleNamespace(title="Fix notification wording", assignee="worker", result=None)
++ANSI_REFUSAL = (
++    "pid 4242 exited with code 1 Worker's last output: "
++    "'\x1b[31m\u2502 Model declined this request (safety refusal). \x1b[0m'"
++)
++
++
++def _text(kind, payload):
++    return _format_kanban_event_text(SUB, TASK, SimpleNamespace(kind=kind, payload=payload), "main")
++
++
++def _headline(text):
++    return text.split("\nDetails:")[0]
++
++
++def test_gave_up_after_refusal_is_a_refusal_not_a_spawn_failure():
++    text = _text("gave_up", {"failures": 3, "effective_limit": 3, "error": ANSI_REFUSAL,
++                             "trigger_outcome": "crashed", "retry_status": "ready"})
++    head = _headline(text)
++    assert "Fix notification wording" in head
++    assert "refused" in head and "refusal" in head
++    assert "spawn" not in head.lower()
++    assert "3 of 3" in head and "Blocked" in head
++    assert "Hermes needs to recover; no user action identified." in head
++    assert "no alternate provider is tried automatically" in head
++    # raw material lives only under Details, with ANSI stripped
++    assert "pid" not in head and "\x1b" not in text and "pid 4242" in text.split("Details:")[1]
++
++
++def test_generic_crash_event_names_title_retry_and_owner():
++    text = _text("crashed", {"pid": 99, "exit_kind": "nonzero_exit", "exit_code": 137, "retry_status": "ready"})
++    head = _headline(text)
++    assert "Fix notification wording" in head and "exited unexpectedly" in head
++    assert "dispatcher will retry automatically" in head
++    assert "pid gone" not in text and "pid" not in head
++    assert "no user action identified" in head
++    assert "pid 99" in text.split("Details:")[1]
++
++
++def test_crash_with_refusal_output_is_classified_as_refusal_and_retry_stated():
++    text = _text("crashed", {"pid": 7, "worker_output": "Model declined: safety refusal", "retry_status": "ready"})
++    assert "refused" in _headline(text) and "will retry" in _headline(text)
++
++
++def test_true_spawn_failure_still_says_spawn():
++    text = _text("gave_up", {"failures": 2, "effective_limit": 2, "trigger_outcome": "spawn_failed",
++                             "error": "spawn failed: [Errno 2] No such file or directory: 'hermes'"})
++    head = _headline(text)
++    assert "could not be launched" in head and "2 of 2" in head
++    assert "refus" not in head
++    assert "No such file" in text.split("Details:")[1]
++
++
++def test_connection_refused_is_not_a_model_refusal():
++    text = _text("gave_up", {"failures": 3, "trigger_outcome": "crashed", "error": "connect: Connection refused"})
++    assert "refus" not in _headline(text).lower()
++    assert "exited unexpectedly" in _headline(text)
++
++
++def test_terminal_provider_config_is_the_one_actionable_ask():
++    text = _text("gave_up", {"failures": 1, "terminal_provider": True, "trigger_outcome": "crashed",
++                             "error": "pid 5 exited on a terminal provider error"})
++    head = _headline(text)
++    assert "credential or model" in head and "Fix the provider credential/model" in head
++    assert "no user action" not in head
++
++
++def test_human_input_block_is_untouched():
++    text = _text("blocked", {"kind": "needs_input", "reason": "Which account should I use?"})
++    assert text.endswith("blocked: Which account should I use?")
++    assert "Hermes needs to recover" not in text
++
++
++def test_poller_marks_failure_notices_diagnostic():
++    from gateway.kanban_watchers_notifier import diagnostic_event
++
++    for kind in ("gave_up", "crashed"):
++        assert diagnostic_event(SimpleNamespace(kind=kind, payload={}))
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 823ef32ee9..9300879878 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -344,13 +344,18 @@ def _kb_timed_out(task, payload: dict, title: str) -> str:
+     return " timed out (max_runtime=0s); will retry"
+ 
+ 
++def _kb_failure(kind: str, payload: dict, title: str) -> str:
++    """Cause-accurate gave_up/crashed wording; pid/exit/raw output only under ``Details:``. [daveey]"""
++    from hermes_cli.kanban_failure_summary import describe_failure
++    return describe_failure(kind, title, payload)
++
++
+ # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
+ _KANBAN_EVENT_FORMATTERS = {
+     "completed": ("✔", _kb_completed),
+     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
+-    "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
+-                + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
+-    "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
++    "gave_up": ("✖", lambda t, p, title: _kb_failure("gave_up", p, title)),
++    "crashed": ("✖", lambda t, p, title: _kb_failure("crashed", p, title)),
+     "timed_out": ("⏱", _kb_timed_out),
+     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
+ }
+-- 
+2.55.0
+
