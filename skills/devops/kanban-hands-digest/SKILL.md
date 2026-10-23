@@ -29,6 +29,8 @@ task strip, then `kanban_show` each and report the blocked ones. Also report two
   latest `continued`/`scheduled` event, or a wake cron that no longer exists): they sit unrun
   indefinitely. Re-queue with `hermes kanban unblock <id>` (it accepts scheduled cards). A `needs_input`
   card parked in scheduled is an ask of the user; report it.
+Before treating a blocked card as a human ask, inspect the event that caused the current stop. `gave_up`, `crashed`, `spawn_failed`, model refusal and timeout are operational failures, not evidence of a user obligation. Never turn the task body's first sentence into an unblock instruction. Report the actual cause, whether retries remain, and who owns recovery; say no user action is identified when none is verified. A model refusal should not be repeatedly requeued unchanged or routed around by switching providers. Preserve a paused failure visibly as an agent issue, without a Done button. For genuine human blockers, state the exact action, device, reason, and observable completion condition.
+
 When the user's step is done, re-queue the card yourself (`kanban_unblock`, or the CLI for triage) after a
 comment saying what changed. Don't wait for the card to notice. Go global (the digest script below, all
 boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
