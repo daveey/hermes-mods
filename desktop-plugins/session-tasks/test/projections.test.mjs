@@ -115,3 +115,46 @@ test('scheduled (timer-blocked) chips are yellow, pill included', () => {
   assert.doesNotMatch(m.chipFrame('todo').border, /#e3b341/)
   assert.equal(m.chipColor('blocked'), '#f85149')
 })
+
+test('hubLinkChips: other gateways only, deduped by gateway+board+id, gateway + sync age in the title', () => {
+  const now = Date.now() / 1000
+  const chips = m.hubLinkChips(
+    [
+      { id: 't_here', title: 'Mine', status: 'running', gateway: 'laptop', local: true, synced_at: now },
+      { id: 't_live', title: 'Dup', status: 'running', gateway: 'mini', board: 'bb', local: false, synced_at: now },
+      { id: 't_live', title: 'Same id, other gateway', status: 'running', gateway: 'nas', local: false, synced_at: now },
+      { id: 't_mini', title: 'Remote', status: 'blocked', gateway: 'mini', local: false, synced_at: now - 300, via: 'subscribed' },
+      { id: 't_mini', title: 'Remote dup', status: 'blocked', gateway: 'mini', board: 'default', local: false, synced_at: now },
+      { id: 't_done', title: 'Old', status: 'done', gateway: 'mini', local: false, synced_at: now }
+    ],
+    new Set([m.taskKey('mini', 'bb', 't_live')])
+  )
+  assert.deepEqual(chips.map(c => c.key), ['kb:nas:default:t_live', 'kb:mini:default:t_mini'])
+  const mini = chips[1]
+  assert.equal(mini.id, 't_mini')
+  assert.equal(mini.gateway, 'mini')
+  assert.equal(mini.state, 'blocked')
+  assert.match(mini.title, /on mini/)
+  assert.match(mini.title, /synced 5m ago/)
+  assert.match(mini.title, /shepherding/)
+})
+
+test('staleChips keeps last-known remote rows, marked stale (hub down never means no tasks)', () => {
+  const out = m.staleChips([{ key: 'kb:mini:default:t1', title: 'x' }])
+  assert.equal(out.length, 1)
+  assert.equal(out[0].stale, true)
+  assert.match(out[0].title, /last known/)
+  assert.equal(m.staleChips(out)[0].title, out[0].title)
+})
+
+test('hubLinkChips tolerates a missing/unavailable hub answer', () => {
+  assert.deepEqual(m.hubLinkChips(null, new Set()), [])
+  assert.deepEqual(m.hubLinkChips(undefined), [])
+})
+
+test('connectionForHubGateway reads the core-learned connection -> hub name map', () => {
+  const storage = { getItem: () => JSON.stringify({ local: 'laptop', 'conn-mini': 'mini' }) }
+  assert.equal(m.connectionForHubGateway('mini', storage), 'conn-mini')
+  assert.equal(m.connectionForHubGateway('nas', storage), null)
+  assert.equal(m.connectionForHubGateway('mini', { getItem: () => '{bad' }), null)
+})

@@ -8,7 +8,10 @@
  *          across every board, in todo / ready / running / scheduled / blocked / review
  *          — the same cards the sidebar row's kanban counts cover
  *          (`/api/session-kanban-tasks?ids=<lineage>`; older backends: a scan of the
- *          current `/api/plugins/kanban/board` for cards the lineage created)
+ *          current `/api/plugins/kanban/board` for cards the lineage created),
+ *          plus linked cards on OTHER gateways from this gateway's hermes-hub
+ *          replica (`/api/plugins/hub-sync/session-links/<id>`; marked with the
+ *          owner gateway + sync age; absent plugin or hub down → none)
  *   ▣ box  rented machines linked to this session (or an ancestor in its lineage)
  *          by the compute-rentals plugin's local registry
  *          (`/api/plugins/compute-rentals/inventory`, polled every 30 s; absent → no chips)
@@ -131,6 +134,66 @@ export function sessionTaskChips(tasks) {
     out.push(taskChip(t, status))
   }
   return byRank(out)
+}
+
+function syncedAgo(at) {
+  const t = Number(at)
+  if (!t) return 'never synced'
+  const s = Math.max(0, Date.now() / 1000 - t)
+  if (s < 60) return 'synced just now'
+  if (s < 3600) return `synced ${Math.floor(s / 60)}m ago`
+  if (s < 86_400) return `synced ${Math.floor(s / 3600)}h ago`
+  return `synced ${Math.floor(s / 86_400)}d ago`
+}
+
+/** hermes-hub replica rows (`/api/plugins/hub-sync/session-links`): cards this
+ *  lineage created/shepherds on OTHER gateways. The gateway's own cards come
+ *  from the live route, so `local` rows are dropped; everything is keyed by
+ *  gateway + board + id (the same t_ id can exist on two gateways).
+ *  `liveKeys`: `${gateway}:${board}:${id}` of cards already listed live. */
+export const taskKey = (gateway, board, id) => `${str(gateway)}:${str(board) || 'default'}:${str(id)}`
+
+export function hubLinkChips(tasks, liveKeys = new Set()) {
+  const seen = new Set()
+  const out = []
+  for (const t of Array.isArray(tasks) ? tasks : []) {
+    const status = str(t?.status)
+    const gateway = str(t?.gateway)
+    const board = str(t?.board) || 'default'
+    if (!t?.id || t.local || !gateway || !KANBAN_ACTIVE.has(status)) continue
+    const k = taskKey(gateway, board, t.id)
+    if (liveKeys.has(k) || seen.has(k)) continue
+    seen.add(k)
+    const chip = taskChip(t, status)
+    out.push({ ...chip, key: `kb:${k}`, gateway, board, title: `${chip.title}\non ${gateway} · ${syncedAgo(t.synced_at)} (hermes-hub replica)` })
+  }
+  return byRank(out)
+}
+
+/** Last-known remote chips, marked stale, for when the hub answer is missing:
+ *  never "no tasks" just because the hub (or hub-sync) is down. */
+export function staleChips(chips) {
+  return (chips || []).map(c => (c.stale ? c : { ...c, stale: true, title: `${c.title}\n(last known — hermes-hub replica unavailable)` }))
+}
+
+const HUB_NAMES_KEY = 'hermes.desktop.hubGatewayNames.v1' // connection id -> hub gateway name (core store/hub-sync.ts)
+
+/** Registry connection id of a hub gateway name, from the map core learns. */
+export function connectionForHubGateway(gateway, storage = typeof localStorage !== 'undefined' ? localStorage : null) {
+  try {
+    const map = JSON.parse(storage?.getItem(HUB_NAMES_KEY) || '{}')
+    return Object.keys(map).find(id => map[id] === gateway) || null
+  } catch {
+    return null
+  }
+}
+
+// A card on another gateway opens in the Kanban drawer on its owner (the board
+// falls back to the hub replica when that gateway is unreachable).
+function openRemoteTask(chip) {
+  const open = typeof window !== 'undefined' ? window.__hermesKanbanOpenTask : null
+  if (typeof open !== 'function') return false
+  return open(chip.id, chip.board, connectionForHubGateway(chip.gateway)) !== false
 }
 
 /** Fallback for backends without that route: scan the current board. */
@@ -267,14 +330,40 @@ let rerun = false
 
 const emit = () => subs.forEach(fn => fn(snapshot))
 
+// Last good hub answer for the focused lineage (shown stale while the hub is unreachable).
+let hubLinkCache = { session: null, chips: [] }
+
 async function loadKanban(ids) {
   const list = await safe(
     () => api(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
     null
   )
-  if (list && Array.isArray(list.tasks)) return sessionTaskChips(list.tasks)
-  const board = await safe(() => api('/api/plugins/kanban/board'), null)
-  return board ? kanbanChips(board, ids) : null
+  let live = null
+  if (list && Array.isArray(list.tasks)) live = sessionTaskChips(list.tasks)
+  else {
+    const board = await safe(() => api('/api/plugins/kanban/board'), null)
+    live = board ? kanbanChips(board, ids) : null
+  }
+  // Linked cards on other gateways, from this gateway's hermes-hub replica
+  // (hub-sync plugin). Absent plugin / hub down → no extra chips.
+  const [first, ...rest] = [...ids]
+  const hub = first
+    ? await safe(
+        () => api(`/api/plugins/hub-sync/session-links/${encodeURIComponent(first)}?ids=${encodeURIComponent(rest.join(','))}`, null, 4_000),
+        null
+      )
+    : null
+  let remote
+  if (hub && hub.available !== false && Array.isArray(hub.tasks)) {
+    // Live cards belong to the gateway that served this answer (hub.gateway).
+    const liveKeys = new Set((list?.tasks || []).map(t => taskKey(hub.gateway, t.board, t.id)))
+    remote = hubLinkChips(hub.tasks, liveKeys)
+    hubLinkCache = { session: first, chips: remote }
+  } else {
+    remote = first && hubLinkCache.session === first ? staleChips(hubLinkCache.chips) : []
+  }
+  if (!live && !remote.length) return null
+  return [...(live || []), ...remote]
 }
 
 function focusedProfile() {
@@ -393,6 +482,7 @@ function Chip({ chip, now }) {
   const clickable = chip.kind === 'kanban' || showMachine
   const onClick = chip.kind === 'kanban'
     ? () => {
+        if (chip.gateway && openRemoteTask(chip)) return
         if (typeof window.__taskMentionsOpen === 'function') window.__taskMentionsOpen(chip.id)
         else host.navigate?.('/kanban')
       }
@@ -406,6 +496,7 @@ function Chip({ chip, now }) {
     title: chip.title,
     'data-session-task': chip.kind,
     style: {
+      ...(chip.stale || chip.gateway ? { opacity: chip.stale ? 0.5 : 0.75 } : {}),
       display: 'inline-flex',
       alignItems: 'center',
       gap: 5,

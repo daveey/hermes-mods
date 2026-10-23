@@ -726,3 +726,105 @@ test('sidebar row Archive goes through act (steps when the row is the open chat)
   assert.equal(ctx.calls[0][0], '/items/n2/archive')
   assert.deepEqual(stepped, ['n2'])
 })
+
+// ── hermes-hub replica (hub-sync plugin): other gateways' open cards ─────────
+
+const HUB_ROW = {
+  gateway: 'nas', key: 'default/h1', version: 7, local: false, stale: false, synced_at: 100,
+  session_id: 'h1', title: 'Remote card', state: 'open', profile: 'default', poster: 'cron', updated_at: 50,
+  actions: [{ id: 'approve', label: 'Approve', kind: 'resolve', style: 'primary' }, { id: 'go', label: 'Go', kind: 'prompt' }],
+  pending: []
+}
+
+test('hubInboxItems: only open cards of gateways not live, prompt actions dropped, routed by hub name', () => {
+  const rows = [
+    HUB_ROW,
+    { ...HUB_ROW, gateway: 'mini', key: 'default/m1', session_id: 'm1' },
+    { ...HUB_ROW, gateway: 'nas', key: 'default/c1', session_id: 'c1', state: 'resolved' },
+    { ...HUB_ROW, gateway: 'laptop', key: 'default/l1', session_id: 'l1', local: true }
+  ]
+  const out = m.hubInboxItems(rows, new Set(['mini']), name => (name === 'nas' ? 'conn-nas' : null))
+  assert.deepEqual(out.map(i => i.session_id), ['h1'])
+  assert.equal(out[0].gateway, 'conn-nas')
+  assert.deepEqual(out[0].hub, { gateway: 'nas', key: 'default/h1', version: 7, synced_at: 100 })
+  assert.deepEqual(out[0].actions.map(a => a.id), ['approve'])
+  assert.equal(m.hubInboxItems([{ ...HUB_ROW }], new Set(), () => null)[0].gateway, 'hub:nas')
+  assert.deepEqual(m.hubInboxItems(null, new Set(), () => null), [])
+})
+
+test('refresh adds replica cards only for gateways whose live read failed', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [{ id: 'local', kind: 'local' }, { id: 'conn-mini', kind: 'ssh' }, { id: 'conn-nas', kind: 'ssh' }] }
+  host.state.focusedStoredSessionId = { get: () => null, listen: () => () => {} }
+  const names = { local: 'laptop', 'conn-mini': 'mini', 'conn-nas': 'nas' }
+  const hubCalls = []
+  const ctx = fakeCtx((path, opts) =>
+    opts.connectionId === 'conn-nas' ? new Error('timed out') : { profile: 'default', items: [{ session_id: `live-${opts.connectionId || 'local'}`, updated_at: 1 }] })
+  ctx.hubRest = async (path, opts = {}) => {
+    hubCalls.push([path, opts])
+    return { available: true, gateway: 'laptop', items: [HUB_ROW, { ...HUB_ROW, gateway: 'mini', key: 'default/m1', session_id: 'm1' }] }
+  }
+  ctx.hubGatewayName = cid => names[cid]
+  const store = m.createStore(ctx)
+  await store.refresh()
+  assert.equal(hubCalls[0][0], '/inbox')
+  const ids = store.$items.get().map(i => `${i.gateway}:${i.session_id}`).sort()
+  assert.deepEqual(ids, ['conn-mini:live-conn-mini', 'conn-nas:h1', 'local:live-local'])
+})
+
+test('refresh without hub-sync (unavailable / error) keeps the live list', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  const ctx = fakeCtx(() => ({ items: [{ session_id: 'a', updated_at: 1 }] }))
+  ctx.hubRest = async () => { throw new Error('404') }
+  const store = m.createStore(ctx)
+  await store.refresh()
+  assert.deepEqual(store.$items.get().map(i => i.session_id), ['a'])
+})
+
+test('replica card: resolve and archive become hub requests with base_version and leave a pending marker', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  host.state.focusedStoredSessionId = { get: () => null, listen: () => () => {} }
+  const ctx = fakeCtx(() => ({ items: [] }))
+  const hubCalls = []
+  ctx.hubRest = async (path, opts = {}) => {
+    hubCalls.push([path, opts])
+    return path === '/request' ? { id: 'hr-1', state: 'local', queued_locally: true } : { available: true, items: [] }
+  }
+  const store = m.createStore(ctx)
+  const [item] = m.hubInboxItems([HUB_ROW], new Set(), () => 'conn-nas')
+  store.$items.set([item])
+  assert.equal(await store.act(item, item.actions[0]), true)
+  assert.deepEqual(hubCalls[0], ['/request', { method: 'POST', body: { gateway: 'nas', coll: 'inbox', key: 'default/h1', action: 'act', args: { action: 'approve' }, base_version: 7 } }])
+  assert.equal(ctx.calls.length, 0)  // nothing sent to the unreachable gateway
+  assert.equal(m.isPending(store.$items.get()[0]), true)
+  hubCalls.length = 0
+  await store.act(store.$items.get()[0], { id: 'archive', kind: 'archive' })
+  assert.deepEqual(hubCalls[0][1].body, { gateway: 'nas', coll: 'inbox', key: 'default/h1', action: 'archive', base_version: 7 })
+  hubCalls.length = 0
+  await store.act(item, { id: 'note', kind: 'resolve', input: true }, 'hi')
+  assert.deepEqual(hubCalls[0][1].body.args, { action: 'note', input: 'hi' })
+})
+
+test('replica card row: greyed with the synced hint, pending shown once requested', () => {
+  const [item] = m.hubInboxItems([HUB_ROW], new Set(), () => 'conn-nas')
+  assert.match(m.rowMeta(item, 100_000 + 300_000), /synced 5m ago/)
+  assert.equal(m.rowMeta({ ...item, pending: [{ state: 'local' }] }), 'pending')
+  assert.equal(m.rowMeta({ updated_at: 0, poster: 'cron' }), 'cron')
+})
+
+test('archiveHotkey on a replica card queues a hub archive, never the unreachable gateway', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  const ctx = fakeCtx(() => ({ items: [] }))
+  const hubCalls = []
+  ctx.hubRest = async (path, opts = {}) => (hubCalls.push([path, opts]), { id: 'hr-2', state: 'queued' })
+  const store = m.createStore(ctx)
+  const [item] = m.hubInboxItems([HUB_ROW], new Set(), () => 'conn-nas')
+  store.$items.set([item])
+  assert.equal(store.archiveHotkey({ sessionId: 'h1', isFocused: false }), true)
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(hubCalls[0][1].body.action, 'archive')
+  assert.equal(ctx.calls.length, 0)
+})

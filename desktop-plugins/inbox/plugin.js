@@ -14,6 +14,14 @@
  * steps to the next session like core's ⌘⇧A (ctx.registerArchiveHotkeyHandler).
  * An empty inbox shows one muted "Nothing to review" row.
  *
+ * Offline gateways: open cards of a gateway whose live /items read failed (or
+ * that this Desktop has no connection for) come from the routed gateway's
+ * hermes-hub replica (GET /api/plugins/hub-sync/inbox), greyed with "<gw> ·
+ * synced Xm ago". Their resolve/task actions and Archive become hub owner
+ * requests (POST /api/plugins/hub-sync/request {coll:'inbox', action:'act'|
+ * 'archive', base_version}); the card stays, marked pending, until the owner
+ * applies it. Prompt / Do it actions need the chat and are not offered there.
+ *
  * Card types (gateway api 3): an item carries its type's `actions`; the bar
  * renders them (primary first, Archive last) and runs them via POST …/act
  * {action, input}. `prompt` actions submit the returned prompt into the chat
@@ -209,6 +217,56 @@ export function counterText(value, max) {
   return max ? `${n}/${max}` : `${n}`
 }
 
+// ── hermes-hub replica (hub-sync plugin) ────────────────────────────────────
+// Open cards of gateways whose live /items read failed (unreachable) or that
+// this Desktop has no connection for, from the routed gateway's hub replica.
+// Their actions become hub owner requests (queued locally while the hub is down).
+
+const HUB_NAMES_KEY = 'hermes.desktop.hubGatewayNames.v1' // connection id -> hub gateway name (core store/hub-sync.ts)
+const HUB_ACTION_KINDS = new Set(['resolve', 'task']) // prompt/accept need the chat on its own gateway
+
+function storedHubNames() {
+  try {
+    return JSON.parse((typeof localStorage !== 'undefined' && localStorage.getItem(HUB_NAMES_KEY)) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+
+export function isPending(item) {
+  return Array.isArray(item && item.pending) && item.pending.some(p => p && (p.state === 'local' || p.state === 'queued'))
+}
+
+export function syncedAgo(sec, nowMs = Date.now()) {
+  const a = ago(sec, nowMs)
+  return !a ? 'never synced' : a === 'now' ? 'synced just now' : `synced ${a} ago`
+}
+
+/** Replica rows -> inbox items. `liveNames`: hub names of gateways answered live
+ *  (their own list is primary); `connFor(name)`: registry connection id or null. */
+export function hubInboxItems(rows, liveNames, connFor) {
+  const out = []
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!r || r.local || !r.session_id || !r.gateway || liveNames.has(r.gateway)) continue
+    if (r.state !== 'open' && r.state !== 'queuing') continue
+    out.push({
+      ...r,
+      gateway: connFor(r.gateway) || `hub:${r.gateway}`,
+      profile: r.profile || 'default',
+      unread: false,
+      actions: (Array.isArray(r.actions) ? r.actions : []).filter(a => a && a.id && HUB_ACTION_KINDS.has(a.kind)),
+      hub: { gateway: r.gateway, key: r.key, version: r.version ?? null, synced_at: r.synced_at ?? null }
+    })
+  }
+  return out
+}
+
+/** Sidebar row meta: replica cards show their sync age (or pending). */
+export function rowMeta(item, nowMs = Date.now()) {
+  if (item && item.hub) return isPending(item) ? 'pending' : `${item.hub.gateway} · ${syncedAgo(item.hub.synced_at, nowMs)}`
+  return [ago(item.updated_at, nowMs), posterShort(item.poster)].filter(Boolean).join(' · ')
+}
+
 // ── store ───────────────────────────────────────────────────────────────────
 
 const routedGateway = () => {
@@ -235,6 +293,39 @@ export function createStore(ctx) {
   let inflight = null
   let again = false
 
+  // hub-sync REST on the routed gateway (ctx.hubRest: test seam).
+  const hubRest = (path, opts = {}) => {
+    if (ctx.hubRest) return ctx.hubRest(path, opts)
+    const api = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+    if (!api) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
+    return api({ path: `/api/plugins/hub-sync${path}`, timeoutMs: 6000, ...opts })
+  }
+  const safeHub = path => Promise.resolve().then(() => hubRest(path)).catch(() => null)
+  const hubName = cid => (ctx.hubGatewayName ? ctx.hubGatewayName(cid) : storedHubNames()[cid]) || ''
+  const connForHub = name => {
+    const ids = new Set((host.state.gateways?.get?.() ?? []).map(g => g.id))
+    ids.add(routedGateway())
+    for (const id of ids) if (hubName(id) === name) return id
+    return null
+  }
+
+  // Owner request for a replica card; the card stays, marked pending.
+  const hubSend = async (item, action, args) => {
+    $busy.set(item.session_id)
+    try {
+      const body = { gateway: item.hub.gateway, coll: 'inbox', key: item.hub.key, action, ...(args ? { args } : {}), base_version: item.hub.version }
+      const r = await hubRest('/request', { method: 'POST', body })
+      const mark = { id: str(r && r.id), action, state: str(r && r.state) || 'local' }
+      $items.set($items.get().map(i => (i.hub && i.hub.key === item.hub.key && i.hub.gateway === item.hub.gateway ? { ...i, pending: [...(i.pending || []), mark] } : i)))
+      return true
+    } catch (e) {
+      host.notifyError?.(e, `Could not queue the change for ${item.hub.gateway}`)
+      return false
+    } finally {
+      $busy.set('')
+    }
+  }
+
   const refresh = () => {
     if (inflight) {
       again = true
@@ -246,11 +337,20 @@ export function createStore(ctx) {
         ctx
           .rest('/items', gateway === routed ? { timeoutMs: 8000 } : { connectionId: gateway, timeoutMs: 8000 })
           .then(r => ({ gateway, profile: r && r.profile, items: r && r.items }))
-          .catch(() => ({ gateway, items: [] }))
+          .catch(() => ({ gateway, items: [], failed: true }))
       )
     )
-      .then(answers => {
-        $items.set(mergeItems(answers))
+      .then(async answers => {
+        const live = mergeItems(answers)
+        const hub = await safeHub('/inbox')
+        let extra = []
+        if (hub && hub.available !== false && Array.isArray(hub.items)) {
+          const liveNames = new Set(answers.filter(a => !a.failed).map(a => hubName(a.gateway)).filter(Boolean))
+          if (hub.gateway) liveNames.add(hub.gateway)
+          const seen = new Set(live.map(i => `${hubName(i.gateway) || i.gateway}:${i.session_id}`))
+          extra = hubInboxItems(hub.items, liveNames, connForHub).filter(i => !seen.has(`${i.hub.gateway}:${i.session_id}`))
+        }
+        $items.set(extra.length ? [...live, ...extra] : live)
         markRead(itemFor($items.get(), host.state.focusedStoredSessionId?.get?.()))
       })
       .finally(() => {
@@ -266,7 +366,7 @@ export function createStore(ctx) {
   // Desktop's own read state is client-side only, so the inbox keeps the
   // server watermark itself (any door that focuses the chat counts).
   const markRead = item => {
-    if (!item || !item.unread) return
+    if (!item || !item.unread || item.hub) return
     $items.set($items.get().map(i => (i === item ? { ...i, unread: false } : i)))
     // Core's session PATCH (`unread: false` → SessionDB.set_session_read) on the owning gateway.
     const api = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
@@ -278,6 +378,10 @@ export function createStore(ctx) {
   }
 
   const open = item => {
+    if (item.hub && str(item.gateway).startsWith('hub:')) {
+      host.notify?.({ kind: 'info', message: `${item.hub.gateway} is not registered on this Desktop; acting on it through hermes-hub.` })
+      return
+    }
     const route = routeFor(item, routedGateway(), host.state.gateways?.get?.() ?? [])
     markRead(item)
     void host.openSession(item.session_id, route ? { route } : {}).catch(e => host.notifyError?.(e, 'Could not open inbox message'))
@@ -335,6 +439,12 @@ export function createStore(ctx) {
 
   // Run one of the item's card-type actions. Returns false when cancelled.
   const act = async (item, action, input) => {
+    if (item && item.hub) {
+      if (!action || action.kind === 'archive') return hubSend(item, 'archive')
+      if (!HUB_ACTION_KINDS.has(action.kind)) return false
+      if (action.confirm && !confirmFn(str(action.confirm))) return false
+      return hubSend(item, 'act', input == null ? { action: action.id } : { action: action.id, input: str(input) })
+    }
     if (action && action.kind === 'accept') return accept(item).then(() => true)
     const next = nextItemAfter($items.get(), item)
     const wasFocused = host.state.focusedStoredSessionId?.get?.() === item.session_id
@@ -376,7 +486,7 @@ export function createStore(ctx) {
     const item = itemFor(items, sessionId)
     if (!item) return false
     const next = nextItemAfter(items, item)
-    void archive(item)
+    void (item.hub ? hubSend(item, 'archive') : archive(item))
     if (isFocused) {
       if (next) open(next)
       else openNextSession?.()
@@ -496,11 +606,13 @@ function Section({ store }) {
         SidebarSectionRow,
         {
           label: item.title || 'Untitled proposal',
-          tip: [item.title, item.poster && `from ${item.poster}`].filter(Boolean).join(' — '),
+          tip: [item.title, item.poster && `from ${item.poster}`, item.hub && `on ${item.hub.gateway} (offline) · ${syncedAgo(item.hub.synced_at)} · actions go through hermes-hub`].filter(Boolean).join(' — '),
           accentColor: item.unread ? 'var(--accent)' : 'var(--ui-text-tertiary)',
           strong: !!item.unread,
+          muted: !!item.hub,
+          icon: item.hub ? (isPending(item) ? 'sync' : 'cloud') : undefined,
           active: focused === item.session_id,
-          meta: [ago(item.updated_at), who].filter(Boolean).join(' · '),
+          meta: item.hub ? rowMeta(item) : [ago(item.updated_at), who].filter(Boolean).join(' · '),
           actions: jsx(RowActions, { store, item }),
           onSelect: () => store.open(item)
         },

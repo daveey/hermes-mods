@@ -1,0 +1,49 @@
+# hub-sync
+
+REST over this gateway's [hermes-hub](https://github.com/daveey/hermes-hub) replica (`hub.db`), so the Desktop can
+show and act on sessions, Inbox cards and Kanban cards of gateways that are offline right now. Reads are local and
+keep working with the hub down; writes are owner requests that queue locally and are sent when the hub is reachable.
+Without hermes-hub installed every GET answers `200 {available: false}` with empty lists, and the Desktop surfaces
+built on it show nothing extra.
+
+No agent hooks or tools: `register()` is a no-op; everything is `dashboard/plugin_api.py` → `hubview.py`.
+
+## Endpoints (`/api/plugins/hub-sync`)
+
+| Method | Path | Answer |
+|---|---|---|
+| GET | `/status` | `{available, gateway, synced_at, stale, gateways:[…], last_error, requests_pending, …}` |
+| GET | `/sessions[?gateway=&exclude=a,b&archived=1&limit=]` | `{sessions:[row + gateway/key/version/local/stale/synced_at/pending]}` |
+| GET | `/inbox[?gateway=&exclude=&all=1]` | `{items:[…]}` (open/queuing cards unless `all=1`) |
+| GET | `/tasks[?gateway=&exclude=&board=&all=1]` | `{tasks:[…]}` |
+| GET | `/where/{session_id}` | `{hits:[{gateway, profile, local, stale, synced_at, …}]}` |
+| GET | `/session-links/{session_id}[?ids=a,b]` | `{tasks:[{id, board, gateway, via, local, stale, …}]}` |
+| GET | `/requests` | what this gateway asked other gateways to change |
+| POST | `/request` `{gateway, coll, key, action, args?, base_version?}` | `{id, queued_locally, state}`; 400 bad action/args, 404 unknown gateway, 503 hermes-hub missing |
+
+Own records come from the `published` table (`local: true`), other gateways' from `replica`; `stale` is true when
+the last successful hub pull is older than 180 s. `pending` lists this gateway's unsent/unapplied requests for the
+record. Allowed actions: sessions `rename{title}`/`archive`/`unarchive`/`pin`/`unpin`; inbox `act{action, input?}`/
+`archive`; tasks `create`/`comment`/`complete`/`block`/`unblock`/`archive`/`assign`.
+
+## Consumers
+
+- Fork core (`core/hub-sync-replica.md`): owner lookup via `/where`, the Kanban board's fallback to `/tasks` for an
+  unreachable gateway, and the sidebar's "Synced from other gateways" section (`/sessions` + `/request`).
+- `desktop-plugins/inbox`: other gateways' open cards via `/inbox`; resolve/archive via `/request`.
+- `desktop-plugins/session-tasks`: linked cards on other gateways via `/session-links`.
+
+## Config
+
+- `HERMES_HUB_STATE` — state dir holding `hub.db` (default `~/.local/state/hermes-hub`).
+- `HERMES_HUB_CLIENT` — the hermes-hub client module (default `~/.local/share/hermes-mail/hermes_hub.py`; used for `queue_request` / `send_queued`).
+
+## Tests
+
+```
+cd ~/code/hermes-mods
+uv run --with pytest --with fastapi --with httpx python -m pytest -q -p no:cacheprovider plugins/hub-sync/tests
+```
+
+`tests/fake_hermes_hub.py` builds a throwaway `hub.db`; `test_real_client.py` exercises the installed client when
+present and skips otherwise.
