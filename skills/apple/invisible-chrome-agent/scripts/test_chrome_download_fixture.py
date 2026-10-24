@@ -66,6 +66,15 @@ class DownloadFixtureTests(unittest.TestCase):
             pass
 
         original_load = smoke.importlib.machinery.SourceFileLoader.exec_module
+        original_popen = smoke.subprocess.Popen
+        captured = []
+
+        def capture_chrome(args, *positional, **kwargs):
+            # subprocess is shared: native boot-clock probes must run normally.
+            if args and args[0] == sys.executable and any(a.startswith('--user-data-dir=') for a in args):
+                captured.append((args, kwargs))
+                raise LaunchCaptured
+            return original_popen(args, *positional, **kwargs)
 
         def load(loader, module):
             original_load(loader, module)
@@ -81,14 +90,14 @@ class DownloadFixtureTests(unittest.TestCase):
                      mock.patch.object(fixtures, 'sys', mock.Mock(platform=platform)), \
                      mock.patch.object(sys, 'argv', argv), \
                      mock.patch.object(smoke.importlib.machinery.SourceFileLoader, 'exec_module', load), \
-                     mock.patch.object(smoke.subprocess, 'Popen', side_effect=LaunchCaptured) as spawn:
+                     mock.patch.object(smoke.subprocess, 'Popen', side_effect=capture_chrome):
                     with self.assertRaises(LaunchCaptured):
                         smoke.main()
-                    launch = spawn.call_args.args[0]
+                    launch, environment = captured.pop()
                     self.assertEqual('--use-mock-keychain' in launch, platform == 'darwin')
                     self.assertEqual('--headless=new' in launch, not headful)
                     profile = Path(next(a.split('=', 1)[1] for a in launch if a.startswith('--user-data-dir=')))
-                    self.assertEqual(spawn.call_args.kwargs['env']['HOME'], str(profile.parent))
+                    self.assertEqual(environment['env']['HOME'], str(profile.parent))
                     self.assertFalse(profile.parent.exists())
 
     def test_production_launch_never_uses_mock_keychain(self):
