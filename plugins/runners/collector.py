@@ -279,7 +279,7 @@ class Collector:
                     source_id=host['resource_id'], collected_at=iso(evidence['at']),
                     expires_at=iso(evidence['at']+policy.host_ttl),
                     evidence_summary='Bounded fixed SSH management probe',
-                    error_class=None if evidence['management']=='reachable' else 'probe_unavailable'), at=now)
+                    error_class=None if evidence['management']=='reachable' else 'network'), at=now)
                 evidence['observation_ids'] = [oid]
             old = self.store.list('Runner')
             identities = {(r['scope_id'], r['provider_runner_id']): r for r in old}

@@ -27,3 +27,16 @@ def test_host_management_evidence_durable_once_per_probe(tmp_path):
         assert rows[0]['entity_id'] == cfg['hosts'][0]['resource_id']
         assert rows[0]['value'] == 'reachable'
         assert rows[0]['id'] in c.host_results[cfg['hosts'][0]['id']]['observation_ids']
+
+
+def test_unavailable_host_persists_valid_error_evidence(tmp_path):
+    def probe(host):
+        raise OSError('unavailable')
+    cfg, path, a = setup(tmp_path, probe)
+    with Store(path) as store:
+        c = Collector(store, cfg, a, clock=lambda: 1000, host_probe=probe)
+        c.tick()
+        rows = [o for o in store.list('Observation') if o['dimension'] == 'management']
+        assert len(rows) == 1
+        assert rows[0]['value'] == 'unreachable'
+        assert rows[0]['error_class'] == 'network'
