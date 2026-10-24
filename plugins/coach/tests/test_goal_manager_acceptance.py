@@ -84,7 +84,7 @@ def environment(tmp_path, monkeypatch):
         manager.unload()
 
 
-def run_turn(monkeypatch, *, budget=6, before_call=None, texts=None):
+def run_turn(monkeypatch, *, budget=6, before_call=None, texts=None, request=REQUEST, history=None, db_name="acceptance.db"):
     from run_agent import AIAgent
     with patch('model_tools.get_tool_definitions', return_value=[]), \
          patch('model_tools.check_toolset_requirements', return_value={}), \
@@ -95,7 +95,7 @@ def run_turn(monkeypatch, *, budget=6, before_call=None, texts=None):
                         skip_context_files=True, skip_memory=True, platform='cli')
     from hermes_state import SessionDB
     from hermes_constants import get_hermes_home
-    agent._session_db = SessionDB(db_path=get_hermes_home() / 'acceptance.db')
+    agent._session_db = SessionDB(db_path=get_hermes_home() / db_name)
     agent._session_db_created = False
     agent._cached_system_prompt = 'stable isolated test prompt'
     agent.save_trajectories = False
@@ -115,7 +115,7 @@ def run_turn(monkeypatch, *, budget=6, before_call=None, texts=None):
             content=text, tool_calls=None), finish_reason='stop')], model='test/model', usage=None)
     agent._interruptible_api_call = api
     agent._interruptible_streaming_api_call = lambda kw, on_first_delta=None: api(kw)
-    result = agent.run_conversation(REQUEST)
+    result = agent.run_conversation(request, conversation_history=history)
     assert agent._session_db is not None
     persisted = agent._session_db.get_messages(agent.session_id)
     assert persisted, 'real isolated database must receive the turn'
@@ -246,3 +246,28 @@ def test_pre_verify_runs_once_after_owner_accepts(environment, monkeypatch, orde
     nudges = [row for row in out[1][-1]['messages']
               if row.get('content') == 'ACCEPTANCE_VERIFY_NUDGE']
     assert len(nudges) == 1
+
+
+def test_complete_turn_captures_before_persist_and_keeps_restriction(environment, monkeypatch):
+    import json
+    from hermes_state import SessionDB
+    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import get_active_profile_name
+    manager, load_order, configure, events = environment
+    gd = load_order(ORDERS[0])
+    db = SessionDB(get_hermes_home() / 'state.db')
+    db.create_session(session_id='manager-acceptance', source='cli', profile_name=get_active_profile_name())
+    db.append_message('manager-acceptance', 'user', 'Do not publish')
+    db.append_message('manager-acceptance', 'assistant', 'Understood.')
+    history = db.get_messages('manager-acceptance')
+    db.close()
+    seen = []
+    def judge(_, prompt):
+        seen.append(json.loads(prompt)['evidence'])
+        return verdict()
+    monkeypatch.setattr(gd, 'aux_judge', judge)
+    out = run_turn(monkeypatch, budget=1, history=history, db_name='state.db')
+    assert_private(out)
+    assert seen
+    assert [r['content'] for r in seen[0].values() if r['role']=='user']==['Do not publish', REQUEST]
+    assert 'Unresolved goal' in out[0]['final_response']

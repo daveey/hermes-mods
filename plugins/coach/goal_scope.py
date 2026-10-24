@@ -4,6 +4,16 @@ import json
 import math
 from pathlib import Path
 
+
+def is_evidence_row(row):
+    """Persistence identity is not synthetic content; unknown markers fail closed."""
+    from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
+    return (isinstance(row, dict)
+            and not any(k.startswith('_') and k not in PERSISTENCE_ONLY_MESSAGE_FIELDS
+                        and k != '_db_persisted' and row[k] for k in row)
+            and not row.get('observed')
+            and not (row.get('role') == 'user' and row.get('display_kind')))
+
 def _ro_connect(path):
     import sqlite3
     uri = Path(path).resolve().as_uri()
@@ -33,9 +43,8 @@ def recover_scope(session_id, user_message, history):
     from hermes_state_messages import SessionMessagesMixin
     from hermes_cli.profiles import get_active_profile_name
 
-    rows = [copy.deepcopy(r) for r in history or [] if isinstance(r, dict)
-            and r.get('role') == 'user' and not any(k.startswith('_') and r[k] for k in r)
-            and not r.get('display_kind') and not r.get('observed')]
+    raw_rows = [r for r in history or [] if is_evidence_row(r) and r.get('role') == 'user']
+    rows = [{'role': 'user', 'content': copy.deepcopy(r.get('content'))} for r in raw_rows]
     path = Path(get_hermes_home()) / 'state.db'
     recovered = []
     if path.exists():
@@ -57,13 +66,20 @@ def recover_scope(session_id, user_message, history):
                                        ' AND content=? LIMIT 2', (session_id, user_message)).fetchall()
                 if len(anchors) > 1:
                     raise ValueError('scope_ambiguous_anchor')
-                if not anchors and conn.execute(
-                        'SELECT 1 FROM messages WHERE session_id=? AND ' + clean + ' LIMIT 1',
-                        (session_id,)).fetchone():
-                    raise ValueError('scope_missing_anchor')
                 segments = []
                 if anchors:
                     segments.append((session_id, 'id < ?', anchors[0]['id']))
+                else:
+                    # Core captures before persisting the current request. Its stamped
+                    # row is a frozen cutoff, unlike guessing the latest durable row.
+                    current_rows = [r for r in raw_rows if r.get('content') == user_message]
+                    cutoff = current_rows[0].get('timestamp') if len(current_rows) == 1 else None
+                    if (type(cutoff) in (int, float) and math.isfinite(cutoff)
+                            and cutoff >= current['started_at']):
+                        segments.append((session_id, 'timestamp < ?', cutoff))
+                    elif conn.execute('SELECT 1 FROM messages WHERE session_id=? AND ' + clean + ' LIMIT 1',
+                                      (session_id,)).fetchone():
+                        raise ValueError('scope_missing_anchor')
                 seen = {session_id}
                 for _ in range(32):
                     if SessionMessagesMixin._is_explicit_fork_child_row(None, current, include_reset=True):
@@ -156,9 +172,7 @@ def resolve_scope(session_id, contexts, turn_messages=None):
                     if rows is None:
                         raise ValueError('scope_incomplete_capture')
                     supplied_users = [r.get('content') for r in turn_messages or []
-                                      if isinstance(r, dict) and r.get('role') == 'user'
-                                      and not any(k.startswith('_') and r[k] for k in r)
-                                      and not r.get('display_kind') and not r.get('observed')]
+                                      if is_evidence_row(r) and r.get('role') == 'user']
                     captured_users = [r.get('content') for r in rows if r.get('role') == 'user']
                     if supplied_users and (not captured_users or supplied_users[-1] != captured_users[-1]):
                         raise ValueError('scope_current_request_mismatch')
@@ -184,9 +198,7 @@ def resolve_scope(session_id, contexts, turn_messages=None):
                 current = parent
             else:
                 raise ValueError('scope_lineage_limit')
-    rows = [r for r in turn_messages or [] if isinstance(r, dict)
-            and r.get('role') == 'user' and not any(k.startswith('_') and r[k] for k in r)
-            and not r.get('display_kind') and not r.get('observed')]
+    rows = [r for r in turn_messages or [] if is_evidence_row(r) and r.get('role') == 'user']
     if not rows or not isinstance(rows[-1].get('content'), str) or not rows[-1]['content']:
         raise ValueError('scope_current_request_unavailable')
     return recover_scope(session_id, rows[-1]['content'], rows[:-1])

@@ -85,8 +85,12 @@ hostname/profile/board/task from authoritative stores. It requires exact request
 matches, a live matching process claim, and an origin-linked TUI result subscription. This proves a
 durable return route, not notifier health or eventual delivery. Remote, scheduled, cross-profile,
 paraphrased-goal and non-TUI-return cases remain UNKNOWN; no cached tool assertion certifies ownership.
-Compression that changes the session ID can lose the in-memory turn capture. Prior context is limited
-to 24 rows; complete evidence is limited to 200 rows / 32k serialized characters and 128 sessions.
+Scope recovery reads only real user rows through bounded, profile-qualified compression ancestry.
+Rotation transfers captured restrictions/tool pairs; restart requires a unique current request anchor.
+Before core persists that request, its runtime-stamped message timestamp bounds recovery instead.
+Unknown profiles, ambiguous anchors and unsupported lineage fail UNKNOWN. Captures are isolated by
+profile home and session; persistence metadata is not mistaken for synthetic content. Complete
+evidence is limited to 200 rows / 32k serialized characters and 128 captures.
 Oversized evidence fails open with telemetry. This is not a hard completion guarantee: judge errors,
 missing evidence and timeouts fail open. No live-model precision/recall or latency claim is made.
 Do not enable enforcement until owner/lineage support and a labeled semantic holdout are validated.
@@ -104,7 +108,13 @@ mode/buffering, scope-preserving capture and bounded errors. `test_goal_disposit
 uses scripted model responses through complete `AIAgent.run_conversation` text stops for `cli` and
 `desktop`, including isolated normal plugin discovery, streaming holds, cap warning and ephemeral
 history stripping. It also loads coach with ask-gate/chat-closeout in two configured orders and
-force-reloads discovery. These are backend tests, not Electron UI or production activation proof.
+force-reloads discovery. `test_goal_manager_acceptance.py` additionally registers plugins in genuinely
+reversed orders, exercises individual unload/reload during held complete turns, and verifies no
+rejected text leaks to streams, interims, returned history or SQLite. It verifies pre_verify runs
+once only after acceptance and persisted history restrictions survive pre-persist capture.
+`test_goal_scope_gate.py`, `test_goal_scope_recovery.py` and `test_goal_scope_rotation.py` cover
+profile isolation, bounded ancestry, restart and rotation recovery through real isolated SessionDBs.
+These are backend tests, not Electron UI or production activation proof.
 Semantic judges are injected; scope negatives test routing, not model classification accuracy.
 `test_goal_ownership.py` also exercises real isolated Kanban tables through discovered agent text
 stops, scope/liveness/return-route rejection, and read-only WAL fallback without creating databases.

@@ -26,7 +26,8 @@ def setup(tmp_path, monkeypatch):
     db.close()
 
 def session(db, sid, parent=None):
-    db.create_session(session_id=sid, source='cli', parent_session_id=parent)
+    from hermes_cli.profiles import get_active_profile_name
+    db.create_session(session_id=sid, source='cli', parent_session_id=parent, profile_name=get_active_profile_name())
 
 def users(seen):
     return [v['content'] for v in seen[-1].values() if v['role'] == 'user']

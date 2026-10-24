@@ -40,7 +40,7 @@ def evidence_for(messages, candidate):
     evidence = {'candidate': {'role': 'assistant', 'content': candidate}}
     calls = {}
     for row in messages or []:
-        if not isinstance(row, dict) or any(k.startswith('_') and row[k] for k in row):
+        if not _scope.is_evidence_row(row):
             continue
         if row.get('role') == 'user':
             ref = 'user:' + str(sum(e['role'] == 'user' for e in evidence.values()))
@@ -248,90 +248,18 @@ def validate_disposition(v, evidence, *, session_id=""):
     return v
 
 
-def recover_scope(session_id, user_message, history):
-    """Recover only user rows, backwards through verified compression edges.
+# Load by path because the plugin also supports standalone file-based discovery.
+import importlib.util
+_scope_spec = importlib.util.spec_from_file_location('_coach_goal_scope', Path(__file__).with_name('goal_scope.py'))
+_scope = importlib.util.module_from_spec(_scope_spec)
+_scope_spec.loader.exec_module(_scope)
+recover_scope = _scope.recover_scope
 
-    Never chase a compression tip (it can be a future turn). Ancestors are cut
-    at the child's creation time; same-session recovery requires a unique exact
-    current request anchor. Missing anchors use caller history, not latest DB
-    rows. Ambiguity/overflow is UNKNOWN rather than partial authorization.
-    """
-    from contextlib import closing
+
+def _profile_key():
     from hermes_constants import get_hermes_home
-    from hermes_state_messages import SessionMessagesMixin
-
-    rows = [copy.deepcopy(r) for r in history or [] if isinstance(r, dict)
-            and r.get('role') == 'user' and not any(k.startswith('_') and r[k] for k in r)
-            and not r.get('display_kind') and not r.get('observed')]
-    path = Path(get_hermes_home()) / 'state.db'
-    recovered = []
-    if path.exists():
-        with closing(_ro_connect(path)) as conn:
-            conn.execute('BEGIN')
-            # Bound SQL work as well as returned data; no migrations or writes.
-            ticks = [0]
-            def budget():
-                ticks[0] += 1
-                return int(ticks[0] > 1000)
-            conn.set_progress_handler(budget, 1000)
-            current = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
-            if current:
-                current = dict(current)
-                clean = "role='user' AND COALESCE(_compressed_summary,0)=0 AND COALESCE(observed,0)=0 AND display_kind IS NULL"
-                anchors = conn.execute('SELECT id FROM messages WHERE session_id=? AND ' + clean +
-                                       ' AND content=? LIMIT 2', (session_id, user_message)).fetchall()
-                if len(anchors) > 1:
-                    raise ValueError('scope_ambiguous_anchor')
-                segments = []
-                if anchors:
-                    segments.append((session_id, 'id < ?', anchors[0]['id']))
-                seen = {session_id}
-                for _ in range(32):
-                    if SessionMessagesMixin._is_explicit_fork_child_row(None, current, include_reset=True):
-                        break
-                    parent_id = current.get('parent_session_id')
-                    if not parent_id:
-                        break
-                    parent = conn.execute('SELECT * FROM sessions WHERE id=?', (parent_id,)).fetchone()
-                    if not parent:
-                        raise ValueError('scope_missing_ancestor')
-                    parent = dict(parent)
-                    if parent.get('end_reason') != 'compression':
-                        break
-                    if parent_id in seen:
-                        raise ValueError('scope_lineage_cycle')
-                    if parent.get('profile_name') != current.get('profile_name'):
-                        raise ValueError('scope_profile_mismatch')
-                    cutoff = current.get('started_at')
-                    if not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff):
-                        raise ValueError('scope_missing_cutoff')
-                    segments.append((parent_id, 'timestamp < ?', cutoff))
-                    seen.add(parent_id)
-                    current = parent
-                else:
-                    raise ValueError('scope_lineage_limit')
-                for sid, bound, cutoff in reversed(segments):
-                    saved = conn.execute('SELECT content FROM messages WHERE session_id=? AND ' + clean +
-                                         ' AND ' + bound + ' ORDER BY id LIMIT 201', (sid, cutoff)).fetchall()
-                    for row in saved:
-                        content = row['content']
-                        # Multimodal JSON cannot safely be treated as human text here.
-                        if not isinstance(content, str) or content.startswith(('[', '{')):
-                            raise ValueError('scope_unsupported_content')
-                        recovered.append({'role': 'user', 'content': content})
-                    if len(recovered) > 200 or len(json.dumps(recovered)) > 32000:
-                        raise ValueError('context_limit')
-    # Retain ordering/repeated restrictions; only remove an overlapping suffix/prefix.
-    overlap = 0
-    for n in range(1, min(len(recovered), len(rows)) + 1):
-        if recovered[-n:] == rows[:n]:
-            overlap = n
-    rows = recovered + rows[overlap:]
-    if not rows or rows[-1].get('content') != user_message:
-        rows.append({'role': 'user', 'content': user_message})
-    if len(rows) > 200 or len(json.dumps(rows)) > 32000:
-        raise ValueError('context_limit')
-    return rows
+    from hermes_cli.profiles import get_active_profile_name
+    return (str(Path(get_hermes_home()).resolve()), get_active_profile_name())
 
 
 def build_gate(store):
@@ -347,8 +275,8 @@ def build_gate(store):
             # Incomplete/ambiguous recovery must not become an actionable scope.
             rows = None
         with lock:
-            contexts[session_id] = copy.deepcopy(rows)
-            contexts.move_to_end(session_id)
+            contexts[(_profile_key(), session_id)] = copy.deepcopy(rows)
+            contexts.move_to_end((_profile_key(), session_id))
             while len(contexts) > 128:
                 contexts.popitem(last=False)
 
@@ -357,16 +285,23 @@ def build_gate(store):
         if not session_id or not tool_call_id or settings()['mode'] == 'off':
             return
         with lock:
-            if session_id not in contexts:
-                return
-            rows = contexts[session_id]
+            key = (_profile_key(), session_id)
+            if key not in contexts:
+                try:
+                    contexts[key] = _scope.resolve_scope(session_id, {
+                        sid: rows for (profile, sid), rows in contexts.items() if profile == key[0]})
+                except Exception:
+                    contexts[key] = None
+                while len(contexts) > 128:
+                    contexts.popitem(last=False)
+            rows = contexts[key]
             if rows is None:
                 return
             rows.extend([{'role': 'assistant', 'tool_calls': [{'id': tool_call_id, 'function': {
                 'name': tool_name, 'arguments': json.dumps(args)}}]},
                 {'role': 'tool', 'tool_call_id': tool_call_id, 'content': copy.deepcopy(result), 'status': status}])
             if len(rows) > 200 or len(json.dumps(rows)) > 32000:
-                contexts[session_id] = None
+                contexts[key] = None
 
     def gate(session_id='', final_response='', turn_messages=None, attempt=0, **_):
         cfg = settings()
@@ -378,11 +313,21 @@ def build_gate(store):
             return None
         try:
             with lock:
-                rows = copy.deepcopy(contexts.get(session_id, []))
+                key = (_profile_key(), session_id)
+                if session_id and key not in contexts:
+                    contexts[key] = _scope.resolve_scope(session_id, {
+                        sid: rows for (profile, sid), rows in contexts.items() if profile == key[0]}, turn_messages)
+                    while len(contexts) > 128:
+                        contexts.popitem(last=False)
+                rows = copy.deepcopy(contexts.get(key, []))
             if rows is None:
                 raise ValueError('context_limit')
             observed_ids = {r.get('tool_call_id') for r in rows if r.get('role') == 'tool'}
             for row in turn_messages or []:
+                if not _scope.is_evidence_row(row):
+                    continue
+                if row.get('role') == 'user':
+                    row = {'role': 'user', 'content': row.get('content')}
                 if row.get('role') == 'tool' and row.get('tool_call_id') in observed_ids:
                     continue
                 if row.get('role') == 'assistant' and row.get('tool_calls'):
