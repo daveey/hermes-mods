@@ -577,9 +577,17 @@ function Strip() {
   const [snap, setSnap] = useState(snapshot)
   const [now, setNow] = useState(Date.now())
   const focused = useValue(host.state.focusedSessionId)
+  const stored = useValue(host.state.focusedStoredSessionId)
+  // Subscribe to owner and ambient fallback changes, not just the runtime id.
+  // Older hosts have no owner atom; their connection atom is a stable fallback.
+  useValue(host.state.focusedSessionOwner || host.state.connectionId)
+  useValue(host.state.connectionId)
+  useValue(host.state.profile || host.state.connectionId)
+  const route = focusedRoute()
+  const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
   useEffect(() => subscribe(next => (setSnap(next), setNow(Date.now()))), [])
-  useEffect(() => void refresh(), [focused])
-  const chips = snap.runtime === focused ? snap.chips : []
+  useEffect(() => void refresh(), [focused, scope])
+  const chips = snap.runtime === focused && snap.scope === scope ? snap.chips : []
   if (!chips.length) return null
   return jsx('div', {
     'data-slot': 'session-tasks',
