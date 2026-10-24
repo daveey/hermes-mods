@@ -448,7 +448,8 @@ class CDPProxy:
     """Transparent CDP proxy 127.0.0.1:port -> 127.0.0.1:upstream (HTTP /json/* and websockets) that applies
     the focus filter. port=0 binds an ephemeral port (tests); the bound port is in .port."""
 
-    def __init__(self, port, upstream, show=show_active, logf=None):
+    def __init__(self, port, upstream, show=show_active, logf=None, lifecycle=None):
+        self.lifecycle = lifecycle
         self.want_port, self.upstream = port, upstream
         self.port = port
         self.show = show
@@ -533,6 +534,18 @@ class CDPProxy:
             method, target = parts[0], parts[1]
             headers = [tuple(x.strip() for x in l.split(":", 1)) for l in lines[1:] if ":" in l]
             hmap = {k.lower(): v for k, v in headers}
+            if target.startswith(('/lifecycle/', '/lease/')):
+                if self.lifecycle is None:
+                    self._respond(c, 403, 'Forbidden', 'managed lifecycle is not configured')
+                    return
+                from types import SimpleNamespace
+                length = int(hmap.get('content-length') or 0)
+                if not 0 <= length <= 65536:
+                    self._respond(c, 413, 'Too Large', 'control body too large')
+                    return
+                body = r.read(length)
+                self.lifecycle.route(self, c, r, method, target, headers, body, SimpleNamespace(**globals()))
+                return
             if hmap.get("upgrade", "").lower() == "websocket":
                 self._ws(c, r, lines[0], headers, addr)
             else:
@@ -843,6 +856,7 @@ class Supervisor:
         self.hooked = set()
         self.last_notice = {}
         self.sess_target = {}
+        self.frame_target = {}
         self.passkey = None  # {"target": id, "until": t, "wid": windowId|None} while a request is pending
         self.stop = False
         self.chrome_fails = 0
@@ -852,6 +866,72 @@ class Supervisor:
         self.notices = {}   # targetId -> running notifier Popen (its notification is still on screen)
         self.focus = FocusGuard()
         self.proxy = None
+        self.lifecycle = None
+
+    def configure_lifecycle(self):
+        from chrome_agent_lifecycle import Config, Ledger, Lifecycle, LifecycleError
+        path = os.path.join(STATE_DIR, 'lifecycle-config.json')
+        try:
+            with open(path) as stream:
+                config = json.load(stream)
+        except FileNotFoundError:
+            return  # existing installations remain raw/always-on until explicitly installed
+        if not FOCUS_FILTER:
+            raise LifecycleError('managed lifecycle requires the focus proxy')
+        if set(config) - {'installation_id', 'settings'} or not isinstance(config.get('installation_id'), str) or not config['installation_id']:
+            raise LifecycleError('invalid lifecycle configuration')
+        ledger = Ledger(os.path.join(STATE_DIR, 'leases.json'), Config(**config.get('settings', {})))
+        self.lifecycle = Lifecycle(ledger, config['installation_id'], self.wake_managed, self.idle_managed)
+
+    def wake_managed(self):
+        from chrome_agent_lifecycle import LifecycleError
+        if self.stop:
+            raise LifecycleError('supervisor is stopping')
+        # Never kill/adopt a browser left by an earlier supervisor in managed mode.
+        try:
+            pid = int(os.readlink(os.path.join(PROFILE, 'SingletonLock')).rsplit('-', 1)[1])
+        except (OSError, ValueError):
+            pid = None
+        if pid and pid_alive(pid):
+            raise LifecycleError('existing profile browser requires operator recovery')
+        self.lifecycle.ledger.new_generation()
+        try:
+            self.start_vdisplay()
+            self.start_chrome()
+            if not cdp_version():
+                raise LifecycleError('Chrome did not become ready')
+        except BaseException:
+            self.idle_managed()
+            raise
+
+    def idle_managed(self):
+        if self.cdp:
+            self.cdp.close()
+            self.cdp = None
+        self.stop_children()
+        self.chrome = self.vd = None
+        self.vbounds = None
+        self.hooked.clear()
+        self.sess_target.clear()
+
+    def lifecycle_tick(self):
+        if not self.lifecycle or not self.cdp:
+            return
+        targets = [t['targetId'] for t in self.cdp.call('Target.getTargets').get('targetInfos', [])
+                   if t.get('type') in ('page', 'webview')]
+        if show_active():
+            for tid in targets:
+                self.lifecycle.ledger.protect(tid, 'handoff')
+        # Use a separate reply-only connection: the observation reader can be
+        # delivering a download event which needs the ledger lock during a sweep.
+        version = cdp_version()
+        if not version:
+            return
+        closer = CDP(version['webSocketDebuggerUrl'])
+        try:
+            self.lifecycle.tick(targets, lambda tid: closer.call('Target.closeTarget', {'targetId': tid}).get('success', False))
+        finally:
+            closer.close()
 
     # -- children
     def start_vdisplay(self):
@@ -929,7 +1009,8 @@ class Supervisor:
             log("Local State: Memory Saver / Energy Saver forced off")
 
     def start_chrome(self):
-        self._kill_stale_chrome()
+        if not self.lifecycle:
+            self._kill_stale_chrome()
         os.makedirs(PROFILE, exist_ok=True)
         self._prefs_off_savers()
         args = [CHROME, "--user-data-dir=" + PROFILE, "--remote-debugging-port=%d" % CHROME_PORT,
@@ -972,6 +1053,8 @@ class Supervisor:
         self.hooked.clear()
         self.cdp.call("Target.setDiscoverTargets", {"discover": True})
         self.cdp.call("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True})
+        if self.lifecycle:
+            self.cdp.call('Browser.setDownloadBehavior', {'behavior': 'default', 'eventsEnabled': True})
         log("CDP connected")
         return self.cdp
 
@@ -992,6 +1075,10 @@ class Supervisor:
     def on_event(self, m):
         method = m.get("method")
         p = m.get("params", {})
+        if self.lifecycle and method == 'Page.frameNavigated':
+            self.frame_target[p.get('frame', {}).get('id')] = self.sess_target.get(m.get('sessionId'))
+        if self.lifecycle and method in ('Browser.downloadWillBegin', 'Browser.downloadProgress'):
+            self.lifecycle.ledger.download(method.split('.')[1], p, self.frame_target.get(p.get('frameId')))
         if method == "Target.attachedToTarget":
             info = p.get("targetInfo", {})
             sid = p.get("sessionId")
@@ -1072,6 +1159,8 @@ class Supervisor:
         """The human clicked the passkey notification: put the window holding `target` on the main display,
         select that tab, bring Chrome forward, and keep re-homing off it until the request settles."""
         c = self.cdp
+        if self.lifecycle and target:
+            self.lifecycle.ledger.protect(target, 'handoff')
         chrome_pid = self.chrome.pid if self.chrome else None
         wid = None
         self.focus.allow()
@@ -1244,6 +1333,34 @@ class Supervisor:
         os.replace(tmp, STATE_FILE)
 
     def run(self):
+        from chrome_agent_lifecycle import ExclusiveLock
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with ExclusiveLock(os.path.join(STATE_DIR, 'supervisor.lock')):
+            self.configure_lifecycle()
+            return self._run()
+
+    def managed_step(self):
+        from chrome_agent_lifecycle import LifecycleError
+        with self.lifecycle.lock:
+            if not self.lifecycle.running:
+                return
+            try:
+                if self.vd.poll() is not None:
+                    self.start_vdisplay()
+                if self.chrome.poll() is not None:
+                    if self.cdp:
+                        self.cdp.close()
+                        self.cdp = None
+                    self.lifecycle.ledger.new_generation()
+                    self.start_chrome()
+                if self.connect():
+                    self.rehome()
+                    self.lifecycle_tick()
+                self.evict()
+            except (CDPError, LifecycleError, OSError) as exc:
+                log('managed lifecycle: %s' % exc)
+
+    def _run(self):
         os.makedirs(STATE_DIR, exist_ok=True)
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stop", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stop", True))
@@ -1253,16 +1370,22 @@ class Supervisor:
         if not notifier_ok(ns):
             log("NOTIFICATIONS NOT ALLOWED for Hermes Touch ID (%s): passkey requests reveal the window plus a "
                 "floating alert instead. Allow them: open '%s'" % (ns, NOTIFIER_SETTINGS_URL))
-        self.start_vdisplay()
-        self.start_chrome()
+        if not self.lifecycle:
+            self.start_vdisplay()
+            self.start_chrome()
         if FOCUS_FILTER:
-            self.proxy = CDPProxy(PORT, CHROME_PORT).start(wait=False)
+            self.proxy = CDPProxy(PORT, CHROME_PORT, lifecycle=self.lifecycle).start(wait=False)
         if FOCUS_GUARD:
             threading.Thread(target=self.focus_loop, daemon=True).start()
             log("focus-guard: on")
         backoff_until = 0
         try:
             while not self.stop:
+                if self.lifecycle:
+                    self.managed_step()
+                    self.write_state()
+                    time.sleep(1)
+                    continue
                 if self.vd.poll() is not None:
                     log("vdisplay exited (%s); restarting" % self.vd.returncode)
                     self.start_vdisplay()
@@ -1289,7 +1412,14 @@ class Supervisor:
                 time.sleep(1)
         finally:
             log("supervisor stopping")
-            self.stop_children()
+            if self.lifecycle:
+                with self.lifecycle.lock:
+                    self.lifecycle.disabled = True
+                    self.idle_managed()
+            else:
+                self.stop_children()
+            if self.proxy:
+                self.proxy.close()
 
 
 # ---------------------------------------------------------------- CLI
@@ -1379,7 +1509,7 @@ def plist_text():
   <key>ProgramArguments</key><array><string>%(py)s</string><string>%(script)s</string><string>run</string></array>
   <key>EnvironmentVariables</key><dict><key>HERMES_HOME</key><string>%(home)s</string>%(env)s</dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>%(log)s</string>
@@ -1448,14 +1578,14 @@ def notifier_ok(status):
     return status.split(" ")[0] in ("authorized", "provisional", "ephemeral")
 
 
-def cmd_install():
+def cmd_install(no_start=False):
     os.makedirs(TOOLS, exist_ok=True)
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     subprocess.check_call(["swiftc", "-O", "-import-objc-header", os.path.join(SRC_DIR, "CGVirtualDisplay.h"),
                            os.path.join(SRC_DIR, "vdisplay.swift"), "-o", VDISPLAY])
     subprocess.check_call(["swiftc", "-O", os.path.join(SRC_DIR, "window-evict.swift"), "-o", EVICT])
     print("notifier signed with %s; notifications: %s" % (build_notifier(), notifier_status()))
-    if notifier_status().startswith("notDetermined"):
+    if not no_start and notifier_status().startswith("notDetermined"):
         # Ask for notification permission now (macOS asks once per app); the helper waits for the answer.
         subprocess.Popen([NOTIFIER_BIN, "--title", "Hermes Touch ID is ready",
                           "--body", "Passkey requests from the hidden Chrome show up here. Click one to see the page.",
@@ -1471,10 +1601,31 @@ def cmd_install():
     plist = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
     with open(plist, "w") as f:
         f.write(plist_text())
+    from chrome_agent_lifecycle import atomic_json
+    import secrets
+    config = os.path.join(STATE_DIR, 'lifecycle-config.json')
+    if not os.path.exists(config):
+        atomic_json(config, {'installation_id': secrets.token_urlsafe(32)})
     uid = os.getuid()
     subprocess.call(["launchctl", "bootout", "gui/%d/%s" % (uid, LABEL)], stderr=subprocess.DEVNULL)
-    subprocess.check_call(["launchctl", "bootstrap", "gui/%d" % uid, plist])
+    if not no_start:
+        cmd_activate()
     print("installed %s, %s; log %s" % (VDISPLAY, plist, LOG))
+    return 0
+
+
+def cmd_activate():
+    plist = os.path.join(HOME, 'Library', 'LaunchAgents', LABEL + '.plist')
+    subprocess.check_call(['launchctl', 'enable', 'gui/%d/%s' % (os.getuid(), LABEL)])
+    subprocess.check_call(['launchctl', 'bootstrap', 'gui/%d' % os.getuid(), plist])
+    return 0
+
+
+def cmd_stop(disable=False):
+    service = 'gui/%d/%s' % (os.getuid(), LABEL)
+    if disable:
+        subprocess.check_call(['launchctl', 'disable', service])
+    subprocess.check_call(['launchctl', 'bootout', service])
     return 0
 
 
@@ -1520,7 +1671,9 @@ def main(argv):
     table = {"run": lambda: Supervisor().run() or 0, "status": cmd_status,
              "show": lambda: cmd_show(argv[3] if len(argv) > 3 and argv[2] == "--minutes" else None),
              "hide": cmd_hide,
-             "install": cmd_install, "uninstall": cmd_uninstall}
+             "install": lambda: cmd_install(no_start='--no-start' in argv[2:]),
+             "activate": cmd_activate, "stop": cmd_stop, "disable": lambda: cmd_stop(disable=True),
+             "uninstall": cmd_uninstall}
     if cmd not in table:
         print(__doc__)
         return 2
