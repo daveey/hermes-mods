@@ -1,0 +1,192 @@
+"""Bounded, profile-qualified user scope recovery. No runtime writes."""
+import copy
+import json
+import math
+from pathlib import Path
+
+def _ro_connect(path):
+    import sqlite3
+    uri = Path(path).resolve().as_uri()
+    try:
+        conn = sqlite3.connect(uri + '?mode=ro', uri=True, timeout=1)
+    except sqlite3.OperationalError:
+        # WAL sidecars may have been removed by the last writer. Never create a DB.
+        conn = sqlite3.connect(uri + '?mode=rw', uri=True, timeout=1)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA query_only=ON')
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+def recover_scope(session_id, user_message, history):
+    """Recover only user rows, backwards through verified compression edges.
+
+    Never chase a compression tip (it can be a future turn). Ancestors are cut
+    at the child's creation time; same-session recovery requires a unique exact
+    current request anchor. Missing anchors use caller history, not latest DB
+    rows. Ambiguity/overflow is UNKNOWN rather than partial authorization.
+    """
+    from contextlib import closing
+    from hermes_constants import get_hermes_home
+    from hermes_state_messages import SessionMessagesMixin
+    from hermes_cli.profiles import get_active_profile_name
+
+    rows = [copy.deepcopy(r) for r in history or [] if isinstance(r, dict)
+            and r.get('role') == 'user' and not any(k.startswith('_') and r[k] for k in r)
+            and not r.get('display_kind') and not r.get('observed')]
+    path = Path(get_hermes_home()) / 'state.db'
+    recovered = []
+    if path.exists():
+        with closing(_ro_connect(path)) as conn:
+            conn.execute('BEGIN')
+            # Bound SQL work as well as returned data; no migrations or writes.
+            ticks = [0]
+            def budget():
+                ticks[0] += 1
+                return int(ticks[0] > 1000)
+            conn.set_progress_handler(budget, 1000)
+            current = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+            if current:
+                current = dict(current)
+                if current.get('profile_name') != get_active_profile_name():
+                    raise ValueError('scope_profile_mismatch')
+                clean = "role='user' AND COALESCE(_compressed_summary,0)=0 AND COALESCE(observed,0)=0 AND display_kind IS NULL"
+                anchors = conn.execute('SELECT id FROM messages WHERE session_id=? AND ' + clean +
+                                       ' AND content=? LIMIT 2', (session_id, user_message)).fetchall()
+                if len(anchors) > 1:
+                    raise ValueError('scope_ambiguous_anchor')
+                if not anchors and conn.execute(
+                        'SELECT 1 FROM messages WHERE session_id=? AND ' + clean + ' LIMIT 1',
+                        (session_id,)).fetchone():
+                    raise ValueError('scope_missing_anchor')
+                segments = []
+                if anchors:
+                    segments.append((session_id, 'id < ?', anchors[0]['id']))
+                seen = {session_id}
+                for _ in range(32):
+                    if SessionMessagesMixin._is_explicit_fork_child_row(None, current, include_reset=True):
+                        break
+                    parent_id = current.get('parent_session_id')
+                    if not parent_id:
+                        break
+                    parent = conn.execute('SELECT * FROM sessions WHERE id=?', (parent_id,)).fetchone()
+                    if not parent:
+                        raise ValueError('scope_missing_ancestor')
+                    parent = dict(parent)
+                    if parent.get('end_reason') != 'compression':
+                        break
+                    if parent_id in seen:
+                        raise ValueError('scope_lineage_cycle')
+                    if parent.get('profile_name') != current.get('profile_name'):
+                        raise ValueError('scope_profile_mismatch')
+                    cutoff = current.get('started_at')
+                    if not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff):
+                        raise ValueError('scope_missing_cutoff')
+                    segments.append((parent_id, 'timestamp < ?', cutoff))
+                    seen.add(parent_id)
+                    current = parent
+                else:
+                    raise ValueError('scope_lineage_limit')
+                for sid, bound, cutoff in reversed(segments):
+                    saved = conn.execute('SELECT content FROM messages WHERE session_id=? AND ' + clean +
+                                         ' AND ' + bound + ' ORDER BY id LIMIT 201', (sid, cutoff)).fetchall()
+                    for row in saved:
+                        content = row['content']
+                        # Multimodal JSON cannot safely be treated as human text here.
+                        if not isinstance(content, str) or content.startswith(('[', '{')):
+                            raise ValueError('scope_unsupported_content')
+                        recovered.append({'role': 'user', 'content': content})
+                    if len(recovered) > 200 or len(json.dumps(recovered)) > 32000:
+                        raise ValueError('context_limit')
+    # Retain ordering/repeated restrictions; only remove an overlapping suffix/prefix.
+    overlap = 0
+    for n in range(1, min(len(recovered), len(rows)) + 1):
+        if recovered[-n:] == rows[:n]:
+            overlap = n
+    rows = recovered + rows[overlap:]
+    if not rows or rows[-1].get('content') != user_message:
+        rows.append({'role': 'user', 'content': user_message})
+    if len(rows) > 200 or len(json.dumps(rows)) > 32000:
+        raise ValueError('context_limit')
+    return rows
+
+
+def resolve_scope(session_id, contexts, turn_messages=None):
+    """Resolve a cache miss after rotation, or recover a fresh-process request.
+
+    `contexts` must be the caller's bounded, active-profile, per-turn capture
+    cache. Caller owns locking and storing the returned isolated copy under the
+    new ID. Never follows descendants, imports durable tool results, or reads
+    newer user rows into a frozen capture. None is a poisoned capture, not a miss.
+    For restart without a capture, caller must supply real current-turn user
+    rows; durable latest-message guessing is forbidden.
+    """
+    from contextlib import closing
+    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_state_messages import SessionMessagesMixin
+
+    path = Path(get_hermes_home()) / 'state.db'
+    if not session_id:
+        raise ValueError('scope_missing_session')
+    if path.exists():
+        with closing(_ro_connect(path)) as conn:
+            conn.execute('BEGIN')
+            ticks = [0]
+            def budget():
+                ticks[0] += 1
+                return int(ticks[0] > 1000)
+            conn.set_progress_handler(budget, 1000)
+            current = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+            seen = set()
+            for _ in range(32):
+                if current is None:
+                    raise ValueError('scope_missing_ancestor')
+                current = dict(current)
+                sid = current['id']
+                if sid in seen:
+                    raise ValueError('scope_lineage_cycle')
+                seen.add(sid)
+                if current.get('profile_name') != get_active_profile_name():
+                    raise ValueError('scope_profile_mismatch')
+                if sid in contexts:
+                    rows = copy.deepcopy(contexts[sid])
+                    if rows is None:
+                        raise ValueError('scope_incomplete_capture')
+                    supplied_users = [r.get('content') for r in turn_messages or []
+                                      if isinstance(r, dict) and r.get('role') == 'user'
+                                      and not any(k.startswith('_') and r[k] for k in r)
+                                      and not r.get('display_kind') and not r.get('observed')]
+                    captured_users = [r.get('content') for r in rows if r.get('role') == 'user']
+                    if supplied_users and (not captured_users or supplied_users[-1] != captured_users[-1]):
+                        raise ValueError('scope_current_request_mismatch')
+                    if len(rows) > 200 or len(json.dumps(rows)) > 32000:
+                        raise ValueError('context_limit')
+                    return rows
+                if SessionMessagesMixin._is_explicit_fork_child_row(None, current, include_reset=True):
+                    break
+                parent_id = current.get('parent_session_id')
+                if not parent_id:
+                    break
+                parent = conn.execute('SELECT * FROM sessions WHERE id=?', (parent_id,)).fetchone()
+                if parent is None:
+                    raise ValueError('scope_missing_ancestor')
+                if parent['end_reason'] != 'compression':
+                    break
+                cutoff = current.get('started_at')
+                started = parent['started_at']
+                if (type(cutoff) not in (int, float) or not math.isfinite(cutoff)
+                        or type(started) not in (int, float) or not math.isfinite(started)
+                        or started > cutoff):
+                    raise ValueError('scope_invalid_cutoff')
+                current = parent
+            else:
+                raise ValueError('scope_lineage_limit')
+    rows = [r for r in turn_messages or [] if isinstance(r, dict)
+            and r.get('role') == 'user' and not any(k.startswith('_') and r[k] for k in r)
+            and not r.get('display_kind') and not r.get('observed')]
+    if not rows or not isinstance(rows[-1].get('content'), str) or not rows[-1]['content']:
+        raise ValueError('scope_current_request_unavailable')
+    return recover_scope(session_id, rows[-1]['content'], rows[:-1])
