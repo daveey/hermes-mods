@@ -15,6 +15,7 @@ from unittest import mock
 from test_hermes_chrome_agent import hca
 from chrome_agent_lifecycle import Ledger, Lifecycle, LifecycleError
 from chrome_agent_process import fingerprint
+from chrome_test_fixtures import chrome_environment
 
 
 def free_port():
@@ -31,6 +32,9 @@ class EndpointOwnershipTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(prefix='astra-endpoint-')
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        environment = mock.patch.dict(os.environ, chrome_environment(self.root))
+        environment.start()
+        self.addCleanup(environment.stop)
         self.port = free_port()
         self.log = (self.root / 'chrome.log').open('w')
         self.addCleanup(self.log.close)

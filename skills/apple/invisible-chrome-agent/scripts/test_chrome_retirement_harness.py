@@ -4,7 +4,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -14,6 +13,7 @@ from chrome_agent_daemons import exchange
 from chrome_agent_lifecycle import Config, Ledger, Lifecycle
 from chrome_agent_process import fingerprint
 import test_chrome_endpoint_ownership as endpoints
+from chrome_test_fixtures import socket_directory
 
 hca = endpoints.hca
 
@@ -54,7 +54,7 @@ class HarnessRetirementTests(unittest.TestCase):
                         Config(idle_lease_s=90 if worker_exit else 2, orphan_s=1), clock=lambda: now[0])
         life = Lifecycle(ledger, 'test', supervisor.wake_managed, supervisor.idle_managed)
         supervisor.lifecycle = life
-        runtime = tempfile.TemporaryDirectory(prefix='rh-')
+        runtime = socket_directory()
         self.addCleanup(runtime.cleanup)
         worker = subprocess.Popen(['sleep', '180'])
         def stop_worker():

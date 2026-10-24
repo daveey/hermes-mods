@@ -17,6 +17,7 @@ import time
 import urllib.request
 
 from chrome_agent_lifecycle import Config, Ledger, Lifecycle
+from chrome_test_fixtures import chrome_environment
 
 
 def validate_isolation(port, upstream, profile, root):
@@ -78,7 +79,8 @@ def main():
                     '--remote-debugging-port=' + str(upstream), '--no-startup-window']
             if not args.headful:
                 argv.append('--headless=new')
-            child = subprocess.Popen(argv, stdout=log, stderr=log)
+            child = subprocess.Popen(argv, stdout=log, stderr=log,
+                                     env=dict(os.environ, **chrome_environment(root)))
             children.append(child)
             deadline = time.monotonic() + 30
             while not api.cdp_version(port=upstream):

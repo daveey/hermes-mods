@@ -2,16 +2,16 @@
 import os
 from pathlib import Path
 import socket
-import tempfile
 import unittest
 from unittest import mock
 
 import chrome_agent_daemons as daemons
+from chrome_test_fixtures import socket_directory
 
 
 class DaemonIdentityTests(unittest.TestCase):
     def test_empty_scoped_daemon_is_recoverable_but_foreign_page_is_not(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with socket_directory() as tmp:
             path = Path(tmp) / 'bu-lease-testcap.sock'
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
                 listener.bind(str(path))

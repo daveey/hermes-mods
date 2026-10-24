@@ -141,6 +141,20 @@ connection refusal alone never proves an unknown process exited. Live legacy
 identities are re-inspected to add the stamp. A dead legacy identity with an
 extant uninspectable socket remains unresolved; missing endpoints can be cleared.
 
+Unreaped zombies count as retired: Linux `/proc` state or bounded `ps` PID/state
+evidence (including macOS `ZN`) establishes this even while `kill(pid, 0)` succeeds.
+A timed-out, unavailable, denied or malformed probe is never proof of exit.
+The fallback consumes the same candidate deadline, not a fresh timeout. Retirement
+of a PID generation still does not authorize a replacement endpoint.
+
+The configured harness runtime directory must fit its full capability socket name
+within the OS pathname limit (103 encoded bytes on macOS, 107 on Linux, excluding
+the terminating NUL). Acquire rejects an oversized path before committing a request
+or waking Chrome. Configure a shorter `BH_RUNTIME_DIR` for the core/harness; paths
+are never silently relocated or capability names truncated. Socket test fixtures
+allocate short private names under managed scratch (explicit non-system `TMPDIR`,
+otherwise `$HERMES_HOME/cache/scratch`), without changing global tempfile defaults.
+
 Each candidate receives at most 0.5 seconds of the sweep's total budget (5 seconds
 for idle cleanup, 10 seconds for explicit retirement). A capability-order cursor
 rotates across successive sweeps in the same supervisor, including when a prior
@@ -224,6 +238,7 @@ From `scripts/`:
 python3 -m unittest -v test_chrome_agent_lifecycle test_hermes_chrome_agent test_chrome_lifecycle_rework test_chrome_supervisor_rework test_chrome_daemon_rework
 python3 -m unittest -v test_chrome_astra_rework test_chrome_clock_rework test_chrome_daemon_processes
 python3 -m unittest -v test_chrome_endpoint_ownership test_chrome_stop_ownership
+python3 -m unittest -v test_chrome_retirement test_chrome_retirement_harness test_chrome_native_retirement
 ```
 
 The lifecycle tests cover ledger isolation/persistence/permissions, corrupt state,
@@ -236,11 +251,15 @@ Mac launchd process behavior is mocked, not an on-host acceptance test.
 The additional suites exercise bound listeners, real quiet sockets and pending
 reader reclamation, deterministic forward/backward clocks and reloads, private
 Unix IPC processes, foreign/sibling preservation and ignored shutdown ACKs. The
-last command requires Linux Chrome and browser-harness: it launches disposable
-profiles on ephemeral ports, tests occupied ports and the actual launch race,
+endpoint/stop and harness-retirement suites require Linux Chrome and browser-harness:
+they launch disposable profiles on ephemeral ports, test occupied ports and the actual launch race,
 exact-child recovery, and supervisor-only stop with separately spawned harnesses,
 including the actual 30-second protected drain bound. Fixtures clean only their
 own recorded children. These Linux results do not verify the macOS OS adapters.
+The native-retirement suite distinguishes zombie evidence from failed probes,
+checks remaining probe budgets and runtime socket-byte limits, and binds a real
+short fixture socket. Chrome fixtures also redirect HOME, launcher data and crash/cache
+directories; `--user-data-dir` alone does not isolate those writes on Linux.
 
 For a separately approved real-CDP smoke, the harness launches only its own fresh
 headless Chrome/profile and ephemeral ports, refuses ports 9333/9334 and existing
