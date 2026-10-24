@@ -286,26 +286,34 @@ function activeConnection() {
   }
 }
 
-function api(path, connection, timeoutMs = 15_000) {
+function focusedRoute() {
+  const owner = host.state?.focusedSessionOwner?.get?.()
+  return {
+    connectionId: owner?.connectionId || activeConnection(),
+    profile: owner?.targetProfile || owner?.profile || host.state?.profile?.get?.() || 'default'
+  }
+}
+
+function api(path, connection, timeoutMs = 15_000, profile) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
   const connectionId = connection || activeConnection()
-  return bridge({ path, ...(connectionId ? { connectionId } : {}), timeoutMs })
+  return bridge({ path, ...(connectionId ? { connectionId } : {}), ...(profile !== undefined ? { profile } : {}), timeoutMs })
 }
 
 // stored id → { at, ids:Set } — the session plus its parent chain (compression
 // rotates the stored id; kanban tasks keep the id they were created under).
 const lineageCache = new Map()
 
-async function lineageIds(storedId, connection) {
-  const cacheKey = connection ? `${connection}\u0000${storedId}` : storedId
+async function lineageIds(storedId, connection, profile = 'default') {
+  const cacheKey = JSON.stringify([connection || '', profile, storedId])
   const hit = lineageCache.get(cacheKey)
   if (hit && Date.now() - hit.at < LINEAGE_TTL_MS) return hit.ids
   const ids = new Set([storedId])
   let cur = storedId
   for (let hop = 0; hop < 12 && cur; hop++) {
     try {
-      const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, connection, 5_000)
+      const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, connection, 5_000, profile)
       if (row?.id) ids.add(str(row.id))
       cur = str(row?.parent_session_id)
       if (cur) ids.add(cur)
@@ -341,16 +349,17 @@ const emit = () => subs.forEach(fn => fn(snapshot))
 // Last good hub answer for the focused lineage (shown stale while the hub is unreachable).
 let hubLinkCache = { session: null, chips: [] }
 
-export async function loadKanban(ids) {
-  const cacheScope = JSON.stringify([activeConnection() || '', focusedProfile(), [...ids].sort()])
+export async function loadKanban(ids, route = focusedRoute()) {
+  const cacheScope = JSON.stringify([route.connectionId || '', route.profile, [...ids].sort()])
+  const read = (path, timeoutMs = 15_000) => api(path, route.connectionId, timeoutMs, route.profile)
   const list = await safe(
-    () => api(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
+    () => read(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
     null
   )
   let live = null
   if (list && Array.isArray(list.tasks)) live = sessionTaskChips(list.tasks)
   else {
-    const board = await safe(() => api('/api/plugins/kanban/board'), null)
+    const board = await safe(() => read('/api/plugins/kanban/board'), null)
     live = board ? kanbanChips(board, ids) : null
   }
   // Linked cards on other gateways, from this gateway's hermes-hub replica
@@ -358,7 +367,7 @@ export async function loadKanban(ids) {
   const [first, ...rest] = [...ids]
   const hub = first
     ? await safe(
-        () => api(`/api/plugins/hub-sync/session-links/${encodeURIComponent(first)}?ids=${encodeURIComponent(rest.join(','))}`, null, 4_000),
+        () => read(`/api/plugins/hub-sync/session-links/${encodeURIComponent(first)}?ids=${encodeURIComponent(rest.join(','))}`, 4_000),
         null
       )
     : null
@@ -402,14 +411,14 @@ async function loadMachines(ids) {
 export async function archiveGuard({ sessionId, ids, profile, connectionId } = {}) {
   if (!sessionId) return []
   const lineage = new Set(ids || [])
-  for (const id of await lineageIds(sessionId, connectionId)) lineage.add(id)
+  for (const id of await lineageIds(sessionId, connectionId, profile || 'default')) lineage.add(id)
   const inv = await api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id=', connectionId, 2_000)
   if (!inv || !Array.isArray(inv.machines)) return []
   const chips = machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile: profile || 'default', ids: lineage })
   return machineArchiveLines(chips)
 }
 
-async function refresh() {
+export async function refresh() {
   // A focus change during an in-flight round must not be dropped (that left the
   // strip empty for a whole poll interval after opening a chat): run again after.
   if (running) {
@@ -421,11 +430,13 @@ async function refresh() {
   try {
     const runtime = host.state.focusedSessionId.get()
     const stored = host.state.focusedStoredSessionId.get()
+    const route = focusedRoute()
+    const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
     if (!runtime && !stored) {
       snapshot = { runtime, stored, chips: [] }
       return emit()
     }
-    const sameSession = stored === snapshot.stored
+    const sameSession = scope === snapshot.scope
     const [procs, subagents] = await Promise.all([
       runtime ? safe(() => host.request('process.list', { session_id: runtime }), null) : null,
       runtime ? safe(() => host.request('subagent.list', { session_id: runtime }), null) : null
@@ -433,9 +444,9 @@ async function refresh() {
     const kanbanDue = stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)
     const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
     if (kanbanDue || machinesDue) {
-      const ids = await lineageIds(stored)
+      const ids = await lineageIds(stored, route.connectionId, route.profile)
       const [kChips, mChips] = await Promise.all([
-        kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids)) : undefined,
+        kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)) : undefined,
         machinesDue ? ((lastMachinesAt = Date.now()), loadMachines(ids)) : undefined
       ])
       // null = fetch failed: keep this chat's last good list, never the previous chat's.
@@ -453,6 +464,7 @@ async function refresh() {
     snapshot = {
       runtime,
       stored,
+      scope,
       chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
     }
     emit()

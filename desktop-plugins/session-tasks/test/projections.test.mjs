@@ -227,6 +227,78 @@ test('hub fallback cache cannot leak between profiles with the same session id',
   } finally { delete globalThis.window; delete host.state }
 })
 
+test('poller reloads the same stored id when its owner profile changes', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  let profile = 'work'
+  host.state = {
+    focusedSessionId: { get: () => 'runtime-same' },
+    focusedStoredSessionId: { get: () => 'stored-same' },
+    focusedSessionOwner: { get: () => ({ connectionId: 'owner', profile }) }
+  }
+  host.request = async () => ({})
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    if (args.path.startsWith('/api/sessions/')) return { id: 'stored-same' }
+    if (args.path.startsWith('/api/session-kanban-tasks')) return { tasks: [] }
+    if (args.path.includes('session-links')) return { gateway: 'origin', tasks: [] }
+    return { gateway_id: 'owner', machines: [] }
+  } } }
+  try {
+    await m.refresh()
+    profile = 'other'
+    await m.refresh()
+    const taskReads = calls.filter(c => c.path.startsWith('/api/session-kanban-tasks'))
+    assert.deepEqual(taskReads.map(c => [c.connectionId, c.profile]), [['owner', 'work'], ['owner', 'other']])
+    const lineageReads = calls.filter(c => c.path.startsWith('/api/sessions/'))
+    assert.deepEqual(lineageReads.map(c => c.profile), ['work', 'other'])
+  } finally { delete globalThis.window; delete host.state; delete host.request }
+})
+
+test('lineage reads and caches keep identical session ids separate by owner profile', async () => {
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    if (args.path.startsWith('/api/sessions/')) return { id: 's_same', parent_session_id: null }
+    return { gateway_id: 'owner', machines: [] }
+  } } }
+  try {
+    for (const profile of ['work', 'other']) {
+      await m.archiveGuard({ sessionId: 's_same', connectionId: 'owner-connection', profile })
+    }
+    const reads = calls.filter(c => c.path.startsWith('/api/sessions/'))
+    assert.equal(reads.length, 2)
+    assert.deepEqual(reads.map(c => [c.connectionId, c.profile]), [
+      ['owner-connection', 'work'], ['owner-connection', 'other']
+    ])
+  } finally { delete globalThis.window }
+})
+
+test('task reads pin the focused owner throughout a mid-fetch focus switch', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  let owner = { connectionId: 'owner-connection', profile: 'worker' }
+  host.state = {
+    focusedSessionOwner: { get: () => owner },
+    profile: { get: () => 'ambient' }, connectionId: { get: () => 'ambient-connection' }
+  }
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    owner = { connectionId: 'new-connection', profile: 'other' }
+    if (args.path.startsWith('/api/session-kanban-tasks')) return { tasks: [] }
+    if (args.path.includes('session-links')) return { gateway: 'origin', tasks: [] }
+    throw new Error('unexpected route')
+  } } }
+  try {
+    assert.deepEqual(await m.loadKanban(new Set(['s_pinned'])), [])
+    assert.equal(calls.length, 2)
+    for (const call of calls) {
+      assert.equal(call.connectionId, 'owner-connection')
+      assert.equal(call.profile, 'worker')
+    }
+  } finally { delete globalThis.window; delete host.state }
+})
+
 test('remote task clicks never fall back to the active gateway', () => {
   const calls = []
   const open = (...args) => { calls.push(args); return true }
