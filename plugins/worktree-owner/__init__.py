@@ -403,6 +403,19 @@ def _teardown_locked(task_id: str, env, ws: str, live: set[str]) -> list[dict]:
     # the card's own dir: workspace, when it is a linked worktree (a .git FILE) that no other open card uses
     if ws and os.path.isfile(os.path.join(ws, ".git")) and \
             not any(os.path.realpath(r["path"]) == os.path.realpath(ws) for r in results):
+        gd = _git(ws, 'rev-parse', '--absolute-git-dir')
+        if gd.returncode:
+            return results
+        marker = Path(gd.stdout.strip(), MARKER)
+        if marker.exists():
+            try:
+                rec = json.loads(marker.read_text())
+            except (OSError, ValueError):
+                return results
+            if rec.get('task_id') and (rec.get('task_id') != task_id
+                    or rec.get('run_id') != env.get('HERMES_KANBAN_RUN_ID')
+                    or rec.get('board_db') != os.path.realpath(env['HERMES_KANBAN_DB'])):
+                return results  # own workspace fallback must not bypass marker fence
         results.append(remove(ws, f"dir workspace of {task_id}"))
     return results
 

@@ -68,6 +68,11 @@ class Lifecycle(unittest.TestCase):
         self.call(self.result)
         self.assertTrue(self.tree.exists())
 
+    def test_legacy_marker_on_own_workspace_kept(self):
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('update tasks set workspace_path=?', (str(self.tree),))
+        self.test_legacy_marker_kept()
+
     def test_shared_parent_and_child_keep_marked_tree(self):
         for shared in (self.ws, self.tree / 'child'):
             with closing(sqlite3.connect(self.db)) as c, c:
