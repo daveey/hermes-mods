@@ -143,7 +143,7 @@ default/local entry smoke checks passed. Mac headful acceptance is still require
 - Core registers worker PID and the capability-specific harness socket directory.
   Dead workers get `orphan_s` grace, while unexpired request/download/handoff deadlines
   remain protected. Harness cleanup verifies a private capability-named IPC socket,
-  owned page and process creation identity before issuing its shutdown protocol;
+  owned page (or an empty/disconnected CDP daemon) and process creation identity before issuing its shutdown protocol;
   it never kills by process-name matching. Unverifiable endpoints are preserved.
 - Quiet-but-alive tasks expire after `idle_lease_s` without browser use. Observer
   polling and open sockets do not renew them. Their next request gets a new capability;
@@ -158,7 +158,7 @@ default/local entry smoke checks passed. Mac headful acceptance is still require
 From `scripts/`:
 
 ```sh
-python3 -m unittest -v test_chrome_agent_lifecycle test_hermes_chrome_agent test_chrome_lifecycle_rework test_chrome_supervisor_rework
+python3 -m unittest -v test_chrome_agent_lifecycle test_hermes_chrome_agent test_chrome_lifecycle_rework test_chrome_supervisor_rework test_chrome_daemon_rework
 ```
 
 The lifecycle tests cover ledger isolation/persistence/permissions, corrupt state,
