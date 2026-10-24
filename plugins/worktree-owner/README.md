@@ -21,38 +21,19 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
    only if its directory name appears in the command or code, or, for `terminal` only, a shell loop (`for`, `while`,
    `xargs`, `parallel`) builds the paths from `$` variables. A tree that another agent creates in the same seconds is
    not claimed.
-2. **Teardown.** When a Kanban worker calls `kanban_complete` for its own card, the hook goes through every
-   worktree registered to that card. It also checks the card's own `dir:` workspace, when that is a linked
-   worktree no other open card uses. Each one is removed with `git worktree remove` when it is clean, its HEAD is
-   on a remote and no live process has its cwd inside it. Nothing can be lost that way, and the branch is kept.
-   Dirty or unpushed trees are left alone, so a backstop GC (for example `mac-worktree-gc --all-repos`) can archive
-   and then delete them after 7 idle days. The exception is a dirty tree nested inside the card's own scratch
-   workspace (`…/kanban/workspaces/<id>/`). **If it still exists when the hook runs**, that tree is
-   archived first to `~/.hermes/archive/worktrees/<name>-<date>/` (`unpushed.bundle` + `commits/*.patch`,
-   `uncommitted.diff`, `untracked.tar.gz`, `meta.json`). Then it is force-removed, so the repo keeps no stale entry.
-   See the core-ordering limitation below before relying on this archive behavior.
+2. **Teardown.** Only a successful `kanban_complete` result for the worker's own task and run can start cleanup. A writer reservation on the exact worker board protects verification and removal: the task must be `done`, its current run cleared, and its latest run must match the worker and have ended `done/completed`. Missing, failed, rejected, foreign-board/task, stale-run and review results do nothing. Markers carry the canonical board DB and run ID; ambiguous legacy markers are preserved.
+   Open-card workspace overlaps on that board and live process cwd paths preserve trees. Clean, pushed trees are removed without force, retaining their branches. Simple dirty/untracked/unpushed linked trees nested in the completed scratch workspace are archived before removal: a self-contained verified `unpushed.bundle`, binary `uncommitted.diff`, readable `untracked.tar.gz`, and `meta.json`. Archive failure preserves the source. Recover with `git clone <archive>/unpushed.bundle <restore>`, `git -C <restore> apply <archive>/uncommitted.diff` when present, then extract the untracked archive there.
+   Staged changes, ignored files, nested Git entries, symlinks, special files and scan uncertainty are conservatively preserved, not force-removed. Trees outside scratch with unsaved work remain for explicit owner cleanup or an independently verified backstop.
 
 ### Portability and safety limits
 
-- macOS uses native `st_birthtime`; Linux uses GNU `stat -c %W`. Neither Unix ctime nor
-  mtime is creation time. If birth time is unavailable, only the first HEAD reflog entry with
-  a null old object id is accepted; missing, malformed or expired creation records mean
-  unknown birth and the candidate is skipped, not attributed to the latest caller.
-- `lsof` is resolved on PATH (with `/usr/sbin/lsof` as a macOS fallback). Missing commands,
-  timeouts, nonzero exits, stderr warnings about incomplete scans, or no cwd records abort
-  teardown without removing anything. Container mount visibility warnings can therefore
-  keep cleanup disabled until the process scan can run completely.
-- **Nested scratch preservation is not guaranteed by a post-tool hook.** Core versions that
-  delete scratch inside `complete_task` remove it before this hook runs. The archive path
-  described above works only while the nested tree still exists. Core must defer scratch
-  cleanup or provide a preservation gate before deletion; moving destructive teardown to
-  a pre-tool hook would be unsafe when completion is rejected. Do not rely on this plugin
-  to save nested scratch work on those cores.
-- The existing completion hook does not inspect the tool's success result. A rejected
-  `kanban_complete` can still trigger cleanup of eligible owned trees. Deployment should
-  remain disabled where this is unacceptable pending a success-gated lifecycle hook.
-- SSH-created remote trees and plain-shell work are not automatically owned. No broad
-  managed-directory globs confer ownership retroactively.
+- macOS uses native `st_birthtime`; Linux uses GNU `stat -c %W`, falling back only to an intact initial HEAD reflog. Never ctime. Unknown creation times are not claimed.
+- Linux scans `/proc` cwd links for the current UID. Exited processes and proven zombies are tolerated; unknown visibility fails closed. Non-dumpable same-UID services can deny readlink. Optional per-profile `<HERMES_HOME>/worktree-owner.json` with `{"linux_sudo_readlink": true}` enables only `sudo -n -- /usr/bin/readlink -- /proc/<pid>/cwd` fallback, with process-start identity checked before/after. It never prompts, changes sudoers, runs a privileged shell/Python, or ignores a failed probe. Without an existing noninteractive grant, cleanup stays conservative.
+- macOS retains PATH-resolved `lsof` (fallback `/usr/sbin/lsof`); any warning, timeout, failed exit or empty scan prevents cleanup. Linux deliberately does not use Docker-sensitive lsof mount scans.
+- **Core prerequisite:** Git-bearing scratch must be preserved inside `complete_task` before any post-tool hook. Fork commit `20358a17bdec17ed5692d9be0f4b99b60c3c4ddf` guards both direct and deferred-parent deletion, for tool, CLI and REST completion. Do not enable this lifecycle on an older core expecting it to protect nested scratch. CLI/REST completion preserves Git but does not invoke this tool-only teardown callback.
+- SSH-created remote trees, existing sessions and plain-shell work are not automatically owned. SSH commands are excluded from local attribution. For remote/manual work, run explicit `register_markers` on the owning host with its real owner environment and verified paths, or remove the worktree explicitly after safe archival. No directory glob confers ownership retroactively.
+- Registration is best-effort, not a security boundary: command text and creation windows cannot prove arbitrary shell semantics or concurrent loop ownership. Unregistered trees remain protected by core preservation, not automatically reaped.
+- Process and filesystem scans are snapshots, not locks on arbitrary external Git users. The board reservation serializes transitions on that board; it is not a cross-host filesystem lease. Never use this as a global managed-root exemption.
 
 Log: `~/.hermes/logs/worktree-owner.log` (`REGISTER`, `REMOVED`, `KEEP`, `SKIP` lines).
 
@@ -101,4 +82,12 @@ New sessions and Kanban workers load it. Sessions that are already open keep run
 python3 -B -m unittest discover -s plugins/worktree-owner/tests
 ```
 
-Stdlib only. The tests use temp git repos and a temp bare remote.
+Stdlib unit suite: 48 tests using disposable Git repos and boards, including actual archive recovery and staged-version preservation. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
+
+Bootstrapped runtime integration (requires a core checkout with scratch preservation, and on Linux an existing noninteractive readlink grant for non-dumpable processes):
+
+```
+hermes --run-module cProfile -o /dev/null "$PWD/plugins/worktree-owner/tests/runtime_fixture.py" /absolute/path/to/patched/core
+```
+
+The fixture creates a disposable profile, discovers the actual plugin, selects its registered callback, uses real Kanban tool completion for clean/dirty/untracked/unpushed nested worktrees, verifies rejection preservation and post-success ordering, and performs a real Linux process scan without stubbing it. No production board transitions. This proves the candidate code; deployment must separately verify the default runtime contains the prerequisite core commit.

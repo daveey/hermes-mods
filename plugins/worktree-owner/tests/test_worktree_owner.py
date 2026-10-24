@@ -116,6 +116,7 @@ class Owner(unittest.TestCase):
         self.db = self.tmp / 'board.db'
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute('create table tasks (id text primary key, status text, current_run_id text, workspace_path text)')
+            c.execute('create table task_runs (id text, task_id text, status text, outcome text, ended_at integer)')
         self.m = load()
         original = self.m.on_tool_call
         def verified_call(name, args, duration_ms=0, env=None, **kwargs):
@@ -123,7 +124,9 @@ class Owner(unittest.TestCase):
             if name == 'kanban_complete' and env.get('HERMES_KANBAN_TASK'):
                 with closing(sqlite3.connect(self.db)) as c, c:
                     c.execute('insert or replace into tasks values (?, ?, ?, ?)',
-                              (env['HERMES_KANBAN_TASK'], 'done', 'run1', env.get('HERMES_KANBAN_WORKSPACE', '')))
+                              (env['HERMES_KANBAN_TASK'], 'done', None, env.get('HERMES_KANBAN_WORKSPACE', '')))
+                    c.execute('delete from task_runs where task_id=?', (env['HERMES_KANBAN_TASK'],))
+                    c.execute("insert into task_runs values ('run1', ?, 'done', 'completed', 1)", (env['HERMES_KANBAN_TASK'],))
                     c.execute("delete from tasks where id like 'shared%'")
                     for i, path in enumerate(self.live):
                         c.execute('insert into tasks values (?, ?, ?, ?)', (f'shared{i}', 'running', 'other', path))

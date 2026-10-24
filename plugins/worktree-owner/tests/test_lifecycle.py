@@ -35,7 +35,9 @@ class Lifecycle(unittest.TestCase):
         self.db = self.root / 'board.db'
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute('create table tasks (id text, status text, current_run_id text, workspace_path text)')
-            c.execute('insert into tasks values (?, ?, ?, ?)', ('task', 'done', 'run', str(self.ws)))
+            c.execute('insert into tasks values (?, ?, ?, ?)', ('task', 'done', None, str(self.ws)))
+            c.execute('create table task_runs (id text, task_id text, status text, outcome text, ended_at integer)')
+            c.execute("insert into task_runs values ('run', 'task', 'done', 'completed', 1)")
         self.env = dict(HERMES_KANBAN_TASK='task', HERMES_KANBAN_RUN_ID='run', HERMES_KANBAN_DB=str(self.db), HERMES_KANBAN_WORKSPACE=str(self.ws))
         self.result = dict(ok=True, task_id='task', run_id='run')
         self.m.register_markers(0, self.env)
@@ -43,6 +45,22 @@ class Lifecycle(unittest.TestCase):
 
     def call(self, result=None, args=None):
         return self.m.on_tool_call('kanban_complete', args or {}, env=self.env, result=result)
+
+    def test_integer_run_id_from_actual_core_contract(self):
+        # tasks.current_run_id and tool result run_id are INTEGER, env is text.
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('drop table tasks')
+            c.execute('create table tasks (id text, status text, current_run_id integer, workspace_path text)')
+            c.execute('insert into tasks values (?, ?, ?, ?)', ('task', 'done', None, str(self.ws)))
+            c.execute('drop table task_runs')
+            c.execute('create table task_runs (id integer, task_id text, status text, outcome text, ended_at integer)')
+            c.execute("insert into task_runs values (7, 'task', 'done', 'completed', 1)")
+        self.env['HERMES_KANBAN_RUN_ID'] = '7'
+        gd = Path(git(self.tree, 'rev-parse', '--absolute-git-dir').strip())
+        (gd / self.m.MARKER).unlink()
+        self.m.register_markers(0, self.env)
+        self.call(dict(ok=True, task_id='task', run_id=7))
+        self.assertFalse(self.tree.exists())
 
     def test_result_gate(self):
         for result in (None, {}, {'ok': False}, dict(self.result, error='failed'), dict(self.result, task_id='other'), dict(self.result, run_id='old')):
@@ -135,6 +153,14 @@ class Lifecycle(unittest.TestCase):
                 self.call(self.result)
                 self.assertTrue(self.tree.exists())
 
+    def test_staged_and_working_versions_are_not_collapsed(self):
+        (self.tree / 'a').write_text('staged version')
+        git(self.tree, 'add', 'a')
+        (self.tree / 'a').write_text('working version')
+        self.call(self.result)
+        self.assertTrue(self.tree.exists())
+        self.assertEqual(git(self.tree, 'show', ':a').strip(), 'staged version')
+
     def test_archive_failure_keeps_data(self):
         (self.tree / 'wip').write_text('valuable')
         with patch.object(self.m, '_archive', side_effect=OSError('disk full')):
@@ -143,6 +169,22 @@ class Lifecycle(unittest.TestCase):
 
 
 class LinuxCwd(unittest.TestCase):
+    def test_opt_in_sudo_readlink_fallback_is_narrow_and_fail_closed(self):
+        m = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '42').mkdir()
+            (root / '42/stat').write_text('42 (test) S ' + '0 ' * 30)
+            with patch.object(m, '_sudo_proc_enabled', return_value=True, create=True), \
+                 patch.object(m.os, 'readlink', side_effect=PermissionError()), \
+                 patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '/fixture\n', '')) as run:
+                self.assertEqual(m._proc_cwds(tmp), ['/fixture'])
+                self.assertEqual(run.call_args.args[0], ['sudo', '-n', '--', '/usr/bin/readlink', '--', str(root / '42/cwd')])
+                run.return_value = subprocess.CompletedProcess([], 1, '', 'denied')
+                with self.assertRaises(RuntimeError):
+                    m._proc_cwds(tmp)
+
+
     def test_proc_unknown_permission_and_zombie(self):
         m = load()
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,9 +12,10 @@ Two hooks, both ``post_tool_call`` (never block or change a tool call):
 2. Teardown. When a Kanban worker calls ``kanban_complete`` for its own card, every worktree registered to that
    card, plus the card's own ``dir:`` workspace if that is a linked worktree no other open card uses, is removed
    with ``git worktree remove`` when it is clean and its HEAD is on a remote (nothing can be lost; the branch is
-   kept). Dirty or unpushed trees are left for mac-worktree-gc, which archives then deletes them after 7 idle days,
-   except trees nested in the card's scratch workspace (deleted by the dispatcher right after completion): those are
-   archived to ~/.hermes/archive/worktrees/<name>-<date>/ first, then force-removed.
+   kept). Dirty or unpushed trees outside scratch are preserved. Simple nested scratch trees are instead
+   archived to ~/.hermes/archive/worktrees/<name>-<date>/ before removal. Requires core Git-bearing scratch
+   preservation: the post-tool hook cannot recover data already deleted by older cores. Teardown requires the
+   successful own-task/run result and durable completed run under a board writer reservation.
 
 Log: ~/.hermes/logs/worktree-owner.log.
 """
@@ -214,6 +215,15 @@ def _removable(path: str) -> str | None:
     return None
 
 
+def _sudo_proc_enabled() -> bool:
+    """Explicit per-profile opt-in; never prompt or change sudo policy."""
+    home = Path(os.environ.get('HERMES_HOME') or H / '.hermes')
+    try:
+        return json.loads((home / 'worktree-owner.json').read_text()).get('linux_sudo_readlink') is True
+    except FileNotFoundError:
+        return False
+
+
 def _proc_cwds(root: str = '/proc') -> list[str]:
     paths = []
     for name in os.listdir(root):
@@ -229,11 +239,28 @@ def _proc_cwds(root: str = '/proc') -> list[str]:
                 # Linux may report EACCES, not ENOENT, for a zombie cwd.
                 # A zombie has no cwd; any other existing process is unknown.
                 try:
-                    state = (proc / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+                    before = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
                 except FileNotFoundError:
                     continue  # exited during enumeration
-                if state != 'Z':
+                if before[0] == 'Z':
+                    continue
+                if not _sudo_proc_enabled():
                     raise RuntimeError(f'cannot read cwd for live pid {name}')
+                # Non-dumpable same-UID processes (systemd --user) deny readlink.
+                # Only this read-only command may elevate, never Python or a shell.
+                r = subprocess.run(['sudo', '-n', '--', '/usr/bin/readlink', '--', str(proc / 'cwd')],
+                                   capture_output=True, text=True, timeout=10)
+                try:
+                    after = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                except FileNotFoundError:
+                    continue
+                if after[0] == 'Z':
+                    continue
+                if (r.returncode or r.stderr or not r.stdout.startswith('/') or
+                        len(before) < 20 or len(after) < 20 or before[19] != after[19] or
+                        proc.stat().st_uid != os.getuid()):
+                    raise RuntimeError(f'cannot read cwd for live pid {name}')
+                paths.append(r.stdout.removesuffix('\n'))
         except FileNotFoundError:
             continue  # disappeared before stat
     if not paths:
@@ -325,6 +352,9 @@ def _complex_reason(path: str) -> str | None:
                 return 'nested git or symlink'
             if not os.path.isdir(p) and not os.path.isfile(p):
                 return 'special file'
+    staged = _git(path, 'diff', '--cached', '--quiet', 'HEAD')
+    if staged.returncode != 0:
+        return 'staged changes or unreadable index'
     ignored = _git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
     if ignored.returncode or ignored.stdout:
         return 'ignored files or unreadable listing'
@@ -371,7 +401,11 @@ def teardown(task_id: str, env) -> list[dict]:
     with closing(sqlite3.connect(Path(db).resolve().as_uri() + '?mode=rw', uri=True, timeout=10)) as c:
         c.execute('BEGIN IMMEDIATE')
         row = c.execute('select status, current_run_id, workspace_path from tasks where id=?', (task_id,)).fetchone()
-        if not row or row[0] != 'done' or row[1] != run:
+        if not row or row[0] != 'done' or row[1] is not None:
+            return []
+        ended = c.execute('select id, status, outcome, ended_at from task_runs where task_id=? order by id desc limit 1',
+                          (task_id,)).fetchone()
+        if not ended or str(ended[0]) != run or ended[1:3] != ('done', 'completed') or ended[3] is None:
             return []
         live = {os.path.realpath(r[0]) for r in c.execute(
             "select workspace_path from tasks where status not in ('done','archived') and id != ? and coalesce(workspace_path,'') != ''", (task_id,))}
@@ -445,7 +479,7 @@ def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None, resu
             r = json.loads(result) if isinstance(result, str) else result
             if (not isinstance(r, dict) or r.get('ok') is not True or r.get('error')
                     or r.get('task_id') != task or not env.get('HERMES_KANBAN_RUN_ID')
-                    or r.get('run_id') != env['HERMES_KANBAN_RUN_ID']):
+                    or str(r.get('run_id')) != env['HERMES_KANBAN_RUN_ID']):
                 return []
             # An explicit board is safe only when the worker identifies that board.
             if a.get('board') is not None and a['board'] != env.get('HERMES_KANBAN_BOARD'):
