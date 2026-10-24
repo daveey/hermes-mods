@@ -2,6 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { React, host, route, snapshot, fixtures, loadPlugin, mount, button } from './sdk-mock.mjs'
 const p = await loadPlugin()
+test('status chip cannot wrap or shrink below its reduced label', () => {
+  assert.match(p.CSS, /\[data-slot=runners-chip\]\{flex-shrink:0;white-space:nowrap\}/)
+})
 test('same-owner duplicates choose newest usable evidence independent of route ordering', () => {
   const a = snapshot(),
     b = snapshot()

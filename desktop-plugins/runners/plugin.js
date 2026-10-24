@@ -493,6 +493,7 @@ export function diagnosticSummary(row) {
 }
 
 export const CSS = `
+[data-slot=runners-chip]{flex-shrink:0;white-space:nowrap}
 .hermes-runners {font-size:12px;line-height:1.45;color:var(--foreground);display:flex;flex-direction:column;gap:8px;min-width:0}
 .hermes-runners button,.hermes-runners input,.hermes-runners select{font:inherit;color:inherit}
 .hermes-runners button{cursor:pointer}.hermes-runners button:disabled{cursor:default;opacity:.5}
