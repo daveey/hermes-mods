@@ -171,6 +171,21 @@ test('linkSegments: web URLs and local paths become links; fractions, and/or and
   assert.deepEqual(m.linkSegments(''), [])
 })
 
+test('linkSegments: a path with spaces links whole (\u201c~/d/Morning Digest Board.html\u201d), prose after it does not', () => {
+  const t = 'Open ~/design/bb-digest/Morning Digest Board.html and review it. Also `/Users/me/My Notes/todo list.md` here.'
+  const links = m.linkSegments(t).filter(x => x.kind !== 'text')
+  assert.deepEqual(links, [
+    { kind: 'path', value: '~/design/bb-digest/Morning Digest Board.html' },
+    { kind: 'path', value: '/Users/me/My Notes/todo list.md' }
+  ])
+  assert.equal(m.linkSegments(t).map(x => x.value).join(''), t)
+  // Lowercase prose after a directory never joins; a path that already has an extension stays as is.
+  assert.deepEqual(m.linkSegments('see ~/code/foo and bar.txt').filter(x => x.kind !== 'text'), [{ kind: 'path', value: '~/code/foo' }])
+  assert.deepEqual(m.linkSegments('ran /tmp/a.log Then Board.html').filter(x => x.kind !== 'text'), [{ kind: 'path', value: '/tmp/a.log' }])
+  // No extension within 5 words: keep the short match.
+  assert.deepEqual(m.linkSegments('in ~/design/Big Project Folder.').filter(x => x.kind !== 'text'), [{ kind: 'path', value: '~/design/Big' }])
+})
+
 test('linkSegments: scheme-less web addresses link with an https href; file names and emails do not', () => {
   const t = 'Open github.com/settings/billing while signed in. Edit plugin.js, README.md; mail someone@example.com.'
   const links = m.linkSegments(t).filter(s => s.kind !== 'text')

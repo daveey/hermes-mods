@@ -39,6 +39,32 @@ const LINK_RE = /(https?:\/\/[^\s<>"'`]+)|(?:^|(?<=[\s("'`]))(~?\/[A-Za-z0-9._~-
 /** href for a link segment: bare web addresses get https://, paths file://. */
 export const linkHref = x => (x.kind === 'path' ? `file://${x.value}` : /^https?:\/\//i.test(x.value) ? x.value : `https://${x.value}`)
 const TRAIL_RE = /[.,;:!?)\]}]+$/
+const HAS_EXT_RE = /\.[A-Za-z0-9]{1,8}$/
+/** A local path the space-delimited match cut short ("~/d/Morning" of "~/d/Morning Digest Board.html"):
+ *  inside `backticks` the whole span to the closing backtick is the path; otherwise, when the cut part has
+ *  no extension, up to 5 following words that each start with a capital or digit join it if the last one
+ *  ends in an extension. Lowercase prose ("~/code/foo and bar.txt") never joins. */
+export function widenPath(s, start, value) {
+  if (s[start - 1] === '`') {
+    const close = s.indexOf('`', start)
+    const nl = s.indexOf('\n', start)
+    if (close > start && (nl < 0 || close < nl) && !/[<>"]/.test(s.slice(start, close))) return s.slice(start, close)
+  }
+  if (HAS_EXT_RE.test(value.split('/').pop())) return value
+  let pos = start + value.length
+  let out = value
+  for (let i = 0; i < 5; i++) {
+    const w = s.slice(pos).match(/^ ([A-Z0-9][^\s<>"'`()/]*)/)
+    if (!w) break
+    const trail = w[1].match(TRAIL_RE)?.[0] || ''
+    const word = trail ? w[1].slice(0, -trail.length) : w[1]
+    out += ' ' + word
+    if (HAS_EXT_RE.test(word)) return out
+    if (trail) break
+    pos += w[0].length
+  }
+  return value
+}
 
 /** text → [{ kind: 'text'|'url'|'path', value }] for rendering clickable links. */
 export function linkSegments(text) {
@@ -50,6 +76,8 @@ export function linkSegments(text) {
     const trail = value.match(TRAIL_RE)?.[0] || ''
     if (trail) value = value.slice(0, -trail.length)
     const kind = m[2] ? 'path' : 'url'
+    if (m.index < last) continue
+    if (kind === 'path') value = widenPath(s, m.index, value)
     if (kind === 'path' && !/[A-Za-z]/.test(value)) continue
     if (m.index > last) out.push({ kind: 'text', value: s.slice(last, m.index) })
     out.push({ kind, value })
