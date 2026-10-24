@@ -348,6 +348,7 @@ class ProxyTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.request('/json/list')  # a managed listener is never a legacy tunnel
         self.assertEqual(error.exception.code, 403)
+        error.exception.close()
 
 
 if __name__ == '__main__':

@@ -157,6 +157,7 @@ class EndpointOwnershipTests(unittest.TestCase):
         foreign = self.foreign()
         base = 'http://127.0.0.1:%d/lease/%s' % (proxy.port, grant['capability'])
         for path, method in [('/json/version', 'GET'), ('/json/list', 'GET'), ('/json/new?about:blank', 'PUT')]:
-            with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError):
+            with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as error:
                 urllib.request.urlopen(urllib.request.Request(base + path, method=method), timeout=3)
+            error.exception.close()
         self.assertIsNone(foreign.poll())
