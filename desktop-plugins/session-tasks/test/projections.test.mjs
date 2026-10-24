@@ -360,6 +360,46 @@ test('failed lineage stays unknown and retries rather than caching an empty task
   } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
 })
 
+test('archive guard warns when session ancestry is unavailable and retries recovery', async () => {
+  let failed = true
+  let reads = 0
+  globalThis.window = { hermesDesktop: { api: async args => {
+    if (args.path.startsWith('/api/sessions/')) {
+      reads++
+      if (failed) throw new Error('owner offline')
+      return { id: 's_archive_unknown', parent_session_id: null }
+    }
+    return { gateway_id: 'owner', machines: [] }
+  } } }
+  try {
+    const target = { sessionId: 's_archive_unknown', connectionId: 'owner-connection', profile: 'work' }
+    const warnings = await m.archiveGuard(target)
+    assert.ok(warnings.some(line => /ancestry unavailable/i.test(line.value)), 'unknown ancestry must require archive confirmation')
+    failed = false
+    assert.deepEqual(await m.archiveGuard(target), [])
+    assert.equal(reads, 2)
+  } finally { delete globalThis.window }
+})
+
+test('malformed ancestry cannot certify a root or poison the lineage cache', async () => {
+  const invalid = [null, {}, { id: 'wrong', parent_session_id: null }, { id: 's_invalid_3', parent_session_id: {} }]
+  let response
+  globalThis.window = { hermesDesktop: { api: async args => {
+    if (args.path.startsWith('/api/sessions/')) return response
+    return { gateway_id: 'owner', machines: [] }
+  } } }
+  try {
+    for (const [index, row] of invalid.entries()) {
+      const sessionId = `s_invalid_${index}`
+      const target = { sessionId, connectionId: 'owner-connection', profile: 'work' }
+      response = row
+      assert.ok((await m.archiveGuard(target)).some(line => /ancestry unavailable/i.test(line.value)), `invalid row ${index}`)
+      response = { id: sessionId, parent_session_id: null }
+      assert.deepEqual(await m.archiveGuard(target), [])
+    }
+  } finally { delete globalThis.window }
+})
+
 test('lineage reads and caches keep identical session ids separate by owner profile', async () => {
   const calls = []
   globalThis.window = { hermesDesktop: { api: async args => {

@@ -314,8 +314,12 @@ async function lineageIds(storedId, connection, profile = 'default') {
   for (let hop = 0; hop < 12 && cur; hop++) {
     try {
       const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, connection, 5_000, profile)
-      if (row?.id) ids.add(str(row.id))
-      cur = str(row?.parent_session_id)
+      if (!row || row.id !== cur || (row.parent_session_id != null && typeof row.parent_session_id !== 'string')) {
+        ids.incomplete = true
+        return ids
+      }
+      ids.add(row.id)
+      cur = str(row.parent_session_id)
       if (cur) ids.add(cur)
     } catch {
       ids.incomplete = true
@@ -431,7 +435,9 @@ async function loadMachines(ids) {
 export async function archiveGuard({ sessionId, ids, profile, connectionId } = {}) {
   if (!sessionId) return []
   const lineage = new Set(ids || [])
-  for (const id of await lineageIds(sessionId, connectionId, profile || 'default')) lineage.add(id)
+  const resolved = await lineageIds(sessionId, connectionId, profile || 'default')
+  if (resolved.incomplete) return [{ label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }]
+  for (const id of resolved) lineage.add(id)
   const inv = await api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id=', connectionId, 2_000)
   if (!inv || !Array.isArray(inv.machines)) return []
   const chips = machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile: profile || 'default', ids: lineage })
