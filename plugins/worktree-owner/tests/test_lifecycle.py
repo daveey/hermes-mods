@@ -36,6 +36,7 @@ class Lifecycle(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute('create table tasks (id text, status text, current_run_id text, workspace_path text)')
             c.execute('insert into tasks values (?, ?, ?, ?)', ('task', 'done', None, str(self.ws)))
+            c.execute('create table task_links (parent_id text, child_id text)')
             c.execute('create table task_runs (id text, task_id text, status text, outcome text, ended_at integer)')
             c.execute("insert into task_runs values ('run', 'task', 'done', 'completed', 1)")
         self.env = dict(HERMES_KANBAN_TASK='task', HERMES_KANBAN_RUN_ID='run', HERMES_KANBAN_DB=str(self.db), HERMES_KANBAN_WORKSPACE=str(self.ws))
@@ -90,6 +91,13 @@ class Lifecycle(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute('update tasks set workspace_path=?', (str(self.tree),))
         self.test_legacy_marker_kept()
+
+    def test_active_child_without_workspace_keeps_parent_trees(self):
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("insert into tasks values ('child', 'ready', null, null)")
+            c.execute("insert into task_links values ('task', 'child')")
+        self.call(self.result)
+        self.assertTrue(self.tree.exists())
 
     def test_shared_parent_and_child_keep_marked_tree(self):
         for shared in (self.ws, self.tree / 'child'):

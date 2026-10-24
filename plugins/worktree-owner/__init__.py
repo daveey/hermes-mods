@@ -407,6 +407,11 @@ def teardown(task_id: str, env) -> list[dict]:
                           (task_id,)).fetchone()
         if not ended or str(ended[0]) != run or ended[1:3] != ('done', 'completed') or ended[3] is None:
             return []
+        # Children consume parent artifacts even before receiving a workspace.
+        if c.execute("select 1 from task_links l join tasks t on t.id=l.child_id "
+                     "where l.parent_id=? and t.status not in ('done','archived','failed','cancelled') limit 1",
+                     (task_id,)).fetchone():
+            return []
         live = {os.path.realpath(r[0]) for r in c.execute(
             "select workspace_path from tasks where status not in ('done','archived') and id != ? and coalesce(workspace_path,'') != ''", (task_id,))}
         return _teardown_locked(task_id, env, row[2] or '', live)

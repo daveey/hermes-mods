@@ -116,6 +116,7 @@ class Owner(unittest.TestCase):
         self.db = self.tmp / 'board.db'
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute('create table tasks (id text primary key, status text, current_run_id text, workspace_path text)')
+            c.execute('create table task_links (parent_id text, child_id text)')
             c.execute('create table task_runs (id text, task_id text, status text, outcome text, ended_at integer)')
         self.m = load()
         original = self.m.on_tool_call

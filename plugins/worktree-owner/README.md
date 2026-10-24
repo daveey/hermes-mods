@@ -22,7 +22,7 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
    `xargs`, `parallel`) builds the paths from `$` variables. A tree that another agent creates in the same seconds is
    not claimed.
 2. **Teardown.** Only a successful `kanban_complete` result for the worker's own task and run can start cleanup. A writer reservation on the exact worker board protects verification and removal: the task must be `done`, its current run cleared, and its latest run must match the worker and have ended `done/completed`. Missing, failed, rejected, foreign-board/task, stale-run and review results do nothing. Markers carry the canonical board DB and run ID; ambiguous legacy markers are preserved.
-   Open-card workspace overlaps on that board and live process cwd paths preserve trees. Clean, pushed trees are removed without force, retaining their branches. Simple dirty/untracked/unpushed linked trees nested in the completed scratch workspace are archived before removal: a self-contained verified `unpushed.bundle`, binary `uncommitted.diff`, readable `untracked.tar.gz`, and `meta.json`. Archive failure preserves the source. Recover with `git clone <archive>/unpushed.bundle <restore>`, `git -C <restore> apply <archive>/uncommitted.diff` when present, then extract the untracked archive there.
+   Active child dependencies (even before workspace assignment), open-card workspace overlaps on that board and live process cwd paths preserve trees. Clean, pushed trees are removed without force, retaining their branches. Simple dirty/untracked/unpushed linked trees nested in the completed scratch workspace are archived before removal: a self-contained verified `unpushed.bundle`, binary `uncommitted.diff`, readable `untracked.tar.gz`, and `meta.json`. Archive failure preserves the source. Recover with `git clone <archive>/unpushed.bundle <restore>`, `git -C <restore> apply <archive>/uncommitted.diff` when present, then extract the untracked archive there.
    Staged changes, ignored files, nested Git entries, symlinks, special files and scan uncertainty are conservatively preserved, not force-removed. Trees outside scratch with unsaved work remain for explicit owner cleanup or an independently verified backstop.
 
 ### Portability and safety limits
@@ -82,7 +82,7 @@ New sessions and Kanban workers load it. Sessions that are already open keep run
 python3 -B -m unittest discover -s plugins/worktree-owner/tests
 ```
 
-Stdlib unit suite: 48 tests using disposable Git repos and boards, including actual archive recovery and staged-version preservation. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
+Stdlib unit suite: 49 tests using disposable Git repos and boards, including actual archive recovery and staged-version preservation. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
 
 Bootstrapped runtime integration (requires a core checkout with scratch preservation, and on Linux an existing noninteractive readlink grant for non-dumpable processes):
 
