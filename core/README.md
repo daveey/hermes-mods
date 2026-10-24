@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [managed-chrome-leases.md](managed-chrome-leases.md) | 0264–0265 | Experimental, not release-approved: opt-in owner-scoped default/local/named browser requests, selected vault scope and task/shutdown lease cleanup; native core and genuine credential gates remain open |
 | [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0278–0279, 0281 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
 | [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0283 | Orderly park releases PR guard; broker-aware PR-state reads |
 | [orphan-reaper-home-scope.md](orphan-reaper-home-scope.md) | 0286 | Orphan reaping requires proven home/UID ownership and fresh process identity |

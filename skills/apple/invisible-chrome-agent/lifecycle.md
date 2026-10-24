@@ -192,8 +192,38 @@ returns `{"completed":false}`. Repeated release is idempotent.
 
 ## Known limitations / acceptance still required
 
-**Not production-verified. Isolated Linux headless Chrome and core browser-use
-default/local entry smoke checks passed. Mac headful acceptance is still required.**
+**Experimental; not release-approved. Isolated Linux core default/local/named
+entry and selected vault-route smoke checks passed. Uploaded native evidence
+also covers the isolated production supervisor paths listed below, not native
+core runtime or genuine credential acceptance.**
+
+### Native acceptance evidence and remaining boundaries
+
+A separate native run exercised the actual generated launchd plist with existing
+staged helpers and the production headful supervisor, without mock Keychain.
+It demonstrated disabled-job bootstrap refusal, explicit activation into a
+listener-only idle state, authorized browser/display wake, scoped evaluation and
+focus filtering with unchanged foreground application, and actual window bounds
+fully contained in the virtual display. Release led to browser and display exit;
+the next request started a new browser. Explicit stop left the job disabled and
+unloaded, with subsequent bootstrap refused. Final fixture receipts report the
+service and CDP endpoint absent after cleanup.
+
+These are inspected uploaded receipts, not a native run performed by the
+publication verifier. The supervisor source digest matches the inspected source.
+The first probe failed because it required a corrective rehome log even though
+placement was already correct; it also reported a cleanup assertion failure.
+That run remains failed. The later passing probe asserts actual window bounds
+and verifies cleanup rather than requiring a correction to have occurred.
+
+Still required before release: actual `cmd_install` helper compilation and
+managed/no-start installation, OFF persistence across a real login/reboot,
+native core default/local/named/vault entry execution, genuine Keychain/Touch ID/
+passkey and sign-in handoff acceptance, notification/reveal behavior, and broader
+consumer compatibility. Existing-helper launchd evidence does not close those
+gates. An installed WebAuthn hook or notifier authorization message does not prove
+credential use. Exact-head CI and independent review of publication/integration
+changes remain separate requirements.
 
 - The scoped protocol is a restricted CDP subset, not a transparent browser-level
   tunnel. Browser-global mutations/context creation, opaque nested Target envelopes,
@@ -248,7 +278,9 @@ concurrent wake, unknown-target shutdown blocking, scoped discovery and WebSocke
 against a loopback fake Chrome, owned reconnect auto-attach, forbidden target/session
 operations, install-without-start, launchd plist semantics and smoke safety guards.
 The existing suite exercises the original focus proxy, guard and passkey paths.
-Mac launchd process behavior is mocked, not an on-host acceptance test.
+Launchd behavior in this unit suite is mocked. The separate uploaded native
+production-supervisor run above exercises actual launchd; it does not turn these
+unit tests into native installation or credential acceptance.
 The additional suites exercise bound listeners, real quiet sockets and pending
 reader reclamation, deterministic forward/backward clocks and reloads, private
 Unix IPC processes, foreign/sibling preservation and ignored shutdown ACKs. The
