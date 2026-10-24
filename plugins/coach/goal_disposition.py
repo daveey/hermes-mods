@@ -134,7 +134,89 @@ def capability_failure(row):
                                  'authentication_required', 'access_denied')
 
 
-def validate_disposition(v, evidence):
+def authoritative_owner(v, evidence, session_id):
+    """Conservative local running-worker proof, never cached model/tool assertions.
+
+    Supported route: exact local hostname, current profile, explicit board, native
+    task ID, TUI/Desktop origin subscription. Exact request/body equality avoids
+    turning a model's claimed goal match into authority. Other routes (including
+    scheduled work) are UNKNOWN. cross_task.read is deliberately NOT invoked:
+    its session-mentions contract also adopts/shepherds remote cards and its
+    relay is neither a bounded read-only probe nor a profile-qualified proof.
+    """
+    import re
+    import socket
+    import sqlite3
+    import time
+    from contextlib import closing
+    from hermes_constants import get_hermes_home
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_cli.kanban_host_identity import is_local_claim
+    from hermes_cli.kanban_db_dispatch import _worker_alive
+
+    ref = v.get('continuation_ref')
+    if (not isinstance(ref, dict) or set(ref) != {'gateway', 'profile', 'board', 'task_id'}
+            or any(not isinstance(x, str) or not x for x in ref.values())
+            or not re.fullmatch(r't_[0-9a-f]{8}', ref['task_id'])
+            or not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', ref['board'])):
+        raise ValueError('owner_readback_unavailable')
+    if ref['gateway'] != socket.gethostname():
+        raise ValueError('owner_remote_readback_unavailable')
+    profile = get_active_profile_name() or 'default'
+    if ref['profile'] != profile or not session_id:
+        raise ValueError('owner_profile_or_origin_mismatch')
+    users = [row.get('content') for row in evidence.values() if row['role'] == 'user']
+    request = users[-1] if users else None
+    if not isinstance(request, str) or not request or not v['actionable'] or not v['unfinished']:
+        raise ValueError('owner_request_unavailable')
+
+    def readonly(path):
+        conn = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=1)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA query_only=ON')
+        return conn
+
+    try:
+        # Never SessionDB()/kb.connect(): those may create/migrate/write stores.
+        with closing(readonly(Path(get_hermes_home()) / 'state.db')) as state:
+            origin = state.execute('SELECT profile_name FROM sessions WHERE id=?', (session_id,)).fetchone()
+            current = state.execute("SELECT content FROM messages WHERE session_id=? AND role='user' ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+            if not origin or origin['profile_name'] != profile or not current or current['content'] != request:
+                raise ValueError('owner_current_request_mismatch')
+        # Resolve an explicit board, but refuse environment-pinned foreign paths.
+        expected = (kb.kanban_home() / 'kanban.db' if ref['board'] == 'default'
+                    else kb.board_dir(ref['board']) / 'kanban.db')
+        path = kb.kanban_db_path(board=ref['board'])
+        if path.resolve() != expected.resolve():
+            raise ValueError('owner_board_pin_mismatch')
+        if kb.read_board_metadata(ref['board']).get('archived'):
+            raise ValueError('owner_board_archived')
+        with closing(readonly(path)) as conn:
+            conn.execute('BEGIN')  # consistent card/run/subscription snapshot
+            task = conn.execute('SELECT * FROM tasks WHERE id=?', (ref['task_id'],)).fetchone()
+            if (not task or task['status'] != 'running' or task['assignee'] != profile
+                    or task['session_id'] != session_id or task['body'] != request
+                    or task['title'] != v['goal'] or task['completed_at'] is not None):
+                raise ValueError('owner_task_scope_or_state_mismatch')
+            run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
+                               (task['current_run_id'], ref['task_id'])).fetchone()
+            if (not run or run['profile'] != profile or run['status'] != 'running'
+                    or run['ended_at'] is not None or run['outcome'] is not None
+                    or not run['claim_expires'] or run['claim_expires'] <= time.time()
+                    or not is_local_claim(run['claim_lock'])
+                    or not isinstance(run['worker_started_at'], str)
+                    or '|' not in run['worker_started_at']
+                    or not _worker_alive(run['worker_pid'], run['worker_started_at'])):
+                raise ValueError('owner_live_continuation_unverified')
+            sub = conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform='tui' AND chat_id=? AND thread_id='' AND notifier_profile=? AND delivery_mode IN ('notify','notify+wake')", (ref['task_id'], session_id, profile)).fetchone()
+            if not sub:
+                raise ValueError('owner_result_return_unverified')
+    except (OSError, sqlite3.Error) as exc:
+        raise ValueError('owner_readback_unavailable') from exc
+
+
+def validate_disposition(v, evidence, *, session_id=""):
     d = v['disposition']
     refs = [evidence[r] for r in v['evidence_refs']]
     tools = [r for r in refs if r['role'] == 'tool']
@@ -142,8 +224,7 @@ def validate_disposition(v, evidence):
         if not v['actionable'] or not v['unfinished'] or 'candidate' not in v['evidence_refs']:
             raise ValueError('inconsistent_abandonment')
     elif d == 'owned_continuing':
-        # No authoritative owner adapter registered: never claim a cached tool result is fresh.
-        raise ValueError('owner_readback_unavailable')
+        authoritative_owner(v, evidence, session_id)
     elif d == 'remediated_verified':
         if v['unfinished'] or not tools or not all(successful(r) for r in tools):
             raise ValueError('missing_successful_path_readback')
@@ -215,7 +296,7 @@ def build_gate(store):
                     rows.append(row)
             evidence = evidence_for(rows, final_response)
             v = validate_disposition(validate(aux_judge(SYSTEM, json.dumps({
-                'evidence': evidence})), evidence), evidence)
+                'evidence': evidence})), evidence), evidence, session_id=session_id)
             store.log({'event': 'goal_disposition', 'session_id': session_id, 'attempt': attempt,
                        'disposition': v['disposition'], 'confidence': v['confidence'], 'mode': cfg['mode']})
             if (v['disposition'] == 'unknown' or v['confidence'] < .85) and cfg['mode'] == 'enforce' and attempt:
