@@ -31,7 +31,7 @@ bootstrap a stopped launchd job or execute an inferred wake helper.
 
 ## Code
 
-Proposed appended patches **0264–0265**, after the existing series through 0263:
+Proposed appended patches **0264–0266**, after the existing series through 0263:
 
 - `tools/browser_agent_lifecycle.py`: route validation, acquire/complete/release,
   owner-specific daemon and vault identity, bounded cleanup retry.
@@ -40,10 +40,13 @@ Proposed appended patches **0264–0265**, after the existing series through 026
 - `tools/browser_tool_lifecycle.py`, `gateway/run_shutdown.py`: task cleanup versus
   explicit process-shutdown release boundary.
 - `hermes_cli/config_defaults.py`: disabled-by-default managed-agent mapping.
+- `website/docs/user-guide/configuration.md`: explicit opt-in, empty defaults,
+  exact endpoint matching and operator activation for a stopped installation.
 
 ## Tests
 
-Fresh Linux checks on the integrated core head passed:
+Linux checks on the integrated core head before the documentation-only correction
+passed (runtime files are unchanged):
 
 - `scripts/run_tests.sh tests/tools/test_browser_agent_rework.py tests/tools/test_browser_agent_lifecycle.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_vault.py tests/tools/test_browser_supervisor_reconnect.py tests/gateway/test_shutdown_kill_off_loop.py tests/gateway/test_gateway_shutdown.py`:
   189 passed across seven files, zero failures.
@@ -59,28 +62,43 @@ Fresh Linux checks on the integrated core head passed:
   harness retirement and bounded stop. A separate native public run reported 151
   tests OK with eleven Linux-only skips; that is uploaded evidence, not local execution.
 
+For the configuration-documentation correction, the canonical
+`scripts/run_tests.sh tests/ci/test_docs_drift.py` reproduced one failure on the
+two missing managed-agent keys before the edit, then passed both tests after it.
+No baseline or test was changed.
+
 The vault smoke evaluates harmless markers through the actual selected-owner API;
 it does not fill genuine credentials. Native core runtime remains untested.
 Uploaded native production-supervisor evidence covers generated launchd plist,
 existing helpers, disabled-bootstrap refusal, headful virtual-display placement,
-scoped evaluation/focus containment, idle browser/display exit, next wake and
-explicit OFF. It does not prove installer compilation, login/reboot persistence,
-real Keychain/Touch ID/passkeys, notification/handoff or broad consumer compatibility.
+scoped evaluation/focus containment with unchanged loginwindow foreground on a
+locked screen, idle browser/display exit, next wake and explicit OFF. Unlocked
+typing was not tested. A separate isolated native `install --managed --no-start`
+run compiled the Swift helpers/notifier and verified owner-only configuration,
+disabled/unloaded state, refused bootstrap and no browser creation; cleanup
+restored the original notifier registration. Real login/reboot persistence,
+genuine Keychain/Touch ID/passkeys, notification/handoff and broad consumer
+compatibility remain unexercised, not claimed. Native core repetition and these
+coverage limitations are not additional mandatory gates for this lifecycle change.
 See the lifecycle acceptance section for the failed-first-probe qualification.
 
 ## Applying
 
-These two patches are feature-branch proposals, not a released installation.
+These three patches are feature-branch proposals, not a released installation.
 Apply in order after 0263; do not renumber existing siblings. The full mirror uses
 the fork/upstream merge-base, not the newer upstream tip. Existing public privacy
-substitutions and the merge-adapted patch 0242 must be preserved. Publication
-verification applied all 265 patches with `git am -3` from merge-base
-`4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63` in a disposable clone; all nine
-feature-path blobs matched the integrated core head. Patches 0001–0263 were
+substitutions and the merge-adapted patch 0242 must be preserved. The documentation
+correction verification applied all 266 patches with `git am -3` from merge-base
+`4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63` in a disposable clone; all ten
+feature-path blobs matched core head `6add72d407e8cc47fabc01b1f2a468828f4c1578`.
+Patches 0001–0265 were
 preserved byte-for-byte. This application check is not a full-suite CI result.
 
-Keep the supervisor OFF until native install/core entry and credential gates,
-exact-head CI, review comments and independent publication-diff review are closed.
+Keep the supervisor OFF until the identified integration/release blockers are
+closed and the operator explicitly authorizes deployment/activation. This remains
+experimental and not release-approved: unsuccessful/incomplete exact-head CI and
+independent changed-head review remain blockers. The configuration-documentation
+ratchet is corrected locally; CI and independent review must verify the new heads.
 Configure only an explicitly approved dedicated installation. Never attach to or
 retire an unrelated browser. No deployment command is authorized by these docs.
 
