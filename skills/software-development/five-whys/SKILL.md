@@ -82,6 +82,8 @@ For each answer:
 - **It is one step**, not a leap to the cause you already suspected. Jumping straight to a familiar cause is the
   most common way the method fails.
 
+**For a long agent session, reconstruct the critical path before explaining the delay.** Separate productive execution, dependency waits, failed attempts, recovery and deployment using timestamped runs and artifacts. Run counts alone do not measure wasted work; a continuation may preserve useful progress. Tie each disk, quota or memory failure to the operation it stopped. A per-worker OOM proves that job exceeded its limit, not that global concurrency caused it; a tiny successful provider probe proves only that request succeeded. Inspect existing mechanisms before claiming an architectural control is absent: bypassed, misconfigured and missing controls require different fixes. Treat similar UI symptoms as separate hypotheses until their API, association and rendering paths match.
+
 ### 3. Branch where causes split
 
 One problem often has several independent causes. When one why has two true answers, branch and follow each.
@@ -142,6 +144,10 @@ scratch or code root that also contains unmanaged work; retain leak detection fo
 Each countermeasure is concrete and verifiable: a regression test that fails before and passes after, a guard you
 can trigger, a doc or skill change with its path. "Be more careful" is not a countermeasure. If a root-level fix is
 too big for now, file it (card or issue with the chain) and say so in the report; don't drop it silently.
+
+**For this user, an authorized correction includes implementation, not just diagnosis or dispatch.** Write a bounded prevention plan, execute the in-scope mitigation, and read back the live effect before reporting progress. Keep immediate delivery recovery separate from systemic hardening: require an explicit necessity argument before making another preventive card a release prerequisite. Reuse existing owners and preserved work rather than grow a competing graph. Verify that an owner actually claimed execution and acknowledged the handoff; a ready card or posted comment is not active recovery. If exact execution approval is still required, preserve that gate even when disruptive host work is broadly authorized.
+
+Choose enforcement at the failure point rather than relying only on prose: capability preflight before placement; bounded typed recovery for checkpoints, quota and exhausted budgets; per-job memory feasibility plus aggregate resource admission; and end-to-end origin visibility and deployed-revision checks. Pair each with failure-injection acceptance. State the coverage limits of containment: stopping new idle workers does not constrain already-running producers or restore disk space, and a guard holding the cleanup lock may prevent reclamation until its owner coordinates release. Never present such a brake as capacity recovery.
 
 After the countermeasures ship, verify each one against live data before calling the chain closed: the guard's own
 telemetry (did it fire, how often, what did it fall back to), not the worker's "done" summary. A guard that "works"
