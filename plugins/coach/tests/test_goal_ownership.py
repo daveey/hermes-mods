@@ -35,10 +35,14 @@ def owner(tmp_path, monkeypatch):
         c.execute("INSERT INTO tasks (id,title,body,assignee,status,created_at,session_id,current_run_id) VALUES (?,?,?,'default','running',?,?,1)", (TID,REQUEST,REQUEST,int(time.time()),SID))
         c.execute("INSERT INTO task_runs (id,task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_started_at,started_at) VALUES (1,?,'default','running',?,?,?,?,?)", (TID,claim_prefix() + str(os.getpid()),int(time.time())+300,os.getpid(),_process_fingerprint(os.getpid()),int(time.time())))
         c.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,notifier_profile,created_at) VALUES (?,'tui',?,'default',?)", (TID,SID,int(time.time())))
-    with sqlite3.connect(tmp_path / 'state.db') as c:
-        c.executescript('CREATE TABLE sessions (id TEXT, profile_name TEXT); CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT);')
-        c.execute('INSERT INTO sessions VALUES (?,?)',(SID,'default'))
-        c.execute('INSERT INTO messages VALUES (1,?,?,?)',(SID,'user',REQUEST))
+    from hermes_state import SessionDB
+    state = SessionDB(tmp_path / 'state.db')
+    try:
+        state.create_session(session_id=SID, source='desktop')
+        state._conn.execute('UPDATE sessions SET profile_name=? WHERE id=?', ('default', SID))
+        state.append_message(SID, 'user', REQUEST)
+    finally:
+        state.close()
     ref = dict(gateway=socket.gethostname(), profile='default', board='default', task_id=TID)
     v = dict(goal=REQUEST, actionable=True, unfinished=True, disposition='owned_continuing', evidence_refs=['user:0','candidate'], boundary_kind=None, continuation_ref=ref, confidence=.99)
     evidence = gd.evidence_for([dict(role='user',content=REQUEST)], 'An existing worker is continuing.')

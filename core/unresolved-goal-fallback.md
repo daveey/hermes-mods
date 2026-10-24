@@ -44,3 +44,22 @@ This is not a remediation guarantee. The companion coach guard has a conservativ
 ## Plugin?
 
 Detection belongs in the coach plugin. Core is needed only because a plugin cannot otherwise control the budget/error fallback that reuses its rejected candidate.
+
+## Pending initial-assessment correction
+
+Independent review reproduced an earlier ordinary gate starving the coach before its
+first assessment, so a one-iteration turn returned the rejected diagnosis. The draft
+core now supports opt-in `assess_before_holds`; coach enables it only with enforce-mode
+buffering. Pending callback identity still runs first. Legacy callback order is unchanged
+without an opt-in. Complete isolated agent turns with real discovery of ask-gate and coach
+reproduced two failures before the fix and pass for CLI/Desktop platform values afterward.
+These are backend-loop tests, not actual client transport acceptance.
+
+The ancestry increment recovers user rows only through verified compression parents,
+bounded at child creation, and uses a unique exact current-request anchor for restart
+recovery. Fork/reset/delegate children do not inherit parent permission. Ambiguity,
+overflow and unsupported multimodal durable data remain UNKNOWN. Mid-turn session-ID
+rotation is still unverified. The combined suite passed 515 tests, with one SQLite
+host-dependent skip. Independent review still requests changes: exact-action/approval
+proof, remote/scheduled ownership and return liveness, holdout/private replay, transport
+acceptance, CI, mirror/apply and activation remain required. Do not activate this draft.

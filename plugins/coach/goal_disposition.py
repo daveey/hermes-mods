@@ -418,4 +418,5 @@ def build_gate(store):
     gate.capture = capture
     gate.observe = observe
     gate.needs_buffer = settings()['mode'] == 'enforce'
+    gate.assess_before_holds = gate.needs_buffer
     return gate
