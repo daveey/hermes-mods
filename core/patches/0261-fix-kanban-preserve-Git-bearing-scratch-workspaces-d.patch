@@ -1,0 +1,296 @@
+From 20358a17bdec17ed5692d9be0f4b99b60c3c4ddf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 06:25:15 +0000
+Subject: [PATCH] fix(kanban): preserve Git-bearing scratch workspaces [daveey]
+
+---
+ hermes_cli/kanban_db_workspace.py             |  44 +++-
+ .../test_kanban_scratch_git_preservation.py   | 197 ++++++++++++++++++
+ 2 files changed, 239 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_git_preservation.py
+
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index f10e8088f8..388e7d8a93 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ import os
+ import shutil
+ import sqlite3
++import stat
+ import subprocess
+ import time
+ import unicodedata
+@@ -359,10 +360,44 @@ def _is_managed_scratch_path(p: Path) -> bool:
+     return _managed_scratch_path_info(p)[0]
+ 
+ 
++def _scratch_tree_removable(path: Path) -> bool:
++    """Only remove scratch proven free of Git metadata and scan uncertainty.
++
++    Managed storage is not proof that its contents are disposable: workers can
++    clone repositories or create linked worktrees anywhere below it. Preserve
++    the WHOLE scratch tree, even for clean/pushed repositories; repository-aware
++    teardown belongs to their owner, not generic scratch cleanup. Never follow
++    symlinks or execute Git/config/hooks while inspecting untrusted contents.
++    """
++    pending = [path]
++    try:
++        while pending:
++            directory = pending.pop()
++            if not stat.S_ISDIR(directory.lstat().st_mode):
++                return False
++            with os.scandir(directory) as entries:
++                names = set()
++                for entry in entries:
++                    names.add(entry.name)
++                    if entry.name == ".git" or entry.is_symlink():
++                        return False
++                    mode = entry.stat(follow_symlinks=False).st_mode
++                    if stat.S_ISDIR(mode):
++                        pending.append(Path(entry.path))
++                # Bare repositories (including reftable storage) have no .git.
++                # Names alone deliberately err towards preserving uncertain data.
++                if {"HEAD", "objects"} <= names and names & {"refs", "reftable"}:
++                    return False
++    except OSError:
++        return False
++    return True
++
++
+ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+     """Remove a task's scratch workspace dir and kill its stale tmux session.
+     Called from :func:`complete_task` after the transaction commits; best-effort
+-    so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
++    so cleanup never blocks completion. ``scratch`` is removed only when its
++    entire tree is free of Git metadata and scan uncertainty; ``worktree``
+     only when provably free of work (clean tree, every commit reachable from a
+     remote-tracking ref); ``dir`` is intentionally preserved."""
+     try:
+@@ -402,7 +437,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+             # See #28818. Containment runs first so an unmanaged dir that is
+             # never removed does not pay for (or log) the shared-use scan.
+             if _is_managed_scratch_path(wp):
+-                if not _defer_shared_workspace_cleanup(conn, task_id, path):
++                if not _scratch_tree_removable(wp):
++                    _kb._log.info("Preserving scratch workspace with Git metadata or scan uncertainty: %s", wp)
++                elif not _defer_shared_workspace_cleanup(conn, task_id, path):
+                     release_lsp_clients(str(wp))
+                     shutil.rmtree(wp, ignore_errors=True)
+                     _kb._log.debug("Removed scratch workspace: %s", wp)
+@@ -528,6 +565,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
+             if not wp.is_dir():
+                 continue
+             if _is_managed_scratch_path(wp):
++                if not _scratch_tree_removable(wp):
++                    _kb._log.info("Preserving parent scratch workspace with Git metadata or scan uncertainty: %s", wp)
++                    continue
+                 if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
+                     continue
+                 release_lsp_clients(str(wp))
+diff --git a/tests/hermes_cli/test_kanban_scratch_git_preservation.py b/tests/hermes_cli/test_kanban_scratch_git_preservation.py
+new file mode 100644
+index 0000000000..478ea0a7c9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_git_preservation.py
+@@ -0,0 +1,197 @@
++"""Scratch ownership never authorizes deleting embedded Git repositories."""
++from pathlib import Path
++from unittest.mock import Mock
++import argparse
++import json
++import os
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_workspace as kbw
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: home)
++    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
++    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
++                "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    kb.init_db()
++    with kbc.connect() as conn:
++        yield conn
++
++
++def scratch(conn):
++    tid = kb.create_task(conn, title="scratch preservation", assignee="test-worker")
++    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
++    kbw.set_workspace_path(conn, tid, ws)
++    (ws / "handoff.txt").write_text("keep the whole tree")
++    return tid, ws
++
++
++def git(path, *args):
++    return subprocess.run(
++        ["git", "-C", str(path), *args], check=True, capture_output=True, text=True,
++        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
++    ).stdout.strip()
++
++
++def repository(ws, state):
++    repo = ws / "nested" / "repo"
++    repo.mkdir(parents=True)
++    git(repo, "init", "--bare" if state == "bare" else "--quiet")
++    if state == "bare":
++        return repo
++    git(repo, "config", "user.email", "test@example.invalid")
++    git(repo, "config", "user.name", "Test")
++    (repo / "tracked").write_text("initial")
++    git(repo, "add", "tracked")
++    git(repo, "commit", "-qm", "initial")
++    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
++    if state == "dirty":
++        (repo / "tracked").write_text("dirty work")
++    elif state == "untracked":
++        (repo / "untracked").write_text("untracked work")
++    elif state == "unpushed":
++        (repo / "tracked").write_text("local commit")
++        git(repo, "commit", "-qam", "unpushed")
++    return repo
++
++
++def snapshot(ws):
++    return {str(p.relative_to(ws)): p.read_bytes() for p in ws.rglob("*") if p.is_file()}
++
++
++@pytest.mark.parametrize("state", ["clean", "dirty", "untracked", "unpushed", "bare"])
++def test_tool_completion_preserves_nested_git(board, monkeypatch, state):
++    from tools import kanban_tools as kt
++
++    tid, ws = scratch(board)
++    repo = repository(ws, state)
++    before = snapshot(ws)
++    kb.claim_task(board, tid)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(board, tid)))
++    result = json.loads(kt._handle_complete({"summary": "verified"}))
++    assert result.get("ok") is True, result
++    assert kb.get_task(board, tid).status == "done"
++    assert ws.is_dir(), "completion must not delete Git-bearing scratch"
++    assert snapshot(ws) == before
++    assert git(repo, "rev-parse", "--is-bare-repository") == str(state == "bare").lower()
++
++
++@pytest.mark.parametrize("marker", ["directory", "file", "symlink", "broken-link", "scan-error"])
++@pytest.mark.parametrize("deferred", [False, True])
++def test_cleanup_preserves_git_markers_and_uncertain_trees(board, monkeypatch, marker, deferred):
++    tid, ws = scratch(board)
++    nested = ws / "nested"
++    nested.mkdir()
++    if marker == "directory":
++        (nested / ".git").mkdir()
++    elif marker == "file":
++        (nested / ".git").write_text("gitdir: /missing/worktree/metadata")
++    elif marker in ("symlink", "broken-link"):
++        (nested / "link").symlink_to(ws if marker == "symlink" else ws / "missing", target_is_directory=True)
++    else:
++        original = os.scandir
++
++        def unreadable(path):
++            if Path(path) == nested:
++                raise PermissionError("scan denied")
++            return original(path)
++
++        monkeypatch.setattr(os, "scandir", unreadable)
++    remove = Mock(wraps=kbw.shutil.rmtree)
++    monkeypatch.setattr(kbw.shutil, "rmtree", remove)
++    child = None
++    if deferred:
++        child = kb.create_task(board, title="child", workspace_kind="dir", workspace_path=str(ws / "child"))
++        kb.link_tasks(board, tid, child)
++    assert kb.complete_task(board, tid, result="done")
++    if child is not None:
++        assert kb.complete_task(board, child, result="done")
++    remove.assert_not_called()
++    assert (ws / "handoff.txt").read_text() == "keep the whole tree"
++    assert nested.exists()
++
++
++def test_rejected_tool_completion_keeps_everything(board, monkeypatch):
++    from tools import kanban_tools as kt
++
++    tid, ws = scratch(board)
++    repository(ws, "dirty")
++    before = snapshot(ws)
++    kb.claim_task(board, tid)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(board, tid)))
++    result = json.loads(kt._handle_complete({"summary": "invalid", "created_cards": ["t_nonexistent"]}))
++    assert result.get("error"), result
++    assert kb.get_task(board, tid).status == "running"
++    assert snapshot(ws) == before
++
++
++def test_plain_scratch_still_removed(board):
++    tid, ws = scratch(board)
++    assert kb.complete_task(board, tid, result="done")
++    assert not ws.exists()
++
++
++@pytest.mark.parametrize("surface", ["cli", "rest"])
++@pytest.mark.parametrize("state", ["clean", "dirty", "untracked", "unpushed"])
++@pytest.mark.parametrize("rejected", [False, True])
++def test_completion_surfaces_preserve_nested_git(board, state, rejected, surface, monkeypatch):
++    from hermes_cli import kanban as kc
++
++    tid, ws = scratch(board)
++    repository(ws, state)
++    before = snapshot(ws)
++    if rejected:
++        parent = kb.create_task(board, title="unfinished dependency")
++        kb.link_tasks(board, parent, tid)
++    initial = kb.get_task(board, tid).status
++    if surface == "cli":
++        parser = argparse.ArgumentParser()
++        kc.build_parser(parser.add_subparsers(dest="command"))
++        args = parser.parse_args(["kanban", "complete", tid, "--result", "verified"])
++        rc = kc.kanban_command(args)
++        assert (rc != 0) is rejected
++    else:
++        import importlib.util
++        import sys
++        from fastapi import FastAPI
++        from fastapi.testclient import TestClient
++
++        plugin_file = Path(__file__).resolve().parents[2] / "plugins/kanban/dashboard/plugin_api.py"
++        spec = importlib.util.spec_from_file_location("scratch_preservation_api", plugin_file)
++        assert spec is not None and spec.loader is not None
++        module = importlib.util.module_from_spec(spec)
++        monkeypatch.setitem(sys.modules, spec.name, module)
++        spec.loader.exec_module(module)
++        app = FastAPI()
++        app.include_router(module.router, prefix="/api/plugins/kanban")
++        with TestClient(app) as client:
++            response = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "done", "result": "verified"})
++        assert response.status_code == (409 if rejected else 200), response.text
++    assert kb.get_task(board, tid).status == (initial if rejected else "done")
++    assert snapshot(ws) == before
++
++
++def test_real_linked_worktree_inside_scratch_survives(board, tmp_path):
++    tid, ws = scratch(board)
++    repo = repository(tmp_path / "external", "clean")
++    checkout = ws / "nested" / "worktree"
++    checkout.parent.mkdir()
++    git(repo, "worktree", "add", "-b", "task-work", str(checkout))
++    assert (checkout / ".git").is_file()
++    before = snapshot(ws)
++    assert kb.complete_task(board, tid, result="done")
++    assert snapshot(ws) == before
++    assert git(checkout, "rev-parse", "HEAD") == git(repo, "rev-parse", "HEAD")
+-- 
+2.55.0
+

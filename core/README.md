@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-scratch-git-preservation.md](kanban-scratch-git-preservation.md) | 0261 | Tool, CLI and REST completion preserve Git-bearing or uncertain scratch before any optional post-tool cleanup |
 | [kanban-touch-subscriptions.md](kanban-touch-subscriptions.md) | 0249 | Touch subscriptions do not own work |
 | [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0250 | Condition-driven scheduled wakes |
 | [inline-preview-full-document.md](inline-preview-full-document.md) | 0251 | Whole-document inline previews |
