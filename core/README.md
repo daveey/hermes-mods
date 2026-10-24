@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [managed-chrome-leases.md](managed-chrome-leases.md) | 0264–0265 | Experimental, not release-approved: opt-in owner-scoped default/local/named browser requests, selected vault scope and task/shutdown lease cleanup; native core and genuine credential gates remain open |
 | [kanban-scratch-git-preservation.md](kanban-scratch-git-preservation.md) | 0261 | Tool, CLI and REST completion preserve Git-bearing or uncertain scratch before any optional post-tool cleanup |
 | [kanban-touch-subscriptions.md](kanban-touch-subscriptions.md) | 0249 | Touch subscriptions do not own work |
 | [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0250 0262 | Condition-driven scheduled wakes with generation fencing and shared-park guards |

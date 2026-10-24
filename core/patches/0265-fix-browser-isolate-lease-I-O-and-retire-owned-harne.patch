@@ -1,0 +1,476 @@
+From 2825630d6475c8491a2d0cc6267414f433f7eccb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 05:47:33 +0000
+Subject: [PATCH] fix(browser): isolate lease I/O and retire owned harness
+ scopes [daveey]
+
+---
+ tests/tools/test_browser_agent_lifecycle.py |   3 +-
+ tests/tools/test_browser_agent_rework.py    | 155 ++++++++++++++++++
+ tools/browser_agent_lifecycle.py            | 168 ++++++++++++++++----
+ tools/browser_use_cli.py                    |   7 +-
+ tools/browser_vault_tool.py                 |  15 +-
+ 5 files changed, 313 insertions(+), 35 deletions(-)
+ create mode 100644 tests/tools/test_browser_agent_rework.py
+
+diff --git a/tests/tools/test_browser_agent_lifecycle.py b/tests/tools/test_browser_agent_lifecycle.py
+index 5fa2d0a958..ab3179e972 100644
+--- a/tests/tools/test_browser_agent_lifecycle.py
++++ b/tests/tools/test_browser_agent_lifecycle.py
+@@ -55,7 +55,8 @@ def managed(tmp_path, monkeypatch):
+     executions = []
+ 
+     def run(cmd, code, env, timeout):
+-        executions.append((code, dict(env), timeout))
++        if '--reload' not in cmd:
++            executions.append((code, dict(env), timeout))
+         return subprocess.CompletedProcess(cmd, 0, 'ok', '')
+ 
+     monkeypatch.setattr(cli, '_run_cli_killing_process_group', run)
+diff --git a/tests/tools/test_browser_agent_rework.py b/tests/tools/test_browser_agent_rework.py
+new file mode 100644
+index 0000000000..8d0df813f9
+--- /dev/null
++++ b/tests/tools/test_browser_agent_rework.py
+@@ -0,0 +1,155 @@
++"""Managed cleanup and unrelated-owner concurrency contracts."""
++import threading
++import subprocess
++from concurrent.futures import ThreadPoolExecutor
++
++from tools import browser_agent_lifecycle as lifecycle
++from tools import browser_use_cli as cli
++
++
++def test_slow_acquire_does_not_block_another_owner(monkeypatch):
++    entered, resume, other_done = threading.Event(), threading.Event(), threading.Event()
++    config = {'endpoint': 'http://127.0.0.1:19001', 'installation_id': 'test'}
++
++    def post(config, action, **payload):
++        if action != 'acquire':
++            return {}
++        task = payload['owner'][1]
++        if task == 'slow':
++            entered.set()
++            assert resume.wait(5)
++        return {'capability': task, 'request_id': task, 'daemon_name': 'lease-' + task,
++                'endpoint': config['endpoint'] + '/lease/' + task}
++
++    monkeypatch.setattr(lifecycle, '_post', post)
++    monkeypatch.setattr(cli, '_find_cli', lambda: None)
++
++    def run(task):
++        with lifecycle.request_lease(config, task, '', 30, {}):
++            if task == 'fast':
++                other_done.set()
++
++    with ThreadPoolExecutor(2) as pool:
++        slow = pool.submit(run, 'slow')
++        assert entered.wait(2)
++        fast = pool.submit(run, 'fast')
++        try:
++            assert other_done.wait(2), 'unrelated owner serialized behind network acquire'
++        finally:
++            resume.set()
++            slow.result()
++            fast.result()
++            lifecycle.release_all()
++
++
++def test_cleanup_defers_release_and_owned_daemon_stop_until_request_finishes(monkeypatch):
++    calls = []
++    config = {'endpoint': 'http://127.0.0.1:19001', 'installation_id': 'test'}
++
++    def post(config, action, **payload):
++        calls.append(action)
++        return {'capability': 'owner', 'request_id': 'req', 'daemon_name': 'lease-owner',
++                'endpoint': config['endpoint'] + '/lease/owner'}
++
++    monkeypatch.setattr(lifecycle, '_post', post)
++    monkeypatch.setattr(cli, '_find_cli', lambda: ['test-harness'])
++    stopped = []
++    def run(cmd, code, env, timeout):
++        stopped.append((cmd, env))
++        return subprocess.CompletedProcess(cmd, 0)
++    monkeypatch.setattr(cli, '_run_cli_killing_process_group', run)
++    env = {'BH_RUNTIME_DIR': '/isolated/runtime'}
++    with lifecycle.request_lease(config, 'owner', '', 30, env):
++        lifecycle.release_task('owner')
++        assert calls == ['acquire']
++        assert stopped == []
++    assert calls == ['acquire', 'complete', 'release']
++    assert stopped[0][0] == ['test-harness', '--reload']
++    assert stopped[0][1]['BU_NAME'] == 'lease-owner'
++    assert stopped[0][1]['BH_RUNTIME_DIR'] == '/isolated/runtime'
++    assert stopped[0][1]['BH_RUNTIME_DIR_SHARED'] == '1'
++
++
++def test_named_sessions_keep_separate_vault_supervisors(monkeypatch):
++    config = {'endpoint': 'http://127.0.0.1:19001', 'installation_id': 'test'}
++
++    def post(config, action, **payload):
++        cap = payload['owner'][2].replace(':', '-') if action == 'acquire' else 'unused'
++        return {'capability': cap, 'request_id': 'req', 'daemon_name': 'lease-' + cap,
++                'endpoint': config['endpoint'] + '/lease/' + cap}
++
++    monkeypatch.setattr(lifecycle, '_post', post)
++    monkeypatch.setattr(cli, '_find_cli', lambda: None)
++    keys = []
++    try:
++        for session in ('first', 'second', 'first'):
++            with lifecycle.request_lease(config, 'vault-task', session, 30, {}):
++                keys.append(lifecycle.supervisor_task('vault-task'))
++        assert keys[0] != keys[1]
++        assert keys[0] == keys[2]
++    finally:
++        lifecycle.release_all()
++
++
++def test_expired_capability_rotation_retires_old_daemon(monkeypatch):
++    config = {'endpoint': 'http://127.0.0.1:19001', 'installation_id': 'test'}
++    grants = iter(('old', 'new'))
++    stopped = []
++
++    def post(config, action, **payload):
++        if action != 'acquire':
++            return {}
++        cap = next(grants)
++        return dict(capability=cap, request_id='req', daemon_name='lease-' + cap,
++                    endpoint=config['endpoint'] + '/lease/' + cap)
++
++    monkeypatch.setattr(lifecycle, '_post', post)
++    monkeypatch.setattr(cli, '_find_cli', lambda: ['test-harness'])
++    def run(cmd, code, env, timeout):
++        stopped.append(env['BU_NAME'])
++        return subprocess.CompletedProcess(cmd, 0)
++    monkeypatch.setattr(cli, '_run_cli_killing_process_group', run)
++    try:
++        for _ in range(2):
++            with lifecycle.request_lease(config, 'rotating-owner', '', 30, {}):
++                pass
++        assert stopped == ['lease-old']
++    finally:
++        lifecycle.release_all()
++    assert stopped == ['lease-old', 'lease-new']
++
++
++def test_managed_vault_exception_never_falls_back_to_unscoped_eval(monkeypatch):
++    from unittest.mock import Mock
++    from tools import browser_vault_tool as vault
++    from tools import browser_tool_session
++    from tools.browser_supervisor import SUPERVISOR_REGISTRY
++    monkeypatch.setattr(lifecycle, 'supervisor_task', lambda task: 'managed-scope')
++    supervisor = Mock()
++    supervisor.evaluate_runtime.side_effect = RuntimeError('connection disappeared')
++    monkeypatch.setattr(SUPERVISOR_REGISTRY, 'get', lambda task: supervisor)
++    raw = Mock(side_effect=AssertionError('unscoped fallback'))
++    monkeypatch.setattr(browser_tool_session, '_run_browser_command', raw)
++    result = vault._eval_js('task', 'document.title')
++    assert result['success'] is False
++    raw.assert_not_called()
++
++
++def test_failed_daemon_stop_retries_before_owner_reuse(monkeypatch):
++    from unittest.mock import Mock
++    config = {'endpoint': 'http://127.0.0.1:19001', 'installation_id': 'test'}
++    grant = dict(capability='retry', request_id='req', daemon_name='lease-retry',
++                 endpoint=config['endpoint'] + '/lease/retry')
++    monkeypatch.setattr(lifecycle, '_post', lambda *args, **kwargs: grant)
++    monkeypatch.setattr(cli, '_find_cli', lambda: ['test-harness'])
++    stop = Mock(side_effect=[subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0),
++                             subprocess.CompletedProcess([], 0)])
++    monkeypatch.setattr(cli, '_run_cli_killing_process_group', stop)
++    try:
++        with lifecycle.request_lease(config, 'retry-owner', '', 30, {}):
++            pass
++        lifecycle.release_task('retry-owner')
++        with lifecycle.request_lease(config, 'retry-owner', '', 30, {}):
++            assert stop.call_count == 2
++    finally:
++        lifecycle.release_all()
+diff --git a/tools/browser_agent_lifecycle.py b/tools/browser_agent_lifecycle.py
+index 752747fb78..961835d26b 100644
+--- a/tools/browser_agent_lifecycle.py
++++ b/tools/browser_agent_lifecycle.py
+@@ -5,9 +5,13 @@ only keeps this process's capabilities for task-scoped release. A dead worker's
+ request protection expires at the supervisor; open daemon sockets are not activity.
+ """
+ import contextlib
++from dataclasses import dataclass, field
++import hashlib
+ import json
+ import logging
++import os
+ import re
++import subprocess
+ import threading
+ import urllib.error
+ import urllib.parse
+@@ -18,7 +22,32 @@ from hermes_constants import get_hermes_home
+ logger = logging.getLogger(__name__)
+ _TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+ _lock = threading.RLock()
+-_leases: dict[tuple[str, str, str, str], tuple[dict, str]] = {}
++
++@dataclass
++class _Lease:
++    config: dict
++    capability: str = ""
++    env: dict = field(default_factory=dict)
++    active: int = 0
++    closing: bool = False
++    supervisor: str = ""
++    retired: list = field(default_factory=list)
++    lock: threading.RLock = field(default_factory=threading.RLock)
++
++
++_leases: dict[tuple[str, str, str, str], _Lease] = {}
++_vault_owners: dict[tuple[str, str], str] = {}
++
++
++def supervisor_task(task_id: str) -> str:
++    """Vault's existing no-session API addresses the last selected scope, never a union."""
++    with _lock:
++        return _vault_owners.get((str(get_hermes_home()), task_id), task_id)
++
++
++def supervisor_identity(task_id: str, capability: str) -> str:
++    return 'managed-' + hashlib.sha256(json.dumps(
++        [str(get_hermes_home()), task_id, capability]).encode()).hexdigest()
+ 
+ 
+ class ManagedBrowserError(RuntimeError):
+@@ -64,7 +93,7 @@ def _post(config: dict, action: str, **payload) -> dict:
+ 
+     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+     try:
+-        with opener.open(request, timeout=60) as response:
++        with opener.open(request, timeout=120 if action == "acquire" else 15) as response:
+             result = json.loads(response.read(65537))
+         if not isinstance(result, dict) or result.get("error"):
+             raise ManagedBrowserError("Managed browser rejected lifecycle " + action)
+@@ -95,45 +124,122 @@ def request_lease(config: dict, task_id: str | None, session: str, timeout: int,
+     owner = (str(get_hermes_home()), task_id, f"named:{session}" if session else "default")
+     key = (*owner, config["endpoint"])
+     with _lock:
+-        grant = _post(config, "acquire", owner=list(owner), timeout_s=timeout)
+-        _validate_grant(config, grant)
+-        _leases[key] = (dict(config), grant["capability"])
+-    env.pop("BU_CDP_WS", None)
+-    env["BU_CDP_URL"] = grant["endpoint"]
+-    env["BU_NAME"] = grant["daemon_name"]
+-    # Caller-provided harness directories otherwise use a bare 'bu' socket,
+-    # silently ignoring BU_NAME and merging independently leased owners.
+-    env["BH_RUNTIME_DIR_SHARED"] = "1"
+-    env["BH_TMP_DIR_SHARED"] = "1"
+-    env["BU_AUTOSPAWN"] = "0"  # failed owned setup must not spawn an unrelated cloud browser
++        pending = _leases.get(key)
++    if pending and pending.closing:
++        _release_record(key, pending)
++    with _lock:
++        record = _leases.setdefault(key, _Lease(dict(config)))
++        if record.closing:
++            raise ManagedBrowserError("Managed browser owner cleanup is pending")
++        record.active += 1
++    grant = None
+     try:
++        # Serialize this owner's grant mutation, never unrelated owners or cleanup.
++        with record.lock:
++            result = _post(config, "acquire", owner=list(owner), timeout_s=timeout,
++                           worker_pid=os.getpid(), daemon_dir=_daemon_dir(env))
++            _validate_grant(config, result)
++            grant = result
++            env.pop("BU_CDP_WS", None)
++            env.update(BU_CDP_URL=grant["endpoint"], BU_NAME=grant["daemon_name"],
++                       BH_RUNTIME_DIR_SHARED="1", BH_TMP_DIR_SHARED="1", BU_AUTOSPAWN="0")
++            with _lock:
++                if record.capability and record.capability != grant["capability"]:
++                    record.retired.append(_Lease(record.config, capability=record.capability,
++                                                 env=record.env, supervisor=record.supervisor))
++                record.capability = grant["capability"]
++                record.env = dict(env)
++                record.supervisor = supervisor_identity(task_id, record.capability)
++                _vault_owners[owner[:2]] = record.supervisor
+         yield
+     finally:
+-        try:
+-            _post(config, "complete", capability=grant["capability"], request_id=grant["request_id"])
+-        except ManagedBrowserError:
+-            logger.warning("Managed browser completion unavailable; request deadline remains bounded")
+-
+-
+-def _release(keys) -> None:
+-    for key in keys:
+-        config, capability = _leases[key]
+-        try:
+-            _post(config, "release", capability=capability)
+-        except ManagedBrowserError:
+-            logger.warning("Managed browser release unavailable; retaining capability for retry")
++        if grant:
++            try:
++                _post(config, "complete", capability=grant["capability"], request_id=grant["request_id"])
++            except ManagedBrowserError:
++                logger.warning("Managed browser completion unavailable; request deadline remains bounded")
++        with _lock:
++            record.active -= 1
++            release = record.closing and not record.active
++            if not record.capability and not record.active:
++                _leases.pop(key, None)
++        if release:
++            _release_record(key, record)
+         else:
+-            _leases.pop(key, None)
++            _release_retired(record)
++
++
++def _daemon_dir(env: dict) -> str:
++    """Match harness paths without importing its environment-bound IPC module."""
++    from pathlib import Path
++    runtime = env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR")
++    if runtime:
++        return str(Path(runtime).expanduser().resolve())
++    home = env.get("BH_HOME") or env.get("BROWSER_HARNESS_HOME")
++    if not home:
++        home = str(Path(env.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "browser-harness")
++    return str(Path(home).expanduser().resolve() / "runtime")
++
++
++def _release_record(key, record) -> None:
++    with record.lock:
++        with _lock:
++            if _leases.get(key) is not record or record.active:
++                return
++        _release_retired(record)
++        if _dispose(record) and not record.retired:
++            with _lock:
++                if _leases.get(key) is record:
++                    del _leases[key]
++                    if _vault_owners.get(key[:2]) == record.supervisor:
++                        del _vault_owners[key[:2]]
++
++
++def _dispose(record) -> bool:
++    from tools import browser_use_cli as cli
++    from tools.browser_supervisor import SUPERVISOR_REGISTRY
++    try:
++        _post(record.config, "release", capability=record.capability)
++        cmd = cli._find_cli()
++        if cmd and record.env:
++            result = cli._run_cli_killing_process_group([*cmd, "--reload"], "", record.env, 15)
++            if result.returncode:
++                raise ManagedBrowserError("Owned harness daemon shutdown failed")
++        if record.supervisor:
++            SUPERVISOR_REGISTRY.stop(record.supervisor)
++    except (ManagedBrowserError, OSError, subprocess.SubprocessError):
++        logger.warning("Managed browser cleanup unavailable; retaining capability for retry")
++        return False
++    return True
++
++
++def _release_retired(record) -> None:
++    with record.lock:
++        with _lock:
++            if record.active:
++                return
++            retired, record.retired = record.retired, []
++        failed = [old for old in retired if not _dispose(old)]
++        with _lock:
++            record.retired.extend(failed)
++
++
++def _release_matching(predicate) -> None:
++    with _lock:
++        records = [(key, record) for key, record in _leases.items() if predicate(key)]
++        for _, record in records:
++            record.closing = True
++    for key, record in records:
++        if not record.active:
++            _release_record(key, record)
+ 
+ 
+ def release_task(task_id: str) -> None:
+     """Never release another profile's identically named task or a sibling task."""
+     home = str(get_hermes_home())
+-    with _lock:
+-        _release([key for key in _leases if key[:2] == (home, task_id)])
++    _release_matching(lambda key: key[:2] == (home, task_id))
+ 
+ 
+ def release_all() -> None:
+     """Process shutdown only: records carry the original installation and profile."""
+-    with _lock:
+-        _release(list(_leases))
++    _release_matching(lambda key: True)
+diff --git a/tools/browser_use_cli.py b/tools/browser_use_cli.py
+index ba20b0f882..e9be9f52de 100644
+--- a/tools/browser_use_cli.py
++++ b/tools/browser_use_cli.py
+@@ -579,9 +579,14 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
+         return
+     try:
+         from tools.browser_supervisor import SUPERVISOR_REGISTRY
++        from tools.browser_agent_lifecycle import supervisor_identity
+         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
+         policy, timeout_s = _get_dialog_policy_config()
+-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
++        owner = task_id or "default"
++        name = env.get("BU_NAME", "")
++        if name.startswith("lease-") and cdp.endswith("/lease/" + name[6:]):
++            owner = supervisor_identity(owner, name[6:])
++        SUPERVISOR_REGISTRY.get_or_start(task_id=owner, cdp_url=_resolve_cdp_override(cdp),
+                                          dialog_policy=policy, dialog_timeout_s=timeout_s)
+     except Exception as exc:
+         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
+diff --git a/tools/browser_vault_tool.py b/tools/browser_vault_tool.py
+index 9474435dc6..a2493ebbd1 100644
+--- a/tools/browser_vault_tool.py
++++ b/tools/browser_vault_tool.py
+@@ -60,10 +60,13 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
+     embed secret values — the fallback places the expression in subprocess
+     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
+     """
++    selected = task_id
+     try:
+         from tools.browser_supervisor import SUPERVISOR_REGISTRY
++        from tools.browser_agent_lifecycle import supervisor_task
+ 
+-        supervisor = SUPERVISOR_REGISTRY.get(task_id)
++        selected = supervisor_task(task_id)
++        supervisor = SUPERVISOR_REGISTRY.get(selected)
+         if supervisor is not None:
+             sup = supervisor.evaluate_runtime(expression)
+             if sup.get("ok"):
+@@ -71,10 +74,14 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
+             err = str(sup.get("error") or "")
+             if "supervisor" not in err.lower():
+                 return {"success": False, "error": err}
++        if selected != task_id:
++            return {"success": False, "error": "Managed browser supervisor unavailable; run browser_exec in the selected session again"}
+     except ImportError:
+         pass
+     except Exception as exc:  # pragma: no cover — defensive
+         logger.debug("vault fill: supervisor eval unavailable (%s)", exc)
++        if selected != task_id:
++            return {"success": False, "error": "Managed browser supervisor unavailable; reconnect the selected session"}
+ 
+     from tools.browser_tool import _last_session_key
+     from tools.browser_tool_session import _run_browser_command
+@@ -94,10 +101,14 @@ def _ensure_supervisor(task_id: str):
+     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
+     Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
+     from tools.browser_supervisor import SUPERVISOR_REGISTRY
++    from tools.browser_agent_lifecycle import supervisor_task
+ 
+-    supervisor = SUPERVISOR_REGISTRY.get(task_id)
++    selected = supervisor_task(task_id)
++    supervisor = SUPERVISOR_REGISTRY.get(selected)
+     if supervisor is not None:
+         return supervisor
++    if selected != task_id:
++        return None  # Never widen a managed vault lookup to an unscoped local browser.
+     from tools.browser_tool import _last_session_key
+     from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
+     from tools.browser_tool_session import _run_browser_command
+-- 
+2.55.0
+
