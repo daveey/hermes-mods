@@ -330,6 +330,36 @@ test('poller never publishes an old owner after same-runtime focus changes in fl
   } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
 })
 
+test('failed lineage stays unknown and retries rather than caching an empty task answer', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.state = {
+    focusedSessionId: { get: () => 'lineage-runtime' },
+    focusedStoredSessionId: { get: () => 'lineage-failure' },
+    focusedSessionOwner: { get: () => ({ connectionId: 'owner', profile: 'default' }) }
+  }
+  host.request = async () => ({})
+  let failed = true
+  let lineageReads = 0
+  globalThis.document = { hidden: false, getElementById: () => ({ remove() {} }), addEventListener() {}, removeEventListener() {} }
+  globalThis.window = { hermesDesktop: { api: async args => {
+    if (args.path.startsWith('/api/sessions/')) {
+      lineageReads++
+      if (failed) throw new Error('owner unavailable')
+      return { id: 'lineage-failure', parent_session_id: null }
+    }
+    return { tasks: [], machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    assert.ok(window.__sessionTasks.snapshot.chips.some(c => c.state === 'unknown'), 'incomplete lineage must not look idle')
+    failed = false
+    await m.refresh()
+    assert.equal(lineageReads, 2, 'failed lineage must retry on next poll')
+    assert.equal(window.__sessionTasks.snapshot.chips.some(c => c.state === 'unknown'), false)
+  } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
+})
+
 test('lineage reads and caches keep identical session ids separate by owner profile', async () => {
   const calls = []
   globalThis.window = { hermesDesktop: { api: async args => {

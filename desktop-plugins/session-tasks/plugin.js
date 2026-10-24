@@ -318,8 +318,13 @@ async function lineageIds(storedId, connection, profile = 'default') {
       cur = str(row?.parent_session_id)
       if (cur) ids.add(cur)
     } catch {
-      break
+      ids.incomplete = true
+      return ids
     }
+  }
+  if (cur) {
+    ids.incomplete = true
+    return ids
   }
   lineageCache.set(cacheKey, { at: Date.now(), ids })
   return ids
@@ -465,6 +470,22 @@ export async function refresh() {
     const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
     if (kanbanDue || machinesDue) {
       const ids = await lineageIds(stored, route.connectionId, route.profile)
+      if (ids.incomplete) {
+        if (!stillFocused()) return
+        // Never turn a partial ancestry read into an authoritative empty answer.
+        // Keep only this owner's previous chips and retry ancestry next poll.
+        lastKanbanAt = 0
+        lastMachinesAt = 0
+        snapshot = {
+          runtime, stored, scope,
+          chips: [...(sameSession ? staleChips(snapshot.chips).filter(c => c.key !== `lineage-status:${scope}`) : []), {
+            key: `lineage-status:${scope}`, kind: 'kanban-status', state: 'unknown', stale: true,
+            label: 'Session lineage unavailable', title: 'Could not read full session ancestry; work may still be unfinished.'
+          }]
+        }
+        emit()
+        return
+      }
       const [kChips, mChips] = await Promise.all([
         kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)) : undefined,
         machinesDue ? ((lastMachinesAt = Date.now()), loadMachines(ids)) : undefined
