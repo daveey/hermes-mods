@@ -290,7 +290,7 @@ function focusedRoute() {
   const owner = host.state?.focusedSessionOwner?.get?.()
   return {
     connectionId: owner?.connectionId || activeConnection(),
-    profile: owner?.targetProfile || owner?.profile || host.state?.profile?.get?.() || 'default'
+    profile: owner ? (owner.targetProfile || owner.profile || 'default') : (host.state?.profile?.get?.() || 'default')
   }
 }
 
@@ -392,7 +392,12 @@ export async function loadKanban(ids, route = focusedRoute()) {
     remote = first && hubLinkCache.session === cacheScope ? staleChips(hubLinkCache.chips) : []
   }
   if (!live && !remote.length) return null
-  return [...(live || []), ...remote]
+  const seen = new Set()
+  return [...(live || []), ...remote].filter(chip => {
+    if (seen.has(chip.key)) return false
+    seen.add(chip.key)
+    return true
+  })
 }
 
 function focusedProfile() {
@@ -442,6 +447,11 @@ export async function refresh() {
     const stored = host.state.focusedStoredSessionId.get()
     const route = focusedRoute()
     const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
+    const stillFocused = () => {
+      const current = focusedRoute()
+      return host.state.focusedSessionId.get() === runtime &&
+        JSON.stringify([current.connectionId || '', current.profile, host.state.focusedStoredSessionId.get()]) === scope
+    }
     if (!runtime && !stored) {
       snapshot = { runtime, stored, chips: [] }
       return emit()
@@ -459,6 +469,7 @@ export async function refresh() {
         kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)) : undefined,
         machinesDue ? ((lastMachinesAt = Date.now()), loadMachines(ids)) : undefined
       ])
+      if (!stillFocused()) return
       // null = fetch failed: keep this chat's last good list, never the previous chat's.
       if (kChips) kanbanCache = kChips
       else if (kanbanDue && !sameSession) kanbanCache = []
@@ -470,7 +481,7 @@ export async function refresh() {
       machineCache = []
     }
     // Focus moved while we were fetching: drop this round, the next tick reloads.
-    if (host.state.focusedSessionId.get() !== runtime) return
+    if (!stillFocused()) return
     snapshot = {
       runtime,
       stored,

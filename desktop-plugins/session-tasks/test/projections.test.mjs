@@ -205,6 +205,27 @@ test('loadKanban dedupes by actual owner gateway, profile, board and id', async 
   } finally { delete globalThis.window }
 })
 
+test('failed authoritative reads dedupe retained remote rows against hub rows', async () => {
+  const row = { id: 't_retained_remote', status: 'running', gateway: 'remote', profile: 'work', board: 'default' }
+  let online = true
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/session-kanban-tasks')) {
+      if (online) return { tasks: [row] }
+      throw new Error('offline ledger')
+    }
+    if (path.includes('session-links')) return { gateway: 'origin', tasks: [row, { ...row, profile: 'other' }] }
+    return { columns: [] }
+  } } }
+  try {
+    const ids = new Set(['s_retained_remote'])
+    await m.loadKanban(ids)
+    online = false
+    const chips = await m.loadKanban(ids)
+    assert.equal(chips.filter(c => c.id === row.id).length, 2)
+    assert.equal(chips.some(c => c.kind === 'kanban-status'), true)
+  } finally { delete globalThis.window }
+})
+
 test('hub fallback cache cannot leak between profiles with the same session id', async () => {
   const { host } = await import('@hermes/plugin-sdk')
   let profile = 'work'
@@ -283,6 +304,32 @@ test('poller reloads the same stored id when its owner profile changes', async (
   } finally { delete globalThis.window; delete host.state; delete host.request }
 })
 
+test('poller never publishes an old owner after same-runtime focus changes in flight', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  let profile = 'before'
+  host.state = {
+    focusedSessionId: { get: () => 'race-runtime' },
+    focusedStoredSessionId: { get: () => 'race-stored' },
+    focusedSessionOwner: { get: () => ({ connectionId: 'race-owner', profile }) }
+  }
+  host.request = async () => ({})
+  globalThis.document = { hidden: false, getElementById: () => ({ remove() {} }), addEventListener() {}, removeEventListener() {} }
+  globalThis.window = { hermesDesktop: { api: async args => {
+    if (args.path.startsWith('/api/sessions/')) return { id: 'race-stored' }
+    if (args.path.startsWith('/api/session-kanban-tasks')) {
+      profile = 'after'
+      return { tasks: [{ id: 't_race', status: 'running', title: 'Old owner task', gateway: 'race-owner', profile: 'before', board: 'default' }] }
+    }
+    return { tasks: [], machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  const before = window.__sessionTasks.snapshot
+  try {
+    await m.refresh()
+    assert.equal(window.__sessionTasks.snapshot, before)
+  } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
+})
+
 test('lineage reads and caches keep identical session ids separate by owner profile', async () => {
   const calls = []
   globalThis.window = { hermesDesktop: { api: async args => {
@@ -324,6 +371,23 @@ test('task reads pin the focused owner throughout a mid-fetch focus switch', asy
       assert.equal(call.connectionId, 'owner-connection')
       assert.equal(call.profile, 'worker')
     }
+  } finally { delete globalThis.window; delete host.state }
+})
+
+test('explicit owner without a profile uses its default, not the ambient profile', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.state = {
+    focusedSessionOwner: { get: () => ({ connectionId: 'remote-default' }) },
+    profile: { get: () => 'ambient-work' }
+  }
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    return { tasks: [], gateway: 'remote' }
+  } } }
+  try {
+    await m.loadKanban(new Set(['s_owner_default']))
+    assert.deepEqual(calls.map(c => c.profile), ['default', 'default'])
   } finally { delete globalThis.window; delete host.state }
 })
 
