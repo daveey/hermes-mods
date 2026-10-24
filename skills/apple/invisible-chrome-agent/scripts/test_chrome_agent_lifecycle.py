@@ -95,6 +95,33 @@ class LedgerTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_request_deadline_starts_after_cold_wake(self):
+        from chrome_agent_lifecycle import Lifecycle
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [1000]
+            ledger = Ledger(Path(tmp) / 'ledger.json', clock=lambda: now[0])
+            def wake():
+                now[0] += 40
+            lifecycle = Lifecycle(ledger, 'example', wake)
+            grant = lifecycle.control('acquire', dict(installation_id='example',
+                owner=['/profiles/example', 'task', 'default'], timeout_s=5), '')
+            with ledger.transaction() as state:
+                self.assertGreaterEqual(state['leases'][grant['capability']]['requests'][grant['request_id']], now[0] + 35)
+
+    def test_managed_launch_has_no_unowned_bootstrap_page(self):
+        from test_hermes_chrome_agent import hca
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.multiple(hca, PROFILE=tmp), mock.patch.object(hca.subprocess, 'Popen') as spawn, \
+                 mock.patch.object(hca, 'cdp_version', return_value={'Browser': 'Fake'}):
+                supervisor = hca.Supervisor()
+                supervisor.lifecycle = mock.Mock()
+                spawn.return_value.poll.return_value = None
+                supervisor.start_chrome()
+                argv = spawn.call_args.args[0]
+                self.assertIn('--no-startup-window', argv)
+                self.assertNotIn('about:blank', argv)
+
     def test_serial_wake_idle_shutdown_and_disabled_refusal(self):
         from concurrent.futures import ThreadPoolExecutor
         from chrome_agent_lifecycle import Lifecycle
@@ -131,7 +158,8 @@ class RuntimeTests(unittest.TestCase):
                     ExclusiveLock(Path(tmp) / 'supervisor.lock')
             config = Path(tmp) / 'lifecycle-config.json'
             config.write_text(json.dumps({'installation_id': 'example'}))
-            with mock.patch.multiple(hca, STATE_DIR=tmp, PROFILE=str(Path(tmp) / 'profile')):
+            config.chmod(0o600)
+            with mock.patch.multiple(hca, HERMES_HOME=tmp, STATE_DIR=tmp, PROFILE=str(Path(tmp) / 'chrome-agent')):
                 s = hca.Supervisor()
                 s.configure_lifecycle()
                 self.assertFalse(s.lifecycle.running)
@@ -140,6 +168,21 @@ class RuntimeTests(unittest.TestCase):
                     s.lifecycle.control('acquire', dict(installation_id='example', owner=['/profiles/example', 'task', 'session'], timeout_s=60), '')
                     vd.assert_called_once()
                     chrome.assert_called_once()
+
+    def test_managed_configuration_refuses_unsafe_file_and_personal_profile(self):
+        from test_hermes_chrome_agent import hca
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp, 'lifecycle-config.json')
+            config.write_text(json.dumps({'installation_id': 'example'}))
+            with mock.patch.multiple(hca, HERMES_HOME=tmp, STATE_DIR=tmp, PROFILE=str(Path(tmp) / 'chrome-agent')):
+                config.chmod(0o644)
+                with self.assertRaises(LifecycleError):
+                    hca.Supervisor().configure_lifecycle()
+                config.chmod(0o600)
+                with mock.patch.object(hca, 'PROFILE', str(Path(tmp) / 'personal')):
+                    with self.assertRaises(LifecycleError):
+                        hca.Supervisor().configure_lifecycle()
 
     def test_supervisor_routes_download_events_and_passkey_holds(self):
         from test_hermes_chrome_agent import hca
@@ -201,13 +244,20 @@ class ScopedCommandTests(unittest.TestCase):
             connection.call('Target.setAutoAttach', {'autoAttach': True, 'flatten': True})
             self.assertEqual([e['params']['targetInfo']['targetId'] for e in events], ['owned'])
             connection.call('Runtime.evaluate', {'expression': '1'}, 'owned-session')
+            self.assertEqual(connection.call('Target.setAutoAttach', {'autoAttach': True, 'flatten': True,
+                              'waitForDebuggerOnStart': False}, 'owned-session'), {})
             with self.assertRaises(LifecycleError):
                 connection.call('Runtime.evaluate', {'expression': '1'}, 'unknown-session')
             now[0] += 1801
             with self.assertRaises(LifecycleError):
                 connection.call('Runtime.evaluate', {'expression': '1'}, 'owned-session')
+            now[0] = 1001
             ledger.new_generation()
             self.assertFalse(ledger.owns(cap, 'owned'))
+            ledger.acquire(['/profiles/example', 'task', 'session'], 60)
+            ledger.bind(cap, 'owned')
+            with self.assertRaises(LifecycleError):
+                connection.call('Target.getTargets', {})
 
 
 class SmokeSafetyTests(unittest.TestCase):

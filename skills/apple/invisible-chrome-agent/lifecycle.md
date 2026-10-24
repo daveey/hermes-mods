@@ -1,7 +1,7 @@
 # Managed Chrome leases (opt-in, experimental)
 
 This extends the existing focus proxy; it does **not** replace the passkey notifier,
-focus guard, virtual display, Chrome arguments, or saver preferences. Existing
+focus guard, virtual display, anti-backgrounding flags, or saver preferences. Existing
 installations without `cache/chrome-agent/lifecycle-config.json` retain always-on
 raw CDP behavior. Reinstalling writes that file and opts into demand startup.
 
@@ -20,6 +20,8 @@ raw CDP behavior. Reinstalling writes that file and opts into demand startup.
   diff inference or adoption. Invalid scoped requests never fall back to raw CDP.
 - Raw `/json/*` and WebSockets keep the existing focus filter and remain unowned.
   Unknown targets block browser idle shutdown and are never automatically closed.
+  Managed launches use `--no-startup-window` instead of an unowned bootstrap blank;
+  legacy always-on launches retain their initial blank tab.
 - Owned expired tabs are closed through CDP, not by killing renderers. Defaults:
   lease idle 1800 seconds, release/orphan grace 300, browser idle 120, handoff 1200.
   Each request protects through `timeout_s + 30` seconds, including after ledger reload.
@@ -70,6 +72,8 @@ Private agent-local configuration at
 
 Install generates the identity once; reinstall preserves it. Settings are finite
 numbers between 1 and 86400 seconds; booleans and unknown keys are rejected.
+The supervisor requires owner-only configuration permissions and the dedicated
+`$HERMES_HOME/chrome-agent` profile, rejecting a different profile or redirected symlink.
 Changing settings requires a deliberate supervisor restart, which closes its children.
 The core's separate opt-in is `browser.managed_agent.endpoint` (the exact raw
 loopback endpoint) and `browser.managed_agent.installation_id` (this identity).
@@ -98,15 +102,14 @@ returns `{"completed":false}`. Repeated release is idempotent.
 
 ## Known limitations / acceptance still required
 
-**Not production-verified. No real Chrome or browser-use run was performed for this change.**
+**Not production-verified. Isolated Linux headless Chrome and core browser-use
+default/local entry smoke checks passed. Mac headful acceptance is still required.**
 
-- Chrome's unchanged launch arguments include an initial `about:blank` tab. It is
-  unknown and therefore intentionally blocks automatic idle shutdown until an
-  operator closes it. This implementation does not silently adopt/delete it.
 - The scoped protocol is a restricted CDP subset, not a transparent browser-level
   tunnel. Browser-global mutations/context creation, nested Target envelopes,
-  popup/worker adoption, and unknown sessions are refused. Browser-use/Playwright
-  compatibility must be tested before deployment; clients needing unsupported
+  popup adoption, and unknown sessions are refused. Nested iframe/worker sessions
+  attached through an owned page inherit that page's revocation, never tab ownership.
+  Broader browser-use/Playwright compatibility must be tested before deployment; clients needing unsupported
   browser-level methods may fail. Shared profile cookies are not isolated.
 - Frame-associated download events need the supervisor's Page observation to have
   identified the frame. A download that precedes that observation may not be bound.
@@ -145,6 +148,30 @@ profiles, and cleans up its child/proxy in `finally`:
 python3 smoke_chrome_lifecycle.py --chrome '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 ```
 
-It verifies acquire/create/attach/evaluate/list/close/complete/release, **not** the
-virtual display, launchd, passkeys, full browser-use execution, or startup-tab idle
-acceptance. Do not run it against the installed supervisor.
+It verifies acquire/create/attach/evaluate/list/complete/release, automatic owned
+target reaping, idle process/CDP exit, and a second request waking a new process.
+`--test-idle-seconds 1` (range 1..10) bounds the test; release grace is one second.
+`--headful` opts into a visible isolated browser for Mac testing. It does **not**
+prove virtual-display placement, launchd, passkeys, focus guard, or full browser-use
+compatibility. Do not run it against the installed supervisor.
+
+## Core routing and rollback
+
+Set `browser.cdp_url` and `browser.managed_agent.endpoint` to the same exact
+loopback HTTP root; set `browser.managed_agent.installation_id` to the installed
+identity. Core reads these settings per call from the served profile's config.yaml
+(use `hermes config set` for the registered keys). Both default and `local=true`
+calls acquire before discovery, use the scoped endpoint and owner-specific daemon,
+and complete their request in `finally`. A missing tool task identity fails closed.
+The lease owner is profile home + task + supplied session, with `default` for an
+omitted session. Personal-copy/cloud and unrelated explicit overrides are unchanged.
+Task cleanup releases only that profile/task's recorded capabilities. Process exit
+and explicit gateway shutdown release all recorded capabilities; a legacy browser
+route reset does not revoke managed sibling sessions. Failed releases are retained
+for retry, with supervisor expiry as the crashed-worker fallback.
+
+To roll back: explicitly stop the supervisor, restore the prior supervisor build,
+and remove the managed_agent config mapping. Preserve the Chrome profile. Do not
+activate a raw always-on supervisor unless the operator intends that rollback;
+removing lifecycle-config.json switches to the legacy always-on behavior. Keep the
+ledger for diagnosis rather than deleting it to force reclamation of unknown tabs.
