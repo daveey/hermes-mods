@@ -218,7 +218,7 @@ def build_gate(store):
                 'evidence': evidence})), evidence), evidence)
             store.log({'event': 'goal_disposition', 'session_id': session_id, 'attempt': attempt,
                        'disposition': v['disposition'], 'confidence': v['confidence'], 'mode': cfg['mode']})
-            if v['disposition'] == 'unknown' and cfg['mode'] == 'enforce' and attempt:
+            if (v['disposition'] == 'unknown' or v['confidence'] < .85) and cfg['mode'] == 'enforce' and attempt:
                 raise ValueError('recheck_unknown')
             if v['disposition'] != 'abandoned' or v['confidence'] < .85:
                 return None

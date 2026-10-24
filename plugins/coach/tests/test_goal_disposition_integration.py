@@ -18,7 +18,7 @@ def verdict():
                 boundary_kind=None, continuation_ref=None, confidence=0.99)
 
 
-@pytest.mark.parametrize('recheck_error', [False, True])
+@pytest.mark.parametrize('recheck_error', [False, True, 'unknown', 'low_confidence'])
 @pytest.mark.parametrize('discovered', [False, True])
 @pytest.mark.parametrize('platform', ['cli', 'desktop'])
 def test_diagnosis_only_text_stop_is_held_before_delivery(tmp_path, monkeypatch, platform, discovered, recheck_error):
@@ -36,6 +36,10 @@ def test_diagnosis_only_text_stop_is_held_before_delivery(tmp_path, monkeypatch,
     def judge(*_):
         checks.append(True)
         if recheck_error and len(checks) > 1:
+            if recheck_error == 'unknown':
+                return dict(verdict(), disposition='unknown')
+            if recheck_error == 'low_confidence':
+                return dict(verdict(), confidence=.1)
             raise TimeoutError('synthetic provider timeout')
         return verdict()
     if 'pre_final_gate' in hooks:
