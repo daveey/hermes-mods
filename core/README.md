@@ -111,8 +111,15 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [api-server-thread-hops.md](api-server-thread-hops.md) | 0214 0226 | API-server SSE flushes worker-thread hops before `assistant.completed`/EOS so the last commentary is not dropped |
 | [codex-subscription-routing.md](codex-subscription-routing.md) | 0233 0234 0235 0236 0237 | Account-gated Codex models route via an entitled ChatGPT/Codex subscription: union catalog, plan-gated pool selection, subscription-first picker |
 | [kanban-quota-recovery.md](kanban-quota-recovery.md) | 0248 | A recovered quota/429 wall takes the cooldown path and never becomes a human block; stale guard-hold blocks are released |
+| [runtime-safety-followups.md](runtime-safety-followups.md) | 0256–0259 | Portable wake cleanup, disabled-MCP diagnostics, fail-closed delegated lineage and Git-guard PATH isolation |
+| [session-start-requests.md](session-start-requests.md) | 0260 | Durable plugin-authorized session start identity, at-most-once first-turn dispatch and owner-local reconciliation |
 
 ## Applying
+
+The 0256–0260 mirror verification applied all 260 patches with `git am -3` at
+merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`. All five changed regression
+files passed on the applied series: 58 tests, zero failures, canonical runner with `-j 1`.
+This does not claim full-suite, Desktop rendering, deployment or exact-head CI verification.
 
 The patches touch shared files (keybind registry, i18n, sidebar, the RPC contract), so they are
 **not independent**. Apply them in order, either all of them or a prefix up to the last one you
