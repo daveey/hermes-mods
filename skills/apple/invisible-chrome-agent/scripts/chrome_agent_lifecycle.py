@@ -304,6 +304,9 @@ class Lifecycle:
                     if not self.running:
                         self.wake()
                         self.running = True
+                        # Startup must not consume the caller's execution budget.
+                        self.ledger.complete(result['capability'], result['request_id'])
+                        result = self.ledger.acquire(payload['owner'], payload['timeout_s'])
                 except BaseException:
                     self.ledger.release(result['capability'])
                     raise
@@ -460,6 +463,8 @@ class ScopedCDP:
 
     def __init__(self, lifecycle, proxy, capability, api, send_event=lambda m: None):
         self.lifecycle, self.proxy, self.cap, self.api = lifecycle, proxy, capability, api
+        with lifecycle.ledger.transaction() as data:
+            self.generation = data['generation']
         self.sessions = {}
         self.page_session = None
         self.auto_attach = False
@@ -483,17 +488,36 @@ class ScopedCDP:
         return result
 
     def event(self, message):
+        with self.lifecycle.ledger.transaction() as data:
+            if data['generation'] != self.generation:
+                return
         sid = message.get('sessionId')
         if sid not in self.sessions or not self.lifecycle.ledger.owns(self.cap, self.sessions[sid]):
             return
-        if message.get('method', '').startswith('Target.'):
-            return  # no implicit ownership from auto-attach/popups
+        if message.get('method') == 'Target.attachedToTarget':
+            params = message.get('params', {})
+            # A nested attachment delivered on an owned page session proves
+            # ancestry. It does not confer ownership of another top-level tab.
+            if params.get('targetInfo', {}).get('type') not in ('iframe', 'worker'):
+                return
+            self.sessions[params['sessionId']] = self.sessions[sid]
+        elif message.get('method') == 'Target.detachedFromTarget':
+            self.sessions.pop(message.get('params', {}).get('sessionId'), None)
+        elif message.get('method', '').startswith('Target.'):
+            return  # no implicit ownership from browser-wide discovery/popups
         if sid == self.page_session:
             message = dict(message)
             message.pop('sessionId', None)
         self.send_event(message)
 
     def call(self, method, params, session=None):
+        with self.lifecycle.lock:
+            return self._call(method, params, session)
+
+    def _call(self, method, params, session=None):
+        with self.lifecycle.ledger.transaction() as data:
+            if data['generation'] != self.generation:
+                raise LifecycleError('stale browser generation; reconnect required')
         self.lifecycle.ledger.valid(self.cap)
         if not isinstance(params, dict):
             raise LifecycleError('params must be an object')
@@ -502,6 +526,10 @@ class ScopedCDP:
             if session not in self.sessions:
                 raise LifecycleError('unowned session')
             self.owned(self.sessions[session])
+            if method == 'Target.setAutoAttach':
+                # Nested auto-attach is scoped by Chrome to this owned page;
+                # child sessions inherit its revocation, never a new tab lease.
+                return self.cdp.call(method, params, session=session)
             if method.partition('.')[0] not in self.PAGE_DOMAINS or 'targetId' in params or 'sessionId' in params:
                 raise LifecycleError('unsupported scoped session method')
             rule = self.api.filter_cdp_message(dict(id=0, method=method, params=params), self.proxy.show())
