@@ -27,9 +27,32 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
    on a remote and no live process has its cwd inside it. Nothing can be lost that way, and the branch is kept.
    Dirty or unpushed trees are left alone, so a backstop GC (for example `mac-worktree-gc --all-repos`) can archive
    and then delete them after 7 idle days. The exception is a dirty tree nested inside the card's own scratch
-   workspace (`…/kanban/workspaces/<id>/`), which the dispatcher deletes right after completion. That tree is
+   workspace (`…/kanban/workspaces/<id>/`). **If it still exists when the hook runs**, that tree is
    archived first to `~/.hermes/archive/worktrees/<name>-<date>/` (`unpushed.bundle` + `commits/*.patch`,
    `uncommitted.diff`, `untracked.tar.gz`, `meta.json`). Then it is force-removed, so the repo keeps no stale entry.
+   See the core-ordering limitation below before relying on this archive behavior.
+
+### Portability and safety limits
+
+- macOS uses native `st_birthtime`; Linux uses GNU `stat -c %W`. Neither Unix ctime nor
+  mtime is creation time. If birth time is unavailable, only the first HEAD reflog entry with
+  a null old object id is accepted; missing, malformed or expired creation records mean
+  unknown birth and the candidate is skipped, not attributed to the latest caller.
+- `lsof` is resolved on PATH (with `/usr/sbin/lsof` as a macOS fallback). Missing commands,
+  timeouts, nonzero exits, stderr warnings about incomplete scans, or no cwd records abort
+  teardown without removing anything. Container mount visibility warnings can therefore
+  keep cleanup disabled until the process scan can run completely.
+- **Nested scratch preservation is not guaranteed by a post-tool hook.** Core versions that
+  delete scratch inside `complete_task` remove it before this hook runs. The archive path
+  described above works only while the nested tree still exists. Core must defer scratch
+  cleanup or provide a preservation gate before deletion; moving destructive teardown to
+  a pre-tool hook would be unsafe when completion is rejected. Do not rely on this plugin
+  to save nested scratch work on those cores.
+- The existing completion hook does not inspect the tool's success result. A rejected
+  `kanban_complete` can still trigger cleanup of eligible owned trees. Deployment should
+  remain disabled where this is unacceptable pending a success-gated lifecycle hook.
+- SSH-created remote trees and plain-shell work are not automatically owned. No broad
+  managed-directory globs confer ownership retroactively.
 
 Log: `~/.hermes/logs/worktree-owner.log` (`REGISTER`, `REMOVED`, `KEEP`, `SKIP` lines).
 

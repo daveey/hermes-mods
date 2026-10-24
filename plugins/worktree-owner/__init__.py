@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import sqlite3
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -54,9 +55,30 @@ def _git(cwd: str, *a: str, timeout: int = 120) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True, timeout=timeout)
 
 
-def _birth(p: str) -> float:
+def _birth(p: str) -> float | None:
+    """Creation time, never Unix ctime (which changes on metadata writes)."""
     st = os.stat(p)
-    return getattr(st, "st_birthtime", st.st_ctime)
+    birth = getattr(st, "st_birthtime", 0)
+    if birth > 0:
+        return birth
+    try:
+        r = subprocess.run(["stat", "-c", "%W", "--", p], capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and int(r.stdout.strip()) > 0:
+            return float(r.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    # Only an intact initial HEAD reflog (null old object id) proves creation.
+    # An expired/truncated log starts later and must not claim an old tree.
+    try:
+        with open(os.path.join(p, "logs", "HEAD")) as fh:
+            first = fh.readline().split("\t", 1)[0]
+        ids = first.split(" ", 2)
+        timestamp, zone = first.rsplit("> ", 1)[1].split()
+        if len(ids[0]) in (40, 64) and set(ids[0]) == {"0"} and int(timestamp) > 0:
+            return float(timestamp)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _common_dirs(extra: list[str]) -> list[str]:
@@ -89,7 +111,8 @@ def new_gitdirs(since: float, extra_dirs: list[str] | None = None) -> list[str]:
         for n in names:
             gd = os.path.join(wdir, n)
             try:
-                if _birth(gd) >= since and not os.path.exists(os.path.join(gd, MARKER)):
+                birth = _birth(gd)
+                if birth is not None and birth >= since and not os.path.exists(os.path.join(gd, MARKER)):
                     found.append(gd)
             except OSError:
                 continue
@@ -181,8 +204,17 @@ def _removable(path: str) -> str | None:
 
 
 def live_cwds() -> list[str]:
-    r = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=120)
-    return [l[1:] for l in r.stdout.splitlines() if l.startswith("n")]
+    """Raise on an unavailable/incomplete process scan: unknown is never idle."""
+    lsof = shutil.which("lsof")
+    if not lsof and os.access("/usr/sbin/lsof", os.X_OK):
+        lsof = "/usr/sbin/lsof"  # macOS launchers may omit sbin from PATH
+    if not lsof:
+        raise RuntimeError("cannot check live cwd: lsof is not installed")
+    r = subprocess.run([lsof, "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=120)
+    paths = [l[1:] for l in r.stdout.splitlines() if l.startswith("n/")]
+    if r.returncode != 0 or r.stderr.strip() or not paths:
+        raise RuntimeError(f"cannot check live cwd: lsof failed or incomplete (exit {r.returncode}): {r.stderr.strip()[:200]}")
+    return paths
 
 
 def _archive(path: str) -> str:
