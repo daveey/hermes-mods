@@ -1,0 +1,406 @@
+From 7c8b62aca8fab308d4ab7a76063abdff0eb5ed42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 03:57:20 +0000
+Subject: [PATCH] fix(kanban): diagnose OOM and signal scope deaths before
+ clean exits [daveey]
+
+---
+ hermes_cli/kanban_db_dispatch.py              |  43 +++---
+ hermes_cli/kanban_worker_scope.py             | 124 ++++++++++++++++++
+ hermes_cli/quiet_single_query.py              |   2 +
+ .../test_kanban_worker_scope_failure.py       |  94 +++++++++++++
+ website/docs/user-guide/features/kanban.md    |  12 +-
+ 5 files changed, 252 insertions(+), 23 deletions(-)
+ create mode 100644 hermes_cli/kanban_worker_scope.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_scope_failure.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 85e1828497..96734f7524 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -30,6 +30,7 @@ from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+ from hermes_cli import kanban_db_dispatch_guard_notice as _guard_notice
+ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as _guard_hold_started_at
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
++from hermes_cli import kanban_worker_scope as _worker_scope
+ 
+ if TYPE_CHECKING:
+     from hermes_cli.kanban_db import Task
+@@ -1134,7 +1135,7 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
+     lines = []
+     for ln in raw.splitlines():
+         ln = _LOG_CHROME.sub("", ln).strip()
+-        if ln and not ln.startswith(_log_noise_prefixes()):
++        if ln and not ln.startswith((*_log_noise_prefixes(), _worker_scope.SNAPSHOT_PREFIX)):
+             lines.append(ln)
+     return " ".join(lines)[-400:]
+ 
+@@ -1156,6 +1157,8 @@ class _DeadWorker:
+ 
+     @property
+     def run_outcome(self) -> str:
++        if self.event_kind in {"oom_killed", "signaled"}:
++            return self.kind
+         # A rate-limited requeue is recorded as ``rate_limited`` so board history
+         # doesn't show a phantom crash for a quota wall.
+         return "rate_limited" if self.rate_limited else "crashed"
+@@ -1163,6 +1166,7 @@ class _DeadWorker:
+ 
+ def _classify_dead_worker(
+     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
++    run_id: Optional[int] = None,
+ ) -> _DeadWorker:
+     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
+ 
+@@ -1170,7 +1174,14 @@ def _classify_dead_worker(
+     in the event payload, appended to the error text) so the board and the retry
+     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+     """
+-    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
++    log = _kb.read_worker_log(task_id, tail_bytes=4000, board=board) if task_id and run_id else ""
++    failure = _worker_scope.read_failure(task_id, run_id, log or "") if task_id else None
++    if failure:
++        kind = "oom_killed" if failure["scope_result"] == "oom-kill" else "signaled"
++        dead = _DeadWorker(kind, None, _worker_scope.describe(failure), kind,
++                           {"pid": pid, "claimer": claimer, **failure})
++    else:
++        dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
+     if task_id and not dead.rate_limited:
+         worker_output = _worker_final_output(task_id, board=board)
+         if worker_output:
+@@ -1265,7 +1276,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+     sweep = _CrashSweep()
+     with _kb.write_txn(conn):
+         rows = conn.execute(
+-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
++            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id "
+             "FROM tasks "
+             "WHERE status = 'running' AND worker_pid IS NOT NULL"
+         ).fetchall()
+@@ -1283,7 +1294,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                 continue
+ 
+             pid = int(row["worker_pid"])
+-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
++            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board,
++                                         run_id=row["current_run_id"])
+             retry_status = _kb._retry_status_for_run(conn, row["id"])
+             dead.event_payload["retry_status"] = retry_status
+             cur = conn.execute(
+@@ -1423,6 +1435,8 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
+     sweep = _reclaim_dead_workers(conn, board=board)
+     # Outside the main txn: account each crash and maybe trip the breaker.
+     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
++    for _, _, _, dead in sweep.crash_details:
++        _worker_scope.release_failure(dead.event_payload)
+     # Side-channel attributes keep the public ``list[str]`` return stable;
+     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
+     # requeues did NOT count a failure and are NOT crashes.
+@@ -1435,22 +1449,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
+         for hook_fields in sweep.exited_hook_payloads:
+             hook_fields = dict(hook_fields)
+             _kb._fire_kanban_lifecycle_hook(
+-                # Kanban worker-lifecycle, task-mutation, and dispatcher-tick observers (RFC #58548,
+-                # accepted as the design basis in the #64231 batch disposition; on_kanban_dispatch_tick is
+-                # the re-port of PR #56066). All five are observers only: return values are ignored, and
+-                # every fire site is fully best-effort, so a broken callback can never break dispatch or a
+-                # task mutation. Cost rule: every call site short-circuits on has_hook(), so when nothing
+-                # subscribes no payload is built and the hot paths (each dispatcher tick, each task write)
+-                # pay one dict probe. WHICH PROCESS: worker spawn/exit/stale-claim and the dispatch tick
+-                # fire in the DISPATCHER process (gateway-embedded dispatcher or ``hermes kanban
+-                # dispatch``); on_kanban_task_updated fires in whichever process committed the mutation
+-                # (CLI, worker, or the gateway-embedded dashboard API). Common kwargs (task-scoped hooks):
+-                # task_id: str, profile_name: str, board: str | None, assignee: str | None, run_id: int |
+-                # None. on_kanban_worker_spawned fires after ``spawn_fn`` returns AND the worker PID (when
+-                # one was reported) is durably persisted, per the RFC timing contract; like
+-                # kanban_task_claimed it runs inside the board's dispatch lock, so callbacks must stay fast.
+-                # Adds: worker_pid: int | None, workspace_path: str. Privacy: workspace_path is a filesystem
+-                # path and may reveal project layout or usernames.
++                # Best-effort observer in the dispatcher, after durable accounting.
+                 "on_kanban_worker_exited",
+                 hook_fields.pop("task_id"),
+                 board=_board,
+@@ -3005,12 +3004,12 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
+             )
+         return command
+ 
+-    return restart_safe_gateway_child_argv(
++    return _worker_scope.retain_failed_scope(restart_safe_gateway_child_argv(
+         command,
+         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+         require_restart_safe_scope=True,
+         outlives_parent=True,
+-    ).argv
++    ).argv)
+ 
+ 
+ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+new file mode 100644
+index 0000000000..cf992ee660
+--- /dev/null
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -0,0 +1,124 @@
++"""Retain failed worker scopes until their cause is durably booked by the reaper.
++
++Only Kanban opts out of --collect. Successful scopes still collect automatically;
++failed scopes retain systemd's Result/MemoryPeak even after their cgroup is gone.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++SNAPSHOT_PREFIX = "[kanban-worker-scope] "
++
++
++def emit_exit_snapshot() -> None:
++    """Save cgroup peak before a SIGTERM-handling worker exits and systemd removes it.
++
++    Older systemd versions retain Result but not MemoryPeak. No snapshot is
++    possible when the worker itself takes SIGKILL; that peak stays unknown.
++    """
++    task_id = os.environ.get("HERMES_KANBAN_TASK", "")
++    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "")
++    if not task_id or not run_id.isdecimal():
++        return
++    unit = f"hermes-worker-kanban-{task_id}-run-{run_id}.scope"
++    try:
++        relative = next(line[3:] for line in Path("/proc/self/cgroup").read_text(encoding="utf-8-sig").splitlines()
++                        if line.startswith("0::") and line.endswith("/" + unit))
++        cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
++        values: dict = {key: _bytes((cgroup / filename).read_text(encoding="utf-8-sig").strip()) for key, filename in (
++            ("memory_max_bytes", "memory.max"), ("memory_peak_bytes", "memory.peak"))}
++        events = dict(line.split() for line in (cgroup / "memory.events").read_text(encoding="utf-8-sig").splitlines())
++        values.update(systemd_unit=unit, oom_kill=int(events.get("oom_kill", "0")))
++        print(SNAPSHOT_PREFIX + json.dumps(values), file=sys.stderr, flush=True)
++    except (OSError, ValueError, StopIteration):
++        return
++
++
++def _logged_snapshot(log: str, unit: str) -> dict:
++    for line in reversed(log.splitlines()):
++        if not line.startswith(SNAPSHOT_PREFIX):
++            continue
++        try:
++            data = json.loads(line[len(SNAPSHOT_PREFIX):])
++            if not isinstance(data, dict) or data.get("systemd_unit") != unit:
++                continue
++            return {key: value for key, value in data.items()
++                    if key in {"memory_max_bytes", "memory_peak_bytes", "oom_kill"}
++                    and type(value) is int and 0 <= value < (1 << 64) - 1}
++        except ValueError:
++            continue
++    return {}
++
++
++def retain_failed_scope(argv: list[str]) -> list[str]:
++    """Remove systemd-run's --collect, never a worker argument of the same name."""
++    if not argv or Path(argv[0]).name != "systemd-run" or "--scope" not in argv or "--" not in argv:
++        return argv
++    boundary = argv.index("--")
++    return [arg for arg in argv[:boundary] if arg != "--collect"] + argv[boundary:]
++
++
++def _systemctl(*args: str) -> subprocess.CompletedProcess | None:
++    from tools.process_registry import systemd_user_bus_env
++
++    env = systemd_user_bus_env()
++    if env is None:
++        return None
++    try:
++        return subprocess.run(
++            ["systemctl", "--user", *args], env=env, capture_output=True,
++            text=True, timeout=2, check=False,
++        )
++    except (OSError, subprocess.SubprocessError):
++        # Non-systemd hosts, unavailable bus, or old systemd: preserve exit-code handling.
++        return None
++
++
++def read_failure(task_id: str, run_id: int | None, log: str = "") -> dict | None:
++    if run_id is None:
++        return None
++    unit = f"hermes-worker-kanban-{task_id}-run-{run_id}.scope"
++    proc = _systemctl("show", unit, "-p", "LoadState", "-p", "Result",
++                      "-p", "MemoryMax", "-p", "MemoryPeak")
++    props = (dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
++             if proc is not None and not proc.returncode else {})
++    snapshot = _logged_snapshot(log, unit)
++    result = props.get("Result") if props.get("LoadState") == "loaded" else None
++    if snapshot.get("oom_kill", 0) > 0:
++        result = "oom-kill"
++    if result not in {"oom-kill", "signal"}:
++        return None
++    return {
++        "systemd_unit": unit, "scope_result": result,
++        "memory_max_bytes": snapshot.get("memory_max_bytes", _bytes(props.get("MemoryMax", ""))),
++        "memory_peak_bytes": snapshot.get("memory_peak_bytes", _bytes(props.get("MemoryPeak", ""))),
++    }
++
++
++def _bytes(raw: str) -> int | None:
++    # UINT64_MAX is systemd's unset sentinel; don't report an exabyte-scale peak.
++    return int(raw) if raw.isdecimal() and int(raw) < (1 << 64) - 1 else None
++
++
++def _size(value: int | None) -> str:
++    return f"{value / (1024 * 1024):g} MiB" if value is not None else "unknown"
++
++
++def describe(failure: dict) -> str:
++    limit = _size(failure["memory_max_bytes"])
++    peak = _size(failure["memory_peak_bytes"])
++    if failure["scope_result"] == "oom-kill":
++        return (f"Worker was OOM-killed at {limit} (peak {peak}); run memory-heavy steps "
++                "under `systemd-run --user --scope -p MemoryMax=…` or reduce the footprint.")
++    return f"Worker scope died from a signal (MemoryMax {limit}; peak {peak})."
++
++
++def release_failure(metadata: dict) -> None:
++    """Called only after run/error accounting commits; reset-failed allows scope GC."""
++    unit = metadata.get("systemd_unit")
++    if unit:
++        _systemctl("reset-failed", unit)
+diff --git a/hermes_cli/quiet_single_query.py b/hermes_cli/quiet_single_query.py
+index 16c2783262..b43ede856c 100644
+--- a/hermes_cli/quiet_single_query.py
++++ b/hermes_cli/quiet_single_query.py
+@@ -34,6 +34,8 @@ def exit_single_query(code: int) -> None:
+     """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""
+     if os.environ.get("HERMES_KANBAN_TASK"):
+         with contextlib.suppress(Exception):
++            from hermes_cli.kanban_worker_scope import emit_exit_snapshot
++            emit_exit_snapshot()
+             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
+             # captures both streams.
+             print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
+diff --git a/tests/hermes_cli/test_kanban_worker_scope_failure.py b/tests/hermes_cli/test_kanban_worker_scope_failure.py
+new file mode 100644
+index 0000000000..f58d0aff43
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_scope_failure.py
+@@ -0,0 +1,94 @@
++"""Scope failures outrank a worker's misleading clean-exit trailer."""
++import json
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from tests.hermes_cli.test_kanban_worker_exit_trailer import _dead_worker_with_log
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    from pathlib import Path
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
++    kbd._recent_worker_exits.clear()
++    kb.init_db()
++    return home
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("result,outcome", [("oom-kill", "oom_killed"), ("signal", "signaled")])
++def test_scope_failure_overrides_clean_exit_and_reaches_retry_context(kanban_home, monkeypatch, result, outcome):
++    calls = []
++    def systemctl(argv, **kwargs):
++        calls.append(argv)
++        return subprocess.CompletedProcess(argv, 0, stdout=(
++            f"LoadState=loaded\nResult={result}\nMemoryMax=67108864\nMemoryPeak=67239936\n"
++        ), stderr="")
++    monkeypatch.setattr(subprocess, "run", systemctl)
++    monkeypatch.setattr("tools.process_registry.systemd_user_bus_env", dict)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="scope failure", assignee="a")
++        for attempt in range(2):
++            _dead_worker_with_log(conn, tid, 72001 + attempt, 0)
++            run_id = kb.get_task(conn, tid).current_run_id
++            kbd.detect_crashed_workers(conn)
++            run = conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
++            assert run["outcome"] == outcome
++            meta = kb._json_dict(run["metadata"])
++            assert meta["scope_result"] == result
++            assert meta["memory_max_bytes"] == 67108864
++            assert meta["memory_peak_bytes"] == 67239936
++            assert not meta.get("protocol_violation")
++            assert kbd._protocol_violation_streak(conn, tid) == 0
++            task = kb.get_task(conn, tid)
++            assert task.consecutive_failures == attempt + 1
++            assert task.status == ("ready" if attempt == 0 else "blocked")
++            assert "protocol violation" not in task.last_failure_error
++            if result == "oom-kill":
++                assert "OOM-killed at 64 MiB" in task.last_failure_error
++                assert "reduce the footprint" in task.last_failure_error
++                assert "OOM-killed at 64 MiB" in kb.build_worker_context(conn, tid)
++        assert any("reset-failed" in argv for argv in calls)
++
++
++def test_scope_retention_preserves_worker_arguments(monkeypatch):
++    from types import SimpleNamespace
++    from tools import process_registry as pr
++    command = ["python", "worker.py", "--collect"]
++    monkeypatch.setattr(pr, "restart_safe_gateway_child_argv", lambda *a, **kw: SimpleNamespace(
++        argv=["systemd-run", "--user", "--scope", "--collect", "--", *command], mode="scope"))
++    argv = kbd._restart_safe_worker_argv(SimpleNamespace(id="t_test", current_run_id=1), command)
++    assert "--collect" not in argv[:argv.index("--")]
++    assert argv[argv.index("--") + 1:] == command
++
++
++@pytest.mark.parametrize("props", ["", "LoadState=not-found\nResult=oom-kill\n", "LoadState=loaded\nResult=success\n"])
++def test_absent_or_successful_scope_keeps_clean_exit_protocol(monkeypatch, props):
++    from hermes_cli import kanban_worker_scope as scope
++    monkeypatch.setattr(scope, "_systemctl", lambda *a: subprocess.CompletedProcess(a, 0, props))
++    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda pid: ("clean_exit", 0))
++    monkeypatch.setattr(kb, "read_worker_log", lambda *a, **kw: "")
++    dead = kbd._classify_dead_worker(1, None, task_id="t_fake", run_id=2)
++    assert dead.protocol_violation
++
++
++def test_snapshot_survives_scope_gc_but_cannot_cross_runs(monkeypatch):
++    from hermes_cli import kanban_worker_scope as scope
++    monkeypatch.setattr(scope, "_systemctl", lambda *a: None)
++    log = scope.SNAPSHOT_PREFIX + json.dumps({
++        "systemd_unit": "hermes-worker-kanban-t_fake-run-2.scope", "oom_kill": 1,
++        "memory_max_bytes": 67108864, "memory_peak_bytes": 67108864})
++    assert scope.read_failure("t_fake", 2, log)["memory_peak_bytes"] == 67108864
++    assert scope.read_failure("t_fake", 3, log) is None
++    assert scope.read_failure("t_other", 2, log) is None
++    assert scope.read_failure("t_fake", 2, scope.SNAPSHOT_PREFIX + "[123]") is None
++    assert scope.retain_failed_scope(["python", "--scope", "--collect", "--"]) == ["python", "--scope", "--collect", "--"]
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index ca62d40bdb..2e44841c88 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -639,7 +639,17 @@ That final terminal board call (`kanban_complete` / `kanban_request_review` /
+ is part of the worker
+ protocol. If the worker process exits with status 0 while the task is still
+ `running`, the dispatcher treats that as a protocol violation and emits a
+-`protocol_violation` event. A dispatcher-spawned worker whose turn failed
++`protocol_violation` event, unless the worker's systemd scope records an OOM
++or signal death. Scope `oom-kill` is recorded as `oom_killed`, and `signal` as
++`signaled`, even when the agent handled SIGTERM and exited 0. These consume the
++existing crash retry budget, not the protocol-violation budget. Run metadata and
++the next worker's context carry the memory limit, peak, and remedy. Failed scopes
++are retained until the reaper commits the diagnosis, then reset for collection.
++Workers also snapshot cgroup memory counters on exit: older systemd releases do
++not retain peak memory after cgroup deletion. If the worker itself takes SIGKILL
++and systemd cannot report a peak, it is explicitly `unknown`, never estimated.
++
++A dispatcher-spawned worker whose turn failed
+ therefore exits non-zero: `1` for an ordinary failure, `75`
+ (`EX_TEMPFAIL`) when the provider was rate-limited, overloaded, returning
+ 5xx or timing out, or the account hit a billing/quota wall — the dispatcher records that run as `rate_limited` and
+-- 
+2.55.0
+

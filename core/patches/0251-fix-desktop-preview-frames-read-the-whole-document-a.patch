@@ -1,0 +1,594 @@
+From 7993f9bc6be348fc5aa4e903d3c3949cd1dd733a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 20:20:30 -0700
+Subject: [PATCH] fix(desktop): ::preview frames read the whole document and
+ grow to its height
+
+Problem: an inline ::preview of a 662 KB design board rendered section 0, then
+the tail of the injected measurement script as text; nothing after it showed.
+Smaller boards taller than 1200 px showed only their first section.
+
+Why 1: the frame's srcdoc was cut at 512 KiB, inside an inlined image's data
+  URI, so the appended chrome <script> was parsed as attribute text up to its
+  first quote; everything after the cut was lost (hermes:readFileText,
+  TEXT_PREVIEW_MAX_BYTES; /api/fs/read-text, _FS_TEXT_PREVIEW_MAX_BYTES).
+Why 2: InlinePreviewDirective rendered with readDesktopFileText, the *preview*
+  read (skim the head of a file for the right rail), and ignored the
+  `truncated: true` it returned.
+Why 3: when the same truncation broke runtime plugins, the fix added a
+  plugin-only full read (readPluginSource) instead of a full-read mode for
+  every caller that renders/evaluates a document; the inline preview sibling
+  kept the skim read.
+Why 4 (height): MAX_HEIGHT = 1200 clamped every frame; the rest sat behind an
+  inner scrollbar inside the transcript, which reads as "only A rendered".
+Root: no way to ask for a whole document from the fs bridge, and a renderer
+  that silently accepted a truncated one.
+Not caught: no test fed the directive a > 512 KiB or > 1200 px document.
+
+Fix:
+- readFileText(path, { full: true }) (Electron IPC) and read-text?full=1
+  (remote API): whole file up to 16 MiB, EFBIG/413 above it, never truncated.
+- readInlineDoc: full read; a result still marked truncated (older shell)
+  falls back to the attachment card instead of a broken frame.
+- Frame height cap 1200 -> 16000; viewport-coupled pages (100vh + margin)
+  are stopped by nextFrameHeight (two equal grow steps = feedback loop)
+  instead of by a low ceiling.
+Tests: textReadLimits + 700 KB file (electron), readInlineDoc full/truncated/
+  error (renderer), desktop-fs local+remote full paths, read-text full=1 and
+  413 (python), nextFrameHeight growth/churn/runaway.
+---
+ apps/desktop/electron/hardening.test.ts       | 30 +++++++
+ apps/desktop/electron/hardening.ts            | 21 +++++
+ apps/desktop/electron/main.ts                 | 16 ++--
+ apps/desktop/electron/preload.ts              |  2 +-
+ .../inline-preview-directive.test.ts          | 64 ++++++++++++++-
+ .../assistant-ui/inline-preview-directive.tsx | 79 +++++++++++++++----
+ apps/desktop/src/global.d.ts                  |  8 +-
+ apps/desktop/src/lib/desktop-fs.test.ts       |  8 ++
+ apps/desktop/src/lib/desktop-fs.ts            |  9 ++-
+ hermes_cli/web_routers/files.py               | 18 +++--
+ tests/hermes_cli/test_web_server_fs.py        | 20 +++++
+ 11 files changed, 239 insertions(+), 36 deletions(-)
+
+diff --git a/apps/desktop/electron/hardening.test.ts b/apps/desktop/electron/hardening.test.ts
+index 7d70271009..08c3761bcc 100644
+--- a/apps/desktop/electron/hardening.test.ts
++++ b/apps/desktop/electron/hardening.test.ts
+@@ -27,10 +27,40 @@ import {
+   SAFE_STORAGE_ENCODING,
+   SECRET_FILE_MODE,
+   sensitiveFileBlockReason,
++  TEXT_FULL_READ_MAX_BYTES,
++  TEXT_PREVIEW_MAX_BYTES,
++  TEXT_PREVIEW_SOURCE_MAX_BYTES,
++  textReadLimits,
+   tightenSecretFileMode,
+   writeSecretFileAtomic
+ } from './hardening'
+ 
++// hermes:readFileText — the preview read skims 512 KiB; `{ full: true }` (inline
++// ::preview documents) returns the whole file or rejects it, never a cut one.
++test('textReadLimits: preview skims, full never truncates', async () => {
++  assert.deepEqual(textReadLimits(undefined), {
++    full: false,
++    maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
++    readLimit: TEXT_PREVIEW_MAX_BYTES
++  })
++  assert.deepEqual(textReadLimits({ full: 'yes' }), textReadLimits(undefined), 'only a literal true opts in')
++
++  const full = textReadLimits({ full: true })
++  assert.equal(full.full, true)
++  assert.equal(full.readLimit, full.maxBytes, 'a full read returns everything it accepts')
++  assert.equal(full.maxBytes, TEXT_FULL_READ_MAX_BYTES)
++  assert.ok(full.readLimit > 5 * 1024 * 1024, 'room for a multi-MB design board')
++
++  // A 700 KB board (the size that broke) is accepted whole and over the cap is rejected outright.
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-fullread-'))
++  const board = path.join(dir, 'board.html')
++  fs.writeFileSync(board, 'x'.repeat(700 * 1024))
++  const ok = await resolveReadableFileForIpc(board, { maxBytes: full.maxBytes, purpose: 'Full text read' })
++  assert.ok(ok.stat.size <= full.readLimit)
++  await assert.rejects(resolveReadableFileForIpc(board, { maxBytes: 600 * 1024, purpose: 'Full text read' }), /too large/)
++  fs.rmSync(dir, { force: true, recursive: true })
++})
++
+ /**
+  * Real temp dir per test: the property under test IS the on-disk mode after a
+  * temp-file-then-rename, which a mocked fs would assert into existence rather
+diff --git a/apps/desktop/electron/hardening.ts b/apps/desktop/electron/hardening.ts
+index cd23f65818..b9b08ce483 100644
+--- a/apps/desktop/electron/hardening.ts
++++ b/apps/desktop/electron/hardening.ts
+@@ -19,6 +19,24 @@ const DEFAULT_FETCH_TIMEOUT_MS = 30_000
+ // after base64 + framing. Preview stays on the Settings-configurable path.
+ const ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES = 256 * 1024 * 1024
+ const TEXT_PREVIEW_SOURCE_MAX_BYTES = 64 * 1024 * 1024
++const TEXT_PREVIEW_MAX_BYTES = 512 * 1024
++/** `readFileText(path, { full: true })`: inline `::preview` documents are
++ *  rendered, not skimmed, so they are read whole up to this cap (an HTML board
++ *  with inlined images is routinely 0.5–5 MB). Over it the read fails EFBIG
++ *  instead of handing back a cut document. */
++const TEXT_FULL_READ_MAX_BYTES = 16 * 1024 * 1024
++
++/** Byte limits for `hermes:readFileText`: `maxBytes` rejects the file outright
++ *  (EFBIG), `readLimit` is how much is returned (`truncated` past it). The
++ *  default preview read skims the head of any file up to 64 MiB; a full read
++ *  never truncates. */
++function textReadLimits(options) {
++  const full = options?.full === true
++
++  return full
++    ? { full, maxBytes: TEXT_FULL_READ_MAX_BYTES, readLimit: TEXT_FULL_READ_MAX_BYTES }
++    : { full, maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES, readLimit: TEXT_PREVIEW_MAX_BYTES }
++}
+ 
+ function dataUrlReadMaxBytesFromMb(maxMb) {
+   return clampDataUrlReadMaxMb(maxMb) * 1024 * 1024
+@@ -651,7 +669,10 @@ export {
+   SAFE_STORAGE_ENCODING,
+   SECRET_FILE_MODE,
+   sensitiveFileBlockReason,
++  TEXT_FULL_READ_MAX_BYTES,
++  TEXT_PREVIEW_MAX_BYTES,
+   TEXT_PREVIEW_SOURCE_MAX_BYTES,
++  textReadLimits,
+   tightenSecretFileMode,
+   writeSecretFileAtomic
+ }
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 113118949d..074ca22535 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -306,7 +306,8 @@ import {
+   resolveRequestedPathForIpc,
+   resolveTimeoutMs,
+   SAFE_STORAGE_ENCODING,
+-  TEXT_PREVIEW_SOURCE_MAX_BYTES,
++  TEXT_PREVIEW_MAX_BYTES,
++  textReadLimits,
+   tightenSecretFileMode,
+   writeSecretFileAtomic
+ } from './hardening'
+@@ -1754,7 +1755,6 @@ const MEDIA_MIME_TYPES = {
+ const PREVIEW_HTML_EXTENSIONS = new Set(['.html', '.htm'])
+ const PREVIEW_PDF_EXTENSIONS = new Set(['.pdf'])
+ const PREVIEW_WATCH_DEBOUNCE_MS = 120
+-const TEXT_PREVIEW_MAX_BYTES = 512 * 1024
+ 
+ const PREVIEW_LANGUAGE_BY_EXT = {
+   '.c': 'c',
+@@ -17841,16 +17841,18 @@ ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
+   }
+ })
+ 
+-ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
++ipcMain.handle('hermes:readFileText', async (_event, filePath, options?: { full?: unknown }) => {
++  const { full, maxBytes, readLimit } = textReadLimits(options)
++
+   try {
+     const { resolvedPath, stat } = await resolveReadableFileForIpc(resolveIpcFileReadPath(filePath), {
+-      maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
+-      purpose: 'Text preview'
++      maxBytes,
++      purpose: full ? 'Full text read' : 'Text preview'
+     })
+ 
+     const ext = path.extname(resolvedPath).toLowerCase()
+     const handle = await fs.promises.open(resolvedPath, 'r')
+-    const bytesToRead = Math.min(stat.size, TEXT_PREVIEW_MAX_BYTES)
++    const bytesToRead = Math.min(stat.size, readLimit)
+ 
+     try {
+       const buffer = Buffer.alloc(bytesToRead)
+@@ -17863,7 +17865,7 @@ ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
+         mimeType: mimeTypeForPath(resolvedPath),
+         path: resolvedPath,
+         text: buffer.subarray(0, bytesRead).toString('utf8'),
+-        truncated: stat.size > TEXT_PREVIEW_MAX_BYTES
++        truncated: stat.size > readLimit
+       }
+     } finally {
+       await handle.close()
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index b385b14fe1..4e64400a0a 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -349,7 +349,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+     get: () => ipcRenderer.invoke('hermes:data-url-read-max:get'),
+     set: maxMb => ipcRenderer.invoke('hermes:data-url-read-max:set', maxMb)
+   },
+-  readFileText: filePath => ipcRenderer.invoke('hermes:readFileText', filePath),
++  readFileText: (filePath, options) => ipcRenderer.invoke('hermes:readFileText', filePath, options),
+   readPluginSource: (filePath: string) => ipcRenderer.invoke('hermes:readPluginSource', filePath),
+   selectPaths: options => ipcRenderer.invoke('hermes:selectPaths', options),
+   selectSavePath: options => ipcRenderer.invoke('hermes:selectSavePath', options),
+diff --git a/apps/desktop/src/components/assistant-ui/inline-preview-directive.test.ts b/apps/desktop/src/components/assistant-ui/inline-preview-directive.test.ts
+index 3f14220dc9..e2e144d4c7 100644
+--- a/apps/desktop/src/components/assistant-ui/inline-preview-directive.test.ts
++++ b/apps/desktop/src/components/assistant-ui/inline-preview-directive.test.ts
+@@ -1,5 +1,12 @@
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
++const readText = vi.hoisted(() => vi.fn())
++
++vi.mock('@/lib/desktop-fs', async importOriginal => ({
++  ...(await importOriginal<object>()),
++  readDesktopFileText: readText
++}))
++
+ import {
+   collectThemeBridge,
+   directiveFrameHeight,
+@@ -9,6 +16,8 @@ import {
+   intentAckMessage,
+   intentScript,
+   MAX_INTENT_LENGTH,
++  nextFrameHeight,
++  readInlineDoc,
+   themePrelude,
+   withInlineChrome
+ } from './inline-preview-directive'
+@@ -24,7 +33,56 @@ describe('directiveFrameHeight', () => {
+   it('clamps an explicit height to the sane band', () => {
+     expect(directiveFrameHeight('50')).toBe(120)
+     expect(directiveFrameHeight('480')).toBe(480)
+-    expect(directiveFrameHeight('99999')).toBe(1200)
++    expect(directiveFrameHeight('99999')).toBe(16000)
++  })
++})
++
++describe('readInlineDoc', () => {
++  afterEach(() => readText.mockReset())
++
++  it('asks for the WHOLE file and returns it', async () => {
++    const big = '<html><body>' + 'x'.repeat(700 * 1024) + '<h2>Section C</h2></body></html>'
++    readText.mockResolvedValue({ byteSize: big.length, path: '/b.html', text: big, truncated: false })
++
++    await expect(readInlineDoc('/b.html')).resolves.toBe(big)
++    expect(readText).toHaveBeenCalledWith('/b.html', { full: true })
++  })
++
++  it('never frames a truncated document (older shell ignored `full`)', async () => {
++    readText.mockResolvedValue({ byteSize: 700 * 1024, path: '/b.html', text: '<img src="data:image/png;base64,iVBOR', truncated: true })
++
++    await expect(readInlineDoc('/b.html')).resolves.toBeNull()
++  })
++
++  it('falls back on read errors and binary files', async () => {
++    readText.mockResolvedValue({ error: 'too-large', message: 'File too large' })
++    await expect(readInlineDoc('/b.html')).resolves.toBeNull()
++    readText.mockResolvedValue({ binary: true, byteSize: 4, path: '/b.html', text: 'abcd' })
++    await expect(readInlineDoc('/b.html')).resolves.toBeNull()
++  })
++})
++
++describe('nextFrameHeight', () => {
++  it('follows real content growth and shrink', () => {
++    expect(nextFrameHeight(280, 4800, 0)).toEqual({ height: 4800, grow: 4520 })
++    expect(nextFrameHeight(4800, 5200, 4520)).toEqual({ height: 5200, grow: 400 })
++    expect(nextFrameHeight(5200, 900, 400)).toEqual({ height: 900, grow: 0 })
++  })
++
++  it('ignores rounding churn', () => {
++    expect(nextFrameHeight(500, 503, 0)).toEqual({ height: 500, grow: 0 })
++  })
++
++  it('stops a viewport-coupled page (100vh + margin) from growing forever', () => {
++    let height = 280
++    let grow = 0
++
++    // The page always answers "frame + 16 px".
++    for (let i = 0; i < 50; i++) {
++      ;({ height, grow } = nextFrameHeight(height, height + 16, grow))
++    }
++
++    expect(height).toBe(296)
+   })
+ })
+ 
+@@ -124,7 +182,9 @@ describe('frameSizeFromMessage', () => {
+   it('accepts our message with our token, height clamped', () => {
+     expect(frameSizeFromMessage(msg(), 'tok')).toEqual({ height: 500, width: 300 })
+     expect(frameSizeFromMessage(msg({ height: 12 }), 'tok')?.height).toBe(120)
+-    expect(frameSizeFromMessage(msg({ height: 5000 }), 'tok')?.height).toBe(1200)
++    // A tall board keeps its full height (the old 1200 px cap hid everything below section one).
++    expect(frameSizeFromMessage(msg({ height: 5000 }), 'tok')?.height).toBe(5000)
++    expect(frameSizeFromMessage(msg({ height: 99999 }), 'tok')?.height).toBe(16000)
+     expect(frameSizeFromMessage(msg({ height: 500.7 }), 'tok')?.height).toBe(501)
+   })
+ 
+diff --git a/apps/desktop/src/components/assistant-ui/inline-preview-directive.tsx b/apps/desktop/src/components/assistant-ui/inline-preview-directive.tsx
+index 2d0ca408d9..6dafa8dac8 100644
+--- a/apps/desktop/src/components/assistant-ui/inline-preview-directive.tsx
++++ b/apps/desktop/src/components/assistant-ui/inline-preview-directive.tsx
+@@ -48,7 +48,12 @@ import { localPreviewTarget } from '@/lib/local-preview'
+  */
+ 
+ const MIN_HEIGHT = 120
+-const MAX_HEIGHT = 1200
++/** Tall enough for a whole design board or report: a frame that clamps
++ *  shorter hides everything below the fold behind an inner scrollbar, which
++ *  reads as "only the first section rendered". Viewport-coupled pages (a
++ *  `100vh` body plus margin) would chase any cap, so growth that repeats the
++ *  same step is stopped by `nextFrameHeight` instead of by a low ceiling. */
++const MAX_HEIGHT = 16000
+ const DEFAULT_HEIGHT = 280
+ /** The transcript column cap the frame renders inside (`max-w-160` = 40rem). */
+ const MAX_COLUMN_WIDTH = 640
+@@ -334,8 +339,48 @@ export function frameSizeFromMessage(data: unknown, token: string): FrameSizeRep
+   }
+ }
+ 
++/** The frame's next height for a size report, or `prev` to stay put.
++ *  Ignores rounding churn (RESIZE_TOLERANCE), and stops a viewport-coupled
++ *  page from growing without end: such a page answers every resize with
++ *  "frame + k px", so two consecutive grows by the same step (±2 px) are a
++ *  feedback loop, not content. `lastGrow` is the previous grow step (0 when
++ *  the last change was not a grow). */
++export function nextFrameHeight(
++  prev: number,
++  reported: number,
++  lastGrow: number
++): { height: number; grow: number } {
++  if (Math.abs(reported - prev) <= RESIZE_TOLERANCE) {
++    return { height: prev, grow: lastGrow }
++  }
++
++  const grow = reported > prev ? reported - prev : 0
++
++  if (grow > 0 && lastGrow > 0 && Math.abs(grow - lastGrow) <= 2) {
++    return { height: prev, grow: lastGrow }
++  }
++
++  return { height: reported, grow }
++}
++
+ const HTML_FILE_RE = /\.(?:html?|xhtml)$/i
+ 
++/** The whole document for the frame, or null (render the card instead).
++ *  A FULL read: the preview read stops at 512 KiB, and a cut document renders
++ *  as garbage (the cut lands inside an inlined image's data URI, so the
++ *  injected chrome script is parsed as attribute text and every section after
++ *  it is gone). An older shell ignores `full`; a result it still marks
++ *  truncated falls back to the card rather than a broken frame. */
++export async function readInlineDoc(path: string): Promise<string | null> {
++  const result = await readDesktopFileText(path, { full: true })
++
++  if (!result || isReadFileErrorResult(result) || result.binary || !result.text || result.truncated) {
++    return null
++  }
++
++  return result.text
++}
++
+ export function InlinePreviewDirective({
+   attrs,
+   streaming
+@@ -378,7 +423,10 @@ function InlineHtmlFrame({
+ 
+   const [doc, setDoc] = useState<string | null>(null)
+   const [failed, setFailed] = useState(false)
+-  const [measured, setMeasured] = useState<number | null>(null)
++  // Measured height plus the last grow step (nextFrameHeight's loop check),
++  // in one state so the updater stays pure under a double-invoke.
++  const [sizing, setSizing] = useState<{ grow: number; measured: number | null }>({ grow: 0, measured: null })
++  const measured = sizing.measured
+   const [contentWidth, setContentWidth] = useState<number | null>(null)
+ 
+   // One token per mount: the message listener only trusts reports from the
+@@ -399,22 +447,16 @@ function InlineHtmlFrame({
+ 
+     let alive = true
+ 
+-    void Promise.resolve(readDesktopFileText(path))
+-      .then(result => {
++    void readInlineDoc(path)
++      .then(text => {
+         if (!alive) {
+           return
+         }
+ 
+-        if (!result || isReadFileErrorResult(result)) {
+-          setFailed(true)
+-
+-          return
+-        }
+-
+-        if (result.binary || !result.text) {
++        if (text === null) {
+           setFailed(true)
+         } else {
+-          setDoc(result.text)
++          setDoc(text)
+         }
+       })
+       .catch(() => alive && setFailed(true))
+@@ -471,9 +513,16 @@ function InlineHtmlFrame({
+       // shadow ref: same-value sets bail out in React, and the tolerance
+       // keeps a vh-sized page (which measures what it's given) from
+       // oscillating.
+-      setMeasured(prev =>
+-        Math.abs(next.height - (prev ?? initialHeight ?? DEFAULT_HEIGHT)) > RESIZE_TOLERANCE ? next.height : prev
+-      )
++      setSizing(prev => {
++        const current = prev.measured ?? initialHeight ?? DEFAULT_HEIGHT
++        const step = nextFrameHeight(current, next.height, prev.grow)
++
++        if (step.height === current && step.grow === prev.grow) {
++          return prev
++        }
++
++        return { grow: step.grow, measured: step.height === current ? prev.measured : step.height }
++      })
+ 
+       // Width adopts ONCE, from the first report — measured at full column
+       // width, so it is the content's intrinsic span. Tracking width live
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index a0ddabdadf..601ed7b0d4 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -313,7 +313,13 @@ declare global {
+         get: () => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>
+         set: (maxMb: number) => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>
+       }
+-      readFileText: (filePath: string) => Promise<HermesReadFileTextResult | HermesReadFileErrorResult>
++      /** Preview read: truncates at 512 KiB (`truncated: true`). `{ full: true }`
++       *  reads the whole file up to 16 MiB and fails EFBIG above that. Older
++       *  shells ignore the option, so full callers must still reject `truncated`. */
++      readFileText: (
++        filePath: string,
++        options?: { full?: boolean }
++      ) => Promise<HermesReadFileTextResult | HermesReadFileErrorResult>
+       /** Full-source read for runtime desktop plugins (readFileText truncates
+        *  at the 512 KiB preview cap). Absent on older shells — callers fall
+        *  back to readFileText and must reject a `truncated` result. */
+diff --git a/apps/desktop/src/lib/desktop-fs.test.ts b/apps/desktop/src/lib/desktop-fs.test.ts
+index edccb47159..7a7d313b7e 100644
+--- a/apps/desktop/src/lib/desktop-fs.test.ts
++++ b/apps/desktop/src/lib/desktop-fs.test.ts
+@@ -98,6 +98,10 @@ describe('desktop filesystem facade', () => {
+     expect(readDir).toHaveBeenCalledWith('/work')
+     expect(readFileText).toHaveBeenCalledWith('/work/file.txt')
+     expect(readFileDataUrl).toHaveBeenCalledWith('/work/file.txt')
++
++    // Full reads (inline ::preview documents) pass the option to the IPC.
++    await readDesktopFileText('/work/board.html', { full: true })
++    expect(readFileText).toHaveBeenCalledWith('/work/board.html', { full: true })
+     expect(gitRoot).toHaveBeenCalledWith('/work')
+     expect(selectPaths).toHaveBeenCalledWith({ directories: true, profile: 'team-local' })
+     expect(api).not.toHaveBeenCalled()
+@@ -117,6 +121,10 @@ describe('desktop filesystem facade', () => {
+     expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-data-url?path=%2Fhome%2Fuser%2Fproject%2Fa%20b.txt' })
+     expect(api).toHaveBeenCalledWith({ path: '/api/fs/git-root?path=%2Fhome%2Fuser%2Fproject' })
+     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd' })
++
++    // Full reads ask the backend for the whole file.
++    await readDesktopFileText('/home/user/board.html', { full: true })
++    expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-text?path=%2Fhome%2Fuser%2Fboard.html&full=1' })
+     expect(readDir).not.toHaveBeenCalled()
+     expect(readFileText).not.toHaveBeenCalled()
+     expect(readFileDataUrl).not.toHaveBeenCalled()
+diff --git a/apps/desktop/src/lib/desktop-fs.ts b/apps/desktop/src/lib/desktop-fs.ts
+index 82620029f7..c212f2fbc4 100644
+--- a/apps/desktop/src/lib/desktop-fs.ts
++++ b/apps/desktop/src/lib/desktop-fs.ts
+@@ -109,9 +109,12 @@ export async function readDesktopDir(path: string): Promise<HermesReadDirResult>
+   return remoteFsApi<HermesReadDirResult>(fsPath('list', path))
+ }
+ 
+-export async function readDesktopFileText(path: string): Promise<HermesReadFileTextResult> {
++export async function readDesktopFileText(
++  path: string,
++  options?: { full?: boolean }
++): Promise<HermesReadFileTextResult> {
+   if (!isDesktopFsRemoteMode()) {
+-    const result = await bridge().readFileText(path)
++    const result = await (options?.full ? bridge().readFileText(path, { full: true }) : bridge().readFileText(path))
+ 
+     if (isReadFileErrorResult(result)) {
+       throwForReadErrorResult(result)
+@@ -120,7 +123,7 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
+     return result
+   }
+ 
+-  return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path))
++  return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path) + (options?.full ? '&full=1' : ''))
+ }
+ 
+ // Save UTF-8 text back to a file. Local writes go through the hardened Electron
+diff --git a/hermes_cli/web_routers/files.py b/hermes_cli/web_routers/files.py
+index 26dd072974..aeeb7ad4a2 100644
+--- a/hermes_cli/web_routers/files.py
++++ b/hermes_cli/web_routers/files.py
+@@ -108,6 +108,8 @@ def _is_sensitive_path(path: Path) -> bool:
+ 
+ 
+ _FS_TEXT_SOURCE_MAX_BYTES = 64 * 1024 * 1024
++# ``read-text?full=1`` (inline ::preview documents): whole file up to this cap, 413 above it, never truncated.
++_FS_TEXT_FULL_MAX_BYTES = 16 * 1024 * 1024
+ _FS_TEXT_PREVIEW_MAX_BYTES = 512 * 1024
+ # Spot-editor save ceiling: the editor only opens non-truncated text (<= the
+ # preview cap), so this guards against a pasted megablob, not expected payloads.
+@@ -790,15 +792,17 @@ async def fs_list(path: str, request: Request, profile: Optional[str] = None):
+ 
+ 
+ @router.get("/api/fs/read-text")
+-async def fs_read_text(path: str, request: Request = None, profile: Optional[str] = None):
++async def fs_read_text(path: str, request: Request = None, profile: Optional[str] = None, full: bool = False):
++    source_max = _FS_TEXT_FULL_MAX_BYTES if full else _FS_TEXT_SOURCE_MAX_BYTES
++    read_limit = _FS_TEXT_FULL_MAX_BYTES if full else _FS_TEXT_PREVIEW_MAX_BYTES
+     backend = await asyncio.to_thread(_fs_backend, profile)
+     if backend is not None:
+         try:
+             data, size, target = await asyncio.to_thread(
+                 backend.read_bytes,
+                 path,
+-                max_bytes=_FS_TEXT_SOURCE_MAX_BYTES,
+-                read_limit=_FS_TEXT_PREVIEW_MAX_BYTES,
++                max_bytes=source_max,
++                read_limit=read_limit,
+             )
+         except Exception as exc:
+             _raise_fs_backend_error(exc)
+@@ -810,15 +814,15 @@ async def fs_read_text(path: str, request: Request = None, profile: Optional[str
+             "mimeType": _fs_mime_type(target_path),
+             "path": target,
+             "text": data.decode("utf-8", errors="replace"),
+-            "truncated": size > _FS_TEXT_PREVIEW_MAX_BYTES,
++            "truncated": size > read_limit,
+         }
+     target = _fs_path(path)
+     _hosted_fs_read_guard(target, request)
+     target, st = _fs_regular_file(target)
+-    if st.st_size > _FS_TEXT_SOURCE_MAX_BYTES:
++    if st.st_size > source_max:
+         raise HTTPException(status_code=413, detail="File too large")
+     data = await asyncio.to_thread(
+-        _fs_read_bytes, target, min(st.st_size, _FS_TEXT_PREVIEW_MAX_BYTES),
++        _fs_read_bytes, target, min(st.st_size, read_limit),
+     )
+     return {
+         "binary": _fs_looks_binary(data[:4096]),
+@@ -827,7 +831,7 @@ async def fs_read_text(path: str, request: Request = None, profile: Optional[str
+         "mimeType": _fs_mime_type(target),
+         "path": str(target),
+         "text": data.decode("utf-8", errors="replace"),
+-        "truncated": st.st_size > _FS_TEXT_PREVIEW_MAX_BYTES,
++        "truncated": st.st_size > read_limit,
+     }
+ 
+ 
+diff --git a/tests/hermes_cli/test_web_server_fs.py b/tests/hermes_cli/test_web_server_fs.py
+index 24cfc5ddca..c4f57b8221 100644
+--- a/tests/hermes_cli/test_web_server_fs.py
++++ b/tests/hermes_cli/test_web_server_fs.py
+@@ -349,6 +349,26 @@ def test_fs_endpoints_require_auth(tmp_path):
+     assert default_response.status_code == 401
+ 
+ 
++def test_fs_read_text_full_returns_whole_document(client, tmp_path, monkeypatch):
++    """Inline ::preview documents read with full=1: a 700 KB board comes back whole (the
++    preview read cut it at 512 KiB inside an inlined image, rendering garbage)."""
++    board = tmp_path / "board.html"
++    board.write_text("<html><body>" + "x" * (700 * 1024) + "<h2>Section C</h2></body></html>")
++
++    skim = client.get("/api/fs/read-text", params={"path": str(board)}).json()
++    assert skim["truncated"] is True
++    assert "Section C" not in skim["text"]
++
++    full = client.get("/api/fs/read-text", params={"path": str(board), "full": "1"}).json()
++    assert full["truncated"] is False
++    assert full["text"].endswith("<h2>Section C</h2></body></html>")
++
++    from hermes_cli.web_routers import files as fs_router
++    monkeypatch.setattr(fs_router, "_FS_TEXT_FULL_MAX_BYTES", 600 * 1024)
++    over = client.get("/api/fs/read-text", params={"path": str(board), "full": "1"})
++    assert over.status_code == 413
++
++
+ def test_fs_read_text_decodes_double_encoded_non_ascii_path(client, tmp_path):
+     target = tmp_path / "半导体行业运营分享会纪要.md"
+     target.write_text("hello")
+-- 
+2.55.0
+
