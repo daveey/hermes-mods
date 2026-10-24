@@ -17,11 +17,19 @@ Draft core PR: https://github.com/daveey/hermes/pull/48
 - `agent/turn_final_response.py`
 - `agent/turn_finalizer.py`
 
-Commits: `26ab40ebed4f3c8031f15f302663033cd6c5bb0a`, `88e38164b66c1da05894c58146df5b41ca968ce6`.
+Commits: `26ab40ebed4f3c8031f15f302663033cd6c5bb0a`, `88e38164b66c1da05894c58146df5b41ca968ce6`,
+`dfd0c50d1f3977f7275dbd2baa4a98ab558e4485`,
+`626102e336f83a826a80f6dba8c8a70ff7ba9e24`.
 
 ## Tests
 
 78 targeted core tests passed, including full shared-agent text-stop tests for streaming/nonstreaming budget/cap failure, Stop, history cleanup, successful recheck and profile-context propagation. Four output-transform/lifecycle tests also passed. All 12 core lint checks passed.
+
+The ownership/verification follow-up ran 124 tests across 13 files. A parent adversarial regression
+then reproduced stale rejection after an accepted owning recheck plus another gate hold; after the
+fix, 64 focused tests across five files passed, including 20 full-loop ownership/order/interim tests.
+The combined plugin/repository suite passed 501 tests (one platform-dependent SQLite skip).
+These are overlapping suites, not an additive unique test total.
 
 Combined coach discovery and scripted agent-loop tests cover CLI/Desktop platform settings, cap and unavailable/uncertain rechecks. These are not transport-level CLI executable or Electron UI acceptance tests. Production activation is unverified and enforcement remains off.
 
