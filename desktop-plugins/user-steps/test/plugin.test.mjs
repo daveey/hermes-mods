@@ -375,4 +375,30 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   delete window.__blockedPanel
 })
 
+test('strip: an external-event wait (kind=time, classified in place) shows no For you row and no unblock button', async () => {
+  const ev = (id, kind, payload) => ({ id, kind, payload, created_at: 1000 + id })
+  const tasks = [{ id: 't_tracker1', title: 'Deliver Upkeep — remote build unfinished', status: 'blocked', board: 'default' }]
+  const details = new Map([['default:t_tracker1', { task: { body: 'Tracking card; not a request for approval.' }, events: [
+    ev(1, 'blocked', { reason: 'initial_status' }),
+    ev(2, 'blocked', { kind: 'time', reason: 'External-event wait while the remote graph executes.', classified_in_place: true })
+  ] }]])
+  window.__blockedPanel = {
+    snapshot: { stored: 'S1', items: bpm.blockedItems(tasks, details), issues: bpm.agentIssues(tasks, details) },
+    askSummary: bpm.askSummary, checklist: bpm.checklist, unblockCard: async () => {}, openCard: () => {}
+  }
+  focused.set('S1')
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'time-wait' }))
+  assert.equal(el().querySelector('[data-slot="user-steps"]'), null, el().innerHTML)
+  assert.doesNotMatch(el().textContent, /For you|Done → unblock|unblock/)
+  // control: the same card with a real ask is listed with its Done button
+  details.get('default:t_tracker1').events.push(ev(3, 'blocked', { kind: 'needs_input', reason: 'Pick A or B.' }))
+  window.__blockedPanel.snapshot = { stored: 'S1', items: bpm.blockedItems(tasks, details), issues: bpm.agentIssues(tasks, details) }
+  await m.refresh(fakeRest([], {}))
+  await show(React.createElement(m.Strip, { key: 'time-wait-ask' }))
+  const card = el().querySelector('[data-user-steps-card="t_tracker1"]')
+  assert.ok(card && [...card.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
+  delete window.__blockedPanel
+})
+
 test('done', () => { root.unmount() })
