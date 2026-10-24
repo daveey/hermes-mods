@@ -129,7 +129,7 @@ test('hubLinkChips: other gateways only, deduped by gateway+board+id, gateway + 
     ],
     new Set([m.taskKey('mini', 'bb', 't_live')])
   )
-  assert.deepEqual(chips.map(c => c.key), ['kb:nas:default:t_live', 'kb:mini:default:t_mini'])
+  assert.deepEqual(chips.map(c => c.key), ['kb:nas:default:default:t_live', 'kb:mini:default:default:t_mini'])
   const mini = chips[1]
   assert.equal(mini.id, 't_mini')
   assert.equal(mini.gateway, 'mini')
@@ -150,6 +150,97 @@ test('staleChips keeps last-known remote rows, marked stale (hub down never mean
 test('hubLinkChips tolerates a missing/unavailable hub answer', () => {
   assert.deepEqual(m.hubLinkChips(null, new Set()), [])
   assert.deepEqual(m.hubLinkChips(undefined), [])
+})
+
+test('sessionTaskChips preserves qualified owners and stale state without collapsing ids', () => {
+  const task = { id: 't_same', title: 'Work', status: 'running', gateway: 'remote', profile: 'default', board: 'default', stale: true }
+  const chips = m.sessionTaskChips([
+    task, { ...task }, { ...task, gateway: 'other' },
+    { ...task, board: 'other' }, { ...task, profile: 'work' }
+  ])
+  assert.equal(chips.length, 4)
+  assert.equal(new Set(chips.map(c => c.key)).size, 4)
+  assert.deepEqual(chips.map(c => [c.gateway, c.profile, c.board, c.stale]), [
+    ['remote', 'default', 'default', true], ['other', 'default', 'default', true],
+    ['remote', 'default', 'other', true], ['remote', 'work', 'default', true]
+  ])
+  assert.match(chips[0].title, /stale/)
+})
+
+test('hub-only unknown obligations remain visible with unknown owner profile', () => {
+  const chips = m.hubLinkChips([{ id: 't_legacy', gateway: 'remote', profile: null, status: 'unknown', stale: true }])
+  assert.equal(chips.length, 1)
+  assert.equal(chips[0].state, 'unknown')
+  assert.equal(chips[0].profile, null)
+})
+
+test('unknown ledger obligations stay visible, including unreleased terminal reports', () => {
+  const rows = [
+    { id: 't_unknown', status: 'unknown', unfinished: true, stale: true },
+    { id: 't_unverified', status: 'done', unfinished: true },
+    { id: 't_released', status: 'done', unfinished: false }
+  ]
+  assert.deepEqual(m.sessionTaskChips(rows).map(c => c.id), ['t_unknown', 't_unverified'])
+  assert.equal(m.sessionTaskChips(rows)[1].state, 'unknown')
+})
+
+test('unknown profile is not silently assigned to default ownership', () => {
+  const row = { id: 't_same', status: 'unknown', gateway: 'remote', profile: null, board: 'default' }
+  const chips = m.sessionTaskChips([row, { ...row, profile: 'default' }])
+  assert.equal(chips.length, 2)
+  assert.equal(chips[0].profile, null)
+})
+
+test('loadKanban dedupes by actual owner gateway, profile, board and id', async () => {
+  const row = { id: 't_same', status: 'running', gateway: 'remote', profile: 'work', board: 'default' }
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [row] }
+    if (path.includes('session-links')) return { gateway: 'origin', tasks: [row, { ...row, profile: 'other' }] }
+    throw new Error('unexpected route')
+  } } }
+  try {
+    const chips = await m.loadKanban(new Set(['s_one']))
+    assert.equal(chips.length, 2)
+    assert.equal(new Set(chips.map(c => c.key)).size, 2)
+  } finally { delete globalThis.window }
+})
+
+test('hub fallback cache cannot leak between profiles with the same session id', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  let profile = 'work'
+  let online = true
+  host.state = { profile: { get: () => profile } }
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [] }
+    if (online && path.includes('session-links')) return { gateway: 'origin', tasks: [
+      { id: 't_work', status: 'running', gateway: 'remote', profile: 'work' }
+    ] }
+    throw new Error('offline')
+  } } }
+  try {
+    const ids = new Set(['s_collision'])
+    assert.equal((await m.loadKanban(ids)).length, 1)
+    online = false
+    assert.equal((await m.loadKanban(ids))[0].stale, true)
+    profile = 'other'
+    assert.deepEqual(await m.loadKanban(ids), [])
+  } finally { delete globalThis.window; delete host.state }
+})
+
+test('remote task clicks never fall back to the active gateway', () => {
+  const calls = []
+  const open = (...args) => { calls.push(args); return true }
+  globalThis.window = { __hermesKanbanOpenTask: open, __taskMentionsOpen: () => calls.push('fallback') }
+  globalThis.localStorage = { getItem: () => JSON.stringify({ conn: 'remote' }) }
+  try {
+    assert.equal(m.openTaskChip({ id: 't1', gateway: 'missing', profile: 'default', board: 'default' }), false)
+    assert.equal(m.openTaskChip({ id: 't1', gateway: 'remote', profile: null, board: 'default' }), false)
+    assert.equal(m.openTaskChip({ id: 't1', gateway: 'remote', profile: 'work', board: 'default' }), false)
+    assert.deepEqual(calls, [])
+    open.supportsQualifiedOwners = true
+    assert.equal(m.openTaskChip({ id: 't1', gateway: 'remote', profile: 'work', board: 'default' }), true)
+    assert.deepEqual(calls, [['t1', 'default', 'conn', 'work']])
+  } finally { delete globalThis.window; delete globalThis.localStorage }
 })
 
 test('connectionForHubGateway reads the core-learned connection -> hub name map', () => {

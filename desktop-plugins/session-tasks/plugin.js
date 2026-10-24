@@ -111,12 +111,16 @@ const KANBAN_RANK = { running: 0, blocked: 1, review: 2, ready: 3, scheduled: 4,
 function taskChip(t, status) {
   const watching = t.via === 'subscribed'
   return {
-    key: `kb:${t.id}`,
+    key: `kb:${taskKey(t.gateway, t.board, t.id, t.profile)}`,
     kind: 'kanban',
     id: str(t.id),
+    gateway: str(t.gateway),
+    profile: t.profile === null ? null : str(t.profile) || 'default',
+    board: str(t.board) || 'default',
+    stale: Boolean(t.stale),
     state: status,
     label: str(t.title) || t.id,
-    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}\n${str(t.title)}`,
+    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}`,
     since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
   }
 }
@@ -128,9 +132,11 @@ export function sessionTaskChips(tasks) {
   const seen = new Set()
   const out = []
   for (const t of Array.isArray(tasks) ? tasks : []) {
-    const status = str(t?.status)
-    if (!t?.id || !KANBAN_ACTIVE.has(status) || seen.has(t.id)) continue
-    seen.add(t.id)
+    const reported = str(t?.status)
+    const status = t?.unfinished && !KANBAN_ACTIVE.has(reported) ? 'unknown' : reported
+    const key = taskKey(t?.gateway, t?.board, t?.id, t?.profile)
+    if (!t?.id || (!KANBAN_ACTIVE.has(status) && status !== 'unknown') || seen.has(key)) continue
+    seen.add(key)
     out.push(taskChip(t, status))
   }
   return byRank(out)
@@ -149,19 +155,20 @@ function syncedAgo(at) {
 /** hermes-hub replica rows (`/api/plugins/hub-sync/session-links`): cards this
  *  lineage created/shepherds on OTHER gateways. The gateway's own cards come
  *  from the live route, so `local` rows are dropped; everything is keyed by
- *  gateway + board + id (the same t_ id can exist on two gateways).
- *  `liveKeys`: `${gateway}:${board}:${id}` of cards already listed live. */
-export const taskKey = (gateway, board, id) => `${str(gateway)}:${str(board) || 'default'}:${str(id)}`
+ *  gateway + profile + board + id (the same id can exist on multiple owners).
+ *  `liveKeys`: `${gateway}:${profile}:${board}:${id}` already listed live. */
+export const taskKey = (gateway, board, id, profile) => `${str(gateway)}:${profile === null ? '?' : str(profile) || 'default'}:${str(board) || 'default'}:${str(id)}`
 
 export function hubLinkChips(tasks, liveKeys = new Set()) {
   const seen = new Set()
   const out = []
   for (const t of Array.isArray(tasks) ? tasks : []) {
-    const status = str(t?.status)
+    const reported = str(t?.status)
+    const status = t?.unfinished && !KANBAN_ACTIVE.has(reported) ? 'unknown' : reported
     const gateway = str(t?.gateway)
     const board = str(t?.board) || 'default'
-    if (!t?.id || t.local || !gateway || !KANBAN_ACTIVE.has(status)) continue
-    const k = taskKey(gateway, board, t.id)
+    if (!t?.id || t.local || !gateway || (!KANBAN_ACTIVE.has(status) && status !== 'unknown')) continue
+    const k = taskKey(gateway, board, t.id, t.profile)
     if (liveKeys.has(k) || seen.has(k)) continue
     seen.add(k)
     const chip = taskChip(t, status)
@@ -192,8 +199,9 @@ export function connectionForHubGateway(gateway, storage = typeof localStorage !
 // falls back to the hub replica when that gateway is unreachable).
 function openRemoteTask(chip) {
   const open = typeof window !== 'undefined' ? window.__hermesKanbanOpenTask : null
-  if (typeof open !== 'function') return false
-  return open(chip.id, chip.board, connectionForHubGateway(chip.gateway)) !== false
+  const connection = connectionForHubGateway(chip.gateway)
+  if (typeof open !== 'function' || !connection || !chip.profile || !open.supportsQualifiedOwners) return false
+  return open(chip.id, chip.board, connection, chip.profile) !== false
 }
 
 /** Fallback for backends without that route: scan the current board. */
@@ -333,7 +341,8 @@ const emit = () => subs.forEach(fn => fn(snapshot))
 // Last good hub answer for the focused lineage (shown stale while the hub is unreachable).
 let hubLinkCache = { session: null, chips: [] }
 
-async function loadKanban(ids) {
+export async function loadKanban(ids) {
+  const cacheScope = JSON.stringify([activeConnection() || '', focusedProfile(), [...ids].sort()])
   const list = await safe(
     () => api(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
     null
@@ -355,12 +364,13 @@ async function loadKanban(ids) {
     : null
   let remote
   if (hub && hub.available !== false && Array.isArray(hub.tasks)) {
-    // Live cards belong to the gateway that served this answer (hub.gateway).
-    const liveKeys = new Set((list?.tasks || []).map(t => taskKey(hub.gateway, t.board, t.id)))
+    // The shared route already contains remote owners. Only untagged local
+    // rows inherit the serving gateway; never restamp a remote owner.
+    const liveKeys = new Set((list?.tasks || []).map(t => taskKey(t.gateway || hub.gateway, t.board, t.id, t.profile)))
     remote = hubLinkChips(hub.tasks, liveKeys)
-    hubLinkCache = { session: first, chips: remote }
+    hubLinkCache = { session: cacheScope, chips: remote }
   } else {
-    remote = first && hubLinkCache.session === first ? staleChips(hubLinkCache.chips) : []
+    remote = first && hubLinkCache.session === cacheScope ? staleChips(hubLinkCache.chips) : []
   }
   if (!live && !remote.length) return null
   return [...(live || []), ...remote]
@@ -476,16 +486,19 @@ function subscribe(fn) {
 
 const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist', machine: 'codicon-vm' }
 
+export function openTaskChip(chip) {
+  if (chip.gateway) return openRemoteTask(chip)
+  if (typeof window.__taskMentionsOpen === 'function') window.__taskMentionsOpen(chip.id)
+  else host.navigate?.('/kanban')
+  return true
+}
+
 function Chip({ chip, now }) {
   const color = chipColor(chip.state)
   const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
   const clickable = chip.kind === 'kanban' || showMachine
   const onClick = chip.kind === 'kanban'
-    ? () => {
-        if (chip.gateway && openRemoteTask(chip)) return
-        if (typeof window.__taskMentionsOpen === 'function') window.__taskMentionsOpen(chip.id)
-        else host.navigate?.('/kanban')
-      }
+    ? () => openTaskChip(chip)
     : showMachine
       ? () => window.__computeRentalsShow(chip.id)
       : undefined
