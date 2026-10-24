@@ -26,7 +26,7 @@ def exchange(path, payload):
 
 
 def inspect(path, capability, owned_targets):
-    """Pin a private socket to a live harness process and an owned page."""
+    """Pin a registered private capability socket to its live harness process."""
     path = Path(path)
     if not path.is_absolute() or path.name != 'bu-lease-' + capability + '.sock':
         return None
@@ -39,7 +39,11 @@ def inspect(path, capability, owned_targets):
         if not ping.get('pong') or type(pid) is not int or pid <= 0:
             return None
         current = exchange(str(path), {'meta': 'current_tab'})
-        if current.get('targetId') not in owned_targets:
+        empty = (ping.get('browser_kind') == 'cdp'
+                 and current.get('error') in ('not_attached', 'cdp_disconnected'))
+        # A closed last tab must not make the registered nonce-named daemon
+        # immortal. A live foreign target still refuses attribution.
+        if current.get('targetId') not in owned_targets and not empty:
             return None
         started = fingerprint(pid)
         if started is None or path.lstat().st_ino != info.st_ino:
