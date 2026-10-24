@@ -113,7 +113,8 @@ class RuntimeTests(unittest.TestCase):
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.multiple(hca, PROFILE=tmp), mock.patch.object(hca.subprocess, 'Popen') as spawn, \
-                 mock.patch.object(hca, 'cdp_version', return_value={'Browser': 'Fake'}):
+                 mock.patch.object(hca, 'cdp_version', return_value={'Browser': 'Fake'}), \
+                 mock.patch.object(hca.Supervisor, 'owned_version', return_value={'Browser': 'Fake'}):
                 supervisor = hca.Supervisor()
                 supervisor.lifecycle = mock.Mock()
                 spawn.return_value.poll.return_value = None
@@ -344,7 +345,9 @@ class ProxyTests(unittest.TestCase):
             with self.subTest(method=method), self.assertRaises(self.hca.CDPError):
                 c.call(method, params)
         self.assertEqual(self.chrome.received, [])
-        self.assertEqual(len(self.request('/json/list')), 1)  # legacy is unowned and unchanged
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request('/json/list')  # a managed listener is never a legacy tunnel
+        self.assertEqual(error.exception.code, 403)
 
 
 if __name__ == '__main__':

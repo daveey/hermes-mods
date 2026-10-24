@@ -214,11 +214,7 @@ class CDP:
         except Exception:
             pass
         finally:
-            self.closed = True
-            with self.lock:
-                for ev in self.pending.values():
-                    ev[1] = {"error": {"message": "connection closed"}}
-                    ev[0].set()
+            self.close()
 
     def _dispatch(self, m):
         if "id" in m:
@@ -248,9 +244,9 @@ class CDP:
             self.sock.sendall(hdr + mask + body)
 
     def call(self, method, params=None, session=None, timeout=10):
-        if self.closed:
-            raise CDPError("connection closed")
         with self.lock:
+            if self.closed:
+                raise CDPError("connection closed")
             self.next_id += 1
             mid = self.next_id
             slot = [threading.Event(), None]
@@ -258,7 +254,11 @@ class CDP:
         msg = {"id": mid, "method": method, "params": params or {}}
         if session:
             msg["sessionId"] = session
-        self._send_frame(1, json.dumps(msg).encode())
+        try:
+            self._send_frame(1, json.dumps(msg).encode())
+        except OSError as exc:
+            self.close()
+            raise CDPError("connection closed") from exc
         if not slot[0].wait(timeout):
             with self.lock:
                 self.pending.pop(mid, None)
@@ -269,11 +269,20 @@ class CDP:
         return r.get("result", {})
 
     def close(self):
-        self.closed = True
+        with self.lock:
+            self.closed = True
+            pending, self.pending = self.pending, {}
+            for slot in pending.values():
+                slot[1] = {"error": {"message": "connection closed"}}
+                slot[0].set()
+        # close alone does not interrupt a recv in another thread on Linux.
         try:
-            self.sock.close()
-        except Exception:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
             pass
+        self.sock.close()
+        if threading.current_thread() is not self.reader:
+            self.reader.join(timeout=2)
 
 
 def cdp_version(timeout=1.0, port=None):
@@ -534,7 +543,7 @@ class CDPProxy:
             method, target = parts[0], parts[1]
             headers = [tuple(x.strip() for x in l.split(":", 1)) for l in lines[1:] if ":" in l]
             hmap = {k.lower(): v for k, v in headers}
-            if target.startswith(('/lifecycle/', '/lease/')):
+            if self.lifecycle is not None or target.startswith(('/lifecycle/', '/lease/')):
                 if self.lifecycle is None:
                     self._respond(c, 403, 'Forbidden', 'managed lifecycle is not configured')
                     return
@@ -596,7 +605,8 @@ class CDPProxy:
 
     def _new_background(self, url):
         """PUT /json/new?url without raising: Target.createTarget background:true, answered like Chrome would."""
-        v = cdp_version(timeout=5, port=self.upstream)
+        v = (self.lifecycle.browser_version(self.upstream, cdp_version) if self.lifecycle
+             else cdp_version(timeout=5, port=self.upstream))
         if not v:
             raise CDPError("Chrome not answering on %d" % self.upstream)
         cdp = CDP(v["webSocketDebuggerUrl"])
@@ -895,8 +905,11 @@ class Supervisor:
 
     def wake_managed(self):
         from chrome_agent_lifecycle import LifecycleError
+        from chrome_agent_process import require_free_endpoint
+        self.lifecycle.require_browser_identity = True
         if self.stop:
             raise LifecycleError('supervisor is stopping')
+        require_free_endpoint(CHROME_PORT)
         # Never kill/adopt a browser left by an earlier supervisor in managed mode.
         try:
             pid = int(os.readlink(os.path.join(PROFILE, 'SingletonLock')).rsplit('-', 1)[1])
@@ -917,8 +930,6 @@ class Supervisor:
             self.start_chrome()
             if self.stop:
                 raise LifecycleError('supervisor stopped during wake')
-            if not cdp_version():
-                raise LifecycleError('Chrome did not become ready')
             self.remember_browser()
         except BaseException:
             self.idle_managed()
@@ -943,24 +954,39 @@ class Supervisor:
 
     def remember_browser(self):
         from chrome_agent_process import record
-        version = cdp_version()
-        if not version:
-            raise RuntimeError('cannot persist browser instance identity')
+        version = self.owned_version()
         browser = dict(record(self.chrome), websocket=version['webSocketDebuggerUrl'], profile=os.path.realpath(PROFILE))
         if self.vd:
             browser['display'] = record(self.vd)
         with self.lifecycle.ledger.transaction() as data:
             data['browser'] = browser
 
+    def owned_version(self):
+        from chrome_agent_process import record, owns_listener
+        from chrome_agent_lifecycle import LifecycleError
+        if self.chrome is None or self.chrome.poll() is not None:
+            raise LifecycleError('owned Chrome is not running')
+        identity = record(self.chrome)
+        if not owns_listener(identity, CHROME_PORT):
+            raise LifecycleError('upstream listener does not belong to recorded Chrome child')
+        version = cdp_version()
+        prefix = 'ws://127.0.0.1:%d/devtools/browser/' % CHROME_PORT
+        if (not version or not version.get('webSocketDebuggerUrl', '').startswith(prefix)
+                or not owns_listener(identity, CHROME_PORT)):
+            raise LifecycleError('cannot verify owned Chrome endpoint')
+        return version
+
     def recover_managed(self):
-        from chrome_agent_process import RecoveredProcess
+        from chrome_agent_process import RecoveredProcess, owns_listener
+        self.lifecycle.require_browser_identity = True
         with self.lifecycle.ledger.transaction(readonly=True) as data:
             browser = dict(data.get('browser') or {})
         if not browser or browser.get('profile') != os.path.realpath(PROFILE):
             return False
         child = RecoveredProcess(browser)
         version = cdp_version()
-        if child.poll() is not None or not version or version.get('webSocketDebuggerUrl') != browser.get('websocket'):
+        if (child.poll() is not None or not version or version.get('webSocketDebuggerUrl') != browser.get('websocket')
+                or not owns_listener(browser, CHROME_PORT)):
             return False
         self.chrome = child
         display = browser.get('display')
@@ -993,6 +1019,9 @@ class Supervisor:
             until = shown.st_mtime + self.lifecycle.ledger.config.handoff_s
             if text:
                 until = min(until, float(text))
+            clock = self.lifecycle.ledger.runtime_clock
+            if clock:
+                until = clock.from_wall(until, self.lifecycle.ledger.config.handoff_s)
             for tid in targets:
                 self.lifecycle.ledger.protect(tid, 'handoff', episode=episode, until=until)
         # Reap does not hold the ledger lock over I/O; reuse the observation CDP.
@@ -1006,8 +1035,8 @@ class Supervisor:
         self.vd = subprocess.Popen([VDISPLAY], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    universal_newlines=True, bufsize=1)
         threading.Thread(target=self._vd_reader, args=(self.vd,), daemon=True).start()
-        deadline = time.time() + 10
-        while not self.stop and self.vbounds is None and time.time() < deadline and self.vd.poll() is None:
+        deadline = time.monotonic() + 10
+        while not self.stop and self.vbounds is None and time.monotonic() < deadline and self.vd.poll() is None:
             time.sleep(0.1)
         log("vdisplay pid %d bounds %s main %s" % (self.vd.pid, self.vbounds, self.main))
 
@@ -1076,6 +1105,9 @@ class Supervisor:
     def start_chrome(self):
         if not self.lifecycle:
             self._kill_stale_chrome()
+        else:
+            from chrome_agent_process import require_free_endpoint
+            require_free_endpoint(CHROME_PORT)
         os.makedirs(PROFILE, exist_ok=True)
         self._prefs_off_savers()
         args = [CHROME, "--user-data-dir=" + PROFILE, "--remote-debugging-port=%d" % CHROME_PORT,
@@ -1090,9 +1122,11 @@ class Supervisor:
         self.chrome = subprocess.Popen(args, stdout=sys.stdout, stderr=subprocess.STDOUT)
         log("chrome pid %d started" % self.chrome.pid)
         self.hooked.clear()
-        deadline = time.time() + 30
-        while not self.stop and time.time() < deadline and self.chrome.poll() is None:
+        deadline = time.monotonic() + 30
+        while not self.stop and time.monotonic() < deadline and self.chrome.poll() is None:
             if cdp_version():
+                if self.lifecycle:
+                    self.owned_version()
                 return
             time.sleep(0.2)
         log("chrome CDP did not come up within 30s")
@@ -1112,7 +1146,7 @@ class Supervisor:
     def connect(self):
         if self.cdp and not self.cdp.closed:
             return self.cdp
-        v = cdp_version()
+        v = self.owned_version() if self.lifecycle else cdp_version()
         if not v:
             return None
         self.cdp = CDP(v["webSocketDebuggerUrl"], on_event=self.on_event)
@@ -1421,9 +1455,14 @@ class Supervisor:
 
     def managed_step(self):
         from chrome_agent_lifecycle import LifecycleError
-        if self.stop or not self.lifecycle.running:
+        if self.stop:
             return
         try:
+            if not self.lifecycle.running:
+                self.lifecycle.ledger.reap_workers()
+                self.lifecycle.revoke_connections()
+                self.lifecycle.maintain_daemons()
+                return
             with self.lifecycle.transition:
                 if self.vd.poll() is not None:
                     self.start_vdisplay()
@@ -1512,6 +1551,8 @@ class Supervisor:
                 drained = self.lifecycle.drain(timeout=30)
                 log('managed drain: %s' % ('completed' if drained else '30s bound reached; explicit stop wins'))
                 with self.lifecycle.transition:
+                    remaining = self.lifecycle.retire_daemons(timeout=10)
+                    log('managed daemon retirement: %s unverified/unretired records retained' % remaining)
                     self.idle_managed()
                     self.lifecycle.running = False
                     with self.lifecycle.lock:

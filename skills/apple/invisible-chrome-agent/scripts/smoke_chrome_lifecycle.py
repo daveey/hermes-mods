@@ -87,6 +87,14 @@ def main():
                     raise RuntimeError('isolated Chrome did not start; inspect smoke Chrome output')
                 time.sleep(0.1)
             events.append(('wake', child.pid))
+            # This fixture replaces the Mac launch adapter; retain the real
+            # child/listener identity contract when waking after reconciliation.
+            from chrome_agent_process import record, owns_listener
+            identity = record(child)
+            assert owns_listener(identity, upstream)
+            with ledger.transaction() as data:
+                data['browser'] = dict(identity, profile=str(profile.resolve()),
+                    websocket=api.cdp_version(port=upstream)['webSocketDebuggerUrl'])
 
         try:
             for sock in reserved:

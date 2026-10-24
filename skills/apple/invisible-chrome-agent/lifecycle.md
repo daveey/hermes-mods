@@ -21,8 +21,11 @@ does not migrate a legacy installation.
   diff inference or URL-based adoption. Chrome-reported current-generation opener
   lineage binds new owned popups, including sign-in windows, to the opener's owner.
   Invalid scoped requests never fall back to raw CDP.
-- Managed raw `/json/new`, `/json/close/*` and `/devtools/*` are refused without
-  waking Chrome. Ordinary raw tools cannot create unowned tabs through this port.
+- The actual managed listener refuses every unscoped HTTP/WebSocket route,
+  including raw discovery, create, close and activate, without waking Chrome or
+  forwarding upstream. Only `/lifecycle/` and `/lease/` are served. Ordinary raw
+  tools cannot create unowned tabs through this port; unconfigured legacy proxies
+  retain their original behavior.
   Unknown pre-existing targets block browser idle shutdown and are never automatically closed.
   Managed launches use `--no-startup-window` instead of an unowned bootstrap blank;
   legacy always-on launches retain their initial blank tab.
@@ -48,6 +51,33 @@ does not migrate a legacy installation.
   from the explicit show event. An indefinite show is therefore not indefinite protection.
 - The listener remains alive after idle shutdown. Concurrent acquires serialize
   wake. A deliberately stopped/disabled launchd job is not auto-bootstrapped.
+
+### Elapsed time and persisted clocks
+
+Lease activity, request/download/handoff deadlines and browser idle intervals use
+a monotonic runtime clock, not wall-clock elapsed time. Backward wall jumps cannot
+extend orphans and forward jumps cannot prematurely expire active protection.
+The optional version-1 `clock` object stores `{boot, logical, monotonic}` at each
+durable mutation. `logical` timestamps keep an epoch-shaped origin but are not
+current civil time after a wall adjustment. Linux uses its boot UUID; macOS uses
+`kern.bootsessionuuid` (not a wall-time-derived boot date). Missing boot identity
+refuses managed startup rather than guessing elapsed time.
+
+Same-boot reload consumes monotonic downtime, preserving exact deadlines even
+after repeated supervisor crashes. Across boots (or a reset monotonic counter),
+elapsed downtime cannot be proven safely: preserve only the remaining bounded
+durations at the last snapshot, then immediately persist the new clock anchor.
+This deliberately does not count power-off time; it is a bound in running clock
+time, not a promise of expiry during arbitrarily repeated machine reboots.
+Legacy ledgers without a clock anchor get one conservative migration: activity
+and release start at migration, existing requests receive at most 86400 seconds
+plus configured grace, and protection gets at most its configured handoff/stall/
+download maximum. This can delay legacy cleanup but never destroy a potentially
+active operation because the wall clock jumped forward. Migration is persisted
+even on the first readonly access, so ordinary restarts do not renew it.
+Corrupt/nonfinite anchors fail closed. Explicit show wall deadlines are converted
+to a remaining monotonic duration per episode; polling the same episode, target
+discovery, autoattach and open sockets never renew it.
 
 ## Install / configure
 
@@ -93,8 +123,13 @@ The supervisor requires owner-only configuration permissions and the dedicated
 Changing settings requires a deliberate supervisor restart. SIGTERM/SIGINT rejects
 new acquires immediately upon entering drain, permits completions, and waits up to
 30 seconds for active requests/downloads/handoffs. Explicit stop ultimately wins:
-children are terminated after that bound; startup and process teardown have their
-own bounded waits. A disabled installation is never automatically enabled.
+owned harness daemons get a separate 10-second total verified IPC retirement
+budget after drain, then browser/display children are terminated. A shutdown ACK
+alone is not success: process retirement must be observed. Silent, replaced or
+unverifiable sockets are not signalled or deleted; their retry records remain
+and the remaining count is logged. Idle supervisors retry ordinary eligible
+daemon cleanup without requiring a browser wake. Startup and child teardown
+retain their own bounded waits. A disabled installation is never automatically enabled.
 The core's separate opt-in is `browser.managed_agent.endpoint` (the exact raw
 loopback endpoint) and `browser.managed_agent.installation_id` (this identity).
 Do not infer management from a port number. This file is configuration, not a
@@ -135,8 +170,13 @@ default/local entry smoke checks passed. Mac headful acceptance is still require
   command has a 60-second upstream limit, independent of the longer tool request.
   Broader browser-use/Playwright compatibility must be tested before deployment; clients needing unsupported
   browser-level methods may fail. Shared profile cookies are not isolated.
-- A surviving browser is reconciled only when its recorded PID/start identity,
-  dedicated profile and browser-instance WebSocket all match. A fresh supervisor
+- Before launch, even a non-CDP occupant of the upstream port is refused. After
+  launch, the exact child must own the loopback listener (Linux socket inode/PID,
+  macOS `lsof` PID/listener verification); unavailable verification fails closed.
+  Readiness cannot combine a newly launched PID with another Chrome's WebSocket.
+  Scoped reconnect/discovery also refuses a replacement endpoint after browser death.
+  A surviving browser is reconciled only when its recorded PID/start identity,
+  dedicated profile, listener ownership and browser-instance WebSocket all match. A fresh supervisor
   reloads the same generation and applies one bounded orphan grace, without renewing
   it on repeated crashes. Unknown existing browsers still require operator recovery.
   A new Chrome process gets a new generation and stale scoped sockets close.
@@ -145,6 +185,8 @@ default/local entry smoke checks passed. Mac headful acceptance is still require
   remain protected. Harness cleanup verifies a private capability-named IPC socket,
   owned page (or an empty/disconnected CDP daemon) and process creation identity before issuing its shutdown protocol;
   it never kills by process-name matching. Unverifiable endpoints are preserved.
+  Scoped disposal shuts down both socket directions, fails pending commands and
+  joins the upstream reader with a two-second bound (never self-joins).
 - Quiet-but-alive tasks expire after `idle_lease_s` without browser use. Observer
   polling and open sockets do not renew them. Their next request gets a new capability;
   old unprotected tabs may already have been reaped. Use an explicit bounded handoff
@@ -159,6 +201,8 @@ From `scripts/`:
 
 ```sh
 python3 -m unittest -v test_chrome_agent_lifecycle test_hermes_chrome_agent test_chrome_lifecycle_rework test_chrome_supervisor_rework test_chrome_daemon_rework
+python3 -m unittest -v test_chrome_astra_rework test_chrome_clock_rework test_chrome_daemon_processes
+python3 -m unittest -v test_chrome_endpoint_ownership test_chrome_stop_ownership
 ```
 
 The lifecycle tests cover ledger isolation/persistence/permissions, corrupt state,
@@ -168,6 +212,14 @@ against a loopback fake Chrome, owned reconnect auto-attach, forbidden target/se
 operations, install-without-start, launchd plist semantics and smoke safety guards.
 The existing suite exercises the original focus proxy, guard and passkey paths.
 Mac launchd process behavior is mocked, not an on-host acceptance test.
+The additional suites exercise bound listeners, real quiet sockets and pending
+reader reclamation, deterministic forward/backward clocks and reloads, private
+Unix IPC processes, foreign/sibling preservation and ignored shutdown ACKs. The
+last command requires Linux Chrome and browser-harness: it launches disposable
+profiles on ephemeral ports, tests occupied ports and the actual launch race,
+exact-child recovery, and supervisor-only stop with separately spawned harnesses,
+including the actual 30-second protected drain bound. Fixtures clean only their
+own recorded children. These Linux results do not verify the macOS OS adapters.
 
 For a separately approved real-CDP smoke, the harness launches only its own fresh
 headless Chrome/profile and ephemeral ports, refuses ports 9333/9334 and existing
@@ -209,8 +261,12 @@ Vault keeps its existing no-session API: it addresses the task's last selected
 managed session, never a union of capabilities. Alternate sessions using
 `browser_exec(session=...)` before vault actions. Each capability has its own
 supervisor; failures never fall back to an unscoped browser. Explicit gateway
-shutdown remains a release boundary (tabs are not guaranteed across a long gateway
-restart); it stops recorded harness daemons rather than leaving them behind.
+shutdown remains a release boundary: release immediately invalidates the old
+capability. Even a fast shutdown/restart gets a fresh capability and does not
+automatically reclaim still-open old tabs; physical closure follows the old
+grace/protection bounds. Soft cache eviction is different and remains resumable.
+Gateway shutdown stops recorded harness daemons rather than leaving them behind.
+Exact-browser supervisor crash recovery is separate from this gateway policy.
 
 To roll back: explicitly stop the supervisor, restore the prior supervisor build,
 and remove the managed_agent config mapping. Preserve the Chrome profile. Do not

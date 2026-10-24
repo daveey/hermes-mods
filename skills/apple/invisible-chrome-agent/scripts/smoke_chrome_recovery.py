@@ -13,7 +13,7 @@ def reconcile(api, ledger, lifecycle, profile, child, upstream):
     original = api.Supervisor()
     original.chrome = child
     original.lifecycle = lifecycle
-    with mock.patch.object(api, 'PROFILE', str(profile)), \
+    with mock.patch.object(api, 'PROFILE', str(profile)), mock.patch.object(api, 'CHROME_PORT', upstream), \
          mock.patch.object(api, 'cdp_version', side_effect=lambda: version(port=upstream)):
         original.remember_browser()
         with ledger.transaction(readonly=True) as data:

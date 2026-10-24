@@ -83,10 +83,16 @@ class ExclusiveLock:
 
 
 class Ledger:
-    def __init__(self, path, config=None, clock=time.time):
+    def __init__(self, path, config=None, clock=None):
+        from chrome_agent_clock import RuntimeClock
         self.path = Path(path)
         self.config = config or Config()
-        self.clock = clock
+        # An injected clock is already a logical clock (deterministic tests).
+        try:
+            self.runtime_clock = RuntimeClock() if clock is None else None
+        except RuntimeError as exc:
+            raise LifecycleError(str(exc)) from exc
+        self.clock = clock if clock is not None else self.runtime_clock
         self.lock = threading.RLock()
         self._data = None
         self._stamp = None
@@ -95,6 +101,7 @@ class Ledger:
         self._holds = {}
         self._closing = set()
         self._retiring = set()
+        self._daemon_lock = threading.Lock()
 
     @staticmethod
     def validate(data):
@@ -103,6 +110,12 @@ class Ledger:
                 raise ValueError('invalid timestamp')
         if data['version'] != 1 or not isinstance(data['generation'], str):
             raise ValueError('invalid schema')
+        if 'clock' in data:
+            clock = data['clock']
+            number(clock['logical'])
+            number(clock['monotonic'])
+            if not isinstance(clock['boot'], str) or not clock['boot'] or clock['monotonic'] < 0:
+                raise ValueError('invalid clock anchor')
         if not isinstance(data['leases'], dict) or not isinstance(data['targets'], dict):
             raise ValueError('invalid maps')
         for cap, lease in data['leases'].items():
@@ -153,6 +166,12 @@ class Ledger:
                     for tid, record in data['targets'].items():
                         for guid, download in record.pop('downloads', {}).items():
                             downloads[guid] = dict(download, target=tid)
+                    if self.runtime_clock and self.runtime_clock.restore(data, self.config):
+                        # Reconciliation is durable even when the first operation
+                        # is readonly: a crash must not renew migration/reboot grace.
+                        data['clock'] = self.runtime_clock.snapshot()
+                        atomic_json(self.path, data)
+                        stamp = self._file_stamp()
                     self._data, self._stamp = data, stamp
                 except (ValueError, KeyError, TypeError, AttributeError) as exc:
                     raise LifecycleError('corrupt lease ledger; refusing destructive operations') from exc
@@ -162,6 +181,8 @@ class Ledger:
                 if not readonly:
                     self._dirty = self._dirty or not track or before != self._data or self._stamp is None
                     if persist and self._dirty:
+                        if self.runtime_clock:
+                            self._data['clock'] = self.runtime_clock.snapshot()
                         atomic_json(self.path, self._data)
                         self._stamp = self._file_stamp()
                         self._dirty = False
@@ -351,9 +372,9 @@ class Ledger:
                 if not owned:
                     lease.setdefault('restart_until', self.clock() + self.config.orphan_s)
 
-    def sweep_daemons(self):
+    def sweep_daemons(self, force=False, deadline=None):
         from chrome_agent_daemons import sweep
-        sweep(self)
+        sweep(self, force=force, deadline=deadline)
 
     def popup(self, info):
         """Only Chrome-reported opener identity confers ownership, never URLs."""
@@ -502,6 +523,7 @@ class Lifecycle:
         self.empty_since = None
         self.connections = set()
         self.daemon_sweep = None
+        self.require_browser_identity = False
 
     def revoke_connections(self):
         with self.lock:
@@ -570,12 +592,28 @@ class Lifecycle:
                 return False
             waiter.wait(min(.1, remaining))
 
-    def tick(self, targets, close):
+    def maintain_daemons(self):
+        with self.lock:
+            if self.daemon_sweep is None or not self.daemon_sweep.is_alive():
+                self.daemon_sweep = threading.Thread(target=self.ledger.sweep_daemons, daemon=True)
+                self.daemon_sweep.start()
+
+    def retire_daemons(self, timeout=10):
+        """Only after drain: explicit stop wins, but unknown processes never do."""
+        deadline = time.monotonic() + timeout
         with self.ledger.transaction(readonly=True) as data:
-            has_daemons = any(lease.get('daemon_socket') for lease in data['leases'].values())
-        if has_daemons and (self.daemon_sweep is None or not self.daemon_sweep.is_alive()):
-            self.daemon_sweep = threading.Thread(target=self.ledger.sweep_daemons, daemon=True)
-            self.daemon_sweep.start()
+            remaining = sum(bool(lease.get('daemon_socket')) for lease in data['leases'].values())
+        while time.monotonic() < deadline:
+            self.ledger.sweep_daemons(force=True, deadline=deadline)
+            with self.ledger.transaction(readonly=True) as data:
+                remaining = sum(bool(lease.get('daemon_socket')) for lease in data['leases'].values())
+            if not remaining:
+                break
+            threading.Event().wait(min(.1, max(0, deadline - time.monotonic())))
+        return remaining
+
+    def tick(self, targets, close):
+        self.maintain_daemons()
         with self.transition:
             self.ledger.reap_workers()
             self.revoke_connections()
@@ -594,12 +632,10 @@ class Lifecycle:
             return closed
 
     def route(self, proxy, c, reader, method, target, headers, body, api):
-        """Return false only for legacy raw endpoints. Scoped failures never fall back."""
-        if target.startswith(('/devtools/', '/json/new', '/json/close/')):
+        """Managed requests never fall back to the unscoped HTTP/WS tunnel."""
+        if not target.startswith(('/lifecycle/', '/lease/')):
             proxy._respond(c, 403, 'Forbidden', json.dumps({'error': 'managed Chrome requires an owner lease'}), 'application/json')
             return True
-        if not (target.startswith('/lifecycle/') or target.startswith('/lease/')):
-            return False
         try:
             if target.startswith('/lifecycle/'):
                 if method != 'POST':
@@ -621,19 +657,36 @@ class Lifecycle:
             proxy._respond(c, 503, 'Unavailable', json.dumps({'error': str(exc)}), 'application/json')
         return True
 
+    def browser_version(self, port, read_version):
+        """A replaced internal listener is not authority for an existing scope."""
+        from chrome_agent_process import owns_listener
+        with self.ledger.transaction(readonly=True) as data:
+            browser = dict(data.get('browser') or {})
+        if self.require_browser_identity and not browser:
+            raise LifecycleError('owned browser identity has not been established')
+        if browser and not owns_listener(browser, port):
+            raise LifecycleError('recorded browser no longer owns upstream listener')
+        version = read_version(port=port)
+        if browser and (not version or version.get('webSocketDebuggerUrl') != browser.get('websocket')
+                        or not owns_listener(browser, port)):
+            raise LifecycleError('recorded browser endpoint changed')
+        return version
+
     def discovery(self, proxy, cap, method, path, api):
         import urllib.request
         import urllib.parse
         prefix = 'ws://127.0.0.1:%d/lease/%s' % (proxy.port, cap)
         if method == 'GET' and path == '/json/version':
-            version = api.cdp_version(port=proxy.upstream)
+            version = self.browser_version(proxy.upstream, api.cdp_version)
             if not version:
                 raise LifecycleError('browser is idle or unavailable')
             version['webSocketDebuggerUrl'] = prefix + '/devtools/browser/scoped'
             return version
         if method == 'GET' and path in ('/json', '/json/list', '/json/'):
+            self.browser_version(proxy.upstream, api.cdp_version)
             with urllib.request.urlopen('http://127.0.0.1:%d/json/list' % proxy.upstream, timeout=5) as response:
                 targets = json.load(response)
+            self.browser_version(proxy.upstream, api.cdp_version)
             owned = [t for t in targets if self.ledger.owns(cap, t['id'])]
             for t in owned:
                 t['webSocketDebuggerUrl'] = prefix + '/devtools/page/' + t['id']
@@ -699,8 +752,8 @@ class Lifecycle:
         def close_client():
             import socket
             with contextlib.suppress(OSError):
-                with send_lock:
-                    c.sendall(api.encode_frame(8, b'', mask=False))
+                # Do not wait for a blocked sender or write another frame to a
+                # peer that stopped reading. Revocation must interrupt both ends.
                 c.shutdown(socket.SHUT_RDWR)
 
         connection.close_client = close_client
@@ -757,7 +810,7 @@ class ScopedCDP:
         self.page_session = None
         self.auto_attach = False
         self.send_event = send_event
-        version = api.cdp_version(port=proxy.upstream)
+        version = lifecycle.browser_version(proxy.upstream, api.cdp_version)
         if not version:
             raise LifecycleError('browser unavailable')
         self.cdp = api.CDP(version['webSocketDebuggerUrl'], on_event=self.event)
@@ -770,8 +823,10 @@ class ScopedCDP:
                 return
             self.closed = True
             self.lifecycle.connections.discard(self)
-        self.close_client()
-        self.cdp.close()
+        try:
+            self.close_client()
+        finally:
+            self.cdp.close()
 
     def owned(self, tid):
         if not self.lifecycle.ledger.owns(self.cap, tid):
