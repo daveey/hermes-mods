@@ -89,6 +89,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [session-context-nested-rebind.md](session-context-nested-rebind.md) | 0159 | A nested re-bind of the turn's own session restores the binding on clear, so cards created after a queued model switch keep their session id |
 | [credential-pool-norefresh-adopt.md](credential-pool-norefresh-adopt.md) | 0160 | A live credential pool adopts tokens pushed to disk for no-refresh OAuth rows instead of keeping the expired copy |
 | [kanban-escalated-triage-red.md](kanban-escalated-triage-red.md) | 0161 0231 | A block-loop-escalated triage card counts as waiting on you, so its chat paints red; 0231: non-human/NULL triage counts as unfinished work, so its chat is not green |
+| [kanban-worktree-retention.md](kanban-worktree-retention.md) | 0264 | Age-based terminal-worktree cleanup with verified recovery refs; startup orphan tombstones |
 | [kanban-worker-worktree-cleanup.md](kanban-worker-worktree-cleanup.md) | 0162 | Worker guidance: `git worktree remove` every worktree you add before `kanban_complete` |
 | [browser-background-tab.md](browser-background-tab.md) | 0163 0164 | `browser_exec`'s own tab and the CDP supervisor's fallback page open with `background=True`, so a new browser session stops stealing keyboard focus on macOS |
 | [pre-final-gate.md](pre-final-gate.md) | 0165 0167 | `pre_final_gate` plugin hook: hold a final answer silently (never shown or stored) or append to it; `needs_buffer` keeps a held answer from streaming |
