@@ -348,6 +348,7 @@ const emit = () => subs.forEach(fn => fn(snapshot))
 
 // Last good hub answer for the focused lineage (shown stale while the hub is unreachable).
 let hubLinkCache = { session: null, chips: [] }
+let taskReadCache = { session: null, chips: [] }
 
 export async function loadKanban(ids, route = focusedRoute()) {
   const cacheScope = JSON.stringify([route.connectionId || '', route.profile, [...ids].sort()])
@@ -357,10 +358,19 @@ export async function loadKanban(ids, route = focusedRoute()) {
     null
   )
   let live = null
-  if (list && Array.isArray(list.tasks)) live = sessionTaskChips(list.tasks)
-  else {
+  if (list && Array.isArray(list.tasks)) {
+    live = sessionTaskChips(list.tasks)
+    taskReadCache = { session: cacheScope, chips: live }
+  } else {
     const board = await safe(() => read('/api/plugins/kanban/board'), null)
-    live = board ? kanbanChips(board, ids) : null
+    const previous = taskReadCache.session === cacheScope ? staleChips(taskReadCache.chips) : []
+    const fallback = board ? kanbanChips(board, ids) : []
+    const seen = new Set(previous.map(c => c.key))
+    // A readable legacy board cannot establish that the origin ledger is empty.
+    live = [...previous, ...fallback.filter(c => !seen.has(c.key)), {
+      key: `kb-status:${cacheScope}`, kind: 'kanban-status', state: 'unknown', stale: true,
+      label: 'Task status unavailable', title: 'Could not read authoritative session tasks; work may still be unfinished.'
+    }]
   }
   // Linked cards on other gateways, from this gateway's hermes-hub replica
   // (hub-sync plugin). Absent plugin / hub down → no extra chips.
@@ -496,7 +506,7 @@ function subscribe(fn) {
 
 // ── UI ──────────────────────────────────────────────────────────────────────
 
-const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist', machine: 'codicon-vm' }
+const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist', 'kanban-status': 'codicon-warning', machine: 'codicon-vm' }
 
 export function openTaskChip(chip) {
   if (chip.gateway) return openRemoteTask(chip)

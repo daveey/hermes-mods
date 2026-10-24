@@ -227,6 +227,34 @@ test('hub fallback cache cannot leak between profiles with the same session id',
   } finally { delete globalThis.window; delete host.state }
 })
 
+test('failed authoritative task read stays unknown even when legacy board succeeds empty', async () => {
+  let online = true
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/session-kanban-tasks')) {
+      if (online) return { tasks: [{ id: 't_retained', status: 'running', gateway: 'owner', profile: 'work' }] }
+      throw new Error('unreadable ledger')
+    }
+    if (path.includes('session-links')) return { gateway: 'origin', tasks: [] }
+    return { columns: [] }
+  } } }
+  try {
+    const ids = new Set(['s_read_failure'])
+    assert.equal((await m.loadKanban(ids)).length, 1)
+    online = false
+    const warm = await m.loadKanban(ids)
+    assert.equal(warm.find(c => c.id === 't_retained')?.stale, true)
+    assert.equal(warm.some(c => c.state === 'unknown'), true)
+    const cold = await m.loadKanban(new Set(['s_cold_failure']))
+    assert.equal(cold.length, 1)
+    assert.equal(cold[0].state, 'unknown')
+    assert.equal(cold[0].kind, 'kanban-status')
+    online = true
+    const recovered = await m.loadKanban(ids)
+    assert.deepEqual(recovered.map(c => c.id), ['t_retained'])
+    assert.equal(recovered.some(c => c.kind === 'kanban-status'), false)
+  } finally { delete globalThis.window }
+})
+
 test('poller reloads the same stored id when its owner profile changes', async () => {
   const { host } = await import('@hermes/plugin-sdk')
   let profile = 'work'
