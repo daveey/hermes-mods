@@ -128,8 +128,29 @@ budget after drain, then browser/display children are terminated. A shutdown ACK
 alone is not success: process retirement must be observed. Silent, replaced or
 unverifiable sockets are not signalled or deleted; their retry records remain
 and the remaining count is logged. Idle supervisors retry ordinary eligible
-daemon cleanup without requiring a browser wake. Startup and child teardown
-retain their own bounded waits. A disabled installation is never automatically enabled.
+daemon cleanup without requiring a browser wake. Cached process exit is not endpoint
+retirement: the current private capability socket is inspected afresh before a
+replacement is tracked. A still-live old process remains tracked even when its
+socket has changed; unknown replacements remain unresolved, never sent shutdown.
+Socket/process identity is checked again on the connected IPC channel before
+shutdown (including peer credentials on Linux), and vacancy is rechecked before
+removing the record. Verified daemon identities carry an optional `socket_stamp`
+(device, inode, nanosecond ctime) within the existing v1 ledger. This distinguishes
+an abandoned verified socket from an unverified replacement that refuses connects;
+connection refusal alone never proves an unknown process exited. Live legacy
+identities are re-inspected to add the stamp. A dead legacy identity with an
+extant uninspectable socket remains unresolved; missing endpoints can be cleared.
+
+Each candidate receives at most 0.5 seconds of the sweep's total budget (5 seconds
+for idle cleanup, 10 seconds for explicit retirement). A capability-order cursor
+rotates across successive sweeps in the same supervisor, including when a prior
+record was removed; a candidate is not skipped merely because the previous attempt
+used almost all the budget. This prevents silent/ACK-without-exit owners starving
+later owners. Large populations can require multiple idle sweeps; explicit stop
+still ends at its total deadline and reports unresolved records. The cursor is
+in-memory scheduling state, reset on supervisor restart, not a new ledger schema.
+Startup and child teardown retain their own bounded waits. A disabled installation
+is never automatically enabled.
 The core's separate opt-in is `browser.managed_agent.endpoint` (the exact raw
 loopback endpoint) and `browser.managed_agent.installation_id` (this identity).
 Do not infer management from a port number. This file is configuration, not a

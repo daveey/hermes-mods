@@ -23,7 +23,11 @@ def peer(path, target, ignore):
         listener.listen()
         while True:
             with listener.accept()[0] as client:
-                payload = json.loads(client.makefile('rb').readline())
+                with client.makefile('rb') as stream:
+                    raw = stream.readline()
+                if not raw:
+                    continue  # A connected client may reject a replaced peer before sending.
+                payload = json.loads(raw)
                 command = payload['meta']
                 if command == 'ping':
                     reply = dict(pong=True, pid=os.getpid(), browser_kind='cdp')
