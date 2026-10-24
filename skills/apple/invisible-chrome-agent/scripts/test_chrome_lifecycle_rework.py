@@ -223,7 +223,9 @@ class LedgerReworkTests(unittest.TestCase):
             shutdown.assert_not_called()
             self.now += 2000
             self.ledger.sweep_daemons()
-            shutdown.assert_called_once_with(identity)
+            shutdown.assert_called_once()
+            self.assertEqual(shutdown.call_args.args[0], identity)
+            self.assertIsInstance(shutdown.call_args.args[1], float)
 
 
 class RawGuardTests(unittest.TestCase):

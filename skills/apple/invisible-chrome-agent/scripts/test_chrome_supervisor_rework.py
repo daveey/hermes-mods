@@ -107,9 +107,10 @@ class InstallSafetyTests(unittest.TestCase):
                 with mock.patch.object(hca, 'PROFILE', tmp), \
                      mock.patch.object(hca, 'cdp_version', return_value={'webSocketDebuggerUrl': 'ws://127.0.0.1:19002/devtools/browser/known'}), \
                      mock.patch.object(supervisor, 'start_vdisplay') as display:
-                    self.assertTrue(supervisor.recover_managed())
-                    self.assertEqual(supervisor.chrome.pid, child.pid)
-                    display.assert_called_once()
+                    # A matching URL plus an unrelated sleep PID is not ownership.
+                    # Real Chrome recovery success is exercised by the process suite.
+                    self.assertFalse(supervisor.recover_managed())
+                    display.assert_not_called()
             finally:
                 child.terminate()
                 child.wait(timeout=5)
