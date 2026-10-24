@@ -102,6 +102,7 @@ class Ledger:
         self._closing = set()
         self._retiring = set()
         self._daemon_lock = threading.Lock()
+        self._daemon_cursor = ''
 
     @staticmethod
     def validate(data):

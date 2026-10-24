@@ -9,11 +9,26 @@ import time
 from chrome_agent_process import fingerprint
 
 
-def exchange(path, payload, deadline=None):
+def exchange(path, payload, deadline=None, identity=None):
     deadline = deadline if deadline is not None else time.monotonic() + 2
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(_remaining(deadline))
         client.connect(path)
+        if identity:
+            # Check AFTER connect, BEFORE sending authority. A replacement between
+            # ping and shutdown must not receive the old generation's command.
+            info = Path(path).lstat()
+            if (info.st_ino != identity['inode'] or not stat.S_ISSOCK(info.st_mode)
+                    or (identity.get('socket_stamp') is not None
+                        and [info.st_dev, info.st_ino, info.st_ctime_ns] != identity['socket_stamp'])
+                    or info.st_uid != os.getuid() or info.st_mode & 0o077
+                    or _fingerprint(identity['pid'], deadline) != identity['started']):
+                raise ValueError('harness endpoint changed')
+            if hasattr(socket, 'SO_PEERCRED'):
+                import struct
+                pid, uid, _ = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if pid != identity['pid'] or uid != os.getuid():
+                    raise ValueError('harness peer changed')
         client.sendall(json.dumps(payload).encode() + b'\n')
         data = b''
         while not data.endswith(b'\n') and len(data) <= 65536:
@@ -70,17 +85,21 @@ def inspect(path, capability, owned_targets, deadline=None):
         pid = ping.get('pid')
         if not ping.get('pong') or type(pid) is not int or pid <= 0:
             return None
-        current = exchange(str(path), {'meta': 'current_tab'}, deadline)
+        started = _fingerprint(pid, deadline)
+        if started is None:
+            return None
+        identity = dict(path=str(path), pid=pid, started=started, inode=info.st_ino,
+                        socket_stamp=[info.st_dev, info.st_ino, info.st_ctime_ns])
+        current = exchange(str(path), {'meta': 'current_tab'}, deadline, identity=identity)
         empty = (ping.get('browser_kind') == 'cdp'
                  and current.get('error') in ('not_attached', 'cdp_disconnected'))
         # A closed last tab must not make the registered nonce-named daemon
         # immortal. A live foreign target still refuses attribution.
         if current.get('targetId') not in owned_targets and not empty:
             return None
-        started = _fingerprint(pid, deadline)
-        if started is None or path.lstat().st_ino != info.st_ino:
+        if _fingerprint(pid, deadline) != started or path.lstat().st_ino != info.st_ino:
             return None
-        return dict(path=str(path), pid=pid, started=started, inode=info.st_ino)
+        return identity
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -96,10 +115,10 @@ def shutdown(identity, deadline=None):
         info = Path(identity['path']).lstat()
         if info.st_ino != identity['inode']:
             return False  # replacement socket is not authority over the old live process
-        ping = exchange(identity['path'], {'meta': 'ping'}, deadline)
+        ping = exchange(identity['path'], {'meta': 'ping'}, deadline, identity=identity)
         if ping.get('pid') != identity['pid'] or not ping.get('pong'):
             return False
-        result = exchange(identity['path'], {'meta': 'shutdown'}, deadline)
+        result = exchange(identity['path'], {'meta': 'shutdown'}, deadline, identity=identity)
         if result.get('error'):
             return False
         while not _retired(identity, deadline):
@@ -125,36 +144,92 @@ def sweep(ledger, force=False, deadline=None):
         ledger._daemon_lock.release()
 
 
+def _endpoint_stamp(path):
+    try:
+        info = Path(path).lstat()
+        return [info.st_dev, info.st_ino, info.st_ctime_ns]
+    except FileNotFoundError:
+        return None
+
+
+def _vacant(path, deadline, identity=None):
+    """Missing endpoint or refused socket of a proven retired generation only."""
+    try:
+        before = Path(path).lstat()
+        if (not identity or identity.get('socket_stamp') != [before.st_dev, before.st_ino, before.st_ctime_ns]
+                or not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o077):
+            return False
+        try:
+            exchange(path, {'meta': 'ping'}, deadline)
+        except ConnectionRefusedError:
+            after = Path(path).lstat()
+            return (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        return False
+    except FileNotFoundError:
+        return not os.path.lexists(path)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _sweep(ledger, force, deadline):
     with ledger.transaction(readonly=True) as data:
-        candidates = [(cap, dict(lease)) for cap, lease in data['leases'].items() if lease.get('daemon_socket')]
+        candidates = sorted((cap, dict(lease)) for cap, lease in data['leases'].items() if lease.get('daemon_socket'))
         owned = {cap: {tid for tid, target in data['targets'].items() if target['capability'] == cap}
                  for cap, _ in candidates}
-    for cap, snapshot in candidates:
-        if time.monotonic() >= deadline:
+    # A capability cursor survives successive sweeps, even if that record was
+    # removed. A bounded slice alone would repeatedly starve a large ledger.
+    cursor = ledger._daemon_cursor
+    candidates = [c for c in candidates if c[0] > cursor] + [c for c in candidates if c[0] <= cursor]
+    for index, (cap, snapshot) in enumerate(candidates):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (index and remaining < .1):
             return
-        identity = snapshot.get('daemon')
-        identity = identity or inspect(snapshot['daemon_socket'], cap, owned[cap], deadline)
-        with ledger.transaction() as data:
-            lease = data['leases'].get(cap)
-            if not lease or lease.get('daemon_socket') != snapshot['daemon_socket']:
-                continue
-            if identity:
-                lease['daemon'] = identity
-            if not force and not _eligible(ledger, data, cap, lease):
-                continue
-            ledger._retiring.add(cap)
+        ledger._daemon_cursor = cap
+        # Reserve a fair share for later owners, with enough minimum time for
+        # real IPC when there are more owners than fit into one sweep.
+        budget = min(.5, max(.1, remaining / (len(candidates) - index)))
         try:
-            done = shutdown(identity, deadline) if identity else not Path(snapshot['daemon_socket']).exists()
-            if done:
-                with ledger.transaction() as data:
-                    lease = data['leases'].get(cap)
-                    if lease:
-                        lease.pop('daemon_socket', None)
-                        lease.pop('daemon', None)
-        finally:
-            with ledger.lock:
-                ledger._retiring.discard(cap)
+            _candidate(ledger, force, cap, snapshot, owned[cap], min(deadline, time.monotonic() + budget))
+        except (OSError, ValueError, KeyError, TypeError):
+            # Timeout/probe failure is unresolved, never proof of retirement.
+            continue
+
+
+def _candidate(ledger, force, cap, snapshot, owned, deadline):
+    identity = snapshot.get('daemon')
+    if not identity or _retired(identity, deadline):
+        # Keep a live old generation until its exit is proven. Only then may a
+        # replacement inherit tracking, and only via complete fresh inspection.
+        identity = inspect(snapshot['daemon_socket'], cap, owned, deadline) or identity
+    elif 'socket_stamp' not in identity:
+        # Upgrade legacy live identities without replacing a still-live PID.
+        current = inspect(snapshot['daemon_socket'], cap, owned, deadline)
+        if current and (current['pid'], current['started']) == (identity['pid'], identity['started']):
+            identity = current
+    with ledger.transaction() as data:
+        lease = data['leases'].get(cap)
+        if not lease or lease.get('daemon_socket') != snapshot['daemon_socket']:
+            return
+        if identity:
+            lease['daemon'] = identity
+        if not force and not _eligible(ledger, data, cap, lease):
+            return
+        ledger._retiring.add(cap)
+    try:
+        retired = not identity or shutdown(identity, deadline)
+        # Process retirement does not establish endpoint retirement: a harness
+        # reload can replace it during either inspection or shutdown.
+        stamp = _endpoint_stamp(snapshot['daemon_socket'])
+        if retired and _vacant(snapshot['daemon_socket'], deadline, identity):
+            with ledger.transaction() as data:
+                lease = data['leases'].get(cap)
+                if (lease and lease.get('daemon_socket') == snapshot['daemon_socket']
+                        and _endpoint_stamp(snapshot['daemon_socket']) == stamp):
+                    lease.pop('daemon_socket', None)
+                    lease.pop('daemon', None)
+    finally:
+        with ledger.lock:
+            ledger._retiring.discard(cap)
 
 
 def _eligible(ledger, data, cap, lease):

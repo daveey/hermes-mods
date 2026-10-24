@@ -46,7 +46,10 @@ class SupervisorStopTests(unittest.TestCase):
     def test_explicit_stop_wins_only_after_real_thirty_second_drain(self):
         self.exercise_stop(finish_requests=False)
 
-    def exercise_stop(self, finish_requests):
+    def test_supervisor_only_stop_reconciles_repeated_same_capability_reload(self):
+        self.exercise_stop(finish_requests=True, reloads=2)
+
+    def exercise_stop(self, finish_requests, reloads=0):
         with tempfile.TemporaryDirectory(prefix='as-') as tmp:
             root = Path(tmp)
             port, upstream = free_port(), free_port()
@@ -61,7 +64,7 @@ class SupervisorStopTests(unittest.TestCase):
                        BH_RUNTIME_DIR_SHARED='1', BH_TMP_DIR=tmp, BH_TMP_DIR_SHARED='1', BU_AUTOSPAWN='0')
             env.pop('BU_CDP_WS', None)
             env.pop('BU_CDP_URL', None)
-            grants, pids, errors = [], [], []
+            grants, pids, current_pids, errors = [], [], [], []
             def run():
                 try:
                     supervisor._run()
@@ -96,12 +99,24 @@ class SupervisorStopTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                         path = str(root / ('bu-' + grant['daemon_name'] + '.sock'))
                         pids.append(exchange(path, {'meta': 'ping'})['pid'])
+                        for _ in range(reloads):
+                            ledger.sweep_daemons()
+                            with ledger.transaction(readonly=True) as data:
+                                self.assertEqual(data['leases'][grant['capability']]['daemon']['pid'], pids[-1])
+                            result = subprocess.run(['browser-harness', '--reload'], env=env,
+                                                    capture_output=True, timeout=20)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            result = subprocess.run(['browser-harness'], input="new_tab('about:blank')",
+                                text=True, env=env, capture_output=True, timeout=35)
+                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                            pids.append(exchange(path, {'meta': 'ping'})['pid'])
+                        current_pids.append(pids[-1])
                     stop_started = time.monotonic()
                     supervisor.request_stop()
                     # Drain has outstanding requests: neither daemon may be stopped yet.
                     thread.join(timeout=2)
                     self.assertTrue(thread.is_alive())
-                    self.assertTrue(all(fingerprint(pid) for pid in pids))
+                    self.assertTrue(all(fingerprint(pid) for pid in current_pids))
                     if finish_requests:
                         for grant in grants:
                             ledger.complete(grant['capability'], grant['request_id'])
