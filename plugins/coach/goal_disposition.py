@@ -91,6 +91,11 @@ repair mandates. A why-not-fixed question with a prior repair mandate can be act
 A diagnosis/recommendation/deferred prerequisite is abandoned only when an already-authorized
 actionable goal remains unfinished and no current boundary or real ongoing owner is supported.
 Cite user scope AND candidate for abandonment. Never infer repair permission from a 503 alone.
+When the user explicitly confirms an existing repair mandate and the candidate admits it remains
+unfinished, a reference to old notes or a deferred prerequisite is NOT a supported current boundary.
+That combination is abandonment unless actual evidence establishes a present boundary or owner;
+do not use unknown merely because the candidate omitted a remediation attempt or boundary proof.
+Do not apply this rule to a status-only or analysis-only question without a repair mandate.
 Remediated requires a successful result exercising the actual requested path, not a patch attempt.
 Owned continuing requires matching goal, exact owner route, assigned owner, actionable state,
 real wake/continuation and origin/result-return link. Bare mentions, failed creates, unrelated
@@ -213,6 +218,8 @@ def build_gate(store):
                 'evidence': evidence})), evidence), evidence)
             store.log({'event': 'goal_disposition', 'session_id': session_id, 'attempt': attempt,
                        'disposition': v['disposition'], 'confidence': v['confidence'], 'mode': cfg['mode']})
+            if v['disposition'] == 'unknown' and cfg['mode'] == 'enforce' and attempt:
+                raise ValueError('recheck_unknown')
             if v['disposition'] != 'abandoned' or v['confidence'] < .85:
                 return None
             if cfg['mode'] != 'enforce':
@@ -228,6 +235,9 @@ def build_gate(store):
             store.log({'event': 'goal_disposition_unknown', 'session_id': session_id,
                        'error': type(exc).__name__,
                        'reason': str(exc) if type(exc) is ValueError and len(str(exc)) < 80 else 'judge_or_context_error'})
+            # A failed recheck is not acceptance. Let core retain any confirmed fallback.
+            if cfg['mode'] == 'enforce' and attempt:
+                raise
             return None
     gate.capture = capture
     gate.observe = observe

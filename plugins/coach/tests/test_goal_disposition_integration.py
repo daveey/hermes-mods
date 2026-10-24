@@ -18,9 +18,10 @@ def verdict():
                 boundary_kind=None, continuation_ref=None, confidence=0.99)
 
 
+@pytest.mark.parametrize('recheck_error', [False, True])
 @pytest.mark.parametrize('discovered', [False, True])
 @pytest.mark.parametrize('platform', ['cli', 'desktop'])
-def test_diagnosis_only_text_stop_is_held_before_delivery(tmp_path, monkeypatch, platform, discovered):
+def test_diagnosis_only_text_stop_is_held_before_delivery(tmp_path, monkeypatch, platform, discovered, recheck_error):
     from run_agent import AIAgent
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_VERIFY_ON_STOP', '0')
@@ -31,8 +32,14 @@ def test_diagnosis_only_text_stop_is_held_before_delivery(tmp_path, monkeypatch,
     _, hooks = coach_plugin.build(store=coach_plugin._load('core').Store(tmp_path / 'coach'))
     # Missing hook is the original failure: no diagnosis-only gate exists.
     hook = hooks.get('pre_final_gate', lambda **kw: None)
+    checks = []
+    def judge(*_):
+        checks.append(True)
+        if recheck_error and len(checks) > 1:
+            raise TimeoutError('synthetic provider timeout')
+        return verdict()
     if 'pre_final_gate' in hooks:
-        monkeypatch.setattr(coach_plugin._load('goal_disposition'), 'aux_judge', lambda *_: verdict())
+        monkeypatch.setattr(coach_plugin._load('goal_disposition'), 'aux_judge', judge)
     with patch('model_tools.get_tool_definitions', return_value=[]), \
          patch('model_tools.check_toolset_requirements', return_value={}), \
          patch('agent.process_bootstrap.OpenAI'):
@@ -74,9 +81,12 @@ def test_diagnosis_only_text_stop_is_held_before_delivery(tmp_path, monkeypatch,
             stack.enter_context(patch('hermes_cli.plugins.iter_hook_callbacks', return_value=(hook,)))
             stack.enter_context(patch('hermes_cli.plugins.invoke_hook', return_value=[]))
         result = agent.run_conversation('Repair example app. Why have we not fixed it yet?')
-    assert len(calls) == 3, 'diagnosis must be held and rechecked, not delivered immediately'
-    assert 'Unresolved work' in result['final_response']
-    assert ''.join(screen).count(diagnosis) <= 1
+    assert len(calls) == (2 if recheck_error else 3), 'diagnosis must be held and rechecked'
+    assert 'Unresolved goal' in result['final_response']
+    assert diagnosis not in result['final_response']
+    assert diagnosis not in ''.join(screen)
+    if recheck_error:
+        assert 'continuation unavailable' in result['final_response']
     assert not any(m.get('_pre_final_gate_synthetic') for m in result['messages'])
 
 
