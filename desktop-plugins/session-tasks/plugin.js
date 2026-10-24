@@ -289,7 +289,8 @@ function activeConnection() {
 function focusedRoute() {
   const owner = host.state?.focusedSessionOwner?.get?.()
   return {
-    connectionId: owner?.connectionId || activeConnection(),
+    // An owner with no connection is unresolved (including primary), not active.
+    connectionId: owner ? owner.connectionId : activeConnection(),
     profile: owner ? (owner.targetProfile || owner.profile || 'default') : (host.state?.profile?.get?.() || 'default')
   }
 }
@@ -297,8 +298,11 @@ function focusedRoute() {
 function api(path, connection, timeoutMs = 15_000, profile) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
-  const connectionId = connection || activeConnection()
-  return bridge({ path, ...(connectionId ? { connectionId } : {}), ...(profile !== undefined ? { profile } : {}), timeoutMs })
+  // Only an explicitly ambient caller may resolve the active connection.
+  // An unresolved captured owner must never be interpreted by the bridge.
+  const connectionId = arguments.length === 1 ? activeConnection() : connection
+  if (!connectionId) return Promise.reject(new Error('Session owner connection unavailable'))
+  return bridge({ path, connectionId, ...(profile !== undefined ? { profile } : {}), timeoutMs })
 }
 
 // stored id → { at, ids:Set } — the session plus its parent chain (compression
@@ -468,6 +472,18 @@ export async function refresh() {
       return emit()
     }
     const sameSession = scope === snapshot.scope
+    if (!route.connectionId) {
+      lastKanbanAt = 0
+      lastMachinesAt = 0
+      snapshot = {
+        runtime, stored, scope,
+        chips: [{
+          key: `owner-status:${scope}`, kind: 'kanban-status', state: 'unknown', stale: true,
+          label: 'Session owner unavailable', title: 'Could not resolve the session owner; work may still be unfinished.'
+        }]
+      }
+      return emit()
+    }
     const [procs, subagents] = await Promise.all([
       runtime ? safe(() => host.request('process.list', { session_id: runtime }), null) : null,
       runtime ? safe(() => host.request('subagent.list', { session_id: runtime }), null) : null

@@ -1,5 +1,5 @@
 // node --test: pure projections only (the SDK import is stubbed by the loader below).
-import { test } from 'node:test'
+import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { register } from 'node:module'
 
@@ -10,6 +10,12 @@ export async function resolve(spec, ctx, next) {
   return next(spec, ctx)
 }`))
 const m = await import('../plugin.js')
+
+// Successful reader fixtures need a resolved route; undefined now means unknown.
+beforeEach(async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.state = { connectionId: { get: () => 'fixture-connection' } }
+})
 
 test('processChips keeps only live processes, first command line', () => {
   const chips = m.processChips([
@@ -230,7 +236,7 @@ test('hub fallback cache cannot leak between profiles with the same session id',
   const { host } = await import('@hermes/plugin-sdk')
   let profile = 'work'
   let online = true
-  host.state = { profile: { get: () => profile } }
+  host.state = { ...host.state, profile: { get: () => profile } }
   globalThis.window = { hermesDesktop: { api: async ({ path }) => {
     if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [] }
     if (online && path.includes('session-links')) return { gateway: 'origin', tasks: [
@@ -274,6 +280,55 @@ test('failed authoritative task read stays unknown even when legacy board succee
     assert.deepEqual(recovered.map(c => c.id), ['t_retained'])
     assert.equal(recovered.some(c => c.kind === 'kanban-status'), false)
   } finally { delete globalThis.window }
+})
+
+test('explicit unresolved task and archive routes never re-resolve the active connection', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.state = { connectionId: { get: () => 'unrelated-active' } }
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    if (args.path.startsWith('/api/sessions/')) return { id: 's_unknown_route' }
+    return { tasks: [], machines: [] }
+  } } }
+  try {
+    for (const connectionId of [undefined, null, '']) {
+      const chips = await m.loadKanban(new Set(['s_unknown_route']), { connectionId, profile: 'work' })
+      assert.ok(chips.some(c => c.state === 'unknown'), 'unresolved tasks must not look empty')
+      const warnings = await m.archiveGuard({ sessionId: 's_unknown_route', connectionId, profile: 'work' })
+      assert.ok(warnings.some(line => /unavailable/i.test(line.value)))
+    }
+    assert.deepEqual(calls, [], 'no bridge call may inherit an active route')
+  } finally { delete globalThis.window; delete host.state }
+})
+
+test('unresolved primary owner stays unknown without querying the active connection', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  let connectionId
+  const calls = []
+  host.state = {
+    focusedSessionId: { get: () => 'primary-runtime' },
+    focusedStoredSessionId: { get: () => 'primary-stored' },
+    focusedSessionOwner: { get: () => ({ connectionId, profile: 'work' }) },
+    connectionId: { get: () => 'unrelated-active' }
+  }
+  host.request = async (...args) => { calls.push(args); return {} }
+  globalThis.document = { hidden: false, getElementById: () => ({ remove() {} }), addEventListener() {}, removeEventListener() {} }
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    if (args.path.startsWith('/api/sessions/')) return { id: 'primary-stored' }
+    return { tasks: [], machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    assert.deepEqual(calls, [], 'unresolved primary must not use ambient REST or RPC')
+    assert.ok(window.__sessionTasks.snapshot.chips.some(c => c.state === 'unknown'))
+    connectionId = 'resolved-primary'
+    await m.refresh()
+    assert.equal(window.__sessionTasks.snapshot.chips.some(c => c.state === 'unknown'), false)
+    assert.ok(calls.some(c => c.connectionId === 'resolved-primary'))
+  } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
 })
 
 test('poller reloads the same stored id when its owner profile changes', async () => {
