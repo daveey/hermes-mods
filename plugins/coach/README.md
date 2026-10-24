@@ -76,8 +76,15 @@ the candidate, and paired tool calls/results retaining call IDs and executor sta
 post-tool observations survive a later steering message. Orphan tool results cannot authorize work.
 The schema rejects nonfinite scores, invented references, missing user citations and inconsistent
 abandonment. Structured success/error fields are checked for remediation/capability claims;
-HTTP 503 is not proof that the agent lacks repair capability. Scope and whether a readback exercises
-the requested path still require semantic judgment. Analysis-only, plan-first, status-only,
+HTTP 503 is not proof that the agent lacks repair capability. Authorization and remediation now
+require an additional `proof` object binding cited source to exact action/path. Authorization
+currently supports a latest literal user restriction (`Do not`/`Never`, explicit-user-direction
+path), or the native terminal pending-approval envelope with its exact command and `/approve`
+path. Other policy/denial formats remain UNKNOWN, not permission to retry. Remediation currently
+supports a requested exact HTTP(S) URL shared by user scope, tool arguments, result URL/status
+and candidate; a newer readback invalidates the older citation. Non-URL verification and other
+tool result formats remain UNKNOWN. Semantic judgment still decides whether that path fulfills
+the goal; these narrow adapters do not complete general action/approval/path acceptance. Analysis-only, plan-first, status-only,
 conceptual, hypothetical and genuine permission boundaries must not become repair mandates.
 
 **Limits / not rollout-ready:** a conservative local running-task adapter reads the exact
@@ -104,7 +111,10 @@ Telemetry uses `goal_disposition`, `goal_disposition_unknown`, and `abandonment_
 coach log, without storing full tool results in those events.
 
 Tests: `test_goal_disposition.py` covers strict schema/provenance, structured result validation,
-mode/buffering, scope-preserving capture and bounded errors. `test_goal_disposition_integration.py`
+mode/buffering, scope-preserving capture and bounded errors. `test_goal_proofs.py` covers
+exact action/path/source bindings, invented approval, untrusted printed status, URL-prefix
+mismatches and superseded evidence. The manager suite proves unsupported approval cannot clear
+a confirmed hold through the complete turn. `test_goal_disposition_integration.py`
 uses scripted model responses through complete `AIAgent.run_conversation` text stops for `cli` and
 `desktop`, including isolated normal plugin discovery, streaming holds, cap warning and ephemeral
 history stripping. It also loads coach with ask-gate/chat-closeout in two configured orders and

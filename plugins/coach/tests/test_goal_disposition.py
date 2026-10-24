@@ -73,13 +73,15 @@ def test_result_status_is_not_completion_or_missing_capability():
 
 
 def test_successful_readback_and_denied_access_have_distinct_dispositions():
-    base = [{'role': 'user', 'content': 'Repair example app'},
-            {'role': 'assistant', 'tool_calls': [{'id': 'c', 'function': {'name': 'fetch', 'arguments': '{}'}}]}]
-    for data, d, boundary in [('{"status":200}', 'remediated_verified', None),
+    base = [{'role': 'user', 'content': 'Repair https://example.com/health'},
+            {'role': 'assistant', 'tool_calls': [{'id': 'c', 'function': {'name': 'fetch', 'arguments': '{"url":"https://example.com/health"}'}}]}]
+    for data, d, boundary in [('{"status":200,"url":"https://example.com/health"}', 'remediated_verified', None),
                                ('{"error":"missing_credentials"}', 'capability_boundary', 'credentials')]:
-        e = gd.evidence_for(base + [{'role': 'tool', 'tool_call_id': 'c', 'content': data}], 'result')
+        e = gd.evidence_for(base + [{'role': 'tool', 'tool_call_id': 'c', 'content': data}], 'https://example.com/health result')
         v = verdict(disposition=d, unfinished=d != 'remediated_verified', boundary_kind=boundary,
                     evidence_refs=['user:0', 'tool:c'])
+        if d == 'remediated_verified':
+            v['proof'] = dict(target='https://example.com/health', source_ref='tool:c', scope_ref='user:0')
         assert gd.validate_disposition(v, e)['disposition'] == d
 
 
