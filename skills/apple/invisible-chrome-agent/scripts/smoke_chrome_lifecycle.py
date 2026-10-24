@@ -17,7 +17,7 @@ import time
 import urllib.request
 
 from chrome_agent_lifecycle import Config, Ledger, Lifecycle
-from chrome_test_fixtures import chrome_environment
+from chrome_test_fixtures import chrome_environment, fresh_profile_arguments
 
 
 def validate_isolation(port, upstream, profile, root):
@@ -49,9 +49,12 @@ def main():
     spec = importlib.util.spec_from_loader(loader.name, loader)
     api = importlib.util.module_from_spec(spec)
     loader.exec_module(api)
-    with tempfile.TemporaryDirectory(prefix='chrome-lease-smoke-') as directory:
+    allocation = tempfile.TemporaryDirectory(prefix='chrome-lease-smoke-')
+    with allocation as directory:
         root = Path(directory)
         profile = root / 'profile'
+        # Select only while fresh; reuse for this fixture's idle-exit/wake cycle.
+        profile_args = fresh_profile_arguments(allocation, profile)
         reserved = [reserve_port(), reserve_port()]
         port, upstream = [sock.getsockname()[1] for sock in reserved]
         validate_isolation(port, upstream, profile, root)
@@ -75,7 +78,7 @@ def main():
             assert not api.cdp_version(port=upstream), 'refusing occupied upstream port'
             ledger.new_generation()
             argv = [str(args.chrome), '--no-first-run', '--no-default-browser-check',
-                    '--user-data-dir=' + str(profile), '--remote-debugging-address=127.0.0.1',
+                    *profile_args, '--remote-debugging-address=127.0.0.1',
                     '--remote-debugging-port=' + str(upstream), '--no-startup-window']
             if not args.headful:
                 argv.append('--headless=new')

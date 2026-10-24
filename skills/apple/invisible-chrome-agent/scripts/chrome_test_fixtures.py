@@ -2,6 +2,26 @@
 import os
 from pathlib import Path
 import tempfile
+import sys
+
+
+def fresh_profile_arguments(directory, profile):
+    """Select test-only flags once, before launching a disposable profile.
+
+    Keep the TemporaryDirectory alive through all wakes and child cleanup.
+    This is not a production launch option or a real-Keychain acceptance test.
+    """
+    if not isinstance(directory, tempfile.TemporaryDirectory):
+        raise ValueError('a live disposable TemporaryDirectory is required')
+    root = Path(directory.name)
+    profile = Path(profile)
+    if (not root.is_dir() or root.is_symlink() or profile.parent != root
+            or profile.is_symlink() or profile.exists()):
+        raise ValueError('refusing existing or non-isolated fixture profile')
+    args = ['--user-data-dir=' + str(profile)]
+    if sys.platform == 'darwin':
+        args.append('--use-mock-keychain')
+    return args
 
 
 def chrome_environment(root):

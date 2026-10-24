@@ -239,6 +239,7 @@ python3 -m unittest -v test_chrome_agent_lifecycle test_hermes_chrome_agent test
 python3 -m unittest -v test_chrome_astra_rework test_chrome_clock_rework test_chrome_daemon_processes
 python3 -m unittest -v test_chrome_endpoint_ownership test_chrome_stop_ownership
 python3 -m unittest -v test_chrome_retirement test_chrome_retirement_harness test_chrome_native_retirement
+python3 -m unittest -v test_chrome_download_fixture
 ```
 
 The lifecycle tests cover ledger isolation/persistence/permissions, corrupt state,
@@ -261,9 +262,24 @@ checks remaining probe budgets and runtime socket-byte limits, and binds a real
 short fixture socket. Chrome fixtures also redirect HOME, launcher data and crash/cache
 directories; `--user-data-dir` alone does not isolate those writes on Linux.
 
+The download-fixture regression checks fresh disposable profile ownership,
+Darwin-only mock-Keychain arguments, smoke wiring before launch, and captured
+managed/legacy production supervisor argv without the mock flag. The Linux-only
+endpoint/stop builders (also used by harness-retirement) keep their existing flags.
+
 For a separately approved real-CDP smoke, the harness launches only its own fresh
 headless Chrome/profile and ephemeral ports, refuses ports 9333/9334 and existing
 profiles, and cleans up its child/proxy in `finally`:
+
+On macOS this disposable smoke uses `--use-mock-keychain`, selected before the
+first launch and retained for that fixture's wake. Other platforms are unchanged.
+Controlled native fixture runs demonstrated a Keychain-dependent download stall
+without that flag; they do not establish the exact OS-internal cause. The flag is
+test-only: the production supervisor never imports this helper or adds the flag.
+Both headless and `--headful` smoke use mock Keychain on macOS and cannot establish
+real Keychain, Touch ID or passkey acceptance. Those require separate native
+production-launch acceptance without the mock flag; do not add it to installation
+settings or use personal credentials in the smoke.
 
 ```sh
 python3 smoke_chrome_lifecycle.py --chrome '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
