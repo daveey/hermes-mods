@@ -312,7 +312,9 @@ class FocusGuardTest(unittest.TestCase):
 
     def test_show_age_follows_show_flag_mtime(self):
         import tempfile
-        d = tempfile.mkdtemp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = tmp.name
         with mock.patch.object(hca, "SHOW_FLAG", os.path.join(d, "show")):
             self.assertEqual(hca.show_age(), float("inf"))
             open(hca.SHOW_FLAG, "w").close()
@@ -380,7 +382,9 @@ class FocusFilterRules(unittest.TestCase):
 
     def test_show_active_respects_flag_and_expiry(self):
         import tempfile
-        d = tempfile.mkdtemp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = tmp.name
         with mock.patch.object(hca, "SHOW_FLAG", os.path.join(d, "show")):
             self.assertFalse(hca.show_active())
             open(hca.SHOW_FLAG, "w").close()                       # `show` with no deadline
@@ -401,11 +405,15 @@ class FakeChrome:
         import socket as _s
         import threading as _t
         self.received, self.http, self.handshakes = [], [], []
+        self.connections = set()
+        self.workers = []
+        self.connection_lock = _t.Lock()
         self.srv = _s.socket()
         self.srv.bind(("127.0.0.1", 0))
         self.srv.listen(16)
         self.port = self.srv.getsockname()[1]
-        _t.Thread(target=self._accept, daemon=True).start()
+        self.accept_thread = _t.Thread(target=self._accept, daemon=True)
+        self.accept_thread.start()
 
     def _accept(self):
         import threading as _t
@@ -414,9 +422,23 @@ class FakeChrome:
                 c, _ = self.srv.accept()
             except OSError:
                 return
-            _t.Thread(target=self._conn, args=(c,), daemon=True).start()
+            with self.connection_lock:
+                self.connections.add(c)
+            worker = _t.Thread(target=self._conn, args=(c,), daemon=True)
+            self.workers.append(worker)
+            worker.start()
 
     def _conn(self, c):
+        try:
+            with c:
+                self._serve_conn(c)
+        except OSError:
+            pass
+        finally:
+            with self.connection_lock:
+                self.connections.discard(c)
+
+    def _serve_conn(self, c):
         import hashlib
         r = hca._Reader(c)
         head = r.read_head()
@@ -463,7 +485,23 @@ class FakeChrome:
         c.close()
 
     def close(self):
+        import socket
+        try:
+            self.srv.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.srv.close()
+        self.accept_thread.join(2)
+        with self.connection_lock:
+            clients = list(self.connections)
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            client.close()
+        for worker in self.workers:
+            worker.join(2)
 
 
 import base64  # noqa: E402  (FakeChrome handshake)
@@ -475,7 +513,6 @@ class FocusFilterProxy(unittest.TestCase):
     """End to end over loopback: client -> CDPProxy -> FakeChrome."""
 
     def setUp(self):
-        import tempfile
         self.chrome = FakeChrome()
         self.addCleanup(self.chrome.close)
         self.show = False
@@ -487,7 +524,7 @@ class FocusFilterProxy(unittest.TestCase):
         self.proxy.start()
         self.addCleanup(self.proxy.close)
         self.port = self.proxy.port
-        self.tmp = tempfile.mkdtemp()
+
 
     def get(self, path, method="GET"):
         req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path), method=method)
