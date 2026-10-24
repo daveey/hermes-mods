@@ -6,7 +6,7 @@ An opt-in pre-final plugin can attach `unresolved_fallback: {goal, evidence_refs
 
 ## How it works
 
-`pre_final_gate` structurally validates the fallback; the plugin is responsible for evidence and authorization validation. Stop-gate state carries the typed fallback to the finalizer. Held text is private scaffolding and removed from returned history. Hook worker threads copy ContextVars so profile-local settings and auxiliary credentials resolve in the caller's scope.
+`pre_final_gate` structurally validates the fallback; the plugin is responsible for evidence and authorization validation. Stop-gate state carries the typed fallback to the finalizer. Held text is private scaffolding and removed from returned history. Hook worker threads copy ContextVars so profile-local settings and auxiliary credentials resolve in the caller's scope. The exact holding callback owns its recheck; removal or replacement cannot be accepted by an unrelated callback. Buffered gates run before verification interim emission. Successful owner acceptance clears the old rejection even when another pre-final gate subsequently holds.
 
 ## Code
 
@@ -31,7 +31,7 @@ Do not enable enforcement yet. The changes are on draft branches, not the releas
 
 ## Gotchas
 
-This is not a remediation guarantee. The companion coach guard still lacks authoritative owner readbacks and complete ancestry recovery. Uncertain first checks fail open with telemetry; confirmed rejected candidates must not silently become accepted merely because a recheck failed. No task is created, no permission broadened, and no self-heal or Inbox policy changed.
+This is not a remediation guarantee. The companion coach guard has a conservative local running-task readback only; remote ownership and complete ancestry recovery remain incomplete. Uncertain first checks fail open with telemetry; confirmed rejected candidates must not silently become accepted merely because a recheck failed. No task is created, no permission broadened, and no self-heal or Inbox policy changed.
 
 ## Plugin?
 

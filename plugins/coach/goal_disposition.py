@@ -134,6 +134,23 @@ def capability_failure(row):
                                  'authentication_required', 'access_denied')
 
 
+def _ro_connect(path):
+    import sqlite3
+    uri = Path(path).resolve().as_uri()
+    try:
+        conn = sqlite3.connect(uri + '?mode=ro', uri=True, timeout=1)
+    except sqlite3.OperationalError:
+        # WAL sidecars may have been removed by the last writer. Never create a DB.
+        conn = sqlite3.connect(uri + '?mode=rw', uri=True, timeout=1)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA query_only=ON')
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
 def authoritative_owner(v, evidence, session_id):
     """Conservative local running-worker proof, never cached model/tool assertions.
 
@@ -171,15 +188,9 @@ def authoritative_owner(v, evidence, session_id):
     if not isinstance(request, str) or not request or not v['actionable'] or not v['unfinished']:
         raise ValueError('owner_request_unavailable')
 
-    def readonly(path):
-        conn = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=1)
-        conn.row_factory = sqlite3.Row
-        conn.execute('PRAGMA query_only=ON')
-        return conn
-
     try:
         # Never SessionDB()/kb.connect(): those may create/migrate/write stores.
-        with closing(readonly(Path(get_hermes_home()) / 'state.db')) as state:
+        with closing(_ro_connect(Path(get_hermes_home()) / 'state.db')) as state:
             origin = state.execute('SELECT profile_name FROM sessions WHERE id=?', (session_id,)).fetchone()
             current = state.execute("SELECT content FROM messages WHERE session_id=? AND role='user' ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
             if not origin or origin['profile_name'] != profile or not current or current['content'] != request:
@@ -192,7 +203,7 @@ def authoritative_owner(v, evidence, session_id):
             raise ValueError('owner_board_pin_mismatch')
         if kb.read_board_metadata(ref['board']).get('archived'):
             raise ValueError('owner_board_archived')
-        with closing(readonly(path)) as conn:
+        with closing(_ro_connect(path)) as conn:
             conn.execute('BEGIN')  # consistent card/run/subscription snapshot
             task = conn.execute('SELECT * FROM tasks WHERE id=?', (ref['task_id'],)).fetchone()
             if (not task or task['status'] != 'running' or task['assignee'] != profile

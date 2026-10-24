@@ -80,8 +80,11 @@ HTTP 503 is not proof that the agent lacks repair capability. Scope and whether 
 the requested path still require semantic judgment. Analysis-only, plan-first, status-only,
 conceptual, hypothetical and genuine permission boundaries must not become repair mandates.
 
-**Limits / not rollout-ready:** authoritative fresh task/process owner adapters are not yet wired;
-`owned_continuing` always becomes UNKNOWN (`owner_readback_unavailable`), never fabricated ownership.
+**Limits / not rollout-ready:** a conservative local running-task adapter reads the exact
+hostname/profile/board/task from authoritative stores. It requires exact request/body and goal/title
+matches, a live matching process claim, and an origin-linked TUI result subscription. This proves a
+durable return route, not notifier health or eventual delivery. Remote, scheduled, cross-profile,
+paraphrased-goal and non-TUI-return cases remain UNKNOWN; no cached tool assertion certifies ownership.
 Compression that changes the session ID can lose the in-memory turn capture. Prior context is limited
 to 24 rows; complete evidence is limited to 200 rows / 32k serialized characters and 128 sessions.
 Oversized evidence fails open with telemetry. This is not a hard completion guarantee: judge errors,
@@ -103,6 +106,8 @@ uses scripted model responses through complete `AIAgent.run_conversation` text s
 history stripping. It also loads coach with ask-gate/chat-closeout in two configured orders and
 force-reloads discovery. These are backend tests, not Electron UI or production activation proof.
 Semantic judges are injected; scope negatives test routing, not model classification accuracy.
+`test_goal_ownership.py` also exercises real isolated Kanban tables through discovered agent text
+stops, scope/liveness/return-route rejection, and read-only WAL fallback without creating databases.
 
 ### Fix loops across turns (`pre_llm_call` + `post_llm_call`)
 

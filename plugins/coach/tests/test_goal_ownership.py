@@ -201,3 +201,41 @@ def test_unavailable_remote_is_visible_unknown(owner, monkeypatch):
     gate = gd.build_gate(SimpleNamespace(log=events.append))
     assert gate(session_id=SID, turn_messages=[dict(role='user',content=REQUEST)]) is None
     assert events[-1]['reason'] == 'owner_remote_readback_unavailable'
+
+
+def test_authoritative_reads_survive_readonly_wal_open_failure(owner, monkeypatch):
+    original = sqlite3.connect
+    opened = []
+    def connect(database, *args, **kwargs):
+        if isinstance(database, str) and database.endswith('?mode=ro'):
+            raise sqlite3.OperationalError('unable to open database file')
+        conn = original(database, *args, **kwargs)
+        opened.append(conn)
+        return conn
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    assert certify(owner)['disposition'] == 'owned_continuing'
+    assert len(opened) == 2
+
+
+def test_owner_readonly_helper_rejects_writes_and_missing_database(tmp_path, monkeypatch):
+    p = tmp_path / 'owner.db'
+    with sqlite3.connect(p) as c:
+        c.execute('CREATE TABLE proof (x)')
+    original = sqlite3.connect
+    def connect(database, *args, **kwargs):
+        if isinstance(database, str) and database.endswith('?mode=ro'):
+            raise sqlite3.OperationalError('unable to open database file')
+        return original(database, *args, **kwargs)
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    c = gd._ro_connect(p)
+    try:
+        assert c.execute('PRAGMA query_only').fetchone()[0] == 1
+        assert c.execute('SELECT count(*) FROM proof').fetchone()[0] == 0
+        with pytest.raises(sqlite3.OperationalError):
+            c.execute('INSERT INTO proof VALUES (1)')
+    finally:
+        c.close()
+    missing = tmp_path / 'missing.db'
+    with pytest.raises(sqlite3.OperationalError):
+        gd._ro_connect(missing)
+    assert not missing.exists()
