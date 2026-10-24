@@ -176,6 +176,9 @@ def _teardown(sid: str, agent: str, cwd: str = "") -> list[dict]:
                 rec = json.loads(Path(gd, base.MARKER).read_text())
             except (OSError, ValueError):
                 continue
+            # Worker trees must go through the board/run/result gate, never Stop.
+            if rec.get('task_id'):
+                continue
             path = rec.get("path") or base._wt_path(gd)
             if rec.get("agent") == agent and rec.get("agent_session_id") == sid and path and os.path.isdir(path):
                 out.append(remove_if_merged(path, f"made by {agent} session {sid}"))

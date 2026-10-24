@@ -2,13 +2,19 @@
 
 Run: python3 -B -m unittest discover -s plugins/worktree-owner/tests   (stdlib only; temp git repos)
 """
-import importlib.util, json, os, subprocess, tempfile, time, unittest
+import importlib.util, json, os, sqlite3, subprocess, tempfile, time, unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 
 class CwdPortability(unittest.TestCase):
+    def setUp(self):
+        platform = patch('sys.platform', 'darwin')
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def test_lsof_resolved_from_path(self):
         m = load()
         with patch("shutil.which", return_value="/usr/bin/lsof"), \
@@ -104,8 +110,26 @@ def load():
 
 class Owner(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
+        self.db = self.tmp / 'board.db'
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('create table tasks (id text primary key, status text, current_run_id text, workspace_path text)')
         self.m = load()
+        original = self.m.on_tool_call
+        def verified_call(name, args, duration_ms=0, env=None, **kwargs):
+            env = dict(env or {}, HERMES_KANBAN_DB=str(self.db), HERMES_KANBAN_RUN_ID='run1')
+            if name == 'kanban_complete' and env.get('HERMES_KANBAN_TASK'):
+                with closing(sqlite3.connect(self.db)) as c, c:
+                    c.execute('insert or replace into tasks values (?, ?, ?, ?)',
+                              (env['HERMES_KANBAN_TASK'], 'done', 'run1', env.get('HERMES_KANBAN_WORKSPACE', '')))
+                    c.execute("delete from tasks where id like 'shared%'")
+                    for i, path in enumerate(self.live):
+                        c.execute('insert into tasks values (?, ?, ?, ?)', (f'shared{i}', 'running', 'other', path))
+                kwargs['result'] = json.dumps(dict(ok=True, task_id=env['HERMES_KANBAN_TASK'], run_id='run1'))
+            return original(name, args, duration_ms, env, **kwargs)
+        self.m.on_tool_call = verified_call
         self.code = self.tmp / "code"
         self.code.mkdir()
         self.m.REPO_GLOBS = [str(self.code / "*" / ".git"), str(self.code / "*" / "*" / ".git")]

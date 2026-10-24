@@ -22,7 +22,9 @@ def load():
 
 class AgentHook(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
         self.h = load()
         self.b = self.h.base
         self.code = self.tmp / "code"; self.code.mkdir()
@@ -152,6 +154,15 @@ class AgentHook(unittest.TestCase):
         [t.start() for t in ts]; [t.join() for t in ts]
         acts = [r["action"] for res in out for r in res]
         self.assertEqual(acts, ["removed"]); self.assertFalse(p.exists())
+
+    def test_kanban_owned_tree_waits_for_verified_completion(self):
+        p = self.make('proj-worker', 'worker')
+        gd = Path(git(p, 'rev-parse', '--absolute-git-dir').strip())
+        marker = self.marker(p)
+        marker['task_id'] = 'task'
+        (gd / self.b.MARKER).write_text(json.dumps(marker))
+        self.assertEqual(self.end(), [])
+        self.assertTrue(p.exists())
 
     def test_main_never_fails_on_garbage(self):
         self.assertEqual(self.h.handle({}, "claude", env={}), [])

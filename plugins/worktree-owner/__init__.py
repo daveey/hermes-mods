@@ -21,6 +21,10 @@ Log: ~/.hermes/logs/worktree-owner.log.
 from __future__ import annotations
 
 import glob
+import re
+import sys
+import tarfile
+from contextlib import closing
 import json
 import logging
 import os
@@ -129,6 +133,8 @@ def _wt_path(gd: str) -> str | None:
 def owner_from_env(env) -> dict:
     return {k: v for k, v in dict(task_id=env.get("HERMES_KANBAN_TASK") or None,
                                     session_id=env.get("HERMES_SESSION_ID") or None,
+                                    board_db=os.path.realpath(env['HERMES_KANBAN_DB']) if env.get('HERMES_KANBAN_DB') else None,
+                                    run_id=env.get('HERMES_KANBAN_RUN_ID') or None,
                                     profile=env.get("HERMES_PROFILE") or None).items() if v}
 
 
@@ -136,7 +142,7 @@ def _ours(path: str | None, text: str, tool: str = "terminal") -> bool:
     """Attribution guard: the new tree's dir name is in the command, or (terminal only) a shell loop builds the paths
     from variables (`for b in ...; do git worktree add ... $W/$b`). A tree another agent creates in the same seconds
     and that this call does not name is not claimed. execute_code must name the path: Python code is full of `{`."""
-    if not path:
+    if not path or re.search(r'\bssh\b', text):
         return False
     if os.path.basename(path.rstrip("/")) in text:
         return True
@@ -197,14 +203,48 @@ def _removable(path: str) -> str | None:
         return "git status failed"
     if st.stdout.strip():
         return "uncommitted/untracked changes"
-    head = _git(path, "rev-parse", "HEAD").stdout.strip()
-    if not _git(path, "branch", "-r", "--contains", head).stdout.strip():
+    head = _git(path, 'rev-parse', 'HEAD')
+    if head.returncode:
+        return 'git status failed'
+    remotes = _git(path, 'branch', '-r', '--contains', head.stdout.strip())
+    if remotes.returncode:
+        return 'git status failed'
+    if not remotes.stdout.strip():
         return "HEAD not on any remote"
     return None
 
 
+def _proc_cwds(root: str = '/proc') -> list[str]:
+    paths = []
+    for name in os.listdir(root):
+        if not name.isdigit():
+            continue
+        proc = Path(root, name)
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            try:
+                paths.append(os.readlink(proc / 'cwd'))
+            except (FileNotFoundError, PermissionError):
+                # Linux may report EACCES, not ENOENT, for a zombie cwd.
+                # A zombie has no cwd; any other existing process is unknown.
+                try:
+                    state = (proc / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+                except FileNotFoundError:
+                    continue  # exited during enumeration
+                if state != 'Z':
+                    raise RuntimeError(f'cannot read cwd for live pid {name}')
+        except FileNotFoundError:
+            continue  # disappeared before stat
+    if not paths:
+        raise RuntimeError('empty process cwd scan')
+    return paths
+
+
 def live_cwds() -> list[str]:
     """Raise on an unavailable/incomplete process scan: unknown is never idle."""
+    if sys.platform.startswith('linux'):
+        return _proc_cwds()
     lsof = shutil.which("lsof")
     if not lsof and os.access("/usr/sbin/lsof", os.X_OK):
         lsof = "/usr/sbin/lsof"  # macOS launchers may omit sbin from PATH
@@ -227,20 +267,25 @@ def _archive(path: str) -> str:
         i += 1
         dst = ARCHIVE / f"{os.path.basename(path.rstrip('/'))}-{stamp}-{i}"
     dst.mkdir(parents=True)
-    head = _git(path, "rev-parse", "HEAD").stdout.strip()
-    meta = dict(path=path, head=head, branch=_git(path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+    head_result = _git(path, 'rev-parse', 'HEAD')
+    if head_result.returncode:
+        raise RuntimeError('HEAD lookup failed')
+    head = head_result.stdout.strip()
+    meta = dict(path=path, head=head,
                 archived_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), by="worktree-owner")
-    if _git(path, "rev-list", "-1", "HEAD", "--not", "--remotes").stdout.strip():
-        b = _git(path, "bundle", "create", str(dst / "unpushed.bundle"), "HEAD", "--not", "--remotes", timeout=600)
-        if b.returncode != 0 or _git(path, "bundle", "verify", str(dst / "unpushed.bundle")).returncode != 0:
-            raise RuntimeError(f"bundle failed: {b.stderr.strip()[:150]}")
-        _git(path, "format-patch", "-q", "-o", str(dst / "commits"), "HEAD", "--not", "--remotes", timeout=600)
+    # Full history: recovery must not depend on the original repo or remote.
+    b = _git(path, 'bundle', 'create', str(dst / 'unpushed.bundle'), 'HEAD', timeout=600)
+    if b.returncode or _git(path, 'bundle', 'verify', str(dst / 'unpushed.bundle')).returncode:
+        raise RuntimeError('bundle creation/verification failed')
     d = subprocess.run(["git", "-C", path, "diff", "HEAD", "--binary"], capture_output=True, timeout=600)
     if d.returncode != 0:
         raise RuntimeError("diff failed")
     if d.stdout.strip():
         (dst / "uncommitted.diff").write_bytes(d.stdout)
-    un = [f for f in _git(path, "ls-files", "-o", "--exclude-standard", "-z", timeout=600).stdout.split("\0") if f]
+    listing = _git(path, 'ls-files', '-o', '--exclude-standard', '-z', timeout=600)
+    if listing.returncode:
+        raise RuntimeError('untracked listing failed')
+    un = [f for f in listing.stdout.split('\0') if f]
     if un:
         lst = dst / "untracked.list"
         lst.write_text("\0".join(un) + "\0")
@@ -248,6 +293,12 @@ def _archive(path: str) -> str:
                            capture_output=True, timeout=900)
         if t.returncode != 0:
             raise RuntimeError(f"tar failed: {t.stderr[:150]!r}")
+        with tarfile.open(dst / 'untracked.tar.gz') as archive:
+            for member in archive:
+                if member.isfile():
+                    with archive.extractfile(member) as stream:
+                        while stream.read(1024 * 1024):
+                            pass
         lst.unlink()
         meta["untracked_files"] = len(un)
     (dst / "meta.json").write_text(json.dumps(meta, indent=1))
@@ -262,11 +313,32 @@ def _in_scratch(path: str, ws: str) -> bool:
     return rp.startswith(rw + "/")
 
 
+def _complex_reason(path: str) -> str | None:
+    if os.path.realpath(path) != os.path.abspath(path):
+        return 'symlink target'
+    def fail(error):
+        raise error
+    for root, dirs, files in os.walk(path, onerror=fail, followlinks=False):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            if os.path.islink(p) or (name == '.git' and root != path):
+                return 'nested git or symlink'
+            if not os.path.isdir(p) and not os.path.isfile(p):
+                return 'special file'
+    ignored = _git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
+    if ignored.returncode or ignored.stdout:
+        return 'ignored files or unreadable listing'
+    return None
+
+
 def _remove(path: str, why_owned: str, ws: str = "") -> dict:
     rp = os.path.realpath(path)
     if any(c == rp or c.startswith(rp + "/") or c == path or c.startswith(path + "/") for c in live_cwds()):
         _log(f"KEEP {path} ({why_owned}): a live process works in it")
         return dict(path=path, action="kept: live process")
+    complex_reason = _complex_reason(path)
+    if complex_reason:
+        return dict(path=path, action=f'kept: {complex_reason}')
     keep = _removable(path)
     archived = None
     if keep and _in_scratch(path, ws) and keep != "git status failed":
@@ -291,8 +363,32 @@ def _remove(path: str, why_owned: str, ws: str = "") -> dict:
 
 
 def teardown(task_id: str, env) -> list[dict]:
+    db, run = env.get('HERMES_KANBAN_DB'), env.get('HERMES_KANBAN_RUN_ID')
+    if not db or not run:
+        return []
+    # mode=rw never creates a missing board. Hold the writer reservation through
+    # filesystem removal so reopen/reassignment cannot race our authorization.
+    with closing(sqlite3.connect(Path(db).resolve().as_uri() + '?mode=rw', uri=True, timeout=10)) as c:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('select status, current_run_id, workspace_path from tasks where id=?', (task_id,)).fetchone()
+        if not row or row[0] != 'done' or row[1] != run:
+            return []
+        live = {os.path.realpath(r[0]) for r in c.execute(
+            "select workspace_path from tasks where status not in ('done','archived') and id != ? and coalesce(workspace_path,'') != ''", (task_id,))}
+        return _teardown_locked(task_id, env, row[2] or '', live)
+
+
+def _overlap(a: str, b: str) -> bool:
+    a, b = os.path.realpath(a), os.path.realpath(b)
+    return a == b or a.startswith(b + '/') or b.startswith(a + '/')
+
+
+def _teardown_locked(task_id: str, env, ws: str, live: set[str]) -> list[dict]:
     results = []
-    ws = env.get("HERMES_KANBAN_WORKSPACE") or ""
+    def remove(path, why, scratch=''):
+        if any(_overlap(path, other) for other in live):
+            return dict(path=path, action='kept: shared with an open card')
+        return _remove(path, why, scratch)
     for common in _common_dirs([ws]):
         for gd in glob.glob(os.path.join(common, "worktrees", "*")):
             try:
@@ -300,17 +396,14 @@ def teardown(task_id: str, env) -> list[dict]:
             except (OSError, ValueError):
                 continue
             path = rec.get("path") or _wt_path(gd)
-            if rec.get("task_id") == task_id and path and os.path.isdir(path):
-                results.append(_remove(path, f"registered to {task_id}", ws))
+            if (rec.get('task_id') == task_id and rec.get('run_id') == env.get('HERMES_KANBAN_RUN_ID')
+                    and rec.get('board_db') == os.path.realpath(env['HERMES_KANBAN_DB'])
+                    and path and os.path.isdir(path) and os.path.realpath(path) == os.path.realpath(_wt_path(gd) or '/')):
+                results.append(remove(path, f"registered to {task_id}", ws))
     # the card's own dir: workspace, when it is a linked worktree (a .git FILE) that no other open card uses
     if ws and os.path.isfile(os.path.join(ws, ".git")) and \
             not any(os.path.realpath(r["path"]) == os.path.realpath(ws) for r in results):
-        live = live_workspace_paths(exclude=task_id)
-        if "*" in live or os.path.realpath(ws) in live:
-            _log(f"KEEP {ws}: another open card uses this workspace (or the board is unreadable)")
-            results.append(dict(path=ws, action="kept: shared with an open card"))
-        else:
-            results.append(_remove(ws, f"dir workspace of {task_id}"))
+        results.append(remove(ws, f"dir workspace of {task_id}"))
     return results
 
 
@@ -319,7 +412,7 @@ def _mentions_worktree_add(text: str) -> bool:
     return "worktree add" in t
 
 
-def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None) -> list[dict]:
+def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None, result=None) -> list[dict]:
     env = os.environ if env is None else env
     try:
         name = str(tool_name or "")
@@ -336,6 +429,14 @@ def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None) -> l
             task = str(a.get("task_id") or env["HERMES_KANBAN_TASK"])
             if task != env["HERMES_KANBAN_TASK"]:
                 return []  # completing another card (orchestrator/reviewer): not ours to tear down
+            r = json.loads(result) if isinstance(result, str) else result
+            if (not isinstance(r, dict) or r.get('ok') is not True or r.get('error')
+                    or r.get('task_id') != task or not env.get('HERMES_KANBAN_RUN_ID')
+                    or r.get('run_id') != env['HERMES_KANBAN_RUN_ID']):
+                return []
+            # An explicit board is safe only when the worker identifies that board.
+            if a.get('board') is not None and a['board'] != env.get('HERMES_KANBAN_BOARD'):
+                return []
             return teardown(task, env)
     except Exception as e:  # noqa: BLE001 - must never break a tool call
         _log(f"WARN hook failed for {tool_name}: {type(e).__name__}: {e}")
@@ -343,8 +444,8 @@ def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None) -> l
     return []
 
 
-def _post_tool_call(tool_name: str = "", args: Any = None, duration_ms: Any = 0, **_: Any) -> None:
-    on_tool_call(tool_name, args, duration_ms)
+def _post_tool_call(tool_name: str = "", args: Any = None, duration_ms: Any = 0, result=None, **_: Any) -> None:
+    on_tool_call(tool_name, args, duration_ms, result=result)
     return None
 
 
