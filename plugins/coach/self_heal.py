@@ -33,7 +33,12 @@ COMPONENTS = ("agent", "desktop", "plugin", "cron", "kanban", "bot", "gateway", 
 
 OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
 # Hermes-written user-role text: "[IMPORTANT: ...", "[System note: ...", kanban completion notices.
-SYNTHETIC_RE = re.compile(r"^\s*(?:\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|You've reached the maximum|[✔✓✗✖⚠] )")
+# Keep coordination notices out of the user-complaint lane. Their underlying failures
+# belong to the machine-signal collector, not a second complaint filed by the recipient.
+SYNTHETIC_RE = re.compile(
+    r"^\s*(?:\[Message from another Hermes session(?:\s|\])|\[chat-closeout\]|"
+    r"⏸\ufe0f?\s+\[[^\]\n]+\]\s+(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
+    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|You've reached the maximum|[✔✓✗✖⚠] )")
 # Plugin-appended blocks that are not the user's words.
 TRAILER_RE = re.compile(r"\n?\s*(?:\[user-steps\]|--- Attached Context ---|Session link\(s\) @session).*", re.S)
 
