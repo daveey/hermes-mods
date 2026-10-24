@@ -17,7 +17,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 |---|---|---|
 | [kanban-scratch-git-preservation.md](kanban-scratch-git-preservation.md) | 0261 | Tool, CLI and REST completion preserve Git-bearing or uncertain scratch before any optional post-tool cleanup |
 | [kanban-touch-subscriptions.md](kanban-touch-subscriptions.md) | 0249 | Touch subscriptions do not own work |
-| [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0250 | Condition-driven scheduled wakes |
+| [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0250 0262 | Condition-driven scheduled wakes with generation fencing and shared-park guards |
 | [inline-preview-full-document.md](inline-preview-full-document.md) | 0251 | Whole-document inline previews |
 | [kanban-default-provider.md](kanban-default-provider.md) | 0252 | Default tier provider inference |
 | [test-live-git-config-guard.md](test-live-git-config-guard.md) | 0253 0255 | Protect live git identity during tests |
@@ -82,7 +82,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-false-done-attention.md](kanban-false-done-attention.md) | 0194 | A chat whose kanban cards are all done stripes amber, not green, when a card finished in the last 24 h admits dropped work with no follow-up card (judged by a plugin-registered check, e.g. `plugins/kanban-honest-done`) |
 | [tool-search-defer-outside-worker.md](tool-search-defer-outside-worker.md) | 0145 | `tools.tool_search.defer_outside_kanban_worker` defers the listed tools (the Kanban worker-lifecycle tools on the fork) in chats, cron and one-shots only; dispatcher-spawned Kanban workers keep them direct, saving ~3.7k tokens per call elsewhere |
 | [plugin-archive-hotkey.md](plugin-archive-hotkey.md) | 0147, 0157 | Plugins can take over ⌘⇧A for sessions they own (`ctx.registerArchiveHotkeyHandler`); Inbox uses it to archive and open the next Inbox message. `ctx.openNextSession(id)` gives plugin buttons the same next-session step (Inbox last card) |
-| [model-tiers.md](model-tiers.md) | 0151 0152 | Per-task `model`/`provider` on delegate_task (`delegation.allow_task_model`); Kanban cards with no pinned model run on `kanban.default_model`, except reviews, retries after a failed run and keep-pattern matches (each run logs a `model_tier` event) |
+| [model-tiers.md](model-tiers.md) | 0151 0152 0263 | Lazy selected-route preflight; per-task `model`/`provider` on delegate_task (`delegation.allow_task_model`); Kanban cards with no pinned model run on `kanban.default_model`, except reviews, retries after a failed run and keep-pattern matches (each run logs a `model_tier` event) |
 | [sidebar-exclude-sources.md](sidebar-exclude-sources.md) | 0154 | Per-profile `sessions.sidebar_exclude_sources` (e.g. `[api_server]`) keeps a machine profile's sessions out of the sidebar project tree |
 | [gemini-provider-defaults.md](gemini-provider-defaults.md) | 0156 0247 | `--provider gemini` without `-m` uses a Gemini model instead of sending your `claude-*` default (404); Gemini aux/title default is `gemini-3.8-flash` |
 | [sidebar-created-sort.md](sidebar-created-sort.md) | 0158 | Sidebar 'created' sort orders, clusters and date-buckets by `started_at`, so a reply in an old chat no longer lifts it to the top |

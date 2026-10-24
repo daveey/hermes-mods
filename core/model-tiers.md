@@ -10,6 +10,8 @@ Patches:
 What you see: routine Kanban cards and subagents run on a cheaper model (Sonnet on the fork), while reviews, hard
 retries and cards you pin stay on the profile's model (Opus). Each Kanban run records why in a `model_tier` event.
 
+Patch 0263 fixes eager default-route preflight: only routes selected by a child are resolved.
+
 ## Behavior
 
 delegate_task:
@@ -19,6 +21,7 @@ delegate_task:
 - `model` alone keeps the configured (or inherited) provider. A `provider` different from `delegation.provider`
   drops that block's `base_url`/`api_key`/`api_mode`/`command`/`args` and its model, then resolves through the
   same credential path as `delegation.provider`.
+- An unavailable unused default does not veto an explicit per-task provider. A mixed batch still fails atomically if any child needs an unavailable route.
 - A non-string pin or a provider that fails to resolve refuses the whole call before any child spawns
   (`Task <i>: ...`).
 - Off (upstream default): the schema does not advertise the fields and the model-facing entry points strip them,
@@ -67,7 +70,7 @@ sample had run on the strong model, so the labels are predictions; measure befor
   per-task model overrides `delegation.model` for that child only; a task model beats parent inheritance; a
   provider pin resolves through the credential path; a bad pin refuses the call before spawn; pins are stripped
   when not allowed; the dynamic schema advertises `model`/`provider` only when allowed and the static schema never.
-  Unit tests for `_task_route_cfg`.
+  Unit tests for `_task_route_cfg`. Patch 0263 adds unavailable-default/explicit-provider success and mixed-batch no-spawn tests (registered tool handler). All 12 tests passed; the new success test failed before the fix. Related batch-validation, fallback-matrix, external-provider and request-overrides suites: 58 tests passed together.
 - `tests/hermes_cli/test_kanban_model_tier.py` (dispatcher via `dispatch_once`; `kanban_create` tool via
   `_handle_create`): unpinned card gets the default and a `model_tier` event while the row stays unpinned; default
   off = upstream; `kanban_create(model=...)` keeps its pin while an unpinned tool-created card gets the default;
@@ -99,6 +102,7 @@ Add a rule to your agent instructions telling it when to pin the strong model (r
   doesn't serve that model will fail its workers. Scope with `default_model_profiles`.
 - Keep patterns are matched against the whole body, so a brief that mentions a pattern word incidentally keeps
   the strong model. Prefer specific patterns.
+- Leave both `delegation.model` and `delegation.provider` empty to inherit the active parent route; a hardcoded default requires credentials on every host. No automatic fallback is added for unavailable explicit pins.
 - `delegation.model` without `delegation.provider` follows the parent's provider; if the parent fell back to a
   different provider, the child asks that provider for the model. Set `delegation.provider` too.
 - hermes-sync's shared-config list compare only parses YAML items without spaces or quotes; keep patterns as
