@@ -21,6 +21,7 @@ DONE_STATUSES = ("done", "archived")
 HUMAN_STATUSES = ("review",)
 HUMAN_BLOCK_KINDS = (None, "", "needs_input", "capability")
 USER_QUIET_S = 300.0          # skip a wake while the user typed in the chat this recently
+MAX_WAKES_PER_HOUR = 2        # hard cap per chat, whatever the cards do
 STALE_S = 1800.0              # watchdog: unseen results / missing close-out older than this
 WATCHDOG_EVERY_S = 900.0
 NOTICE_RE = re.compile(r"^\s*(?:[✔⏸✖⏱🔄]\s*\[|\[chat-closeout\])")
@@ -106,6 +107,39 @@ def settled_sig(batch: Iterable[str], cards: dict[str, dict[str, Any]]) -> Optio
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
+def uncovered(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> list[str]:
+    """Settled batch cards no close-out has reported yet, when the whole batch is settled; else []."""
+    batch = row.get("batch") or []
+    if not settled_sig(batch, cards):
+        return []
+    covered = set(row.get("covered") or [])
+    return sorted(i for i in set(batch) if i not in covered)
+
+
+def closeout_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:
+    """Wake/close-out key: the id set of the settled cards not yet covered by a close-out. Statuses are not part of
+    it, so settled->settled churn (blocked->archived, done->archived) never makes a new key; only a card that was
+    not reported yet does."""
+    new = uncovered(row, cards)
+    return hashlib.sha1(";".join(new).encode()).hexdigest()[:16] if new else None
+
+
+def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Coverage upkeep: a covered card that went back to work (unblocked -> running) is uncovered, so its real
+    result gets a close-out; a covered card that is done/archived leaves the batch. Returns changed fields."""
+    batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
+    reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
+    gone = {i for i in covered & batch if (cards.get(i) or {}).get("status") in DONE_STATUSES}
+    out: dict[str, Any] = {}
+    if reopened or gone:
+        out["covered"] = (covered - reopened) - gone
+    if reopened:  # the same id set may settle again: its old key must not suppress the new close-out
+        out.update(done_sig=None, claim_sig=None)
+    if gone:
+        out["batch"] = batch - gone
+    return out
+
+
 # ---- the ledger ------------------------------------------------------------------------------------------------
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS waiting (
@@ -115,12 +149,21 @@ CREATE TABLE IF NOT EXISTS waiting (
   stamped_at REAL,
   settled_sig TEXT, settled_at REAL,     -- first time the batch was seen fully settled (this sig)
   done_sig TEXT, done_at REAL,           -- a turn ended after the batch settled: the close-out happened
-  claim_sig TEXT, claim_at REAL, claim_pid INTEGER, wake_result TEXT
+  claim_sig TEXT, claim_at REAL, claim_pid INTEGER, wake_result TEXT,
+  covered TEXT NOT NULL DEFAULT '[]',    -- batch cards a close-out already reported (never wake for them again)
+  closing TEXT,                          -- JSON batch ids while a close-out turn runs (NULL otherwise)
+  wakes TEXT NOT NULL DEFAULT '[]',      -- wall times of recent wakes (per-chat hourly cap)
+  wake_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS unseen_seen (session_id TEXT PRIMARY KEY, since REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
+
+
+_MIGRATE = (("covered", "TEXT NOT NULL DEFAULT '[]'"), ("closing", "TEXT"),
+            ("wakes", "TEXT NOT NULL DEFAULT '[]'"), ("wake_count", "INTEGER NOT NULL DEFAULT 0"))
+_JSON_SETS = ("batch", "open", "covered")
 
 
 class Ledger:
@@ -137,6 +180,10 @@ class Ledger:
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(_SCHEMA)
+        have = _cols(c, "waiting")
+        for col, ddl in _MIGRATE:
+            if col not in have:
+                c.execute(f"ALTER TABLE waiting ADD COLUMN {col} {ddl}")
         return c
 
     def get(self, sid: str) -> Optional[dict[str, Any]]:
@@ -159,7 +206,9 @@ class Ledger:
         return [_row(r) for r in rows]
 
     def write(self, sid: str, **fields: Any) -> None:
-        enc = {k: (json.dumps(sorted(v)) if k in ("batch", "open") else v) for k, v in fields.items()}
+        enc = {k: (json.dumps(sorted(v)) if k in _JSON_SETS else
+                   json.dumps(list(v)) if k in ("closing", "wakes") and v is not None else v)
+               for k, v in fields.items()}
         cols = ", ".join(enc)
         sets = ", ".join(f"{k}=excluded.{k}" for k in enc)
         with self._lock:
@@ -245,8 +294,7 @@ def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict]) -> di
     that state: the sidebar keeps them grey "waiting" until the closing answer lands."""
     out: dict[str, list[str]] = {}
     for row in ledger.pending():
-        sig = settled_sig(row["batch"], read(row["batch"]))
-        if sig and sig != row.get("done_sig"):
+        if closeout_key(row, read(row["batch"])):
             out[row["session_id"]] = sorted(row["batch"])
     return out
 
@@ -255,20 +303,28 @@ def _row(r) -> Optional[dict[str, Any]]:
     if r is None:
         return None
     d = dict(r)
-    for k in ("batch", "open"):
+    for k in ("batch", "open", "covered", "wakes"):
         try:
             d[k] = list(json.loads(d.get(k) or "[]"))
         except ValueError:
             d[k] = []
+    try:
+        d["closing"] = json.loads(d["closing"]) if d.get("closing") else None
+    except ValueError:
+        d["closing"] = None
     return d
 
 
 # ---- turn end --------------------------------------------------------------------------------------------------
 def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Callable[[list[str]], dict],
                     now: Optional[float] = None, observed_sig: Optional[str] = None) -> dict[str, Any]:
-    """Stamp ``waiting_on`` for the chat at a turn end. Every card it handed work to joins the batch; once the batch
-    is fully settled, clear it only if this turn received that exact handoff signature before inference.
-    Completion during an unrelated turn must not silently acknowledge unseen handoffs."""
+    """Stamp ``waiting_on`` for the chat at a turn end. Every card it handed work to joins the batch.
+
+    A turn is a close-out when it was briefed on the settled batch (``observed_sig`` from ``pre_llm_call``) or was
+    started by the waker (``closing`` in the ledger). Only then are the batch's settled cards marked covered,
+    including cards the close-out turn itself created that are already settled (a needs_input card): those must
+    not make the batch "newly settled" and wake the chat again. An ordinary turn during which a card finished
+    covers nothing, so it can't silently acknowledge a handoff nobody saw."""
     now = time.time() if now is None else now
     row = ledger.get(sid) or {}
     open_now = set(open_ids)
@@ -276,33 +332,51 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
     batch = set(row.get("batch") or []) | open_now
     cards = read(sorted(batch)) if batch else {}
     open_now |= {i for i in batch if not is_settled(cards.get(i))}
-    sig = settled_sig(batch, cards)
+    view = {**row, "batch": sorted(batch)}
+    fix = reconcile(view, cards)
+    view.update(fix)
+    batch, covered = set(view["batch"]), set(view.get("covered") or [])
+    key = closeout_key(view, cards)
     fields: dict[str, Any] = {"open": open_now, "stamped_at": now}
-    if sig and sig != row.get("settled_sig"):
-        fields.update(settled_sig=sig, settled_at=now)  # the watchdog's "settled since" clock
-    if sig and sig == observed_sig:
-        fields.update(done_sig=sig, done_at=now)
-        if not any(needs_human(cards.get(i)) for i in batch):
-            batch = set()  # all done and this turn closed it out
-    fields["batch"] = batch
+    fields.update({k: fix[k] for k in ("done_sig", "claim_sig") if k in fix})
+    if key and key != row.get("settled_sig"):
+        fields.update(settled_sig=key, settled_at=now)  # the watchdog's "settled since" clock
+    closing = bool(observed_sig) or row.get("closing") is not None
+    if closing:
+        done = key or row.get("settled_sig")  # the waker covered the batch before the turn: its key was stamped
+        if done:
+            fields.update(done_sig=done, done_at=now)
+        covered |= {i for i in batch if is_settled(cards.get(i))}
+        gone = {i for i in covered if (cards.get(i) or {}).get("status") in DONE_STATUSES}
+        batch -= gone   # reported and finished; human-blocked cards stay (covered) until they move
+        covered -= gone
+        fields["closing"] = None
+    fields["batch"], fields["covered"] = batch, covered
     if not batch and not row:
         return {"open": [], "batch": []}
     ledger.write(sid, **fields)
-    return {**fields, "open": sorted(open_now), "batch": sorted(batch), "sig": sig}
+    return {**fields, "open": sorted(open_now), "batch": sorted(batch), "closeout": closing,
+            "sig": fields.get("done_sig") if closing else None}
 
 
 # ---- close-out decision ----------------------------------------------------------------------------------------
+def wakes_last_hour(row: dict[str, Any], now: float) -> int:
+    return sum(1 for t in row.get("wakes") or [] if 0 <= now - float(t) < 3600)
+
+
 def closeout_due(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, unseen: int, last_user_at: float,
                  now: float) -> Optional[str]:
-    """The settled signature when this chat needs a close-out turn now, else None. Rules: every batch card settled;
-    no close-out turn for this state yet (``done_sig``) and nobody claimed it (``claim_sig``); its notices were
-    handed over (no unseen results); the user did not type here in the last 5 min."""
-    sig = settled_sig(row.get("batch") or [], cards)
-    if not sig or sig == row.get("done_sig") or sig == row.get("claim_sig"):
+    """The close-out key when this chat needs a close-out turn now, else None. Rules: every batch card settled
+    and at least one not reported by an earlier close-out; nobody claimed this key; its notices were handed over
+    (no unseen results); the user did not type here in the last 5 min; under the per-chat hourly wake cap."""
+    key = closeout_key(row, cards)
+    if not key or key == row.get("done_sig") or key == row.get("claim_sig"):
         return None
     if unseen > 0 or now - (last_user_at or 0) < USER_QUIET_S:
         return None
-    return sig
+    if wakes_last_hour(row, now) >= MAX_WAKES_PER_HOUR:
+        return None
+    return key
 
 
 def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:

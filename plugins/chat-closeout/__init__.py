@@ -5,7 +5,7 @@ they finish. Logic lives in core.py; this file wires Hermes hooks and the backen
   pre_llm_call      a turn that runs after the whole batch settled gets the close-out brief (handoffs + what to say)
   pre_final_gate    a reply promising to report later with nothing tracked behind it is held (then annotated)
   thread (serve)    close-out waker: wake an idle chat whose cards all settled, once per batch state (in-process
-                    resume via server._wake_session_turn); watchdog every 15 min: Inbox item + WARNING for a chat
+                    resume via server._wake_session_turn), at most MAX_WAKES_PER_HOUR per chat; watchdog every 15 min: Inbox item + WARNING for a chat
                     with unseen kanban results > 30 min or a settled batch with no close-out > 30 min
 Every hook fails open. [daveey]
 """
@@ -96,9 +96,10 @@ def post_llm_call(session_id: str = "", platform: str = "", **_: Any) -> None:
         observed = _state.setdefault("observed", {}).pop(session_id, None)
         out = core.record_turn_end(ledger(), session_id, open_card_ids(session_id), read_cards,
                                    observed_sig=observed)
-        if out.get("open") or out.get("sig"):
+        if out.get("open") or out.get("closeout"):
             logger.info("chat-closeout: %s waiting_on=%s%s", session_id, out.get("open"),
-                        " (batch settled: close-out turn)" if out.get("sig") else "")
+                        " (close-out turn: covered %s)" % sorted(out.get("covered") or [])
+                        if out.get("closeout") else "")
     except Exception:
         logger.debug("chat-closeout post_llm_call failed", exc_info=True)
 
@@ -114,10 +115,11 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not row or not row.get("batch"):
             return None
         cards = read_cards(row["batch"])
-        sig = core.settled_sig(row["batch"], cards)
-        if not sig or sig == row.get("done_sig"):
-            return None
-        _state["observed"][session_id] = sig
+        key = core.closeout_key(row, cards)
+        if not key or key == row.get("done_sig") or row.get("closing") is not None:
+            return None  # nothing new to report, or the waker already briefed this turn
+        _state["observed"][session_id] = key
+        ledger().write(session_id, closing=sorted(row["batch"]))
         return {"context": core.closeout_prompt(row, cards)}
     except Exception:
         logger.debug("chat-closeout pre_llm_call failed", exc_info=True)
@@ -246,14 +248,31 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
     for row in led.pending():
         sid = row["session_id"]
         cards = read(row["batch"])
-        sig = core.settled_sig(row["batch"], cards)
-        if sig and sig != row.get("settled_sig"):
-            led.write(sid, settled_sig=sig, settled_at=now)
+        fix = core.reconcile(row, cards)
+        if fix:
+            led.write(sid, **fix)
+            row = {**row, **fix}
+            if not row["batch"]:
+                continue
+        key = core.closeout_key(row, cards)
+        if key and key != row.get("settled_sig"):
+            led.write(sid, settled_sig=key, settled_at=now)
         ids = _lineage(sid)
+        if key and key != row.get("done_sig") and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
+            if _state.setdefault("capped", {}).get(sid) != key:
+                _state["capped"][sid] = key
+                logger.warning("chat-closeout: %s hit the %d wakes/hour cap; close-out deferred", sid,
+                               core.MAX_WAKES_PER_HOUR)
         due = core.closeout_due(row, cards, unseen=sum(unseen.get(i, 0) for i in ids),
                                 last_user_at=last_user(ids), now=now)
         if not due or not led.claim(sid, due, now):
             continue
+        new_ids = core.uncovered(row, cards)
+        # Mark the batch covered and the turn as a close-out BEFORE it starts: the turn's own end (or a card it
+        # creates) must never read as a fresh settled batch.
+        wakes = [t for t in row.get("wakes") or [] if 0 <= now - float(t) < 3600] + [now]
+        led.write(sid, covered=set(row.get("covered") or []) | set(new_ids), closing=sorted(row["batch"]),
+                  wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1)
         try:
             result = wake(sid, core.closeout_prompt(row, cards), display_kind="kanban_notice",
                           display_metadata={"display_text": core.notice_text(row, cards), "closeout": True,
@@ -264,9 +283,13 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
             result = "error"
         if result == "started":
             led.write(sid, wake_result="started")
-            logger.info("chat-closeout: woke %s for its close-out (%d cards settled)", sid, len(row["batch"]))
+            logger.info("chat-closeout: woke %s for its close-out (%d cards settled, %d new; wake #%d)", sid,
+                        len(row["batch"]), len(new_ids), int(row.get("wake_count") or 0) + 1)
         else:
-            led.release(sid, due, result)  # busy/refused/error: a later tick (or the owning backend) retries
+            # busy/refused/error: undo the coverage + count; a later tick (or the owning backend) retries
+            led.write(sid, covered=set(row.get("covered") or []), closing=None, wakes=row.get("wakes") or [],
+                      wake_count=int(row.get("wake_count") or 0))
+            led.release(sid, due, result)
             logger.info("chat-closeout: close-out wake of %s deferred (%s)", sid, result)
         done.append({"session_id": sid, "result": result, "sig": due})
     return done
@@ -311,8 +334,8 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
         sig, at = row.get("settled_sig"), row.get("settled_at")
         if not sig or not at or sig == row.get("done_sig"):
             continue
-        if core.settled_sig(row["batch"], read(row["batch"])) != sig:
-            continue  # the state moved on since
+        if row.get("closing") is None and core.closeout_key(row, read(row["batch"])) != sig:
+            continue  # reported since, or the batch moved on (a woken turn still in flight stays watched)
         key = f"chat-closeout:no-closeout:{row['session_id']}:{sig}"
         first = seen_mono.setdefault(key, mono)
         if now - float(at) < core.STALE_S or mono - first < core.STALE_S:
