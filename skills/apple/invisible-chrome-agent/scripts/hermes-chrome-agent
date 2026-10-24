@@ -860,6 +860,8 @@ class Supervisor:
         self.passkey = None  # {"target": id, "until": t, "wid": windowId|None} while a request is pending
         self.stop = False
         self.chrome_fails = 0
+        self.backoff_until = 0
+        self.chrome_started = 0
         self.shown = False
         self.evict_next = 0.0
         self.evict_untrusted_logged = False
@@ -887,6 +889,8 @@ class Supervisor:
         if set(config) - {'installation_id', 'settings'} or not isinstance(config.get('installation_id'), str) or not config['installation_id']:
             raise LifecycleError('invalid lifecycle configuration')
         ledger = Ledger(os.path.join(STATE_DIR, 'leases.json'), Config(**config.get('settings', {})))
+        with ledger.transaction(readonly=True):
+            pass  # Validate durable state before entering launchd's restart path.
         self.lifecycle = Lifecycle(ledger, config['installation_id'], self.wake_managed, self.idle_managed)
 
     def wake_managed(self):
@@ -899,13 +903,23 @@ class Supervisor:
         except (OSError, ValueError):
             pid = None
         if pid and pid_alive(pid):
-            raise LifecycleError('existing profile browser requires operator recovery')
+            try:
+                command = subprocess.check_output(['ps', '-p', str(pid), '-o', 'command='], text=True, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                raise LifecycleError('cannot verify existing profile process identity')
+            if re.search(r'(?:^|\s)--user-data-dir=' + re.escape(PROFILE) + r'(?:\s|$)', command):
+                raise LifecycleError('existing profile browser requires operator recovery')
         self.lifecycle.ledger.new_generation()
         try:
             self.start_vdisplay()
+            if self.stop:
+                raise LifecycleError('supervisor stopped during wake')
             self.start_chrome()
+            if self.stop:
+                raise LifecycleError('supervisor stopped during wake')
             if not cdp_version():
                 raise LifecycleError('Chrome did not become ready')
+            self.remember_browser()
         except BaseException:
             self.idle_managed()
             raise
@@ -919,6 +933,52 @@ class Supervisor:
         self.vbounds = None
         self.hooked.clear()
         self.sess_target.clear()
+        self.frame_target.clear()
+        self.passkey = None
+        self.last_notice.clear()
+        for proc in self.notices.values():
+            if proc.poll() is None:
+                proc.terminate()
+        self.notices.clear()
+
+    def remember_browser(self):
+        from chrome_agent_process import record
+        version = cdp_version()
+        if not version:
+            raise RuntimeError('cannot persist browser instance identity')
+        browser = dict(record(self.chrome), websocket=version['webSocketDebuggerUrl'], profile=os.path.realpath(PROFILE))
+        if self.vd:
+            browser['display'] = record(self.vd)
+        with self.lifecycle.ledger.transaction() as data:
+            data['browser'] = browser
+
+    def recover_managed(self):
+        from chrome_agent_process import RecoveredProcess
+        with self.lifecycle.ledger.transaction(readonly=True) as data:
+            browser = dict(data.get('browser') or {})
+        if not browser or browser.get('profile') != os.path.realpath(PROFILE):
+            return False
+        child = RecoveredProcess(browser)
+        version = cdp_version()
+        if child.poll() is not None or not version or version.get('webSocketDebuggerUrl') != browser.get('websocket'):
+            return False
+        self.chrome = child
+        display = browser.get('display')
+        if display:
+            old_display = RecoveredProcess(display)
+            old_display.terminate()
+            try:
+                old_display.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                old_display.kill()
+                old_display.wait(timeout=5)
+        self.start_vdisplay()
+        self.lifecycle.ledger.reconcile()
+        self.remember_browser()
+        self.lifecycle.running = True
+        self.chrome_started = time.monotonic()
+        log('reconciled recorded browser instance; bounded orphan grace applied')
+        return True
 
     def lifecycle_tick(self):
         if not self.lifecycle or not self.cdp:
@@ -926,18 +986,17 @@ class Supervisor:
         targets = [t['targetId'] for t in self.cdp.call('Target.getTargets').get('targetInfos', [])
                    if t.get('type') in ('page', 'webview')]
         if show_active():
+            with open(SHOW_FLAG) as stream:
+                shown = os.fstat(stream.fileno())
+                text = stream.read().strip()
+            episode = 'show:%s' % shown.st_mtime_ns
+            until = shown.st_mtime + self.lifecycle.ledger.config.handoff_s
+            if text:
+                until = min(until, float(text))
             for tid in targets:
-                self.lifecycle.ledger.protect(tid, 'handoff')
-        # Use a separate reply-only connection: the observation reader can be
-        # delivering a download event which needs the ledger lock during a sweep.
-        version = cdp_version()
-        if not version:
-            return
-        closer = CDP(version['webSocketDebuggerUrl'])
-        try:
-            self.lifecycle.tick(targets, lambda tid: closer.call('Target.closeTarget', {'targetId': tid}).get('success', False))
-        finally:
-            closer.close()
+                self.lifecycle.ledger.protect(tid, 'handoff', episode=episode, until=until)
+        # Reap does not hold the ledger lock over I/O; reuse the observation CDP.
+        self.lifecycle.tick(targets, lambda tid: self.cdp.call('Target.closeTarget', {'targetId': tid}).get('success', False))
 
     # -- children
     def start_vdisplay(self):
@@ -948,7 +1007,7 @@ class Supervisor:
                                    universal_newlines=True, bufsize=1)
         threading.Thread(target=self._vd_reader, args=(self.vd,), daemon=True).start()
         deadline = time.time() + 10
-        while self.vbounds is None and time.time() < deadline and self.vd.poll() is None:
+        while not self.stop and self.vbounds is None and time.time() < deadline and self.vd.poll() is None:
             time.sleep(0.1)
         log("vdisplay pid %d bounds %s main %s" % (self.vd.pid, self.vbounds, self.main))
 
@@ -1032,7 +1091,7 @@ class Supervisor:
         log("chrome pid %d started" % self.chrome.pid)
         self.hooked.clear()
         deadline = time.time() + 30
-        while time.time() < deadline and self.chrome.poll() is None:
+        while not self.stop and time.time() < deadline and self.chrome.poll() is None:
             if cdp_version():
                 return
             time.sleep(0.2)
@@ -1046,6 +1105,7 @@ class Supervisor:
                     p.wait(10)
                 except subprocess.TimeoutExpired:
                     p.kill()
+                    p.wait(timeout=5)
                 log("%s stopped" % name)
 
     # -- CDP
@@ -1083,8 +1143,16 @@ class Supervisor:
         p = m.get("params", {})
         if self.lifecycle and method == 'Page.frameNavigated':
             self.frame_target[p.get('frame', {}).get('id')] = self.sess_target.get(m.get('sessionId'))
+        if method == 'Page.frameDetached':
+            self.frame_target.pop(p.get('frameId'), None)
         if self.lifecycle and method in ('Browser.downloadWillBegin', 'Browser.downloadProgress'):
-            self.lifecycle.ledger.download(method.split('.')[1], p, self.frame_target.get(p.get('frameId')))
+            frame = p.get('frameId')
+            self.lifecycle.ledger.download(method.split('.')[1], p, self.frame_target.get(frame, frame))
+        if self.lifecycle and method == 'Target.targetCreated':
+            self.lifecycle.ledger.popup(p.get('targetInfo', {}))
+        if method == 'Target.targetDestroyed':
+            tid = p.get('targetId')
+            self.frame_target = {frame: target for frame, target in self.frame_target.items() if target != tid}
         if method == "Target.attachedToTarget":
             info = p.get("targetInfo", {})
             sid = p.get("sessionId")
@@ -1094,6 +1162,7 @@ class Supervisor:
                 threading.Thread(target=self.hook_session, args=(sid, info), daemon=True).start()
         elif method == "Target.detachedFromTarget":
             self.hooked.discard(p.get("sessionId"))
+            self.sess_target.pop(p.get('sessionId'), None)
         elif method == "Runtime.bindingCalled" and p.get("name") == BINDING:
             try:
                 req = json.loads(p.get("payload") or "{}")
@@ -1166,7 +1235,7 @@ class Supervisor:
         select that tab, bring Chrome forward, and keep re-homing off it until the request settles."""
         c = self.cdp
         if self.lifecycle and target:
-            self.lifecycle.ledger.protect(target, 'handoff')
+            self.lifecycle.ledger.protect(target, 'handoff', episode='reveal:%s' % time.time_ns())
         chrome_pid = self.chrome.pid if self.chrome else None
         wid = None
         self.focus.allow()
@@ -1339,37 +1408,56 @@ class Supervisor:
         os.replace(tmp, STATE_FILE)
 
     def run(self):
-        from chrome_agent_lifecycle import ExclusiveLock
+        from chrome_agent_lifecycle import ExclusiveLock, LifecycleError
         os.makedirs(STATE_DIR, exist_ok=True)
         with ExclusiveLock(os.path.join(STATE_DIR, 'supervisor.lock')):
-            self.configure_lifecycle()
+            try:
+                self.configure_lifecycle()
+            except (LifecycleError, ValueError, TypeError) as exc:
+                # A permanent configuration error must not trigger KeepAlive.
+                log('managed configuration refused; correct it before activate: %s' % exc)
+                return 0
             return self._run()
 
     def managed_step(self):
         from chrome_agent_lifecycle import LifecycleError
-        with self.lifecycle.lock:
-            if not self.lifecycle.running:
-                return
-            try:
+        if self.stop or not self.lifecycle.running:
+            return
+        try:
+            with self.lifecycle.transition:
                 if self.vd.poll() is not None:
                     self.start_vdisplay()
                 if self.chrome.poll() is not None:
+                    now = time.monotonic()
+                    if now < self.backoff_until:
+                        return
+                    self.chrome_fails = 1 if now - self.chrome_started > 60 else self.chrome_fails + 1
+                    self.backoff_until = now + min(60, 2 ** min(self.chrome_fails, 6))
+                    log('managed Chrome crash; restart attempt %s' % self.chrome_fails)
                     if self.cdp:
                         self.cdp.close()
                         self.cdp = None
                     self.lifecycle.ledger.new_generation()
+                    self.lifecycle.revoke_connections()
                     self.start_chrome()
-                if self.connect():
-                    self.rehome()
-                    self.lifecycle_tick()
-                self.evict()
-            except (CDPError, LifecycleError, OSError) as exc:
-                log('managed lifecycle: %s' % exc)
+                    self.chrome_started = now
+                    self.remember_browser()
+            if self.connect():
+                self.rehome()
+                self.lifecycle_tick()
+            self.evict()
+        except (CDPError, LifecycleError, OSError) as exc:
+            log('managed lifecycle: %s' % exc)
+
+    def request_stop(self, *_):
+        self.stop = True
+        if self.lifecycle:
+            self.lifecycle.disabled = True
 
     def _run(self):
         os.makedirs(STATE_DIR, exist_ok=True)
-        signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stop", True))
-        signal.signal(signal.SIGINT, lambda *_: setattr(self, "stop", True))
+        signal.signal(signal.SIGTERM, self.request_stop)
+        signal.signal(signal.SIGINT, self.request_stop)
         log("supervisor pid %d starting (port %d, profile %s)" % (os.getpid(), PORT, PROFILE))
         ns = notifier_status()
         log("passkey notifier: %s" % ns)
@@ -1379,6 +1467,8 @@ class Supervisor:
         if not self.lifecycle:
             self.start_vdisplay()
             self.start_chrome()
+        else:
+            self.recover_managed()
         if FOCUS_FILTER:
             self.proxy = CDPProxy(PORT, CHROME_PORT, lifecycle=self.lifecycle).start(wait=False)
         if FOCUS_GUARD:
@@ -1419,9 +1509,15 @@ class Supervisor:
         finally:
             log("supervisor stopping")
             if self.lifecycle:
-                with self.lifecycle.lock:
-                    self.lifecycle.disabled = True
+                drained = self.lifecycle.drain(timeout=30)
+                log('managed drain: %s' % ('completed' if drained else '30s bound reached; explicit stop wins'))
+                with self.lifecycle.transition:
                     self.idle_managed()
+                    self.lifecycle.running = False
+                    with self.lifecycle.lock:
+                        connections = list(self.lifecycle.connections)
+                    for connection in connections:
+                        connection.close()
             else:
                 self.stop_children()
             if self.proxy:
@@ -1517,6 +1613,7 @@ def plist_text():
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>90</integer>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>%(log)s</string>
   <key>StandardErrorPath</key><string>%(log)s</string>
@@ -1584,7 +1681,7 @@ def notifier_ok(status):
     return status.split(" ")[0] in ("authorized", "provisional", "ephemeral")
 
 
-def cmd_install(no_start=False):
+def cmd_install(no_start=False, managed=False):
     os.makedirs(TOOLS, exist_ok=True)
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     subprocess.check_call(["swiftc", "-O", "-import-objc-header", os.path.join(SRC_DIR, "CGVirtualDisplay.h"),
@@ -1605,14 +1702,17 @@ def cmd_install(no_start=False):
             os.remove(link)
         os.symlink(me, link)
     plist = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
+    os.makedirs(os.path.dirname(plist), exist_ok=True)
     with open(plist, "w") as f:
         f.write(plist_text())
     from chrome_agent_lifecycle import atomic_json
     import secrets
     config = os.path.join(STATE_DIR, 'lifecycle-config.json')
-    if not os.path.exists(config):
+    if managed and not os.path.exists(config):
         atomic_json(config, {'installation_id': secrets.token_urlsafe(32)})
     uid = os.getuid()
+    if no_start:
+        subprocess.check_call(['launchctl', 'disable', 'gui/%d/%s' % (uid, LABEL)])
     subprocess.call(["launchctl", "bootout", "gui/%d/%s" % (uid, LABEL)], stderr=subprocess.DEVNULL)
     if not no_start:
         cmd_activate()
@@ -1629,8 +1729,8 @@ def cmd_activate():
 
 def cmd_stop(disable=False):
     service = 'gui/%d/%s' % (os.getuid(), LABEL)
-    if disable:
-        subprocess.check_call(['launchctl', 'disable', service])
+    # Both spellings are durable OFF; only explicit activation enables the job.
+    subprocess.check_call(['launchctl', 'disable', service])
     subprocess.check_call(['launchctl', 'bootout', service])
     return 0
 
@@ -1677,7 +1777,7 @@ def main(argv):
     table = {"run": lambda: Supervisor().run() or 0, "status": cmd_status,
              "show": lambda: cmd_show(argv[3] if len(argv) > 3 and argv[2] == "--minutes" else None),
              "hide": cmd_hide,
-             "install": lambda: cmd_install(no_start='--no-start' in argv[2:]),
+             "install": lambda: cmd_install(no_start='--no-start' in argv[2:], managed='--managed' in argv[2:]),
              "activate": cmd_activate, "stop": cmd_stop, "disable": lambda: cmd_stop(disable=True),
              "uninstall": cmd_uninstall}
     if cmd not in table:

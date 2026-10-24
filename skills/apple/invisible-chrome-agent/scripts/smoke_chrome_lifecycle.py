@@ -113,6 +113,15 @@ def main():
             answer = client.call('Runtime.evaluate', {'expression': '6 * 7', 'returnByValue': True}, session=sid)
             assert answer['result']['value'] == 42
             assert [t['id'] for t in request(scope + '/json/list')] == [tid]
+            from smoke_chrome_rework import exercise
+            exercise(api, ledger, lifecycle, client, tid, sid, request, root, upstream)
+            from smoke_chrome_recovery import reconcile, repeated_show
+            client.close()
+            ledger, lifecycle = reconcile(api, ledger, lifecycle, profile, children[-1], upstream)
+            proxy.lifecycle = lifecycle
+            client = api.CDP(request(scope + '/json/version')['webSocketDebuggerUrl'])
+            assert any(t['targetId'] == tid for t in client.call('Target.getTargets')['targetInfos'])
+            repeated_show(api, ledger, lifecycle, client, root, tid)
             request('/lifecycle/complete', dict(installation_id='smoke-installation',
                     capability=lease['capability'], request_id=lease['request_id']))
             request('/lifecycle/release', dict(installation_id='smoke-installation', capability=lease['capability']))
@@ -146,6 +155,9 @@ def main():
                 client.close()
             if proxy:
                 proxy.close()
+            if 'lifecycle' in locals():
+                for connection in list(lifecycle.connections):
+                    connection.close()
             stop()
             log.close()
             assert all(child.poll() is not None for child in children), 'smoke child survived cleanup'

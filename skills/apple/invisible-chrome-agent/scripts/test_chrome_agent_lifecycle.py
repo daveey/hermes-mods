@@ -164,6 +164,7 @@ class RuntimeTests(unittest.TestCase):
                 s.configure_lifecycle()
                 self.assertFalse(s.lifecycle.running)
                 with mock.patch.object(s, 'start_vdisplay') as vd, mock.patch.object(s, 'start_chrome') as chrome, \
+                     mock.patch.object(s, 'remember_browser'), \
                      mock.patch.object(hca, 'cdp_version', return_value={'Browser': 'Fake'}):
                     s.lifecycle.control('acquire', dict(installation_id='example', owner=['/profiles/example', 'task', 'session'], timeout_s=60), '')
                     vd.assert_called_once()
@@ -209,7 +210,7 @@ class RuntimeTests(unittest.TestCase):
                      mock.patch.object(hca.subprocess, 'call') as call, \
                      mock.patch.object(hca, 'build_notifier', return_value='test'), \
                      mock.patch.object(hca, 'notifier_status', return_value='authorized'):
-                    hca.cmd_install(no_start=True)
+                    hca.cmd_install(no_start=True, managed=True)
                     self.assertFalse(any('bootstrap' in c.args[0] for c in check.call_args_list))
                     self.assertTrue(any('bootout' in c.args[0] for c in call.call_args_list))
                     manifest = json.loads(Path(tmp, 'lifecycle-config.json').read_text())
