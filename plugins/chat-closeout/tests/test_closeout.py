@@ -334,3 +334,21 @@ def test_failed_wake_undoes_coverage(tmp_path, monkeypatch):
     assert row['covered'] == [] and row['closing'] is None and row['wake_count'] == 0
     assert plugin.wake_tick(now=1030, wake=lambda *a, **k: 'started', unseen={}, last_user=lambda _: 0,
                             read=lambda _: cards)
+
+
+def test_reload_stops_the_previous_waker_thread(monkeypatch):
+    """A plugin reload must not leave the old module's waker running its old logic next to the new one."""
+    import threading
+    old_stop = threading.Event()
+    old = threading.Thread(target=lambda ev: ev.wait(), args=(old_stop,), daemon=True, name='chat-closeout')
+    old.start()
+    monkeypatch.setattr(plugin, '_state', {})
+    monkeypatch.setattr(plugin, 'TICK_S', 3600.0)
+    monkeypatch.setattr(plugin, '_loop', lambda stop: stop.wait())
+    stop = plugin.start_thread()
+    try:
+        old.join(2)
+        assert old_stop.is_set() and not old.is_alive()
+        assert plugin._state['thread'].is_alive()
+    finally:
+        stop.set()

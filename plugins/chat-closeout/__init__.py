@@ -387,10 +387,28 @@ def _loop(stop: threading.Event) -> None:
         stop.wait(TICK_S)
 
 
+def _stop_stale_threads() -> int:
+    """A plugin reload re-executes this module with a fresh ``_state``, but the previous module's waker thread keeps
+    running the OLD wake logic next to the new one. Stop every earlier chat-closeout thread in the process via its
+    stop event (its first arg)."""
+    stopped = 0
+    for t in threading.enumerate():
+        if t.name != "chat-closeout" or t is _state.get("thread") or not t.is_alive():
+            continue
+        ev = (getattr(t, "_args", None) or (None,))[0]
+        if isinstance(ev, threading.Event):
+            ev.set()
+            stopped += 1
+    if stopped:
+        logger.info("chat-closeout: stopped %d waker thread(s) from a previous load", stopped)
+    return stopped
+
+
 def start_thread() -> Optional[threading.Event]:
     with _thread_lock:
         if _state.get("thread") or TICK_S <= 0:
             return None
+        _stop_stale_threads()
         stop = threading.Event()
         t = threading.Thread(target=_loop, args=(stop,), daemon=True, name="chat-closeout")
         _state.update(thread=t, stop=stop)
