@@ -11,6 +11,10 @@ These are the changes I carry on my fork of
 
 Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
+## Draft work (not in the released patch series)
+
+- [Unresolved goal fallback](unresolved-goal-fallback.md): optional structured pre-final fallback; companion coach guard remains default-off pending ownership/context and activation acceptance.
+
 ## Features
 
 | Doc | Patches | What you get |

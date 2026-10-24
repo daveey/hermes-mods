@@ -55,6 +55,80 @@ Settings: `COACH_REPLY_RULES` (comma list or `none`) and `COACH_REPLY_THRESHOLD`
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
 
+### Goal disposition (`pre_final_gate`, experimental and default off)
+
+`goal_disposition.py` checks diagnosis-only endings that do not contain an ask, promise or
+completion claim. It uses the separate `coach_goal_disposition` auxiliary task (15-second
+request timeout), not the reply regex prefilter or System One screener. A strictly parsed,
+cited `abandoned` verdict at confidence ≥0.85 silently holds the candidate and asks the agent
+to continue **only already-authorized** work. The hook never repairs anything, creates tasks,
+retries approvals, sends messages, or changes self-heal configuration.
+
+Profile-local `<HERMES_HOME>/coach/goal-disposition.json` accepts `{"mode":"off"}` (default),
+`{"mode":"shadow"}` (judge/log only), or `{"mode":"enforce"}`. Reload the plugin after enabling
+enforcement: buffering is selected at registration so the disabled hook does not buffer every
+answer. Switching off takes effect on the next check; reload also removes buffering. A runtime
+switch to enforce without a reload logs `reload_required_for_buffering` and does not hold.
+Background agents remain excluded by core.
+
+Evidence includes bounded past turn context captured at `pre_llm_call`, explicit user steering,
+the candidate, and paired tool calls/results retaining call IDs and executor status. Structured
+post-tool observations survive a later steering message. Orphan tool results cannot authorize work.
+The schema rejects nonfinite scores, invented references, missing user citations and inconsistent
+abandonment. Structured success/error fields are checked for remediation/capability claims;
+HTTP 503 is not proof that the agent lacks repair capability. Authorization and remediation now
+require an additional `proof` object binding cited source to exact action/path. Authorization
+currently supports a latest literal user restriction (`Do not`/`Never`, explicit-user-direction
+path), or the native terminal pending-approval envelope with its exact command and `/approve`
+path. Other policy/denial formats remain UNKNOWN, not permission to retry. Remediation currently
+supports a requested exact HTTP(S) URL shared by user scope, tool arguments, result URL/status
+and candidate; a newer readback invalidates the older citation. Non-URL verification and other
+tool result formats remain UNKNOWN. Semantic judgment still decides whether that path fulfills
+the goal; these narrow adapters do not complete general action/approval/path acceptance. Analysis-only, plan-first, status-only,
+conceptual, hypothetical and genuine permission boundaries must not become repair mandates.
+
+**Limits / not rollout-ready:** a conservative local running-task adapter reads the exact
+hostname/profile/board/task from authoritative stores. It requires exact request/body and goal/title
+matches, a live matching process claim, and an origin-linked TUI result subscription. This proves a
+durable return route, not notifier health or eventual delivery. Remote, scheduled, cross-profile,
+paraphrased-goal and non-TUI-return cases remain UNKNOWN; no cached tool assertion certifies ownership.
+Scope recovery reads only real user rows through bounded, profile-qualified compression ancestry.
+Rotation transfers captured restrictions/tool pairs; restart requires a unique current request anchor.
+Before core persists that request, its runtime-stamped message timestamp bounds recovery instead.
+Unknown profiles, ambiguous anchors and unsupported lineage fail UNKNOWN. Captures are isolated by
+profile home and session; persistence metadata is not mistaken for synthetic content. Complete
+evidence is limited to 200 rows / 32k serialized characters and 128 captures.
+Oversized evidence fails open with telemetry. This is not a hard completion guarantee: judge errors,
+missing evidence and timeouts fail open. No live-model precision/recall or latency claim is made.
+Do not enable enforcement until owner/lineage support and a labeled semantic holdout are validated.
+
+Each held candidate is rechecked. At the core hold cap, the plugin appends **Unresolved work**
+and logs `abandonment_exhausted`, without claiming a continuing owner. Holds also supply the
+structured `unresolved_fallback: {goal, evidence_refs}` contract for cores supporting safe budget
+fallback. Older cores ignore that field and can release the rejected candidate on budget exhaustion;
+the cap append alone does not fix that branch. Core cancellation/Stop retains precedence.
+Telemetry uses `goal_disposition`, `goal_disposition_unknown`, and `abandonment_exhausted` in the
+coach log, without storing full tool results in those events.
+
+Tests: `test_goal_disposition.py` covers strict schema/provenance, structured result validation,
+mode/buffering, scope-preserving capture and bounded errors. `test_goal_proofs.py` covers
+exact action/path/source bindings, invented approval, untrusted printed status, URL-prefix
+mismatches and superseded evidence. The manager suite proves unsupported approval cannot clear
+a confirmed hold through the complete turn. `test_goal_disposition_integration.py`
+uses scripted model responses through complete `AIAgent.run_conversation` text stops for `cli` and
+`desktop`, including isolated normal plugin discovery, streaming holds, cap warning and ephemeral
+history stripping. It also loads coach with ask-gate/chat-closeout in two configured orders and
+force-reloads discovery. `test_goal_manager_acceptance.py` additionally registers plugins in genuinely
+reversed orders, exercises individual unload/reload during held complete turns, and verifies no
+rejected text leaks to streams, interims, returned history or SQLite. It verifies pre_verify runs
+once only after acceptance and persisted history restrictions survive pre-persist capture.
+`test_goal_scope_gate.py`, `test_goal_scope_recovery.py` and `test_goal_scope_rotation.py` cover
+profile isolation, bounded ancestry, restart and rotation recovery through real isolated SessionDBs.
+These are backend tests, not Electron UI or production activation proof.
+Semantic judges are injected; scope negatives test routing, not model classification accuracy.
+`test_goal_ownership.py` also exercises real isolated Kanban tables through discovered agent text
+stops, scope/liveness/return-route rejection, and read-only WAL fallback without creating databases.
+
 ### Fix loops across turns (`pre_llm_call` + `post_llm_call`)
 
 `post_llm_call` remembers each turn's final answer and tool log. On the next user message, `fix_loop.py`
