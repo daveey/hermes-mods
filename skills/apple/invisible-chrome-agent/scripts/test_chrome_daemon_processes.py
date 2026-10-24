@@ -5,7 +5,6 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -14,6 +13,7 @@ from chrome_agent_lifecycle import Ledger, Lifecycle, Config
 from chrome_agent_process import fingerprint
 from chrome_agent_daemons import exchange, inspect, shutdown
 from test_hermes_chrome_agent import hca
+from chrome_test_fixtures import socket_directory
 
 
 def peer(path, target, ignore):
@@ -45,7 +45,7 @@ def peer(path, target, ignore):
 
 class RealDaemonTests(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(prefix='ad-')
+        tmp = socket_directory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.now = 1000

@@ -17,6 +17,7 @@ from chrome_agent_lifecycle import Ledger, Lifecycle, Config
 from chrome_agent_daemons import exchange
 from chrome_agent_process import fingerprint
 from test_chrome_endpoint_ownership import free_port
+from chrome_test_fixtures import chrome_environment, socket_directory
 
 
 class IdleRetirementTests(unittest.TestCase):
@@ -50,7 +51,7 @@ class SupervisorStopTests(unittest.TestCase):
         self.exercise_stop(finish_requests=True, reloads=2)
 
     def exercise_stop(self, finish_requests, reloads=0):
-        with tempfile.TemporaryDirectory(prefix='as-') as tmp:
+        with socket_directory() as tmp, mock.patch.dict(os.environ, chrome_environment(tmp)):
             root = Path(tmp)
             port, upstream = free_port(), free_port()
             self.assertNotEqual(port, upstream)

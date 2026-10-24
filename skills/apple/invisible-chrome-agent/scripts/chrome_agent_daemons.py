@@ -6,7 +6,7 @@ import socket
 import stat
 import time
 
-from chrome_agent_process import fingerprint
+from chrome_agent_process import fingerprint, is_zombie
 
 
 def exchange(path, payload, deadline=None, identity=None):
@@ -60,10 +60,9 @@ def _retired(identity, deadline):
         return current != identity['started']
     # A failed/timeout ps probe is NOT proof of exit. Zombies are retired, but
     # otherwise require the OS to report that the exact PID no longer exists.
+    if is_zombie(identity['pid'], timeout=_remaining(deadline)):
+        return True
     try:
-        stat_path = Path('/proc/%d/stat' % identity['pid'])
-        if stat_path.exists() and stat_path.read_text().rsplit(')', 1)[1].split()[0] == 'Z':
-            return True
         os.kill(identity['pid'], 0)
     except ProcessLookupError:
         return True

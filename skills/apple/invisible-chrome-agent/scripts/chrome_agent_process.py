@@ -1,6 +1,7 @@
 """Verified process handles for recovery of this supervisor's dedicated children."""
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -21,6 +22,25 @@ def fingerprint(pid, timeout=5):
         return None if state.startswith('Z') else 'ps:' + started
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def is_zombie(pid, timeout):
+    """Positive OS state only; a failed/ambiguous probe is not retirement.
+
+    ps reports unreaped children on Darwin, where kill(pid, 0) still succeeds.
+    Include the PID and validate the whole state token so diagnostics/extra rows
+    cannot accidentally become evidence. Callers supply their remaining budget.
+    """
+    try:
+        stat = Path('/proc/%d/stat' % pid)
+        if stat.exists():
+            return stat.read_text().rsplit(')', 1)[1].split()[0] == 'Z'
+        result = subprocess.check_output(['ps', '-p', str(pid), '-o', 'pid=', '-o', 'stat='],
+                                         text=True, timeout=timeout).split()
+        return (len(result) == 2 and result[0] == str(pid)
+                and re.fullmatch(r'Z[<+ENLsVX]*', result[1]) is not None)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
 
 
 def record(process):

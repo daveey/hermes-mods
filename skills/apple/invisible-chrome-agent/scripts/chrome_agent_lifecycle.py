@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import secrets
+import sys
 import tempfile
 import threading
 import time
@@ -288,7 +289,14 @@ class Ledger:
             request = secrets.token_urlsafe(24)
             lease.pop('restart_until', None)
             if daemon_dir:
-                lease['daemon_socket'] = str(Path(daemon_dir) / ('bu-lease-' + cap + '.sock'))
+                path = str(Path(daemon_dir) / ('bu-lease-' + cap + '.sock'))
+                # Reserve the terminating NUL in sockaddr_un.sun_path. Reject
+                # before committing the lease or waking Chrome; never relocate
+                # the endpoint away from the harness's configured runtime dir.
+                maximum = 107 if sys.platform == 'linux' else 103
+                if '\0' in path or len(os.fsencode(path)) > maximum:
+                    raise LifecycleError('daemon socket path exceeds OS limit; configure a shorter harness runtime directory')
+                lease['daemon_socket'] = path
             if worker:
                 workers = lease.setdefault('workers', {})
                 if str(worker_pid) not in workers and len(workers) >= 256:
