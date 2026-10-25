@@ -70,6 +70,70 @@ def authorization(v, evidence):
         raise ValueError('superseded_approval_evidence')
 
 
+def _capability_operation(row):
+    """Only paired calls with one literal command/HTTP URL are supported."""
+    paired = row.get('call')
+    call_id = row.get('tool_call_id')
+    if (row.get('role') != 'tool' or not isinstance(paired, dict)
+            or not isinstance(call_id, str) or not call_id
+            or paired.get('id') != call_id):
+        raise ValueError('unpaired_capability_evidence')
+    fn = paired.get('function')
+    if (not isinstance(fn, dict) or not isinstance(fn.get('name'), str)
+            or not fn['name'].strip()):
+        raise ValueError('unsupported_capability_operation')
+    _, args = call(row)
+    fields = [key for key in ('command', 'url') if key in args]
+    if len(fields) != 1:
+        raise ValueError('unsupported_capability_operation')
+    field = fields[0]
+    action = args[field]
+    if not isinstance(action, str) or not action.strip() or len(action) > 4000:
+        raise ValueError('unsupported_capability_operation')
+    if field == 'url':
+        parsed = urlsplit(action)
+        if (parsed.scheme not in ('http', 'https') or not parsed.netloc
+                or parsed.username is not None or parsed.password is not None
+                or any(c.isspace() for c in action)):
+            raise ValueError('unsupported_capability_operation')
+    return field, action
+
+
+def capability(v, evidence):
+    """Prove freshness and literal operation binding, not semantic goal relevance.
+
+    evidence must be the ordered output of evidence_for, which pairs original
+    calls/results and retains all subsequent user steering and tool results.
+    Unsupported proof formats raise ValueError (the gate records UNKNOWN).
+    No operation is executed and no access/approval bypass is authorized here.
+    """
+    p, source = proof(v, evidence, ('source_ref', 'action'))
+    operation = _capability_operation(source)
+    result = data(source)
+    error = result.get('error')
+    status = result.get('status', result.get('status_code'))
+    if (p['action'] != operation[1]
+            or v.get('boundary_kind') not in ('credentials', 'tool', 'service')
+            or not isinstance(error, str)
+            or error not in ('missing_credentials', 'permission_denied', 'tool_unavailable',
+                             'authentication_required', 'access_denied')
+            or result.get('success') is True
+            or type(result.get('exit_code')) is int and result['exit_code'] == 0
+            or type(status) is int and 200 <= status < 300):
+        raise ValueError('missing_current_capability_evidence')
+    keys = list(evidence)
+    for key in keys[keys.index(p['source_ref']) + 1:]:
+        row = evidence[key]
+        if row.get('role') == 'user':
+            raise ValueError('superseded_capability_evidence')
+        if row.get('role') == 'tool':
+            # Ignore timeout/options/tool-name differences: another result for
+            # the same literal command/URL supersedes the cited failure, even
+            # when the newer result is itself a failure or is not cited.
+            if _capability_operation(row) == operation:
+                raise ValueError('superseded_capability_evidence')
+
+
 def urls(text):
     if not isinstance(text, str):
         return set()
