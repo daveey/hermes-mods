@@ -112,7 +112,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [desktop-kanban-worker-readonly.md](desktop-kanban-worker-readonly.md) | 0213 0227 | Desktop opens a Kanban worker session read-only and quietly instead of a "Resume failed" toast (gateway code 4132) |
 | [api-server-thread-hops.md](api-server-thread-hops.md) | 0214 0226 | API-server SSE flushes worker-thread hops before `assistant.completed`/EOS so the last commentary is not dropped |
 | [codex-subscription-routing.md](codex-subscription-routing.md) | 0233 0234 0235 0236 0237 | Account-gated Codex models route via an entitled ChatGPT/Codex subscription: union catalog, plan-gated pool selection, subscription-first picker |
-| [kanban-quota-recovery.md](kanban-quota-recovery.md) | 0248 | A recovered quota/429 wall takes the cooldown path and never becomes a human block; stale guard-hold blocks are released |
+| [kanban-quota-recovery.md](kanban-quota-recovery.md) | 0248, 0265 | Recovered quota walls use cooldowns; healthy heartbeats/checkpoints clear stale failure errors; stale guard-hold blocks are released |
 | [runtime-safety-followups.md](runtime-safety-followups.md) | 0256–0259 | Portable wake cleanup, disabled-MCP diagnostics, fail-closed delegated lineage and Git-guard PATH isolation |
 | [session-start-requests.md](session-start-requests.md) | 0260 | Durable plugin-authorized session start identity, at-most-once first-turn dispatch and owner-local reconciliation |
 
