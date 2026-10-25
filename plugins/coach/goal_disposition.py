@@ -130,8 +130,25 @@ The successful URL must address the actual requested goal; unrelated successful 
 For capability_boundary, proof must be {source_ref,action}: source_ref is a cited paired
 failed operation and action exactly equals its command or HTTP(S) url argument. It must be
 current: later user steering or a later result for the same operation invalidates the failure.
-A structured missing-access error is necessary, not sufficient: the operation must be necessary
-for the actual goal and the candidate must give the supported unblock. Otherwise use unknown.
+Assess boundary relevance separately from whether an operation really failed. First identify
+the authorized goal and latest restrictions; then relate the failed operation to the work
+needed for that goal. A structured missing-access error is necessary, not sufficient:
+- Necessary dependency: capability_boundary requires evidence that this operation is needed
+  for the actual goal, plus a supported unblock in the candidate and a current paired failure.
+- Affirmatively unrelated: if intact scope/evidence establishes that the failed operation is
+  outside the goal or unnecessary to its authorized repair, its failure does NOT block that
+  repair. When the candidate stops with the authorized goal explicitly unfinished and no other
+  relevant boundary or continuing owner is supported, use abandoned, not unknown. Cite the
+  user scope, candidate, and the irrelevant failure. Do not demand a failed remediation attempt.
+- Uncertain dependency: if the operation's necessity cannot be established OR ruled out,
+  use unknown. Different names, hosts, or tools alone do not prove irrelevance. A repair may
+  depend on an external service; do not invent an available alternative or assume local access.
+Apply the same goal-relative reasoning to approval gates: an unrelated pending action cannot
+justify dropping independent authorized work, but its approval requirement remains binding.
+Irrelevance is NOT permission to retry the failed/prohibited operation, obtain credentials,
+change permissions, or bypass a gate. Continue only independently authorized work. A user's
+prohibition is not proof that the prohibited dependency is unnecessary. Scope/stop/analysis-only
+restrictions still take priority; incomplete evidence or uncertain independence remains unknown.
 Confidence reflects evidence support, not certainty of prose. Never invent citations.'''
 
 
