@@ -33,7 +33,7 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 |---|---|---|
 | L1 | `pre_llm_call` | Injects a short block each turn: status of every card whose `tasks.session_id` is this chat (read straight from `kanban.db`, all boards) plus asks the user already answered (ledger). One sqlite read; silent when there is nothing to say. |
 | L2 | `pre_final_gate` | If the final reply contains an ask (`core.find_asks`: "needs you", "still waiting on you", "your call", "want me to…?", "can you…", "if you'd like me to…", "up to you", a "Needs you:" heading with its list), the judge returns a verdict per ask: `ok`, `already_done`, `already_answered`, `unverified`, `agent_can_do`. Anything but `ok` holds the reply with a private nudge naming the evidence. Two nudges max, then the reply is delivered with a short "could not verify" note. Judge down or garbled → deliver, log, never break a chat. |
-| L3 | `pre_tool_call` | `kanban_create` with `initial_status=blocked` or a title/body saying the user must act, and `kanban_block` (not `dependency`/`time`/`transient`): refused unless the text has a `Checked: <tool or command> — <one line of output>` line that matches a tool call made earlier in the same turn (card tools never count as evidence). The judge then reads the body too. Kanban workers: `kanban_complete` handoffs with "David's call / David should / needs David" sentences are judged; any that is not judge-ok **and** backed by a matching `Checked:` line becomes `FYI (unverified, not an ask for David): …`. |
+| L3 | `pre_tool_call` | Explicit `human_request` on `kanban_create`/`kanban_block` is validated and judged as a complete structured request (see below), never via unrelated body/reason text. Status or operational failure alone is not an ask. Legacy prose explicitly saying the user must act retains its `Checked:` gate; worker `kanban_complete` handoffs retain the existing verified-ask/FYI rewrite. |
 | L4 | ledger | `~/.hermes/state/ask-ledger.sqlite` (not synced). When the user's message answers or dismisses an open ask ("done", "i keep completing it", "stop asking", "you can do it") the aux model classifies it and the topic/answer is stored. L1 shows it in every chat (cross-session); L2's judge treats a repeat as `already_answered`. A cheap regex gates the classifier call, so unrelated messages cost nothing. |
 
 **Terminal hand-offs (L2, no model call).** Before the judge, `handoff.py` looks for a sentence that hands the user a
@@ -66,7 +66,33 @@ a core without it the plugin still registers (L1/L3/L4 work); L2 is simply never
 
 `open-asks` files a blocked card for an ask left in a reply. That would publish an unverified premise as a card. It now
 checks `cache/ask-gate/verdicts.json` and files nothing when ask-gate held or could not verify the ask; with no record
-(ask-gate absent) it behaves as before. Cards `open-asks` files itself are exempt from the L3 `Checked:` rule.
+(ask-gate absent) it behaves as before. The legacy prose exemption remains only for cards **without** an explicit
+`human_request`. The filing marker anywhere in an explicit request or its body/reason cannot bypass validation or judging.
+
+## Structured human requests
+
+A request requires nonblank strings `action`, `why_human`, `scope`, `evidence`, and `interaction`; interaction is
+`approval`, `reply`, `user_terminal`, `physical`, or `external`. Missing/null metadata is not a request. A malformed
+non-null request is refused, not silently downgraded. Creation requires `initial_status=blocked`; requests cannot
+accompany dependency/time/transient blocks. The gate does not change task state or grant permission.
+
+Only the request's own `evidence` (optionally prefixed `Checked:`) can satisfy the same-turn tool-evidence check.
+Unrelated Checked lines in body/reason cannot supply it. The complete five-field object is then one judge item,
+without prose detection or sentence truncation. A tool-name match is only a preliminary check: the judge must
+verify that the output supports the actual action, scope and need for a human. Explicit requests fail closed on
+judge errors, malformed/missing verdicts or non-ok verdicts. Ordinary final replies and legacy prose keep their
+existing failure behavior; this is not a replacement for core authorization/security enforcement.
+
+An initial blocked status, capability label, or `sudo -n` authentication failure alone is an operational issue,
+not evidence that the user owes an approval. Keep it parked and owned without inventing a human request. Standing
+authorization does not authenticate the OS. For a verified authentication step, use the supported user-terminal
+flow with the precise command/host and step; never request passwords or secret codes/tokens in chat. Metadata
+neither authorizes execution, bypasses security denials, completes work nor automatically unblocks a card.
+
+`tests/test_human_request.py` exercises create/block hooks, required fields, supported interactions, unrelated
+prose/evidence, operational failures, open-asks marker smuggling, judge outages, and ordinary clarification
+preservation. Security prompt delivery and refusal handling are tested with a stub judge; real-model semantic
+accuracy and live UI/REST/CLI paths are not established by these plugin unit tests.
 
 ## Model and config
 

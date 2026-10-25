@@ -335,6 +335,7 @@ def session_links(session_ids: List[str], include_closed: bool = False) -> dict:
             run = t.get("run") or {}
             out.append({"id": t.get("id"), "title": t.get("title"), "status": t.get("status"),
                         "assignee": t.get("assignee"), "board": t.get("board") or "default",
+                        "block_kind": t.get("block_kind"), "human_request": t.get("human_request"),
                         "session_id": links[0].get("session"), "via": via, "created_at": t.get("created_at"),
                         "started_at": t.get("started_at"),
                         "current_run_started_at": run.get("started_at") if run.get("status") == "running" else None,

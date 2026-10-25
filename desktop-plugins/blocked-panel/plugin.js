@@ -5,23 +5,22 @@
  * A session is blocked when:
  *   - one of its Kanban cards (created or shepherded by any id in its compression
  *     lineage, any board) sits in `blocked` waiting on a human. Each card shows the
- *     instructions the worker wrote when it blocked (the latest `blocked` event's
- *     reason; for a card created blocked with no reason, the card body) as a NUMBERED
+ *     explicit human_request.action from the latest `blocked` event as a NUMBERED
  *     checklist. Source order: the `blocked-panel` agent plugin's model rewrite
  *     (POST /api/plugins/blocked-panel/steps, disk-cached) → the note's own numbering →
  *     one step per sentence. The list always ends with how to hand the card back; the raw
  *     note stays one click away ("Agent's note"). Buttons: Open card · Done → unblock
  *     · Reply & unblock (posts your note as a card comment, then unblocks, so the
  *     resumed worker reads it).
- *     Skipped: `transient` blocks (they clear on their own) and reasons that say
- *     "no human action needed" (time waits that should have been kanban_schedule).
- *   - Cards parked by an operational failure (newest event gave_up/crashed/timed_out/spawn_failed, no later
- *     `blocked`) are agent issues, not asks: snapshot.issues, "No action required from you", Open card only.
+ *     Only complete human_request evidence is actionable. Metadata is presentation,
+ *     not permission or completion. Typed dependency/time waits are not human asks.
+ *   - Operational failures, transient pauses, missing details and unclassified blockers
+ *     are agent issues, not asks: snapshot.issues, owner, "No action required from you", Open card only.
  *   - you parked it with ⌘B (core's `hermes.desktop.blockedSessionIds`). With no
  *     blocked cards that shows one line: parked by you, ⌘B to unblock.
  *
  * Data: `/api/session-kanban-tasks?ids=<lineage>` (every board) + per blocked card
- * `/api/plugins/kanban/tasks/<id>?board=<slug>` (events → reason/kind). Polls every
+ * `/api/plugins/kanban/tasks/<id>?board=<slug>` (events → reason/kind/human_request). Polls every
  * 10 s while visible; card details are cached 60 s or until the blocked set changes.
  * Only the FOCUSED session is known to a composer plugin, so every tile's composer
  * renders the focused chat's panel only when that tile is the focused one.
@@ -30,6 +29,7 @@
  * strip shows these cards via window.__blockedPanel.{snapshot,subscribe,unblockCard,openCard,checklist}.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
+import * as sdk from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -129,19 +129,20 @@ const payloadOf = e => {
   }
 }
 
-/** The block currently in force: the newest `blocked` event after the newest
- *  `unblocked`. `initial_status` (card created blocked) carries no instructions. */
+/** Latest blocked event after unblock. initial_status itself is not instructions;
+ *  any explicit human_request is propagated independently for validation. */
 export function latestBlock(events) {
   const list = (Array.isArray(events) ? events : []).slice().sort((a, b) => (Number(a?.id) || 0) - (Number(b?.id) || 0))
   let block = null
   for (const e of list) {
     if (e?.kind === 'unblocked') block = null
-    else if (e?.kind === 'blocked') {
+    else if (['blocked', 'block_loop_detected'].includes(e?.kind)) {
       const p = payloadOf(e)
       const reason = str(p.reason).trim()
       block = {
         reason: reason === 'initial_status' ? '' : reason,
         kind: str(p.kind) || null,
+        human_request: p.human_request,
         at: Number(e.created_at) || 0
       }
     }
@@ -149,14 +150,14 @@ export function latestBlock(events) {
   return block
 }
 
-const NO_HUMAN_RE = /^\s*(no human action (is )?(needed|required)|nothing (is )?needed from you|waiting on time)/i
 
-/** Does this block need a person? transient → clears itself; "no human action
- *  needed" text → a time wait. Everything else (needs_input, capability, unset) does. */
+/** Classification is not authorization. Only a complete, explicit interaction is a human ask. */
 export function needsHuman(block) {
-  if (!block) return true
-  if (block.kind === 'transient' || block.kind === 'dependency') return false
-  return !NO_HUMAN_RE.test(block.reason || '')
+  if (!block || ['transient', 'dependency', 'time'].includes(block.kind)) return false
+  const request = block.human_request
+  if (!request || typeof request !== 'object' || Array.isArray(request)) return false
+  if (!['approval', 'reply', 'user_terminal', 'physical', 'external'].includes(request.interaction)) return false
+  return ['action', 'why_human', 'scope', 'evidence'].every(key => typeof request[key] === 'string' && request[key].trim())
 }
 
 const FAILURE_KINDS = new Set(['gave_up', 'crashed', 'timed_out', 'spawn_failed'])
@@ -189,31 +190,27 @@ export function failureSummary(kind, payload) {
   }
 }
 
-const PAUSE_WORDS_RE = /paused|refus|gave up|give up|failed|failure|crash|timed out|time out|recovery/i
-
-/** An explicit non-human `blocked` event (kind transient, or "no human action needed") is an operational
- *  pause when it is transient or its own text says recovery/failure; dependency and time waits are benign. */
+/** Typed dependency/time waits are benign; unknown asks stay visible and agent-owned. */
 function pauseFailure(block) {
-  if (block.kind !== 'transient' && !PAUSE_WORDS_RE.test(block.reason)) return null
+  if (['dependency', 'time'].includes(block.kind)) return null
+  if (block.kind !== 'transient') return { kind: 'unclassified', reason: 'No actionable human request was recorded. The assigned agent must classify this blocker.', refusal: false, at: block.at }
   const reason = oneLine(block.reason, 300)
   return { kind: 'paused', reason: reason || 'Paused automatically; no reason was recorded.', refusal: /refus|safety filter|declined/i.test(reason), at: block.at }
 }
 
-/** Why is this card blocked? Walks events oldest→newest and keeps whichever came last since the newest
- *  `unblocked`: a worker/human `blocked` event (origin 'human' — `initial` when the card was created blocked,
- *  `recorded` when the worker wrote a reason, `unrecorded` when the reason is empty) or an operational
- *  failure (`gave_up`/`crashed`/`timed_out`/`spawn_failed`, origin 'agent': the dispatcher parked it, nobody asked
- *  you for anything). No such event at all → origin 'unknown' (legacy cards: treated as human). */
+/** Latest signal since unblock wins. Only explicit, complete human_request metadata
+ *  produces a human item; initial status, prose and legacy missing events do not.
+ *  This projection never changes execution permission, task status or ownership. */
 export function blockState(events) {
   const list = (Array.isArray(events) ? events : []).slice().sort((a, b) => (Number(a?.id) || 0) - (Number(b?.id) || 0))
   let state = { origin: 'unknown', block: null, failure: null }
   for (const e of list) {
     if (e?.kind === 'unblocked') state = { origin: 'unknown', block: null, failure: null }
-    else if (e?.kind === 'blocked') {
+    else if (['blocked', 'block_loop_detected'].includes(e?.kind)) {
       const p = payloadOf(e)
       const reason = str(p.reason).trim()
       const initial = reason === 'initial_status'
-      const block = { reason: initial ? '' : reason, kind: str(p.kind) || null, at: Number(e.created_at) || 0, source: initial ? 'initial' : reason ? 'recorded' : 'unrecorded' }
+      const block = { reason: initial ? '' : reason, kind: str(p.kind) || null, human_request: p.human_request, at: Number(e.created_at) || 0, source: initial ? 'initial' : reason ? 'recorded' : 'unrecorded' }
       if (needsHuman(block)) state = { origin: 'human', failure: null, block }
       else state = { origin: 'agent', block: null, failure: pauseFailure(block) }
     } else if (FAILURE_KINDS.has(e?.kind)) {
@@ -266,32 +263,45 @@ export function stepsOf(text) {
 
 const KIND_LABEL = { needs_input: 'Needs your input', capability: 'Needs access you have' }
 
-/** Session tasks + fetched details → panel items that need YOU (human-blocked cards only).
- *  Cards parked by a worker failure are NOT here: see agentIssues(). An unloaded card is kept as a
- *  `loaded:false` placeholder (no unblock buttons until we know why it is blocked). */
+// Modern owners expose canonical evidence on the task. Explicit null retires
+// old event evidence; events remain a compatibility fallback for older owners.
+function detailState(d) {
+  if (!d) return { origin: 'unknown', block: null, failure: null }
+  if (Object.prototype.hasOwnProperty.call(d.task || {}, 'human_request')) {
+    const block = { kind: d.task.block_kind, human_request: d.task.human_request, at: 0, source: 'recorded' }
+    return needsHuman(block) ? { origin: 'human', block, failure: null }
+      : { origin: 'agent', block: null, failure: pauseFailure(block) }
+  }
+  return blockState(d.events)
+}
+
+/** Only validated requests enter the human strip. Missing details remain operational
+ *  in agentIssues(); task descriptions are never inferred to be instructions. */
 export function blockedItems(tasks, details) {
   const out = []
   const seen = new Set()
   for (const t of Array.isArray(tasks) ? tasks : []) {
-    if (!t?.id || str(t.status) !== 'blocked' || seen.has(t.id)) continue
-    seen.add(t.id)
+    if (!t?.id || !['blocked', 'triage'].includes(str(t.status)) || seen.has(detailKey(t))) continue
+    seen.add(detailKey(t))
     const d = details?.get ? details.get(detailKey(t)) : details?.[detailKey(t)]
-    const st = d ? blockState(d.events) : { origin: 'unknown', block: null, failure: null }
+    const st = detailState(d)
     if (st.origin === 'agent') continue
     const block = st.block
-    if (!needsHuman(block) && d) continue
-    const fromBody = !block?.reason
-    const text = unescapeText(block?.reason || str(d?.task?.body).trim())
+    if (!needsHuman(block)) continue
+    const fromBody = false
+    const text = unescapeText(block.human_request.action)
     out.push({
       id: str(t.id),
+      connectionId: t.connectionId,
+      gateway: t.gateway,
       board: str(t.board) || 'default',
       title: unescapeText(t.title) || str(t.id),
       kind: block?.kind || null,
+      human_request: { ...block.human_request },
       kindLabel: KIND_LABEL[block?.kind] || 'Waiting on you',
       text,
       fromBody,
-      // 'initial': created blocked, its description IS the ask; 'recorded': the worker wrote a reason;
-      // otherwise the description is only a guess at what is wanted.
+      // Source is provenance only: instructions always come from human_request.action.
       reasonSource: !d ? 'loading' : block?.source || 'legacy',
       loaded: Boolean(d),
       at: block?.at || 0,
@@ -301,22 +311,26 @@ export function blockedItems(tasks, details) {
   return out.sort((a, b) => b.at - a.at)
 }
 
-/** Blocked cards whose newest signal is an operational failure (dispatcher gave up, worker crashed,
- *  model refusal…). They are agent/system issues: shown, but never as something you must do. */
+/** Operational failures and unclassified blockers stay visible with their owner,
+ *  never as something you must do. Classification does not unblock them. */
 export function agentIssues(tasks, details) {
   const out = []
   const seen = new Set()
   for (const t of Array.isArray(tasks) ? tasks : []) {
-    if (!t?.id || str(t.status) !== 'blocked' || seen.has(t.id)) continue
-    seen.add(t.id)
+    if (!t?.id || !['blocked', 'triage'].includes(str(t.status)) || seen.has(detailKey(t))) continue
+    seen.add(detailKey(t))
     const d = details?.get ? details.get(detailKey(t)) : details?.[detailKey(t)]
-    const f = d ? blockState(d.events).failure : null
+    const state = detailState(d)
+    const f = state.origin === 'unknown' ? pauseFailure({ kind: null, at: 0 }) : state.failure
     if (!f) continue
     out.push({
       id: str(t.id),
+      connectionId: t.connectionId,
+      gateway: t.gateway,
       board: str(t.board) || 'default',
       title: unescapeText(t.title) || str(t.id),
       failureKind: f.kind,
+      owner: str(d?.task?.assignee || t.assignee) || 'unassigned',
       refusal: f.refusal,
       reason: f.reason,
       noAction: true,
@@ -326,15 +340,14 @@ export function agentIssues(tasks, details) {
   return out.sort((a, b) => b.at - a.at)
 }
 
-/** The one-line headline a strip shows for a human item. A description is only quoted when it IS the ask
- *  (created blocked) or the worker wrote a reason; otherwise say so instead of quoting an unrelated line. */
+/** One-line headline for a validated request; retain the legacy fallback defensively. */
 export function askSummary(item, rewritten) {
   if (!item?.loaded) return 'Loading what this card needs\u2026'
   if (item.fromBody && item.reasonSource !== 'initial') return 'No block reason was recorded. Open the card to see what it needs.'
   return checklist(item, rewritten).steps[0]
 }
 
-export const detailKey = t => `${str(t?.board) || 'default'}:${str(t?.id)}`
+export const detailKey = t => `${t?.connectionId || t?.gateway ? `${str(t.connectionId || t.gateway)}:` : ''}${str(t?.board) || 'default'}:${str(t?.id)}`
 
 export const HANDBACK = 'When you\u2019re done, click Done \u2192 unblock (or Reply & unblock to send the agent an answer).'
 const HANDBACK_RE = /\bunblock\b/i
@@ -375,7 +388,7 @@ export function checklist(item, rewritten) {
 
 export const PARKED_STEPS = ['Do what you parked this chat for (see its last messages above).', 'Press \u2318B to unblock it.']
 
-export const rewriteKey = item => `${item.board}:${item.id}|${item.text.length}|${item.text.slice(0, 64)}|${item.text.slice(-64)}`
+export const rewriteKey = item => `${detailKey(item)}|${item.text.length}|${item.text.slice(0, 64)}|${item.text.slice(-64)}`
 
 // ── data ────────────────────────────────────────────────────────────────────
 
@@ -397,21 +410,63 @@ function api(path, opts = {}) {
 const boardQs = board => (board && board !== 'default' ? `?board=${encodeURIComponent(board)}` : '')
 const taskPath = (id, board, sub = '') => `/api/plugins/kanban/tasks/${encodeURIComponent(id)}${sub}${boardQs(board)}`
 
+/** Live lists on every registered gateway, plus hub session links for cross-host
+ * subscriptions and offline owners. Replica rows discover cards; only the owner
+ * detail response makes them actionable. Never guess a connection from a name. */
+export async function sessionTasks(ids, call = api, registry = () => host.connections?.(), resolve = name => sdk.connectionForHubGateway?.(name)) {
+  const active = activeConnection() || 'local'
+  let connections = []
+  try { connections = await registry() || [] } catch { /* active still works */ }
+  const owners = [...new Set([active, ...connections.map(c => c.id).filter(Boolean)])]
+  const query = encodeURIComponent([...ids].join(','))
+  const rows = new Map()
+  let answered = false
+  const live = await Promise.all(owners.map(async connectionId => {
+    try {
+      await sdk.learnHubGatewayName?.(connectionId)
+      const r = await call(`/api/session-kanban-tasks?ids=${query}`, { connectionId })
+      if (!Array.isArray(r?.tasks)) return []
+      answered = true
+      return r.tasks.map(t => ({ ...t, connectionId }))
+    } catch { return [] }
+  }))
+  try {
+    const r = await call(`/api/plugins/hub-sync/session-links/${encodeURIComponent([...ids][0] || '')}?ids=${query}`, { connectionId: active })
+    if (Array.isArray(r?.tasks)) {
+      answered = true
+      for (const t of r.tasks) {
+        const connectionId = t.local ? active : resolve(t.gateway)
+        const row = { ...t, connectionId }
+        rows.set(detailKey(row), row)
+      }
+    }
+  } catch { /* hub plugin is optional */ }
+  // Live records win over replicas, including cards which have since unblocked.
+  for (const t of live.flat()) rows.set(detailKey(t), t)
+  return answered ? [...rows.values()] : null
+}
+
 /** Done → unblock, optionally posting `note` first. `call` is injectable for tests. */
 export async function unblockCard(item, note = '', call = api) {
+  if (item.gateway && !item.connectionId) throw new Error('The owning gateway is unavailable; reconnect before unblocking.')
+  const route = item.connectionId ? { connectionId: item.connectionId } : {}
   const body = str(note).trim()
   if (body) {
     await call(taskPath(item.id, item.board, '/comments'), {
+      ...route,
       method: 'POST',
       body: { body, author: 'user' }
     })
   }
-  return call(taskPath(item.id, item.board), { method: 'PATCH', body: { status: 'ready' } })
+  return call(taskPath(item.id, item.board), { ...route, method: 'PATCH', body: { status: 'ready' } })
 }
 
 /** Open the card's drawer: core hook → task-mentions popup → Kanban page. */
 export function openCard(item, win = typeof window !== 'undefined' ? window : {}, nav = p => host.navigate?.(p)) {
-  if (typeof win.__hermesKanbanOpenTask === 'function' && win.__hermesKanbanOpenTask(item.id, item.board)) return 'drawer'
+  if (item.gateway && !item.connectionId) { notify('error', 'The owning gateway is unavailable.'); return 'unavailable' }
+  if (typeof win.__hermesKanbanOpenTask === 'function' && win.__hermesKanbanOpenTask(item.id, item.board, item.connectionId)) return 'drawer'
+  // Legacy popup/page hooks cannot route to a different owner.
+  if (item.connectionId && item.connectionId !== activeConnection()) return 'unavailable'
   if (typeof win.__taskMentionsOpen === 'function') {
     win.__taskMentionsOpen(item.id)
     return 'popup'
@@ -423,15 +478,18 @@ export function openCard(item, win = typeof window !== 'undefined' ? window : {}
 const lineageCache = new Map()
 
 async function lineageIds(storedId) {
-  const conn = activeConnection() || ''
-  const key = `${conn}\u0000${storedId}`
+  const owner = host.state.focusedSessionOwner?.get?.()
+  if (host.state.focusedSessionOwner && !owner) return new Set([storedId])
+  const conn = owner?.connectionId || activeConnection() || ''
+  const profile = owner?.profile || ''
+  const key = `${conn}\u0000${profile}\u0000${storedId}`
   const hit = lineageCache.get(key)
   if (hit && Date.now() - hit.at < LINEAGE_TTL_MS) return hit.ids
   const ids = new Set([storedId])
   let cur = storedId
   for (let hop = 0; hop < 12 && cur; hop++) {
     try {
-      const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, { timeoutMs: 5_000 })
+      const row = await api(`/api/sessions/${encodeURIComponent(cur)}${profile ? `?profile=${encodeURIComponent(profile)}` : ''}`, { connectionId: conn, timeoutMs: 5_000 })
       if (row?.id) ids.add(str(row.id))
       cur = str(row?.parent_session_id)
       if (cur) ids.add(cur)
@@ -492,9 +550,10 @@ async function requestRewrites(items, detailMap) {
   emit()
   for (const it of todo) {
     const k = rewriteKey(it)
-    const d = detailMap.get(`${it.board}:${it.id}`)
+    const d = detailMap.get(detailKey(it))
     const comments = (Array.isArray(d?.comments) ? d.comments : []).slice(-3).map(c => str(c?.body)).filter(Boolean)
     api('/api/plugins/blocked-panel/steps', {
+      connectionId: it.connectionId,
       method: 'POST',
       timeoutMs: 60_000,
       body: { title: it.title, reason: it.fromBody ? '' : it.text, body: str(d?.task?.body), comments }
@@ -522,15 +581,21 @@ async function loadDetails(tasks) {
   const now = Date.now()
   await Promise.all(
     tasks
-      .filter(t => str(t.status) === 'blocked')
+      .filter(t => ['blocked', 'triage'].includes(str(t.status)))
       .map(async t => {
         const k = detailKey(t)
         const hit = details.get(k)
-        if (hit && now - hit.at < DETAIL_TTL_MS) return
+        if (hit && now - hit.at < DETAIL_TTL_MS) {
+          if (hit.data?.task?.status) t.status = hit.data.task.status
+          return
+        }
         try {
-          const data = await api(taskPath(t.id, t.board), { timeoutMs: 8_000 })
+          if (t.gateway && !t.connectionId) return
+          const data = await api(taskPath(t.id, t.board), { connectionId: t.connectionId, timeoutMs: 8_000 })
+          if (data?.task?.status) t.status = data.task.status
           details.set(k, { at: now, data })
         } catch (e) {
+          details.delete(k) // expired evidence is not an actionable offline cache
           log('detail failed', t.id, e?.message || e)
         }
       })
@@ -552,8 +617,7 @@ export async function refresh(force = false) {
     }
     if (force) details.clear()
     const ids = await lineageIds(stored)
-    const list = await api(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`).catch(() => null)
-    const tasks = Array.isArray(list?.tasks) ? list.tasks : null
+    const tasks = await sessionTasks(ids)
     if (tasks) await loadDetails(tasks)
     if (host.state.focusedStoredSessionId.get() !== stored) return
     const flat = new Map([...details].map(([k, v]) => [k, v.data]))
@@ -799,6 +863,7 @@ function IssueItem({ issue }) {
         ]
       }),
       jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45, userSelect: 'text' }, children: issue.reason }),
+      jsx('div', { 'data-blocked-owner': true, style: { fontSize: 11.5 }, children: `Owner: ${issue.owner || 'unassigned'}` }),
       jsxs('div', {
         style: { display: 'flex', gap: 6, alignItems: 'center' },
         children: [
@@ -878,8 +943,8 @@ function Panel() {
           style: { margin: '2px 0 0', paddingLeft: 20, fontSize: 12.5, lineHeight: 1.45, display: 'flex', flexDirection: 'column', gap: 3 },
           children: PARKED_STEPS.map((s, i) => jsx('li', { children: jsx(Linked, { text: s }) }, i))
         }),
-      !collapsed && items.map(item => jsx(Item, { item }, item.id)),
-      !collapsed && issues.map(issue => jsx(IssueItem, { issue }, issue.id))
+      !collapsed && items.map(item => jsx(Item, { item }, detailKey(item))),
+      !collapsed && issues.map(issue => jsx(IssueItem, { issue }, detailKey(issue)))
     ]
   })
 }

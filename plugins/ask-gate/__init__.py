@@ -3,10 +3,10 @@
 Layers (see README):
   L1 pre_llm_call        fresh block: status of every card linked to this chat + asks David already answered
   L2 pre_final_gate      judge every ask in a final reply BEFORE it is shown; hold + private nudge, or deliver
-  L3 pre_tool_call       kanban_create(blocked) / kanban_block / "needs David" bodies need a verified `Checked:` line;
+  L3 pre_tool_call       explicit human_request contract + evidence + judge; legacy human-ask prose needs Checked;
                          workers' kanban_complete / kanban_block handoffs are judged and leftovers become FYI lines
   L4 answered-asks ledger (sqlite, ~/.hermes/state) filled when David's message answers or dismisses an ask
-Every hook fails open: a broken gate must never break a chat.
+Ordinary chat hooks fail open; explicit structured requests fail closed when validation/judging fails.
 """
 from __future__ import annotations
 
@@ -175,14 +175,14 @@ def _user_msgs(session_id: str) -> list[str]:
         return []
 
 
-def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "") -> list[dict]:
+def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "", *, structured: bool = False) -> list[dict]:
     ids = core.card_ids(" ".join(asks) + " " + reply)
     statuses = core.card_status(ids)
     led = ledger().recent(14 * 86400, limit=20)
     ledger_text = "\n".join(f"- {a['topic']} -> {a['answer']} ({core.fmt_ts(a['ts'])})" for a in led)
     return judge_mod.judge(asks, tools_text=core.render_tools(tools), user_msgs=_user_msgs(session_id),
                            card_status=statuses, ledger_text=ledger_text, caps=core.capability_sheet(),
-                           reply=reply, llm=_llm(), ledger=led,
+                           reply=reply, llm=judge_mod.structured_llm(_llm()) if structured else _llm(), ledger=led,
                            soft=[core.is_soft_ask(a) for a in asks])
 
 
@@ -340,6 +340,36 @@ def _tools_now(session_id: str) -> list[dict]:
     return LOG.get(session_id)
 
 
+def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
+    """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
+    try:
+        request = core.validate_human_request(args["human_request"])
+        kind = args.get("kind") if tool_name == "kanban_block" else args.get("block_kind")
+        if kind in _WORKER_NO_ASK_KINDS:
+            raise ValueError("human_request cannot accompany dependency/time/transient blocks")
+        if tool_name == "kanban_create" and args.get("initial_status") != "blocked":
+            raise ValueError("human_request requires initial_status=blocked on creation")
+        tools = _tools_now(session_id)
+        evidence = request["evidence"]
+        claim = core.checked_line(evidence) or evidence
+        if not core.checked_matches(claim, tools):
+            raise ValueError("human_request.evidence matches no tool call made this turn; verify the actual action and scope")
+        # Keep the complete contract in the ask itself: prose detectors and their sentence/length
+        # caps must not select an unrelated sentence or drop a late field from this explicit ask.
+        text = json.dumps(request, ensure_ascii=False)
+        verdicts = run_judge(session_id, [text], tools, text, structured=True)
+        if not verdicts or judge_mod.bad(verdicts):
+            raise ValueError("human_request was not verified: " + judge_mod.nudge([text], verdicts))
+        core.log_event("l3_human_request", tool=tool_name, session=session_id, verdict="ok")
+        return None
+    except Exception as e:
+        core.log_event("l3_human_request_held", tool=tool_name, session=session_id, error=repr(e))
+        return {"action": "block", "message": "ask-gate: human_request refused. " + str(e)
+                + " Keep operational failures parked without a human_request; supply the actual action, why_human, "
+                  "scope, evidence and interaction only when a human step is verified. Metadata is not authorization. "
+                  "OS authentication is distinct from approval; use the supported user-terminal flow, never passwords in chat."}
+
+
 def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any) -> dict | None:
     if _off() or not isinstance(args, dict):
         return None
@@ -348,6 +378,8 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             return _worker_complete(session_id, args)
         if tool_name not in ("kanban_create", "kanban_block"):
             return None
+        if args.get("human_request") is not None:
+            return _human_request_gate(session_id, tool_name, args)
         if tool_name == "kanban_block" and str(args.get("kind") or "") in _WORKER_NO_ASK_KINDS:
             return None
         gated, text = core.needs_checked(tool_name, args, _is_worker())

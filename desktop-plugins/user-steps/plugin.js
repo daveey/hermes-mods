@@ -150,8 +150,16 @@ export async function performAction(step, action, sessionId, deps = {}) {
   return 'sent'
 }
 
-/** Ledger steps + blocked-panel Kanban items → strip rows, ledger steps oldest first, then cards oldest first.
- *  The chat's own rolling card is dropped: its steps are already listed. */
+/** Defense against old/malformed blocked-panel snapshots. Presentation, not authorization. */
+export function actionableCard(item) {
+  if (!item || item.loaded === false || ['transient', 'dependency', 'time'].includes(item.kind)) return false
+  const r = item.human_request
+  return !!r && typeof r === 'object' && !Array.isArray(r) &&
+    ['approval', 'reply', 'user_terminal', 'physical', 'external'].includes(r.interaction) &&
+    ['action', 'why_human', 'scope', 'evidence'].every(k => typeof r[k] === 'string' && r[k].trim())
+}
+
+/** Ledger steps then validated Kanban requests, oldest first; omit the rolling card. */
 export function projectStrip(ledger, kanbanItems) {
   // the chat's own rolling cards (current + already archived: blocked-panel's snapshot can lag the archive)
   const own = new Set([str(ledger?.card?.id), ...(Array.isArray(ledger?.own_cards) ? ledger.own_cards.map(str) : [])].filter(Boolean))
@@ -161,17 +169,19 @@ export function projectStrip(ledger, kanbanItems) {
     .sort((a, b) => (Number(a.created) || 0) - (Number(b.created) || 0))
     .map(s => ({ type: 'step', key: `s:${s.id}`, step: s, actions: actionsFor(s) }))
   const cards = (Array.isArray(kanbanItems) ? kanbanItems : [])
-    .filter(it => it?.id && !own.has(str(it.id)))
+    .filter(it => it?.id && actionableCard(it) && !(own.has(str(it.id)) &&
+      str(it.connectionId || it.gateway) === str(ledger?.connectionId) &&
+      (it.board || 'default') === (ledger?.card?.board || 'default')))
     .slice()
     .sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
-    .map(it => ({ type: 'card', key: `c:${it.board || 'default'}:${it.id}`, item: it }))
+    .map(it => ({ type: 'card', key: `c:${it.connectionId || it.gateway ? `${it.connectionId || it.gateway}:` : ''}${it.board || 'default'}:${it.id}`, item: it }))
   return [...steps, ...cards]
 }
 
 /** First line of what a blocked card wants (blocked-panel's checklist when available). */
 export function cardSummary(item, checklist, askSummary) {
   try {
-    // blocked-panel >= v5 decides when a card description may be quoted as the ask (created blocked / worker reason)
+    // Only validated explicit requests enter this projection, never task descriptions.
     if (typeof askSummary === 'function') return short(askSummary(item, item.rewritten), 160)
     const list = typeof checklist === 'function' ? checklist(item, item.rewritten) : null
     if (list?.steps?.length) return short(list.steps[0], 160)
@@ -274,11 +284,19 @@ export async function refresh(call = api) {
       snapshot = { ...snapshot, stored, ledger: { steps: [], card: null } }
       return emit()
     }
-    let ledger = snapshot.stored === stored ? snapshot.ledger : { steps: [], card: null }
+    const connectionId = activeConnection()
+    let ledger = snapshot.stored === stored && snapshot.ledger.connectionId === connectionId
+      ? snapshot.ledger : { connectionId, steps: [], card: null }
     let ok = snapshot.ok
     try {
-      const r = await call(`${BASE}/steps?session=${encodeURIComponent(stored)}`, { timeoutMs: 6_000 })
-      ledger = { steps: Array.isArray(r?.steps) ? r.steps : [], card: r?.card || null, own_cards: Array.isArray(r?.own_cards) ? r.own_cards : [] }
+      const r = await call(`${BASE}/steps?session=${encodeURIComponent(stored)}`, { connectionId, timeoutMs: 6_000 })
+      // A connection switch may keep the same session ID. Drop the old owner's
+      // response before it can populate either the strip or the step cache.
+      if (focusedId() !== stored || activeConnection() !== connectionId) {
+        rerun = true
+        return
+      }
+      ledger = { connectionId, steps: Array.isArray(r?.steps) ? r.steps : [], card: r?.card || null, own_cards: Array.isArray(r?.own_cards) ? r.own_cards : [] }
       ok = true
       const open = new Set(ledger.steps.map(s => s.id))
       for (const [sid, hit] of stepCache) if ((hit.step?.status || 'open') === 'open' && !open.has(sid) && hit.step?.session && snapshot.ledger.steps.some(x => x.id === sid)) stepCache.delete(sid)
@@ -287,7 +305,7 @@ export async function refresh(call = api) {
       ok = false
       log('steps fetch failed', e?.message || e)
     }
-    if (focusedId() !== stored) {
+    if (focusedId() !== stored || activeConnection() !== connectionId) {
       rerun = true
       return
     }
@@ -517,6 +535,7 @@ function CardRow({ item }) {
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const unblock = async withNote => {
+    if (!actionableCard(item)) return
     if (typeof bp?.unblockCard !== 'function') return notify('error', 'blocked-panel is not loaded')
     setBusy(true)
     try {
@@ -594,6 +613,7 @@ export function IssueRow({ issue }) {
         ]
       }),
       jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: issue.reason }),
+      jsx('div', { 'data-user-steps-owner': true, style: { fontSize: 11.5 }, children: `Owner: ${issue.owner || 'unassigned'}` }),
       jsxs('div', {
         style: { display: 'flex', gap: 6, alignItems: 'center' },
         children: [

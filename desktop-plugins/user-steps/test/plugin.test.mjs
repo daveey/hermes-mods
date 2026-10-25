@@ -40,6 +40,38 @@ export async function resolve(spec, ctx, next) {
   return next(spec, ctx)
 }`))
 const m = await import('../plugin.js')
+const request = (action, interaction = 'approval') => ({ action, interaction, why_human: 'Only the owner can use this control.', scope: action, evidence: 'Checked the documented owner-only control; owner interaction is required.' })
+
+test('owner-qualified cards do not collide or hide behind another gateway rolling card', () => {
+  const card = connectionId => ({ id: 'same', board: 'default', connectionId, human_request: request('Approve staging') })
+  const rows = m.projectStrip({ connectionId: 'owner-a', card: { id: 'same' } }, [card('owner-a'), card('owner-b')])
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].item.connectionId, 'owner-b')
+  const both = m.projectStrip({}, [card('owner-a'), card('owner-b')])
+  assert.notEqual(both[0].key, both[1].key)
+})
+
+test('connection switch during ledger fetch never publishes or caches the previous owner', async () => {
+  let owner = 'owner-a'
+  const h = globalThis.__us.sdk.host
+  h.activeConnectionId = () => owner
+  const calls = []
+  const call = async (_path, opts) => {
+    calls.push(opts.connectionId)
+    if (calls.length === 1) {
+      owner = 'owner-b'
+      return { steps: [], card: { id: 'old-owner' } }
+    }
+    return { steps: [], card: { id: 'new-owner' } }
+  }
+  try {
+    await m.refresh(call)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    assert.deepEqual(calls, ['owner-a', 'owner-b'])
+    assert.equal(m.getSnapshot().ledger.connectionId, 'owner-b')
+    assert.equal(m.getSnapshot().ledger.card.id, 'new-owner')
+  } finally { delete h.activeConnectionId }
+})
 
 // fake REST: /steps, /step, /resolve over an in-memory ledger
 function fakeRest(steps, { card = null, down = false } = {}) {
@@ -111,7 +143,7 @@ test('projectStrip: open steps oldest first, then blocked cards, minus the chat\
     steps: [step('us_bbbbbb02', 'do', { created: 20 }), step('us_bbbbbb01', 'approve', { created: 10 }), step('us_bbbbbb03', 'do', { status: 'resolved' })],
     card: { id: 't_rolling1', board: 'default' }
   }
-  const kanban = [{ id: 't_other002', board: 'default', title: 'B', at: 50 }, { id: 't_rolling1', board: 'default', title: 'For you: …', at: 1 }, { id: 't_other001', board: 'x', title: 'A', at: 40 }]
+  const kanban = [{ id: 't_other002', board: 'default', title: 'B', at: 50 }, { id: 't_rolling1', board: 'default', title: 'For you: …', at: 1 }, { id: 't_other001', board: 'x', title: 'A', at: 40 }].map(it => ({ ...it, human_request: request('Approve the reviewed plan.') }))
   const rows = m.projectStrip(ledger, kanban)
   assert.deepEqual(rows.map(r => r.key), ['s:us_bbbbbb01', 's:us_bbbbbb02', 'c:x:t_other001', 'c:default:t_other002'])
   assert.deepEqual(m.projectStrip({ steps: [], card: null }, []), [])
@@ -154,7 +186,7 @@ test('strip: lists open steps + other blocked cards for the focused chat, hides 
   const steps = [step('us_eeeeee01', 'do', { text: 'Plug the watch in' })]
   let card = { id: 't_rolling9', board: 'default' }
   const call = fakeRest(steps, { card })
-  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_rolling9', board: 'default', title: 'For you: Plug', at: 1 }, { id: 't_human001', board: 'default', title: 'Approve the doc', text: 'Read the doc.', at: 2 }] } }
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_rolling9', board: 'default', title: 'For you: Plug', at: 1 }, { id: 't_human001', board: 'default', title: 'Approve the doc', text: 'Read the doc.', human_request: request('Read the doc.'), at: 2 }] } }
   focused.set('S1')
   await m.refresh(call)
   await show(React.createElement(m.Strip, { key: 's1' }))
@@ -239,7 +271,7 @@ test('strip: URLs in a blocked card summary and in a step are clickable and open
   const dispose = m.default.register({ register: () => {}, os: { openExternal: async u => (opened.push(u), true) } })
   const steps = [step('us_eeeeee77', 'do', { text: 'Visit https://example.com/step now' })]
   const call = fakeRest(steps)
-  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_billing1', board: 'default', title: 'Fix CI', text: 'Open github.com/settings/billing while signed in as you.', at: 2 }] } }
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_billing1', board: 'default', title: 'Fix CI', text: 'Open github.com/settings/billing while signed in as you.', human_request: request('Open github.com/settings/billing while signed in as you.', 'external'), at: 2 }] } }
   focused.set('S1')
   await m.refresh(call)
   await show(React.createElement(m.Strip, { key: 's-links' }))
@@ -262,7 +294,7 @@ test('strip: a .md path in a blocked card opens in the preview pane via ctx.open
   const opened = [], previewed = []
   const dispose = m.default.register({ register: () => {}, os: { openExternal: async u => (opened.push(u), true) }, openPreview: async p => (previewed.push(p), true) })
   const call = fakeRest([])
-  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_mdplan1', board: 'default', title: 'Go/no-go', text: 'Open /Users/you/design/plan.md and /tmp/run.log then decide.', at: 3 }] } }
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: [{ id: 't_mdplan1', board: 'default', title: 'Go/no-go', text: 'Open /Users/you/design/plan.md and /tmp/run.log then decide.', human_request: request('Open /Users/you/design/plan.md and /tmp/run.log then decide.'), at: 3 }] } }
   focused.set('S1')
   await m.refresh(call)
   await show(React.createElement(m.Strip, { key: 's-md' }))
@@ -299,7 +331,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   ]
   const details = new Map([
     ['default:t_failed01', { task: { body: 'Remaining after the sweep: three things.' }, events: [ev(1, 'crashed', { exit_code: 1, worker_output: 'Model declined to respond (safety refusal)' }), ev(2, 'gave_up', { failures: 2, error: 'safety refusal' })] }],
-    ['default:t_human002', { task: { body: 'Unrelated.' }, events: [ev(3, 'blocked', { reason: 'Approve the plan in the doc.', kind: 'needs_input' })] }],
+    ['default:t_human002', { task: { body: 'Unrelated.' }, events: [ev(3, 'blocked', { reason: 'Approve the plan in the doc.', kind: 'needs_input', human_request: request('Approve the plan in the doc.') })] }],
     ['default:t_nodesc004', { task: { body: 'Remaining after the sweep: three things.' }, events: [] }]
   ])
   const opened = []
@@ -315,7 +347,8 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await show(React.createElement(m.Strip, { key: 'issues' }))
   const strip = el().querySelector('[data-slot="user-steps"]')
   assert.ok(strip, el().innerHTML)
-  assert.match(strip.textContent, /For you \(3\)/) // human, loading, legacy: the failure is not counted
+  assert.match(strip.textContent, /For you/)
+  assert.equal(strip.querySelectorAll('[data-user-steps-card]').length, 1)
   const issue = strip.querySelector('[data-user-steps-issue="t_failed01"]')
   assert.ok(issue)
   assert.match(issue.textContent, /safety refusal/)
@@ -326,11 +359,11 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   const human = strip.querySelector('[data-user-steps-card="t_human002"]')
   assert.match(human.textContent, /Approve the plan in the doc/)
   assert.ok([...human.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
-  const loading = strip.querySelector('[data-user-steps-card="t_loading03"]')
-  assert.match(loading.textContent, /Loading/)
-  assert.deepEqual([...loading.querySelectorAll('button')].map(b => b.textContent), ['Open card'])
-  const legacy = strip.querySelector('[data-user-steps-card="t_nodesc004"]')
-  assert.match(legacy.textContent, /No block reason was recorded/)
+  const loading = strip.querySelector('[data-user-steps-issue="t_loading03"]')
+  assert.match(loading.textContent, /No actionable human request/)
+  assert.deepEqual([...loading.querySelectorAll('button')].map(b => b.textContent), ['Open card', 'Dismiss'])
+  const legacy = strip.querySelector('[data-user-steps-issue="t_nodesc004"]')
+  assert.match(legacy.textContent, /Owner: unassigned/)
   assert.doesNotMatch(legacy.textContent, /Remaining after/)
   await React.act(async () => { issue.querySelector('button').click(); await flush() })
   assert.deepEqual(opened, ['t_failed01'])
@@ -339,7 +372,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await m.refresh(fakeRest([], {}))
   await show(React.createElement(m.Strip, { key: 'issues2' }))
   const only = el().querySelector('[data-slot="user-steps"]')
-  assert.match(only.textContent, /Agent issue .* no action required from you/)
+  assert.match(only.textContent, /Agent issues .* no action required from you/)
   assert.doesNotMatch(only.textContent, /For you/)
   // The user can dismiss an issue they can't act on; it stays hidden until a NEW failure lands on the card.
   const onlyIssues = bpm.agentIssues(tasks, details)
@@ -355,7 +388,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   assert.ok(again, 'a new failure on the same card shows again')
   // per-row Dismiss hides just that issue
   await React.act(async () => { again.querySelector('[data-user-steps-dismiss]').click(); await flush() })
-  assert.equal(el().querySelector('[data-slot="user-steps"]'), null)
+  assert.equal(el().querySelectorAll('[data-user-steps-issue]').length, 2)
   // with an open ask (For you) present, the header has no dismiss-all: asks can't be dismissed
   window.__blockedPanel.snapshot = { stored: 'S1', items: bpm.blockedItems(tasks, details), issues: onlyIssues.map(i => ({ ...i, at: i.at + 2 })) }
   await m.refresh(fakeRest([], {}))
@@ -379,7 +412,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   assert.doesNotMatch(el().textContent, /For you|Done → unblock|Retry/)
   // A later, explicit user request replaces the issue and gets the normal human-action buttons.
   details.get('default:t_failed01').events.push(ev(5, 'blocked', {
-    kind: 'needs_input', reason: 'Approve the plan in the doc.'
+    kind: 'needs_input', reason: 'Approve the plan in the doc.', human_request: request('Approve the plan in the doc.')
   }))
   window.__blockedPanel.snapshot = { stored: 'S1', items: bpm.blockedItems(failedTask, details), issues: bpm.agentIssues(failedTask, details) }
   await m.refresh(fakeRest([], {}))
@@ -388,6 +421,37 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   const actionable = el().querySelector('[data-user-steps-card="t_failed01"]')
   assert.ok([...actionable.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
   delete window.__blockedPanel
+})
+
+test('downstream rejects stale legacy or malformed asks; evidence alone never invokes unblock', async () => {
+  const good = { id: 't_explicit', board: 'ops', text: 'Approve the plan.', human_request: request('Approve the plan.') }
+  const bad = [
+    { id: 't_legacy', text: 'Approve sudo installation.', kind: 'capability' },
+    { ...good, human_request: { ...good.human_request, evidence: ' ' } },
+    { ...good, human_request: { ...good.human_request, interaction: 'execute' } },
+    { ...good, kind: 'dependency' },
+    { ...good, loaded: false }
+  ]
+  assert.deepEqual(m.projectStrip({}, bad), [])
+  for (const interaction of ['approval', 'reply', 'user_terminal', 'physical', 'external']) {
+    assert.equal(m.projectStrip({}, [{ ...good, human_request: { ...good.human_request, interaction } }]).length, 1)
+  }
+  const calls = []
+  window.__blockedPanel = { snapshot: { stored: 'S1', items: bad }, unblockCard: (...args) => calls.push(args) }
+  await React.act(async () => { await m.refresh(fakeRest([])) })
+  await show(React.createElement(m.Strip, { key: 'reject-stale' }))
+  assert.equal(el().querySelector('[data-slot="user-steps"]'), null)
+  assert.deepEqual(calls, [])
+  delete window.__blockedPanel
+})
+
+test('both issue renderers show assigned ownership without human action buttons', async () => {
+  const issue = { id: 't_owned', title: 'Unclassified blocker', owner: 'operator', reason: 'No actionable human request was recorded.' }
+  for (const component of [bpm.IssueItem, m.IssueRow]) {
+    await show(React.createElement(component, { issue }))
+    assert.match(el().textContent, /Owner: operator/)
+    assert.doesNotMatch(el().textContent, /Done|unblock|Approve/)
+  }
 })
 
 test('done', () => { root.unmount() })
