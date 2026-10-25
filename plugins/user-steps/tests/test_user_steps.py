@@ -522,3 +522,23 @@ def test_full_span_search_skips_earlier_prefix_collision(home):
     assert len(out["steps"]) == 1
     assert out["steps"][0]["paragraph"] == exact
     assert out["text"].startswith(first + "\n\n::user-step")
+
+
+@pytest.mark.parametrize("question", ["Want me to delete it?", "May I delete it?"])
+def test_recommendation_does_not_hide_consent_questions(home, question):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    reply = "I recommend deleting the backup. " + question
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Approve deleting the backup", "kind": "approve", "verbatim_span": reply}]}))
+    assert len(out["steps"]) == 1 and board.rows()[0][3] == "blocked"
+
+
+def test_recommended_action_after_colon_is_not_user_instruction(home):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    reply = "Recommended first fix: open tabs only when needed and close them after automation. Your browser is stopped."
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Choose the first fix", "kind": "choose", "verbatim_span": reply,
+        "options": ["Open tabs on demand", "Another option"]}]}))
+    assert out["steps"] == [] and board.rows() == []

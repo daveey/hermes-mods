@@ -366,8 +366,9 @@ _RECOMMENDATION = re.compile(r"\b(?:recommend(?:ed|ation|ations|s)?|suggest(?:ed
 _EXPLICIT_REQUEST = re.compile(
     r"\b(?:can you|could you|would you|will you|you (?:must|need to|have to)|"
     r"(?:needs?|requires?|awaiting|waiting for) your|let me know|tell me|"
-    r"do you (?:approve|consent|want)|should i|shall i|which .{0,80}(?:want|choose|prefer))\b"
-    r"|(?:^|[.!;:,]\s+)(?:please\s+)?(?:choose|pick|approve|confirm|decide|select|reply|"
+    r"do you (?:approve|consent|want)|want me to|may i|can i|could i|would you like|should i|shall i|which .{0,80}(?:want|choose|prefer))\b"
+    r"|\bplease\s+(?:approve|confirm|authorize|choose|sign in|log in)\b"
+    r"|(?:^|[.!;,]\s+)(?:please\s+)?(?:choose|pick|approve|confirm|decide|select|reply|"
     r"sign in|log in|tap|click|plug|open|authorize|grant)\b",
     re.I,
 )
