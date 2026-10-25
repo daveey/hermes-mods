@@ -17,6 +17,108 @@ beforeEach(async () => {
   host.state = { connectionId: { get: () => 'fixture-connection' } }
 })
 
+test('local read captures A/work route and board through later focus changes', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  let owner = { connectionId: 'A', profile: 'work' }
+  host.state = { connectionId: { get: () => 'B' }, focusedSessionOwner: { get: () => owner } }
+  const calls = []
+  const open = (...args) => calls.push(args)
+  open.supportsQualifiedOwners = true
+  globalThis.window = { __hermesKanbanOpenTask: open, __taskMentionsOpen: () => assert.fail('bare route'), hermesDesktop: { api: async ({ path, connectionId, profile }) => {
+    assert.equal(connectionId, 'A'); assert.equal(profile, 'work')
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [{ id: 't_collision', status: 'running', board: 'special' }] }
+    return { available: false }
+  } } }
+  try {
+    const [chip] = await m.loadKanban(new Set(['local-route']))
+    assert.equal(chip.connectionId, 'A')
+    assert.equal(chip.profile, 'work')
+    owner = { connectionId: 'B', profile: 'default' }
+    m.openTaskChip(chip)
+    assert.deepEqual(calls, [['t_collision', 'special', 'A', 'work']])
+  } finally { delete globalThis.window }
+})
+
+test('authoritative release wins over replica and omitted profile is never default', async () => {
+  const unknown = m.hubLinkChips([{ id: 't_old', gateway: 'remote', status: 'running' }])[0]
+  assert.equal(unknown.profile, null)
+  globalThis.window = { __taskMentionsOpen: () => assert.fail('bare route'), hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [] }
+    return { tasks: [{ id: 't_old', gateway: 'remote', status: 'running' }] }
+  } } }
+  try {
+    assert.equal(m.openTaskChip(unknown), false)
+    assert.deepEqual(await m.loadKanban(new Set(['released'])), [])
+  } finally { delete globalThis.window }
+})
+
+test('fallback qualifies the origin profile; old replica rows stay nonclickable; outages retain uncertainty', async () => {
+  let qualified = true
+  let available = true
+  const route = { connectionId: 'fallback-A', profile: 'work' }
+  globalThis.localStorage = { getItem: () => JSON.stringify({ R: 'remote', S: 'second' }) }
+  globalThis.window = { hermesDesktop: { api: async ({ path, connectionId, profile }) => {
+    assert.equal(connectionId, route.connectionId); assert.equal(profile, route.profile)
+    if (!path.includes('session-links')) throw new Error('unavailable authoritative/board')
+    assert.match(path, /origin_profile=work/)
+    if (!available) return { available: false }
+    return { qualified_origins: qualified, origin_profile: 'work', tasks: [
+      { id: 'same', gateway: 'remote', profile: 'work', board: 'bb', status: 'running' },
+      { id: 'same', gateway: 'remote', profile: 'default', board: 'bb', status: 'running' },
+      { id: 'same', gateway: 'second', profile: 'work', board: 'bb', status: 'running' },
+      { id: 'legacy', gateway: 'remote', board: 'bb', status: 'unknown' }
+    ] }
+  } } }
+  try {
+    const ids = new Set(['fallback-alias', 'fallback-tip'])
+    const chips = (await m.loadKanban(ids, route)).filter(c => c.kind === 'kanban')
+    assert.equal(chips.length, 4)
+    assert.equal(new Set(chips.map(c => c.key)).size, 4)
+    assert.deepEqual(chips.slice(0, 3).map(c => c.connectionId), ['R', 'R', 'S'])
+    assert.equal(m.openTaskChip(chips[3]), false)
+    available = false
+    const stale = (await m.loadKanban(ids, route)).filter(c => c.kind === 'kanban')
+    assert.equal(stale.length, 4); assert.ok(stale.every(c => c.stale))
+    route.connectionId = 'fallback-B'
+    assert.equal((await m.loadKanban(ids, route)).filter(c => c.kind === 'kanban').length, 0)
+    available = true; qualified = false
+    const legacy = (await m.loadKanban(new Set(['legacy-api']), route)).filter(c => c.kind === 'kanban')
+    assert.ok(legacy.every(c => c.profile === null && c.state === 'unknown'))
+  } finally { delete globalThis.window; delete globalThis.localStorage }
+})
+
+test('released authoritative set survives outage and intervening owner switch', async () => {
+  let online = true
+  const row = { id: 'released-task', gateway: 'remote', profile: 'work', board: 'bb', status: 'running' }
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/session-kanban-tasks') && online) return { tasks: [] }
+    if (path.includes('session-links')) return { tasks: [row] }
+    if (path.includes('/board')) return { columns: [{ tasks: [{ ...row, session_id: 'release-outage' }] }] }
+    throw new Error('offline')
+  } } }
+  try {
+    const ids = new Set(['release-outage'])
+    const route = { connectionId: 'release-A', profile: 'work' }
+    assert.deepEqual(await m.loadKanban(ids, route), [])
+    await m.loadKanban(ids, { connectionId: 'release-B', profile: 'default' })
+    online = false
+    const chips = await m.loadKanban(ids, route)
+    assert.deepEqual(chips.map(c => c.kind), ['kanban-status'])
+  } finally { delete globalThis.window }
+})
+
+test('local colliding IDs remain distinct by captured connection/profile/board', () => {
+  const row = { id: 'same', status: 'running', board: 'bb' }
+  const a = m.sessionTaskChips([row], { connectionId: 'A', profile: 'work' })[0]
+  const b = m.sessionTaskChips([row], { connectionId: 'B', profile: 'default' })[0]
+  const d = m.sessionTaskChips([row], { connectionId: 'A', profile: 'default' })[0]
+  assert.equal(new Set([a.key, b.key, d.key]).size, 3)
+  const unknown = m.sessionTaskChips([{ ...row, profile: null }], { connectionId: 'A', profile: 'work' })[0]
+  assert.equal(unknown.profile, null)
+  assert.equal(unknown.connectionId, null)
+  assert.equal(m.openTaskChip(unknown), false)
+})
+
 test('processChips keeps only live processes, first command line', () => {
   const chips = m.processChips([
     { session_id: 'p1', command: 'npm run dev\n--watch', status: 'running', uptime_seconds: 90 },
@@ -135,7 +237,7 @@ test('hubLinkChips: other gateways only, deduped by gateway+board+id, gateway + 
     ],
     new Set([m.taskKey('mini', 'bb', 't_live')])
   )
-  assert.deepEqual(chips.map(c => c.key), ['kb:nas:default:default:t_live', 'kb:mini:default:default:t_mini'])
+  assert.deepEqual(chips.map(c => c.key), ['kb:nas:?:default:t_live', 'kb:mini:?:default:t_mini'])
   const mini = chips[1]
   assert.equal(mini.id, 't_mini')
   assert.equal(mini.gateway, 'mini')
@@ -197,10 +299,10 @@ test('unknown profile is not silently assigned to default ownership', () => {
   assert.equal(chips[0].profile, null)
 })
 
-test('loadKanban dedupes by actual owner gateway, profile, board and id', async () => {
+test('loadKanban preserves authoritative owners without adding replica rows', async () => {
   const row = { id: 't_same', status: 'running', gateway: 'remote', profile: 'work', board: 'default' }
   globalThis.window = { hermesDesktop: { api: async ({ path }) => {
-    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [row] }
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [row, row, { ...row, profile: 'default' }] }
     if (path.includes('session-links')) return { gateway: 'origin', tasks: [row, { ...row, profile: 'other' }] }
     throw new Error('unexpected route')
   } } }
@@ -227,7 +329,7 @@ test('failed authoritative reads dedupe retained remote rows against hub rows', 
     await m.loadKanban(ids)
     online = false
     const chips = await m.loadKanban(ids)
-    assert.equal(chips.filter(c => c.id === row.id).length, 2)
+    assert.equal(chips.filter(c => c.id === row.id).length, 1)
     assert.equal(chips.some(c => c.kind === 'kanban-status'), true)
   } finally { delete globalThis.window }
 })
@@ -238,19 +340,19 @@ test('hub fallback cache cannot leak between profiles with the same session id',
   let online = true
   host.state = { ...host.state, profile: { get: () => profile } }
   globalThis.window = { hermesDesktop: { api: async ({ path }) => {
-    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [] }
-    if (online && path.includes('session-links')) return { gateway: 'origin', tasks: [
+    if (path.startsWith('/api/session-kanban-tasks')) throw new Error('legacy backend')
+    if (online && path.includes('session-links')) return { gateway: 'origin', qualified_origins: true, origin_profile: profile, tasks: [
       { id: 't_work', status: 'running', gateway: 'remote', profile: 'work' }
     ] }
     throw new Error('offline')
   } } }
   try {
     const ids = new Set(['s_collision'])
-    assert.equal((await m.loadKanban(ids)).length, 1)
+    assert.equal((await m.loadKanban(ids)).filter(c => c.kind === 'kanban').length, 1)
     online = false
     assert.equal((await m.loadKanban(ids))[0].stale, true)
     profile = 'other'
-    assert.deepEqual(await m.loadKanban(ids), [])
+    assert.deepEqual((await m.loadKanban(ids)).filter(c => c.kind === 'kanban'), [])
   } finally { delete globalThis.window; delete host.state }
 })
 
@@ -491,7 +593,7 @@ test('task reads pin the focused owner throughout a mid-fetch focus switch', asy
   } } }
   try {
     assert.deepEqual(await m.loadKanban(new Set(['s_pinned'])), [])
-    assert.equal(calls.length, 2)
+    assert.equal(calls.length, 1)
     for (const call of calls) {
       assert.equal(call.connectionId, 'owner-connection')
       assert.equal(call.profile, 'worker')
@@ -512,7 +614,7 @@ test('explicit owner without a profile uses its default, not the ambient profile
   } } }
   try {
     await m.loadKanban(new Set(['s_owner_default']))
-    assert.deepEqual(calls.map(c => c.profile), ['default', 'default'])
+    assert.deepEqual(calls.map(c => c.profile), ['default'])
   } finally { delete globalThis.window; delete host.state }
 })
 
@@ -527,7 +629,9 @@ test('remote task clicks never fall back to the active gateway', () => {
     assert.equal(m.openTaskChip({ id: 't1', gateway: 'remote', profile: 'work', board: 'default' }), false)
     assert.deepEqual(calls, [])
     open.supportsQualifiedOwners = true
-    assert.equal(m.openTaskChip({ id: 't1', gateway: 'remote', profile: 'work', board: 'default' }), true)
+    const [chip] = m.sessionTaskChips([{ id: 't1', gateway: 'remote', profile: 'work', board: 'default', status: 'running' }])
+    globalThis.localStorage = { getItem: () => JSON.stringify({ wrong: 'remote' }) }
+    assert.equal(m.openTaskChip(chip), true)
     assert.deepEqual(calls, [['t1', 'default', 'conn', 'work']])
   } finally { delete globalThis.window; delete globalThis.localStorage }
 })

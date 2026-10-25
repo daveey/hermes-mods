@@ -22,7 +22,7 @@ globalThis.stripHost = {
 }
 globalThis.document = { hidden: false, getElementById: () => true, addEventListener() {}, removeEventListener() {} }
 globalThis.window = {}
-const { default: plugin, refresh } = await import('../plugin.js')
+const { default: plugin, refresh, sessionTaskChips } = await import('../plugin.js')
 let contribution
 plugin.register({ register: c => { contribution = c } })
 const render = () => contribution.render().type()
@@ -44,4 +44,26 @@ test('real Strip hides prior owner snapshot immediately on same-runtime owner sw
   stripHost.state.focusedStoredSessionId.value = 'other-stored'
   assert.equal(render(), null, 'same runtime, different stored chat hides old chips')
   assert.ok(stripReads.includes(stripHost.state.focusedStoredSessionId))
+})
+
+test('rendered chips disable unresolved owners and click only their captured route', async () => {
+  stripHost.state.focusedStoredSessionId.value = null
+  await refresh()
+  const Chip = render().props.children[0].type
+  const row = { id: 't_same', status: 'running', board: 'bb' }
+  const [known] = sessionTaskChips([row], { connectionId: 'A', profile: 'work' })
+  const [unknown] = sessionTaskChips([{ ...row, profile: null }])
+  const disabled = Chip({ chip: unknown, now: Date.now() })
+  assert.equal(disabled.type, 'span')
+  assert.equal(disabled.props.onClick, undefined)
+  const calls = []
+  const open = (...args) => calls.push(args)
+  open.supportsQualifiedOwners = true
+  window.__hermesKanbanOpenTask = open
+  window.__taskMentionsOpen = () => assert.fail('bare task mention')
+  const button = Chip({ chip: known, now: Date.now() })
+  assert.equal(button.type, 'button')
+  stripHost.state.focusedSessionOwner.value = { connectionId: 'B', profile: 'default' }
+  button.props.onClick()
+  assert.deepEqual(calls, [['t_same', 'bb', 'A', 'work']])
 })
