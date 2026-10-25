@@ -242,6 +242,8 @@ Kinds:
 - input: the user must type information or an open answer (a name, a value, a free-form decision).
 
 Rules:
+- Extract requests, never invent them. A recommendation or implementation plan is NOT a request to choose
+  or approve it. Do not add an "another option" choice that the reply never offered.
 - Only LIVE asks addressed to the user in THIS reply. Not: mentions of what the user could do someday,
   hypotheticals ("if you ever want...", "unless you..."), past asks, things already answered, asks to third
   parties, text inside code blocks or quotes, rhetorical questions, or the assistant's own next steps.
@@ -320,7 +322,7 @@ def locate(reply: str, span: str) -> Optional[dict]:
         if b["code"] or b["quote"]:
             continue
         nb = _norm(re.sub(r"`[^`\n]*`", lambda m: m.group(0).strip("`"), b["text"]))
-        if ns in nb or (len(ns) > 60 and ns[:60] in nb):
+        if ns in nb:
             return b
     return None
 
@@ -358,6 +360,49 @@ def is_terminal_handoff(text: str, span: str, reply: str = "") -> bool:
     return bool(h.find_handoffs(text) or h.find_handoffs(span) or h.find_handoffs(ctx))
 
 
+# Recommendations are often misread by the extractor as a choice menu. Require
+# an actual request in the cited span, not an imperative invented in step.text.
+_RECOMMENDATION = re.compile(r"\b(?:recommend(?:ed|ation|ations|s)?|suggest(?:ed|ion|ions|s)?)\b", re.I)
+_EXPLICIT_REQUEST = re.compile(
+    r"\b(?:can you|could you|would you|will you|you (?:must|need to|have to)|"
+    r"(?:needs?|requires?|awaiting|waiting for) your|let me know|tell me|"
+    r"do you (?:approve|consent|want|give me permission)|do i have your (?:permission|consent|approval)|"
+    r"(?:is|would) it (?:be )?(?:ok|okay|all right) for me|want me to|may i|can i|could i|would you like|should i|shall i|which .{0,80}(?:want|choose|prefer))\b"
+    r"|\bplease\s+(?:approve|confirm|authorize|choose|sign in|log in)\b"
+    r"|(?:^|[.!;,]\s+)(?:please\s+)?(?:choose|pick|approve|confirm|decide|select|reply|"
+    r"sign in|log in|tap|click|scan|plug|open|authorize|grant)\b",
+    re.I,
+)
+
+
+def recommendation_without_request(span: str, block: str = "") -> bool:
+    # Use the containing paragraph to catch excerpts which omit "Recommended".
+    # Quoted labels, code and rhetorical question marks are not requests.
+    def request_text(value: str) -> str:
+        unquoted = re.sub(r"(?<!\w)'[^'\n]+'", " ", _strip_noise(value))
+        return _norm(re.sub(r'["“][^"”\n]*["”]', " ", unquoted))
+
+    context = _norm(block or span)
+    clean = request_text(span)
+    # Sentence boundaries belong to the source, not an arbitrary extracted
+    # excerpt. A colon-prefixed recommendation cannot become an imperative
+    # merely because the extractor starts its evidence after that colon.
+    source = request_text(block or span)
+    grounded = False
+    if clean:
+        for occurrence in re.finditer(re.escape(clean), source):
+            for match in _EXPLICIT_REQUEST.finditer(source):
+                # Ignore the boundary punctuation when the evidence begins at
+                # the request itself, but retain the source occurrence identity.
+                start = match.start() + len(match.group(0)) - len(match.group(0).lstrip(".!;, "))
+                if occurrence.start() <= start and match.end() <= occurrence.end():
+                    grounded = True
+                    break
+            if grounded:
+                break
+    return bool(_RECOMMENDATION.search(context) and not grounded)
+
+
 def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None) -> list[dict]:
     out: list[dict] = []
     seen = {_norm(s.get("text", "")) for s in open_steps}
@@ -378,8 +423,11 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             opts = []
         if _NOT_ASK.search(span):
             continue  # hypothetical / mention-only, whatever the model said
-        if locate(reply, span) is None:
-            continue  # not in the reply's prose (hallucinated, or inside code/quote)
+        block = locate(reply, span)
+        if block is None or _norm(span) not in _norm(block["text"]):
+            continue  # full evidence required; locate's framing prefix is not validation
+        if recommendation_without_request(span, block["text"]):
+            continue  # a recommendation is not permission to manufacture a choice
         if _norm(text) in seen:
             continue
         if is_terminal_handoff(text, span, reply):
