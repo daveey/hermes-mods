@@ -98,9 +98,14 @@ conceptual, hypothetical and genuine permission boundaries must not become repai
 
 **Limits / not rollout-ready:** a conservative local running-task adapter reads the exact
 hostname/profile/board/task from authoritative stores. It requires exact request/body and goal/title
-matches, a live matching process claim, and an origin-linked TUI result subscription. This proves a
-durable return route, not notifier health or eventual delivery. Remote, scheduled, cross-profile,
-paraphrased-goal and non-TUI-return cases remain UNKNOWN; no cached tool assertion certifies ownership.
+matches, a live matching process claim, and an origin-linked TUI result subscription. It additionally
+requires a native registered consumer and a recent successful poll of the exact board, bound to
+profile home and session key. A subscription, thread name or attempted-but-failed poll is not enough.
+The draft core's `kanban_consumer_health` publishes in-memory read-only receipts; there is no foreign
+thread-frame introspection. This is point-in-time local consumer health, not eventual delivery.
+Remote, scheduled, dependency-waiting, cross-profile, paraphrased-goal and non-TUI-return cases
+remain UNKNOWN. Native wake/dependency rows are inspected but do not prove dispatcher health;
+no cached tool assertion certifies ownership.
 Scope recovery reads only real user rows through bounded, profile-qualified compression ancestry.
 Rotation transfers captured restrictions/tool pairs; restart requires a unique current request anchor.
 Before core persists that request, its runtime-stamped message timestamp bounds recovery instead.
@@ -133,6 +138,15 @@ rejected text leaks to streams, interims, returned history or SQLite. It verifie
 once only after acceptance and persisted history restrictions survive pre-persist capture.
 `test_goal_scope_gate.py`, `test_goal_scope_recovery.py` and `test_goal_scope_rotation.py` cover
 profile isolation, bounded ancestry, restart and rotation recovery through real isolated SessionDBs.
+`test_goal_owner_gate_liveness.py` and `test_goal_ownership_liveness.py` require native successful
+poll receipts and exercise isolated completion collection to the exact origin test sink. Failed
+board polls cannot certify return. This is not actual Desktop socket delivery acceptance.
+`test_goal_restriction_gate.py` and `test_goal_restriction_turn.py` verify a deliberately narrow
+whole-turn veto: an entire latest user row such as "Stop.", "Cancel.", "Analysis only.",
+"Status only.", "Plan first.", "Do not continue.", "Do not change anything." or
+"Do not execute anything." cannot be overridden by a mistaken abandonment verdict. Quotes,
+partial action restrictions and compound instructions do not match this literal veto; broader
+scope remains semantic, and lack of a veto is never permission.
 These are backend tests, not Electron UI or production activation proof.
 Semantic judges are injected; scope negatives test routing, not model classification accuracy.
 `test_goal_ownership.py` also exercises real isolated Kanban tables through discovered agent text

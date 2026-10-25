@@ -63,3 +63,19 @@ rotation is still unverified. The combined suite passed 515 tests, with one SQLi
 host-dependent skip. Independent review still requests changes: exact-action/approval
 proof, remote/scheduled ownership and return liveness, holdout/private replay, transport
 acceptance, CI, mirror/apply and activation remain required. Do not activate this draft.
+
+
+## Native local result-consumer evidence (draft)
+
+The companion guard now consumes `tui_gateway/kanban_consumer_health.py` receipts. Native
+`session_notifications.py` registers its actual consumer thread/session and records a receipt
+only after a successful board poll. Receipts bind profile home, origin key and board path;
+they expire after 15 seconds and fail on stopped/dead/finalized/refused consumers. A receipt
+is not a future delivery guarantee. Other processes, unloaded consumers, remote gateways
+and scheduled dispatcher liveness are not certified by this API.
+
+Tests: `tests/tui_gateway/test_kanban_consumer_health.py` verifies registration, successful
+poll requirement, scope/rotation, wrong-thread rejection, refusal, expiration and shutdown.
+The coach `test_goal_owner_gate_liveness.py` exercises native board polling with an unreadable
+board negative; `test_goal_ownership_liveness.py` covers isolated completion collection to an
+origin test sink. These do not claim real client transport acceptance.

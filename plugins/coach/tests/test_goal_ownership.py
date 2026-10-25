@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from goal_consumer_fixture import consumer
 
 spec = importlib.util.spec_from_file_location('owner_goal_test', Path(__file__).parents[1] / 'goal_disposition.py')
 gd = importlib.util.module_from_spec(spec)
@@ -54,7 +55,7 @@ def certify(owner):
     return gd.validate_disposition(v, evidence, session_id=SID)
 
 
-def test_authoritative_running_owner(owner):
+def test_authoritative_running_owner(consumer, owner):
     assert certify(owner)['disposition'] == 'owned_continuing'
 
 
@@ -101,7 +102,7 @@ def test_independent_current_request_required(owner):
         certify(owner)
 
 
-def test_gate_public_entry_certifies_fresh_owner_without_writes(owner, monkeypatch):
+def test_gate_public_entry_certifies_fresh_owner_without_writes(consumer, owner, monkeypatch):
     events = []
     monkeypatch.setattr(gd, 'settings', lambda: {'mode':'enforce'})
     monkeypatch.setattr(gd, 'aux_judge', lambda *_: owner[1])
@@ -117,7 +118,7 @@ def test_gate_public_entry_certifies_fresh_owner_without_writes(owner, monkeypat
     assert events[-1]['event'] == 'goal_disposition_unknown'
 
 
-def test_owned_continuation_through_discovered_agent_text_stop(owner, monkeypatch):
+def test_owned_continuation_through_discovered_agent_text_stop(consumer, owner, monkeypatch):
     from unittest.mock import patch
     from run_agent import AIAgent
     from hermes_cli.plugins import get_plugin_manager
@@ -207,14 +208,17 @@ def test_unavailable_remote_is_visible_unknown(owner, monkeypatch):
     assert events[-1]['reason'] == 'owner_remote_readback_unavailable'
 
 
-def test_authoritative_reads_survive_readonly_wal_open_failure(owner, monkeypatch):
+def test_authoritative_reads_survive_readonly_wal_open_failure(consumer, owner, monkeypatch):
+    import threading
+    caller = threading.current_thread()
     original = sqlite3.connect
     opened = []
     def connect(database, *args, **kwargs):
         if isinstance(database, str) and database.endswith('?mode=ro'):
             raise sqlite3.OperationalError('unable to open database file')
         conn = original(database, *args, **kwargs)
-        opened.append(conn)
+        if threading.current_thread() is caller:
+            opened.append(conn)
         return conn
     monkeypatch.setattr(sqlite3, 'connect', connect)
     assert certify(owner)['disposition'] == 'owned_continuing'

@@ -131,53 +131,16 @@ def _waiting_continuation(conn, task):
 
 
 def _live_result_consumer(session_id, home, board_path):
-    """Observe an already-running native per-session poller, without importing
-    server/startup code or calling any delivery/claim/migration API.
+    """Read native successful-poll receipts; never inspect foreign thread frames.
 
-    Require the actual native loop frame, exact session key/profile home, a
-    recent poll, and a live registered non-stopped thread. Bare thread names,
-    session dictionaries, subscriptions and sweeper-started flags do not count.
-    Unloaded-chat sweepers and other processes have no scoped progress proof
-    readable here and deliberately remain UNKNOWN.
+    Older cores or unloaded/cross-process consumers have no authoritative local
+    receipt. A live thread whose database reads fail does not certify return.
     """
-    import sys
-    import time
+    from tui_gateway import kanban_consumer_health
     from hermes_cli import kanban_db as kb
-    module = sys.modules.get('tui_gateway.session_notifications')
-    loop = getattr(module, '_notification_poller_scoped_loop', None)
-    code = getattr(loop, '__code__', None)
-    if code is None:
-        raise ValueError('owner_result_consumer_unverified')
-    # The consumer enumerates these same boards. A subscription on an otherwise
-    # invisible DB cannot be returned by this poller.
     boards = kb.list_boards(include_archived=False)
     if not any(Path(meta.get('db_path') or kb.kanban_db_path(meta['slug'])).resolve()
                == board_path.resolve() for meta in boards):
         raise ValueError('owner_result_consumer_unverified')
-    frames = sys._current_frames()
-    try:
-        for ident, frame in frames.items():
-            for _ in range(96):
-                if frame is None:
-                    break
-                if frame.f_code is code:
-                    local = frame.f_locals.copy()
-                    session = local.get('session')
-                    stop = local.get('stop_event')
-                    last = local.get('last_kanban_poll', 0)
-                    pollers = frame.f_globals.get('_notification_pollers', ())
-                    if (isinstance(session, dict) and session.get('session_key') == session_id
-                            and session.get('profile_home')
-                            and Path(session['profile_home']).resolve() == home.resolve()
-                            and not session.get('_finalized')
-                            and not session.get('_kanban_refused_until', 0) > time.monotonic()
-                            and type(last) in (int, float)
-                            and 0 <= time.monotonic() - last <= 15
-                            and any(event is stop and thread.is_alive()
-                                    and thread.ident == ident
-                                    and not event.is_set() for event, thread in pollers)):
-                        return
-                frame = frame.f_back
-    finally:
-        frames.clear()  # do not retain foreign thread locals beyond the probe
-    raise ValueError('owner_result_consumer_unverified')
+    if not kanban_consumer_health.available(home, session_id, board_path):
+        raise ValueError('owner_result_consumer_unverified')
