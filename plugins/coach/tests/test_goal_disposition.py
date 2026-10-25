@@ -82,6 +82,8 @@ def test_successful_readback_and_denied_access_have_distinct_dispositions():
                     evidence_refs=['user:0', 'tool:c'])
         if d == 'remediated_verified':
             v['proof'] = dict(target='https://example.com/health', source_ref='tool:c', scope_ref='user:0')
+        else:
+            v['proof'] = dict(action='https://example.com/health', source_ref='tool:c')
         assert gd.validate_disposition(v, e)['disposition'] == d
 
 

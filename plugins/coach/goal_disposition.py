@@ -118,6 +118,11 @@ For remediated_verified, proof must be {target,source_ref,scope_ref}: exact HTTP
 user scope, paired tool url argument and successful result url/status, and candidate. Other
 readback formats remain unknown. source_ref and scope_ref must be included in evidence_refs.
 The successful URL must address the actual requested goal; unrelated successful probes do not qualify.
+For capability_boundary, proof must be {source_ref,action}: source_ref is a cited paired
+failed operation and action exactly equals its command or HTTP(S) url argument. It must be
+current: later user steering or a later result for the same operation invalidates the failure.
+A structured missing-access error is necessary, not sufficient: the operation must be necessary
+for the actual goal and the candidate must give the supported unblock. Otherwise use unknown.
 Confidence reflects evidence support, not certainty of prose. Never invent citations.'''
 
 
@@ -253,8 +258,7 @@ def validate_disposition(v, evidence, *, session_id=""):
             raise ValueError('missing_successful_path_readback')
         _proofs.remediation(v, evidence)
     elif d == 'capability_boundary':
-        if v['boundary_kind'] not in ('credentials', 'tool', 'service') or not any(capability_failure(r) for r in tools):
-            raise ValueError('missing_current_capability_evidence')
+        _proofs.capability(v, evidence)
     elif d == 'authorization_boundary':
         if v['boundary_kind'] not in ('policy', 'approval', 'denial', 'scope'):
             raise ValueError('missing_authorization_boundary')

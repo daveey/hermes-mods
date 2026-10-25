@@ -76,7 +76,16 @@ the candidate, and paired tool calls/results retaining call IDs and executor sta
 post-tool observations survive a later steering message. Orphan tool results cannot authorize work.
 The schema rejects nonfinite scores, invented references, missing user citations and inconsistent
 abandonment. Structured success/error fields are checked for remediation/capability claims;
-HTTP 503 is not proof that the agent lacks repair capability. Authorization and remediation now
+HTTP 503 is not proof that the agent lacks repair capability. Capability boundaries require
+`proof: {source_ref, action}` tied to a cited paired failed command or HTTP(S) URL. Later user
+steering or another result for that operation invalidates the failure, including changed tool
+names/options. Missing or unsupported proofs are UNKNOWN; after a confirmed hold they cannot
+clear the unresolved fallback. Tests: `test_goal_capability_proofs.py` covers bindings and
+freshness, `test_goal_capability_gate.py` covers verdict/recheck validation, and
+`test_goal_capability_turn.py` exercises a real discovered multi-plugin agent turn: a superseded
+credential error cannot release held text into returned, streamed, interim or persisted output.
+This validates freshness, not goal relevance or an unblock plan.
+Authorization and remediation now
 require an additional `proof` object binding cited source to exact action/path. Authorization
 currently supports a latest literal user restriction (`Do not`/`Never`, explicit-user-direction
 path), or the native terminal pending-approval envelope with its exact command and `/approve`
