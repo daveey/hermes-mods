@@ -460,19 +460,19 @@ explicit uncertainty flag. Re-budgeting cached observations preserves the origin
 digest. Both direct gate input and `capture`/`observe` paths use this budget;
 `observe` no longer poisons the entire capture solely for a large result.
 
-A recognized `<memory-context>...</memory-context>` suffix is separate `role=memory`
-evidence, not human authorization. Ambiguous/non-suffix tags fail UNKNOWN rather
-than deleting possible restrictions. This text boundary is conservative, not an
-authenticated provenance channel. The original scope recovery limits still apply:
-oversized user rows during durable recovery/capture may remain UNKNOWN, including
-large memory suffixes before evidence assembly. No user restrictions are truncated.
+Textual `<memory-context>` markers are not authenticated provenance. Any user row
+containing them is UNKNOWN, even if the tags are balanced: otherwise a human's
+current restrictions could be silently reclassified as old memory. Native
+transport/persistence provenance is still required before suffixes can be safely
+separated. Oversized genuine user rows remain UNKNOWN; restrictions are never trimmed.
 
-Partial evidence cannot certify remediation, capability/authorization boundaries,
-or ownership when cited; memory cannot certify these either. The judge must not
-infer absence of boundaries from omitted text and must return UNKNOWN if the missing
-body is needed. Abandonment can still be judged from intact affirmative user scope
-and candidate evidence; semantic correctness still requires real-model evaluation.
-There is no claim that a digest proves the omitted body's meaning.
+Partial cited evidence cannot certify remediation, capability/authorization
+boundaries, or ownership. Any omitted body also prevents an abandonment hold,
+including when the verdict does not cite it: an unseen denial or missing-access
+boundary could change the decision. The guard emits `omitted_boundary_evidence`
+rather than relying on the semantic judge to notice that risk. This conservative
+path is a safety measure, NOT a solution to original-incident recall. A digest
+identifies omitted bytes but cannot establish their meaning.
 
 Limits remain: 200 input rows, 32,000 serialized evidence characters, and UNKNOWN
 when full human scope/candidate/call arguments or required metadata do not fit.
@@ -483,3 +483,8 @@ Tests: `tests/test_goal_bounded_evidence.py` covers direct long-result input,
 `capture`/`observe`, pairing/duplicate rejection, JSON escaping and cumulative
 budgets, repeated budgeting, memory provenance, restriction retention, and rejected
 closure proofs; `tests/test_goal_disposition.py` retains the gate's existing tests.
+
+`tests/test_goal_omission_safety.py` exercises mistaken high-confidence abandoned
+verdicts with cited/uncited omitted denial and missing-access evidence, plus
+human-authored balanced memory tags. `tests/test_goal_omission_turn.py` covers
+those refusal paths through the real discovered complete-turn gate.

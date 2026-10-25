@@ -48,12 +48,7 @@ def evidence_for(messages, candidate):
             continue
         if row.get('role') == 'user':
             ref = 'user:' + str(sum(e['role'] == 'user' for e in evidence.values()))
-            human, memory = _evidence.split_user(row.get('content'))
-            evidence[ref] = {'role': 'user', 'content': human}
-            if memory is not None:
-                evidence['memory:' + ref.split(':')[1]] = {
-                    'role': 'memory', 'content': memory,
-                    'provenance': 'recalled_memory_not_user_input', 'source_ref': ref}
+            evidence[ref] = {'role': 'user', 'content': _evidence.user_content(row.get('content'))}
         elif row.get('role') == 'assistant':
             for call in row.get('tool_calls') or []:
                 if isinstance(call, dict) and isinstance(call.get('id'), str):
@@ -174,6 +169,8 @@ def validate_disposition(v, evidence, *, session_id=""):
         if any(r.get('omission') or r.get('role') == 'memory' for r in refs):
             raise ValueError('omitted_evidence_cannot_certify_closure')
     if d == 'abandoned':
+        if any(r.get('omission') for r in evidence.values()):
+            raise ValueError('omitted_boundary_evidence')
         if not v['actionable'] or not v['unfinished'] or 'candidate' not in v['evidence_refs']:
             raise ValueError('inconsistent_abandonment')
     elif d == 'owned_continuing':

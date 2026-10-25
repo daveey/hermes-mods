@@ -10,20 +10,17 @@ import json
 LIMIT = 32000
 
 
-def split_user(content):
+def user_content(content):
     """Quarantine the runtime's recalled-memory suffix, not fresh human authority.
 
     Ambiguous tags fail closed rather than deleting possible user restrictions.
     This is a conservative text boundary, not cryptographic provenance.
     """
     if not isinstance(content, str) or '<memory-context>' not in content:
-        return content, None
-    start = content.index('<memory-context>')
-    suffix = content[start:]
-    if (suffix.count('<memory-context>') != 1 or suffix.count('</memory-context>') != 1
-            or not suffix.rstrip().endswith('</memory-context>')):
-        raise ValueError('ambiguous_memory_provenance')
-    return content[:start], suffix
+        return content
+    # Text alone cannot distinguish runtime recall from human-authored limits.
+    # Until the native transport carries provenance, both must stay UNKNOWN.
+    raise ValueError('ambiguous_memory_provenance')
 
 
 def _shorten(row, limit):
