@@ -931,23 +931,34 @@ def _budget_mod():
 def budget(board: Optional[str] = None, now: Optional[float] = None) -> dict:
     """{"usd", "cap", "running", "ok_usd", "ok_running", "why"} for the selfheal lane today (UTC)."""
     now = now or time.time()
-    out = {"usd": 0.0, "cap": USD_DAY, "running": 0, "ok_usd": True, "ok_running": True, "why": ""}
-    eb = _budget_mod()
-    if eb is None:
-        return out
+    out = {"usd": None, "cap": USD_DAY, "running": None, "ok_usd": False,
+           "ok_running": False, "available": False, "why": ""}
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     b = board or os.environ.get("COACH_KANBAN_BOARD") or "default"
     try:
+        eb = _budget_mod()
+        if eb is None:
+            raise RuntimeError("accounting module unavailable")
         snap = eb.snapshot(home=home, board=b, now=now)
-        out["usd"] = snap["lanes"].get("selfheal", 0.0)
-        out["cap"] = snap["caps"].get("selfheal", USD_DAY)
+        usd = snap["lanes"]["selfheal"]
+        cap = snap["caps"]["selfheal"]
         ok, why = eb.check(snap, "selfheal")
-        out["ok_usd"], out["why"] = ok, why
-        out["running"] = sum(1 for c in eb.engine_cards(home, b, ("running",)) if c["lane"] == "selfheal")
+        running = sum(1 for c in eb.engine_cards(home, b, ("running",)) if c["lane"] == "selfheal")
+        # Commit the observation only after BOTH reads succeed. Unknown is not zero spend.
+        out.update(usd=usd, cap=cap, running=running, ok_usd=ok,
+                   ok_running=running < MAX_RUNNING, available=True, why=why)
     except Exception as exc:
         out["why"] = f"budget read failed: {exc}"
-    out["ok_running"] = out["running"] < MAX_RUNNING
     return out
+
+
+def _budget_unavailable(b: dict, fp: str, store) -> Optional[dict]:
+    """Refuse creation, not create-then-schedule, when accounting cannot be read."""
+    if b.get("available", True):  # legacy injected budget functions retain their contract
+        return None
+    why = b.get("why") or "budget unavailable"
+    store.log({"event": "selfheal_budget_unavailable", "fingerprint": fp, "why": why})
+    return {"action": "error", "why": why}
 
 
 def generation(st: dict) -> int:
@@ -1082,9 +1093,13 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
     if m != "live" or not hub:
         rec = {"event": "selfheal_would_file", "mode": m, "fingerprint": fp, "component": d.get("component"),
                "source": d.get("source"), "why": dec["why"], "recurrence": bool(dec.get("previous")),
-               "schedule": sched, "args": args, "host": d.get("host")}
+               "schedule": sched, "args": args, "host": d.get("host"),
+               "budget_available": b.get("available", True)}
         store.log(rec)
         return {"action": "would_file", **rec}
+    unavailable = _budget_unavailable(b, fp, store)
+    if unavailable:
+        return unavailable
     known, gen = known_cards(st), dec["gen"]
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
@@ -1140,6 +1155,9 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY}
     b = (budget_fn or budget)(args.get("board"), now)
+    unavailable = _budget_unavailable(b, fp, store)
+    if unavailable:
+        return unavailable
     rc, out, err = _run(kanban_argv(args), runner)
     tid = _task_id(out) if rc == 0 else None
     if not tid:

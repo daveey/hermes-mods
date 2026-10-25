@@ -155,6 +155,41 @@ def test_off_mode_files_nothing(store):
     assert sh.file_defect(defect(), store=store, m="off", runner=Runner(), now=NOW, cfg=HUB)["action"] == "skip"
 
 
+@pytest.mark.parametrize("failure", ["missing", "import", "snapshot", "cards"])
+def test_budget_unavailable_never_creates_investigation_or_fix(store, monkeypatch, failure):
+    def broken(*args, **kwargs):
+        raise OSError("injected accounting failure")
+
+    eb = SimpleNamespace(
+        snapshot=lambda **kw: {"lanes": {"selfheal": 0}, "caps": {"selfheal": 25}},
+        check=lambda *args: (True, ""), engine_cards=lambda *args: [])
+    if failure in ("snapshot", "cards"):
+        setattr(eb, "snapshot" if failure == "snapshot" else "engine_cards", broken)
+    monkeypatch.setattr(sh, "_budget_mod", broken if failure == "import" else
+                        lambda: None if failure == "missing" else eb)
+    b = sh.budget(now=NOW)
+    assert b["available"] is False
+    assert not b["ok_usd"] and not b["ok_running"]
+    r = Runner()
+    d = defect()
+    result = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB)
+    assert result["action"] == "error" and "budget" in result["why"]
+    assert not r.calls and not sh.LaneState(store.root).read()
+    sh.LaneState(store.root).update(d["fingerprint"], status="proposed", component="desktop")
+    result = sh.file_fix(d["fingerprint"], store=store, runner=r, now=NOW)
+    assert result["action"] == "error" and not r.calls
+    assert sh.LaneState(store.root).get(d["fingerprint"])["status"] == "proposed"
+    assert len(ev(store, "selfheal_budget_unavailable")) == 2
+
+
+def test_budget_unavailable_shadow_remains_observable(store, monkeypatch):
+    monkeypatch.setattr(sh, "_budget_mod", lambda: None)
+    r = Runner()
+    result = sh.file_defect(defect(), store=store, m="shadow", runner=r, now=NOW, cfg=HUB)
+    assert result["action"] == "would_file" and not r.calls
+    assert ev(store, "selfheal_would_file")[0]["budget_available"] is False
+
+
 # ── dedupe ──
 def test_one_filing_per_fingerprint_per_day_and_none_while_open(store):
     r = Runner()
