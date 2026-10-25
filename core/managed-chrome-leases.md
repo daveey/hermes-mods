@@ -31,7 +31,7 @@ bootstrap a stopped launchd job or execute an inferred wake helper.
 
 ## Code
 
-Proposed appended patches **0264–0266**, after the existing series through 0263:
+Proposed appended patches **0268–0270**, after the existing series through 0267:
 
 - `tools/browser_agent_lifecycle.py`: route validation, acquire/complete/release,
   owner-specific daemon and vault identity, bounded cleanup retry.
@@ -85,7 +85,7 @@ See the lifecycle acceptance section for the failed-first-probe qualification.
 ## Applying
 
 These three patches are feature-branch proposals, not a released installation.
-Apply in order after 0263; do not renumber existing siblings. The full mirror uses
+Apply in order after 0267; do not renumber existing siblings. The full mirror uses
 the fork/upstream merge-base, not the newer upstream tip. Existing public privacy
 substitutions and the merge-adapted patch 0242 must be preserved. The documentation
 correction verification applied all 266 patches with `git am -3` from merge-base
@@ -93,6 +93,13 @@ correction verification applied all 266 patches with `git am -3` from merge-base
 feature-path blobs matched core head `6add72d407e8cc47fabc01b1f2a468828f4c1578`.
 Patches 0001–0265 were
 preserved byte-for-byte. This application check is not a full-suite CI result.
+
+The subsequent integration onto fork main `f51c577542` moves only these three
+feature patches to 0268–0270. All 267 existing main patches, including privacy
+adaptations and 0242, remain byte-for-byte intact. All 270 patches applied with
+`git am -3` from the same merge-base in a disposable clone; all ten feature-path
+blobs matched integrated core `b27b88b0dc67c27b8a4724905a6ff3dce13ecbf1`.
+The earlier 266-patch receipt above is historical, not the current apply order.
 
 Keep the supervisor OFF until the identified integration/release blockers are
 closed and the operator explicitly authorizes deployment/activation. This remains
