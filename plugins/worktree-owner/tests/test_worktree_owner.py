@@ -2,8 +2,96 @@
 
 Run: python3 -B -m unittest discover -s plugins/worktree-owner/tests   (stdlib only; temp git repos)
 """
-import importlib.util, json, os, subprocess, tempfile, time, unittest
+import importlib.util, json, os, sqlite3, subprocess, tempfile, time, unittest
+from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+class CwdPortability(unittest.TestCase):
+    def setUp(self):
+        platform = patch('sys.platform', 'darwin')
+        platform.start()
+        self.addCleanup(platform.stop)
+
+    def test_lsof_resolved_from_path(self):
+        m = load()
+        with patch("shutil.which", return_value="/usr/bin/lsof"), \
+             patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "p123\nn/fixture/tree\n", "")) as run:
+            self.assertEqual(m.live_cwds(), ["/fixture/tree"])
+            self.assertEqual(run.call_args.args[0][0], "/usr/bin/lsof")
+
+    def test_lsof_failures_never_authorize_removal(self):
+        m = load()
+        for result in (subprocess.CompletedProcess([], 1, "", ""),
+                       subprocess.CompletedProcess([], 0, "n/partial\n", "permission denied"),
+                       subprocess.CompletedProcess([], 0, "", "")):
+            with self.subTest(result=result), patch("shutil.which", return_value="/usr/bin/lsof"), \
+                 patch.object(m.subprocess, "run", return_value=result), \
+                 patch.object(m, "_git") as git_call:
+                with self.assertRaises(RuntimeError):
+                    m._remove("/fixture/tree", "fixture")
+                git_call.assert_not_called()
+
+    def test_missing_or_timed_out_lsof_never_authorizes_removal(self):
+        m = load()
+        for error in (FileNotFoundError(), subprocess.TimeoutExpired("lsof", 120)):
+            with self.subTest(error=error), patch.object(m.subprocess, "run", side_effect=error), \
+                 patch.object(m, "_git") as git_call:
+                with self.assertRaises((OSError, RuntimeError, subprocess.TimeoutExpired)):
+                    m._remove("/fixture/tree", "fixture")
+                git_call.assert_not_called()
+
+
+class BirthPortability(unittest.TestCase):
+    def test_native_birth_and_stat_failures(self):
+        m = load()
+        with patch.object(m.os, "stat", return_value=SimpleNamespace(st_birthtime=123, st_ctime=999)), \
+             patch.object(m.subprocess, "run") as run:
+            self.assertEqual(m._birth("/fixture/gitdir"), 123)
+            run.assert_not_called()
+        with tempfile.TemporaryDirectory() as root:
+            for failure in (FileNotFoundError(), subprocess.TimeoutExpired("stat", 20)):
+                with self.subTest(failure=failure), \
+                     patch.object(m.os, "stat", return_value=SimpleNamespace(st_ctime=999)), \
+                     patch.object(m.subprocess, "run", side_effect=failure):
+                    self.assertIsNone(m._birth(root))
+
+    def test_linux_uses_birth_not_recent_metadata_change(self):
+        m = load()
+        with patch.object(m.os, "stat", return_value=SimpleNamespace(st_ctime=999)), \
+             patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "123\n", "")) as run:
+            self.assertEqual(m._birth("/fixture/gitdir"), 123)
+            self.assertEqual(run.call_args.args[0], ["stat", "-c", "%W", "--", "/fixture/gitdir"])
+
+
+    def test_reflog_fallback_requires_creation_record(self):
+        m = load()
+        with tempfile.TemporaryDirectory() as root:
+            gd = Path(root)
+            (gd / "logs").mkdir()
+            log = gd / "logs" / "HEAD"
+            creation = "0" * 40 + " " + "a" * 40 + " User <u@example.com> 123 +0000\t\n"
+            with patch.object(m.os, "stat", return_value=SimpleNamespace(st_ctime=999)), \
+                 patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "0\n", "")):
+                log.write_text(creation + "later entry\n")
+                self.assertEqual(m._birth(root), 123)
+                log.write_text(creation.replace("0" * 40, "b" * 40))
+                self.assertIsNone(m._birth(root))  # expired initial reflog is not creation
+                log.write_text("malformed\n")
+                self.assertIsNone(m._birth(root))
+                log.unlink()
+                self.assertIsNone(m._birth(root))
+
+    def test_unknown_birth_skips_candidate_without_breaking_scan(self):
+        m = load()
+        with tempfile.TemporaryDirectory() as root:
+            for name in ("unknown", "known"):
+                Path(root, "worktrees", name).mkdir(parents=True)
+            with patch.object(m, "_common_dirs", return_value=[root]), \
+                 patch.object(m, "_birth", side_effect=lambda p: None if p.endswith("unknown") else 123):
+                self.assertEqual(m.new_gitdirs(100), [str(Path(root, "worktrees", "known"))])
 
 SRC = Path(__file__).resolve().parent.parent / "__init__.py"
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
@@ -22,8 +110,30 @@ def load():
 
 class Owner(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
+        self.db = self.tmp / 'board.db'
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('create table tasks (id text primary key, status text, current_run_id text, workspace_path text)')
+            c.execute('create table task_links (parent_id text, child_id text)')
+            c.execute('create table task_runs (id text, task_id text, status text, outcome text, ended_at integer)')
         self.m = load()
+        original = self.m.on_tool_call
+        def verified_call(name, args, duration_ms=0, env=None, **kwargs):
+            env = dict(env or {}, HERMES_KANBAN_DB=str(self.db), HERMES_KANBAN_RUN_ID='run1')
+            if name == 'kanban_complete' and env.get('HERMES_KANBAN_TASK'):
+                with closing(sqlite3.connect(self.db)) as c, c:
+                    c.execute('insert or replace into tasks values (?, ?, ?, ?)',
+                              (env['HERMES_KANBAN_TASK'], 'done', None, env.get('HERMES_KANBAN_WORKSPACE', '')))
+                    c.execute('delete from task_runs where task_id=?', (env['HERMES_KANBAN_TASK'],))
+                    c.execute("insert into task_runs values ('run1', ?, 'done', 'completed', 1)", (env['HERMES_KANBAN_TASK'],))
+                    c.execute("delete from tasks where id like 'shared%'")
+                    for i, path in enumerate(self.live):
+                        c.execute('insert into tasks values (?, ?, ?, ?)', (f'shared{i}', 'running', 'other', path))
+                kwargs['result'] = json.dumps(dict(ok=True, task_id=env['HERMES_KANBAN_TASK'], run_id='run1'))
+            return original(name, args, duration_ms, env, **kwargs)
+        self.m.on_tool_call = verified_call
         self.code = self.tmp / "code"
         self.code.mkdir()
         self.m.REPO_GLOBS = [str(self.code / "*" / ".git"), str(self.code / "*" / "*" / ".git")]

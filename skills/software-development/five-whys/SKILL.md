@@ -1,6 +1,6 @@
 ---
 name: five-whys
-description: "Use for failure analysis: why-chain to a fixable root. Any bug, incident, failed task, red CI, bad agent output or postmortem."
+description: "Use when analyzing a failure. Trace evidence-backed whys to a fixable root for bugs, incidents, CI or bad agent output."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -59,6 +59,18 @@ level: snapshot the alert store's row count, run the suite, and confirm the coun
 one real run (for example `systemctl --user start <svc>`) and confirm its success line, instead of waiting
 for the next scheduled run.
 
+**Validate what the metric measures before attributing its cause.** Preserve the original report and its
+measurement timestamp before rerunning a detector: even a dry run may overwrite its report, and concurrent
+workers can create or remove evidence. Reconcile every group in the machine-readable report, not just the
+notification's truncated list. Separate creation rate, retained inventory and actual leaks; a burst alone does
+not prove failed cleanup.
+
+For filesystem-age alerts, inspect the timestamp implementation on the running OS. On Linux, `st_ctime` is
+metadata-change time, not creation time; compare GNU `stat -c '%W|%Z' <path>` (birth time versus ctime) before
+trusting a "new files/worktrees" count. Treat `%W = 0` as unknown, not a recent birth. Use a fixed report-time
+cutoff when checking the original alert, and label later measurements separately rather than claiming they
+reconstruct a changing inventory exactly.
+
 ### 2. Ask why, one causal step at a time
 
 For each answer:
@@ -69,6 +81,8 @@ For each answer:
   chips got in, therefore the shaft wore…". If a "therefore" doesn't follow, a step is missing or wrong.
 - **It is one step**, not a leap to the cause you already suspected. Jumping straight to a familiar cause is the
   most common way the method fails.
+
+**For a long agent session, reconstruct the critical path before explaining the delay.** Separate productive execution, dependency waits, failed attempts, recovery and deployment using timestamped runs and artifacts. Run counts alone do not measure wasted work; a continuation may preserve useful progress. Tie each disk, quota or memory failure to the operation it stopped. A per-worker OOM proves that job exceeded its limit, not that global concurrency caused it; a tiny successful provider probe proves only that request succeeded. Inspect existing mechanisms before claiming an architectural control is absent: bypassed, misconfigured and missing controls require different fixes. Treat similar UI symptoms as separate hypotheses until their API, association and rendering paths match.
 
 ### 3. Branch where causes split
 
@@ -120,9 +134,20 @@ problem gets small fixes at every level, not a rewrite. Usually:
   agents noticing and fixing first, not by telling David faster. A human-facing alert is only for a decision only
   he can make.
 
+For cleanup incidents, distinguish a creator's lifecycle reaper from a generic age-based GC backstop. Trace
+creator ownership from markers, task records or creation commands; directory names alone are not attribution.
+Before exempting a creator from burst monitoring, verify its reaper is discovered and enabled in the actual
+runtime and exercises cleanup safely on an isolated fixture. Source code existing on disk or a healthy generic
+GC timer does not prove creator-owned teardown works. Scope exemptions to that verified creator, not a shared
+scratch or code root that also contains unmanaged work; retain leak detection for exempted creators.
+
 Each countermeasure is concrete and verifiable: a regression test that fails before and passes after, a guard you
 can trigger, a doc or skill change with its path. "Be more careful" is not a countermeasure. If a root-level fix is
 too big for now, file it (card or issue with the chain) and say so in the report; don't drop it silently.
+
+**For this user, an authorized correction includes implementation, not just diagnosis or dispatch.** Write a bounded prevention plan, execute the in-scope mitigation, and read back the live effect before reporting progress. Keep immediate delivery recovery separate from systemic hardening: require an explicit necessity argument before making another preventive card a release prerequisite. Reuse existing owners and preserved work rather than grow a competing graph. Verify that an owner actually claimed execution and acknowledged the handoff; a ready card or posted comment is not active recovery. If exact execution approval is still required, preserve that gate even when disruptive host work is broadly authorized.
+
+Choose enforcement at the failure point rather than relying only on prose: capability preflight before placement; bounded typed recovery for checkpoints, quota and exhausted budgets; per-job memory feasibility plus aggregate resource admission; and end-to-end origin visibility and deployed-revision checks. Pair each with failure-injection acceptance. State the coverage limits of containment: stopping new idle workers does not constrain already-running producers or restore disk space, and a guard holding the cleanup lock may prevent reclamation until its owner coordinates release. Never present such a brake as capacity recovery.
 
 After the countermeasures ship, verify each one against live data before calling the chain closed: the guard's own
 telemetry (did it fire, how often, what did it fall back to), not the worker's "done" summary. A guard that "works"
@@ -195,6 +220,7 @@ Countermeasures:
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
+- Treating a filesystem timestamp as creation evidence without checking platform semantics. Linux `st_ctime` is metadata-change time, not birth time; Git activity can make old worktrees look newly created. Compare true birth (`stat -c %W` on GNU systems) with creation-call history before attributing a burst. A generic safety GC or written cleanup instruction does not prove that a creator reaps its own trees; require lifecycle tests and live plugin discovery before suppressing its alerts.
 - Fixing the copy you can reach when another copy is the source of truth (a mirrored dir, a synced host, a vendored
   file). The next sync silently reverts the fix. Before editing, check what syncs into the file (rsync jobs, mtimes
   with whole-second precision, a "mirror" note). Land the fix at the source, or hand it to whoever owns the source.

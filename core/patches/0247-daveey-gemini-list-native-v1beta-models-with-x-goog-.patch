@@ -1,0 +1,179 @@
+From 8ce6afeeb352b880ad405043ef556641d91e9659 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 16:02:45 -0700
+Subject: [PATCH 247/248] [daveey] gemini: list native /v1beta/models with
+ x-goog-api-key (Bearer 401'd) and parse native shape
+
+---
+ plugins/model-providers/gemini/__init__.py    | 59 +++++++++++++
+ .../model_providers/test_gemini_profile.py    | 87 +++++++++++++++++++
+ 2 files changed, 146 insertions(+)
+
+diff --git a/plugins/model-providers/gemini/__init__.py b/plugins/model-providers/gemini/__init__.py
+index 2659e9a20b..02ce13f9c2 100644
+--- a/plugins/model-providers/gemini/__init__.py
++++ b/plugins/model-providers/gemini/__init__.py
+@@ -36,6 +36,65 @@ class GeminiProfile(ProviderProfile):
+         budget = long_decode_max_output_tokens(context.get("model") or "", context.get("reasoning_config"))
+         return {"thinking_config": raw, **({"max_output_tokens": budget} if budget and is_native_gemini_base_url(base_url) else {})}
+ 
++    def fetch_models(
++        self,
++        *,
++        api_key: str | None = None,
++        base_url: str | None = None,
++        timeout: float = 8.0,
++    ) -> list[str] | None:
++        """[daveey] Native AI Studio ``/models`` rejects Bearer auth (401) and returns
++        ``{"models": [{"name": "models/<id>", "supportedGenerationMethods": [...]}]}``, so list it
++        with ``x-goog-api-key`` and parse that shape. ``/openai`` bases, Vertex express and custom
++        proxies keep the OpenAI-compatible base implementation."""
++        from agent.gemini_native_adapter import is_native_gemini_base_url
++
++        base = ((base_url or "").strip() or self.base_url or "").rstrip("/")
++        if not (is_native_gemini_base_url(base) and "generativelanguage.googleapis.com" in base.lower()):
++            return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
++        if not api_key or not self.supports_model_listing:
++            return None
++
++        import json
++        import urllib.parse
++        import urllib.request
++
++        from hermes_cli.chat_catalog import chat_catalog_ids
++        from hermes_cli.urllib_security import open_credentialed_url
++        from providers.base import _profile_user_agent
++
++        items: list[dict[str, Any]] = []
++        page_token = ""
++        try:
++            for _ in range(20):  # pagination guard
++                query = {"pageSize": "1000", **({"pageToken": page_token} if page_token else {})}
++                req = urllib.request.Request(f"{base}/models?{urllib.parse.urlencode(query)}")
++                req.add_header("x-goog-api-key", api_key)
++                req.add_header("Accept", "application/json")
++                req.add_header("User-Agent", _profile_user_agent())
++                for k, v in self.default_headers.items():
++                    req.add_header(k, v)
++                with open_credentialed_url(req, timeout=timeout) as resp:
++                    data = json.loads(resp.read().decode())
++                for model in data.get("models") or []:
++                    if not isinstance(model, dict):
++                        continue
++                    if "generateContent" not in (model.get("supportedGenerationMethods") or []):
++                        continue
++                    name = str(model.get("name") or "").strip()
++                    mid = name.removeprefix("models/")
++                    if mid:
++                        items.append({"id": mid})
++                page_token = str(data.get("nextPageToken") or "")
++                if not page_token:
++                    break
++        except Exception as exc:  # never log the key: exc carries status/reason only
++            import logging
++
++            logging.getLogger(__name__).debug("fetch_models(%s): %s", self.name, exc)
++            return None
++        return chat_catalog_ids(items)
++
+ 
+ gemini = GeminiProfile(
+     name="gemini", aliases=("google", "google-gemini", "google-ai-studio"), api_mode="chat_completions",
+diff --git a/tests/plugins/model_providers/test_gemini_profile.py b/tests/plugins/model_providers/test_gemini_profile.py
+index 3b749d038b..0da4b7409b 100644
+--- a/tests/plugins/model_providers/test_gemini_profile.py
++++ b/tests/plugins/model_providers/test_gemini_profile.py
+@@ -25,3 +25,90 @@ def test_native_gemini_auxiliary_default_is_in_curated_catalog(gemini_profile):
+     from hermes_cli.models import _PROVIDER_MODELS
+ 
+     assert gemini_profile.default_aux_model in _PROVIDER_MODELS["gemini"]
++
++
++# [daveey] fetch_models: native AI Studio /models takes x-goog-api-key, not Bearer.
++import json as _json
++from unittest.mock import patch as _patch
++
++
++class _Resp:
++    def __init__(self, payload):
++        self._body = _json.dumps(payload).encode()
++
++    def read(self):
++        return self._body
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        return False
++
++
++def _capture(pages):
++    seen = []
++
++    def fake_open(req, *, timeout, **_kw):
++        seen.append(req)
++        return _Resp(pages[len(seen) - 1])
++
++    return seen, fake_open
++
++
++def test_native_fetch_models_uses_goog_api_key_and_native_shape(gemini_profile):
++    pages = [
++        {
++            "models": [
++                {"name": "models/gemini-3.8-flash", "supportedGenerationMethods": ["generateContent", "countTokens"]},
++                {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
++            ],
++            "nextPageToken": "tok2",
++        },
++        {"models": [{"name": "models/gemini-3.8-pro", "supportedGenerationMethods": ["generateContent"]}]},
++    ]
++    seen, fake_open = _capture(pages)
++    with _patch("hermes_cli.urllib_security.open_credentialed_url", side_effect=fake_open):
++        ids = gemini_profile.fetch_models(api_key="k-test", base_url=gemini_profile.base_url)
++    assert ids == ["gemini-3.8-flash", "gemini-3.8-pro"]
++    assert len(seen) == 2
++    for req in seen:
++        assert req.full_url.startswith("https://generativelanguage.googleapis.com/v1beta/models?")
++        assert "pageSize=1000" in req.full_url
++        assert req.get_header("X-goog-api-key") == "k-test"
++        assert req.get_header("Authorization") is None
++    assert "pageToken=tok2" in seen[1].full_url
++
++
++def test_openai_compat_base_keeps_bearer(gemini_profile):
++    base = "https://generativelanguage.googleapis.com/v1beta/openai"
++    seen, fake_open = _capture([{"data": [{"id": "gemini-3.8-flash"}]}])
++    with _patch("hermes_cli.urllib_security.open_credentialed_url", side_effect=fake_open):
++        ids = gemini_profile.fetch_models(api_key="k-test", base_url=base)
++    assert ids == ["gemini-3.8-flash"]
++    assert seen[0].full_url == base + "/models"
++    assert seen[0].get_header("Authorization") == "Bearer k-test"
++    assert seen[0].get_header("X-goog-api-key") is None
++
++
++def test_custom_proxy_base_uses_base_models(gemini_profile):
++    base = "https://proxy.example.com/v1"
++    seen, fake_open = _capture([{"data": [{"id": "gemini-proxy"}]}])
++    with _patch("hermes_cli.urllib_security.open_credentialed_url", side_effect=fake_open):
++        ids = gemini_profile.fetch_models(api_key="k-test", base_url=base)
++    assert ids == ["gemini-proxy"]
++    assert seen[0].full_url == base + "/models"
++    assert seen[0].get_header("X-goog-api-key") is None
++
++
++def test_native_fetch_models_401_returns_none_without_logging_key(gemini_profile, caplog):
++    import logging
++    import urllib.error
++
++    def boom(req, *, timeout, **_kw):
++        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
++
++    caplog.set_level(logging.DEBUG)
++    with _patch("hermes_cli.urllib_security.open_credentialed_url", side_effect=boom):
++        assert gemini_profile.fetch_models(api_key="k-secret-xyz") is None
++    assert "k-secret-xyz" not in caplog.text
+-- 
+2.54.0 (Apple Git-157)
+

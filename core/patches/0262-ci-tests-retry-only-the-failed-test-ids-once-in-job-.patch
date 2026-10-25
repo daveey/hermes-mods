@@ -1,0 +1,823 @@
+From 9b7e8f26b158d07825cd6c85295b56b76add297f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:58:34 -0700
+Subject: [PATCH] ci(tests): retry only the failed test ids once in-job; flaky
+ ids get one Kanban card each [daveey]
+
+run_tests_parallel.py retried a failing FILE: one flaky test in
+test_run_agent.py cost another 320 s, and a test that flaked twice under
+load turned the slice red, which meant a ~1 h whole-shard rerun (#38).
+The retry now reruns only the node ids from pytest's short summary
+(falling back to the whole file for collection errors/crashes). A pass
+on retry stays FLAKY and is written to --flaky-report
+(HERMES_TEST_FLAKY_REPORT); scripts/ci/flaky_kanban.py turns each id
+into one deflake card (comments while open, a linked new card if it
+flakes after close). A test that fails twice keeps the run red.
+
+t_94f2c8ba
+---
+ scripts/ci/flaky_kanban.py               | 215 +++++++++++++++++++++++
+ scripts/run_tests.sh                     |   8 +-
+ scripts/run_tests_parallel.py            | 151 +++++++++++++++-
+ tests/ci/test_flaky_kanban.py            | 158 +++++++++++++++++
+ tests/scripts/test_run_tests_parallel.py | 126 +++++++++++++
+ tests/scripts/test_run_tests_shell.py    |  29 +++
+ 6 files changed, 674 insertions(+), 13 deletions(-)
+ create mode 100644 scripts/ci/flaky_kanban.py
+ create mode 100644 tests/ci/test_flaky_kanban.py
+
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+new file mode 100644
+index 0000000000..ce759c4bd8
+--- /dev/null
++++ b/scripts/ci/flaky_kanban.py
+@@ -0,0 +1,215 @@
++#!/usr/bin/env python3
++"""File ONE Kanban deflake card per flaky test id (t_94f2c8ba).
++
++scripts/run_tests_parallel.py retries a failed test once in the same job. A
++test that passes only on that retry keeps the job green but must never pass
++silently: the runner writes it to ``--flaky-report`` JSON, CI uploads that as
++a ``flaky-tests-*`` artifact, and this script turns each test id into a card.
++
++* first flake of a test id: create a card (idempotency key ``deflake:<id>``)
++* later flakes while that card is open: append a comment to it
++* flake after its card was closed (done/archived): open a new card that links
++  the old one, since the fix did not hold
++
++Two input modes:
++
++  flaky_kanban.py --report flaky.json [--report ...] --run-url URL [--branch B]
++  flaky_kanban.py --from-github --repo OWNER/NAME     # hub cron: poll artifacts
++
++``--from-github`` reads ``GH_TOKEN``/``GITHUB_TOKEN`` and remembers processed
++artifact ids in ``--state`` so each run is filed once. Cards go through the
++``hermes kanban`` CLI of the host it runs on (the hub's board).
++"""
++from __future__ import annotations
++
++import argparse
++import io
++import json
++import os
++import subprocess
++import sys
++import time
++import urllib.request
++import zipfile
++from pathlib import Path
++from typing import Any, Iterable, Protocol
++
++ARTIFACT_PREFIX = "flaky-tests-"
++CLOSED = {"done", "archived"}
++DEFAULT_STATE = Path(os.path.expanduser("~/.hermes/state/ci-flaky-cards.json"))
++EXCERPT_LIMIT = 3000
++
++
++class Board(Protocol):
++    def create(self, title: str, body: str, key: str) -> str: ...
++    def status(self, card_id: str) -> str | None: ...
++    def comment(self, card_id: str, body: str) -> None: ...
++
++
++class CliBoard:
++    """The host's Kanban board through ``hermes kanban`` (never its DB directly)."""
++
++    def __init__(self, hermes: str | list[str] = "hermes", assignee: str = "default") -> None:
++        self.hermes = [hermes] if isinstance(hermes, str) else list(hermes)
++        self.assignee = assignee
++
++    def _run(self, *args: str, stdin: str | None = None) -> str:
++        proc = subprocess.run([*self.hermes, "kanban", *args], input=stdin, capture_output=True,
++                              text=True, timeout=120, check=False)
++        if proc.returncode != 0:
++            raise RuntimeError(f"hermes kanban {args[0]} failed ({proc.returncode}): {proc.stderr.strip()[:400]}")
++        return proc.stdout
++
++    def create(self, title: str, body: str, key: str) -> str:
++        out = self._run("create", title, "--assignee", self.assignee, "--idempotency-key", key,
++                        "--created-by", "ci-flaky-cards", "--body-file", "-", "--json", stdin=body)
++        data = json.loads(out)
++        return str(data.get("id") or data.get("task_id") or data["task"]["id"])
++
++    def status(self, card_id: str) -> str | None:
++        try:
++            data = json.loads(self._run("show", card_id, "--json"))
++        except (RuntimeError, ValueError):
++            return None
++        task = data.get("task", data)
++        return task.get("status")
++
++    def comment(self, card_id: str, body: str) -> None:
++        self._run("comment", card_id, body)
++
++
++def load_state(path: Path) -> dict[str, Any]:
++    try:
++        state = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        state = {}
++    state.setdefault("cards", {})       # test id -> {"card": id, "generation": n}
++    state.setdefault("artifacts", [])   # processed artifact ids
++    return state
++
++
++def save_state(path: Path, state: dict[str, Any]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    state["artifacts"] = state["artifacts"][-500:]
++    tmp = path.with_suffix(".tmp")
++    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    tmp.replace(path)
++
++
++def _card_body(entry: dict[str, str], run_url: str, branch: str, previous: str | None) -> str:
++    excerpt = (entry.get("first_attempt_excerpt") or "")[-EXCERPT_LIMIT:]
++    lines = [
++        f"Flaky test: `{entry['test_id']}`",
++        "",
++        f"It failed on its first attempt and passed when CI retried it ({run_url}, branch `{branch}`).",
++        "The retry keeps the job green, so this card is the only signal. Fix the cause, don't widen the retry.",
++        "",
++        "Usual cause on the hub runners: a fixed wall-clock deadline (sleep, short wait/join timeout, short",
++        "lease) that a CPU-throttled container misses. Wait on events or use generous timeouts that return",
++        "as soon as the condition holds. Reproduce by starving the process (SIGSTOP/SIGCONT duty cycle) rather",
++        "than on a quiet laptop.",
++    ]
++    if previous:
++        lines += ["", f"An earlier deflake card {previous} was closed, but the test flaked again."]
++    if entry.get("retried") == "file":
++        lines += ["", "The failure could not be pinned to test ids (collection error or crash), so the whole file was retried."]
++    lines += ["", "First-attempt output (tail):", "```", excerpt, "```"]
++    return "\n".join(lines)
++
++
++def file_cards(entries: Iterable[dict[str, str]], *, run_url: str, branch: str, board: Board,
++               state: dict[str, Any]) -> list[str]:
++    """Open or append one card per distinct test id; returns one log line per id."""
++    log = []
++    seen: set[str] = set()
++    for entry in entries:
++        test_id = entry["test_id"]
++        if test_id in seen:
++            continue
++        seen.add(test_id)
++        known = state["cards"].get(test_id)
++        if known and board.status(known["card"]) not in CLOSED | {None}:
++            board.comment(known["card"], f"Flaked again: {run_url} (branch `{branch}`).\n\n```\n"
++                          f"{(entry.get('first_attempt_excerpt') or '')[-1500:]}\n```")
++            log.append(f"appended {known['card']} {test_id}")
++            continue
++        generation = (known or {}).get("generation", 0) + (1 if known else 0)
++        key = f"deflake:{test_id}" + (f"#{generation}" if generation else "")
++        card = board.create(f"Deflake {test_id}", _card_body(entry, run_url, branch, (known or {}).get("card")), key)
++        state["cards"][test_id] = {"card": card, "generation": generation}
++        log.append(f"opened {card} {test_id}")
++    return log
++
++
++def read_report(raw: bytes | str) -> list[dict[str, str]]:
++    data = json.loads(raw)
++    if data.get("version") != 1:
++        raise ValueError(f"unknown flaky report version: {data.get('version')!r}")
++    return list(data.get("flaky") or [])
++
++
++# --- GitHub polling (hub cron) -------------------------------------------------
++
++
++def _gh(url: str, token: str, *, raw: bool = False) -> Any:
++    req = urllib.request.Request(url, headers={
++        "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
++        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "hermes-ci-flaky-cards"})
++    with urllib.request.urlopen(req, timeout=60) as resp:
++        body = resp.read()
++    return body if raw else json.loads(body)
++
++
++def poll_github(repo: str, token: str, board: Board, state: dict[str, Any]) -> list[str]:
++    log: list[str] = []
++    page = _gh(f"https://api.github.com/repos/{repo}/actions/artifacts?per_page=100", token)
++    done = set(state["artifacts"])
++    for art in sorted(page.get("artifacts", []), key=lambda a: a["id"]):
++        if not art["name"].startswith(ARTIFACT_PREFIX) or art["id"] in done or art.get("expired"):
++            continue
++        run = art.get("workflow_run") or {}
++        run_url = f"https://github.com/{repo}/actions/runs/{run.get('id')}"
++        blob = _gh(art["archive_download_url"], token, raw=True)
++        entries: list[dict[str, str]] = []
++        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
++            for name in zf.namelist():
++                if name.endswith(".json"):
++                    entries += read_report(zf.read(name))
++        log += file_cards(entries, run_url=run_url, branch=run.get("head_branch") or "?", board=board, state=state)
++        state["artifacts"].append(art["id"])
++    return log
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--report", action="append", default=[], help="flaky report JSON (repeatable)")
++    ap.add_argument("--run-url", default="(local run)")
++    ap.add_argument("--branch", default="?")
++    ap.add_argument("--from-github", action="store_true")
++    ap.add_argument("--repo", default="daveey/hermes")
++    ap.add_argument("--state", type=Path, default=DEFAULT_STATE)
++    ap.add_argument("--hermes", default=os.environ.get("HERMES_BIN", "hermes"))
++    ap.add_argument("--assignee", default="default")
++    args = ap.parse_args(argv)
++
++    board = CliBoard(args.hermes, args.assignee)
++    state = load_state(args.state)
++    if args.from_github:
++        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
++        if not token:
++            print("flaky_kanban: GH_TOKEN/GITHUB_TOKEN not set", file=sys.stderr)
++            return 2
++        log = poll_github(args.repo, token, board, state)
++    else:
++        entries: list[dict[str, str]] = []
++        for path in args.report:
++            entries += read_report(Path(path).read_text(encoding="utf-8"))
++        log = file_cards(entries, run_url=args.run_url, branch=args.branch, board=board, state=state)
++    save_state(args.state, state)
++    for line in log:  # silent when nothing flaked (no-agent cron delivers stdout)
++        print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {line}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index 36d7abffbf..26eef4d6ff 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -125,9 +125,9 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ # The runner's own documented environment knobs must survive the hermetic
+ # `env -i` below, or they are silent no-ops for anyone invoking this script:
+ #
+-#   * HERMES_TEST_WORKERS / PATHS / FILE_TIMEOUT / FILE_RETRIES / SLICE are
+-#     read by run_tests_parallel.py at argparse-default time — inside the
+-#     stripped environment.
++#   * HERMES_TEST_WORKERS / PATHS / FILE_TIMEOUT / FILE_RETRIES / SLICE /
++#     FLAKY_REPORT are read by run_tests_parallel.py at argparse-default
++#     time — inside the stripped environment.
+ #   * HERMES_TEST_IMAGE is read by tests/docker/conftest.py to skip its
+ #     session-scoped `docker build`. CI's docker.yml sets it to the image
+ #     the build step just loaded; stripping it made every per-file pytest
+@@ -160,7 +160,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ # credential can leak" property stays auditable at a glance.
+ TEST_ENV=()
+ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
++  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_FLAKY_REPORT \
+   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
+   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
+   HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
+diff --git a/scripts/run_tests_parallel.py b/scripts/run_tests_parallel.py
+index 521a95eb64..417a433fe3 100644
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -590,28 +590,141 @@ def _run_one_file(
+         retries = 0
+     while rc != 0 and attempt < retries:
+         attempt += 1
+-        first_output = output
+-        file, rc, output, summary, subproc_wall2 = _run_one_file_once(
+-            file, pytest_args, repo_root, file_timeout
++        first_output, first_summary = output, summary
++        # Retry only the test ids that failed, not the whole file: a 300 s
++        # file with one flaky test used to pay 300 s again (t_94f2c8ba).
++        node_ids = _failed_node_ids(first_output, first_summary)
++        retried: list[str] | None = None
++        if node_ids:
++            targets = [_reroot_node_id(n, file) for n in node_ids]
++            _f, rc, output, retry_summary, subproc_wall2 = _run_one_file_once(
++                file, pytest_args, repo_root, file_timeout, targets=targets
++            )
++            subproc_wall += subproc_wall2
++            if rc in (4, 5) or not retry_summary:
++                # The ids did not resolve (odd parametrize ids, usage error):
++                # fall through to the whole-file retry below.
++                node_ids = None
++            else:
++                retried = node_ids
++                summary = _merge_retry_summary(first_summary, retry_summary)
++        if not node_ids:
++            file, rc, output, summary, subproc_wall2 = _run_one_file_once(
++                file, pytest_args, repo_root, file_timeout
++            )
++            subproc_wall += subproc_wall2
++        scope = (
++            f"{len(retried)} failed test id{'s' if len(retried) != 1 else ''}"
++            if retried else "whole file"
+         )
+-        subproc_wall += subproc_wall2
+         if rc == 0:
+             output = (
+-                f"⚠ FLAKY: failed on attempt 1, passed on retry "
+-                f"(attempt {attempt + 1}). Fix the flake — do not ignore this.\n"
++                f"\u26a0 FLAKY: failed on attempt 1, passed on retry "
++                f"(attempt {attempt + 1}, retried {scope}). Fix the flake \u2014 do not ignore this.\n"
+                 f"--- first-attempt output ---\n{first_output}\n"
+                 f"--- retry output ---\n{output}"
+             )
++            ids = retried or [_repo_relative(file, repo_root)]
+             with _flaky_lock:
+                 _FLAKY_RESULTS.append((file, output))
++                for test_id in ids:
++                    _FLAKY_TESTS.append({
++                        "test_id": test_id,
++                        "file": _repo_relative(file, repo_root),
++                        "retried": "tests" if retried else "file",
++                        "first_attempt_excerpt": _failure_excerpt(first_output),
++                    })
++        else:
++            output = (
++                f"--- first-attempt output ---\n{first_output}\n"
++                f"--- retry output (retried {scope}; still failing) ---\n{output}"
++            )
+     return file, rc, output, summary, subproc_wall
+ 
+ 
++# Short-summary lines pytest prints for each failed/erroring test (default -rfE).
++_SUMMARY_HEADER_RE = re.compile(r"^=+ short test summary info =+$")
++# A node id has no spaces outside its parametrize brackets, which may hold " - ".
++_FAILED_LINE_RE = re.compile(r"^(?:FAILED|ERROR) (\S+?::[^\[\s]*(?:\[.*?\])?)(?: - .*)?$")
++
++
++def _failed_node_ids(output: str, summary: dict[str, int]) -> list[str] | None:
++    """Node ids from the LAST short test summary in ``output``, or None.
++
++    None means "cannot pin the failure to test ids" and the caller retries the
++    whole file: a collection error (``ERROR file.py`` has no ``::``), a crash
++    with no summary, ``-rN``, or an id count that disagrees with the counts
++    line (a nested pytest in a test can print its own FAILED lines).
++    """
++    lines = output.splitlines()
++    starts = [i for i, line in enumerate(lines) if _SUMMARY_HEADER_RE.match(line.strip())]
++    if not starts:
++        return None
++    ids: list[str] = []
++    for line in lines[starts[-1] + 1:]:
++        line = line.rstrip()
++        if line.startswith("="):
++            break
++        if line.startswith(("FAILED ", "ERROR ")):
++            m = _FAILED_LINE_RE.match(line)
++            if not m:
++                return None
++            ids.append(m.group(1))
++    ids = list(dict.fromkeys(ids))
++    expected = summary.get("failed", 0) + summary.get("errors", 0)
++    if not ids or len(ids) != expected:
++        return None
++    return ids
++
++
++def _reroot_node_id(node_id: str, file: Path) -> str:
++    """Point ``path::rest`` at ``file`` so the retry never depends on rootdir."""
++    return f"{file}::{node_id.split('::', 1)[1]}"
++
++
++def _merge_retry_summary(first: dict[str, int], retry: dict[str, int]) -> dict[str, int]:
++    """File-level counts after a test-id retry: attempt-1 passes plus the retry's outcome."""
++    merged = dict(first)
++    merged["passed"] = first.get("passed", 0) + retry.get("passed", 0)
++    merged["failed"] = retry.get("failed", 0)
++    merged["errors"] = retry.get("errors", 0)
++    for key in ("crashed",):
++        if retry.get(key):
++            merged[key] = retry[key]
++    return {k: v for k, v in merged.items() if v or k in ("passed", "failed")}
++
++
++def _repo_relative(file: Path, repo_root: Path) -> str:
++    try:
++        return Path(file).resolve().relative_to(Path(repo_root).resolve()).as_posix()
++    except ValueError:
++        return Path(file).as_posix()
++
++
++def _failure_excerpt(output: str, limit: int = 4000) -> str:
++    """The first attempt's tail (assertion + short summary), bounded for the report."""
++    return output[-limit:]
++
++
++def _write_flaky_report(path: str, repo_root: Path) -> None:
++    """JSON report of pass-on-retry tests for scripts/ci/flaky_kanban.py.
++
++    Written even when empty, so CI can upload it unconditionally and the card
++    filer can tell "no flakes" from "no report".
++    """
++    payload = {"version": 1, "flaky": sorted(_FLAKY_TESTS, key=lambda e: e["test_id"])}
++    Path(path).parent.mkdir(parents=True, exist_ok=True)
++    Path(path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
++
++
+ # Files that failed once and passed on retry, with both attempts' output.
+ # Keeping the traceback is load-bearing: a self-healed flake without its
+ # failing assertion is only a filename, which forces another expensive full
+ # run to rediscover the race.
+ _FLAKY_RESULTS: list[tuple[Path, str]] = []
++# One entry per flaky TEST id (or file, when the retry had to rerun the whole
++# file); written by --flaky-report so CI can file one deflake card per id.
++_FLAKY_TESTS: list[dict[str, str]] = []
+ _flaky_lock = threading.Lock()
+ 
+ 
+@@ -620,9 +733,13 @@ def _run_one_file_once(
+     pytest_args: list[str],
+     repo_root: Path,
+     file_timeout: float,
++    targets: list[str] | None = None,
+ ) -> tuple[Path, int, str, dict[str, int], float]:
+-    """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
++    """Single attempt of a per-file pytest subprocess (see _run_one_file).
++
++    ``targets`` narrows the run to those node ids of ``file`` (the retry).
++    """
++    cmd = [sys.executable, "-m", "pytest", *(targets or [str(file)]), *pytest_args]
+ 
+     # Give this subprocess its own pytest temp root.
+     #
+@@ -1248,6 +1365,17 @@ def main() -> int:
+             "the per-argv-element cap; mutually exclusive with --files."
+         ),
+     )
++    parser.add_argument(
++        "--flaky-report",
++        metavar="PATH",
++        default=os.environ.get("HERMES_TEST_FLAKY_REPORT") or None,
++        help=(
++            "Write a JSON list of tests that failed once and passed on the "
++            "retry to PATH (written even when empty). CI uploads it and "
++            "scripts/ci/flaky_kanban.py files one deflake card per test id. "
++            "Env: HERMES_TEST_FLAKY_REPORT."
++        ),
++    )
+     parser.add_argument(
+         "--fail-on-skip",
+         action="store_true",
+@@ -1286,7 +1414,7 @@ def main() -> int:
+     OUR_FLAGS = {
+         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
+         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+-        "--files-from", "--fail-on-skip",
++        "--files-from", "--fail-on-skip", "--flaky-report",
+     }
+     # pytest short flags that consume the NEXT token as their value.
+     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
+@@ -1612,6 +1740,11 @@ def main() -> int:
+             print(f"  {_format_file(f, repo_root)}")
+             print(output.rstrip())
+ 
++    if args.flaky_report:
++        _write_flaky_report(args.flaky_report, repo_root)
++        if _FLAKY_TESTS:
++            print(f"  Flaky test ids written to {args.flaky_report} ({len(_FLAKY_TESTS)})")
++
+     # Save durations for future runs (LPT slicing and the per-file timeout
+     # scaler, see _effective_file_timeout). _save_durations merges with any
+     # existing cache so entries from previous runs aren't lost.
+diff --git a/tests/ci/test_flaky_kanban.py b/tests/ci/test_flaky_kanban.py
+new file mode 100644
+index 0000000000..7666611f6e
+--- /dev/null
++++ b/tests/ci/test_flaky_kanban.py
+@@ -0,0 +1,158 @@
++"""scripts/ci/flaky_kanban.py: one deflake card per flaky test id (t_94f2c8ba).
++
++The end-to-end case runs the real per-file runner on a probe suite with one
++flaky and one hard-failing test, then files cards on a real (isolated) board
++through the `hermes kanban` CLI: the flaky test passes and gets a card, the
++hard failure keeps the run red and gets none.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import shutil
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++_ROOT = Path(__file__).resolve().parents[2]
++_spec = importlib.util.spec_from_file_location("flaky_kanban", _ROOT / "scripts" / "ci" / "flaky_kanban.py")
++fk = importlib.util.module_from_spec(_spec)
++sys.modules["flaky_kanban"] = fk
++_spec.loader.exec_module(fk)
++
++
++class FakeBoard:
++    def __init__(self):
++        self.cards: dict[str, dict] = {}
++        self.keys: dict[str, str] = {}
++
++    def create(self, title, body, key):
++        if key in self.keys and self.cards[self.keys[key]]["status"] != "archived":
++            return self.keys[key]
++        card = f"t_{len(self.cards) + 1}"
++        self.cards[card] = {"title": title, "body": body, "status": "ready", "comments": [], "key": key}
++        self.keys[key] = card
++        return card
++
++    def status(self, card):
++        return self.cards.get(card, {}).get("status")
++
++    def comment(self, card, body):
++        self.cards[card]["comments"].append(body)
++
++
++def _entry(test_id, excerpt="AssertionError: boom"):
++    return {"test_id": test_id, "file": test_id.split("::")[0], "retried": "tests",
++            "first_attempt_excerpt": excerpt}
++
++
++def test_one_card_per_test_id_then_comments_while_it_is_open():
++    board, state = FakeBoard(), fk.load_state(Path("/nonexistent/state.json"))
++    a, b = "tests/x.py::test_a", "tests/x.py::T::test_b[p - q]"
++
++    log = fk.file_cards([_entry(a), _entry(b), _entry(a)], run_url="https://r/1", branch="main",
++                        board=board, state=state)
++    assert [line.split()[0] for line in log] == ["opened", "opened"]
++    assert sorted(c["title"] for c in board.cards.values()) == sorted([f"Deflake {a}", f"Deflake {b}"])
++    assert board.cards[state["cards"][a]["card"]]["key"] == f"deflake:{a}"
++    assert "https://r/1" in board.cards[state["cards"][a]["card"]]["body"]
++
++    log = fk.file_cards([_entry(a, "second traceback")], run_url="https://r/2", branch="pr", board=board, state=state)
++    assert log == [f"appended {state['cards'][a]['card']} {a}"]
++    assert len(board.cards) == 2
++    assert "https://r/2" in board.cards[state["cards"][a]["card"]]["comments"][0]
++
++
++def test_flake_after_the_card_was_closed_opens_a_linked_new_card():
++    board, state = FakeBoard(), fk.load_state(Path("/nonexistent/state.json"))
++    a = "tests/x.py::test_a"
++    fk.file_cards([_entry(a)], run_url="https://r/1", branch="main", board=board, state=state)
++    first = state["cards"][a]["card"]
++    board.cards[first]["status"] = "done"
++
++    fk.file_cards([_entry(a)], run_url="https://r/2", branch="main", board=board, state=state)
++    second = state["cards"][a]["card"]
++    assert second != first
++    assert board.cards[second]["key"] == f"deflake:{a}#1"
++    assert first in board.cards[second]["body"]
++    assert board.cards[first]["comments"] == []
++
++
++def test_state_round_trips_and_rejects_unknown_report_versions(tmp_path):
++    path = tmp_path / "s.json"
++    state = fk.load_state(path)
++    state["cards"]["t"] = {"card": "t_1", "generation": 0}
++    state["artifacts"].append(7)
++    fk.save_state(path, state)
++    assert fk.load_state(path)["cards"]["t"]["card"] == "t_1"
++    with pytest.raises(ValueError):
++        fk.read_report(json.dumps({"version": 2, "flaky": []}))
++
++
++@pytest.mark.platforms("posix")
++def test_flaky_test_passes_and_files_a_card_while_a_hard_failure_stays_red(tmp_path, monkeypatch):
++    # Real runner: copy it the way tests/scripts/test_run_tests_parallel.py does.
++    root = tmp_path / "runner-root"
++    (root / "scripts" / "ci").mkdir(parents=True)
++    shutil.copy2(_ROOT / "scripts" / "run_tests_parallel.py", root / "scripts")
++    shutil.copy2(_ROOT / "scripts" / "ci" / "list_os_marked_tests.py", root / "scripts" / "ci")
++    marker = tmp_path / "flaked-once"
++    suite = tmp_path / "suite"
++    suite.mkdir()
++    (suite / "test_flaky_probe.py").write_text(textwrap.dedent(f"""
++        from pathlib import Path
++
++        def test_steady():
++            assert True
++
++        def test_flaky_under_load():
++            m = Path({str(marker)!r})
++            if not m.exists():
++                m.write_text("x")
++                assert False, "first attempt starved"
++    """), encoding="utf-8")
++    (suite / "test_hard_probe.py").write_text(
++        "def test_real_regression():\n    assert 1 == 2, 'real regression'\n", encoding="utf-8")
++    report = tmp_path / "flaky.json"
++
++    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
++    proc = subprocess.run(
++        [sys.executable, str(root / "scripts" / "run_tests_parallel.py"),
++         "--files", f"{suite / 'test_flaky_probe.py'}:{suite / 'test_hard_probe.py'}",
++         "--file-retries", "1", "-j", "2", "--flaky-report", str(report)],
++        cwd=tmp_path, capture_output=True, text=True, timeout=180, check=False,
++    )
++    out = proc.stdout + proc.stderr
++    assert proc.returncode == 1, out                       # the hard failure keeps the run red
++    assert "real regression" in out and "still failing" in out
++    flaky = fk.read_report(report.read_text(encoding="utf-8"))
++    assert [e["test_id"].rsplit("/", 1)[-1] for e in flaky] == ["test_flaky_probe.py::test_flaky_under_load"]
++
++    # File it on an isolated real board through the hermes kanban CLI.
++    home = tmp_path / "hermes-home"
++    home.mkdir()
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME", "HERMES_KANBAN_TASK",
++                "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_DELEGATED_CHILD_OWNER", "HERMES_SESSION_ID",
++                "HERMES_SESSION_KEY"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    board = fk.CliBoard([sys.executable, "-m", "hermes_cli.main"])
++    state_path = tmp_path / "state.json"
++    state = fk.load_state(state_path)
++    fk.file_cards(flaky, run_url="https://ci/run/1", branch="main", board=board, state=state)
++    fk.file_cards(flaky, run_url="https://ci/run/2", branch="main", board=board, state=state)
++
++    listed = subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "list", "--json"],
++                            capture_output=True, text=True, timeout=120, check=True, cwd=_ROOT)
++    cards = json.loads(listed.stdout)
++    assert len(cards) == 1, cards                         # one card, the second flake appended
++    assert cards[0]["title"].startswith("Deflake ")
++    assert cards[0]["title"].endswith("test_flaky_probe.py::test_flaky_under_load")
++    assert "first attempt starved" in cards[0]["body"]
++    shown = json.loads(subprocess.run(
++        [sys.executable, "-m", "hermes_cli.main", "kanban", "show", cards[0]["id"], "--json"],
++        capture_output=True, text=True, timeout=120, check=True, cwd=_ROOT).stdout)
++    assert any("https://ci/run/2" in c["body"] for c in shown["comments"])
+diff --git a/tests/scripts/test_run_tests_parallel.py b/tests/scripts/test_run_tests_parallel.py
+index 262dcb047c..9506e67821 100644
+--- a/tests/scripts/test_run_tests_parallel.py
++++ b/tests/scripts/test_run_tests_parallel.py
+@@ -427,6 +427,132 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
+ 
+ 
+ 
++# ---------------------------------------------------------------------------
++# The retry reruns only the failed test ids (t_94f2c8ba). A file whose one
++# flaky test failed used to pay the whole file again (test_run_agent.py: 2 x
++# 320 s under load). A pass-on-retry is still FLAKY and lands in the report
++# that files the deflake card; a test that fails twice keeps the run red.
++
++
++def _run_probe_file(tmp_path: Path, body: str, *extra: str) -> tuple[subprocess.CompletedProcess, dict]:
++    repo_root = _probe_root(tmp_path)
++    runner = repo_root / "scripts" / "run_tests_parallel.py"
++    probe = tmp_path / "test_retry_probe.py"
++    probe.write_text(textwrap.dedent(body), encoding="utf-8")
++    report = tmp_path / "flaky.json"
++    proc = subprocess.run(
++        [sys.executable, str(runner), "--files", str(probe), "--file-retries", "1",
++         "-j", "1", "--flaky-report", str(report), *extra],
++        cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++        text=True, timeout=120, check=False,
++    )
++    return proc, json.loads(report.read_text(encoding="utf-8"))
++
++
++def test_retry_reruns_only_the_failed_test_and_reports_it_flaky(tmp_path: Path) -> None:
++    runs = tmp_path / "runs.log"
++    marker = tmp_path / "failed-once"
++    proc, report = _run_probe_file(tmp_path, f"""
++        from pathlib import Path
++
++        def _note(name):
++            with open({str(runs)!r}, "a") as f:
++                f.write(name + "\\n")
++
++        def test_steady():
++            _note("steady")
++
++        class TestGroup:
++            def test_flaky_once(self):
++                _note("flaky")
++                marker = Path({str(marker)!r})
++                if not marker.exists():
++                    marker.write_text("x")
++                    assert False, "simulated load flake"
++    """)
++
++    assert proc.returncode == 0, proc.stdout
++    assert "FLAKY" in proc.stdout and "retried 1 failed test id" in proc.stdout
++    assert "simulated load flake" in proc.stdout
++    # The passing test ran once: only the failed id was retried.
++    assert runs.read_text().split() == ["steady", "flaky", "flaky"]
++    assert [e["test_id"].rsplit("/", 1)[-1] for e in report["flaky"]] == [
++        "test_retry_probe.py::TestGroup::test_flaky_once"
++    ]
++    assert report["flaky"][0]["retried"] == "tests"
++    assert "simulated load flake" in report["flaky"][0]["first_attempt_excerpt"]
++    # The summary counts the file's tests once each, not the retry twice.
++    assert "2 tests passed, 0 failed" in proc.stdout
++
++
++def test_retry_keeps_a_hard_failure_red_and_out_of_the_flaky_report(tmp_path: Path) -> None:
++    proc, report = _run_probe_file(tmp_path, """
++        def test_fine():
++            assert True
++
++        def test_broken():
++            assert 1 == 2, "real regression"
++    """)
++
++    assert proc.returncode == 1, proc.stdout
++    assert "still failing" in proc.stdout
++    assert "real regression" in proc.stdout
++    assert "FLAKY" not in proc.stdout
++    assert report == {"version": 1, "flaky": []}
++    assert "1 tests passed, 1 failed" in proc.stdout
++
++
++def test_collection_error_falls_back_to_a_whole_file_retry(tmp_path: Path) -> None:
++    marker = tmp_path / "import-failed-once"
++    proc, report = _run_probe_file(tmp_path, f"""
++        from pathlib import Path
++
++        _m = Path({str(marker)!r})
++        if not _m.exists():
++            _m.write_text("x")
++            raise RuntimeError("import-time flake")
++
++        def test_after_import():
++            assert True
++    """)
++
++    assert proc.returncode == 0, proc.stdout
++    assert "retried whole file" in proc.stdout
++    assert len(report["flaky"]) == 1 and report["flaky"][0]["retried"] == "file"
++    assert report["flaky"][0]["test_id"].endswith("test_retry_probe.py")
++
++
++def test_failed_node_ids_ignore_nested_pytest_summaries() -> None:
++    import importlib.util
++
++    spec = importlib.util.spec_from_file_location(
++        "rtp_ids", Path(__file__).resolve().parents[2] / "scripts" / "run_tests_parallel.py"
++    )
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["rtp_ids"] = mod
++    spec.loader.exec_module(mod)
++    out = "\n".join([
++        "captured: ==== short test summary info ====",
++        "FAILED inner.py::test_nested - from a subprocess the test ran",
++        "=========================== short test summary info ============================",
++        "FAILED tests/a.py::TestX::test_one[p - q] - AssertionError: boom",
++        "ERROR tests/a.py::test_two - fixture failed",
++        "=================== 1 failed, 1 error, 3 passed in 1.0s ===================",
++    ])
++    assert mod._failed_node_ids(out, {"failed": 1, "errors": 1, "passed": 3}) == [
++        "tests/a.py::TestX::test_one[p - q]",
++        "tests/a.py::test_two",
++    ]
++    # Count mismatch (e.g. -rN or a truncated summary) -> whole-file retry.
++    assert mod._failed_node_ids(out, {"failed": 3, "passed": 3}) is None
++    # Collection error has no test id.
++    assert mod._failed_node_ids(
++        "==== short test summary info ====\nERROR tests/a.py - ImportError\n==== 1 error ====",
++        {"errors": 1},
++    ) is None
++    assert mod._reroot_node_id("tests/a.py::T::t", Path("/abs/a.py")) == "/abs/a.py::T::t"
++
++
+ # ---------------------------------------------------------------------------
+ # Zero-collection is not a pass; node ids are translated, not dropped.
+ #
+diff --git a/tests/scripts/test_run_tests_shell.py b/tests/scripts/test_run_tests_shell.py
+index 247ae711b4..45b7dd3967 100644
+--- a/tests/scripts/test_run_tests_shell.py
++++ b/tests/scripts/test_run_tests_shell.py
+@@ -30,3 +30,32 @@ def test_shell_runner_executes_tests_and_propagates_failure(tmp_path):
+     assert marker.read_text(encoding="utf-8") == "executed", result.stdout + result.stderr
+     assert result.returncode != 0, result.stdout + result.stderr
+     assert "runner failure propagation canary" in result.stdout + result.stderr
++
++
++@pytest.mark.platforms("posix")
++def test_shell_runner_forwards_the_flaky_report_path(tmp_path):
++    """CI sets HERMES_TEST_FLAKY_REPORT on the step; the hermetic env -i must keep it (t_94f2c8ba)."""
++    marker = tmp_path / "failed-once"
++    case = tmp_path / "test_flaky_canary.py"
++    case.write_text(
++        "from pathlib import Path\n"
++        "def test_flaky_canary():\n"
++        f"    m = Path({str(marker)!r})\n"
++        "    if not m.exists():\n"
++        "        m.write_text('x')\n"
++        "        assert False, 'first attempt flake'\n",
++        encoding="utf-8",
++    )
++    report = tmp_path / "out" / "flaky.json"
++    root = Path(__file__).resolve().parents[2]
++    result = subprocess.run(
++        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
++        cwd=tmp_path, capture_output=True, text=True, timeout=180,
++        env={**os.environ, "HERMES_PYTHON": sys.executable, "HERMES_TEST_FILE_RETRIES": "1",
++             "HERMES_TEST_FLAKY_REPORT": str(report)},
++        check=False,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    import json
++    ids = [e["test_id"] for e in json.loads(report.read_text(encoding="utf-8"))["flaky"]]
++    assert len(ids) == 1 and ids[0].endswith("test_flaky_canary.py::test_flaky_canary"), ids
+-- 
+2.55.0
+

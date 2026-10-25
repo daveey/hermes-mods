@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import re
 import sys
 import threading
 import time
@@ -43,6 +44,25 @@ _lock = threading.RLock()
 
 class PosterMuted(ValueError):
     """The poster's recent cards were all dismissed; its posts are refused until it is fixed + unmuted."""
+
+
+class AgentFixablePost(ValueError):
+    """An automated poster tried to put agent-fixable state in the Inbox (owner-only decisions)."""
+
+
+# Posters that report board state an agent can fix: never the Inbox, always a Kanban comment/card.
+AGENT_FIXABLE_POSTERS = frozenset({"kanban-dispatcher"})
+# A "Do it" that tells an agent to fix a Kanban card and unblock it is not a decision for David.
+_AGENT_FIX_PROMPT = re.compile(r"kanban\s+card\b.*\bfix\b.*\bunblock", re.I | re.S)
+
+
+def agent_fixable_reason(poster: Optional[str], accept_prompt: str) -> Optional[str]:
+    """Why this post belongs on Kanban instead of the Inbox, or None when it may be posted."""
+    if poster and poster.strip().lower() in AGENT_FIXABLE_POSTERS:
+        return f"poster {poster!r} reports agent-fixable board state"
+    if accept_prompt and _AGENT_FIX_PROMPT.search(accept_prompt):
+        return "its 'Do it' asks an agent to fix and unblock a Kanban card"
+    return None
 
 
 class TaskError(RuntimeError):
@@ -208,6 +228,11 @@ class Inbox:
         poster = (" ".join(str(poster).split())[:80] or None) if poster else None
         if not title:
             raise ValueError("title is required")
+        why = agent_fixable_reason(poster, accept_prompt)
+        if why:  # detection-level guard: refuse before David ever sees it (the noise breaker needs 3)
+            raise AgentFixablePost(
+                f"refused: {why}. The Inbox is for decisions only David can make; put this on the "
+                f"Kanban board instead (kanban_comment on the card, or kanban_create a fix card).")
         tdef = self.types.get(type or "default")
         fvals = ct.check_fields(tdef, fields)
         if not accept_prompt and ct.needs_accept_prompt(tdef):

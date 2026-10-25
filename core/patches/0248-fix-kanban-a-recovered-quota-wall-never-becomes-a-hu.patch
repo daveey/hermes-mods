@@ -1,0 +1,515 @@
+From 48e6b709d8f8639e4ba575661d66040961c6b44b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 16:05:31 -0700
+Subject: [PATCH 248/248] fix(kanban): a recovered quota wall never becomes a
+ human block [daveey]
+
+Problem: six cards sat blocked kind=capability for ~13 h (2026-10-23) with
+"Held in ready by the respawn guard (blocker_auth) ... Last error: pid N exited
+rate-limited (quota wall)" after the wall had cleared.
+Why: the rate-limit requeue stamps last_failure_error; a later non-failure run
+(changes_requested/blocked) became the latest run, so the outcome=rate_limited
+cooldown branch no longer fired and the stamp matched _RESPAWN_BLOCKER_RE as
+blocker_auth; the 30-min hold cap then blocked it as capability (a human kind).
+
+- Quota/rate-limit/429 text (no auth signal) takes the rate_limit_cooldown path
+  whatever the latest outcome; once the cooldown elapses the stamp is cleared
+  (also on the rate_limited-outcome path) and the card retries.
+- Hold cap on a quota-flavored error or rate_limit_cooldown re-queues (clears
+  the stamp) instead of blocking. Real auth errors still block capability.
+- Dispatcher tick releases existing guard-hold capability/needs_input blocks on
+  a quota error once another card completed after the block, with a comment.
+---
+ hermes_cli/kanban_db_dispatch.py              |  45 +++-
+ hermes_cli/kanban_db_dispatch_quota.py        | 126 +++++++++++
+ .../test_kanban_list_undecodable_text.py      |   4 +-
+ tests/hermes_cli/test_kanban_quota_guard.py   | 209 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |   4 +-
+ 5 files changed, 378 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_quota.py
+ create mode 100644 tests/hermes_cli/test_kanban_quota_guard.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 31f876c405..85e1828497 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
+ from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+ from hermes_cli import kanban_db_dispatch_guard_notice as _guard_notice
+ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as _guard_hold_started_at
++from hermes_cli import kanban_db_dispatch_quota as _kbq
+ 
+ if TYPE_CHECKING:
+     from hermes_cli.kanban_db import Task
+@@ -83,7 +84,9 @@ _COMPLETION_GATE_ERROR_PREFIXES = ("PR acceptance ",)
+ # saying so (2026-10-21: ``blocker_auth`` held t_10de9798 for hours; a held card never
+ # runs, so ``consecutive_failures`` never grows and the breaker never trips). Past the cap
+ # the dispatcher blocks the card with the guard reason so it shows as waiting on someone.
+-# ``blocker_auth`` gets the short cap: it never clears without a human. Every other guard
++# ``blocker_auth`` gets the short cap: a real auth failure never clears without a human. A
++# quota wall does clear on its own, so it never reaches ``blocker_auth`` and a quota-flavored
++# hold is re-queued at the cap instead of blocked (``kanban_db_dispatch_quota``). Every other guard
+ # is time-bounded by design and only hits the long cap when something is wrong.
+ # ``shared_blocker`` holds are exempt: they are a declared wall another card is probing.
+ # Override via ``HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS`` / ``..._LONG_SECONDS``. [daveey]
+@@ -191,6 +194,9 @@ class DispatchResult:
+     shared_blocker_released: list[str] = field(default_factory=list)
+     """Blocked task ids unblocked because a probe cleared the shared blocker
+     they were parked behind (``kanban_shared_blockers``). [daveey]"""
++    quota_block_released: list[str] = field(default_factory=list)
++    """Guard-hold blocks on a quota wall released once another card completed after them
++    (``kanban_db_dispatch_quota.release_recovered_quota_blocks``). [daveey]"""
+     rate_limited: list[str] = field(default_factory=list)
+     """Task ids whose workers bailed on a provider rate-limit / quota wall
+     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
+@@ -1645,10 +1651,17 @@ def _block_if_guard_hold_capped(conn: sqlite3.Connection, task_id: str, reason:
+     if held < cap:
+         return False
+     row = conn.execute("SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-    err = _kb._first_line(_kb._lossy_text(row["last_failure_error"]) if row else "", 300) or "(no error recorded)"
++    raw_err = _kb._lossy_text(row["last_failure_error"]) if row else ""
++    if reason == "rate_limit_cooldown" or _kbq.is_quota_error(raw_err):
++        # A quota wall clears on its own: never a human block. Drop the stamp (the event it
++        # appends restarts the hold clock) and let the next tick retry. [daveey]
++        if raw_err:
++            _kbq.clear_quota_error(conn, task_id, raw_err)
++        return False
++    err = _kb._first_line(raw_err, 300) or "(no error recorded)"
+     minutes = max(1, held // 60)
+     message = (f"Held in ready by the respawn guard ({reason}) for {minutes} min without running. "
+-               f"Last error: {err} Fix the cause (credentials, quota, PR binding), then unblock.")
++               f"Last error: {err} Fix the cause (credentials, PR binding), then unblock.")
+     kind = "capability" if reason in _GUARD_HOLD_SHORT_CAP_REASONS else "needs_input"
+     try:
+         return bool(_kb.block_task(conn, task_id, reason=message, kind=kind))
+@@ -1717,14 +1730,30 @@ def check_respawn_guard(
+         # Cooldown elapsed — return early so blocker_auth doesn't catch the
+         # stamped rate-limit text; this path intentionally retries forever
+         # (spaced by the cooldown) until quota returns or a real run supersedes it.
++        # The stamp is dropped so it cannot outlive this run (see 1b). [daveey]
++        stamp = _kb._lossy_text(row["last_failure_error"])
++        if _kbq.is_quota_error(stamp):
++            _kbq.clear_quota_error(conn, task_id, stamp)
+         return None
+ 
+-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
++    err = _kb._lossy_text(row["last_failure_error"])
++    latest_outcome = latest_run["outcome"] if latest_run is not None else None
++    # 1b. Quota stamp that outlived its ``rate_limited`` run (a later ``blocked`` /
++    #     ``changes_requested`` run is now the latest): still a quota wall, never
++    #     ``blocker_auth``. Same cooldown, measured from the latest run's end; once
++    #     it has elapsed the stamp is dropped and the card retries. (2026-10-23:
++    #     six cards blocked ``capability`` for 13 h on a cleared quota wall.) [daveey]
++    if err and latest_outcome != "crashed" and not _is_completion_gate_error(err) and _kbq.is_quota_error(err):
++        ended_at = _kb._to_epoch(latest_run["ended_at"]) if latest_run is not None else None
++        if rl_cooldown > 0 and ended_at is not None and (now - ended_at) < rl_cooldown:
++            return "rate_limit_cooldown"
++        _kbq.clear_quota_error(conn, task_id, err)
++        err = ""
++
++    # 2. Auth blocker: retrying immediately will not help.  A plain
+     # crash is different: its persisted error includes the worker's last
+     # captured output, which is context rather than a diagnosis and may contain
+     # benign commands such as ``claude auth status`` (#117097).
+-    err = _kb._lossy_text(row["last_failure_error"])
+-    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+     if (err and latest_outcome != "crashed" and not _is_completion_gate_error(err)
+             and _RESPAWN_BLOCKER_RE.search(err)):
+         return "blocker_auth"
+@@ -2355,6 +2384,10 @@ def _run_reclaim_phase(
+         result.shared_blocker_released = release_cleared_blockers(conn)
+     except Exception:
+         _kb._log.warning("kanban: releasing cleared shared blockers failed", exc_info=True)
++    try:
++        result.quota_block_released = _kbq.release_recovered_quota_blocks(conn)
++    except Exception:
++        _kb._log.warning("kanban: releasing recovered quota-wall blocks failed", exc_info=True)
+ 
+ 
+ def _tick_spawn_budget(
+diff --git a/hermes_cli/kanban_db_dispatch_quota.py b/hermes_cli/kanban_db_dispatch_quota.py
+new file mode 100644
+index 0000000000..b520c9c603
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_quota.py
+@@ -0,0 +1,126 @@
++"""Quota walls clear on their own, so the respawn guard never turns one into a human block. [daveey]
++
++2026-10-23: six cards sat ``blocked`` / ``kind=capability`` for ~13 h after a quota wall that had
++already cleared. The rate-limit requeue stamps ``last_failure_error`` with "exited rate-limited
++(quota wall)". A later non-failure run (``changes_requested``, ``blocked``...) then became the
++latest run, so the ``outcome == 'rate_limited'`` cooldown branch no longer fired, and the stamp
++matched ``_RESPAWN_BLOCKER_RE`` as ``blocker_auth``. After the 30-min hold cap the dispatcher blocked
++the card as ``capability``, a human kind, so the owning chats painted red.
++
++The rules here:
++
++* :func:`is_quota_error` tells quota / rate-limit text from auth text. Auth wins when both appear
++  (a 401 next to a 429 still needs a person).
++* :func:`clear_quota_error` drops the stamp once the cooldown is over, so it cannot re-trap the card.
++* :func:`release_recovered_quota_blocks` releases blocks the old code already made: a guard-hold
++  block whose recorded error is a quota wall, once another card has completed since the block
++  (proof the provider is answering again).
++
++Split out of ``kanban_db_dispatch`` (code-health file cap).
++"""
++
++from __future__ import annotations
++
++import re
++import sqlite3
++from typing import Optional
++
++_QUOTA_RE = re.compile(
++    r"\b(quota|rate[\s_\-]?limit(?:ed|s|ing)?|429|too[\s_]many[\s_]requests)\b",
++    re.IGNORECASE,
++)
++
++# The auth half of ``kanban_db_dispatch._RESPAWN_BLOCKER_RE``: a person (or a credential refresh)
++# has to act. ``billing``/``subscription`` stay here because an empty balance does not refill itself.
++_AUTH_RE = re.compile(
++    r"\b(401|403|auth|authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
++    r"authoris(?:e|es|ed|ing|ation)|authz|unauthorized|forbidden|billing|subscription|"
++    r"access[\s_]denied|permission[\s_]denied|invalid[\s_]api[\s_]key)\b",
++    re.IGNORECASE,
++)
++
++GUARD_HOLD_BLOCK_PREFIX = "Held in ready by the respawn guard ("
++# Guard reasons whose hold-cap block a recovered quota wall may release.
++_RELEASABLE_GUARD_REASONS = ("blocker_auth", "rate_limit_cooldown")
++_HELD_RE = re.compile(
++    r"^Held in ready by the respawn guard \((?P<reason>[a-z_]+)\) for \d+ min without running\. "
++    r"Last error: (?P<error>.*?)(?: Fix the cause\b.*)?$",
++    re.DOTALL,
++)
++RELEASE_NOTE_MARKER = "[respawn-guard quota release]"
++
++
++def is_quota_error(err: Optional[str]) -> bool:
++    """True when ``err`` reads as a quota wall / rate limit and carries no auth signal."""
++    return bool(err) and bool(_QUOTA_RE.search(err)) and not _AUTH_RE.search(err)
++
++
++def clear_quota_error(conn: sqlite3.Connection, task_id: str, err: str) -> None:
++    """Drop a stale quota stamp so it cannot re-trap the card (compare-and-swap on the text)."""
++    from hermes_cli import kanban_db as _kb
++
++    with _kb.write_txn(conn, allow_nested=True):
++        cur = conn.execute(
++            "UPDATE tasks SET last_failure_error = NULL WHERE id = ? AND last_failure_error = ?",
++            (task_id, err),
++        )
++        if cur.rowcount:
++            _kb._append_event(conn, task_id, "quota_error_cleared", {"error": err[:300]})
++
++
++def _parse_hold_block(reason: Optional[str]) -> Optional[tuple[str, str]]:
++    if not reason or not reason.startswith(GUARD_HOLD_BLOCK_PREFIX):
++        return None
++    m = _HELD_RE.match(reason.strip())
++    if m is None:
++        return None
++    return m.group("reason"), m.group("error").strip()
++
++
++def release_recovered_quota_blocks(conn: sqlite3.Connection) -> list[str]:
++    """Unblock guard-hold blocks that were really quota walls, once the wall has cleared.
++
++    A card qualifies when it is ``blocked``/``triage`` with a human ``block_kind``
++    (``capability``/``needs_input``), its newest block reason is the respawn guard's hold-cap
++    sentence for ``blocker_auth``/``rate_limit_cooldown``, the error in it is quota-flavored
++    (:func:`is_quota_error`), and some OTHER card has a ``completed`` run that ended after the
++    block. Each release gets a comment saying why.
++    """
++    from hermes_cli import kanban_db as _kb
++
++    released: list[str] = []
++    rows = conn.execute(
++        "SELECT id FROM tasks WHERE status IN ('blocked', 'triage') "
++        "AND block_kind IN ('capability', 'needs_input')"
++    ).fetchall()
++    for row in rows:
++        task_id = row["id"]
++        parsed = _parse_hold_block(_kb._latest_block_reason(conn, task_id))
++        if parsed is None:
++            continue
++        guard_reason, err = parsed
++        if guard_reason not in _RELEASABLE_GUARD_REASONS or not is_quota_error(err):
++            continue
++        blocked_at = conn.execute(
++            "SELECT MAX(created_at) FROM task_events WHERE task_id = ? "
++            "AND kind IN ('blocked', 'block_loop_detected')", (task_id,),
++        ).fetchone()[0]
++        if blocked_at is None:
++            continue
++        proof = conn.execute(
++            "SELECT task_id, ended_at FROM task_runs WHERE outcome = 'completed' AND task_id != ? "
++            "AND ended_at > ? ORDER BY ended_at LIMIT 1", (task_id, int(blocked_at)),
++        ).fetchone()
++        if proof is None:
++            continue
++        if not _kb.unblock_task(conn, task_id):
++            continue
++        _kb.add_comment(
++            conn, task_id, "kanban-dispatcher",
++            f"{RELEASE_NOTE_MARKER} Released automatically. This block was the respawn guard's "
++            f"hold cap ({guard_reason}) on a quota/rate-limit error ({err[:200]}), which clears on its "
++            f"own and never needed a person. Card {proof['task_id']} completed after the block, so the "
++            f"provider is answering again; back to ready.",
++        )
++        released.append(task_id)
++    return released
+diff --git a/tests/hermes_cli/test_kanban_list_undecodable_text.py b/tests/hermes_cli/test_kanban_list_undecodable_text.py
+index b3f6f7c629..9aca2e323e 100644
+--- a/tests/hermes_cli/test_kanban_list_undecodable_text.py
++++ b/tests/hermes_cli/test_kanban_list_undecodable_text.py
+@@ -97,7 +97,7 @@ def test_respawn_guard_survives_blob_comment_body_and_failure_error(board):
+         with kb.write_txn(conn):
+             conn.execute(
+                 "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+-                (sqlite3.Binary(b"429 quota exceeded"), tid),
++                (sqlite3.Binary(b"401 unauthorized"), tid),
+             )
+-        # BLOB last_failure_error still matches the quota/auth blocker pattern.
++        # BLOB last_failure_error still matches the auth blocker pattern (quota text never does).
+         assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+diff --git a/tests/hermes_cli/test_kanban_quota_guard.py b/tests/hermes_cli/test_kanban_quota_guard.py
+new file mode 100644
+index 0000000000..6573c5d59f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_guard.py
+@@ -0,0 +1,209 @@
++"""A recovered quota wall must never become a human block. [daveey]
++
++Regression tests for 2026-10-23: six cards sat ``blocked`` / ``kind=capability`` for ~13 h with
++"Held in ready by the respawn guard (blocker_auth) for 30 min without running. Last error: pid N
++exited rate-limited (quota wall)". The rate-limit stamp outlived its ``rate_limited`` run (the
++latest run was ``changes_requested`` / ``blocked``), so the guard read it as ``blocker_auth`` and
++the hold cap escalated it to a human kind.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_quota as kbq
++
++QUOTA_ERR = "pid 82594 exited rate-limited (quota wall) — requeued without counting a failure"
++LEGACY_BLOCK = ("Held in ready by the respawn guard (blocker_auth) for 30 min without running. "
++                f"Last error: {QUOTA_ERR} Fix the cause (credentials, quota, PR binding), then unblock.")
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT",
++                "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS"):
++        monkeypatch.delenv(key, raising=False)
++    kb.init_db()
++    return home
++
++
++def _ended_with_error(conn, tid, outcome, error, ended_at):
++    """A run that ended with ``outcome`` while a stale ``error`` stamp stays on the task."""
++    kb.claim_task(conn, tid)
++    run_id = kb.get_task(conn, tid).current_run_id
++    conn.execute("UPDATE task_runs SET outcome=?, status=?, ended_at=? WHERE id=?",
++                 (outcome, outcome, ended_at, run_id))
++    conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
++                 "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?", (error, tid))
++    conn.commit()
++
++
++def _err(conn, tid):
++    return conn.execute("SELECT last_failure_error FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++
++
++@pytest.mark.parametrize("outcome", ["blocked", "changes_requested"])
++def test_stale_quota_stamp_is_not_blocker_auth(kanban_home, monkeypatch, outcome):
++    now = 5_000_000
++    monkeypatch.setattr(kb.time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="quota stamp", assignee="a")
++        _ended_with_error(conn, tid, outcome, QUOTA_ERR, now - 10)
++        # Inside the cooldown: the quota cooldown path, never blocker_auth.
++        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
++        assert _err(conn, tid) == QUOTA_ERR
++        # Cooldown over: retry, and the stamp is gone so it cannot re-trap the card.
++        monkeypatch.setattr(kb.time, "time", lambda: now + 400)
++        assert kbd.check_respawn_guard(conn, tid) is None
++        assert _err(conn, tid) is None
++
++
++@pytest.mark.parametrize("text", ["429 Too Many Requests", "provider quota exceeded",
++                                  "hit the rate limit", "exited rate-limited (quota wall)"])
++def test_quota_text_never_blocker_auth_with_no_runs(kanban_home, text):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="quota", assignee="a")
++        conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", (text, tid))
++        conn.commit()
++        assert kbd.check_respawn_guard(conn, tid) != "blocker_auth"
++
++
++def test_rate_limited_outcome_clears_stamp_after_cooldown(kanban_home, monkeypatch):
++    now = 5_000_000
++    monkeypatch.setattr(kb.time, "time", lambda: now + 400)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="rl", assignee="a")
++        _ended_with_error(conn, tid, "rate_limited", QUOTA_ERR, now)
++        assert kbd.check_respawn_guard(conn, tid) is None
++        assert _err(conn, tid) is None
++
++
++def test_real_auth_error_still_blocker_auth_and_escalates(kanban_home, monkeypatch, all_assignees_spawnable):
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", "600")
++    spawned = []
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="auth", assignee="a")
++        now = int(time.time())
++        _ended_with_error(conn, tid, "changes_requested", "401 authentication error", now - 5)
++        monkeypatch.setattr(kb.time, "time", lambda: now)
++        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
++        monkeypatch.setattr(kb.time, "time", lambda: now + 700)
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
++        task = kb.get_task(conn, tid)
++        assert task.status == "blocked"
++        assert task.block_kind == "capability"
++        assert not spawned
++
++
++def test_auth_wins_over_quota_words():
++    assert not kbq.is_quota_error("429 then 401 unauthorized")
++    assert kbq.is_quota_error(QUOTA_ERR)
++    assert not kbq.is_quota_error("invalid api key")
++
++
++@pytest.mark.parametrize("outcome", ["blocked", "changes_requested"])
++def test_quota_hold_never_escalates_to_human_block(kanban_home, monkeypatch, all_assignees_spawnable, outcome):
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", "600")
++    spawned = []
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="quota hold", assignee="a")
++        now = int(time.time())
++        _ended_with_error(conn, tid, outcome, QUOTA_ERR, now - 5)
++        for dt in (0, 300, 700, 1300):
++            monkeypatch.setattr(kb.time, "time", lambda dt=dt: now + dt)
++            res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
++            assert tid not in res.auto_blocked
++            task = kb.get_task(conn, tid)
++            assert task.status != "blocked"
++            assert task.block_kind not in ("capability", "needs_input")
++        assert spawned, "the card retries once the cooldown has elapsed"
++
++
++def test_hold_cap_requeues_quota_error_instead_of_blocking(kanban_home, monkeypatch):
++    """The hold-cap path itself, reached for a quota-flavored error: re-queue, never a human kind."""
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", "600")
++    now = 5_000_000
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="capped", assignee="a")
++        conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", (QUOTA_ERR, tid))
++        conn.commit()
++        monkeypatch.setattr(kb.time, "time", lambda: now)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "respawn_guarded", {"reason": "blocker_auth"})
++        monkeypatch.setattr(kb.time, "time", lambda: now + 3600)
++        for reason in ("blocker_auth", "rate_limit_cooldown"):
++            assert kbd._block_if_guard_hold_capped(conn, tid, reason) is False
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready"
++        assert _err(conn, tid) is None
++
++
++def _legacy_blocked(conn, monkeypatch, at, reason=LEGACY_BLOCK):
++    monkeypatch.setattr(kb.time, "time", lambda: at)
++    tid = kb.create_task(conn, title="legacy held", assignee="nobody-runs-this")
++    conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", (QUOTA_ERR, tid))
++    conn.commit()
++    assert kb.block_task(conn, tid, reason=reason, kind="capability")
++    assert kb.get_task(conn, tid).status == "blocked"
++    return tid
++
++
++def _complete_other(conn, monkeypatch, at):
++    monkeypatch.setattr(kb.time, "time", lambda: at)
++    other = kb.create_task(conn, title="other", assignee="b")
++    kb.claim_task(conn, other)
++    assert kb.complete_task(conn, other, result="ok")
++    return other
++
++
++def test_existing_quota_hold_block_released_after_other_completion(kanban_home, monkeypatch):
++    now = 5_000_000
++    with kbc.connect() as conn:
++        tid = _legacy_blocked(conn, monkeypatch, now)
++        # Nothing completed since the block: stays blocked.
++        assert kbq.release_recovered_quota_blocks(conn) == []
++        _complete_other(conn, monkeypatch, now + 60)
++        monkeypatch.setattr(kb.time, "time", lambda: now + 120)
++        res = kbd.dispatch_once(conn, dry_run=True)
++        assert tid in res.quota_block_released
++        assert kb.get_task(conn, tid).status == "ready"
++        bodies = [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))]
++        assert any(b.startswith(kbq.RELEASE_NOTE_MARKER) and "quota" in b for b in bodies)
++
++
++def test_completion_before_block_is_not_proof(kanban_home, monkeypatch):
++    now = 5_000_000
++    with kbc.connect() as conn:
++        _complete_other(conn, monkeypatch, now - 60)
++        tid = _legacy_blocked(conn, monkeypatch, now)
++        monkeypatch.setattr(kb.time, "time", lambda: now + 120)
++        assert kbq.release_recovered_quota_blocks(conn) == []
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_auth_hold_block_is_not_released(kanban_home, monkeypatch):
++    now = 5_000_000
++    with kbc.connect() as conn:
++        reason = ("Held in ready by the respawn guard (blocker_auth) for 30 min without running. "
++                  "Last error: 401 authentication error Fix the cause (credentials, quota, PR binding), "
++                  "then unblock.")
++        tid = _legacy_blocked(conn, monkeypatch, now, reason=reason)
++        _complete_other(conn, monkeypatch, now + 60)
++        monkeypatch.setattr(kb.time, "time", lambda: now + 120)
++        assert kbq.release_recovered_quota_blocks(conn) == []
++        task = kb.get_task(conn, tid)
++        assert task.status == "blocked" and task.block_kind == "capability"
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()
++        assert json.loads(ev[0])["kind"] == "capability"
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 3c21ee79b2..7bad3ca51f 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1083,7 +1083,7 @@ hermes kanban create "nightly backup audit" \
+ 
+ ### Respawn guard
+ 
+-The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 error on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). Two cooldowns hold a card without ever counting against it: `rate_limit_cooldown` after a quota-wall requeue and `infrastructure_cooldown` after the host refused to place the worker (no restart-safe systemd scope — see [Workers and systemd cgroups](#workers-and-systemd-cgroups)); both share the `HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS` window (default 300 s). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
++The dispatcher refuses to re-spawn a ready task when it hit an auth error (401, invalid API key, unauthorized, billing) on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). Two cooldowns hold a card without ever counting against it: `rate_limit_cooldown` after a quota-wall requeue and `infrastructure_cooldown` after the host refused to place the worker (no restart-safe systemd scope — see [Workers and systemd cgroups](#workers-and-systemd-cgroups)); both share the `HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS` window (default 300 s). Quota / rate-limit / 429 text in `last_failure_error` always takes the `rate_limit_cooldown` path, even when a later non-failure run superseded the `rate_limited` one; once the cooldown elapses the stamp is cleared and the card retries. A quota wall is never `blocker_auth` and never escalates to a human block kind, and a legacy guard-hold block on a quota error is released automatically once another card completes after it. This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+ 
+ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run` — the output lists `Guarded (<reason>): <task id>` per held card (and `respawn_guarded`, `rate_limited`, `skipped_locked`, `memory_pressure` with `--json`). The gateway's and the standalone daemon's "dispatcher stuck" warning also names what the last tick held back, e.g. `Last tick held back: active_pr=1`.
+ 
+@@ -1485,7 +1485,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
+ | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+ | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
+ | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
+-| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
++| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last failure was a quota wall / rate limit / 429; same cooldown, never counted), `blocker_auth` (last failure was an auth error — a person must fix credentials), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+ | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
+ | `skipped_nonspawnable` | `{assignee}` | Dispatcher refused to spawn because the assignee profile does not exist in this home (or is not in `kanban.dispatch_profiles`). Written once per card — repeated only when another event landed in between — so `show`/`tail` name the missing profile without a row per tick. The card stays in `ready`; reassign it or install the profile. |
+ | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | Worker exited successfully while the task was still `running`, usually because it answered without a terminal board call (`kanban_complete`, `kanban_request_review` or `kanban_block`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |
+-- 
+2.54.0 (Apple Git-157)
+

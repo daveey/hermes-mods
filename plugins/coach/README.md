@@ -164,7 +164,9 @@ real complaints. With the resample, the strict-prompt changes and the confirm mo
 the backstop: 19/25 and 16/25 on two runs (13/13 without), control 28 and 30 (32 without).
 
 Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
-workers. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
+workers. The complaint prefilter also rejects cross-session courier messages, generated blocked-card notices and
+standalone chat-closeout messages before any judge call. Those are coordination, not fresh user complaints;
+underlying failures remain eligible through machine signals. Real user text before an appended notice is retained. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
 `coach/log.jsonl`; live also appends the defect to `coach/selfheal_queue.jsonl` for the self-heal lane, once per
 fingerprint per UTC day (`coach/selfheal.json` holds the fingerprints). The fingerprint is a hash of the component
 and the symptom's stemmed content words, so "sidebar sessions reshuffle" and "session sidebar reshuffles" match.

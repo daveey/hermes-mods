@@ -1,10 +1,10 @@
 # Sidebar status stripe + gateway device glyph (Desktop)
 
-Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091`, `0094`, `0095`, `0099`, `0104`, `0124`, `0212` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
+Patches: `0038`, `0039`, `0044`, `0051`, `0063`, `0070`, `0089`, `0091`, `0094`, `0095`, `0099`, `0104`, `0124`, `0215` in `core/patches/`. `0038`/`0039` touch `apps/desktop`
 only, as does `0089`; `0044`, `0051`, `0063` and `0070` also add backend fields to the session-list endpoints; `0091`
 is backend-only (`tui_gateway/server.py`), as is `0094` (`tui_gateway/session_reaper.py`); `0095` touches cron, the
 session-list endpoints and `apps/desktop`. `0099` and `0104` are Desktop-only refresh fixes; `0124` touches the
-project-tree RPCs and `apps/desktop`; `0212` is backend-only (`hermes_cli/kanban_session_activity.py`). Replaces the per-gateway
+project-tree RPCs and `apps/desktop`; `0215` is backend-only (`hermes_cli/kanban_session_activity.py`). Replaces the per-gateway
 row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 
 - `0038`: stripe shows session status (green/red); gateway becomes a device glyph after the age.
@@ -21,7 +21,7 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - `0104`: a store-level sweep refreshes stale running background rows, including hidden sessions.
 - `0124`: project-mode rows older than the recents page get the same activity stamps, so they no longer paint
   green while their `/goal`, cards or background jobs run.
-- `0212`: a session that shepherds cards on ANOTHER gateway (hermes-hub) counts them too, so it no longer paints
+- `0215`: a session that shepherds cards on ANOTHER gateway (hermes-hub) counts them too, so it no longer paints
   green while its remote work runs.
 - Red for blocked kanban cards is `0092`, documented in [kanban-session-links.md](kanban-session-links.md).
 
@@ -91,7 +91,7 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
   `_lineage_ids`) and clears a stale stamp when the count is zero. It never raises. It runs in
   `get_sessions` (`web_routers/sessions.py`) and in `get_profiles_sessions` and
   `get_profiles_sessions_sidebar` (`web_routers/profiles.py`).
-- Remote cards (`0212`): a session can own work that runs on another gateway (`hermes-hub create-task` sends the
+- Remote cards (`0215`): a session can own work that runs on another gateway (`hermes-hub create-task` sends the
   creating session as `origin`; `hermes-hub request <gw> tasks <board>/<id> shepherd --arg session=<sid>` adopts a
   card; the hermes-mods `session-mentions` `cross_task` read/comment sends that request on its own). The owning
   gateway stores a `kanban_notify_subs` row (`platform='hub'`, `chat_id=<gw>/<profile>/<session>`, the gateway
@@ -225,13 +225,13 @@ The three 0099/0104 regression files below passed in the full-series verificatio
 - `app/chat/sidebar/session-row.test.tsx`: "SidebarSessionRow selection arc" (no arc on an unselected settled
   or running row; arc on the selected row, idle or not) (`0089`), and "SidebarSessionRow kanban counts" (counts follow the age,
   zero side hidden, nothing when idle).
-- `0212` (`tests/hermes_cli/test_kanban_session_activity.py`, red on the old code where noted, Oct 22, 2026 PT):
+- `0215` (`tests/hermes_cli/test_kanban_session_activity.py`, red on the old code where noted, Oct 22, 2026 PT):
   `test_replica_card_shepherded_by_a_local_session_keeps_it_busy` (running card + todo child via `children` = 2
   active, blocked grandchild = 1 blocked, the owner-gateway session gets nothing; red),
   `test_replica_link_for_another_gateway_does_not_count`, `test_replica_counts_add_to_local_boards_and_follow_lineage`
   (red), `test_missing_or_corrupt_replica_is_harmless` (no file, garbage file, junk JSON row; red on the junk-row
   count), `test_hub_platform_subscription_on_a_local_board_is_not_a_tui_shepherd`. The REST endpoints themselves
-  are untested for 0212 (they call the same `annotate_kanban_activity`). Live: `_read_hub_replica` on the
+  are untested for 0215 (they call the same `annotate_kanban_activity`). Live: `_read_hub_replica` on the
   MacBook's real replica returned `{'20261022_205159_268197': 4}` after the backfill shepherd requests.
 - `tests/hermes_cli/test_kanban_session_activity.py`: only pending/running count across boards, lineage
   stamping and stale-stamp clearing, old schema never breaks the list,

@@ -1,0 +1,529 @@
+From ae781e9188e3e71ae9d3bc6bc3a8e3a92f85e1aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 10:30:04 -0700
+Subject: [PATCH] fix(kanban): archive and reap stale terminal worktrees
+ [daveey]
+
+---
+ hermes_cli/config_defaults.py                 |   6 +-
+ hermes_cli/kanban_db_workspace.py             |  30 +++-
+ hermes_cli/kanban_ops.py                      |  19 +--
+ hermes_cli/kanban_parser.py                   |   2 +
+ hermes_cli/kanban_worktree_gc.py              | 140 +++++++++++++++++
+ hermes_cli/worktree_ops.py                    |   2 +
+ .../test_kanban_worktree_teardown.py          | 143 +++++++++++++++++-
+ website/docs/user-guide/features/kanban.md    |  27 +++-
+ 8 files changed, 348 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/kanban_worktree_gc.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index ac40ce3321..e01c7b313e 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1898,6 +1898,9 @@ DEFAULT_CONFIG = {
+     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
+     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
+     "kanban": {
++        # Calendar retention for terminal worktrees; archive commits to recovery
++        # refs before reaping. 0 disables age-based archival/startup sweeping.
++        "worktree_retention_days": 7,
+         # Auto-subscribe the originating gateway/TUI session to completion + block events when
+         # kanban_create is called from a session with a persistent delivery channel. Disable for
+         # profiles that prefer explicit kanban_notify-subscribe calls per task.
+@@ -1930,9 +1933,6 @@ DEFAULT_CONFIG = {
+         # Assignee when the orchestrator can't match one to an installed profile; "" = default
+         # profile. A task never ends up with assignee=None.
+         "default_assignee": "",
+-        # Global cap: positive int = the HOST never has more than N tasks 'running' across all
+-        # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
+-        # MemTotal is unreadable (macOS/Windows) None means no cap.
+         # Global concurrency cap (#33488): when set to a positive int, the HOST never has more than N tasks
+         # in 'running' at once — counted across every active board and across both the ready and review
+         # dispatch lanes (workers are OS processes sharing one machine's memory, so the cap bounds the
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index 388e7d8a93..4583942271 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -461,14 +461,16 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+ 
+ 
+ def _cleanup_worktree_workspace(
+-    task_id: str, path: str, branch_name: Optional[str] = None
++    task_id: str, path: str, branch_name: Optional[str] = None,
++    *, archive_unpushed: bool = False,
+ ) -> None:
+     """Remove a finished task's linked git worktree when it holds no work.
+     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
+     requires a clean tree AND every commit reachable from a remote-tracking
+     ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
+     it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
+-    branches are kept. Best-effort."""
++    branches are kept. Retention GC may opt into archive_unpushed: first save
++    HEAD to a verified recovery ref, then remove without --force. Best-effort."""
+     try:
+         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+     except Exception:
+@@ -483,12 +485,28 @@ def _cleanup_worktree_workspace(
+         repo_root = common.parent
+         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
+             return  # never remove the main checkout
+-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
++        archived_head = None
++        if _worktree_is_dirty(str(wp), str(repo_root)) or (
++            not archive_unpushed and _worktree_has_unpushed_commits(str(wp))
++        ):
+             _kb._log.info(
+                 "Preserving worktree for task %s: dirty or unpushed work at %s",
+                 task_id, wp,
+             )
+             return
++        if archive_unpushed:
++            # Keep the entire history reachable even after ordinary Git GC. The
++            # object id in the ref name makes retries/non-fast-forward runs safe.
++            head = _git(wp, "rev-parse", "--verify", "HEAD^{commit}", timeout=10)
++            if head.returncode != 0:
++                return
++            archived_head = head.stdout.strip()
++            ref = f"refs/hermes/kanban-archive/{task_id}/{archived_head}"
++            saved = _git(repo_root, "update-ref", ref, archived_head, timeout=10)
++            verified = _git(repo_root, "rev-parse", "--verify", ref, timeout=10)
++            if saved.returncode or verified.returncode or verified.stdout.strip() != archived_head:
++                return  # archive failure MUST preserve both tree and branch
++            _kb._log.info("Archived worktree %s at %s", wp, ref)
+         # Windows cannot delete a directory while this process has its current
+         # directory inside it. Completed workers normally run from their own
+         # linked worktree, so move this process back to the main checkout
+@@ -528,7 +546,11 @@ def _cleanup_worktree_workspace(
+         _kb._log.debug("Removed worktree workspace: %s", wp)
+         branch = (branch_name or "").strip() or f"wt/{task_id}"
+         if branch.startswith("wt/"):
+-            _git(repo_root, "branch", "-D", branch, timeout=30)
++            if archived_head:
++                # Compare-and-delete: never drop a branch advanced since archival.
++                _git(repo_root, "update-ref", "-d", f"refs/heads/{branch}", archived_head, timeout=30)
++            else:
++                _git(repo_root, "branch", "-D", branch, timeout=30)
+     except Exception:
+         pass  # best-effort — never block completion
+ 
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 9e43b6d359..7ca8094de4 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -313,7 +313,13 @@ def _cmd_gc(args: argparse.Namespace) -> int:
+     if event_days < 0 or log_days < 0:
+         return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
+     scratch_root = kb.workspaces_root()
+-    removed_ws = 0
++    from hermes_cli.kanban_worktree_gc import gc_task_worktrees, retention_days
++    wt_days = getattr(args, "worktree_retention_days", None)
++    wt_days = retention_days() if wt_days is None else wt_days
++    if wt_days < 0:
++        return _err("kanban gc: worktree retention days must be >= 0", 2)
++    with kbc.connect_closing() as conn:
++        removed_ws = gc_task_worktrees(conn, older_than_days=wt_days)
+     with kbc.connect_closing() as conn:
+         rows = conn.execute(
+             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+@@ -321,16 +327,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
+         ).fetchall()
+         for row in rows:
+             if row["workspace_kind"] == "worktree":
+-                # Backstop for worktrees that escaped the completion/archive hook.
+-                # Same safety predicate: only clean, fully-pushed worktrees go.
+-                wt_path = row["workspace_path"]
+-                if wt_path and Path(wt_path).is_dir():
+-                    if kbw._defer_shared_worktree_cleanup(conn, row["id"], wt_path):
+-                        continue
+-                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+-                    if not Path(wt_path).is_dir():
+-                        removed_ws += 1
+-                continue
++                continue  # handled by the retention-aware sweep above
+             if row["workspace_kind"] != "scratch":
+                 continue
+             path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index a43ab4fb84..26db84c465 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -453,6 +453,8 @@ _SPECS = [
+               "to specify-style single-task promotion when the task "
+               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
+     _cmd("gc", [
++        _arg("--worktree-retention-days", type=_nonnegative_int, default=None,
++             help="Archive committed work and reap terminal task worktrees after N days (config/default: 7; 0 disables)"),
+         _arg("--event-retention-days", type=_nonnegative_int, default=30,
+              help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
+         _arg("--log-retention-days", type=_nonnegative_int, default=30,
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+new file mode 100644
+index 0000000000..1326329aaf
+--- /dev/null
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -0,0 +1,140 @@
++"""Retention-based task worktree GC, shared by kanban gc and CLI startup.
++
++Clean committed work is saved under refs/hermes/kanban-archive/<task>/<oid>.
++Dirty trees are never forced away. Missing owners are tombstoned, not deleted:
++a missing board/task is not sufficient evidence that arbitrary work is disposable.
++"""
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import logging
++import re
++import sqlite3
++import time
++from pathlib import Path
++
++from hermes_cli import kanban_db_workspace as ws
++
++log = logging.getLogger(__name__)
++
++
++def retention_days() -> int:
++    from hermes_cli.config import load_config
++    try:
++        value = load_config().get("kanban", {}).get("worktree_retention_days", 7)
++        if isinstance(value, bool) or int(value) != value or value < 0:
++            raise ValueError("invalid worktree retention")
++        return int(value)
++    except Exception:
++        log.warning("Cannot read worktree retention; age-based GC disabled", exc_info=True)
++        return 0
++
++
++def gc_task_worktrees(conn: sqlite3.Connection, *, older_than_days: int = 7,
++                     repo_root: str | None = None) -> int:
++    """Reap terminal rows only, retaining active children and cross-board sharers.
++
++    Persistent calendar timestamps intentionally use wall time, not process
++    liveness timers. Zero disables archival, retaining legacy pushed-only GC.
++    A write transaction prevents the owner being resumed during this sweep.
++    """
++    from hermes_cli import kanban_db as kb
++    removed = 0
++    with kb.write_txn(conn):
++        rows = conn.execute(
++            "SELECT t.*, (SELECT MAX(created_at) FROM task_events e WHERE e.task_id=t.id) AS last_event "
++            "FROM tasks t WHERE workspace_kind='worktree' AND workspace_path IS NOT NULL "
++            f"AND status IN {ws._TERMINAL_STATUSES_SQL}"
++        ).fetchall()
++        for row in rows:
++            path = Path(row["workspace_path"]).expanduser()
++            if not path.is_dir() or path.is_symlink():
++                continue
++            if repo_root is not None and ws._git_common_dir(path) != Path(repo_root).resolve() / ".git":
++                continue
++            if ws._has_active_children(conn, row["id"]):
++                continue
++            if ws._defer_shared_worktree_cleanup(conn, row["id"], str(path)):
++                continue
++            # Latest lifecycle evidence wins (e.g. reopened then archived again).
++            since = max(row["completed_at"] or 0, row["last_event"] or 0, row["created_at"] or 0)
++            old = bool(older_than_days > 0 and since and since <= time.time() - older_than_days * 86400)
++            ws._cleanup_worktree_workspace(row["id"], str(path), row["branch_name"], archive_unpushed=old)
++            removed += int(not path.exists())
++    return removed
++
++
++@contextlib.contextmanager
++def _read_board(path: Path):
++    """No creation, with WAL read-only fallback; an unreadable board aborts GC."""
++    try:
++        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)
++    except sqlite3.OperationalError:
++        conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=1)
++    try:
++        conn.execute("PRAGMA query_only=ON")
++        conn.row_factory = sqlite3.Row
++        yield conn
++    finally:
++        conn.close()
++
++
++def sweep_repo(repo_root: str) -> None:
++    """Startup backstop across all boards. Unknown task trees get durable tombstones.
++
++    Enumerate registered worktrees, including outside .worktrees/. Do not guess
++    ownership from a directory's age. No missing-owner tree is automatically
++    removed; tombstones make it discoverable for explicit recovery/review.
++    """
++    try:
++        _sweep_repo(repo_root)
++    except Exception:
++        log.warning("Kanban worktree sweep aborted; preserving uncertain worktrees", exc_info=True)
++
++
++def _sweep_repo(repo_root: str) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_constants import get_hermes_home
++    days = retention_days()
++    if not days:
++        return
++    # Use the shared enumerator without opening/creating the selected board.
++    with contextlib.closing(sqlite3.connect(":memory:")) as empty:
++        boards = ws._sibling_board_db_files(empty)
++    selected = kb.kanban_db_path().resolve()
++    if selected.is_file() and selected not in boards:
++        boards.append(selected)
++    known_paths: set[str] = set()
++    # Read ALL boards before any mutation: corruption must not look like deletion.
++    for board in boards:
++        with _read_board(board) as conn:
++            for row in conn.execute("SELECT workspace_path FROM tasks WHERE workspace_path IS NOT NULL"):
++                known_paths.add(str(Path(row["workspace_path"]).expanduser().resolve()))
++    listing = ws._git(Path(repo_root), "worktree", "list", "--porcelain", timeout=10)
++    if listing.returncode:
++        return
++    for line in listing.stdout.splitlines():
++        if not line.startswith("worktree "):
++            continue
++        path = Path(line.removeprefix("worktree "))
++        if not re.fullmatch(r"t_[0-9a-f]+", path.name) or str(path.resolve()) in known_paths:
++            continue
++        # Tombstones are metadata outside the worktree; never alter unknown data.
++        key = hashlib.sha256(str(path.resolve()).encode()).hexdigest()
++        tombstones = get_hermes_home() / "archive" / "kanban-orphans"
++        tombstones.mkdir(parents=True, exist_ok=True)
++        try:
++            with (tombstones / f"{key}.json").open("x") as out:
++                json.dump({"path": str(path), "repo": repo_root, "first_seen": time.time(),
++                           "reason": "No owning task workspace found; preserved for manual recovery"}, out)
++        except FileExistsError:
++            pass
++        log.warning("Orphan task worktree preserved and tombstoned: %s", path)
++    for board in boards:
++        # mode=rw refuses to fabricate a missing board after discovery.
++        with contextlib.closing(sqlite3.connect(board.as_uri() + "?mode=rw", uri=True, timeout=1,
++                                               isolation_level=None)) as conn:
++            conn.row_factory = sqlite3.Row
++            gc_task_worktrees(conn, older_than_days=days, repo_root=repo_root)
+diff --git a/hermes_cli/worktree_ops.py b/hermes_cli/worktree_ops.py
+index 15ea8e43b7..2ebb1fe83e 100644
+--- a/hermes_cli/worktree_ops.py
++++ b/hermes_cli/worktree_ops.py
+@@ -973,6 +973,8 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
+     -> ``_prune_orphaned_branches``.
+     """
+     try:
++        from hermes_cli.kanban_worktree_gc import sweep_repo
++        sweep_repo(repo_root)
+         _prune_stale_worktree_trees(repo_root, max_age_hours)
+     finally:
+         _reclaim_orphan_install_states()
+diff --git a/tests/hermes_cli/test_kanban_worktree_teardown.py b/tests/hermes_cli/test_kanban_worktree_teardown.py
+index 1d9458940d..00f00b964d 100644
+--- a/tests/hermes_cli/test_kanban_worktree_teardown.py
++++ b/tests/hermes_cli/test_kanban_worktree_teardown.py
+@@ -175,6 +175,28 @@ def test_unpushed_commits_preserved(repo: Path) -> None:
+     assert wt.is_dir()
+ 
+ 
++def test_gc_reaps_stale_unpushed_worktree(kanban_home: Path, repo: Path) -> None:
++    import argparse
++    import time
++    from hermes_cli.kanban_ops import _cmd_gc
++
++    with kbc.connect_closing() as conn:
++        tid, wt = _worktree_task(conn, repo)
++        (wt / "local.txt").write_text("recover me\n")
++        _git("-C", str(wt), "add", "local.txt")
++        _git("-C", str(wt), "commit", "-m", "unpushed")
++        head = _git("-C", str(wt), "rev-parse", "HEAD").strip()
++        old = int(time.time()) - 9 * 86400
++        conn.execute("UPDATE tasks SET status='archived', completed_at=?, created_at=? WHERE id=?",
++                     (old, old, tid))
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (old, tid))
++    assert _cmd_gc(argparse.Namespace(event_retention_days=0, log_retention_days=0,
++                                      worktree_retention_days=7)) == 0
++    assert not wt.exists()
++    assert not _branch_exists(repo, f"wt/{tid}")
++    assert _git("-C", str(repo), "show", f"refs/hermes/kanban-archive/{tid}/{head}:local.txt") == "recover me\n"
++
++
+ def test_custom_branch_survives_worktree_removal(repo: Path) -> None:
+     wt = _make_worktree(repo, "t_dddd4444", branch="feature/custom")
+     kbw._cleanup_worktree_workspace("t_dddd4444", str(wt), "feature/custom")
+@@ -206,8 +228,6 @@ def test_tree_dirtied_between_check_and_removal_preserved(
+     ``--force``, git's own dirty guard re-verifies at removal time and the
+     removal fails safe.
+     """
+-    import cli
+-
+     wt = _make_worktree(repo, "t_gggg7777")
+     (wt / "late-wip.txt").write_text("dirtied after the check\n", encoding="utf-8")
+     # Pre-check lies (as if the file appeared just after it ran) — real git
+@@ -290,6 +310,125 @@ def test_parent_worktree_deferred_until_children_done(
+     assert not parent_wt.exists()
+ 
+ 
++def _age_task(conn, tid, status="done", days=9):
++    import time
++    old = int(time.time()) - days * 86400
++    conn.execute("UPDATE tasks SET status=?, completed_at=?, created_at=? WHERE id=?", (status, old, old, tid))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (old, tid))
++
++
++def _local_commit(wt):
++    (wt / "local.txt").write_text("precious\n")
++    _git("-C", str(wt), "add", "local.txt")
++    _git("-C", str(wt), "commit", "-m", "local")
++    return _git("-C", str(wt), "rev-parse", "HEAD").strip()
++
++
++@pytest.mark.parametrize("status,days,retention,dirty,keep", [
++    ("done", 9, 7, False, False), ("failed", 9, 7, False, False),
++    ("cancelled", 9, 7, False, False), ("archived", 9, 7, False, False),
++    ("running", 9, 7, False, True), ("review", 9, 7, False, True),
++    ("blocked", 9, 7, False, True), ("done", 1, 7, False, True),
++    ("done", 9, 0, False, True), ("done", 9, 30, False, True),
++    ("done", 9, 7, True, True),
++])
++def test_retention_safety(kanban_home, repo, status, days, retention, dirty, keep):
++    from hermes_cli.kanban_worktree_gc import gc_task_worktrees
++    with kbc.connect_closing() as conn:
++        tid, wt = _worktree_task(conn, repo)
++        head = _local_commit(wt)
++        _age_task(conn, tid, status, days)
++        if dirty:
++            (wt / "local.txt").write_text("uncommitted\n")
++        assert gc_task_worktrees(conn, older_than_days=retention) == int(not keep)
++    assert wt.exists() == keep
++    if not keep:
++        _git("-C", str(repo), "gc", "--prune=now")
++        assert _git("-C", str(repo), "show", f"refs/hermes/kanban-archive/{tid}/{head}:local.txt") == "precious\n"
++
++
++@pytest.mark.parametrize("guard", ["child", "shared", "archive-failure", "locked"])
++def test_retention_preserves_guarded_tree(kanban_home, repo, monkeypatch, guard):
++    from hermes_cli.kanban_worktree_gc import gc_task_worktrees
++    with kbc.connect_closing() as conn:
++        tid, wt = _worktree_task(conn, repo)
++        _local_commit(wt)
++        _age_task(conn, tid)
++        if guard in {"child", "shared"}:
++            other = kb.create_task(conn, title="still working", assignee="worker")
++            if guard == "child":
++                kb.link_tasks(conn, tid, other)
++            else:
++                conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(wt), other))
++        elif guard == "locked":
++            _git("-C", str(repo), "worktree", "lock", str(wt))
++        else:
++            real_git = kbw._git
++            def fail_archive(root, *args, **kwargs):
++                if args[0] == "update-ref":
++                    return subprocess.CompletedProcess(args, 1, "", "archive failed")
++                return real_git(root, *args, **kwargs)
++            monkeypatch.setattr(kbw, "_git", fail_archive)
++        assert gc_task_worktrees(conn) == 0
++        assert wt.exists()
++        assert _branch_exists(repo, f"wt/{tid}")
++
++
++def test_startup_reaps_archived_and_tombstones_missing_owner(kanban_home, repo, monkeypatch):
++    import json
++    from hermes_cli import kanban_worktree_gc as gc
++    monkeypatch.setattr(gc, "retention_days", lambda: 7)
++    with kbc.connect_closing() as conn:
++        tid, wt = _worktree_task(conn, repo)
++        _local_commit(wt)
++        _age_task(conn, tid, "archived")
++        missing, orphan = _worktree_task(conn, repo)
++        _local_commit(orphan)
++        conn.execute("DELETE FROM task_events WHERE task_id=?", (missing,))
++        conn.execute("DELETE FROM tasks WHERE id=?", (missing,))
++    gc.sweep_repo(str(repo))
++    assert not wt.exists()
++    assert orphan.exists()
++    tombstones = list((kanban_home / "archive" / "kanban-orphans").glob("*.json"))
++    assert len(tombstones) == 1
++    assert json.loads(tombstones[0].read_text())["path"] == str(orphan)
++    gc.sweep_repo(str(repo))
++    assert len(list(tombstones[0].parent.glob("*.json"))) == 1
++
++
++def test_retention_config_and_startup_entry(kanban_home, repo, monkeypatch):
++    from hermes_cli import kanban_worktree_gc as gc, worktree_ops
++    config = kanban_home / "config.yaml"
++    config.write_text("kanban:\n  worktree_retention_days: 30\n")
++    assert gc.retention_days() == 30
++    with kbc.connect_closing() as conn:
++        tid, wt = _worktree_task(conn, repo)
++        _local_commit(wt)
++        _age_task(conn, tid)
++    monkeypatch.setattr(worktree_ops, "_prune_stale_worktree_trees", lambda *a: None)
++    monkeypatch.setattr(worktree_ops, "_reclaim_orphan_install_states", lambda: None)
++    worktree_ops._prune_stale_worktrees(str(repo))
++    assert wt.exists()
++    config.write_text("kanban:\n  worktree_retention_days: 7\n")
++    worktree_ops._prune_stale_worktrees(str(repo))
++    assert not wt.exists()
++
++
++def test_startup_unreadable_board_preserves_everything(kanban_home, repo, monkeypatch):
++    from hermes_cli import kanban_worktree_gc as gc
++    monkeypatch.setattr(gc, "retention_days", lambda: 7)
++    with kbc.connect_closing() as conn:
++        tid, wt = _worktree_task(conn, repo)
++        _local_commit(wt)
++        _age_task(conn, tid)
++    bad = kanban_home / "kanban" / "boards" / "broken" / "kanban.db"
++    bad.parent.mkdir(parents=True)
++    bad.write_text("not sqlite")
++    gc.sweep_repo(str(repo))
++    assert wt.exists()
++    assert not (kanban_home / "archive" / "kanban-orphans").exists()
++
++
+ def _running_scratch_parent(conn, title: str = "parent") -> tuple[str, Path]:
+     tid = kb.create_task(conn, title=title)
+     assert kb.claim_task(conn, tid) is not None  # -> running
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2e44841c88..9a90f6d1d9 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1073,10 +1073,35 @@ hermes kanban notify-unsubscribe <id>
+ hermes kanban context <id>                             # what a worker sees
+ hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-column idea
+         [--author NAME] [--json]                       #   into a full spec and promote to todo
+-hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
++hermes kanban gc [--event-retention-days N] [--worktree-retention-days N] # workspaces + old events + old logs
+         [--log-retention-days N]                       #   (negative N is rejected; 0 disables that sweep)
+ ```
+ 
++Worktree GC also covers done, failed, and cancelled tasks. After
++`kanban.worktree_retention_days` (default 7, overridden by the GC flag), clean
++worktrees may be removed even with unpushed commits: their HEAD and history are
++first retained in the repository at `refs/hermes/kanban-archive/<task-id>/<commit>`.
++Zero disables this age-based archival; legacy clean, fully-pushed cleanup remains.
++Dirty trees, locked trees, active tasks, active children and live shared workspaces
++are preserved. Custom branches remain; generated `wt/` branches are pruned only
++when their tip still matches the archived commit.
++
++CLI worktree startup maintenance applies the same policy across the current home's
++boards. Registered `t_<hex>` worktrees with no known owning workspace are not
++silently deleted: they receive JSON tombstones in
++`<hermes-home>/archive/kanban-orphans/` for manual review. Unreadable boards abort
++the startup task sweep rather than treating their workspaces as orphans.
++
++To recover archived committed work, run these commands in the original repository:
++
++```bash
++git for-each-ref refs/hermes/kanban-archive/
++git worktree add -b recovered-task ../recovered-task refs/hermes/kanban-archive/<task-id>/<commit>
++```
++
++Recovery refs do not expire automatically and survive ordinary `git gc`. They
++are local references, not remote backups; retain the original repository.
++
+ All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+ 
+ `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+-- 
+2.55.0
+

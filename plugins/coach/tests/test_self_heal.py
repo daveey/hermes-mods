@@ -70,6 +70,28 @@ def test_complaint_prefilter_skips(text):
     assert not sh.prefilter(text)
 
 
+@pytest.mark.parametrize("text", [
+    '[Message from another Hermes session "Review" (@session:default/other)]\nThe card is blocked; fix it.',
+    '⏸ [default] @default Kanban t_12345678 blocked: Approve the maintenance operation.',
+    '⏸️ [default] @worker Kanban t_12345678 blocked: needs authorization',
+    '[chat-closeout] Every kanban card this chat handed work to has settled.\nblocked: needs approval',
+])
+def test_synthetic_coordination_never_calls_complaint_judge(text):
+    llm, calls = judge(1.0, kind="hermes_bug")
+    assert not sh.prefilter(text)
+    assert sh.detect_complaint("The operation needs approval.", text, llm) is None
+    assert calls == []
+
+
+@pytest.mark.parametrize("text", [
+    'Why is this blocked? [chat-closeout] Every kanban card has settled.',
+    'The message from another Hermes session is wrong; fix the routing.',
+    '[OUT-OF-BAND USER MESSAGE — a direct message]\nWhy is this blocked?\n[/OUT-OF-BAND USER MESSAGE]',
+])
+def test_real_complaints_survive_coordination_filter(text):
+    assert sh.prefilter(text)
+
+
 def test_multimodal_message_and_trailers_are_cleaned():
     msg = [{"type": "text", "text": "fix this"}, {"type": "image_url", "image_url": {"url": "data:..."}}]
     assert sh.clean_user(msg) == "fix this [screenshot]" and sh.prefilter(msg)

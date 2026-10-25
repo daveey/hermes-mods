@@ -1,0 +1,258 @@
+From e6b9eb3cbb5d802a1ae61ec109a2f5196fc116d6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 05:46:26 +0000
+Subject: [PATCH 226/248] refactor(api_server): worker-thread hops in
+ api_server_thread_hops; EOS via call_later, no dangling task (code-health
+ ratchet; batch fix-up for #35) [daveey]
+
+---
+ gateway/platforms/api_server.py               | 60 +-----------
+ gateway/platforms/api_server_openai_routes.py | 10 +-
+ gateway/platforms/api_server_thread_hops.py   | 91 +++++++++++++++++++
+ tests/gateway/test_api_server_thread_hops.py  | 22 ++++-
+ 4 files changed, 113 insertions(+), 70 deletions(-)
+ create mode 100644 gateway/platforms/api_server_thread_hops.py
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 13c4e27975..a0e03f0aba 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -139,6 +139,7 @@ from gateway.platforms import api_server_room_dispatch as _room_dispatch
+ from gateway.platforms import api_server_room_grants as _room_grants
+ from gateway.platforms import api_server_runs as _api_runs
+ from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
++from gateway.platforms.api_server_thread_hops import ThreadSafeAsyncQueue, _ThreadHops
+ from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
+ from gateway.platforms.base import (
+     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
+@@ -241,65 +242,6 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+ RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
+ 
+ 
+-class _ThreadHops:
+-    """Tracks ``call_soon_threadsafe`` hops from worker threads onto the owning loop.
+-
+-    A hop scheduled by the executor thread is NOT guaranteed to run before the loop observes
+-    that same thread's ``run_in_executor`` future as done (reproduced on CPython 3.14.7: roughly
+-    1 in 7000 under load). A terminal event or EOS sentinel enqueued right after the worker
+-    returns could therefore overtake the worker's last event, which the SSE writer then never
+-    sends. The counter is bumped synchronously in the worker thread, so after the worker returns
+-    ``flush_hops`` waits for every hop it scheduled.
+-    """
+-
+-    _hops_pending = 0
+-
+-    def _init_hops(self) -> None:
+-        self._hops_lock = threading.Lock()
+-        self._hops_pending = 0
+-
+-    def _hop(self, loop: asyncio.AbstractEventLoop, fn, *args) -> None:
+-        with self._hops_lock:
+-            self._hops_pending += 1
+-
+-        def _run() -> None:
+-            try:
+-                fn(*args)
+-            finally:
+-                with self._hops_lock:
+-                    self._hops_pending -= 1
+-
+-        try:
+-            loop.call_soon_threadsafe(_run)
+-        except BaseException:
+-            with self._hops_lock:
+-                self._hops_pending -= 1
+-            raise
+-
+-    async def flush_hops(self, timeout: float = 5.0) -> None:
+-        """Wait (bounded) until every hop scheduled so far has run on the loop."""
+-        deadline = time.monotonic() + timeout
+-        spins = 0
+-        while self._hops_pending > 0 and time.monotonic() < deadline:
+-            spins += 1
+-            await asyncio.sleep(0 if spins < 50 else 0.002)
+-
+-
+-class ThreadSafeAsyncQueue(_ThreadHops, asyncio.Queue):
+-    """``asyncio.Queue`` a non-loop thread (run_conversation's executor) can push into via
+-    ``put_threadsafe``; the SSE consumer's ``await get()`` is woken by ``call_soon_threadsafe``.
+-    Writers must ``await flush_hops()`` once the worker is done and before enqueueing EOS."""
+-
+-    def put_threadsafe(self, item, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
+-        self._hop(loop or self._loop_ref, self.put_nowait, item)
+-
+-    def __init__(self, *args, **kwargs):
+-        super().__init__(*args, **kwargs)
+-        self._init_hops()
+-        # Always constructed inside a running async handler (the SSE
+-        # request handlers below), so get_running_loop() is safe here.
+-        self._loop_ref = asyncio.get_running_loop()
+-
+ 
+ def _sse_frame(
+     data: Any, *, event: str | None = None, ensure_ascii: bool = True, id: Optional[int] = None
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+index 60c5257a8f..8e9ef81f70 100644
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -630,15 +630,7 @@ class OpenAICompatRoutesMixin:
+                 logger.debug("[api_server] stream on_done hook failed", exc_info=True)
+             finally:
+                 # EOS must not overtake hops the worker thread scheduled just before returning.
+-                if getattr(stream_q, "_hops_pending", 0) > 0:
+-                    async def _eos():
+-                        try:
+-                            await stream_q.flush_hops()
+-                        finally:
+-                            stream_q.put_nowait(None)
+-                    asyncio.ensure_future(_eos())
+-                else:
+-                    stream_q.put_nowait(None)
++                (getattr(stream_q, "put_after_hops", None) or stream_q.put_nowait)(None)
+         agent_task.add_done_callback(_done)
+         return agent_task, agent_ref
+ 
+diff --git a/gateway/platforms/api_server_thread_hops.py b/gateway/platforms/api_server_thread_hops.py
+new file mode 100644
+index 0000000000..6577d58f95
+--- /dev/null
++++ b/gateway/platforms/api_server_thread_hops.py
+@@ -0,0 +1,91 @@
++"""Worker-thread hops onto the owning event loop, and the SSE queue built on them. [daveey]
++
++Split out of ``api_server`` (code-health file cap). ``api_server`` re-exports both names.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import threading
++import time
++
++__all__ = ["ThreadSafeAsyncQueue", "_ThreadHops"]
++
++
++class _ThreadHops:
++    """Tracks ``call_soon_threadsafe`` hops from worker threads onto the owning loop.
++
++    A hop scheduled by the executor thread is NOT guaranteed to run before the loop observes
++    that same thread's ``run_in_executor`` future as done (reproduced on CPython 3.14.7: roughly
++    1 in 7000 under load). A terminal event or EOS sentinel enqueued right after the worker
++    returns could therefore overtake the worker's last event, which the SSE writer then never
++    sends. The counter is bumped synchronously in the worker thread, so after the worker returns
++    ``flush_hops`` waits for every hop it scheduled.
++    """
++
++    _hops_pending = 0
++
++    def _init_hops(self) -> None:
++        self._hops_lock = threading.Lock()
++        self._hops_pending = 0
++
++    def _hop(self, loop: asyncio.AbstractEventLoop, fn, *args) -> None:
++        with self._hops_lock:
++            self._hops_pending += 1
++
++        def _run() -> None:
++            try:
++                fn(*args)
++            finally:
++                with self._hops_lock:
++                    self._hops_pending -= 1
++
++        try:
++            loop.call_soon_threadsafe(_run)
++        except BaseException:
++            with self._hops_lock:
++                self._hops_pending -= 1
++            raise
++
++    async def flush_hops(self, timeout: float = 5.0) -> None:
++        """Wait (bounded) until every hop scheduled so far has run on the loop."""
++        deadline = time.monotonic() + timeout
++        spins = 0
++        while self._hops_pending > 0 and time.monotonic() < deadline:
++            spins += 1
++            await asyncio.sleep(0 if spins < 50 else 0.002)
++
++    def call_when_flushed(self, loop: asyncio.AbstractEventLoop, fn, *args, timeout: float = 5.0) -> None:
++        """Run ``fn(*args)`` on ``loop`` once every hop scheduled so far has run (bounded).
++
++        For sync callbacks (e.g. a task done-callback) that cannot ``await flush_hops()``:
++        re-checks with ``call_later`` instead of spawning a task nobody holds."""
++        deadline = time.monotonic() + timeout
++
++        def _check() -> None:
++            if self._hops_pending > 0 and time.monotonic() < deadline:
++                loop.call_later(0.002, _check)
++                return
++            fn(*args)
++
++        _check()
++
++
++class ThreadSafeAsyncQueue(_ThreadHops, asyncio.Queue):
++    """``asyncio.Queue`` a non-loop thread (run_conversation's executor) can push into via
++    ``put_threadsafe``; the SSE consumer's ``await get()`` is woken by ``call_soon_threadsafe``.
++    Writers must ``await flush_hops()`` once the worker is done and before enqueueing EOS."""
++
++    def put_threadsafe(self, item, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
++        self._hop(loop or self._loop_ref, self.put_nowait, item)
++
++    def put_after_hops(self, item) -> None:
++        """``put_nowait(item)`` once pending worker hops have landed (call on the loop)."""
++        self.call_when_flushed(self._loop_ref, self.put_nowait, item)
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._init_hops()
++        # Always constructed inside a running async handler (the SSE
++        # request handlers below), so get_running_loop() is safe here.
++        self._loop_ref = asyncio.get_running_loop()
+diff --git a/tests/gateway/test_api_server_thread_hops.py b/tests/gateway/test_api_server_thread_hops.py
+index d942c7d779..04afbba4ed 100644
+--- a/tests/gateway/test_api_server_thread_hops.py
++++ b/tests/gateway/test_api_server_thread_hops.py
+@@ -34,7 +34,8 @@ async def test_session_event_queue_flush_waits_for_slow_worker_hop():
+     await loop.run_in_executor(None, lambda: events.enqueue("assistant.commentary", {"text": "hi"}))
+     assert events.queue.empty()  # the hop has not landed yet: the old code sent "completed" here
+     flusher = asyncio.create_task(events.flush_hops())
+-    await asyncio.sleep(0.02)
++    for _ in range(10):
++        await asyncio.sleep(0)  # yield; the flusher keeps waiting
+     assert not flusher.done()  # flush is really waiting on the hop
+     release()
+     await flusher
+@@ -51,7 +52,8 @@ async def test_threadsafe_queue_flush_waits_for_slow_worker_hop():
+     await loop.run_in_executor(None, lambda: q.put_threadsafe("delta"))
+     assert q.empty()
+     flusher = asyncio.create_task(q.flush_hops())
+-    await asyncio.sleep(0.02)
++    for _ in range(10):
++        await asyncio.sleep(0)  # yield; the flusher keeps waiting
+     assert not flusher.done()
+     release()
+     await flusher
+@@ -63,3 +65,19 @@ async def test_flush_hops_is_bounded_when_a_hop_never_runs():
+     events = _SessionEventQueue("s", "r")
+     events._hops_pending = 1
+     await events.flush_hops(timeout=0.05)  # returns instead of hanging
++
++
++@pytest.mark.asyncio
++async def test_put_after_hops_waits_for_slow_worker_hop():
++    """The sync done-callback path (chat completions EOS) must not overtake a pending hop."""
++    loop = asyncio.get_running_loop()
++    q = ThreadSafeAsyncQueue()
++    release = _hold_hops(loop)
++    await loop.run_in_executor(None, lambda: q.put_threadsafe("delta"))
++    q.put_after_hops(None)
++    for _ in range(10):
++        await asyncio.sleep(0)
++    assert q.empty()  # EOS held back while the hop is pending
++    release()
++    assert await asyncio.wait_for(q.get(), 5) == "delta"
++    assert await asyncio.wait_for(q.get(), 5) is None
+-- 
+2.54.0 (Apple Git-157)
+

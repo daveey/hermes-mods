@@ -1,0 +1,409 @@
+From 9a9cdc16e480b919652bcb735e9c2aef05036eb2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 10:22:26 -0700
+Subject: [PATCH 239/248] fix(kanban): respawn guard releases active_pr once
+ PRs merge/close; no Inbox card; one event per hold [daveey]
+
+---
+ hermes_cli/kanban_db_dispatch.py              |  23 +++-
+ hermes_cli/kanban_db_dispatch_guard_notice.py |  47 ++++----
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  79 ++++++++++++
+ tests/hermes_cli/conftest.py                  |  14 +++
+ .../hermes_cli/test_kanban_park_invariants.py | 112 ++++++++++++++++--
+ 5 files changed, 242 insertions(+), 33 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_pr_state.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 465c008e80..efacae74ea 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1766,15 +1766,26 @@ def check_respawn_guard(
+     #    sat in ``ready`` for the rest of the 24 h window after its PR merged.
+     #    A crash/reclaim is not a handoff, so the worker that opened the PR is
+     #    still not re-spawned against it.
+-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
+-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
++    #    Also lifted once EVERY PR named in those comments is MERGED or CLOSED
++    #    (gh, cached; any gh failure keeps the hold): there is nothing left to
++    #    duplicate. t_d507533c sat held 6 h after its PR merged. [daveey]
++    pr_times: list[int] = []
++    pr_urls: list[str] = []
++    for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
++                            cols=", body", unreadable=now):  # duplicate-PR risk: fail closed
++        urls = _RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or "")
++        if urls:
++            pr_times.append(t)
++            pr_urls.extend(urls)
+     if pr_times:
+         # Strictly after: a same-second tie stays guarded (fail closed).
+         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
+                 conn, "task_events", task_id, max(pr_times),
+                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')", cols=", kind, payload", strict=True)):
+             return None
++        from hermes_cli.kanban_db_dispatch_pr_state import all_prs_finished
++        if all_prs_finished(pr_urls):
++            return None
+         return "active_pr"
+ 
+     return None
+@@ -2235,8 +2246,10 @@ def _dispatch_lane_task(
+                 result.auto_blocked.append(task_id)
+                 return False
+             _guard_notice.notify_guard_hold_safely(conn, task_id, guard_reason)
+-            with _kb.write_txn(conn):
+-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
++            # One event per unbroken hold per reason, not one per tick (~1400/card). [daveey]
++            if _guard_notice.guard_hold_reason(conn, task_id) != guard_reason:
++                with _kb.write_txn(conn):
++                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+         return False
+ 
+     def _count_spawn(name: str) -> None:
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index ba9bc38b98..117425dd1a 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -1,18 +1,20 @@
+-"""Respawn-guard hold notice: one kanban comment + Inbox card per unbroken hold. [daveey]
++"""Respawn-guard hold notice: one kanban comment per unbroken hold. [daveey]
+ 
+ Well before the hold cap, a held card must be visible: past
+ ``HERMES_KANBAN_GUARD_HOLD_NOTIFY_SECONDS`` (default 30 min) of unbroken hold the dispatcher
+-posts ONE kanban comment + Inbox card naming the guard reason and, for ``active_pr``, the PR
+-and its failing checks (2026-10-21: t_806b9e8f sat held 360 min on a PR with 11 failing
+-checks and nothing said so). Split out of ``kanban_db_dispatch`` (code-health file cap).
++posts ONE kanban comment naming the guard reason and, for ``active_pr``, the PR and its
++failing checks (2026-10-21: t_806b9e8f sat held 360 min on a PR with 11 failing checks and
++nothing said so). No Inbox card: the Inbox is reserved for owner-only decisions (AGENTS.md)
++and a guard hold is agent-fixable board state. Split out of ``kanban_db_dispatch``
++(code-health file cap).
+ """
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import sqlite3
+ import subprocess
+-import sys
+ import time
+ from typing import Optional
+ 
+@@ -33,6 +35,25 @@ def guard_hold_started_at(conn: sqlite3.Connection, task_id: str) -> Optional[in
+     return int(row[0]) if row and row[0] is not None else None
+ 
+ 
++def guard_hold_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """The reason of the hold in progress, or None: the newest event (ignoring the dispatcher's own
++    notice comments, as :func:`guard_hold_started_at` does) when it is a ``respawn_guarded`` one.
++    The dispatcher appends a new ``respawn_guarded`` event only when this differs, so an unbroken
++    hold logs one event per reason instead of one per tick."""
++    row = conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? AND NOT (kind = 'commented' AND "
++        "json_extract(payload, '$.author') = 'kanban-dispatcher') ORDER BY id DESC LIMIT 1", (task_id,),
++    ).fetchone()
++    if row is None or row[0] != "respawn_guarded":
++        return None
++    try:
++        data = json.loads(row[1] or "{}")
++    except ValueError:
++        return None
++    reason = data.get("reason") if isinstance(data, dict) else None
++    return reason if isinstance(reason, str) else None
++
++
+ def _pr_failing_checks(pr_url: str) -> str:
+     """Best-effort one-line summary of ``pr_url``'s failing checks ('' if unavailable)."""
+     try:
+@@ -45,21 +66,8 @@ def _pr_failing_checks(pr_url: str) -> str:
+     return f"{len(failing)} failing check(s): " + ", ".join(failing[:12]) if failing else ""
+ 
+ 
+-def _post_inbox_card(task_id: str, title: str, body: str) -> None:
+-    """Best-effort Inbox card via ``hermes inbox post`` (never raises)."""
+-    try:
+-        subprocess.run([sys.executable, "-m", "hermes_cli.main", "inbox", "post", title[:80], "--body", body,
+-                        "--key", f"guard-hold:{task_id}", "--prompt",
+-                        f"Look at kanban card {task_id}: it is held by the respawn guard. Read its latest "
+-                        f"[respawn-guard] comment, fix the cause (failing PR checks, binding) and unblock it.",
+-                        "--poster", "kanban-dispatcher"],
+-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
+-    except (OSError, subprocess.SubprocessError):
+-        logger.warning("kanban: guard-hold inbox post for %s failed", task_id, exc_info=True)
+-
+-
+ def notify_guard_hold(conn: sqlite3.Connection, task_id: str, reason: str) -> bool:
+-    """Once per unbroken hold, past the notify threshold: comment + Inbox card. [daveey]"""
++    """Once per unbroken hold, past the notify threshold: one kanban comment. [daveey]"""
+     from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_dispatch as _kbd
+ 
+@@ -87,7 +95,6 @@ def notify_guard_hold(conn: sqlite3.Connection, task_id: str, reason: str) -> bo
+             f"without running.{detail} It will be auto-blocked at the hold cap; fix the cause "
+             f"(merge/close the PR, rebind, or unblock) before then.")
+     _kb.add_comment(conn, task_id, "kanban-dispatcher", body)
+-    _post_inbox_card(task_id, f"Kanban {task_id} held by respawn guard ({reason})", body)
+     return True
+ 
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+new file mode 100644
+index 0000000000..0fcab96ed2
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -0,0 +1,79 @@
++"""PR state lookup for the respawn guard's ``active_pr`` hold. [daveey]
++
++``active_pr`` exists to stop a second worker opening a duplicate PR. Once every PR a
++card's comments name is MERGED or CLOSED there is nothing left to duplicate, so the hold
++must lift (2026-10-23: t_d507533c sat held 6 h after Metta-AI/coworld-qwop#1 merged).
++States come from ``gh pr view --json state``; anything else (gh missing, auth, network,
++timeout, unparseable output) is ``None`` and the caller keeps holding (fail closed).
++
++Results are cached per process: terminal states forever (a merged PR never reopens; a
++closed one can, but a reopened PR is caught again by the next comment or after restart),
++OPEN for :data:`OPEN_TTL_SECONDS`, failures for :data:`ERROR_TTL_SECONDS` so a gh outage
++does not cost a subprocess per held card per tick.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import subprocess
++import time
++from typing import Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++TERMINAL_STATES = frozenset({"MERGED", "CLOSED"})
++OPEN_TTL_SECONDS = 300
++ERROR_TTL_SECONDS = 120
++GH_TIMEOUT_SECONDS = 20
++
++# url -> (state or None, monotonic expiry or None for "forever")
++_cache: dict[str, tuple[Optional[str], Optional[float]]] = {}
++
++
++def _gh_pr_state(url: str) -> Optional[str]:
++    """``MERGED`` / ``CLOSED`` / ``OPEN`` for ``url`` via gh, or ``None`` on any failure."""
++    try:
++        proc = subprocess.run(["gh", "pr", "view", url, "--json", "state"], stdin=subprocess.DEVNULL,
++                              capture_output=True, text=True, encoding="utf-8", errors="replace",
++                              timeout=GH_TIMEOUT_SECONDS, check=False)
++    except (OSError, subprocess.SubprocessError):
++        logger.debug("kanban: gh pr view %s failed", url, exc_info=True)
++        return None
++    if proc.returncode != 0:
++        logger.debug("kanban: gh pr view %s exited %s: %s", url, proc.returncode, (proc.stderr or "")[:200])
++        return None
++    try:
++        state = json.loads(proc.stdout or "{}").get("state")
++    except (ValueError, AttributeError):
++        return None
++    return state.upper() if isinstance(state, str) and state else None
++
++
++def pr_state(url: str) -> Optional[str]:
++    """Cached :func:`_gh_pr_state`."""
++    key = url.rstrip("/").lower()
++    now = time.monotonic()
++    hit = _cache.get(key)
++    if hit is not None and (hit[1] is None or now < hit[1]):
++        return hit[0]
++    state = _gh_pr_state(url)
++    if state in TERMINAL_STATES:
++        _cache[key] = (state, None)
++    else:
++        _cache[key] = (state, now + (OPEN_TTL_SECONDS if state else ERROR_TTL_SECONDS))
++    return state
++
++
++def all_prs_finished(urls: Iterable[str]) -> bool:
++    """True only when ``urls`` is non-empty and every PR is MERGED or CLOSED.
++
++    An unknown state (gh failure) counts as unfinished: duplicate-PR risk fails closed."""
++    seen = {u.rstrip("/").lower(): u for u in urls}
++    if not seen:
++        return False
++    return all(pr_state(u) in TERMINAL_STATES for u in seen.values())
++
++
++def clear_cache() -> None:
++    _cache.clear()
+diff --git a/tests/hermes_cli/conftest.py b/tests/hermes_cli/conftest.py
+index 5909756117..9714d8c0e2 100644
+--- a/tests/hermes_cli/conftest.py
++++ b/tests/hermes_cli/conftest.py
+@@ -102,6 +102,20 @@ def _source_channels_resolve_locally(request, monkeypatch):
+         "stable", "stable", repository, branch="stable"))
+ 
+ 
++@pytest.fixture(autouse=True)
++def _pr_state_offline(monkeypatch):
++    """Keep the respawn guard's PR-state lookup off the network: gh "fails", so ``active_pr``
++    holds exactly as before (fail closed). Tests of the lookup re-patch ``_gh_pr_state``. [daveey]"""
++    try:
++        from hermes_cli import kanban_db_dispatch_pr_state as prs
++    except Exception:
++        return
++    prs.clear_cache()
++    monkeypatch.setattr(prs, "_gh_pr_state", lambda url: None)
++    yield
++    prs.clear_cache()
++
++
+ @pytest.fixture(autouse=True)
+ def _discharge_host_update_obligation():
+     """Start and end every ``hermes_cli`` test with NO host update-restart obligation.
+diff --git a/tests/hermes_cli/test_kanban_park_invariants.py b/tests/hermes_cli/test_kanban_park_invariants.py
+index 7b5a12861e..429f313009 100644
+--- a/tests/hermes_cli/test_kanban_park_invariants.py
++++ b/tests/hermes_cli/test_kanban_park_invariants.py
+@@ -18,6 +18,7 @@ import pytest
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_pr_state as _prs_mod
+ 
+ 
+ @pytest.fixture
+@@ -379,14 +380,22 @@ def test_desktop_relaunch_after_update_gets_scrubbed_env(monkeypatch, tmp_path):
+     assert not ({"HERMES_KANBAN_TASK", *LEAK} & set(env))
+ 
+ 
+-def test_guard_hold_posts_comment_and_inbox_card_once_naming_pr_and_checks(
++def test_guard_hold_posts_one_comment_and_no_inbox_card_naming_pr_and_checks(
+         kanban_home, monkeypatch, all_assignees_spawnable):
+-    """Within 30 min of a hold the card gets ONE comment + Inbox card naming the PR and its
+-    failing checks, and the notice does not restart the hold clock (the 6 h cap still fires). [daveey]"""
++    """Within 30 min of a hold the card gets ONE kanban comment naming the PR and its failing
++    checks, NO Inbox card (Inbox = owner-only decisions, AGENTS.md), one ``respawn_guarded``
++    event per hold instead of one per tick, and the notice does not restart the hold clock
++    (the 6 h cap still fires). [daveey]"""
+     pr = "https://github.com/daveey/hermes/pull/19"
+-    cards = []
++    posted = []
+     monkeypatch.setattr(kbd._guard_notice, "_pr_failing_checks", lambda url: "2 failing check(s): lint, unit")
+-    monkeypatch.setattr(kbd._guard_notice, "_post_inbox_card", lambda tid, title, body: cards.append((tid, title, body)))
++    real_run = kbd._guard_notice.subprocess.run
++
++    def _spy_run(cmd, *a, **k):
++        if "inbox" in cmd:
++            posted.append(cmd)
++        return real_run(["true"], *a, **k)
++    monkeypatch.setattr(kbd._guard_notice.subprocess, "run", _spy_run)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="pr held", assignee="a")
+         kb.add_comment(conn, tid, "a", f"opened {pr}")
+@@ -396,16 +405,103 @@ def test_guard_hold_posts_comment_and_inbox_card_once_naming_pr_and_checks(
+         assert (tid, "active_pr") in res.respawn_guarded
+         monkeypatch.setattr(kb.time, "time", lambda: now + 600)
+         kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+-        assert not cards  # under 30 min: silent
+         monkeypatch.setattr(kb.time, "time", lambda: now + 1900)
+         kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+         kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)  # second tick: no duplicate
+-        assert len(cards) == 1
++        assert not posted and not hasattr(kbd._guard_notice, "_post_inbox_card")
+         notes = [c for c in kb.list_comments(conn, tid) if c.body.startswith("[respawn-guard]")]
+         assert len(notes) == 1
+         assert pr in notes[0].body and "lint, unit" in notes[0].body and "active_pr" in notes[0].body
+-        assert pr in cards[0][2]
++        guarded = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded'",
++                               (tid,)).fetchone()[0]
++        assert guarded == 1  # 4 ticks, one unbroken hold -> one event
+         # The notice must not restart the hold clock: the 6 h cap still blocks.
+         monkeypatch.setattr(kb.time, "time", lambda: now + 6 * 3600 + 100)
+         res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+         assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_guard_event_relogged_after_hold_is_broken(kanban_home, monkeypatch, all_assignees_spawnable):
++    """A human comment breaks the hold: the next held tick logs a fresh ``respawn_guarded`` event. [daveey]"""
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pr held", assignee="a")
++        kb.add_comment(conn, tid, "a", "opened https://github.com/daveey/hermes/pull/19")
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
++        kb.add_comment(conn, tid, "david", "still waiting on review")
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
++        n = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded'",
++                         (tid,)).fetchone()[0]
++        assert n == 2
++
++
++class _Proc:
++    def __init__(self, returncode, stdout="", stderr=""):
++        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
++
++
++def _gh_states(monkeypatch, states):
++    """Route the real ``_gh_pr_state`` through a fake ``gh``: url -> state, or an Exception/int rc."""
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++    monkeypatch.setattr(prs, "_gh_pr_state", _REAL_GH_PR_STATE)
++    prs.clear_cache()
++    calls = []
++
++    def _run(cmd, *a, **k):
++        calls.append(cmd)
++        st = states[cmd[3]]
++        if isinstance(st, BaseException):
++            raise st
++        if isinstance(st, int):
++            return _Proc(st, stderr="gh: could not resolve host")
++        return _Proc(0, json.dumps({"state": st}))
++    monkeypatch.setattr(prs.subprocess, "run", _run)
++    return calls
++
++
++_REAL_GH_PR_STATE = _prs_mod._gh_pr_state
++PR_A = "https://github.com/Metta-AI/coworld-qwop/pull/1"
++PR_B = "https://github.com/daveey/hermes/pull/19"
++
++
++@pytest.mark.parametrize("states,expected", [
++    ({PR_A: "MERGED"}, None),                         # (b) merged PR -> released
++    ({PR_A: "CLOSED"}, None),                         # closed unmerged -> nothing to duplicate
++    ({PR_A: "OPEN"}, "active_pr"),                    # (c) open PR -> still held
++    ({PR_A: 1}, "active_pr"),                         # (d) gh error exit -> fail closed
++    ({PR_A: OSError("gh not found")}, "active_pr"),   # (d) gh missing -> fail closed
++    ({PR_A: "MERGED", PR_B: "OPEN"}, "active_pr"),    # one PR still open -> held
++    ({PR_A: "MERGED", PR_B: 1}, "active_pr"),         # one PR unknown -> held
++    ({PR_A: "MERGED", PR_B: "CLOSED"}, None),         # every PR finished -> released
++])
++def test_active_pr_guard_checks_pr_state(kanban_home, monkeypatch, states, expected):
++    calls = _gh_states(monkeypatch, states)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pr card", assignee="a")
++        kb.add_comment(conn, tid, "a", "opened " + " and ".join(states))
++        assert kbd.check_respawn_guard(conn, tid) == expected
++        assert {c[3] for c in calls} <= set(states)
++
++
++def test_pr_state_is_cached(kanban_home, monkeypatch):
++    """Merged is cached for good, so a held tick does not shell out to gh per card per tick."""
++    calls = _gh_states(monkeypatch, {PR_A: "MERGED"})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pr card", assignee="a")
++        kb.add_comment(conn, tid, "a", f"opened {PR_A}")
++        for _ in range(3):
++            assert kbd.check_respawn_guard(conn, tid) is None
++    assert len(calls) == 1
++
++
++def test_merged_pr_card_gets_a_worker(kanban_home, monkeypatch, all_assignees_spawnable):
++    """End to end: a ready card whose only PR merged is spawned, not held (t_d507533c). [daveey]"""
++    _gh_states(monkeypatch, {PR_A: "MERGED"})
++    spawned = []
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pr merged", assignee="a")
++        kb.add_comment(conn, tid, "a", f"opened {PR_A}")
++        res = kbd.dispatch_once(conn, spawn_fn=lambda task, *a, **k: spawned.append(task.id) or 1)
++        assert tid not in dict(res.respawn_guarded)
++        assert spawned == [tid]
+-- 
+2.54.0 (Apple Git-157)
+

@@ -2,9 +2,9 @@
 
 Patches:
 
-- `patches/0213-fix-kanban-gave_up-crashed-notices-name-the-real-cau.patch`: shared classifier
+- `patches/0216-fix-kanban-gave_up-crashed-notices-name-the-real-cau.patch`: shared classifier
   `hermes_cli/kanban_failure_summary.py`, used by the Desktop/TUI notice (`tui_gateway/session_notifications.py`).
-- `patches/0214-fix-kanban-gateway-failure-notices-share-the-classif.patch`: the messaging gateway notifier
+- `patches/0217-fix-kanban-gateway-failure-notices-share-the-classif.patch`: the messaging gateway notifier
   (`gateway/kanban_watchers_notifier.py`) uses the same classifier; retry/refusal wording corrected.
 
 ## Behavior
@@ -47,7 +47,7 @@ wording is English-only), and real-delivery to Telegram/Slack adapters beyond th
 
 ## Applying
 
-`git am -3` in order, 0213 then 0214.
+`git am -3` in order, 0216 then 0217.
 
 ## Gotchas
 

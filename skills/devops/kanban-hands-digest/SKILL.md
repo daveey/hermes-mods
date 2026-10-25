@@ -1,6 +1,6 @@
 ---
 name: kanban-hands-digest
-description: "Use when asked what's blocked or what do you need from me. Session-scoped by default; global digest on request."
+description: "Use when asked about Kanban blockers or human steps. Clear blockers and explain stalled cards in a scoped digest."
 version: 1.0.0
 author: daveey
 license: MIT
@@ -19,8 +19,14 @@ machine can verify.
 
 ## Scope: this session by default
 
-"What's blocked?" / "what do you need from me?" means **this chat's cards** (the ones it created or is
-subscribed to — its task strip), not every board. Find them from this session's own `kanban_create` results /
+"What's blocked?" means **this chat's cards** (the ones it created or is subscribed to, i.e. its task strip),
+not every board. **"What do you need me to do?" is wider.** He is reading the Desktop "For you" panel, which
+lists every human-blocked or gave-up card on the gateway, not only the thread you were just discussing. Before
+you say "nothing needed", sweep the board for `blocked` (`needs_input`/`capability`) and `gave_up` cards
+(`hermes kanban list` plus `kanban_show` on each) and clear them. He calls an answer of "nothing" given while
+that panel still shows asks a lie.
+
+The card set for the session-scoped question: Find them from this session's own `kanban_create` results /
 task strip, then `kanban_show` each and report the blocked ones. Also report two states that wait silently:
 - `triage` with a human `block_kind` (`needs_input`/`capability`): block-loop detection moved a repeatedly
   re-blocked card there. It still waits on the user, and the latest `block_loop_detected` event holds the ask.
@@ -30,6 +36,16 @@ task strip, then `kanban_show` each and report the blocked ones. Also report two
   indefinitely. Re-queue with `hermes kanban unblock <id>` (it accepts scheduled cards). A `needs_input`
   card parked in scheduled is an ask of the user; report it.
 Before treating a blocked card as a human ask, inspect the event that caused the current stop. `gave_up`, `crashed`, `spawn_failed`, model refusal and timeout are operational failures, not evidence of a user obligation. Never turn the task body's first sentence into an unblock instruction. Report the actual cause, whether retries remain, and who owns recovery; say no user action is identified when none is verified. A model refusal should not be repeatedly requeued unchanged or routed around by switching providers. Preserve a paused failure visibly as an agent issue, without a Done button. For genuine human blockers, state the exact action, device, reason, and observable completion condition.
+
+## This user: clear it yourself, never hand him cards
+
+He wants blockers cleared, not reported. "What are these, you do it" / "you run things for me" means:
+1. Sweep every blocked card and clear each one that is not a genuine human step yourself, in the same turn (recipe by stop cause: `references/clearing-blockers-yourself.md`).
+2. Bring genuine decisions to him INLINE as a `clarify` form. Use one question per decision in plain words, recommended option first, and batch the low-stakes defaults into one "accept all recommended" question. Never answer with card ids or links, or with "answer in a comment on t_x". Then record his answers on the cards yourself (comment the decision on the card and on every card waiting on it, then `hermes kanban complete` the decision card).
+   Before you relay a human ask, re-test its premise; block reasons go stale. "Reconnect Desktop / the relay has no connected client" is disproved by a successful `cross_session read` of the target session. Check "needs a credential" against what other profiles on the host already hold. If the premise is false, comment the evidence and the working route, then unblock.
+   An old scope-hold comment ("STOP remediation until told") on a card counts as superseded only with evidence, such as sibling cards in the same program now landing under the same authority. Say in your reply that you treated it as lifted and offer to re-hold.
+3. Do sign-in/OAuth blockers yourself through the hub's agent browser before asking him for anything (same reference). Only a step that truly needs his hand or device (a password not in the vault, Touch ID, a physical action) goes to him, and only after you have tried the self-service route.
+4. A "walk me through it" request still means doing everything automatable yourself; the walk-through covers only what remains.
 
 When the user's step is done, re-queue the card yourself (`kanban_unblock`, or the CLI for triage) after a
 comment saying what changed. Don't wait for the card to notice. Go global (the digest script below, all

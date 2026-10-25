@@ -1,0 +1,1652 @@
+From 9a804c9f447a7cbe5c6efd5bf34949366835706a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 15:32:28 -0700
+Subject: [PATCH] =?UTF-8?q?feat(kanban):=20condition=20wakes=20=E2=80=94?=
+ =?UTF-8?q?=20scheduled=20cards=20wake=20when=20a=20wake=5Fcheck=20probe?=
+ =?UTF-8?q?=20passes=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Parks (kanban_schedule, kanban_block kind=time, kanban_continue wait, CLI
+schedule/block) accept wake_check/check_every/clock_only. The dispatcher probes
+due checks off-thread (bash -lc, 30 s timeout, <=4 at once, never blocks the
+tick); exit 0 wakes with condition_met, 3 broken runs wake with
+wake_check_broken. Parks >2 h out with no probe are refused unless clock_only.
+State in task_wake_checks; shown in kanban show, worker context, board API;
+diagnostics flag clock_only_park, wake_check_failing, wake_check_overdue.
+---
+ agent/prompt_builder.py                     |   6 +-
+ hermes_cli/kanban.py                        |  90 +++-
+ hermes_cli/kanban_continuation.py           |   6 +
+ hermes_cli/kanban_db.py                     |  58 +--
+ hermes_cli/kanban_db_schedule.py            |  50 ++
+ hermes_cli/kanban_diagnostics.py            |  76 ++++
+ hermes_cli/kanban_parser.py                 |  15 +
+ hermes_cli/kanban_timed_park.py             |   4 +
+ hermes_cli/kanban_wake_check.py             | 479 ++++++++++++++++++++
+ plugins/kanban/dashboard/plugin_api.py      |   7 +-
+ tests/hermes_cli/test_kanban_block_kinds.py |   4 +-
+ tests/hermes_cli/test_kanban_timed_park.py  |   3 +-
+ tests/hermes_cli/test_kanban_wake_check.py  | 271 +++++++++++
+ tests/tools/test_kanban_tools.py            |   3 +-
+ tools/kanban_tools.py                       |  57 ++-
+ tools/kanban_tools_schemas.py               |  38 +-
+ website/docs/user-guide/features/kanban.md  |  20 +-
+ 17 files changed, 1115 insertions(+), 72 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_schedule.py
+ create mode 100644 hermes_cli/kanban_wake_check.py
+ create mode 100644 tests/hermes_cli/test_kanban_wake_check.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 1232e68dd9..4325fec3d8 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -294,7 +294,11 @@ KANBAN_GUIDANCE = (
+     "Waiting on time is not a block: when the next step must wait for a clock or an external event (a run cap, a soak, "
+     "a release window), call `kanban_schedule(reason=\"SCHEDULED_UNTIL=<ISO8601> — what you're waiting for\")` "
+     "(goal-mode cards: `kanban_block(kind=\"time\", reason=\"SCHEDULED_UNTIL=…\")`); the card wakes at that time; "
+-    "say what else wakes the card. A blocked card marks its chat red as needing a human. When the wall is outside "
++    "say what else wakes the card. If what you wait on can be read (a DB row, a tag, a file, a log line), also pass "
++    "`wake_check=\"<shell cmd: exit 0 when it holds, 1 when not yet>\"`: the dispatcher probes it cheaply and wakes "
++    "the card the moment it holds. A park more than 2 h out without one is refused unless `clock_only=true` (a pure "
++    "time wait). A wait on another card on the board is a parent link (`kanban_link`), not a park. "
++    "A blocked card marks its chat red as needing a human. When the wall is outside "
+     "your card and would stop other cards too (CI billing/quota refused, a service outage), also pass "
+     "`blocker_id=\"<short-slug>\"` to `kanban_block`/`kanban_continue`, reusing an id from \"Open shared "
+     "blockers\" in your context: the dispatcher then probes that wall with one card instead of every card.\n"
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 9cc62e3ab0..c24aad2af7 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -520,6 +520,18 @@ def _print_section(title: str, lines) -> None:
+         print(line)
+ 
+ 
++def _print_max_retries(task) -> None:
++    """Effective retry threshold (task > config > default); it explains auto-blocks."""
++    if task.max_retries is not None:
++        print(f"  max-retries: {task.max_retries} (task)")
++        return
++    cfg_val = _kanban_config().get("failure_limit")
++    if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
++        print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
++    else:
++        print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
++
++
+ def _cmd_show(args: argparse.Namespace) -> int:
+     rsk, rc = _run_state_kwargs(args, "show")
+     if rc:
+@@ -537,6 +549,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         runs = kb.list_runs(conn, args.task_id, **rsk)
+         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
+         latest_summary = kb.latest_summary(conn, args.task_id)
++        from hermes_cli import kanban_wake_check as kwc
++        wake_check = kwc.get_state(conn, args.task_id)
+         if not want_json:
+             graph = kb.task_graph_context(conn, task.id)
+ 
+@@ -546,6 +560,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
+             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
++            "wake_check": wake_check,
+         })
+         return 0
+ 
+@@ -565,23 +580,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
+     if task.model_override:
+         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
+         field("model", f"{task.model_override}{_prov}")
+-    # Effective retry threshold (task > config > default) explains auto-blocks.
+-    if task.max_retries is not None:
+-        print(f"  max-retries: {task.max_retries} (task)")
+-    else:
+-        cfg_val = _kanban_config().get("failure_limit")
+-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+-            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
+-        else:
+-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
++    _print_max_retries(task)
+     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
+ 
+     # Diagnostics up top so CLI users see distress signals before scrolling.
+     from hermes_cli import kanban_diagnostics as kd
+-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
++    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph, wake_check=wake_check)
+     if diags:
+         print(f"\n  Diagnostics ({len(diags)}):")
+         _print_diagnostics(diags, "    ", with_kind=False)
++    if wake_check:
++        field("wake check", kwc.describe_state(wake_check))
+     if task.started_at:
+         field("started", _fmt_ts(task.started_at))
+     if task.completed_at:
+@@ -693,9 +702,11 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
+             task = kb.get_task(conn, args.task)
+             if task is None:
+                 return _err(f"no such task: {args.task}")
++            from hermes_cli import kanban_wake_check as kwc
+             diags_by_task = {args.task: kd.compute_task_diagnostics(
+                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
+-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
++                graph=kb.task_graph_context(conn, args.task), config=diag_config,
++                wake_check=kwc.get_state(conn, args.task))}
+         else:
+             # Fleet mode: pull all non-archived tasks + their events/runs.
+             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
+@@ -705,10 +716,13 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
+                 ev_by = _rows_by_task(conn, "task_events", ids)
+                 run_by = _rows_by_task(conn, "task_runs", ids)
+                 graph_by = kb.task_graph_contexts(conn, ids)
++                from hermes_cli import kanban_wake_check as kwc
++                wake_by = kwc.load_states(conn)
+                 for r in rows:
+                     tid = r["id"]
+                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
+-                                                     graph=graph_by.get(tid), config=diag_config)
++                                                     graph=graph_by.get(tid), config=diag_config,
++                                                     wake_check=wake_by.get(tid))
+                     if dl:
+                         diags_by_task[tid] = dl
+ 
+@@ -1030,6 +1044,29 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
+     return run
+ 
+ 
++def _cli_wake_check(args: argparse.Namespace):
++    """``(wake_check, check_every, clock_only)`` from ``--wake-check/--check-every/--clock-only``."""
++    from hermes_cli import kanban_wake_check as kwc
++
++    cmd = kwc.normalize_cmd(getattr(args, "wake_check", None))
++    every = kwc.normalize_every(getattr(args, "check_every", None)) if cmd else None
++    return cmd, every, bool(getattr(args, "clock_only", False))
++
++
++def _guarded_park(conn, op: str, wake, refused: dict, park, **plan):
++    """Per-task op: refuse a park > 2 h out with no probe (``kanban_wake_check.guard_error``). [daveey]"""
++    from hermes_cli import kanban_wake_check as kwc
++
++    def run(tid):
++        err = kwc.guard_error(wake_at=kwc.planned_wake(conn, tid, op=op, **plan),
++                              wake_check=wake[0], clock_only=wake[2])
++        if err:
++            refused[tid] = f"cannot {op} {tid}: {err}"
++            return False
++        return park(tid)
++    return run
++
++
+ def _cmd_block(args: argparse.Namespace) -> int:
+     reason = _joined_words(args.reason)
+     kind = getattr(args, "kind", None)
+@@ -1052,9 +1089,17 @@ def _cmd_block(args: argparse.Namespace) -> int:
+                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
+             return f"Blocked {tid}{suffix}"
+ 
+-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
+-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
++        try:
++            wake = _cli_wake_check(args)
++        except ValueError as exc:
++            return _err(f"kanban block: {exc}", 2)
++        refused: dict = {}
++        op = _guarded_park(conn, "block", wake, refused, _commented(
++            conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
++                conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
++                wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
++            reason=reason, kind=kind)
++        return _bulk_apply(ids, op, ok_msg, lambda tid: refused.get(tid) or f"cannot block {tid}")
+ 
+ 
+ def _cmd_schedule(args: argparse.Namespace) -> int:
+@@ -1063,9 +1108,18 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+     ids = _bulk_ids(args)
+     suffix = f": {reason}" if reason else ""
+     with kbc.connect_closing() as conn:
+-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
+-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
+-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
++        try:
++            wake = _cli_wake_check(args)
++        except ValueError as exc:
++            return _err(f"kanban schedule: {exc}", 2)
++        refused: dict = {}
++        op = _guarded_park(conn, "schedule", wake, refused, _commented(
++            conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
++                conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
++                wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
++            reason=reason)
++        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}",
++                           lambda tid: refused.get(tid) or f"cannot schedule {tid}")
+ 
+ 
+ def _cmd_unblock(args: argparse.Namespace) -> int:
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index dcb9b35bea..70bfea6d85 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -85,6 +85,7 @@ def continue_task(
+     conn: sqlite3.Connection, task_id: str, *, checkpoint: str,
+     resume_after_seconds: int = 0, expected_run_id: Optional[int] = None,
+     max_continuations: Optional[int] = None, metadata: Optional[dict] = None,
++    wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
+ ) -> dict[str, Any]:
+     """End the running run as ``continued`` and re-queue the card.
+ 
+@@ -152,9 +153,12 @@ def continue_task(
+         payload = {"continuation": streak + 1, "status": new_status, "resume_status": source_status}
+         if meta.get("blocker_id"):
+             payload["blocker_id"] = meta["blocker_id"]
++        from hermes_cli import kanban_wake_check as kwc  # condition wake [daveey]
+         if wake_at is not None:
+             payload["wake_at"] = wake_at
++            payload.update(kwc.park_fields(wake_check, check_every, clock_only))
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
++        kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now)
+     return {"ok": True, "status": new_status, "run_id": run_id,
+             "continuation": streak + 1, "wake_at": wake_at}
+ 
+@@ -197,7 +201,9 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     reset ``consecutive_failures``).
+     """
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_wake_check import run_due_wake_checks
+ 
++    run_due_wake_checks(conn)  # condition wakes: start due probes off-thread, never waits [daveey]
+     now = int(time.time()) if now is None else int(now)
+     woken: list[str] = []
+     for row in conn.execute("SELECT id, block_kind FROM tasks WHERE status = 'scheduled'").fetchall():
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 267bbda241..c3e2e9c558 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1005,6 +1005,19 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
+ );
+ 
+ CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
++-- Condition-wake probe of a ``scheduled`` card (``kanban_wake_check``): one row per
++-- card, rewritten per probe instead of one event per probe. [daveey]
++CREATE TABLE IF NOT EXISTS task_wake_checks (
++    task_id   TEXT PRIMARY KEY,
++    cmd       TEXT NOT NULL,
++    every     INTEGER NOT NULL,
++    next_at   INTEGER NOT NULL,
++    last_at   INTEGER,
++    last_rc   INTEGER,
++    last_out  TEXT,
++    fails     INTEGER NOT NULL DEFAULT 0
++);
++
+ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
+ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+@@ -3164,7 +3177,8 @@ def edit_task(
+ def block_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+-    blocker_id: Optional[str] = None,
++    blocker_id: Optional[str] = None, wake_check: Optional[str] = None,
++    check_every: Optional[int] = None, clock_only: bool = False,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+     :func:`_route_block`). A wait on time -- ``kind='time'``, a ``dependency``
+@@ -3217,7 +3231,8 @@ def block_task(
+         from hermes_cli import kanban_timed_park as ktp
+         if not blocker_id and ktp.is_timed_park(kind, reason, parents_satisfied=no_open_parent):
+             return ktp.park(conn, task_id, reason=reason, requested_kind=kind,
+-                            source_status=source_status, expected_run_id=expected_run_id)
++                            source_status=source_status, expected_run_id=expected_run_id,
++                            wake_check=wake_check, check_every=check_every, clock_only=clock_only)
+         # Parent-less ``dependency`` behind a shared blocker: sticky ``needs_input`` (todo would respawn it).
+         if kind == "dependency" and no_open_parent:
+             kind = "needs_input"
+@@ -4012,6 +4027,8 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
+     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
++    with contextlib.suppress(sqlite3.OperationalError):  # board predating condition wakes
++        conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
+ 
+ 
+ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+@@ -4036,40 +4053,6 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+     return True
+ 
+ 
+-def schedule_task(
+-    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+-    expected_run_id: Optional[int] = None,
+-) -> bool:
+-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
+-    (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
+-    ``unblock_task``. Refused (False) while the card waits on a human answer: ``scheduled`` is
+-    not on any needs-me surface, so such a park hid the ask (t_6feb6afd). [daveey]"""
+-    with write_txn(conn):
+-        if _awaiting_human_answer(conn, task_id):
+-            return False
+-        params: list[Any] = [task_id]
+-        sql = """
+-            UPDATE tasks
+-               SET status       = 'scheduled',
+-                   claim_lock   = NULL,
+-                   claim_expires= NULL,
+-                   worker_pid   = NULL
+-             WHERE id = ?
+-               AND status IN ('todo', 'ready', 'running', 'blocked')
+-        """
+-        if expected_run_id is not None:
+-            sql += " AND current_run_id = ?"
+-            params.append(int(expected_run_id))
+-        if conn.execute(sql, params).rowcount != 1:
+-            return False
+-        run_id = _end_or_synthesize_run(
+-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+-        )
+-        from hermes_cli.kanban_timed_park import scheduled_payload  # SCHEDULED_UNTIL= wakes it [daveey]
+-        _append_event(conn, task_id, "scheduled", scheduled_payload(reason), run_id=run_id)
+-        return True
+-
+-
+ def _awaiting_human_answer(conn: sqlite3.Connection, task_id: str) -> bool:
+     """True when the card's outstanding ask is for a human: a human-kind ``block_kind``
+     (``needs_input``/``capability``) whose latest ``blocked``/``block_loop_detected`` event
+@@ -4106,6 +4089,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     checkpoint = render_checkpoint_context(conn, task_id)
+     if checkpoint:
+         lines.append(checkpoint)
++    from hermes_cli.kanban_wake_check import render_wake_context
++    lines += [w for w in (render_wake_context(conn, task_id),) if w]  # condition wake [daveey]
+     from hermes_cli.kanban_shared_blockers import render_blocker_context
+     try:
+         blockers = render_blocker_context(conn, task_id)
+@@ -4609,6 +4594,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
+ 
+ 
+ # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
++from hermes_cli.kanban_db_schedule import schedule_task
+ from hermes_cli.kanban_db_boards import (
+     _default_board_display_name,
+     _dir_holds_board,
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+new file mode 100644
+index 0000000000..7f1dddb58f
+--- /dev/null
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -0,0 +1,50 @@
++"""``schedule_task``: park a card in ``scheduled`` (split out of ``kanban_db``). [daveey]
++
++Late-bound via ``_kb`` (import-cycle breaking) so monkeypatching ``kanban_db`` helpers in
++tests still reaches this code. Re-exported from ``kanban_db``.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Optional
++
++from hermes_cli import kanban_db as _kb
++
++
++def schedule_task(
++    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
++    expected_run_id: Optional[int] = None, wake_check: Optional[str] = None,
++    check_every: Optional[int] = None, clock_only: bool = False,
++) -> bool:
++    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
++    (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
++    ``unblock_task``. Refused (False) while the card waits on a human answer: ``scheduled`` is
++    not on any needs-me surface, so such a park hid the ask (t_6feb6afd). [daveey]"""
++    with _kb.write_txn(conn):
++        if _kb._awaiting_human_answer(conn, task_id):
++            return False
++        params: list[Any] = [task_id]
++        sql = """
++            UPDATE tasks
++               SET status       = 'scheduled',
++                   claim_lock   = NULL,
++                   claim_expires= NULL,
++                   worker_pid   = NULL
++             WHERE id = ?
++               AND status IN ('todo', 'ready', 'running', 'blocked')
++        """
++        if expected_run_id is not None:
++            sql += " AND current_run_id = ?"
++            params.append(int(expected_run_id))
++        if conn.execute(sql, params).rowcount != 1:
++            return False
++        run_id = _kb._end_or_synthesize_run(
++            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
++        )
++        from hermes_cli.kanban_timed_park import scheduled_payload  # SCHEDULED_UNTIL= wakes it [daveey]
++        from hermes_cli import kanban_wake_check as kwc  # condition wake [daveey]
++        _kb._append_event(conn, task_id, "scheduled", {
++            **scheduled_payload(reason), **kwc.park_fields(wake_check, check_every, clock_only),
++        }, run_id=run_id)
++        kwc.set_check(conn, task_id, wake_check, check_every)
++        return True
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index dd0500d9c2..4774bbdd39 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -818,6 +818,78 @@ def _rule_scheduled_without_wake(task, events, runs, now, cfg) -> list[Diagnosti
+     )]
+ 
+ 
++def _rule_clock_only_park(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """A ``scheduled`` card waiting more than 2 h on a clock with no ``wake_check`` and no
++    ``clock_only``: parked before condition wakes existed, so a condition that came true
++    early sits unnoticed until the clock (t_9be6b361). [daveey]"""
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli.kanban_wake_check import GUARD_SECONDS
++
++    if _task_field(task, "status") != "scheduled" or cfg.get("_wake_check"):
++        return []
++    ev = _latest_parking_event(events)
++    if ev is None:
++        return []
++    payload = _parse_payload(ev)
++    if kc.pending_wake_payload(_event_kind(ev), payload) is None:
++        return []
++    if payload.get("wake_check") or payload.get("clock_only"):
++        return []
++    wake_at = int(payload["wake_at"])
++    if wake_at - now <= GUARD_SECONDS:
++        return []
++    task_id = str(_task_field(task, "id") or "")
++    left = (wake_at - now) / 3600
++    return [Diagnostic(
++        kind="clock_only_park", severity="warning",
++        title=f"Parked {left:.1f}h behind a clock with no wake check",
++        detail=("This card waits on a clock with no wake_check probe and was not marked "
++                "clock_only. If it waits on a readable fact (a DB row, a tag, a file, a log line), "
++                "re-park it with a wake_check so it wakes when the fact turns true; if it waits on "
++                "another card, link it as a parent instead."),
++        actions=[_cli_hint("Re-park with a probe",
++                           f"hermes kanban schedule {task_id} --wake-check '<cmd: exit 0 when ready>'",
++                           suggested=True)],
++        first_seen_at=_event_ts(ev), last_seen_at=_event_ts(ev), count=1,
++        data={"wake_at": wake_at},
++    )]
++
++
++def _rule_wake_check_health(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """A parked card's ``wake_check`` that is failing (not exit 0/1), or has not run long after
++    it was due (dispatcher down or probe pool wedged). [daveey]"""
++    state = cfg.get("_wake_check")
++    if not state or _task_field(task, "status") != "scheduled":
++        return []
++    task_id = str(_task_field(task, "id") or "")
++    out: list[Diagnostic] = []
++    fails = int(state.get("fails") or 0)
++    if fails:
++        out.append(Diagnostic(
++            kind="wake_check_failing", severity="warning",
++            title=f"Wake check failing ({fails} in a row, rc {state.get('last_rc')})",
++            detail=(f"The probe `{state.get('cmd')}` exited with neither 0 nor 1. After 3 failures "
++                    f"in a row the card wakes so a worker can fix it. Last output: "
++                    f"{(state.get('last_out') or '(none)')[-200:]}"),
++            actions=[_cli_hint("Inspect the card", f"hermes kanban show {task_id}", suggested=True)],
++            first_seen_at=state.get("last_at") or now, last_seen_at=state.get("last_at") or now,
++            count=fails, data={"cmd": state.get("cmd"), "last_rc": state.get("last_rc")},
++        ))
++    late = now - int(state.get("next_at") or now)
++    grace = max(600, int(state.get("every") or 0))
++    if late > grace:
++        out.append(Diagnostic(
++            kind="wake_check_overdue", severity="error",
++            title=f"Wake check {late // 60}m overdue",
++            detail=("The probe was due but has not run. Check that the dispatcher is running "
++                    "(`hermes kanban diagnostics`), or resume the task now."),
++            actions=[DiagnosticAction(kind="unblock", label="Resume the task now", suggested=True)],
++            first_seen_at=int(state["next_at"]), last_seen_at=int(state["next_at"]), count=1,
++            data={"next_at": state.get("next_at"), "late_seconds": late},
++        ))
++    return out
++
++
+ def _block_loop_ask(events) -> Optional[str]:
+     """Reason of the newest ``block_loop_detected`` event with no human input after it."""
+     latest = None
+@@ -892,6 +964,8 @@ _RULES: list[RuleFn] = [
+     _rule_stranded_in_ready,
+     _rule_overdue_wake,
+     _rule_scheduled_without_wake,
++    _rule_clock_only_park,
++    _rule_wake_check_health,
+     _rule_escalated_waiting_on_user,
+     _rule_waiting_behind_user,
+ ]
+@@ -956,6 +1030,7 @@ def compute_task_diagnostics(
+     now: Optional[int] = None,
+     config: Optional[dict] = None,
+     graph: Optional[dict] = None,
++    wake_check: Optional[dict] = None,
+ ) -> list[Diagnostic]:
+     """Run every rule for one task; critical first, then error, warning; ties
+     broken by most-recent ``last_seen_at``."""
+@@ -964,6 +1039,7 @@ def compute_task_diagnostics(
+     cfg = {**DEFAULT_CONFIG, **config}
+     if graph is not None:
+         cfg["_graph"] = graph
++    cfg["_wake_check"] = wake_check
+     if not _has_explicit_threshold(config) and "failure_limit" in config:
+         cfg["failure_threshold"] = _positive_int(
+             config.get("failure_limit"), DEFAULT_CONFIG["failure_threshold"],
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 83aa80e1f5..a43ab4fb84 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -79,6 +79,19 @@ def _bulk_ids(verb: str):
+ 
+ 
+ _TASK_ID = _arg("task_id")
++
++
++def _WAKE_CHECK_ARGS():
++    """Condition-wake flags shared by ``block`` and ``schedule`` (``kanban_wake_check``). [daveey]"""
++    return (
++        _arg("--wake-check", dest="wake_check", default=None,
++             help="Shell probe run while parked (bash -lc, 30 s timeout): exit 0 wakes the card at "
++                  "once, exit 1 = not yet. Required for a park more than 2 h out unless --clock-only."),
++        _arg("--check-every", dest="check_every", type=int, default=None,
++             help="Seconds between --wake-check probes (default 900, min 120, max 21600)"),
++        _arg("--clock-only", dest="clock_only", action="store_true",
++             help="A pure time wait with nothing to probe (soak window, calendar date)"),
++    )
+ _TASK_IDS = _arg("task_ids", nargs="+")
+ _SLUG = _arg("slug")
+ _TENANT = _arg("--tenant", help="Tenant namespace")
+@@ -322,11 +335,13 @@ _SPECS = [
+                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
+                   "Repeated same-kind re-blocks after unblock route the task to "
+                   "triage to break unblock loops. Omit for a generic block."),
++        *_WAKE_CHECK_ARGS(),
+     ], help="Mark one or more tasks blocked"),
+     _cmd("schedule", [
+         _TASK_ID,
+         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+         _bulk_ids("schedule"),
++        *_WAKE_CHECK_ARGS(),
+     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
+     _cmd("unblock", [
+         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index acef783968..16af6bebbc 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -83,9 +83,11 @@ def is_timed_park(kind: Optional[str], reason: Optional[str], *, parents_satisfi
+ def park(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str], requested_kind: Optional[str],
+     source_status: str = "ready", expected_run_id: Optional[int] = None,
++    wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
+ ) -> bool:
+     """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
+ 
+     now = int(time.time())
+     wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
+@@ -103,5 +105,7 @@ def park(
+     kb._append_event(conn, task_id, "scheduled", {
+         "reason": reason, "timed_park": True, "requested_kind": requested_kind,
+         "wake_at": wake_at, "resume_status": source_status,
++        **kwc.park_fields(wake_check, check_every, clock_only),
+     }, run_id=run_id)
++    kwc.set_check(conn, task_id, wake_check, check_every, now=now)
+     return True
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+new file mode 100644
+index 0000000000..f847d37b3b
+--- /dev/null
++++ b/hermes_cli/kanban_wake_check.py
+@@ -0,0 +1,479 @@
++"""Condition wakes: a ``scheduled`` card wakes when a cheap shell probe passes.
++
++A timed park (``kanban_schedule``, ``kanban_block`` kind=time, ``kanban_continue`` with a
++wait) may carry ``wake_check`` (a shell command) and ``check_every`` (seconds). The
++dispatcher probes it off-thread on each tick:
++
++* exit 0 -> the condition holds: the card wakes now (parents re-gated, ``resume_status``
++  honoured, like ``wake_due_continuations``) with a ``condition_met`` event carrying the
++  stdout tail, which the next worker's context shows;
++* exit 1 -> not yet: probe again ``check_every`` seconds later;
++* anything else, or a timeout, ``BROKEN_AFTER`` times in a row -> the card wakes with a
++  ``wake_check_broken`` event so a worker fixes the probe. A broken probe is never silent.
++
++The park's ``wake_at`` stays the deadline backstop. Probe state lives in one row per card
++(``task_wake_checks``), not one event per probe.
++
++The tick never waits on a probe: due probes go to a module-level pool (``MAX_CONCURRENT``
++workers), and each probe thread applies its own result through its own connection, so a
++slow probe cannot stall dispatch and a one-shot dispatcher process still records results.
++
++``guard_error`` is the park guard: a park that wakes more than ``GUARD_SECONDS`` away with
++no ``wake_check`` is refused unless the caller says ``clock_only`` (a pure time wait).
++Without it workers parked 12 h behind a clock to save LLM runs while the condition they
++waited on was already true (t_9be6b361). [daveey]
++"""
++from __future__ import annotations
++
++import logging
++import os
++import signal
++import sqlite3
++import subprocess
++import threading
++import time
++from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
++from concurrent.futures import TimeoutError as FutureTimeout
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_CHECK_EVERY = 900
++MIN_CHECK_EVERY = 120
++MAX_CHECK_EVERY = 21600
++PROBE_TIMEOUT_SECONDS = 30
++MAX_CONCURRENT = 4
++# ``run_due_wake_checks(wait=True)`` never waits longer than this; the dispatcher never waits.
++TICK_BUDGET_SECONDS = 60
++BROKEN_AFTER = 3
++GUARD_SECONDS = 2 * 3600
++OUTPUT_TAIL_CHARS = 500
++MAX_CMD_CHARS = 2000
++CONDITION_MET_EVENT = "condition_met"
++BROKEN_EVENT = "wake_check_broken"
++
++
++GUARD_HELP = (
++    "A wait on any readable fact needs wake_check=<shell command>: exit 0 = the condition "
++    "holds (the card wakes at once), exit 1 = not yet (re-probed every check_every seconds, "
++    "default 900, min 120). Examples: "
++    "`sqlite3 ~/.bb/hub.db \"select build from devices where name='watch'\" | grep -q 559`, "
++    "`gh api repos/OWNER/REPO/tags --jq '.[].name' | grep -q '^desktop-client-v'`, "
++    "`hermes kanban show t_xxxx --json | jq -e '.task.status==\"done\"'`. "
++    "A wait on another card on this board is a parent link (kanban_link), not a park. "
++    "Only a pure time wait (a soak window, a calendar date, a timed re-measure) may pass "
++    "clock_only=true; SCHEDULED_UNTIL stays the deadline either way."
++)
++
++
++# --- parameters + guard -------------------------------------------------------------------
++
++def normalize_every(value: Any) -> int:
++    """``check_every`` clamped to ``[MIN_CHECK_EVERY, MAX_CHECK_EVERY]``; None -> default."""
++    if value is None or value == "":
++        return DEFAULT_CHECK_EVERY
++    try:
++        every = int(value)
++    except (TypeError, ValueError) as exc:
++        raise ValueError("check_every must be an integer number of seconds") from exc
++    return max(MIN_CHECK_EVERY, min(every, MAX_CHECK_EVERY))
++
++
++def normalize_cmd(value: Any) -> Optional[str]:
++    if value is None:
++        return None
++    if not isinstance(value, str):
++        raise ValueError("wake_check must be a shell command string")
++    cmd = value.strip()
++    if len(cmd) > MAX_CMD_CHARS:
++        raise ValueError(f"wake_check is longer than {MAX_CMD_CHARS} chars; put it in a script")
++    return cmd or None
++
++
++def guard_error(*, wake_at: Optional[int], wake_check: Optional[str], clock_only: bool,
++                now: Optional[int] = None) -> Optional[str]:
++    """Refusal text for a park waking more than ``GUARD_SECONDS`` away with no probe."""
++    if wake_check or clock_only or wake_at is None:
++        return None
++    now = int(time.time()) if now is None else int(now)
++    if wake_at - now <= GUARD_SECONDS:
++        return None
++    hours = (wake_at - now) / 3600
++    return (f"refused: this park wakes in {hours:.1f}h and has no wake_check, so a condition "
++            f"that comes true early would sit unnoticed until then. {GUARD_HELP}")
++
++
++def planned_wake(conn: sqlite3.Connection, task_id: str, *, op: str, reason: Optional[str] = None,
++                 kind: Optional[str] = None, blocker_id: Optional[str] = None,
++                 resume_after: int = 0, now: Optional[int] = None) -> Optional[int]:
++    """The wake time a park call would set, or None when the call is not a timed park
++    (``op`` is ``schedule``, ``block`` or ``continue``)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_timed_park as ktp
++
++    now = int(time.time()) if now is None else int(now)
++    if op == "schedule":
++        return ktp.scheduled_payload(reason, now=now)["wake_at"]
++    if op == "block":
++        if blocker_id or not ktp.is_timed_park(
++                kind, reason, parents_satisfied=kb._parents_satisfied(conn, task_id)):
++            return None
++        return ktp.scheduled_until(reason, now=now) or now + ktp.DEFAULT_WAKE_SECONDS
++    if op == "continue":
++        return now + int(resume_after) if resume_after and int(resume_after) > 0 else None
++    raise ValueError(f"unknown park op {op!r}")
++
++
++def park_fields(wake_check: Optional[str], check_every: Optional[int], clock_only: bool) -> dict:
++    """Keys added to the parking event payload (only the ones that are set)."""
++    out: dict = {}
++    if wake_check:
++        out["wake_check"] = wake_check
++        out["check_every"] = normalize_every(check_every)
++    if clock_only:
++        out["clock_only"] = True
++    return out
++
++
++# --- state table --------------------------------------------------------------------------
++
++def set_check(conn: sqlite3.Connection, task_id: str, cmd: Optional[str], every: Optional[int],
++              *, now: Optional[int] = None) -> None:
++    """Record (or clear, when ``cmd`` is None) the card's probe. Caller holds the write txn.
++    The first probe is due at once: the condition may have come true while the worker parked."""
++    conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
++    if not cmd:
++        return
++    now = int(time.time()) if now is None else int(now)
++    conn.execute(
++        "INSERT INTO task_wake_checks (task_id, cmd, every, next_at, fails) VALUES (?, ?, ?, ?, 0)",
++        (task_id, cmd, normalize_every(every), now))
++
++
++def _row_dict(row) -> dict:
++    keys = ("task_id", "cmd", "every", "next_at", "last_at", "last_rc", "last_out", "fails")
++    return {k: row[i] for i, k in enumerate(keys)}
++
++
++_SELECT = "SELECT task_id, cmd, every, next_at, last_at, last_rc, last_out, fails FROM task_wake_checks"
++
++
++def get_state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    try:
++        row = conn.execute(_SELECT + " WHERE task_id = ?", (task_id,)).fetchone()
++    except sqlite3.OperationalError:  # board created by older code, read-only fenced conn
++        return None
++    return _row_dict(row) if row else None
++
++
++def load_states(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, dict]:
++    try:
++        if task_ids is None:
++            rows = conn.execute(_SELECT).fetchall()
++        elif not task_ids:
++            return {}
++        else:
++            marks = ",".join("?" for _ in task_ids)
++            rows = conn.execute(_SELECT + f" WHERE task_id IN ({marks})", tuple(task_ids)).fetchall()
++    except sqlite3.OperationalError:
++        return {}
++    return {r[0]: _row_dict(r) for r in rows}
++
++
++def describe_state(state: dict, *, now: Optional[int] = None) -> str:
++    """One line for ``kanban show`` / worker context."""
++    now = int(time.time()) if now is None else int(now)
++
++    def stamp(ts):
++        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "never"
++
++    last = ("not run yet" if state.get("last_at") is None
++            else f"last run {stamp(state['last_at'])} (last rc {state.get('last_rc')})")
++    fails = f", {state['fails']} failing in a row" if state.get("fails") else ""
++    due = "due now" if state["next_at"] <= now else f"next {stamp(state['next_at'])}"
++    return f"`{state['cmd']}` every {state['every']}s; {last}{fails}; {due}"
++
++
++# --- probe runner -------------------------------------------------------------------------
++
++_LOCK = threading.Lock()
++_POOL: Optional[ThreadPoolExecutor] = None
++_IN_FLIGHT: dict[tuple[str, str], Future] = {}
++_PROCS: dict[tuple[str, str], subprocess.Popen] = {}
++
++
++def _pool() -> ThreadPoolExecutor:
++    global _POOL
++    with _LOCK:
++        if _POOL is None:
++            _POOL = ThreadPoolExecutor(max_workers=MAX_CONCURRENT, thread_name_prefix="kanban-wake-check")
++        return _POOL
++
++
++def in_flight() -> list[str]:
++    with _LOCK:
++        return sorted(tid for (_, tid), fut in _IN_FLIGHT.items() if not fut.done())
++
++
++def _shutdown_for_tests() -> None:
++    """Kill every running probe and drop the pool (tests only)."""
++    global _POOL
++    with _LOCK:
++        procs = list(_PROCS.values())
++        pool, _POOL = _POOL, None
++    for proc in procs:
++        _kill(proc)
++    if pool is not None:
++        pool.shutdown(wait=True, cancel_futures=True)
++    with _LOCK:
++        _IN_FLIGHT.clear()
++        _PROCS.clear()
++
++
++def _kill(proc: subprocess.Popen) -> None:
++    try:
++        os.killpg(proc.pid, signal.SIGKILL)
++    except (ProcessLookupError, PermissionError, OSError):
++        try:
++            proc.kill()
++        except OSError:
++            pass
++
++
++def _tail(text: str) -> str:
++    text = (text or "").strip()
++    return text[-OUTPUT_TAIL_CHARS:]
++
++
++def _profile_home(task) -> Optional[str]:
++    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
++
++    try:
++        profile = normalize_profile_name(task.assignee) if task.assignee else None
++        return str(resolve_profile_env(profile)) if profile else None
++    except (FileNotFoundError, ValueError, OSError):
++        logger.debug("wake check: no profile home for %s", task.id, exc_info=True)
++        return None
++
++
++def _probe_env(task, db_path: str) -> dict:
++    """The assignee profile's env (``served_profile_child_env``: its HERMES_HOME and its own
++    secrets, never the launch profile's) plus the board pin, so ``hermes kanban show`` in a
++    probe reads the card's board."""
++    from agent.secret_scope import UnscopedSecretError
++    from tools.environments.local import served_profile_child_env
++
++    home = _profile_home(task)
++    try:
++        env = served_profile_child_env(target_home=home, inherit_credentials=True)
++    except UnscopedSecretError:  # multiplex with no profile home: no credentials, not the launcher's
++        logger.debug("wake check: no secret scope for %s", task.id, exc_info=True)
++        env = served_profile_child_env(target_home=home, inherit_credentials=False)
++    for key in ("HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_SESSION_ID", "HERMES_KANBAN_BOARD"):
++        env.pop(key, None)
++    env["HERMES_KANBAN_TASK"] = task.id
++    env["HERMES_KANBAN_DB"] = db_path
++    return env
++
++
++def _run_probe(key: tuple[str, str], cmd: str, cwd: str, env: dict) -> tuple[Any, str]:
++    """``(rc, output)``; rc is ``"timeout"`` when the probe outlived ``PROBE_TIMEOUT_SECONDS``."""
++    try:
++        proc = subprocess.Popen(
++            ["bash", "-lc", cmd], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
++            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
++    except OSError as exc:
++        return 127, f"could not start probe: {exc}"
++    with _LOCK:
++        _PROCS[key] = proc
++    try:
++        out, _ = proc.communicate(timeout=PROBE_TIMEOUT_SECONDS)
++        return proc.returncode, out.decode("utf-8", "replace")
++    except subprocess.TimeoutExpired:
++        _kill(proc)
++        try:
++            out, _ = proc.communicate(timeout=5)
++        except (subprocess.TimeoutExpired, OSError, ValueError):
++            out = b""
++        return "timeout", (out or b"").decode("utf-8", "replace") + f"\n[timed out after {PROBE_TIMEOUT_SECONDS}s]"
++    finally:
++        with _LOCK:
++            _PROCS.pop(key, None)
++
++
++def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int]) -> Any:
++    key = (db_path, task_id)
++    try:
++        rc, out = _run_probe(key, cmd, cwd, env)
++        from hermes_cli import kanban_db_connect as kbc
++        conn = kbc.connect(Path(db_path))
++        try:
++            apply_result(conn, task_id, cmd, rc, out, now=now)
++        finally:
++            conn.close()
++        return rc
++    except Exception:
++        logger.warning("kanban wake check for %s failed to run/apply", task_id, exc_info=True)
++        return None
++
++
++def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str,
++                 *, now: Optional[int] = None) -> Optional[str]:
++    """Record one probe result; wake the card on success or a broken probe. Returns the event
++    kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
++    that is no longer the card's (re-parked, unblocked) is dropped."""
++    from hermes_cli import kanban_db as kb
++
++    now = int(time.time()) if now is None else int(now)
++    tail = _tail(out)
++    with kb.write_txn(conn):
++        state = get_state(conn, task_id)
++        status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if state is None or state["cmd"] != cmd or status is None or status[0] != "scheduled":
++            return None
++        rc_col = rc if isinstance(rc, int) else -1
++        if rc == 0:
++            return _wake(conn, task_id, CONDITION_MET_EVENT, {"wake_check": cmd, "output": tail})
++        if rc == 1:
++            conn.execute(
++                "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
++                "next_at = ? WHERE task_id = ?", (now, tail, now + int(state["every"]), task_id))
++            return None
++        fails = int(state["fails"] or 0) + 1
++        if fails >= BROKEN_AFTER:
++            return _wake(conn, task_id, BROKEN_EVENT, {
++                "wake_check": cmd, "rc": rc, "fails": fails, "output": tail,
++                "note": "The wake_check failed (not exit 0/1) repeatedly. Fix the probe, then park again."})
++        conn.execute(
++            "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, fails = ?, "
++            "next_at = ? WHERE task_id = ?", (now, rc_col, tail, fails, now + int(state["every"]), task_id))
++        return None
++
++
++def _wake(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict) -> Optional[str]:
++    """``scheduled`` -> its resumable phase, as ``wake_due_continuations`` does. In a txn."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_continuation import pending_wake
++
++    park = pending_wake(conn, task_id) or {}
++    resume = park.get("resume_status") if park.get("resume_status") in ("ready", "review") else "ready"
++    landing = kb._landing_status_after_parents(conn, task_id)
++    new_status = "review" if landing == "ready" and resume == "review" else landing
++    cur = conn.execute(
++        "UPDATE tasks SET status = ?, current_run_id = NULL WHERE id = ? AND status = 'scheduled'",
++        (new_status, task_id))
++    if cur.rowcount != 1:
++        return None
++    conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
++    kb._append_event(conn, task_id, kind, {**payload, "status": new_status, "wake_at": park.get("wake_at")})
++    return kind
++
++
++def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None, wait: bool = False) -> dict:
++    """Start every due probe (at most ``MAX_CONCURRENT`` in flight) and return at once;
++    ``wait=True`` (tests, one-shot callers) also waits up to ``TICK_BUDGET_SECONDS`` for them.
++    Returns ``{"submitted": [task ids], "in_flight": n}``. Never raises."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    submitted: list[str] = []
++    futures: list[Future] = []
++    try:
++        db_path = kbc._main_db_file(conn)
++        if not db_path:
++            return {"submitted": [], "in_flight": 0}
++        ts = int(time.time()) if now is None else int(now)
++        try:
++            stale = conn.execute(
++                "SELECT w.task_id FROM task_wake_checks w LEFT JOIN tasks t ON t.id = w.task_id "
++                "WHERE t.status IS NOT 'scheduled'").fetchall()
++        except sqlite3.OperationalError:
++            return {"submitted": [], "in_flight": 0}
++        if stale:
++            with kb.write_txn(conn):
++                for row in stale:
++                    conn.execute("DELETE FROM task_wake_checks WHERE task_id = ? AND task_id NOT IN "
++                                 "(SELECT id FROM tasks WHERE status = 'scheduled')", (row[0],))
++        due = conn.execute(
++            "SELECT w.task_id, w.cmd, w.every FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
++            "WHERE t.status = 'scheduled' AND w.next_at <= ? ORDER BY w.next_at", (ts,)).fetchall()
++        for task_id, cmd, every in due:
++            key = (db_path, task_id)
++            with _LOCK:
++                busy = sum(1 for f in _IN_FLIGHT.values() if not f.done())
++                running = key in _IN_FLIGHT and not _IN_FLIGHT[key].done()
++            if running:
++                continue
++            if busy >= MAX_CONCURRENT:
++                break
++            task = kb.get_task(conn, task_id)
++            if task is None:
++                continue
++            # Claim the slot first so a crash mid-probe cannot re-run it every tick.
++            with kb.write_txn(conn):
++                conn.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ? AND cmd = ?",
++                             (ts + int(every), task_id, cmd))
++            ws = task.workspace_path
++            cwd = ws if ws and os.path.isabs(ws) and os.path.isdir(ws) else str(Path.home())
++            fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now)
++            with _LOCK:
++                _IN_FLIGHT[key] = fut
++            submitted.append(task_id)
++            futures.append(fut)
++        with _LOCK:
++            for k in [k for k, f in _IN_FLIGHT.items() if f.done()]:
++                _IN_FLIGHT.pop(k, None)
++    except Exception:
++        logger.warning("kanban wake checks: tick failed", exc_info=True)
++    if wait and futures:
++        deadline = time.monotonic() + TICK_BUDGET_SECONDS
++        for fut in futures:
++            try:
++                fut.result(timeout=max(0.0, deadline - time.monotonic()))
++            except (FutureTimeout, CancelledError):
++                logger.debug("kanban wake check still running after the wait budget")
++    return {"submitted": submitted, "in_flight": len(in_flight())}
++
++
++# --- worker context -----------------------------------------------------------------------
++
++def render_wake_context(conn: sqlite3.Connection, task_id: str) -> str:
++    """Why this run woke (``condition_met`` / ``wake_check_broken`` after the last park), or
++    the live probe while the card is parked. Advisory: never raises (empty on failure)."""
++    try:
++        return _render_wake_context(conn, task_id)
++    except (sqlite3.Error, KeyError, TypeError, ValueError):
++        logger.debug("wake check context failed for %s", task_id, exc_info=True)
++        return ""
++
++
++def _render_wake_context(conn: sqlite3.Connection, task_id: str) -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_continuation import SCHEDULED_ENTRY_EVENTS
++
++    lines: list[str] = []
++    kinds = (*SCHEDULED_ENTRY_EVENTS, CONDITION_MET_EVENT, BROKEN_EVENT)
++    marks = ",".join("?" for _ in kinds)
++    row = conn.execute(
++        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++        "ORDER BY id DESC LIMIT 1", (task_id, *kinds)).fetchone()
++    if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT):
++        payload = kb._json_dict(row[1])
++        if row[0] == CONDITION_MET_EVENT:
++            lines.append("## Woken by wake check (condition met)")
++            lines.append(f"The park's wake_check `{payload.get('wake_check')}` exited 0, so this card "
++                         "woke before its deadline. Its output:")
++        else:
++            lines.append("## Woken because the wake check is broken")
++            lines.append(f"The park's wake_check `{payload.get('wake_check')}` failed "
++                         f"{payload.get('fails')} times in a row (last rc {payload.get('rc')}). Fix the "
++                         "probe (exit 0 = condition holds, 1 = not yet), then re-check the condition "
++                         "yourself and park again if it still does not hold. Last output:")
++        lines += ["```", payload.get("output") or "(no output)", "```", ""]
++        return "\n".join(lines) + "\n"
++    state = get_state(conn, task_id)
++    if state is not None:
++        lines += ["## Wake check", describe_state(state), ""]
++        return "\n".join(lines) + "\n"
++    return ""
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 4228a0a772..c26977c8d8 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -231,11 +231,14 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
+     events_by_task = _rows_by_task("task_events")
+     runs_by_task = _rows_by_task("task_runs")
+     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
++    from hermes_cli import kanban_wake_check as kwc
++    wake_by_task = kwc.load_states(conn, row_ids)
+     out: dict[str, list[dict]] = {}
+     for r in rows:
+         tid = r["id"]
+         diags = kd.compute_task_diagnostics(
+-            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid))
++            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid),
++            wake_check=wake_by_task.get(tid))
+         if diags:
+             out[tid] = [d.to_dict() for d in diags]
+     return out
+@@ -466,6 +469,8 @@ def get_task(
+         child_summaries = kanban_db.latest_summaries(conn, links["children"])
+         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
+         _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
++        from hermes_cli import kanban_wake_check as kwc
++        task_d["wake_check"] = kwc.get_state(conn, task_id)  # condition wake probe [daveey]
+         return {
+             "task": task_d,
+             "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
+diff --git a/tests/hermes_cli/test_kanban_block_kinds.py b/tests/hermes_cli/test_kanban_block_kinds.py
+index b8423ff1c8..9cea3a74ca 100644
+--- a/tests/hermes_cli/test_kanban_block_kinds.py
++++ b/tests/hermes_cli/test_kanban_block_kinds.py
+@@ -128,7 +128,9 @@ def test_dependency_block_with_terminal_parents_is_a_timed_park(
+         child = _running_task(conn, title="child-of-done", parents=(parent,))
+ 
+         # `hermes kanban block <child> --kind dependency waiting on upstream`
+-        args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"], kind="dependency")
++        # A 24 h wait with nothing to probe must say so (kanban_wake_check guard). [daveey]
++        args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"], kind="dependency",
++                                  clock_only=True)
+         assert kanban_cli._cmd_block(args) == 0
+         capsys.readouterr()
+         parked = kb.get_task(conn, child)
+diff --git a/tests/hermes_cli/test_kanban_timed_park.py b/tests/hermes_cli/test_kanban_timed_park.py
+index bf2937cf77..fcc50ecdce 100644
+--- a/tests/hermes_cli/test_kanban_timed_park.py
++++ b/tests/hermes_cli/test_kanban_timed_park.py
+@@ -120,7 +120,8 @@ def test_kanban_block_tool_time_kind_on_goal_mode_card(kanban_home: Path, monkey
+         run_id = kb.get_task(conn, tid).current_run_id
+     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+-    out = json.loads(kt._handle_block({"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z nightly run", "kind": "time"}))
++    out = json.loads(kt._handle_block({"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z nightly run", "kind": "time",
++                                       "clock_only": True}))
+     assert out.get("status") == "scheduled", out
+     assert out.get("wake_at")
+ 
+diff --git a/tests/hermes_cli/test_kanban_wake_check.py b/tests/hermes_cli/test_kanban_wake_check.py
+new file mode 100644
+index 0000000000..63cd00c6b3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_check.py
+@@ -0,0 +1,271 @@
++"""Condition wakes: a scheduled card wakes when a cheap ``wake_check`` probe passes,
++not only when its clock runs out.
++
++Regression for t_9be6b361: parked until 19:20 with a clock, while its condition (a Watch
++build row) was already true at 10:58; nothing looked until David asked. [daveey]
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    yield home
++    kwc._shutdown_for_tests()
++
++
++def _running(conn) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return tid
++
++
++def _events(conn, tid, kind):
++    return [e for e in kb.list_events(conn, tid) if e.kind == kind]
++
++
++def _worker_env(monkeypatch, conn, tid):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
++
++
++def _flag(tmp_path: Path) -> Path:
++    return tmp_path / "cw-flag"
++
++
++def _probe(flag: Path) -> str:
++    return f"test -f {flag} && cat {flag} || exit 1"
++
++
++def _assert_condition_wake(conn, tid, flag: Path) -> None:
++    park = _events(conn, tid, "scheduled")[-1].payload
++    assert park["wake_check"] == _probe(flag) and park["check_every"] == 300
++    wake_at = park["wake_at"]
++    now = int(time.time())
++    # Probe exits 1: still scheduled; the next probe is due one interval later.
++    kwc.run_due_wake_checks(conn, now=now, wait=True)
++    assert kb.get_task(conn, tid).status == "scheduled"
++    state = kwc.get_state(conn, tid)
++    assert state["last_rc"] == 1 and state["next_at"] >= now + 300 and state["fails"] == 0
++    # Not due yet: nothing runs.
++    assert kwc.run_due_wake_checks(conn, now=now + 10, wait=True)["submitted"] == []
++    flag.write_text("build 559 seen\n")
++    kwc.run_due_wake_checks(conn, now=now + 301, wait=True)
++    task = kb.get_task(conn, tid)
++    assert task.status == "ready"
++    met = _events(conn, tid, "condition_met")
++    assert met and "build 559 seen" in met[-1].payload["output"]
++    assert met[-1].created_at < wake_at
++    # The next worker sees why it woke.
++    assert "build 559 seen" in kb.build_worker_context(conn, tid)
++
++
++def test_kanban_schedule_wake_check_wakes_when_probe_passes(kanban_home, tmp_path, monkeypatch) -> None:
++    from tools import kanban_tools as kt
++
++    flag = _flag(tmp_path)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _worker_env(monkeypatch, conn, tid)
++        out = json.loads(kt._handle_schedule({
++            "reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for build 559",
++            "wake_check": _probe(flag), "check_every": 300}))
++        assert out.get("status") == "scheduled", out
++        _assert_condition_wake(conn, tid, flag)
++
++
++def test_kanban_block_time_wake_check_wakes_when_probe_passes(kanban_home, tmp_path, monkeypatch) -> None:
++    from tools import kanban_tools as kt
++
++    flag = _flag(tmp_path)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (tid,))
++        _worker_env(monkeypatch, conn, tid)
++        out = json.loads(kt._handle_block({
++            "reason": "waiting for build 559", "kind": "time",
++            "wake_check": _probe(flag), "check_every": 300}))
++        assert out.get("status") == "scheduled", out
++        _assert_condition_wake(conn, tid, flag)
++
++
++@pytest.mark.parametrize("cmd", ["exit 2", "sleep 5"])
++def test_broken_probe_wakes_card_after_three_failures(kanban_home, monkeypatch, cmd) -> None:
++    monkeypatch.setattr(kwc, "PROBE_TIMEOUT_SECONDS", 1)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                wake_check=cmd, check_every=120)
++        now = int(time.time())
++        for i in range(2):
++            kwc.run_due_wake_checks(conn, now=now + i * 200, wait=True)
++            assert kb.get_task(conn, tid).status == "scheduled"
++            assert kwc.get_state(conn, tid)["fails"] == i + 1
++        kwc.run_due_wake_checks(conn, now=now + 400, wait=True)
++        assert kb.get_task(conn, tid).status == "ready"
++        broken = _events(conn, tid, "wake_check_broken")
++        assert broken and broken[-1].payload["rc"] == (2 if cmd == "exit 2" else "timeout")
++        assert not _events(conn, tid, "condition_met")
++
++
++def test_long_park_without_wake_check_is_refused(kanban_home, monkeypatch) -> None:
++    from tools import kanban_tools as kt
++
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _worker_env(monkeypatch, conn, tid)
++        far = "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on the nightly tag"
++        out = json.loads(kt._handle_schedule({"reason": far}))
++        assert "error" in out and "wake_check" in out["error"] and "gh api" in out["error"]
++        assert kb.get_task(conn, tid).status == "running"
++        # kind=time with no marker defaults to a 24 h wake: also refused.
++        out = json.loads(kt._handle_block({"reason": "soak", "kind": "time"}))
++        assert "error" in out and kb.get_task(conn, tid).status == "running"
++        # A pure clock wait says so.
++        out = json.loads(kt._handle_block({"reason": far, "kind": "time", "clock_only": True}))
++        assert out.get("status") == "scheduled", out
++        assert _events(conn, tid, "scheduled")[-1].payload["clock_only"] is True
++
++
++def test_kanban_continue_long_wait_needs_wake_check(kanban_home, tmp_path, monkeypatch) -> None:
++    from tools import kanban_tools as kt
++
++    flag = _flag(tmp_path)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _worker_env(monkeypatch, conn, tid)
++        out = json.loads(kt._handle_continue({"checkpoint": "waiting on CI", "resume_after_seconds": 43200}))
++        assert "error" in out and kb.get_task(conn, tid).status == "running"
++        out = json.loads(kt._handle_continue({"checkpoint": "waiting on CI", "resume_after_seconds": 43200,
++                                              "wake_check": _probe(flag), "check_every": 300}))
++        assert out.get("status") == "scheduled", out
++        assert _events(conn, tid, "continued")[-1].payload["wake_check"] == _probe(flag)
++        flag.write_text("ci green\n")
++        kwc.run_due_wake_checks(conn, wait=True)
++        assert kb.get_task(conn, tid).status == "ready"
++        assert "ci green" in _events(conn, tid, "condition_met")[-1].payload["output"]
++
++
++def test_short_park_without_wake_check_is_accepted(kanban_home, monkeypatch) -> None:
++    from datetime import UTC, datetime
++
++    from tools import kanban_tools as kt
++
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _worker_env(monkeypatch, conn, tid)
++        soon = datetime.fromtimestamp(time.time() + 3600, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++        out = json.loads(kt._handle_schedule({"reason": f"SCHEDULED_UNTIL={soon} CI"}))
++        assert out.get("status") == "scheduled", out
++        assert kwc.get_state(conn, tid) is None
++
++
++def test_slow_probe_does_not_stall_the_dispatcher_tick(kanban_home) -> None:
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                wake_check="sleep 40", check_every=120)
++        started = time.monotonic()
++        result = kbd.DispatchResult()
++        kbd._run_reclaim_phase(conn, result, stale_timeout_seconds=3600, failure_limit=2,
++                               reconcile_orphans=False)
++        assert time.monotonic() - started < 5
++        assert kwc.in_flight() == [tid], kwc.get_state(conn, tid)
++        # A second tick while it runs does not start a duplicate.
++        kbd._run_reclaim_phase(conn, kbd.DispatchResult(), stale_timeout_seconds=3600,
++                               failure_limit=2, reconcile_orphans=False)
++        assert kwc.in_flight() == [tid]
++        assert kb.get_task(conn, tid).status == "scheduled"
++
++
++def test_wake_check_state_is_visible_in_show_and_context(kanban_home) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                wake_check="exit 1", check_every=120)
++        kwc.run_due_wake_checks(conn, wait=True)
++        ctx = kb.build_worker_context(conn, tid)
++        assert "Wake check" in ctx and "exit 1" in ctx and "last rc 1" in ctx
++
++
++def test_cli_wake_check_flags_round_trip(kanban_home, capsys) -> None:
++    from hermes_cli import kanban as kcli
++
++    with kbc.connect_closing() as conn:
++        a, b = _running(conn), _running(conn)
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++
++    def run(*argv):
++        return kcli.kanban_command(parser.parse_args(["kanban", *argv]))
++
++    assert run("schedule", a, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z", "--wake-check", "test -f /x",
++               "--check-every", "600") == 0
++    assert run("block", b, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z", "--kind", "time",
++               "--wake-check", "exit 1") == 0
++    with kbc.connect_closing() as conn:
++        assert kwc.get_state(conn, a)["cmd"] == "test -f /x" and kwc.get_state(conn, a)["every"] == 600
++        assert kwc.get_state(conn, b)["every"] == kwc.DEFAULT_CHECK_EVERY
++        c = _running(conn)
++    # The guard holds on the CLI too, and --clock-only lifts it.
++    assert run("schedule", c, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z") != 0
++    assert run("schedule", c, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z", "--clock-only") == 0
++    capsys.readouterr()
++    assert run("show", a, "--json") == 0
++    shown = json.loads(capsys.readouterr().out)
++    assert shown["wake_check"]["cmd"] == "test -f /x" and shown["wake_check"]["every"] == 600
++
++
++def test_check_every_is_clamped(kanban_home) -> None:
++    assert kwc.normalize_every(None) == 900
++    assert kwc.normalize_every(5) == 120
++    assert kwc.normalize_every(10**6) == 21600
++
++
++def test_diagnostics_flag_clock_parks_and_failing_probes(kanban_home) -> None:
++    from hermes_cli import kanban_diagnostics as kd
++
++    with kbc.connect_closing() as conn:
++        legacy, failing, ok = _running(conn), _running(conn), _running(conn)
++        # Legacy: parked 24 h out with no probe and no clock_only (old code path).
++        assert kb.schedule_task(conn, legacy, reason="waiting on a tag")
++        assert kb.schedule_task(conn, failing, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                wake_check="exit 2", check_every=120)
++        assert kb.schedule_task(conn, ok, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                clock_only=True)
++        kwc.run_due_wake_checks(conn, wait=True)
++        states = kwc.load_states(conn)
++
++        def kinds(tid, now=None):
++            return {d.kind for d in kd.compute_task_diagnostics(
++                kb.get_task(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid),
++                wake_check=states.get(tid), now=now)}
++
++        assert "clock_only_park" in kinds(legacy)
++        assert "wake_check_failing" in kinds(failing)
++        assert not ({"clock_only_park", "wake_check_failing"} & kinds(ok))
++        # A probe that has not run long after it was due is flagged too.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_wake_checks SET last_rc = 1, fails = 0 WHERE task_id = ?", (failing,))
++        states = kwc.load_states(conn)
++        assert "wake_check_overdue" in kinds(failing, now=states[failing]["next_at"] + 3600)
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 093fbc755e..3bc7f08114 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -599,7 +599,8 @@ def test_block_dependency_without_open_parent_is_a_timed_park(worker_env):
+     human ``blocked`` bucket: it is a timed wait, and the tool says when it wakes."""
+     from tools import kanban_tools as kt
+ 
+-    d = json.loads(kt._handle_block({"reason": "upstream input is missing", "kind": "dependency"}))
++    d = json.loads(kt._handle_block({"reason": "upstream input is missing", "kind": "dependency",
++                                     "clock_only": True}))
+     assert (d["ok"], d["status"], d["requested_kind"]) == (True, "scheduled", "dependency")
+     assert d["wake_at"] and "not a human block" in d["note"]
+ 
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 182cd2afb4..9519ce8989 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -930,6 +930,37 @@ def _blocker_id_arg(args: dict) -> Optional[str]:
+     return bid
+ 
+ 
++def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
++    """``(wake_check, check_every, clock_only)`` from a park call, validated. [daveey]"""
++    from hermes_cli import kanban_wake_check as kwc
++
++    raw_every = args.get("check_every")
++    _check(raw_every is None or (isinstance(raw_every, (int, float)) and not isinstance(raw_every, bool)),
++           "check_every must be an integer number of seconds")
++    clock_only = args.get("clock_only", False)
++    _check(isinstance(clock_only, bool), "clock_only must be true or false")
++    try:
++        cmd = kwc.normalize_cmd(args.get("wake_check"))
++        every = kwc.normalize_every(raw_every) if cmd else None
++    except ValueError as exc:
++        _check(False, str(exc))
++    return (_redact(cmd) if cmd else None), every, clock_only
++
++
++def _wake_check_echo(wake: tuple) -> dict:
++    """Result fields echoing the park's probe (none when it has no probe)."""
++    return {"wake_check": wake[0], "check_every": wake[1]} if wake[0] else {}
++
++
++def _park_guard(conn, tid: str, op: str, wake: tuple, **plan: Any) -> None:
++    """Refuse a park that wakes > 2 h away with no wake_check and no clock_only. [daveey]"""
++    from hermes_cli import kanban_wake_check as kwc
++
++    wake_at = kwc.planned_wake(conn, tid, op=op, **plan)
++    err = kwc.guard_error(wake_at=wake_at, wake_check=wake[0], clock_only=wake[2])
++    _check(err is None, f"kanban_{op} {err}", "invalid_args")
++
++
+ @_kanban_handler("kanban_block")
+ def _handle_block(args: dict, **kw) -> str:
+     """Transition the task to blocked with a reason a human will read."""
+@@ -957,8 +988,11 @@ def _handle_block(args: dict, **kw) -> str:
+                f"finished or cannot proceed for another reason, call kanban_complete instead — "
+                f"the completion judge will evaluate it.")
+         blocker_id = _blocker_id_arg(args)
++        wake = _wake_check_args(args)
++        _park_guard(conn, tid, "block", wake, reason=reason, kind=kind, blocker_id=blocker_id)
+         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+-                           blocker_id=blocker_id)
++                           blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1],
++                           clock_only=wake[2])
+         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+         landed_kind = kb.get_task(conn, tid).block_kind
+         extra: dict = {"block_kind": landed_kind}
+@@ -968,10 +1002,11 @@ def _handle_block(args: dict, **kw) -> str:
+         if landed_status == "scheduled":
+             # A wait on time, not on a human: parked with a wake time (kanban_timed_park). [daveey]
+             from hermes_cli.kanban_continuation import pending_wake
+-            wake = pending_wake(conn, tid) or {}
+-            return _ok_landed(kb, conn, tid, "scheduled", requested_kind=kind, wake_at=wake.get("wake_at"),
+-                              note=("Parked as a timed wait (scheduled), not a human block: it wakes at "
+-                                    "wake_at, or earlier on `hermes kanban unblock`."))
++            parked = pending_wake(conn, tid) or {}
++            return _ok_landed(kb, conn, tid, "scheduled", requested_kind=kind, wake_at=parked.get("wake_at"),
++                              **_wake_check_echo(wake),
++                              note=("Parked as a timed wait (scheduled), not a human block: it wakes when "
++                                    "wake_check exits 0, at wake_at, or earlier on `hermes kanban unblock`."))
+         if kind == "dependency" and landed_kind != kind:
+             # block_task re-kinds a dependency wait that no open parent can satisfy.
+             extra["requested_kind"] = kind
+@@ -998,11 +1033,14 @@ def _handle_schedule(args: dict, **kw) -> str:
+                "goal_mode tasks cannot be scheduled: for a wait on time or a cron use "
+                "kanban_block with kind='time' (SCHEDULED_UNTIL=<ISO8601> in the reason sets "
+                "the wake), or kanban_complete so the completion judge can evaluate it.")
++        wake = _wake_check_args(args)
++        _park_guard(conn, tid, "schedule", wake, reason=reason)
+         ok = kb.schedule_task(
+-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
++            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
++            wake_check=wake[0], check_every=wake[1], clock_only=wake[2])
+         _check(ok, f"could not schedule {tid} (unknown id, not in todo/ready/running/blocked, or it "
+                    "waits on a human answer: needs_input/capability asks stay blocked, never scheduled)")
+-        return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
++        return _ok_landed(kb, conn, tid, "scheduled", reason=reason, **_wake_check_echo(wake))
+ 
+ 
+ @_kanban_handler("kanban_continue")
+@@ -1026,8 +1064,11 @@ def _handle_continue(args: dict, **kw) -> str:
+         metadata = {**(metadata or {}), "blocker_id": blocker_id}
+     from hermes_cli.kanban_continuation import continue_task
+     with _board(args.get("board")) as (kb, conn):
++        wake = _wake_check_args(args)
++        _park_guard(conn, tid, "continue", wake, resume_after=int(raw_after or 0))
+         res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
+-                            expected_run_id=_worker_run_id(tid), metadata=metadata)
++                            expected_run_id=_worker_run_id(tid), metadata=metadata,
++                            wake_check=wake[0], check_every=wake[1], clock_only=wake[2])
+         _check(res.get("ok"), f"could not continue {tid}: {res.get('error')}")
+         note = ("Checkpoint saved; a fresh run will resume this card"
+                 + (f" after {int(raw_after)}s" if raw_after else " now")
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index f0375c96f9..e9d3178544 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -167,6 +167,26 @@ KANBAN_COMPLETE_SCHEMA = _schema(
+     [],
+ )
+ 
++_WAKE_CHECK_PROPS = {
++    "wake_check": _prop("string", (
++        "Shell command probed by the dispatcher while the card is parked (bash -lc, 30 s "
++        "timeout, cwd = the task workspace): exit 0 = the condition holds and the card wakes "
++        "at once (its stdout reaches the next run), exit 1 = not yet. Any other exit 3 times in "
++        "a row wakes the card to fix the probe. REQUIRED for a wait on any readable fact (a DB "
++        "row, a git tag, a file, a log line, a service state) that wakes more than 2 h out, e.g. "
++        "`gh api repos/O/R/tags --jq '.[].name' | grep -q '^v2'`. A wait on another card on "
++        "this board is a parent link (kanban_link), not a park."
++    )),
++    "check_every": {"type": "integer", "description": (
++        "Seconds between wake_check probes (default 900, min 120, max 21600)."
++    )},
++    "clock_only": {"type": "boolean", "description": (
++        "Set true only for a pure time wait with no fact to probe (a soak window, a calendar "
++        "date, a timed re-measure). A park more than 2 h out needs wake_check or clock_only."
++    )},
++}
++
++
+ KANBAN_BLOCK_SCHEMA = _schema(
+     "kanban_block",
+     (
+@@ -186,7 +206,11 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "block on things you can resolve yourself. Waiting on time or an "
+         "external event (a cap, a soak, a release window) is not a block: use "
+         "kind='time' (put SCHEDULED_UNTIL=<ISO8601> in the reason to set the wake; "
+-        "default 24h), since a blocked card marks its chat as needing a human."
++        "default 24h), since a blocked card marks its chat as needing a human. "
++        "A timed wait on any readable fact needs ``wake_check`` (a shell probe; "
++        "the card wakes the moment it exits 0); a park more than 2 h out without "
++        "one is refused unless ``clock_only`` is true. A wait on another card on "
++        "this board is a parent link (kanban_link), not a park."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+@@ -219,6 +243,7 @@ KANBAN_BLOCK_SCHEMA = _schema(
+             "dispatcher then holds every card behind it and runs one probe card per "
+             "interval; a run that ends without the id clears it and releases the rest."
+         )),
++        **_WAKE_CHECK_PROPS,
+     },
+     ["reason"],
+ )
+@@ -229,7 +254,11 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+         "Park your current task in the 'scheduled' state while it waits for "
+         "time or an external event. This ends the current run and makes the "
+         "task non-dispatchable until an orchestrator unblocks it, or until the "
+-        "time named by a ``SCHEDULED_UNTIL=<ISO8601>`` marker in ``reason``."
++        "time named by a ``SCHEDULED_UNTIL=<ISO8601>`` marker in ``reason`` "
++        "(default 24h), or until ``wake_check`` exits 0. A wait on any readable "
++        "fact needs ``wake_check``; a park more than 2 h out without one is "
++        "refused unless ``clock_only`` is true. A wait on another card on this "
++        "board is a parent link (kanban_link), not a park."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+@@ -237,6 +266,7 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+             "Optional reason or machine-readable wake-up marker recorded on "
+             "the completed run and scheduled event."
+         )),
++        **_WAKE_CHECK_PROPS,
+     },
+     [],
+ )
+@@ -270,8 +300,10 @@ KANBAN_CONTINUE_SCHEMA = _schema(
+         "resume_after_seconds": {"type": "integer", "description": (
+             "Optional. 0 (default) re-queues immediately. N > 0 parks the card in "
+             "'scheduled' and the dispatcher re-queues it after N seconds (max "
+-            "86400): use this to hand off a wait instead of polling."
++            "86400): use this to hand off a wait instead of polling. Over 7200 "
++            "needs wake_check (or clock_only for a pure time wait)."
+         )},
++        **_WAKE_CHECK_PROPS,
+         "metadata": {"type": "object", "description": (
+             "Optional machine-readable state (e.g. {\"pids\": [...], \"ci_run\": ...})."
+         )},
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 7bad3ca51f..ca62d40bdb 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -373,8 +373,24 @@ described above.
+ 
+ `kanban_continue(..., resume_after_seconds=N)` hands off a wait (CI, a release,
+ a soak) instead of polling inside the run: the card parks in `scheduled` and
+-the dispatcher re-queues it after `N` seconds (at most 24 h). Plain
+-`kanban_schedule` parks are never auto-woken.
++the dispatcher re-queues it after `N` seconds (at most 24 h). A plain
++`kanban_schedule` park wakes at its `SCHEDULED_UNTIL=` marker, else after 24 h.
++
++Condition wakes: `kanban_schedule`, `kanban_block(kind="time")` and
++`kanban_continue(resume_after_seconds=N)` accept `wake_check` (a shell command)
++and `check_every` (seconds, default 900, min 120, max 21600). While the card is
++parked the dispatcher runs the probe off-thread (`bash -lc`, 30 s timeout, cwd =
++the task workspace, at most 4 at once) without spawning a worker. Exit 0 wakes
++the card at once with a `condition_met` event carrying the probe's stdout;
++exit 1 means not yet; any other exit (or a timeout) 3 times in a row wakes it
++with `wake_check_broken` so a worker fixes the probe. The wake time stays the
++deadline. A park that wakes more than 2 h out with no `wake_check` is refused
++unless the call passes `clock_only=true` (a pure time wait). A wait on another
++card on the same board is a parent link (`kanban_link`), not a park. CLI:
++`hermes kanban schedule|block <id> --wake-check '<cmd>' [--check-every N] [--clock-only]`.
++Probe state is in the `task_wake_checks` table and shown by `kanban show`,
++the worker context and the board API; `kanban diagnostics` flags failing or
++overdue probes, and parks more than 2 h out that have neither.
+ 
+ Continuations leave `consecutive_failures` and the unblock-loop counter
+ untouched, so they never trip the give-up or block-loop limits. Their own
+-- 
+2.55.0
+

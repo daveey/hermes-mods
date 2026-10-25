@@ -1,0 +1,215 @@
+From 468bf675aa3f1562f5d2601e2789fb35249b8fc3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:39:36 +0000
+Subject: [PATCH] fix(kanban): retain delegated fence when lineage checks fail
+ [daveey]
+
+---
+ agent/delegation_context.py                   |  31 +++--
+ .../test_delegate_lineage_fail_closed.py      | 113 ++++++++++++++++++
+ 2 files changed, 135 insertions(+), 9 deletions(-)
+ create mode 100644 tests/agent/test_delegate_lineage_fail_closed.py
+
+diff --git a/agent/delegation_context.py b/agent/delegation_context.py
+index b2217a1f27..5cc2eb5dfa 100644
+--- a/agent/delegation_context.py
++++ b/agent/delegation_context.py
+@@ -80,15 +80,19 @@ def is_agent_scope_env_key(key: str) -> bool:
+     return key.startswith(AGENT_SCOPE_PREFIXES) and not AGENT_SCOPE_TUNABLE_RE.search(key)
+ 
+ 
+-def strip_agent_scope_env(env: MutableMapping[str, str]) -> list[str]:
++def strip_agent_scope_env(
++    env: MutableMapping[str, str], *, preserve_board_location: bool = False,
++) -> list[str]:
+     """Remove the agent-scope family from *env* in place when a worker marker is present.
+ 
+-    Returns the removed key names (empty when nothing leaked). The single list every top-level
+-    launch path (CLI entry, Desktop relaunch, Electron main, hermes-sync) uses.
++    Returns the removed key names (empty when nothing leaked). Top-level launch
++    scrubbing removes everything; ordinary lineage checks preserve explicit board
++    locations so checking identity cannot silently redirect a caller's database.
+     """
+     if not any(env.get(key) for key in AGENT_SCOPE_MARKER_KEYS):
+         return []
+-    removed = [key for key in list(env) if is_agent_scope_env_key(key)]
++    keep = {"HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD"} if preserve_board_location else set()
++    removed = [key for key in list(env) if is_agent_scope_env_key(key) and key not in keep]
+     for key in removed:
+         env.pop(key, None)
+     return removed
+@@ -206,15 +210,22 @@ def _parent_pid(pid: int) -> int | None:
+ 
+ 
+ def _descends_from(owner: int) -> bool:
++    """Keep the fence unless a complete ancestry walk proves detachment.
++
++    Missing psutil, access denial and a truncated walk are unknown, not evidence
++    that this process left the owner's lineage.
++    """
+     current = os.getpid()
+     for _ in range(64):
+         if current == owner:
+             return True
+         parent = _parent_pid(current)
+-        if not parent or parent == current:
++        if parent is None or parent == current:
++            return True
++        if parent == 0:
+             return False
+         current = parent
+-    return False
++    return True
+ 
+ 
+ def _owner_is_live_ancestor(owner: str) -> bool:
+@@ -226,7 +237,9 @@ def _owner_is_live_ancestor(owner: str) -> bool:
+     if fp_s:
+         current = _start_fingerprint(pid)
+         if current is None:
+-            return False  # owner pid is gone
++            # The fingerprint provider also returns None on lookup/import failure.
++            # A complete parent walk can still prove detachment; absence cannot.
++            return _descends_from(pid)
+         try:
+             from gateway.status import start_time_fingerprints_match
+             if not start_time_fingerprints_match(int(fp_s), current):
+@@ -260,7 +273,7 @@ def _heal_leaked_marker() -> None:
+     """Drop an orphaned marker (and the worker identity riding with it) from this process, so
+     neither it nor anything it spawns is fenced as a delegate child of a lineage it left."""
+     owner = os.environ.get(DELEGATED_CHILD_OWNER_ENV, "")
+-    removed = strip_agent_scope_env(os.environ)
++    removed = strip_agent_scope_env(os.environ, preserve_board_location=True)
+     if removed:
+         _log.warning("dropped leaked delegate-child env %s: pid %d does not descend from owner %s",
+                      ", ".join(sorted(removed)), os.getpid(), owner)
+@@ -358,6 +371,6 @@ def delegated_child_subprocess_env(
+             return None
+         out = dict(env)
+         if out.get(DELEGATED_CHILD_ENV_MARKER):  # leaked into a caller-built env: don't pass it on
+-            strip_agent_scope_env(out)
++            strip_agent_scope_env(out, preserve_board_location=True)
+         return out
+     return scrub_kanban_env(os.environ if env is None else env)
+diff --git a/tests/agent/test_delegate_lineage_fail_closed.py b/tests/agent/test_delegate_lineage_fail_closed.py
+new file mode 100644
+index 0000000000..3fb2525cb3
+--- /dev/null
++++ b/tests/agent/test_delegate_lineage_fail_closed.py
+@@ -0,0 +1,113 @@
++"""Unknown process ancestry must not grant board mutation rights."""
++import os
++import sqlite3
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from agent import delegation_context as dc
++from hermes_cli import kanban_db as kb
++
++
++def test_minimal_interpreter_cannot_drop_inherited_fence(tmp_path):
++    production = tmp_path / "production"
++    pinned = production / "kanban.db"
++    env = dict(os.environ)
++    env.update({dc.DELEGATED_CHILD_ENV_MARKER: str(production),
++                dc.DELEGATED_CHILD_OWNER_ENV: dc._owner_token(),
++                "HERMES_KANBAN_DB": str(pinned), "HERMES_HOME": str(tmp_path / "scratch")})
++    # -S excludes site-packages: reproduce a scratch interpreter with no psutil,
++    # rather than relying only on a patched dependency in the pytest interpreter.
++    probe = """
++import os
++from agent import delegation_context as dc
++try:
++    import psutil
++except ImportError:
++    pass
++else:
++    raise AssertionError('probe must run without psutil')
++assert dc.is_delegated_child_process_context()
++assert dc.kanban_path_is_fenced(os.environ['HERMES_KANBAN_DB'])
++assert not dc.kanban_path_is_fenced(os.path.join(os.environ['HERMES_HOME'], 'kanban.db'))
++print('minimal interpreter fence retained')
++"""
++    result = subprocess.run([sys.executable, "-S", "-c", probe], env=env,
++                            cwd=Path(__file__).resolve().parents[2],
++                            capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    assert "minimal interpreter fence retained" in result.stdout
++    assert not pinned.exists()
++
++
++@pytest.mark.parametrize("failure", ["missing_psutil", "process_lookup", "fingerprint", "depth_limit"])
++def test_unknown_lineage_keeps_fence_and_allows_isolated_db(tmp_path, monkeypatch, failure):
++    import psutil
++
++    production = tmp_path / "production"
++    production.mkdir()
++    pinned = production / "kanban.db"
++    scratch = tmp_path / "scratch.db"
++    owner = os.getppid()
++    fingerprint = dc._start_fingerprint(owner)
++    assert fingerprint is not None
++    monkeypatch.setenv(dc.DELEGATED_CHILD_ENV_MARKER, str(production))
++    monkeypatch.setenv(dc.DELEGATED_CHILD_OWNER_ENV, f"{owner}:{fingerprint}")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(production))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    dc._live_cache.clear()
++    if failure == "missing_psutil":
++        monkeypatch.setitem(sys.modules, "psutil", None)
++    elif failure == "process_lookup":
++        def denied(pid):
++            raise psutil.AccessDenied(pid)
++        monkeypatch.setattr(psutil, "Process", denied)
++    elif failure == "fingerprint":
++        monkeypatch.setattr(dc, "_start_fingerprint", lambda pid: None)
++    else:
++        monkeypatch.setattr(dc, "_parent_pid", lambda pid: pid + 1)
++    try:
++        assert dc.is_delegated_child_process_context()
++        assert os.environ["HERMES_KANBAN_DB"] == str(pinned)
++        assert dc.kanban_path_is_fenced(pinned)
++        with pytest.raises(PermissionError):
++            kb._assert_not_delegated_child_mutation(pinned)
++        # Fenced connection initialization is read-only and cannot create a DB.
++        with pytest.raises(sqlite3.OperationalError, match="unable to open database"):
++            kb.init_db(pinned)
++        assert not pinned.exists()
++        assert not dc.kanban_path_is_fenced(scratch)
++        # Real schema creation and transaction on an isolated DB still work.
++        from hermes_cli.kanban_db_connect import connect
++        conn = connect(scratch)
++        try:
++            with kb.write_txn(conn):
++                conn.execute("CREATE TABLE isolation_probe (value TEXT)")
++                conn.execute("INSERT INTO isolation_probe VALUES ('allowed')")
++            assert conn.execute("SELECT value FROM isolation_probe").fetchone()[0] == "allowed"
++        finally:
++            conn.close()
++    finally:
++        dc._live_cache.clear()
++
++
++def test_verified_detachment_preserves_board_location(tmp_path, monkeypatch):
++    pins = {"HERMES_KANBAN_DB": str(tmp_path / "chosen.db"),
++            "HERMES_KANBAN_HOME": str(tmp_path), "HERMES_KANBAN_BOARD": "chosen"}
++    for key, value in pins.items():
++        monkeypatch.setenv(key, value)
++    monkeypatch.setenv(dc.DELEGATED_CHILD_ENV_MARKER, str(tmp_path))
++    monkeypatch.setenv(dc.DELEGATED_CHILD_OWNER_ENV, "99999999")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_not_owned")
++    monkeypatch.setattr(dc, "_parent_pid", lambda pid: 0)
++    dc._live_cache.clear()
++    try:
++        assert not dc.is_delegated_child_process_context()
++        assert not os.environ.get("HERMES_KANBAN_TASK")
++        assert {key: os.environ.get(key) for key in pins} == pins
++        assert kb.kanban_db_path() == tmp_path / "chosen.db"
++    finally:
++        dc._live_cache.clear()
+-- 
+2.55.0
+

@@ -1,0 +1,31 @@
+# chat-closeout
+
+A chat that hands its work to Kanban cards always shows what it waits on, and closes itself out when they finish.
+
+## Why
+
+A coordinator chat handed all of its work to cards and ended its turn. Nothing recorded "this chat waits on t_x,
+t_y", so the sidebar row went green (looked finished) and, when the cards finished days later, nobody wrote the
+closing answer. Core already delivers completion notices into unloaded chats (the unloaded-session sweeper,
+`kanban_unseen`). This plugin closes the behaviour gap in code instead of relying on the agent remembering to.
+
+## What it does
+
+| Piece | Behavior |
+|---|---|
+| Waiting ledger (`post_llm_call`) | Every turn end stamps the chat's open cards (created or shepherded, not done/archived) into a per-chat **batch** in `<kanban home>/cache/chat-closeout/ledger.db`. Cards stay in the batch across compression until it is closed out. |
+| Sidebar | Registers a `kanban_session_activity` waiting source (core seam `register_waiting_source`): a chat whose batch has settled but whose close-out has not run stays grey **waiting on N cards** (open cards are already counted by core). Never green, never blank, in between. A card blocked on the user paints the row red as before. |
+| Close-out brief (`pre_llm_call`, conditional) | When a turn starts after the whole batch settled (done, review, or blocked on a human), injects each card's handoff and asks for the closing answer. Only a close-out turn (briefed here, or started by the waker) marks the batch's settled cards *covered*; an ordinary turn during which a card finished covers nothing. Cards the close-out turn itself creates that are already settled (a needs_input ask) are covered too. Covered cards that are done/archived leave the batch; human-blocked ones stay covered until they move. |
+| Close-out wake (backend thread, 30 s tick) | When every batch card has settled, its notices were handed to the chat (`kanban_unseen` = 0) and the user has not typed there for 5 min, wakes the chat in-process (core `server._wake_session_turn`: the live chat, or `session.resume` into this backend) for ONE close-out turn. The wake key is the id set of settled cards no close-out has reported yet, never their statuses: settled→settled churn (blocked→archived, done→archived) and cards the close-out turn creates never wake again. A covered card that goes back to work (unblocked → running) is uncovered, so its real result gets one more close-out. Hard cap: `MAX_WAKES_PER_HOUR` (2) per chat, logged as a WARNING when hit. The claim is a CAS in the ledger, so two backends never both wake it; busy / refused / error releases the claim and undoes the coverage for a later tick. `wake_count` in the ledger counts wakes per chat. |
+| Turn-end lint (`pre_final_gate`) | A final reply promising to report later ("I'll report back", "when it finishes", "running now") while the chat has no open working card, background process or cron job is held once with a private nudge (start the tracked thing, or give the result now); a second attempt gets a visible warning line appended. Quotes and code are ignored. |
+| Watchdog (every 15 min, one process) | Inbox item + `WARNING` log line for a chat with unseen kanban results > 30 min, or a settled batch with no close-out > 30 min. Age needs both the persisted wall stamp and 30 min of this process's monotonic observation, so a lid sleep never fakes a stuck pipeline. The flag is recorded only after the Inbox post succeeds. |
+
+Every hook fails open. Skips kanban workers, cron, webhooks and subagents. `CHAT_CLOSEOUT_OFF=1` disables it.
+
+Needs the fork core for the wake (`tui_gateway.server._wake_session_turn`) and the sidebar seam
+(`kanban_session_activity.register_waiting_source`); on an older core the ledger, brief and lint still work, the
+row goes green a little early, and no wake happens.
+
+## Tests
+
+    cd ~/code/hermes-mods && uv run --with pytest python -m pytest -q -p no:cacheprovider plugins/chat-closeout/tests
