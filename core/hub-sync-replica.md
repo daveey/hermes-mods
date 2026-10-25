@@ -5,10 +5,11 @@ Patches:
 - `patches/0219-feat-desktop-hermes-hub-replica-reads-owner-lookup-v.patch`: `apps/desktop/src/store/hub-sync.ts` (the
   Desktop's door to the `hub-sync` backend plugin), owner lookup consulting the replica, Kanban board fallback to
   the replica for a gateway whose live read fails.
-- `patches/0220-feat-desktop-sidebar-shows-offline-gateways-sessions.patch`: bundled Desktop plugin
-  `apps/desktop/src/plugins/hub-sync/` — the left-pane "Synced from other gateways" section.
-- `patches/0229-fix-desktop-use-themed-synced-session-tooltips-and-S.patch`: the synced-sessions section uses the themed tooltip and SDK session rows (`sdk/sessions.ts`) instead of bespoke markup.
-- `patches/0232-fix-desktop-route-hub-sync-plugin-imports-through-th.patch`: the hub-sync and kanban plugins import gateways and hub-sync state through the plugin SDK (`sdk/gateways.ts`: `$gateways`, `PluginGateway`; `sdk/hub-sync.ts`) rather than core stores; `desktop-plugin-sdk.md` documents them.
+- `patches/0220-feat-desktop-sidebar-shows-offline-gateways-sessions.patch`, `0229`, `0232`: the original standalone
+  "Synced from other gateways" sidebar section (and its SDK routing). **Superseded by 0267**, which deletes the section.
+- `patches/0267-feat-desktop-cached-sessions-as-offline-marked-rows-.patch`: cached sessions of unreachable gateways join
+  the NORMAL sidebar list as offline-marked rows; the standalone section is removed. Also bumps the hermes-hub client
+  to 1.4.0 (separate repo) so the collector stamps the owner's `automated` policy.
 
 Needs the public `plugins/hub-sync` backend plugin (this repo) on the window's primary gateway and hermes-hub
 syncing there. Without either, every read answers `null`/`[]` and the Desktop behaves exactly as before.
@@ -17,75 +18,61 @@ syncing there. Without either, every read answers `null`/`[]` and the Desktop be
 
 - **Owner lookup.** Opening a stored session id the window can't place (`findForeignSessionOwner`) asks the primary
   gateway's replica (`GET /api/plugins/hub-sync/where/{id}`) first and routes to that gateway without probing every
-  connection, so a sleeping owner costs no wait. Unknown id → the old by-id probe. An excluded connection (the 4007
-  sender) is never named. A single-gateway Desktop is unaffected.
+  connection. Unknown id: the old by-id probe. A single-gateway Desktop is unaffected.
 - **Kanban board.** When one gateway's live board read fails, its cards come from the replica (`/tasks`), marked
-  "from hub" with their sync age; a gateway that answers is read live only. A gateway whose hub name is unknown
-  stays missing (no guessing). A comment on a replica card is queued as a hub request.
-- **Sidebar section (0220).** Sessions of gateways that are not live right now — no successful hub-sync `/status`
-  probe and no rows in the live sidebar list, or not registered on this Desktop at all — appear in a "Synced from
-  other gateways" section between Pinned and Projects: greyed label, cloud glyph, `synced Xm ago` (tooltip says the
-  gateway isn't reachable). Live data stays primary: the window's own gateway, any reachable gateway and any
-  (gateway, session id) already in the live list are dropped; archived/hidden replica rows are dropped; duplicates
-  are collapsed by (gateway, id). Hover buttons Pin/Unpin, Rename (inline input) and Archive queue an owner request
-  (`POST /api/plugins/hub-sync/request {gateway, coll:'sessions', key, action, args?, base_version}`) on the primary
-  gateway, which works with the hub down; the row then shows `pending` until the owner applies it. Clicking a row
-  opens it through the owner route (`host.openSession(id, {route})`) when the gateway has a connection. Hidden when
-  empty. Bundled plugin id `hub-sync`, on by default.
-
-## How it works
-
-- `store/hub-sync.ts`: hub gateway names ("mini") ↔ registry connection ids are learned from each connection's own
-  `/status` and persisted in localStorage `hermes.desktop.hubGatewayNames.v1` (also read by the `inbox` and
-  `session-tasks` disk plugins), with an id/label/host match as fallback. Every call is best-effort and never
-  throws into a caller.
-- `plugins/hub-sync/model.ts`: pure `replicaSessionsToShow`, `syncedAgo`, `sessionRequestBody`, `markRowPending`.
-  `api.ts`: `loadReplicaSidebarRows(live)` reads `/sessions?limit=300` on the primary, probes the other connections'
-  `/status` (success cached 5 min by `learnHubGatewayName`), and filters. `sessions-section.tsx` renders it with the
-  SDK `SidebarSection`/`SidebarSectionRow`, polling every 60 s.
+  "from hub" with their sync age. A comment on a replica card is queued as a hub request.
+- **Cached sessions in the normal sidebar (0267).** There is no history section. The hub-sync plugin is a poller
+  service that publishes replica rows (`publishOfflineSessions`, `store/offline-sessions.ts`) as `SessionInfo`
+  fallback rows. `ChatSidebar` merges them into `$sessions` before the existing pipeline, so profile/gateway
+  selection, the automated/test toggle, search, pinning, grouping, lineage and ordering apply unchanged.
+  - Eligible: ordinary titled user chats of a gateway that has a registry connection and NO live rows right now.
+  - Never added: sources in the shared `SIDEBAR_EXCLUDED_SOURCES` (cron/acp/kanban/oneshot/subagent/tool/messaging),
+    archived, hidden, empty, internal-child and untitled rows (no raw ids as titles), unregistered gateways.
+    Rows whose owner `automated` stamp is missing count as automated (hidden unless the toggle is on).
+  - Compression chains collapse to the tip. Recency is the session's real `last_active`, never the sync time.
+  - Rows are marked offline (cloud mark + "synced Xm ago", `data-testid=session-row-offline`) and never
+    `is_active`: a stale running turn is not shown as live.
+  - Live wins: any connection that has live rows drops all its cached rows (reconnect, no duplicates); identity is
+    (connection, profile, id) and lineage ids dedupe too.
+  - Clicking a cached row does not call resume; it shows an honest "gateway offline, cannot open" notice.
+    Archive and Rename on a cached row queue an owner request on the hub (pending marker); pin is local only.
 
 ## Code
 
-`apps/desktop/src/store/hub-sync.ts`, `app/session/hooks/use-session-actions/owner-follow.ts`,
-`plugins/kanban/{api.ts,board.tsx,i18n.ts,types.ts}`, `plugins/hub-sync/{plugin.tsx,sessions-section.tsx,api.ts,model.ts}`.
+`apps/desktop/src/store/{hub-sync,offline-sessions,offline-session-actions}.ts`, `lib/{session-source,synced-ago}.ts`,
+`app/chat/sidebar/{use-offline-fallback.ts,session-row-offline.tsx,index.tsx,session-row.tsx}`,
+`app/session/hooks/use-session-actions/`, `plugins/hub-sync/{plugin.tsx,api.ts,model.ts}`, `sdk/hub-sync.ts`,
+`plugins/kanban/*`.
 
 ## Tests
 
-Run in `apps/desktop` (vitest, Oct 23, 2026; `npx tsc -p . --noEmit` clean):
-`npx vitest run src/store/hub-sync.test.ts src/plugins/kanban src/plugins/hub-sync src/app/session/hooks/use-session-actions/owner-follow.hub.test.ts src/contrib`
-→ 29 files, 231 tests passed.
+Run in `apps/desktop`: `npx vitest run src/store/offline-sessions.test.ts src/store/offline-session-actions.test.ts
+src/app/chat/sidebar src/plugins/hub-sync src/store/hub-sync.test.ts src/plugins/kanban`; full suite 262 files /
+2962 tests pass (9 pre-existing electron/* and mac-sign environment failures on the hub); `tsc --noEmit` and eslint clean.
 
-- `store/hub-sync.test.ts`: name learning/persistence, no-plugin → nothing, fallback match never steals a proven
-  name, re-added connection takes the name over; `hubSessionOwner` mapping, exclusion, live-over-archived, caching,
-  unregistered/missing/error → undefined; `hubRequest` posts to the primary.
-- `owner-follow.hub.test.ts`: replica answers without probing; asleep owner; fallback probe; excluded connection;
-  single-gateway inert.
-- `plugins/kanban/api.hub-fallback.test.ts`: failed live read filled from replica (marked); answering gateway stays
-  live; unknown hub name stays missing; replica-card comment → hub request; `hubBoardFromTasks` lanes.
-- `plugins/hub-sync/model.test.ts`: not-live gateways only, local never; live (gateway, id) dropped; dedupe by
-  (gateway, id) keeps the same id on another gateway; archived/hidden dropped; `syncedAgo`; request body with
-  `base_version`; optimistic pending marker.
-- `plugins/hub-sync/sessions-section.test.tsx`: replica read on the primary, reachable gateway excluded; a gateway
-  with live rows is live even when its probe fails; hub-sync unavailable → no rows; section renders nothing when
-  empty and greyed rows with `synced 5m ago` otherwise; Archive / Rename (inline) / Unpin send the right request and
-  Archive shows `pending`; click opens through the owner route.
+- `store/offline-sessions.test.ts` (16): source exclusion, archived/hidden/empty/untitled/unregistered, tip collapse,
+  pinned and unstamped-automated, automated off/on, profile selection, live-over-cache and reconnect, same id on
+  another gateway/profile, lineage dedupe, reference identity, activity-based ordering, no stale running claim.
+- `app/chat/sidebar/offline-fallback.integration.test.tsx` (6, RED before the change): normal row with offline mark
+  and no standalone section, automated toggle, history/untitled excluded, honest refusal to open, live row opens,
+  reconnect without duplicates.
+- `store/offline-session-actions.test.ts` (4): archive/rename of cached rows become hub requests.
+- `plugins/hub-sync/plugin.test.ts`: the plugin registers no sidebar section.
 
-Untested: a real Desktop window (no live render or click was exercised), the backend side of an applied request
-(that is hermes-hub's), and strings are English only (no locale overlays; the section is plugin chrome).
-
-- 0229/0232 touch `plugins/hub-sync/sessions-section.test.tsx`, `sessions-section.tsx`, `api.ts`, `model.ts`, `plugins/kanban/api.ts` and the SDK barrel `sdk/index.ts`; no new test files. Not re-run when this doc was written (untested here).
+Untested / limits: unregistered gateways are skipped; untitled rows are skipped; other row-menu verbs on cached rows
+hit normal offline errors; the backend side of an applied request is hermes-hub's.
 
 ## Applying
 
-`git am -3` in order, after 0090 (Kanban all-gateways) and 0093.
+`git am -3` in order, after 0090 (Kanban all-gateways) and 0093; 0267 replaces the section from 0220/0229/0232.
 
 ## Gotchas
 
-- "Not live" uses a cached `/status` success (5 min): a gateway that just went down keeps its live rows out of the
-  section until the cache expires or its live rows vanish; the replica row then appears.
+- Deploy the hermes-hub client 1.4.0 on every gateway; until then replica rows lack `automated` and are hidden
+  unless the automated toggle is on.
 - A gateway that is reachable but lacks the `hub-sync` plugin counts as live only through its rows in the live list.
 
 ## Plugin?
 
-Partly: the REST is the `hub-sync` agent plugin, and the Inbox/Session Tasks consumers are disk plugins. The owner
-lookup and Kanban fallback live inside core stores, and the section reads core's `$sessions`, so they ship on the fork.
+Partly: the REST is the `hub-sync` agent plugin, and the Inbox/Session Tasks consumers are disk plugins. The
+sidebar merge reads core's `$sessions`, so it ships on the fork.
