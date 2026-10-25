@@ -31,7 +31,8 @@ bootstrap a stopped launchd job or execute an inferred wake helper.
 
 ## Code
 
-Proposed appended patches **0268–0270**, after the existing series through 0267:
+Proposed appended patches **0277–0279**, after the preserved main series through
+0275 and profile-scoped GitHub broker patch 0276:
 
 - `tools/browser_agent_lifecycle.py`: route validation, acquire/complete/release,
   owner-specific daemon and vault identity, bounded cleanup retry.
@@ -85,7 +86,7 @@ See the lifecycle acceptance section for the failed-first-probe qualification.
 ## Applying
 
 These three patches are feature-branch proposals, not a released installation.
-Apply in order after 0267; do not renumber existing siblings. The full mirror uses
+Apply in order after 0276; do not renumber existing siblings. The full mirror uses
 the fork/upstream merge-base, not the newer upstream tip. Existing public privacy
 substitutions and the merge-adapted patch 0242 must be preserved. The documentation
 correction verification applied all 266 patches with `git am -3` from merge-base
@@ -99,7 +100,22 @@ feature patches to 0268–0270. All 267 existing main patches, including privacy
 adaptations and 0242, remain byte-for-byte intact. All 270 patches applied with
 `git am -3` from the same merge-base in a disposable clone; all ten feature-path
 blobs matched integrated core `b27b88b0dc67c27b8a4724905a6ff3dce13ecbf1`.
-The earlier 266-patch receipt above is historical, not the current apply order.
+Both the 266- and 270-patch receipts above are historical, not the current apply order.
+
+The final pinned-base integration uses fork main `ca145ec36e04a7db3271e2df91622dc7adbd91a2`
+and public main `1414cbbb0ca02b30bd7b0159a0a7c1a43a42a4aa`. It preserves all 275
+public main patches byte-for-byte, including historical privacy substitutions and
+adapted 0242. The already-published topology renumbering is retained, not repeated.
+Patch 0276 mirrors the single additional landed Kanban broker commit; these Chrome
+patches follow as 0277–0279. The complete 279-patch series applied with `git am -3`
+from the same merge-base; all ten Chrome paths and all five broker paths match
+integrated core `54716420ff7c58cf1ab34fbfb22ef9e878f87cd3` (the config path overlaps).
+The 189 core tests, two documentation-drift tests and 16 broker/acceptance tests
+pass on that integrated core. The canonical runner uses the existing PM interpreter
+with a scratch-location-only adapter in a disposable clone; no assertions changed.
+Browser runtime/helpers are unchanged. The shared configuration module changes only
+Kanban defaults/comments, so it does not invalidate historical native evidence or
+imply a new native run. Full remote CI and independent exact-delta review remain gates.
 
 Keep the supervisor OFF until the identified integration/release blockers are
 closed and the operator explicitly authorizes deployment/activation. This remains
