@@ -377,7 +377,8 @@ _EXPLICIT_REQUEST = re.compile(
 def recommendation_without_request(span: str, block: str = "") -> bool:
     # Use the containing paragraph to catch excerpts which omit "Recommended".
     # Quoted labels, code and rhetorical question marks are not requests.
-    clean = _norm(re.sub(r'["“][^"”\n]*["”]', " ", _strip_noise(span)))
+    unquoted = re.sub(r"(?<!\w)'[^'\n]+'", " ", _strip_noise(span))
+    clean = _norm(re.sub(r'["“][^"”\n]*["”]', " ", unquoted))
     context = _norm(block or span)
     return bool(_RECOMMENDATION.search(context) and not _EXPLICIT_REQUEST.search(clean))
 

@@ -542,3 +542,11 @@ def test_recommended_action_after_colon_is_not_user_instruction(home):
         "text": "Choose the first fix", "kind": "choose", "verbatim_span": reply,
         "options": ["Open tabs on demand", "Another option"]}]}))
     assert out["steps"] == [] and board.rows() == []
+
+
+@pytest.mark.parametrize("quote", ["'", '"', "`"])
+def test_recommendation_quoted_please_label_is_not_consent(home, quote):
+    add_session(home, "S1")
+    reply = "My recommendation for your app is to change the button label: " + quote + "Please sign in" + quote + "."
+    out = run(home, reply, llm=fake_llm({"steps": [{"text": "Sign in", "kind": "do", "verbatim_span": reply}]}))
+    assert out["steps"] == []
