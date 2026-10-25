@@ -10,7 +10,7 @@ Patches:
 What you see: routine Kanban cards and subagents run on a cheaper model (Sonnet on the fork), while reviews, hard
 retries and cards you pin stay on the profile's model (Opus). Each Kanban run records why in a `model_tier` event.
 
-Patch 0263 fixes eager default-route preflight: only routes selected by a child are resolved.
+Patch 0269 fixes eager default-route preflight: only routes selected by a child are resolved.
 
 ## Behavior
 
@@ -70,7 +70,7 @@ sample had run on the strong model, so the labels are predictions; measure befor
   per-task model overrides `delegation.model` for that child only; a task model beats parent inheritance; a
   provider pin resolves through the credential path; a bad pin refuses the call before spawn; pins are stripped
   when not allowed; the dynamic schema advertises `model`/`provider` only when allowed and the static schema never.
-  Unit tests for `_task_route_cfg`. Patch 0263 adds unavailable-default/explicit-provider success and mixed-batch no-spawn tests (registered tool handler). All 12 tests passed; the new success test failed before the fix. Related batch-validation, fallback-matrix, external-provider and request-overrides suites: 58 tests passed together.
+  Unit tests for `_task_route_cfg`. Patch 0269 adds unavailable-default/explicit-provider success and mixed-batch no-spawn tests (registered tool handler). All 12 tests passed; the new success test failed before the fix. Related batch-validation, fallback-matrix, external-provider and request-overrides suites: 58 tests passed together.
 - `tests/hermes_cli/test_kanban_model_tier.py` (dispatcher via `dispatch_once`; `kanban_create` tool via
   `_handle_create`): unpinned card gets the default and a `model_tier` event while the row stays unpinned; default
   off = upstream; `kanban_create(model=...)` keeps its pin while an unpinned tool-created card gets the default;

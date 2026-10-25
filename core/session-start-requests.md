@@ -34,7 +34,7 @@ No live runner repair, real Desktop click, live provider/LLM, or separate collec
 
 ## Applying
 
-Core commit 7f8355d35ed9cb1aa2f86e4edc45b55da1a6a0be is on fork main. Apply in the ordered public patch series, or update to a fork main containing it. This mirror publishes it as patch 0260 in the full ordered series. No config flag changes or plugin activation are made by this core commit.
+Core commit 7f8355d35ed9cb1aa2f86e4edc45b55da1a6a0be is on fork main. Apply in the ordered public patch series, or update to a fork main containing it. This mirror publishes it as patch 0261 in the full ordered series. No config flag changes or plugin activation are made by this core commit.
 
 ## Gotchas
 

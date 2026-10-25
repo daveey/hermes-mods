@@ -9,7 +9,7 @@ Patches:
 - `patches/0239-fix-kanban-respawn-guard-releases-active_pr-once-PRs.patch`: `active_pr` hold lifts once every named PR is merged/closed; no Inbox card; one event per hold.
 - `patches/0241-refactor-kanban-move-active_pr-step-hold-event-dedup.patch`: PR step and hold-event dedupe move into guard siblings (code-health caps).
 - `patches/0242-kanban-guard-hold-notice-file-a-fix-card-for-default.patch`: the notice files a fix card for the default assignee instead of posting to the Inbox.
-- `patches/0266-fix-kanban-release-rejected-merge-queue-PRs-to-repai.patch`: completed merge-queue rejections release repair workers, with the rejection reason quoted once on the card.
+- `patches/0274-fix-kanban-release-rejected-merge-queue-PRs-to-repai.patch`: completed merge-queue rejections release repair workers, with the rejection reason quoted once on the card.
 
 Extends `kanban-park-invariants.md` and `kanban-pr-unblock.md` (the respawn guard itself).
 
@@ -52,7 +52,7 @@ next lookup. `kanban_db_dispatch_pr_rejection.py` parses the newest marker and d
 - `tests/hermes_cli/conftest.py`: keeps the PR-state lookup offline by default (`gh` "fails", so `active_pr` holds).
 - `tests/hermes_cli/test_kanban_pr_rejection.py`: rejected-open dispatch, quoted reason once, newest queued marker,
   incomplete/malformed/truncated markers, exit-2 alternative, ordinary comment, merged control, and requeue without stale cache.
-- Verified for 0266: 114 passing tests across rejection, park invariants, dispatch and both review lifecycle files;
+- Verified for 0274: 114 passing tests across rejection, park invariants, dispatch and both review lifecycle files;
   rejection regression observed failing before the fix. A real OPEN rejected PR response was fetched read-only and
   its rejection reason parsed. Production dispatcher deployment remains separate from these unit/parser proofs.
 
@@ -60,7 +60,7 @@ next lookup. `kanban_db_dispatch_pr_rejection.py` parses the newest marker and d
 
 `git am -3` in order 0212, 0223, 0225, 0238, 0239, 0241, 0242 (the last four assume the `*_guard_notice` module from 0225).
 
-## Five whys (0266)
+## Five whys (0274)
 
 Repair stalled because `active_pr` treated an OPEN rejected PR as active. The PR stayed open because queue rejection
 ends the merge attempt, not the PR. The guard queried only GitHub lifecycle state, so it could not distinguish
