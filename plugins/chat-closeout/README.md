@@ -26,6 +26,14 @@ Needs the fork core for the wake (`tui_gateway.server._wake_session_turn`) and t
 (`kanban_session_activity.register_waiting_source`); on an older core the ledger, brief and lint still work, the
 row goes green a little early, and no wake happens.
 
+## Ownership and evidence
+
+New batches use local `board/task` keys and remote `gateway/profile/board/task` keys (the local gateway/profile is implicit in the ledger's runtime scope). Remote reads use core's origin-ledger projection, including released rows omitted from `session_tasks`, plus core's unsuperseded historical associations. There is no second ownership ledger or replica-only completion rule.
+
+A remote done/archive settles only with a fresh, verified origin release. Unknown, stale, missing and review remain unfinished; current explicit `needs_input`/`capability` blockers still produce the human ask. Local settlement behavior is unchanged. Historical bare-ID batches resolve only when unambiguous: collisions or an unreadable remote inventory remain unknown rather than borrowing local completion. Such ambiguous historical entries require explicit reconciliation, not an automatic ownership guess. Remote projection currently has no handoff summary, so the brief says `(no handoff)` rather than substituting a local result.
+
 ## Tests
 
-    cd ~/code/hermes-mods && uv run --with pytest python -m pytest -q -p no:cacheprovider plugins/chat-closeout/tests
+Unit tests use throwaway SQLite files. Core integration additionally exercises real owner observation, receipt acceptance and projection using isolated owner/replica/origin databases; set `HERMES_CORE_SOURCE` to the fork checkout to enable those cases. Keep worker safety environment pins intact.
+
+    HERMES_HOME="$PWD/test-home" HERMES_CORE_SOURCE=/path/to/hermes-agent uv run --with pytest --with pyyaml python -m pytest -q -p no:cacheprovider plugins/chat-closeout/tests
