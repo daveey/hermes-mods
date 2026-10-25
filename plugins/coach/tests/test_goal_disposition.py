@@ -157,15 +157,19 @@ def test_midturn_scope_is_retained_and_sessions_isolated(monkeypatch):
     assert 'Explain example app only' not in str(captured[-1])
 
 
-def test_oversized_capture_and_observation_fail_open_without_unbounded_state(monkeypatch):
+def test_oversized_capture_and_observation_keep_bounded_uncertainty(monkeypatch):
+    import json
     monkeypatch.setattr(gd, 'settings', lambda: {'mode': 'enforce'})
-    events = []
+    events, seen = [], []
     gate = gd.build_gate(SimpleNamespace(log=events.append))
     gate.capture(session_id='a', user_message='Repair example app')
     gate.observe(session_id='a', tool_name='fetch', args={}, result='x' * 40000, tool_call_id='huge')
-    monkeypatch.setattr(gd, 'aux_judge', lambda *_: pytest.fail('incomplete evidence must not be judged'))
+    monkeypatch.setattr(gd, 'aux_judge', lambda _, p: seen.append(json.loads(p)['evidence']) or
+                        verdict(disposition='unknown'))
     assert gate(session_id='a', final_response='broken', turn_messages=[]) is None
-    assert events[-1].get('reason') == 'context_limit'
+    assert seen[0]['tool:huge']['omission']['uncertain'] is True
+    assert len(json.dumps(seen[0])) <= 32000
+    assert events[-1]['disposition'] == 'unknown'
 
 
 def test_safe_scope_dispositions_do_not_nudge(monkeypatch):

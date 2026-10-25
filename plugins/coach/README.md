@@ -448,3 +448,38 @@ PATH=~/.nvm/versions/node/v20.20.2/bin:$PATH bash tests/desktop/run.sh   # deskt
 # miner adoption over real data (Hermes venv has ruamel.yaml):
 ~/.hermes/hermes-agent/venv/bin/python ../../skills/productivity/hermes-coach/scripts/coach_mine.py --data ~/code/hermes-coach-data --top 0 --write-adoption
 ```
+
+
+### Bounded goal evidence
+
+`goal_evidence.py` keeps the goal judge's **32,000 serialized-character** evidence
+budget. It preserves human scope, candidate text, call arguments, pair IDs and
+ordering. On overflow only tool-result and recalled-memory bodies become prefix
+previews, with original character count, SHA-256, omitted/retained counts and an
+explicit uncertainty flag. Re-budgeting cached observations preserves the original
+digest. Both direct gate input and `capture`/`observe` paths use this budget;
+`observe` no longer poisons the entire capture solely for a large result.
+
+A recognized `<memory-context>...</memory-context>` suffix is separate `role=memory`
+evidence, not human authorization. Ambiguous/non-suffix tags fail UNKNOWN rather
+than deleting possible restrictions. This text boundary is conservative, not an
+authenticated provenance channel. The original scope recovery limits still apply:
+oversized user rows during durable recovery/capture may remain UNKNOWN, including
+large memory suffixes before evidence assembly. No user restrictions are truncated.
+
+Partial evidence cannot certify remediation, capability/authorization boundaries,
+or ownership when cited; memory cannot certify these either. The judge must not
+infer absence of boundaries from omitted text and must return UNKNOWN if the missing
+body is needed. Abandonment can still be judged from intact affirmative user scope
+and candidate evidence; semantic correctness still requires real-model evaluation.
+There is no claim that a digest proves the omitted body's meaning.
+
+Limits remain: 200 input rows, 32,000 serialized evidence characters, and UNKNOWN
+when full human scope/candidate/call arguments or required metadata do not fit.
+This does not remove capture/recovery lineage limits, recover image pixels, or prove
+original-incident semantic acceptance. It does not execute evidence tools.
+
+Tests: `tests/test_goal_bounded_evidence.py` covers direct long-result input,
+`capture`/`observe`, pairing/duplicate rejection, JSON escaping and cumulative
+budgets, repeated budgeting, memory provenance, restriction retention, and rejected
+closure proofs; `tests/test_goal_disposition.py` retains the gate's existing tests.
