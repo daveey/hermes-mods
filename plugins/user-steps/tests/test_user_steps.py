@@ -162,8 +162,8 @@ def test_choose_without_options_degrades_to_input_and_bad_kind_to_input(home):
     out = run(home, CHOOSE, llm=fake_llm({"steps": [
         {"text": "Pick one", "kind": "choose", "options": ["SQLite"], "verbatim_span": "Should I use Postgres or SQLite"},
         {"text": "Say which you recommend", "kind": "weird", "verbatim_span": "I recommend SQLite."}]}))
-    assert [s["kind"] for s in out["steps"]] == ["input", "input"]
-    # both spans live in the same paragraph -> ONE directive naming both ids
+    assert [s["kind"] for s in out["steps"]] == ["input"]
+    # The recommendation is narrative, not a second user request.
     (ids, _, _), = directives(out["text"])
     assert ids.split(",") == [s["id"] for s in out["steps"]]
 
@@ -434,3 +434,91 @@ def test_approval_to_run_a_command_is_kept(home):
                                "verbatim_span": "Want me to run `sudo pmset -a sleep 0` on the box?"}]})
     out = run(home, reply, llm=llm)
     assert [s["kind"] for s in out["steps"]] == ["approve"] and out["dropped"] == []
+
+
+# Recommendation extraction must not invent a human decision.
+def test_recommendation_cannot_manufacture_blocked_choice(home):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    span = ("**Recommended first fix: tab ownership + idle shutdown**, rather than blindly restoring "
+            "throttling and breaking hidden automation. These prevention changes are not implemented yet; "
+            "the immediate CPU-heavy browser workload is stopped.")
+    reply = "Your browser is stopped.\n\n" + span
+    llm = fake_llm({"steps": [{"text": "Choose the first fix to implement", "kind": "choose",
+        "verbatim_span": span, "options": ["Tab ownership + idle shutdown", "Another option"]}]})
+    out = run(home, reply, user_msg="kill it, and let's figure out how to keep this under control",
+              llm=llm, cards=board)
+    assert out["steps"] == []
+    assert out["text"] is None
+    assert ledger(home).open_steps("S1") == []
+    assert board.rows() == []
+
+
+def test_prefix_match_cannot_invent_consent(home):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    report = "Your browser is stopped and all abandoned session tabs have been cleaned up safely."
+    out = run(home, report, cards=board, llm=fake_llm({"steps": [{
+        "text": "Approve deleting all saved profiles", "kind": "approve",
+        "verbatim_span": report + " Do you approve deleting all saved profiles?"}]}))
+    assert out["steps"] == [] and board.rows() == []
+
+
+@pytest.mark.parametrize("span,kind", [
+    ("I recommend deleting the backup. Do you approve deleting it?", "approve"),
+    ("I recommend the paid plan. Which plan do you want?", "choose"),
+    ("Please sign in to grant access to the account.", "do"),
+    ("Please approve the consent dialog on your device.", "do"),
+    ("Which reviewer should I use?", "input"),
+])
+def test_recommendation_guard_preserves_explicit_human_gates(home, span, kind):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    out = run(home, span, cards=board, llm=fake_llm({"steps": [{
+        "text": "Respond to the explicit request", "kind": kind,
+        "verbatim_span": span, "options": ["Free", "Paid"] if kind == "choose" else []}]}))
+    assert len(out["steps"]) == 1
+    assert board.rows()[0][3] == "blocked"
+
+
+@pytest.mark.parametrize("reply,span", [
+    ("Recommended first fix: tab ownership + idle shutdown. Your browser is stopped.",
+     "tab ownership + idle shutdown"),
+    ("Why this recommendation? Tab ownership prevents your abandoned tabs from consuming CPU.",
+     "Why this recommendation? Tab ownership prevents your abandoned tabs from consuming CPU."),
+    ("My recommendation for your app is to change the button label to `Please sign in`.",
+     "My recommendation for your app is to change the button label to `Please sign in`."),
+])
+def test_recommendation_excerpts_and_labels_are_not_requests(home, reply, span):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Choose the first fix", "kind": "choose", "verbatim_span": span,
+        "options": ["Tab ownership", "Another option"]}]}))
+    assert out["steps"] == [] and board.rows() == []
+
+
+@pytest.mark.parametrize("reply", [
+    "My recommendation needs your approval before I delete the backup.",
+    "I recommend deleting the old backup; before I proceed, approve the deletion.",
+    "I recommend reconnecting the account. Open Settings and authorize access on your phone.",
+])
+def test_recommendation_keeps_indirect_consent_and_auth_requests(home, reply):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Respond to the request", "kind": "approve", "verbatim_span": reply}]}))
+    assert len(out["steps"]) == 1 and board.rows()[0][3] == "blocked"
+
+
+def test_full_span_search_skips_earlier_prefix_collision(home):
+    add_session(home, "S1")
+    prefix = "Before proceeding with deletion of the old backup, I need to verify the selected target. "
+    first = prefix + "Verification is pending."
+    exact = prefix + "Do you approve deleting it?"
+    reply = first + "\n\n" + exact
+    out = run(home, reply, llm=fake_llm({"steps": [{
+        "text": "Approve deleting the backup", "kind": "approve", "verbatim_span": exact}]}))
+    assert len(out["steps"]) == 1
+    assert out["steps"][0]["paragraph"] == exact
+    assert out["text"].startswith(first + "\n\n::user-step")
