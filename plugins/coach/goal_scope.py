@@ -30,7 +30,40 @@ def _ro_connect(path):
         raise
     return conn
 
-def recover_scope(session_id, user_message, history):
+def _user_row(row):
+    if row.get('_user_content_sanitized'):
+        raise ValueError('ambiguous_memory_provenance')
+    if isinstance(row.get('content'), list) and not row.get('api_content'):
+        # Historical multimodal injection shares content, without a native split.
+        raise ValueError('scope_unsupported_content')
+    result = {'role': 'user', 'content': copy.deepcopy(row.get('content'))}
+    # A native sidecar establishes a content/wire split. NULL cannot authenticate
+    # legacy textual memory wrappers. The sidecar itself is never user authority.
+    if isinstance(row.get('api_content'), str) and row['api_content']:
+        result['content_source'] = 'native_content'
+    return result
+
+
+def _capture_rows(raw_rows, history, user_message, canonical):
+    # Import only native fields, never history's self-declared trust labels.
+    native_row = None
+    if canonical is not None:
+        idx = canonical.get('message_index')
+        uid = canonical.get('message_uid')
+        if (type(idx) is not int or not 0 <= idx < len(history or [])
+                or not any(r is history[idx] for r in raw_rows)
+                or not isinstance(uid, str) or not uid
+                or history[idx].get('message_uid') != uid
+                or canonical.get('content') != user_message):
+            raise ValueError('scope_invalid_native_anchor')
+        native_row = history[idx]
+    # Identity, not equality: repeated requests must not promote an older row.
+    return [({'role': 'user', 'content': copy.deepcopy(user_message),
+              'content_source': 'native_content', 'message_uid': canonical['message_uid']}
+             if r is native_row else _user_row(r)) for r in raw_rows]
+
+
+def recover_scope(session_id, user_message, history, *, canonical_user_content=None):
     """Recover only user rows, backwards through verified compression edges.
 
     Never chase a compression tip (it can be a future turn). Ancestors are cut
@@ -44,7 +77,7 @@ def recover_scope(session_id, user_message, history):
     from hermes_cli.profiles import get_active_profile_name
 
     raw_rows = [r for r in history or [] if is_evidence_row(r) and r.get('role') == 'user']
-    rows = [{'role': 'user', 'content': copy.deepcopy(r.get('content'))} for r in raw_rows]
+    rows = _capture_rows(raw_rows, history, user_message, canonical_user_content)
     path = Path(get_hermes_home()) / 'state.db'
     recovered = []
     if path.exists():
@@ -106,22 +139,23 @@ def recover_scope(session_id, user_message, history):
                 else:
                     raise ValueError('scope_lineage_limit')
                 for sid, bound, cutoff in reversed(segments):
-                    saved = conn.execute('SELECT content FROM messages WHERE session_id=? AND ' + clean +
+                    saved = conn.execute("SELECT content, CASE WHEN api_content != '' THEN 'native' END AS api_content "
+                                         'FROM messages WHERE session_id=? AND ' + clean +
                                          ' AND ' + bound + ' ORDER BY id LIMIT 201', (sid, cutoff)).fetchall()
                     for row in saved:
                         content = row['content']
                         # Multimodal JSON cannot safely be treated as human text here.
                         if not isinstance(content, str) or content.startswith(('[', '{')):
                             raise ValueError('scope_unsupported_content')
-                        recovered.append({'role': 'user', 'content': content})
+                        recovered.append(_user_row(dict(row)))
                     if len(recovered) > 200 or len(json.dumps(recovered)) > 32000:
                         raise ValueError('context_limit')
     # Retain ordering/repeated restrictions; only remove an overlapping suffix/prefix.
     overlap = 0
     for n in range(1, min(len(recovered), len(rows)) + 1):
-        if recovered[-n:] == rows[:n]:
+        if [r['content'] for r in recovered[-n:]] == [r['content'] for r in rows[:n]]:
             overlap = n
-    rows = recovered + rows[overlap:]
+    rows = (recovered[:-overlap] if overlap else recovered) + rows
     if not rows or rows[-1].get('content') != user_message:
         rows.append({'role': 'user', 'content': user_message})
     if len(rows) > 200 or len(json.dumps(rows)) > 32000:

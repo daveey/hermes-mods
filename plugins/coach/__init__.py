@@ -60,7 +60,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if not session_id:
                 return None
             goal_gate.capture(session_id=session_id, user_message=user_message,
-                              conversation_history=conversation_history)
+                              conversation_history=conversation_history,
+                              canonical_user_content=_.get("canonical_user_content"))
             rec = store.user_turn(session_id, user_message) or {}
             hint = coach.turn_start(session_id, user_message)
             # The fix-loop window survives process boundaries (`hermes chat -q --resume`, backend restarts): the

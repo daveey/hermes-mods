@@ -10,16 +10,16 @@ import json
 LIMIT = 32000
 
 
-def user_content(content):
-    """Quarantine the runtime's recalled-memory suffix, not fresh human authority.
+def user_content(content, *, canonical=False):
+    """Keep canonical native content verbatim; ambiguous legacy tags fail closed.
 
-    Ambiguous tags fail closed rather than deleting possible user restrictions.
-    This is a conservative text boundary, not cryptographic provenance.
+    ``canonical`` comes from scope recovery's native hook/sidecar projection,
+    never from tag spelling or an input row's self-declared trust label.
     """
-    if not isinstance(content, str) or '<memory-context>' not in content:
+    if canonical or not isinstance(content, str) or '<memory-context>' not in content:
         return content
     # Text alone cannot distinguish runtime recall from human-authored limits.
-    # Until the native transport carries provenance, both must stay UNKNOWN.
+    # Legacy rows without a native split must still stay UNKNOWN.
     raise ValueError('ambiguous_memory_provenance')
 
 

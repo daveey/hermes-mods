@@ -48,7 +48,8 @@ def evidence_for(messages, candidate):
             continue
         if row.get('role') == 'user':
             ref = 'user:' + str(sum(e['role'] == 'user' for e in evidence.values()))
-            evidence[ref] = {'role': 'user', 'content': _evidence.user_content(row.get('content'))}
+            evidence[ref] = {'role': 'user', 'content': _evidence.user_content(
+                row.get('content'), canonical=row.get('content_source') == 'native_content')}
         elif row.get('role') == 'assistant':
             for call in row.get('tool_calls') or []:
                 if isinstance(call, dict) and isinstance(call.get('id'), str):
@@ -169,6 +170,12 @@ def validate_disposition(v, evidence, *, session_id=""):
         if any(r.get('omission') or r.get('role') == 'memory' for r in refs):
             raise ValueError('omitted_evidence_cannot_certify_closure')
     if d == 'abandoned':
+        # Preserve the prior conservative veto even for authenticated literal
+        # tags: expose the full restriction to the judge, but never strip it or
+        # let a mistaken semantic verdict override it.
+        if any(r.get('role') == 'user' and '<memory-context>' in json.dumps(r.get('content'))
+               for r in evidence.values()):
+            raise ValueError('literal_memory_tag_scope')
         if any(r.get('omission') for r in evidence.values()):
             raise ValueError('omitted_boundary_evidence')
         if not v['actionable'] or not v['unfinished'] or 'candidate' not in v['evidence_refs']:
@@ -220,11 +227,13 @@ def build_gate(store):
     contexts = OrderedDict()
     lock = threading.RLock()
 
-    def capture(session_id='', user_message=None, conversation_history=None, **_):
+    def capture(session_id='', user_message=None, conversation_history=None,
+                canonical_user_content=None, **_):
         if not session_id or settings()['mode'] == 'off':
             return
         try:
-            rows = recover_scope(session_id, user_message, conversation_history)
+            rows = recover_scope(session_id, user_message, conversation_history,
+                                 canonical_user_content=canonical_user_content)
         except Exception:
             # Incomplete/ambiguous recovery must not become an actionable scope.
             rows = None
@@ -283,7 +292,13 @@ def build_gate(store):
                 if not _scope.is_evidence_row(row):
                     continue
                 if row.get('role') == 'user':
-                    row = {'role': 'user', 'content': row.get('content')}
+                    native_uids = {r['message_uid'] for r in rows if r.get('message_uid')}
+                    if row.get('message_uid') in native_uids:
+                        continue  # same native turn, not its injected wire payload
+                    row = _scope._user_row(row)
+                    if not native_uids and any(r.get('role') == 'user' and
+                                              r.get('content') == row['content'] for r in rows):
+                        continue
                 if row.get('role') == 'tool' and row.get('tool_call_id') in observed_ids:
                     continue
                 if row.get('role') == 'assistant' and row.get('tool_calls'):

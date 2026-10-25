@@ -460,11 +460,26 @@ explicit uncertainty flag. Re-budgeting cached observations preserves the origin
 digest. Both direct gate input and `capture`/`observe` paths use this budget;
 `observe` no longer poisons the entire capture solely for a large result.
 
-Textual `<memory-context>` markers are not authenticated provenance. Any user row
-containing them is UNKNOWN, even if the tags are balanced: otherwise a human's
-current restrictions could be silently reclassified as old memory. Native
-transport/persistence provenance is still required before suffixes can be safely
-separated. Oversized genuine user rows remain UNKNOWN; restrictions are never trimmed.
+Textual `<memory-context>` markers are not authenticated provenance. Legacy rows
+containing them remain UNKNOWN, even if balanced. Native core `pre_llm_call` now
+passes a canonical inbound-content snapshot anchored to the current row's message
+UID. Coach consumes that snapshot through normal plugin discovery; it does not
+accept history's self-declared trust labels. Final-gate capture matches that UID,
+so adapter preambles and multimodal memory parts cannot become a second user turn.
+
+For historical string rows, the native `content`/`api_content` split supplies human
+scope without copying the API-only recall into user evidence. Durable recovery
+checks sidecar presence in SQL rather than loading large recall bodies. Native
+replay preserves literal human-authored tags in canonical content. A local-only
+core marker preserves uncertainty when the legacy replay sanitizer erased content;
+those rows remain UNKNOWN. Historical multimodal rows lacking a native split are
+also UNKNOWN; current-turn multimodal snapshots retain the full human payload.
+
+Authenticated literal tags reach the judge verbatim, including their restrictions,
+but still cannot support an abandonment hold: the prior conservative tag veto is
+retained against mistaken semantic verdicts. Oversized genuine user rows remain
+UNKNOWN; restrictions are never trimmed. This is a transport-provenance bridge,
+not a new authorization source, a legacy migration, or proof of semantic relevance.
 
 Partial cited evidence cannot certify remediation, capability/authorization
 boundaries, or ownership. Any omitted body also prevents an abandonment hold,
@@ -488,3 +503,11 @@ closure proofs; `tests/test_goal_disposition.py` retains the gate's existing tes
 verdicts with cited/uncited omitted denial and missing-access evidence, plus
 human-authored balanced memory tags. `tests/test_goal_omission_turn.py` covers
 those refusal paths through the real discovered complete-turn gate.
+
+`tests/test_goal_native_provenance.py` exercises normal discovered hooks in both
+registration orders, native persistence/replay, read-only scope recovery, literal
+human restrictions, oversized scope, self-declared trust labels and legacy
+sanitation ambiguity. `tests/test_goal_native_capture.py` exercises adapter persist
+overrides and current multimodal memory injection through complete turns. Provider
+and semantic judge responses are controlled; these are transport/safety contracts,
+not real-model semantic acceptance or live CLI/Desktop transport acceptance.
