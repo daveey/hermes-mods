@@ -9,6 +9,7 @@ Patches:
 - `patches/0239-fix-kanban-respawn-guard-releases-active_pr-once-PRs.patch`: `active_pr` hold lifts once every named PR is merged/closed; no Inbox card; one event per hold.
 - `patches/0241-refactor-kanban-move-active_pr-step-hold-event-dedup.patch`: PR step and hold-event dedupe move into guard siblings (code-health caps).
 - `patches/0242-kanban-guard-hold-notice-file-a-fix-card-for-default.patch`: the notice files a fix card for the default assignee instead of posting to the Inbox.
+- `patches/0266-fix-kanban-release-rejected-merge-queue-PRs-to-repai.patch`: completed merge-queue rejections release repair workers, with the rejection reason quoted once on the card.
 
 Extends `kanban-park-invariants.md` and `kanban-pr-unblock.md` (the respawn guard itself).
 
@@ -22,8 +23,10 @@ Extends `kanban-park-invariants.md` and `kanban-pr-unblock.md` (the respawn guar
   files ONE fix card for the default assignee (0212 first posted an Inbox card; 0239 dropped it; 0242 replaced it with
   a Kanban card because an unread Inbox poster gets muted). The notice does not restart the hold clock: the hold cap
   still fires.
-- The `active_pr` hold lifts as soon as EVERY PR named in the card's comments is MERGED or CLOSED. An unknown state
-  (any `gh` failure) counts as unfinished and the hold stays (fail closed).
+- The `active_pr` hold lifts when EVERY named PR is MERGED, CLOSED, or OPEN with a completed queue rejection.
+  The newest `bb-land` marker must say `done: true` and either `state: rejected` or `exit: 2`. The card gets one
+  comment quoting the rejection reason and directing repair/resubmission of the existing PR. Queued, malformed,
+  incomplete or unknown evidence keeps the hold. Ordinary review comments do not supersede queue markers.
 - The dispatcher logs one `respawn_guarded` event per unbroken hold per reason, not one per tick (about 1400 events per
   card before). A human comment breaks the hold, so the next held tick logs a fresh event.
 
@@ -32,7 +35,10 @@ Extends `kanban-park-invariants.md` and `kanban-pr-unblock.md` (the respawn guar
 `hermes_cli/kanban_db_dispatch.py` calls `guard_hold_reason` to find the hold in progress (newest event, ignoring the
 dispatcher's own logs), then `_notify_guard_hold` in `kanban_db_dispatch_guard_notice.py` posts the comment and files the fix card
 once per hold. `kanban_db_dispatch_pr_state.py` looks up each PR with `gh pr view` (`pr_state`, cached: merged/closed
-forever, open for a short time) and `all_prs_finished(urls)` is true only for a non-empty set of finished PRs.
+forever, open for 300 seconds). A newly observed rejection releases the card in that dispatch pass; a previously
+cached OPEN result can delay observation up to 300 seconds. Rejections are not cached, so a requeue is seen on the
+next lookup. `kanban_db_dispatch_pr_rejection.py` parses the newest marker and deduplicates repair comments.
+`all_prs_finished(urls)` retains its terminal-GitHub-state semantics; the active guard handles rejection separately.
 
 ## Code
 
@@ -44,11 +50,23 @@ forever, open for a short time) and `all_prs_finished(urls)` is true only for a 
   min, hold clock not restarted, the event re-logged after a human comment, PR-state table (merged/closed/open/unknown),
   merged-PR cache, end-to-end "a ready card whose only PR merged is spawned, not held".
 - `tests/hermes_cli/conftest.py`: keeps the PR-state lookup offline by default (`gh` "fails", so `active_pr` holds).
-- Not re-run when this doc was written (untested here). The `gh` helpers are only exercised through fakes.
+- `tests/hermes_cli/test_kanban_pr_rejection.py`: rejected-open dispatch, quoted reason once, newest queued marker,
+  incomplete/malformed/truncated markers, exit-2 alternative, ordinary comment, merged control, and requeue without stale cache.
+- Verified for 0266: 114 passing tests across rejection, park invariants, dispatch and both review lifecycle files;
+  rejection regression observed failing before the fix. A real OPEN rejected PR response was fetched read-only and
+  its rejection reason parsed. Production dispatcher deployment remains separate from these unit/parser proofs.
 
 ## Applying
 
 `git am -3` in order 0212, 0223, 0225, 0238, 0239, 0241, 0242 (the last four assume the `*_guard_notice` module from 0225).
+
+## Five whys (0266)
+
+Repair stalled because `active_pr` treated an OPEN rejected PR as active. The PR stayed open because queue rejection
+ends the merge attempt, not the PR. The guard queried only GitHub lifecycle state, so it could not distinguish
+queue ownership from repair ownership. Earlier merged/closed tests missed this state combination. The previous
+terminal-state release fix therefore did not cover rejection. Countermeasures: model completed queue rejection,
+quote its repair reason, and test the full dispatcher release plus queued/merged/malformed/requeue controls.
 
 ## Gotchas
 

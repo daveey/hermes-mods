@@ -1,0 +1,246 @@
+From 212914fad6c8008b0294a8856cf95162677146d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:41:27 -0700
+Subject: [PATCH] fix(kanban): release rejected merge-queue PRs to repair
+ workers [daveey]
+
+Five whys: repair stalled because active_pr held an OPEN PR; the PR stayed open after queue rejection; the guard queried only GitHub lifecycle state; queue completion was not modeled; tests covered merged/closed but no rejected-open case. The earlier terminal-state fix therefore did not cover queue failures. Read the newest bb-land marker, require done=true plus rejected or exit=2, quote its reason once on the card, and resume repair rather than duplicate creation. Unknown/malformed/queued evidence still holds. Do not cache rejection across requeue. Proof: rejection regression failed before the change; 114 dispatch, park and review tests pass, including queued/latest-marker, malformed, merged, deduped reason and requeue controls.
+---
+ hermes_cli/kanban_db_dispatch_pr_rejection.py | 48 ++++++++++++
+ hermes_cli/kanban_db_dispatch_pr_state.py     | 38 ++++++++--
+ tests/hermes_cli/test_kanban_pr_rejection.py  | 75 +++++++++++++++++++
+ 3 files changed, 153 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_pr_rejection.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_rejection.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_rejection.py b/hermes_cli/kanban_db_dispatch_pr_rejection.py
+new file mode 100644
+index 0000000000..32cb0e1144
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_pr_rejection.py
+@@ -0,0 +1,48 @@
++"""Merge-queue rejection evidence for the respawn guard. [daveey]"""
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++
++_MARKER = re.compile(r"<!--\s*bb-land\s+(.*?)\s*-->", re.DOTALL)
++
++
++def rejection_reason(comments: list) -> str | None:
++    """Inspect the newest marker only (GitHub returns comments oldest first).
++
++    A malformed newest marker fails closed; never fall back to an older rejection.
++    Ordinary review comments do not supersede queue state.
++    """
++    for comment in reversed(comments):
++        body = comment.get("body", "") if isinstance(comment, dict) else ""
++        if not isinstance(body, str):
++            continue
++        starts = list(re.finditer(r"<!--\s*bb-land\b", body))
++        if not starts:
++            continue
++        match = _MARKER.match(body, starts[-1].start())
++        if match is None:
++            return None
++        try:
++            result = json.loads(match.group(1))
++        except ValueError:
++            return None
++        if not isinstance(result, dict) or result.get("done") is not True:
++            return None
++        if result.get("state") != "rejected" and result.get("exit") != 2:
++            return None
++        return _MARKER.sub("", body).strip()[:4000] or "Merge queue rejected this PR (exit 2)."
++    return None
++
++
++def comment_rejection(conn: sqlite3.Connection, task_id: str, url: str, reason: str) -> None:
++    """Persist one repair handoff per distinct rejection, without per-tick spam."""
++    from hermes_cli import kanban_db as kb
++
++    body = (f"Respawn guard released rejected merge-queue PR {url}. "
++            "Repair and resubmit this PR; do not open a duplicate.\n\n"
++            + "\n".join("> " + line for line in reason.splitlines()))
++    if not conn.execute("SELECT 1 FROM task_comments WHERE task_id = ? AND body = ?",
++                        (task_id, body)).fetchone():
++        kb.add_comment(conn, task_id, "respawn-guard", body)
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 8b236505ba..3772f713e2 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -3,7 +3,9 @@
+ ``active_pr`` exists to stop a second worker opening a duplicate PR. Once every PR a
+ card's comments name is MERGED or CLOSED there is nothing left to duplicate, so the hold
+ must lift (2026-10-23: t_d507533c sat held 6 h after Metta-AI/coworld-qwop#1 merged).
+-States come from ``gh pr view --json state``; anything else (gh missing, auth, network,
++States and queue markers come from ``gh pr view --json state,comments``. A completed
++rejection releases the worker to repair the existing PR, with a quoted card comment.
++Anything unknown (gh missing, auth, network,
+ timeout, unparseable output) is ``None`` and the caller keeps holding (fail closed).
+ 
+ Results are cached per process: terminal states forever (a merged PR never reopens; a
+@@ -30,12 +32,13 @@ GH_TIMEOUT_SECONDS = 20
+ 
+ # url -> (state or None, monotonic expiry or None for "forever")
+ _cache: dict[str, tuple[Optional[str], Optional[float]]] = {}
++_rejections: dict[str, str] = {}
+ 
+ 
+ def _gh_pr_state(url: str) -> Optional[str]:
+-    """``MERGED`` / ``CLOSED`` / ``OPEN`` for ``url`` via gh, or ``None`` on any failure."""
++    """GitHub state, ``REJECTED`` for a completed queue rejection, or None on failure."""
+     try:
+-        proc = subprocess.run(["gh", "pr", "view", url, "--json", "state"], stdin=subprocess.DEVNULL,
++        proc = subprocess.run(["gh", "pr", "view", url, "--json", "state,comments"], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=GH_TIMEOUT_SECONDS, check=False)
+     except (OSError, subprocess.SubprocessError):
+@@ -45,10 +48,21 @@ def _gh_pr_state(url: str) -> Optional[str]:
+         logger.debug("kanban: gh pr view %s exited %s: %s", url, proc.returncode, (proc.stderr or "")[:200])
+         return None
+     try:
+-        state = json.loads(proc.stdout or "{}").get("state")
++        data = json.loads(proc.stdout or "{}")
++        state = data.get("state")
+     except (ValueError, AttributeError):
+         return None
+-    return state.upper() if isinstance(state, str) and state else None
++    state = state.upper() if isinstance(state, str) and state else None
++    key = url.rstrip("/").lower()
++    _rejections.pop(key, None)
++    if state == "OPEN":
++        from hermes_cli.kanban_db_dispatch_pr_rejection import rejection_reason
++        comments = data.get("comments", [])
++        reason = rejection_reason(comments) if isinstance(comments, list) else None
++        if reason:
++            _rejections[key] = reason
++            return "REJECTED"
++    return state
+ 
+ 
+ def pr_state(url: str) -> Optional[str]:
+@@ -59,7 +73,9 @@ def pr_state(url: str) -> Optional[str]:
+     if hit is not None and (hit[1] is None or now < hit[1]):
+         return hit[0]
+     state = _gh_pr_state(url)
+-    if state in TERMINAL_STATES:
++    if state == "REJECTED":
++        _cache.pop(key, None)  # requeue must invalidate rejection immediately
++    elif state in TERMINAL_STATES:
+         _cache[key] = (state, None)
+     else:
+         _cache[key] = (state, now + (OPEN_TTL_SECONDS if state else ERROR_TTL_SECONDS))
+@@ -86,7 +102,7 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     merge is resumed by that unblock to ship/verify THAT PR. A crash/reclaim is not a
+     handoff, so the worker that opened the PR is still not re-spawned against it.
+     Also lifted once EVERY PR named in those comments is MERGED or CLOSED (gh, cached; any
+-    gh failure keeps the hold): there is nothing left to duplicate. [daveey]
++    gh failure keeps the hold), or has a completed queue rejection requiring repair. [daveey]
+     """
+     from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_dispatch as _kbd
+@@ -107,10 +123,16 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+             "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')",
+             cols=", kind, payload", strict=True)):
+         return None
+-    if all_prs_finished(pr_urls):
++    states = {u: pr_state(u) for u in dict.fromkeys(pr_urls)}
++    if all(s in TERMINAL_STATES or s == "REJECTED" for s in states.values()):
++        from hermes_cli.kanban_db_dispatch_pr_rejection import comment_rejection
++        for url, state in states.items():
++            if state == "REJECTED":
++                comment_rejection(conn, task_id, url, _rejections[url.rstrip("/").lower()])
+         return None
+     return "active_pr"
+ 
+ 
+ def clear_cache() -> None:
+     _cache.clear()
++    _rejections.clear()
+diff --git a/tests/hermes_cli/test_kanban_pr_rejection.py b/tests/hermes_cli/test_kanban_pr_rejection.py
+new file mode 100644
+index 0000000000..26973925f1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_rejection.py
+@@ -0,0 +1,75 @@
++"""Rejected queue jobs must return an open PR to its worker."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli.test_kanban_park_invariants import kanban_home
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++
++_REAL_LOOKUP = prs._gh_pr_state
++URL = "https://github.com/example/project/pull/12"
++
++
++def marker(state, done=True, exit=2):
++    return 'bb land result: new failing tests\n<!-- bb-land ' + json.dumps(
++        {"done": done, "state": state, "exit": exit}) + ' -->'
++
++
++def lookup(monkeypatch, state, bodies):
++    monkeypatch.setattr(prs, '_gh_pr_state', _REAL_LOOKUP)
++    prs.clear_cache()
++    def run(cmd, **kwargs):
++        return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({
++            'state': state, 'comments': [{'body': b} for b in bodies]}))
++    monkeypatch.setattr(prs.subprocess, 'run', run)
++
++
++def test_rejected_open_pr_spawns_with_reason(kanban_home, monkeypatch, all_assignees_spawnable):
++    lookup(monkeypatch, 'OPEN', [marker('queued', False, 0), marker('rejected')])
++    spawned = []
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='queue repair', assignee='a')
++        kb.add_comment(conn, tid, 'a', f'opened {URL}')
++        assert kbd.check_respawn_guard(conn, tid) is None
++        assert kbd.check_respawn_guard(conn, tid) is None
++        comments = conn.execute('SELECT body FROM task_comments WHERE task_id = ?', (tid,)).fetchall()
++        notes = [r[0] for r in comments if 'new failing tests' in r[0]]
++        assert len(notes) == 1
++        assert URL in notes[0]
++        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *a, **k: spawned.append(task.id) or 1)
++        assert tid not in dict(result.respawn_guarded)
++        assert spawned == [tid]
++
++
++@pytest.mark.parametrize('state,bodies,expected', [
++    ('OPEN', [marker('rejected'), marker('queued', False, 0)], 'active_pr'),
++    ('OPEN', [marker('rejected', False)], 'active_pr'),
++    ('OPEN', [marker('failed', True, 2)], None),
++    ('OPEN', [marker('rejected'), '<!-- bb-land broken -->'], 'active_pr'),
++    ('OPEN', [marker('rejected'), '<!-- bb-land truncated'], 'active_pr'),
++    ('OPEN', [marker('rejected'), 'ordinary review comment'], None),
++    ('MERGED', [marker('rejected')], None),
++])
++def test_newest_queue_result(kanban_home, monkeypatch, state, bodies, expected):
++    lookup(monkeypatch, state, bodies)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='queue state', assignee='a')
++        kb.add_comment(conn, tid, 'a', f'opened {URL}')
++        assert kbd.check_respawn_guard(conn, tid) == expected
++        if state == 'MERGED':
++            assert conn.execute('SELECT COUNT(*) FROM task_comments WHERE task_id = ?', (tid,)).fetchone()[0] == 1
++
++
++def test_requeue_after_rejection_is_not_cached(kanban_home, monkeypatch):
++    bodies = [marker('rejected')]
++    lookup(monkeypatch, 'OPEN', bodies)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='resubmitted', assignee='a')
++        kb.add_comment(conn, tid, 'a', f'opened {URL}')
++        assert kbd.check_respawn_guard(conn, tid) is None
++        bodies.append(marker('queued', False, 0))
++        assert kbd.check_respawn_guard(conn, tid) == 'active_pr'
+-- 
+2.54.0 (Apple Git-157)
+
