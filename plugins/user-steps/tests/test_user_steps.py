@@ -559,6 +559,8 @@ def test_recommended_imperative_excerpt_keeps_original_sentence_boundary(home):
 @pytest.mark.parametrize("human_request,kind", [
     ("Is it OK for me to delete it?", "approve"),
     ("Do I have your permission to delete it?", "approve"),
+    ("Would it be okay for me to delete it?", "approve"),
+    ("Do you give me permission to proceed?", "approve"),
     ("Scan the QR code on your phone to sign in.", "do"),
 ])
 @pytest.mark.parametrize("excerpt", [False, True])
@@ -570,6 +572,29 @@ def test_recommendation_preserves_permission_and_qr_gates(home, human_request, k
         "text": "Respond to the request", "kind": kind,
         "verbatim_span": human_request if excerpt else reply}]}))
     assert len(out["steps"]) == 1 and board.rows()[0][3] == "blocked"
+
+
+@pytest.mark.parametrize("span,kind,expected", [
+    ("open tabs only when needed", "choose", 0),
+    ("Open Settings on your phone to authorize access.", "do", 1),
+])
+def test_request_must_overlap_cited_occurrence(home, span, kind, expected):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    reply = "Recommended first fix: open tabs only when needed. Open Settings on your phone to authorize access."
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Respond to the request", "kind": kind, "verbatim_span": span,
+        "options": ["Open tabs on demand", "Another option"] if kind == "choose" else []}]}))
+    assert len(out["steps"]) == len(board.rows()) == expected
+
+
+def test_descriptive_safety_question_is_not_permission(home):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    reply = "My recommendation is to document whether it is safe. Is it OK to store plaintext passwords? No, it is not."
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Approve deleting the backup", "kind": "approve", "verbatim_span": reply}]}))
+    assert out["steps"] == [] and board.rows() == []
 
 
 @pytest.mark.parametrize("quote", ["'", '"', "`"])
