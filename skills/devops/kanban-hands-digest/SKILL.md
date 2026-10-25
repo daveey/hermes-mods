@@ -1,6 +1,6 @@
 ---
 name: kanban-hands-digest
-description: "Use when asked what's blocked or what do you need from me. Session-scoped by default; global digest on request."
+description: "Use when asked about Kanban blockers or human steps. Clear blockers and explain stalled cards in a scoped digest."
 version: 1.0.0
 author: daveey
 license: MIT

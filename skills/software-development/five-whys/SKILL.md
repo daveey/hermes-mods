@@ -1,6 +1,6 @@
 ---
 name: five-whys
-description: "Use for failure analysis: why-chain to a fixable root. Any bug, incident, failed task, red CI, bad agent output or postmortem."
+description: "Use when analyzing a failure. Trace evidence-backed whys to a fixable root for bugs, incidents, CI or bad agent output."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
