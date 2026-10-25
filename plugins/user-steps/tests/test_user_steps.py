@@ -544,6 +544,34 @@ def test_recommended_action_after_colon_is_not_user_instruction(home):
     assert out["steps"] == [] and board.rows() == []
 
 
+def test_recommended_imperative_excerpt_keeps_original_sentence_boundary(home):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    span = "open tabs only when needed and close them after automation"
+    reply = "Recommended first fix: " + span + ". Your browser is stopped."
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Choose the first fix", "kind": "choose", "verbatim_span": span,
+        "options": ["Open tabs on demand", "Another option"]}]}))
+    assert out["steps"] == [] and board.rows() == []
+    assert ledger(home).open_steps("S1") == []
+
+
+@pytest.mark.parametrize("human_request,kind", [
+    ("Is it OK for me to delete it?", "approve"),
+    ("Do I have your permission to delete it?", "approve"),
+    ("Scan the QR code on your phone to sign in.", "do"),
+])
+@pytest.mark.parametrize("excerpt", [False, True])
+def test_recommendation_preserves_permission_and_qr_gates(home, human_request, kind, excerpt):
+    add_session(home, "S1")
+    board = FakeBoard(home)
+    reply = "I recommend the change. " + human_request
+    out = run(home, reply, cards=board, llm=fake_llm({"steps": [{
+        "text": "Respond to the request", "kind": kind,
+        "verbatim_span": human_request if excerpt else reply}]}))
+    assert len(out["steps"]) == 1 and board.rows()[0][3] == "blocked"
+
+
 @pytest.mark.parametrize("quote", ["'", '"', "`"])
 def test_recommendation_quoted_please_label_is_not_consent(home, quote):
     add_session(home, "S1")

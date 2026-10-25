@@ -366,10 +366,11 @@ _RECOMMENDATION = re.compile(r"\b(?:recommend(?:ed|ation|ations|s)?|suggest(?:ed
 _EXPLICIT_REQUEST = re.compile(
     r"\b(?:can you|could you|would you|will you|you (?:must|need to|have to)|"
     r"(?:needs?|requires?|awaiting|waiting for) your|let me know|tell me|"
-    r"do you (?:approve|consent|want)|want me to|may i|can i|could i|would you like|should i|shall i|which .{0,80}(?:want|choose|prefer))\b"
+    r"do you (?:approve|consent|want)|do i have your (?:permission|consent|approval)|"
+    r"is it (?:ok|okay|all right)|want me to|may i|can i|could i|would you like|should i|shall i|which .{0,80}(?:want|choose|prefer))\b"
     r"|\bplease\s+(?:approve|confirm|authorize|choose|sign in|log in)\b"
     r"|(?:^|[.!;,]\s+)(?:please\s+)?(?:choose|pick|approve|confirm|decide|select|reply|"
-    r"sign in|log in|tap|click|plug|open|authorize|grant)\b",
+    r"sign in|log in|tap|click|scan|plug|open|authorize|grant)\b",
     re.I,
 )
 
@@ -377,10 +378,18 @@ _EXPLICIT_REQUEST = re.compile(
 def recommendation_without_request(span: str, block: str = "") -> bool:
     # Use the containing paragraph to catch excerpts which omit "Recommended".
     # Quoted labels, code and rhetorical question marks are not requests.
-    unquoted = re.sub(r"(?<!\w)'[^'\n]+'", " ", _strip_noise(span))
-    clean = _norm(re.sub(r'["“][^"”\n]*["”]', " ", unquoted))
+    def request_text(value: str) -> str:
+        unquoted = re.sub(r"(?<!\w)'[^'\n]+'", " ", _strip_noise(value))
+        return _norm(re.sub(r'["“][^"”\n]*["”]', " ", unquoted))
+
     context = _norm(block or span)
-    return bool(_RECOMMENDATION.search(context) and not _EXPLICIT_REQUEST.search(clean))
+    clean = request_text(span)
+    # Sentence boundaries belong to the source, not an arbitrary extracted
+    # excerpt. A colon-prefixed recommendation cannot become an imperative
+    # merely because the extractor starts its evidence after that colon.
+    requests = _EXPLICIT_REQUEST.finditer(request_text(block or span))
+    grounded = any(m.group(0).lstrip(".!;, ") in clean for m in requests)
+    return bool(_RECOMMENDATION.search(context) and not grounded)
 
 
 def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None) -> list[dict]:
