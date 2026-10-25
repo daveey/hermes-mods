@@ -511,3 +511,5 @@ sanitation ambiguity. `tests/test_goal_native_capture.py` exercises adapter pers
 overrides and current multimodal memory injection through complete turns. Provider
 and semantic judge responses are controlled; these are transport/safety contracts,
 not real-model semantic acceptance or live CLI/Desktop transport acceptance.
+
+Legacy replay uncertainty survives compaction in native display metadata; scope recovery rejects it rather than treating sanitized text as complete authorization. This is a safety control, not recovery of missing permission.

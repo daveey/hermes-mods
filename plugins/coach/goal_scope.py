@@ -31,7 +31,10 @@ def _ro_connect(path):
     return conn
 
 def _user_row(row):
-    if row.get('_user_content_sanitized'):
+    metadata = row.get('display_metadata') or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    if row.get('_user_content_sanitized') or metadata.get('user_content_sanitized'):
         raise ValueError('ambiguous_memory_provenance')
     if isinstance(row.get('content'), list) and not row.get('api_content'):
         # Historical multimodal injection shares content, without a native split.
@@ -139,7 +142,7 @@ def recover_scope(session_id, user_message, history, *, canonical_user_content=N
                 else:
                     raise ValueError('scope_lineage_limit')
                 for sid, bound, cutoff in reversed(segments):
-                    saved = conn.execute("SELECT content, CASE WHEN api_content != '' THEN 'native' END AS api_content "
+                    saved = conn.execute("SELECT content, display_metadata, CASE WHEN api_content != '' THEN 'native' END AS api_content "
                                          'FROM messages WHERE session_id=? AND ' + clean +
                                          ' AND ' + bound + ' ORDER BY id LIMIT 201', (sid, cutoff)).fetchall()
                     for row in saved:
