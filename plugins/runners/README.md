@@ -34,6 +34,17 @@ expiry and record timestamps; current holds suppress verified readiness. Old or
 unavailable configured checks cannot silently pass. Supervisor withdrawal logs
 are historical evidence only, not proof a label is still withdrawn.
 
+Journal checks are deliberately fail-closed, not complete state machines:
+`headroom` recognizes waits but has no authoritative clear event; admission
+requires a fresh explicit pressure-free record to clear. Opting into these checks
+can therefore leave readiness unverified indefinitely after log expiry or while
+idle, even when the provider says online. Unknown is never inferred clear from
+silence or an unrelated journal line. A stale hold is only last-known, not active.
+Do not enable these checks if verified-ready counts are required without an
+authoritative clear source. Remote clock skew can also make evidence stale.
+Journal checks use only existing read access; denied access remains Not observed.
+This feature neither grants journal permissions nor asks the probe to elevate.
+
 Provision a dedicated forced-command SSH identity additively. Install source from
 `probes.ssh.render_script` and its interpreter at trusted root-owned non-writable
 paths; pin host keys through an independently authenticated route. Restrict keys

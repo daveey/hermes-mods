@@ -52,6 +52,7 @@ def test_headroom_requires_last_record_and_preserves_source_time():
 
 
 def test_marker_permission_failure_is_not_absence(tmp_path):
+    assert lifecycle.marker_evidence(str(tmp_path / 'missing-parent' / 'maintenance'), 1000)['state'] == 'unknown'
     marker = tmp_path / 'maintenance'
     assert lifecycle.marker_evidence(str(marker), 1000)['state'] == 'clear'
     marker.write_text('private details')
@@ -72,6 +73,8 @@ def test_marker_errors_and_symlinks_are_unknown(monkeypatch, tmp_path):
 
 
 def test_withdrawal_is_a_historical_event_not_current_hold():
+    malformed = 'example-runner saved custom labels: [build-ci] withdrawn 9999-12-31T23:59:59-01:00 by supervisor (disk emergency)'
+    assert lifecycle.label_evidence(malformed, 'example-runner', 1000)['recorded_at'] is None
     text = 'example-runner saved custom labels: [build-ci] withdrawn 2026-01-01T00:00:00Z by supervisor (disk emergency)'
     result = lifecycle.label_evidence(text, 'example-runner', 1000)
     assert result['kind'] == 'label_withdrawn'

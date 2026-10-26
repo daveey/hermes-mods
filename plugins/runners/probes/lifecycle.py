@@ -136,7 +136,13 @@ def marker_evidence(path, now):
             return evidence('maintenance', 'maintenance_marker')
         return evidence('maintenance', 'maintenance_marker', 'held', now)
     except FileNotFoundError:
-        return evidence('maintenance', 'maintenance_marker', 'clear', now)
+        try:
+            parent = os.lstat(os.path.dirname(path))
+            if stat.S_ISDIR(parent.st_mode):
+                return evidence('maintenance', 'maintenance_marker', 'clear', now)
+        except OSError:
+            pass
+        return evidence('maintenance', 'maintenance_marker')
     except OSError:
         return evidence('maintenance', 'maintenance_marker')
 
@@ -156,7 +162,7 @@ def label_evidence(text, runner, now):
         if at.tzinfo is None:
             return result
         stamp = at.timestamp()
-        if not math.isfinite(stamp) or stamp < 0:
+        if not valid_timestamp(stamp):
             return result
         # This append-only event is not proof the label is still withdrawn.
         # UI must call it historical, independently of current provider labels.
