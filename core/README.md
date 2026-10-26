@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-actionability-durable-evidence.md](kanban-actionability-durable-evidence.md) | 0393–0400 | Merge-adapted actionable escalation, scope heartbeat freshness, exact legacy attestation with a distinct wire action, contention timestamp retention, and test followups; locally verified candidate |
 | [unresolved-goal-fallback.md](unresolved-goal-fallback.md) | 0392 | Optional structured `pre_final_gate` fallback retained at budget/cap/unavailable boundaries, ownership-bound rechecks, private held text, scoped Kanban/process/dispatcher health receipts; enforcement stays opt-in (coach plugin) |
 | [retention-observation.md](retention-observation.md) | 0391 | Fail-closed, observation-only non-CI retention slice (`retention_cli observe`); cannot delete or authorize deletion |
 | [kanban-origin-adoption.md](kanban-origin-adoption.md) | 0380–0382 | State-preserving existing-task origin adoption with immutable request replay/conflict checks |
@@ -146,10 +147,13 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 ## Applying
 
-The current export contains **392 patches**, pinned to source
-`2228cfe8dada6912c5f8966f967d12870d029c2d`. All 392 apply in order with
-`git am -3 --empty=keep`; 69 selected Python tests (38 platform skips) across nine files pass on the
-applied public series. See [current verification](mirror-392-verification.md)
+The current local candidate contains **400 patches**, pinned to source
+`0146a882edf55e22fc9197e2a2e190a0fbacf068` (0400 pending source review/publication at export).
+All 400 apply in order with `git am -3 --empty=keep`; 290 selected Python tests across
+15 files pass on the applied public series, with no failures or skips.
+Patches 0001–0392 are byte-identical and unrenumbered. Patch 0393 explicitly integrates
+merge `2b6644387f`; overlapping branch commits must not also be replayed.
+See [current verification](mirror-400-verification.md)
 for privacy, preservation and exact execution scope. The earlier 377-patch run's
 Desktop/typecheck results are historical, not rerun for this export. No runtime
 deployment or legacy migration is claimed.

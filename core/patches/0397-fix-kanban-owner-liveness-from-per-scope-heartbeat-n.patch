@@ -1,0 +1,202 @@
+From dc50ba33a29bd0237f33bd2bf22a3e4070f5053a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:01:11 -0700
+Subject: [PATCH] fix(kanban): owner liveness from per-scope heartbeat, not
+ per-task stamps [daveey]
+
+observe_owner_task stamped every task record with observed_at=now, and the
+origin projection required that stamp to be < 180 s old. Every hub sync
+therefore re-hashed and republished every task (measured: 1,952 of 1,954
+changed records per 75 s cycle differed only in observed_at), rewriting
+every gateway's replica and invalidating replica-keyed caches.
+
+- project(): a task is live when the owner's matching gateway/info
+  task_scopes[] entry is readable (state ok) and its observed_at heartbeat
+  is < 180 s old. The per-task stamp is still accepted, for records
+  published before scope heartbeats.
+- observe_owner_task(): no per-task observed_at; an unchanged task now
+  publishes an identical record.
+
+Requires hermes-hub client >= 1.4.3 (publishes task_scopes[].observed_at)
+on every owner gateway before this lands; see the coordinated rollout.
+
+Tests: new test_kanban_origin_scope_heartbeat.py (fresh heartbeat keeps an
+unchanged task current; stale/missing/unreadable/other-board heartbeat is
+unknown; legacy per-task stamp still counts), red on base for the
+behaviour-change cases. Fixtures publish the new collector's scope shape;
+the producer test now asserts an unchanged task re-observes identically
+instead of asserting the removed per-task stamp.
+
+---
+ hermes_cli/kanban_origin_ledger.py            | 19 +++--
+ .../test_kanban_origin_alias_release.py       |  3 +-
+ .../hermes_cli/test_kanban_origin_evidence.py |  7 +-
+ .../test_kanban_origin_scope_heartbeat.py     | 75 +++++++++++++++++++
+ 4 files changed, 96 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_scope_heartbeat.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 9f8adc0f2a..030904a284 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -182,13 +182,19 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+                     and event and run and event[1] == run[0] and run[1] in ('done', 'completed') and run[2] == 'completed'
+                     and row[1] is not None and event[2] >= row[1] and run[3] is not None and run[3] >= row[1])
+     payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    # No per-task timestamp: an unchanged task must publish an identical record, or every sync republishes
++    # every task. Owner liveness is the collector's per-scope heartbeat (``task_scopes[].observed_at``).
+     return {**payload, 'origin_observation': {
+-        'schema': 1, 'observed_at': now,
++        'schema': 1,
+         'task_hash': hashlib.sha256(_json(payload).encode()).hexdigest(),
+         'verified': verified,
+     }}
+ 
+ 
++def _recent(observed_at: object, now: float, window: float = 180) -> bool:
++    return type(observed_at) in (int, float) and 0 <= now - observed_at <= window
++
++
+ def _owner_evidence(task: dict) -> dict:
+     evidence = task.get('origin_observation')
+     if not isinstance(evidence, dict) or type(evidence.get('schema')) is not int or evidence['schema'] != 1:
+@@ -310,11 +316,14 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                                     and (s.get('profile'), s.get('board')) == (owner['profile'], owner['board'])]
+                         readable = (info.get('gateway') == owner['gateway'] and len(matching) == 1
+                                     and matching[0].get('state') == 'ok')
++                        heartbeat = matching[0].get('observed_at') if readable else None
+                     except (ValueError, TypeError, AttributeError):
+-                        readable = False
+-                    evidence = _owner_evidence(task)
+-                    observed_at = evidence.get('observed_at')
+-                    live = (type(observed_at) in (int, float) and 0 <= now - observed_at <= 180)
++                        readable, heartbeat = False, None
++                    # Owner liveness: the collector's per-scope heartbeat (one record per sync) proves it read
++                    # this whole board recently, so an unchanged, current task record is still observed. The
++                    # per-task stamp is accepted too, for records published before scope heartbeats existed.
++                    live = (_recent(heartbeat, now)
++                            or _recent(_owner_evidence(task).get('observed_at'), now))
+                     current = current and readable and live
+                 if (owner['gateway'], owner['profile']) == (gateway, profile):
+                     from hermes_cli.kanban_origin_local import observe_local_binding
+diff --git a/tests/hermes_cli/test_kanban_origin_alias_release.py b/tests/hermes_cli/test_kanban_origin_alias_release.py
+index f756a1772d..7b3e902961 100644
+--- a/tests/hermes_cli/test_kanban_origin_alias_release.py
++++ b/tests/hermes_cli/test_kanban_origin_alias_release.py
+@@ -45,7 +45,8 @@ def publish(conn, replica, binding, sessions, version):
+                    ('owner', 'tasks', binding['task_record_key'], version, json.dumps(task), 1000000))
+         db.execute('INSERT INTO replica VALUES (?,?,?,?,?,?)',
+                    ('owner', 'gateway', 'info', version, json.dumps({'gateway': 'owner', 'task_scopes': [
+-                       {'profile': 'default', 'board': 'default', 'state': 'ok'}]}), 1000000))
++                       {'profile': 'default', 'board': 'default', 'state': 'ok', 'observed_at': 1000}]}),
++                    1000000))
+ 
+ 
+ def prepare(scenario, aliases, *, verified=True):
+diff --git a/tests/hermes_cli/test_kanban_origin_evidence.py b/tests/hermes_cli/test_kanban_origin_evidence.py
+index 0fd748d96a..dab222dfe0 100644
+--- a/tests/hermes_cli/test_kanban_origin_evidence.py
++++ b/tests/hermes_cli/test_kanban_origin_evidence.py
+@@ -62,7 +62,8 @@ def publish_observed(conn, replica, binding, *, version, now=1000):
+         db.execute("INSERT OR REPLACE INTO meta VALUES ('last_ok',?)", (str(now),))
+         db.execute("INSERT INTO replica VALUES ('owner','gateway','info',6,?)",
+                    (json.dumps({'gateway': 'owner', 'task_scopes': [
+-                       {'profile': binding['owner']['profile'], 'board': binding['owner']['board'], 'state': 'ok'}]}),))
++                       {'profile': binding['owner']['profile'], 'board': binding['owner']['board'], 'state': 'ok',
++                        'observed_at': now}]}),))
+ 
+ 
+ @pytest.mark.parametrize('completed', [False, True])
+@@ -235,5 +236,7 @@ def test_owner_observation_proves_current_local_completion(board):
+             [tuple(r) for r in conn.execute('SELECT id,status,outcome,ended_at FROM task_runs WHERE task_id=?', (tid,))],
+             [tuple(r) for r in conn.execute("SELECT id,run_id,created_at FROM task_events WHERE task_id=? AND kind='completed'", (tid,))],
+         )
+-        assert observed['origin_observation']['observed_at'] == 1000
++        # An unchanged task republishes nothing: a later observation is the identical record (liveness is
++        # the collector's per-scope heartbeat, not a per-task stamp).
++        assert observe(conn, task, now=2000) == observed
+         assert task.get('origin_observation') is None
+diff --git a/tests/hermes_cli/test_kanban_origin_scope_heartbeat.py b/tests/hermes_cli/test_kanban_origin_scope_heartbeat.py
+new file mode 100644
+index 0000000000..bacf265b74
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_scope_heartbeat.py
+@@ -0,0 +1,75 @@
++"""Owner liveness comes from the collector's per-scope heartbeat, so unchanged tasks need not republish."""
++import json
++import sqlite3
++
++import pytest
++
++from tests.hermes_cli.test_kanban_origin_ledger import world as world, accept  # noqa: PLC0414 -- pytest fixture registration
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414 -- pytest fixture registration
++from tests.hermes_cli.test_kanban_origin_evidence import publish_observed, create_bound
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_origin_ledger as ledger
++
++
++def project(world, now=1001):
++    path, replica, _ = world
++    return ledger.project(path, replica=replica, gateway='origin', profile='default', now=now)[0]
++
++
++def set_scope(replica, binding, **fields):
++    with sqlite3.connect(replica) as db:
++        info = json.loads(db.execute("SELECT data FROM replica WHERE coll='gateway' AND key='info'").fetchone()[0])
++        scope = {'profile': binding['owner']['profile'], 'board': binding['owner']['board'], 'state': 'ok'}
++        info['task_scopes'] = [{**scope, **fields}]
++        db.execute("UPDATE replica SET data=? WHERE coll='gateway' AND key='info'", (json.dumps(info),))
++
++
++@pytest.fixture
++def published(world, board):
++    _, replica, binding = world
++    with kbc.connect_closing() as conn:
++        create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3, now=1000)
++        accept(world)
++    return replica, binding
++
++
++def test_fresh_scope_heartbeat_keeps_unchanged_task_current(world, published):
++    replica, _ = published
++    with sqlite3.connect(replica) as db:
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks'").fetchone()[0])
++    assert 'observed_at' not in task['origin_observation']  # the producer no longer stamps tasks
++    # 170 s after the task was published, the owner's heartbeat from this sync still proves it current.
++    _, binding = published
++    set_scope(replica, binding, observed_at=1170)
++    row = project(world, now=1170)
++    assert row['status'] == 'ready'
++    assert not row['stale']
++
++
++@pytest.mark.parametrize('scope', [
++    {'observed_at': 800},                      # heartbeat older than the 180 s window
++    {},                                        # no heartbeat and no per-task stamp
++    {'observed_at': 1000, 'state': 'unknown'},  # fresh heartbeat on a scope the owner could not read
++    {'observed_at': 1000, 'board': 'other'},    # fresh heartbeat for a different board
++])
++def test_missing_stale_or_unreadable_heartbeat_is_unknown(world, published, scope):
++    replica, binding = published
++    set_scope(replica, binding, **scope)
++    row = project(world)
++    assert row['status'] == 'unknown'
++    assert row['unfinished'] and row['stale']
++
++
++def test_legacy_per_task_stamp_without_scope_heartbeat_still_counts(world, published):
++    """Records published before scope heartbeats carry the stamp on the task; they stay live meanwhile."""
++    replica, binding = published
++    set_scope(replica, binding)  # an old collector: no heartbeat on the scope
++    with sqlite3.connect(replica) as db:
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks'").fetchone()[0])
++        task['origin_observation']['observed_at'] = 1000  # outside task_hash, as old producers wrote it
++        db.execute("UPDATE replica SET data=? WHERE coll='tasks'", (json.dumps(task),))
++    path, _, _ = world
++    with sqlite3.connect(path) as conn:  # the ledger holds the accepted copy of the published record
++        conn.execute("UPDATE origin_obligations SET task_json=?", (json.dumps(task),))
++    assert project(world)['status'] == 'ready'
+-- 
+2.55.0
+
