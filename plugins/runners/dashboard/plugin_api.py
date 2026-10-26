@@ -133,6 +133,22 @@ def invoke(operation, *args):
         raise HTTPException(503, 'unavailable') from None
 
 
+@router.get('/enrollment')
+def enrollment():
+    """Profile-local capability discovery; never opens state or starts collection."""
+    profile = active_profile()
+    try:
+        backend = service()
+    except FileNotFoundError:
+        return dict(contract_version=1, profile=profile, enrolled=False, capabilities=[])
+    except (ValueError, RuntimeError, OSError, ImportError):
+        raise HTTPException(503, 'configuration_unavailable') from None
+    if not profile or backend.config['owner_profile'] != profile:
+        raise HTTPException(403, 'owner_profile_mismatch')
+    return dict(contract_version=1, profile=profile, enrolled=True,
+                capabilities=['inventory', 'inspect', 'refresh'])
+
+
 @router.get('/inventory')
 def inventory():
     return invoke('inventory')

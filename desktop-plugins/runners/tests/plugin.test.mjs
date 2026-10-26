@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { React, host, route, snapshot, fixtures, loadPlugin, mount, button } from './sdk-mock.mjs'
+import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
 const p = await loadPlugin()
 test('status chip cannot wrap or shrink below its reduced label', () => {
   assert.match(p.CSS, /\[data-slot=runners-chip\]\{flex-shrink:0;white-space:nowrap\}/)
@@ -51,10 +51,22 @@ test('registration counts never imply slots; busy is not unhealthy', () => {
   const v = p.projectFleet([source(s)])
   assert.equal(v.counts.online, 1)
   assert.equal(v.counts.busy, 1)
+  assert.equal(v.counts.unverified, 1)
   assert.equal(v.counts.ready, 0)
   assert.equal(v.counts.issues, 0)
   assert.match(p.chipLabel(v), /1 online · 1 busy/)
   assert.match(p.chipTooltip(v), /registrations.*not.*slots/i)
+})
+test('row observation age never borrows the collector heartbeat', () => {
+  const s = snapshot()
+  const stamp = new Date(Date.now() - 600000).toISOString()
+  s.meta.provenance = [{ source_id: s.data.runners[0].id, observed_at: stamp, state: 'stale' }]
+  const v = p.projectFleet([source(s)])
+  assert.equal(v.rows[0].observed_at, stamp)
+  assert.equal(v.rows[0].stale, true)
+  assert.equal(v.counts.ready, 0)
+  s.meta.provenance = []
+  assert.equal(p.projectFleet([source(s)]).rows[0].observed_at, null)
 })
 test('expired snapshot cannot stay Ready, even if server said fresh', () => {
   const s = snapshot()
@@ -142,6 +154,14 @@ test('source error once, host management warning once, disconnected cached rows 
   assert.equal(v.rows[0].actionable, false)
   assert.equal(v.counts.ready, 0)
 })
+test('source cooldown ETA is aged from its observation, not reset on render', () => {
+  const s = snapshot()
+  const now = Date.now()
+  s.meta.source_errors = [{ source_id: fixtures.Scope.id, code: 'forbidden',
+    retry_after_seconds: 60, observed_at: new Date(now - 20000).toISOString() }]
+  assert.match(p.projectFleet([source(s)], now).messages.join(' '), /retry in 40s/)
+  assert.doesNotMatch(p.projectFleet([source(s)], now + 61000).messages.join(' '), /retry in/)
+})
 test('polling pauses hidden and uses 15/60 second cadence', () => {
   assert.equal(p.pollInterval(true, true), 15000)
   assert.equal(p.pollInterval(false, true), 60000)
@@ -160,6 +180,7 @@ test('render 100 registrations with no per-row request amplification, native pop
   const ctx = {
     rest: async (path, opts) => {
       calls.push([path, opts])
+      if (path.includes('/enrollment')) return enrollment()
       if (path.includes('/runners/'))
         return {
           ...s,
@@ -173,6 +194,7 @@ test('render 100 registrations with no per-row request amplification, native pop
     assert.ok(button('Show runners'))
     await ui.click(button('Show runners'))
     assert.equal(document.querySelectorAll('[data-runner-row]').length, 100)
+    assert.match(document.body.textContent, /Collector heartbeat/)
     assert.equal(calls.filter(([x]) => x.includes('/inventory')).length, 1)
     assert.equal(calls.filter(([x]) => x.includes('/runners/')).length, 0)
     assert.equal(calls.filter(([x]) => x.includes('/refresh')).length, 1)
@@ -189,7 +211,7 @@ test('keyboard slash, arrows, Enter, Escape details then popover and focus resto
   host.profileRoutes = async () => [route]
   const s = snapshot()
   const ctx = {
-    rest: async (path) => (path.includes('/runners/') ? { ...s, data: fixtures.RunnerDetail } : s)
+    rest: async (path) => path.includes('/enrollment') ? enrollment() : (path.includes('/runners/') ? { ...s, data: fixtures.RunnerDetail } : s)
   }
   const ui = await mount(React.createElement(p.Runners, { ctx }))
   try {

@@ -30,6 +30,7 @@ class ProviderResult:
     error: str | None
     observed_at: float
     total_count: int | None
+    retry_after_seconds: int | None = None
 
 
 class Transport(Protocol):
