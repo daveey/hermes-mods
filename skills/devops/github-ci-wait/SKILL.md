@@ -189,6 +189,24 @@ one-shot checks, not another long-lived shell loop.
   SIGTERM, so use `pkill -P <pid>; kill -9 <pid>` and confirm with `ps -p`. Report the containing run/tag to the
   session and tell it to use this script next time.
 
+## Kanban card parked on an external PR
+
+Use the runtime's read-only terminal-state probe as the `wake_check`, not a `gh ... --jq .state` test (that
+treats API failures as pending and never wakes for a superseded PR):
+`hermes --run-module hermes_cli.kanban_pr_wake https://github.com/OWNER/REPO/pull/N`. Exit 1 = OPEN, 0 = merged
+or closed-unmerged (wake to reconcile; neither is acceptance), 2 = evidence/auth error, never pending.
+- When the change will land through a replacement commit while the original PR stays OPEN (a squash train, a
+  batch PR, a cherry-pick), pass BOTH anchors: `--superseding-commit <full 40-char sha> --verification-job
+  <Actions job id that succeeded on exactly that sha>`. It wakes only once that sha is contained in the default
+  branch and that job succeeded on it. Passing one flag alone is an error by design. The caller names the
+  replacement; the probe never infers equivalence, and one job is not all required CI.
+- On wake, reconcile: verify the replacement's behavior, owner dependencies and exact-head required CI before
+  claiming delivery. CLOSED-unmerged alone never means delivered.
+- Stored probes aren't rewritten automatically. When re-parking a card that still has an old `gh` state probe,
+  switch it to this one.
+- This is not a CI-ready probe: an OPEN PR with green checks still waits. Use an exact-head CI probe when the next
+  step is review/landing.
+
 ## Adding helper scripts to a repo
 
 Before choosing a directory for a new tool, read the CI workflows' `on.push.paths` and any plan step's path rules. A
