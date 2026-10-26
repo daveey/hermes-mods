@@ -949,6 +949,44 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
       return next.size === old.size ? old : next
     })
   }, [nodeIdentityKey])
+  const [jumpFocus, setJumpFocus] = useState(null)
+  useEffect(() => {
+    if (!ctx.register || !q.data) return
+    const { groups: allGroups } = selectNodes(inventoryNodes, '', 'All')
+    const disposers = []
+    for (const group of allGroups) {
+      const jump = (row = null) => {
+        setScope(row ? routeKey(row.source.route) : group.source ? routeKey(group.source.route) : 'all')
+        setSearch('')
+        setFilter('All')
+        setExpandedNodes(old => new Set([...old, group.key]))
+        setExpanded(row?.key || null)
+        setOpen(true)
+        setJumpFocus({ key: row?.key || group.key, kind: row ? 'runner' : 'node' })
+      }
+      if (group.host) disposers.push(ctx.register({
+        id: `node:${group.key}`, area: PALETTE_AREA,
+        data: { id: `runners.node:${group.key}`, label: `Show node: ${group.name}`,
+          keywords: ['runners', 'host', text(group.host.os), text(group.host.arch)], run: () => jump() }
+      }))
+      for (const row of group.rows) disposers.push(ctx.register({
+        id: `runner:${row.key}`, area: PALETTE_AREA,
+        data: { id: `runners.runner:${row.key}`, label: `Show runner: ${row.display_name}`,
+          keywords: ['runners', group.name, text(row.os), text(row.arch)], run: () => jump(row) }
+      }))
+    }
+    return () => disposers.forEach(dispose => dispose?.())
+  }, [ctx, q.data])
+  useEffect(() => {
+    if (!open || !jumpFocus) return
+    const frame = requestAnimationFrame(() => {
+      panel.current?.querySelectorAll(`[data-${jumpFocus.kind}-row]`).forEach(el => {
+        if (el.getAttribute(`data-${jumpFocus.kind}-row`) === jumpFocus.key) el.focus()
+      })
+      setJumpFocus(null)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [open, jumpFocus])
   const refreshing = useRef(false)
   async function refresh() {
     if (refreshing.current) return

@@ -130,6 +130,43 @@ test('runner name search retains parent and highlights nested matching text', as
     assert.match(document.body.textContent, /Showing 1 nodes · 1 registrations/)
   } finally { await ui.close() }
 })
+test('native palette jumps to owner-qualified nodes and runners and removes stale contributions', async () => {
+  let s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  const entries = new Map(), calls = []
+  host.profileRoutes = async () => [route]
+  const ctx = {
+    register: entry => { entries.set(entry.id, entry); return () => entries.delete(entry.id) },
+    rest: async (path, options) => { calls.push({ path, options }); return path.includes('/enrollment') ? enrollment() : structuredClone(s) }
+  }
+  const ui = await mount(React.createElement(p.Runners, { ctx }))
+  try {
+    const node = [...entries.values()].find(e => e.data.label.startsWith('Show node:'))
+    const runner = [...entries.values()].find(e => e.data.label.startsWith('Show runner:'))
+    assert.ok(node, 'node registered with native palette')
+    assert.ok(runner, 'runner registered with native palette')
+    assert.equal(node.area, 'palette')
+    assert.equal(calls.filter(c => c.path.includes('/runners/')).length, 0)
+    await React.act(async () => node.data.run())
+    await ui.flush()
+    assert.equal(document.querySelector('[data-node-row]').getAttribute('aria-expanded'), 'true')
+    assert.ok(document.activeElement === document.querySelector('[data-node-row]'), 'jump focuses node')
+    assert.equal(document.querySelector('.hermes-runners-detail'), null)
+    await React.act(async () => runner.data.run())
+    await ui.flush()
+    assert.ok(document.activeElement === document.querySelector('[data-runner-row]'), 'jump focuses runner')
+    assert.ok(document.querySelector('.hermes-runners-detail'))
+    assert.equal(document.querySelector('select').value, JSON.stringify([route.connectionId, route.mode, route.profile, route.targetProfile]))
+    const detail = calls.find(c => c.path.includes('/runners/'))
+    assert.ok(detail, 'runner jump lazily fetches detail')
+    s.data.runners = []
+    await React.act(async () => ui.client.invalidateQueries({ queryKey: ['runners'] }))
+    await ui.flush()
+    assert.ok(!entries.has(runner.id), 'removed runner is removed from native palette')
+  } finally { await ui.close() }
+  assert.equal(entries.size, 0, 'unmount disposes palette contributions')
+})
 test('question mark opens shortcut help and Escape closes help before panel', async () => {
   host.profileRoutes = async () => [route]
   const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : snapshot() } }))
@@ -308,7 +345,7 @@ test('loading, unavailable, hidden polling and palette registration', async () =
     dispose = []
   const ctx = {
     rest: async (path) => path.includes('/enrollment') ? enrollment() : new Promise((r) => (release = r)),
-    register: (c) => contributions.push(c),
+    register: (c) => { contributions.push(c); return () => contributions.splice(contributions.indexOf(c), 1) },
     onDispose: (f) => dispose.push(f)
   }
   p.default.register(ctx)
