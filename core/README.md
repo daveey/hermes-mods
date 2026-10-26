@@ -17,6 +17,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 |---|---|---|
 | [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0276–0277, 0279 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
 | [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0280 | Orderly park releases PR guard; broker-aware PR-state reads |
+| [orphan-reaper-home-scope.md](orphan-reaper-home-scope.md) | 0281 | Orphan reaping requires proven home/UID ownership and fresh process identity |
 | [kanban-pr-broker-transport.md](kanban-pr-broker-transport.md) | 0278 | Profile-scoped GitHub broker execution and sanitized setup receipts |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0260 | AutomatedRow active-Kanban type coverage |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0262 | Failed-node retries and deflake cards |
