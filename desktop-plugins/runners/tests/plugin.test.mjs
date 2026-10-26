@@ -32,6 +32,23 @@ test('node health never turns management reachability or busy activity into veri
   assert.equal(n.health.state, 'unknown')
   assert.equal(n.monitoring, 'unreachable')
 })
+test('node search keeps matching empty hosts and reports only enumerated filtered registrations', () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: 'host_0000000000000002', display_name: 'Empty orchard' }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  const sources = [source(s)]
+  const nodes = p.projectNodes(sources, p.projectFleet(sources).rows)
+  const empty = p.selectNodes(nodes, 'orchard', 'All')
+  assert.equal(empty.groups.length, 1)
+  assert.equal(empty.groups[0].name, 'Empty orchard')
+  assert.equal(empty.rows.length, 0)
+  assert.equal(p.selectNodes(nodes, 'absent-term', 'All').groups.length, 0)
+  assert.equal(p.selectNodes(nodes, 'orchard', 'Busy').groups.length, 0)
+  const all = p.selectNodes(nodes)
+  assert.equal(all.groups.length, 2)
+  assert.equal(all.rows.length, 1)
+  assert.deepEqual(all.rows, all.groups.flatMap(g => g.rows))
+})
 test('status chip cannot wrap or shrink below its reduced label', () => {
   assert.match(p.CSS, /\[data-slot=runners-chip\]\{flex-shrink:0;white-space:nowrap\}/)
 })

@@ -451,6 +451,42 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
   }
   return { nodes: [...nodes.values()], unassigned: projectedRows.filter(r => !nodes.has(r.hostKey)) }
 }
+function highlight(value, query) {
+  const label = text(value), lower = label.toLowerCase()
+  const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean)
+  const marked = Array(label.length).fill(false)
+  for (const term of terms) {
+    let at = lower.indexOf(term)
+    while (at >= 0) {
+      marked.fill(true, at, at + term.length)
+      at = lower.indexOf(term, at + term.length)
+    }
+  }
+  const parts = []
+  for (let start = 0; start < label.length;) {
+    let end = start + 1
+    while (end < label.length && marked[end] === marked[start]) end++
+    parts.push(marked[start] ? h('mark', { key: start }, label.slice(start, end)) : label.slice(start, end))
+    start = end
+  }
+  return parts
+}
+export function selectNodes(projection, search = '', filter = 'All') {
+  const terms = search.toLowerCase().trim().split(/\s+/).filter(Boolean)
+  const groups = projection.nodes.flatMap(n => {
+    const hostText = [n.host.display_name, n.host.os, n.host.arch].join(' ').toLowerCase()
+    const hostMatches = terms.every(t => hostText.includes(t))
+    const rows = selectRows(n.runners, hostMatches ? '' : search, filter)
+    const nodeMatchesFilter = filter === 'All' ||
+      (filter === 'Needs attention' && (n.source.error || n.monitoring !== 'reachable' || n.freshness.state !== 'fresh')) ||
+      (filter === 'Maintenance' && n.host.maintenance?.state === 'active')
+    return rows.length || (hostMatches && nodeMatchesFilter)
+      ? [{ ...n, name: n.host.display_name, rows }] : []
+  })
+  const unassigned = selectRows(projection.unassigned, search, filter)
+  if (unassigned.length) groups.push({ key: 'unmapped', name: 'Unassigned runners', rows: unassigned })
+  return { groups, rows: groups.flatMap(g => g.rows) }
+}
 export function selectRows(rows, search = '', filter = 'All') {
   const terms = search.toLowerCase().trim().split(/\s+/).filter(Boolean)
   return rows
@@ -672,7 +708,7 @@ function Details({ row, transport, visible, onData }) {
       : null
   )
 }
-function RunnerRow({ row, expanded, onExpand, transport, onError, visible, features, os }) {
+function RunnerRow({ row, expanded, onExpand, transport, onError, visible, features, os, search = '' }) {
   const ref = useRef(null)
   const [detail, setDetail] = useState(null)
   const job = detail?.jobs?.find((j) => j.status === 'running' && j.assigned_runner_id === row.id)
@@ -734,7 +770,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
             h(
               'span',
               null,
-              h('span', { className: 'hermes-runners-name' }, text(row.display_name)),
+              h('span', { className: 'hermes-runners-name' }, ...highlight(row.display_name, search)),
               h(
                 'span',
                 { className: 'hermes-runners-meta' },
@@ -876,12 +912,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
   const selected =
     scope === 'all' ? sources : sources.filter((s) => s.route && routeKey(s.route) === scope)
   const view = projectFleet(selected),
-    rows = selectRows(view.rows, search, filter),
     nodes = projectNodes(selected, view.rows),
-    groups = [
-      ...nodes.nodes.map(n => ({ ...n, name: n.host.display_name, rows: n.runners.filter(r => rows.includes(r)) })),
-      ...(nodes.unassigned.length ? [{ key: 'unmapped', name: 'Unassigned runners', rows: nodes.unassigned.filter(r => rows.includes(r)) }] : [])
-    ]
+    { groups, rows } = selectNodes(nodes, search, filter)
   const refreshing = useRef(false)
   async function refresh() {
     if (refreshing.current) return
@@ -1081,7 +1113,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         h(
           'div',
           { className: 'hermes-runners-summary' },
-          `${view.counts.registrations} registrations · ${view.counts.ready} verified-ready · ${view.counts.unverified} readiness-unverified`
+          `Scope: ${view.counts.registrations} registrations · ${view.counts.ready} verified-ready · ${view.counts.unverified} readiness-unverified`,
+          search.trim() || filter !== 'All' ? h('div', { 'data-filtered-cohort': true }, `Showing ${groups.filter(g => g.host).length} nodes · ${rows.length} registrations`) : null
         ),
         h(
           'div',
@@ -1183,7 +1216,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                     })
                 },
                 h('span', null,
-                  h('b', null, `${expandedNodes.has(g.key) ? '▾' : '▸'} ${text(g.name)}`),
+                  h('b', null, `${expandedNodes.has(g.key) ? '▾' : '▸'} `, ...highlight(g.name, search)),
                   g.host ? h('span', { className: 'hermes-runners-meta' }, `${text(g.host.os)} ${text(g.host.arch)} · ${g.registrationCount ? `${g.registrationCount} registrations` : 'No mapped runners'}`) : null,
                   g.activity ? h('span', { className: 'hermes-runners-meta' }, `${g.activity.busy == null ? 'Activity unknown' : `${g.activity.busy} busy · ${g.activity.idle} idle`} · Not observed`) : null
                 ),
@@ -1194,6 +1227,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                     h(RunnerRow, {
                       key: row.key,
                       row,
+                      search,
                       expanded: expanded === row.key,
                       onExpand,
                       transport,

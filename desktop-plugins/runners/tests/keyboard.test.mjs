@@ -25,6 +25,39 @@ test('physical nodes start collapsed including empty hosts; expand reveals lazy 
     assert.equal(calls.filter(p => p.includes('/runners/')).length, 1)
   } finally { await ui.close() }
 })
+test('search narrows physical nodes, highlights a matching empty host and labels scope totals', async () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: '00000000-0000-4000-8000-000000000002', display_name: 'Quartz empty' }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    await ui.key(document.querySelector('[data-node-row]'), 'Q')
+    assert.equal(document.querySelectorAll('[data-node-row]').length, 1)
+    assert.equal(document.querySelector('[data-node-row] mark').textContent, 'Q')
+    assert.match(document.body.textContent, /Scope: 1 registrations/)
+    assert.match(document.body.textContent, /Showing 1 nodes · 0 registrations/)
+    await ui.key(document.querySelector('input'), 'Escape')
+    assert.equal(document.querySelectorAll('[data-node-row]').length, 2)
+  } finally { await ui.close() }
+})
+test('runner name search retains parent and highlights nested matching text', async () => {
+  const s = snapshot()
+  s.data.runners[0].display_name = 'Quartz runner'
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    await ui.key(document.querySelector('[data-node-row]'), 'Q')
+    await ui.click(document.querySelector('[data-node-row]'))
+    assert.equal(document.querySelectorAll('[data-runner-row]').length, 1)
+    assert.equal(document.querySelector('[data-runner-row] mark')?.textContent, 'Q')
+    assert.match(document.body.textContent, /Showing 1 nodes · 1 registrations/)
+  } finally { await ui.close() }
+})
 test('node keyboard traversal and layered Escape preserve focus', async () => {
   const s = snapshot()
   host.profileRoutes = async () => [route]
