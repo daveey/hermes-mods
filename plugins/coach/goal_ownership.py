@@ -103,11 +103,18 @@ def authoritative_owner(v, evidence, session_id):
 
 
 def _waiting_continuation(conn, task):
-    """Read native wait evidence, but never infer a dispatcher from a parked row.
+    """Native wait evidence is not evidence of an operating dispatcher."""
+    waiting_readback(conn, task)
+    raise ValueError('owner_dispatcher_unverified')
 
-    The current schema has no scoped renewable dispatcher lease/heartbeat. A
-    future wake or running dependency alone cannot prove the child will run.
-    Keep these adapters UNKNOWN until that independent evidence is available.
+
+def waiting_readback(conn, task):
+    """Read a bounded native wait snapshot, NOT an ownership certificate.
+
+    Caller supplies a read-only transaction. Never run wake_check commands,
+    recompute readiness, or infer an ongoing dispatcher from a parked row.
+    Native link_tasks gates ready -> todo without setting block_kind; that
+    historical block label is not the dependency contract.
     """
     import math
     import time
@@ -118,16 +125,50 @@ def _waiting_continuation(conn, task):
         if (type(when) not in (int, float) or not math.isfinite(when)
                 or when <= time.time()):
             raise ValueError('owner_scheduled_wake_unverified')
-    else:
-        parents = conn.execute(
-            'SELECT p.id, p.status FROM task_links l LEFT JOIN tasks p '
-            'ON p.id=l.parent_id WHERE l.child_id=? LIMIT 65',
-            (task['id'],)).fetchall()
-        if (task['block_kind'] != 'dependency' or not parents or len(parents) > 64
-                or any(p['id'] is None or p['id'] == task['id'] for p in parents)
-                or not any(p['status'] not in ('done', 'archived') for p in parents)):
+        return {'kind': 'scheduled', 'wake_at': when}
+    if task['status'] != 'todo':
+        raise ValueError('owner_wait_state_unverified')
+    parents = _dependency_readback(conn, task['id'])
+    if not parents or not any(status not in ('done', 'archived') for _, status in parents):
+        raise ValueError('owner_dependency_unverified')
+    return {'kind': 'dependency', 'parents': parents}
+
+
+def _dependency_readback(conn, task_id):
+    """Bound both traversal and rows; reject dangling links and cycles.
+
+    Inspect the whole bounded ancestor graph, not just a self-link at the root.
+    A shared ancestor in a DAG is valid; only a node on the active path cycles.
+    No parent state, even running, asserts worker or dispatcher liveness.
+    """
+    visiting, visited, direct = set(), set(), ()
+    stack = [(task_id, False)]
+    edges = 0
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            visiting.remove(node)
+            visited.add(node)
+            continue
+        if node in visiting:
             raise ValueError('owner_dependency_unverified')
-    raise ValueError('owner_dispatcher_unverified')
+        if node in visited:
+            continue
+        if len(visited) + len(visiting) >= 64:
+            raise ValueError('owner_dependency_unverified')
+        rows = conn.execute(
+            'SELECT p.id, p.status FROM task_links l LEFT JOIN tasks p '
+            'ON p.id=l.parent_id WHERE l.child_id=? ORDER BY l.parent_id LIMIT 65',
+            (node,)).fetchall()
+        edges += len(rows)
+        if edges > 64 or any(p['id'] is None for p in rows):
+            raise ValueError('owner_dependency_unverified')
+        if node == task_id:
+            direct = tuple((p['id'], p['status']) for p in rows)
+        visiting.add(node)
+        stack.append((node, True))
+        stack.extend((p['id'], False) for p in rows)
+    return direct
 
 
 def _live_result_consumer(session_id, home, board_path):
