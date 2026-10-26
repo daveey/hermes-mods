@@ -277,4 +277,5 @@ def _current_user_matches(row, request):
         metadata = json.loads(raw)
     except (TypeError, ValueError):
         return False
-    return isinstance(metadata, dict) and not metadata.get('user_content_sanitized')
+    return (isinstance(metadata, dict) and not metadata.get('user_content_sanitized')
+            and not metadata.get('_queued_prompt'))

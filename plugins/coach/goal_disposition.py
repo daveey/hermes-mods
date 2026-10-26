@@ -290,6 +290,13 @@ def build_gate(store):
 
     def gate(session_id='', final_response='', turn_messages=None, attempt=0, **_):
         cfg = settings()
+        # Disabling or losing config is not acceptance of an already held reply.
+        # Core owns the pending fallback and Stop precedence; an unavailable
+        # recheck preserves it without judging or starting more work.
+        if attempt and gate.needs_buffer and cfg['mode'] != 'enforce':
+            store.log({'event': 'goal_disposition_unknown', 'session_id': session_id,
+                       'reason': 'enforcing_recheck_unavailable'})
+            raise ValueError('enforcing_recheck_unavailable')
         if cfg['mode'] == 'off':
             return None
         if cfg['mode'] == 'enforce' and not gate.needs_buffer:

@@ -67,7 +67,10 @@ retries approvals, sends messages, or changes self-heal configuration.
 Profile-local `<HERMES_HOME>/coach/goal-disposition.json` accepts `{"mode":"off"}` (default),
 `{"mode":"shadow"}` (judge/log only), or `{"mode":"enforce"}`. Reload the plugin after enabling
 enforcement: buffering is selected at registration so the disabled hook does not buffer every
-answer. Switching off takes effect on the next check; reload also removes buffering. A runtime
+answer. Switching off takes effect on the next fresh check; reload also removes buffering.
+An already held reply is never accepted merely because configuration disappears,
+becomes invalid/unreadable, or changes to off/shadow: its recheck is unavailable and
+core retains the explicit unresolved fallback (Stop still wins). A runtime
 switch to enforce without a reload logs `reload_required_for_buffering` and does not hold.
 Background agents remain excluded by core.
 
@@ -688,3 +691,17 @@ adapter using the production base admission/queue. No model or external Telegram
 is exercised. Positive coverage is default-profile Linux native local pipe processes;
 named-profile/multiplex transports are not certified by these tests. Cross-profile,
 cross-gateway, recovered/adopted/detached, PTY, sandbox and wrapper paths remain unproved.
+
+
+### Held rechecks and current verification scope
+
+`tests/test_goal_run23_review.py` covers configuration loss/invalidity and explicit
+off/shadow transitions after a confirmed hold through complete scripted agent turns,
+including streamed-text exclusion, incomplete status, and Stop precedence. Fresh
+off/missing/invalid configuration remains default-off; shadow remains non-enforcing.
+The same suite rejects successful URL readbacks predating newer human steering,
+then accepts a fresh post-steering readback through the native pending-recheck gate.
+This conservative verification epoch does not infer whether older results remain
+semantically applicable. Kanban current-scope reads reject queued UI receipts;
+a later genuine canonical user row is a separate positive control, not a claimed
+end-to-end queue-drain test. All fixtures use isolated state and no live repairs.

@@ -163,9 +163,10 @@ def remediation(v, evidence):
             or type(result.get('status', result.get('status_code'))) is not int
             or not 200 <= result.get('status', result.get('status_code')) < 300):
         raise ValueError('missing_exact_path_readback')
-    # A later failed read of this target invalidates an earlier success citation.
+    # Any newer steering starts a new verification epoch. Without a native
+    # applicability binding, an earlier readback cannot certify current scope.
     keys = list(evidence)
     for key in keys[keys.index(p['source_ref'])+1:]:
         row = evidence[key]
-        if row['role'] == 'tool' and call(row)[1].get('url') == target:
+        if row['role'] == 'user' or (row['role'] == 'tool' and call(row)[1].get('url') == target):
             raise ValueError('superseded_path_readback')
