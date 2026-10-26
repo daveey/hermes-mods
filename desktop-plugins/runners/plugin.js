@@ -134,8 +134,8 @@ export function createTransport(ctx, hostRef = host) {
           const route = list[next++],
             key = routeKey(route),
             prior = sources.get(key)
+          let enrollment, legacy = false
           try {
-            let enrollment, legacy = false
             try {
               enrollment = await request(route, '/enrollment')
             } catch (e) {
@@ -170,7 +170,7 @@ export function createTransport(ctx, hostRef = host) {
             queryClient?.setQueryData(ownerQueryKey(snapshot.meta.owner), snapshot)
             sources.set(key, { route, snapshot, ...(legacy ? { error: 'Deployment pending: enrollment unavailable; last-known inventory' } : {}) })
           } catch (e) {
-            sources.set(key, { ...prior, route, error: failure(e) })
+            sources.set(key, { ...prior, route, ...(enrollment?.enrolled === true ? { enrolled: true } : {}), error: failure(e) })
           }
         }
       })
@@ -1254,7 +1254,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
           },
           q.isPending && !sources.length ? 'Loading inventory…' : null,
           ...selected.filter(s => s.enrolled !== false && (
-            (s.error && (s.snapshot || /Owner (gateway disconnected|identity mismatch)/.test(s.error))) ||
+            (s.error && (s.enrolled === true || s.snapshot || /Owner (gateway disconnected|identity mismatch)/.test(s.error))) ||
             ['owner_disconnected', 'owner_conflict'].includes(s.snapshot?.data.state)
           )).map((s, i) =>
             h('p', { key: i, className: 'hermes-runners-note' }, `${['owner_disconnected', 'owner_conflict'].includes(s.snapshot?.data.state) ? 'Owner unavailable · ' : ''}${s.error || STATES[s.snapshot.data.state]} · ${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''}`))

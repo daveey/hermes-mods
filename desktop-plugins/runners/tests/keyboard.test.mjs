@@ -68,6 +68,18 @@ test('missing plugins on nonowner profiles stay secondary beside a healthy owner
     assert.equal(document.querySelectorAll('[data-node-row]').length, 2)
   } finally { await ui.close() }
 })
+test('enrolled owner first-inventory permission failure stays primary', async () => {
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => {
+    if (path.includes('/enrollment')) return enrollment()
+    throw Object.assign(new Error('403'), { status: 403 })
+  } } }))
+  try {
+    await ui.click(button('Show runners'))
+    assert.match(document.querySelector('[role="status"]').textContent, /Partial permissions/)
+    assert.doesNotMatch(document.querySelector('[role="status"]').textContent, /Owner unavailable/)
+  } finally { await ui.close() }
+})
 test('node detail shows explicit maintenance and enforced capacity without free-slot claims', async () => {
   const s = snapshot()
   s.data.hosts = [{ ...structuredClone(fixtures.Host), capacity: { enforced: true, declared_max_jobs: 4, observed_active_jobs: null }, maintenance: { state: 'active', reason: 'Inspection', expires_at: new Date(Date.now() + 60000).toISOString() } }]
