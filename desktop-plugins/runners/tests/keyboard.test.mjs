@@ -130,6 +130,23 @@ test('runner name search retains parent and highlights nested matching text', as
     assert.match(document.body.textContent, /Showing 1 nodes · 1 registrations/)
   } finally { await ui.close() }
 })
+test('metadata searches highlight OS and matching runner labels beyond the preview', async () => {
+  const s = snapshot()
+  s.data.hosts = [{ ...structuredClone(fixtures.Host), os: 'linux' }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  s.data.runners[0].labels = ['one', 'two', 'three', 'Quartz']
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    await ui.key(document.querySelector('[data-node-row]'), 'l')
+    assert.ok([...document.querySelectorAll('[data-node-row] .hermes-runners-meta mark')].some(e => e.textContent === 'l'), 'OS match highlighted')
+    await ui.key(document.querySelector('input'), 'Escape')
+    await ui.key(document.querySelector('[data-node-row]'), 'Q')
+    await ui.click(document.querySelector('[data-node-row]'))
+    assert.ok([...document.querySelectorAll('[data-runner-row] mark')].some(e => e.textContent === 'Q'), 'matching fourth label is visible and highlighted')
+  } finally { await ui.close() }
+})
 test('native palette jumps to owner-qualified nodes and runners and removes stale contributions', async () => {
   let s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host)]
