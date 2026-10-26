@@ -27,6 +27,19 @@ def _current_request(home, session_id, profile, request, snapshot, ro_connect, c
             raise ValueError("owner_process_current_request_mismatch")
 
 
+def _consumer(snapshot, *, expected=None):
+    if snapshot.session_key == snapshot.session_id:
+        from tui_gateway.process_consumer_health import available, receipt_version
+        version = receipt_version(snapshot.home, snapshot.session_id, snapshot.generation)
+        if version is not None and available(snapshot.home, snapshot.session_id, snapshot.generation,
+                                             expected=expected):
+            return version
+    elif snapshot.session_key.startswith("agent:"):
+        from gateway.process_consumer_health import receipt_version
+        return receipt_version(snapshot, expected=expected)
+    return None
+
+
 def authoritative_process(v, evidence, session_id, ro_connect, current_user_matches):
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_active_profile_name
@@ -40,7 +53,6 @@ def authoritative_process(v, evidence, session_id, ro_connect, current_user_matc
         raise ValueError("owner_process_route_mismatch")
     try:
         from tools.process_registry import process_registry
-        from tui_gateway.process_consumer_health import available
         readback = getattr(process_registry, "ownership_snapshot", None)
         snapshot = readback(ref["process_id"]) if callable(readback) else None
         if snapshot is None:
@@ -53,15 +65,14 @@ def authoritative_process(v, evidence, session_id, ro_connect, current_user_matc
                 or snapshot.content != request):
             raise ValueError("owner_process_scope_mismatch")
         _current_request(home, session_id, profile, request, snapshot, ro_connect, current_user_matches)
-        from tui_gateway.process_consumer_health import receipt_version
-        version = receipt_version(home, session_id, snapshot.generation)
-        if version is None or not available(home, session_id, snapshot.generation):
+        version = _consumer(snapshot)
+        if version is None:
             raise ValueError("owner_process_consumer_unverified")
         # Detect an exit/handoff during the independent scope/consumer reads.
         if readback(ref["process_id"]) != snapshot:
             raise ValueError("owner_process_changed")
         _current_request(home, session_id, profile, request, snapshot, ro_connect, current_user_matches)
-        if not available(home, session_id, snapshot.generation, expected=version):
+        if _consumer(snapshot, expected=version) != version:
             raise ValueError("owner_process_consumer_changed")
     except (ImportError, OSError, sqlite3.Error, AttributeError, TypeError) as exc:
         raise ValueError("owner_readback_unavailable") from exc

@@ -610,10 +610,10 @@ drain, adopt, signal, repair, or write state.
 
 The deliberately narrow supported path requires an **actually admitted process
 completion within 15 seconds** on the same live TUI/serve session, profile and registry
-generation. An empty poll, Kanban receipt or a live thread does not qualify. Stop,
+generation, or the native push-gateway path described below. An empty poll, Kanban receipt or a live thread does not qualify. Stop,
 teardown, lost/released lease, disabled notifications, retirement, stale receipts and
 late pre-Stop dispatch results reject ownership. This is point-in-time continuation,
-not a promise of eventual success or delivery. One-shot, other consumers, detached,
+not a promise of eventual success or delivery. One-shot, other unproved consumers, detached,
 retained, sandbox, PTY, systemd-wrapper, WSL, persistent and handed-off processes
 remain UNKNOWN. Steering/rotation does not rebind an old process to new scope.
 
@@ -637,3 +637,35 @@ completion admissions for retry rather than relying on delegation-only release.
 Tests: `test_goal_process_independent_review.py` exercises native Stop, new canonical
 steering, and retry after false/unknown/exceptional admission; `test_goal_process_serve.py`
 exercises actual isolated serve, approval protocol, spawn and completion admission.
+
+
+### Native messaging-gateway process return proof
+
+The next supported non-TUI path is the existing native push-gateway process watcher,
+not CLI one-shot or the stateless API self-post. Its proof requires a live native
+watcher for the exact running process and immutable request UID/home/session/route,
+plus an actual `admit_internal_event` success for a process completion within 15 seconds.
+Registration, a configured watcher, an empty poll, a watch-pattern event, and a handler
+that merely returns without accepting never qualify. The native source and adapter,
+running gateway loop, current in-memory session route, and notification configuration
+must still match at readback. Reads never drain queues, load retained jobs or repair state.
+
+Stop and new-user ingress (including a message queued behind a busy turn) permanently
+revoke old watcher proof and forget the route's old spawn bindings. This does not kill
+jobs or change their normal result delivery. Late admission and delayed watcher startup
+cannot resurrect pre-boundary proof. Adapter ingress is conservative: even input later
+rejected by runner authorization may remove proof; it cannot grant it. The public guard
+still rechecks the exact latest canonical DB row and the receipt version after its final
+process snapshot. TUI receipts cannot certify a gateway routing key.
+
+Tests: core `tests/gateway/test_process_consumer_health.py` covers real busy-queue
+admission, freshness, Stop/new-user/replacement/shutdown/task loss, late results, refused
+admission, exact snapshot fields, bounded locks and nonconsuming readback. Mods
+`test_goal_process_gateway.py` composes the public guard with an isolated SQLite store;
+its native integration starts a real child, uses the terminal helper to arm the real
+watcher on the gateway loop, observes actual exit/completion batching/native admission,
+and validates another still-running process. Only the external transport is a no-I/O
+adapter using the production base admission/queue. No model or external Telegram service
+is exercised. Positive coverage is default-profile Linux native local pipe processes;
+named-profile/multiplex transports are not certified by these tests. Cross-profile,
+cross-gateway, recovered/adopted/detached, PTY, sandbox and wrapper paths remain unproved.
