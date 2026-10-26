@@ -41,6 +41,25 @@ def test_week_1019_non_handoffs(gate, text):
     assert gate.core.find_asks(text) == []
 
 
+@pytest.mark.parametrize("text", [
+    "None of the cards need you, but please approve the separate production restart.",
+    "Please approve the restart; none of the tasks need you.",
+    "None of them need you, and can you confirm the separate change?",
+    "None of the tasks need you; please open the separate approval page.",
+])
+def test_week_1019_negative_status_preserves_independent_ask(gate, text):
+    assert gate.core.find_asks(text) == [text]
+
+
+@pytest.mark.parametrize("text", [
+    "None of the cards need you, and I will continue the deployment.",
+    "The work is proceeding; none of them need you.",
+    "None of the tasks need you for this release.",
+])
+def test_week_1019_negative_status_with_narration(gate, text):
+    assert gate.core.find_asks(text) == []
+
+
 @pytest.mark.parametrize("key", ["I0", "I1_I2", "I3", "I4"])
 def test_incident_replies_contain_asks(gate, key):
     assert gate.core.find_asks(FIX[key]["reply"]), key

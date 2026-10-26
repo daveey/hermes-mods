@@ -193,12 +193,15 @@ def find_asks(text: str, howto: bool = False) -> list[str]:
     out: list[str] = []
     n_imp = 0
     for s, forced in _units(_strip_quotes(text)):
-        if _NOT_ASK.search(s) or s in out:
+        # This negative status negates only its own "need you" span, not an
+        # independent request before/after it. Keep the original for the judge.
+        candidate = re.sub(r"\bnone of (?:them|the (?:cards|tasks)) needs? you\b", "X", s, flags=re.I)
+        if _NOT_ASK.search(candidate) or s in out:
             continue
-        hit = bool(_ASK.search(s)) or bool(_CANT.search(s))
+        hit = bool(_ASK.search(candidate)) or bool(_CANT.search(candidate))
         if not hit and forced:
-            hit = not howto
-        if not hit and not howto and n_imp < 8 and is_imperative(s):
+            hit = not howto and not _NOT_ASK.search(s)
+        if not hit and not howto and n_imp < 8 and is_imperative(candidate):
             hit, n_imp = True, n_imp + 1
         if hit:
             out.append(s[:1200] if forced else s[:600])
