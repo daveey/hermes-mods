@@ -1,6 +1,7 @@
 """Deterministic evidence bindings; unsupported proof shapes remain UNKNOWN."""
 import json
 import re
+import shlex
 from urllib.parse import urlsplit
 
 
@@ -145,28 +146,71 @@ def urls(text):
     return {value.rstrip('.,;!?') for value in re.findall(r'https?://[^\s<>"\'`\[\]()]+' , text)}
 
 
+def _terminal_http_target(row):
+    """Recognize one literal curl readback, never arbitrary successful shell text.
+
+    Canonical shell quoting excludes substitutions, pipelines and appended commands.
+    Command recognition is NOT executable provenance: ordinary shells can spoof it.
+    This is only HTTP availability evidence, not application/content correctness.
+    """
+    name, args = call(row)
+    command = args.get('command')
+    if name != 'terminal' or not isinstance(command, str):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    prefix = ['/usr/bin/curl', '-q', '--noproxy', '*', '--path-as-is',
+              '--max-time', '5', '--silent', '--show-error', '--output',
+              '/dev/null', '--write-out', '%{http_code}', '--']
+    if (len(tokens) != len(prefix) + 1 or tokens[:-1] != prefix
+            or command != shlex.join(tokens)):
+        return None
+    return tokens[-1]
+
+
+def _http_readback(source, target, scope):
+    name, args = call(source)
+    result = data(source)
+    if name == 'terminal':
+        # Do not equate HTTP reachability with broader repair/content goals.
+        # The semantic judge cannot widen this deliberately literal contract.
+        return (scope == 'Restore HTTP 2xx at ' + target + '.'
+                and _terminal_http_target(source) == target
+                and args.get("http_readback") is True
+                and result.get("execution") == "local-http-readback-v1"
+                and not urlsplit(target).fragment
+                and args.get('background', False) is False
+                and type(result.get('exit_code')) is int and result['exit_code'] == 0
+                and not result.get('error') and not result.get('session_id')
+                and not result.get('approval_pending')
+                and isinstance(result.get('output'), str)
+                and re.fullmatch(r'2[0-9]{2}', result['output'].strip()) is not None)
+    status = result.get('status', result.get('status_code'))
+    return (args.get('url') == target and result.get('url') == target
+            and not result.get('error') and result.get('success') is not False
+            and type(status) is int and 200 <= status < 300)
+
+
 def remediation(v, evidence):
     p, source = proof(v, evidence, ('target', 'source_ref', 'scope_ref'))
     target = p['target']
     scope = evidence.get(p['scope_ref'], {})
     parsed = urlsplit(target)
-    name, args = call(source)
-    result = data(source)
     if (source['role'] != 'tool' or scope.get('role') != 'user'
             or p['scope_ref'] not in v['evidence_refs']
             or not isinstance(scope.get('content'), str)
             or target not in urls(scope['content']) or target not in urls(evidence['candidate'].get('content', ''))
             or parsed.scheme not in ('http', 'https') or not parsed.netloc
             or parsed.username is not None or parsed.password is not None
-            or args.get('url') != target or result.get('url') != target
-            or result.get('error') or result.get('success') is False
-            or type(result.get('status', result.get('status_code'))) is not int
-            or not 200 <= result.get('status', result.get('status_code')) < 300):
+            or not _http_readback(source, target, scope['content'])):
         raise ValueError('missing_exact_path_readback')
     # Any newer steering starts a new verification epoch. Without a native
     # applicability binding, an earlier readback cannot certify current scope.
     keys = list(evidence)
     for key in keys[keys.index(p['source_ref'])+1:]:
         row = evidence[key]
-        if row['role'] == 'user' or (row['role'] == 'tool' and call(row)[1].get('url') == target):
+        if row['role'] == 'user' or (row['role'] == 'tool' and (call(row)[1].get('url') == target
+                                     or _terminal_http_target(row) == target)):
             raise ValueError('superseded_path_readback')

@@ -125,7 +125,16 @@ Candidate must name the action and the supported path (say 'explicit user direct
 No automatic retry is permitted. Other policy/approval sources remain unknown, not inferred permission.
 For remediated_verified, proof must be {target,source_ref,scope_ref}: exact HTTP(S) URL in the
 user scope, paired tool url argument and successful result url/status, and candidate. Other
-readback formats remain unknown. source_ref and scope_ref must be included in evidence_refs.
+readback formats remain unknown except this bounded native terminal contract: user scope is
+exactly 'Restore HTTP 2xx at <URL>.' and the paired foreground command is the shell-quoted
+argv /usr/bin/curl -q --noproxy '*' --path-as-is --max-time 5 --silent --show-error
+--output /dev/null --write-out '%{http_code}' -- <URL>, with native exit_code=0,
+no error and output consisting only of a 2xx status. The call must set http_readback=true
+and the native outer result must carry execution=local-http-readback-v1 (Linux local only).
+Ordinary shell output, even an exact command/200, has no execution provenance and stays unknown.
+No redirects or arbitrary shell
+wrappers; this proves HTTP availability only, never transaction/content correctness.
+source_ref and scope_ref must be included in evidence_refs.
 The successful URL must address the actual requested goal; unrelated successful probes do not qualify.
 For capability_boundary, proof must be {source_ref,action}: source_ref is a cited paired
 failed operation and action exactly equals its command or HTTP(S) url argument. It must be

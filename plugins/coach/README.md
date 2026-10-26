@@ -94,7 +94,8 @@ currently supports a latest literal user restriction (`Do not`/`Never`, explicit
 path), or the native terminal pending-approval envelope with its exact command and `/approve`
 path. Other policy/denial formats remain UNKNOWN, not permission to retry. Remediation currently
 supports a requested exact HTTP(S) URL shared by user scope, tool arguments, result URL/status
-and candidate; a newer readback invalidates the older citation. Non-URL verification and other
+and candidate; a newer readback invalidates the older citation. The bounded native terminal
+HTTP-availability contract below also consumes actual exit/output envelopes. Non-URL verification and other
 tool result formats remain UNKNOWN. Semantic judgment still decides whether that path fulfills
 the goal; these narrow adapters do not complete general action/approval/path acceptance. Analysis-only, plan-first, status-only,
 conceptual, hypothetical and genuine permission boundaries must not become repair mandates.
@@ -722,3 +723,54 @@ steering and spoofed tails. Core `test_steering_provenance.py` covers identity
 binding, copying, wire stripping and suffix preservation. These are native seam
 tests, not whole-transport steering acceptance. The attestation is not historical
 authentication after restart. Native whole-turn in-place/rotated compaction now persists accepted steering before summarization. A bounded profile-qualified scan treats a lost live attestation (including archived steering) as UNKNOWN, not permission; pending holds cannot clear even with a fresh readback while scope is missing. `test_goal_steering_retention.py` exercises actual AIAgent turns and SessionDB compaction with scripted model/judge/summarizer boundaries, plus cold-history loss detection. Core `test_steering_compaction_retention.py` covers failed/missing storage and duplicate-free flushing. Hook registration is fixture-wired; provider-owned compaction and real transport restart retention remain unverified.
+
+
+### Native HTTP-availability remediation (bounded acceptance)
+
+For a literal user request `Restore HTTP 2xx at <URL>.`, the read-only validator also
+accepts a paired foreground native `terminal` result from this canonical shell-quoted
+argv (use `shlex.join` to quote the URL and arguments):
+
+```
+/usr/bin/curl -q --noproxy '*' --path-as-is --max-time 5 --silent --show-error --output /dev/null --write-out '%{http_code}' -- <URL>
+```
+
+The call must set `http_readback=true`. This requires the matching core producer:
+Linux **local** foreground only, validated before acquiring a shell environment. After
+ordinary pre-exec and approval guards it directly executes the fixed argv with no shell,
+no startup/snapshot, and an explicit clean child environment (no inherited loader,
+function, proxy or curl-config overrides). It emits the outer
+`execution="local-http-readback-v1"` field; this is native producer metadata, never
+parsed from command output or supplied by the judge. Ordinary shell execution remains
+unchanged but **cannot certify remediation**, even when its exact curl command prints 200.
+Older cores and unsupported backends/environments remain UNKNOWN, never host-local fallback.
+The actual terminal envelope must also have integer `exit_code=0`, no error/pending
+approval or background session, and output consisting only of a 2xx HTTP status.
+The command does not follow redirects, use proxies, or print page content as status.
+The native producer rejects curl URL globbing, credentials and fragments, bounds curl
+to five seconds (outer wait at most six seconds or the requested shorter timeout),
+and kills/reaps on Stop/timeout without success provenance. Trust assumes the native
+runtime, OS/system executable and trust store are intact; this is not cryptographic
+host attestation or protection from privileged binary/network compromise.
+No shell suffixes/substitutions or arbitrary
+successful commands qualify. This is HTTP availability, **not** proof of transactions,
+content correctness or arbitrary natural-language repair goals. Other native shapes and
+broader goals remain UNKNOWN; missing curl is not remediation. No command runs in the hook.
+Later user steering or a later supported same-target readback invalidates the citation.
+
+`tests/test_goal_native_remediation.py` drives complete held AIAgent text stops using the
+real executor/registered terminal and private exact-command approvals against a disposable
+loopback app. It proves a native repair changes the requested path from 503 to 200 and
+clears the hold, while an ineffective repair/continued 503, an unrelated 200 path, stale
+pre-steering success and Stop do not. Separate parser/envelope controls reject redirects,
+shell wrappers, failures, broader goals and later failures. The native shell-function
+regression rejects an actual uncontacted-app 200; opt-in readbacks still contact the
+app despite configured startup functions, inherited function/startup/loader/proxy
+variables, curl config and an existing shell snapshot. Core
+`tests/tools/test_terminal_http_readback.py` exercises real user-deny preservation,
+unsupported remote/background/PTY/timeout-promotion/command/glob rejection, and
+active request Stop/timeout. All HTTP servers are disposable loopback fixtures.
+Primary/judge answers and hook
+wiring are fixture-controlled; HTTP/terminal results and repair are real. This is not
+live-model, production or activation acceptance, and does not close the original-incident
+or remote-ownership release gates.
