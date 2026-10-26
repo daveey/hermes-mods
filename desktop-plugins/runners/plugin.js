@@ -969,11 +969,20 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         data: { id: `runners.node:${group.key}`, label: `Show node: ${group.name}`,
           keywords: ['runners', 'host', text(group.host.os), text(group.host.arch)], run: () => jump() }
       }))
-      for (const row of group.rows) disposers.push(ctx.register({
-        id: `runner:${row.key}`, area: PALETTE_AREA,
-        data: { id: `runners.runner:${row.key}`, label: `Show runner: ${row.display_name}`,
-          keywords: ['runners', group.name, text(row.os), text(row.arch)], run: () => jump(row) }
-      }))
+      for (const row of group.rows) {
+        disposers.push(ctx.register({
+          id: `runner:${row.key}`, area: PALETTE_AREA,
+          data: { id: `runners.runner:${row.key}`, label: `Show runner: ${row.display_name}`,
+            keywords: ['runners', group.name, text(row.observed_os), text(row.host?.arch)], run: () => jump(row) }
+        }))
+        const url = settingsURL(row)
+        if (url) disposers.push(ctx.register({
+          id: `settings:${row.key}`, area: PALETTE_AREA,
+          data: { id: `runners.settings:${row.key}`, label: `Runner settings: ${row.display_name}`,
+            keywords: ['configuration', 'preferences', 'github', text(row.scope?.name)],
+            run: () => ctx.os?.openExternal?.(url) }
+        }))
+      }
     }
     return () => disposers.forEach(dispose => dispose?.())
   }, [ctx, q.data])

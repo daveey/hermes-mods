@@ -147,6 +147,27 @@ test('metadata searches highlight OS and matching runner labels beyond the previ
     assert.ok([...document.querySelectorAll('[data-runner-row] mark')].some(e => e.textContent === 'Q'), 'matching fourth label is visible and highlighted')
   } finally { await ui.close() }
 })
+test('runner settings palette aliases use the validated scope URL', async () => {
+  const s = snapshot(), entries = new Map(), opened = []
+  s.data.runners[0].endpoint = 'https://api.github.com'
+  s.data.scopes[0].kind = 'repository'
+  s.data.scopes[0].name = 'example/project'
+  host.profileRoutes = async () => [route]
+  const ctx = {
+    os: { openExternal: url => opened.push(url) },
+    register: entry => { entries.set(entry.id, entry); return () => entries.delete(entry.id) },
+    rest: async path => path.includes('/enrollment') ? enrollment() : s
+  }
+  const ui = await mount(React.createElement(p.Runners, { ctx }))
+  try {
+    const settings = [...entries.values()].find(e => e.data.label.startsWith('Runner settings:'))
+    assert.ok(settings, 'settings contributes to existing palette')
+    assert.ok(settings.data.keywords.includes('configuration'))
+    assert.ok(settings.data.keywords.includes('preferences'))
+    settings.data.run()
+    assert.deepEqual(opened, ['https://github.com/example/project/settings/actions/runners'])
+  } finally { await ui.close() }
+})
 test('native palette jumps to owner-qualified nodes and runners and removes stale contributions', async () => {
   let s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host)]
