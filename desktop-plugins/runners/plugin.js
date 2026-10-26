@@ -218,6 +218,39 @@ export function ago(stamp, now = Date.now()) {
   const seconds = Math.max(0, Math.floor((now - t) / 1000))
   return seconds < 60 ? `${seconds}s ago` : `${Math.floor(seconds / 60)}m ago`
 }
+const HOLD_LABELS = {
+  drained: 'Drained (intentional)',
+  maintenance: 'Maintenance',
+  disk_pressure: 'Withheld: disk pressure',
+  root_headroom: 'Waiting for root headroom',
+  label_withdrawn: 'Label withdrawn by supervisor (historical)'
+}
+const OPERATIONAL_SOURCES = ['systemd', 'maintenance_marker', 'admission_journal', 'runner_journal', 'supervisor_log']
+function operationalTime(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    ? Date.parse(value) : NaN
+}
+function operationalEvidence(items, stale, now) {
+  if (!Array.isArray(items)) return []
+  return items.filter(e => e && Object.hasOwn(HOLD_LABELS, e.kind)).map(e => {
+    const historical = e.kind === 'label_withdrawn'
+    const current = !stale && OPERATIONAL_SOURCES.includes(e.source) &&
+      e.freshness === 'fresh' && operationalTime(e.observed_at) <= now &&
+      operationalTime(e.expires_at) > now &&
+      (e.recorded_at == null || operationalTime(e.recorded_at) <= now)
+    return {
+      ...e, label: historical && !Number.isFinite(operationalTime(e.recorded_at))
+        ? 'Supervisor label withdrawal' : HOLD_LABELS[e.kind],
+      timestamp: historical ? e.recorded_at : e.observed_at,
+      held: !historical && current && e.state === 'held',
+      status: historical ? (Number.isFinite(operationalTime(e.recorded_at)) && operationalTime(e.recorded_at) <= now
+        ? 'Historical — not a current hold' : 'Not observed')
+        : e.state === 'unknown' || ['unknown', 'unavailable'].includes(e.freshness) ? 'Not observed'
+          : !current ? 'Last-known / stale'
+            : e.state === 'held' ? 'Held' : e.state === 'clear' ? 'Clear' : 'Not observed'
+    }
+  })
+}
 function rowState(r, source, hostRow, now) {
   const provenance = source.snapshot.meta.provenance?.find((p) => p.source_id === r.id)
   const stale =
@@ -226,14 +259,16 @@ function rowState(r, source, hostRow, now) {
     !['ready', 'partial'].includes(source.snapshot.data.state) ||
     !fresh(source.snapshot.meta, now) ||
     r.freshness !== 'fresh'
-  const maintenance =
-    hostRow?.maintenance?.state === 'active' && Date.parse(hostRow.maintenance.expires_at) > now
+  const operational = operationalEvidence(r.operational_evidence, stale, now)
+  const holds = [...new Set(operational.filter(e => e.held).map(e => e.label))]
+  const maintenance = holds.includes('Maintenance') ||
+    (hostRow?.maintenance?.state === 'active' && Date.parse(hostRow.maintenance.expires_at) > now)
   const issue =
     stale || ['offline', 'missing', 'unknown'].includes(r.registration) ||
     ['fail', 'warn'].includes(r.readiness)
   const health = stale
     ? 'Stale'
-    : r.readiness === 'fail'
+    : holds.length ? 'Held' : r.readiness === 'fail'
       ? 'Unavailable'
       : r.readiness === 'warn'
         ? 'Degraded'
@@ -243,7 +278,7 @@ function rowState(r, source, hostRow, now) {
             ? 'Missing'
             : r.registration === 'unknown'
               ? 'Unknown'
-              : r.activity === 'busy'
+              : holds.length ? 'Held' : r.activity === 'busy'
                 ? 'Busy'
                 : r.readiness === 'pass' && r.activity === 'idle'
                   ? 'Ready'
@@ -252,18 +287,21 @@ function rowState(r, source, hostRow, now) {
   // consecutive-observation count. Never invent confirmation from one snapshot.
   const reason = stale
     ? 'Last-known observations; readiness not verified'
+    : holds.length ? `${holds.join(' · ')}; provider: ${r.registration}; readiness: ${r.readiness}`
     : r.registration === 'offline'
       ? 'Provider reports offline; inspect observation history'
       : r.readiness === 'fail'
         ? 'Required readiness check failed'
         : r.readiness === 'warn'
           ? 'Readiness check warning'
-          : r.activity === 'busy'
+          : holds.length ? holds.join(' · ') : r.activity === 'busy'
             ? 'Busy — job not identified'
             : health === 'Ready'
               ? 'Fresh online/idle; readiness checks passed'
               : 'Mandatory readiness evidence unavailable'
   return {
+    operational,
+    holds,
     stale,
     maintenance,
     issue,
@@ -272,7 +310,7 @@ function rowState(r, source, hostRow, now) {
     ready: health === 'Ready' && !maintenance,
     tone: stale
       ? 'muted'
-      : !maintenance && r.readiness === 'fail'
+      : (!maintenance || holds.length > 0) && r.readiness === 'fail'
         ? 'bad'
         : issue
           ? 'warn'
@@ -692,6 +730,16 @@ function Details({ row, transport, visible, onData }) {
       null,
       h('dt', null, 'Labels'),
       h('dd', null, (row.labels || []).map(text).join(', ') || 'None observed'),
+      h('dt', null, 'Provider registration'),
+      h('dd', null, text(row.registration)),
+      h('dt', null, 'Runner lifecycle'),
+      h('dd', null, text(row.lifecycle) || 'Not observed'),
+      h('dt', null, 'Operational evidence'),
+      h('dd', null, row.operational.length ? row.operational.map((e, i) =>
+        h('div', { key: i },
+          `${e.label} · ${e.status} · source ${text(e.source)} · state ${text(e.state)} · freshness ${text(e.freshness)}`,
+          h('div', null, `Observed: ${text(e.observed_at) || 'Not observed'} · Expires: ${text(e.expires_at) || 'Not observed'} · Recorded: ${text(e.recorded_at) || 'Not observed'}`)
+        )) : 'Not observed'),
       h('dt', null, 'Host service refs'),
       h('dd', null, row.host?.service_refs?.map(text).join(', ') || 'Not observed'),
       h('dt', null, 'Runner version'),
@@ -803,7 +851,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               type: 'button',
               'data-runner-row': row.key,
               className: 'hermes-runners-row',
-              'aria-label': `${row.display_name} · ${row.health} · ${row.activity}`,
+              'aria-label': `${row.display_name} · ${[...row.holds, row.health, row.activity].join(' · ')}`,
               'aria-expanded': expanded,
               onClick: () => onExpand(row.key),
               onKeyDown: (e) => {
@@ -833,6 +881,8 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               'span',
               null,
               `${row.maintenance ? 'Maintenance · ' : ''}${row.health} · ${row.activity}`,
+              ...row.operational.filter(e => e.kind !== 'label_withdrawn').map((e, i) =>
+                h('span', { key: i, className: 'hermes-runners-meta' }, `${e.label}${e.held ? '' : ` · ${e.status}`}`)),
               h('span', { className: 'hermes-runners-meta' }, ago(row.observed_at)),
               !['none', 'closed'].includes(row.repair)
                 ? h('span', { className: 'hermes-runners-meta' }, `Repair ${row.repair}`)

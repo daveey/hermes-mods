@@ -15,6 +15,7 @@ import uuid
 
 from .health import Sample, advance, Checks, Policy, disk_state
 from .models import validate
+from .probes.lifecycle import valid_timestamp
 
 
 def ident(prefix='obj'):
@@ -49,11 +50,53 @@ class OwnerLock(AbstractContextManager):
             self.fd = None
 
 
-def readiness(config, row, host_results, now):
+def operational_evidence(config, row, host_results, now, *, snapshot_current=True):
+    """Project only the verified service's evidence, never host-wide guesses.
+
+    Journal observation times belong to the source record, not the SSH poll.
+    Historical label events cannot assert a present hold, even if read today.
+    """
+    binding = next((b for b in config['bindings']
+                    if b['runner_id'] == row['id'] and b['host_id'] == row.get('host_id')), None)
+    if binding is None:
+        return []
+    host = host_results.get(binding['host_id'], {})
+    facts = host.get('facts', {})
+    ttl = config['thresholds']['host_stale_seconds']
+    host_at = host.get('at')
+    current = (valid_timestamp(host_at, ttl) and valid_timestamp(now)
+               and 0 <= now-host_at < ttl and snapshot_current)
+    rows = []
+    for item in facts.get('operational_evidence', {}).get(binding['service_ref'], []):
+        at = item['observed_at']
+        historical = item['kind'] == 'label_withdrawn'
+        recorded = item['recorded_at']
+        valid = ((at is None or valid_timestamp(at, 0 if historical else ttl))
+                 and (recorded is None or valid_timestamp(recorded)))
+        if not valid:
+            at = recorded = None
+        if historical:
+            freshness = 'unknown'
+        elif host.get('management') != 'reachable':
+            freshness = 'unavailable'
+        elif at is None:
+            freshness = 'unknown'
+        else:
+            freshness = 'fresh' if (current and 0 <= now-at < ttl
+                                    and (recorded is None or recorded <= now)) else 'stale'
+        rows.append(dict(kind=item['kind'], source=item['source'],
+                         state='unknown' if historical or not valid else item['state'], freshness=freshness,
+                         observed_at=iso(at) if at is not None else None,
+                         expires_at=iso(at+ttl) if at is not None and not historical else None,
+                         recorded_at=iso(recorded) if recorded is not None else None))
+    return rows
+
+
+def readiness(config, row, host_results, now, *, snapshot_current=True):
     """Only persisted authenticated host links may consume host evidence."""
     evidence=host_results.get(row.get('host_id'), {})
     binding=next((b for b in config['bindings'] if b['runner_id']==row['id'] and b['host_id']==row.get('host_id')),None)
-    if not binding or not evidence or evidence['management']!='reachable':
+    if not snapshot_current or not binding or not evidence or evidence['management']!='reachable':
         return Checks(), 'not_checked'
     at=evidence['at']; ttl=config['thresholds']['host_stale_seconds']
     if not 0<=now-at<=ttl:
@@ -66,6 +109,13 @@ def readiness(config, row, host_results, now):
     tools_at=facts.get('tools_observed_at',at)
     for tool,value in facts.get('tools',{}).items():
         statuses['tool:'+tool]=('pass' if value else 'fail') if tools_at is not None and 0<=now-tools_at<=900 else 'not_checked'
+    for item in operational_evidence(config, row, host_results, now):
+        if item['kind'] == 'label_withdrawn':
+            continue
+        # Unknown/expired configured checks cannot silently become clear.
+        key = 'operational:' + item['kind'] + ':' + item['source']
+        statuses[key] = ('fail' if item['state'] == 'held' else
+                         'pass' if item['state'] == 'clear' else 'not_checked') if item['freshness'] == 'fresh' else 'not_checked'
     checks=Checks(at=at,required=tuple(statuses),passed=tuple(k for k,v in statuses.items() if v=='pass'),failed=tuple(k for k,v in statuses.items() if v=='fail'),warned=tuple(k for k,v in statuses.items() if v=='warn'))
     state='fail' if checks.failed else ('warn' if checks.warned else ('pass' if set(checks.required)<=set(checks.passed) else 'not_checked'))
     return checks,state
