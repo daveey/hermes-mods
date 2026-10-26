@@ -16,6 +16,24 @@ known_hosts_file and port; specs contain platform, opaque-ref-to-exact-service
 `services`, build_volume and explicit `tools`. Optional `job_repositories` maps
 scope IDs to bounded repository allowlists; omitted means no job enrichment.
 
+Linux specs optionally contain `lifecycle_sources`, keyed by an existing opaque
+service ref. Trusted provisioning may opt into `intentional_drain` (boolean),
+`admission_unit` plus `lane`, `maintenance_marker` (absolute path), `headroom`
+(boolean), or `supervisor_log` (absolute path) plus `runner` (exact identity).
+These are fixed at provisioning, never accepted from API requests. Checks only
+read systemd state, bounded journal output, marker metadata and a bounded log tail.
+No new privileges, service writes, admission changes or automatic provisioning
+are introduced. Denied/missing sources remain unknown; old probes report configured
+checks as not observed until updated. Journal record times are preserved, not
+renewed by polling. Disabled/inactive is intentional drain evidence only when
+explicitly configured; host-wide disk pressure alone cannot establish a lane hold.
+
+Optional runner `operational_evidence` keeps holds separate from provider
+registration and persistent/ephemeral lifecycle. Each source carries observation,
+expiry and record timestamps; current holds suppress verified readiness. Old or
+unavailable configured checks cannot silently pass. Supervisor withdrawal logs
+are historical evidence only, not proof a label is still withdrawn.
+
 Provision a dedicated forced-command SSH identity additively. Install source from
 `probes.ssh.render_script` and its interpreter at trusted root-owned non-writable
 paths; pin host keys through an independently authenticated route. Restrict keys

@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .collector import ident, iso, readiness
+from .collector import ident, iso, readiness, operational_evidence
 from .health import State, project, Policy
 from .models import validate
 
@@ -62,7 +62,13 @@ class Service:
         policy=Policy(inventory_ttl=c['thresholds']['inventory_stale_seconds'],host_ttl=c['thresholds']['host_stale_seconds'])
         for row in snap['runners'] if snap else ():
             row=deepcopy(row)
-            checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock())
+            current = meta['freshness'] == 'fresh'
+            checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock(), snapshot_current=current)
+            # This is host projection data, never provider-supplied runner data.
+            row.pop('operational_evidence', None)
+            operational = operational_evidence(c, row, snap.get('host_results', {}), self.clock(), snapshot_current=current)
+            if operational:
+                row['operational_evidence'] = operational
             host=snap.get('host_results',{}).get(row.get('host_id'),{})
             maintenance=next((h['maintenance'] for h in c['hosts'] if h['id']==row.get('host_id')), {})
             until=(datetime.fromisoformat(maintenance['expires_at'].replace('Z','+00:00')).timestamp()

@@ -22,6 +22,13 @@ Node ages use host-resource provenance from actual probes, never inventory-envel
 
 Detail monitoring explicitly distinguishes not-configured, forbidden, unavailable, unknown and configured-but-unattributed activity. Provider `observed_jobs` appear separately from dispatched `jobs`, with observation ages and stale labels. Current-job links require a fresh busy registration, matching provider runner ID and repository/organization scope, valid observation times and numeric IDs, and an exact canonical GitHub URL; raw provider URLs are never opened blindly.
 
+Optional operational evidence displays intentional drain, maintenance, disk-pressure
+withholding and root-headroom waits separately from provider Offline observations.
+Current holds require fresh source and owner timestamps and never promote readiness.
+Details retain all source timestamps, unavailable/unknown “Not observed” states,
+last-known stale evidence and historical supervisor label withdrawals. Existing
+readiness failures and provider activity remain visible; no controls modify holds.
+
 ## Tests
 
 From the repository root, Node >=22:
