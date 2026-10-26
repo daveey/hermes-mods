@@ -314,6 +314,7 @@ def build_gate(store):
                 rows = copy.deepcopy(contexts.get(key, []))
             if rows is None:
                 raise ValueError('context_limit')
+            _scope.require_known_steering(session_id, turn_messages)
             rows, observed_pairs = _scope.align_observed(rows, turn_messages)
             observed_ids = set(observed_pairs)
             for row in turn_messages or []:

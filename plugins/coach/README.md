@@ -716,4 +716,4 @@ capture/observe and pending evaluation with stale/fresh verification, repeated
 steering and spoofed tails. Core `test_steering_provenance.py` covers identity
 binding, copying, wire stripping and suffix preservation. These are native seam
 tests, not whole-transport steering acceptance. The attestation is not historical
-authentication after restart; compaction/restart retention remains unverified.
+authentication after restart. Native whole-turn in-place/rotated compaction now persists accepted steering before summarization. A bounded profile-qualified scan treats a lost live attestation (including archived steering) as UNKNOWN, not permission; pending holds cannot clear even with a fresh readback while scope is missing. `test_goal_steering_retention.py` exercises actual AIAgent turns and SessionDB compaction with scripted model/judge/summarizer boundaries, plus cold-history loss detection. Core `test_steering_compaction_retention.py` covers failed/missing storage and duplicate-free flushing. Hook registration is fixture-wired; provider-owned compaction and real transport restart retention remain unverified.

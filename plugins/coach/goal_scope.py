@@ -62,6 +62,84 @@ def _user_row(row):
     return result
 
 
+def require_known_steering(session_id, live_rows, *, historical=False):
+    """Missing live attestation is UNKNOWN, never absence of a restriction.
+
+    The DB is used only as a loss detector, not to manufacture human authority.
+    Archived rows count too. A later/concurrent durable steer conservatively
+    makes assessment unavailable; its text is never imported as permission.
+    """
+    from agent.steering_provenance import steering_content
+
+    known = set()
+    for row in live_rows or []:
+        if row.get('role') != 'user' or row.get('display_kind') != 'steer' or _queued_receipt(row):
+            continue
+        if not is_evidence_row(row) or steering_content(row) is None:
+            if historical or row.get('_native_steer'):
+                raise ValueError('scope_unknown_steering')
+            continue  # an unpersisted display-only spoof is not human input
+        known.add((row.get('message_uid'), row.get('content')))
+    _check_saved_steering(session_id, known)
+
+
+def _check_saved_steering(session_id, known):
+    from contextlib import closing
+    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_state_messages import SessionMessagesMixin
+
+    path = Path(get_hermes_home()) / 'state.db'
+    if not session_id or not path.exists():
+        return
+    with closing(_ro_connect(path)) as conn:
+        conn.execute('BEGIN')
+        ticks = [0]
+        def budget():
+            ticks[0] += 1
+            return int(ticks[0] > 1000)
+        conn.set_progress_handler(budget, 1000)
+        seen = set()
+        cutoff = float('inf')
+        for _ in range(32):
+            current = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+            if current is None:
+                if seen:
+                    raise ValueError('scope_missing_ancestor')
+                return
+            current = dict(current)
+            if session_id in seen:
+                raise ValueError('scope_lineage_cycle')
+            seen.add(session_id)
+            if current.get('profile_name') != get_active_profile_name():
+                raise ValueError('scope_profile_mismatch')
+            saved = conn.execute(
+                "SELECT message_uid, content, display_metadata FROM messages WHERE session_id=? "
+                "AND role='user' AND display_kind='steer' AND timestamp < ? LIMIT 201",
+                (session_id, cutoff)).fetchall()
+            if len(saved) > 200:
+                raise ValueError('context_limit')
+            for row in saved:
+                if not _queued_receipt(dict(row)) and (row['message_uid'], row['content']) not in known:
+                    raise ValueError('scope_unknown_steering')
+            if SessionMessagesMixin._is_explicit_fork_child_row(None, current, include_reset=True):
+                return
+            parent_id = current.get('parent_session_id')
+            if not parent_id:
+                return
+            parent = conn.execute('SELECT end_reason FROM sessions WHERE id=?', (parent_id,)).fetchone()
+            if parent is None:
+                raise ValueError('scope_missing_ancestor')
+            if parent['end_reason'] != 'compression':
+                return
+            started = current.get('started_at')
+            if type(started) not in (int, float) or not math.isfinite(started):
+                raise ValueError('scope_missing_cutoff')
+            cutoff = min(cutoff, started)
+            session_id = parent_id
+        raise ValueError('scope_lineage_limit')
+
+
 def _capture_rows(raw_rows, history, user_message, canonical):
     # Import only native fields, never history's self-declared trust labels.
     native_row = None
@@ -94,6 +172,7 @@ def recover_scope(session_id, user_message, history, *, canonical_user_content=N
     from hermes_state_messages import SessionMessagesMixin
     from hermes_cli.profiles import get_active_profile_name
 
+    require_known_steering(session_id, history, historical=True)
     raw_rows = [r for r in history or [] if is_evidence_row(r) and r.get('role') == 'user']
     rows = _capture_rows(raw_rows, history, user_message, canonical_user_content)
     path = Path(get_hermes_home()) / 'state.db'
