@@ -1287,7 +1287,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                 h('span', null,
                   h('b', null, `${expandedNodes.has(g.key) ? '▾' : '▸'} `, ...highlight(g.name, search)),
                   g.host ? h('span', { className: 'hermes-runners-meta' }, ...highlight(`${text(g.host.os)} ${text(g.host.arch)}`, search), ` · ${g.registrationCount ? `${g.registrationCount} registrations` : 'No mapped runners'}`) : null,
-                  g.activity ? h('span', { className: 'hermes-runners-meta' }, `${g.activity.busy == null ? 'Activity unknown' : `${g.activity.busy} busy · ${g.activity.idle} idle`} · Not observed`) : null
+                  g.activity ? h('span', { className: 'hermes-runners-meta' }, `${g.activity.busy == null ? 'Activity unknown' : `${g.activity.busy} busy · ${g.activity.idle} idle`} · ${g.freshness.observedAt ? `${g.freshness.state} · ${ago(g.freshness.observedAt)}` : 'Not observed'}`) : null
                 ),
                 h('small', null, g.health?.reason || `${g.rows.length} · mapping needed`)
               ),

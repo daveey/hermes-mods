@@ -32,6 +32,19 @@ test('host provenance supplies only actual probe age including empty nodes', () 
   assert.equal(node().freshness.observedAt, null)
   assert.notEqual(node().freshness.state, 'fresh')
 })
+test('node summary renders probe age and freshness rather than collector heartbeat', async () => {
+  const s = snapshot(), now = Date.now()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.meta.provenance.push({ source_id: fixtures.Host.resource_id, observed_at: new Date(now - 120000).toISOString(), expires_at: new Date(now - 1000).toISOString(), state: 'stale', observation_ids: ['probe'] })
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    const node = document.querySelector('[data-node-row]')
+    assert.match(node.textContent, /stale.*2m/i)
+    assert.doesNotMatch(node.textContent, /Not observed/)
+  } finally { await ui.close() }
+})
 test('node health never turns management reachability or busy activity into verified health', () => {
   const s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host)]
