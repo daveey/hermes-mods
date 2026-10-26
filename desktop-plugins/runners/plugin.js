@@ -1179,6 +1179,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
       {
         side: 'top',
         align: 'end',
+        // Do not tether the panel to a status item beyond a narrow viewport.
+        sticky: 'always',
         'aria-label': 'Runners',
         style: {
           width: 'min(680px, calc(100vw - 24px))',
