@@ -1,6 +1,6 @@
 ---
 name: pr-blocker-check
-description: "Use when a PR is stuck or you are about to watch/merge one. One-shot check that classifies the real blocker and names the next action."
+description: "Use when checking PR blockers before waiting or merging. Classify the real blocker and name the next action."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

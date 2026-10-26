@@ -1,0 +1,234 @@
+From 90bd2dc99d37c27180fb7773ffa2f657ff41c602 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:58:35 -0700
+Subject: [PATCH] ci(tests): size test workers from the hub CI slice budget,
+ upload flaky reports [daveey]
+
+Workers were 2 x nproc per shard (6), so six concurrent shards put 36
+test processes on ci.slice's 8-core quota: load ~70 on 16 vCPU and
+timing tests failing. scripts/ci/test_workers.py derives the count from
+HERMES_CI_SLICE_CPUS / HERMES_CI_CONCURRENT_SHARDS (capped at the
+runner's own quota, x1.5), which the hub passes into each runner
+container; without them it keeps 2 x nproc. The Python test job writes
+the flaky report, annotates each id, and uploads non-empty reports as
+flaky-tests-* artifacts for the hub's ci-flaky-cards cron.
+
+t_94f2c8ba
+---
+ .github/workflows/tests.yml   | 48 +++++++++++++++++++++----
+ scripts/ci/test_workers.py    | 68 +++++++++++++++++++++++++++++++++++
+ tests/ci/test_test_workers.py | 57 +++++++++++++++++++++++++++++
+ 3 files changed, 167 insertions(+), 6 deletions(-)
+ create mode 100644 scripts/ci/test_workers.py
+ create mode 100644 tests/ci/test_test_workers.py
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index ad7c6e5d39..37a9432d1d 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -115,23 +115,59 @@ jobs:
+         #
+         # No --files: the runner discovers the suite itself. The discovered
+         # set is identical to the list the removed matrix job used to pass in.
+-        # Workers = 2x the CPUs this runner can actually use. hermes-hub
+-        # runners are cpuset-pinned to 3 CPUs (nproc=3); the old fixed 32
+-        # put ~10 test files per core, which made timing-sensitive tests
+-        # fail (barrier timeouts, "11.98 < 10.0") and pushed host load to
+-        # ~70 (t_0259fe53). nproc honours cpusets; os.cpu_count() does not.
++        # Workers come from the CPU budget of the runners' shared systemd
++        # slice divided by the shards that run at once, not from nproc
++        # (scripts/ci/test_workers.py; the host passes HERMES_CI_SLICE_CPUS,
++        # HERMES_CI_CONCURRENT_SHARDS and HERMES_CI_RUNNER_CPUS into each
++        # runner container). 2 x nproc per shard put 36 test processes on an
++        # 8-core budget, load ~70, and timing tests failed (t_94f2c8ba).
++        #
++        # A failed test is retried ONCE in this job, by test id only
++        # (run_tests_parallel.py). A pass on that retry stays green but is
++        # written to the flaky report; the hub's ci-flaky-cards cron turns
++        # each id into one deflake Kanban card. A test that fails twice fails
++        # the job.
+         run: |
+-          export HERMES_TEST_WORKERS="${HERMES_TEST_WORKERS:-$(( $(nproc) * 2 ))}"
++          HERMES_TEST_WORKERS="$(python3 scripts/ci/test_workers.py)"
++          export HERMES_TEST_WORKERS
+           echo "HERMES_TEST_WORKERS=$HERMES_TEST_WORKERS (nproc=$(nproc))"
+           scripts/run_tests.sh
+         env:
+           HERMES_TEST_SLICE: ${{ matrix.slice }}/2
+           HERMES_TEST_FILE_TIMEOUT: 600
++          HERMES_TEST_FLAKY_REPORT: ${{ runner.temp }}/flaky-tests/slice-${{ matrix.slice }}.json
+           # Ensure tests don't accidentally call real APIs
+           OPENROUTER_API_KEY: ""
+           OPENAI_API_KEY: ""
+           NOUS_API_KEY: ""
+ 
++      - name: Report flaky tests
++        # Runs after a green AND a red test step: a red slice can still carry
++        # flakes in other files. Only a non-empty report is uploaded.
++        id: flaky
++        if: ${{ !cancelled() }}
++        env:
++          REPORT: ${{ runner.temp }}/flaky-tests/slice-${{ matrix.slice }}.json
++        run: |
++          if [ ! -s "$REPORT" ]; then echo "no flaky report"; exit 0; fi
++          python3 - "$REPORT" <<'PY'
++          import json, os, sys
++          flaky = json.load(open(sys.argv[1]))["flaky"]
++          for e in flaky:
++              print(f"::warning title=FLAKY (passed only on retry)::{e['test_id']}")
++          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
++              out.write(f"count={len(flaky)}\n")
++          PY
++
++      - name: Upload flaky report
++        if: ${{ !cancelled() && steps.flaky.outputs.count != '' && steps.flaky.outputs.count != '0' }}
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: flaky-tests-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slice }}
++          path: ${{ runner.temp }}/flaky-tests/slice-${{ matrix.slice }}.json
++          retention-days: 7
++          if-no-files-found: ignore
++
+       - name: Save per-file duration cache (main only)
+         # Only green first-attempt durations are written by the runner, so
+         # a hang on main cannot ratchet its own bound upward.
+diff --git a/scripts/ci/test_workers.py b/scripts/ci/test_workers.py
+new file mode 100644
+index 0000000000..d6c648e43f
+--- /dev/null
++++ b/scripts/ci/test_workers.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""Worker count for scripts/run_tests_parallel.py on a CI runner (t_94f2c8ba).
++
++The hermes-hub runners share one systemd slice (ci.slice) with an aggregate
++CPU quota. Sizing workers from nproc (2 x 3 pinned CPUs = 6 per shard) put 36
++test processes on an 8-core budget when six shards ran at once: load ~70 on 16
++vCPU, timing tests failing, a slice taking 78 min. Size from the budget instead:
++
++    per_shard = HERMES_CI_SLICE_CPUS / HERMES_CI_CONCURRENT_SHARDS
++                (capped at HERMES_CI_RUNNER_CPUS, the container's own quota)
++    workers   = max(2, round(per_shard * OVERSUBSCRIBE))
++
++OVERSUBSCRIBE > 1 because a per-file pytest subprocess spends part of its life
++in startup I/O, sleeps and subprocess waits. HERMES_TEST_WORKERS, when set,
++wins (manual runs). Without the host variables it falls back to 2 x nproc, the
++old behaviour, so runners that are not in a budgeted slice are unchanged.
++The host sets the variables in /etc/systemd/system/gh-runner@.service.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++OVERSUBSCRIBE = 1.5
++
++
++def _positive(env: dict[str, str], name: str) -> float | None:
++    raw = (env.get(name) or "").strip()
++    if not raw:
++        return None
++    try:
++        value = float(raw)
++    except ValueError:
++        raise SystemExit(f"test_workers: {name}={raw!r} is not a number")
++    if value <= 0:
++        raise SystemExit(f"test_workers: {name}={raw!r} must be > 0")
++    return value
++
++
++def workers(env: dict[str, str], nproc: int) -> tuple[int, str]:
++    explicit = (env.get("HERMES_TEST_WORKERS") or "").strip()
++    if explicit:
++        return int(explicit), "HERMES_TEST_WORKERS"
++    cpus = _positive(env, "HERMES_CI_SLICE_CPUS")
++    shards = _positive(env, "HERMES_CI_CONCURRENT_SHARDS")
++    if cpus is None or shards is None:
++        return max(1, nproc) * 2, f"2 x nproc ({nproc}); no CI slice budget in the environment"
++    per_shard = cpus / shards
++    cap = _positive(env, "HERMES_CI_RUNNER_CPUS")
++    if cap is not None:
++        per_shard = min(per_shard, cap)
++    n = max(2, round(per_shard * OVERSUBSCRIBE))
++    why = (f"slice {cpus:g} CPUs / {shards:g} concurrent shards = {per_shard:.2f} CPUs"
++           f"{f' (runner cap {cap:g})' if cap is not None else ''} x {OVERSUBSCRIBE}")
++    return n, why
++
++
++def main() -> int:
++    affinity = getattr(os, "sched_getaffinity", None)
++    nproc = len(affinity(0)) if affinity else (os.cpu_count() or 1)
++    n, why = workers(dict(os.environ), nproc)
++    print(f"test_workers: {n} ({why})", file=sys.stderr)
++    print(n)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/ci/test_test_workers.py b/tests/ci/test_test_workers.py
+new file mode 100644
+index 0000000000..0e51136a67
+--- /dev/null
++++ b/tests/ci/test_test_workers.py
+@@ -0,0 +1,57 @@
++"""scripts/ci/test_workers.py: test workers come from the CI slice budget, not nproc (t_94f2c8ba)."""
++from __future__ import annotations
++
++import importlib.util
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++_PATH = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "test_workers.py"
++_spec = importlib.util.spec_from_file_location("test_workers_mod", _PATH)
++tw = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(tw)
++
++
++def test_budget_divides_the_slice_across_concurrent_shards():
++    n, why = tw.workers({"HERMES_CI_SLICE_CPUS": "10", "HERMES_CI_CONCURRENT_SHARDS": "3"}, nproc=16)
++    assert n == 5  # 10/3 = 3.33 CPUs x 1.5
++    assert "10 CPUs / 3 concurrent shards" in why
++
++
++def test_nproc_does_not_change_a_budgeted_count():
++    env = {"HERMES_CI_SLICE_CPUS": "10", "HERMES_CI_CONCURRENT_SHARDS": "3"}
++    assert tw.workers(env, nproc=3)[0] == tw.workers(env, nproc=64)[0]
++
++
++def test_runner_quota_caps_the_per_shard_share():
++    env = {"HERMES_CI_SLICE_CPUS": "10", "HERMES_CI_CONCURRENT_SHARDS": "1", "HERMES_CI_RUNNER_CPUS": "4"}
++    assert tw.workers(env, nproc=16)[0] == 6
++
++
++def test_floor_of_two_workers_and_explicit_override_wins():
++    assert tw.workers({"HERMES_CI_SLICE_CPUS": "2", "HERMES_CI_CONCURRENT_SHARDS": "8"}, nproc=16)[0] == 2
++    env = {"HERMES_TEST_WORKERS": "7", "HERMES_CI_SLICE_CPUS": "10", "HERMES_CI_CONCURRENT_SHARDS": "3"}
++    assert tw.workers(env, nproc=16) == (7, "HERMES_TEST_WORKERS")
++
++
++def test_without_a_slice_budget_it_keeps_the_old_two_per_cpu():
++    assert tw.workers({}, nproc=3)[0] == 6
++
++
++def test_bad_budget_values_fail_loudly():
++    with pytest.raises(SystemExit):
++        tw.workers({"HERMES_CI_SLICE_CPUS": "ten", "HERMES_CI_CONCURRENT_SHARDS": "3"}, nproc=4)
++    with pytest.raises(SystemExit):
++        tw.workers({"HERMES_CI_SLICE_CPUS": "10", "HERMES_CI_CONCURRENT_SHARDS": "0"}, nproc=4)
++
++
++def test_cli_prints_only_the_number_on_stdout():
++    proc = subprocess.run(
++        [sys.executable, str(_PATH)],
++        env={"HERMES_CI_SLICE_CPUS": "10", "HERMES_CI_CONCURRENT_SHARDS": "3", "PATH": "/usr/bin:/bin"},
++        capture_output=True, text=True, timeout=60, check=True,
++    )
++    assert proc.stdout.strip() == "5"
++    assert "slice 10 CPUs" in proc.stderr
+-- 
+2.55.0
+

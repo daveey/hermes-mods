@@ -1,6 +1,6 @@
 ---
 name: github-ci-wait
-description: "Use when waiting for a pushed commit's GitHub CI or release, or for Actions blocked by billing. Waits on runs/tags containing the commit, never the newest run."
+description: "Use when waiting for GitHub CI or a release. Track runs/tags containing the commit; diagnose Actions billing blocks."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

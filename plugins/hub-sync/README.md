@@ -29,7 +29,7 @@ record. Allowed actions: sessions `rename{title}`/`archive`/`unarchive`/`pin`/`u
 ## Consumers
 
 - Fork core (`core/hub-sync-replica.md`): owner lookup via `/where`, the Kanban board's fallback to `/tasks` for an
-  unreachable gateway, and the sidebar's "Synced from other gateways" section (`/sessions` + `/request`).
+  unreachable gateway, and offline-marked cached rows in the normal sidebar (`/sessions` + `/request`).
 - `desktop-plugins/inbox`: other gateways' open cards via `/inbox`; resolve/archive via `/request`.
 - `desktop-plugins/session-tasks`: linked cards on other gateways via `/session-links`.
 

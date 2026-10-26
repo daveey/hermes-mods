@@ -1,0 +1,121 @@
+From 4961aff13f0f0e31d4826294f61615cfca2e6c1c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 02:48:58 -0700
+Subject: [PATCH] fix(delegate): resolve only selected child routes during
+ preflight [daveey]
+
+---
+ tests/tools/test_delegate_per_task_model.py | 38 ++++++++++++++++++++-
+ tools/delegate_tool.py                      | 23 +++++++------
+ 2 files changed, 49 insertions(+), 12 deletions(-)
+
+diff --git a/tests/tools/test_delegate_per_task_model.py b/tests/tools/test_delegate_per_task_model.py
+index 3b3c9fd761..28ee368232 100644
+--- a/tests/tools/test_delegate_per_task_model.py
++++ b/tests/tools/test_delegate_per_task_model.py
+@@ -129,7 +129,43 @@ class TestDelegateToolPerTaskModel(unittest.TestCase):
+             )
+         self.assertEqual(models, ["z-ai/glm-5.3", "claude-sonnet-5-5"])
+         self.assertEqual(providers, ["openrouter", "anthropic"])
+-        self.assertEqual(seen[1]["provider"], "openrouter")
++        self.assertEqual(seen[0]["provider"], "openrouter")
++        self.assertNotIn("provider", seen[1])
++
++    def test_unavailable_default_does_not_block_explicit_provider(self):
++        def resolve(*, requested, target_model):
++            if requested == "anthropic":
++                raise ValueError("No Anthropic credentials found")
++            return {"provider": "openai-codex", "model": target_model,
++                    "base_url": "https://chatgpt.com/backend-api/codex",
++                    "api_key": "synthetic-token", "api_mode": "codex_responses"}
++
++        with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve) as resolver:
++            out, models, providers = self._run(
++                [{"goal": "review this change using the selected provider", "provider": "openai-codex",
++                  "model": "test-model"}],
++                {"provider": "anthropic", "model": "claude-sonnet-5-5"},
++            )
++        self.assertNotIn("error", json.loads(out), out)
++        self.assertEqual(models, ["test-model"])
++        self.assertEqual(providers, ["openai-codex"])
++        resolver.assert_called_once_with(requested="openai-codex", target_model="test-model")
++
++    def test_unavailable_default_still_refuses_mixed_batch_before_spawn(self):
++        def resolve(cfg, parent):
++            if cfg.get("provider") == "anthropic":
++                raise ValueError("No Anthropic credentials found")
++            return {"model": "test-model", "provider": "openai-codex", "base_url": "https://example.com",
++                    "api_key": "synthetic-token", "api_mode": "codex_responses"}
++
++        with patch("tools.delegate_tool._resolve_delegation_credentials", side_effect=resolve):
++            out, models, _ = self._run(
++                [{"goal": "review this change on the selected route", "provider": "openai-codex"},
++                 {"goal": "review this change on the default route"}],
++                {"provider": "anthropic"},
++            )
++        self.assertIn("No Anthropic credentials found", json.loads(out)["error"])
++        self.assertEqual(models, [])
+ 
+     def test_bad_task_pin_refuses_whole_call_before_spawn(self):
+         out, models, _ = self._run([{"goal": "this has a bogus model value", "model": ["x"]}], {})
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 7bd10037a2..dde2c2806b 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -446,7 +446,7 @@ def _task_route_cfg(task: dict[str, Any], routing_cfg: dict[str, Any]) -> tuple[
+ 
+ 
+ def _resolve_task_routes(
+-    task_list: list[dict[str, Any]], creds: dict[str, Any], routing_cfg: dict[str, Any], parent_agent,
++    task_list: list[dict[str, Any]], creds: Optional[dict[str, Any]], routing_cfg: dict[str, Any], parent_agent,
+ ) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], Optional[str]]:
+     """``[(creds, routing_cfg), ...]`` per task: the call-wide route, or the task's own ``model``/``provider`` pin
+     resolved through the same credential path as ``delegation.*``. ``([], error)`` on a bad pin."""
+@@ -455,10 +455,14 @@ def _resolve_task_routes(
+         task_cfg, err = _task_route_cfg(t, routing_cfg)
+         if err:
+             return [], f"Task {i}: {err}"
+-        if task_cfg is None:
+-            routes.append((creds, routing_cfg))
+-            continue
+         try:
++            if task_cfg is None:
++                # Resolve the default only if a child actually uses it. An unused
++                # default with missing credentials must not veto an explicit route.
++                if creds is None:
++                    creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
++                routes.append((creds, routing_cfg))
++                continue
+             task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
+         except ValueError as exc:
+             return [], f"Task {i}: {exc}"
+@@ -591,12 +595,6 @@ def delegate_task(
+     # a per-call routing owner shaped like the delegation config section. Keep
+     # the route and its fallback policy together through child construction.
+     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+-    try:
+-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+-    except ValueError as exc:
+-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
+-        # spawn loudly (#80450).
+-        return tool_error(str(exc))
+     max_children = _get_max_concurrent_children()
+     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+     if not err:
+@@ -605,9 +603,12 @@ def delegate_task(
+         task_images, err = _coerce_task_images(task_list, images)
+     if err:
+         return tool_error(err)
+-    task_routes, err = _resolve_task_routes(task_list, creds, routing_cfg, parent_agent)
++    task_routes, err = _resolve_task_routes(task_list, None, routing_cfg, parent_agent)
+     if err:
+         return tool_error(err)
++    # Batch metadata uses an actual selected route, never an unused default.
++    # Child construction always receives its own preflighted task_routes entry.
++    creds = task_routes[0][0]
+     err = _oneshot_spawn_budget(parent_agent, len(task_list))
+     if err:
+         return tool_error(err)
+-- 
+2.54.0 (Apple Git-157)
+

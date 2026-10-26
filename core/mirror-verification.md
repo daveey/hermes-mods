@@ -1,4 +1,25 @@
-# Core mirror verification through 0255
+# Core mirror verification
+
+## Full-series re-verification through 0265
+
+The ordered non-merge `upstream/main..origin/main` export was regenerated on
+2026-10-25 with upstream `710fa8a073` and fork `8f4c3a23cd`. All 265 entries
+were already published; matching numbered filenames, the privacy substitutions
+in 0132/0174/0230, and the merge adaptation in 0242 were preserved. No additional
+runtime changes or unmerged PR patches were introduced.
+
+- All 265 patches applied successfully with `git am -3` in a fresh worktree at
+  merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63` (exit 0).
+- `python3 core/check_coverage.py` passed from the mirror repository root.
+- Full-series private-denylist scan returned zero matches.
+- A standalone clone of the applied series ran the canonical runner:
+  `bash scripts/run_tests.sh -j 1 tests/hermes_cli/test_kanban_wake_check.py tests/hermes_cli/test_kanban_continuation.py tests/hermes_cli/test_kanban_timed_park.py tests/hermes_cli/test_kanban_park_invariants.py`.
+  Result: 82 passed, zero failed, one macOS-only test skipped on Linux.
+- These are focused kernel/scheduling regressions, not a full suite or proof of
+  Desktop rendering. The earlier notifier/bootstrap failures below were not
+  rerun in this batch and are not claimed resolved.
+
+## Earlier verification through 0255
 
 ## Export
 

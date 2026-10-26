@@ -4,6 +4,8 @@ Patches:
 
 - `patches/0248-fix-kanban-a-recovered-quota-wall-never-becomes-a-hu.patch`: quota/429 text takes the cooldown path whatever the latest run outcome.
 
+- `patches/0271-fix-kanban-clear-stale-failure-errors-on-healthy-pro.patch`: healthy heartbeats and checkpoints clear stale failure diagnostics.
+
 Extends `kanban-shared-blockers.md` and `kanban-park-invariants.md`.
 
 ## Behavior
@@ -18,6 +20,8 @@ the quota wall had cleared. Now:
 - On each dispatcher tick, existing guard-hold `capability`/`needs_input` blocks whose error is a quota error are released
   once another card completed after the block, with a comment saying so.
 
+- Successful worker heartbeats and immediate/scheduled checkpoints clear `last_failure_error` atomically with their ownership-checked update. Failure counters and historical runs/events remain unchanged. Completion already clears the error and is covered by regression tests.
+
 ## How it works
 
 The rate-limit requeue stamps `last_failure_error`. A later non-failure run (`changes_requested`, `blocked`) became the
@@ -27,13 +31,15 @@ latest run, so the `outcome=rate_limited` branch stopped firing and the stamp ma
 
 ## Code
 
-- `hermes_cli/kanban_db_dispatch.py`, `hermes_cli/kanban_db_dispatch_quota.py`, `website/docs/user-guide/features/kanban.md`.
+- `hermes_cli/kanban_continuation.py`, `hermes_cli/kanban_db_dispatch.py`, `hermes_cli/kanban_db_dispatch_quota.py`, `website/docs/user-guide/features/kanban.md`.
 
 ## Tests
 
 - `tests/hermes_cli/test_kanban_quota_guard.py`: a stale quota stamp is not `blocker_auth` (any latest outcome, or no runs); the rate-limited outcome clears the stamp after the cooldown; a real auth error still escalates and auth words win over quota words; a quota hold never escalates to a human block; the hold cap re-queues a quota error; an existing quota-hold block is released after another card completed (a completion before the block is no proof; an auth hold block is never released).
 - `tests/hermes_cli/test_kanban_list_undecodable_text.py`: its BLOB fixture now uses auth text (`401 unauthorized`), since quota text no longer matches the blocker pattern.
-- Not re-run when this doc was written (untested here).
+- `tests/hermes_cli/test_kanban_db_dispatch.py`: 14 cases cover clearing on heartbeat, immediate/scheduled checkpoint and completion, plus rejection of stale-run writes. Six cases failed before patch 0271; all pass after. Exact `No Anthropic credentials` text persists before the fix but does not match the current auth regex; an authentication-prefixed variant also proves the false hold.
+- Verification for 0271: dispatch, continuation, quota-guard and PR-acceptance suites: 43 passed, 2 platform skips. Including `test_kanban_db.py`: 96 passed, 3 skipped, 1 pre-existing macOS infrastructure-spawn failure (reproduced on the parent). Undecodable-text tests were not rerun.
+- This verifies database entry points; live dispatcher deployment was not exercised.
 
 ## Applying
 

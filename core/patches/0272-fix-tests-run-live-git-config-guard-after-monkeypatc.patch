@@ -1,0 +1,119 @@
+From 4ccd362a303ea153e0f6dc24a921adeb366786e8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:24:26 +0000
+Subject: [PATCH] fix(tests): run live git config guard after monkeypatch undo;
+ pin utf-8 in worker scope systemctl
+
+---
+ hermes_cli/kanban_worker_scope.py   |  2 +-
+ tests/conftest.py                   | 30 +++++++++++++++++++++++++----
+ tests/test_live_git_config_guard.py | 25 ++++++++++++++++++------
+ 3 files changed, 46 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+index cf992ee660..a618594772 100644
+--- a/hermes_cli/kanban_worker_scope.py
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -71,7 +71,7 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess | None:
+     try:
+         return subprocess.run(
+             ["systemctl", "--user", *args], env=env, capture_output=True,
+-            text=True, timeout=2, check=False,
++            text=True, encoding="utf-8", errors="replace", timeout=2, check=False,
+         )
+     except (OSError, subprocess.SubprocessError):
+         # Non-systemd hosts, unavailable bus, or old systemd: preserve exit-code handling.
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 9eb415cd60..3ec04469ba 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -559,11 +559,33 @@ def _live_git_config_guard(request):
+     its own repo under ``tmp_path``.
+     """
+     if request.node.get_closest_marker("allow_live_git_config"):
+-        yield
+         return
+-    snapshots = {path: _read_bytes_or_none(path) for path in _live_git_config_paths()}
+-    yield
+-    _assert_git_configs_unchanged(snapshots)
++    # The comparison runs in ``pytest_runtest_teardown`` below, not here: it
++    # spawns git, and fixture teardown precedes monkeypatch's undo (the
++    # builtin is set up first and torn down last), so a test's patches of
++    # ``os.open``/``os.read``/``pathlib`` would still be live.
++    request.node.stash[_GIT_CONFIG_SNAPSHOTS] = {
++        path: _read_bytes_or_none(path) for path in _live_git_config_paths()
++    }
++
++
++_GIT_CONFIG_SNAPSHOTS = pytest.StashKey()
++
++
++@pytest.hookimpl(wrapper=True)
++def pytest_runtest_teardown(item, nextitem):
++    """Run the live git config check once every fixture, monkeypatch included, is torn down."""
++    try:
++        return (yield)
++    finally:
++        _check_live_git_configs(item)
++
++
++def _check_live_git_configs(item) -> None:
++    snapshots = item.stash.get(_GIT_CONFIG_SNAPSHOTS, None)
++    if snapshots is not None:
++        del item.stash[_GIT_CONFIG_SNAPSHOTS]
++        _assert_git_configs_unchanged(snapshots)
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/test_live_git_config_guard.py b/tests/test_live_git_config_guard.py
+index a7ac187937..8f22e57c30 100644
+--- a/tests/test_live_git_config_guard.py
++++ b/tests/test_live_git_config_guard.py
+@@ -20,9 +20,8 @@ def _init(path):
+ def test_guard_teardown_with_mocked_popen(tmp_path, monkeypatch, fake_kind, mutate):
+     cfg = _init(tmp_path)
+     monkeypatch.setattr(guard, "_live_git_config_paths", lambda: [cfg])
+-    request = SimpleNamespace(node=SimpleNamespace(get_closest_marker=lambda name: None))
+-    fixture = guard._live_git_config_guard.__wrapped__(request)
+-    next(fixture)
++    request = SimpleNamespace(node=SimpleNamespace(get_closest_marker=lambda name: None, stash=pytest.Stash()))
++    guard._live_git_config_guard.__wrapped__(request)
+     if mutate:
+         subprocess.run([
+             "git", "config", "--file", str(cfg), "user.email", "fixture@example.invalid",
+@@ -42,11 +41,10 @@ def test_guard_teardown_with_mocked_popen(tmp_path, monkeypatch, fake_kind, muta
+         mocks.setattr(subprocess, "run", fake_run)
+         if mutate:
+             with pytest.raises(pytest.fail.Exception, match="test wrote user.* into a live checkout"):
+-                next(fixture)
++                guard._check_live_git_configs(request.node)
+             assert guard._read_bytes_or_none(cfg) == b""
+         else:
+-            with pytest.raises(StopIteration):
+-                next(fixture)
++            guard._check_live_git_configs(request.node)
+ 
+ 
+ @pytest.mark.parametrize("mutate", [False, True])
+@@ -91,3 +89,18 @@ def test_guard_ignores_branch_and_remote_entries(tmp_path):
+     snapshots = {cfg: _read_bytes_or_none(cfg)}
+     subprocess.run(["git", "-C", str(tmp_path), "config", "branch.x.remote", "origin"], check=True)
+     _assert_git_configs_unchanged(snapshots)
++
++
++def test_guard_teardown_runs_after_monkeypatch_undo(monkeypatch):
++    """Teardown spawns git via Popen, so a test's global ``os`` patches must be undone first.
++
++    If the guard tore down before monkeypatch, this test would error at
++    teardown with the BlockingIOError raised below.
++    """
++    import os
++
++    def would_block(*_args, **_kwargs):
++        raise BlockingIOError(11, "try again")
++
++    monkeypatch.setattr(os, "read", would_block)
++    monkeypatch.setattr(os, "open", would_block)
+-- 
+2.55.0
+

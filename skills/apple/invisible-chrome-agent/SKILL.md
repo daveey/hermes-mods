@@ -1,6 +1,6 @@
 ---
 name: invisible-chrome-agent
-description: "Use when driving the agent Chrome or a Mac app steals focus. Hidden Chrome on a virtual display, a CDP supervisor, and front-window fixes."
+description: "Use when driving hidden Chrome or fixing Mac focus. Virtual-display Chrome, CDP supervisor and front-window fixes."
 version: 1.0.0
 author: Claude Code
 license: MIT
