@@ -103,3 +103,24 @@ def test_named_profile_shares_the_gateway_root_outbox(tmp_path, monkeypatch):
     assert rf.root() == tmp_path / "session_mentions"
     monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: tmp_path))
     assert rf.root() == tmp_path / "session_mentions"
+
+
+def _routed(base: Path, rid: str, route: str) -> None:
+    rf.atomic_write(base / "outbox" / f"{rid}.json", {"id": rid, "action": "send", "route": route,
+                                                         "created_at": time.time(), "ttl": 600})
+
+
+def test_remote_drain_claims_requests_only_it_can_serve_while_home_alive(tmp_path):
+    base = _base(tmp_path)
+    _heartbeat(base)
+    rf.register_courier(base, "mac-mini", ["daveey-mini"], ["mac-mini", "macbook"], home=True)
+    _routed(base, "tomac", "macbook")        # addressed to the remote Mac itself
+    _routed(base, "tohub", "hermes-hub")     # gateway only the remote Mac reaches
+    _routed(base, "tomini", "mac-mini")      # home courier can serve it
+    _request(base, "unrouted")               # anyone-can-serve: home courier keeps it
+    got = rf.claim_pending(base, home=False, courier="macbook", aliases=["david-mbp"],
+                           reach=["macbook", "david-mbp", "hermes-hub", "mac-mini"])
+    assert sorted(r["id"] for r in got) == ["tohub", "tomac"]
+    assert sorted(p.stem for p in (base / "outbox").glob("*.json")) == ["tomini", "unrouted"]
+    assert sorted(r["id"] for r in rf.claim_pending(base, home=True, courier="mac-mini",
+                                                    reach=["mac-mini", "macbook"])) == ["tomini", "unrouted"]
