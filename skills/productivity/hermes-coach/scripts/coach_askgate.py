@@ -31,7 +31,8 @@ PT = ZoneInfo("America/Los_Angeles")
 
 # Turns that are not David typing a correction.
 SKIP = re.compile(
-    r"^\s*(\[(Slack engagement|IMPORTANT:|OUT-OF-BAND)|\{\s*\"(?:person|kind)\"|Without any other tools:|[✔✖✘⏸⏱🔄]\ufe0f?\s+\[)", re.I)
+    r"^\s*(\[(Slack engagement|IMPORTANT:|OUT-OF-BAND|PEER MESSAGE from|Message from another Hermes session)|"
+    r"(?:Go|Chose|✓ Done):|\{\s*\"(?:person|kind)\"|Without any other tools:|[✔✖✘⏸⏱🔄]\ufe0f?\s+\[)", re.I)
 OOB = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
 
 _V = r"(?:do|did|doing|check|checked|merge|nudge|investigate|investigating|figure|fix|run|handle|try|test|verify|find|look|ssh|read|open|search|review|update|click|sign|log)"
@@ -165,9 +166,15 @@ def classify_fix(text):
 
 
 def clean(text):
-    m = OOB.search(text)
-    if m:
-        text = m.group(1)
+    # Only a top-level steering envelope is a user message. Never unwrap one
+    # quoted inside an agent-to-agent message.
+    if re.match(r"^\s*\[OUT-OF-BAND USER MESSAGE", text):
+        m = OOB.search(text)
+        if m:
+            text = m.group(1)
+    # Desktop appends these machine-owned sections to real user text. Their
+    # quoted button labels are not new complaints from the user.
+    text = re.split(r"(?m)^\s*\[(?:user-steps|chat-closeout)\]", text, maxsplit=1)[0]
     return text.strip()
 
 
@@ -354,17 +361,18 @@ def lane_sessions(home):
 
 
 def hit_defect(h):
-    """One ask-gate hit -> a monitor finding for the self-heal lane. A fix request the lane never filed is a detector
-    miss (the review used to ask for exactly that); an ask-me correction is the agent's needless handoff."""
+    """One ask-gate hit -> a monitor finding for the self-heal lane. Missing
+    filing alone does not prove a detection miss (shadow mode never files)."""
     q = quote(h, 160)
     if h["class"] == FIX_CLASS:
-        title = f"self-heal detector missed a fix request: \"{q[:90]}\""
+        title = f"unfiled fix request needs review: \"{q[:90]}\""
         comp = "plugin"
         body = (f"Ask-gate weekly: David had to ask for a Hermes fix ({h['pattern']}) on {fmt_ts(h['t'])}, "
                 f"host {h.get('host')}, session {h['session']}, and the self-heal lane has no filing for that session. "
                 f"Quote: \"{q}\"")
-        prompt = ("Check whether the self-heal detector (plugins/coach/self_heal.py complaint judge or the digest "
-                  "backstop) saw this turn; find why it missed it and fix the detector. Also file the underlying defect.")
+        prompt = ("Check the incident date against detector deployment and shadow/live mode first. No filing is not "
+                  "proof of a detector miss. Check whether the complaint judge or digest backstop saw this turn; "
+                  "fix any proven detector gap and reuse existing ownership for the underlying defect.")
     else:
         title = f"agent asked David to do it himself: \"{q[:90]}\""
         comp = "agent"

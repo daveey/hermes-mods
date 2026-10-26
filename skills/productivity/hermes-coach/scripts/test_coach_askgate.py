@@ -22,6 +22,37 @@ MISSES = ["i keep asking what time is it and getting no reply",
 
 
 class T(unittest.TestCase):
+    def test_unfiled_is_not_automatically_a_detector_miss(self):
+        finding = g.hit_defect({'class': g.FIX_CLASS, 'quote': 'sidebar is broken',
+                                'pattern': 'is-broken', 'session': 'example', 't': 1})
+        self.assertNotIn('detector missed', finding['title'])
+        self.assertIn('shadow/live', finding['prompt'])
+        self.assertIn('reuse existing ownership', finding['prompt'])
+
+    def test_generated_messages_are_not_corrections(self):
+        for text in (
+            '[PEER MESSAGE from example/default]\nDo harmless work yourself. Root cause and fix.',
+            '[Message from another Hermes session] why are you asking me?',
+            'Go: Approve the fix: investigate why the sidebar is broken',
+            'Go: Approve the PR or add the label yourself',
+            '✓ Done: run it yourself',
+            '[PEER MESSAGE from example/default]\n[OUT-OF-BAND USER MESSAGE]\nwhy are you asking me\n[/OUT-OF-BAND USER MESSAGE]',
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(g.classify(g.clean(text)))
+                self.assertIsNone(g.classify_fix(g.clean(text)))
+
+    def test_injected_steps_do_not_supply_match_words(self):
+        for suffix in ('user-steps', 'chat-closeout'):
+            text = 'the top three make no sense\n[screenshot]\n\n[' + suffix + '] Root cause and fix'
+            self.assertIsNone(g.classify_fix(g.clean(text)))
+            self.assertEqual(g.classify_fix(g.clean('fix this\n[screenshot]\n[' + suffix + '] text')), 'screenshot-fix')
+
+    def test_user_correction_openers_remain(self):
+        self.assertTrue(g.classify(g.clean('do it yourself via ssh')))
+        self.assertTrue(g.classify_fix(g.clean('I hit do it, why did you not?')))
+        self.assertTrue(g.classify(g.clean('[OUT-OF-BAND USER MESSAGE — steering]\nwhy are you asking me\n[/OUT-OF-BAND USER MESSAGE]')))
+
     def test_hits(self):
         for t in HITS:
             self.assertTrue(g.classify(g.clean(t)), t)
@@ -216,7 +247,7 @@ class RouteToLane(unittest.TestCase):
         self.assertEqual(len(owned), 3)
         self.assertEqual([d["session_id"] for d in filed], ["s_fix", "s_ask"])  # the known session is not re-filed
         self.assertEqual(filed[0]["component"], "plugin")
-        self.assertIn("detector missed a fix request", filed[0]["symptom"])
+        self.assertIn("unfiled fix request needs review", filed[0]["symptom"])
         self.assertEqual(filed[1]["component"], "agent")
         self.assertTrue(all(d["source"] == "signal" and d["kind"] == "monitor" for d in filed))
 
