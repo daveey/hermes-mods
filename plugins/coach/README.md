@@ -55,6 +55,149 @@ Settings: `COACH_REPLY_RULES` (comma list or `none`) and `COACH_REPLY_THRESHOLD`
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
 
+### Goal disposition (`pre_final_gate`, experimental and default off)
+
+`goal_disposition.py` checks diagnosis-only endings that do not contain an ask, promise or
+completion claim. It uses the separate `coach_goal_disposition` auxiliary task (15-second
+request timeout), not the reply regex prefilter or System One screener. A strictly parsed,
+cited `abandoned` verdict at confidence ≥0.85 silently holds the candidate and asks the agent
+to continue **only already-authorized** work. The hook never repairs anything, creates tasks,
+retries approvals, sends messages, or changes self-heal configuration.
+
+Profile-local `<HERMES_HOME>/coach/goal-disposition.json` accepts `{"mode":"off"}` (default),
+`{"mode":"shadow"}` (judge/log only), or `{"mode":"enforce"}`. Reload the plugin after enabling
+enforcement: buffering is selected at registration so the disabled hook does not buffer every
+answer. Switching off takes effect on the next fresh check; reload also removes buffering.
+An already held reply is never accepted merely because configuration disappears,
+becomes invalid/unreadable, or changes to off/shadow: its recheck is unavailable and
+core retains the explicit unresolved fallback (Stop still wins). A runtime
+switch to enforce without a reload logs `reload_required_for_buffering` and does not hold.
+Background agents remain excluded by core.
+
+Evidence includes bounded past turn context captured at `pre_llm_call`, explicit user steering,
+the candidate, and paired tool calls/results retaining call IDs and executor status. Structured
+post-tool observations survive a later steering message. Orphan tool results cannot authorize work.
+The schema rejects nonfinite scores, invented references, missing user citations and inconsistent
+abandonment. Structured success/error fields are checked for remediation/capability claims;
+HTTP 503 is not proof that the agent lacks repair capability. Capability boundaries require
+`proof: {source_ref, action}` tied to a cited paired failed command or HTTP(S) URL. Later user
+steering or another result for that operation invalidates the failure, including changed tool
+names/options. Missing or unsupported proofs are UNKNOWN; after a confirmed hold they cannot
+clear the unresolved fallback. Tests: `test_goal_capability_proofs.py` covers bindings and
+freshness, `test_goal_capability_gate.py` covers verdict/recheck validation, and
+`test_goal_capability_turn.py` exercises a real discovered multi-plugin agent turn: a superseded
+credential error cannot release held text into returned, streamed, interim or persisted output.
+This validates freshness, not goal relevance or an unblock plan.
+Authorization and remediation now
+require an additional `proof` object binding cited source to exact action/path. Authorization
+currently supports a latest literal user restriction (`Do not`/`Never`, explicit-user-direction
+path), or the native terminal pending-approval envelope with its exact command and `/approve`
+path. Other policy/denial formats remain UNKNOWN, not permission to retry. Remediation currently
+supports a requested exact HTTP(S) URL shared by user scope, tool arguments, result URL/status
+and candidate; a newer readback invalidates the older citation. The bounded native terminal
+HTTP-availability contract below also consumes actual exit/output envelopes. Non-URL verification and other
+tool result formats remain UNKNOWN. Semantic judgment still decides whether that path fulfills
+the goal; these narrow adapters do not complete general action/approval/path acceptance. Analysis-only, plan-first, status-only,
+conceptual, hypothetical and genuine permission boundaries must not become repair mandates.
+
+**Limits / not rollout-ready:** a conservative local running-task adapter reads the exact
+hostname/profile/board/task from authoritative stores. It requires exact request/body and goal/title
+matches, a live matching process claim, and an origin-linked TUI result subscription. It additionally
+requires a native registered consumer and a recent successful poll of the exact board, bound to
+profile home and session key. A subscription, thread name or attempted-but-failed poll is not enough.
+The draft core's `kanban_consumer_health` publishes in-memory read-only receipts; there is no foreign
+thread-frame introspection. This is point-in-time local consumer health, not eventual delivery.
+Local scheduled ownership additionally requires a future native wake, the draft core's fresh
+Linux dispatcher receipt for the exact board/profile/ready lane, and the same scoped return
+consumer. Disabled/zero-capacity ticks do not certify; each board pass retains its own timestamp.
+The native runtime root is resolved independently of the model. Same-UID runtime files are trusted
+state, not authentication against malicious local writers. Tests: `test_goal_scheduled_ownership.py`
+composes a real isolated board tick with the native consumer and verifies close/scope/return failures.
+Local dependency waits also require every unfinished ancestor to have a verified live
+worker, future scheduled wake, or bounded dependency chain to such owners. Both scheduled
+and todo children are parent-gated: a timer cannot certify blocked or stale ancestors.
+The child still needs the fresh dispatcher and result-consumer proofs. Review-lane wakes,
+archived/ambiguous ancestors, and foreign-profile ancestors remain UNKNOWN.
+`test_goal_dependency_ownership.py` covers native links, transitive/shared ancestors,
+missing/stale proofs, SQL/graph limits and the public gate without database writes.
+Remote, cross-profile, paraphrased-goal and non-TUI-return cases remain UNKNOWN. Native wake/dependency rows alone do not prove dispatcher health;
+no cached tool assertion certifies ownership. Native dependency waits come from actual links,
+not a `block_kind` label: `link_tasks` can gate a task without setting one. The bounded
+ancestor readback rejects dangling links, cycles and oversized graphs, and never executes
+wake commands. A valid wait snapshot still does not certify a live dispatcher.
+The current origin request is read in a consistent state transaction and must not be observed,
+synthetic/display-only, a compression summary, or marked as provenance-lost. Malformed
+metadata is UNKNOWN, not trusted user scope. Tests: `test_goal_waiting_readback.py` uses
+native wait producers and release operations; `test_goal_owner_user_provenance.py` covers
+these origin exclusions and the public gate's UNKNOWN telemetry.
+Scope recovery reads only real user rows through bounded, profile-qualified compression ancestry.
+Rotation transfers captured restrictions/tool pairs; restart requires a unique current request anchor.
+Native boolean `_queued_prompt` receipts are excluded from both history and durable recovery:
+they are unexecuted queue placeholders, not current anchors or new authority. False markers
+and ordinary executed repeated requests are not excluded. `test_goal_scope_queued.py` verifies
+queue duplicates cannot poison the anchor or add unexecuted permission.
+Before core persists that request, its runtime-stamped message timestamp bounds recovery instead.
+Unknown profiles, ambiguous anchors and unsupported lineage fail UNKNOWN. Captures are isolated by
+profile home and session; persistence metadata is not mistaken for synthetic content. Complete
+evidence is limited to 200 rows / 32k serialized characters and 128 captures.
+Oversized evidence fails open with telemetry. This is not a hard completion guarantee: judge errors,
+missing evidence and timeouts fail open. No live-model precision/recall or latency claim is made.
+Do not enable enforcement until owner/lineage support and a labeled semantic holdout are validated.
+
+Each held candidate is rechecked. At the core hold cap, the plugin appends **Unresolved work**
+and logs `abandonment_exhausted`, without claiming a continuing owner. Holds also supply the
+structured `unresolved_fallback: {goal, evidence_refs}` contract for cores supporting safe budget
+fallback. Older cores ignore that field and can release the rejected candidate on budget exhaustion;
+the cap append alone does not fix that branch. Core cancellation/Stop retains precedence.
+Telemetry uses `goal_disposition`, `goal_disposition_unknown`, and `abandonment_exhausted` in the
+coach log, without storing full tool results in those events.
+
+Tests: `test_goal_disposition.py` covers strict schema/provenance, structured result validation,
+mode/buffering, scope-preserving capture and bounded errors. `test_goal_proofs.py` covers
+exact action/path/source bindings, invented approval, untrusted printed status, URL-prefix
+mismatches and superseded evidence. The manager suite proves unsupported approval cannot clear
+a confirmed hold through the complete turn. `test_goal_disposition_integration.py`
+uses scripted model responses through complete `AIAgent.run_conversation` text stops for `cli` and
+`desktop`, including isolated normal plugin discovery, streaming holds, cap warning and ephemeral
+history stripping. It also loads coach with ask-gate/chat-closeout in two configured orders and
+force-reloads discovery. `test_goal_manager_acceptance.py` additionally registers plugins in genuinely
+reversed orders, exercises individual unload/reload during held complete turns, and verifies no
+rejected text leaks to streams, interims, returned history or SQLite. It verifies pre_verify runs
+once only after acceptance and persisted history restrictions survive pre-persist capture.
+`test_goal_scope_gate.py`, `test_goal_scope_recovery.py` and `test_goal_scope_rotation.py` cover
+profile isolation, bounded ancestry, restart and rotation recovery through real isolated SessionDBs.
+`test_goal_owner_gate_liveness.py` and `test_goal_ownership_liveness.py` require native successful
+poll receipts and exercise isolated completion collection to the exact origin test sink. Failed
+board polls cannot certify return. This is not actual Desktop socket delivery acceptance.
+`test_goal_restriction_gate.py` and `test_goal_restriction_turn.py` verify a deliberately narrow
+whole-turn veto: an entire latest user row such as "Stop.", "Cancel.", "Analysis only.",
+"Status only.", "Plan first.", "Do not continue.", "Do not change anything." or
+"Do not execute anything." cannot be overridden by a mistaken abandonment verdict. Quotes,
+partial action restrictions and compound instructions do not match this literal veto; broader
+scope remains semantic, and lack of a veto is never permission.
+`test_goal_serve_acceptance.py` runs actual isolated `hermes serve` startup on loopback,
+with synthetic token authentication and a network-fenced local primary/judge HTTP endpoint.
+It verifies missing/wrong tokens are denied, held candidates stay off wire/logs/persistence,
+and ordinary plus deterministically queued analysis-only next turns are assessed and complete.
+These are backend tests, not Electron UI, public OAuth or production activation proof.
+Semantic judges are injected; scope negatives test routing, not model classification accuracy.
+`test_goal_ownership.py` also exercises real isolated Kanban tables through discovered agent text
+stops, scope/liveness/return-route rejection, and read-only WAL fallback without creating databases.
+
+Additional native process-return certification: `test_goal_process_profiles.py` exercises
+real temporary named-profile homes and concurrent multiplex profile scopes, real child exits,
+native watcher/busy-queue admission and the public ownership gate. It verifies same-chat profile
+isolation and targeted Stop/new-user/adapter-loss revocation. Adapter maps and watcher descriptors
+are fixture-assembled in that suite. `test_goal_process_native_terminal.py` additionally
+exercises registered terminal dispatch on worker threads, native watcher registration and
+loop arming, and shared-bot satellite/own-bot routing through real profile scopes and busy
+admission. Receiving-bot loss revokes proof even when another bot remains alive. Adapter
+startup state remains fixture-installed; no authenticated transport, model turn, service
+restart or cross-gateway delivery is certified. `test_goal_process_run21_review.py`
+verifies route-component source replacement at
+admission/readback fails closed, while equivalent copies and nonrouting changes preserve proof.
+These tests do not establish production activation or satisfy the historical incident replay gate.
+
 ### Fix loops across turns (`pre_llm_call` + `post_llm_call`)
 
 `post_llm_call` remembers each turn's final answer and tool log. On the next user message, `fix_loop.py`
@@ -357,3 +500,281 @@ PATH=~/.nvm/versions/node/v20.20.2/bin:$PATH bash tests/desktop/run.sh   # deskt
 # miner adoption over real data (Hermes venv has ruamel.yaml):
 ~/.hermes/hermes-agent/venv/bin/python ../../skills/productivity/hermes-coach/scripts/coach_mine.py --data ~/code/hermes-coach-data --top 0 --write-adoption
 ```
+
+
+### Bounded goal evidence
+
+`goal_evidence.py` keeps the goal judge's **32,000 serialized-character** evidence
+budget. It preserves human scope, candidate text, call arguments, pair IDs and
+ordering. On overflow only tool-result and recalled-memory bodies become prefix
+previews, with original character count, SHA-256, omitted/retained counts and an
+explicit uncertainty flag. Re-budgeting cached observations preserves the original
+digest. Both direct gate input and `capture`/`observe` paths use this budget;
+`observe` no longer poisons the entire capture solely for a large result.
+
+Textual `<memory-context>` markers are not authenticated provenance. Legacy rows
+containing them remain UNKNOWN, even if balanced. Native core `pre_llm_call` now
+passes a canonical inbound-content snapshot anchored to the current row's message
+UID. Coach consumes that snapshot through normal plugin discovery; it does not
+accept history's self-declared trust labels. Final-gate capture matches that UID,
+so adapter preambles and multimodal memory parts cannot become a second user turn.
+
+For historical string rows, the native `content`/`api_content` split supplies human
+scope without copying the API-only recall into user evidence. Durable recovery
+checks sidecar presence in SQL rather than loading large recall bodies. Native
+replay preserves literal human-authored tags in canonical content. A local-only
+core marker preserves uncertainty when the legacy replay sanitizer erased content;
+those rows remain UNKNOWN. Historical multimodal rows lacking a native split are
+also UNKNOWN; current-turn multimodal snapshots retain the full human payload.
+
+Authenticated literal tags reach the judge verbatim, including their restrictions,
+but still cannot support an abandonment hold: the prior conservative tag veto is
+retained against mistaken semantic verdicts. Oversized genuine user rows remain
+UNKNOWN; restrictions are never trimmed. This is a transport-provenance bridge,
+not a new authorization source, a legacy migration, or proof of semantic relevance.
+
+Partial cited evidence cannot certify remediation, capability/authorization
+boundaries, or ownership. Any omitted body also prevents an abandonment hold,
+including when the verdict does not cite it: an unseen denial or missing-access
+boundary could change the decision. The guard emits `omitted_boundary_evidence`
+rather than relying on the semantic judge to notice that risk. This conservative
+path is a safety measure, NOT a solution to original-incident recall. A digest
+identifies omitted bytes but cannot establish their meaning.
+
+Limits remain: 200 input rows, 32,000 serialized evidence characters, and UNKNOWN
+when full human scope/candidate/call arguments or required metadata do not fit.
+This does not remove capture/recovery lineage limits, recover image pixels, or prove
+original-incident semantic acceptance. It does not execute evidence tools.
+
+Tests: `tests/test_goal_bounded_evidence.py` covers direct long-result input,
+`capture`/`observe`, pairing/duplicate rejection, JSON escaping and cumulative
+budgets, repeated budgeting, memory provenance, restriction retention, and rejected
+closure proofs; `tests/test_goal_disposition.py` retains the gate's existing tests.
+
+`tests/test_goal_omission_safety.py` exercises mistaken high-confidence abandoned
+verdicts with cited/uncited omitted denial and missing-access evidence, plus
+human-authored balanced memory tags. `tests/test_goal_omission_turn.py` covers
+those refusal paths through the real discovered complete-turn gate.
+
+`tests/test_goal_native_provenance.py` exercises normal discovered hooks in both
+registration orders, native persistence/replay, read-only scope recovery, literal
+human restrictions, oversized scope, self-declared trust labels and legacy
+sanitation ambiguity. `tests/test_goal_native_capture.py` exercises adapter persist
+overrides and current multimodal memory injection through complete turns. Provider
+and semantic judge responses are controlled; these are transport/safety contracts,
+not real-model semantic acceptance or live CLI/Desktop transport acceptance.
+
+Legacy replay uncertainty survives compaction in native display metadata; scope recovery rejects it rather than treating sanitized text as complete authorization. This is a safety control, not recovery of missing permission.
+
+
+`tests/test_goal_transport_controls.py` exercises actual stdio/WebSocket interrupt RPC,
+WebSocket disconnect/reconnect during a turn, fresh-process persisted fallback hydration,
+and interactive CLI PTY Ctrl-C. Together with `test_goal_disposition_transport.py`, all
+13 transport cases pass with isolated homes and loopback-only provider fixtures. PTY
+keypresses respect the native 50ms paste debounce; no input-handler bypass is used.
+These do not cover Electron, production serve auth/startup, real-model semantics or
+actual-profile activation. The original private incident replay remains unresolved.
+
+
+### Electron and approval consistency acceptance
+
+`tests/test_goal_approval_consistency.py` rejects pending-approval evidence that
+simultaneously claims success, a zero exit, or a successful HTTP status. Its core
+recheck test proves this cannot clear a confirmed hold. Exact literal action
+binding alone is not semantic proof that the action is necessary for the requested
+goal. After structural validation, `goal_relevance.py` independently judges the
+operation's necessity from user/evidence scope, without the main verdict. It requires
+the latest real user steering and operation-source citations, finite high confidence
+and a supported dependency. Unrelated, uncertain, omitted or malformed evidence
+becomes UNKNOWN; it cannot clear an existing hold or authorize bypass. Initial
+UNKNOWN remains fail-open. This is semantic defense in depth, not deterministic
+entailment, and adds one bounded auxiliary call for a structurally valid boundary.
+
+`test_goal_boundary_relevance.py` and `test_goal_relevance_review.py` exercise the
+real core recheck, latest versus stale user citations, timeout, synthetic scope,
+omission, and genuine necessary boundary controls. The opt-in
+`test_goal_boundary_relevance_live.py` checks actual-model necessity judgments;
+these authored cases are not a blind holdout.
+
+`tests/test_goal_electron_acceptance.py` drives a built Electron renderer under
+Linux Xvfb through its composer and actual production serve/token-auth transport.
+Its six cases cover initial rejection, composer Stop, Ctrl+Enter queueing,
+reconnection of the exact remote session socket, full renderer-document reload,
+and simultaneous loss/replacement of all gateway sockets in the single configured
+remote topology (ambient plus default-profile socket). Reload asserts a new document
+identity and keeps DOM leak observation active across navigation. Each checks rejected-candidate
+DOM observation and persistence, one shared session, and a second analysis-only
+turn. Stop produces interrupted status; the other first turns produce unresolved
+error status. The deterministic loopback model is not a live-model evaluation. Prepare a core worktree with its locked
+Desktop dependencies, installed Electron binary and `npm run build --workspace
+apps/desktop`; provide Node, `xvfb-run`, a C compiler and the same Python transport
+dependencies used by `test_goal_serve_acceptance.py`. Run both files using that
+core's `scripts/run_tests.sh`. Missing Electron prerequisites skip the optional
+renderer test; a skipped run does not meet Electron acceptance.
+
+The test seeds only sandbox-local connection settings, supplies the source Python
+interpreter for ancillary local roster backends, and waits for both Backend ready
+and restored remote route before submitting. `electron_loopback_fence.c` is inherited by test subprocesses to reject
+non-loopback connect/sendto and signals to processes with a different HERMES_HOME.
+`test_goal_electron_fence.py` verifies the foreign-process and network denials using
+an owned disposable process. This is a regression-fixture guard, not a security
+sandbox for hostile executables or direct syscalls. No production profile should be
+used for these tests. Renderer reload is not Electron process relaunch or backend
+restart. Socket-loss fault injection permits immediate reconnect; sustained network
+outage, completion while offline and multiple remote gateways remain unverified.
+Production activation, remote owner adapters and exact-original replay remain
+separate requirements.
+
+`test_goal_process_ownership.py` verifies that cached process handles, notify flags
+and forged consumer assertions cannot certify ownership or release a prior hold.
+Those conservative UNKNOWN regressions are retained. The native local adapter in
+`goal_process_ownership.py` accepts only exact `{gateway,profile,process_id}` routes,
+full process handles, immutable canonical message-UID/profile/session spawn bindings,
+a live local pipe Popen with matching kernel identity and reader, and a fresh native
+process-completion consumer receipt. It compares the latest canonical stored human
+row, not command text or cached ownership assertions. Guard reads never spawn, poll,
+drain, adopt, signal, repair, or write state.
+
+The deliberately narrow supported path requires an **actually admitted process
+completion within 15 seconds** on the same live TUI/serve session, profile and registry
+generation, or the native push-gateway path described below. An empty poll, Kanban receipt or a live thread does not qualify. Stop,
+teardown, lost/released lease, disabled notifications, retirement, stale receipts and
+late pre-Stop dispatch results reject ownership. This is point-in-time continuation,
+not a promise of eventual success or delivery. One-shot, other unproved consumers, detached,
+retained, sandbox, PTY, systemd-wrapper, WSL, persistent and handed-off processes
+remain UNKNOWN. Steering/rotation does not rebind an old process to new scope.
+
+`test_goal_process_adapter.py` composes real native spawns/queue consumption and an
+isolated canonical state DB through the public gate (the admission result is substituted
+in its focused fixture). `test_goal_process_serve.py` additionally runs unpatched
+production serve and token-authenticated WebSocket requests with deterministic primary
+and judge replies over loopback HTTP: two real terminal spawns, exact-command fixture
+approval through the native request protocol, actual completion admission, positive
+ownership at the discovered coach gate, and the owned process's subsequent completion.
+No production configuration or external provider is used. It does not exercise Electron
+or certify other process consumers.
+
+Process-proof race checks re-read the canonical user row and require the same
+consumer receipt/revocation version after the final running-process snapshot.
+Stop, a new canonical request, or changed admission evidence observed during those
+reads rejects ownership. This is bounded point-in-time evidence, not an atomic
+transaction across process state, SQLite and the transport, or a future-delivery
+guarantee. The native batch consumer retains refused/unknown/exceptional process
+completion admissions for retry rather than relying on delegation-only release.
+Tests: `test_goal_process_independent_review.py` exercises native Stop, new canonical
+steering, and retry after false/unknown/exceptional admission; `test_goal_process_serve.py`
+exercises actual isolated serve, approval protocol, spawn and completion admission.
+
+
+### Native messaging-gateway process return proof
+
+The next supported non-TUI path is the existing native push-gateway process watcher,
+not CLI one-shot or the stateless API self-post. Its proof requires a live native
+watcher for the exact running process and immutable request UID/home/session/route,
+plus an actual `admit_internal_event` success for a process completion within 15 seconds.
+Registration, a configured watcher, an empty poll, a watch-pattern event, and a handler
+that merely returns without accepting never qualify. The native source and adapter,
+running gateway loop, current in-memory session route, and notification configuration
+must still match at readback. Reads never drain queues, load retained jobs or repair state.
+
+Stop and new-user ingress (including a message queued behind a busy turn) permanently
+revoke old watcher proof and forget the route's old spawn bindings. This does not kill
+jobs or change their normal result delivery. Late admission and delayed watcher startup
+cannot resurrect pre-boundary proof. Adapter ingress is conservative: even input later
+rejected by runner authorization may remove proof; it cannot grant it. The public guard
+still rechecks the exact latest canonical DB row and the receipt version after its final
+process snapshot. TUI receipts cannot certify a gateway routing key.
+
+Tests: core `tests/gateway/test_process_consumer_health.py` covers real busy-queue
+admission, freshness, Stop/new-user/replacement/shutdown/task loss, late results, refused
+admission, exact snapshot fields, bounded locks and nonconsuming readback. Mods
+`test_goal_process_gateway.py` composes the public guard with an isolated SQLite store;
+its native integration starts a real child, uses the terminal helper to arm the real
+watcher on the gateway loop, observes actual exit/completion batching/native admission,
+and validates another still-running process. Only the external transport is a no-I/O
+adapter using the production base admission/queue. No model or external Telegram service
+is exercised. Positive coverage is default-profile Linux native local pipe processes;
+named-profile/multiplex transports are not certified by these tests. Cross-profile,
+cross-gateway, recovered/adopted/detached, PTY, sandbox and wrapper paths remain unproved.
+
+
+### Held rechecks and current verification scope
+
+`tests/test_goal_run23_review.py` covers configuration loss/invalidity and explicit
+off/shadow transitions after a confirmed hold through complete scripted agent turns,
+including streamed-text exclusion, incomplete status, and Stop precedence. Fresh
+off/missing/invalid configuration remains default-off; shadow remains non-enforcing.
+The same suite rejects successful URL readbacks predating newer human steering,
+then accepts a fresh post-steering readback through the native pending-recheck gate.
+This conservative verification epoch does not infer whether older results remain
+semantically applicable. Kanban current-scope reads reject queued UI receipts;
+a later genuine canonical user row is a separate positive control.
+`test_goal_queue_owner_acceptance.py` additionally connects native busy acceptance,
+queue draining and adopt/stage/flush persistence to the public owner guard and real
+scoped consumer health. Its five cases cover matching, mismatching, newer-request,
+Stop and consumer-loss boundaries. The worker launch is replaced with the existing
+native turn-body fixture: this is in-process integration, not a complete agent or
+serve/WebSocket ownership turn. All fixtures use isolated state and no live repairs.
+
+Native mid-turn steering now carries a process-local core attestation: the guard
+uses the original human text only when identity and content still match. Arbitrary
+display rows and marker-shaped text cannot mint this proof. Observed tool results
+retain their captured payloads but are ordered at their live suffix positions;
+duplicate, reordered or incomplete observed suffixes fail unavailable rather than
+guessing freshness. `test_goal_run24_review.py` exercises native steering injection,
+capture/observe and pending evaluation with stale/fresh verification, repeated
+steering and spoofed tails. Core `test_steering_provenance.py` covers identity
+binding, copying, wire stripping and suffix preservation. These are native seam
+tests, not whole-transport steering acceptance. The attestation is not historical
+authentication after restart. Native whole-turn in-place/rotated compaction now persists accepted steering before summarization. A bounded profile-qualified scan treats a lost live attestation (including archived steering) as UNKNOWN, not permission; pending holds cannot clear even with a fresh readback while scope is missing. `test_goal_steering_retention.py` exercises actual AIAgent turns and SessionDB compaction with scripted model/judge/summarizer boundaries, plus cold-history loss detection. Core `test_steering_compaction_retention.py` covers failed/missing storage and duplicate-free flushing. Hook registration is fixture-wired; provider-owned compaction and real transport restart retention remain unverified.
+
+
+### Native HTTP-availability remediation (bounded acceptance)
+
+For a literal user request `Restore HTTP 2xx at <URL>.`, the read-only validator also
+accepts a paired foreground native `terminal` result from this canonical shell-quoted
+argv (use `shlex.join` to quote the URL and arguments):
+
+```
+/usr/bin/curl -q --noproxy '*' --path-as-is --max-time 5 --silent --show-error --output /dev/null --write-out '%{http_code}' -- <URL>
+```
+
+The call must set `http_readback=true`. This requires the matching core producer:
+Linux **local** foreground only, validated before acquiring a shell environment. After
+ordinary pre-exec and approval guards it directly executes the fixed argv with no shell,
+no startup/snapshot, and an explicit clean child environment (no inherited loader,
+function, proxy or curl-config overrides). It emits the outer
+`execution="local-http-readback-v1"` field; this is native producer metadata, never
+parsed from command output or supplied by the judge. Ordinary shell execution remains
+unchanged but **cannot certify remediation**, even when its exact curl command prints 200.
+Older cores and unsupported backends/environments remain UNKNOWN, never host-local fallback.
+The actual terminal envelope must also have integer `exit_code=0`, no error/pending
+approval or background session, and output consisting only of a 2xx HTTP status.
+The command does not follow redirects, use proxies, or print page content as status.
+The native producer rejects curl URL globbing, credentials and fragments, bounds curl
+to five seconds (outer wait at most six seconds or the requested shorter timeout),
+and kills/reaps on Stop/timeout without success provenance. Trust assumes the native
+runtime, OS/system executable and trust store are intact; this is not cryptographic
+host attestation or protection from privileged binary/network compromise.
+No shell suffixes/substitutions or arbitrary
+successful commands qualify. This is HTTP availability, **not** proof of transactions,
+content correctness or arbitrary natural-language repair goals. Other native shapes and
+broader goals remain UNKNOWN; missing curl is not remediation. No command runs in the hook.
+Later user steering or a later supported same-target readback invalidates the citation.
+
+`tests/test_goal_native_remediation.py` drives complete held AIAgent text stops using the
+real executor/registered terminal and private exact-command approvals against a disposable
+loopback app. It proves a native repair changes the requested path from 503 to 200 and
+clears the hold, while an ineffective repair/continued 503, an unrelated 200 path, stale
+pre-steering success and Stop do not. Separate parser/envelope controls reject redirects,
+shell wrappers, failures, broader goals and later failures. The native shell-function
+regression rejects an actual uncontacted-app 200; opt-in readbacks still contact the
+app despite configured startup functions, inherited function/startup/loader/proxy
+variables, curl config and an existing shell snapshot. Core
+`tests/tools/test_terminal_http_readback.py` exercises real user-deny preservation,
+unsupported remote/background/PTY/timeout-promotion/command/glob rejection, and
+active request Stop/timeout. All HTTP servers are disposable loopback fixtures.
+Primary/judge answers and hook
+wiring are fixture-controlled; HTTP/terminal results and repair are real. This is not
+live-model, production or activation acceptance, and does not close the original-incident
+or remote-ownership release gates.

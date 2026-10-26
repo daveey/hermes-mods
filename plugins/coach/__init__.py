@@ -52,12 +52,16 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     core, rules = _load("core"), _load("agent_rules")
     store = store or core.Store()
     coach = rules.AgentCoach(checkout if checkout is not None else rules.default_live_checkout(), signals=store)
+    goal_gate = _load("goal_disposition").build_gate(store)
 
     def pre_llm_call(session_id="", user_message=None, platform="", parent_session_id="", conversation_history=None,
                      **_):
         try:
             if not session_id:
                 return None
+            goal_gate.capture(session_id=session_id, user_message=user_message,
+                              conversation_history=conversation_history,
+                              canonical_user_content=_.get("canonical_user_content"))
             rec = store.user_turn(session_id, user_message) or {}
             hint = coach.turn_start(session_id, user_message)
             # The fix-loop window survives process boundaries (`hermes chat -q --resume`, backend restarts): the
@@ -84,6 +88,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     def post_tool_call(tool_name="", args=None, result=None, session_id="", status=None, duration_ms=0,
                        error_type=None, error_message=None, **_):
         try:
+            goal_gate.observe(session_id=session_id, tool_name=tool_name, args=args, result=result,
+                              status=status, tool_call_id=_.get("tool_call_id"))
             coach.observe(session_id, tool_name, args, result, status, duration_ms or 0, error_type, error_message)
         except Exception as exc:
             log.debug("coach post_tool_call: %s", exc)
@@ -316,7 +322,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             log.debug("coach pre_verify: %s", exc)
             return None
 
-    return coach, {"pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
+    return coach, {"pre_final_gate": goal_gate, "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
                    "transform_tool_result": transform_tool_result}
 
 
