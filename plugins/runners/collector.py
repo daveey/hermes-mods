@@ -294,7 +294,8 @@ class Collector:
                     provenance=dict(source_id=sid, collection_id=cycle,
                                     observed_at=iso(result.observed_at), expires_at=iso(result.observed_at+ttl),
                                     state='fresh' if result.complete else 'unavailable', observation_ids=[]),
-                    error=result.error, complete=result.complete, observed_at=result.observed_at)
+                    error=result.error, retry_after_seconds=result.retry_after_seconds,
+                    complete=result.complete, observed_at=result.observed_at)
                 seen = set()
                 # Incomplete page sets cannot replace last-known evidence.
                 for row in result.rows if result.complete else ():
@@ -339,7 +340,7 @@ class Collector:
                 provenance.append(p)
                 complete &= saved['complete'] and fresh
                 if saved['error']:
-                    errors.append(dict(source_id=sid,code=saved['error'],retry_after_seconds=None,observed_at=iso(saved['attempted_at'])))
+                    errors.append(dict(source_id=sid,code=saved['error'],retry_after_seconds=saved.get('retry_after_seconds'),observed_at=iso(saved['attempted_at'])))
             rows = self.store.list('Runner')
             snapshot = dict(at=now, owner=self.owner(), scope_results=deepcopy(self.scope_results),
                             collection=dict(id=cycle,state='complete' if complete else 'partial',target_ids=[]),

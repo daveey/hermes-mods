@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { React, host, route, snapshot, loadPlugin, mount, button } from './sdk-mock.mjs'
+import { React, host, route, snapshot, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
 const p = await loadPlugin()
 test('native menu right click, overflow, Shift+F10, Escape preserve details and owner refresh', async () => {
   const s = snapshot(),
@@ -10,6 +10,7 @@ test('native menu right click, overflow, Shift+F10, Escape preserve details and 
   const ctx = {
     rest: async (path, opts) => {
       calls.push([path, opts])
+      if (path.includes('/enrollment')) return enrollment()
       return s
     },
     os: {
@@ -94,7 +95,7 @@ for (const [state, label] of [
     s.data.state = state
     s.data.runners = []
     host.profileRoutes = async () => [route]
-    const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async () => s } }))
+    const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async (path) => path.includes('/enrollment') ? enrollment() : s } }))
     try {
       assert.ok(button('Show runners'))
       await ui.click(button('Show runners'))
@@ -113,7 +114,7 @@ test('loading, unavailable, hidden polling and palette registration', async () =
   const contributions = [],
     dispose = []
   const ctx = {
-    rest: async () => new Promise((r) => (release = r)),
+    rest: async (path) => path.includes('/enrollment') ? enrollment() : new Promise((r) => (release = r)),
     register: (c) => contributions.push(c),
     onDispose: (f) => dispose.push(f)
   }

@@ -64,6 +64,14 @@ class Service:
             p=project(State(**snap['states'][row['id']]),now=self.clock(),policy=policy,checks=checks,management=host.get('management','unknown'),host_at=host.get('at'))
             row.update(registration=p.registration,activity=p.activity,freshness=p.freshness,readiness=ready)
             rows.append(row); projections.append(p)
+            observed = snap['states'][row['id']]
+            at = observed.get('at')
+            if at is not None:
+                meta['provenance'].append(dict(
+                    source_id=row['id'], collection_id=observed['cycle'],
+                    observed_at=iso(at), expires_at=iso(at+policy.inventory_ttl),
+                    state='fresh' if p.freshness == 'fresh' and not observed.get('source_error') else 'stale',
+                    observation_ids=row['observation_ids']))
         for provenance in meta['provenance']:
             if provenance['state']=='fresh' and (meta['freshness']!='fresh' or self.clock()>datetime.fromisoformat(provenance['expires_at'].replace('Z','+00:00')).timestamp()): provenance['state']='stale'
         count=dict(registrations=len(rows),online=sum(r.registration=='online' for r in projections),busy=sum(r.activity=='busy' for r in projections),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(r.registration=='online' and not r.ready for r in projections),issues=sum(r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)

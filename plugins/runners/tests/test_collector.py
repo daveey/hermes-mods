@@ -45,7 +45,27 @@ def test_atomic_collection_restart_and_cached_read(tmp_path):
         Collector(store,config(),adapter,clock=lambda:1031).tick()
         assert store.load_health(F['Runner']['id']).registration=='online'
         assert store.load_health(F['Runner']['id']).source_error=='auth'
-    assert Service(path,config(),clock=lambda:1032).inventory()['data']['state']=='partial'
+    result = Service(path,config(),clock=lambda:1032).inventory()
+    assert result['data']['state']=='partial'
+    provenance = next(p for p in result['meta']['provenance'] if p['source_id'] == F['Runner']['id'])
+    from plugins.runners.collector import iso
+    assert provenance['observed_at'] == iso(1000)
+    assert provenance['observed_at'] != result['meta']['observed_at']
+    assert provenance['state'] != 'fresh'
+    validate('InventoryResponse', result)
+
+def test_scope_error_persists_retry_eta_in_cached_api(tmp_path):
+    path = tmp_path / 'state.sqlite'
+    adapter = Adapter()
+    adapter.result = ProviderResult((), False, 'forbidden', 1000, None, 60)
+    with Store(path) as store:
+        Collector(store, config(), adapter, clock=lambda: 1000).tick()
+    response = Service(path, config(), clock=lambda: 1001).inventory()
+    error = response['meta']['source_errors'][0]
+    assert error['code'] == 'forbidden'
+    assert error['retry_after_seconds'] == 60
+    validate('InventoryResponse', response)
+
 
 def test_hosts_once_concurrency_and_cache(tmp_path):
     from copy import deepcopy

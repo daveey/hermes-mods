@@ -107,6 +107,13 @@ export function createTransport(ctx, hostRef = host) {
     )
     if (!(await routes()).some((r) => routeKey(r) === key))
       throw safeError('Owner gateway disconnected: route changed')
+    if (path === '/enrollment') {
+      if (response?.contract_version !== 1 || response.profile !== route.targetProfile ||
+          typeof response.enrolled !== 'boolean' || !Array.isArray(response.capabilities) ||
+          (response.enrolled && !response.capabilities.includes('inventory')))
+        throw safeError('Invalid enrollment response')
+      return response
+    }
     return verifyEnvelope(response, route, expected, path === '/inventory' && !options.method)
   }
   async function inventory(queryClient) {
@@ -128,6 +135,11 @@ export function createTransport(ctx, hostRef = host) {
             key = routeKey(route),
             prior = sources.get(key)
           try {
+            const enrollment = await request(route, '/enrollment')
+            if (!enrollment.enrolled) {
+              sources.set(key, { route, enrolled: false })
+              continue
+            }
             const fetch = () => request(route, '/inventory', {}, prior?.snapshot?.meta.owner)
             // Bootstrap is route-keyed until the server establishes a stable UUID.
             const queryKey = prior?.snapshot
@@ -199,7 +211,9 @@ export function ago(stamp, now = Date.now()) {
   return seconds < 60 ? `${seconds}s ago` : `${Math.floor(seconds / 60)}m ago`
 }
 function rowState(r, source, hostRow, now) {
+  const provenance = source.snapshot.meta.provenance?.find((p) => p.source_id === r.id)
   const stale =
+    (provenance && (provenance.state !== 'fresh' || Date.parse(provenance.expires_at) <= now)) ||
     !!source.error ||
     !['ready', 'partial'].includes(source.snapshot.data.state) ||
     !fresh(source.snapshot.meta, now) ||
@@ -278,6 +292,7 @@ export function projectFleet(sources = [], now = Date.now()) {
       label = source.route
         ? `${source.route.connectionId} / ${source.route.targetProfile}`
         : 'Sources'
+    if (source.enrolled === false) messages.push(`${label}: Not enrolled`)
     if (source.error) messages.push(`${label}: ${source.error}`)
     if (!s) continue
     if (STATES[s.data.state]) messages.push(`${label}: ${STATES[s.data.state]}`)
@@ -315,7 +330,7 @@ export function projectFleet(sources = [], now = Date.now()) {
         source: origin,
         conflict: false,
         actionable: !source.error,
-        observed_at: s.meta.observed_at,
+        observed_at: s.meta.provenance?.find((p) => p.source_id === r.id)?.observed_at || null,
         hostKey: hostRow ? JSON.stringify([ownerKey(s.meta.owner), hostRow.id]) : 'unmapped'
       }
       if (rows.has(key)) {
@@ -359,8 +374,7 @@ export function projectFleet(sources = [], now = Date.now()) {
     online: list.filter((r) => r.registration === 'online').length,
     busy: list.filter((r) => r.activity === 'busy').length,
     ready: list.filter((r) => r.ready).length,
-    unverified: list.filter((r) => r.registration === 'online' && !r.ready && r.activity !== 'busy')
-      .length,
+    unverified: list.filter((r) => r.registration === 'online' && !r.ready).length,
     issues: list.filter((r) => r.issue).length + groups.filter((g) => g.issue).length
   }
   const complete =
@@ -993,7 +1007,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         h(
           'div',
           { className: 'hermes-runners-muted' },
-          `Checked ${ago(
+          `Collector heartbeat ${ago(
             selected
               .map((s) => s.snapshot?.meta.observed_at)
               .filter(Boolean)
