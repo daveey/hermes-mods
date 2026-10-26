@@ -9,9 +9,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import hashlib
 import re
+import time
 from typing import Protocol
 
-from .store import Store
+from .store import Store, followup_text
+from .native import InboundChanged
 
 
 @dataclass(frozen=True)
@@ -115,11 +117,32 @@ class Service:
     def request(self, ctx, text):
         return self._receive(ctx, text, False)
 
+    def publication_gate(self, workflow_id, card_id):
+        """Read-only host broker query; never an agent tool or publication lease."""
+        with self.store.lock():
+            row = self._row(workflow_id)
+            member = any(entry.get('id') == card_id for entry in row['cards'].values())
+            approved = False
+            if row['approved'] and member and row['state'] == 'running':
+                ctx = AuthContext('slack', row['team_id'], row['channel_id'],
+                                  row['approved_message_id'], row['thread_id'],
+                                  row['approved_by'], self.policy.ingress_profile)
+                approved = self.ports.verify_approval(ctx, row, row['plan_hash']) is True
+                for event, text in self.ports.thread_events(row):
+                    self._authorize(event)
+                    if (event.message_id != row['approved_message_id']
+                            and not self.store.seen(event)):
+                        approved = False
+            return {'current_generation': row['generation'], 'approved': approved,
+                    'card_in_current_generation': member}
+
     def followup(self, ctx, text):
         return self._receive(ctx, text, True)
 
     def _receive(self, ctx, text, followup):
         self._authorize(ctx)
+        if followup:
+            text = followup_text(text)
         if not isinstance(text, str) or not text.strip():
             raise ValueError('Nonempty request text required')
         with self.store.lock():
@@ -281,6 +304,7 @@ class Service:
                               repo=self.policy.repo, cwd=self.policy.cwd,
                               profile=self.policy.reviewer_profile if stage == 'review' else self.policy.builder_profile,
                               depends_on=[previous] if previous else [], session_id=row['session_id'],
+                              stored_session_id=row['stored_session_id'],
                               generation=row['generation'], text=row['text'], plan=row['plan'])
                 if entry:
                     card_id = self.ports.recover_card(row['workflow_id'], stage, entry['params'])
@@ -387,7 +411,8 @@ class Service:
             row['state'] = 'posted'
             self.store.save(row)
             raise
-        row.update(state='archived', error=None, archive_pending=False)
+        row.update(state='archived', error=None, archive_pending=False,
+                   archived_at=time.time(), archive_check_after=0)
         self.store.save(row)
 
     def _backfill(self, row):
@@ -424,14 +449,23 @@ class Service:
                 if candidate['policy'] != self.policy.document():
                     continue
                 row = self._row(candidate['workflow_id'])
+                if row['state'] == 'archived':
+                    now = time.time()
+                    # Verified history is not a perpetual Slack polling obligation.
+                    # Authenticated live ingress still reopens at any age.
+                    if (now - row.get('archived_at', 0) > 86400
+                            or now < row.get('archive_check_after', 0)):
+                        continue
+                    row['archive_check_after'] = now + 300
+                    self.store.save(row)
                 try:
                     row = self._backfill(row)
                 except Exception as exc:
                     row = self._row(candidate['workflow_id'])
-                    if row['state'] == 'archived':
-                        row.update(state='posted', archive_pending=True)
+                    if row['state'] == 'archived' and isinstance(exc, InboundChanged):
+                        row.update(state='invalidated', archive_pending=True)
                         self.store.save(row)
-                    if row.get('stored_session_id'):
+                    if row['state'] != 'archived' and row.get('stored_session_id'):
                         self._attempt(row, self._visible)
                     row['error'] = 'Thread reconciliation blocked: ' + type(exc).__name__
                     self.store.save(row)
@@ -439,16 +473,20 @@ class Service:
                     continue
                 if row['state'] == 'archived':
                     def verify_archived(r):
-                        try:
-                            valid = self.ports.read_result(r, r['result_receipt'], r['result_text']) is True
-                        except Exception:
-                            valid = False
+                        # Transport failures retain the proven archive and retry later.
+                        valid = self.ports.read_result(r, r['result_receipt'], r['result_text']) is True
                         if not valid:
-                            r.update(state='posted', archive_pending=True)
+                            r.update(state='invalidated', archive_pending=True)
                             self.store.save(r)
                             self._visible(r)
                             raise WorkflowError('Archived receipt or approval changed')
                     self._attempt(row, verify_archived)
+                    continue
+                if row['state'] == 'invalidated':
+                    # Do not demand today's repository HEAD for historic delivery.
+                    # A fresh human followup starts a newly approved generation.
+                    self._attempt(row, self._visible)
+                    results.append(self.store.get(row['workflow_id']))
                     continue
                 if row['state'] in ('post_intent', 'posted', 'archive_intent'):
                     self._attempt(row, lambda r: self._close(r, r['result_text']))

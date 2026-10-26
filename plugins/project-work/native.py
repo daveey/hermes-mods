@@ -19,6 +19,10 @@ import re
 import uuid
 
 
+class InboundChanged(RuntimeError):
+    """Positive thread invalidation, not a transport outage."""
+
+
 class NativeBridge:
     def __init__(self, policy, *, rpc, owner_tool, sessions, cards, slack, evidence, bot_user_id,
                  projects=None, card_keys=None, quiesce=None):
@@ -160,7 +164,19 @@ class NativeBridge:
                     'profile': self.policy.reviewer_profile if stage == 'review' else self.policy.builder_profile}
         if any(params.get(k) != v for k, v in expected.items()):
             raise PermissionError('Card target override')
-        live, stored = self._resolve_live(params['session_id'])
+        stored = params.get('stored_session_id')
+        if stored:
+            # Card lookup/readback only needs durable ownership, not a live RPC ID.
+            live = next((key for key, value in self.live.items() if value == stored), None)
+        else:
+            # Upgrade old intents by unique durable title, never an expired live ID.
+            rows = self.sessions({'title': 'Project work ' + workflow_id,
+                                  'profile': self.policy.builder_profile})
+            rows = [r for r in rows if r.get('title') == 'Project work ' + workflow_id]
+            if len(rows) != 1:
+                raise ValueError('Ambiguous durable card owner')
+            stored = rows[0]['id']
+            live = next((key for key, value in self.live.items() if value == stored), None)
         session = self._exact(stored)
         if session.get('title') != 'Project work ' + workflow_id:
             raise PermissionError('Card owner session mismatch')
@@ -174,6 +190,11 @@ class NativeBridge:
         if recovered is not None:
             return recovered
         live, stored, marker, project = scope
+        if live is None:
+            resumed = self.recover_session(workflow_id)
+            if not resumed or resumed['stored_session_id'] != stored:
+                raise PermissionError('Card owner resume mismatch')
+            live = resumed['session_id']
         args = {'title': f'{stage}: {workflow_id}', 'assignee': params['profile'],
                 'session_id': stored, 'workspace_kind': 'worktree',
                 'board': params['board'], 'project': project['id'],
@@ -298,13 +319,13 @@ class NativeBridge:
                     or message.get('user_team', self.policy.team_id) != self.policy.team_id
                     or (ts != row['thread_id'] and message.get('thread_ts') != row['thread_id'])
                     or not isinstance(message.get('text'), str) or ts in seen):
-                raise RuntimeError('Uncertain native thread event')
+                raise InboundChanged('Uncertain native thread event')
             seen.add(ts)
             ctx = AuthContext('slack', self.policy.team_id, row['channel_id'], ts,
                               message.get('thread_ts'), message['user'], self.policy.ingress_profile)
             events.append((ctx, message['text']))
         if not set(row.get('source_ids', [row['message_id']])).issubset(seen):
-            raise RuntimeError('Previously ingested source message was deleted')
+            raise InboundChanged('Previously ingested source message was deleted')
         return sorted(events, key=lambda event: Decimal(event[0].message_id))
 
     def _approval(self, messages, row, message_id, user_id, plan_hash):
@@ -362,6 +383,7 @@ class NativeBridge:
                     and approval == f"!project approve {row.get('workflow_id')} {row.get('plan_hash')}"
                     and not m.get('edited')):
                 continue
-            if m.get('edited') or m.get('subtype') == 'message_deleted' or Decimal(m['ts']) > Decimal(row['message_id']):
+            if (m.get('edited') or m.get('subtype') == 'message_deleted'
+                    or m.get('ts') not in row.get('source_ids', [row['message_id']])):
                 return False
         return True

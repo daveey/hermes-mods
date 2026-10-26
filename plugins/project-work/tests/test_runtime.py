@@ -108,7 +108,7 @@ def test_controller_rejects_nonowner_approval(env):
     plan = controller.call('propose_plan', {'workflow_id': row['workflow_id'], 'plan_text': 'Concrete scope', 'generation': row['generation']})
     context = asdict(ctx)
     context['user_id'] = 'member'
-    assert controller.call('approve', {'context': context, 'workflow_id': row['workflow_id'], 'plan_hash': plan['plan_hash']}) == {'rejected': True}
+    assert controller.call('approve', {'context': context, 'workflow_id': row['workflow_id'], 'plan_hash': plan['plan_hash']}) == {'rejected': True, 'reason': 'PermissionError'}
     assert service.store.get(row['workflow_id'])['approved'] is False
 
 

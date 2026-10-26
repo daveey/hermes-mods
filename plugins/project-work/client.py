@@ -37,6 +37,7 @@ class DurableIngressQueue:
             os.close(fd)
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, retry_at REAL NOT NULL DEFAULT 0)')
+            db.execute('CREATE TABLE IF NOT EXISTS rejected (payload TEXT NOT NULL, reason TEXT NOT NULL, rejected_at REAL NOT NULL)')
 
     @contextmanager
     def connect(self):
@@ -62,7 +63,7 @@ class DurableIngressQueue:
             return False
         event = json.loads(row[1])
         try:
-            self.client.call(event['operation'], **event['arguments'])
+            result = self.client.call(event['operation'], **event['arguments'])
         except Exception:
             # One rejected command must not permanently starve later messages.
             with self.connect() as db:
@@ -70,6 +71,9 @@ class DurableIngressQueue:
                            (time.time() + self.retry_interval, row[0]))
             raise
         with self.connect() as db:
+            if isinstance(result, dict) and result.get('rejected') is True:
+                db.execute('INSERT INTO rejected VALUES (?,?,?)',
+                           (row[1], result.get('reason', 'rejected'), time.time()))
             db.execute('DELETE FROM pending WHERE id=?', (row[0],))
         return True
 

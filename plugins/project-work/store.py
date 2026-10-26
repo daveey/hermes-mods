@@ -6,6 +6,20 @@ from pathlib import Path
 import sqlite3
 import threading
 import uuid
+from decimal import Decimal, InvalidOperation
+
+
+def message_order(value):
+    try:
+        return (0, Decimal(value))
+    except InvalidOperation:
+        return (1, value)  # Non-Slack test/transport identifiers.
+
+
+def followup_text(text):
+    if not isinstance(text, str):
+        raise ValueError('Text must be a string')
+    return text if text.strip() else '[Non-text human follow-up: inspect the original Slack message and attachments.]'
 
 _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
@@ -104,6 +118,8 @@ class Store:
             else:
                 if followup:
                     raise KeyError('No workflow for this thread')
+                if context['thread_id'] and context['thread_id'] != context['message_id']:
+                    raise ValueError('Start new project work in a root channel message')
                 row = dict(workflow_id=str(uuid.uuid4()), team_id=team, channel_id=channel,
                            thread_id=thread, policy=policy, generation=1, approved=approved,
                            session_id=None, stored_session_id=None, cards={}, evidence={},
@@ -111,9 +127,11 @@ class Store:
                            prompt_state=None, session_state=None, plan=None, plan_hash=None)
                 row['title'] = 'Project work ' + row['workflow_id']
             chain = row.get('text', '')
+            text = followup_text(text)
             row.setdefault('source_ids', []).append(context['message_id'])
             row.update(context=context, text=(chain + '\n\nFollow-up:\n' + text if chain else text),
-                       message_id=context['message_id'])
+                       message_id=max(row.get('message_id', context['message_id']),
+                                      context['message_id'], key=message_order))
             db.execute('INSERT INTO inbound VALUES (?,?,?,?,?,?)',
                        (team, channel, context['message_id'], row['workflow_id'], json.dumps(context), text))
             db.execute('INSERT INTO workflows VALUES (?,?,?,?,?) ON CONFLICT(workflow_id) DO UPDATE SET data=excluded.data',

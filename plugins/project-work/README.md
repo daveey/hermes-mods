@@ -24,6 +24,8 @@ board, project, channel and session targets are private policy, never model argu
   rolls the archive back. No session or transcript deletion is implemented.
 - Restart reconciliation and exact-effect recovery. An unprovable prompt or send is
   retained as an error, never blindly retried. Failed work remains visible.
+- Out-of-order input keeps a monotonic watermark and explicit incorporated-message
+  membership. Uncertain card recovery uses durable owner IDs, not expired runtime IDs.
 
 This is a transport-independent plugin, not an installation of a particular workspace.
 A deployment must supply the native transport/readers described below. Unit tests do
@@ -119,6 +121,9 @@ The adapter file is trusted executable host configuration, current-UID owned and
 - `card_keys({idempotency_key, board, profile, include_archived: true})` returns ALL
   matching IDs, including archived. Ambiguity fails closed. Uncertain create intents
   only recover; they never invoke `kanban_create` again on a missing lookup.
+  Intents persist `stored_session_id`; legacy intents resolve the unique workflow
+  title in the fixed builder profile. Recovery validates scope without resuming a
+  session or requiring the old runtime ID to exist.
 - `cards(id)` returns native Task fields plus trusted `board` and ordered `parents`.
   Readback validates `project_id`, `assignee`, durable `session_id`, `idempotency_key`,
   `workspace_kind: worktree`, `workspace_path: <cwd>/.worktrees/<id>` and
@@ -162,16 +167,31 @@ workflow thread are required followups, including messages without a mention and
 `file_share`, `thread_broadcast`, `me_message`. Bots are not new authority; external
 Slack Connect `user_team` values are rejected. Root turns accept either the native
 reply-in-thread root timestamp or no thread binding. Status is thread-local or owner-only.
+New workflows must start in a root channel message. A request in an already-owned
+workflow thread is a followup; a request in an unrelated existing thread is rejected.
+Captionless human messages become an explicit non-text followup requiring inspection
+of the original message/attachments, identically in live ingress and backfill.
+Even "status?" or "thanks" in an owned thread is new work: it revokes the old plan
+and reopens a completed session. Explain this conservative UX during deployment.
 
 Middleware appends to a private `ingress.sqlite3` journal without making network calls
 and always calls native `next()`. A background worker retries uncertain deliveries.
-The journal is independent of the controller effect lock; network stalls do not block
+Deterministic invalid requests are acknowledged and retained in the journal's
+`rejected(payload, reason, rejected_at)` table, not retried forever. Transport failures
+remain pending. The journal is independent of the controller effect lock; network stalls do not block
 Bolt acknowledgement. Register refuses non-sandboxed terminal/code backends and Docker
 custom host mounts. Verify actual implicit mounts and profile routing in deployment.
-Reconciliation backfills complete thread history, including archived workflows and
-approval attempts. Exact source deletions/edits or unknown events surface a thread
-reconciliation error and keep the session visible; they require operator adjudication,
-not silent acceptance. Unchanged awaiting-approval sessions are not resumed each tick.
+Reconciliation backfills active threads and approval attempts. Successfully archived
+threads are checked at most once per five minutes for the first 24 hours, then only
+authenticated live ingress reopens them. Old ledger archives without `archived_at`
+are not polled. Deployments needing catch-up after longer gateway outages must replay
+their durable authenticated event journal; this is not an indefinite Slack history scan.
+A transport/read outage records an error but preserves a previously verified archive.
+Positive source/approval/receipt changes reopen it as `invalidated`, retaining the old
+completion evidence; the controller never compares that historical delivery to a
+later repository HEAD. A fresh human followup creates a new plan generation. Exact
+source edits/deletions still require operator adjudication, not silent acceptance.
+Unchanged awaiting-approval sessions are not resumed each tick.
 
 A trusted owner-conversation/runtime binding collects the concrete planning response,
 then calls local `propose_plan(workflow_id, plan_text, generation)`, posts the plan/hash in the source
@@ -185,7 +205,15 @@ the deployment's native planning-response hook/controller.
 
 Local operations are `request(context, text)`, `status(context, workflow_id)`,
 `approve(context, workflow_id, plan_hash)`, `observe_followup(context, text)`,
-`propose_plan(workflow_id, plan_text, generation)`, `closeout(workflow_id, result_text)`, and `reconcile()`.
+`propose_plan(workflow_id, plan_text, generation)`, `closeout(workflow_id, result_text)`,
+`publication_gate(workflow_id, card_id)`, and `reconcile()`.
+The read-only publication gate is for the host broker, without fabricated AuthContext.
+It returns `{current_generation, approved, card_in_current_generation}` after fresh
+approval and complete thread readback. Exceptions are denial, not permission. Both
+booleans must be true and the generation must match the broker's intended operation.
+This is a point-in-time check, NOT a transferable authorization token or lease: the
+private broker must serialize its check-and-publish with generation retirement,
+recheck immediately before publishing, and never hand credentials to workers.
 The socket is a trusted host capability, not a remote API. Its filesystem boundary is
 part of the deployment security model; all same-UID host code is trusted. Never expose
 it through an unauthenticated proxy or model terminal.
@@ -202,6 +230,36 @@ An archive intent carries a durable compensation obligation; on restart, unarchi
 and verify visibility BEFORE checking evidence or thread watermark. Failed unarchive
 readback retains the obligation. Deleted/edited owner approvals cannot authorize archive.
 Never manually change ledger status to `archived` or fabricate delivery receipts.
+
+### Operator procedure for an irrecoverable intent
+
+There is deliberately no "force retry" or direct ledger-edit operation. If an
+authoritative lookup proves an intent absent rather than recoverable, use this
+quarantine-and-replace procedure (trusted deployment operator, not the agent):
+
+1. Pause the dedicated project runtime and its ingress delivery worker under their
+   supervisors. Keep the Bolt journal accepting events. Snapshot the ledger and
+   journal with SQLite's backup API; retain them as the incident audit record.
+2. Revoke publication for the old workflow at the private broker. Use native task
+   operations to stop all its workers and park all dispatchable cards. Resolve the
+   exact idempotency keys including archived cards. Confirm no in-flight native RPC,
+   pending prompt, background writer, or outbound Slack request can still apply.
+   A missing lookup alone does not prove an in-flight effect cannot arrive later.
+3. Check the exact native session title/stored ID and prompt marker, all stage keys,
+   and original Slack thread/result `client_msg_id`. Record the lookup evidence and
+   native cancellation receipts in the private incident record. If an effect exists,
+   restore the reader's exact mapping and let normal reconciliation recover it.
+4. If the effect is conclusively absent, retain the old workflow as failed and visible;
+   do not archive it, mark it successful, reset its intent, or reuse its keys. Announce
+   the failed workflow ID and replacement reason in its Slack thread. Ask the owner
+   for a new root request referencing the incident. It receives a new workflow/session
+   and requires its own concrete-plan approval. Keep the old broker revocation in force.
+5. Resume the supervisors and verify that only the replacement's new keys can dispatch
+   and publish. The old row remains a visible audit record with its recovery error.
+
+This procedure intentionally abandons the failed attempt rather than pretending it
+completed. Native cancellation and publication revocation are deployment-specific
+operations; the deployment runbook must name and verify them before activation.
 
 Archive reads exact native identity, source, profile, cwd and title; Slack-origin or
 parented sessions are refused. Native compression/lineage changes that cannot satisfy
