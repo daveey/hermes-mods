@@ -18,6 +18,10 @@ Keyboard: the existing native palette offers “Show runners”, node/runner jum
 
 Refresh and validated GitHub settings links are supported. Diagnostic copy uses the SDK clipboard door and a bounded field allowlist (no raw logs/config). Repair menu placeholders are hidden behind the `repair_sessions` component feature flag (default false); even when exposed they are disabled. Maintenance controls are disabled and explicitly state that maintenance does not drain jobs. This UI does not create sessions, restart runners, dispatch jobs or modify maintenance.
 
+Node ages use host-resource provenance from actual probes, never inventory-envelope or collector-heartbeat timestamps. Missing evidence remains “Not observed”; expired or failed evidence is labeled stale/unavailable.
+
+Detail monitoring explicitly distinguishes not-configured, forbidden, unavailable, unknown and configured-but-unattributed activity. Provider `observed_jobs` appear separately from dispatched `jobs`, with observation ages and stale labels. Current-job links require a fresh busy registration, matching provider runner ID and repository/organization scope, valid observation times and numeric IDs, and an exact canonical GitHub URL; raw provider URLs are never opened blindly.
+
 ## Tests
 
 From the repository root, Node >=22:
