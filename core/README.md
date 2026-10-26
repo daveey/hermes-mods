@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0277 | Orderly park releases PR guard; broker-aware PR-state reads |
 | [kanban-pr-broker-transport.md](kanban-pr-broker-transport.md) | 0276 | Profile-scoped GitHub broker execution and sanitized setup receipts |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0260 | AutomatedRow active-Kanban type coverage |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0262 | Failed-node retries and deflake cards |
