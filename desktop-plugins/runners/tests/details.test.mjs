@@ -25,7 +25,7 @@ test('job links require exact provider, scope, assignment, owner and numeric IDs
 test('empty job data does not claim idle or unconfigured monitoring', async () => {
   const s = snapshot()
   s.data.runners[0].activity = 'busy'
-  const d = { ...s, data: { ...fixtures.RunnerDetail, runner: s.data.runners[0], jobs: [] } }
+  const d = { ...s, data: { ...fixtures.RunnerDetail, runner: s.data.runners[0], jobs: [], job_monitoring: undefined } }
   host.profileRoutes = async () => [route]
   const ui = await mount(React.createElement(p.Runners, { ctx: {
     rest: async path => path.includes('/enrollment') ? enrollment() : path.includes('/runners/') ? d : s
@@ -37,6 +37,25 @@ test('empty job data does not claim idle or unconfigured monitoring', async () =
     const detail = document.querySelector('.hermes-runners-detail')
     assert.match(detail.textContent, /Job attribution unavailable/)
     assert.doesNotMatch(detail.textContent, /not configured|Current job not identified|idle/i)
+  } finally { await ui.close() }
+})
+for (const [state, expected] of [
+  ['not_configured', 'Job details not configured'],
+  ['forbidden', 'Job details permission denied'],
+  ['unavailable', 'Job collector unavailable'],
+  ['unknown', 'Job attribution unavailable'],
+  ['configured', 'Current job not identified']
+]) test(`explicit job monitoring ${state} stays distinct from activity`, async () => {
+  const s = snapshot()
+  s.data.runners[0].activity = 'busy'
+  const d = { ...s, data: { ...fixtures.RunnerDetail, runner: s.data.runners[0], jobs: [], observed_jobs: [], job_monitoring: { state, reason_code: null, observed_at: s.meta.observed_at, expires_at: new Date(Date.now() + 60000).toISOString() } } }
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : path.includes('/runners/') ? d : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
+    await ui.click(document.querySelector('[data-runner-row]'))
+    assert.ok(document.querySelector('.hermes-runners-detail').textContent.includes(expected))
   } finally { await ui.close() }
 })
 test('known job appears only after bounded detail read and SDK opens its exact URL', async () => {

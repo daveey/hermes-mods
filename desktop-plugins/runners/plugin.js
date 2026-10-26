@@ -718,7 +718,9 @@ function Details({ row, transport, visible, onData }) {
             )
           ),
           h('p', null, `Recent jobs: ${(d.jobs || []).length}`),
-          !d.jobs?.length ? h('p', null, 'Job attribution unavailable') : null,
+          !d.jobs?.length && !d.observed_jobs?.length ? h('p', null,
+            ({ not_configured: 'Job details not configured', forbidden: 'Job details permission denied', unavailable: 'Job collector unavailable',
+              configured: row.activity === 'busy' ? 'Current job not identified' : 'No attributed jobs observed' })[d.job_monitoring?.state] || 'Job attribution unavailable') : null,
           ...(d.jobs || []).map((j) =>
             h(
               'p',
