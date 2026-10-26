@@ -1,6 +1,6 @@
 # Whole-document inline previews
 
-Patches: 0251.
+Patches: 0252.
 
 ## Behavior
 

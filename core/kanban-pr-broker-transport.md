@@ -1,6 +1,6 @@
 # Profile-scoped PR acceptance transport
 
-Patch: **0278**, source commit `ca145ec36e04a7db3271e2df91622dc7adbd91a2`.
+Patch: **0280**, source commit `ca145ec36e04a7db3271e2df91622dc7adbd91a2`.
 
 ## Behavior
 

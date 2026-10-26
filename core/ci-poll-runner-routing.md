@@ -1,6 +1,6 @@
 # Separate CI polling from test execution
 
-Patches: **0276**, **0277**, **0279**.
+Patches: **0278**, **0279**, **0281**.
 
 ## Behavior
 
@@ -19,9 +19,9 @@ These are workflow configuration changes, not runner provisioning. The labels ar
 
 | Patch | Source | Scope |
 |---|---|---|
-| 0276 | `3ffbbbee9b26ad65b2206f1a95801983a02fc2fc` | Review poller workflow and fork routing script |
-| 0277 | `52e8ce804dc8d41e911c7028fc64865ea36ef46d` | Actionlint label registration |
-| 0279 | `4a97e9b694d9fadd18379a0dcad900e6d8c030d6` | CI/supply-chain aggregators, Detect timeout, routing script and tests |
+| 0278 | `3ffbbbee9b26ad65b2206f1a95801983a02fc2fc` | Review poller workflow and fork routing script |
+| 0279 | `52e8ce804dc8d41e911c7028fc64865ea36ef46d` | Actionlint label registration |
+| 0281 | `4a97e9b694d9fadd18379a0dcad900e6d8c030d6` | CI/supply-chain aggregators, Detect timeout, routing script and tests |
 
 ## Tests
 
@@ -37,7 +37,7 @@ The full **280-patch** series applied successfully using `git am -3` at merge-ba
 
 ## Applying
 
-Apply the full ordered series from its merge-base. This merged branch inserts commits before previously published entries: broker transport is now 0278 and PR park handoff is now 0280. The existing patches were moved without changing their bytes, and their documentation references were updated.
+Apply the full ordered series from its merge-base. This merged branch inserts commits before previously published entries: broker transport is now 0280 and PR park handoff is now 0283. The existing patches were moved without changing their bytes, and their documentation references were updated.
 
 ## Gotchas
 

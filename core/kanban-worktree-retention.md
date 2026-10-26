@@ -1,6 +1,6 @@
 # Kanban worktree retention and orphan detection
 
-Patch: `0270-fix-kanban-archive-and-reap-stale-terminal-worktrees.patch`.
+Patch: `0272-fix-kanban-archive-and-reap-stale-terminal-worktrees.patch`.
 
 ## Behavior
 
@@ -55,7 +55,7 @@ before any mutation, so corruption cannot be mistaken for an absent owner.
 
 ## Applying
 
-Apply in series after 0269. Fork commit `ae781e9188`.
+Apply in series after 0271. Fork commit `ae781e9188`.
 
 ## Gotchas
 

@@ -1,6 +1,6 @@
 # PR guard handoff after an orderly park
 
-Patch: **0280**, source `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`.
+Patch: **0283**, source `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`.
 
 ## Behavior
 
@@ -32,7 +32,7 @@ The full ordered **277-patch** `git am -3` succeeded at merge-base `4957bbd0a0f6
 
 ## Applying
 
-Apply the complete ordered series from its merge-base. This depends on the earlier PR guard and broker transport work, including patch 0278.
+Apply the complete ordered series from its merge-base. This depends on the earlier PR guard and broker transport work, including patch 0280.
 
 ## Gotchas
 

@@ -6,8 +6,8 @@ Patches:
   Desktop's door to the `hub-sync` backend plugin), owner lookup consulting the replica, Kanban board fallback to
   the replica for a gateway whose live read fails.
 - `patches/0220-feat-desktop-sidebar-shows-offline-gateways-sessions.patch`, `0229`, `0232`: the original standalone
-  "Synced from other gateways" sidebar section (and its SDK routing). **Superseded by 0275**, which deletes the section.
-- `patches/0275-feat-desktop-cached-sessions-as-offline-marked-rows-.patch`: cached sessions of unreachable gateways join
+  "Synced from other gateways" sidebar section (and its SDK routing). **Superseded by 0277**, which deletes the section.
+- `patches/0277-feat-desktop-cached-sessions-as-offline-marked-rows-.patch`: cached sessions of unreachable gateways join
   the NORMAL sidebar list as offline-marked rows; the standalone section is removed. Also bumps the hermes-hub client
   to 1.4.0 (separate repo) so the collector stamps the owner's `automated` policy.
 
@@ -21,7 +21,7 @@ syncing there. Without either, every read answers `null`/`[]` and the Desktop be
   connection. Unknown id: the old by-id probe. A single-gateway Desktop is unaffected.
 - **Kanban board.** When one gateway's live board read fails, its cards come from the replica (`/tasks`), marked
   "from hub" with their sync age. A comment on a replica card is queued as a hub request.
-- **Cached sessions in the normal sidebar (0275).** There is no history section. The hub-sync plugin is a poller
+- **Cached sessions in the normal sidebar (0277).** There is no history section. The hub-sync plugin is a poller
   service that publishes replica rows (`publishOfflineSessions`, `store/offline-sessions.ts`) as `SessionInfo`
   fallback rows. `ChatSidebar` merges them into `$sessions` before the existing pipeline, so profile/gateway
   selection, the automated/test toggle, search, pinning, grouping, lineage and ordering apply unchanged.
@@ -64,7 +64,7 @@ hit normal offline errors; the backend side of an applied request is hermes-hub'
 
 ## Applying
 
-`git am -3` in order, after 0090 (Kanban all-gateways) and 0093; 0275 replaces the section from 0220/0229/0232.
+`git am -3` in order, after 0090 (Kanban all-gateways) and 0093; 0277 replaces the section from 0220/0229/0232.
 
 ## Gotchas
 

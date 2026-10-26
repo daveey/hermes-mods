@@ -1,6 +1,6 @@
 # Protect live git identity during tests
 
-Patches: 0253 0255.
+Patches: 0254 0256.
 
 ## Behavior
 
@@ -8,7 +8,7 @@ An autouse test guard detects and undoes writes to user.* identity settings in l
 
 ## How it works
 
-The fixture snapshots live git configuration and restores identity mutations before failing the offending test. Patch 0255 preserves real subprocess primitives so subprocess mocks do not corrupt guard behavior.
+The fixture snapshots live git configuration and restores identity mutations before failing the offending test. Patch 0256 preserves real subprocess primitives so subprocess mocks do not corrupt guard behavior.
 
 ## Code
 

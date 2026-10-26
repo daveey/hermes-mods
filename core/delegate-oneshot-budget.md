@@ -1,6 +1,6 @@
 # Advertise the one-shot delegation budget
 
-Patch: **0283**, source `d906269336ccb62b554afad513fb316d2deb3176`.
+Patch: **0289**, source `d906269336ccb62b554afad513fb316d2deb3176`.
 
 ## Behavior
 

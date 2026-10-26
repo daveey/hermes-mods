@@ -15,25 +15,25 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
-| [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0276–0277, 0279 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
-| [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0280 | Orderly park releases PR guard; broker-aware PR-state reads |
-| [orphan-reaper-home-scope.md](orphan-reaper-home-scope.md) | 0281 | Orphan reaping requires proven home/UID ownership and fresh process identity |
-| [kanban-pr-broker-transport.md](kanban-pr-broker-transport.md) | 0278 | Profile-scoped GitHub broker execution and sanitized setup receipts |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0260 | AutomatedRow active-Kanban type coverage |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0262 | Failed-node retries and deflake cards |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0263 | CPU/shard-budget-aware workers |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0264 | Load-tolerant test synchronization |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0265 | Flaky CI warning annotations |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0266 | Reporting helpers and BOM-safe reads |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0272 | Git guard teardown ordering and UTF-8 decoding |
-| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0273 | LSP Git-bearing scratch regression |
-| [kanban-scratch-git-preservation.md](kanban-scratch-git-preservation.md) | 0267 | Tool, CLI and REST completion preserve Git-bearing or uncertain scratch before any optional post-tool cleanup |
-| [kanban-touch-subscriptions.md](kanban-touch-subscriptions.md) | 0249 | Touch subscriptions do not own work |
-| [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0250 0268 | Condition-driven scheduled wakes with generation fencing and shared-park guards |
-| [inline-preview-full-document.md](inline-preview-full-document.md) | 0251 | Whole-document inline previews |
-| [kanban-default-provider.md](kanban-default-provider.md) | 0252 | Default tier provider inference |
-| [test-live-git-config-guard.md](test-live-git-config-guard.md) | 0253 0255 | Protect live git identity during tests |
-| [kanban-worker-scope-failures.md](kanban-worker-scope-failures.md) | 0254 | Diagnose worker OOM and signal deaths |
+| [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0278–0279, 0281 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
+| [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0283 | Orderly park releases PR guard; broker-aware PR-state reads |
+| [orphan-reaper-home-scope.md](orphan-reaper-home-scope.md) | 0286 | Orphan reaping requires proven home/UID ownership and fresh process identity |
+| [kanban-pr-broker-transport.md](kanban-pr-broker-transport.md) | 0280 | Profile-scoped GitHub broker execution and sanitized setup receipts |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0262 | AutomatedRow active-Kanban type coverage |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0264 | Failed-node retries and deflake cards |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0265 | CPU/shard-budget-aware workers |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0266 | Load-tolerant test synchronization |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0267 | Flaky CI warning annotations |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0268 | Reporting helpers and BOM-safe reads |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0274 | Git guard teardown ordering and UTF-8 decoding |
+| [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0275 | LSP Git-bearing scratch regression |
+| [kanban-scratch-git-preservation.md](kanban-scratch-git-preservation.md) | 0269 | Tool, CLI and REST completion preserve Git-bearing or uncertain scratch before any optional post-tool cleanup |
+| [kanban-touch-subscriptions.md](kanban-touch-subscriptions.md) | 0250 | Touch subscriptions do not own work |
+| [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0251 0270 | Condition-driven scheduled wakes with generation fencing and shared-park guards |
+| [inline-preview-full-document.md](inline-preview-full-document.md) | 0252 | Whole-document inline previews |
+| [kanban-default-provider.md](kanban-default-provider.md) | 0253 | Default tier provider inference |
+| [test-live-git-config-guard.md](test-live-git-config-guard.md) | 0254 0256 | Protect live git identity during tests |
+| [kanban-worker-scope-failures.md](kanban-worker-scope-failures.md) | 0255 | Diagnose worker OOM and signal deaths |
 | [archive-linked-confirm.md](archive-linked-confirm.md) | 0110 | Archiving a chat with open Kanban tasks or rented machines asks first, listing them; plugins add checks via `ctx.registerArchiveGuard` |
 | [screen-share.md](screen-share.md) | 0109 | Inline Screen Share plugin opens strictly validated VNC addresses on the client Desktop OS, never the remote gateway |
 | [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 0049 0050 0065 | ⌘]/⌘[ next/prev session with a green/red status stripe (stepping from the focused tab), ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume (⌥⌘R in 0064–0070), ⌥⇧⌘R window reload |
@@ -94,17 +94,17 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-false-done-attention.md](kanban-false-done-attention.md) | 0194 | A chat whose kanban cards are all done stripes amber, not green, when a card finished in the last 24 h admits dropped work with no follow-up card (judged by a plugin-registered check, e.g. `plugins/kanban-honest-done`) |
 | [tool-search-defer-outside-worker.md](tool-search-defer-outside-worker.md) | 0145 | `tools.tool_search.defer_outside_kanban_worker` defers the listed tools (the Kanban worker-lifecycle tools on the fork) in chats, cron and one-shots only; dispatcher-spawned Kanban workers keep them direct, saving ~3.7k tokens per call elsewhere |
 | [plugin-archive-hotkey.md](plugin-archive-hotkey.md) | 0147, 0157 | Plugins can take over ⌘⇧A for sessions they own (`ctx.registerArchiveHotkeyHandler`); Inbox uses it to archive and open the next Inbox message. `ctx.openNextSession(id)` gives plugin buttons the same next-session step (Inbox last card) |
-| [delegate-route-conflicts.md](delegate-route-conflicts.md) | 0282 | Offline model/provider coherence preflight rejects incompatible delegated batches before spawning |
-| [delegate-oneshot-budget.md](delegate-oneshot-budget.md) | 0283 | Advertise the one-shot total delegation budget and distinguish oversized requests from exhaustion |
-| [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md) | 0284 | Blocked-only work stays unfinished in both Desktop dots; archive writes invalidate cached counts; conditional child holds require immediate human action |
-| [model-tiers.md](model-tiers.md) | 0151 0152 0269 | Lazy selected-route preflight; per-task `model`/`provider` on delegate_task (`delegation.allow_task_model`); Kanban cards with no pinned model run on `kanban.default_model`, except reviews, retries after a failed run and keep-pattern matches (each run logs a `model_tier` event) |
+| [delegate-route-conflicts.md](delegate-route-conflicts.md) | 0288 | Offline model/provider coherence preflight rejects incompatible delegated batches before spawning |
+| [delegate-oneshot-budget.md](delegate-oneshot-budget.md) | 0289 | Advertise the one-shot total delegation budget and distinguish oversized requests from exhaustion |
+| [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md) | 0290 | Blocked-only work stays unfinished in both Desktop dots; archive writes invalidate cached counts; conditional child holds require immediate human action |
+| [model-tiers.md](model-tiers.md) | 0151 0152 0271 | Lazy selected-route preflight; per-task `model`/`provider` on delegate_task (`delegation.allow_task_model`); Kanban cards with no pinned model run on `kanban.default_model`, except reviews, retries after a failed run and keep-pattern matches (each run logs a `model_tier` event) |
 | [sidebar-exclude-sources.md](sidebar-exclude-sources.md) | 0154 | Per-profile `sessions.sidebar_exclude_sources` (e.g. `[api_server]`) keeps a machine profile's sessions out of the sidebar project tree |
-| [gemini-provider-defaults.md](gemini-provider-defaults.md) | 0156 0247 | `--provider gemini` without `-m` uses a Gemini model instead of sending your `claude-*` default (404); Gemini aux/title default is `gemini-3.8-flash` |
+| [gemini-provider-defaults.md](gemini-provider-defaults.md) | 0156 0248 | `--provider gemini` without `-m` uses a Gemini model instead of sending your `claude-*` default (404); Gemini aux/title default is `gemini-3.8-flash` |
 | [sidebar-created-sort.md](sidebar-created-sort.md) | 0158 | Sidebar 'created' sort orders, clusters and date-buckets by `started_at`, so a reply in an old chat no longer lifts it to the top |
 | [session-context-nested-rebind.md](session-context-nested-rebind.md) | 0159 | A nested re-bind of the turn's own session restores the binding on clear, so cards created after a queued model switch keep their session id |
 | [credential-pool-norefresh-adopt.md](credential-pool-norefresh-adopt.md) | 0160 | A live credential pool adopts tokens pushed to disk for no-refresh OAuth rows instead of keeping the expired copy |
 | [kanban-escalated-triage-red.md](kanban-escalated-triage-red.md) | 0161 0231 | A block-loop-escalated triage card counts as waiting on you, so its chat paints red; 0231: non-human/NULL triage counts as unfinished work, so its chat is not green |
-| [kanban-worktree-retention.md](kanban-worktree-retention.md) | 0270 | Age-based terminal-worktree cleanup with verified recovery refs; startup orphan tombstones |
+| [kanban-worktree-retention.md](kanban-worktree-retention.md) | 0272 | Age-based terminal-worktree cleanup with verified recovery refs; startup orphan tombstones |
 | [kanban-worker-worktree-cleanup.md](kanban-worker-worktree-cleanup.md) | 0162 | Worker guidance: `git worktree remove` every worktree you add before `kanban_complete` |
 | [browser-background-tab.md](browser-background-tab.md) | 0163 0164 | `browser_exec`'s own tab and the CDP supervisor's fallback page open with `background=True`, so a new browser session stops stealing keyboard focus on macOS |
 | [pre-final-gate.md](pre-final-gate.md) | 0165 0167 | `pre_final_gate` plugin hook: hold a final answer silently (never shown or stored) or append to it; `needs_buffer` keeps a held answer from streaming |
@@ -121,15 +121,15 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-worker-session-id.md](kanban-worker-session-id.md) | 0211 | Task detail API gives each run its `worker_session_id`, so clients open the worker's transcript, not the creating chat |
 | [kanban-failure-notices.md](kanban-failure-notices.md) | 0216 0217 | Kanban `gave_up` / `crashed` / `timed_out` notices (Desktop and messaging gateway) name the real cause (model refusal, provider configuration, no result reported, launch failure, time limit, process exit), promise a retry only when the event records one, and make no unsupported fallback claims |
 | [file-safety-token-broker.md](file-safety-token-broker.md) | 0221 | Read- and write-deny `~/.config/token-broker` (broker client token) in file tools, search, vision and `@file` refs |
-| [hub-sync-replica.md](hub-sync-replica.md) | 0219 0220 0229 0232 0275 | Desktop reads the hermes-hub replica (hub-sync plugin): owner lookup without probing, Kanban falls back to the replica for an unreachable gateway, and cached sessions of unreachable gateways appear as offline-marked rows in the normal sidebar list (standalone section removed; live rows win) |
+| [hub-sync-replica.md](hub-sync-replica.md) | 0219 0220 0229 0232 0277 | Desktop reads the hermes-hub replica (hub-sync plugin): owner lookup without probing, Kanban falls back to the replica for an unreachable gateway, and cached sessions of unreachable gateways appear as offline-marked rows in the normal sidebar list (standalone section removed; live rows win) |
 | [chat-closeout.md](chat-closeout.md) | 0244 0245 0246 | Chat close-out seams: session rows carry `kanban_waiting_on`, grey `waiting` sidebar stripe while cards are open, plugin waiting sources, and `_wake_session_turn` to run one turn in an unloaded chat |
-| [kanban-respawn-guard-hold.md](kanban-respawn-guard-hold.md) | 0212 0223 0225 0238 0239 0241 0242 0274 | A held card gets one comment + fix card; `active_pr` lifts for merged/closed PRs or completed queue rejections, quoting the repair reason; one event per hold |
+| [kanban-respawn-guard-hold.md](kanban-respawn-guard-hold.md) | 0212 0223 0225 0238 0239 0241 0242 0276 | A held card gets one comment + fix card; `active_pr` lifts for merged/closed PRs or completed queue rejections, quoting the repair reason; one event per hold |
 | [desktop-kanban-worker-readonly.md](desktop-kanban-worker-readonly.md) | 0213 0227 | Desktop opens a Kanban worker session read-only and quietly instead of a "Resume failed" toast (gateway code 4132) |
 | [api-server-thread-hops.md](api-server-thread-hops.md) | 0214 0226 | API-server SSE flushes worker-thread hops before `assistant.completed`/EOS so the last commentary is not dropped |
 | [codex-subscription-routing.md](codex-subscription-routing.md) | 0233 0234 0235 0236 0237 | Account-gated Codex models route via an entitled ChatGPT/Codex subscription: union catalog, plan-gated pool selection, subscription-first picker |
-| [kanban-quota-recovery.md](kanban-quota-recovery.md) | 0248, 0271 | Recovered quota walls use cooldowns; healthy heartbeats/checkpoints clear stale failure errors; stale guard-hold blocks are released |
-| [runtime-safety-followups.md](runtime-safety-followups.md) | 0256–0259 | Portable wake cleanup, disabled-MCP diagnostics, fail-closed delegated lineage and Git-guard PATH isolation |
-| [session-start-requests.md](session-start-requests.md) | 0261 | Durable plugin-authorized session start identity, at-most-once first-turn dispatch and owner-local reconciliation |
+| [kanban-quota-recovery.md](kanban-quota-recovery.md) | 0249, 0273 | Recovered quota walls use cooldowns; healthy heartbeats/checkpoints clear stale failure errors; stale guard-hold blocks are released |
+| [runtime-safety-followups.md](runtime-safety-followups.md) | 0257–0261 | Portable wake cleanup, disabled-MCP diagnostics, fail-closed delegated lineage and Git-guard PATH isolation |
+| [session-start-requests.md](session-start-requests.md) | 0263 | Durable plugin-authorized session start identity, at-most-once first-turn dispatch and owner-local reconciliation |
 
 ## Applying
 
@@ -138,7 +138,7 @@ See [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) for the
 current verification and topology renumbering (67 tests passed, two bootstrap
 home-guard failures; not a fully green suite).
 
-The earlier 0256–0260 mirror verification (historical numbering) applied all 260 patches with `git am -3` at
+The earlier 0257–0262 mirror verification (historical numbering) applied all 260 patches with `git am -3` at
 merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`. All five changed regression
 files passed on the applied series: 58 tests, zero failures, canonical runner with `-j 1`.
 This does not claim full-suite, Desktop rendering, deployment or exact-head CI verification.
@@ -201,6 +201,18 @@ passed the changed test files: 92 Python tests across 3 files.
 
 The 0130 mirror verification (October 18, 2026 PT) applied all 130 patches cleanly with `git am -3`
 at merge-base `4957bbd0a0`; the patch's new schema test passes (and fails without it).
+
+## Latest mirror additions
+
+Verified full ordered series: 292 patches from merge-base `4957bbd0a0`, fetched upstream `9b904dcc22`, fork `e295d0da73` (last non-merge patch `2c047de606`). All patches apply with `git am -3`. The applied final public series passes 43 tests across six files: shebang checker, durable CLI takeover, adversarial takeover, full-turn takeover, durable recovery and terminal background-chat guard. Coverage and normal privacy hooks pass. Desktop suites and full Nix builds were not independently rerun by this mirror.
+
+Merged branches inserted earlier commits: existing patch bytes and slugs are preserved while numbers and documentation references move together. Patch 0260 substitutes example contributor identifiers. Patch 0292 shortens a mock API key and parenthesizes a fixture argument to avoid scanner false positives; both affected test files pass in the final applied series. Existing privacy scrubs and the 0242 adaptation remain intact.
+
+| Feature | Patches | Behavior |
+|---|---|---|
+| [CI and source fixes](mirror-ci-source-fixes.md) | 0247 0260 0282 0284–0285 0287 | CI race/warmup fixes, public attribution, pinned source mirror and pipefail guards |
+| [Foreign tile lifecycle](foreign-tile-lifecycle.md) | 0291 | Keep owner-routed foreign tiles across ambient refresh; retry missing owner sessions |
+| [Session takeover](session-takeover.md) | 0292 | Cooperative durable CLI handoff and detached-chat origin guard |
 
 ## Gotchas
 
