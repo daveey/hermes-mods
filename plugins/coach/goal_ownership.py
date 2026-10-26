@@ -1,7 +1,8 @@
 """Bounded, read-only local owner evidence.
 
 Local scheduled ownership needs a native future wake, a fresh dispatcher receipt
-and a scoped result consumer. Remote/process and dependency owners remain UNKNOWN.
+and a scoped result consumer. Dependency waits additionally require verified
+ongoing ancestors. Remote/process owners remain UNKNOWN.
 Runtime liveness is a point-in-time observation, not a future delivery guarantee.
 """
 from pathlib import Path
@@ -17,6 +18,14 @@ def _ro_connect(path):
     try:
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA query_only=ON')
+        # LIMIT bounds returned rows, not scans on older/unindexed native DBs.
+        # This cumulative connection budget also bounds all ancestor queries.
+        budget = 1000
+        def exhausted():
+            nonlocal budget
+            budget -= 1
+            return budget <= 0
+        conn.set_progress_handler(exhausted, 1000)
     except Exception:
         conn.close()
         raise
@@ -28,20 +37,17 @@ def authoritative_owner(v, evidence, session_id):
 
     Supported route: exact local hostname, current profile, explicit board, native
     task ID, TUI/Desktop origin subscription. Exact request/body equality avoids
-    turning a model's claimed goal match into authority. Scheduled routes need native dispatcher evidence; dependency routes remain UNKNOWN. cross_task.read is deliberately NOT invoked:
+    turning a model's claimed goal match into authority. Waiting routes need native dispatcher evidence and dependencies need live ancestors. cross_task.read is deliberately NOT invoked:
     its session-mentions contract also adopts/shepherds remote cards and its
     relay is neither a bounded read-only probe nor a profile-qualified proof.
     """
     import re
     import socket
     import sqlite3
-    import time
     from contextlib import closing
     from hermes_constants import get_hermes_home
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import get_active_profile_name
-    from hermes_cli.kanban_host_identity import is_local_claim
-    from hermes_cli.kanban_db_dispatch import _worker_alive
 
     ref = v.get('continuation_ref')
     if (not isinstance(ref, dict) or set(ref) != {'gateway', 'profile', 'board', 'task_id'}
@@ -85,16 +91,7 @@ def authoritative_owner(v, evidence, session_id):
             if task['status'] != 'running':
                 _waiting_continuation(conn, task, path, profile)
             else:
-                run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
-                                   (task['current_run_id'], ref['task_id'])).fetchone()
-                if (not run or run['profile'] != profile or run['status'] != 'running'
-                        or run['ended_at'] is not None or run['outcome'] is not None
-                        or not run['claim_expires'] or run['claim_expires'] <= time.time()
-                        or not is_local_claim(run['claim_lock'])
-                        or not isinstance(run['worker_started_at'], str)
-                        or '|' not in run['worker_started_at']
-                        or not _worker_alive(run['worker_pid'], run['worker_started_at'])):
-                    raise ValueError('owner_live_continuation_unverified')
+                _running_continuation(conn, task, profile)
             sub = conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform='tui' AND chat_id=? AND thread_id='' AND notifier_profile=? AND delivery_mode IN ('notify','notify+wake')", (ref['task_id'], session_id, profile)).fetchone()
             if not sub:
                 raise ValueError('owner_result_return_unverified')
@@ -104,23 +101,40 @@ def authoritative_owner(v, evidence, session_id):
 
 
 
+def _running_continuation(conn, task, profile):
+    """Share exact current-run, local claim and process-start checks."""
+    import time
+    from hermes_cli.kanban_host_identity import is_local_claim
+    from hermes_cli.kanban_db_dispatch import _worker_alive
+    run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
+                       (task['current_run_id'], task['id'])).fetchone()
+    if (not run or run['profile'] != profile or run['status'] != 'running'
+            or run['ended_at'] is not None or run['outcome'] is not None
+            or not run['claim_expires'] or run['claim_expires'] <= time.time()
+            or not is_local_claim(run['claim_lock'])
+            or not isinstance(run['worker_started_at'], str)
+            or '|' not in run['worker_started_at']
+            or not _worker_alive(run['worker_pid'], run['worker_started_at'])):
+        raise ValueError('owner_live_continuation_unverified')
+
+
 def _waiting_continuation(conn, task, board_path, profile):
     """Compose a native future wake with scoped recent scheduler evidence.
 
-    Dependency graphs still require continuing proof for each unfinished parent.
+    Dependency graphs require continuing proof for every unfinished ancestor.
     The root is resolved by native code, never supplied by the model/tool result.
     Files owned by the runtime UID are trusted state, not a hostile-UID boundary.
     """
     from hermes_cli import kanban_db as kb
-    wait = waiting_readback(conn, task)
-    if wait['kind'] != 'scheduled':
-        raise ValueError('owner_dispatcher_unverified')
+    waiting_readback(conn, task)
     try:
         from gateway.kanban_dispatcher_health import available
     except ImportError as exc:
         raise ValueError('owner_dispatcher_unverified') from exc
     if not available(kb.kanban_home() / 'kanban', board_path, profile, 'ready'):
         raise ValueError('owner_dispatcher_unverified')
+    # A scheduled wake is parent-gated too; a timer cannot own a blocked DAG.
+    _dependency_continuation(conn, task, profile)
 
 
 def waiting_readback(conn, task):
@@ -135,10 +149,11 @@ def waiting_readback(conn, task):
     import time
     from hermes_cli.kanban_continuation import pending_wake
     if task['status'] == 'scheduled':
+        # Our receipt contract certifies the ready lane only, not review.
         wake = pending_wake(conn, task['id'])
         when = wake.get('wake_at') if wake else None
         if (type(when) not in (int, float) or not math.isfinite(when)
-                or when <= time.time()):
+                or when <= time.time() or wake.get('resume_status') == 'review'):
             raise ValueError('owner_scheduled_wake_unverified')
         return {'kind': 'scheduled', 'wake_at': when}
     if task['status'] != 'todo':
@@ -149,7 +164,7 @@ def waiting_readback(conn, task):
     return {'kind': 'dependency', 'parents': parents}
 
 
-def _dependency_readback(conn, task_id):
+def _dependency_readback(conn, task_id, *, full=False):
     """Bound both traversal and rows; reject dangling links and cycles.
 
     Inspect the whole bounded ancestor graph, not just a self-link at the root.
@@ -159,6 +174,7 @@ def _dependency_readback(conn, task_id):
     visiting, visited, direct = set(), set(), ()
     stack = [(task_id, False)]
     edges = 0
+    graph = {}
     while stack:
         node, leaving = stack.pop()
         if leaving:
@@ -172,18 +188,52 @@ def _dependency_readback(conn, task_id):
         if len(visited) + len(visiting) >= 64:
             raise ValueError('owner_dependency_unverified')
         rows = conn.execute(
-            'SELECT p.id, p.status FROM task_links l LEFT JOIN tasks p '
-            'ON p.id=l.parent_id WHERE l.child_id=? ORDER BY l.parent_id LIMIT 65',
+            'SELECT p.id, p.status, p.assignee, p.completed_at, p.current_run_id '
+            'FROM task_links l LEFT JOIN tasks p ON p.id=l.parent_id '
+            'WHERE l.child_id=? ORDER BY l.parent_id LIMIT 65',
             (node,)).fetchall()
         edges += len(rows)
         if edges > 64 or any(p['id'] is None for p in rows):
             raise ValueError('owner_dependency_unverified')
+        graph[node] = rows
         if node == task_id:
             direct = tuple((p['id'], p['status']) for p in rows)
         visiting.add(node)
         stack.append((node, True))
         stack.extend((p['id'], False) for p in rows)
-    return direct
+    return graph if full else direct
+
+
+def _dependency_continuation(conn, task, profile):
+    """Certify a bounded DAG, not merely its direct parent status snapshot.
+
+    Native edges establish relevance; parents need not repeat the child's body
+    or origin. Return delivery belongs to the child, whose exact scope was checked
+    by the caller. All ancestors must remain in this board/profile. Archived and
+    ambiguous terminal rows fail closed even though native readiness allows them.
+    """
+    graph = _dependency_readback(conn, task['id'], full=True)
+    ancestors = {row['id']: row for rows in graph.values() for row in rows}
+    for parent in ancestors.values():
+        status = parent['status']
+        if parent['assignee'] != profile:
+            raise ValueError('owner_dependency_unverified')
+        if status == 'done' and parent['completed_at'] is not None:
+            continue
+        if parent['completed_at'] is not None:
+            raise ValueError('owner_dependency_unverified')
+        if status == 'running':
+            _running_continuation(conn, parent, profile)
+        elif status == 'scheduled':
+            waiting_readback(conn, parent)
+        elif status == 'todo':
+            # The entire graph was already bounded and cycle checked. Avoid
+            # recursively rereading shared ancestors or multiplying read budgets.
+            parents = graph[parent['id']]
+            if not parents or not any(p['status'] not in ('done', 'archived') for p in parents):
+                raise ValueError('owner_dependency_unverified')
+        else:
+            raise ValueError('owner_dependency_unverified')
 
 
 def _live_result_consumer(session_id, home, board_path):

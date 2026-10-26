@@ -109,8 +109,14 @@ consumer. Disabled/zero-capacity ticks do not certify; each board pass retains i
 The native runtime root is resolved independently of the model. Same-UID runtime files are trusted
 state, not authentication against malicious local writers. Tests: `test_goal_scheduled_ownership.py`
 composes a real isolated board tick with the native consumer and verifies close/scope/return failures.
-Remote, dependency-waiting, cross-profile, paraphrased-goal and non-TUI-return cases
-remain UNKNOWN. Native wake/dependency rows alone do not prove dispatcher health;
+Local dependency waits also require every unfinished ancestor to have a verified live
+worker, future scheduled wake, or bounded dependency chain to such owners. Both scheduled
+and todo children are parent-gated: a timer cannot certify blocked or stale ancestors.
+The child still needs the fresh dispatcher and result-consumer proofs. Review-lane wakes,
+archived/ambiguous ancestors, and foreign-profile ancestors remain UNKNOWN.
+`test_goal_dependency_ownership.py` covers native links, transitive/shared ancestors,
+missing/stale proofs, SQL/graph limits and the public gate without database writes.
+Remote, cross-profile, paraphrased-goal and non-TUI-return cases remain UNKNOWN. Native wake/dependency rows alone do not prove dispatcher health;
 no cached tool assertion certifies ownership. Native dependency waits come from actual links,
 not a `block_kind` label: `link_tasks` can gate a task without setting one. The bounded
 ancestor readback rejects dangling links, cycles and oversized graphs, and never executes
@@ -529,3 +535,12 @@ and semantic judge responses are controlled; these are transport/safety contract
 not real-model semantic acceptance or live CLI/Desktop transport acceptance.
 
 Legacy replay uncertainty survives compaction in native display metadata; scope recovery rejects it rather than treating sanitized text as complete authorization. This is a safety control, not recovery of missing permission.
+
+
+`tests/test_goal_transport_controls.py` exercises actual stdio/WebSocket interrupt RPC,
+WebSocket disconnect/reconnect during a turn, fresh-process persisted fallback hydration,
+and interactive CLI PTY Ctrl-C. Together with `test_goal_disposition_transport.py`, all
+13 transport cases pass with isolated homes and loopback-only provider fixtures. PTY
+keypresses respect the native 50ms paste debounce; no input-handler bypass is used.
+These do not cover Electron, production serve auth/startup, real-model semantics or
+actual-profile activation. The original private incident replay remains unresolved.

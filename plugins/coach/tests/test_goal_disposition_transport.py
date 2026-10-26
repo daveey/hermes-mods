@@ -40,9 +40,12 @@ def isolated_env(home):
         'compression:\n  enabled: false\ncheckpoints:\n  enabled: false\n'
         'terminal:\n  cwd: ' + str(home) + '\n'
         'curator:\n  enabled: false\n')
+    # The canonical runner strips PYTHONPATH; children still need this tested core.
+    import hermes_constants
     # Allowlist instead of inheriting hub credentials, card routes or proxy URLs.
     env = {k: os.environ[k] for k in ('PATH', 'PYTHONPATH', 'LANG', 'TZ') if k in os.environ}
-    env.update(HOME=str(home), HERMES_HOME=str(home), HERMES_RUNTIME_DIR=str(home / 'runtime'),
+    env.update(PYTHONPATH=str(Path(hermes_constants.__file__).resolve().parent),
+               HOME=str(home), HERMES_HOME=str(home), HERMES_RUNTIME_DIR=str(home / 'runtime'),
                OPENAI_API_KEY='local-test', COACH_LESSONS='0', COACH_REPLY_RULES='none',
                HERMES_VERIFY_ON_STOP='0', PYTHONUNBUFFERED='1', HERMES_TEST_ISOLATION='1')
     return env

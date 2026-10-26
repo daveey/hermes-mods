@@ -115,8 +115,19 @@ and delayed publication. Seven focused gateway/consumer files passed 42 tests; f
 native-dispatch files passed 18 tests. These are not production activation evidence.
 
 Coach scheduled ownership composes this with a future native wake and the native origin
-result-consumer receipt. It does not certify unfinished dependency parents, remote tasks,
+result-consumer receipt. The companion plugin now separately verifies bounded local dependency ancestors, including
+parents of scheduled children. It does not certify remote tasks,
 standalone daemons, or process-notification routes. Linux only; unsupported systems fail
 UNKNOWN. The native runtime directory is a trusted same-UID state boundary; readable process
 identity plus flock does not authenticate evidence against arbitrary malicious same-UID writers.
 No new enforcement setting, service restart or live activation is included.
+
+
+## Additional isolated transport controls (draft)
+
+`plugins/coach/tests/test_goal_transport_controls.py` adds actual stdio/WebSocket
+interrupt RPC, reconnect during pending completion, cold-process fallback hydration,
+and interactive CLI PTY Ctrl-C. All 13 cases across this and the original transport
+file passed together through the canonical core test runner. Provider/auxiliary output
+is controlled and external networking is rejected; no production activation or Electron
+verification is inferred. Exact private incident replay and final rollout gates remain open.
