@@ -197,8 +197,16 @@ class Collector:
         cached = store.connection.execute("SELECT payload FROM collector_cache WHERE key='snapshot'").fetchone()
         if cached:
             cached = json.loads(cached[0])
-            if cached.get('owner') not in (None, self.owner()):
-                raise RuntimeError('owner_conflict')
+            prior, owner = cached.get('owner'), self.owner()
+            if prior is not None and prior != owner:
+                # A newer CAS config revision for the same owner/epoch is a
+                # normal config edit: drop the old-revision observations and
+                # recollect. Foreign owners, epochs or older revisions refuse.
+                same = all(prior.get(k) == owner[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch'))
+                rev = prior.get('config_revision')
+                if not (same and type(rev) is int and rev < owner['config_revision']):
+                    raise RuntimeError('owner_conflict')
+                cached = {}
             self.host_results = cached.get('host_results', {})
             self.scope_results = cached.get('scope_results', {})
             self.refresh_progress = cached.get('refresh_progress', {})
