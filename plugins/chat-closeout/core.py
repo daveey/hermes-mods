@@ -166,6 +166,89 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     return out
 
 
+def pending_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:
+    """THE close-out decision, shared by the sidebar, the pre_llm_call brief, the waker and the watchdog: the key of
+    the settled-but-unreported cards, unless a close-out turn already ended for exactly that key."""
+    key = closeout_key(row, cards)
+    return key if key and key != row.get("done_sig") else None
+
+
+def _bare(tid: str) -> str:
+    return str(tid).split("/")[-1]
+
+
+def reconcile_done(row: dict[str, Any], cards: dict[str, dict[str, Any]],
+                   proof: Optional[Callable[[str, dict[str, Any]], bool]] = None) -> dict[str, Any]:
+    """Settle a row whose ``done_sig`` equals its current key (so nothing would ever process it) by evidence:
+
+    - (when the batch is still partly working, only the transcript proof applies, per card)
+    - a done card finished at or before ``done_at``, or ``proof(id, card)`` shows a notice for it was delivered and
+      answered after it finished: acknowledged, so it is covered (and leaves the batch);
+    - a done card finished AFTER ``done_at`` with no such proof: the stamp belongs to an earlier state (the card
+      was reopened), so ``done_sig`` is cleared and the final handoff gets its close-out;
+    - anything else (no timestamps, remote or unknown state) is left exactly as it is.
+    Returns changed fields (empty when nothing is proven)."""
+    if row.get("closing") is not None:
+        return {}  # a close-out turn is running: its own turn end settles the row
+    key = closeout_key(row, cards)
+    stamped = bool(key) and key == row.get("done_sig")
+    done_at = float(row.get("done_at") or 0)
+    covered = set(row.get("covered") or [])
+    acked: set[str] = set()
+    stale = False
+    for tid in sorted(set(row.get("batch") or [])):
+        card = cards.get(tid)
+        if not card or card.get("status") not in DONE_STATUSES or tid in covered:
+            continue
+        at = card.get("completed_at")
+        local = at is not None and not card.get("remote")
+        if stamped and local and float(at) <= done_at:
+            acked.add(tid)
+        elif proof is not None and proof(tid, card):
+            acked.add(tid)  # evidence beats the batch state: the final notice was shown and answered
+        elif stamped and local and float(at) > done_at:
+            stale = True
+    out: dict[str, Any] = {}
+    if acked:
+        covered = set(row.get("covered") or []) | acked
+        out["covered"] = covered - acked  # acked cards are done: they leave both sets
+        out["batch"] = set(row.get("batch") or []) - acked
+    if stale:
+        out.update(done_sig=None, claim_sig=None)
+    return out
+
+
+def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: float) -> bool:
+    """A kanban/close-out notice naming ``tid`` reached the chat at or after ``since`` (its completion) and an
+    assistant reply followed it: the final handoff was shown and answered."""
+    ids = [i for i in dict.fromkeys(ids) if i]
+    bare = _bare(tid)
+    if not ids or not bare:
+        return False
+    for path in state_dbs:
+        try:
+            conn = ro_connect(Path(path))
+        except sqlite3.Error:
+            continue
+        try:
+            ph = ",".join("?" for _ in ids)
+            rows = conn.execute(f"SELECT role, content, timestamp FROM messages WHERE session_id IN ({ph}) "
+                                f"AND timestamp >= ? ORDER BY timestamp", (*ids, float(since))).fetchall()
+            notice_at = None
+            for r in rows:
+                text = str(r["content"] or "")
+                if notice_at is None:
+                    if r["role"] == "user" and NOTICE_RE.match(text) and bare in text:
+                        notice_at = float(r["timestamp"])
+                elif r["role"] == "assistant" and text.strip():
+                    return True
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+    return False
+
+
 # ---- the ledger ------------------------------------------------------------------------------------------------
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS waiting (
@@ -315,13 +398,19 @@ class Ledger:
         return {sid: have[sid] for sid in current}
 
 
-def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict]) -> dict[str, list[str]]:
+def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
+                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None) -> dict[str, list[str]]:
     """``{session_id: batch ids}`` for chats whose whole batch has settled but whose close-out turn has not run for
-    that state: the sidebar keeps them grey "waiting" until the closing answer lands."""
+    that state: the sidebar keeps them grey "waiting" until the closing answer lands. Read-only; it applies the
+    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip."""
     out: dict[str, list[str]] = {}
     for row in ledger.pending():
-        if closeout_key(row, read(row["batch"])):
-            out[row["session_id"]] = sorted(row["batch"])
+        cards = read(row["batch"])
+        sid = row["session_id"]
+        fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
+        row = {**row, **fix}
+        if row["batch"] and pending_key(row, cards):
+            out[sid] = sorted(row["batch"])
     return out
 
 
@@ -369,7 +458,10 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
         fields.update(settled_sig=key, settled_at=now)  # the watchdog's "settled since" clock
     closing = bool(observed_sig) or row.get("closing") is not None
     if closing:
-        done = key or row.get("settled_sig")  # the waker covered the batch before the turn: its key was stamped
+        # The waker covered the batch before the turn, so its key was stamped. Only trust that stamp while the whole
+        # batch is still settled: a card reopened during the turn (reviewer -> running) makes the stamp stale, and
+        # stamping it as done would hide the card's final handoff forever.
+        done = key or (row.get("settled_sig") if settled_sig(batch, cards) else None)
         if done:
             fields.update(done_sig=done, done_at=now)
         covered |= {i for i in batch if is_settled(cards.get(i))}
@@ -395,8 +487,8 @@ def closeout_due(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, unsee
     """The close-out key when this chat needs a close-out turn now, else None. Rules: every batch card settled
     and at least one not reported by an earlier close-out; nobody claimed this key; its notices were handed over
     (no unseen results); the user did not type here in the last 5 min; under the per-chat hourly wake cap."""
-    key = closeout_key(row, cards)
-    if not key or key == row.get("done_sig") or key == row.get("claim_sig"):
+    key = pending_key(row, cards)
+    if not key or key == row.get("claim_sig"):
         return None
     if unseen > 0 or now - (last_user_at or 0) < USER_QUIET_S:
         return None

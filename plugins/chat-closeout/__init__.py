@@ -124,6 +124,18 @@ def open_card_ids(session_id: str) -> list[str]:
     return sorted({core.card_key(t) for t in ksa.session_tasks([session_id], ksa.LISTED_STATUSES)})
 
 
+def session_proof(sid: str, tid: str, card: dict) -> bool:
+    """Transcript evidence that a finished card's final notice was delivered to the chat and answered."""
+    try:
+        at = card.get("completed_at")
+        if at is None:
+            return False
+        return core.ack_proven(state_dbs(), _lineage(sid), tid, float(at))
+    except Exception:
+        logger.debug("chat-closeout: ack proof unavailable", exc_info=True)
+        return False
+
+
 def _eligible(session_id: str, platform: str = "") -> bool:
     return bool(session_id) and not _off() and not os.environ.get("HERMES_KANBAN_TASK") \
         and (platform or "").lower() not in SKIP_PLATFORMS
@@ -157,8 +169,14 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not row or not row.get("batch"):
             return None
         cards = read_cards(row["batch"])
-        key = core.closeout_key(row, cards)
-        if not key or key == row.get("done_sig") or row.get("closing") is not None:
+        fix = core.reconcile_done(row, cards, lambda t, c: session_proof(session_id, t, c))
+        if fix:
+            ledger().write(session_id, **fix)
+            row = {**row, **fix}
+            if not row["batch"]:
+                return None
+        key = core.pending_key(row, cards)
+        if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
         ledger().write(session_id, closing=sorted(row["batch"]))
@@ -223,7 +241,7 @@ def waiting_source() -> dict[str, list[str]]:
     if hit and mono - hit[0] < 3.0:
         return hit[1]
     try:
-        out = core.pending_closeouts(ledger(), read_cards)
+        out = core.pending_closeouts(ledger(), read_cards, proof=session_proof)
     except Exception:
         logger.debug("chat-closeout waiting source failed", exc_info=True)
         out = {}
@@ -273,7 +291,8 @@ def _unseen_counts() -> Optional[dict[str, int]]:
 
 def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]] = None,
               unseen: Optional[dict[str, int]] = None, last_user: Optional[Callable[[list[str]], float]] = None,
-              read: Callable[[list[str]], dict] = read_cards) -> list[dict]:
+              read: Callable[[list[str]], dict] = read_cards,
+              proof: Optional[Callable[[str, str, dict], bool]] = None) -> list[dict]:
     """One close-out pass over the ledger. Returns what it did (for logs/tests)."""
     now = time.time() if now is None else now
     if wake is None:
@@ -291,16 +310,18 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
         sid = row["session_id"]
         cards = read(row["batch"])
         fix = core.reconcile(row, cards)
+        fix.update(core.reconcile_done({**row, **fix}, cards,
+                                       lambda t, c, sid=sid: (proof or session_proof)(sid, t, c)))
         if fix:
             led.write(sid, **fix)
             row = {**row, **fix}
             if not row["batch"]:
                 continue
-        key = core.closeout_key(row, cards)
+        key = core.pending_key(row, cards)
         if key and key != row.get("settled_sig"):
             led.write(sid, settled_sig=key, settled_at=now)
         ids = _lineage(sid)
-        if key and key != row.get("done_sig") and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
+        if key and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
             if _state.setdefault("capped", {}).get(sid) != key:
                 _state["capped"][sid] = key
                 logger.warning("chat-closeout: %s hit the %d wakes/hour cap; close-out deferred", sid,

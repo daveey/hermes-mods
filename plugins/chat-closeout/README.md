@@ -32,6 +32,14 @@ New batches use local `board/task` keys and remote `gateway/profile/board/task` 
 
 A remote done/archive settles only with a fresh, verified origin release. Unknown, stale, missing and review remain unfinished; current explicit `needs_input`/`capability` blockers still produce the human ask. Local settlement behavior is unchanged. Historical bare-ID batches resolve only when unambiguous: collisions or an unreadable remote inventory remain unknown rather than borrowing local completion. Such ambiguous historical entries require explicit reconciliation, not an automatic ownership guess. Remote projection currently has no handoff summary, so the brief says `(no handoff)` rather than substituting a local result.
 
+## One pending decision
+
+`core.pending_key` is the single "does this row need a close-out" answer used by the sidebar source, `pre_llm_call`,
+the waker and `closeout_due`. `core.reconcile_done` settles rows whose `done_sig` would otherwise hide a card forever:
+done before the stamped close-out, or notice delivered and answered after completion (`ack_proven` over state.db) ->
+covered; completed after the stamp with no proof -> `done_sig` cleared so the final handoff is closed out. A card
+reopened during a close-out turn no longer gets its stale `settled_sig` stamped as `done_sig`.
+
 ## Tests
 
 Unit tests use throwaway SQLite files. Core integration additionally exercises real owner observation, receipt acceptance and projection using isolated owner/replica/origin databases; set `HERMES_CORE_SOURCE` to the fork checkout to enable those cases. Keep worker safety environment pins intact.
