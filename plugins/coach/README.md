@@ -105,7 +105,15 @@ The draft core's `kanban_consumer_health` publishes in-memory read-only receipts
 thread-frame introspection. This is point-in-time local consumer health, not eventual delivery.
 Remote, scheduled, dependency-waiting, cross-profile, paraphrased-goal and non-TUI-return cases
 remain UNKNOWN. Native wake/dependency rows are inspected but do not prove dispatcher health;
-no cached tool assertion certifies ownership.
+no cached tool assertion certifies ownership. Native dependency waits come from actual links,
+not a `block_kind` label: `link_tasks` can gate a task without setting one. The bounded
+ancestor readback rejects dangling links, cycles and oversized graphs, and never executes
+wake commands. A valid wait snapshot still does not certify a live dispatcher.
+The current origin request is read in a consistent state transaction and must not be observed,
+synthetic/display-only, a compression summary, or marked as provenance-lost. Malformed
+metadata is UNKNOWN, not trusted user scope. Tests: `test_goal_waiting_readback.py` uses
+native wait producers and release operations; `test_goal_owner_user_provenance.py` covers
+these origin exclusions and the public gate's UNKNOWN telemetry.
 Scope recovery reads only real user rows through bounded, profile-qualified compression ancestry.
 Rotation transfers captured restrictions/tool pairs; restart requires a unique current request anchor.
 Before core persists that request, its runtime-stamped message timestamp bounds recovery instead.

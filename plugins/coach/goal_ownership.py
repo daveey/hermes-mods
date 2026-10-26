@@ -62,9 +62,10 @@ def authoritative_owner(v, evidence, session_id):
     try:
         # Never SessionDB()/kb.connect(): those may create/migrate/write stores.
         with closing(_ro_connect(Path(get_hermes_home()) / 'state.db')) as state:
+            state.execute('BEGIN')
             origin = state.execute('SELECT profile_name FROM sessions WHERE id=?', (session_id,)).fetchone()
-            current = state.execute("SELECT content FROM messages WHERE session_id=? AND role='user' ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
-            if not origin or origin['profile_name'] != profile or not current or current['content'] != request:
+            current = state.execute("SELECT content, observed, display_kind, _compressed_summary, display_metadata FROM messages WHERE session_id=? AND role='user' ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+            if not origin or origin['profile_name'] != profile or not _current_user_matches(current, request):
                 raise ValueError('owner_current_request_mismatch')
         # Resolve an explicit board, but refuse environment-pinned foreign paths.
         expected = (kb.kanban_home() / 'kanban.db' if ref['board'] == 'default'
@@ -185,3 +186,23 @@ def _live_result_consumer(session_id, home, board_path):
         raise ValueError('owner_result_consumer_unverified')
     if not kanban_consumer_health.available(home, session_id, board_path):
         raise ValueError('owner_result_consumer_unverified')
+
+
+def _current_user_matches(row, request):
+    """Matching text does not authenticate a synthetic or provenance-lost row.
+
+    Do not skip a newer synthetic row to find a convenient older request.
+    The wire sidecar is never user authority.
+    """
+    import json
+    if (row is None or row['content'] != request or row['observed']
+            or row['display_kind'] is not None or row['_compressed_summary']):
+        return False
+    raw = row['display_metadata']
+    if raw is None:
+        return True
+    try:
+        metadata = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(metadata, dict) and not metadata.get('user_content_sanitized')
