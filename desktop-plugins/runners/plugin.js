@@ -434,7 +434,8 @@ export function rowState(r, source, hostRow, now) {
     causes: false, failed: [], explained: [], unexplained: [], warned: [], notObserved: []
   }
   const causes = checks.state === 'unknown' || invalidIdentity ? null : readinessCauses(r.readiness_evidence, now)
-  if (causes && (checks.state !== 'fail' || causes.failed.length)) {
+  // Causes must agree with the owner's aggregate in both directions.
+  if (causes && (checks.state === 'fail') === (causes.failed.length > 0) && !(checks.state === 'pass' && causes.warned.length)) {
     // An explanation is trusted only when this client also sees the matching
     // hold as current; service is explained only by a current systemd drain.
     const current = new Set(operational.filter(e => e.held).map(e => `operational:${e.kind}:${e.source}`))
@@ -494,6 +495,12 @@ export function rowState(r, source, hostRow, now) {
     evidence: { state: stale ? 'unknown' : 'fresh', observedAt: provenance?.observed_at || null, expiresAt: provenance?.expires_at || null },
     maintenance: operational.some(e => e.held && e.kind === 'maintenance'),
     issue: bucket === 'failed' || bucket === 'unknown' || checks.state === 'warn' || checks.warned.length > 0,
+    // Chip/scope issue count keeps parity with the owner API's canonical
+    // counts.issues (stale, non-online registration, or fail/warn readiness);
+    // the Needs-attention filter above uses the display-precedence `issue`.
+    apiIssue: sourceStale || r.freshness !== 'fresh' ||
+      (!!provenance && (provenance.state !== 'fresh' || !(Date.parse(provenance.expires_at) > now))) ||
+      ['offline', 'missing', 'unknown'].includes(r.registration) || ['fail', 'warn'].includes(r.readiness),
     ready, inspectable: !source.error && !invalidIdentity,
     actionable: !stale && !invalidIdentity && !conflicting,
     tone: bucket === 'failed' ? 'bad' : bucket === 'held' ? 'warn' : ready ? 'good' : 'muted'
@@ -601,6 +608,7 @@ export function projectFleet(sources = [], now = Date.now()) {
           row.tone = 'warn'
           row.ready = false
           row.issue = true
+          row.apiIssue = true
         }
         rows.set(key, row)
       } else rows.set(key, candidate)
@@ -615,7 +623,7 @@ export function projectFleet(sources = [], now = Date.now()) {
     busy: list.filter((r) => r.activity === 'busy').length,
     ready: list.filter((r) => r.ready).length,
     unverified: list.filter((r) => r.registration === 'online' && !r.ready).length,
-    issues: list.filter((r) => r.issue).length + groups.filter((g) => g.issue).length
+    issues: list.filter((r) => r.apiIssue).length + groups.filter((g) => g.issue).length
   }
   const complete =
     sources.length > 0 &&

@@ -6,7 +6,7 @@ An earlier review found the held fixture paired `not_checked` readiness with a f
 
 ## Latest executed results
 
-- Node: **163 passed, 0 failed** (includes `readiness-evidence.test.mjs` and API count-parity regressions). Owner backend suite `plugins/runners/tests`: all pass except `test_models.py::test_strict_validation_no_values[Observation-collected_at-not-time]`, which fails identically on unmodified `origin/main` in this environment.
+- Node: **165 passed, 0 failed** (includes `readiness-evidence.test.mjs`, API count-parity and aggregate-consistency regressions). Owner backend suite `plugins/runners/tests`: all pass except `test_models.py::test_strict_validation_no_values[Observation-collected_at-not-time]`, which fails identically on unmodified `origin/main` in this environment.
 - Browser `npm test`: **97 checks passed, 0 failed**, zero browser page errors; **23 captures**; three consecutive green runs. Machine evidence: local `report.json`.
 - All fixtures are fictional public-contract data. These results do not claim deployment.
 
