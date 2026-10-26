@@ -173,8 +173,18 @@ def pending_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Option
     return key if key and key != row.get("done_sig") else None
 
 
-def _bare(tid: str) -> str:
-    return str(tid).split("/")[-1]
+def _notice_matches(text: str, tid: str) -> bool:
+    """Legacy notices are local-board scoped. Never strip a remote owner to a bare id."""
+    match = re.match(r"^\s*✔\s*\[([^\]]+)\]\s+@\S+\s+Kanban\s+(\S+)\s+(done|archived)(?:\s|$)", text)
+    if not match:
+        return False
+    board, named, _ = match.groups()
+    parts = str(tid).split('/')
+    if len(parts) == 4:
+        return named == tid and board == parts[2]
+    if len(parts) == 2:
+        return board == parts[0] and named == parts[1]
+    return len(parts) == 1 and board == 'default' and named == tid
 
 
 def reconcile_done(row: dict[str, Any], cards: dict[str, dict[str, Any]],
@@ -198,7 +208,7 @@ def reconcile_done(row: dict[str, Any], cards: dict[str, dict[str, Any]],
     stale = False
     for tid in sorted(set(row.get("batch") or [])):
         card = cards.get(tid)
-        if not card or card.get("status") not in DONE_STATUSES or tid in covered:
+        if not card or not is_settled(card) or card.get("status") not in DONE_STATUSES or tid in covered:
             continue
         at = card.get("completed_at")
         local = at is not None and not card.get("remote")
@@ -219,11 +229,13 @@ def reconcile_done(row: dict[str, Any], cards: dict[str, dict[str, Any]],
 
 
 def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: float) -> bool:
-    """A kanban/close-out notice naming ``tid`` reached the chat at or after ``since`` (its completion) and an
-    assistant reply followed it: the final handoff was shown and answered."""
+    """An owner-exact final notice followed by a successful final assistant reply.
+
+    Missing legacy completion metadata is ambiguous, not acknowledgement. Inactive,
+    commentary, failed, interrupted and tool-calling messages cannot close work.
+    """
     ids = [i for i in dict.fromkeys(ids) if i]
-    bare = _bare(tid)
-    if not ids or not bare:
+    if not ids or not tid:
         return False
     for path in state_dbs:
         try:
@@ -231,16 +243,24 @@ def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: f
         except sqlite3.Error:
             continue
         try:
+            required = {'display_kind', 'finish_reason', 'tool_calls', 'active'}
+            if not required.issubset(_cols(conn, 'messages')):
+                continue
             ph = ",".join("?" for _ in ids)
-            rows = conn.execute(f"SELECT role, content, timestamp FROM messages WHERE session_id IN ({ph}) "
+            rows = conn.execute(f"SELECT role, content, timestamp, display_kind, finish_reason, tool_calls "
+                                f"FROM messages WHERE session_id IN ({ph}) AND active=1 "
                                 f"AND timestamp >= ? ORDER BY timestamp", (*ids, float(since))).fetchall()
             notice_at = None
             for r in rows:
                 text = str(r["content"] or "")
-                if notice_at is None:
-                    if r["role"] == "user" and NOTICE_RE.match(text) and bare in text:
-                        notice_at = float(r["timestamp"])
-                elif r["role"] == "assistant" and text.strip():
+                if r['role'] == 'user':
+                    # A different user turn breaks the causal notice/reply pair.
+                    notice_at = float(r['timestamp']) if _notice_matches(text, tid) else None
+                elif (notice_at is not None and r['role'] == 'assistant' and text.strip()
+                      and float(r['timestamp']) > notice_at
+                      and r['display_kind'] in (None, '', 'final')
+                      and r['finish_reason'] in ('stop', 'end_turn')
+                      and r['tool_calls'] in (None, '', '[]', 'null')):
                     return True
         except sqlite3.Error:
             pass

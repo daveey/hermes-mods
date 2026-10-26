@@ -40,6 +40,12 @@ done before the stamped close-out, or notice delivered and answered after comple
 covered; completed after the stamp with no proof -> `done_sig` cleared so the final handoff is closed out. A card
 reopened during a close-out turn no longer gets its stale `settled_sig` stamped as `done_sig`.
 
+Historical acknowledgement requires trusted settled state even when a transcript proof callback succeeds.
+Notices match the exact board/task or full remote owner key, never a bare-ID substring. Ambiguous legacy remote
+notices fail closed. Only active successful final replies (`stop`/`end_turn`, no tool calls, no commentary or failed
+turn display kind) count; missing completion metadata and interrupted replies remain unacknowledged.
+Registration logs `owner-final-proof-v2` and the selected module paths to distinguish activation from files on disk.
+
 ## Tests
 
 Unit tests use throwaway SQLite files. Core integration additionally exercises real owner observation, receipt acceptance and projection using isolated owner/replica/origin databases; set `HERMES_CORE_SOURCE` to the fork checkout to enable those cases. Keep worker safety environment pins intact.

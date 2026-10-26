@@ -142,7 +142,8 @@ def test_ack_proof_from_transcript(tmp_path):
     db = tmp_path / 'state.db'
     c = sqlite3.connect(db)
     c.execute('create table messages (id integer primary key, session_id text, role text, content text, '
-              'timestamp real, display_kind text)')
+              'timestamp real, display_kind text, finish_reason text DEFAULT "stop", '
+              'tool_calls text, active integer DEFAULT 1)')
     rows = [('s', 'user', '✔ [default] @default Kanban t_x done — x', 1462.0),
             ('s', 'assistant', 'Confirmed: final review passed', 1473.0)]
     for r in rows:
