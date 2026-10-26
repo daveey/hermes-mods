@@ -39,8 +39,23 @@ Coverage never claims complete merely because a tick finished. HTTP/SSH have
 bounded subprocess deadlines; partial pagination never replaces last-known rows.
 No LLM or notifications run on ticks.
 
-Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/inventory`, GET
-`/runners/{id}`, POST `/refresh`. GETs read SQLite only. Refresh queues bounded,
+Permission denials (403/404 without quota or secondary-throttle evidence) cool down
+only the denied resource. Actual rate limits share the credential quota key.
+Cooldown cause and deadline survive collector restart; the API exposes sanitized
+error codes and retry delays, and the panel ages the displayed delay from its
+observation time. GitHub OS aliases are normalized case-insensitively.
+
+Each runner's provenance records its last actual observation, not the latest
+collector attempt. The panel shows this row age separately from the collector
+heartbeat. Failed refreshes retain last-known registrations without asserting
+fresh readiness or available capacity.
+
+Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/enrollment`, GET
+`/inventory`, GET `/runners/{id}`, POST `/refresh`. Enrollment returns the explicit
+profile, enrollment flag and observe capabilities without opening the database or
+starting a collector. A profile with no runners configuration is not enrolled;
+invalid configuration or an unavailable plugin is not silently treated as empty.
+Other GETs read SQLite only. Refresh queues bounded,
 deduplicated asynchronous work. Core gateway authentication plus profile and
 same-origin/CSRF fences apply; no standalone unauthenticated fallback exists.
 Config parsing is stat-fenced/cached while response freshness and owner checks run
