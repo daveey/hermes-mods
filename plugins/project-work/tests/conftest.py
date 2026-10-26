@@ -61,6 +61,23 @@ class Ports:
             raise TimeoutError('uncertain card create')
         return key
 
+    def verify_approval(self, ctx, row, plan_hash):
+        return True
+
+    def thread_events(self, row):
+        return []
+
+    def recover_card(self, workflow_id, stage, params):
+        key = params['idempotency_key']
+        return key if key in self.cards else None
+
+    def quiesce_generation(self, row, old):
+        for entry in old['cards'].values():
+            card = self.cards[entry.get('id') or entry['params']['idempotency_key']]
+            if card['status'] != 'done':
+                card['status'] = 'cancelled'
+        return True
+
     def prompt(self, session_id, text, idempotency_key):
         self.calls.append(('prompt', idempotency_key))
         if self.fail == 'prompt':
@@ -107,6 +124,6 @@ def env(tmp_path):
 def start(service, ctx, text):
     row = service.request(ctx, text)
     if row['state'] == 'awaiting_approval':
-        row = service.propose_plan(row['workflow_id'], 'Implement the request and run its tests.')
+        row = service.propose_plan(row['workflow_id'], 'Implement the request and run its tests.', row['generation'])
         row = service.approve(ctx, row['workflow_id'], row['plan_hash'])
     return row

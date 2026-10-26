@@ -10,7 +10,7 @@ def test_owner_request_requires_current_concrete_plan(env):
     assert row['stored_session_id'] and not ports.cards
     with pytest.raises(PermissionError):
         service.approve(ctx, row['workflow_id'], '')
-    plan = service.propose_plan(row['workflow_id'], 'Change only documentation; run link tests.')
+    plan = service.propose_plan(row['workflow_id'], 'Change only documentation; run link tests.', row['generation'])
     with pytest.raises(PermissionError):
         service.approve(ctx, row['workflow_id'], 'forged')
     result = service.approve(ctx, row['workflow_id'], plan['plan_hash'])
@@ -19,7 +19,7 @@ def test_owner_request_requires_current_concrete_plan(env):
     assert kinds.index('prompt') < kinds.index('create_card')
 
 
-def test_followup_invalidates_approval_and_old_work_remains_gate(env):
+def test_followup_invalidates_approval_and_quiesces_old_work(env):
     service, ctx, ports = env
     row = start(service, ctx, 'first')
     old_hash = row['plan_hash']
@@ -28,13 +28,14 @@ def test_followup_invalidates_approval_and_old_work_remains_gate(env):
     assert not newer['approved'] and newer['plan_hash'] is None
     with pytest.raises(PermissionError):
         service.approve(ctx, row['workflow_id'], old_hash)
-    plan = service.propose_plan(row['workflow_id'], 'New plan')
+    plan = service.propose_plan(row['workflow_id'], 'New plan', newer['generation'])
     newer = service.approve(ctx, row['workflow_id'], plan['plan_hash'])
     for card in newer['cards'].values():
         ports.cards[card['id']]['status'] = 'done'
     result = service.closeout(row['workflow_id'], 'complete')
-    assert 'Earlier generation' in result['error']
-    assert not ports.posts
+    assert result['error'] is None
+    assert result['history'][0]['retired']
+    assert all(ports.cards[e['id']]['status'] == 'cancelled' for e in row['cards'].values())
 
 
 @pytest.mark.parametrize('field,value', [('busy', True), ('busy', None), ('pending_approval', True), ('pending_approval', None)])

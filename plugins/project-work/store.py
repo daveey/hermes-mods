@@ -69,6 +69,17 @@ class Store:
         with self.connect() as db:
             return [json.loads(r[0]) for r in db.execute('SELECT data FROM workflows')]
 
+    def seen(self, ctx):
+        with self.connect() as db:
+            return db.execute('SELECT 1 FROM inbound WHERE team_id=? AND channel_id=? AND message_id=?',
+                              (ctx.team_id, ctx.channel_id, ctx.message_id)).fetchone() is not None
+
+    def record(self, ctx, text, workflow_id):
+        from dataclasses import asdict
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO inbound VALUES (?,?,?,?,?,?)',
+                (ctx.team_id, ctx.channel_id, ctx.message_id, workflow_id, json.dumps(asdict(ctx)), text))
+
     def receive(self, context, text, policy, approved=False, followup=False):
         """Caller holds lock. Atomic inbound uniqueness and generation transition."""
         team, channel = context['team_id'], context['channel_id']
@@ -85,7 +96,7 @@ class Store:
                 row = json.loads(found[0])
                 if row['policy'] != policy:
                     raise PermissionError('Stored policy differs from configured policy')
-                snapshot = {k: v for k, v in row.items() if k != 'history'}
+                snapshot = {k: v for k, v in row.items() if k not in ('history', 'text', 'source_ids', 'approval_attempts')}
                 row.setdefault('history', []).append(snapshot)
                 row.update(generation=row['generation'] + 1, cards={}, evidence={},
                            result_text=None, result_receipt=None, state='pending', error=None,
@@ -99,7 +110,10 @@ class Store:
                            result_text=None, result_receipt=None, state='pending', error=None,
                            prompt_state=None, session_state=None, plan=None, plan_hash=None)
                 row['title'] = 'Project work ' + row['workflow_id']
-            row.update(context=context, text=text, message_id=context['message_id'])
+            chain = row.get('text', '')
+            row.setdefault('source_ids', []).append(context['message_id'])
+            row.update(context=context, text=(chain + '\n\nFollow-up:\n' + text if chain else text),
+                       message_id=context['message_id'])
             db.execute('INSERT INTO inbound VALUES (?,?,?,?,?,?)',
                        (team, channel, context['message_id'], row['workflow_id'], json.dumps(context), text))
             db.execute('INSERT INTO workflows VALUES (?,?,?,?,?) ON CONFLICT(workflow_id) DO UPDATE SET data=excluded.data',

@@ -13,9 +13,23 @@ if not __package__:
     __package__ = package.__name__
 
 Client = importlib.import_module(__package__ + '.client').Client
+DurableIngressQueue = importlib.import_module(__package__ + '.client').DurableIngressQueue
 load_config = importlib.import_module(__package__ + '.config').load_config
 _ingress = importlib.import_module(__package__ + '.ingress')
 Ingress, register_tools = _ingress.Ingress, _ingress.register_tools
+
+
+def require_sandbox():
+    # execute_code uses this same terminal backend. Local/SSH/custom backends
+    # cannot establish that host sockets are inaccessible; fail closed.
+    from tools.terminal_tool import _get_env_config
+    config = _get_env_config()
+    backend = config.get('env_type')
+    if backend not in {'docker', 'modal', 'daytona', 'vercel'}:
+        raise PermissionError('Project work requires a sandboxed terminal/code backend')
+    if backend == 'docker' and any(config.get(key) for key in (
+            'docker_volumes', 'docker_extra_args', 'docker_mount_cwd_to_workspace')):
+        raise PermissionError('Project work forbids host mounts and custom Docker arguments')
 
 
 def register(ctx):
@@ -24,10 +38,14 @@ def register(ctx):
     if not (home / 'project-work.json').exists():
         return
     policy, endpoint, _ = load_config(home)
+    require_sandbox()
     # Profile-local configuration is necessary but not sufficient: prove the
     # gateway has bound this profile before authorizing each individual turn.
-    ingress = Ingress(policy, Client(endpoint))
+    client = Client(endpoint)
+    queue = DurableIngressQueue(endpoint.parent / 'ingress.sqlite3', client)
+    ingress = Ingress(policy, client, queue)
     def wire(native, adapter):
         native.use(ingress.middleware)
     ctx.register_platform_handler('slack', wire)
     register_tools(ctx, ingress)
+    queue.start()

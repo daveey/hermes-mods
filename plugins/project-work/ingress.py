@@ -1,5 +1,5 @@
 """Authenticated Slack ingress. Only request/status are exposed to the model."""
-import asyncio
+import logging
 from collections import OrderedDict
 from dataclasses import asdict
 import json
@@ -10,8 +10,9 @@ from .service import AuthContext
 
 
 class Ingress:
-    def __init__(self, policy, client):
+    def __init__(self, policy, client, queue=None):
         self.policy, self.client = policy, client
+        self.queue = queue
         self.events = OrderedDict()
         self.lock = threading.Lock()
 
@@ -20,7 +21,9 @@ class Ingress:
         ev = body.get('event', {})
         if (body.get('type') != 'event_callback' or body.get('team_id') != self.policy.team_id
                 or ev.get('channel') != self.policy.channel_id or ev.get('type') not in ('message', 'app_mention')
-                or not ev.get('user') or not ev.get('ts') or ev.get('bot_id') or ev.get('subtype')):
+                or not ev.get('user') or not ev.get('ts') or ev.get('bot_id')
+                or ev.get('user_team', self.policy.team_id) != self.policy.team_id
+                or ev.get('subtype') not in (None, 'file_share', 'thread_broadcast', 'me_message')):
             return None
         ctx = AuthContext('slack', body['team_id'], ev['channel'], ev['ts'],
                           ev.get('thread_ts'), ev['user'], self.policy.ingress_profile)
@@ -43,7 +46,8 @@ class Ingress:
         key = (value('SCOPE_ID'), value('CHAT_ID'), value('MESSAGE_ID'), value('USER_ID'))
         with self.lock:
             ctx = self.events.get(key)
-        if ctx is None or (ctx.thread_id or '') != value('THREAD_ID'):
+        allowed_threads = {ctx.thread_id} if ctx and ctx.thread_id else {'', ctx.message_id} if ctx else set()
+        if ctx is None or value('THREAD_ID') not in allowed_threads:
             raise PermissionError('No authenticated Slack event for this turn')
         return ctx
 
@@ -57,9 +61,19 @@ class Ingress:
         return self.client.call('status', context=asdict(ctx), workflow_id=args['workflow_id'])
 
     async def middleware(self, body, next):
+        try:
+            self.enqueue(body)
+        except Exception:
+            logging.getLogger(__name__).exception('Project ingress append failed')
+        finally:
+            # Native Bolt routing/ack must run even on malformed input or disk failure.
+            result = await next()
+        return result
+
+    def enqueue(self, body):
         ctx = self.observe(body)
         if ctx is None:
-            return await next()
+            return
         text = body['event'].get('text', '')
         # Strip only a leading bot mention, never arbitrary interior content.
         command = re.sub(r'^<@[A-Z0-9]+>\s*', '', text).strip()
@@ -75,10 +89,9 @@ class Ingress:
             # Unknown threads are ignored by the server, not converted to new workflows.
             operation, args = 'observe_followup', {'text': text}
         if operation:
-            await asyncio.to_thread(self.client.call, operation, context=asdict(ctx), **args)
-        # Keep native Slack routing/home-channel behavior untouched. Tool calls dedupe
-        # the same event if Alpha also decides to request work from it.
-        return await next()
+            if self.queue is None:
+                raise RuntimeError('Durable ingress queue is required')
+            self.queue.append(operation, context=asdict(ctx), **args)
 
 
 def register_tools(ctx, ingress):

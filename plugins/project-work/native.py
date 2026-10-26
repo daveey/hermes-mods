@@ -4,8 +4,10 @@ Inject trusted host-side callables (never model arguments):
   rpc(method, params) -> unwrapped native result
   owner_tool(name, arguments, live_session_id) -> native tool result
   sessions(query) -> normalized exact persisted session rows (with messages)
-  cards(card_id) -> normalized native card row
-  slack(method, payload) -> native Slack Web API response
+  cards(card_id) -> native Task fields plus trusted board and parents readback
+  projects(query) -> native Project.to_dict plus verified profile and repo
+  card_keys(query) -> all matching task IDs, including archived (never truncated)
+  slack(method, payload) -> native Slack Web API response for policy.team_id
   evidence(workflow_row) -> freshly collected evidence facts; see verify_evidence
 
 The deployment binds these to its supervised native gateway/owner conversation,
@@ -18,10 +20,13 @@ import uuid
 
 
 class NativeBridge:
-    def __init__(self, policy, *, rpc, owner_tool, sessions, cards, slack, evidence, bot_user_id):
+    def __init__(self, policy, *, rpc, owner_tool, sessions, cards, slack, evidence, bot_user_id,
+                 projects=None, card_keys=None, quiesce=None):
         self.policy = policy
         self.rpc, self.owner_tool = rpc, owner_tool
         self.sessions, self.cards, self.slack, self.evidence = sessions, cards, slack, evidence
+        self.projects, self.card_keys = projects, card_keys
+        self.quiesce = quiesce
         self.bot_user_id = bot_user_id
         self.live = {}
 
@@ -99,7 +104,55 @@ class NativeBridge:
             raise PermissionError('Not a workflow session')
         return self.rpc('session.archive', {'session_key': stored_id, 'profile': profile, 'archived': archived})
 
-    def create_card(self, workflow_id, stage, params):
+    def _card_scope(self, workflow_id, stage, params):
+        """Resolve the project in the *owner tool's* profile before any write.
+
+        projects(query) returns a native Project.to_dict(), augmented by trusted
+        profile and repo facts (repo verified from primary_path's git remote).
+        card_keys(query) returns ALL matching native task IDs, including archived,
+        from the requested owner profile and board. It must never use the native
+        create tool's active-only idempotency lookup.
+        """
+        if not callable(self.projects) or not callable(self.card_keys):
+            raise RuntimeError('Trusted project lookup and archived-inclusive card recovery required')
+        live, stored, marker = self._card_target(workflow_id, stage, params)
+        project = self.projects({'project': self.policy.project, 'profile': self.policy.builder_profile})
+        if (not isinstance(project, dict) or not project.get('id')
+                or self.policy.project not in (project.get('id'), project.get('slug'))
+                or project.get('profile') != self.policy.builder_profile
+                or project.get('board_slug') != self.policy.board
+                or project.get('primary_path') != self.policy.cwd
+                or project.get('repo') != self.policy.repo or project.get('archived') is not False):
+            raise PermissionError('Native project mapping outside workflow policy')
+        return live, stored, marker, project
+
+    def _validate_card(self, card_id, params, scope):
+        _, stored, marker, project = scope
+        card = self.get_card(card_id)
+        expected = {'id': card_id, 'board': self.policy.board, 'project_id': project['id'],
+                    'assignee': params['profile'], 'session_id': stored,
+                    'parents': params['depends_on'], 'idempotency_key': params['idempotency_key'],
+                    'workspace_kind': 'worktree',
+                    'workspace_path': self.policy.cwd + '/.worktrees/' + card_id,
+                    'completion_contract': self.policy.repo}
+        if (not isinstance(card, dict) or any(card.get(k) != v for k, v in expected.items())
+                or not (card.get('body') or '').startswith(marker + '\n')):
+            raise RuntimeError('Native card scope readback failed')
+        return card_id
+
+    def _recover_card(self, params, scope):
+        ids = self.card_keys({'idempotency_key': params['idempotency_key'],
+                             'board': self.policy.board, 'profile': self.policy.builder_profile,
+                             'include_archived': True})
+        if not isinstance(ids, list) or len(ids) > 1:
+            raise RuntimeError('Ambiguous or incomplete native card recovery')
+        return self._validate_card(ids[0], params, scope) if ids else None
+
+    def recover_card(self, workflow_id, stage, params) -> str | None:
+        """Read-only recovery after a saved create_intent; never creates on a miss."""
+        return self._recover_card(params, self._card_scope(workflow_id, stage, params))
+
+    def _card_target(self, workflow_id, stage, params):
         if stage not in ('implement', 'review', 'release'):
             raise ValueError('Unknown stage')
         expected = {'board': self.policy.board, 'project': self.policy.project,
@@ -112,8 +165,18 @@ class NativeBridge:
         if session.get('title') != 'Project work ' + workflow_id:
             raise PermissionError('Card owner session mismatch')
         marker = f"project-work:{workflow_id}:{params['generation']}:{stage}"
+        return live, stored, marker
+
+    def create_card(self, workflow_id, stage, params):
+        """First attempt only. Persisted uncertain intents MUST use recover_card."""
+        scope = self._card_scope(workflow_id, stage, params)
+        recovered = self._recover_card(params, scope)
+        if recovered is not None:
+            return recovered
+        live, stored, marker, project = scope
         args = {'title': f'{stage}: {workflow_id}', 'assignee': params['profile'],
-                'board': params['board'], 'project': params['project'],
+                'session_id': stored, 'workspace_kind': 'worktree',
+                'board': params['board'], 'project': project['id'],
                 'parents': params['depends_on'], 'idempotency_key': params['idempotency_key'],
                 'body': marker + '\nRepository: ' + self.policy.repo + '\nApproved plan:\n' + params['plan'] +
                     '\nRequest:\n' + params['text'] + '\nDo not change workflow scope. Keep evidence for this exact generation and commit.',
@@ -124,13 +187,23 @@ class NativeBridge:
         card_id = result.get('task_id') or result.get('id') or result.get('task', {}).get('id')
         if not card_id:
             raise RuntimeError('Native kanban_create did not return a task ID')
-        card = self.get_card(card_id)
-        if card.get('id') != card_id or marker not in card.get('body', ''):
-            raise RuntimeError('Native card ownership readback failed')
-        return card_id
+        return self._validate_card(card_id, params, scope)
 
     def get_card(self, card_id):
         return self.cards(card_id)
+
+    def quiesce_generation(self, row, old):
+        # Trusted deployment must revoke publication authorization, stop workers,
+        # and park pending cards via native APIs. A callback is not a model tool.
+        if not callable(self.quiesce):
+            raise RuntimeError('Native generation retirement adapter required')
+        proof = self.quiesce(row, old)
+        return (isinstance(proof, dict) and proof.get('workflow_id') == row['workflow_id']
+                and proof.get('generation') == old['generation']
+                and proof.get('publication_revoked') is True
+                and proof.get('live_writer') is False and proof.get('pending_dispatch') is False
+                and set(proof.get('idempotency_keys', [])) ==
+                    {e['params']['idempotency_key'] for e in old['cards'].values()})
 
     def verify_evidence(self, row):
         """Facts MUST be refreshed from native task runs, GitHub and delivery now.
@@ -204,11 +277,66 @@ class NativeBridge:
             return {'channel': row['channel_id'], 'ts': matches[0]['ts']}
         return None
 
+    def thread_events(self, row):
+        """Return [(AuthContext, text)] from a complete authenticated Slack read.
+
+        Includes approval attempts verbatim: the service must route commands before
+        ordinary followups, and dedupe by message identity. Edited/deleted or unknown
+        human subtypes fail closed rather than silently lose an obligation.
+        """
+        from decimal import Decimal
+        from .service import AuthContext
+        if row['channel_id'] != self.policy.channel_id:
+            raise PermissionError('Thread outside workflow policy')
+        events, seen = [], set()
+        for message in self._thread(row):
+            if message.get('bot_id') or message.get('user') == self.bot_user_id:
+                continue
+            ts = message.get('ts')
+            if (not ts or not message.get('user') or message.get('edited')
+                    or message.get('subtype') not in (None, 'file_share', 'thread_broadcast', 'me_message')
+                    or message.get('user_team', self.policy.team_id) != self.policy.team_id
+                    or (ts != row['thread_id'] and message.get('thread_ts') != row['thread_id'])
+                    or not isinstance(message.get('text'), str) or ts in seen):
+                raise RuntimeError('Uncertain native thread event')
+            seen.add(ts)
+            ctx = AuthContext('slack', self.policy.team_id, row['channel_id'], ts,
+                              message.get('thread_ts'), message['user'], self.policy.ingress_profile)
+            events.append((ctx, message['text']))
+        if not set(row.get('source_ids', [row['message_id']])).issubset(seen):
+            raise RuntimeError('Previously ingested source message was deleted')
+        return sorted(events, key=lambda event: Decimal(event[0].message_id))
+
+    def _approval(self, messages, row, message_id, user_id, plan_hash):
+        if user_id not in self.policy.owner_ids or not message_id or not plan_hash:
+            return False
+        matches = [m for m in messages if m.get('ts') == message_id]
+        if len(matches) != 1:
+            return False
+        m = matches[0]
+        command = re.sub(r'^<@[A-Z0-9]+>\s*', '', m.get('text', '')).strip()
+        return (m.get('user') == user_id and m.get('thread_ts') == row['thread_id']
+                and not m.get('edited') and not m.get('bot_id')
+                and m.get('subtype') in (None, 'file_share', 'thread_broadcast')
+                and command == f"!project approve {row['workflow_id']} {plan_hash}")
+
+    def verify_approval(self, ctx, row, plan_hash):
+        """Read back the exact unedited owner command; transport errors propagate."""
+        if (ctx.platform != 'slack' or ctx.team_id != self.policy.team_id
+                or ctx.profile != self.policy.ingress_profile
+                or ctx.channel_id != self.policy.channel_id or ctx.channel_id != row['channel_id']
+                or ctx.thread_id != row['thread_id'] or plan_hash != row.get('plan_hash')):
+            return False
+        return self._approval(self._thread(row), row, ctx.message_id, ctx.user_id, plan_hash)
+
     def read_result(self, row, receipt, text):
         from decimal import Decimal
         if not isinstance(receipt, dict) or receipt.get('channel') != row['channel_id']:
             return False
         messages = self._thread(row)
+        if not self._approval(messages, row, row.get('approved_message_id'),
+                              row.get('approved_by'), row.get('plan_hash')):
+            return False
         matches = [m for m in messages if m.get('ts') == receipt.get('ts')]
         if len(matches) != 1:
             return False
@@ -217,11 +345,17 @@ class NativeBridge:
                 or message.get('thread_ts') != row['thread_id'] or message.get('edited')):
             return False
         # Missing source/deleted/edited source is uncertainty, not completion.
-        source = [m for m in messages if m.get('ts') == row['message_id']]
-        if len(source) != 1 or source[0].get('edited') or source[0].get('subtype') == 'message_deleted':
-            return False
+        for source_id in row.get('source_ids', [row['message_id']]):
+            source = [m for m in messages if m.get('ts') == source_id]
+            if len(source) != 1 or source[0].get('edited') or source[0].get('subtype') == 'message_deleted':
+                return False
         for m in messages:
-            if m.get('user') == self.bot_user_id:
+            if m.get('user') == self.bot_user_id or m.get('bot_id'):
+                continue
+            if any(m.get('ts') == a['ts'] and m.get('user') == a['user']
+                   and m.get('text') == a['text'] and not m.get('edited')
+                   and m.get('thread_ts') == row['thread_id']
+                   for a in row.get('approval_attempts', [])):
                 continue
             approval = re.sub(r'^<@[A-Z0-9]+>\s*', '', m.get('text', '')).strip()
             if (m.get('ts') == row.get('approved_message_id') and m.get('user') == row.get('approved_by')

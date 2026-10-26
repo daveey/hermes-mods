@@ -50,17 +50,134 @@ def test_native_card_uses_tool_not_private_database(env):
         called.append((name, args, sid))
         return {'task_id': 'native-task'}
     def cards(cid):
-        return {'id': cid, 'body': called[0][1]['body']}
+        return native_card(service, row, params, cid, called[0][1]['body'])
     native = bridge(env, owner_tool=owner_tool, cards=cards,
+                    projects=lambda query: native_project(service), card_keys=lambda query: [],
                     sessions=lambda query: [ports.get_session(row['stored_session_id'])])
     native.live[row['session_id']] = row['stored_session_id']
     assert native.create_card(row['workflow_id'], 'implement', params) == 'native-task'
     name, args, sid = called[0]
     assert name == 'kanban_create' and sid == row['session_id']
-    assert args['project'] == service.policy.project and 'project_id' not in args
+    assert args['project'] == 'project-id' and 'project_id' not in args
     assert args['parents'] == []
     with pytest.raises(PermissionError):
         native.create_card(row['workflow_id'], 'implement', dict(params, repo='elsewhere/repo'))
+
+
+def native_project(service):
+    p = service.policy
+    # Native Project.to_dict fields plus trusted reader profile/git-remote facts.
+    return dict(id='project-id', slug=p.project, name='Project', created_at=1,
+                board_slug=p.board, primary_path=p.cwd, archived=False, folders=[],
+                profile=p.builder_profile, repo=p.repo)
+
+
+def native_card(service, row, params, cid, body):
+    # Native Task fields; board and parents are added by the scoped reader.
+    return dict(id=cid, body=body, project_id='project-id', board=service.policy.board,
+                assignee=params['profile'], session_id=row['stored_session_id'],
+                workspace_kind='worktree', workspace_path=service.policy.cwd + '/.worktrees/' + cid,
+                parents=params['depends_on'], idempotency_key=params['idempotency_key'],
+                completion_contract=service.policy.repo, status='running')
+
+
+@pytest.mark.parametrize('field', ['profile', 'repo', 'primary_path', 'board_slug', 'slug', 'archived'])
+def test_project_preflight_blocks_create(env, field):
+    service, ctx, ports = env
+    row = start(service, ctx, 'work')
+    project = native_project(service)
+    project[field] = 'wrong'
+    calls = []
+    native = bridge(env, projects=lambda q: project, card_keys=lambda q: [],
+                    owner_tool=lambda *a: calls.append(a),
+                    sessions=lambda q: [ports.get_session(row['stored_session_id'])])
+    native.live[row['session_id']] = row['stored_session_id']
+    with pytest.raises(PermissionError):
+        native.create_card(row['workflow_id'], 'implement', row['cards']['implement']['params'])
+    assert calls == []
+
+
+@pytest.mark.parametrize('field', ['project_id', 'board', 'assignee', 'session_id', 'workspace_path',
+                                   'workspace_kind', 'parents', 'idempotency_key', 'completion_contract', 'body'])
+def test_full_card_scope_readback(env, field):
+    service, ctx, ports = env
+    row = start(service, ctx, 'work')
+    params = row['cards']['implement']['params']
+    card = native_card(service, row, params, 'task', f"project-work:{row['workflow_id']}:{row['generation']}:implement\n")
+    card[field] = 'wrong'
+    native = bridge(env, projects=lambda q: native_project(service), card_keys=lambda q: ['task'],
+                    cards=lambda cid: card, sessions=lambda q: [ports.get_session(row['stored_session_id'])])
+    native.live[row['session_id']] = row['stored_session_id']
+    with pytest.raises(RuntimeError):
+        native.recover_card(row['workflow_id'], 'implement', params)
+
+
+def test_recovery_includes_archived_and_never_creates(env):
+    service, ctx, ports = env
+    row = start(service, ctx, 'work')
+    params = row['cards']['implement']['params']
+    card = native_card(service, row, params, 'task', f"project-work:{row['workflow_id']}:{row['generation']}:implement\n")
+    card['status'] = 'archived'
+    ids, queries, creates = ['task'], [], []
+    def keys(query):
+        queries.append(query)
+        return ids
+    native = bridge(env, projects=lambda q: native_project(service), card_keys=keys,
+                    cards=lambda cid: card, owner_tool=lambda *a: creates.append(a),
+                    sessions=lambda q: [ports.get_session(row['stored_session_id'])])
+    native.live[row['session_id']] = row['stored_session_id']
+    assert native.recover_card(row['workflow_id'], 'implement', params) == 'task'
+    assert native.create_card(row['workflow_id'], 'implement', params) == 'task'
+    ids.clear()
+    assert native.recover_card(row['workflow_id'], 'implement', params) is None
+    ids.extend(['task', 'duplicate'])
+    with pytest.raises(RuntimeError):
+        native.recover_card(row['workflow_id'], 'implement', params)
+    assert creates == []
+    assert all(q['include_archived'] is True and q['profile'] == service.policy.builder_profile for q in queries)
+
+
+def test_missing_trusted_callbacks_fail_closed(env):
+    native = bridge(env)
+    with pytest.raises(RuntimeError):
+        native.create_card('wid', 'implement', {})
+    with pytest.raises(RuntimeError):
+        native.recover_card('wid', 'implement', {})
+
+
+@pytest.mark.parametrize('mutation', ['none', 'missing', 'duplicate', 'edited', 'user', 'thread_ts', 'text', 'bot_id', 'subtype'])
+def test_exact_owner_approval_required(env, mutation):
+    from conftest import AuthContext
+    row = dict(channel_id='channel', thread_id='1.0', message_id='1.0', workflow_id='wid',
+               plan_hash='hash', approved_message_id='1.5', approved_by='owner')
+    approval = dict(ts='1.5', thread_ts='1.0', user='owner', text='!project approve wid hash')
+    messages = [dict(ts='1.0', user='owner', text='work'), approval,
+                dict(ts='2.0', thread_ts='1.0', user='bot', text='done')]
+    if mutation == 'missing': messages.remove(approval)
+    elif mutation == 'duplicate': messages.append(dict(approval))
+    elif mutation != 'none': approval[mutation] = 'wrong'
+    native = bridge(env, slack=lambda *a: dict(ok=True, messages=messages))
+    ctx = AuthContext('slack', 'team', 'channel', '1.5', '1.0', 'owner', 'ingress')
+    assert native.verify_approval(ctx, row, 'hash') is (mutation == 'none')
+    assert native.read_result(row, dict(channel='channel', ts='2.0'), 'done') is (mutation == 'none')
+
+
+@pytest.mark.parametrize('subtype', [None, 'file_share', 'thread_broadcast'])
+def test_thread_events_preserve_human_and_approval_attempts(env, subtype):
+    row = dict(channel_id='channel', thread_id='1.0', message_id='1.0')
+    messages = [dict(ts='2.0', thread_ts='1.0', user='member', subtype=subtype,
+                     text='!project approve invalid hash'),
+                dict(ts='1.0', user='owner', text='work'),
+                dict(ts='3.0', thread_ts='1.0', user='bot', text='ignore')]
+    native = bridge(env, slack=lambda *a: dict(ok=True, messages=messages))
+    events = native.thread_events(row)
+    assert [ctx.message_id for ctx, _ in events] == ['1.0', '2.0']
+    assert events[1][1] == '!project approve invalid hash'
+    assert events[1][0].user_id == 'member'
+    assert events[1][0].team_id == 'team'
+    assert events[1][0].profile == 'ingress'
+    messages[0]['edited'] = {'ts': '4.0'}
+    with pytest.raises(RuntimeError): native.thread_events(row)
 
 
 def valid_facts(row):
@@ -95,11 +212,13 @@ def test_exact_head_evidence(env, mutation):
 
 
 def test_slack_pagination_readback_and_recovery(env):
-    row = {'channel_id': 'channel', 'thread_id': '1.0', 'message_id': '1.0'}
+    row = {'channel_id': 'channel', 'thread_id': '1.0', 'message_id': '1.0',
+           'workflow_id': 'wid', 'plan_hash': 'hash', 'approved_message_id': '1.5', 'approved_by': 'owner'}
     key, text = 'stable-key', 'Completed verified work'
     outbound = {'ts': '2.0', 'thread_ts': '1.0', 'user': 'bot', 'text': text,
                 'client_msg_id': str(uuid.uuid5(uuid.NAMESPACE_URL, key))}
-    messages = [{'ts': '1.0', 'user': 'owner', 'text': 'work'}, outbound]
+    messages = [{'ts': '1.0', 'user': 'owner', 'text': 'work'},
+                {'ts': '1.5', 'thread_ts': '1.0', 'user': 'owner', 'text': '!project approve wid hash'}, outbound]
     calls = []
     def slack(method, payload):
         calls.append((method, payload))

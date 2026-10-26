@@ -38,6 +38,8 @@ class Policy:
             raise ValueError('cwd must be an existing resolved absolute directory')
         if not isinstance(self.owner_ids, (tuple, list)) or not self.owner_ids or any(not isinstance(x, str) or not x for x in self.owner_ids):
             raise ValueError('owner_ids must not be empty')
+        if len({self.ingress_profile, self.builder_profile, self.reviewer_profile}) != 3:
+            raise ValueError('Ingress, builder and reviewer profiles must be distinct')
         object.__setattr__(self, 'owner_ids', tuple(self.owner_ids))
 
     def document(self):
@@ -64,6 +66,10 @@ class NativePorts(Protocol):
     def prompt(self, session_id: str, text: str, idempotency_key: str): ...
     def recover_prompt(self, session_id: str, idempotency_key: str) -> bool: ...
     def create_card(self, workflow_id: str, stage: str, params: dict) -> str: ...
+    def recover_card(self, workflow_id: str, stage: str, params: dict) -> str | None: ...
+    def quiesce_generation(self, row: dict, old: dict) -> bool: ...
+    def verify_approval(self, ctx: AuthContext, row: dict, plan_hash: str) -> bool: ...
+    def thread_events(self, row: dict) -> list: ...
     def get_session(self, stored_id: str) -> dict: ...
     def archive(self, stored_id: str, profile: str, archived: bool): ...
     def get_card(self, card_id: str) -> dict: ...
@@ -101,7 +107,10 @@ class Service:
 
     def status(self, ctx, workflow_id):
         self._authorize(ctx)
-        return self._row(workflow_id)
+        row = self._row(workflow_id)
+        if (ctx.thread_id or ctx.message_id) != row['thread_id'] and ctx.user_id not in self.policy.owner_ids:
+            raise PermissionError('Status requires workflow thread or owner')
+        return row
 
     def request(self, ctx, text):
         return self._receive(ctx, text, False)
@@ -121,12 +130,14 @@ class Service:
                 self._attempt(row, self._advance)
             return self.store.get(row['workflow_id'])
 
-    def propose_plan(self, workflow_id, plan_text):
+    def propose_plan(self, workflow_id, plan_text, generation):
         """Trusted controller only; the model has no tool for this mutation."""
         if not isinstance(plan_text, str) or not plan_text.strip():
             raise ValueError('Concrete plan required')
         with self.store.lock():
             row = self._row(workflow_id)
+            if generation != row['generation']:
+                raise WorkflowError('Stale planning generation')
             if row['state'] != 'awaiting_approval' or row['approved']:
                 raise WorkflowError('Plan can only be proposed before approval')
             row['plan'] = plan_text
@@ -143,6 +154,8 @@ class Service:
             row = self._row(workflow_id)
             if not row['plan_hash'] or plan_hash != row['plan_hash']:
                 raise PermissionError('Approval must bind the current concrete plan hash')
+            if self.ports.verify_approval(ctx, row, plan_hash) is not True:
+                raise PermissionError('Exact Slack approval readback required')
             if row['approved']:
                 return row
             row['approved'] = True
@@ -185,7 +198,35 @@ class Service:
         row['session_state'] = 'ready'
         self.store.save(row)
 
+    def _retire(self, row):
+        for old in row.get('history', []):
+            if old.get('retired'):
+                continue
+            # Revoke even when a card's create result was lost: resolve and stop
+            # by durable keys, not only known IDs.
+            if old.get('cards') and self.ports.quiesce_generation(row, old) is not True:
+                raise WorkflowError('Earlier generation has not stopped')
+            for stage, entry in old.get('cards', {}).items():
+                if not entry.get('id'):
+                    card_id = self.ports.recover_card(row['workflow_id'], stage, entry['params'])
+                    if not card_id:
+                        raise WorkflowError('Earlier ambiguous card needs operator recovery')
+                    entry.update(id=card_id, state='created')
+                    self.store.save(row)
+            if old.get('state') == 'post_intent' and not old.get('result_receipt'):
+                old['result_receipt'] = self.ports.recover_result(old, old['result_text'],
+                    f"{row['workflow_id']}:{old['generation']}:result")
+                if old['result_receipt'] is None:
+                    raise WorkflowError('Earlier delivery remains uncertain; operator recovery required')
+            old['retired'] = True
+            self.store.save(row)
+
     def _advance(self, row):
+        if row.get('archive_pending') or (row.get('history') and row.get('stored_session_id')):
+            self._visible(row)
+            row['archive_pending'] = False
+            self.store.save(row)
+        self._retire(row)
         if not row['session_id']:
             if row['session_state'] == 'create_intent':
                 session = self.ports.recover_session(row['workflow_id'])
@@ -241,9 +282,14 @@ class Service:
                               profile=self.policy.reviewer_profile if stage == 'review' else self.policy.builder_profile,
                               depends_on=[previous] if previous else [], session_id=row['session_id'],
                               generation=row['generation'], text=row['text'], plan=row['plan'])
-                row['cards'][stage] = {'state': 'create_intent', 'params': params}
-                self.store.save(row)
-                card_id = self.ports.create_card(row['workflow_id'], stage, params)
+                if entry:
+                    card_id = self.ports.recover_card(row['workflow_id'], stage, entry['params'])
+                    if not card_id:
+                        raise WorkflowError('Ambiguous card creation; operator recovery required')
+                else:
+                    row['cards'][stage] = {'state': 'create_intent', 'params': params}
+                    self.store.save(row)
+                    card_id = self.ports.create_card(row['workflow_id'], stage, params)
                 if not isinstance(card_id, str) or not card_id:
                     raise WorkflowError('Missing native card identifier')
                 if self.ports.get_card(card_id).get('id') != card_id:
@@ -258,9 +304,8 @@ class Service:
         if not row['approved']:
             raise WorkflowError('Current generation lacks owner approval')
         for old in row.get('history', []):
-            for entry in old.get('cards', {}).values():
-                if not entry.get('id') or self.ports.get_card(entry['id']).get('status') not in ('done', 'cancelled'):
-                    raise WorkflowError('Earlier generation work is still outstanding')
+            if not old.get('retired'):
+                raise WorkflowError('Earlier generation work is still outstanding')
         if set(row['cards']) != {'implement', 'review', 'release'}:
             raise WorkflowError('Missing workflow stages')
         evidence = {}
@@ -291,6 +336,12 @@ class Service:
             return self.store.get(workflow_id)
 
     def _close(self, row, text):
+        # Compensate before evidence/watermark gates, including restart after an
+        # archive RPC applied remotely but timed out locally.
+        if row.get('archive_pending') or row['state'] == 'archive_intent':
+            self._visible(row)
+            row.update(archive_pending=False, state='posted')
+            self.store.save(row)
         generation = row['generation']
         self._evidence(row)
         if row['state'] == 'post_intent':
@@ -318,7 +369,7 @@ class Service:
         if not session['archived']:
             if session.get('busy') is not False or session.get('pending_approval') is not False:
                 raise WorkflowError('Native writer or approval state is not idle')
-            row['state'] = 'archive_intent'
+            row.update(state='archive_intent', archive_pending=True)
             self.store.save(row)
             self.ports.archive(row['stored_session_id'], self.policy.builder_profile, True)
         if not self._session(row)['archived']:
@@ -336,20 +387,69 @@ class Service:
             row['state'] = 'posted'
             self.store.save(row)
             raise
-        row.update(state='archived', error=None)
+        row.update(state='archived', error=None, archive_pending=False)
         self.store.save(row)
+
+    def _backfill(self, row):
+        # Call under the workflow effect lock. Never call public methods here:
+        # they acquire that non-reentrant lock again.
+        for ctx, text in self.ports.thread_events(row):
+            self._authorize(ctx)
+            if self.store.seen(ctx):
+                continue
+            command = re.sub(r'^<@[A-Z0-9]+>\s*', '', text).strip()
+            if command.startswith('!project approve '):
+                attempts = row.setdefault('approval_attempts', [])
+                if not any(a['ts'] == ctx.message_id for a in attempts):
+                    attempts.append({'ts': ctx.message_id, 'user': ctx.user_id, 'text': text})
+                parts = command.split()
+                if (len(parts) == 4 and parts[2] == row['workflow_id']
+                        and parts[3] == row.get('plan_hash') and ctx.user_id in self.policy.owner_ids
+                        and self.ports.verify_approval(ctx, row, parts[3]) is True):
+                    row.update(approved=True, approved_by=ctx.user_id, approved_message_id=ctx.message_id)
+                self.store.save(row)
+                self.store.record(ctx, text, row['workflow_id'])
+            else:
+                row, fresh = self.store.receive(asdict(ctx), text, self.policy.document(), False, True)
+                if fresh:
+                    self._advance(row)
+        return row
 
     def reconcile(self):
         """Replay only safe pending effects; ambiguity is retained as a visible error."""
         results = []
-        with self.store.lock():
-            for candidate in self.store.rows():
-                if candidate['state'] == 'archived':
-                    continue
+        for candidate in self.store.rows():
+            with self.store.lock():
                 # Never apply a new configuration to previously authorized work.
                 if candidate['policy'] != self.policy.document():
                     continue
                 row = self._row(candidate['workflow_id'])
+                try:
+                    row = self._backfill(row)
+                except Exception as exc:
+                    row = self._row(candidate['workflow_id'])
+                    if row['state'] == 'archived':
+                        row.update(state='posted', archive_pending=True)
+                        self.store.save(row)
+                    if row.get('stored_session_id'):
+                        self._attempt(row, self._visible)
+                    row['error'] = 'Thread reconciliation blocked: ' + type(exc).__name__
+                    self.store.save(row)
+                    results.append(row)
+                    continue
+                if row['state'] == 'archived':
+                    def verify_archived(r):
+                        try:
+                            valid = self.ports.read_result(r, r['result_receipt'], r['result_text']) is True
+                        except Exception:
+                            valid = False
+                        if not valid:
+                            r.update(state='posted', archive_pending=True)
+                            self.store.save(r)
+                            self._visible(r)
+                            raise WorkflowError('Archived receipt or approval changed')
+                    self._attempt(row, verify_archived)
+                    continue
                 if row['state'] in ('post_intent', 'posted', 'archive_intent'):
                     self._attempt(row, lambda r: self._close(r, r['result_text']))
                 elif row['state'] == 'running':
@@ -362,7 +462,7 @@ class Service:
                                 ', '.join(e['id'] for e in r['cards'].values()))
                         self._close(r, text)
                     self._attempt(row, finish)
-                else:
+                elif not (row['state'] == 'awaiting_approval' and row['prompt_state'] == 'sent' and not row['approved']):
                     self._attempt(row, self._advance)
                 results.append(self.store.get(row['workflow_id']))
         return results

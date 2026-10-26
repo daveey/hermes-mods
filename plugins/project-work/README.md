@@ -13,7 +13,8 @@ board, project, channel and session targets are private policy, never model argu
 - A visible top-level native project conversation; the planning prompt must be read
   back from persisted history before any Kanban card is created.
 - Concrete plan confirmation for every generation, including owner requests. Approval
-  binds the plan hash; followups invalidate approvals, evidence and old delivery state.
+  binds the plan hash and generation; followups invalidate approvals and evidence,
+  retire old work through a verified native adapter, and retain old delivery obligations.
 - Native `session.create`, `prompt.submit`, `session.resume`, `session.archive` bindings
   and owner-conversation `kanban_create` tool calls, not parallel session/task stores.
 - Implementation → independent review → release graph; closeout checks prior outstanding
@@ -85,6 +86,8 @@ def build_ports(policy, NativeBridge):
         sessions=read_native_sessions, cards=read_native_card,
         slack=native_slack_web_api, evidence=refresh_completion_facts,
         bot_user_id=configured_bot_user_id,
+        projects=read_owner_project, card_keys=read_all_card_keys,
+        quiesce=retire_native_generation,
     )
 ```
 
@@ -109,7 +112,17 @@ The adapter file is trusted executable host configuration, current-UID owned and
   and durable idempotency. Do not substitute private handlers, raw SQL or Kanban CLI.
   Returns native JSON with `task_id`, `id`, or `task.id`. Tool arguments use `project`
   and `parents`, not private schema names. Worker assignee/scope comes from policy.
-- `cards(id)` returns native `id`, `status`, `body`, `board`, and ordered `parents`.
+- `projects({project, profile})` returns native `Project.to_dict()` augmented with
+  trusted `profile` and git-remote-verified `repo`. ID/slug, `primary_path`,
+  `board_slug` and `archived: false` must match policy in the owner-tool profile
+  BEFORE creation. Keep this mapping immutable while the controller is active.
+- `card_keys({idempotency_key, board, profile, include_archived: true})` returns ALL
+  matching IDs, including archived. Ambiguity fails closed. Uncertain create intents
+  only recover; they never invoke `kanban_create` again on a missing lookup.
+- `cards(id)` returns native Task fields plus trusted `board` and ordered `parents`.
+  Readback validates `project_id`, `assignee`, durable `session_id`, `idempotency_key`,
+  `workspace_kind: worktree`, `workspace_path: <cwd>/.worktrees/<id>` and
+  `completion_contract` as well as marker/parents.
   The implementation/review/release cards carry a unique workflow/generation/stage
   marker. The reader must retain native run provenance for the evidence collector.
 - `slack(method, payload)` uses the configured workspace's native bot client; it returns
@@ -120,6 +133,17 @@ The adapter file is trusted executable host configuration, current-UID owned and
   head/checks, independent review and actual release/delivery. Never relay a model's
   assertions as verified facts. The public bridge validates the facts' relationships;
   the private reader owns provenance and freshness.
+- `quiesce(workflow, old_generation)` is a mandatory native retirement boundary.
+  Revoke old-generation publication, stop active workers, and park pending native
+  cards using supported native operations. Resolve ALL old stage idempotency keys,
+  including lost-create responses and archived cards. Return freshly verified
+  `{workflow_id, generation, publication_revoked: true, live_writer: false,
+  pending_dispatch: false, idempotency_keys: [...]}` with the exact old key set.
+  No callback or incomplete proof blocks the new prompt/graph. A model promise is
+  not proof. The private publication broker must check current generation/approval
+  and the latest Slack thread immediately before every publish; credentials must
+  never be retained in workers. Retirement cannot revoke a credential already leaked
+  into a worker, nor undo an external publication. Prove this boundary during rollout.
 
 Evidence fields: `repo`, `workflow_id`, `generation`, `head_sha` (40 lowercase hex),
 `implementation_run_id`, `review_run_id` (nonempty and different), `review_head_sha`,
@@ -134,11 +158,23 @@ fail. If the repository has no protected checks, enumerate the agreed CI set exp
 The model tools cannot approve, propose plans, close out, publish or archive. Native
 middleware supports `!project request <text>` and owner-only
 `!project approve <workflow UUID> <full plan hash>`. Normal human replies in an existing
-workflow thread are required followups, including messages without a mention. Bots and
-message subtypes are not accepted as new authority.
+workflow thread are required followups, including messages without a mention and
+`file_share`, `thread_broadcast`, `me_message`. Bots are not new authority; external
+Slack Connect `user_team` values are rejected. Root turns accept either the native
+reply-in-thread root timestamp or no thread binding. Status is thread-local or owner-only.
+
+Middleware appends to a private `ingress.sqlite3` journal without making network calls
+and always calls native `next()`. A background worker retries uncertain deliveries.
+The journal is independent of the controller effect lock; network stalls do not block
+Bolt acknowledgement. Register refuses non-sandboxed terminal/code backends and Docker
+custom host mounts. Verify actual implicit mounts and profile routing in deployment.
+Reconciliation backfills complete thread history, including archived workflows and
+approval attempts. Exact source deletions/edits or unknown events surface a thread
+reconciliation error and keep the session visible; they require operator adjudication,
+not silent acceptance. Unchanged awaiting-approval sessions are not resumed each tick.
 
 A trusted owner-conversation/runtime binding collects the concrete planning response,
-then calls local `propose_plan(workflow_id, plan_text)`, posts the plan/hash in the source
+then calls local `propose_plan(workflow_id, plan_text, generation)`, posts the plan/hash in the source
 thread and awaits the owner's exact approval command. Host callers use `Client.call`
 with named arguments. After all graph stages finish, call
 `closeout(workflow_id, result_text)`; the runtime durably owns retries after this point.
@@ -149,7 +185,7 @@ the deployment's native planning-response hook/controller.
 
 Local operations are `request(context, text)`, `status(context, workflow_id)`,
 `approve(context, workflow_id, plan_hash)`, `observe_followup(context, text)`,
-`propose_plan(workflow_id, plan_text)`, `closeout(workflow_id, result_text)`, and `reconcile()`.
+`propose_plan(workflow_id, plan_text, generation)`, `closeout(workflow_id, result_text)`, and `reconcile()`.
 The socket is a trusted host capability, not a remote API. Its filesystem boundary is
 part of the deployment security model; all same-UID host code is trusted. Never expose
 it through an unauthenticated proxy or model terminal.
@@ -160,6 +196,11 @@ Inspect status `state` and `error`. `create_intent`, prompt `intent` and `post_i
 are persisted BEFORE effects. Recovery requires proof of exactly the intended effect:
 unique native title/ID, exact user prompt marker, or original-thread bot message with
 matching deterministic `client_msg_id` and text. No proof means no replay and no archive.
+Native empty drafts are not necessarily persisted: a lost create response before the
+first prompt requires operator reconciliation. It is deliberately not retried blindly.
+An archive intent carries a durable compensation obligation; on restart, unarchive
+and verify visibility BEFORE checking evidence or thread watermark. Failed unarchive
+readback retains the obligation. Deleted/edited owner approvals cannot authorize archive.
 Never manually change ledger status to `archived` or fabricate delivery receipts.
 
 Archive reads exact native identity, source, profile, cwd and title; Slack-origin or

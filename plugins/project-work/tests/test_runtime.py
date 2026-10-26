@@ -62,7 +62,7 @@ def test_private_policy_exact_schema_and_socket(env, tmp_path):
         config_mod.load_config(home)
 
 
-def test_ingress_native_event_and_tool_scope(env):
+def test_ingress_native_event_and_tool_scope(env, tmp_path):
     service, ctx, _ = env
     class Client:
         def __init__(self): self.calls = []
@@ -70,14 +70,17 @@ def test_ingress_native_event_and_tool_scope(env):
             self.calls.append((op, args))
             return runtime.Controller(service).call(op, args)
     client = Client()
-    ingress = ingress_mod.Ingress(service.policy, client)
+    queue = importlib.import_module(PACKAGE + '.client').DurableIngressQueue(tmp_path / 'queue' / 'ingress.db', client)
+    ingress = ingress_mod.Ingress(service.policy, client, queue)
     body = {'type': 'event_callback', 'team_id': ctx.team_id,
             'event': {'type': 'message', 'user': ctx.user_id, 'channel': ctx.channel_id,
                       'ts': ctx.message_id, 'text': '!project request Build a feature'}}
     called = []
     async def next_(): called.append(True)
     asyncio.run(ingress.middleware(body, next_))
-    assert called and client.calls[0][0] == 'request'
+    assert called and not client.calls
+    assert queue.drain_once()
+    assert client.calls[0][0] == 'request'
     assert ingress.observe(body) == ctx
     bad = dict(body, team_id='elsewhere')
     assert ingress.observe(bad) is None
@@ -102,11 +105,11 @@ def test_controller_rejects_nonowner_approval(env):
     service, ctx, _ = env
     controller = runtime.Controller(service)
     row = controller.call('request', {'context': asdict(ctx), 'text': 'work'})
-    plan = controller.call('propose_plan', {'workflow_id': row['workflow_id'], 'plan_text': 'Concrete scope'})
+    plan = controller.call('propose_plan', {'workflow_id': row['workflow_id'], 'plan_text': 'Concrete scope', 'generation': row['generation']})
     context = asdict(ctx)
     context['user_id'] = 'member'
-    with pytest.raises(PermissionError):
-        controller.call('approve', {'context': context, 'workflow_id': row['workflow_id'], 'plan_hash': plan['plan_hash']})
+    assert controller.call('approve', {'context': context, 'workflow_id': row['workflow_id'], 'plan_hash': plan['plan_hash']}) == {'rejected': True}
+    assert service.store.get(row['workflow_id'])['approved'] is False
 
 
 def test_environment_cannot_impersonate_native_context(env, monkeypatch):

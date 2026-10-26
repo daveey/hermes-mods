@@ -44,7 +44,7 @@ class Controller:
     def call(self, operation, args):
         expected = {'request': {'context', 'text'}, 'status': {'context', 'workflow_id'},
             'approve': {'context', 'workflow_id', 'plan_hash'}, 'observe_followup': {'context', 'text'},
-            'propose_plan': {'workflow_id', 'plan_text'}, 'closeout': {'workflow_id', 'result_text'}, 'reconcile': set()}
+            'propose_plan': {'workflow_id', 'plan_text', 'generation'}, 'closeout': {'workflow_id', 'result_text'}, 'reconcile': set()}
         if operation not in expected or not isinstance(args, dict) or set(args) != expected[operation]:
             raise ValueError('Unknown operation or argument')
         args = dict(args)
@@ -56,7 +56,14 @@ class Controller:
                 return public_status(self.service.followup(**args))
             except KeyError:
                 return {'ignored': True}
-        result = getattr(self.service, operation)(**args)
+        try:
+            result = getattr(self.service, operation)(**args)
+        except PermissionError:
+            if operation == 'approve':
+                # A rejected command is terminal, not an outage to retry forever.
+                # The Slack backfill records the exact attempt for watermarking.
+                return {'rejected': True}
+            raise
         return [public_status(row) for row in result] if operation == 'reconcile' else public_status(result)
 
 

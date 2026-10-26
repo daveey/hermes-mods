@@ -26,7 +26,7 @@ def test_owner_approval(env):
     assert row['state'] == 'awaiting_approval'
     assert ports.get_session(row['stored_session_id'])['archived'] is False
     assert not ports.cards
-    row = service.propose_plan(row['workflow_id'], 'Concrete plan and acceptance tests')
+    row = service.propose_plan(row['workflow_id'], 'Concrete plan and acceptance tests', row['generation'])
     with pytest.raises(PermissionError):
         service.approve(outsider, row['workflow_id'], row['plan_hash'])
     assert service.approve(ctx, row['workflow_id'], row['plan_hash'])['state'] == 'running'
