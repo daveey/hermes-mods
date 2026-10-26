@@ -42,7 +42,8 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-default-provider.md](kanban-default-provider.md) | 0265 | Default tier provider inference |
 | [test-live-git-config-guard.md](test-live-git-config-guard.md) | 0266 0271 | Protect live git identity during tests |
 | [kanban-worker-scope-failures.md](kanban-worker-scope-failures.md) | 0267 | Diagnose worker OOM and signal deaths |
-| [archive-linked-confirm.md](archive-linked-confirm.md) | 0110 | Archiving a chat with open Kanban tasks or rented machines asks first, listing them; plugins add checks via `ctx.registerArchiveGuard` |
+| [kanban-dependency-review-continuation.md](kanban-dependency-review-continuation.md) | 0378–0379 | Authenticated dependency parks permit one same-PR repair after structured independent review; claim release remains transactional |
+| [archive-linked-confirm.md](archive-linked-confirm.md) | 0110 0380 | Archiving a chat with open Kanban tasks or rented machines asks first, listing them; plugins add checks via `ctx.registerArchiveGuard` |
 | [screen-share.md](screen-share.md) | 0109 | Inline Screen Share plugin opens strictly validated VNC addresses on the client Desktop OS, never the remote gateway |
 | [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 0049 0050 0065 | ⌘]/⌘[ next/prev session with a green/red status stripe (stepping from the focused tab), ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume (⌥⌘R in 0064–0070), ⌥⇧⌘R window reload |
 | [ai-session-rename.md](ai-session-rename.md) | 0020 0032 0042 | ⌘⇧E rename (was ⌘⇧N until 0042), pre-filled with an AI short name (`session.title.suggest` RPC) |

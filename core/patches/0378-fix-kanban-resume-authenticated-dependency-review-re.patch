@@ -1,0 +1,327 @@
+From cd68a2ce18780db60db9ccfd6f7ea33e792437a3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 09:35:01 +0000
+Subject: [PATCH] fix(kanban): resume authenticated dependency review repairs
+ once
+
+---
+ hermes_cli/kanban_db.py                       |  5 +
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  3 +
+ hermes_cli/kanban_dependency_review.py        | 95 +++++++++++++++++++
+ .../test_kanban_dependency_review.py          | 73 ++++++++++++++
+ .../test_kanban_dependency_review_evidence.py | 53 +++++++++++
+ website/docs/user-guide/features/kanban.md    | 26 +++++
+ 6 files changed, 255 insertions(+)
+ create mode 100644 hermes_cli/kanban_dependency_review.py
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_review.py
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_review_evidence.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 2f7977de51..0309d78be7 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3279,6 +3279,11 @@ def block_task(
+                 payload["recurrences"] = prev
+                 payload.pop("limit", None)
+                 payload["shared_blocker_probe"] = True
++        if kind == "dependency":
++            from hermes_cli.kanban_dependency_review import checkpoint
++            review_checkpoint = checkpoint(conn, task_id, expected_run_id)
++            if review_checkpoint:
++                payload["review_checkpoint"] = review_checkpoint
+         sql = f"""
+                 UPDATE tasks
+                    SET status        = '{new_status}',
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index e8497e6440..fe5fbebf18 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -193,6 +193,9 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+             "'continued', 'scheduled')",
+             cols=", kind, payload", strict=True)):
+         return None
++    from hermes_cli.kanban_dependency_review import resumes_review
++    if resumes_review(conn, task_id, pr_urls):
++        return None
+     states = {u: pr_state(u) for u in dict.fromkeys(pr_urls)}
+     if all(s in TERMINAL_STATES or s == "REJECTED" for s in states.values()):
+         from hermes_cli.kanban_db_dispatch_pr_rejection import comment_rejection
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+new file mode 100644
+index 0000000000..213e252ed5
+--- /dev/null
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -0,0 +1,95 @@
++"""Run-owned dependency review checkpoints for resuming an existing PR.
++
++Neither a promotion nor comment prose is permission to retry an implementation.
++Only an authenticated park can capture the PRs and dependency edges being awaited;
++a completed independent review must subsequently request repair of those same PRs.
++"""
++from __future__ import annotations
++
++import re
++
++
++_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
++
++
++def checkpoint(conn, task_id, expected_run_id):
++    """Capture scope inside block_task's transaction, before closing the owner run."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE
++
++    if expected_run_id is None:
++        return None
++    row = conn.execute(
++        "SELECT r.id FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
++        "WHERE t.id = ? AND t.status = 'running' AND r.id = ? "
++        "AND r.task_id = t.id AND r.profile = t.assignee AND r.ended_at IS NULL",
++        (task_id, expected_run_id),
++    ).fetchone()
++    if row is None:
++        return None
++    parents = kb.parent_ids(conn, task_id)
++    urls = set()
++    for comment in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (task_id,)):
++        urls.update(u.lower() for u in _RESPAWN_GUARD_PR_URL_RE.findall(comment["body"] or ""))
++    if not parents or not urls:
++        return None
++    return {"run_id": expected_run_id, "parents": sorted(parents), "prs": sorted(urls)}
++
++
++def _reviewed_pr(conn, parent_id, parked_at, owner_run_id):
++    """Structured evidence from the latest completed run, never a board comment."""
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute(
++        "SELECT r.*, EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id "
++        "AND e.run_id = r.id AND e.kind = 'claimed') AS was_claimed "
++        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
++        "WHERE t.id = ? AND t.status = 'done' ORDER BY r.id DESC LIMIT 1",
++        (parent_id,),
++    ).fetchone()
++    if (row is None or not row["was_claimed"] or row["outcome"] != "completed"
++            or row["id"] == owner_run_id
++            or (kb._to_epoch(row["ended_at"]) or 0) < parked_at):
++        return None
++    data = kb._json_dict(row["metadata"])
++    sha = data.get("reviewed_sha")
++    pr = data.get("pr")
++    if (data.get("verdict") != "changes_required" or not isinstance(sha, str)
++            or not _SHA.fullmatch(sha) or not isinstance(pr, str)):
++        return None
++    return pr.rstrip("/").lower()
++
++
++def resumes_review(conn, task_id, pr_urls):
++    """One continuation only: claiming any new run consumes the park's permission."""
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute(
++        "SELECT e.payload, e.created_at, r.id, r.profile, r.outcome, t.assignee "
++        "FROM task_events e JOIN task_runs r ON r.id = e.run_id "
++        "JOIN tasks t ON t.id = e.task_id "
++        "WHERE e.task_id = ? AND e.kind = 'dependency_wait' AND r.task_id = t.id "
++        "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = t.id) "
++        "ORDER BY e.id DESC LIMIT 1", (task_id,),
++    ).fetchone()
++    if row is None or row["outcome"] != "blocked" or row["profile"] != row["assignee"]:
++        return False
++    payload = kb._json_dict(row["payload"])
++    evidence = payload.get("review_checkpoint")
++    if not isinstance(evidence, dict) or evidence.get("run_id") != row["id"]:
++        return False
++    parents = kb.parent_ids(conn, task_id)
++    if (not parents or sorted(parents) != evidence.get("parents")
++            or kb.unsatisfied_parents(conn, task_id)):
++        return False
++    captured = evidence.get("prs")
++    if not isinstance(captured, list) or not all(isinstance(u, str) for u in captured):
++        return False
++    urls = {u.rstrip("/").lower() for u in pr_urls}
++    if not urls or not urls.issubset(set(captured)):
++        return False
++    parked_at = kb._to_epoch(row["created_at"])
++    if parked_at is None:
++        return False
++    reviewed = {_reviewed_pr(conn, p, parked_at, row["id"]) for p in parents}
++    return urls.issubset(reviewed)
+diff --git a/tests/hermes_cli/test_kanban_dependency_review.py b/tests/hermes_cli/test_kanban_dependency_review.py
+new file mode 100644
+index 0000000000..310a32bcd9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_review.py
+@@ -0,0 +1,73 @@
++"""Dependency-review continuation must repair the same PR, not defeat respawn guards."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++
++PR = "https://github.com/example/repo/pull/10"
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    kb.init_db()
++    with kbc.connect() as conn:
++        yield conn
++
++
++def parked(conn, *, authenticated=True):
++    task = kb.create_task(conn, title="implementation", assignee="dev")
++    kb.claim_task(conn, task)
++    run = kb.get_task(conn, task).current_run_id
++    kb.add_comment(conn, task, "dev", PR)
++    reviews = [kb.create_task(conn, title="review", assignee="reviewer") for _ in range(2)]
++    for review in reviews:
++        kb.link_tasks(conn, review, task, expected_child_run_id=run)
++    assert kb.block_task(conn, task, kind="dependency", reason="Independent review",
++                         expected_run_id=run if authenticated else None)
++    return task, reviews
++
++
++def finish_reviews(conn, reviews, *, verdict="changes_required", pr=PR):
++    for review in reviews:
++        kb.claim_task(conn, review)
++        run = kb.get_task(conn, review).current_run_id
++        assert kb.complete_task(conn, review, summary="Review complete", expected_run_id=run,
++                                metadata={"verdict": verdict, "pr": pr, "reviewed_sha": "a" * 40})
++    kb.recompute_ready(conn)
++
++
++def test_completed_reviews_resume_same_pr_despite_later_comments(board):
++    task, reviews = parked(board)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    # Production ordering: owner parks; reviews comment with PR URL; guard notice;
++    # review completions promote; another reviewer repeats the SAME PR.
++    kb.add_comment(board, task, "reviewer", "Repair " + PR)
++    kb.add_comment(board, task, "dispatcher", "active_pr hold: " + PR)
++    finish_reviews(board, reviews)
++    kb.add_comment(board, task, "reviewer", "Changes required at " + PR)
++    assert kb.get_task(board, task).status == "ready"
++    assert dispatch.check_respawn_guard(board, task) is None
++    # Permission is consumed by the next claim, even if that worker crashes.
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    assert kb.reclaim_task(board, task, reason="Worker died", signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("mode", ["unowned", "unrelated", "approved", "new_pr", "noop_assign", "pending"])
++def test_dependency_and_comments_do_not_grant_generic_retry(board, mode):
++    task, reviews = parked(board, authenticated=mode != "unowned")
++    if mode != "pending":
++        finish_reviews(board, reviews,
++                       verdict="approved" if mode in {"approved", "noop_assign"} else "changes_required",
++                       pr=PR + "1" if mode == "unrelated" else PR)
++    if mode == "new_pr":
++        kb.add_comment(board, task, "dev", PR + "1")
++    if mode == "noop_assign":
++        kb.assign_task(board, task, "dev")
++    kb.add_comment(board, task, "reviewer", "changes_required " + PR)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_evidence.py b/tests/hermes_cli/test_kanban_dependency_review_evidence.py
+new file mode 100644
+index 0000000000..b3350ff584
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_review_evidence.py
+@@ -0,0 +1,53 @@
++"""Adversarial persisted-evidence tests for dependency-review continuation."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli.test_kanban_dependency_review import parked, finish_reviews
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    kb.init_db()
++    with kbc.connect() as conn:
++        yield conn
++
++
++@pytest.mark.parametrize("bad", [None, 4, [{}], "https://github.com/example/repo/pull/10"])
++def test_malformed_pr_checkpoint_fails_closed(board, bad):
++    task, reviews = parked(board)
++    finish_reviews(board, reviews)
++    row = board.execute(
++        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'dependency_wait'",
++        (task,),
++    ).fetchone()
++    payload = json.loads(row["payload"])
++    payload["review_checkpoint"]["prs"] = bad
++    # Corrupt only this fixture's temp database, never the operator's board.
++    with kb.write_txn(board):
++        board.execute("UPDATE task_events SET payload = ? WHERE id = ?", (json.dumps(payload), row["id"]))
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_newer_unclaimed_completion_cannot_fall_back_to_old_review(board):
++    task, reviews = parked(board)
++    finish_reviews(board, reviews)
++    assert dispatch.check_respawn_guard(board, task) is None
++    for review in reviews:
++        with kb.write_txn(board):
++            kb._synthesize_ended_run(board, review, outcome="completed", summary="Superseding approval",
++                                     metadata={"verdict": "approved"})
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_changed_dependency_graph_cannot_reuse_checkpoint(board):
++    task, reviews = parked(board)
++    finish_reviews(board, reviews)
++    assert kb.unlink_tasks(board, reviews[0], task)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 9b2ee1bba7..34347b07d5 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1224,6 +1224,32 @@ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run`
+ 
+ `recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, or a review reopen — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window.
+ 
++### Dependency-review repair continuation
++
++An owning worker can link independent review cards as parents with `kanban_link`,
++then call `kanban_block(kind="dependency")`. If its comments already identify the
++PR, the authenticated park captures the current run, parent IDs, and PR URLs.
++After all parents finish, the `active_pr` guard permits one continuation to repair
++those same PRs when each guarded PR has a completed review with structured metadata:
++
++```json
++{"verdict": "changes_required", "pr": "https://github.com/owner/repo/pull/123", "reviewed_sha": "0123456789abcdef0123456789abcdef01234567"}
++```
++
++The evidence must come from the review card's latest, actually claimed completed
++run, finishing at or after the park. This is routing evidence, not merge approval
++or proof of current-head CI. Reviewer comments or guard notices repeating the same
++PR after the park do not invalidate it. A new PR, changed parent set, unclaimed
++completion, unrelated dependency, or malformed evidence does not authorize retry.
++The next implementation claim consumes the checkpoint: a subsequent crash/reclaim
++stays guarded. Same-owner assignment remains a no-op for this guard.
++
++No new recovery tool is needed for this worker-owned path. Existing legacy parks
++without the authenticated checkpoint fail closed; `kanban_continue` only accepts
++an actively owned running task and cannot recover an already-held ready card.
++Such legacy holds still require an explicit operator handoff. Do not manufacture
++comments, edit database rows, or use timed scheduling as a review authorization.
++
+ ### Drag-to-delete and bulk delete (dashboard)
+ 
+ The dashboard exposes a **trash drop zone** on the kanban page — drag any card into it to delete the task (cascades through `task_events`, child links, and subscriptions). A confirmation prompt protects against accidents. Bulk delete is also reachable via `DELETE /api/plugins/kanban/tasks` with a JSON body `{"ids": ["t_abc", "t_def", ...]}`.
+-- 
+2.55.0
+

@@ -18,7 +18,7 @@ shell root) with the lines as `details`:
 
 - **Core Kanban check**: the row's own `kanban_active` + `kanban_blocked` counts (the backend sums them over the
   compression lineage, so they match the sidebar badge; see [kanban-session-links.md](kanban-session-links.md)).
-  No extra request.
+  Fresh evidence needs no extra request. Patch **0380** refreshes missing, expired or unknown evidence before warning: it captures the row owner (omitted connection = registry primary), walks ancestry and queries `/api/session-kanban-tasks` with that connection/profile pinned. The whole refresh is bounded to 2.5 seconds. Read failures, malformed ancestry/task responses, stale replicas and unknown obligations remain uncertain; a successful empty answer archives without a spurious task warning.
 - **Plugin guards**: new `ctx.registerArchiveGuard(guard)` on the plugin context. The guard receives
   `{ sessionId, session, ids, profile, connectionId }` (the row's owning gateway, so cross-gateway rows are
   checked on their own gateway). Guards run in parallel. Each is capped at 2.5 s, and one that throws or times out
@@ -56,6 +56,19 @@ Plugin: `node --test desktop-plugins/session-tasks/test/projections.test.mjs`.
 `git am -3 --empty=keep` patch 0110 on top of the series (it needs the fork's `kanban_active`/`kanban_blocked` row fields from
 the kanban-session-links patches, or the Kanban line never shows). Then rebuild Desktop. The session-tasks plugin
 hot-reloads, but its guard only takes effect once the rebuilt Desktop provides `registerArchiveGuard`.
+
+## Regression diagnosis and verification (0380)
+
+Two independent defects produced similar warnings: the session-tasks plugin rejected an omitted archive connection before issuing REST, despite the guard contract defining it as registry primary; core classified expired sidebar observations as unknown without attempting a new read. Existing tests supplied resolved owners or tested only the conservative failure branch, not successful revalidation. The plugin now resolves primary through the SDK registry and pins the inventory profile; it never substitutes the active gateway. Dialog copy in all existing locale overlays describes a status check, not proof of linked work.
+
+Executed on core `f63cdf362c`:
+- `confirm-linked-archive.test.ts`: primary/remote empty revalidation, compressed ancestry, confirmed tasks, offline/malformed/stale/unknown failures with recovery, and bounded timeout. The missing-read cases failed before the change; uncertainty copy also failed before its correction.
+- Six Vitest files (the new file, `archive-linked-confirm.test.tsx`, `use-session-actions.test.tsx`, `unarchive-session.test.tsx`, `archive-guards.test.ts`, `overlay-completeness.test.ts`): **189 passed**.
+- `tsc --noEmit` and ESLint on changed action modules: clean.
+- Plugin projection and strip suites: **42 passed**, including omitted primary and explicit remote machine ownership.
+- Full public series **380 patches** applied cleanly with `git am -3 --empty=keep` at merge-base `4957bbd0a0`; resulting archive helper matches the tested fork source. Coverage check passed.
+
+These are automated client tests, not proof that a running Desktop bundle has loaded the revision. The disk plugin can hot-reload after sync; the core change requires the normal Desktop update/build activation. No Desktop restart is performed by the repair.
 
 ## Gotchas
 
