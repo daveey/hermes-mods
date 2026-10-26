@@ -4,7 +4,7 @@ Patches:
 
 - `patches/0169-fix-kanban-cards-never-park-forever-without-showing-.patch`: parts 1-4 below (part 5 is the env scrub,
   documented in [top-level-env-scrub.md](top-level-env-scrub.md)).
-- Patch **0276**, fork commit `ca145ec36e04a7db3271e2df91622dc7adbd91a2`:
+- Patch **0278**, fork commit `ca145ec36e04a7db3271e2df91622dc7adbd91a2`:
   profile-scoped GitHub broker execution for PR acceptance.
 
 Root cause: a board with cards "not running, not blocked". Three separate holes let a card park with nothing on the
@@ -28,7 +28,7 @@ and `scheduled` parks could carry no wake time (or hide a question for a human).
    phase and exception type instead of "check gh authentication" (that wording used to match the guard's auth regex).
    A binding to a closed-unmerged PR may be replaced by a new `published_pr` in the same repo (`pr_rebound` event);
    rebinding happens only on GitHub's positive "closed, not merged" answer, and never while the bound PR is open.
-   Patch 0276 adds optional per-profile `kanban.pr_acceptance.gh_command_prefix`
+   Patch 0278 adds optional per-profile `kanban.pr_acceptance.gh_command_prefix`
    (default `[]`): an argv prefix, not a shell command. Routed profiles do not
    inherit the launch profile's wrapper. Missing `gh`, invalid wrapper values and
    unreadable configuration return a sanitized `setup` rejection; HTTP auth
@@ -50,7 +50,7 @@ and `scheduled` parks could carry no wake time (or hide a question for a human).
   the card lands in `result.auto_blocked`).
 - `hermes_cli/kanban_pr_acceptance.py`: `phase` tracking, `closed_unmerged`, `pr_closed_unmerged(url, assignee)`;
   `kanban_pr_acceptance_store.py` does the rebind.
-  For 0276, effective configuration/interpolation is bound to the assignee's home
+  For 0278, effective configuration/interpolation is bound to the assignee's home
   and secret scope. The wrapper receives the isolated environment and resolved
   `gh` argv. `hermes_platform/resolver/github.py` searches child PATH, then
   `~/bin` and `~/.local/bin`. No credential is returned to the parent process.
@@ -67,7 +67,7 @@ and `scheduled` parks could carry no wake time (or hide a question for a human).
 `hermes_cli/kanban_db_dispatch.py`, `hermes_cli/kanban_pr_acceptance.py`, `hermes_cli/kanban_pr_acceptance_store.py`,
 `hermes_cli/kanban_timed_park.py`, `hermes_cli/kanban_continuation.py`, `hermes_cli/kanban_db.py`,
 `hermes_cli/kanban_diagnostics.py`, `hermes_cli/kanban.py`, `tools/kanban_tools.py`.
-Patch 0276 also changes `hermes_cli/config_defaults.py`, adds
+Patch 0278 also changes `hermes_cli/config_defaults.py`, adds
 `hermes_platform/resolver/github.py`, and documents configuration in
 `website/docs/user-guide/features/kanban.md`.
 
@@ -85,7 +85,7 @@ Patch 0276 also changes `hermes_cli/config_defaults.py`, adds
 `test_kanban_db.py`, `test_kanban_diagnostics.py`, `test_kanban_timed_park.py`.
 Untested: the `waiting_behind_user` diagnostic and the `kanban stats` "Waiting on you" line.
 
-Patch 0276 verification on integrated core `54716420ff7c58cf1ab34fbfb22ef9e878f87cd3`:
+Historical verification (broker numbered 0276 in that snapshot) on integrated core `54716420ff7c58cf1ab34fbfb22ef9e878f87cd3`:
 canonical `scripts/run_tests.sh tests/hermes_cli/test_kanban_pr_transport.py
 tests/hermes_cli/test_kanban_pr_acceptance.py -j 2 --file-retries 0` passed
 16 tests (11 transport, five acceptance). The existing PM interpreter ran in a
@@ -101,10 +101,16 @@ Apply in series after [kanban-timed-waits.md](kanban-timed-waits.md) (0113 0153 
 `kanban_timed_park` and `wake_due_continuations` it extends, and after [kanban-block-loop-escalation.md](kanban-block-loop-escalation.md)
 and [kanban-escalated-triage-red.md](kanban-escalated-triage-red.md) (0161). Needs the PR-acceptance gate
 (`completion_contract`).
-Patch 0276 follows the complete preserved series through 0275. Full ordered
+Current ordering: broker patch 0278 follows the preserved series through 0277.
+The published baseline contains patches 0001–0284; Chrome patches 0285–0287
+follow it and are not broker dependencies. Apply the ordered series, not an
+isolated broker patch. Patch 0276 now covers CI poll routing, not the broker.
+
+Historical application receipt for core `54716420ff7c58cf1ab34fbfb22ef9e878f87cd3`:
+the broker was numbered 0276 after the preserved series through 0275. Full ordered
 279-patch application from merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`
-passed; all five broker paths match the integrated core. The last three patches
-are the separate experimental Chrome feature, not broker dependencies.
+passed; all five broker paths match the integrated core. The last three patches in that historical 279-patch snapshot
+were the separate experimental Chrome feature, not broker dependencies.
 
 ## Gotchas
 
