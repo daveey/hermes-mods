@@ -1,7 +1,7 @@
 """Bounded, read-only local owner evidence.
 
-No remote/process adapter or durable dispatcher lease exists here. Scheduled and
- dependency reads explain UNKNOWN, never turn a parked row into a live owner.
+Local scheduled ownership needs a native future wake, a fresh dispatcher receipt
+and a scoped result consumer. Remote/process and dependency owners remain UNKNOWN.
 Runtime liveness is a point-in-time observation, not a future delivery guarantee.
 """
 from pathlib import Path
@@ -28,7 +28,7 @@ def authoritative_owner(v, evidence, session_id):
 
     Supported route: exact local hostname, current profile, explicit board, native
     task ID, TUI/Desktop origin subscription. Exact request/body equality avoids
-    turning a model's claimed goal match into authority. Scheduled/dependency routes without dispatcher evidence are UNKNOWN. cross_task.read is deliberately NOT invoked:
+    turning a model's claimed goal match into authority. Scheduled routes need native dispatcher evidence; dependency routes remain UNKNOWN. cross_task.read is deliberately NOT invoked:
     its session-mentions contract also adopts/shepherds remote cards and its
     relay is neither a bounded read-only probe nor a profile-qualified proof.
     """
@@ -83,17 +83,18 @@ def authoritative_owner(v, evidence, session_id):
                     or task['title'] != v['goal'] or task['completed_at'] is not None):
                 raise ValueError('owner_task_scope_or_state_mismatch')
             if task['status'] != 'running':
-                _waiting_continuation(conn, task)
-            run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
-                               (task['current_run_id'], ref['task_id'])).fetchone()
-            if (not run or run['profile'] != profile or run['status'] != 'running'
-                    or run['ended_at'] is not None or run['outcome'] is not None
-                    or not run['claim_expires'] or run['claim_expires'] <= time.time()
-                    or not is_local_claim(run['claim_lock'])
-                    or not isinstance(run['worker_started_at'], str)
-                    or '|' not in run['worker_started_at']
-                    or not _worker_alive(run['worker_pid'], run['worker_started_at'])):
-                raise ValueError('owner_live_continuation_unverified')
+                _waiting_continuation(conn, task, path, profile)
+            else:
+                run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
+                                   (task['current_run_id'], ref['task_id'])).fetchone()
+                if (not run or run['profile'] != profile or run['status'] != 'running'
+                        or run['ended_at'] is not None or run['outcome'] is not None
+                        or not run['claim_expires'] or run['claim_expires'] <= time.time()
+                        or not is_local_claim(run['claim_lock'])
+                        or not isinstance(run['worker_started_at'], str)
+                        or '|' not in run['worker_started_at']
+                        or not _worker_alive(run['worker_pid'], run['worker_started_at'])):
+                    raise ValueError('owner_live_continuation_unverified')
             sub = conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform='tui' AND chat_id=? AND thread_id='' AND notifier_profile=? AND delivery_mode IN ('notify','notify+wake')", (ref['task_id'], session_id, profile)).fetchone()
             if not sub:
                 raise ValueError('owner_result_return_unverified')
@@ -103,10 +104,23 @@ def authoritative_owner(v, evidence, session_id):
 
 
 
-def _waiting_continuation(conn, task):
-    """Native wait evidence is not evidence of an operating dispatcher."""
-    waiting_readback(conn, task)
-    raise ValueError('owner_dispatcher_unverified')
+def _waiting_continuation(conn, task, board_path, profile):
+    """Compose a native future wake with scoped recent scheduler evidence.
+
+    Dependency graphs still require continuing proof for each unfinished parent.
+    The root is resolved by native code, never supplied by the model/tool result.
+    Files owned by the runtime UID are trusted state, not a hostile-UID boundary.
+    """
+    from hermes_cli import kanban_db as kb
+    wait = waiting_readback(conn, task)
+    if wait['kind'] != 'scheduled':
+        raise ValueError('owner_dispatcher_unverified')
+    try:
+        from gateway.kanban_dispatcher_health import available
+    except ImportError as exc:
+        raise ValueError('owner_dispatcher_unverified') from exc
+    if not available(kb.kanban_home() / 'kanban', board_path, profile, 'ready'):
+        raise ValueError('owner_dispatcher_unverified')
 
 
 def waiting_readback(conn, task):

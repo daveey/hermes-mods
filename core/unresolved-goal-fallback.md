@@ -98,3 +98,25 @@ All nine cases pass after reproducing progress leaks and incorrect terminal stat
 on both gateway routes. Analysis-only and explicit action-denial controls pass.
 This does not claim Electron UI, authenticated serve startup, interactive PTY,
 interrupt-RPC, or production activation coverage. Enforcement remains disabled.
+
+
+## Native scheduled-dispatch evidence (draft)
+
+`gateway/kanban_dispatcher_health.py` records successful embedded-loop board passes with
+exact board/profile/lane, per-board monotonic observation time, bounded expiry, boot and
+process-start identity and kernel flock ownership. Pause, failed ticks, cancellation and
+stop invalidate evidence. One-shot/dry-run execution does not publish. The native dispatch
+result now identifies admission past global budget/memory gates; a disabled or suppressed
+tick cannot certify scheduling. `kanban_db_dispatch_queries.py` owns the unchanged lane query.
+
+Tests: `tests/gateway/test_kanban_dispatcher_health.py` exercises actual isolated watcher
+loops, cross-process reads, scope/expiry/identity, zero-budget and critical-memory suppression,
+and delayed publication. Seven focused gateway/consumer files passed 42 tests; five adjacent
+native-dispatch files passed 18 tests. These are not production activation evidence.
+
+Coach scheduled ownership composes this with a future native wake and the native origin
+result-consumer receipt. It does not certify unfinished dependency parents, remote tasks,
+standalone daemons, or process-notification routes. Linux only; unsupported systems fail
+UNKNOWN. The native runtime directory is a trusted same-UID state boundary; readable process
+identity plus flock does not authenticate evidence against arbitrary malicious same-UID writers.
+No new enforcement setting, service restart or live activation is included.

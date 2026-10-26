@@ -103,8 +103,14 @@ requires a native registered consumer and a recent successful poll of the exact 
 profile home and session key. A subscription, thread name or attempted-but-failed poll is not enough.
 The draft core's `kanban_consumer_health` publishes in-memory read-only receipts; there is no foreign
 thread-frame introspection. This is point-in-time local consumer health, not eventual delivery.
-Remote, scheduled, dependency-waiting, cross-profile, paraphrased-goal and non-TUI-return cases
-remain UNKNOWN. Native wake/dependency rows are inspected but do not prove dispatcher health;
+Local scheduled ownership additionally requires a future native wake, the draft core's fresh
+Linux dispatcher receipt for the exact board/profile/ready lane, and the same scoped return
+consumer. Disabled/zero-capacity ticks do not certify; each board pass retains its own timestamp.
+The native runtime root is resolved independently of the model. Same-UID runtime files are trusted
+state, not authentication against malicious local writers. Tests: `test_goal_scheduled_ownership.py`
+composes a real isolated board tick with the native consumer and verifies close/scope/return failures.
+Remote, dependency-waiting, cross-profile, paraphrased-goal and non-TUI-return cases
+remain UNKNOWN. Native wake/dependency rows alone do not prove dispatcher health;
 no cached tool assertion certifies ownership. Native dependency waits come from actual links,
 not a `block_kind` label: `link_tasks` can gate a task without setting one. The bounded
 ancestor readback rejects dangling links, cycles and oversized graphs, and never executes
