@@ -7,8 +7,12 @@ Base: `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`.
 Applied public commit: `a61785d75bdefa3e9e63601c309c8045cf58f76b`.
 Applied public tree: `60057747260313e88f70f190e2f415f12902830d`.
 This is a locally verified candidate, not a deployment or publication receipt.
-Source 0146a882ed was locally committed and pending independent review when exported;
-publication of the source and this mirror must be coordinated separately.
+Source 0146a882ed was pending independent review when exported. It subsequently
+passed independent exact-head review (76 focused tests) and was published to the
+fork main branch with exact remote-SHA readback. A second reviewer replayed all
+400 patches without conflicts and independently verified the tree hash, all 392
+preserved patches, privacy scan, coverage and 22 production-path comparisons.
+Mirror publication and runtime activation remain separate from that source receipt.
 
 ## Merge-history reasoning (0393)
 

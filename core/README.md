@@ -148,7 +148,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 ## Applying
 
 The current local candidate contains **400 patches**, pinned to source
-`0146a882edf55e22fc9197e2a2e190a0fbacf068` (0400 pending source review/publication at export).
+`0146a882edf55e22fc9197e2a2e190a0fbacf068` (source independently reviewed and published).
 All 400 apply in order with `git am -3 --empty=keep`; 290 selected Python tests across
 15 files pass on the applied public series, with no failures or skips.
 Patches 0001–0392 are byte-identical and unrenumbered. Patch 0393 explicitly integrates
