@@ -46,19 +46,33 @@ def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 # ---- cards -----------------------------------------------------------------------------------------------------
+def card_key(card: dict[str, Any]) -> str:
+    """Retain core's owner-qualified key; local boards live in this ledger's scope."""
+    if card.get('remote') or card.get('gateway'):
+        if all(card.get(k) for k in ('gateway', 'profile', 'board', 'id')):
+            return '/'.join(str(card[k]) for k in ('gateway', 'profile', 'board', 'id'))
+        # Legacy remote keys remain remote, never fall through to a local bare ID.
+        return str(card.get('key') or f"unknown/unknown/unknown/{card['id']}")
+    return f"{card.get('board') or 'default'}/{card['id']}"
+
+
 def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dict[str, Any]]:
     """``{id: {id, status, block_kind, title, summary, completed_at, board}}`` for the ids found on any board."""
     want = sorted({str(i) for i in ids if i})
     found: dict[str, dict[str, Any]] = {}
     if not want:
         return found
-    for path in board_paths:
-        left = [i for i in want if i not in found]
+    ambiguous: set[str] = set()
+    for path in dict.fromkeys(board_paths):
+        board = Path(path).parent.name if Path(path).parent.parent.name == 'boards' else 'default'
+        left = sorted({i.split('/')[-1] for i in want
+                       if '/' not in i or (i.count('/') == 1 and i.split('/')[0] == board)})
         if not left:
-            break
+            continue
         try:
             conn = ro_connect(Path(path))
         except sqlite3.Error:
+            ambiguous.update(i for i in want if '/' not in i)
             continue
         try:
             cols = _cols(conn, "tasks")
@@ -71,13 +85,18 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dic
             ph = ",".join("?" for _ in left)
             for r in conn.execute(f"SELECT t.id, t.status, t.title, {bk} AS block_kind, {comp} AS completed_at, "
                                   f"{summary} AS summary FROM tasks t WHERE t.id IN ({ph})", left):
-                board = Path(path).parent.name if Path(path).parent.parent.name == "boards" else "default"
-                found[r["id"]] = {**dict(r), "board": board}
+                card = {**dict(r), 'board': board}
+                for key in (r['id'], card_key(card)):
+                    if key in want:
+                        if key in found:
+                            ambiguous.add(key)
+                        found[key] = card
         except sqlite3.Error as exc:
+            ambiguous.update(i for i in want if '/' not in i)
             logger.debug("chat-closeout: card read failed on %s: %s", path, exc)
         finally:
             conn.close()
-    return found
+    return {key: card for key, card in found.items() if key not in ambiguous}
 
 
 def is_settled(card: Optional[dict[str, Any]]) -> bool:
@@ -86,6 +105,13 @@ def is_settled(card: Optional[dict[str, Any]]) -> bool:
     if card is None:
         return False
     status = card.get("status")
+    if card.get('remote'):
+        if card.get('stale') is not False:
+            return False
+        if status in DONE_STATUSES:
+            return card.get('unfinished') is False and card.get('via') == 'origin' and bool(card.get('binding_id'))
+        # Remote review is unfinished agent/verification work, not a human ask.
+        return status in ('blocked', 'triage') and card.get('block_kind') in ('needs_input', 'capability')
     if status in DONE_STATUSES or status in HUMAN_STATUSES:
         return True
     if status in ("blocked", "triage"):
@@ -129,7 +155,7 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     result gets a close-out; a covered card that is done/archived leaves the batch. Returns changed fields."""
     batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
     reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
-    gone = {i for i in covered & batch if (cards.get(i) or {}).get("status") in DONE_STATUSES}
+    gone = {i for i in covered & batch if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
     out: dict[str, Any] = {}
     if reopened or gone:
         out["covered"] = (covered - reopened) - gone
@@ -347,7 +373,7 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
         if done:
             fields.update(done_sig=done, done_at=now)
         covered |= {i for i in batch if is_settled(cards.get(i))}
-        gone = {i for i in covered if (cards.get(i) or {}).get("status") in DONE_STATUSES}
+        gone = {i for i in covered if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
         batch -= gone   # reported and finished; human-blocked cards stay (covered) until they move
         covered -= gone
         fields["closing"] = None

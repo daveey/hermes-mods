@@ -65,8 +65,50 @@ def board_paths() -> list[Path]:
                 if p.is_file()]
 
 
+def remote_cards() -> list[dict]:
+    """Use core's authoritative projection, including released rows (session_tasks omits those).
+
+    No replica/status-only fallback can prove a release. Older cores retain unknown
+    remote batches rather than silently treating a missing card as completed.
+    """
+    from hermes_constants import get_hermes_home
+    from hermes_cli import kanban_session_activity as ksa
+    from hermes_cli.kanban_origin_adapter import _gateway
+    from hermes_cli.kanban_origin_ledger import project
+    from hermes_cli.profiles import get_active_profile_name
+
+    path = get_hermes_home() / 'kanban' / 'origin-ledger.db'
+    if not path.exists():
+        return ksa._remote_links()
+    replica = ksa._hub_db_path()
+    rows = project(path, replica=replica,
+                   gateway=_gateway(replica or path.with_name('absent-replica.db')),
+                   profile=get_active_profile_name())
+    # Core alone decides which historical associations the receipts supersede.
+    # Its inventory also retains unsuperseded legacy obligations; don't lose those
+    # when adding released rows (which the open inventory deliberately omits).
+    return [card for card in ksa._remote_links() if card.get('via') != 'origin'] + rows
+
+
 def read_cards(ids: list[str]) -> dict:
-    return core.read_cards(board_paths(), ids)
+    cards = core.read_cards(board_paths(), ids)
+    try:
+        remote = remote_cards()
+    except Exception:
+        # Qualified local cards remain usable. Old bare IDs have lost ownership:
+        # without the remote inventory they cannot safely resolve to local done.
+        logger.debug('chat-closeout: origin projection unavailable', exc_info=True)
+        return {key: card for key, card in cards.items() if '/' in key}
+    want = set(ids)
+    for card in remote:
+        key = core.card_key(card)
+        cards.pop(str(card['id']), None)  # ambiguous historical bare-ID ledger
+        if key in want:
+            previous = cards.get(key)
+            # Several origin bindings can name one owner; no unsafe first match.
+            if previous is None or not core.is_settled(card):
+                cards[key] = card
+    return cards
 
 
 def state_dbs() -> list[Path]:
@@ -79,7 +121,7 @@ def state_dbs() -> list[Path]:
 def open_card_ids(session_id: str) -> list[str]:
     """Cards the chat created or shepherds that are not done/archived (queued, running, blocked, review)."""
     from hermes_cli import kanban_session_activity as ksa
-    return sorted({str(t["id"]) for t in ksa.session_tasks([session_id], ksa.LISTED_STATUSES)})
+    return sorted({core.card_key(t) for t in ksa.session_tasks([session_id], ksa.LISTED_STATUSES)})
 
 
 def _eligible(session_id: str, platform: str = "") -> bool:

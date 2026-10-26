@@ -356,3 +356,15 @@ test('failure summary never leaks the raw error or worker output, and strips ANS
   }
   assert.match(m.failureSummary('gave_up', { error: raw, failures: 2 }), /^The dispatcher gave up after 2 failed attempts\.$/)
 })
+
+test('structured kind=time (external-event wait, classified in place) is not a human ask nor an agent issue', () => {
+  const p = { kind: 'time', reason: 'External-event wait while the remote graph executes; parent verifies outcomes.', classified_in_place: true }
+  assert.equal(m.needsHuman(p), false)
+  const d = mapOf('t_wait', [ev(1, 'blocked', { reason: 'initial_status' }), ev(2, 'blocked', p)])
+  assert.deepEqual(m.blockedItems([T('t_wait')], d), [])
+  assert.deepEqual(m.agentIssues([T('t_wait')], d), [])
+  // a real ask after it is shown again with its buttons' data
+  d.get('default:t_wait').events.push(ev(3, 'blocked', { kind: 'needs_input', reason: 'Approve the plan in the doc.' }))
+  assert.equal(m.blockedItems([T('t_wait')], d).length, 1)
+  assert.equal(m.needsHuman({ kind: 'capability', reason: 'External-event wait: restore the API login.' }), true)
+})

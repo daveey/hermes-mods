@@ -90,7 +90,8 @@ def test_session_links_cover_lineage_and_other_gateways(hub):
     assert [(t["gateway"], t["id"], t["via"]) for t in tasks] == [("mini", "t_mini", "subscribed"),
                                                                   ("laptop", "t_own", "created")]
     mini = tasks[0]
-    assert mini["board"] == "bb" and mini["status"] == "blocked" and mini["current_run_started_at"] == NOW - 60
+    assert mini["board"] == "bb" and mini["status"] == "unknown" and mini["current_run_started_at"] == NOW - 60
+    assert mini["profile"] is None and mini["reported_status"] == "blocked"
     # a lineage id that created the card wins over the subscription
     assert hv.session_links(["s_local", "s_parent"])["tasks"][0]["via"] == "created"
     assert "t_done" in {t["id"] for t in hv.session_links(["s_local"], include_closed=True)["tasks"]}
@@ -136,6 +137,50 @@ def test_client_installed_but_no_db_yet(tmp_path, monkeypatch, fake_client):
     monkeypatch.setattr(hv, "load_client", lambda: fake_client)
     assert hv.sessions()["available"] is False
     assert not (tmp_path / "empty" / "hub.db").exists()
+
+
+def test_links_qualified_origin_and_owner_collisions(api_client):
+    c, hv, state = api_client
+    with sqlite3.connect(state / "hub.db") as db:
+        for gateway, profile, origin_gateway, origin_profile in [
+            ("mini", "work", "laptop", "work"),
+            ("mini", "default", "laptop", "default"),
+            ("cloud", "work", "other", "work"),
+        ]:
+            data = dict(id="t_same", board="bb", status="running", sessions=[
+                dict(session="s_same", gw=origin_gateway, profile=origin_profile, rel="created")])
+            db.execute("INSERT INTO replica VALUES (?,?,?,?,?,?,?)", (
+                gateway, "tasks", f"{profile}/bb/t_same", 1, 1, json.dumps(data), int(NOW * 1000)))
+        data = dict(id="t_legacy", board="bb", status="running", sessions=[dict(session="s_same")])
+        db.execute("INSERT INTO replica VALUES (?,?,?,?,?,?,?)", (
+            "mini", "tasks", "bb/t_legacy", 1, 1, json.dumps(data), int(NOW * 1000)))
+    tasks = c.get('/session-links/s_tip?ids=s_same&origin_profile=work').json()['tasks']
+    known = [t for t in tasks if t['id'] == 't_same']
+    assert [(t['gateway'], t['profile'], t['board']) for t in known] == [('mini', 'work', 'bb')]
+    legacy = next(t for t in tasks if t['id'] == 't_legacy')
+    assert legacy['profile'] is None and legacy['status'] == 'unknown'
+    assert legacy['ownership_state'] == 'unknown'
+    other = c.get('/session-links/s_same?origin_gateway=other&origin_profile=work').json()['tasks']
+    assert [(t['gateway'], t['profile']) for t in other if t['id'] == 't_same'] == [('cloud', 'work')]
+
+
+def test_links_binding_origin_alias_and_missing_owner_provenance(hub):
+    hv, state = hub
+    with sqlite3.connect(state / "hub.db") as db:
+        for key in ["work/bb/t_bound", "bb/t_historical"]:
+            tid = key.split('/')[-1]
+            data = dict(id=tid, board="bb", status="running", origin_bindings=[
+                dict(origin=dict(gateway="laptop", profile="work", session="ancestor"))])
+            db.execute("INSERT INTO replica VALUES (?,?,?,?,?,?,?)", (
+                "mini", "tasks", key, 1, 1, json.dumps(data), int(NOW * 1000)))
+    rows = hv.session_links(["tip", "ancestor"], origin_profile="work")["tasks"]
+    by_id = {t['id']: t for t in rows}
+    assert by_id['t_bound']['profile'] == 'work'
+    assert by_id['t_bound']['status'] == 'running'
+    assert by_id['t_historical']['profile'] is None
+    assert by_id['t_historical']['status'] == 'unknown'
+    assert hv.session_links(["ancestor"], origin_profile="default")["tasks"] == []
+    assert hv.session_links(["ancestor"], origin_gateway="cloud", origin_profile="work")["tasks"] == []
 
 
 # ---------------------------------------------------------------- requests

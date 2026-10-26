@@ -17,8 +17,8 @@
  *          (`/api/plugins/compute-rentals/inventory`, polled every 30 s; absent → no chips)
  *
  * Hidden when nothing is running. Polls every 5 s while the window is visible.
- * Clicking a kanban chip opens the Task Mentions popup when that plugin is
- * loaded, else the Kanban page; a machine chip opens that machine in the
+ * Known-owner kanban chips open the qualified Kanban drawer (never ambient
+ * task mentions); unresolved owners are non-clickable. A machine chip opens the
  * Compute Rentals status-bar popover. Hover any chip for the full title.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
@@ -111,13 +111,19 @@ const KANBAN_RANK = { running: 0, blocked: 1, review: 2, triage: 2, ready: 3, sc
 
 function taskChip(t, status) {
   const watching = t.via === 'subscribed'
+  const connectionId = t.connectionId || (t.gateway ? connectionForHubGateway(t.gateway) : null)
   return {
-    key: `kb:${t.id}`,
+    key: `kb:${taskKey(t.gateway || connectionId, t.board, t.id, t.profile)}`,
     kind: 'kanban',
     id: str(t.id),
+    gateway: str(t.gateway),
+    connectionId,
+    profile: str(t.profile) || null,
+    board: str(t.board) || 'default',
+    stale: Boolean(t.stale),
     state: status,
     label: str(t.title) || t.id,
-    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}\n${str(t.title)}`,
+    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}`,
     since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
   }
 }
@@ -125,13 +131,22 @@ function taskChip(t, status) {
 const byRank = chips => chips.sort((a, b) => (KANBAN_RANK[a.state] ?? 9) - (KANBAN_RANK[b.state] ?? 9))
 
 /** `/api/session-kanban-tasks` rows (already filtered to the lineage by the backend). */
-export function sessionTaskChips(tasks) {
+function withLocalRoute(t, route) {
+  // Only untagged serving-profile rows inherit the captured read route.
+  if (!t || !route || t.gateway || t.connectionId || t.profile === null || t.ownership_state === 'unknown') return t
+  return { ...t, connectionId: route.connectionId || null, profile: t.profile || route.profile || null }
+}
+
+export function sessionTaskChips(tasks, route) {
   const seen = new Set()
   const out = []
-  for (const t of Array.isArray(tasks) ? tasks : []) {
-    const status = str(t?.status)
-    if (!t?.id || !KANBAN_ACTIVE.has(status) || seen.has(t.id)) continue
-    seen.add(t.id)
+  for (const row of Array.isArray(tasks) ? tasks : []) {
+    const t = withLocalRoute(row, route)
+    const reported = str(t?.status)
+    const status = t?.unfinished && !KANBAN_ACTIVE.has(reported) ? 'unknown' : reported
+    const key = taskKey(t?.gateway || t?.connectionId, t?.board, t?.id, t?.profile)
+    if (!t?.id || (!KANBAN_ACTIVE.has(status) && status !== 'unknown') || seen.has(key)) continue
+    seen.add(key)
     out.push(taskChip(t, status))
   }
   return byRank(out)
@@ -150,19 +165,20 @@ function syncedAgo(at) {
 /** hermes-hub replica rows (`/api/plugins/hub-sync/session-links`): cards this
  *  lineage created/shepherds on OTHER gateways. The gateway's own cards come
  *  from the live route, so `local` rows are dropped; everything is keyed by
- *  gateway + board + id (the same t_ id can exist on two gateways).
- *  `liveKeys`: `${gateway}:${board}:${id}` of cards already listed live. */
-export const taskKey = (gateway, board, id) => `${str(gateway)}:${str(board) || 'default'}:${str(id)}`
+ *  gateway + profile + board + id (the same id can exist on multiple owners).
+ *  `liveKeys`: `${gateway}:${profile}:${board}:${id}` already listed live. */
+export const taskKey = (gateway, board, id, profile) => `${str(gateway)}:${str(profile) || '?'}:${str(board) || 'default'}:${str(id)}`
 
 export function hubLinkChips(tasks, liveKeys = new Set()) {
   const seen = new Set()
   const out = []
   for (const t of Array.isArray(tasks) ? tasks : []) {
-    const status = str(t?.status)
+    const reported = str(t?.status)
+    const status = t?.unfinished && !KANBAN_ACTIVE.has(reported) ? 'unknown' : reported
     const gateway = str(t?.gateway)
     const board = str(t?.board) || 'default'
-    if (!t?.id || t.local || !gateway || !KANBAN_ACTIVE.has(status)) continue
-    const k = taskKey(gateway, board, t.id)
+    if (!t?.id || t.local || !gateway || (!KANBAN_ACTIVE.has(status) && status !== 'unknown')) continue
+    const k = taskKey(gateway, board, t.id, t.profile)
     if (liveKeys.has(k) || seen.has(k)) continue
     seen.add(k)
     const chip = taskChip(t, status)
@@ -191,21 +207,22 @@ export function connectionForHubGateway(gateway, storage = typeof localStorage !
 
 // A card on another gateway opens in the Kanban drawer on its owner (the board
 // falls back to the hub replica when that gateway is unreachable).
-function openRemoteTask(chip) {
+function openQualifiedTask(chip) {
   const open = typeof window !== 'undefined' ? window.__hermesKanbanOpenTask : null
-  if (typeof open !== 'function') return false
-  return open(chip.id, chip.board, connectionForHubGateway(chip.gateway)) !== false
+  const connection = chip.connectionId
+  if (typeof open !== 'function' || !connection || !chip.profile || !open.supportsQualifiedOwners) return false
+  return open(chip.id, chip.board, connection, chip.profile) !== false
 }
 
 /** Fallback for backends without that route: scan the current board. */
-export function kanbanChips(board, sessionIds) {
+export function kanbanChips(board, sessionIds, route) {
   const ids = sessionIds instanceof Set ? sessionIds : new Set(sessionIds || [])
   const out = []
   for (const col of board?.columns || []) {
     for (const t of col?.tasks || []) {
       const status = str(t?.status || col?.name)
       if (!KANBAN_ACTIVE.has(status) || !ids.has(str(t?.session_id))) continue
-      out.push(taskChip(t, status))
+      out.push(taskChip(withLocalRoute({ ...t, board: t.board || board.board || board.slug || 'default' }, route), status))
     }
   }
   return byRank(out)
@@ -279,32 +296,53 @@ function activeConnection() {
   }
 }
 
-function api(path, connection, timeoutMs = 15_000) {
+function focusedRoute() {
+  const owner = host.state?.focusedSessionOwner?.get?.()
+  return {
+    // An owner with no connection is unresolved (including primary), not active.
+    connectionId: owner ? owner.connectionId : activeConnection(),
+    profile: owner ? (owner.targetProfile || owner.profile || 'default') : (host.state?.profile?.get?.() || 'default')
+  }
+}
+
+function api(path, connection, timeoutMs = 15_000, profile) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
-  const connectionId = connection || activeConnection()
-  return bridge({ path, ...(connectionId ? { connectionId } : {}), timeoutMs })
+  // Only an explicitly ambient caller may resolve the active connection.
+  // An unresolved captured owner must never be interpreted by the bridge.
+  const connectionId = arguments.length === 1 ? activeConnection() : connection
+  if (!connectionId) return Promise.reject(new Error('Session owner connection unavailable'))
+  return bridge({ path, connectionId, ...(profile !== undefined ? { profile } : {}), timeoutMs })
 }
 
 // stored id → { at, ids:Set } — the session plus its parent chain (compression
 // rotates the stored id; kanban tasks keep the id they were created under).
 const lineageCache = new Map()
 
-async function lineageIds(storedId, connection) {
-  const cacheKey = connection ? `${connection}\u0000${storedId}` : storedId
+async function lineageIds(storedId, connection, profile = 'default') {
+  const cacheKey = JSON.stringify([connection || '', profile, storedId])
   const hit = lineageCache.get(cacheKey)
   if (hit && Date.now() - hit.at < LINEAGE_TTL_MS) return hit.ids
   const ids = new Set([storedId])
   let cur = storedId
   for (let hop = 0; hop < 12 && cur; hop++) {
     try {
-      const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, connection, 5_000)
-      if (row?.id) ids.add(str(row.id))
-      cur = str(row?.parent_session_id)
+      const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, connection, 5_000, profile)
+      if (!row || row.id !== cur || (row.parent_session_id != null && typeof row.parent_session_id !== 'string')) {
+        ids.incomplete = true
+        return ids
+      }
+      ids.add(row.id)
+      cur = str(row.parent_session_id)
       if (cur) ids.add(cur)
     } catch {
-      break
+      ids.incomplete = true
+      return ids
     }
+  }
+  if (cur) {
+    ids.incomplete = true
+    return ids
   }
   lineageCache.set(cacheKey, { at: Date.now(), ids })
   return ids
@@ -333,38 +371,66 @@ const emit = () => subs.forEach(fn => fn(snapshot))
 
 // Last good hub answer for the focused lineage (shown stale while the hub is unreachable).
 let hubLinkCache = { session: null, chips: [] }
+const taskReadCache = new Map()
 
-async function loadKanban(ids) {
+export async function loadKanban(ids, route = focusedRoute()) {
+  route = { ...route }
+  const cacheScope = JSON.stringify([route.connectionId || '', route.profile, [...ids].sort()])
+  const read = (path, timeoutMs = 15_000) => api(path, route.connectionId, timeoutMs, route.profile)
   const list = await safe(
-    () => api(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
+    () => read(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
     null
   )
   let live = null
-  if (list && Array.isArray(list.tasks)) live = sessionTaskChips(list.tasks)
-  else {
-    const board = await safe(() => api('/api/plugins/kanban/board'), null)
-    live = board ? kanbanChips(board, ids) : null
+  if (list && Array.isArray(list.tasks)) {
+    live = sessionTaskChips(list.tasks, route)
+    taskReadCache.set(cacheScope, live)
+    // Authoritative projections include remote obligations and releases.
+    // Replica inventory must not add back released or unrelated tasks.
+    hubLinkCache = { session: cacheScope, chips: [] }
+    return live
+  } else {
+    const board = await safe(() => read('/api/plugins/kanban/board'), null)
+    const known = taskReadCache.has(cacheScope)
+    const previous = known ? staleChips(taskReadCache.get(cacheScope)) : []
+    const fallback = !known && board ? kanbanChips(board, ids, route) : []
+    const seen = new Set(previous.map(c => c.key))
+    // A readable legacy board cannot establish that the origin ledger is empty.
+    live = [...previous, ...fallback.filter(c => !seen.has(c.key)), {
+      key: `kb-status:${cacheScope}`, kind: 'kanban-status', state: 'unknown', stale: true,
+      label: 'Task status unavailable', title: 'Could not read authoritative session tasks; work may still be unfinished.'
+    }]
+    // Preserve the last authoritative set, including absence after release.
+    // An outage adds uncertainty, not replica resurrection of released work.
+    if (known) return live
   }
   // Linked cards on other gateways, from this gateway's hermes-hub replica
   // (hub-sync plugin). Absent plugin / hub down → no extra chips.
   const [first, ...rest] = [...ids]
   const hub = first
     ? await safe(
-        () => api(`/api/plugins/hub-sync/session-links/${encodeURIComponent(first)}?ids=${encodeURIComponent(rest.join(','))}`, null, 4_000),
+        () => read(`/api/plugins/hub-sync/session-links/${encodeURIComponent(first)}?ids=${encodeURIComponent(rest.join(','))}&origin_profile=${encodeURIComponent(route.profile || '')}`, 4_000),
         null
       )
     : null
   let remote
   if (hub && hub.available !== false && Array.isArray(hub.tasks)) {
-    // Live cards belong to the gateway that served this answer (hub.gateway).
-    const liveKeys = new Set((list?.tasks || []).map(t => taskKey(hub.gateway, t.board, t.id)))
-    remote = hubLinkChips(hub.tasks, liveKeys)
-    hubLinkCache = { session: first, chips: remote }
+    // Older plugins do not qualify the origin join. Keep their discovery rows
+    // visible as unknown, but never manufacture a clickable owner from them.
+    const rows = hub.qualified_origins === true && hub.origin_profile === route.profile
+      ? hub.tasks : hub.tasks.map(t => ({ ...t, profile: null, connectionId: null, status: 'unknown' }))
+    remote = hubLinkChips(rows)
+    hubLinkCache = { session: cacheScope, chips: remote }
   } else {
-    remote = first && hubLinkCache.session === first ? staleChips(hubLinkCache.chips) : []
+    remote = first && hubLinkCache.session === cacheScope ? staleChips(hubLinkCache.chips) : []
   }
   if (!live && !remote.length) return null
-  return [...(live || []), ...remote]
+  const seen = new Set()
+  return [...(live || []), ...remote].filter(chip => {
+    if (seen.has(chip.key)) return false
+    seen.add(chip.key)
+    return true
+  })
 }
 
 function focusedProfile() {
@@ -393,14 +459,16 @@ async function loadMachines(ids) {
 export async function archiveGuard({ sessionId, ids, profile, connectionId } = {}) {
   if (!sessionId) return []
   const lineage = new Set(ids || [])
-  for (const id of await lineageIds(sessionId, connectionId)) lineage.add(id)
+  const resolved = await lineageIds(sessionId, connectionId, profile || 'default')
+  if (resolved.incomplete) return [{ label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }]
+  for (const id of resolved) lineage.add(id)
   const inv = await api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id=', connectionId, 2_000)
   if (!inv || !Array.isArray(inv.machines)) return []
   const chips = machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile: profile || 'default', ids: lineage })
   return machineArchiveLines(chips)
 }
 
-async function refresh() {
+export async function refresh() {
   // A focus change during an in-flight round must not be dropped (that left the
   // strip empty for a whole poll interval after opening a chat): run again after.
   if (running) {
@@ -412,11 +480,30 @@ async function refresh() {
   try {
     const runtime = host.state.focusedSessionId.get()
     const stored = host.state.focusedStoredSessionId.get()
+    const route = focusedRoute()
+    const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
+    const stillFocused = () => {
+      const current = focusedRoute()
+      return host.state.focusedSessionId.get() === runtime &&
+        JSON.stringify([current.connectionId || '', current.profile, host.state.focusedStoredSessionId.get()]) === scope
+    }
     if (!runtime && !stored) {
       snapshot = { runtime, stored, chips: [] }
       return emit()
     }
-    const sameSession = stored === snapshot.stored
+    const sameSession = scope === snapshot.scope
+    if (!route.connectionId) {
+      lastKanbanAt = 0
+      lastMachinesAt = 0
+      snapshot = {
+        runtime, stored, scope,
+        chips: [{
+          key: `owner-status:${scope}`, kind: 'kanban-status', state: 'unknown', stale: true,
+          label: 'Session owner unavailable', title: 'Could not resolve the session owner; work may still be unfinished.'
+        }]
+      }
+      return emit()
+    }
     const [procs, subagents] = await Promise.all([
       runtime ? safe(() => host.request('process.list', { session_id: runtime }), null) : null,
       runtime ? safe(() => host.request('subagent.list', { session_id: runtime }), null) : null
@@ -424,11 +511,28 @@ async function refresh() {
     const kanbanDue = stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)
     const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
     if (kanbanDue || machinesDue) {
-      const ids = await lineageIds(stored)
+      const ids = await lineageIds(stored, route.connectionId, route.profile)
+      if (ids.incomplete) {
+        if (!stillFocused()) return
+        // Never turn a partial ancestry read into an authoritative empty answer.
+        // Keep only this owner's previous chips and retry ancestry next poll.
+        lastKanbanAt = 0
+        lastMachinesAt = 0
+        snapshot = {
+          runtime, stored, scope,
+          chips: [...(sameSession ? staleChips(snapshot.chips).filter(c => c.key !== `lineage-status:${scope}`) : []), {
+            key: `lineage-status:${scope}`, kind: 'kanban-status', state: 'unknown', stale: true,
+            label: 'Session lineage unavailable', title: 'Could not read full session ancestry; work may still be unfinished.'
+          }]
+        }
+        emit()
+        return
+      }
       const [kChips, mChips] = await Promise.all([
-        kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids)) : undefined,
+        kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)) : undefined,
         machinesDue ? ((lastMachinesAt = Date.now()), loadMachines(ids)) : undefined
       ])
+      if (!stillFocused()) return
       // null = fetch failed: keep this chat's last good list, never the previous chat's.
       if (kChips) kanbanCache = kChips
       else if (kanbanDue && !sameSession) kanbanCache = []
@@ -440,10 +544,11 @@ async function refresh() {
       machineCache = []
     }
     // Focus moved while we were fetching: drop this round, the next tick reloads.
-    if (host.state.focusedSessionId.get() !== runtime) return
+    if (!stillFocused()) return
     snapshot = {
       runtime,
       stored,
+      scope,
       chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
     }
     emit()
@@ -475,18 +580,19 @@ function subscribe(fn) {
 
 // ── UI ──────────────────────────────────────────────────────────────────────
 
-const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist', machine: 'codicon-vm' }
+const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist', 'kanban-status': 'codicon-warning', machine: 'codicon-vm' }
+
+export function openTaskChip(chip) {
+  return openQualifiedTask(chip)
+}
 
 function Chip({ chip, now }) {
   const color = chipColor(chip.state)
   const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
-  const clickable = chip.kind === 'kanban' || showMachine
-  const onClick = chip.kind === 'kanban'
-    ? () => {
-        if (chip.gateway && openRemoteTask(chip)) return
-        if (typeof window.__taskMentionsOpen === 'function') window.__taskMentionsOpen(chip.id)
-        else host.navigate?.('/kanban')
-      }
+  const taskClickable = chip.kind === 'kanban' && !!chip.connectionId && !!chip.profile
+  const clickable = taskClickable || showMachine
+  const onClick = taskClickable
+    ? () => openTaskChip(chip)
     : showMachine
       ? () => window.__computeRentalsShow(chip.id)
       : undefined
@@ -532,9 +638,17 @@ function Strip() {
   const [snap, setSnap] = useState(snapshot)
   const [now, setNow] = useState(Date.now())
   const focused = useValue(host.state.focusedSessionId)
+  const stored = useValue(host.state.focusedStoredSessionId)
+  // Subscribe to owner and ambient fallback changes, not just the runtime id.
+  // Older hosts have no owner atom; their connection atom is a stable fallback.
+  useValue(host.state.focusedSessionOwner || host.state.connectionId)
+  useValue(host.state.connectionId)
+  useValue(host.state.profile || host.state.connectionId)
+  const route = focusedRoute()
+  const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
   useEffect(() => subscribe(next => (setSnap(next), setNow(Date.now()))), [])
-  useEffect(() => void refresh(), [focused])
-  const chips = snap.runtime === focused ? snap.chips : []
+  useEffect(() => void refresh(), [focused, scope])
+  const chips = snap.runtime === focused && snap.scope === scope ? snap.chips : []
   if (!chips.length) return null
   return jsx('div', {
     'data-slot': 'session-tasks',
