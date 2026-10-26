@@ -31,8 +31,8 @@ bootstrap a stopped launchd job or execute an inferred wake helper.
 
 ## Code
 
-Proposed appended patches **0277–0279**, after the preserved main series through
-0275 and profile-scoped GitHub broker patch 0276:
+Proposed appended patches **0285–0287**, after the preserved published series
+through 0284 (including profile-scoped GitHub broker patch 0278):
 
 - `tools/browser_agent_lifecycle.py`: route validation, acquire/complete/release,
   owner-specific daemon and vault identity, bounded cleanup retry.
@@ -86,7 +86,7 @@ See the lifecycle acceptance section for the failed-first-probe qualification.
 ## Applying
 
 These three patches are feature-branch proposals, not a released installation.
-Apply in order after 0276; do not renumber existing siblings. The full mirror uses
+Apply in order after 0284; do not renumber existing siblings. The full mirror uses
 the fork/upstream merge-base, not the newer upstream tip. Existing public privacy
 substitutions and the merge-adapted patch 0242 must be preserved. The documentation
 correction verification applied all 266 patches with `git am -3` from merge-base
@@ -102,7 +102,7 @@ adaptations and 0242, remain byte-for-byte intact. All 270 patches applied with
 blobs matched integrated core `b27b88b0dc67c27b8a4724905a6ff3dce13ecbf1`.
 Both the 266- and 270-patch receipts above are historical, not the current apply order.
 
-The final pinned-base integration uses fork main `ca145ec36e04a7db3271e2df91622dc7adbd91a2`
+The earlier final pinned-base integration uses fork main `ca145ec36e04a7db3271e2df91622dc7adbd91a2`
 and public main `1414cbbb0ca02b30bd7b0159a0a7c1a43a42a4aa`. It preserves all 275
 public main patches byte-for-byte, including historical privacy substitutions and
 adapted 0242. The already-published topology renumbering is retained, not repeated.
@@ -116,6 +116,20 @@ with a scratch-location-only adapter in a disposable clone; no assertions change
 Browser runtime/helpers are unchanged. The shared configuration module changes only
 Kanban defaults/comments, so it does not invalidate historical native evidence or
 imply a new native run. Full remote CI and independent exact-delta review remain gates.
+
+The recovered-CI integration pins core `39cdabdc623caf3661406446efc4610640b81107`
+and published public main `44ec0cd377b6afba7b656107eb29c1e13d3d4b9a`.
+All 284 published patches are preserved byte-for-byte; the three unchanged Chrome
+commits now occupy 0285–0287. The complete 287-patch series applied with `git am -3`
+from the same merge-base. All ten Chrome paths match integrated core
+`6d2434b45db1a4f2c0a6206930504cce1c4549db`; the 24 newly integrated sibling paths
+also match except the preserved published task-identifier substitution in a Kanban
+test docstring (no assertion change). Canonical targeted tests passed 189 core
+and two documentation cases using the same PM interpreter/allocation-only adapter.
+The 279-patch receipt above is historical. This imports published poll-runner
+workflow routing, not a CI waiver: applicable exact-head CI and independent
+delta review remain required. Later unpublished mirror work is not duplicated.
+No browser/native behavior is changed or new native execution claimed.
 
 Keep the supervisor OFF until the identified integration/release blockers are
 closed and the operator explicitly authorizes deployment/activation. This remains
