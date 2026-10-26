@@ -22,7 +22,7 @@ const BAR =
   'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
 const ID_PATTERN = /^[a-z]{2,12}_[0-9a-f]{16,64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const FILTERS = ['All', 'Needs attention', 'Busy', 'Ready', 'Maintenance']
+const FILTERS = ['All', 'Needs attention', 'Running (Busy)', 'Idle', 'Held/maintenance', 'Failed', 'Unknown/stale', 'Checks passed + idle (Ready)']
 const STATES = {
   not_configured: 'Not configured',
   owner_disconnected: 'Owner gateway disconnected',
@@ -376,72 +376,127 @@ function operationalEvidence(items, stale, now) {
     }
   })
 }
-function rowState(r, source, hostRow, now) {
-  const provenance = source.snapshot.meta.provenance?.find((p) => p.source_id === r.id)
-  const stale =
-    (provenance && (provenance.state !== 'fresh' || Date.parse(provenance.expires_at) <= now)) ||
-    !!source.error ||
-    !['ready', 'partial'].includes(source.snapshot.data.state) ||
-    !fresh(source.snapshot.meta, now) ||
-    r.freshness !== 'fresh'
-  const operational = operationalEvidence(r.operational_evidence, stale, now)
-  const holds = [...new Set(operational.filter(e => e.held).map(e => e.label))]
-  const maintenance = holds.includes('Maintenance') ||
-    (hostRow?.maintenance?.state === 'active' && Date.parse(hostRow.maintenance.expires_at) > now)
-  const issue =
-    stale || ['offline', 'missing', 'unknown'].includes(r.registration) ||
-    ['fail', 'warn'].includes(r.readiness)
-  const health = stale
-    ? 'Stale'
-    : holds.length ? 'Held' : r.readiness === 'fail'
-      ? 'Unavailable'
-      : r.readiness === 'warn'
-        ? 'Degraded'
-        : r.registration === 'offline'
-          ? 'Offline observation'
-          : r.registration === 'missing'
-            ? 'Missing'
-            : r.registration === 'unknown'
-              ? 'Unknown'
-              : holds.length ? 'Held' : r.activity === 'busy'
-                ? 'Busy'
-                : r.readiness === 'pass' && r.activity === 'idle'
-                  ? 'Ready'
-                  : 'Readiness unverified'
-  // Offline confirmation belongs to the collector; the base contract lacks its
-  // consecutive-observation count. Never invent confirmation from one snapshot.
-  const reason = stale
-    ? 'Last-known observations; readiness not verified'
-    : holds.length ? `${holds.join(' · ')}; provider: ${r.registration}; readiness: ${r.readiness}`
-    : r.registration === 'offline'
-      ? 'Provider reports offline; inspect observation history'
-      : r.readiness === 'fail'
-        ? 'Required readiness check failed'
-        : r.readiness === 'warn'
-          ? 'Readiness check warning'
-          : holds.length ? holds.join(' · ') : r.activity === 'busy'
-            ? 'Busy — job not identified'
-            : health === 'Ready'
-              ? 'Fresh online/idle; readiness checks passed'
-              : 'Mandatory readiness evidence unavailable'
+const SOURCE_LABELS = {
+  systemd: 'systemd', maintenance_marker: 'maintenance marker', admission_journal: 'admission journal',
+  runner_journal: 'runner journal', supervisor_log: 'supervisor log'
+}
+const CHECK_KEY = /^(?:disk|service|tool:[A-Za-z0-9_.+-]{1,64}|operational:[a-z_]{1,32}:[a-z_]{1,32})$/
+export function checkLabel(key) {
+  if (key === 'disk') return 'Disk'
+  if (key === 'service') return 'Service'
+  if (key.startsWith('tool:')) return `Tool ${key.slice(5)}`
+  const [, kind, src] = key.split(':')
+  return `${HOLD_LABELS[kind] || kind} (${SOURCE_LABELS[src] || src})`
+}
+// Validates the owner's optional per-check readiness causes. Anything that is
+// malformed, not fresh on the client clock, or internally inconsistent is
+// discarded so the aggregate failure stays conservative.
+function readinessCauses(e, now) {
+  if (!e || typeof e !== 'object') return null
+  const lists = ['required', 'passed', 'failed', 'warned', 'hold_explained_failures']
+  if (!lists.every(k => Array.isArray(e[k]) && e[k].length <= 256 && e[k].every(v => typeof v === 'string' && CHECK_KEY.test(v)))) return null
+  if (e.freshness !== 'fresh' || !(operationalTime(e.observed_at) <= now) || !(operationalTime(e.expires_at) > now)) return null
+  const required = new Set(e.required), failed = new Set(e.failed)
+  if (![...e.passed, ...e.failed, ...e.warned].every(k => required.has(k))) return null
+  if (!e.hold_explained_failures.every(k => failed.has(k))) return null
+  const settled = new Set([...e.passed, ...e.failed, ...e.warned])
   return {
-    operational,
-    holds,
-    stale,
-    maintenance,
-    issue,
-    health,
-    reason,
-    ready: health === 'Ready' && !maintenance,
-    tone: stale
-      ? 'muted'
-      : (!maintenance || holds.length > 0) && r.readiness === 'fail'
-        ? 'bad'
-        : issue
-          ? 'warn'
-          : health === 'Ready'
-            ? 'good'
-            : 'muted'
+    failed: [...failed], warned: [...new Set(e.warned)], explained: [...new Set(e.hold_explained_failures)],
+    notObserved: [...required].filter(k => !settled.has(k))
+  }
+}
+function provenanceFresh(p, now, maxAge = Infinity) {
+  return p?.state === 'fresh' && operationalTime(p.observed_at) <= now &&
+    operationalTime(p.expires_at) > now && now - operationalTime(p.observed_at) <= maxAge
+}
+// Pure client classification. Raw activity is retained, never used as eligibility.
+export function rowState(r, source, hostRow, now) {
+  const meta = source.snapshot.meta
+  const provenance = meta.provenance?.find(p => p.source_id === r.id)
+  const coverage = meta.coverage?.find(c => c.scope_id === r.scope_id)
+  const invalidIdentity = !ID_PATTERN.test(r.id || '') || !/^[1-9][0-9]{0,19}$/.test(r.provider_runner_id || '') ||
+    !UUID.test(meta.owner?.gateway_id || '') || !source.snapshot.data.scopes.some(s => s.id === r.scope_id && s.provider === r.provider && s.endpoint === r.endpoint)
+  const sourceStale = !!source.error || !['ready', 'partial'].includes(source.snapshot.data.state) || !fresh(meta, now)
+  const stale = sourceStale || !provenanceFresh(provenance, now, 120000) || r.freshness !== 'fresh' ||
+    coverage?.state !== 'complete' || coverage?.pagination_complete !== true
+  // Hold age is independent of provider age. A fresh hold can describe a stale
+  // listener, but cannot make that listener's activity current.
+  const operational = operationalEvidence(r.operational_evidence, sourceStale || invalidIdentity, now)
+  const holds = [...new Set(operational.filter(e => e.held).map(e => e.label))]
+  const holdReason = operational.filter(e => e.held).map(e => `${e.label} (${SOURCE_LABELS[e.source] || e.source})`).join(' · ')
+  const unresolvedHold = operational.some(e => e.kind !== 'label_withdrawn' && !e.held && e.status !== 'Clear')
+  const expiredHold = operational.some(e => e.kind !== 'label_withdrawn' && e.state === 'held' && operationalTime(e.expires_at) <= now)
+  const checkProvenance = meta.provenance?.find(p => hostRow?.resource_id && p.source_id === hostRow.resource_id)
+  const checks = {
+    state: !sourceStale && provenanceFresh(checkProvenance, now) && ['pass', 'warn', 'fail'].includes(r.readiness) ? r.readiness : 'unknown',
+    observedAt: checkProvenance?.observed_at || null, expiresAt: checkProvenance?.expires_at || null,
+    evidenceIds: checkProvenance?.observation_ids || [],
+    causes: false, failed: [], explained: [], unexplained: [], warned: [], notObserved: []
+  }
+  const causes = checks.state === 'unknown' || invalidIdentity ? null : readinessCauses(r.readiness_evidence, now)
+  if (causes && (checks.state !== 'fail' || causes.failed.length)) {
+    // An explanation is trusted only when this client also sees the matching
+    // hold as current; service is explained only by a current systemd drain.
+    const current = new Set(operational.filter(e => e.held).map(e => `operational:${e.kind}:${e.source}`))
+    const explained = causes.explained.filter(k => k === 'service' ? current.has('operational:drained:systemd') : current.has(k))
+    Object.assign(checks, {
+      causes: true, failed: causes.failed, explained, warned: causes.warned, notObserved: causes.notObserved,
+      unexplained: causes.failed.filter(k => !explained.includes(k))
+    })
+  }
+  const holdOnly = checks.state === 'fail' && checks.causes && checks.unexplained.length === 0 && holds.length > 0
+  let bucket = 'unknown', bucketLabel = 'Unknown', reason = 'Activity unknown'
+  const conflicting = r.registration === 'offline' && r.activity === 'busy'
+  if (invalidIdentity) {
+    bucketLabel = 'Identity unknown'; reason = 'Invalid or incomplete registration identity'
+  } else if (stale) {
+    bucketLabel = 'Stale'; reason = 'Last-known observations; current activity unverified'
+  } else if (conflicting) {
+    bucketLabel = 'Conflicting observations'; reason = 'Provider reports offline and busy; current activity unverified'
+  } else if (checks.state === 'fail' && !holdOnly) {
+    // Never suppress an independent failure just because a hold exists. Without
+    // usable per-check causes the aggregate stays a failure.
+    bucket = 'failed'; bucketLabel = 'Failed'
+    reason = checks.causes && checks.unexplained.length
+      ? `Failed: ${checks.unexplained.map(checkLabel).join(', ')}`
+      : 'Required checks failed; individual check causes not reported'
+  } else if (r.activity === 'busy' && r.registration === 'online') {
+    bucket = 'running'; bucketLabel = 'Running'
+    reason = holds.length ? 'Running · draining / no new jobs' : 'Running — job not identified'
+  } else if (holds.length) {
+    bucket = 'held'; bucketLabel = 'Held'; reason = `Intentional hold; provider: ${r.registration}`
+  } else if (checks.state === 'warn') {
+    bucket = 'held'; bucketLabel = 'Degraded'; reason = 'Required check warning — not an intentional hold'
+  } else if (unresolvedHold) {
+    bucketLabel = expiredHold ? 'Hold expired · awaiting evidence' : 'Hold unconfirmed · awaiting evidence'
+    reason = bucketLabel
+  } else if (r.registration !== 'online') {
+    bucketLabel = ({ offline: 'Offline observation', missing: 'Missing' })[r.registration] || 'Registration unknown'
+    reason = r.registration === 'offline' ? 'Provider reports offline; failure not confirmed' : bucketLabel
+  } else if (r.activity === 'idle') {
+    bucket = 'idle'; bucketLabel = 'Idle'
+    reason = checks.state === 'pass' ? 'Provider idle · checks passed; not a free slot' : 'Provider idle · checks not reported'
+  } else {
+    bucketLabel = 'Activity unknown'
+  }
+  if (holdReason) reason += ` · ${holdReason}`
+  if (checks.warned.length && bucketLabel !== 'Degraded') reason += ` · Required check warning: ${checks.warned.map(checkLabel).join(', ')}`
+  else if (checks.warned.length) reason = `Required check warning: ${checks.warned.map(checkLabel).join(', ')} — not an intentional hold`
+  else if (bucket === 'running' && checks.state === 'warn') reason += ' · Required check warning'
+  // Host maintenance is not a runner hold, but like the owner API it withholds
+  // the verified-ready claim while it is active.
+  const hostMaintenance = hostRow?.maintenance?.state === 'active' && Date.parse(hostRow.maintenance.expires_at) > now
+  if (bucket === 'idle' && hostMaintenance) reason += ' · Host maintenance; not counted ready'
+  const ready = bucket === 'idle' && checks.state === 'pass' && !hostMaintenance
+  return {
+    operational, holds, stale, checks, bucket, bucketLabel, health: bucketLabel, reason,
+    lastKnownActivity: ['busy', 'idle'].includes(r.activity) ? r.activity : null,
+    evidence: { state: stale ? 'unknown' : 'fresh', observedAt: provenance?.observed_at || null, expiresAt: provenance?.expires_at || null },
+    maintenance: operational.some(e => e.held && e.kind === 'maintenance'),
+    issue: bucket === 'failed' || bucket === 'unknown' || checks.state === 'warn' || checks.warned.length > 0,
+    ready, inspectable: !source.error && !invalidIdentity,
+    actionable: !stale && !invalidIdentity && !conflicting,
+    tone: bucket === 'failed' ? 'bad' : bucket === 'held' ? 'warn' : ready ? 'good' : 'muted'
   }
 }
 export function projectFleet(sources = [], now = Date.now()) {
@@ -507,7 +562,7 @@ export function projectFleet(sources = [], now = Date.now()) {
         sources: [origin],
         source: origin,
         conflict: false,
-        actionable: !source.error,
+
         observed_at: s.meta.provenance?.find((p) => p.source_id === r.id)?.observed_at || null,
         hostKey: hostRow ? JSON.stringify([ownerKey(s.meta.owner), hostRow.id]) : 'unmapped'
       }
@@ -533,8 +588,14 @@ export function projectFleet(sources = [], now = Date.now()) {
             : previous
         row.sources = attribution
         row.conflict = new Set(attribution.map((x) => ownerKey(x.snapshot.meta.owner))).size > 1
-        row.actionable = !row.conflict && !row.source.error
+        row.actionable = row.actionable && !row.conflict
         if (row.conflict) {
+          row.inspectable = false
+          row.holds = []
+          row.maintenance = false
+          row.operational = row.operational.map(e => ({ ...e, held: false, status: 'Owner conflict — unverified' }))
+          row.bucket = 'unknown'
+          row.bucketLabel = 'Ownership conflict'
           row.health = 'Ownership conflict'
           row.reason = 'Multiple owners claim this provider registration'
           row.tone = 'warn'
@@ -550,6 +611,7 @@ export function projectFleet(sources = [], now = Date.now()) {
   const counts = {
     registrations: list.length,
     online: list.filter((r) => r.registration === 'online').length,
+    // Canonical API parity: last-known provider activity, not the display bucket.
     busy: list.filter((r) => r.activity === 'busy').length,
     ready: list.filter((r) => r.ready).length,
     unverified: list.filter((r) => r.registration === 'online' && !r.ready).length,
@@ -558,6 +620,7 @@ export function projectFleet(sources = [], now = Date.now()) {
   const complete =
     sources.length > 0 &&
     sources.every((s) => s.snapshot && !s.error && fresh(s.snapshot.meta, now)) &&
+    list.every(r => !r.stale && !r.conflict) &&
     coverage.length > 0 &&
     coverage.every((c) => c.state === 'complete' && c.pagination_complete) &&
     !messages.length
@@ -579,10 +642,26 @@ export function projectFleet(sources = [], now = Date.now()) {
               (r) => r.stale || r.conflict || ['Unknown', 'Readiness unverified'].includes(r.health)
             )
           ? 'muted'
-          : list.length
+          : list.length && list.every(r => r.ready)
             ? 'good'
             : 'muted'
   }
+}
+export function bucketCounts(rows) {
+  const counts = { running: 0, idle: 0, held: 0, failed: 0, unknown: 0 }
+  for (const r of rows) counts[Object.hasOwn(counts, r.bucket) ? r.bucket : 'unknown']++
+  return counts
+}
+function cohortSummary(rows, now = Date.now()) {
+  const counts = bucketCounts(rows)
+  const priority = r => r.bucket === 'failed' ? 0 : r.holds.length || r.bucket === 'held' || r.checks?.state === 'warn' ? 1 : r.bucket === 'unknown' ? 2 : 3
+  const blocking = [...rows].filter(r => priority(r) < 3).sort((a, b) => priority(a) - priority(b) || a.key.localeCompare(b.key))[0]
+  const stamps = rows.flatMap(r => [r.observed_at, ...(r.checks.state !== 'unknown' ? [r.checks.observedAt] : []), ...r.operational.filter(e => e.kind !== 'label_withdrawn').map(e => e.observed_at)])
+  const known = stamps.filter(s => Number.isFinite(operationalTime(s)))
+  const mixed = known.length > 0 && (known.length !== stamps.length || new Set(known).size > 1)
+  const oldest = known.sort((a, b) => Date.parse(a) - Date.parse(b))[0]
+  return { counts, registrationCount: rows.length, reason: blocking?.reason || null,
+    age: !rows.length ? null : mixed ? 'Mixed ages' : oldest ? ago(oldest, now) : 'Not observed' }
 }
 export function projectNodes(sources = [], projectedRows = [], now = Date.now()) {
   const nodes = new Map()
@@ -605,17 +684,17 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
       const observedAt = Number.isFinite(Date.parse(probe?.observed_at)) ? probe.observed_at : null
       const freshness = { observedAt, state: source.error ? 'stale'
         : probe?.state === 'unavailable' ? 'unavailable'
-          : !observedAt ? 'unknown'
+          : !observedAt || operationalTime(probe.observed_at) > now ? 'unknown'
             : probe?.state === 'stale' || Date.parse(probe?.expires_at) <= now ? 'stale'
-              : probe?.state === 'fresh' && Date.parse(probe?.expires_at) > now ? 'fresh' : 'unknown' }
+              : provenanceFresh(probe, now) && fresh(snapshot.meta, now) ? 'fresh' : 'unknown' }
       const runners = projectedRows.filter(r => r.hostKey === key)
-      const unknown = runners.filter(r => r.stale || !['busy', 'idle'].includes(r.activity)).length
+      const summary = cohortSummary(runners, now)
       nodes.set(key, {
         key, host, owner: snapshot.meta.owner, source, runners,
-        registrationCount: runners.length,
+        ...summary,
         capacity: {
-          enforced: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs >= 0,
-          limit: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs >= 0 ? host.capacity.declared_max_jobs : null,
+          enforced: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs > 0 && host.capacity.declared_max_jobs <= 1024,
+          limit: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs > 0 && host.capacity.declared_max_jobs <= 1024 ? host.capacity.declared_max_jobs : null,
           active: Number.isInteger(host.capacity?.observed_active_jobs) && host.capacity.observed_active_jobs >= 0 ? host.capacity.observed_active_jobs : null
         },
         maintenance: {
@@ -633,9 +712,9 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
               : 'Monitoring unavailable · health unverified'
         },
         activity: {
-          busy: !runners.length || unknown ? null : runners.filter(r => r.activity === 'busy').length,
-          idle: !runners.length || unknown ? null : runners.filter(r => r.activity === 'idle').length,
-          unknown
+          busy: runners.length ? summary.counts.running : null,
+          idle: runners.length ? summary.counts.idle : null,
+          unknown: summary.counts.unknown
         },
         freshness
       })
@@ -663,7 +742,7 @@ function highlight(value, query) {
   }
   return parts
 }
-export function selectNodes(projection, search = '', filter = 'All') {
+export function selectNodes(projection, search = '', filter = 'All', now = Date.now()) {
   const terms = search.toLowerCase().trim().split(/\s+/).filter(Boolean)
   const groups = projection.nodes.flatMap(n => {
     const hostText = [n.host.display_name, n.host.os, n.host.arch].join(' ').toLowerCase()
@@ -671,12 +750,12 @@ export function selectNodes(projection, search = '', filter = 'All') {
     const rows = selectRows(n.runners, hostMatches ? '' : search, filter)
     const nodeMatchesFilter = filter === 'All' ||
       (filter === 'Needs attention' && (n.source.error || n.monitoring !== 'reachable' || n.freshness.state !== 'fresh')) ||
-      (filter === 'Maintenance' && n.maintenance.active)
+      (['Maintenance', 'Held/maintenance'].includes(filter) && n.maintenance.active)
     return rows.length || (hostMatches && nodeMatchesFilter)
-      ? [{ ...n, name: n.host.display_name, rows }] : []
+      ? [{ ...n, ...cohortSummary(rows, now), name: n.host.display_name, rows }] : []
   })
   const unassigned = selectRows(projection.unassigned, search, filter)
-  if (unassigned.length) groups.push({ key: 'unmapped', name: 'Unassigned runners', rows: unassigned })
+  if (unassigned.length) groups.push({ key: 'unmapped', name: 'Unassigned runners', rows: unassigned, ...cohortSummary(unassigned, now) })
   return { groups, rows: groups.flatMap(g => g.rows) }
 }
 export function selectRows(rows, search = '', filter = 'All') {
@@ -707,8 +786,12 @@ export function selectRows(rows, search = '', filter = 'All') {
             r.host?.management === 'unreachable' ||
             r.health === 'Unknown' ||
             r.health === 'Readiness unverified')) ||
-        (filter === 'Busy' && r.activity === 'busy') ||
-        (filter === 'Ready' && r.ready) ||
+        (['Busy', 'Running (Busy)'].includes(filter) && r.bucket === 'running') ||
+        (filter === 'Idle' && r.bucket === 'idle') ||
+        (filter === 'Failed' && r.bucket === 'failed') ||
+        (filter === 'Unknown/stale' && r.bucket === 'unknown') ||
+        (['Ready', 'Checks passed + idle (Ready)'].includes(filter) && r.ready) ||
+        (filter === 'Held/maintenance' && (r.bucket === 'held' || r.holds.length > 0)) ||
         (filter === 'Maintenance' && r.maintenance)
     )
     .sort(
@@ -800,7 +883,21 @@ export const CSS = `
 .hermes-runners-head,.hermes-runners-summary,.hermes-runners-filters{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .hermes-runners-head strong{margin-right:auto}.hermes-runners-summary,.hermes-runners-muted{font-size:11px;color:var(--ui-text-secondary)}
 .hermes-runners input,.hermes-runners select{background:var(--ui-bg-elevated);border:1px solid var(--ui-stroke-secondary);border-radius:4px;padding:4px 6px;min-width:0;max-width:100%}
-.hermes-runners-search{width:100%}.hermes-runners-filters button{border-radius:4px;padding:3px 7px;font-size:11px}
+.hermes-runners-search{flex:1;width:100%;min-width:0!important}.hermes-runners-filters{flex-wrap:nowrap}.hermes-runners-filters select{width:170px;flex-shrink:1}
+.hermes-runners-bar{display:flex;gap:2px;height:8px;margin:5px 0;width:100%}
+.hermes-runners-segment{min-width:6px;border-radius:2px;box-sizing:border-box}
+.hermes-runners-running{background:var(--ui-accent,#3778c2)}
+.hermes-runners-idle{border:1px solid var(--ui-text-secondary);background:transparent}
+.hermes-runners-held{background:repeating-linear-gradient(135deg,transparent 0 3px,var(--warning,#b87918) 3px 5px);border:1px solid var(--warning,#b87918)}
+.hermes-runners-failed{background:var(--destructive,#c74949)}
+.hermes-runners-unknown{border:1px dashed var(--ui-text-secondary);background:repeating-linear-gradient(90deg,transparent 0 4px,var(--ui-text-secondary) 4px 6px)}
+.hermes-runners-key{display:flex;flex-wrap:wrap;gap:4px 10px;font-size:11px;color:var(--ui-text-secondary)}
+.hermes-runners-unassigned{border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:5px}
+.hermes-runners-blocking{display:block;font-size:11px;margin-top:4px;color:var(--ui-text-secondary)}
+.hermes-runners-state-icon{font-size:11px;color:var(--ui-text-secondary)}
+.hermes-runners-state-icon[data-bucket=running]{color:var(--ui-accent,#3778c2)}
+.hermes-runners-state-icon[data-bucket=held]{color:var(--warning,#b87918)}
+.hermes-runners-state-icon[data-bucket=failed]{color:var(--destructive,#c74949)}
 .hermes-runners-filters button[aria-pressed=true],.hermes-runners button:hover{background:var(--chrome-action-hover)}
 .hermes-runners-scroll{min-height:0;overflow:auto;overscroll-behavior:contain}
 .hermes-runners-group{border-top:1px solid var(--ui-stroke-secondary);padding-top:6px;margin-top:6px}
@@ -826,6 +923,19 @@ function useVisible() {
   }, [])
   return visible
 }
+const BUCKET_LABELS = { running: 'running', idle: 'idle', held: 'held/degraded', failed: 'failed', unknown: 'unknown' }
+const BUCKET_ICONS = { running: '▶', idle: '○', held: 'Ⅱ', failed: '×', unknown: '?' }
+function RegistrationBar({ counts, total }) {
+  if (!total) return null
+  return h('span', { style: { display: 'block' } },
+    h('span', { className: 'hermes-runners-bar', 'data-registration-bar': true, role: 'img',
+      'aria-label': `${total} registrations: ${Object.entries(counts).map(([k, n]) => `${n} ${BUCKET_LABELS[k]}`).join(', ')}` },
+      ...Object.entries(counts).filter(([, n]) => n).map(([k, n]) => h('span', {
+        key: k, 'aria-hidden': true, className: `hermes-runners-segment hermes-runners-${k}`, style: { flex: `${n} 1 0%` }
+      }))),
+    h('span', { className: 'hermes-runners-key', 'aria-hidden': true },
+      ...Object.entries(counts).map(([k, n]) => h('span', { key: k }, `${BUCKET_ICONS[k]} ${n} ${BUCKET_LABELS[k]}`))))
+}
 function Details({ row, transport, visible, onData }) {
   const q = useQuery({
     queryKey: [
@@ -841,7 +951,7 @@ function Details({ row, transport, visible, onData }) {
         {},
         row.source.snapshot.meta.owner
       ),
-    enabled: visible && row.actionable && ID_PATTERN.test(row.id),
+    enabled: visible && row.inspectable && ID_PATTERN.test(row.id),
     retry: false,
     staleTime: 15000
   })
@@ -851,7 +961,7 @@ function Details({ row, transport, visible, onData }) {
     'div',
     { className: 'hermes-runners-detail' },
     h('strong', null, 'Source observations'),
-    q.isPending ? h('p', null, 'Loading details…') : null,
+    q.isPending ? h('p', null, row.inspectable ? 'Loading details…' : 'Owner evidence unavailable; showing last-known facts') : null,
     q.error ? h('p', { role: 'alert' }, failure(q.error)) : null,
     h(
       'dl',
@@ -862,6 +972,17 @@ function Details({ row, transport, visible, onData }) {
       h('dd', null, text(row.registration)),
       h('dt', null, 'Runner lifecycle'),
       h('dd', null, text(row.lifecycle) || 'Not observed'),
+      h('dt', null, 'Provider activity'),
+      h('dd', null, `${row.stale || row.bucket === 'unknown' ? 'Last known: ' : ''}${row.lastKnownActivity || 'unknown'} · observed ${row.evidence.observedAt || 'Not observed'} · expires ${row.evidence.expiresAt || 'Not observed'}`),
+      h('dt', null, 'Required checks'),
+      h('dd', null, `${row.checks.state} · observed ${row.checks.observedAt || 'Not observed'} · expires ${row.checks.expiresAt || 'Not observed'}`,
+        row.checks.causes ? [
+          ['Failed (independent)', row.checks.unexplained], ['Failed (explained by current hold)', row.checks.explained],
+          ['Warning', row.checks.warned], ['Not observed', row.checks.notObserved]
+        ].filter(([, keys]) => keys.length).map(([label, keys]) => h('div', { key: label }, `${label}: ${keys.map(checkLabel).join(', ')}`))
+          : h('div', null, 'Individual check causes: Not reported')),
+      h('dt', null, 'OS / architecture'),
+      h('dd', null, `${text(row.observed_os)} / ${text(row.host?.arch) || 'Not reported'}`),
       h('dt', null, 'Operational evidence'),
       h('dd', null, row.operational.length ? row.operational.map((e, i) =>
         h('div', { key: i },
@@ -943,9 +1064,12 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
   useEffect(() => setOpenedRepair(null), [row.source.snapshot])
   const job = detail?.jobs?.find((j) => j.status === 'running' && j.assigned_runner_id === row.id)
   const observedJob = detail?.observed_jobs?.find(j => j.status === 'in_progress' && observedJobURL(row, j))
-  const currentJob = row.activity === 'busy' && !row.stale
+  const currentJob = row.bucket === 'running' && row.actionable && !row.stale
     ? (observedJob ? observedJobURL(row, observedJob) : job ? jobURL(row, job) : null) : null
   const currentJobId = observedJob?.job_id || job?.provider_job_id
+  const displayReason = currentJob
+    ? row.reason.replace('Running — job not identified', `Running — job ${currentJobId}`)
+    : row.reason
   function openMenu(e) {
     e.preventDefault()
     e.stopPropagation()
@@ -989,7 +1113,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               type: 'button',
               'data-runner-row': row.key,
               className: 'hermes-runners-row',
-              'aria-label': `${row.display_name} · ${[...row.holds, row.health, row.activity].join(' · ')}`,
+              'aria-label': `${row.display_name} · ${row.bucketLabel} · ${displayReason}`,
               'aria-expanded': expanded,
               onClick: () => onExpand(row.key),
               onKeyDown: (e) => {
@@ -999,7 +1123,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
                 }
               }
             },
-            h(StatusDot, { tone: row.tone }),
+            h('span', { className: 'hermes-runners-state-icon', 'data-bucket': row.bucket, 'aria-hidden': true }, BUCKET_ICONS[row.bucket]),
             h(
               'span',
               null,
@@ -1007,20 +1131,20 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               h(
                 'span',
                 { className: 'hermes-runners-meta' },
-                ...highlight(`${text(row.scope?.name)} · ${row.provider} · ${row.observed_os} ${row.host?.arch || ''} · ${(row.labels || []).filter((label, i) => i < 3 || search.trim().toLowerCase().split(/\s+/).filter(Boolean).some(term => text(label).toLowerCase().includes(term))).map(text).join(', ')}`, search)
+                ...highlight(`${text(row.scope?.name)} · ${row.provider} · ${(row.labels || []).filter((label, i) => i < 3 || search.trim().toLowerCase().split(/\s+/).filter(Boolean).some(term => text(label).toLowerCase().includes(term))).map(text).join(', ')}`, search),
+                search.trim() && search.toLowerCase().trim().split(/\s+/).some(t => `${row.observed_os} ${row.host?.arch || ''}`.toLowerCase().includes(t))
+                  ? h('span', null, ' · ', ...highlight(`${row.observed_os} ${row.host?.arch || ''}`, search)) : null
               ),
               h(
                 'span',
                 { className: 'hermes-runners-meta' },
-                currentJob ? `Busy — job ${currentJobId}` : row.reason
+                displayReason
               )
             ),
             h(
               'span',
               null,
-              `${row.maintenance ? 'Maintenance · ' : ''}${row.health} · ${row.activity}`,
-              ...row.operational.filter(e => e.kind !== 'label_withdrawn').map((e, i) =>
-                h('span', { key: i, className: 'hermes-runners-meta' }, `${e.label}${e.held ? '' : ` · ${e.status}`}`)),
+              row.bucketLabel,
               h('span', { className: 'hermes-runners-meta' }, ago(row.observed_at)),
               !['none', 'closed'].includes(repairState)
                 ? h('span', { className: 'hermes-runners-meta' }, `Repair ${repairState}`)
@@ -1327,7 +1451,8 @@ export function Runners({ ctx, features = null }) {
     }
   }
   function keyboard(e) {
-    if (e.defaultPrevented || e.target.closest?.('[role=menu]')) return
+    if (e.defaultPrevented || e.isComposing || e.nativeEvent?.isComposing || e.keyCode === 229 ||
+        e.ctrlKey || e.metaKey || e.altKey || e.target.isContentEditable || e.target.closest?.('[role=menu]')) return
     const node = e.target.closest('.hermes-runners-group')?.querySelector('[data-node-row]')
     if (node && ['ArrowRight', 'ArrowLeft'].includes(e.key) && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
       e.preventDefault()
@@ -1468,8 +1593,7 @@ export function Runners({ ctx, features = null }) {
         h(
           'div',
           { className: 'hermes-runners-summary' },
-          `Scope: ${view.counts.registrations} registrations · ${view.counts.ready} verified-ready · ${view.counts.unverified} readiness-unverified`,
-          search.trim() || filter !== 'All' ? h('div', { 'data-filtered-cohort': true }, `Showing ${groups.filter(g => g.host).length} nodes · ${rows.length} registrations`) : null
+          h('span', { 'data-filtered-cohort': true }, `${view.counts.registrations} registrations${search.trim() || filter !== 'All' ? ` · ${rows.length} shown` : ''}`)
         ),
         h(
           'div',
@@ -1486,33 +1610,16 @@ export function Runners({ ctx, features = null }) {
             h('p', { key: i, className: 'hermes-runners-note' }, `${['owner_disconnected', 'owner_conflict'].includes(s.snapshot?.data.state) ? 'Owner unavailable · ' : ''}${s.error || STATES[s.snapshot.data.state]} · ${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''}`))
         ),
         actionError ? h('p', { role: 'alert' }, actionError) : null,
-        h('input', {
+        h('div', { className: 'hermes-runners-filters' }, h('input', {
           ref: searchRef,
           className: 'hermes-runners-search',
           'aria-label': 'Search runners',
-          placeholder: 'Search name, host, scope, OS, architecture, labels…  /',
+          placeholder: 'Search runners…  /',
           value: search,
           onChange: (e) => setSearch(e.target.value)
         }),
-        h(
-          'div',
-          {
-            className: 'hermes-runners-filters',
-            'aria-label': 'Filter runners'
-          },
-          ...FILTERS.map((f) =>
-            h(
-              'button',
-              {
-                key: f,
-                type: 'button',
-                'aria-pressed': filter === f,
-                onClick: () => setFilter(f)
-              },
-              f
-            )
-          )
-        ),
+        h('select', { 'aria-label': 'Runner state', value: filter, onChange: e => setFilter(e.target.value) },
+          ...FILTERS.map(f => h('option', { key: f, value: f }, f)))),
         h(
           'div',
           { className: 'hermes-runners-scroll' },
@@ -1526,7 +1633,7 @@ export function Runners({ ctx, features = null }) {
           ...groups.map((g) =>
             h(
               'section',
-              { key: g.key, className: 'hermes-runners-group' },
+              { key: g.key, className: `hermes-runners-group${g.host ? '' : ' hermes-runners-unassigned'}` },
               h(
                 'button',
                 {
@@ -1543,12 +1650,20 @@ export function Runners({ ctx, features = null }) {
                 },
                 h('span', null,
                   h('b', null, `${expandedNodes.has(g.key) ? '▾' : '▸'} `, ...highlight(g.name, search)),
-                  g.host ? h('span', { className: 'hermes-runners-meta' }, ...highlight(`${text(g.host.os)} ${text(g.host.arch)}`, search), ` · ${g.registrationCount ? `${g.registrationCount} registrations` : 'No mapped runners'}`) : null,
-                  g.activity ? h('span', { className: 'hermes-runners-meta' }, `${g.activity.busy == null ? 'Activity unknown' : `${g.activity.busy} busy · ${g.activity.idle} idle`} · ${g.freshness.observedAt ? `${g.freshness.state} · ${ago(g.freshness.observedAt)}` : 'Not observed'}`) : null
+                  g.host && search.trim() && search.toLowerCase().trim().split(/\s+/).some(t => `${g.host.os} ${g.host.arch}`.toLowerCase().includes(t))
+                    ? h('span', { className: 'hermes-runners-meta' }, ...highlight(`${g.host.os} ${g.host.arch}`, search)) : null,
+                  h('span', { className: 'hermes-runners-meta' }, g.registrationCount ? `${g.registrationCount} registrations` : g.runners?.length ? 'No matching registrations' : 'No mapped registrations'),
+                  h(RegistrationBar, { counts: g.counts, total: g.registrationCount }),
+                  h('span', { className: 'hermes-runners-blocking' },
+                    g.reason || (g.maintenance?.active ? `Maintenance: ${g.maintenance.reason || 'Reason not reported'}` : g.health?.reason) || 'No physical node mapping',
+                    !g.host && g.reason ? ' · No physical node mapping' : '',
+                    g.age ? ` · ${g.age}` : '')
                 ),
-                h('small', null, g.health?.reason || `${g.rows.length} · mapping needed`)
+                g.freshness?.observedAt ? h('small', null, `Probe ${g.freshness.state} · ${ago(g.freshness.observedAt)}`) : null
               ),
               expandedNodes.has(g.key) && g.host ? h('div', { 'data-node-evidence': true, className: 'hermes-runners-note' },
+                h('div', null, `${text(g.host.os)} / ${text(g.host.arch)} · CPU: not reported · Memory: not reported`),
+                h('div', null, `${g.health.reason} · Probe observed: ${g.freshness.observedAt || 'Not observed'} · Source: ${g.source.route.connectionId} / ${g.source.route.targetProfile}`),
                 g.capacity.enforced ? `Enforced limit: ${g.capacity.limit} · ` : 'No enforced limit reported · ',
                 `Observed active jobs: ${g.capacity.active ?? 'unknown'}`,
                 g.maintenance.active ? h('div', null, `Maintenance: ${g.maintenance.reason || 'Reason unavailable'} · expires ${g.maintenance.expiresAt}`) : null

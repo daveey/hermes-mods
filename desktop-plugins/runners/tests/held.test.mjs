@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
+import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment, observe } from './sdk-mock.mjs'
 const p = await loadPlugin()
 const now = Date.now()
 const iso = delta => new Date(now + delta).toISOString()
@@ -11,6 +11,9 @@ function setup(items, change = {}) {
   s.meta.observed_at = iso(-1000)
   s.meta.expires_at = iso(120000)
   Object.assign(s.data.runners[0], { registration: 'online', readiness: 'pass', activity: 'idle', operational_evidence: items }, change)
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  observe(s, { hosts: s.data.hosts, now })
   return s
 }
 const project = (s, error = null) => p.projectFleet([{ route, snapshot: s, error }], now).rows[0]
@@ -21,20 +24,21 @@ test('current hold remains separate from offline, lifecycle and readiness failur
   assert.equal(row.health, 'Held')
   assert.equal(row.registration, 'offline')
   assert.match(row.reason, /provider: offline/)
-  assert.equal(row.issue, true)
+  assert.equal(row.issue, false)
   assert.equal(row.ready, false)
   assert.notEqual(row.tone, 'bad')
   assert.equal(row.lifecycle, s.data.runners[0].lifecycle)
   const failed = project(setup([evidence()], { readiness: 'fail', activity: 'busy' }))
-  assert.equal(failed.health, 'Held')
-  assert.match(failed.reason, /readiness: fail/)
+  assert.equal(failed.health, 'Failed')
+  assert.match(failed.reason, /checks failed/)
+  assert.deepEqual(failed.holds, ['Drained (intentional)'])
   assert.equal(failed.tone, 'bad')
   assert.equal(failed.activity, 'busy')
   const held = project(setup([evidence()]))
   assert.equal(held.health, 'Held')
   assert.equal(held.ready, false)
   assert.equal(held.issue, false)
-  assert.equal(held.tone, 'muted')
+  assert.equal(held.tone, 'warn')
 })
 for (const change of [
   { freshness: 'stale' }, { observed_at: iso(1000) }, { observed_at: null },
@@ -57,7 +61,10 @@ test('snapshot freshness and owner errors fence current holds', () => {
   const expired = setup([evidence()])
   expired.meta.expires_at = iso(-1)
   assert.deepEqual(project(expired).holds, [])
-  assert.deepEqual(project(setup([evidence()], { freshness: 'stale' })).holds, [])
+  const stale = project(setup([evidence()], { freshness: 'stale' }))
+  assert.deepEqual(stale.holds, ['Drained (intentional)'])
+  assert.equal(stale.bucket, 'unknown')
+  assert.equal(stale.actionable, false)
 })
 test('unknown evidence is not observed and stale clear is not current', () => {
   for (const change of [{ state: 'unknown' }, { freshness: 'unknown' }]) {
@@ -75,7 +82,7 @@ test('each hold is informational, suppresses ready, and preserves input lifecycl
       const original = structuredClone(s)
       const row = project(s)
       assert.equal(row.health, 'Held')
-      assert.equal(row.tone, 'muted')
+      assert.equal(row.tone, 'warn')
       assert.equal(row.issue, false)
       assert.equal(row.ready, false)
       assert.equal(row.lifecycle, lifecycle)
@@ -97,7 +104,7 @@ test('historical withdrawal never creates a hold; absent evidence stays compatib
   assert.equal(row.operational[0].timestamp, iso(-2000))
   const old = project(setup(undefined))
   assert.deepEqual(old.operational, [])
-  assert.equal(old.health, 'Ready')
+  assert.equal(old.health, 'Idle')
   assert.equal(old.ready, true)
 })
 test('all holds and historical provenance render alongside provider registration', async () => {
@@ -110,7 +117,7 @@ test('all holds and historical provenance render alongside provider registration
     await ui.click(button('Show runners'))
     await ui.click(document.querySelector('[data-node-row]'))
     const row = document.querySelector('[data-runner-row]')
-    for (const label of ['Drained (intentional)', 'Maintenance', 'Withheld: disk pressure', 'Waiting for root headroom', 'Held', 'busy']) assert.ok(row.textContent.includes(label), label)
+    for (const label of ['Drained (intentional)', 'Maintenance', 'Withheld: disk pressure', 'Waiting for root headroom', 'Conflicting observations', 'busy']) assert.ok(row.textContent.includes(label), label)
     await ui.click(row)
     const detail = document.querySelector('.hermes-runners-detail').textContent
     assert.match(detail, /Provider registrationoffline/)
