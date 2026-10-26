@@ -25,6 +25,22 @@ test('physical nodes start collapsed including empty hosts; expand reveals lazy 
     assert.equal(calls.filter(p => p.includes('/runners/')).length, 1)
   } finally { await ui.close() }
 })
+test('node detail shows explicit maintenance and enforced capacity without free-slot claims', async () => {
+  const s = snapshot()
+  s.data.hosts = [{ ...structuredClone(fixtures.Host), capacity: { enforced: true, declared_max_jobs: 4, observed_active_jobs: null }, maintenance: { state: 'active', reason: 'Inspection', expires_at: new Date(Date.now() + 60000).toISOString() } }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
+    const detail = document.querySelector('[data-node-evidence]')
+    assert.ok(detail, 'expanded node has evidence')
+    assert.match(detail.textContent, /Enforced limit: 4.*Observed active jobs: unknown/)
+    assert.match(detail.textContent, /Maintenance: Inspection.*expires/)
+    assert.doesNotMatch(detail.textContent, /slots|draining/i)
+  } finally { await ui.close() }
+})
 test('poll retains expanded nodes and detail but prunes removed identities before rediscovery', async () => {
   let s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host)]

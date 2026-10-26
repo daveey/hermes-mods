@@ -1260,6 +1260,11 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                 ),
                 h('small', null, g.health?.reason || `${g.rows.length} · mapping needed`)
               ),
+              expandedNodes.has(g.key) && g.host ? h('div', { 'data-node-evidence': true, className: 'hermes-runners-note' },
+                g.capacity.enforced ? `Enforced limit: ${g.capacity.limit} · ` : 'No enforced limit reported · ',
+                `Observed active jobs: ${g.capacity.active ?? 'unknown'}`,
+                g.maintenance.active ? h('div', null, `Maintenance: ${g.maintenance.reason || 'Reason unavailable'} · expires ${g.maintenance.expiresAt}`) : null
+              ) : null,
               expandedNodes.has(g.key)
                 ? g.rows.map((row) =>
                     h(RunnerRow, {
