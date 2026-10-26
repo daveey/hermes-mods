@@ -32,6 +32,28 @@ test('node health never turns management reachability or busy activity into veri
   assert.equal(n.health.state, 'unknown')
   assert.equal(n.monitoring, 'unreachable')
 })
+test('node duplicates select newest usable owner evidence independent of discovery order', () => {
+  const older = snapshot(), newer = snapshot()
+  older.data.hosts = [structuredClone(fixtures.Host)]
+  newer.data.hosts = [{ ...structuredClone(fixtures.Host), management: 'unreachable' }]
+  older.meta.observed_at = new Date(Date.now() - 60000).toISOString()
+  const a = source(older), b = source(newer, { route: { ...route, connectionId: 'second' } })
+  for (const sources of [[a, b], [b, a]]) {
+    const n = p.projectNodes(sources).nodes[0]
+    assert.equal(n.monitoring, 'unreachable')
+    assert.equal(n.source.route.connectionId, 'second')
+  }
+  b.error = 'Owner unreachable'
+  assert.equal(p.projectNodes([b, a]).nodes[0].monitoring, 'reachable')
+  const failed = p.projectNodes([b]).nodes[0]
+  assert.match(failed.health.reason, /Owner unreachable/)
+  assert.equal(failed.freshness.state, 'stale')
+  assert.equal(failed.monitoring, 'unknown')
+})
+test('node projection tolerates unavailable directory entries without routes', () => {
+  const result = p.projectNodes([{ error: 'Directory unavailable' }, { error: 'No routes' }])
+  assert.deepEqual(result, { nodes: [], unassigned: [] })
+})
 test('node search keeps matching empty hosts and reports only enumerated filtered registrations', () => {
   const s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: 'host_0000000000000002', display_name: 'Empty orchard' }]

@@ -420,7 +420,13 @@ export function projectFleet(sources = [], now = Date.now()) {
 }
 export function projectNodes(sources = [], projectedRows = [], now = Date.now()) {
   const nodes = new Map()
-  for (const source of sources) {
+  // Select a usable owner response before recency, with stable route tie-breaking.
+  // Envelope time selects the response only; it is never node observation age.
+  const ordered = sources.filter(s => s.snapshot).sort((a, b) =>
+    Number(!b.error) - Number(!a.error) ||
+    (Date.parse(b.snapshot?.meta.observed_at) || 0) - (Date.parse(a.snapshot?.meta.observed_at) || 0) ||
+    routeKey(a.route).localeCompare(routeKey(b.route)))
+  for (const source of ordered) {
     const snapshot = source.snapshot
     if (!snapshot) continue
     for (const host of snapshot.data.hosts) {
@@ -431,10 +437,10 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
       nodes.set(key, {
         key, host, owner: snapshot.meta.owner, source, runners,
         registrationCount: runners.length,
-        monitoring: host.management || 'unknown',
+        monitoring: source.error ? 'unknown' : host.management || 'unknown',
         health: {
           state: 'unknown',
-          reason: host.management === 'reachable'
+          reason: source.error ? `Owner unavailable · ${source.error} · last-known node` : host.management === 'reachable'
             ? 'Reachable · health unverified'
             : host.management === 'unreachable'
               ? 'Management probe unavailable — not proof of a node outage'
@@ -445,7 +451,7 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
           idle: !runners.length || unknown ? null : runners.filter(r => r.activity === 'idle').length,
           unknown
         },
-        freshness: { state: 'unknown', observedAt: null }
+        freshness: { state: source.error ? 'stale' : 'unknown', observedAt: null }
       })
     }
   }
