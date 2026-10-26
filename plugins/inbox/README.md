@@ -36,6 +36,10 @@ Kanban card is refused with `AgentFixablePost` (a `ValueError`, same CLI/tool/RE
 Kanban board (comment or fix card). The noise breaker only fires after David archived 3 cards; this needs none.
 Tests: `tests/test_mute_paths.py::test_agent_fixable_posts_refused_before_any_card_exists`.
 
+## Social cards go to the `pr` project
+
+Desktop groups a session under the project owning its `cwd`. A new card that is social (type or key starting `x-`/`bsky-`/`bluesky-`/`social-`, or a title naming X/Twitter/Bluesky together with a post/reply/DM/draft/approval/engagement word; a bare "PR"/pull-request title never matches) gets the host's own `pr` project folder as its cwd, read from that host's `projects.db` (Mac `/Users/.../code/pr`, hub `/home/ubuntu/code/pr`; ids differ, nothing is copied across hosts). An explicit `cwd` (tool arg, CLI `--cwd`, REST field) always wins; an inherited poster-session cwd already inside `pr` is kept; updates to existing cards never move sessions. `hermes inbox backfill-social [--apply]` moves existing social cards still in the fallback home-dir cwd (skips explicit cwds, archived and recently active sessions). Code: `routing.py`; tests `tests/test_social_routing.py`.
+
 ## Card types
 
 A plain card has **Do it** + **Archive**. A *typed* card has its type's own buttons, and the poster reads the decision back later by key, so "archive" never doubles as "approve".

@@ -107,6 +107,21 @@ _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"),
 _TYPES = Path(__file__).resolve().parent / "card_types.py"
 
 
+_ROUTING = Path(__file__).resolve().parent / "routing.py"
+
+
+def routing_module():
+    """routing.py loaded by path, like card_types.py."""
+    key = f"_hermes_inbox_routing_{int(_ROUTING.stat().st_mtime_ns)}"
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, _ROUTING)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod = sys.modules.setdefault(key, mod)
+    return mod
+
+
 def types_module():
     """card_types.py loaded by path (this module itself is loaded without a package)."""
     key = f"_hermes_inbox_card_types_{int(_TYPES.stat().st_mtime_ns)}"
@@ -214,11 +229,56 @@ class Inbox:
     def exists(self) -> bool:
         return self.path.exists()
 
+    # ── social routing backfill ─────────────────────────────────────────────
+    QUIET_S = 900  # a session active within this window may be a running worker: never moved
+
+    def backfill_social(self, *, apply: bool = False, include_archived: bool = False) -> list[dict[str, Any]]:
+        """Move clearly-social cards sitting in the generic fallback cwd (the home dir, or none) into
+        this host's `pr` project folder. Skips cards whose cwd was chosen (any other directory), live
+        or recently active sessions, and archived cards unless asked. Dry run unless ``apply``."""
+        rt = routing_module()
+        target = rt.project_path(self.home)
+        out: list[dict[str, Any]] = []
+        if not target or not self.exists():
+            return out
+        side, db = self._side(), self._sessions()
+        try:
+            rows = side.execute("SELECT session_id, key, title, poster, type FROM items").fetchall()
+            for r in rows:
+                if not rt.is_social(key=r["key"], type=r["type"], title=r["title"] or "", poster=r["poster"]):
+                    continue
+                s = db.get_session(r["session_id"]) or {}
+                cwd = s.get("cwd") or ""
+                rec = {"session_id": r["session_id"], "key": r["key"], "from": cwd, "to": target}
+                if rt.within(cwd, target):
+                    rec["action"] = "already"
+                elif s.get("archived") and not include_archived:
+                    rec["action"] = "skip:archived"
+                elif cwd and os.path.normpath(cwd) != os.path.normpath(str(Path.home())):
+                    rec["action"] = "skip:explicit-cwd"
+                elif s.get("ended_at") is None and (self.clock() - float(
+                        s.get("last_activity_at") or s.get("started_at") or 0)) < self.QUIET_S and \
+                        (s.get("message_count") or 0) > 1:
+                    rec["action"] = "skip:active"
+                else:
+                    rec["action"] = "moved" if apply else "would-move"
+                    if apply:
+                        db._execute_write(lambda c, sid=r["session_id"]: c.execute(
+                            "UPDATE sessions SET cwd=? WHERE id=?", (target, sid)))
+                out.append(rec)
+            return out
+        finally:
+            side.close()
+            self._close(db)
+
     # ── posting ─────────────────────────────────────────────────────────────
     def post(self, title: str, body: str, accept_prompt: str = "", *, key: Optional[str] = None,
              poster: Optional[str] = None, cwd: Optional[str] = None,
              model: Optional[str] = None, prompt_label: Optional[str] = None,
-             type: Optional[str] = None, fields: Optional[dict] = None) -> dict[str, Any]:
+             type: Optional[str] = None, fields: Optional[dict] = None,
+             inherited_cwd: Optional[str] = None) -> dict[str, Any]:
+        """``cwd`` is an explicit caller choice and always wins; ``inherited_cwd`` is the posting
+        session's own cwd, which social cards replace with this host's `pr` project folder."""
         ct = types_module()
         title = " ".join(str(title or "").split())[:MAX_TITLE]
         prompt_label = " ".join(str(prompt_label or "").split())[:200] or None
@@ -279,6 +339,9 @@ class Inbox:
                         f"Unmute after fixing the poster: `hermes inbox unmute {poster!r}`.")
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
+                rt = routing_module()
+                cwd = rt.route_cwd(self.home, explicit=cwd, inherited=inherited_cwd, social=rt.is_social(
+                    key=key, type=type, title=title, body=body, poster=poster))
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
                 db.set_session_hidden(sid, True)
                 text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy
