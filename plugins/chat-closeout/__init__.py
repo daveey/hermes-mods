@@ -33,6 +33,7 @@ SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 TICK_S = float(os.environ.get("CHAT_CLOSEOUT_TICK_S", "30"))
 _state: dict[str, Any] = {}
 _thread_lock = threading.Lock()
+_waiting_lock = threading.Lock()
 
 
 # ---- environment -----------------------------------------------------------------------------------------------
@@ -90,10 +91,10 @@ def remote_cards() -> list[dict]:
     return [card for card in ksa._remote_links() if card.get('via') != 'origin'] + rows
 
 
-def read_cards(ids: list[str]) -> dict:
+def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None) -> dict:
     cards = core.read_cards(board_paths(), ids)
     try:
-        remote = remote_cards()
+        remote = (remote_inventory or remote_cards)()
     except Exception:
         # Qualified local cards remain usable. Old bare IDs have lost ownership:
         # without the remote inventory they cannot safely resolve to local done.
@@ -109,6 +110,25 @@ def read_cards(ids: list[str]) -> dict:
             if previous is None or not core.is_settled(card):
                 cards[key] = card
     return cards
+
+
+def _pass_reader() -> Callable[[list[str]], dict]:
+    """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) is read
+    once and reused for every row, not once per pending row. A failed read fails every row the same way."""
+    memo: list[tuple[Optional[list[dict]], Optional[BaseException]]] = []
+
+    def inventory() -> list[dict]:
+        if not memo:
+            try:
+                memo.append((remote_cards(), None))
+            except Exception as exc:
+                memo.append((None, exc))
+        rows, exc = memo[0]
+        if exc is not None:
+            raise exc
+        return rows
+
+    return lambda ids: read_cards(ids, remote_inventory=inventory)
 
 
 def state_dbs() -> list[Path]:
@@ -233,20 +253,21 @@ pre_final_gate.needs_buffer = True
 # ---- sidebar: a settled batch stays "waiting" until its close-out ----------------------------------------------
 def waiting_source() -> dict[str, list[str]]:
     """kanban_session_activity waiting source: chats whose cards all settled but whose close-out has not run yet.
-    Cached for 3 s (the session list polls)."""
+    Cached for 3 s (the session list polls). Single-flight: polls that arrive while a pass runs wait for it and
+    share its answer instead of each starting their own."""
     if _off():
         return {}
-    hit = _state.get("waiting_cache")
-    mono = time.monotonic()
-    if hit and mono - hit[0] < 3.0:
-        return hit[1]
-    try:
-        out = core.pending_closeouts(ledger(), read_cards, proof=session_proof)
-    except Exception:
-        logger.debug("chat-closeout waiting source failed", exc_info=True)
-        out = {}
-    _state["waiting_cache"] = (mono, out)
-    return out
+    with _waiting_lock:
+        hit = _state.get("waiting_cache")
+        if hit and time.monotonic() - hit[0] < 3.0:
+            return hit[1]
+        try:
+            out = core.pending_closeouts(ledger(), _pass_reader(), proof=session_proof)
+        except Exception:
+            logger.debug("chat-closeout waiting source failed", exc_info=True)
+            out = {}
+        _state["waiting_cache"] = (time.monotonic(), out)
+        return out
 
 
 def _register_waiting_source() -> None:
