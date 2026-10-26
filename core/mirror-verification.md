@@ -1,6 +1,6 @@
 # Core mirror verification
 
-## Full-series re-verification through 0265
+## Full-series re-verification through 0267
 
 The ordered non-merge `upstream/main..origin/main` export was regenerated on
 2026-10-25 with upstream `710fa8a073` and fork `8f4c3a23cd`. All 265 entries
@@ -19,7 +19,7 @@ runtime changes or unmerged PR patches were introduced.
   Desktop rendering. The earlier notifier/bootstrap failures below were not
   rerun in this batch and are not claimed resolved.
 
-## Earlier verification through 0255
+## Earlier verification through 0256
 
 ## Export
 

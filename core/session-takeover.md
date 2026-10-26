@@ -23,6 +23,12 @@ was off screen.
 
 ## Behavior
 
+### Durable CLI writers (0292)
+
+Desktop admission now checks the SQLite conversation writer even with a warm active-session registry. It refuses promptly instead of waiting for the long writer timeout. `session.take_over` requests a holder-qualified cooperative handoff and acknowledges only actual release; replacement holders and profile mismatches are rejected. A CLI takeover latch prevents automatic reacquisition, including after compression. Accepted late-race row identity is retained for the existing Take over/reload exactly-once recovery.
+
+The terminal origin guard rejects detached `hermes chat --continue TITLE --create-if-missing`, including timeout promotion, while preserving foreground chat and normal workers. It is a narrow origin guard, not a shell security sandbox.
+
 ### Take over here (0013 + 0014)
 
 - **Shown only for `SESSION_NOT_OWNED`.** `errorRecoveryPlan` sets `takeOver: true` for that code alone. That plan is
@@ -96,6 +102,8 @@ was off screen.
 - `tour` and `terminal.read` still follow the rule that the session must be shown.
 
 ## How it works
+
+0292 adds durable-writer preflight and holder-qualified cooperative release before the older registry takeover flow below. The CLI latch is preserved across compression; the SQLite lease is not deleted and no process is killed.
 
 ### Background: active-session leases (stock)
 
@@ -216,6 +224,8 @@ from a client-less sibling runtime in the **same process**. Nothing in stock ups
   - `previewAct` now refuses only when `!isActiveSession && !backgroundPreviewTabFor(owner)`.
 
 ## Code
+
+0292 changes `agent/turn_facade_lease.py`, `hermes_cli/active_sessions.py`, `hermes_cli/cli_chat_turn_mixin.py`, `hermes_state_compression.py`, `tui_gateway/session_lifecycle.py`, `tui_gateway/methods_session_takeover.py`, `tui_gateway/prompt_turn.py`, `tools/terminal_tool.py`, and `tools/terminal_tool_guards.py`. The excerpts below describe the earlier registry protocol, not the newer durable preflight.
 
 The excerpts below are the core of each patch. See the patch files for the complete diff.
 
@@ -475,6 +485,8 @@ i18n (0014) adds the keys `assistant.thread.errorTakeOver`, `errorTakeOverUnconf
 
 ## Tests
 
+0292 adds `tests/tui_gateway/test_cli_durable_takeover.py`, `test_cli_takeover_adversarial.py`, `test_cli_takeover_full_turn.py`, `test_durable_takeover_recovery.py`, and `tests/tools/test_terminal_background_user_chat.py`. The implementation handoff reports 703 delta-file/adversarial passes; narrower overlapping runs are not additive. The full-turn fixture uses real cross-process AIAgent and SQLite through Desktop `message.complete`, with a stub at the provider boundary. No live Electron/provider/deployment proof is claimed.
+
 Python. Use the repo runner (AGENTS.md: never bare `pytest`):
 
 ```bash
@@ -526,6 +538,8 @@ Verified on upstream/main (`e06df9c2ea`) with 0001–0015 applied and 0013 resol
 - `gen_gateway_contracts.py --check` and `i18n-keys.mjs --check` were both clean.
 
 ## Applying
+
+For 0292 apply the complete ordered series at the merge-base. Update both gateway and CLI participants separately; publishing a patch does not activate either.
 
 ```bash
 cd ~/.hermes/hermes-agent        # on upstream/main, after 0001–0012
@@ -579,6 +593,8 @@ After applying, rebuild the desktop app (0014/0015) and restart the backend (001
 displaced needs 0013 too, because the old owner's watcher is what stops its turn and acks. See Gotchas.
 
 ## Gotchas
+
+- With 0292, an older CLI that cannot cooperate gets a bounded refusal: stop the chat explicitly in its owning terminal, then retry. Do not delete its durable lease or kill its process as a takeover shortcut. The legacy registry-only behavior below does not override this durable-writer check.
 
 - **Generated RPC contract.** `apps/shared/src/gateway-contract.generated.ts` and
   `apps/shared/src/gateway-contract.openrpc.json` are rendered from the Pydantic models in `tui_gateway/contracts/`

@@ -1,0 +1,497 @@
+From d4f1bc486466bc9ac5ac8f96c9f70822e08f3cbc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 01:39:18 -0700
+Subject: [PATCH] fix(desktop): preserve owner-routed foreign session tiles
+ [daveey]
+
+Remove the ambient identity guard and wrong-backend resume classification.
+Keep conservative restored-dead-tile deletion checks and owner-scoped routing.
+
+Why chain:
+- Correctly routed foreign tiles lost their runtime on ambient connection
+  refresh: startTileBackendIdentityGuard unconditionally compared owner to
+  ambient and deleted runtimeId (session-tile.tsx, base lines 149-162).
+- The guard assumed a tile must use the primary backend. cd2915ac6c added
+  that assumption alongside the valid registry-primary boot fix, but the
+  tile delegate now explicitly routes REST/RPC through the tile owner.
+- Recovery also stalled: owner 404s became WRONG_BACKEND_TILE_ERROR and
+  the reconnect effect specifically refused to clear that error.
+- Detection gap: old tests asserted foreign tiles must be unbound; resolver
+  and delegate tests did not run the controller's connection subscription.
+  The new integration imports real controller/open/resolver/store/delegate
+  and mounts SessionTilePane for retry/reconnect (transport and ChatView
+  rendering mocked). On base: 4 failures, 1 pass; fixed: 5 pass.
+
+Preserve workspace bucket changes: changing connection IDs intentionally
+hides/restores runtime-less persisted tiles (session-states.ts:1502-1525).
+Test that restoration is unpoisoned and owner resume succeeds; same-scope
+connection refresh/baseURL/token changes keep the existing foreign runtime.
+
+Verified: targeted vitest 10 files / 255 tests (including original Electron
+primary-startup/remote-route controls), eslint touched files, separate tsc.
+No live checkout changes, app restart, push or deployment.
+---
+ .../session-tile-owner-lifecycle.test.tsx     | 181 ++++++++++++++++++
+ .../desktop/src/app/chat/session-tile.test.ts |  83 +-------
+ apps/desktop/src/app/chat/session-tile.tsx    |  69 +------
+ apps/desktop/src/app/contrib/controller.tsx   |   2 -
+ 4 files changed, 188 insertions(+), 147 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/session-tile-owner-lifecycle.test.tsx
+
+diff --git a/apps/desktop/src/app/chat/session-tile-owner-lifecycle.test.tsx b/apps/desktop/src/app/chat/session-tile-owner-lifecycle.test.tsx
+new file mode 100644
+index 0000000000..47f15d2d0f
+--- /dev/null
++++ b/apps/desktop/src/app/chat/session-tile-owner-lifecycle.test.tsx
+@@ -0,0 +1,181 @@
++// Boot the real contribution lifecycle, including connection subscriptions.
++import '@/app/contrib/controller'
++
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { useSessionTileDelegate } from '@/app/contrib/hooks/use-session-tile-delegate'
++import { openSession } from '@/app/open-session'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { parseSessionRefValue } from '@/lib/session-refs'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { $connection, $gatewayState, _resetSessionOwnerHintsForTests, setSessions } from '@/store/session'
++import { $sessionTiles, patchSessionTile, sessionTileDelegate } from '@/store/session-states'
++
++import { resolveSessionRefOwner } from './session-ref-owner'
++import { SessionTilePane } from './session-tile'
++
++vi.mock('@/hermes', async original => ({
++  ...(await original<Record<string, unknown>>()),
++  getLatestSessionMessages: vi.fn(),
++  getSession: vi.fn()
++}))
++vi.mock('@/store/gateway', async original => ({
++  ...(await original<Record<string, unknown>>()),
++  requestGatewayForAgent: vi.fn(),
++  requestGatewayForProfile: vi.fn()
++}))
++
++vi.mock('@/app/chat', () => ({ ChatView: () => <div>Loaded tile</div> }))
++
++const { getLatestSessionMessages, getSession } = await import('@/hermes')
++const { requestGatewayForAgent, requestGatewayForProfile } = await import('@/store/gateway')
++const ref = 'default@hub-ec2/20261023_040944_37ae77'
++const storedId = parseSessionRefValue(ref).sessionId
++const owner = { connectionId: 'hermes-hub', profile: 'default', targetProfile: 'default' }
++
++function openRef() {
++  const route = resolveSessionRefOwner(ref)
++  expect(route).toEqual(owner)
++  openSession(storedId, vi.fn(), 'tab', { ownerRoute: route, workspaceMode: 'sessions' })
++  expect($sessionTiles.get()).toHaveLength(1)
++  expect($sessionTiles.get()[0]?.ownerRoute).toEqual(owner)
++}
++
++function mountDelegate() {
++  const ambient = vi.fn()
++  const states = new Map<string, ReturnType<typeof createClientSessionState>>()
++  renderHook(() => useSessionTileDelegate({
++    archiveSession: vi.fn(),
++    branchLoadedSession: vi.fn(),
++    branchStoredSession: vi.fn(),
++    executeSlashCommand: vi.fn(),
++    removeSession: vi.fn(),
++    requestGateway: ambient,
++    runtimeIdByStoredSessionIdRef: { current: new Map() },
++    sessionStateByRuntimeIdRef: { current: states },
++    updateSessionState: (id, update, stored) => {
++      const state = update(states.get(id) ?? createClientSessionState(stored ?? null))
++      states.set(id, state)
++
++      return state
++    }
++  } as Parameters<typeof useSessionTileDelegate>[0]))
++
++  return { ambient, states }
++}
++
++describe('owner-routed session reference tile lifecycle', () => {
++  beforeEach(() => {
++    _resetSessionOwnerHintsForTests({ storage: true })
++    $connectionsRegistry.set({
++      connections: [
++        { id: 'local', kind: 'local', label: 'This device' },
++        { id: 'hermes-hub', kind: 'ssh', label: 'hub (EC2)' }
++      ],
++      primary: 'local', version: 2
++    } as never)
++    $connection.set({ connectionId: 'local', mode: 'local' } as never)
++    vi.mocked(getLatestSessionMessages).mockResolvedValue({
++      messages: [{ content: 'owner transcript', role: 'user', timestamp: 1 }], session_id: storedId
++    } as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({
++      info: {}, messages: [], messages_omitted: true, session_id: 'rt-hub', session_key: storedId
++    } as never)
++  })
++
++  afterEach(() => {
++    cleanup()
++    $gatewayState.set('idle')
++    $sessionTiles.set([])
++    setSessions([])
++    $connection.set(null)
++    $connectionsRegistry.set(null)
++    _resetSessionOwnerHintsForTests({ storage: true })
++    vi.clearAllMocks()
++  })
++
++  it('loads the exact hub ref through its owner and keeps its runtime across ambient refresh and change', async () => {
++    openRef()
++    const { ambient, states } = mountDelegate()
++    const runtimeId = await sessionTileDelegate()!.resumeTile(storedId)
++    patchSessionTile(storedId, { runtimeId })
++    expect(states.get(runtimeId)?.messages).toHaveLength(1)
++    expect(getLatestSessionMessages).toHaveBeenCalledWith(storedId, { connectionId: 'hermes-hub', profile: 'default' })
++    expect(requestGatewayForAgent).toHaveBeenCalledWith('hermes-hub', 'default', 'session.resume', {
++      session_id: storedId, cols: 96, omit_messages: true, profile: 'default'
++    })
++
++    for (const connection of [
++      { connectionId: 'local', mode: 'local' },
++      { connectionId: 'local', mode: 'local', baseUrl: 'http://127.0.0.1:9220' },
++      { connectionId: 'local', mode: 'local', token: 'refreshed-test-token' }
++    ]) {
++      $connection.set(connection as never)
++      expect($sessionTiles.get()[0]?.runtimeId).toBe('rt-hub')
++      expect($sessionTiles.get()[0]?.error).toBeUndefined()
++      expect($sessionTiles.get()[0]?.ownerRoute).toEqual(owner)
++    }
++
++    expect(ambient).not.toHaveBeenCalled()
++    expect(requestGatewayForProfile).not.toHaveBeenCalled()
++  })
++
++  it('preserves workspace scope switching without poisoning the restored foreign tile', async () => {
++    openRef()
++    mountDelegate()
++    patchSessionTile(storedId, { runtimeId: await sessionTileDelegate()!.resumeTile(storedId) })
++    // An actual workspace/backend switch deliberately swaps the visible bucket
++    // and restores runtime-less tiles. That is distinct from connection refresh.
++    $connection.set({ connectionId: 'other', mode: 'ssh' } as never)
++    expect($sessionTiles.get()).toEqual([])
++    $connection.set({ connectionId: 'local', mode: 'local' } as never)
++    expect($sessionTiles.get()).toHaveLength(1)
++    expect($sessionTiles.get()[0]?.ownerRoute).toEqual(owner)
++    expect($sessionTiles.get()[0]?.error).toBeUndefined()
++    patchSessionTile(storedId, { runtimeId: await sessionTileDelegate()!.resumeTile(storedId) })
++    expect($sessionTiles.get()[0]?.runtimeId).toBe('rt-hub')
++  })
++
++  it('keeps an owner 404 retryable and the Retry button resumes through the owner', async () => {
++    openRef()
++    vi.mocked(requestGatewayForAgent).mockRejectedValueOnce(new Error('404: Session not found'))
++    vi.mocked(getSession).mockRejectedValue(new Error('404: Session not found'))
++    const { ambient } = mountDelegate()
++    $gatewayState.set('open')
++    render(<QueryClientProvider client={new QueryClient()}><SessionTilePane storedSessionId={storedId} /></QueryClientProvider>)
++    await screen.findByText('Session unavailable — you can retry resuming it.')
++    expect($sessionTiles.get()[0]?.error).not.toMatch(/wrong backend/i)
++    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
++    await waitFor(() => expect($sessionTiles.get()[0]?.runtimeId).toBe('rt-hub'))
++    expect($sessionTiles.get()[0]?.error).toBeUndefined()
++    expect(ambient).not.toHaveBeenCalled()
++    expect(requestGatewayForAgent).toHaveBeenCalledTimes(2)
++  })
++
++  it('reconnect retries an existing wrong-backend error through the explicit owner', async () => {
++    openRef()
++    patchSessionTile(storedId, { error: 'Wrong backend — this session lives on another connection. Reconnect to that backend to open it.' })
++    const { ambient } = mountDelegate()
++    $gatewayState.set('idle')
++    render(<QueryClientProvider client={new QueryClient()}><SessionTilePane storedSessionId={storedId} /></QueryClientProvider>)
++    expect(requestGatewayForAgent).not.toHaveBeenCalled()
++    act(() => $gatewayState.set('open'))
++    await waitFor(() => expect($sessionTiles.get()[0]?.runtimeId).toBe('rt-hub'))
++    expect($sessionTiles.get()[0]?.error).toBeUndefined()
++    expect(ambient).not.toHaveBeenCalled()
++  })
++
++  it('never falls back to the ambient gateway when the explicit owner is unreachable', async () => {
++    openRef()
++    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('owner unreachable'))
++    vi.mocked(requestGatewayForAgent).mockRejectedValue(new Error('owner unreachable'))
++    const { ambient } = mountDelegate()
++    await expect(sessionTileDelegate()!.resumeTile(storedId)).rejects.toThrow('owner unreachable')
++    expect(ambient).not.toHaveBeenCalled()
++    expect(requestGatewayForProfile).not.toHaveBeenCalled()
++    expect($sessionTiles.get()[0]?.ownerRoute).toEqual(owner)
++    expect($sessionTiles.get()[0]?.runtimeId).toBeUndefined()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/session-tile.test.ts b/apps/desktop/src/app/chat/session-tile.test.ts
+index 225c635598..6a2e7e2585 100644
+--- a/apps/desktop/src/app/chat/session-tile.test.ts
++++ b/apps/desktop/src/app/chat/session-tile.test.ts
+@@ -1,20 +1,16 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import type { HermesConnection } from '@/global'
+ import { getSession } from '@/hermes'
+ import { clearSessionDraft, stashSessionDraft } from '@/store/composer'
+ import { $gatewaySwitching } from '@/store/gateway-switch'
+ import { $activeGatewayProfile, $profiles } from '@/store/profile'
+ import { $connection, $gatewayState, $sessions, setSessions } from '@/store/session'
+-import { $sessionTiles, openSessionTile, reopenLastClosedTile, type SessionTile } from '@/store/session-states'
++import { $sessionTiles, openSessionTile, reopenLastClosedTile } from '@/store/session-states'
+ 
+ import {
+   sessionTileResumeFailure,
+   shouldResumeSessionTile,
+-  startTileBackendIdentityGuard,
+   startUnrestoredTileTitleBackfill,
+-  unbindTilesForBackendIdentityChange,
+-  WRONG_BACKEND_TILE_ERROR
+ } from './session-tile'
+ 
+ vi.mock('@/hermes', async importOriginal => ({
+@@ -22,19 +18,6 @@ vi.mock('@/hermes', async importOriginal => ({
+   getSession: vi.fn()
+ }))
+ 
+-function localConnection(): HermesConnection {
+-  return {
+-    baseUrl: 'http://127.0.0.1:9119',
+-    isFullscreen: false,
+-    logs: [],
+-    mode: 'local',
+-    nativeOverlayWidth: 0,
+-    token: 'test',
+-    windowButtonPosition: null,
+-    wsUrl: 'ws://127.0.0.1:9119'
+-  }
+-}
+-
+ describe('shouldResumeSessionTile', () => {
+   const live = {
+     gatewayOpen: true,
+@@ -78,71 +61,7 @@ describe('sessionTileResumeFailure', () => {
+     expect(sessionTileResumeFailure('session not found', true, false)).toBeUndefined()
+   })
+ 
+-  it('unbinds onto a wrong-backend error when the active backend identity changed', () => {
+-    expect(sessionTileResumeFailure('session not found', true, true, true)).toBe(
+-      'Wrong backend — this session lives on another connection. Reconnect to that backend to open it.'
+-    )
+-    expect(sessionTileResumeFailure('404', true, true, true)).not.toMatch(/still available/i)
+-  })
+-})
+-
+-describe('unbindTilesForBackendIdentityChange', () => {
+-  it('clears a runtime binding and latches the wrong-backend error when the active backend is not the tile owner', () => {
+-    const tiles: SessionTile[] = [
+-      {
+-        ownerRoute: { connectionId: '100-106-105-2', profile: 'writer' },
+-        runtimeId: 'rt-ssh',
+-        storedSessionId: 'ssh-chat'
+-      },
+-      {
+-        ownerRoute: { connectionId: 'local', profile: 'default' },
+-        runtimeId: 'rt-local',
+-        storedSessionId: 'local-chat'
+-      }
+-    ]
+-
+-    const next = unbindTilesForBackendIdentityChange(tiles, { mode: 'local' })
+-
+-    expect(next[0]).toEqual({
+-      error: WRONG_BACKEND_TILE_ERROR,
+-      ownerRoute: { connectionId: '100-106-105-2', profile: 'writer' },
+-      storedSessionId: 'ssh-chat'
+-    })
+-    expect(next[1]?.runtimeId).toBe('rt-local')
+-    expect(next[1]?.error).toBeUndefined()
+-  })
+-
+-  it('leaves a durable same-backend miss retryable', () => {
+-    const tiles: SessionTile[] = [
+-      { ownerRoute: { connectionId: 'local', profile: 'default' }, storedSessionId: 'local-chat' }
+-    ]
+-
+-    expect(unbindTilesForBackendIdentityChange(tiles, { connectionId: 'local', mode: 'local' })).toBe(tiles)
+-  })
+-})
+ 
+-describe('startTileBackendIdentityGuard', () => {
+-  afterEach(() => {
+-    $connection.set(null)
+-    $sessionTiles.set([])
+-  })
+-
+-  it('unbinds persisted tiles when an unqualified local boot replaces their owner', () => {
+-    $sessionTiles.set([
+-      {
+-        ownerRoute: { connectionId: '100-106-105-2', profile: 'writer' },
+-        runtimeId: 'rt-ssh',
+-        storedSessionId: 'ssh-chat'
+-      }
+-    ])
+-
+-    const stop = startTileBackendIdentityGuard()
+-    $connection.set(localConnection())
+-
+-    expect($sessionTiles.get()[0]?.error).toBe(WRONG_BACKEND_TILE_ERROR)
+-    expect($sessionTiles.get()[0]?.runtimeId).toBeUndefined()
+-    stop()
+-  })
+ })
+ 
+ describe('startUnrestoredTileTitleBackfill (#94167)', () => {
+diff --git a/apps/desktop/src/app/chat/session-tile.tsx b/apps/desktop/src/app/chat/session-tile.tsx
+index 6719a1624b..3b8fbb2350 100644
+--- a/apps/desktop/src/app/chat/session-tile.tsx
++++ b/apps/desktop/src/app/chat/session-tile.tsx
+@@ -91,14 +91,10 @@ import { ChatView } from '.'
+ 
+ const NO_MESSAGES: ChatMessage[] = []
+ 
+-export const WRONG_BACKEND_TILE_ERROR =
+-  'Wrong backend — this session lives on another connection. Reconnect to that backend to open it.'
+-
+ export function sessionTileResumeFailure(
+   message: string,
+   durableSessionFound: boolean | undefined,
+-  tileStillUnbound: boolean,
+-  backendIdentityChanged = false
++  tileStillUnbound: boolean
+ ): string | undefined {
+   if (!tileStillUnbound) {
+     return undefined
+@@ -108,10 +104,6 @@ export function sessionTileResumeFailure(
+     return message
+   }
+ 
+-  if (backendIdentityChanged) {
+-    return WRONG_BACKEND_TILE_ERROR
+-  }
+-
+   if (durableSessionFound) {
+     return 'Session is still available — retry resuming it.'
+   }
+@@ -119,9 +111,9 @@ export function sessionTileResumeFailure(
+   return 'Session unavailable — you can retry resuming it.'
+ }
+ 
+-/** True when a persisted tile's owner is a different backend than the one that
+- *  just became active. An unqualified local boot (no connectionId, mode local)
+- *  counts as the local identity — that is the post-update empty backend. */
++/** Conservative deletion check for restored, missing tiles only. A different
++ *  ambient backend is NOT a resume failure: live tiles use their owner route.
++ *  An unqualified local boot still counts as the local identity here. */
+ export function tileBackendIdentityChanged(
+   ownerConnectionId: string | null | undefined,
+   activeConnection: { connectionId?: string | null; mode?: string | null } | null | undefined
+@@ -138,33 +130,6 @@ export function tileBackendIdentityChanged(
+   return Boolean(active) && owner !== active
+ }
+ 
+-export function unbindTilesForBackendIdentityChange<
+-  T extends { error?: string; ownerRoute?: { connectionId?: string }; runtimeId?: string }
+->(
+-  tiles: readonly T[],
+-  activeConnection: { connectionId?: string | null; mode?: string | null } | null | undefined
+-): T[] {
+-  let changed = false
+-
+-  const next = tiles.map(tile => {
+-    if (!tileBackendIdentityChanged(tile.ownerRoute?.connectionId, activeConnection)) {
+-      return tile
+-    }
+-
+-    if (!tile.runtimeId && tile.error === WRONG_BACKEND_TILE_ERROR) {
+-      return tile
+-    }
+-
+-    changed = true
+-    const unbound = { ...tile, error: WRONG_BACKEND_TILE_ERROR }
+-    delete unbound.runtimeId
+-
+-    return unbound
+-  })
+-
+-  return changed ? next : (tiles as T[])
+-}
+-
+ /** Should this tile dispatch a `session.resume`?
+  *
+  *  - The gateway must be OPEN: persisted tiles mount at boot while it is still
+@@ -540,13 +505,11 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
+         // reconnect-time lookup.
+         const durableSession = await resolveStoredSession(storedSessionId, ownerRoute).catch(() => undefined)
+         const current = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+-        const identityChanged = tileBackendIdentityChanged(ownerRoute?.connectionId, $connection.get())
+ 
+         const error = sessionTileResumeFailure(
+           message,
+           Boolean(durableSession),
+-          Boolean(current && !current.runtimeId),
+-          identityChanged
++          Boolean(current && !current.runtimeId)
+         )
+ 
+         if (error) {
+@@ -563,7 +526,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
+   // retriggers the resume effect: one bounded auto-retry per (re)connect,
+   // mirroring the primary path's became-open resync.
+   useEffect(() => {
+-    if (gatewayOpen && tile?.error && tile.error !== WRONG_BACKEND_TILE_ERROR) {
++    if (gatewayOpen && tile?.error) {
+       patchSessionTile(storedSessionId, { error: undefined })
+     }
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+@@ -696,26 +659,6 @@ export function startUnrestoredTileTitleBackfill(lookup = probeStoredSession): (
+   }
+ }
+ 
+-/** Drop persisted tile bindings that belong to a different backend than the
+- *  one that just became active, and latch the wrong-backend error so a later
+- *  resume cannot turn a cross-backend 404 into the durable-session retry copy. */
+-export function startTileBackendIdentityGuard(activeConnection = () => $connection.get()): () => void {
+-  const run = () => {
+-    const connection = activeConnection()
+-    const tiles = $sessionTiles.get()
+-    const next = unbindTilesForBackendIdentityChange(tiles, connection)
+-
+-    if (next !== tiles) {
+-      $sessionTiles.set(next)
+-    }
+-  }
+-
+-  const off = $connection.listen(run)
+-  run()
+-
+-  return off
+-}
+-
+ /** The tab's REGISTERED name. Deliberately the bare placeholder for a draft
+  *  rather than its live composer title (`tabTitle` renders that): re-registering
+  *  per keystroke would re-render the strip, and holding the draft's text here
+diff --git a/apps/desktop/src/app/contrib/controller.tsx b/apps/desktop/src/app/contrib/controller.tsx
+index f2e5260490..4d7aac47ac 100644
+--- a/apps/desktop/src/app/contrib/controller.tsx
++++ b/apps/desktop/src/app/contrib/controller.tsx
+@@ -105,7 +105,6 @@ import { startSessionDrag } from '../chat/session-drag'
+ import {
+   SessionTileCloseConfirm,
+   stackSessionTilesIntoMain,
+-  startTileBackendIdentityGuard,
+   startUnrestoredTileTitleBackfill,
+   watchSessionTiles,
+   WorkspaceTabMenu
+@@ -463,7 +462,6 @@ hydrateContributedPanes()
+ if (!isBrowserWindow() && !isHudWindow()) {
+   watchSessionTiles()
+   startUnrestoredTileTitleBackfill()
+-  startTileBackendIdentityGuard()
+   watchRouteTiles()
+   watchPreviewTiles()
+ }
+-- 
+2.55.0
+
