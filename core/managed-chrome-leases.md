@@ -31,8 +31,8 @@ bootstrap a stopped launchd job or execute an inferred wake helper.
 
 ## Code
 
-Proposed appended patches **0285–0287**, after the preserved published series
-through 0284 (including profile-scoped GitHub broker patch 0278):
+Proposed appended patches **0293–0295**, after the preserved published series
+through 0292 (including profile-scoped GitHub broker patch 0280):
 
 - `tools/browser_agent_lifecycle.py`: route validation, acquire/complete/release,
   owner-specific daemon and vault identity, bounded cleanup retry.
@@ -86,7 +86,7 @@ See the lifecycle acceptance section for the failed-first-probe qualification.
 ## Applying
 
 These three patches are feature-branch proposals, not a released installation.
-Apply in order after 0284; do not renumber existing siblings. The full mirror uses
+Apply in order after 0292; do not renumber existing siblings. The full mirror uses
 the fork/upstream merge-base, not the newer upstream tip. Existing public privacy
 substitutions and the merge-adapted patch 0242 must be preserved. The documentation
 correction verification applied all 266 patches with `git am -3` from merge-base
@@ -117,10 +117,10 @@ Browser runtime/helpers are unchanged. The shared configuration module changes o
 Kanban defaults/comments, so it does not invalidate historical native evidence or
 imply a new native run. Full remote CI and independent exact-delta review remain gates.
 
-The recovered-CI integration pins core `39cdabdc623caf3661406446efc4610640b81107`
+The historical recovered-CI integration pins core `39cdabdc623caf3661406446efc4610640b81107`
 and published public main `44ec0cd377b6afba7b656107eb29c1e13d3d4b9a`.
 All 284 published patches are preserved byte-for-byte; the three unchanged Chrome
-commits now occupy 0285–0287. The complete 287-patch series applied with `git am -3`
+commits occupied 0285–0287 in that snapshot. The complete 287-patch series applied with `git am -3`
 from the same merge-base. All ten Chrome paths match integrated core
 `6d2434b45db1a4f2c0a6206930504cce1c4549db`; the 24 newly integrated sibling paths
 also match except the preserved published task-identifier substitution in a Kanban
@@ -130,6 +130,24 @@ The 279-patch receipt above is historical. This imports published poll-runner
 workflow routing, not a CI waiver: applicable exact-head CI and independent
 delta review remain required. Later unpublished mirror work is not duplicated.
 No browser/native behavior is changed or new native execution claimed.
+
+The subsequent published-baseline reconciliation pins core
+`e295d0da73b18c27e5898ee5ef3411688ba66ef7` and public main
+`b25626626475551ffd4a4b7dcd39cbb41048315b`. Its already-published mirror contains
+292 patches, including merged commits inserted earlier in the ordered history.
+All 292 published patch files are preserved byte-for-byte, including adapted
+0242 and the published attribution/test-fixture privacy substitutions. The broker
+is now 0280 (0278 in the recovered-CI snapshot); Chrome follows as 0293–0295.
+All 295 patches applied with `git am -3` from the same merge-base. The ten Chrome
+blobs match integrated core `5b105d0a1ffd01da75885373d3d39a69270abb33`, and feature
+application preserves every sibling tree entry from the applied public baseline.
+All three Chrome commits remain patch-equivalent to the recovered-CI candidate.
+Canonical tests on this new core passed 189 core cases and two documentation
+cases; `scripts/check --commit HEAD` passed all twelve checks, using the same PM
+interpreter and scratch-allocation-only runner adapter described above.
+The previous core CI success belongs to the old exact head, not this rebased
+candidate: new exact-head CI and independent changed-delta review are required.
+No unpublished sibling backlog is exported or native runtime acceptance implied.
 
 Keep the supervisor OFF until the identified integration/release blockers are
 closed and the operator explicitly authorizes deployment/activation. This remains

@@ -15,7 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
-| [managed-chrome-leases.md](managed-chrome-leases.md) | 0285–0287 | Experimental, not release-approved: opt-in owner-scoped default/local/named browser requests, selected vault scope and task/shutdown lease cleanup; configuration docs corrected locally, exact-head CI and changed-head review remain blockers; native core repetition and genuine credential use are unexercised, not claimed |
+| [managed-chrome-leases.md](managed-chrome-leases.md) | 0293–0295 | Experimental, not release-approved: opt-in owner-scoped default/local/named browser requests, selected vault scope and task/shutdown lease cleanup; configuration docs corrected locally, exact-head CI and changed-head review remain blockers; native core repetition and genuine credential use are unexercised, not claimed |
 | [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0278–0279, 0281 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
 | [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0283 | Orderly park releases PR guard; broker-aware PR-state reads |
 | [orphan-reaper-home-scope.md](orphan-reaper-home-scope.md) | 0286 | Orphan reaping requires proven home/UID ownership and fresh process identity |
@@ -110,7 +110,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [browser-background-tab.md](browser-background-tab.md) | 0163 0164 | `browser_exec`'s own tab and the CDP supervisor's fallback page open with `background=True`, so a new browser session stops stealing keyboard focus on macOS |
 | [pre-final-gate.md](pre-final-gate.md) | 0165 0167 | `pre_final_gate` plugin hook: hold a final answer silently (never shown or stored) or append to it; `needs_buffer` keeps a held answer from streaming |
 | [sidebar-automated-sessions.md](sidebar-automated-sessions.md) | 0166 0190 0191 0192 | Bot / smoke-test sessions (per-profile `sessions.automated_sources`, `"*"` = whole profile, or an allowlist `sessions.interactive_sources` that marks every other source; root `sessions.sidebar_profiles` makes every unlisted profile automated by default, clones included) are hidden from the Desktop sidebar by default; filter-menu "Show automated & test sessions" brings them back; pinned and blocked / needs-attention rows always stay; ⌘]/⌘[ skips the same rows |
-| [kanban-park-invariants.md](kanban-park-invariants.md) | 0169 0278 | Optional profile-scoped GitHub broker argv for PR acceptance; cards never park without showing who they wait on: respawn-guard holds are capped then blocked, a closed-unmerged PR binding can be replaced, every `scheduled` park has a wake (human asks stay blocked), block-loop escalations count as waiting on you |
+| [kanban-park-invariants.md](kanban-park-invariants.md) | 0169 0280 | Optional profile-scoped GitHub broker argv for PR acceptance; cards never park without showing who they wait on: respawn-guard holds are capped then blocked, a closed-unmerged PR binding can be replaced, every `scheduled` park has a wake (human asks stay blocked), block-loop escalations count as waiting on you |
 | [top-level-env-scrub.md](top-level-env-scrub.md) | 0169 0171 0172 | `serve`/`dashboard`/`desktop`/`gui`/`gateway`, the post-update Desktop reopen and Electron main drop the inherited kanban worker / delegate-child / session env (whole agent-scope family, one shared list), so chats are not fenced as delegate children; a process that still carries a leaked marker gets Kanban refusals naming the leak and the dead worker card |
 | [create-titled-session-source.md](create-titled-session-source.md) | 0180 | `chat -c <title> --create-if-missing` labels the created session with `--source` (or an inherited automation source) instead of `cli`, so integration threads stay out of the sidebar |
 | [fork-ci-hardening.md](fork-ci-hardening.md) | 0173 0176 0177 0179 0181 0182 0183 0188 0189 0193 0196–0207 0209 0218 0222 0224 0228 0240 0243 | Fork CI runs its Linux jobs on self-hosted runners; PM-locked Node for python tests; load/container-tolerant test fixes; 0196–0207/0209: hub-runner timeouts and worker sizing, rootless-docker lane, 3-day artifact retention, per-push concurrency on main, nix `workflow_dispatch` |
@@ -134,10 +134,10 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 ## Applying
 
-The pinned published-main 284-patch series applies with `git am -3` at the merge-base below.
-This feature candidate extends it to 287 patches: Chrome 0285–0287; see
+The pinned published-main 292-patch series applies with `git am -3` at the merge-base below.
+This feature candidate extends it to 295 patches: Chrome 0293–0295; see
 [managed-chrome-leases.md](managed-chrome-leases.md) for full-apply verification
-and experimental release limits. All 284 public-main patches are preserved byte-for-byte.
+and experimental release limits. All 292 public-main patches are preserved byte-for-byte.
 See [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) for the
 historical 275-patch verification and topology renumbering (67 tests passed, two bootstrap
 home-guard failures; not a fully green suite).
