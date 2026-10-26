@@ -112,11 +112,12 @@ test('known job appears only after bounded detail read and SDK opens its exact U
   try {
     await ui.click(button('Show runners'))
     await ui.click(document.querySelector('[data-node-row]'))
-    assert.match(document.body.textContent, /Busy — job not identified/)
+    assert.match(document.body.textContent, /Running — job not identified/)
     await ui.click(document.querySelector('[data-runner-row]'))
     await ui.click(button('Open current job 456'))
     assert.deepEqual(links, ['https://github.com/example/project/actions/runs/123/job/456'])
-    assert.doesNotMatch(document.body.textContent, /Busy — job not identified/)
+    assert.match(document.body.textContent, /Running — job 456/)
+    assert.doesNotMatch(document.querySelector('[data-runner-row]').textContent, /job not identified/)
   } finally {
     await ui.close()
   }

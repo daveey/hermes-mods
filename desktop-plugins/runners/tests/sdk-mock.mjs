@@ -109,6 +109,14 @@ export const fixtures = JSON.parse(
     'utf8'
   )
 )
+// Explicit simulated provider/probe observations; never inferred from fetch time.
+export function observe(s, { runners = s.data.runners, hosts = [], now = Date.now() } = {}) {
+  for (const source_id of [...runners.map(r => r.id), ...hosts.map(h => h.resource_id)]) {
+    s.meta.provenance = s.meta.provenance.filter(p => p.source_id !== source_id)
+    s.meta.provenance.push({ source_id, state: 'fresh', observed_at: new Date(now - 1000).toISOString(), expires_at: new Date(now + 60000).toISOString(), observation_ids: ['obs_0000000000000001'] })
+  }
+  return s
+}
 export function snapshot() {
   const s = structuredClone(fixtures.InventoryResponse)
   s.meta.observed_at = new Date().toISOString()
@@ -123,7 +131,7 @@ export function snapshot() {
       provider_total_count: 1
     }
   ]
-  return s
+  return observe(s)
 }
 export async function mount(component) {
   const container = document.createElement('div')

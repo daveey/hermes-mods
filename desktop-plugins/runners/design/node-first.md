@@ -1,5 +1,7 @@
 # Node-first Runners: direction B
 
+The approved [visual-v2 revision](visual-v2.md) extends this composition with labeled registration bars, compact reasons, a native state selector and a full unassigned cohort. Its evidence precedence and acceptance gates supersede the original busy/idle summary below.
+
 Approved composition: a native Monitor popover, not a dashboard. Keep the existing bottom-bar trigger, end-aligned upward popover, header, owner scope, refresh, search and filter controls. Replace registration-first inventory with collapsed physical nodes and a separate Unassigned runners disclosure. Expand a node for registrations; select a registration for inline detail. No reserved inspector.
 
 ## Layout
