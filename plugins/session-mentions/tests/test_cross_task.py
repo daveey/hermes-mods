@@ -104,7 +104,7 @@ def test_read_and_comment_each_queue_one_deduped_shepherd_request(relay, hub):
     sm.handle_task({"action": "read", "target": "t_cccc3333"}, session_id="s_mac")  # same (session, task): deduped
     assert len(hub) == 1
     argv = hub[0]
-    assert argv[:6] == ["/bin/hermes-hub", "request", "hub", "tasks", "default/t_cccc3333", "shepherd"]
+    assert argv[:6] == ["/bin/hermes-hub", "request", "hub", "tasks", "default/default/t_cccc3333", "shepherd"]
     assert "session=s_mac" in argv and "profile=default" in argv and argv[argv.index("--id") + 1].startswith("shep-")
     sm.handle_task({"action": "comment", "target": "hub:t_cccc3333", "message": "hi"}, session_id="s_other")
     assert len(hub) == 2 and "session=s_other" in hub[1]

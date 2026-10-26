@@ -1,0 +1,913 @@
+From 27b7841f7574601c93455abd9e2acc2453652d05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 06:10:27 +0000
+Subject: [PATCH] fix(kanban): retain qualified owners through task drawers
+ [daveey]
+
+---
+ apps/desktop/src/lib/media.ts                 |   4 +-
+ .../src/plugins/kanban/api.gateways.test.ts   |  68 +++++++++
+ apps/desktop/src/plugins/kanban/api.ts        | 132 +++++++++++-------
+ .../desktop/src/plugins/kanban/attach-drop.ts |   6 +-
+ .../src/plugins/kanban/board-owner.test.tsx   | 112 +++++++++++++++
+ apps/desktop/src/plugins/kanban/board.tsx     |  17 ++-
+ apps/desktop/src/plugins/kanban/drawer.tsx    |  71 ++++++----
+ .../src/plugins/kanban/open-task.test.ts      |  13 +-
+ apps/desktop/src/plugins/kanban/open-task.ts  |   9 +-
+ 9 files changed, 340 insertions(+), 92 deletions(-)
+ create mode 100644 apps/desktop/src/plugins/kanban/board-owner.test.tsx
+
+diff --git a/apps/desktop/src/lib/media.ts b/apps/desktop/src/lib/media.ts
+index 288c56f467..3949910c32 100644
+--- a/apps/desktop/src/lib/media.ts
++++ b/apps/desktop/src/lib/media.ts
+@@ -433,8 +433,8 @@ export async function downloadGatewayFileWithFeedback(path: string, origin?: Gat
+  *  a cached resource belongs to the connection/profile that returned it, not
+  *  to whichever backend is focused when the user clicks. The path stays on the
+  *  gateway; only Electron's authenticated save bridge sees it. */
+-export function captureGatewayFileDownload() {
+-  const { connectionId, profile } = capabilityScoped()
++export function captureGatewayFileDownload(owner?: { connectionId?: string; profile?: string }) {
++  const { connectionId, profile } = owner ?? capabilityScoped()
+ 
+   return (path: string, suggestedName: string) =>
+     downloadGatewayFileWithFeedback(path, { owner: { connectionId, profile }, suggestedName })
+diff --git a/apps/desktop/src/plugins/kanban/api.gateways.test.ts b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+index 4a661fb54c..5aa5a93705 100644
+--- a/apps/desktop/src/plugins/kanban/api.gateways.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+@@ -90,6 +90,74 @@ afterEach(() => {
+   vi.useRealTimers()
+ })
+ 
++describe('qualified task routes', () => {
++  it('keeps the delayed dispatcher nudge on the immutable owner profile and board', async () => {
++    await bind(() => board({ ready: [] }))
++    const owner = { gateway: 'nudge-owner', profile: 'work', board: 'ops' }
++    calls = []
++    await api.patchTask('nudge-task', { priority: 1 }, owner)
++    routed.id = 'elsewhere'
++    $boardSlug.set('other')
++    await vi.waitFor(() => expect(calls).toContainEqual({ path: '/dispatch?board=ops', opts: { connectionId: 'nudge-owner', profile: 'work', method: 'POST', body: {} } }))
++  })
++
++  it('rejects ambiguous legacy ids rather than using whichever owner was remembered last', async () => {
++    await bind(() => board({ ready: [] }))
++    api.rememberTaskOwner('ambiguous', 'ops', 'a', 'p')
++    api.rememberTaskOwner('ambiguous', 'ops', 'b', 'p')
++    calls = []
++    await expect(api.fetchTask('ambiguous')).rejects.toThrow(/ambiguous/i)
++    expect(calls).toEqual([])
++    await api.fetchTask('ambiguous', { gateway: 'a', profile: 'p', board: 'ops' })
++    expect(calls[0]).toMatchObject({ opts: { connectionId: 'a', profile: 'p' } })
++  })
++
++  it('pins every drawer action, log and delayed attachment download to the supplied owner', async () => {
++    const save = vi.fn().mockResolvedValue({ saved: true })
++    vi.stubGlobal('hermesDesktop', { saveGatewayFile: save })
++    await bind(() => board({ ready: [] }))
++    const owner = { gateway: 'drawer-owner', profile: 'work', board: 'private' }
++    api.rememberTaskOwner('drawer-id', 'wrong', 'other', 'default')
++    calls = []
++    await api.fetchLog('drawer-id', owner)
++    await api.addComment('drawer-id', 'hello', owner)
++    await api.reclaimTask('drawer-id', owner)
++    await api.reassignTask('drawer-id', 'worker', owner)
++    await api.estimateTask('drawer-id', owner)
++    await api.uploadAttachment('drawer-id', { filename: 'a', bytes: new ArrayBuffer(0) }, owner)
++    await api.deleteTask('drawer-id', owner)
++    const detail = await api.fetchTask('drawer-id', owner)
++    routed.id = 'other'
++    await detail.downloadAttachment('/stored/a', 'a')
++
++    for (const call of calls) {
++      expect(call.opts).toMatchObject({ connectionId: owner.gateway, profile: owner.profile })
++      expect(new URL(call.path, 'http://example.com').searchParams.get('board')).toBe(owner.board)
++    }
++
++    expect(save).toHaveBeenCalledWith({ connectionId: owner.gateway, profile: owner.profile, path: '/stored/a', suggestedName: 'a' })
++    expect(api.logKey('local', '', 'drawer-id', owner)).not.toEqual(api.logKey('local', '', 'drawer-id', { ...owner, profile: 'other' }))
++    vi.unstubAllGlobals()
++  })
++
++  it('keeps colliding task reads and writes on the explicit owner after ambient and registry changes', async () => {
++    await bind(() => board({ ready: [] }))
++    const owner = { gateway: 'owner-a', profile: 'research', board: 'ops' }
++    api.rememberTaskOwner('collision', 'other', 'owner-b', 'default')
++    routed.id = 'owner-b'
++    calls = []
++    await api.fetchTask('collision', owner)
++    await api.patchTask('collision', { priority: 2 }, owner)
++    expect(calls).toEqual([
++      { path: '/tasks/collision?board=ops', opts: { connectionId: 'owner-a', profile: 'research' } },
++      { path: '/tasks/collision?board=ops', opts: { connectionId: 'owner-a', profile: 'research', method: 'PATCH', body: { priority: 2 } } }
++    ])
++    expect(api.taskKey('local', '', 'collision', owner)).not.toEqual(
++      api.taskKey('local', '', 'collision', { ...owner, profile: 'default' })
++    )
++  })
++})
++
+ describe('mergeBoards', () => {
+   it('tags every card with its gateway and keeps the dispatch order across gateways', () => {
+     const merged = mergeBoards([
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 03d5e64010..d59af1e1bd 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -394,10 +394,15 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
+ export const boardKeyPrefix = (scope: string) => ['kanban', 'board', scope] as const
+ export const boardKey = (scope: string, slug: string, archived: boolean) =>
+   [...boardKeyPrefix(scope), slug, archived] as const
+-export const taskKey = (scope: string, slug: string, id: string) => ['kanban', 'task', scope, slug, id] as const
+-export const logKey = (scope: string, slug: string, id: string) => ['kanban', 'log', scope, slug, id] as const
++export const taskKey = (scope: string, slug: string, id: string, owner?: TaskOwner) =>
++  owner ? ['kanban', 'task', owner.gateway, owner.board, id, owner.profile] as const
++    : ['kanban', 'task', scope, slug, id] as const
++export const logKey = (scope: string, slug: string, id: string, owner?: TaskOwner) =>
++  owner ? ['kanban', 'log', owner.gateway, owner.board, id, owner.profile] as const
++    : ['kanban', 'log', scope, slug, id] as const
+ export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
+-export const profilesKey = (scope: string) => ['kanban', 'profiles', scope] as const
++export const profilesKey = (scope: string, owner?: TaskOwner) =>
++  owner ? ['kanban', 'profiles', owner.gateway, owner.profile] as const : ['kanban', 'profiles', scope] as const
+ export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
+ export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', scope] as const
+ /** [daveey] Blocked cards across every board and gateway (sidebar section). */
+@@ -469,15 +474,30 @@ function remoteRead<T>(gateway: string, path: string): Promise<T> {
+   })
+ }
+ 
+-interface TaskOwner {
+-  gateway: string
+-  board: string
+-  profile?: string
++export interface TaskOwner {
++  readonly gateway: string
++  readonly board: string
++  readonly profile?: string
+ }
+ 
+-const taskOwners = new Map<string, TaskOwner>()
++const taskOwners = new Map<string, { id: string; owner: TaskOwner }>()
++
++function ownerKey(id: string, owner: TaskOwner): string {
++  return JSON.stringify([owner.gateway, owner.profile ?? null, owner.board, id])
++}
++
++/** Legacy callers are safe only when the id has exactly one known owner. */
++function rememberedOwner(id: string): TaskOwner | undefined {
++  const matches = [...taskOwners.values()].filter(entry => entry.id === id)
++
++  if (matches.length > 1) {
++    throw new Error(`Ambiguous task id ${id}: supply gateway, profile and board`)
++  }
++
++  return matches[0]?.owner
++}
+ 
+-/** [daveey] Cards read from the hermes-hub replica, by id: their hub gateway
++/** [daveey] Cards read from the hermes-hub replica, by qualified owner key: their hub gateway
+  *  name and board, so a comment on one becomes a hub request instead of a
+  *  call to a gateway that just failed to answer. */
+ const hubTaskRefs = new Map<string, { board: string; hubGateway: string }>()
+@@ -486,7 +506,8 @@ const hubTaskRefs = new Map<string, { board: string; hubGateway: string }>()
+  *  open-task hook: a card opened from a chat on another gateway), so the
+  *  drawer's first fetch goes to the owning gateway + board. */
+ export function rememberTaskOwner(id: string, board: string, gateway: string, profile?: string): void {
+-  taskOwners.set(id, { board, gateway, ...(profile === undefined ? {} : { profile }) })
++  const owner = Object.freeze({ board, gateway, ...(profile === undefined ? {} : { profile }) })
++  taskOwners.set(ownerKey(id, owner), { id, owner })
+ }
+ 
+ /** Registry ids of every gateway, the routed (active) one first. A single
+@@ -514,7 +535,7 @@ function via(gateway: string | undefined): PluginRestOptions {
+ /** Owning gateway of a task (the routed one when unknown — e.g. a task id
+  *  typed before the board loaded, or a single-gateway setup). */
+ export function taskGateway(id: string): string {
+-  return taskOwners.get(id)?.gateway ?? routedScope()
++  return rememberedOwner(id)?.gateway ?? routedScope()
+ }
+ 
+ function withSlug(path: string, slug: string, params: Record<string, string> = {}): string {
+@@ -530,8 +551,8 @@ function withSlug(path: string, slug: string, params: Record<string, string> = {
+ }
+ 
+ /** `withBoard` for a task: its own board slug on its own gateway. */
+-function forTask(id: string, path: string, params: Record<string, string> = {}): [string, PluginRestOptions] {
+-  const owner = taskOwners.get(id)
++function forTask(id: string, path: string, params: Record<string, string> = {}, explicitOwner?: TaskOwner): [string, PluginRestOptions] {
++  const owner = explicitOwner ?? rememberedOwner(id)
+ 
+   return owner
+     ? [
+@@ -656,17 +677,17 @@ function rememberOwners(board: KanbanBoard, slug: string): KanbanBoard {
+   for (const col of board.columns) {
+     for (const task of col.tasks) {
+       if (task.gateway) {
+-        taskOwners.set(task.id, { board: slug, gateway: task.gateway })
++        rememberTaskOwner(task.id, slug, task.gateway)
+       }
+ 
+       if (task.from_hub && task.gateway) {
+         const hubGateway = hubGatewayForConnection(task.gateway)
+ 
+         if (hubGateway) {
+-          hubTaskRefs.set(task.id, { board: slug || 'default', hubGateway })
++          hubTaskRefs.set(ownerKey(task.id, { board: slug, gateway: task.gateway }), { board: slug || 'default', hubGateway })
+         }
+       } else {
+-        hubTaskRefs.delete(task.id)
++        hubTaskRefs.delete(ownerKey(task.id, { board: slug, gateway: task.gateway ?? routedScope() }))
+       }
+     }
+   }
+@@ -801,15 +822,15 @@ export async function fetchBoard(archived: boolean): Promise<KanbanBoard> {
+   return rememberOwners(board, slug)
+ }
+ 
+-export const fetchTask = async (id: string) => {
+-  const downloadAttachment = captureGatewayFileDownload()
+-  const detail = await call<KanbanTaskDetail>(...forTask(id, `/tasks/${id}`))
++export const fetchTask = async (id: string, owner?: TaskOwner) => {
++  const downloadAttachment = captureGatewayFileDownload(owner ? { connectionId: owner.gateway, profile: owner.profile } : undefined)
++  const detail = await call<KanbanTaskDetail>(...forTask(id, `/tasks/${id}`, {}, owner))
+ 
+   return { ...detail, downloadAttachment }
+ }
+ 
+ /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
+-export const fetchLog = (id: string) => call<WorkerLog>(...forTask(id, `/tasks/${id}/log`, { tail: '16384' }))
++export const fetchLog = (id: string, owner?: TaskOwner) => call<WorkerLog>(...forTask(id, `/tasks/${id}/log`, { tail: '16384' }, owner))
+ 
+ /** Every gateway's boards as one list: union by slug, card totals summed,
+  *  `current` = the routed gateway's. A remote-only board is listed too, so
+@@ -951,7 +972,7 @@ export async function fetchBlockedTasks(): Promise<BlockedTask[]> {
+   const tasks = perGateway.flatMap(result => (result.status === 'fulfilled' ? result.value : []))
+ 
+   for (const task of tasks) {
+-    taskOwners.set(task.id, { board: task.board, gateway: task.gateway ?? gateways[0] })
++    rememberTaskOwner(task.id, task.board, task.gateway ?? gateways[0])
+   }
+ 
+   return tasks.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || (b.created_at ?? 0) - (a.created_at ?? 0))
+@@ -961,6 +982,9 @@ export async function fetchBlockedTasks(): Promise<BlockedTask[]> {
+  *  per gateway, so a create aimed at another gateway lists ITS profiles. */
+ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profiles')
+ 
++export const fetchOwnerProfiles = (owner: TaskOwner) =>
++  call<{ profiles: KanbanProfile[] }>('/profiles', { connectionId: owner.gateway, profile: owner.profile })
++
+ export const fetchGatewayProfiles = (gateway: string) => remoteRead<{ profiles: KanbanProfile[] }>(gateway, '/profiles')
+ 
+ /** First-class Hermes projects, for scoping a board's default workspace. */
+@@ -978,35 +1002,43 @@ export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestrat
+ // The nudge goes to the gateway the write landed on — one timer per gateway.
+ const nudgeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+ 
+-function autoNudge(gateway: string = routedScope()): void {
+-  const pending = nudgeTimers.get(gateway)
++function autoNudge(gateway: string | TaskOwner = routedScope()): void {
++  const key = typeof gateway === 'string' ? gateway : ownerKey('', gateway)
++  const pending = nudgeTimers.get(key)
+ 
+   if (pending != null) {
+     clearTimeout(pending)
+   }
+ 
+   nudgeTimers.set(
+-    gateway,
++    key,
+     setTimeout(() => {
+-      nudgeTimers.delete(gateway)
+-      nudgeDispatcher(gateway).catch(() => undefined)
++      nudgeTimers.delete(key)
++
++      const request = typeof gateway === 'string'
++        ? nudgeDispatcher(gateway)
++        : call(withSlug('/dispatch', gateway.board), { connectionId: gateway.gateway, profile: gateway.profile, method: 'POST', body: {} })
++
++      request.catch(() => undefined)
+     }, 400)
+   )
+ }
+ 
+ /** Resolve the write, then kick the owning gateway's dispatcher. Rejections pass through. */
+-function nudged<T>(write: Promise<T>, gateway?: string): Promise<T> {
++function nudged<T>(write: Promise<T>, gateway?: string | TaskOwner): Promise<T> {
++  const captured = typeof gateway === 'object' ? { ...gateway } : gateway
++
+   return write.then(value => {
+-    autoNudge(gateway)
++    autoNudge(captured)
+ 
+     return value
+   })
+ }
+ 
+-export const patchTask = (id: string, patch: Record<string, unknown>) => {
+-  const [path, opts] = forTask(id, `/tasks/${id}`)
++export const patchTask = (id: string, patch: Record<string, unknown>, owner?: TaskOwner) => {
++  const [path, opts] = forTask(id, `/tasks/${id}`, {}, owner)
+ 
+-  return nudged(call(path, { ...opts, method: 'PATCH', body: patch }), taskGateway(id))
++  return nudged(call(path, { ...opts, method: 'PATCH', body: patch }), owner ?? taskGateway(id))
+ }
+ 
+ /** Create on `gateway` (default: the routed one). The board slug is the
+@@ -1031,7 +1063,7 @@ export const createTask = async (body: Record<string, unknown>, gateway?: string
+   // Route the follow-up writes (the dialog's lane move) before any board read
+   // has seen the new card.
+   if (created.task?.id) {
+-    taskOwners.set(created.task.id, { board: slug, gateway })
++    rememberTaskOwner(created.task.id, slug, gateway)
+   }
+ 
+   return created
+@@ -1039,10 +1071,10 @@ export const createTask = async (body: Record<string, unknown>, gateway?: string
+ 
+ // Deleting can unblock dependants (a gone parent no longer gates), so it
+ // nudges too.
+-export const deleteTask = (id: string) => {
+-  const [path, opts] = forTask(id, `/tasks/${id}`)
++export const deleteTask = (id: string, owner?: TaskOwner) => {
++  const [path, opts] = forTask(id, `/tasks/${id}`, {}, owner)
+ 
+-  return nudged(call(path, { ...opts, method: 'DELETE' }), taskGateway(id))
++  return nudged(call(path, { ...opts, method: 'DELETE' }), owner ?? taskGateway(id))
+ }
+ 
+ type BulkResult = { results: Array<{ id: string; ok: boolean; error?: string }> }
+@@ -1085,8 +1117,11 @@ export async function bulkTasks(ids: string[], patch: Record<string, unknown>):
+   return { results: outcomes.flatMap(outcome => outcome.results) }
+ }
+ 
+-export const addComment = (id: string, body: string) => {
+-  const hubRef = hubTaskRefs.get(id)
++export const addComment = (id: string, body: string, owner?: TaskOwner) => {
++  const captured = owner ?? rememberedOwner(id)
++  // The legacy replica request protocol has no profile field. Never queue a
++  // qualified-profile write through that lossy route.
++  const hubRef = captured && captured.profile === undefined ? hubTaskRefs.get(ownerKey(id, captured)) : undefined
+ 
+   // [daveey] A replica card's owner is unreachable: queue the comment as a
+   // hermes-hub owner request (applied when that gateway syncs again).
+@@ -1100,28 +1135,29 @@ export const addComment = (id: string, body: string) => {
+     })
+   }
+ 
+-  const [path, opts] = forTask(id, `/tasks/${id}/comments`)
++  const [path, opts] = forTask(id, `/tasks/${id}/comments`, {}, captured)
+ 
+   return call(path, { ...opts, method: 'POST', body: { author: 'desktop', body } })
+ }
+ 
+-export const reassignTask = (id: string, profile: string) => {
+-  const [path, opts] = forTask(id, `/tasks/${id}/reassign`)
++export const reassignTask = (id: string, profile: string, owner?: TaskOwner) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/reassign`, {}, owner)
+ 
+-  return nudged(call(path, { ...opts, method: 'POST', body: { profile, reclaim_first: true } }), taskGateway(id))
++  return nudged(call(path, { ...opts, method: 'POST', body: { profile, reclaim_first: true } }), owner ?? taskGateway(id))
+ }
+ 
+-export const reclaimTask = (id: string) => {
+-  const [path, opts] = forTask(id, `/tasks/${id}/reclaim`)
++export const reclaimTask = (id: string, owner?: TaskOwner) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/reclaim`, {}, owner)
+ 
+-  return nudged(call(path, { ...opts, method: 'POST', body: {} }), taskGateway(id))
++  return nudged(call(path, { ...opts, method: 'POST', body: {} }), owner ?? taskGateway(id))
+ }
+ 
+ export const uploadAttachment = (
+   id: string,
+-  upload: { filename: string; contentType?: string; bytes: ArrayBuffer }
++  upload: { filename: string; contentType?: string; bytes: ArrayBuffer },
++  owner?: TaskOwner
+ ) => {
+-  const [path, opts] = forTask(id, `/tasks/${id}/attachments`)
++  const [path, opts] = forTask(id, `/tasks/${id}/attachments`, {}, owner)
+ 
+   return call(path, { ...opts, method: 'POST', upload })
+ }
+@@ -1134,8 +1170,8 @@ export const createBoard = (slug: string, name: string, projectId?: string) =>
+ 
+ /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a
+  *  model call — gate behind an explicit user action + disclaimer. */
+-export const estimateTask = (id: string) => {
+-  const [path, opts] = forTask(id, `/tasks/${id}/estimate`)
++export const estimateTask = (id: string, owner?: TaskOwner) => {
++  const [path, opts] = forTask(id, `/tasks/${id}/estimate`, {}, owner)
+ 
+   return call<TaskEstimate>(path, { ...opts, method: 'POST', body: {} })
+ }
+diff --git a/apps/desktop/src/plugins/kanban/attach-drop.ts b/apps/desktop/src/plugins/kanban/attach-drop.ts
+index 7f24a39af6..3a0baf307d 100644
+--- a/apps/desktop/src/plugins/kanban/attach-drop.ts
++++ b/apps/desktop/src/plugins/kanban/attach-drop.ts
+@@ -6,13 +6,13 @@
+ 
+ import { type DragEvent as ReactDragEvent, useRef, useState } from 'react'
+ 
+-import { uploadAttachment } from './api'
++import { type TaskOwner, uploadAttachment } from './api'
+ 
+ export const isFileDrag = (dt: DataTransfer | null | undefined) => !!dt && Array.from(dt.types ?? []).includes('Files')
+ 
+ /** Sequential uploads; resolves with the count stored. The first failure
+  *  rejects (earlier files stay attached — the caller's refresh shows them). */
+-export async function uploadFiles(taskId: string, files: readonly File[]): Promise<number> {
++export async function uploadFiles(taskId: string, files: readonly File[], owner?: TaskOwner): Promise<number> {
+   let stored = 0
+ 
+   for (const file of files) {
+@@ -20,7 +20,7 @@ export async function uploadFiles(taskId: string, files: readonly File[]): Promi
+       bytes: await file.arrayBuffer(),
+       contentType: file.type || undefined,
+       filename: file.name
+-    })
++    }, owner)
+     stored += 1
+   }
+ 
+diff --git a/apps/desktop/src/plugins/kanban/board-owner.test.tsx b/apps/desktop/src/plugins/kanban/board-owner.test.tsx
+new file mode 100644
+index 0000000000..a615d1ac50
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/board-owner.test.tsx
+@@ -0,0 +1,112 @@
++import type { PluginRestOptions } from '@hermes/plugin-sdk'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { afterEach, expect, it, vi } from 'vitest'
++
++// Host setup for a real board + drawer integration.
++// eslint-disable-next-line no-restricted-imports
++import { registerPluginLocales } from '@/i18n/plugin-i18n'
++
++import { bindApi, rememberTaskOwner, taskKey } from './api'
++import { KanbanBoardPage } from './board'
++import { KANBAN_LOCALES } from './i18n'
++import { installOpenTaskHook, OPEN_TASK_HOOK } from './open-task'
++
++vi.mock('@/hermes', () => ({ setApiRequestProfile: vi.fn() }))
++
++let dispose = () => {}
++
++let locales = () => {}
++
++let unhook = () => {}
++const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++afterEach(() => {
++  cleanup()
++  client.clear()
++  dispose()
++  locales()
++  unhook()
++  vi.unstubAllGlobals()
++})
++
++it('carries a qualified open request through the board, drawer, edits, uploads, download and related navigation', async () => {
++  const owner = { gateway: 'owner-a', profile: 'research', board: 'ops' }
++  const save = vi.fn().mockResolvedValue({ saved: true })
++  vi.stubGlobal('hermesDesktop', { saveGatewayFile: save })
++
++  const rest = vi.fn(async (path: string, opts?: PluginRestOptions) => {
++    const url = new URL(path, 'http://example.com')
++
++    if (url.pathname === '/boards') {return { current: 'default', boards: [] }}
++
++    if (url.pathname === '/board') {return { columns: [], tenants: [], assignees: [], latest_event_id: 1 }}
++
++    if (url.pathname === '/profiles') {return { profiles: [{ name: `${opts?.connectionId ?? 'ambient'}-worker` }] }}
++
++    if (url.pathname === '/orchestration') {return { default_assignee: '' }}
++
++    if (url.pathname.endsWith('/log')) {return { exists: false, content: '' }}
++
++    if (opts?.method) {return { ok: true }}
++
++    if (url.pathname.startsWith('/tasks/')) {
++      const id = url.pathname.split('/')[2]
++
++      return {
++        task: { id, title: `${opts?.connectionId}/${opts?.profile}/${id}`, status: 'todo', body: 'Description' },
++        comments: [], events: [], runs: [], links: { parents: id === 'same' ? ['related'] : [], children: [] },
++        attachments: [{ id: 1, filename: 'report.md', stored_path: '/stored/report.md' }]
++      }
++    }
++
++    throw new Error(`Unexpected ${path}`)
++  })
++
++  locales = registerPluginLocales('kanban', KANBAN_LOCALES)
++  dispose = bindApi(rest as never, { get: (_key, fallback) => fallback, set: vi.fn(), remove: vi.fn() }, () => vi.fn())
++  const target: Record<string, unknown> = {}
++  unhook = installOpenTaskHook({ navigate: vi.fn(), rememberOwner: rememberTaskOwner }, target)
++  const open = target[OPEN_TASK_HOOK] as (id: string, board: string, gateway: string, profile: string) => boolean
++  render(<QueryClientProvider client={client}><KanbanBoardPage /></QueryClientProvider>)
++  act(() => { open('same', 'ops', 'owner-a', 'research') })
++  // A same-id board refresh must not redirect the parked request or later actions.
++  rememberTaskOwner('same', 'wrong', 'owner-b', 'default')
++  await screen.findByRole('heading', { name: 'owner-a/research/same' })
++  await waitFor(() => expect(rest).toHaveBeenCalledWith('/profiles', { connectionId: 'owner-a', profile: 'research' }))
++  fireEvent.pointerDown(screen.getByRole('button', { name: 'unassigned' }), { button: 0, ctrlKey: false })
++  fireEvent.click(await screen.findByRole('menuitem', { name: /owner-a-worker/ }))
++  await waitFor(() => expect(rest).toHaveBeenCalledWith('/tasks/same/reassign?board=ops', expect.objectContaining({ connectionId: 'owner-a', profile: 'research', body: { profile: 'owner-a-worker', reclaim_first: true } })))
++  fireEvent.change(screen.getByPlaceholderText('Add a comment…'), { target: { value: 'owner note' } })
++  fireEvent.click(screen.getByRole('button', { name: 'Comment' }))
++  await waitFor(() => expect(rest).toHaveBeenCalledWith('/tasks/same/comments?board=ops', expect.objectContaining({ connectionId: 'owner-a', profile: 'research', body: { author: 'desktop', body: 'owner note' } })))
++  fireEvent.click(screen.getByRole('button', { name: 'Edit description' }))
++  fireEvent.change(screen.getByDisplayValue('Description'), { target: { value: 'Updated' } })
++  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
++  await waitFor(() => expect(rest).toHaveBeenCalledWith('/tasks/same?board=ops', expect.objectContaining({ connectionId: 'owner-a', profile: 'research', method: 'PATCH', body: { body: 'Updated' } })))
++  fireEvent.click(screen.getByRole('button', { name: 'Download report.md' }))
++  await waitFor(() => expect(save).toHaveBeenCalledWith({ connectionId: 'owner-a', profile: 'research', path: '/stored/report.md', suggestedName: 'report.md' }))
++  const file = new File(['a'], 'a.txt', { type: 'text/plain' })
++  Object.defineProperty(file, 'arrayBuffer', { value: async () => new ArrayBuffer(1) })
++  fireEvent.change(screen.getByRole('dialog').querySelector('input[type="file"]')!, { target: { files: [file] } })
++  await waitFor(() => expect(rest).toHaveBeenCalledWith('/tasks/same/attachments?board=ops', expect.objectContaining({ connectionId: 'owner-a', profile: 'research', method: 'POST' })))
++  // Related ids are local to the same owning board, not globally unique.
++  fireEvent.click(screen.getByRole('button', { name: 'relate' }))
++  await screen.findByRole('heading', { name: 'owner-a/research/related' })
++  // Start an upload on A, switch the same-id drawer to B while reading bytes,
++  // then finish A. The old mutation must retain A's owner after unmount.
++  let releaseBytes!: (bytes: ArrayBuffer) => void
++  const delayed = new File(['b'], 'delayed.txt', { type: 'text/plain' })
++  Object.defineProperty(delayed, 'arrayBuffer', { value: () => new Promise<ArrayBuffer>(resolve => { releaseBytes = resolve }) })
++  fireEvent.change(screen.getByRole('dialog').querySelector('input[type="file"]')!, { target: { files: [delayed] } })
++  await waitFor(() => expect(releaseBytes).toBeTypeOf('function'))
++  act(() => { open('same', 'ops', 'owner-b', 'default') })
++  await screen.findByRole('heading', { name: 'owner-b/default/same' })
++  await act(async () => releaseBytes(new ArrayBuffer(1)))
++  await waitFor(() => expect(rest).toHaveBeenCalledWith('/tasks/related/attachments?board=ops', expect.objectContaining({ connectionId: 'owner-a', profile: 'research', upload: expect.objectContaining({ filename: 'delayed.txt' }) })))
++  expect(client.getQueryData(taskKey('local', '', 'same', owner))).toMatchObject({ task: { title: 'owner-a/research/same' } })
++
++  for (const [path, opts] of rest.mock.calls.filter(([path]) => path.startsWith('/tasks/'))) {
++    expect(opts?.connectionId).toMatch(/^owner-[ab]$/)
++    expect(new URL(path, 'http://example.com').searchParams.get('board')).toBe('ops')
++  }
++})
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index 5c850d263a..e27cecfdd6 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -89,7 +89,7 @@ import { isFileDrag, uploadFiles, useFileDrop } from './attach-drop'
+ import { BoardSwitcher } from './board-switcher'
+ import { TaskDrawer } from './drawer'
+ import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
+-import { $openTaskRequest } from './open-task'
++import { $openTaskRequest, type OpenTaskRequest } from './open-task'
+ import { OrchestrationPanel } from './orchestration'
+ import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+ import {
+@@ -1217,7 +1217,7 @@ export function KanbanBoardPage() {
+   const gatewayFilter = gateways.some(gateway => gateway.id === pickedGateway) ? pickedGateway : ''
+   const createGateway = gatewayFilter || scope
+ 
+-  const [openId, setOpenId] = useState<null | string>(null)
++  const [openTask, setOpenTask] = useState<null | OpenTaskRequest>(null)
+   const [addStatus, setAddStatus] = useState<null | string>(null)
+   const [settingsOpen, setSettingsOpen] = useState(false)
+   const [search, setSearch] = useState('')
+@@ -1253,7 +1253,7 @@ export function KanbanBoardPage() {
+       $boardSlug.set(requestedTask.board)
+     }
+ 
+-    setOpenId(requestedTask.taskId)
++    setOpenTask({ ...requestedTask, ...(requestedTask.owner ? { owner: Object.freeze({ ...requestedTask.owner }) } : {}) })
+     $openTaskRequest.set(null)
+   }, [requestedTask])
+ 
+@@ -1566,7 +1566,7 @@ export function KanbanBoardPage() {
+                 onDelete={id => deleteMut.mutate(id)}
+                 onDropTask={onMove}
+                 onMove={onMove}
+-                onOpen={setOpenId}
++                onOpen={id => setOpenTask({ taskId: id, board: slug })}
+                 onToggle={() => toggleLane(col.name, auto)}
+                 onToggleSelect={toggleSelect}
+                 selected={selected}
+@@ -1591,7 +1591,14 @@ export function KanbanBoardPage() {
+         parents={parentOptions}
+         target={addStatus}
+       />
+-      <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
++      <TaskDrawer
++        columns={columnNames}
++        id={openTask?.taskId ?? null}
++        key={JSON.stringify(openTask)}
++        onClose={() => setOpenTask(null)}
++        onOpen={(id, owner) => setOpenTask({ taskId: id, board: owner?.board ?? slug, owner })}
++        owner={openTask?.owner}
++      />
+     </div>
+   )
+ }
+diff --git a/apps/desktop/src/plugins/kanban/drawer.tsx b/apps/desktop/src/plugins/kanban/drawer.tsx
+index 1040c77168..7f8212f595 100644
+--- a/apps/desktop/src/plugins/kanban/drawer.tsx
++++ b/apps/desktop/src/plugins/kanban/drawer.tsx
+@@ -44,6 +44,7 @@ import {
+   deleteTask,
+   estimateTask,
+   fetchLog,
++  fetchOwnerProfiles,
+   fetchProfiles,
+   fetchTask,
+   logKey,
+@@ -53,6 +54,7 @@ import {
+   reclaimTask,
+   routedToScope,
+   taskKey,
++  type TaskOwner,
+   useKanbanScope
+ } from './api'
+ import { uploadFiles, useFileDrop } from './attach-drop'
+@@ -299,14 +301,22 @@ function Diagnostics({
+  *  streak — the explicit human recovery action). */
+ function AssigneeMenu({
+   current,
++  owner,
+   onReassign
+ }: {
+   current: null | string | undefined
++  owner?: TaskOwner
+   onReassign: (p: string) => void
+ }) {
+   const k = useKanban()
+   const scope = useKanbanScope()
+-  const { data: roster } = useQuery({ queryKey: profilesKey(scope), queryFn: fetchProfiles, staleTime: 60_000 })
++
++  const { data: roster } = useQuery({
++    enabled: query => !!owner || routedToScope(query),
++    queryKey: profilesKey(scope, owner),
++    queryFn: () => owner ? fetchOwnerProfiles(owner) : fetchProfiles(),
++    staleTime: 60_000
++  })
+ 
+   return (
+     <DropdownMenu>
+@@ -582,12 +592,12 @@ function AttachmentsSection({
+ // behind an explicit click + disclaimer since it makes a model call. The
+ // control keeps a stable footprint (spinner swaps in place) so there's no
+ // layout jump when it runs.
+-function EstimateSection({ id }: { id: string }) {
++function EstimateSection({ id, owner }: { id: string; owner?: TaskOwner }) {
+   const k = useKanban()
+   const [result, setResult] = useState<null | TaskEstimate>(null)
+ 
+   const est = useMutation({
+-    mutationFn: () => estimateTask(id),
++    mutationFn: () => estimateTask(id, owner),
+     onError: err => host.notify({ kind: 'error', message: errText(err) }),
+     onSuccess: r => {
+       if (r.ok) {
+@@ -833,13 +843,15 @@ function FeedTabs({
+ export function TaskDrawer({
+   columns,
+   id,
++  owner,
+   onClose,
+   onOpen
+ }: {
+   columns: string[]
+   id: null | string
++  owner?: TaskOwner
+   onClose: () => void
+-  onOpen: (id: string) => void
++  onOpen: (id: string, owner?: TaskOwner) => void
+ }) {
+   const k = useKanban()
+   const qc = useQueryClient()
+@@ -848,9 +860,9 @@ export function TaskDrawer({
+ 
+   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
+   const { data: detail, error } = useQuery({
+-    enabled: query => !!id && routedToScope(query),
+-    queryFn: () => fetchTask(id!),
+-    queryKey: taskKey(scope, slug, id ?? ''),
++    enabled: query => !!id && (!!owner || routedToScope(query)),
++    queryFn: () => fetchTask(id!, owner),
++    queryKey: taskKey(scope, slug, id ?? '', owner),
+     refetchInterval: 30_000
+   })
+ 
+@@ -859,34 +871,34 @@ export function TaskDrawer({
+   const defaultAssignee = useDefaultAssignee()
+ 
+   const { data: log } = useQuery({
+-    enabled: query => !!id && routedToScope(query),
+-    queryFn: () => fetchLog(id!),
+-    queryKey: logKey(scope, slug, id ?? ''),
++    enabled: query => !!id && (!!owner || routedToScope(query)),
++    queryFn: () => fetchLog(id!, owner),
++    queryKey: logKey(scope, slug, id ?? '', owner),
+     refetchInterval: running ? 3_000 : 15_000
+   })
+ 
+   const invalidate = () => {
+-    void qc.invalidateQueries({ queryKey: taskKey(scope, slug, id!) })
++    void qc.invalidateQueries({ queryKey: taskKey(scope, slug, id!, owner) })
+     void qc.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
+   }
+ 
+   // Optimistic status change against the task cache; rolls back + toasts on a
+   // rejected transition (the backend enforces the workflow).
+   const moveMut = useMutation({
+-    mutationFn: (status: string) => patchTask(id!, { status }),
++    mutationFn: (status: string) => patchTask(id!, { status }, owner),
+     onMutate: async status => {
+-      await qc.cancelQueries({ queryKey: taskKey(scope, slug, id!) })
+-      const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(scope, slug, id!))
++      await qc.cancelQueries({ queryKey: taskKey(scope, slug, id!, owner) })
++      const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(scope, slug, id!, owner))
+ 
+       if (previous) {
+-        qc.setQueryData(taskKey(scope, slug, id!), { ...previous, task: { ...previous.task, status } })
++        qc.setQueryData(taskKey(scope, slug, id!, owner), { ...previous, task: { ...previous.task, status } })
+       }
+ 
+       return { previous }
+     },
+     onError: (err, _status, context) => {
+       if (context?.previous) {
+-        qc.setQueryData(taskKey(scope, slug, id!), context.previous)
++        qc.setQueryData(taskKey(scope, slug, id!, owner), context.previous)
+       }
+ 
+       host.notify({ kind: 'error', message: errText(err) })
+@@ -904,7 +916,7 @@ export function TaskDrawer({
+     )
+ 
+   const commentMut = useMutation({
+-    mutationFn: (body: string) => addComment(id!, body),
++    mutationFn: (body: string) => addComment(id!, body, owner),
+     onError: err => host.notify({ kind: 'error', message: errText(err) }),
+     onSuccess: invalidate
+   })
+@@ -914,8 +926,8 @@ export function TaskDrawer({
+   // replacement for the block → comment → unblock dance.
+   const requeueMut = useMutation({
+     mutationFn: async (body: string) => {
+-      await addComment(id!, body)
+-      await reclaimTask(id!)
++      await addComment(id!, body, owner)
++      await reclaimTask(id!, owner)
+     },
+     onError: err => host.notify({ kind: 'error', message: errText(err) }),
+     onSuccess: () => {
+@@ -925,7 +937,7 @@ export function TaskDrawer({
+   })
+ 
+   const uploadMut = useMutation({
+-    mutationFn: (files: File[]) => uploadFiles(id!, files),
++    mutationFn: (files: File[]) => uploadFiles(id!, files, owner),
+     onError: err => host.notify({ kind: 'error', message: errText(err) }),
+     onSettled: invalidate
+   })
+@@ -1025,13 +1037,13 @@ export function TaskDrawer({
+                       {k.copyTitle}
+                     </DropdownMenuItem>
+                     <DropdownMenuSeparator />
+-                    <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
++                    <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }, owner), onClose)}>
+                       <Codicon name="archive" size="0.85rem" />
+                       {k.archive}
+                     </DropdownMenuItem>
+                     <DropdownMenuItem
+                       className="text-destructive"
+-                      onSelect={mutate(() => deleteTask(task.id), onClose)}
++                      onSelect={mutate(() => deleteTask(task.id, owner), onClose)}
+                     >
+                       <Codicon name="trash" size="0.85rem" />
+                       {k.delete}
+@@ -1072,10 +1084,10 @@ export function TaskDrawer({
+                     <Section label={k.diagnosticsN(task.diagnostics.length)}>
+                       <Diagnostics
+                         items={task.diagnostics}
+-                        onReclaim={() => void mutate(() => reclaimTask(task.id))()}
++                        onReclaim={() => void mutate(() => reclaimTask(task.id, owner))()}
+                         onUnblock={() =>
+                           void mutate(
+-                            () => patchTask(task.id, { status: 'ready' }),
++                            () => patchTask(task.id, { status: 'ready' }, owner),
+                             () => host.notify({ kind: 'success', message: k.unblockedMessage(shortId(task.id)) })
+                           )()
+                         }
+@@ -1085,7 +1097,7 @@ export function TaskDrawer({
+ 
+                   <DescriptionSection
+                     body={task.body}
+-                    onSave={body => void mutate(() => patchTask(task.id, { body }))()}
++                    onSave={body => void mutate(() => patchTask(task.id, { body }, owner))()}
+                   />
+ 
+                   {task.result && (
+@@ -1114,7 +1126,8 @@ export function TaskDrawer({
+                 <MetaRow label={k.assignee}>
+                   <AssigneeMenu
+                     current={task.assignee}
+-                    onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
++                    onReassign={profile => void mutate(() => reassignTask(task.id, profile, owner))()}
++                    owner={owner}
+                   />
+                 </MetaRow>
+                 {typeof task.priority === 'number' && (
+@@ -1157,7 +1170,7 @@ export function TaskDrawer({
+                 )}
+                 <MetaRow label={k.model}>
+                   <ModelOverrideField
+-                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
++                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next), owner))()}
+                     value={{
+                       effort: task.reasoning_effort ?? '',
+                       model: task.model_override ?? '',
+@@ -1169,14 +1182,14 @@ export function TaskDrawer({
+                   (['parents', 'children'] as const).map(side =>
+                     detail.links[side].length > 0 ? (
+                       <MetaRow key={side} label={side === 'parents' ? k.blockedBy : k.blocks}>
+-                        <LinkChips ids={detail.links[side]} linkTitles={linkTitles} onOpen={onOpen} />
++                        <LinkChips ids={detail.links[side]} linkTitles={linkTitles} onOpen={linked => owner ? onOpen(linked, owner) : onOpen(linked)} />
+                       </MetaRow>
+                     ) : null
+                   )}
+                 {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
+                 {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
+                 {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+-                <EstimateSection id={task.id} />
++                <EstimateSection id={task.id} owner={owner} />
+ 
+                 {Array.isArray(detail.attachments) && (
+                   <AttachmentsSection
+diff --git a/apps/desktop/src/plugins/kanban/open-task.test.ts b/apps/desktop/src/plugins/kanban/open-task.test.ts
+index 963e69a33d..6631aaf2bf 100644
+--- a/apps/desktop/src/plugins/kanban/open-task.test.ts
++++ b/apps/desktop/src/plugins/kanban/open-task.test.ts
+@@ -58,8 +58,8 @@ describe('installOpenTaskHook', () => {
+     expect($openTaskRequest.get()).toEqual({
+       board: 'ops', taskId: 't_abcdef01', owner: { gateway: 'remote', profile: 'worker', board: 'ops' }
+     })
+-    // Do not advertise support until the drawer/actions consume the identity.
+-    expect((hook as unknown as { supportsQualifiedOwners?: boolean }).supportsQualifiedOwners).not.toBe(true)
++    expect(Object.isFrozen($openTaskRequest.get()?.owner)).toBe(true)
++    expect((hook as unknown as { supportsQualifiedOwners?: boolean }).supportsQualifiedOwners).toBe(true)
+   })
+ 
+   it.each([null, '', 'worker'])('rejects incomplete explicit owner routes (%s)', profile => {
+@@ -76,6 +76,15 @@ describe('installOpenTaskHook', () => {
+     expect($openTaskRequest.get()).toBeNull()
+   })
+ 
++  it('rejects a qualified request without an explicit board', () => {
++    const target: Record<string, unknown> = {}
++    const navigate = vi.fn()
++    installOpenTaskHook({ navigate }, target)
++    const hook = target[OPEN_TASK_HOOK] as (...args: string[]) => boolean
++    expect(hook('t_x', '', 'remote', 'work')).toBe(false)
++    expect(navigate).not.toHaveBeenCalled()
++  })
++
+   it('disposer removes only its own hook', () => {
+     const target: Record<string, unknown> = {}
+     const dispose = installOpenTaskHook({ navigate: vi.fn() }, target)
+diff --git a/apps/desktop/src/plugins/kanban/open-task.ts b/apps/desktop/src/plugins/kanban/open-task.ts
+index bdef690e69..121603144d 100644
+--- a/apps/desktop/src/plugins/kanban/open-task.ts
++++ b/apps/desktop/src/plugins/kanban/open-task.ts
+@@ -13,7 +13,7 @@ import { atom } from '@hermes/plugin-sdk'
+ export interface OpenTaskRequest {
+   board: string
+   taskId: string
+-  owner?: { gateway: string; profile: string; board: string }
++  owner?: Readonly<{ gateway: string; profile?: string; board: string }>
+ }
+ 
+ export const $openTaskRequest = atom<null | OpenTaskRequest>(null)
+@@ -49,10 +49,10 @@ export function installOpenTaskHook(
+     const slug = typeof board === 'string' ? board : ''
+ 
+     const owner = typeof gateway === 'string' && gateway && typeof profile === 'string' && profile
+-      ? { gateway, profile, board: slug }
++      ? Object.freeze({ gateway, profile, board: slug })
+       : undefined
+ 
+-    if (profile !== undefined && !owner) {
++    if (profile !== undefined && (!owner || !slug)) {
+       return false
+     }
+ 
+@@ -68,6 +68,9 @@ export function installOpenTaskHook(
+     return true
+   }
+ 
++  // Advertised only now that board, drawer, cache keys and file saves retain
++  // the complete route (board-owner.test.tsx exercises the mounted path).
++  Object.defineProperty(hook, 'supportsQualifiedOwners', { value: true })
+   target[OPEN_TASK_HOOK] = hook
+ 
+   return () => {
+-- 
+2.55.0
+

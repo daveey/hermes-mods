@@ -97,7 +97,7 @@ cross_session as direct; on the previous core cross_session was deferred.
 ## Applying
 
 0114 is standalone; it touches only `tools/tool_search.py`, its test file and `config_defaults.py`. 0120 edits the
-same functions and needs 0114 (its tests use `eager`). Verified: 0001–0127 apply with `git am -3` at merge-base
+same functions and needs 0114 (its tests use `eager`). Verified: 0001–0127 apply with `git am -3 --empty=keep` at merge-base
 `4957bbd0a0` (Oct 17, 2026 PT).
 
 ## Gotchas

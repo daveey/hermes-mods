@@ -1,4 +1,4 @@
-// Native Observe surface. No credentials, ambient routing or repair mutations.
+// Native node-first surface. No credentials or ambient action routing.
 import {
   host,
   useValue,
@@ -16,7 +16,7 @@ import {
   ContextMenuItem,
   ContextMenuSeparator
 } from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect, useRef } from 'react'
+import { createElement as h, useState, useEffect, useLayoutEffect, useRef } from 'react'
 
 const BAR =
   'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
@@ -107,6 +107,13 @@ export function createTransport(ctx, hostRef = host) {
     )
     if (!(await routes()).some((r) => routeKey(r) === key))
       throw safeError('Owner gateway disconnected: route changed')
+    if (path === '/enrollment') {
+      if (response?.contract_version !== 1 || response.profile !== route.targetProfile ||
+          typeof response.enrolled !== 'boolean' || !Array.isArray(response.capabilities) ||
+          (response.enrolled && !response.capabilities.includes('inventory')))
+        throw safeError('Invalid enrollment response')
+      return response
+    }
     return verifyEnvelope(response, route, expected, path === '/inventory' && !options.method)
   }
   async function inventory(queryClient) {
@@ -127,7 +134,20 @@ export function createTransport(ctx, hostRef = host) {
           const route = list[next++],
             key = routeKey(route),
             prior = sources.get(key)
+          let enrollment, legacy = false
           try {
+            try {
+              enrollment = await request(route, '/enrollment')
+            } catch (e) {
+              // An older mounted router may still serve a valid owner inventory.
+              // Only 404 permits a read-only probe; auth/config failures never do.
+              if (e?.status !== 404) throw e
+              legacy = true
+            }
+            if (!legacy && !enrollment.enrolled) {
+              sources.set(key, { route, enrolled: false })
+              continue
+            }
             const fetch = () => request(route, '/inventory', {}, prior?.snapshot?.meta.owner)
             // Bootstrap is route-keyed until the server establishes a stable UUID.
             const queryKey = prior?.snapshot
@@ -148,9 +168,16 @@ export function createTransport(ctx, hostRef = host) {
             )
               throw safeError('Invalid inventory response')
             queryClient?.setQueryData(ownerQueryKey(snapshot.meta.owner), snapshot)
-            sources.set(key, { route, snapshot })
+            const features = { repair_sessions: enrollment?.features?.repair_sessions === true }
+            let repairs = []
+            if (features.repair_sessions) {
+              const response = await request(route, '/repairs', {}, snapshot.meta.owner)
+              if (!Array.isArray(response.data)) throw safeError('Invalid repair list')
+              repairs = response.data
+            }
+            sources.set(key, { route, snapshot, features, repairs, ...(legacy ? { error: 'Deployment pending: enrollment unavailable; last-known inventory' } : {}) })
           } catch (e) {
-            sources.set(key, { ...prior, route, error: failure(e) })
+            sources.set(key, { ...prior, route, ...(enrollment?.enrolled === true ? { enrolled: true } : {}), error: failure(e) })
           }
         }
       })
@@ -181,7 +208,125 @@ export function createTransport(ctx, hostRef = host) {
       pending.delete(key)
     }
   }
-  return { inventory, request, refresh }
+  // Retain ambiguous attempts for this transport's lifetime. A retry queries
+  // status, never sends a prompt or schedules the first turn again.
+  const starts = new Set(), repairPending = new Map(), repairKeys = new Map()
+  async function assertRoute(route) {
+    if (!(await routes()).some(r => routeKey(r) === routeKey(route)))
+      throw safeError('Owner gateway disconnected: route removed')
+  }
+  async function openRepair(route, owner, repair) {
+    if (!repair?.owner || ownerKey(repair.owner) !== ownerKey(owner) ||
+        repair.owner.owner_epoch !== owner.owner_epoch ||
+        !ID_PATTERN.test(repair.session?.start_request_id || ''))
+      throw safeError('Invalid repair owner or start request')
+    if (typeof hostRef.requestProfile !== 'function' || typeof hostRef.openSession !== 'function')
+      throw safeError('Repair sessions unsupported: update Hermes Desktop')
+    const params = { profile: route.targetProfile, namespace: 'runners', start_request_id: repair.session.start_request_id }
+    async function status() {
+      const response = await request(route, `/repairs/${encodeURIComponent(repair.id)}`, {}, owner)
+      const current = response.data.repair
+      if (current?.owner?.gateway_id !== owner.gateway_id || current.owner.profile !== owner.profile)
+        throw safeError('Repair session owner identity mismatch')
+      return { gateway_id: current.owner.gateway_id, profile: current.owner.profile,
+        stored_session_id: current.session.stored_session_id, resolved_session_id: current.session.lineage_tip_id,
+        exists: !!current.session.stored_session_id, reconciliation: current.session.state }
+    }
+    const key = JSON.stringify([ownerKey(owner), owner.owner_epoch, params.start_request_id])
+    await assertRoute(route)
+    let result
+    if (starts.has(key)) {
+      try {
+        result = await status()
+      } catch {
+        throw safeError('Repair outcome unknown; status reconciliation unavailable. No prompt resent.')
+      }
+    } else {
+      starts.add(key)
+      try {
+        result = await hostRef.requestProfile(route, 'session.start_request', params, 10000, { spawnPriority: 'foreground' })
+      } catch {
+        await assertRoute(route)
+        try {
+          result = await status()
+        } catch {
+          throw safeError('Repair outcome unknown; status reconciliation unavailable. No prompt resent.')
+        }
+      }
+    }
+    // Only an authoritative owner status of reserved/queued permits recovery of
+    // a pre-create/pre-claim crash. Reuse the durable core ID, never send text.
+    if (['reserved', 'queued'].includes(result?.reconciliation)) {
+      await assertRoute(route)
+      result = await hostRef.requestProfile(route, 'session.start_request', params, 10000, { spawnPriority: 'foreground' })
+    }
+    await assertRoute(route)
+    if (result?.gateway_id !== owner.gateway_id || result.profile !== owner.profile)
+      throw safeError('Repair session owner identity mismatch')
+    const id = result.resolved_session_id || result.stored_session_id
+    if (!result.exists || !/^[A-Za-z0-9_-]{1,128}$/.test(id || ''))
+      throw safeError('Repair session outcome unknown; no session available to open')
+    await hostRef.openSession(id, { route: { ...route } })
+    return repair
+  }
+  async function repair(row) {
+    if (!row?.actionable || !row.source?.snapshot || row.source.error)
+      throw safeError('Owner gateway disconnected or ownership conflict')
+    if (!ID_PATTERN.test(row.id)) throw safeError('Invalid runner ID')
+    // Copy both routing and authority before the first await, not from the
+    // selected chat or a mutable source row after the network responds.
+    const route = { ...row.source.route }, owner = { ...row.source.snapshot.meta.owner }, entity = row.id
+    const key = JSON.stringify([ownerKey(owner), owner.owner_epoch, entity])
+    const related = new Set([entity, ...row.source.snapshot.data.runners
+      .filter(r => row.host_id && r.host_id === row.host_id).map(r => r.id)])
+    const mappedHost = row.source.snapshot.data.hosts.find(h => h.id === row.host_id)
+    if (ID_PATTERN.test(mappedHost?.resource_id || '')) related.add(mappedHost.resource_id)
+    if (repairPending.has(key)) return repairPending.get(key)
+    const run = async () => {
+      const detail = await request(route, `/runners/${encodeURIComponent(entity)}?history_limit=50`, {}, owner)
+      const existing = (detail.data.repairs || []).find(r =>
+        related.has(r.entity_id) && !['closed', 'failed'].includes(r.state))
+      if (existing) {
+        starts.add(JSON.stringify([ownerKey(owner), owner.owner_epoch, existing.session?.start_request_id]))
+        return openRepair(route, owner, existing)
+      }
+      const incident = (detail.data.incidents || []).find(i => i.entity_id === entity && !i.resolved_at && ID_PATTERN.test(i.id))
+      if (!incident) throw safeError('No current incident identity; refresh runner evidence before investigating')
+      const previous = (detail.data.repairs || []).find(r => related.has(r.entity_id))
+      const attempt = `${key}:${incident.id}:${previous?.id || 'first'}`
+      if (!repairKeys.has(attempt)) repairKeys.set(attempt, `repair_${crypto.randomUUID().replaceAll('-', '')}`)
+      const response = await request(route, '/repairs', { method: 'POST', body: {
+        entity_id: entity, incident_id: incident.id,
+        idempotency_key: repairKeys.get(attempt), mode: row.issue ? 'repair' : 'diagnose', expected_owner: owner
+      } }, owner)
+      // Backend route hints are not authority. The captured, verified registry
+      // route reaches this owner even when the runner host itself is dead.
+      if (!related.has(response.data.repair?.entity_id))
+        throw safeError('Invalid repair entity')
+      return openRepair(route, owner, response.data.repair)
+    }
+    const promise = run()
+    repairPending.set(key, promise)
+    try { return await promise } finally { repairPending.delete(key) }
+  }
+  async function maintenance(row, { state, reason, expires_at }) {
+    if (!row?.actionable || row.source?.error) throw safeError('Owner gateway disconnected or ownership conflict')
+    const entity = row.host?.resource_id
+    if (!ID_PATTERN.test(entity || '') || !['active', 'inactive'].includes(state) ||
+        typeof reason !== 'string' || !reason.trim() || reason.length > 512 ||
+        (state === 'active' && !(Date.parse(expires_at) > Date.now())))
+      throw safeError('Maintenance requires a mapped host, reason and future expiry')
+    const owner = { ...row.source.snapshot.meta.owner }
+    const route = { ...row.source.route }
+    const version = await request(route, '/maintenance', {}, owner)
+    if (!Number.isSafeInteger(version.data?.revision) || version.data.revision < 1)
+      throw safeError('Maintenance revision unavailable; refresh before retrying')
+    return request(route, '/maintenance', { method: 'POST', body: {
+      entity_id: entity, state, reason: reason.trim(), expires_at: state === 'active' ? expires_at : null,
+      expected_config_revision: version.data.revision, expected_owner: owner
+    } }, owner)
+  }
+  return { inventory, request, refresh, repair, maintenance }
 }
 
 function fresh(meta, now) {
@@ -198,20 +343,57 @@ export function ago(stamp, now = Date.now()) {
   const seconds = Math.max(0, Math.floor((now - t) / 1000))
   return seconds < 60 ? `${seconds}s ago` : `${Math.floor(seconds / 60)}m ago`
 }
+const HOLD_LABELS = {
+  drained: 'Drained (intentional)',
+  maintenance: 'Maintenance',
+  disk_pressure: 'Withheld: disk pressure',
+  root_headroom: 'Waiting for root headroom',
+  label_withdrawn: 'Label withdrawn by supervisor (historical)'
+}
+const OPERATIONAL_SOURCES = ['systemd', 'maintenance_marker', 'admission_journal', 'runner_journal', 'supervisor_log']
+function operationalTime(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    ? Date.parse(value) : NaN
+}
+function operationalEvidence(items, stale, now) {
+  if (!Array.isArray(items)) return []
+  return items.filter(e => e && Object.hasOwn(HOLD_LABELS, e.kind)).map(e => {
+    const historical = e.kind === 'label_withdrawn'
+    const current = !stale && OPERATIONAL_SOURCES.includes(e.source) &&
+      e.freshness === 'fresh' && operationalTime(e.observed_at) <= now &&
+      operationalTime(e.expires_at) > now &&
+      (e.recorded_at == null || operationalTime(e.recorded_at) <= now)
+    return {
+      ...e, label: historical && !Number.isFinite(operationalTime(e.recorded_at))
+        ? 'Supervisor label withdrawal' : HOLD_LABELS[e.kind],
+      timestamp: historical ? e.recorded_at : e.observed_at,
+      held: !historical && current && e.state === 'held',
+      status: historical ? (Number.isFinite(operationalTime(e.recorded_at)) && operationalTime(e.recorded_at) <= now
+        ? 'Historical — not a current hold' : 'Not observed')
+        : e.state === 'unknown' || ['unknown', 'unavailable'].includes(e.freshness) ? 'Not observed'
+          : !current ? 'Last-known / stale'
+            : e.state === 'held' ? 'Held' : e.state === 'clear' ? 'Clear' : 'Not observed'
+    }
+  })
+}
 function rowState(r, source, hostRow, now) {
+  const provenance = source.snapshot.meta.provenance?.find((p) => p.source_id === r.id)
   const stale =
+    (provenance && (provenance.state !== 'fresh' || Date.parse(provenance.expires_at) <= now)) ||
     !!source.error ||
     !['ready', 'partial'].includes(source.snapshot.data.state) ||
     !fresh(source.snapshot.meta, now) ||
     r.freshness !== 'fresh'
-  const maintenance =
-    hostRow?.maintenance?.state === 'active' && Date.parse(hostRow.maintenance.expires_at) > now
+  const operational = operationalEvidence(r.operational_evidence, stale, now)
+  const holds = [...new Set(operational.filter(e => e.held).map(e => e.label))]
+  const maintenance = holds.includes('Maintenance') ||
+    (hostRow?.maintenance?.state === 'active' && Date.parse(hostRow.maintenance.expires_at) > now)
   const issue =
-    (!maintenance && ['offline', 'missing'].includes(r.registration)) ||
-    (!maintenance && ['fail', 'warn'].includes(r.readiness))
+    stale || ['offline', 'missing', 'unknown'].includes(r.registration) ||
+    ['fail', 'warn'].includes(r.readiness)
   const health = stale
     ? 'Stale'
-    : r.readiness === 'fail'
+    : holds.length ? 'Held' : r.readiness === 'fail'
       ? 'Unavailable'
       : r.readiness === 'warn'
         ? 'Degraded'
@@ -221,7 +403,7 @@ function rowState(r, source, hostRow, now) {
             ? 'Missing'
             : r.registration === 'unknown'
               ? 'Unknown'
-              : r.activity === 'busy'
+              : holds.length ? 'Held' : r.activity === 'busy'
                 ? 'Busy'
                 : r.readiness === 'pass' && r.activity === 'idle'
                   ? 'Ready'
@@ -230,18 +412,21 @@ function rowState(r, source, hostRow, now) {
   // consecutive-observation count. Never invent confirmation from one snapshot.
   const reason = stale
     ? 'Last-known observations; readiness not verified'
+    : holds.length ? `${holds.join(' · ')}; provider: ${r.registration}; readiness: ${r.readiness}`
     : r.registration === 'offline'
       ? 'Provider reports offline; inspect observation history'
       : r.readiness === 'fail'
         ? 'Required readiness check failed'
         : r.readiness === 'warn'
           ? 'Readiness check warning'
-          : r.activity === 'busy'
+          : holds.length ? holds.join(' · ') : r.activity === 'busy'
             ? 'Busy — job not identified'
             : health === 'Ready'
               ? 'Fresh online/idle; readiness checks passed'
               : 'Mandatory readiness evidence unavailable'
   return {
+    operational,
+    holds,
     stale,
     maintenance,
     issue,
@@ -250,7 +435,7 @@ function rowState(r, source, hostRow, now) {
     ready: health === 'Ready' && !maintenance,
     tone: stale
       ? 'muted'
-      : !maintenance && r.readiness === 'fail'
+      : (!maintenance || holds.length > 0) && r.readiness === 'fail'
         ? 'bad'
         : issue
           ? 'warn'
@@ -278,6 +463,7 @@ export function projectFleet(sources = [], now = Date.now()) {
       label = source.route
         ? `${source.route.connectionId} / ${source.route.targetProfile}`
         : 'Sources'
+    if (source.enrolled === false) messages.push(`${label}: Not enrolled`)
     if (source.error) messages.push(`${label}: ${source.error}`)
     if (!s) continue
     if (STATES[s.data.state]) messages.push(`${label}: ${STATES[s.data.state]}`)
@@ -291,8 +477,12 @@ export function projectFleet(sources = [], now = Date.now()) {
         label,
         scope: s.data.scopes.find((x) => x.id === c.scope_id)?.name || c.scope_id
       })
-    for (const e of s.meta.source_errors || [])
-      messages.push(`${label}: ${text(e.source_id)} · ${text(e.code)}`)
+    for (const e of s.meta.source_errors || []) {
+      const remaining = typeof e.retry_after_seconds === 'number'
+        ? Math.ceil((Date.parse(e.observed_at) + e.retry_after_seconds * 1000 - now) / 1000)
+        : 0
+      messages.push(`${label}: ${text(e.source_id)} · ${text(e.code)}${Number.isFinite(remaining) && remaining > 0 ? ` · retry in ${remaining}s` : ''}`)
+    }
     for (const r of s.data.runners) {
       const scope = s.data.scopes.find((x) => x.id === r.scope_id),
         hostRow = s.data.hosts.find((x) => x.id === r.host_id)
@@ -308,6 +498,9 @@ export function projectFleet(sources = [], now = Date.now()) {
       const candidate = {
         ...r,
         ...rowState(r, source, hostRow, now),
+        repair: (source.repairs || []).some(repair => !['closed', 'failed'].includes(repair.state) &&
+          (repair.entity_id === r.id || (hostRow && (repair.entity_id === hostRow.resource_id ||
+            s.data.runners.some(sibling => sibling.id === repair.entity_id && sibling.host_id === r.host_id))))) ? 'active' : 'none',
         key,
         host: hostRow,
         scope,
@@ -315,7 +508,7 @@ export function projectFleet(sources = [], now = Date.now()) {
         source: origin,
         conflict: false,
         actionable: !source.error,
-        observed_at: s.meta.observed_at,
+        observed_at: s.meta.provenance?.find((p) => p.source_id === r.id)?.observed_at || null,
         hostKey: hostRow ? JSON.stringify([ownerKey(s.meta.owner), hostRow.id]) : 'unmapped'
       }
       if (rows.has(key)) {
@@ -359,8 +552,7 @@ export function projectFleet(sources = [], now = Date.now()) {
     online: list.filter((r) => r.registration === 'online').length,
     busy: list.filter((r) => r.activity === 'busy').length,
     ready: list.filter((r) => r.ready).length,
-    unverified: list.filter((r) => r.registration === 'online' && !r.ready && r.activity !== 'busy')
-      .length,
+    unverified: list.filter((r) => r.registration === 'online' && !r.ready).length,
     issues: list.filter((r) => r.issue).length + groups.filter((g) => g.issue).length
   }
   const complete =
@@ -391,6 +583,101 @@ export function projectFleet(sources = [], now = Date.now()) {
             ? 'good'
             : 'muted'
   }
+}
+export function projectNodes(sources = [], projectedRows = [], now = Date.now()) {
+  const nodes = new Map()
+  // Select a usable owner response before recency, with stable route tie-breaking.
+  // Envelope time selects the response only; it is never node observation age.
+  const ordered = sources.filter(s => s.snapshot).map(entry => ({
+    ...entry,
+    error: entry.error || (['owner_disconnected', 'plugin_unavailable', 'owner_conflict'].includes(entry.snapshot.data.state) ? STATES[entry.snapshot.data.state] : null)
+  })).sort((a, b) =>
+    Number(!b.error) - Number(!a.error) ||
+    (Date.parse(b.snapshot?.meta.observed_at) || 0) - (Date.parse(a.snapshot?.meta.observed_at) || 0) ||
+    routeKey(a.route).localeCompare(routeKey(b.route)))
+  for (const source of ordered) {
+    const snapshot = source.snapshot
+    if (!snapshot) continue
+    for (const host of snapshot.data.hosts) {
+      const key = JSON.stringify([ownerKey(snapshot.meta.owner), host.id])
+      if (nodes.has(key)) continue
+      const probe = snapshot.meta.provenance?.find(p => host.resource_id && p.source_id === host.resource_id)
+      const observedAt = Number.isFinite(Date.parse(probe?.observed_at)) ? probe.observed_at : null
+      const freshness = { observedAt, state: source.error ? 'stale'
+        : probe?.state === 'unavailable' ? 'unavailable'
+          : !observedAt ? 'unknown'
+            : probe?.state === 'stale' || Date.parse(probe?.expires_at) <= now ? 'stale'
+              : probe?.state === 'fresh' && Date.parse(probe?.expires_at) > now ? 'fresh' : 'unknown' }
+      const runners = projectedRows.filter(r => r.hostKey === key)
+      const unknown = runners.filter(r => r.stale || !['busy', 'idle'].includes(r.activity)).length
+      nodes.set(key, {
+        key, host, owner: snapshot.meta.owner, source, runners,
+        registrationCount: runners.length,
+        capacity: {
+          enforced: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs >= 0,
+          limit: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs >= 0 ? host.capacity.declared_max_jobs : null,
+          active: Number.isInteger(host.capacity?.observed_active_jobs) && host.capacity.observed_active_jobs >= 0 ? host.capacity.observed_active_jobs : null
+        },
+        maintenance: {
+          active: host.maintenance?.state === 'active' && Date.parse(host.maintenance.expires_at) > now,
+          reason: host.maintenance?.reason || null,
+          expiresAt: host.maintenance?.expires_at || null
+        },
+        monitoring: source.error ? 'unknown' : host.management || 'unknown',
+        health: {
+          state: 'unknown',
+          reason: source.error ? `Owner unavailable · ${source.error} · last-known node` : host.management === 'reachable'
+            ? 'Reachable · health unverified'
+            : host.management === 'unreachable'
+              ? 'Management probe unavailable — not proof of a node outage'
+              : 'Monitoring unavailable · health unverified'
+        },
+        activity: {
+          busy: !runners.length || unknown ? null : runners.filter(r => r.activity === 'busy').length,
+          idle: !runners.length || unknown ? null : runners.filter(r => r.activity === 'idle').length,
+          unknown
+        },
+        freshness
+      })
+    }
+  }
+  return { nodes: [...nodes.values()], unassigned: projectedRows.filter(r => !nodes.has(r.hostKey)) }
+}
+function highlight(value, query) {
+  const label = text(value), lower = label.toLowerCase()
+  const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean)
+  const marked = Array(label.length).fill(false)
+  for (const term of terms) {
+    let at = lower.indexOf(term)
+    while (at >= 0) {
+      marked.fill(true, at, at + term.length)
+      at = lower.indexOf(term, at + term.length)
+    }
+  }
+  const parts = []
+  for (let start = 0; start < label.length;) {
+    let end = start + 1
+    while (end < label.length && marked[end] === marked[start]) end++
+    parts.push(marked[start] ? h('mark', { key: start }, label.slice(start, end)) : label.slice(start, end))
+    start = end
+  }
+  return parts
+}
+export function selectNodes(projection, search = '', filter = 'All') {
+  const terms = search.toLowerCase().trim().split(/\s+/).filter(Boolean)
+  const groups = projection.nodes.flatMap(n => {
+    const hostText = [n.host.display_name, n.host.os, n.host.arch].join(' ').toLowerCase()
+    const hostMatches = terms.every(t => hostText.includes(t))
+    const rows = selectRows(n.runners, hostMatches ? '' : search, filter)
+    const nodeMatchesFilter = filter === 'All' ||
+      (filter === 'Needs attention' && (n.source.error || n.monitoring !== 'reachable' || n.freshness.state !== 'fresh')) ||
+      (filter === 'Maintenance' && n.maintenance.active)
+    return rows.length || (hostMatches && nodeMatchesFilter)
+      ? [{ ...n, name: n.host.display_name, rows }] : []
+  })
+  const unassigned = selectRows(projection.unassigned, search, filter)
+  if (unassigned.length) groups.push({ key: 'unmapped', name: 'Unassigned runners', rows: unassigned })
+  return { groups, rows: groups.flatMap(g => g.rows) }
 }
 export function selectRows(rows, search = '', filter = 'All') {
   const terms = search.toLowerCase().trim().split(/\s+/).filter(Boolean)
@@ -488,6 +775,18 @@ export function jobURL(row, job) {
     return null
   return `https://github.com/${row.scope.name}/actions/runs/${job.provider_run_id}/job/${job.provider_job_id}`
 }
+export function observedJobURL(row, job, now = Date.now()) {
+  if (!job || row.stale || !row.actionable || !settingsURL(row) ||
+      job.runner_id !== row.provider_runner_id ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(job.repository || '') ||
+      !/^\d+$/.test(job.run_id || '') || !/^\d+$/.test(job.job_id || '') ||
+      !(Date.parse(job.observed_at) <= now) || !(Date.parse(job.expires_at) > now)) return null
+  const scopeMatches = row.scope.kind === 'repository' ? job.repository === row.scope.name
+    : row.scope.kind === 'organization' && job.repository.split('/')[0] === row.scope.name
+  if (!scopeMatches) return null
+  const url = `https://github.com/${job.repository}/actions/runs/${job.run_id}/job/${job.job_id}`
+  return job.url === url ? url : null
+}
 export function diagnosticSummary(row) {
   return `${text(row.display_name)}\n${text(row.scope?.name)} · ${row.provider}\n${row.health} · ${row.activity}\n${row.reason}\nObserved ${row.observed_at || 'unknown'}\nOwner ${row.source.snapshot.meta.owner.gateway_id} / ${row.source.snapshot.meta.owner.profile}`
 }
@@ -505,8 +804,8 @@ export const CSS = `
 .hermes-runners-filters button[aria-pressed=true],.hermes-runners button:hover{background:var(--chrome-action-hover)}
 .hermes-runners-scroll{min-height:0;overflow:auto;overscroll-behavior:contain}
 .hermes-runners-group{border-top:1px solid var(--ui-stroke-secondary);padding-top:6px;margin-top:6px}
-.hermes-runners-host{display:flex;flex-wrap:wrap;text-align:left;width:100%;gap:8px;padding:4px}
-.hermes-runners-host small{margin-left:auto}.hermes-runners-rowwrap{display:flex;align-items:start;gap:2px}
+.hermes-runners-host{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,auto);align-items:start;text-align:left;width:100%;gap:8px;padding:4px}
+.hermes-runners-host>span{min-width:0;overflow-wrap:anywhere}.hermes-runners-host small{max-width:160px;text-align:right;overflow-wrap:anywhere}.hermes-runners-rowwrap{display:flex;align-items:start;gap:2px}
 .hermes-runners-row{flex:1;min-width:0;display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:6px;text-align:left;padding:6px;border-radius:4px}
 .hermes-runners-row span{min-width:0;overflow-wrap:anywhere}.hermes-runners-name{display:block;font-weight:500}.hermes-runners-meta{display:block;font-size:11px;color:var(--ui-text-secondary)}
 .hermes-runners-overflow{padding:6px;flex:none}.hermes-runners-detail{margin:2px 8px 8px 20px;font-size:11px;overflow-wrap:anywhere}
@@ -559,6 +858,16 @@ function Details({ row, transport, visible, onData }) {
       null,
       h('dt', null, 'Labels'),
       h('dd', null, (row.labels || []).map(text).join(', ') || 'None observed'),
+      h('dt', null, 'Provider registration'),
+      h('dd', null, text(row.registration)),
+      h('dt', null, 'Runner lifecycle'),
+      h('dd', null, text(row.lifecycle) || 'Not observed'),
+      h('dt', null, 'Operational evidence'),
+      h('dd', null, row.operational.length ? row.operational.map((e, i) =>
+        h('div', { key: i },
+          `${e.label} · ${e.status} · source ${text(e.source)} · state ${text(e.state)} · freshness ${text(e.freshness)}`,
+          h('div', null, `Observed: ${text(e.observed_at) || 'Not observed'} · Expires: ${text(e.expires_at) || 'Not observed'} · Recorded: ${text(e.recorded_at) || 'Not observed'}`)
+        )) : 'Not observed'),
       h('dt', null, 'Host service refs'),
       h('dd', null, row.host?.service_refs?.map(text).join(', ') || 'Not observed'),
       h('dt', null, 'Runner version'),
@@ -597,6 +906,9 @@ function Details({ row, transport, visible, onData }) {
             )
           ),
           h('p', null, `Recent jobs: ${(d.jobs || []).length}`),
+          !d.jobs?.length && !d.observed_jobs?.length ? h('p', null,
+            ({ not_configured: 'Job details not configured', forbidden: 'Job details permission denied', unavailable: 'Job collector unavailable',
+              configured: row.activity === 'busy' ? 'Current job not identified' : 'No attributed jobs observed' })[d.job_monitoring?.state] || 'Job attribution unavailable') : null,
           ...(d.jobs || []).map((j) =>
             h(
               'p',
@@ -604,6 +916,9 @@ function Details({ row, transport, visible, onData }) {
               `${text(j.provider_run_id)} · ${text(j.status)} · ${text(j.conclusion)}`
             )
           ),
+          h('p', null, `Provider job observations: ${(d.observed_jobs || []).length}`),
+          ...(d.observed_jobs || []).map(j => h('p', { key: `${j.repository}/${j.job_id}` },
+            `${text(j.repository)} · ${text(j.job_id)} · ${text(j.status)} · ${text(j.conclusion)} · ${ago(j.observed_at)} · ${Date.parse(j.expires_at) > Date.now() ? 'current' : 'stale'}`)),
           h('p', null, `Repair history: ${(d.repairs || []).length}`),
           ...(d.repairs || []).map((r) =>
             h('p', { key: r.id }, `${text(r.state)} · ${text(r.mode)}`)
@@ -613,11 +928,24 @@ function Details({ row, transport, visible, onData }) {
       : null
   )
 }
-function RunnerRow({ row, expanded, onExpand, transport, onError, visible, features, os }) {
+function RunnerRow({ row, expanded, onExpand, transport, onError, visible, features, os, search = '' }) {
   const ref = useRef(null)
   const [detail, setDetail] = useState(null)
+  const [repairBusy, setRepairBusy] = useState(false)
+  const [openedRepair, setOpenedRepair] = useState(null)
+  const [maintenanceForm, setMaintenanceForm] = useState(false)
+  const [maintenanceReason, setMaintenanceReason] = useState('')
+  const [maintenanceExpiry, setMaintenanceExpiry] = useState('')
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false)
+  const queryClient = useQueryClient()
+  const repairState = openedRepair ? 'active' : row.repair
+  // A subsequent collector snapshot owns lifecycle state, including closure.
+  useEffect(() => setOpenedRepair(null), [row.source.snapshot])
   const job = detail?.jobs?.find((j) => j.status === 'running' && j.assigned_runner_id === row.id)
-  const currentJob = row.activity === 'busy' && !row.stale && job ? jobURL(row, job) : null
+  const observedJob = detail?.observed_jobs?.find(j => j.status === 'in_progress' && observedJobURL(row, j))
+  const currentJob = row.activity === 'busy' && !row.stale
+    ? (observedJob ? observedJobURL(row, observedJob) : job ? jobURL(row, job) : null) : null
+  const currentJobId = observedJob?.job_id || job?.provider_job_id
   function openMenu(e) {
     e.preventDefault()
     e.stopPropagation()
@@ -633,7 +961,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
     )
   }
   const repairLabel =
-    row.repair === 'active'
+    repairState === 'active'
       ? 'Open repair session'
       : row.issue
         ? 'Repair in new session'
@@ -661,7 +989,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               type: 'button',
               'data-runner-row': row.key,
               className: 'hermes-runners-row',
-              'aria-label': `${row.display_name} · ${row.health} · ${row.activity}`,
+              'aria-label': `${row.display_name} · ${[...row.holds, row.health, row.activity].join(' · ')}`,
               'aria-expanded': expanded,
               onClick: () => onExpand(row.key),
               onKeyDown: (e) => {
@@ -675,25 +1003,27 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
             h(
               'span',
               null,
-              h('span', { className: 'hermes-runners-name' }, text(row.display_name)),
+              h('span', { className: 'hermes-runners-name' }, ...highlight(row.display_name, search)),
               h(
                 'span',
                 { className: 'hermes-runners-meta' },
-                `${text(row.scope?.name)} · ${row.provider} · ${row.observed_os} ${row.host?.arch || ''} · ${(row.labels || []).slice(0, 3).map(text).join(', ')}`
+                ...highlight(`${text(row.scope?.name)} · ${row.provider} · ${row.observed_os} ${row.host?.arch || ''} · ${(row.labels || []).filter((label, i) => i < 3 || search.trim().toLowerCase().split(/\s+/).filter(Boolean).some(term => text(label).toLowerCase().includes(term))).map(text).join(', ')}`, search)
               ),
               h(
                 'span',
                 { className: 'hermes-runners-meta' },
-                currentJob ? `Busy — job ${job.provider_job_id}` : row.reason
+                currentJob ? `Busy — job ${currentJobId}` : row.reason
               )
             ),
             h(
               'span',
               null,
               `${row.maintenance ? 'Maintenance · ' : ''}${row.health} · ${row.activity}`,
+              ...row.operational.filter(e => e.kind !== 'label_withdrawn').map((e, i) =>
+                h('span', { key: i, className: 'hermes-runners-meta' }, `${e.label}${e.held ? '' : ` · ${e.status}`}`)),
               h('span', { className: 'hermes-runners-meta' }, ago(row.observed_at)),
-              !['none', 'closed'].includes(row.repair)
-                ? h('span', { className: 'hermes-runners-meta' }, `Repair ${row.repair}`)
+              !['none', 'closed'].includes(repairState)
+                ? h('span', { className: 'hermes-runners-meta' }, `Repair ${repairState}`)
                 : null
             )
           ),
@@ -717,10 +1047,36 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
                 className: 'hermes-runners-muted',
                 onClick: () => os?.openExternal?.(currentJob)
               },
-              `Open current job ${job.provider_job_id}`
+              `Open current job ${currentJobId}`
             )
           : null,
-        expanded ? h(Details, { row, transport, visible, onData: setDetail }) : null
+        expanded ? h(Details, { row, transport, visible, onData: setDetail }) : null,
+        maintenanceForm ? h('form', {
+          className: 'hermes-runners-detail',
+          onSubmit: async e => {
+            e.preventDefault()
+            if (maintenanceBusy) return
+            setMaintenanceBusy(true)
+            onError('')
+            try {
+              await transport.maintenance(row, {
+                state: row.maintenance ? 'inactive' : 'active', reason: maintenanceReason,
+                expires_at: row.maintenance ? null : new Date(maintenanceExpiry).toISOString()
+              })
+              await queryClient.invalidateQueries({ queryKey: ['runners'] })
+              setMaintenanceForm(false)
+            } catch (error) { onError(error instanceof RangeError ? 'Choose a future maintenance expiry' : failure(error)) }
+            finally { setMaintenanceBusy(false) }
+          }
+        },
+          h('p', null, 'Maintenance is a label only; it does not drain jobs or authorize restarts.'),
+          h('input', { 'aria-label': 'Maintenance reason', required: true, maxLength: 512, value: maintenanceReason,
+            onChange: e => setMaintenanceReason(e.target.value) }),
+          !row.maintenance ? h('input', { 'aria-label': 'Maintenance expiry', type: 'datetime-local', required: true,
+            value: maintenanceExpiry, onChange: e => setMaintenanceExpiry(e.target.value) }) : null,
+          h('button', { type: 'submit', disabled: maintenanceBusy }, row.maintenance ? 'End maintenance' : 'Save maintenance'),
+          h('button', { type: 'button', onClick: () => setMaintenanceForm(false) }, 'Cancel')
+        ) : null
       )
     ),
     h(
@@ -734,7 +1090,16 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
         onEscapeKeyDown: (e) => e.stopPropagation()
       },
       features.repair_sessions
-        ? h(ContextMenuItem, { disabled: true }, `${repairLabel} — not available yet`)
+        ? h(ContextMenuItem, {
+            disabled: !row.actionable || repairBusy,
+            onSelect: async () => {
+              setRepairBusy(true)
+              onError('')
+              try { setOpenedRepair(await transport.repair(row)) }
+              catch (e) { onError(failure(e)) }
+              finally { setRepairBusy(false) }
+            }
+          }, repairBusy ? 'Opening repair session…' : repairLabel)
         : null,
       h(
         ContextMenuItem,
@@ -774,27 +1139,36 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
       ),
       h(
         ContextMenuItem,
-        { disabled: true },
-        'Maintenance controls unavailable — does not drain jobs'
+        { disabled: !features.repair_sessions || !row.actionable || !ID_PATTERN.test(row.host?.resource_id || ''),
+          onSelect: () => setMaintenanceForm(true) },
+        features.repair_sessions ? (row.maintenance ? 'End maintenance…' : 'Mark maintenance…') : 'Maintenance controls unavailable — does not drain jobs'
       )
     )
   )
 }
 
-export function Runners({ ctx, features = { repair_sessions: false } }) {
+export function Runners({ ctx, features = null }) {
   const [open, setOpen] = useState(false),
     [search, setSearch] = useState(''),
     [filter, setFilter] = useState('All'),
     [scope, setScope] = useState('all'),
     [expanded, setExpanded] = useState(null),
-    [collapsed, setCollapsed] = useState(new Set()),
+    [expandedNodes, setExpandedNodes] = useState(new Set()),
+    [help, setHelp] = useState(false),
     [actionError, setActionError] = useState('')
   const visible = useVisible(),
     client = useQueryClient(),
     transportRef = useRef(null),
     trigger = useRef(null),
     panel = useRef(null),
-    searchRef = useRef(null)
+    searchRef = useRef(null),
+    searchHandoff = useRef(false)
+  useLayoutEffect(() => {
+    if (!searchHandoff.current) return
+    searchHandoff.current = false
+    searchRef.current?.focus()
+    searchRef.current?.setSelectionRange(search.length, search.length)
+  }, [search])
   if (!transportRef.current) transportRef.current = createTransport(ctx)
   const transport = transportRef.current
   const gateways = useValue(host.state.gateways || host.state.connectionId),
@@ -817,8 +1191,77 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
   const selected =
     scope === 'all' ? sources : sources.filter((s) => s.route && routeKey(s.route) === scope)
   const view = projectFleet(selected),
-    rows = selectRows(view.rows, search, filter),
-    groups = groupRows(rows)
+    nodes = projectNodes(selected, view.rows),
+    { groups, rows } = selectNodes(nodes, search, filter)
+  // Prune against the complete inventory, not the filtered/scope-visible cohort.
+  const inventory = projectFleet(sources)
+  const inventoryNodes = projectNodes(sources, inventory.rows)
+  const nodeIdentityKey = JSON.stringify([
+    ...inventoryNodes.nodes.map(n => n.key),
+    ...(inventoryNodes.unassigned.length ? ['unmapped'] : [])
+  ].sort())
+  useEffect(() => {
+    const present = new Set(JSON.parse(nodeIdentityKey))
+    setExpandedNodes(old => {
+      const next = new Set([...old].filter(key => present.has(key)))
+      return next.size === old.size ? old : next
+    })
+  }, [nodeIdentityKey])
+  const [jumpFocus, setJumpFocus] = useState(null)
+  const { groups: paletteGroups } = selectNodes(inventoryNodes, '', 'All')
+  // Observations refresh frequently; only contribution identity, labels or routing
+  // changes should replace entries while the native palette is open.
+  const paletteKey = JSON.stringify(paletteGroups.map(group => [
+    group.key, group.name, group.source?.route, group.host?.os, group.host?.arch,
+    group.rows.map(row => [row.key, row.display_name, row.source.route,
+      row.observed_os, row.host?.arch, row.scope?.name, settingsURL(row)])
+  ]))
+  useEffect(() => {
+    if (!ctx.register) return
+    const allGroups = paletteGroups
+    const disposers = []
+    for (const group of allGroups) {
+      const jump = (row = null) => {
+        setScope(row ? routeKey(row.source.route) : group.source ? routeKey(group.source.route) : 'all')
+        setSearch('')
+        setFilter('All')
+        setExpandedNodes(old => new Set([...old, group.key]))
+        setExpanded(row?.key || null)
+        setOpen(true)
+        setJumpFocus({ key: row?.key || group.key, kind: row ? 'runner' : 'node' })
+      }
+      if (group.host) disposers.push(ctx.register({
+        id: `node:${group.key}`, area: PALETTE_AREA,
+        data: { id: `runners.node:${group.key}`, label: `Show node: ${group.name}`,
+          keywords: ['runners', 'host', text(group.host.os), text(group.host.arch)], run: () => jump() }
+      }))
+      for (const row of group.rows) {
+        disposers.push(ctx.register({
+          id: `runner:${row.key}`, area: PALETTE_AREA,
+          data: { id: `runners.runner:${row.key}`, label: `Show runner: ${row.display_name}`,
+            keywords: ['runners', group.name, text(row.observed_os), text(row.host?.arch)], run: () => jump(row) }
+        }))
+        const url = settingsURL(row)
+        if (url) disposers.push(ctx.register({
+          id: `settings:${row.key}`, area: PALETTE_AREA,
+          data: { id: `runners.settings:${row.key}`, label: `Runner settings: ${row.display_name}`,
+            keywords: ['configuration', 'preferences', 'github', text(row.scope?.name)],
+            run: () => ctx.os?.openExternal?.(url) }
+        }))
+      }
+    }
+    return () => disposers.forEach(dispose => dispose?.())
+  }, [ctx, paletteKey])
+  useEffect(() => {
+    if (!open || !jumpFocus) return
+    const frame = requestAnimationFrame(() => {
+      panel.current?.querySelectorAll(`[data-${jumpFocus.kind}-row]`).forEach(el => {
+        if (el.getAttribute(`data-${jumpFocus.kind}-row`) === jumpFocus.key) el.focus()
+      })
+      setJumpFocus(null)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [open, jumpFocus])
   const refreshing = useRef(false)
   async function refresh() {
     if (refreshing.current) return
@@ -853,14 +1296,72 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
   function onExpand(key) {
     setExpanded((old) => (old === key ? null : key))
   }
+  function escape(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (help) { setHelp(false); return }
+    if (expanded) {
+      const key = expanded
+      setExpanded(null)
+      panel.current?.querySelectorAll('[data-runner-row]').forEach(el => {
+        if (el.getAttribute('data-runner-row') === key) el.focus()
+      })
+    } else if (search) {
+      setSearch('')
+      searchRef.current?.focus()
+    } else {
+      const activeNode = document.activeElement?.closest('.hermes-runners-group')?.querySelector('[data-node-row]')
+      const node = activeNode?.getAttribute('aria-expanded') === 'true' ? activeNode :
+        panel.current?.querySelector('[data-node-row][aria-expanded="true"]')
+      if (node) {
+        setExpandedNodes(old => {
+          const next = new Set(old)
+          next.delete(node.getAttribute('data-node-row'))
+          return next
+        })
+        node.focus()
+      } else {
+        setOpen(false)
+        trigger.current?.focus()
+      }
+    }
+  }
   function keyboard(e) {
-    if (e.target.closest?.('[role=menu]')) return
+    if (e.defaultPrevented || e.target.closest?.('[role=menu]')) return
+    const node = e.target.closest('.hermes-runners-group')?.querySelector('[data-node-row]')
+    if (node && ['ArrowRight', 'ArrowLeft'].includes(e.key) && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+      e.preventDefault()
+      const key = node.getAttribute('data-node-row')
+      setExpandedNodes(old => {
+        const next = new Set(old)
+        e.key === 'ArrowRight' ? next.add(key) : next.delete(key)
+        return next
+      })
+      if (e.key === 'ArrowLeft') { setExpanded(null); node.focus() }
+    }
+    if (e.key === 'Enter' && e.target.hasAttribute('data-node-row')) {
+      e.preventDefault()
+      e.target.click()
+    }
+    if (e.key.length === 1 && e.key !== '/' && e.key !== ' ' && e.key !== '?' &&
+        !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing &&
+        !e.target.isContentEditable && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+      e.preventDefault()
+      const next = search + e.key
+      searchHandoff.current = true
+      setSearch(next)
+    }
+    if (e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing &&
+        !e.target.isContentEditable && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+      e.preventDefault()
+      setHelp(old => !old)
+    }
     if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
       e.preventDefault()
       searchRef.current?.focus()
     }
     if (['ArrowDown', 'ArrowUp'].includes(e.key) && e.target.tagName !== 'SELECT') {
-      const buttons = [...panel.current.querySelectorAll('[data-runner-row]')]
+      const buttons = [...panel.current.querySelectorAll('[data-node-row], [data-runner-row]')]
       if (buttons.length) {
         e.preventDefault()
         const index = buttons.indexOf(document.activeElement),
@@ -869,20 +1370,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         buttons[next].focus()
       }
     }
-    if (e.key === 'Escape') {
-      e.preventDefault()
-      e.stopPropagation()
-      if (expanded) {
-        const key = expanded
-        setExpanded(null)
-        panel.current?.querySelectorAll('[data-runner-row]').forEach((el) => {
-          if (el.getAttribute('data-runner-row') === key) el.focus()
-        })
-      } else {
-        setOpen(false)
-        trigger.current?.focus()
-      }
-    }
+    if (e.key === 'Escape') escape(e)
   }
   return h(
     Popover,
@@ -915,6 +1403,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
       {
         side: 'top',
         align: 'end',
+        // Do not tether the panel to a status item beyond a narrow viewport.
+        sticky: 'always',
         'aria-label': 'Runners',
         style: {
           width: 'min(680px, calc(100vw - 24px))',
@@ -925,17 +1415,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
           e.preventDefault()
           searchRef.current?.focus()
         },
-        onEscapeKeyDown: (e) => {
-          if (expanded) {
-            e.preventDefault()
-            e.stopPropagation()
-            const key = expanded
-            setExpanded(null)
-            panel.current?.querySelectorAll('[data-runner-row]').forEach((el) => {
-              if (el.getAttribute('data-runner-row') === key) el.focus()
-            })
-          }
-        },
+        onEscapeKeyDown: escape,
         onCloseAutoFocus: (e) => {
           e.preventDefault()
           trigger.current?.focus()
@@ -988,40 +1468,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         h(
           'div',
           { className: 'hermes-runners-summary' },
-          `${view.counts.registrations} registrations · ${view.counts.ready} verified-ready · ${view.counts.unverified} readiness-unverified`
-        ),
-        h(
-          'div',
-          { className: 'hermes-runners-muted' },
-          `Checked ${ago(
-            selected
-              .map((s) => s.snapshot?.meta.observed_at)
-              .filter(Boolean)
-              .sort()[0]
-          )} · Coverage ${view.coverage.filter((c) => c.state === 'complete').length}/${view.coverage.length} scopes complete · ${view.complete ? 'current' : 'incomplete / stale'}`
-        ),
-        h(
-          'details',
-          null,
-          h(
-            'summary',
-            { className: 'hermes-runners-muted' },
-            'Source coverage and observation ages'
-          ),
-          ...selected.map((s, i) =>
-            h(
-              'div',
-              { key: i, className: 'hermes-runners-note' },
-              `${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''} · checked ${ago(s.snapshot?.meta.observed_at)}`
-            )
-          ),
-          ...view.coverage.map((c, i) =>
-            h(
-              'div',
-              { key: `coverage-${i}`, className: 'hermes-runners-note' },
-              `${c.scope}: ${c.state} · ${c.enumerated_count ?? '?'} / ${c.provider_total_count ?? '?'} · ${text(c.reason_code)}`
-            )
-          )
+          `Scope: ${view.counts.registrations} registrations · ${view.counts.ready} verified-ready · ${view.counts.unverified} readiness-unverified`,
+          search.trim() || filter !== 'All' ? h('div', { 'data-filtered-cohort': true }, `Showing ${groups.filter(g => g.host).length} nodes · ${rows.length} registrations`) : null
         ),
         h(
           'div',
@@ -1031,7 +1479,11 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
             style: { maxHeight: 100, overflow: 'auto', flexShrink: 0 }
           },
           q.isPending && !sources.length ? 'Loading inventory…' : null,
-          ...view.messages.map((m) => h('p', { key: m, className: 'hermes-runners-note' }, m))
+          ...selected.filter(s => s.enrolled !== false && (
+            (s.error && (s.enrolled === true || s.snapshot || /Owner (gateway disconnected|identity mismatch)/.test(s.error))) ||
+            ['owner_disconnected', 'owner_conflict'].includes(s.snapshot?.data.state)
+          )).map((s, i) =>
+            h('p', { key: i, className: 'hermes-runners-note' }, `${['owner_disconnected', 'owner_conflict'].includes(s.snapshot?.data.state) ? 'Owner unavailable · ' : ''}${s.error || STATES[s.snapshot.data.state]} · ${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''}`))
         ),
         actionError ? h('p', { role: 'alert' }, actionError) : null,
         h('input', {
@@ -1080,29 +1532,39 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                 {
                   type: 'button',
                   className: 'hermes-runners-host',
-                  'aria-expanded': !collapsed.has(g.key),
+                  'data-node-row': g.key,
+                  'aria-expanded': expandedNodes.has(g.key),
                   onClick: () =>
-                    setCollapsed((old) => {
+                    setExpandedNodes((old) => {
                       const n = new Set(old)
                       n.has(g.key) ? n.delete(g.key) : n.add(g.key)
                       return n
                     })
                 },
-                h('b', null, `${collapsed.has(g.key) ? '▸' : '▾'} ${text(g.name)}`),
-                h('small', null, g.capacity)
+                h('span', null,
+                  h('b', null, `${expandedNodes.has(g.key) ? '▾' : '▸'} `, ...highlight(g.name, search)),
+                  g.host ? h('span', { className: 'hermes-runners-meta' }, ...highlight(`${text(g.host.os)} ${text(g.host.arch)}`, search), ` · ${g.registrationCount ? `${g.registrationCount} registrations` : 'No mapped runners'}`) : null,
+                  g.activity ? h('span', { className: 'hermes-runners-meta' }, `${g.activity.busy == null ? 'Activity unknown' : `${g.activity.busy} busy · ${g.activity.idle} idle`} · ${g.freshness.observedAt ? `${g.freshness.state} · ${ago(g.freshness.observedAt)}` : 'Not observed'}`) : null
+                ),
+                h('small', null, g.health?.reason || `${g.rows.length} · mapping needed`)
               ),
-              g.issue ? h('p', { className: 'hermes-runners-note' }, g.issue) : null,
-              !collapsed.has(g.key)
+              expandedNodes.has(g.key) && g.host ? h('div', { 'data-node-evidence': true, className: 'hermes-runners-note' },
+                g.capacity.enforced ? `Enforced limit: ${g.capacity.limit} · ` : 'No enforced limit reported · ',
+                `Observed active jobs: ${g.capacity.active ?? 'unknown'}`,
+                g.maintenance.active ? h('div', null, `Maintenance: ${g.maintenance.reason || 'Reason unavailable'} · expires ${g.maintenance.expiresAt}`) : null
+              ) : null,
+              expandedNodes.has(g.key)
                 ? g.rows.map((row) =>
                     h(RunnerRow, {
                       key: row.key,
                       row,
+                      search,
                       expanded: expanded === row.key,
                       onExpand,
                       transport,
                       onError: setActionError,
                       visible,
-                      features,
+                      features: features || row.source.features || { repair_sessions: false },
                       os: ctx.os
                     })
                   )
@@ -1111,9 +1573,26 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
           )
         ),
         h(
+          'details',
+          { 'data-runners-diagnostics': true, style: { maxHeight: 100, overflow: 'auto', flexShrink: 0 } },
+          h('summary', { className: 'hermes-runners-muted' }, 'Source diagnostics'),
+          h('div', { className: 'hermes-runners-muted' },
+            `Collector heartbeat ${ago(selected.map(s => s.snapshot?.meta.observed_at).filter(Boolean).sort()[0])} · Coverage ${view.coverage.filter(c => c.state === 'complete').length}/${view.coverage.length} scopes complete · ${view.complete ? 'current' : 'incomplete / stale'}`),
+          h('details', null,
+            h('summary', { className: 'hermes-runners-muted' }, 'Source coverage and observation ages'),
+            ...selected.map((s, i) => h('div', { key: i, className: 'hermes-runners-note' },
+              `${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''} · checked ${ago(s.snapshot?.meta.observed_at)}`)),
+            ...view.coverage.map((c, i) => h('div', { key: `coverage-${i}`, className: 'hermes-runners-note' },
+              `${c.scope}: ${c.state} · ${c.enumerated_count ?? '?'} / ${c.provider_total_count ?? '?'} · ${text(c.reason_code)}`))
+          ),
+          ...view.messages.map(m => h('p', { key: m, className: 'hermes-runners-note' }, m))
+        ),
+        h(
           'div',
           { className: 'hermes-runners-muted' },
-          '↑↓ Move · Enter Details · Shift+F10 Actions · Esc Back'
+          '↑↓ Move · Enter Details · Shift+F10 Actions · Esc Back · ? Help',
+          help ? h('div', { 'data-runners-help': true, role: 'note' },
+            '↑↓ Move through visible nodes and runners. Enter toggles a node or runner detail. Right: expand node. Left: collapse node. / or type: search. Shift+F10: runner actions. Escape: help, detail, query, expanded node, then panel.') : null
         )
       )
     )

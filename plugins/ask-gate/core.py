@@ -43,11 +43,13 @@ _ASK = re.compile(
     r"|\b(reply|answer|say|tell me) (with )?[\"'“]?(yes|no|go)\b"
     r"|\b(let me know|tell me) (if|whether|which|when)\b"
     r"|\bplease (confirm|approve|decide|pick|choose|reply|sign|add|click|revoke|cancel)\b"
+    r"|\bneeds? (?:a )?manual nudge on (?:the )?(?:kanban )?board\b"
     r"|\b(unblock|unblocks) (it|the card|t_[0-9a-f]{8})\b",
     re.I)
 # Mentions that are not a live ask: hypotheticals, explicit "nothing for you", past/third person.
 _NOT_ASK = re.compile(
     r"\b(if you (ever|later|still|prefer)|unless|in case|whenever you|no action (is )?needed|"
+    r"none of (?:them|the (?:cards|tasks)) needs? you|"
     r"nothing (is )?(waiting|needed|needs?|left) (on|from|for) you|nothing (for|to do for) you|"
     r"nothing in this (work|card) is waiting|doesn'?t need you|don'?t need (anything|you)|"
     r"you (already|have already)|you (said|answered|approved|asked|told)|no (more|further) (input|action)|"
@@ -68,7 +70,7 @@ _PLEASE_VERB = re.compile(r"\bplease\s+" + _VERB + r"\b" + _VERB_NOT_NOUN, re.I)
 # headings that hand the reader steps: "Your checklist", "What I need from you:", "To confirm:", "@user", "For you"
 _USER_HEAD = re.compile(
     r"^\W*(?:your (?:checklist|steps|turn|action items?|to-?dos?)|what i need from you|to confirm|to clear it|"
-    r"@user|for you|needs you|on you)\b[^:\n]{0,40}(?::|$)", re.I)
+    r"@user|for you|decision for you|needs you|on you)\b[^:\n]{0,40}(?::|$)", re.I)
 # "I can't" claims: the gap stays with the reader unless this turn's tool output shows the attempt failing
 _CANT = re.compile(
     r"\bI (?:can['\u2019]?t|cannot) (?:change|check|do|open|fix|reach)\b"
@@ -191,12 +193,15 @@ def find_asks(text: str, howto: bool = False) -> list[str]:
     out: list[str] = []
     n_imp = 0
     for s, forced in _units(_strip_quotes(text)):
-        if _NOT_ASK.search(s) or s in out:
+        # This negative status negates only its own "need you" span, not an
+        # independent request before/after it. Keep the original for the judge.
+        candidate = re.sub(r"\bnone of (?:them|the (?:cards|tasks)) needs? you\b", "X", s, flags=re.I)
+        if _NOT_ASK.search(candidate) or s in out:
             continue
-        hit = bool(_ASK.search(s)) or bool(_CANT.search(s))
+        hit = bool(_ASK.search(candidate)) or bool(_CANT.search(candidate))
         if not hit and forced:
-            hit = not howto
-        if not hit and not howto and n_imp < 8 and is_imperative(s):
+            hit = not howto and not _NOT_ASK.search(s)
+        if not hit and not howto and n_imp < 8 and is_imperative(candidate):
             hit, n_imp = True, n_imp + 1
         if hit:
             out.append(s[:1200] if forced else s[:600])

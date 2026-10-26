@@ -33,6 +33,55 @@ def test_required_checks_derive_readiness(tmp_path,disk,service,expected):
     assert stale['data']['runners'][0]['readiness']=='not_checked'
 
 
+@pytest.mark.parametrize('expires,ready', [(1100, 0), (1001, 1)])
+def test_maintenance_counts_match_desktop(tmp_path, expires, ready):
+    import json
+    import subprocess
+    from pathlib import Path
+    from plugins.runners.collector import iso
+    def probe(h):
+        return dict(disk_free_bytes=100*1024**3, services={h['service_refs'][0]: 'running'}, tools={})
+    cfg, path, adapter = setup(tmp_path, probe)
+    cfg['hosts'][0]['maintenance'] = dict(state='active', reason='Planned', expires_at=iso(expires))
+    with Store(path) as store:
+        Collector(store, cfg, adapter, clock=lambda: 1000, host_probe=probe).tick()
+    snapshot = Service(path, cfg, clock=lambda: 1001).inventory()
+    validate('InventoryResponse', snapshot)
+    result = subprocess.run(['node', str(Path(__file__).parents[3] / 'desktop-plugins/runners/tests/project-snapshot.mjs')],
+                            input=json.dumps(dict(snapshot=snapshot, now=1001)), text=True,
+                            capture_output=True, check=True, timeout=15)
+    ui = json.loads(result.stdout)
+    assert snapshot['data']['counts']['verified_ready'] == ui['ready'] == ready
+    assert snapshot['data']['counts']['readiness_unverified'] == ui['unverified'] == 1-ready
+
+
+@pytest.mark.parametrize('copies', [1, 2])
+@pytest.mark.parametrize('now', [1001, 1201])
+def test_unreachable_host_counts_once_and_expires(tmp_path, copies, now):
+    import json
+    import subprocess
+    from pathlib import Path
+    def probe(h):
+        raise TimeoutError('probe timed out')
+    cfg, path, adapter = setup(tmp_path, probe)
+    rows = [deepcopy(F['Runner'])]
+    if copies == 2:
+        rows.append(dict(rows[0], id='runner_'+'b'*16, provider_runner_id='999'))
+    with Store(path) as store:
+        for row in rows:
+            store.put('Runner', dict(row, host_id=cfg['hosts'][0]['id']), at=900)
+        adapter.result = ProviderResult(tuple(rows), True, None, 1000, copies)
+        Collector(store, cfg, adapter, clock=lambda:1000, host_probe=probe).tick()
+    snapshot = Service(path, cfg, clock=lambda:now).inventory()
+    validate('InventoryResponse', snapshot)
+    result = subprocess.run(['node', str(Path(__file__).parents[3] / 'desktop-plugins/runners/tests/project-snapshot.mjs')],
+                            input=json.dumps(dict(snapshot=snapshot, now=now)), text=True,
+                            capture_output=True, check=True, timeout=15)
+    ui = json.loads(result.stdout)
+    assert snapshot['data']['counts']['registrations'] == copies
+    assert snapshot['data']['counts']['issues'] == ui['issues'] == (1 if now == 1001 else copies)
+
+
 def test_host_failures_prevent_incident_recovery(tmp_path):
     free=[1]; clock=[1000]
     def probe(h): return dict(disk_free_bytes=free[0]*1024**3,services={h['service_refs'][0]:'running'},tools={})

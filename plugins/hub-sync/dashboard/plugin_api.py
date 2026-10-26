@@ -77,8 +77,11 @@ async def get_where(session_id: str) -> Dict[str, Any]:
 
 
 @router.get("/session-links/{session_id}")
-async def get_session_links(session_id: str, ids: Optional[str] = None, all: int = 0) -> Dict[str, Any]:  # noqa: A002
-    return await asyncio.to_thread(_hv().session_links, [session_id] + _split(ids), bool(all))
+async def get_session_links(session_id: str, ids: Optional[str] = None, all: int = 0,
+                            origin_gateway: Optional[str] = None,
+                            origin_profile: Optional[str] = None) -> Dict[str, Any]:  # noqa: A002
+    return await asyncio.to_thread(_hv().session_links, [session_id] + _split(ids), bool(all),
+                                   origin_gateway, origin_profile)
 
 
 @router.get("/requests")

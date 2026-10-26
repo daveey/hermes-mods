@@ -1,0 +1,127 @@
+From 5a1eeb73db6094dce62a7a4a96b06f8fe744f508 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:02:36 +0000
+Subject: [PATCH] fix(kanban): reject changed adoption before task lookup
+ [daveey]
+
+---
+ hermes_cli/kanban_origin_creation.py          |  4 +--
+ .../hermes_cli/test_kanban_origin_adoption.py | 34 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_origin_owner.py  | 24 ++++++-------
+ 3 files changed, 47 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 1b2d55dd9f..9d02cc6116 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -97,8 +97,6 @@ def adopt_with_origin(conn, intent: dict, *, board: str) -> str:
+     immutable = _json({"operation": "adopt", "intent": intent})
+     task_id = owner["task_id"]
+     with kb.write_txn(conn, allow_nested=True):
+-        if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
+-            raise OriginError("origin_task_missing", "exact owner task does not exist")
+         conn.execute("""CREATE TABLE IF NOT EXISTS origin_creation_intents (
+             request_id TEXT PRIMARY KEY NOT NULL,
+             intent_json TEXT NOT NULL,
+@@ -113,6 +111,8 @@ def adopt_with_origin(conn, intent: dict, *, board: str) -> str:
+             if existing["intent_json"] != immutable:
+                 raise OriginError("origin_creation_conflict", "request ID reused with a different origin intent")
+             return existing["task_id"]
++        if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
++            raise OriginError("origin_task_missing", "exact owner task does not exist")
+         for row in conn.execute("SELECT request_id,binding_json FROM origin_creation_intents WHERE task_id=?", (task_id,)):
+             try:
+                 previous = json.loads(row["binding_json"])
+diff --git a/tests/hermes_cli/test_kanban_origin_adoption.py b/tests/hermes_cli/test_kanban_origin_adoption.py
+index 37ffc27082..4bd082f121 100644
+--- a/tests/hermes_cli/test_kanban_origin_adoption.py
++++ b/tests/hermes_cli/test_kanban_origin_adoption.py
+@@ -91,6 +91,16 @@ def test_retry_archive_and_conflicting_request(board):
+     assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "archived"
+ 
+ 
++def test_changed_retry_to_missing_task_is_an_immutable_conflict(board):
++    conn, tid = board
++    creation.adopt_with_origin(conn, intent(tid), board="default")
++    changed = {**intent(tid), "owner": {**intent(tid)["owner"], "task_id": "t_missing"}}
++    with pytest.raises(OriginError) as exc:
++        creation.adopt_with_origin(conn, changed, board="default")
++    assert exc.value.code == "origin_creation_conflict"
++    assert conn.execute("SELECT COUNT(*) FROM origin_creation_intents").fetchone()[0] == 1
++
++
+ def test_failed_adoption_insert_rolls_back_without_changing_task(board):
+     import sqlite3
+     conn, tid = board
+@@ -123,6 +133,30 @@ def test_concurrent_adoption_replay_keeps_one_marker(board):
+     assert conn.execute("SELECT COUNT(*) FROM origin_creation_intents").fetchone()[0] == 1
+ 
+ 
++@pytest.mark.parametrize("first", ["create", "adopt"])
++def test_create_adopt_request_id_collision_preserves_original_operation(board, first):
++    conn, tid = board
++    adoption = intent(tid)
++    creation_intent = {**adoption, "owner": {
++        key: value for key, value in adoption["owner"].items() if key != "task_id"
++    }}
++    operations = {
++        "create": lambda: kb.create_task(conn, title="Build", origin_intent=creation_intent),
++        "adopt": lambda: creation.adopt_with_origin(conn, adoption, board="default"),
++    }
++    operations[first]()
++    original = [dict(row) for row in conn.execute("SELECT * FROM origin_creation_intents")]
++    tasks = [dict(row) for row in conn.execute("SELECT * FROM tasks ORDER BY id")]
++    events = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
++    second = "adopt" if first == "create" else "create"
++    with pytest.raises(OriginError) as exc:
++        operations[second]()
++    assert exc.value.code == "origin_creation_conflict"
++    assert [dict(row) for row in conn.execute("SELECT * FROM origin_creation_intents")] == original
++    assert [dict(row) for row in conn.execute("SELECT * FROM tasks ORDER BY id")] == tasks
++    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events
++
++
+ def test_registered_adoption_tool_requires_trusted_context(board):
+     from tools import kanban_tools
+     from tools.registry import registry
+diff --git a/tests/hermes_cli/test_kanban_origin_owner.py b/tests/hermes_cli/test_kanban_origin_owner.py
+index 978484adec..1d70d98c5d 100644
+--- a/tests/hermes_cli/test_kanban_origin_owner.py
++++ b/tests/hermes_cli/test_kanban_origin_owner.py
+@@ -198,22 +198,20 @@ def test_adoption_entry_rejects_wrong_route_or_missing_capability(world, monkeyp
+         tid = kb.create_task(conn, title='Existing', session_id='original-creator')
+     request = {**world, 'action': 'origin-adopt', 'key': 'default/default/' + tid,
+                'args': {'origin': world['args']['origin']}}
+-    if damage == 'sender':
+-        request['from'] = 'gw:impostor'
+-    elif damage == 'gateway':
+-        request['to_gw'] = 'other'
+-    elif damage == 'profile':
+-        request['key'] = 'other/default/' + tid
+-    elif damage == 'task':
+-        request['key'] = 'default/default/' + tid[:-1]
+-    elif damage == 'args':
+-        request['args']['create'] = {'title': 'Duplicate'}
+-    elif damage == 'pinned_db':
++    request_changes = {
++        'sender': {'from': 'gw:impostor'},
++        'gateway': {'to_gw': 'other'},
++        'profile': {'key': 'other/default/' + tid},
++        'task': {'key': 'default/default/' + tid[:-1]},
++        'args': {'args': {**request['args'], 'create': {'title': 'Duplicate'}}},
++    }
++    request.update(request_changes.get(damage, {}))
++    if damage == 'pinned_db':
+         monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'wrong.db'))
+         monkeypatch.setattr(kb, '_explicit_board_intent_pinned', lambda: True)
+-    elif damage == 'tool_absent':
++    if damage == 'tool_absent':
+         monkeypatch.setattr(registry, '_snapshot_entries', list)
+-    else:
++    if damage == 'delegated':
+         monkeypatch.setattr('agent.delegation_context.kanban_path_is_fenced', lambda path: True)
+         args = argparse.Namespace(kanban_action='origin-adopt', request_file='-')
+         assert kanban.kanban_command(args) != 0
+-- 
+2.55.0
+

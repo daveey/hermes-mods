@@ -75,6 +75,25 @@ No migration, environment reader, live probe, runtime API test or publication is
 
 ## Domain and state semantics
 
+Optional `Runner.readiness_evidence` is a service-owned projection of existing
+Checks: `required`, `passed`, `failed`, `warned`, and `hold_explained_failures`
+are check-key arrays (`disk`, `service`, `tool:<name>`,
+`operational:<kind>:<source>`). `observed_at`/`expires_at` are nullable RFC3339
+host-observation timestamps, not API/collector heartbeat time; `freshness` is
+fresh/stale/unknown/unavailable. Fresh means host context is current, not that
+every required check passed or was checked. Missing results remain visible as
+required keys absent from passed/failed/warned. Stale/unavailable Checks may be
+empty; never treat empty arrays or an absent object as verified readiness.
+
+Only current, exact-bound held evidence explains its matching failed operational
+key. `service` is explained only when stopped plus fresh drained/systemd held:
+the existing parser proves explicitly configured intentional disabled/inactive
+drain. Failed/missing services and unrelated holds remain independent failures.
+Clients must subtract only explained keys from failed, not suppress all failures
+on a held runner; warnings and unknown required checks remain distinct.
+Unbound runners omit the object. Provider fields are dropped before persistence
+and overwritten/dropped at read time. No probes or mutations are added.
+
 `Host`, `Scope`, `Runner`, `Capability`, `Observation`, `Incident`, `Repair`, `Job`,
 `Provider`, `ExecutionTarget` and `BBBinding` are independent definitions. `RunnerBinding`
 and `BBBinding` require explicit verification observation references. A BB node and a

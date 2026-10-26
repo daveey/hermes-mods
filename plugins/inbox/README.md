@@ -36,6 +36,14 @@ Kanban card is refused with `AgentFixablePost` (a `ValueError`, same CLI/tool/RE
 Kanban board (comment or fix card). The noise breaker only fires after David archived 3 cards; this needs none.
 Tests: `tests/test_mute_paths.py::test_agent_fixable_posts_refused_before_any_card_exists`.
 
+## Social chats and cards go to the `pr` project
+
+Desktop groups a session under the project owning its `cwd`. Social Inbox cards (workflow-owned `x-`/`bsky-`/`bluesky-`/`social-` types or keys, or titles requesting X/Twitter/Bluesky publishing, drafts, approvals, replies or DMs) get the owning host's `pr` project folder from its own `projects.db`. IDs and paths are never copied between gateways. Free-text coding tasks such as “Fix X reply API retry bug” and “Merge PR #123 for Twitter post scheduler” do not match; “Draft a Bluesky post about PR #123” does. Explicit `cwd` wins, including home; an inherited directory already inside `pr` is retained. Reposts never move sessions.
+
+Ordinary unassigned Desktop/TUI chats use the same classifier on their first user turn, before model/tools run. The registered `pre_llm_call` hook finds that exact session in the owning backend, checks both runtime and stored workspace provenance, and uses core's workspace setter to update the live cwd, persisted row and session-info event. It does not select/focus a chat or invalidate the prompt cache. Explicit/pinned projects, persisted cwds (even home), resumed/branched chats, workers, CLI sessions and room plumbing are untouched. A missing project/directory or missing local runtime is a conservative no-op. No polling or historical ordinary-chat reassignment.
+
+`hermes inbox backfill-social [--apply]` considers fallback-directory cards only with recorded non-explicit provenance AND an authoritative `ended_at`; explicit choices, legacy unknown provenance, unended sessions and archived cards are skipped (archive opt-in available). Writes recheck lifecycle/cwd atomically. No age/message-count liveness guess. Code: `routing.py`, `chat_routing.py`, `store.py`; regression tests: `tests/test_social_routing.py`, `tests/test_chat_routing.py` (registered hook, owner-profile lookup, coding negatives, overrides and worker exclusions).
+
 ## Card types
 
 A plain card has **Do it** + **Archive**. A *typed* card has its type's own buttons, and the poster reads the decision back later by key, so "archive" never doubles as "approve".

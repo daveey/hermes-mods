@@ -231,7 +231,7 @@ puts a spaced path in argv[0], but applies alone). Both apply cleanly on current
 
 ```sh
 cd ~/.hermes/hermes-agent            # your Hermes checkout
-git am -3 ~/code/hermes-mods/core/patches/0017-*.patch \
+git am -3 --empty=keep ~/code/hermes-mods/core/patches/0017-*.patch \
           ~/code/hermes-mods/core/patches/0027-*.patch
 ```
 
@@ -242,7 +242,7 @@ make sure any psutil-joined cmdline quotes spaced args before the gateway-identi
 0123 and 0142 need 0017 (`signed_python_app`). 0142 also needs upstream's osascript launchd wrapper
 (`launchd_program_arguments`, #71206). It takes effect only once the launchd plist is regenerated (reinstall the
 gateway service); then grant Accessibility/Automation to Hermes Python once. Verified: 0001–0143 apply with
-`git am -3` at merge-base `4957bbd0a0` (Oct 19, 2026 PT).
+`git am -3 --empty=keep` at merge-base `4957bbd0a0` (Oct 19, 2026 PT).
 
 ## Gotchas
 

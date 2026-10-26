@@ -1,0 +1,245 @@
+From 7da35fd0aa3247e48b7c7d4de77bdf4b7f35fd32 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:27:29 +0000
+Subject: [PATCH] [daveey] distinguish unavailable Anthropic pools from missing
+ credentials
+
+---
+ hermes_cli/runtime_provider.py                |   3 +-
+ .../runtime_provider_anthropic_diagnostics.py |  58 +++++++
+ .../test_anthropic_unavailable_diagnostics.py | 144 ++++++++++++++++++
+ 3 files changed, 204 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/runtime_provider_anthropic_diagnostics.py
+ create mode 100644 tests/hermes_cli/test_anthropic_unavailable_diagnostics.py
+
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 2cba53eb07..aa45fb7615 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -369,7 +369,8 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
+         if model and resolve_anthropic_token():
+             raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
+                             "other Claude models remain available (see `hermes auth list`).")
+-        raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
++        from hermes_cli.runtime_provider_anthropic_diagnostics import unavailable_pool_message
++        raise AuthError(unavailable_pool_message(_NO_ANTHROPIC_CREDENTIALS_MSG))
+     return token
+ 
+ 
+diff --git a/hermes_cli/runtime_provider_anthropic_diagnostics.py b/hermes_cli/runtime_provider_anthropic_diagnostics.py
+new file mode 100644
+index 0000000000..fe2a8a389c
+--- /dev/null
++++ b/hermes_cli/runtime_provider_anthropic_diagnostics.py
+@@ -0,0 +1,58 @@
++"""Non-secret diagnostics when Anthropic token resolution found no usable token."""
++from __future__ import annotations
++
++
++import json
++from pathlib import Path
++
++
++def _entries_at(path: Path | None) -> list:
++    if path is None:
++        return []
++    try:
++        store = json.loads(path.read_text(encoding="utf-8-sig"))
++    except FileNotFoundError:
++        return []
++    if not isinstance(store, dict):
++        raise ValueError("invalid credential store")
++    pool = store.get("credential_pool", {})
++    if not isinstance(pool, dict):
++        raise ValueError("invalid credential pool")
++    entries = pool.get("anthropic", [])
++    if not isinstance(entries, list):
++        raise ValueError("invalid provider pool")
++    return entries
++
++
++def _pool_entries() -> list:
++    # Reuse canonical profile/root paths and provider-level precedence, but not
++    # the general loader: it backs up corrupt files and masks fallback errors.
++    from hermes_cli.auth import _auth_file_path, _global_auth_file_path
++    return _entries_at(_auth_file_path()) or _entries_at(_global_auth_file_path())
++
++
++def unavailable_pool_message(missing_message: str) -> str:
++    """Read persisted statuses, never refresh, select, clear cooldowns or expose row details.
++
++    A failed token resolution proves unavailability, not absence. In particular,
++    the resolver filters globally exhausted entries even without a target model.
++    """
++    try:
++        entries = _pool_entries()
++    except (OSError, ValueError):
++        return ("Anthropic credentials are unavailable and the existing credential pool could not be inspected. "
++                "Check the provider/profile credential store before requesting new authentication.")
++    if not entries:
++        return missing_message
++    statuses = {entry.get("last_status") if isinstance(entry, dict) and isinstance(entry.get("last_status"), str)
++                else None for entry in entries}
++    if statuses and statuses <= {"exhausted", "dead"} and "exhausted" in statuses:
++        return ("Existing Anthropic credentials are marked rate-limited; no usable token is available. "
++                "Inspect the existing pool and reset times with `hermes auth list`; wait for capacity "
++                "or use an explicitly authorized route. Keep explicit model/provider pins unchanged.")
++    if statuses == {"dead"}:
++        return ("Existing Anthropic credentials are marked invalid or revoked. Inspect `hermes auth list`; "
++                "re-authenticate the affected account with `hermes auth add anthropic` if required.")
++    return ("Existing Anthropic credentials were found but no usable token resolved. "
++            "Inspect `hermes auth list` and the active provider/profile before requesting new authentication; "
++            "do not clear cooldowns or change explicit model/provider pins.")
+diff --git a/tests/hermes_cli/test_anthropic_unavailable_diagnostics.py b/tests/hermes_cli/test_anthropic_unavailable_diagnostics.py
+new file mode 100644
+index 0000000000..83585a08b6
+--- /dev/null
++++ b/tests/hermes_cli/test_anthropic_unavailable_diagnostics.py
+@@ -0,0 +1,144 @@
++"""Exhausted credentials are not missing credentials; diagnostics never grant access."""
++import copy
++import json
++from pathlib import Path
++import time
++
++import pytest
++
++from agent import anthropic_credentials as ac
++from agent import credential_pool as cp
++from hermes_cli import auth
++from hermes_cli import runtime_provider as rp
++from hermes_cli import runtime_provider_anthropic_diagnostics as diagnostics
++
++
++@pytest.fixture
++def pool_fixture(monkeypatch):
++    rows = []
++    monkeypatch.setattr(ac, '_getenv', lambda *args: '')
++    monkeypatch.setattr(ac, 'read_claude_code_credentials', lambda: None)
++    monkeypatch.setattr(diagnostics, '_pool_entries', lambda: rows)
++    monkeypatch.setattr(cp, 'load_pool', lambda provider: cp.CredentialPool(
++        provider, [cp.PooledCredential.from_dict(provider, row) for row in rows]))
++    return rows
++
++
++def row(status):
++    return dict(id='fixture', label='private-label', source='manual', auth_type='oauth',
++                access_token='sk-ant-oat-fixture-not-a-real-token', priority=0,
++                last_status=status, last_status_at=time.time(), last_error_code=429 if status == 'exhausted' else 401,
++                last_error_reset_at=time.time() + 3600)
++
++
++@pytest.mark.parametrize('model', [None, 'claude-opus-5-5'])
++def test_globally_exhausted_pool_is_not_missing_login(pool_fixture, model):
++    pool_fixture.append(row('exhausted'))
++    before = copy.deepcopy(pool_fixture)
++    assert ac.resolve_anthropic_token(model=model) is None
++    assert ac.resolve_anthropic_token() is None
++    with pytest.raises(rp.AuthError) as error:
++        rp._anthropic_token_or_raise(model=model)
++    text = str(error.value)
++    assert 'rate-limited' in text
++    assert 'No Anthropic credentials' not in text
++    assert 'auth add' not in text and 'login' not in text.lower()
++    assert 'private-label' not in text and 'sk-ant-' not in text
++    assert pool_fixture == before
++
++
++def test_absent_pool_retains_real_login_guidance(pool_fixture):
++    with pytest.raises(rp.AuthError) as error:
++        rp._anthropic_token_or_raise(model='claude-opus-5-5')
++    assert str(error.value) == rp._NO_ANTHROPIC_CREDENTIALS_MSG
++
++
++def test_dead_pool_retains_reauthentication_gate(pool_fixture):
++    pool_fixture.append(row('dead'))
++    before = copy.deepcopy(pool_fixture)
++    with pytest.raises(rp.AuthError) as error:
++        rp._anthropic_token_or_raise(model='claude-opus-5-5')
++    assert 'auth add anthropic' in str(error.value)
++    assert pool_fixture == before
++
++
++def test_persisted_exhaustion_diagnostic_is_read_only(tmp_path, monkeypatch):
++    home = tmp_path / 'profile'
++    home.mkdir()
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(ac, 'resolve_anthropic_token', lambda **kwargs: None)
++    path = home / 'auth.json'
++    path.write_text(json.dumps({'credential_pool': {'anthropic': [row('exhausted')]}}))
++    before = path.read_bytes()
++    with pytest.raises(rp.AuthError, match='rate-limited'):
++        rp._anthropic_token_or_raise(model='claude-opus-5-5')
++    assert path.read_bytes() == before
++
++
++@pytest.mark.parametrize('statuses', [['ok'], ['exhausted', 'ok'], [None], [['malformed']]])
++def test_unknown_unavailable_pool_does_not_claim_absence(monkeypatch, statuses):
++    monkeypatch.setattr(ac, 'resolve_anthropic_token', lambda **kwargs: None)
++    monkeypatch.setattr(diagnostics, '_pool_entries', lambda: [{'last_status': s} for s in statuses])
++    with pytest.raises(rp.AuthError) as error:
++        rp._anthropic_token_or_raise(model='claude-opus-5-5')
++    assert 'Existing Anthropic credentials were found' in str(error.value)
++
++
++def test_unreadable_pool_does_not_claim_absence_or_log_exception(monkeypatch):
++    monkeypatch.setattr(ac, 'resolve_anthropic_token', lambda **kwargs: None)
++    def unreadable():
++        raise OSError('sensitive-fixture-detail')
++    monkeypatch.setattr(diagnostics, '_pool_entries', unreadable)
++    with pytest.raises(rp.AuthError) as error:
++        rp._anthropic_token_or_raise(model='claude-opus-5-5')
++    assert 'could not be inspected' in str(error.value)
++    assert 'sensitive-fixture-detail' not in str(error.value)
++
++
++@pytest.mark.parametrize('case', ['corrupt_local', 'corrupt_root', 'unreadable_root', 'malformed_pool'])
++def test_store_inspection_failure_is_not_absence_and_never_writes(tmp_path, monkeypatch, case):
++    local = tmp_path / 'profile.json'
++    root = tmp_path / 'root.json'
++    local.write_text('{}')
++    root.write_text('{}')
++    monkeypatch.setattr(auth, '_auth_file_path', lambda: local)
++    monkeypatch.setattr(auth, '_global_auth_file_path', lambda: root)
++    monkeypatch.setattr(ac, 'resolve_anthropic_token', lambda **kwargs: None)
++    if case == 'corrupt_local':
++        local.write_text('{broken')
++    elif case == 'corrupt_root':
++        root.write_text('{broken')
++    elif case == 'malformed_pool':
++        local.write_text('{"credential_pool": []}')
++    else:
++        original = Path.read_text
++        def read(path, *args, **kwargs):
++            if path == root:
++                raise PermissionError('sensitive-fixture-detail')
++            return original(path, *args, **kwargs)
++        monkeypatch.setattr(Path, 'read_text', read)
++    before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
++    with pytest.raises(rp.AuthError) as error:
++        rp._anthropic_token_or_raise(model='claude-opus-5-5')
++    assert 'could not be inspected' in str(error.value)
++    assert 'sensitive-fixture-detail' not in str(error.value)
++    assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
++
++
++def test_profile_pool_wins_without_reading_broken_root(tmp_path, monkeypatch):
++    local = tmp_path / 'profile.json'
++    root = tmp_path / 'root.json'
++    local.write_text(json.dumps({'credential_pool': {'anthropic': [row('dead')]}}))
++    root.write_text('{broken')
++    monkeypatch.setattr(auth, '_auth_file_path', lambda: local)
++    monkeypatch.setattr(auth, '_global_auth_file_path', lambda: root)
++    assert 'auth add anthropic' in diagnostics.unavailable_pool_message('missing')
++    local.write_text('{}')
++    root.write_text(json.dumps({'credential_pool': {'anthropic': [row('exhausted')]}}))
++    assert 'rate-limited' in diagnostics.unavailable_pool_message('missing')
++
++
++def test_healthy_pool_still_resolves_exact_token(pool_fixture):
++    pool_fixture.append(row('ok'))
++    assert rp._anthropic_token_or_raise(model='claude-opus-5-5') == pool_fixture[0]['access_token']
+-- 
+2.55.0
+

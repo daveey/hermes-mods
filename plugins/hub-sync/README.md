@@ -17,7 +17,7 @@ No agent hooks or tools: `register()` is a no-op; everything is `dashboard/plugi
 | GET | `/inbox[?gateway=&exclude=&all=1]` | `{items:[…]}` (open/queuing cards unless `all=1`) |
 | GET | `/tasks[?gateway=&exclude=&board=&all=1]` | `{tasks:[…]}` |
 | GET | `/where/{session_id}` | `{hits:[{gateway, profile, local, stale, synced_at, …}]}` |
-| GET | `/session-links/{session_id}[?ids=a,b]` | `{tasks:[{id, board, gateway, via, local, stale, …}]}` |
+| GET | `/session-links/{session_id}[?ids=a,b&origin_profile=work&origin_gateway=laptop]` | `{qualified_origins:true, origin_gateway, origin_profile, tasks:[{id, board, gateway, profile, ownership_state, via, local, stale, …}]}` |
 | GET | `/requests` | what this gateway asked other gateways to change |
 | POST | `/request` `{gateway, coll, key, action, args?, base_version?}` | `{id, queued_locally, state}`; 400 bad action/args, 404 unknown gateway, 503 hermes-hub missing |
 
@@ -27,6 +27,13 @@ record. Allowed actions: sessions `rename{title}`/`archive`/`unarchive`/`pin`/`u
 `archive`; tasks `create`/`comment`/`complete`/`block`/`unblock`/`archive`/`assign`.
 
 ## Consumers
+
+Session links qualify the origin by gateway/profile and the supplied lineage IDs.
+Omitted `origin_gateway` means this serving gateway; no origin profile is inferred.
+Explicitly foreign origins are excluded. Missing historical origin or owner provenance
+is returned as `status: unknown, profile: null, ownership_state: unknown`, never default.
+Qualified task keys are `<profile>/<board>/<id>`; historical `<board>/<id>` keys stay unknown.
+Unqualified legacy requests remain discovery-only. Replica rows are not authoritative release evidence.
 
 - Fork core (`core/hub-sync-replica.md`): owner lookup via `/where`, the Kanban board's fallback to `/tasks` for an
   unreachable gateway, and offline-marked cached rows in the normal sidebar (`/sessions` + `/request`).

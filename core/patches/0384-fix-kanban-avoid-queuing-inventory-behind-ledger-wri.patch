@@ -1,0 +1,109 @@
+From 074da25647f3d193a238435b8925a290c25bf650 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:45:15 +0000
+Subject: [PATCH] fix(kanban): avoid queuing inventory behind ledger writers
+ [daveey]
+
+---
+ hermes_cli/kanban_origin_ledger.py            | 17 +++++++------
+ ...est_kanban_origin_projection_contention.py | 24 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_projection_contention.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index af56cc31c0..a6aa2d1443 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -14,7 +14,7 @@ import hashlib
+ import json
+ import re
+ import sqlite3
+-from contextlib import contextmanager
++from contextlib import closing, contextmanager
+ from pathlib import Path
+ from typing import Callable
+ 
+@@ -53,9 +53,9 @@ def binding_hash(binding: dict) -> str:
+ 
+ 
+ @contextmanager
+-def _db(path: Path):
++def _db(path: Path, *, timeout: float = 5):
+     path.parent.mkdir(parents=True, exist_ok=True)
+-    conn = sqlite3.connect(path, timeout=5)
++    conn = sqlite3.connect(path, timeout=timeout)
+     try:
+         conn.execute("""CREATE TABLE IF NOT EXISTS origin_obligations (
+             binding_id TEXT PRIMARY KEY, binding_hash TEXT NOT NULL,
+@@ -199,7 +199,7 @@ def _owner_evidence(task: dict) -> dict:
+     return evidence
+ 
+ 
+-def refresh_observations(path: Path, replica: Path) -> None:
++def refresh_observations(path: Path, replica: Path, *, timeout: float = 5) -> None:
+     """Advance durable observations only from newer, exactly bound owner records.
+ 
+     Disappearance is not completion. Corrupt/unreadable stores raise to let callers
+@@ -212,7 +212,7 @@ def refresh_observations(path: Path, replica: Path) -> None:
+ 
+     source = _ro(replica)
+     try:
+-        with _db(path) as conn, conn:
++        with _db(path, timeout=timeout) as conn, conn:
+             conn.execute("BEGIN IMMEDIATE")
+             for key, raw, observed in conn.execute(
+                     "SELECT binding_id,binding_json,observation_version FROM origin_obligations").fetchall():
+@@ -263,7 +263,10 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+     last_ok = None
+     try:
+         if replica is not None and replica.is_file():
+-            refresh_observations(path, replica)
++            # Inventory readers must not queue behind a receipt/sync writer.
++            # Contention is an unavailable observation, handled conservatively
++            # below; the next poll retries without dropping the durable receipt.
++            refresh_observations(path, replica, timeout=0)
+             source = _ro(replica)
+             meta = dict(source.execute("SELECT k,v FROM meta"))
+             last_ok = float(meta.get('last_ok') or 0)
+@@ -274,7 +277,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+         fresh = False
+     result = []
+     try:
+-        with _db(path) as conn:
++        with closing(_ro(path)) as conn:
+             for raw, resolved, payload, version, released in conn.execute(
+                     "SELECT binding_json,resolved_session,task_json,observation_version,released FROM origin_obligations"):
+                 binding = json.loads(raw)
+diff --git a/tests/hermes_cli/test_kanban_origin_projection_contention.py b/tests/hermes_cli/test_kanban_origin_projection_contention.py
+new file mode 100644
+index 0000000000..19bd66fb0f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_projection_contention.py
+@@ -0,0 +1,24 @@
++"""Task inventory must not queue behind a concurrent origin-ledger writer."""
++import sqlite3
++import time
++
++from hermes_cli import kanban_origin_ledger as ledger
++from tests.hermes_cli.test_kanban_origin_ledger import world as world, publish, accept  # noqa: PLC0414
++
++
++def test_projection_preserves_unknown_without_waiting_for_writer(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    with sqlite3.connect(path) as writer:
++        writer.execute('BEGIN IMMEDIATE')
++        start = time.monotonic()
++        rows = ledger.project(path, replica=replica, gateway='origin', profile='default')
++        elapsed = time.monotonic() - start
++        assert len(rows) == 1
++        assert rows[0]['unfinished'] and rows[0]['stale']
++        assert rows[0]['status'] == 'unknown'
++        assert elapsed < 2, f'projection queued behind a writer for {elapsed:.3f}s'
++    # The competing writer has gone; normal refresh remains usable.
++    ledger.refresh_observations(path, replica)
++    assert ledger.project(path, replica=replica, gateway='origin', profile='default')[0]['unfinished']
+-- 
+2.55.0
+

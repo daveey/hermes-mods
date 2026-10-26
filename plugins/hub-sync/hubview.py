@@ -319,7 +319,8 @@ def where(session_id: str) -> dict:
 LINK_STATUSES = ("todo", "ready", "running", "scheduled", "blocked", "review", "triage")
 
 
-def session_links(session_ids: List[str], include_closed: bool = False) -> dict:
+def session_links(session_ids: List[str], include_closed: bool = False,
+                  origin_gateway: Optional[str] = None, origin_profile: Optional[str] = None) -> dict:
     """Cards on any gateway that one of these (lineage) session ids created or subscribed to."""
     wanted = [s for s in dict.fromkeys(session_ids) if s][:50]
 
@@ -328,12 +329,33 @@ def session_links(session_ids: List[str], include_closed: bool = False) -> dict:
         for t in v.rows("tasks"):
             if not include_closed and t.get("status") not in LINK_STATUSES:
                 continue
-            links = [l for l in t.get("sessions") or [] if isinstance(l, dict) and l.get("session") in wanted]
+            candidates = list(t.get("sessions") or [])
+            for binding in t.get("origin_bindings") or []:
+                origin = binding.get("origin") if isinstance(binding, dict) else None
+                if isinstance(origin, dict):
+                    candidates.append(dict(origin, gw=origin.get("gateway"), rel="created"))
+            links = []
+            qualified_origin = False
+            for link in candidates:
+                if not isinstance(link, dict) or link.get("session") not in wanted:
+                    continue
+                gw, profile = link.get("gw") or link.get("gateway"), link.get("profile")
+                if origin_profile:
+                    if (gw and gw != (origin_gateway or v.gateway)) or (profile and profile != origin_profile):
+                        continue
+                    qualified_origin |= bool(gw and profile)
+                links.append(link)
             if not links:
                 continue
+            parts = str(t.get("key") or "").split("/")
+            owner_profile = parts[0] if len(parts) == 3 and all(parts) else None
+            qualified = bool(owner_profile and qualified_origin)
             via = "created" if any(l.get("rel") == "created" for l in links) else "subscribed"
             run = t.get("run") or {}
-            out.append({"id": t.get("id"), "title": t.get("title"), "status": t.get("status"),
+            out.append({"id": t.get("id"), "title": t.get("title"),
+                        "status": t.get("status") if qualified else "unknown",
+                        "reported_status": t.get("status"), "profile": owner_profile if qualified else None,
+                        "ownership_state": "qualified" if qualified else "unknown",
                         "assignee": t.get("assignee"), "board": t.get("board") or "default",
                         "block_kind": t.get("block_kind"), "human_request": t.get("human_request"),
                         "session_id": links[0].get("session"), "via": via, "created_at": t.get("created_at"),
@@ -342,7 +364,8 @@ def session_links(session_ids: List[str], include_closed: bool = False) -> dict:
                         "gateway": t["gateway"], "local": t["local"], "stale": t["stale"],
                         "synced_at": t["synced_at"], "version": t["version"], "pending": t["pending"]})
         out.sort(key=lambda x: (x["local"], -(x.get("created_at") or 0)))
-        return {"session_ids": wanted, "tasks": out}
+        return {"session_ids": wanted, "origin_gateway": origin_gateway or v.gateway,
+                "origin_profile": origin_profile, "qualified_origins": True, "tasks": out}
     return _with_view(fn, session_ids=wanted, tasks=[])
 
 

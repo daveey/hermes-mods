@@ -132,7 +132,7 @@ being in `gateway/status.py`.
 0117 is independent of 0079/0080 in code (different functions) but is the same failure family; apply it after them.
 It edits `run_agent.py` and `build_worker_context`, so a rebase conflict usually lands there. 0121
 ([kanban-soft-deadline.md](kanban-soft-deadline.md)) puts its checkpoint above 0117's continuation tail and its tests
-expect that tail. Verified: 0001–0127 apply with `git am -3` at merge-base `4957bbd0a0` (Oct 17, 2026 PT).
+expect that tail. Verified: 0001–0127 apply with `git am -3 --empty=keep` at merge-base `4957bbd0a0` (Oct 17, 2026 PT).
 
 ## Gotchas
 

@@ -7,7 +7,7 @@ Patches:
 - `patches/0178-fix-subprocess-text-True-needs-encoding-utf-8-errors.patch`: utf-8 subprocess decoding and a psutil pid check.
 - `patches/0187-fix-windows-clear-remaining-footguns-utf-8-sig-read-.patch`: more Windows footguns.
 
-- `patches/0230-chore-map-integration-hub-contributor-identity-davee.patch`: maps the integration host's commit identity for the same contributor check.
+- `patches/0233-chore-map-integration-hub-contributor-identity-davee.patch`: maps the integration host's commit identity for the same contributor check.
 
 ## Behavior
 
@@ -40,7 +40,7 @@ check in CI.
 
 ## Applying
 
-`git am -3`. Small hunks; if one fails, reapply the described change by hand.
+`git am -3 --empty=keep`. Small hunks; if one fails, reapply the described change by hand.
 
 ## Gotchas
 

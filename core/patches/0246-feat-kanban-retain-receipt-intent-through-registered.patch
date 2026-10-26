@@ -1,0 +1,208 @@
+From eb4e43678e4bc63674aa5f420fa7c9541d1c91e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 12:36:58 +0000
+Subject: [PATCH] feat(kanban): retain receipt intent through registered create
+ tool [daveey]
+
+---
+ .../test_kanban_origin_create_tool.py         | 92 +++++++++++++++++++
+ tools/kanban_tools.py                         | 44 +++++++--
+ 2 files changed, 129 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_create_tool.py
+
+diff --git a/tests/hermes_cli/test_kanban_origin_create_tool.py b/tests/hermes_cli/test_kanban_origin_create_tool.py
+new file mode 100644
+index 0000000000..0010c0ed92
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_create_tool.py
+@@ -0,0 +1,92 @@
++"""Actual registered tool -> atomic owner intent, isolated by canonical test runner."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_state import SessionDB
++from tools import kanban_tools  # normal built-in registration
++from tools.registry import registry
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    for name in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_TASK', 'HERMES_ORIGIN_SESSION'):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    db.create_session('creator', 'cli')
++    db.close()
++    kb.init_db()
++    return {'request_id': 'request-tool-001',
++            'owner': {'gateway': 'worker', 'profile': 'default', 'board': 'default'},
++            'origin': {'gateway': 'origin', 'profile': 'work', 'session': 's_old'}}
++
++
++def create(intent, **changes):
++    args = {'title': 'Build', 'assignee': 'default', 'session_id': 'creator', **changes}
++    return json.loads(registry.dispatch('kanban_create', args, origin_intent=intent))
++
++
++def test_registered_tool_persists_intent_and_returns_pending_handoff(world):
++    result = create(world)
++    assert result.get('created') is True, result
++    assert result['ok'] is False, result
++    assert result['code'] == 'origin_bind_pending'
++    assert result.get('handoff_complete') is False, result
++    assert result['origin_creation']['request_id'] == world['request_id']
++    with kbc.connect_closing() as conn:
++        row = conn.execute('SELECT * FROM origin_creation_intents').fetchone()
++        assert result['task_id'] == row['task_id']
++        assert result['origin_creation']['binding'] == json.loads(row['binding_json'])
++        assert result['origin_creation']['child_request_id'] == row['child_request_id']
++        assert kb.get_task(conn, result['task_id']).session_id == 'creator'
++    again = create(world)
++    assert again['task_id'] == result['task_id']
++    assert again['origin_creation'] == result['origin_creation']
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_retry_ignores_ambient_changes_and_retains_creator(world, monkeypatch):
++    first = create(world)
++    monkeypatch.setenv('HERMES_TENANT', 'changed-ambient-tenant')
++    db = SessionDB()
++    db.delete_session('creator')
++    db.close()
++    retry = create(world)
++    assert retry.get('task_id') == first['task_id'], retry
++    assert retry['origin_creation'] == first['origin_creation']
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, first['task_id']).session_id == 'creator'
++
++
++def test_conflicting_retry_is_typed_and_does_not_duplicate(world):
++    first = create(world)
++    result = create(world, title='Changed')
++    assert result.get('code') == 'origin_creation_conflict', result
++    assert result['handoff_complete'] is False
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++        assert kb.get_task(conn, first['task_id']).title == 'Build'
++
++
++def test_archive_retry_retains_exact_marker(world):
++    first = create(world)
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (first['task_id'],))
++    retry = create(world)
++    assert retry['task_id'] == first['task_id']
++    assert retry['origin_creation'] == first['origin_creation']
++    assert retry['handoff_complete'] is False
++
++
++def test_llm_cannot_supply_internal_creation_context(world):
++    result = json.loads(registry.dispatch('kanban_create', {
++        'title': 'Build', 'assignee': 'default', 'origin_intent': world}))
++    assert 'unknown parameter' in result['error']
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 24273b8e7e..f7a2c8622e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -216,6 +216,10 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                     return _tag_rejection(e.args[0], e.rejection or "invalid_args")
+                 return e.args[0]
+             except Exception as e:
++                if tool_name == "kanban_create" and kw.get("origin_intent") is not None:
++                    from hermes_cli.kanban_origin import OriginError
++                    if isinstance(e, OriginError):
++                        return tool_error(str(e), code=e.code, handoff_complete=False)
+                 if not isinstance(e, ValueError):
+                     logger.exception(f"{tool_name} failed")
+                 if classify_rejections:
+@@ -1288,30 +1292,41 @@ def _handle_create(args: dict, **kw) -> str:
+     # [daveey] Validate the origin binding BEFORE the card exists: a binding the origin gateway can never
+     # read back is the silent "cards exist but the chat shows none" failure.
+     from hermes_cli import kanban_origin
++    # Trusted courier context is not an LLM argument. The owner adapter validates
++    # its route; the DB validates/persists its immutable creation intent.
++    origin_intent = kw.get("origin_intent")
+     try:
+-        origin = kanban_origin.resolve(args.get("origin_session"))
++        origin = (None if origin_intent is not None
++                  else kanban_origin.resolve(args.get("origin_session")))
+     except kanban_origin.OriginError as exc:
+         return tool_error(f"{exc.code}: {exc}")
+     with _board(args.get("board")) as (kb, conn):
+         from gateway.session_context import get_session_env
+         from tools.async_delegation import _current_origin_session_id
+         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
+-                    if _is_dispatcher_owned_worker() else None)
++                    if origin_intent is None and _is_dispatcher_owned_worker() else None)
+         self_task = kb.get_task(conn, self_tid) if self_tid else None
+         # The worker/API runtime may be transient; the owning task's origin is durable.
+         # The ambient id is the request-scoped ContextVar binding, not the process-global
+         # os.environ: in a multi-session gateway the env holds the LAST agent built, and an
+         # id that never reached its ``sessions`` row is provenance pointing at nothing.
+-        session_id = (_persisted_session_id(args.get("session_id"))
+-                      or (self_task.session_id if self_task else None)
+-                      or _persisted_session_id(_current_origin_session_id())
+-                      or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
++        if origin_intent is not None:
++            # Courier retries use only their durable envelope, never the receiving
++            # process's current session/tenant/project. Creator provenance remains
++            # unchanged even if its session is compressed or subsequently removed.
++            session_id = args.get("session_id")
++        else:
++            session_id = (_persisted_session_id(args.get("session_id"))
++                          or (self_task.session_id if self_task else None)
++                          or _persisted_session_id(_current_origin_session_id())
++                          or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
+         if project_id is None and workspace_kind is None and workspace_path is None:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
+         new_tid = kb.create_task(
+             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+-            parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
++            parents=tuple(parents), tenant=(args.get("tenant") if origin_intent is not None
++                                           else args.get("tenant") or os.environ.get("HERMES_TENANT")),
+             priority=_opt_int(args.get("priority"), 0),
+             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
+             # Board-project inheritance must read the board this call opened, not the
+@@ -1326,6 +1341,7 @@ def _handle_create(args: dict, **kw) -> str:
+             completion_contract=args.get("completion_contract"),
+             initial_status=str(args.get("initial_status") or "running"),
+             created_by=_persisted_identity(), session_id=session_id,
++            origin_intent=origin_intent,
+             # Reject a worktree path the dispatcher could never resolve now, to the
+             # creator, instead of burning spawn retries on it later. [daveey]
+             validate_workspace=True)
+@@ -1333,8 +1349,22 @@ def _handle_create(args: dict, **kw) -> str:
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+         extra = {}
++        if origin_intent is not None:
++            row = conn.execute(
++                "SELECT binding_json,child_request_id FROM origin_creation_intents WHERE request_id=? AND task_id=?",
++                (origin_intent["request_id"], new_tid),
++            ).fetchone()
++            extra = {"handoff_complete": False, "origin_creation": {
++                "request_id": origin_intent["request_id"],
++                "binding": json.loads(row["binding_json"]),
++                "child_request_id": row["child_request_id"],
++            }}
+         if origin is not None:
+             extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
++        if origin_intent is not None:
++            return json.dumps({"ok": False, "created": True, "code": "origin_bind_pending",
++                               "task_id": new_tid, **landed, **gate,
++                               "subscribed": _maybe_auto_subscribe(conn, new_tid), **extra})
+         return _ok(task_id=new_tid, **landed, **gate,
+                    subscribed=_maybe_auto_subscribe(conn, new_tid), **extra)
+ 
+-- 
+2.55.0
+

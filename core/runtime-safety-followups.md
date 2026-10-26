@@ -2,10 +2,10 @@
 
 ## Behavior
 
-- 0256: timed-out condition-wake probes use portable process-tree termination, retaining direct process kill as a fallback.
-- 0257: a deferred-tool lookup for a uniquely matched configured but disabled MCP server reports that configuration state instead of suggesting alternate names. It neither enables nor invokes the server.
-- 0258: delegated-child restrictions remain in force when process ancestry cannot be determined. A complete walk proving detachment may clear leaked markers, while preserving explicit board location.
-- 0259: the test-only live Git-config guard retains its original PATH through teardown, even when a test clears PATH before monkeypatch restoration.
+- 0272: timed-out condition-wake probes use portable process-tree termination, retaining direct process kill as a fallback.
+- 0280: a deferred-tool lookup for a uniquely matched configured but disabled MCP server reports that configuration state instead of suggesting alternate names. It neither enables nor invokes the server.
+- 0283: delegated-child restrictions remain in force when process ancestry cannot be determined. A complete walk proving detachment may clear leaked markers, while preserving explicit board location.
+- 0285: the test-only live Git-config guard retains its original PATH through teardown, even when a test clears PATH before monkeypatch restoration.
 
 ## How it works
 
@@ -31,7 +31,7 @@ These are focused Python regressions on Linux, not a live Windows process-kill, 
 
 ## Applying
 
-Apply the ordered series through 0259, not these patches independently. The full 260-patch series applied with `git am -3` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`.
+Apply the ordered series through 0285, not these patches independently. The full 260-patch series applied with `git am -3 --empty=keep` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`.
 
 ## Gotchas
 

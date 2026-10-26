@@ -4,6 +4,7 @@ Use an absolute Python interpreter with PyYAML + jsonschema[format] installed.
 Only fixed user-unit names are written. No root/system service or gateway restart.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -89,12 +90,32 @@ def uninstall(platform, *, home=None, runner=subprocess.run):
         raise RuntimeError('service_remove_failed')
 
 
+def runtime_python(launcher, *, runner=subprocess.run):
+    """Discover the installed interpreter; never execute returned launcher code."""
+    _argv([launcher])
+    result = runner([launcher, '--print-runtime-command'], check=True, timeout=30,
+                    shell=False, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    try:
+        command = json.loads(result.stdout)
+        if type(command) is not list:
+            raise ValueError()
+        _argv(command)
+        if not Path(command[0]).is_file() or not os.access(command[0], os.X_OK):
+            raise ValueError()
+        return command[0]
+    except (ValueError, TypeError, IndexError):
+        raise ValueError('invalid_hermes_runtime') from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('--install', action='store_true')
     action.add_argument('--uninstall', action='store_true')
-    parser.add_argument('--python', default=sys.executable)
+    interpreter = parser.add_mutually_exclusive_group()
+    interpreter.add_argument('--python', default=sys.executable)
+    interpreter.add_argument('--hermes-launcher', help='Absolute Hermes launcher; use its installed runtime and bootstrap')
+    parser.add_argument('--core-root', help='Absolute compatible core checkout for repair status reconciliation')
     for name in ('config', 'runtime', 'state-dir', 'owner-gateway-id', 'owner-profile'):
         parser.add_argument('--' + name)
     parser.add_argument('--owner-epoch', type=int)
@@ -109,8 +130,17 @@ def main(argv=None):
         if not Path(getattr(args, name)).is_absolute():
             parser.error(name + ' must be absolute')
     command = [args.python, str(Path(__file__).with_name('run_collector.py').resolve())]
+    if args.hermes_launcher:
+        if args.core_root is None or not Path(args.core_root).is_absolute():
+            parser.error('--hermes-launcher requires absolute --core-root')
+        command = [runtime_python(args.hermes_launcher), '-I',
+                   str(Path(__file__).with_name('runtime_collector.py').resolve())]
     for name in ('config', 'runtime', 'state_dir', 'owner_gateway_id', 'owner_profile', 'owner_epoch'):
         command.extend(['--' + name.replace('_', '-'), str(getattr(args, name))])
+    if args.core_root is not None:
+        if not Path(args.core_root).is_absolute():
+            parser.error('core-root must be absolute')
+        command.extend(['--core-root', args.core_root])
     install(sys.platform, command)
     return 0
 

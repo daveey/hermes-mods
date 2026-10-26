@@ -1,0 +1,257 @@
+From 4982888f5d430f8e5e966d643a2e88cc662905c5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 03:59:19 +0000
+Subject: [PATCH] fix(desktop): confine orphan reaping to proven home and
+ process identity [daveey]
+
+---
+ hermes_cli/dashboard_procs.py                 |  55 +++++++++-
+ .../test_orphan_desktop_serve_reap.py         |  12 ++-
+ .../hermes_cli/test_orphan_reap_home_scope.py | 100 ++++++++++++++++++
+ 3 files changed, 163 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_orphan_reap_home_scope.py
+
+diff --git a/hermes_cli/dashboard_procs.py b/hermes_cli/dashboard_procs.py
+index 5c71e361fd..27a600b453 100644
+--- a/hermes_cli/dashboard_procs.py
++++ b/hermes_cli/dashboard_procs.py
+@@ -949,6 +949,46 @@ def _process_age_seconds(pid: int) -> float:
+     return max(0.0, _time.time() - _psutil.Process(pid).create_time())
+ 
+ 
++def _reap_candidate_in_current_home(pid: int) -> bool:
++    """Require positive install and UID ownership; argv/ppid alone are host-wide.
++
++    Missing exec-time HERMES_HOME is not permission to infer our own home. Old
++    launchers without an explicit home are deliberately left for their owner.
++    """
++    import psutil
++
++    if not hasattr(os, "getuid") or not hasattr(os, "geteuid"):
++        return False
++    try:
++        proc = psutil.Process(pid)
++        uids = proc.uids()
++        if uids.real != os.getuid() or uids.effective != os.geteuid():  # windows-footgun: ok -- hasattr guard above
++            return False
++        argv = proc.cmdline()
++        # SSH backends have their own nonce/owner watchdog. Reparenting is normal
++        # for them, and their lock may live outside even their process home.
++        if any(tok.split("=", 1)[0] in ("--ssh-session-token-file", "--ssh-owner-nonce") for tok in argv):
++            return False
++        home = (_pid_environ(pid) or {}).get("HERMES_HOME", "")
++        if not home or not Path(home).is_absolute():
++            return False
++        # /proc exposes exec-time env, before CLI --profile rewrites HERMES_HOME.
++        if _profile_flag_value(argv) is not None:
++            home = _hermes_home_for_pid(pid)
++        return bool(home and Path(home).resolve() == _hermes_home_dir().resolve())
++    except (psutil.Error, OSError, ValueError, RuntimeError):
++        return False
++
++
++def _reap_identity_still_matches(pid: int, start: int | None) -> bool:
++    from gateway.status import get_process_start_time, start_time_fingerprints_match
++
++    current = get_process_start_time(pid)
++    return (start is not None and current is not None
++            and start_time_fingerprints_match(start, current)
++            and _reap_candidate_in_current_home(pid))
++
++
+ def _reap_orphaned_desktop_local_serves(
+     *, reason: str = "orphaned desktop-local hermes serve", signal_term=None, signal_kill=None,
+     sleep_fn=None, lock_owned_pids_fn=None, process_age_seconds_fn=None) -> dict[str, list]:
+@@ -956,7 +996,8 @@ def _reap_orphaned_desktop_local_serves(
+ 
+     When Electron dies uncleanly its ``serve --host 127.0.0.1 --port 0`` children are
+     reparented to pid 1 with their MCP trees alive; each Desktop boot then stacks a fresh
+-    backend on the corpses until EMFILE. Reaped only if ALL hold: Desktop-local shape; ppid
++    backend on the corpses until EMFILE. Reaped only if ALL hold: positively same UID and
++    explicit HERMES_HOME; no SSH token/owner marker; Desktop-local shape; ppid
+     0/1; not self / parent / HERMES_DESKTOP_CHILD_PID; not claimed by a valid
+     ``backend.lock.json`` (SSH backends other clients started legitimately sit at ppid 1);
+     older than ``_REAP_MIN_AGE_SECONDS`` with a determinable age (Desktop writes the lock only
+@@ -991,9 +1032,12 @@ def _reap_orphaned_desktop_local_serves(
+         scanned = _scan_dashboard_processes(exclude_pids=exclude)
+     except Exception:
+         return _empty_result()
++    from gateway.status import get_process_start_time
++    starts = {pid: get_process_start_time(pid) for pid, _ in scanned}
+     owned_now = _owned_pids()  # re-read: a lock may have been written since the scan
+     matched = [pid for pid, cmd in scanned
+                if _is_desktop_local_serve_cmdline(cmd) and pid not in owned_now
++               and _reap_candidate_in_current_home(pid)
+                and _process_ppid(pid) in (0, 1) and _is_stale_orphan(pid)]
+     if not matched:
+         return _empty_result()
+@@ -1001,6 +1045,9 @@ def _reap_orphaned_desktop_local_serves(
+     killed: list[int] = []
+     failed: list[int] = []
+     for pid in matched:
++        if not _reap_identity_still_matches(pid, starts[pid]):
++            failed.append(pid)
++            continue
+         try:
+             os.kill(pid, signal_term)
+         except ProcessLookupError:
+@@ -1015,6 +1062,9 @@ def _reap_orphaned_desktop_local_serves(
+             continue
+         try:
+             if psutil.pid_exists(pid):
++                if not _reap_identity_still_matches(pid, starts[pid]):
++                    failed.append(pid)
++                    continue
+                 os.kill(pid, signal_kill)
+             killed.append(pid)
+         except ProcessLookupError:
+@@ -1025,9 +1075,8 @@ def _reap_orphaned_desktop_local_serves(
+     # keep the deleted state.db-wal inode open (#112631). The boot-path budget leaves no second
+     # grace, and these trees already lost their Electron and their backend.
+     # A root whose own kill raised (EPERM: not ours) keeps its subtree — do not orphan it half-way.
+-    from gateway.status import get_process_start_time
+     for pid, (root, start) in descendants.items():
+-        if root not in failed and start is not None and get_process_start_time(pid) == start:
++        if root in killed and _reap_identity_still_matches(pid, start):
+             with contextlib.suppress(OSError):
+                 os.kill(pid, signal_kill)
+     with contextlib.suppress(Exception):
+diff --git a/tests/hermes_cli/test_orphan_desktop_serve_reap.py b/tests/hermes_cli/test_orphan_desktop_serve_reap.py
+index 82c126285f..eafe2fb58f 100644
+--- a/tests/hermes_cli/test_orphan_desktop_serve_reap.py
++++ b/tests/hermes_cli/test_orphan_desktop_serve_reap.py
+@@ -11,6 +11,16 @@ from __future__ import annotations
+ import os
+ from unittest.mock import patch
+ 
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def same_home_candidates(monkeypatch):
++    # This suite exercises topology/locks; ownership boundary coverage lives in
++    # test_orphan_reap_home_scope.py and uses real identity checks.
++    monkeypatch.setattr("hermes_cli.dashboard_procs._reap_candidate_in_current_home", lambda pid: True)
++    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 1000)
++
+ from hermes_cli.dashboard_procs import (
+     _is_desktop_local_serve_cmdline,
+     _reap_orphaned_desktop_local_serves,
+@@ -426,7 +436,7 @@ def test_reap_kills_descendants_of_killed_roots_but_spares_a_failed_roots_subtre
+         patch("hermes_cli.dashboard_procs._scan_dashboard_processes", return_value=scanned),
+         patch("hermes_cli.dashboard_procs._process_ppid", return_value=1),
+         patch("hermes_cli.dashboard_procs._posix_descendants", return_value=descendants) as snap,
+-        patch("gateway.status.get_process_start_time", side_effect=start_times.get),
++        patch("gateway.status.get_process_start_time", side_effect=lambda pid: start_times.get(pid, 1000)),
+         patch("psutil.pid_exists", return_value=True),
+         patch("os.kill", side_effect=fake_kill),
+     ):
+diff --git a/tests/hermes_cli/test_orphan_reap_home_scope.py b/tests/hermes_cli/test_orphan_reap_home_scope.py
+new file mode 100644
+index 0000000000..fb9553c93e
+--- /dev/null
++++ b/tests/hermes_cli/test_orphan_reap_home_scope.py
+@@ -0,0 +1,100 @@
++"""A boot reaper must not cross install or user boundaries."""
++import os
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import psutil
++import pytest
++
++from hermes_cli import dashboard_procs as procs
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("identity", ["foreign", "unreadable", "missing", "relative", "uid", "uid-unreadable", "ssh-foreign-lock", "ssh-nonce", "profile-override", "same"])
++def test_reap_requires_positive_same_home_and_uid(tmp_path, monkeypatch, identity):
++    home = tmp_path / "home"
++    monkeypatch.setattr(procs, "_hermes_home_dir", lambda: home)
++    argv = ["hermes", "serve", "--host", "127.0.0.1", "--port", "0"]
++    proc = Mock()
++    proc.cmdline.return_value = argv
++    proc.uids.return_value = SimpleNamespace(real=os.getuid(), effective=os.geteuid())
++    env = {"HERMES_HOME": {"foreign": str(tmp_path / "other"), "missing": "", "relative": "home"}.get(identity, str(home))}
++    if identity == "ssh-foreign-lock":
++        import json
++        from tests.hermes_cli.test_orphan_desktop_serve_reap import _valid_lock_payload
++        oid, nonce = "a" * 32, "b" * 16
++        owner = tmp_path / "foreign" / "desktop-ssh" / oid
++        owner.mkdir(parents=True)
++        (owner / "backend.lock.json").write_text(json.dumps(_valid_lock_payload(777, oid, nonce)))
++        argv.extend(["--ssh-session-token-file", str(owner / "token")])
++    elif identity == "ssh-nonce":
++        argv.extend(["--ssh-owner-nonce=" + "b" * 16])
++    if identity == "profile-override":
++        argv[1:1] = ["--profile", "other"]
++    if identity == "uid":
++        proc.uids.return_value = SimpleNamespace(real=os.getuid() + 1, effective=os.geteuid())
++    elif identity == "uid-unreadable":
++        proc.uids.side_effect = psutil.AccessDenied(777)
++    monkeypatch.setattr(psutil, "Process", lambda pid: proc)
++    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 1000)
++    monkeypatch.setattr(procs, "_pid_environ", lambda pid: None if identity == "unreadable" else env)
++    monkeypatch.setattr(procs, "_scan_dashboard_processes", lambda **kw: [(777, " ".join(argv))])
++    monkeypatch.setattr(procs, "_process_ppid", lambda pid: 1)
++    monkeypatch.setattr(procs, "_posix_descendants", lambda pids: {})
++    monkeypatch.setattr(psutil, "pid_exists", lambda pid: True)
++    kill = Mock()
++    monkeypatch.setattr(os, "kill", kill)
++    result = procs._reap_orphaned_desktop_local_serves(
++        sleep_fn=lambda _: None, lock_owned_pids_fn=lambda: set(),
++        process_age_seconds_fn=lambda pid: 600,
++    )
++    assert result["killed"] == ([777] if identity == "same" else [])
++    assert kill.call_count == (2 if identity == "same" else 0)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("change", ["recycled-root", "foreign-child"])
++def test_reap_does_not_signal_replaced_root_or_foreign_descendant(monkeypatch, change):
++    from gateway import status
++    phase = [False]
++    monkeypatch.setattr(procs, "_scan_dashboard_processes", lambda **kw: [(777, "hermes serve --host 127.0.0.1 --port 0")])
++    monkeypatch.setattr(procs, "_process_ppid", lambda pid: 1)
++    monkeypatch.setattr(procs, "_reap_candidate_in_current_home", lambda pid: pid == 777)
++    monkeypatch.setattr(procs, "_posix_descendants", lambda pids: {888: (777, 1000)} if change == "foreign-child" else {})
++    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 2000 if phase[0] and change == "recycled-root" else 1000)
++    monkeypatch.setattr(psutil, "pid_exists", lambda pid: True)
++    kill = Mock()
++    monkeypatch.setattr(os, "kill", kill)
++    procs._reap_orphaned_desktop_local_serves(
++        sleep_fn=lambda _: phase.__setitem__(0, True),
++        lock_owned_pids_fn=lambda: set(), process_age_seconds_fn=lambda pid: 600,
++    )
++    assert all(call.args[0] != 888 for call in kill.call_args_list)
++    assert kill.call_count == (1 if change == "recycled-root" else 2)
++
++
++@pytest.mark.platforms("posix")
++def test_real_foreign_process_survives_isolated_home_reap(tmp_path, monkeypatch):
++    import subprocess
++    import sys
++
++    home = tmp_path / "test-home"
++    other = tmp_path / "real-home"
++    script = tmp_path / "hermes"
++    script.write_text("import sys\nsys.stdin.read()\n")
++    argv = [sys.executable, str(script), "serve", "--host", "127.0.0.1", "--port", "0"]
++    child = subprocess.Popen(argv, stdin=subprocess.PIPE, env={**os.environ, "HERMES_HOME": str(other)})
++    try:
++        monkeypatch.setattr(procs, "_hermes_home_dir", lambda: home)
++        # Restrict discovery to our disposable child; simulate its orphan topology
++        # without ever exposing real host processes to the test's signal path.
++        monkeypatch.setattr(procs, "_scan_dashboard_processes", lambda **kw: [(child.pid, " ".join(argv))])
++        monkeypatch.setattr(procs, "_process_ppid", lambda pid: 1)
++        result = procs._reap_orphaned_desktop_local_serves(
++            sleep_fn=lambda _: None, lock_owned_pids_fn=lambda: set(),
++            process_age_seconds_fn=lambda pid: 600,
++        )
++        assert result["matched"] == []
++        assert child.poll() is None
++    finally:
++        child.communicate(timeout=10)
+-- 
+2.55.0
+

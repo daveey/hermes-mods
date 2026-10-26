@@ -127,7 +127,7 @@ The three patches touch separate code paths and can be applied alone. 0082 handl
 plain argv element or whose `identify` reports `external`. A gateway started through the runpy bootstrap also
 needs 0083. 0084 is independent of both. They build on the update fleet code already in the fork
 (`update_cmd_stale_survivors.py`, `update_cmd_posix_pause.py`, `_launchd_job_owning_backend`), so apply them in
-order with `git am -3` on a tree that has that code.
+order with `git am -3 --empty=keep` on a tree that has that code.
 
 ## Gotchas
 

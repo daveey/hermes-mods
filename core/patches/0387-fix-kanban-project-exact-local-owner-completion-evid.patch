@@ -1,0 +1,186 @@
+From b47371bdf826a63b7273235ddacb7a88c3cd6ac6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:03:30 +0000
+Subject: [PATCH] fix(kanban): project exact local owner completion evidence
+ [daveey]
+
+---
+ hermes_cli/kanban_origin_ledger.py            | 10 ++
+ hermes_cli/kanban_origin_local.py             | 41 ++++++++
+ .../test_kanban_local_origin_projection.py    | 95 +++++++++++++++++++
+ 3 files changed, 146 insertions(+)
+ create mode 100644 hermes_cli/kanban_origin_local.py
+ create mode 100644 tests/hermes_cli/test_kanban_local_origin_projection.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index a6aa2d1443..9f8adc0f2a 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -316,6 +316,16 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     observed_at = evidence.get('observed_at')
+                     live = (type(observed_at) in (int, float) and 0 <= now - observed_at <= 180)
+                     current = current and readable and live
++                if (owner['gateway'], owner['profile']) == (gateway, profile):
++                    from hermes_cli.kanban_origin_local import observe_local_binding
++                    local = observe_local_binding(binding, profile=profile, now=now)
++                    # An unreadable local authority must not fall back to a stale
++                    # own replica, even one which previously proved completion.
++                    current = local is not None
++                    released = False
++                    if local is not None:
++                        task = local
++                        released = _owner_evidence(task).get('verified') is True
+                 status = task.get('status')
+                 # Acceptance alone is not a release, including an initially
+                 # terminal publication. Unknown status also remains unfinished.
+diff --git a/hermes_cli/kanban_origin_local.py b/hermes_cli/kanban_origin_local.py
+new file mode 100644
+index 0000000000..ccc8a901ef
+--- /dev/null
++++ b/hermes_cli/kanban_origin_local.py
+@@ -0,0 +1,41 @@
++"""Read-only, binding-qualified evidence from the current profile's owner board."""
++from contextlib import closing
++import json
++import sqlite3
++
++
++def observe_local_binding(binding: dict, *, profile: str, now: float) -> dict | None:
++    """Never infer an owner from an ID or release a receipt without its marker.
++
++    Caller has already matched the trusted local gateway and profile. Shared or
++    overridden board locations are ambiguous and cannot authorize this overlay.
++    """
++    from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_origin import _ro
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++    from hermes_cli.profiles import get_active_profile_name
++
++    owner = binding['owner']
++    home = get_hermes_home().resolve()
++    board = owner['board']
++    expected = home / 'kanban.db' if board == 'default' else home / 'kanban/boards' / board / 'kanban.db'
++    if (profile != get_active_profile_name() or owner['profile'] != profile
++            or kb.kanban_home().resolve() != home or kb.kanban_db_path(board).resolve() != expected):
++        return None
++    try:
++        with closing(_ro(expected)) as conn:
++            conn.row_factory = sqlite3.Row
++            conn.execute('BEGIN')
++            row = conn.execute('SELECT * FROM tasks WHERE id=?', (owner['task_id'],)).fetchone()
++            if row is None:
++                return None
++            markers = [json.loads(r[0]) for r in conn.execute(
++                'SELECT binding_json FROM origin_creation_intents WHERE task_id=?', (owner['task_id'],))]
++            marker = {k: v for k, v in binding.items() if k != 'publication_version'}
++            if marker not in markers:
++                return None
++            task = {**dict(row), **owner, 'id': owner['task_id'], 'origin_bindings': markers}
++            return observe_owner_task(conn, task, now=now)
++    except (OSError, sqlite3.Error, ValueError, TypeError):
++        return None
+diff --git a/tests/hermes_cli/test_kanban_local_origin_projection.py b/tests/hermes_cli/test_kanban_local_origin_projection.py
+new file mode 100644
+index 0000000000..76b86e86e9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_local_origin_projection.py
+@@ -0,0 +1,95 @@
++"""Local owner evidence, not stale replicas, governs same-owner obligations."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_ledger as ledger
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414
++from tests.hermes_cli.test_kanban_origin_ledger import world as world, publish, accept  # noqa: PLC0414
++from tests.hermes_cli.test_kanban_origin_evidence import create_bound
++
++
++def setup_local(world, monkeypatch):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    _, replica, binding = world
++    binding['origin']['gateway'] = 'owner'
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++    publish(replica, binding)
++    accept(world, gateway='owner')
++    return tid
++
++
++def projection(world):
++    return ledger.project(world[0], replica=None, gateway='owner', profile='default')[0]
++
++
++def test_local_completion_and_reopen_override_replica_without_mutating_receipt(world, board, monkeypatch):
++    tid = setup_local(world, monkeypatch)
++    before = ledger.receipt(world[0], 'request-0001')
++    assert projection(world)['status'] == 'ready'
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++    row = projection(world)
++    assert row['status'] == 'done' and not row['unfinished'] and not row['stale']
++    assert row['observation_version'] == 3
++    assert row['origin_session'] == 's_old' and row['session'] == 's_current'
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status='blocked',block_kind='needs_input',completed_at=NULL WHERE id=?", (tid,))
++    row = projection(world)
++    assert row['status'] == 'blocked' and row['unfinished']
++    assert row['block_kind'] == 'needs_input'
++    assert ledger.receipt(world[0], 'request-0001') == before
++    with sqlite3.connect(world[0]) as conn:
++        assert conn.execute('SELECT observation_version,released FROM origin_obligations').fetchone() == (3, 0)
++
++
++@pytest.mark.parametrize('fault', ['raw_done', 'archive', 'missing_marker', 'wrong_marker', 'missing_board'])
++def test_local_unverified_terminal_or_binding_never_releases(world, board, monkeypatch, fault):
++    tid = setup_local(world, monkeypatch)
++    with kbc.connect_closing() as conn:
++        if fault == 'raw_done':
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        elif fault == 'archive':
++            assert kb.archive_task(conn, tid)
++        else:
++            assert kb.complete_task(conn, tid, summary='Built and tested')
++            if fault == 'missing_marker':
++                conn.execute('DELETE FROM origin_creation_intents')
++            elif fault == 'wrong_marker':
++                marker = json.loads(conn.execute('SELECT binding_json FROM origin_creation_intents').fetchone()[0])
++                marker['origin']['session'] = 'unrelated'
++                conn.execute('UPDATE origin_creation_intents SET binding_json=?', (json.dumps(marker),))
++    if fault == 'missing_board':
++        kb.kanban_db_path('default').rename(board / 'unavailable.db')
++    row = projection(world)
++    assert row['status'] == 'unknown' and row['unfinished']
++
++
++def test_unreadable_local_owner_does_not_trust_fresh_terminal_replica(world, board, monkeypatch):
++    from tests.hermes_cli.test_kanban_origin_evidence import publish_observed
++    tid = setup_local(world, monkeypatch)
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, world[1], world[2], version=4, now=1000)
++    kb.kanban_db_path('default').rename(board / 'unavailable.db')
++    row = ledger.project(world[0], replica=world[1], gateway='owner', profile='default', now=1001)[0]
++    assert row['status'] == 'unknown' and row['unfinished'] and row['stale']
++
++
++@pytest.mark.parametrize('fault', ['active_profile', 'board_override'])
++def test_ambiguous_local_board_route_cannot_release(world, board, monkeypatch, fault):
++    from hermes_cli import profiles
++    tid = setup_local(world, monkeypatch)
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++    if fault == 'active_profile':
++        monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'other')
++    else:
++        monkeypatch.setenv('HERMES_KANBAN_DB', str(board / 'other.db'))
++        monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    row = projection(world)
++    assert row['status'] == 'unknown' and row['unfinished']
+-- 
+2.55.0
+

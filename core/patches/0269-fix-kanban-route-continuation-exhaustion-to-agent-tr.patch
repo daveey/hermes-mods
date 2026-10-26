@@ -1,0 +1,340 @@
+From 8b43e00d6c5ba94083fe499bd28e3f68ef0e89c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:04:58 +0000
+Subject: [PATCH] fix(kanban): route continuation exhaustion to agent triage
+ [daveey]
+
+---
+ hermes_cli/kanban_block_routing.py            | 34 ++++++++
+ hermes_cli/kanban_continuation.py             | 11 ++-
+ hermes_cli/kanban_continuation_recovery.py    | 51 +++++++++++
+ hermes_cli/kanban_db.py                       | 51 ++---------
+ .../test_kanban_continuation_exhaustion.py    | 86 +++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    | 13 ++-
+ 6 files changed, 200 insertions(+), 46 deletions(-)
+ create mode 100644 hermes_cli/kanban_block_routing.py
+ create mode 100644 hermes_cli/kanban_continuation_recovery.py
+ create mode 100644 tests/hermes_cli/test_kanban_continuation_exhaustion.py
+
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+new file mode 100644
+index 0000000000..a5e8910417
+--- /dev/null
++++ b/hermes_cli/kanban_block_routing.py
+@@ -0,0 +1,34 @@
++"""Block transition policy, separate from the database facade."""
++from __future__ import annotations
++
++
++def _normalized_reason(reason: str | None) -> str:
++    return " ".join((reason or "").split()).casefold()
++
++
++def route_block(
++    kind: str | None, reason: str | None, source_status: str, *,
++    prev_kind: str | None, prev_recurrences: int, prev_reason: str | None = None,
++    compare_reason: bool = False,
++) -> tuple[str, str, str, tuple, dict]:
++    """Return status, event, SQL fields/params and payload for a block.
++
++    Dependency waits never enter the human bucket. Repeated blocks retain the
++    loop breaker; a changed human question resets it because an answer is progress.
++    """
++    from hermes_cli import kanban_db as kb
++
++    payload = {"reason": reason, "kind": kind, "source_status": source_status}
++    if kind == "dependency":
++        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
++    same_cause = prev_kind == kind and (
++        not (compare_reason and kind == "needs_input")
++        or _normalized_reason(reason) == _normalized_reason(prev_reason)
++    )
++    recurrences = prev_recurrences + 1 if same_cause else 1
++    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
++    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
++    if recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
++        payload["limit"] = kb.BLOCK_RECURRENCE_LIMIT
++        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
++    return "blocked", "blocked", set_sql, (kind, recurrences), payload
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 70bfea6d85..020ca10a11 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -121,9 +121,16 @@ def continue_task(
+             return {"ok": False, "error": "this run no longer owns the task"}
+         streak = consecutive_continuations(conn, task_id)
+         if streak >= limit:
+-            return {"ok": False, "error": (
++            kb._append_event(conn, task_id, "continuation_exhausted",
++                             {"continuation": streak, "limit": limit, "checkpoint": checkpoint},
++                             run_id=int(row["current_run_id"]))
++            return {"ok": False, "reason_code": "continuation_exhausted", "block_kind": "transient",
++                    "error": (
+                 f"continuation limit reached ({streak} consecutive continued runs, limit {limit}). "
+-                "Finish with kanban_complete, or kanban_block with what is stopping progress.")}
++                "Finish with kanban_complete, or kanban_block(kind='transient', "
++                "reason='continuation_exhausted: split the work or reset the continuation budget') "
++                "for agent triage. Budget resets and task splitting are agent work, not needs_input. "
++                "Use needs_input only for an actual user decision, recorded in the reason.")}
+         source_status = kb._retry_status_for_run(conn, task_id)
+         new_status = "scheduled" if resume_after > 0 else source_status
+         wake_at = now + resume_after if resume_after > 0 else None
+diff --git a/hermes_cli/kanban_continuation_recovery.py b/hermes_cli/kanban_continuation_recovery.py
+new file mode 100644
+index 0000000000..bc8c370cfd
+--- /dev/null
++++ b/hermes_cli/kanban_continuation_recovery.py
+@@ -0,0 +1,51 @@
++"""Run-scoped budget exhaustion belongs to agent triage, not a human. [daveey]"""
++from __future__ import annotations
++
++import re
++
++
++# Deliberately a full match: an unrelated ask in the same reason must stay visible.
++_ACTION = (r"(?:reset(?:/requeue)?|raise|increase|extend) (?:the )?continuation (?:budget|limit)"
++           r"|split (?:the |this )?(?:work|task|card)(?: into (?:smaller )?(?:tasks|cards))?"
++           r"|route (?:the )?remaining (?:work|integration) as bounded specialist work")
++_BUDGET_ONLY = re.compile(
++    r"(?:continuation_exhausted:\s*)?(?:please |ask (?:a |the )?human to )?"
++    rf"(?:{_ACTION})(?:\s+(?:or|and)\s+(?:{_ACTION}))*"
++    r"(?:,? then unblock (?:this|the) card)?[.!?]?", re.IGNORECASE,
++)
++# These are handoff context, not requests for a product/security decision. Unknown
++# sentences stay human; do not turn this into a keyword match over arbitrary prose.
++_CONTEXT = re.compile(
++    r"(?:review the preserved implementation/checkpoint \S+ for this card; "
++    r"the dispatcher refused continuation after its \d+-run limit"
++    r"|latest unshipped commit\s*[a-z0-9]+ passes\s*\d+ [a-z ]*tests"
++    r"(?: and\s*\d+ [a-z ]*tests)?; [a-z ,/-]+ still remains?"
++    r"|this is not delivered; keep the originating tracker unfinished)[.!]?", re.IGNORECASE,
++)
++
++
++def _budget_only(reason: str | None) -> bool:
++    sentences = re.split(r"(?<=[.!?])\s+", " ".join((reason or "").split()))
++    found = False
++    for sentence in sentences:
++        sentence = re.sub(r"^\d+[.)]\s*", "", sentence)
++        if _BUDGET_ONLY.fullmatch(sentence):
++            found = True
++        elif not _CONTEXT.fullmatch(sentence):
++            return False
++    return found
++
++
++def is_exhausted_budget_block(conn, task_id: str, kind: str | None, reason: str | None) -> bool:
++    """Require both the current run's refusal and an exclusively budget-management ask.
++
++    Unknown prose is never suppressed: human decisions and capability requests remain
++    human, even when a worker mentions continuation exhaustion in their explanation.
++    """
++    if kind not in ("needs_input", "transient") or not _budget_only(reason):
++        return False
++    return conn.execute(
++        "SELECT 1 FROM tasks t JOIN task_events e ON e.task_id = t.id "
++        "AND e.run_id = t.current_run_id WHERE t.id = ? AND t.status = 'running' "
++        "AND e.kind = 'continuation_exhausted' LIMIT 1", (task_id,),
++    ).fetchone() is not None
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index c3e2e9c558..33f6c7f378 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3227,6 +3227,10 @@ def block_task(
+             return True
+         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+         requested_kind, rekind_reason = kind, None
++        from hermes_cli.kanban_continuation_recovery import is_exhausted_budget_block
++        exhausted_budget = is_exhausted_budget_block(conn, task_id, kind, reason)
++        if exhausted_budget:
++            kind, rekind_reason = "transient", "continuation_exhausted"
+         no_open_parent = _parents_satisfied(conn, task_id)
+         from hermes_cli import kanban_timed_park as ktp
+         if not blocker_id and ktp.is_timed_park(kind, reason, parents_satisfied=no_open_parent):
+@@ -3237,7 +3241,8 @@ def block_task(
+         if kind == "dependency" and no_open_parent:
+             kind = "needs_input"
+             rekind_reason = "no_open_parent"
+-        new_status, event_kind, set_sql, params, payload = _route_block(
++        from hermes_cli.kanban_block_routing import route_block
++        new_status, event_kind, set_sql, params, payload = route_block(
+             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+             prev_reason=_latest_block_reason(conn, task_id),
+@@ -3245,6 +3250,8 @@ def block_task(
+             # human question: its rewording is no progress.
+             compare_reason=requested_kind == "needs_input",
+         )
++        if exhausted_budget:
++            new_status, event_kind = "triage", "blocked"
+         if rekind_reason:
+             payload["requested_kind"] = requested_kind
+             payload["rekind_reason"] = rekind_reason
+@@ -3322,48 +3329,6 @@ def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str
+     return value if isinstance(value, str) else None
+ 
+ 
+-def _normalized_reason(reason: Optional[str]) -> str:
+-    return " ".join((reason or "").split()).casefold()
+-
+-
+-def _route_block(
+-    kind: Optional[str], reason: Optional[str], source_status: str, *,
+-    prev_kind: Optional[str], prev_recurrences: int, prev_reason: Optional[str] = None,
+-    compare_reason: bool = False,
+-) -> tuple[str, str, str, tuple, dict]:
+-    """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
+-
+-    ``dependency`` never enters the human ``blocked`` bucket: it waits in
+-    ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
+-    as something to "unblock". Callers that pass ``dependency`` with no
+-    incomplete parent are re-kinded to ``needs_input`` before this runs
+-    (see :func:`block_task`). Every other kind counts unblock-loop
+-    recurrences: block_task only fires from running/ready (AFTER an unblock
+-    returned the task to the pool), so a stored ``block_kind`` equal to the
+-    incoming one means blocked -> unblocked -> re-block for the same cause
+-    (un-typed None compares equal to a prior un-typed block). At
+-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+-
+-    A ``needs_input`` re-block whose reason differs from the previous block's
+-    is progress (the human answered one question, the worker asks the next),
+-    not a loop, so it restarts the count at 1. [daveey]
+-    """
+-    payload = {"reason": reason, "kind": kind, "source_status": source_status}
+-    if kind == "dependency":
+-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+-    same_cause = prev_kind == kind and (
+-        not (compare_reason and kind == "needs_input")
+-        or _normalized_reason(reason) == _normalized_reason(prev_reason)
+-    )
+-    recurrences = prev_recurrences + 1 if same_cause else 1
+-    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
+-        payload["limit"] = BLOCK_RECURRENCE_LIMIT
+-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+-    return "blocked", "blocked", set_sql, (kind, recurrences), payload
+-
+-
+ def redact_review_value(value: Any) -> Any:
+     """Redact secrets at the domain boundary for durable review handoffs."""
+     if isinstance(value, str):
+diff --git a/tests/hermes_cli/test_kanban_continuation_exhaustion.py b/tests/hermes_cli/test_kanban_continuation_exhaustion.py
+new file mode 100644
+index 0000000000..c4bdc1404f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_continuation_exhaustion.py
+@@ -0,0 +1,86 @@
++"""Continuation budgets are agent recovery work, not a human decision."""
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as activity
++
++
++@pytest.fixture
++def board(tmp_path):
++    path = tmp_path / "board.db"
++    kb.init_db(path)
++    conn = kbc.connect(path)
++    yield conn, path
++    conn.close()
++
++
++def exhausted(conn):
++    tid = kb.create_task(conn, title="Long build", assignee="default", session_id="owner")
++    assert kb.claim_task(conn, tid)
++    assert kc.continue_task(conn, tid, checkpoint="Stage one", max_continuations=1)["ok"]
++    assert kb.claim_task(conn, tid)
++    refused = kc.continue_task(conn, tid, checkpoint="Stage two", max_continuations=1)
++    assert not refused["ok"]
++    return tid, refused
++
++
++@pytest.mark.parametrize("kind,reason", [
++    ("needs_input", "Reset the continuation budget or split the work."),
++    ("transient", "continuation_exhausted: split the work or reset the continuation budget"),
++    ("needs_input", "1) Review the preserved implementation/checkpoint NOTES.md for this card; "
++     "the dispatcher refused continuation after its 12-run limit. "
++     "2) Reset/requeue the continuation budget or route the remaining integration as bounded specialist work, "
++     "then unblock this card. Latest unshipped commitabc123 passes20 tests; live acceptance still remains. "
++     "This is not delivered; keep the originating tracker unfinished."),
++])
++def test_budget_only_human_block_routes_to_agent_triage(board, kind, reason):
++    conn, path = board
++    tid, refused = exhausted(conn)
++    assert kb.block_task(conn, tid, kind=kind, reason=reason)
++    task = kb.get_task(conn, tid)
++    assert (task.status, task.block_kind) == ("triage", "transient")
++    assert refused["reason_code"] == "continuation_exhausted"
++    assert refused["block_kind"] == "transient"
++    assert activity._read_counts(path, activity.BLOCKED_STATUSES) == {}
++    assert activity._read_counts(path) == {"owner": 1}
++    assert activity._replica_bucket({"status": task.status, "block_kind": task.block_kind}) == "active"
++    events = kb.list_events(conn, tid)
++    assert any(e.payload.get("rekind_reason") == "continuation_exhausted" for e in events)
++
++
++@pytest.mark.parametrize("kind,reason,human", [
++    ("needs_input", "Which production region should we deploy to?", True),
++    ("needs_input", "Reset the continuation budget. Which production region should we deploy to?", True),
++    ("capability", "Restore the deployment credentials, then unblock this card.", True),
++    ("time", "Waiting for the release window.", False),
++])
++def test_real_human_questions_and_clock_waits_keep_their_kind(board, kind, reason, human):
++    conn, path = board
++    tid, _ = exhausted(conn)
++    assert kb.block_task(conn, tid, kind=kind, reason=reason)
++    task = kb.get_task(conn, tid)
++    assert bool(activity._read_counts(path, activity.BLOCKED_STATUSES)) == human
++    assert (activity._replica_bucket({"status": task.status, "block_kind": task.block_kind}) == "blocked") == human
++
++
++def test_budget_words_without_refusal_are_not_reclassified(board):
++    conn, _ = board
++    tid = kb.create_task(conn, title="Budget decision", assignee="default")
++    assert kb.block_task(conn, tid, kind="needs_input", reason="Reset the continuation budget or split the work.")
++    assert kb.get_task(conn, tid).block_kind == "needs_input"
++
++
++def test_refusal_does_not_leak_to_a_new_run_or_accept_a_stale_worker(board):
++    conn, _ = board
++    tid, _ = exhausted(conn)
++    run_id = kb.get_task(conn, tid).current_run_id
++    reason = "Reset the continuation budget or split the work."
++    assert not kb.block_task(conn, tid, kind="needs_input", reason=reason, expected_run_id=run_id + 1)
++    assert kb.get_task(conn, tid).status == "running"
++    assert kb.block_task(conn, tid, kind="transient", reason="Retry network")
++    assert kb.unblock_task(conn, tid)
++    assert kb.claim_task(conn, tid)
++    assert kb.block_task(conn, tid, kind="needs_input", reason=reason)
++    assert kb.get_task(conn, tid).block_kind == "needs_input"
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2e44841c88..08145a0b0c 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -395,7 +395,18 @@ overdue probes, and parks more than 2 h out that have neither.
+ Continuations leave `consecutive_failures` and the unblock-loop counter
+ untouched, so they never trip the give-up or block-loop limits. Their own
+ bound is `kanban.max_continuations` (default 12) consecutive `continued` runs.
+-Past that, the worker has to complete or block.
++Past that, the worker has to complete or block. The refusal records a run-scoped
++`continuation_exhausted` event with the checkpoint and recommends
++`kanban_block(kind='transient', reason='continuation_exhausted: split the work or reset the continuation budget')`.
++That budget-management block enters agent `triage`, not the human-input list.
++A budget-only `needs_input` following the same run's refusal is corrected to
++`transient`, with `requested_kind` and `rekind_reason=continuation_exhausted`
++in the block event. Actual user questions, capability requests, and time waits
++retain their own routing; unknown prose is not suppressed. This is a supervisor
++handoff, not an automatic budget reset: previously run triage cards are excluded
++from automatic decomposition, so the supervising agent must split or resume the
++preserved work. Local session counts and remote replica counts treat this as
++unfinished agent work, never as waiting on a human.
+ 
+ #### Workers and systemd cgroups
+ 
+-- 
+2.55.0
+

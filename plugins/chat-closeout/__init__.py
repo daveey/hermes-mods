@@ -33,6 +33,7 @@ SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 TICK_S = float(os.environ.get("CHAT_CLOSEOUT_TICK_S", "30"))
 _state: dict[str, Any] = {}
 _thread_lock = threading.Lock()
+_waiting_lock = threading.Lock()
 
 
 # ---- environment -----------------------------------------------------------------------------------------------
@@ -65,8 +66,69 @@ def board_paths() -> list[Path]:
                 if p.is_file()]
 
 
-def read_cards(ids: list[str]) -> dict:
-    return core.read_cards(board_paths(), ids)
+def remote_cards() -> list[dict]:
+    """Use core's authoritative projection, including released rows (session_tasks omits those).
+
+    No replica/status-only fallback can prove a release. Older cores retain unknown
+    remote batches rather than silently treating a missing card as completed.
+    """
+    from hermes_constants import get_hermes_home
+    from hermes_cli import kanban_session_activity as ksa
+    from hermes_cli.kanban_origin_adapter import _gateway
+    from hermes_cli.kanban_origin_ledger import project
+    from hermes_cli.profiles import get_active_profile_name
+
+    path = get_hermes_home() / 'kanban' / 'origin-ledger.db'
+    if not path.exists():
+        return ksa._remote_links()
+    replica = ksa._hub_db_path()
+    rows = project(path, replica=replica,
+                   gateway=_gateway(replica or path.with_name('absent-replica.db')),
+                   profile=get_active_profile_name())
+    # Core alone decides which historical associations the receipts supersede.
+    # Its inventory also retains unsuperseded legacy obligations; don't lose those
+    # when adding released rows (which the open inventory deliberately omits).
+    return [card for card in ksa._remote_links() if card.get('via') != 'origin'] + rows
+
+
+def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None) -> dict:
+    cards = core.read_cards(board_paths(), ids)
+    try:
+        remote = (remote_inventory or remote_cards)()
+    except Exception:
+        # Qualified local cards remain usable. Old bare IDs have lost ownership:
+        # without the remote inventory they cannot safely resolve to local done.
+        logger.debug('chat-closeout: origin projection unavailable', exc_info=True)
+        return {key: card for key, card in cards.items() if '/' in key}
+    want = set(ids)
+    for card in remote:
+        key = core.card_key(card)
+        cards.pop(str(card['id']), None)  # ambiguous historical bare-ID ledger
+        if key in want:
+            previous = cards.get(key)
+            # Several origin bindings can name one owner; no unsafe first match.
+            if previous is None or not core.is_settled(card):
+                cards[key] = card
+    return cards
+
+
+def _pass_reader() -> Callable[[list[str]], dict]:
+    """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) is read
+    once and reused for every row, not once per pending row. A failed read fails every row the same way."""
+    memo: list[tuple[Optional[list[dict]], Optional[BaseException]]] = []
+
+    def inventory() -> list[dict]:
+        if not memo:
+            try:
+                memo.append((remote_cards(), None))
+            except Exception as exc:
+                memo.append((None, exc))
+        rows, exc = memo[0]
+        if exc is not None:
+            raise exc
+        return rows
+
+    return lambda ids: read_cards(ids, remote_inventory=inventory)
 
 
 def state_dbs() -> list[Path]:
@@ -79,7 +141,19 @@ def state_dbs() -> list[Path]:
 def open_card_ids(session_id: str) -> list[str]:
     """Cards the chat created or shepherds that are not done/archived (queued, running, blocked, review)."""
     from hermes_cli import kanban_session_activity as ksa
-    return sorted({str(t["id"]) for t in ksa.session_tasks([session_id], ksa.LISTED_STATUSES)})
+    return sorted({core.card_key(t) for t in ksa.session_tasks([session_id], ksa.LISTED_STATUSES)})
+
+
+def session_proof(sid: str, tid: str, card: dict) -> bool:
+    """Transcript evidence that a finished card's final notice was delivered to the chat and answered."""
+    try:
+        at = card.get("completed_at")
+        if at is None:
+            return False
+        return core.ack_proven(state_dbs(), _lineage(sid), tid, float(at))
+    except Exception:
+        logger.debug("chat-closeout: ack proof unavailable", exc_info=True)
+        return False
 
 
 def _eligible(session_id: str, platform: str = "") -> bool:
@@ -115,8 +189,14 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not row or not row.get("batch"):
             return None
         cards = read_cards(row["batch"])
-        key = core.closeout_key(row, cards)
-        if not key or key == row.get("done_sig") or row.get("closing") is not None:
+        fix = core.reconcile_done(row, cards, lambda t, c: session_proof(session_id, t, c))
+        if fix:
+            ledger().write(session_id, **fix)
+            row = {**row, **fix}
+            if not row["batch"]:
+                return None
+        key = core.pending_key(row, cards)
+        if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
         ledger().write(session_id, closing=sorted(row["batch"]))
@@ -173,20 +253,21 @@ pre_final_gate.needs_buffer = True
 # ---- sidebar: a settled batch stays "waiting" until its close-out ----------------------------------------------
 def waiting_source() -> dict[str, list[str]]:
     """kanban_session_activity waiting source: chats whose cards all settled but whose close-out has not run yet.
-    Cached for 3 s (the session list polls)."""
+    Cached for 3 s (the session list polls). Single-flight: polls that arrive while a pass runs wait for it and
+    share its answer instead of each starting their own."""
     if _off():
         return {}
-    hit = _state.get("waiting_cache")
-    mono = time.monotonic()
-    if hit and mono - hit[0] < 3.0:
-        return hit[1]
-    try:
-        out = core.pending_closeouts(ledger(), read_cards)
-    except Exception:
-        logger.debug("chat-closeout waiting source failed", exc_info=True)
-        out = {}
-    _state["waiting_cache"] = (mono, out)
-    return out
+    with _waiting_lock:
+        hit = _state.get("waiting_cache")
+        if hit and time.monotonic() - hit[0] < 3.0:
+            return hit[1]
+        try:
+            out = core.pending_closeouts(ledger(), _pass_reader(), proof=session_proof)
+        except Exception:
+            logger.debug("chat-closeout waiting source failed", exc_info=True)
+            out = {}
+        _state["waiting_cache"] = (time.monotonic(), out)
+        return out
 
 
 def _register_waiting_source() -> None:
@@ -231,7 +312,8 @@ def _unseen_counts() -> Optional[dict[str, int]]:
 
 def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]] = None,
               unseen: Optional[dict[str, int]] = None, last_user: Optional[Callable[[list[str]], float]] = None,
-              read: Callable[[list[str]], dict] = read_cards) -> list[dict]:
+              read: Callable[[list[str]], dict] = read_cards,
+              proof: Optional[Callable[[str, str, dict], bool]] = None) -> list[dict]:
     """One close-out pass over the ledger. Returns what it did (for logs/tests)."""
     now = time.time() if now is None else now
     if wake is None:
@@ -249,16 +331,18 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
         sid = row["session_id"]
         cards = read(row["batch"])
         fix = core.reconcile(row, cards)
+        fix.update(core.reconcile_done({**row, **fix}, cards,
+                                       lambda t, c, sid=sid: (proof or session_proof)(sid, t, c)))
         if fix:
             led.write(sid, **fix)
             row = {**row, **fix}
             if not row["batch"]:
                 continue
-        key = core.closeout_key(row, cards)
+        key = core.pending_key(row, cards)
         if key and key != row.get("settled_sig"):
             led.write(sid, settled_sig=key, settled_at=now)
         ids = _lineage(sid)
-        if key and key != row.get("done_sig") and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
+        if key and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
             if _state.setdefault("capped", {}).get(sid) != key:
                 _state["capped"][sid] = key
                 logger.warning("chat-closeout: %s hit the %d wakes/hour cap; close-out deferred", sid,
@@ -417,6 +501,7 @@ def start_thread() -> Optional[threading.Event]:
 
 
 def register(ctx) -> None:
+    logger.info("chat-closeout: loaded owner-final-proof-v2 module=%s core=%s", __file__, core.__file__)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)

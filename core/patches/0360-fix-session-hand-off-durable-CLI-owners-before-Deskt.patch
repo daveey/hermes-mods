@@ -1,0 +1,1391 @@
+From 2c047de606ce577c477c0c18a68ce194ad0ebb64 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:56:00 +0000
+Subject: [PATCH] fix(session): hand off durable CLI owners before Desktop
+ admission [daveey]
+
+---
+ agent/turn_facade_lease.py                    |  60 +++++-
+ hermes_cli/active_sessions.py                 |  29 +++
+ hermes_cli/cli_chat_turn_mixin.py             |   6 +
+ hermes_state_compression.py                   |  14 ++
+ .../test_terminal_background_user_chat.py     |  75 +++++++
+ tests/tui_gateway/gateway_dispatch_helpers.py |  16 ++
+ .../tui_gateway/test_cli_durable_takeover.py  | 185 ++++++++++++++++++
+ .../test_cli_takeover_adversarial.py          | 144 ++++++++++++++
+ .../test_cli_takeover_full_turn.py            | 168 ++++++++++++++++
+ .../test_compute_host_borrowed_lease.py       |   8 +-
+ .../test_durable_takeover_recovery.py         |  98 ++++++++++
+ tests/tui_gateway/test_free_tier_task_done.py |   4 +-
+ .../test_lazy_session_regressions.py          |   1 +
+ tests/tui_gateway/test_tui_gateway_server.py  |  24 +--
+ .../test_tui_gateway_server_deep_truncate.py  |   9 +
+ tools/terminal_tool.py                        |   8 +-
+ tools/terminal_tool_guards.py                 |  96 +++++++++
+ tui_gateway/methods_session_takeover.py       |  56 ++++++
+ tui_gateway/prompt_turn.py                    |  35 +++-
+ tui_gateway/session_lifecycle.py              |  32 +++
+ 20 files changed, 1045 insertions(+), 23 deletions(-)
+ create mode 100644 tests/tools/test_terminal_background_user_chat.py
+ create mode 100644 tests/tui_gateway/gateway_dispatch_helpers.py
+ create mode 100644 tests/tui_gateway/test_cli_durable_takeover.py
+ create mode 100644 tests/tui_gateway/test_cli_takeover_adversarial.py
+ create mode 100644 tests/tui_gateway/test_cli_takeover_full_turn.py
+ create mode 100644 tests/tui_gateway/test_durable_takeover_recovery.py
+
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index 4c32148cdc..d3d5d5b2de 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -91,9 +91,25 @@ class DurableTurnLease:
+         from agent.periodic_scheduler import schedule
+ 
+         self.timer_handles.append(schedule(self.refresh_tick, self.refresh_interval))
++        self.timer_handles.append(schedule(self.takeover_tick, 0.5))
+         if self.watchdog is not None:
+             self.timer_handles.append(self.watchdog.schedule())
+ 
++    def takeover_tick(self):
++        """Observe the existing registry handoff, qualified by this exact durable holder.
++
++        Keep renewing until the turn unwinds and releases: an interrupt is NOT a release.
++        Explicit DB home binding also works for multiplexed CLI/background turns.
++        """
++        from pathlib import Path
++        from hermes_cli.active_sessions import find_takeover_of
++        if self.stop.is_set():
++            return False
++        if find_takeover_of(self.holder, registry_home=Path(self.db.db_path).parent):
++            self._interrupt_turn("This chat was taken over by another Hermes window.", taken_over=True)
++            return False
++        return None
++
+     def stop_refresher(self) -> None:
+         """Stop renewal and deactivate the turn. Also the watchdog's deactivate callback: a wedge the
+         hard interrupt cannot unwind must not keep the lease alive forever; TTL expiry lets
+@@ -125,12 +141,17 @@ class DurableTurnLease:
+         with self._lock:
+             return self.turn_active
+ 
+-    def _interrupt_turn(self, message: str) -> None:
++    def _interrupt_turn(self, message: str, *, taken_over: bool = False) -> None:
+         """Lease-loss interrupts fire UNCONDITIONALLY (no generation claim): a lost lease means
+         this process no longer owns the session. Only the watchdog's stalls can be spuriously stale."""
+         with self._lock:
+             if self.stop.is_set() or not self.turn_active:
+                 return
++            if taken_over:
++                # Survive finalizer interrupt clearing: a queued completion/goal must
++                # not reacquire the row in the gap before the new window starts.
++                self.agent._taken_over_session_id = self._current_session_id()
++                self.agent._taken_over_db_path = self.db.db_path
+             self.interrupt_message = message
+             try:
+                 self.agent.interrupt(message, hard_cancel=True, tool_reason=_REASON_LEASE_LOST)
+@@ -351,6 +372,23 @@ def _durable_session_exists(db, session_id: str) -> Optional[bool]:
+         return None
+ 
+ 
++def session_was_taken_over(agent, session_id: str) -> bool:
++    """The stand-down latch follows compression, but never a different profile or fork."""
++    taken = getattr(agent, "_taken_over_session_id", None)
++    if not taken or not session_id:
++        return False
++    db = getattr(agent, "_session_db", None)
++    bound_db = getattr(agent, "_taken_over_db_path", None)
++    if bound_db is not None and bound_db != getattr(db, "db_path", None):
++        return False
++    if taken == session_id:
++        return True
++    if not callable(getattr(type(db), "_session_turn_lease_key", None)):
++        return False
++    # Read errors propagate: a failed lineage lookup must not authorize a writer.
++    return db._session_turn_lease_key(taken) == db._session_turn_lease_key(session_id)
++
++
+ def admit_durable_turn_lease(
+     agent, *, session_id: str, relay_turn_id: str, task_context: dict[str, Any],
+     conversation_history: Optional[list[dict[str, Any]]],
+@@ -362,6 +400,18 @@ def admit_durable_turn_lease(
+     fails; the caller returns it verbatim."""
+     db = getattr(agent, "_session_db", None)
+     admission = TurnLeaseAdmission(conversation_history=conversation_history)
++    if session_was_taken_over(agent, session_id):
++        admission.early_result = {
++            "messages": list(conversation_history or []), "api_calls": 0,
++            "completed": False, "failed": True, "interrupted": True,
++            "_hard_interrupted": True,
++            "failure_reason": "session_busy", "failure_retryable": False,
++            "final_response": (
++                "This chat was taken over by another Hermes window. "
++                "Resume it explicitly to continue here. Your message was not processed."
++            ),
++        }
++        return admission
+     if db is None or not session_id:
+         return admission
+     # Check the concrete type: MagicMock-style shims accept any attribute without the protocol.
+@@ -400,7 +450,8 @@ def admit_durable_turn_lease(
+ 
+     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
+     if not db.acquire_session_turn_lease(
+-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
++        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS,
++        wait_seconds=0.0 if task_context['platform'] in {"desktop", "tui"} else LEASE_WAIT_SECONDS,
+         on_wait=_on_wait, on_contended=_on_contended,
+         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
+     ):
+@@ -527,6 +578,11 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) ->
+         "⏳ Another Hermes process kept this session busy too long. Your message was not "
+         "processed - wait for the other process to finish, then send it again."
+     )
++    if getattr(agent, "platform", None) in {"desktop", "tui"}:
++        timeout_msg = (
++            "This chat has another active writer. Use session.take_over (Take over here), "
++            "then retry your message. Your message was not processed."
++        )
+     logger.error("session turn lease wait timed out for %s", session_id)
+     try:
+         agent._emit_warning(timeout_msg)
+diff --git a/hermes_cli/active_sessions.py b/hermes_cli/active_sessions.py
+index 62d15b02a8..9ebbf8cb08 100644
+--- a/hermes_cli/active_sessions.py
++++ b/hermes_cli/active_sessions.py
+@@ -676,6 +676,35 @@ def take_over_active_session(
+     return lease, owned, None
+ 
+ 
++def turn_handoff_is_current(lease: ActiveSessionLease, holder: str) -> bool:
++    """Read back the exact requester, not a successor that replaced its registry slot."""
++    if lease.released or not lease.enabled:
++        return False
++    state_path, lock_path = _lease_paths(lease)
++    with _FileLock(lock_path):
++        entries = _read_entries(state_path, strict=True)
++        return any(e.get("lease_id") == lease.lease_id
++                   and holder in (e.get("metadata") or {}).get("took_over_from", [])
++                   for e in entries)
++
++
++def request_turn_handoff(lease: ActiveSessionLease, holder: str) -> bool:
++    """Ask one exact durable turn to stand down through the existing takeover metadata."""
++    state_path, lock_path = _lease_paths(lease)
++    with _FileLock(lock_path):
++        entries = _read_entries(state_path, strict=True)
++        own = next((e for e in entries if e.get("lease_id") == lease.lease_id), None)
++        if own is None:
++            return False
++        md = own.setdefault("metadata", {})
++        targets = md.setdefault("took_over_from", [])
++        if holder not in targets:
++            targets.append(holder)
++        md["took_over_at"] = time.time()
++        _write_entries(state_path, entries)
++        return True
++
++
+ def _registry_state_path(registry_home: str | Path | None, state_path: str | Path | None) -> Path:
+     return Path(state_path) if state_path is not None else _state_path(registry_home)
+ 
+diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.py
+index a94395d6b7..b504a79639 100644
+--- a/hermes_cli/cli_chat_turn_mixin.py
++++ b/hermes_cli/cli_chat_turn_mixin.py
+@@ -636,6 +636,12 @@ class CLIChatTurnMixin:
+         _interrupted_this_turn = bool(turn.result and turn.result.get("interrupted"))
+         # Post-turn hooks (e.g. goal continuation) skip themselves on a user-cancelled turn.
+         self._last_turn_interrupted = _interrupted_this_turn
++        from agent.turn_facade_lease import session_was_taken_over
++        if self.agent and session_was_taken_over(self.agent, self.agent.session_id):
++            # Ownership notices are not user redirects. Never feed them back to
++            # the model as a new prompt after the durable lease has been released.
++            self._last_turn_interrupted = True
++            return None, False
+         if _interrupted_this_turn:
+             pending_message = turn.result.get("interrupt_message") or interrupt_msg
+             _show_interrupt_marker = bool(response and pending_message)
+diff --git a/hermes_state_compression.py b/hermes_state_compression.py
+index f80b91980c..9b63b759e2 100644
+--- a/hermes_state_compression.py
++++ b/hermes_state_compression.py
+@@ -657,6 +657,20 @@ class SessionCompressionMixin:
+                 last_notice_at = now
+             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
+ 
++    def session_turn_lease_owner(self, session_id: str) -> Optional[dict[str, Any]]:
++        """Inspect the actual writer at the compression root, without reclaiming its row."""
++        from hermes_state import _compression_lock_holder_process_is_dead
++        with self._read_ctx() as conn:
++            row = conn.execute(
++                "SELECT * FROM session_turn_leases WHERE conversation_id = ?",
++                (self._session_turn_lease_key_on_conn(conn, session_id),),
++            ).fetchone()
++        if row is None or _compression_lock_holder_process_is_dead(row["holder"]):
++            return None
++        # An expired but live holder can still renew: takeover must wait for release,
++        # not mistake expiry for acknowledgement.
++        return dict(row)
++
+     def session_turn_lease_expires_at(self, session_id: str, holder: str) -> Optional[float]:
+         """Committed ``expires_at`` of ``holder``'s turn lease, or None when it does not hold it."""
+         if not session_id or not holder:
+diff --git a/tests/tools/test_terminal_background_user_chat.py b/tests/tools/test_terminal_background_user_chat.py
+new file mode 100644
+index 0000000000..9d913548d4
+--- /dev/null
++++ b/tests/tools/test_terminal_background_user_chat.py
+@@ -0,0 +1,75 @@
++"""Agent-created titled chats must use Desktop routing, not detached CLI ownership."""
++import json
++from unittest.mock import patch
++
++import pytest
++
++from tools.terminal_tool_guards import background_user_chat_block
++
++INCIDENT = (
++    "hermes chat -Q --continue 'AWS runner capacity: dedicated EC2 CI' "
++    "--create-if-missing --query-file /scratch/query.txt --run-budget 28800"
++)
++
++
++@pytest.mark.parametrize("command", [
++    INCIDENT,
++    "env HERMES_HOME=/scratch/hh /opt/bin/hermes --profile work chat "
++    "--create-if-missing --continue='A title' -q 'hello'",
++    "cd /scratch && " + INCIDENT,
++    "nohup " + INCIDENT,
++    "bash -lc \"hermes chat -c 'A title' --create-if-missing -q hello\"",
++    "python3 -m hermes_cli.main chat -c title --create-if-missing -Q",
++    "hermes chat -q '--help' -c title --create-if-missing",
++    "hermes chat -c title --create-if-missing --source tool",
++    "hermes chat --continue=title --create-if-missing; echo --help",
++])
++def test_rejects_only_executed_titled_upsert(command):
++    result = json.loads(background_user_chat_block(command, background=True))
++    assert result["status"] == "blocked"
++    assert result["exit_code"] == 1
++    assert "cross_session" in result["error"]
++    assert "session.create" in result["error"]
++    assert "prompt.submit" in result["error"]
++    assert "--source tool" in result["error"]
++
++
++@pytest.mark.parametrize("command", [
++    "hermes chat -q 'independent worker' --source tool",
++    "hermes chat --query-file /scratch/job --run-budget 28800",
++    "hermes chat --resume worker-id -q continue",
++    "hermes chat --continue worker -q continue",
++    "hermes chat --continue --create-if-missing -q hello",
++    "hermes chat -q '--continue TITLE --create-if-missing'",
++    "hermes chat -c title -q '--create-if-missing'",
++    "hermes chat --create-if-missing -q '--continue=title'",
++    "echo hermes chat --continue title --create-if-missing",
++    "printf '%s' 'hermes chat -c title --create-if-missing'",
++    "hermes chat -c title --create-if-missing --help",
++    "hermes chat -- --continue title --create-if-missing",
++    "cat <<'EOF'\nhermes chat --continue title --create-if-missing\nEOF\n",
++    "python3 -c \"print('hermes chat --continue title --create-if-missing')\"",
++])
++def test_preserves_workers_help_and_inert_text(command):
++    assert background_user_chat_block(command, background=True) is None
++
++
++def test_foreground_cli_is_not_prohibited():
++    assert background_user_chat_block(INCIDENT, background=False) is None
++
++
++@pytest.mark.parametrize("options", [
++    {"background": True},
++    {"background": True, "persist_on_release": True},
++    {"background": True, "pty": True, "force": True},
++    {"timeout": 28800},
++])
++def test_terminal_refuses_before_backend_or_spawn(options):
++    from tools.terminal_tool import terminal_tool
++
++    with patch("tools.terminal_tool._acquire_env") as acquire, \
++         patch("tools.terminal_tool.spawn_background_process") as spawn:
++        result = json.loads(terminal_tool(INCIDENT, **options))
++    assert result["status"] == "blocked"
++    acquire.assert_not_called()
++    spawn.assert_not_called()
+diff --git a/tests/tui_gateway/gateway_dispatch_helpers.py b/tests/tui_gateway/gateway_dispatch_helpers.py
+new file mode 100644
+index 0000000000..b1dafe4441
+--- /dev/null
++++ b/tests/tui_gateway/gateway_dispatch_helpers.py
+@@ -0,0 +1,16 @@
++"""Synchronous RPC dispatch for handler-unit tests."""
++from tui_gateway import server
++from tui_gateway.transport import bind_transport, reset_transport
++
++
++def dispatch_sync(req: dict, transport=None) -> dict | None:
++    """Run one RPC synchronously while preserving its transport binding.
++
++    Voice RPCs run on the RPC pool and dispatch returns None. Handler-unit
++    tests drive the handler inline rather than testing pool routing.
++    """
++    token = bind_transport(transport)
++    try:
++        return server.handle_request(req)
++    finally:
++        reset_transport(token)
+diff --git a/tests/tui_gateway/test_cli_durable_takeover.py b/tests/tui_gateway/test_cli_durable_takeover.py
+new file mode 100644
+index 0000000000..e1677afae0
+--- /dev/null
++++ b/tests/tui_gateway/test_cli_durable_takeover.py
+@@ -0,0 +1,185 @@
++"""Real SQLite/CLI-process handoff through the server-bound Desktop RPC.
++
++No model/network calls: exercises durable admission, scheduled cooperative stop,
++RPC ownership and transcript identity rather than an idle registry-only owner.
++"""
++import json
++import os
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway import server
++from tests.waiting import wait_until
++
++REPO = Path(__file__).resolve().parents[2]
++CHILD = r"""
++import json, os, sys, threading
++from pathlib import Path
++from types import SimpleNamespace
++from hermes_state import SessionDB
++from agent.turn_facade_lease import DurableTurnLease
++from hermes_state_pidns import holder_namespace_token
++home = Path(sys.argv[1])
++db = SessionDB(home / 'state.db')
++holder = f'pid={os.getpid()}{holder_namespace_token()}:turn=child:platform=cli'
++assert db.try_acquire_session_turn_lease('root', holder)
++stopped = threading.Event()
++agent = SimpleNamespace(session_id='root', _touch_activity=lambda *a: None,
++                        interrupt=lambda *a, **k: stopped.set())
++lease = DurableTurnLease(agent, db, 'root', holder)
++if sys.argv[2] == 'cooperative':
++    lease.start()
++(home / 'ready.tmp').write_text(json.dumps({'holder': holder, 'pid': os.getpid()}))
++(home / 'ready.tmp').replace(home / 'ready.json')
++try:
++    if sys.argv[2] == 'cooperative':
++        assert stopped.wait(30), 'handoff never reached the shared lease'
++        # The interrupt alone must not authorize a new writer.
++        (home / 'interrupted').touch()
++        from tests.waiting import wait_until
++        wait_until(lambda: (home / 'release').exists(), timeout=30)
++    else:
++        sys.stdin.readline()
++finally:
++    lease.stop_refresher()
++    lease.join_threads()
++    lease.release()
++    (home / 'released').touch()
++    db.close()
++"""
++
++
++@pytest.fixture
++def setup(tmp_path, monkeypatch):
++    home = tmp_path / 'profile'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    db = SessionDB(home / 'state.db')
++    db.create_session('root', source='cli')
++    db.append_message('root', 'user', 'original')
++    db.append_message('root', 'assistant', 'original answer')
++    db.end_session('root', 'compression')
++    db.create_session('tip', source='cli', parent_session_id='root')
++    session = {'agent': None, 'session_key': 'tip', 'profile_home': str(home),
++               'history': [], 'history_lock': threading.Lock(), 'history_version': 0,
++               'running': False, 'source': 'desktop', 'attached_images': []}
++    sid = 'durable-desktop'
++    monkeypatch.setitem(server._sessions, sid, session)
++    # Reproduce warm Desktop: it already has its registry slot BEFORE CLI starts.
++    assert server._ensure_active_session_slot(sid, session) is None
++    procs = []
++    def spawn(mode):
++        proc = subprocess.Popen([sys.executable, '-c', CHILD, str(home), mode],
++                                cwd=REPO, env=dict(os.environ), stdin=subprocess.PIPE,
++                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        procs.append(proc)
++        wait_until(lambda: (home / 'ready.json').exists() or proc.poll() is not None, timeout=30)
++        assert proc.poll() is None, proc.communicate()
++        return proc, json.loads((home / 'ready.json').read_text())
++    yield home, db, sid, session, spawn
++    for proc in procs:
++        if proc.poll() is None:
++            (home / 'release').touch()
++            proc.communicate(input='finish\n', timeout=35)
++    server._release_active_session_slot(session)
++    db.close()
++
++
++def test_warm_desktop_refuses_cli_then_waits_for_actual_release(setup):
++    home, db, sid, session, spawn = setup
++    proc, ready = spawn('cooperative')
++    owner = db.session_turn_lease_owner('tip')
++    assert owner['conversation_id'] == 'root'
++    assert owner['holder'] == ready['holder']
++    before = db.get_messages('tip')
++    started = time.monotonic()
++    reply = server._methods['prompt.submit']('submit', {'session_id': sid, 'text': 'follow up exactly once'})
++    assert time.monotonic() - started < 5
++    assert reply['error']['data']['reason'] == 'SESSION_NOT_OWNED'
++    assert ready['holder'] in reply['error']['message']
++    assert 'session.take_over' in reply['error']['message']
++    assert db.get_messages('tip') == before  # refusal happens before accepting/persisting input
++
++    outcome = []
++    done = threading.Event()
++    def take_over():
++        try:
++            outcome.append(server._methods['session.take_over']('take', {'session_id': sid}))
++        finally:
++            done.set()
++    worker = threading.Thread(target=take_over)
++    worker.start()
++    try:
++        wait_until(lambda: (home / 'interrupted').exists(), timeout=10)
++        assert not done.is_set()  # interrupt != handoff acknowledgement
++        assert not db.try_acquire_session_turn_lease('tip', 'competing-writer')
++        assert db.session_turn_lease_owner('tip')['holder'] == ready['holder']
++        (home / 'release').touch()
++        assert done.wait(10)
++        assert outcome[0]['result']['status'] == 'taken_over'
++        assert outcome[0]['result']['acknowledged'] is True
++        assert outcome[0]['result']['previous_owner']['surface'] == 'cli'
++        assert outcome[0]['result']['previous_owner']['pid'] == ready['pid']
++        assert db.session_turn_lease_owner('tip') is None
++        assert server._ensure_active_session_slot(sid, session) is None
++        proc.communicate(timeout=10)
++        assert proc.returncode == 0
++    finally:
++        (home / 'release').touch()
++        worker.join(15)
++
++
++def test_older_cli_is_bounded_refusal_and_never_forced_out(setup, monkeypatch):
++    _home, db, sid, _session, spawn = setup
++    proc, ready = spawn('old')
++    monkeypatch.setenv('HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S', '0.5')
++    start = time.monotonic()
++    result = server._methods['session.take_over']('take', {'session_id': sid})
++    assert time.monotonic() - start < 5
++    assert result['error']['data']['reason'] == 'SESSION_NOT_OWNED'
++    assert 'older Hermes CLI' in result['error']['message']
++    assert db.session_turn_lease_owner('tip')['holder'] == ready['holder']
++    assert proc.poll() is None
++    assert not db.try_acquire_session_turn_lease('tip', 'competitor')
++
++
++def test_unavailable_store_refuses_before_accepting_input(setup, monkeypatch):
++    import contextlib
++    _home, db, sid, session, _spawn = setup
++    before = db.get_messages('tip')
++    monkeypatch.setattr(server, '_session_db', lambda _session: contextlib.nullcontext(None))
++    result = server._methods['prompt.submit']('unavailable', {'session_id': sid, 'text': 'never accepted'})
++    assert result['error']['code'] == 4090
++    assert session['running'] is False
++    assert db.get_messages('tip') == before
++    assert '_submit_user_row' not in session
++
++
++def test_late_desktop_admission_is_bounded_and_own_holder_can_steer(setup):
++    from agent.turn_facade_lease import admit_durable_turn_lease
++    _home, db, sid, session, spawn = setup
++    _proc, ready = spawn('old')
++    warnings = []
++    agent = SimpleNamespace(_session_db=db, session_id='tip', platform='desktop',
++                            _interrupt_requested=False, _emit_warning=warnings.append)
++    start = time.monotonic()
++    admission = admit_durable_turn_lease(
++        agent, session_id='tip', relay_turn_id='desktop',
++        task_context={'platform': 'desktop'}, conversation_history=[])
++    assert time.monotonic() - start < 5
++    assert admission.lease is None
++    assert admission.early_result['failure_reason'] == 'session_busy'
++    assert 'session.take_over' in admission.early_result['final_response']
++    assert db.session_turn_lease_owner('tip')['holder'] == ready['holder']
++    # Exact holder equality, not same pid/platform, exempts the running local turn.
++    session['agent'] = SimpleNamespace(_active_session_turn_lease_holder=ready['holder'])
++    assert server._ensure_active_session_slot(sid, session) is None
++    session['agent']._active_session_turn_lease_holder = 'another-generation'
++    assert server._ensure_active_session_slot(sid, session).reason == 'SESSION_NOT_OWNED'
+diff --git a/tests/tui_gateway/test_cli_takeover_adversarial.py b/tests/tui_gateway/test_cli_takeover_adversarial.py
+new file mode 100644
+index 0000000000..697c00408f
+--- /dev/null
++++ b/tests/tui_gateway/test_cli_takeover_adversarial.py
+@@ -0,0 +1,144 @@
++"""Adversarial handoff races: real stores/registries, deterministic interleavings."""
++import contextlib
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from agent.turn_facade_lease import DurableTurnLease, admit_durable_turn_lease
++from agent import turn_facade_lease
++from hermes_cli import active_sessions
++from hermes_state import SessionDB
++from tui_gateway import server
++
++
++@pytest.fixture
++def handoff(tmp_path, monkeypatch):
++    home = tmp_path / "owner-profile"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    db = SessionDB(home / "state.db")
++    db.create_session("chat", source="cli")
++    assert db.try_acquire_session_turn_lease("chat", "original-cli")
++    session = {"session_key": "chat", "profile_home": str(home), "source": "desktop",
++               "agent": None, "history": [], "history_lock": threading.Lock(), "running": False}
++    monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(db))
++    monkeypatch.setattr(server, "_reload_history_after_takeover", lambda s: True)
++    monkeypatch.setattr(server, "_load_cfg", dict)
++    yield home, db, session
++    server._release_active_session_slot(session)
++    db.close()
++
++
++def test_handoff_binds_new_registry_to_inspected_db_not_ambient_profile(handoff, monkeypatch, tmp_path):
++    home, db, session = handoff
++    other = tmp_path / "ambient-profile"
++    other.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(other))
++    session.pop("profile_home")
++    original_request = active_sessions.request_turn_handoff
++
++    def request(lease, holder):
++        assert lease.state_path == active_sessions._state_path(home)
++        ok = original_request(lease, holder)
++        db.release_session_turn_lease("chat", holder)
++        return ok
++
++    monkeypatch.setattr(active_sessions, "request_turn_handoff", request)
++    result = server._take_over_durable_writer("r", "ui", session, db.session_turn_lease_owner("chat"))
++    assert result["result"]["acknowledged"] is True
++    assert not active_sessions._state_path(other).exists()
++
++
++def test_handoff_rejects_cached_registry_from_wrong_profile(handoff, tmp_path):
++    _home, db, session = handoff
++    wrong = tmp_path / "wrong-profile"
++    lease, _, refusal = active_sessions.take_over_active_session(
++        session_id="chat", surface="desktop", registry_home=wrong, config={})
++    assert refusal is None
++    session["active_session_lease"] = lease
++    result = server._take_over_durable_writer("r", "ui", session, db.session_turn_lease_owner("chat"))
++    assert result["error"]["data"]["reason"] == "SESSION_COORDINATION_UNAVAILABLE"
++    assert active_sessions.find_takeover_of("original-cli", registry_home=wrong) is None
++    assert db.session_turn_lease_owner("chat")["holder"] == "original-cli"
++
++
++def test_replaced_requester_cannot_report_success_when_cli_releases(handoff, monkeypatch):
++    home, db, session = handoff
++    original_request = active_sessions.request_turn_handoff
++    replacement = []
++
++    def request(lease, holder):
++        assert original_request(lease, holder)
++        successor, _, refusal = active_sessions.take_over_active_session(
++            session_id="chat", surface="desktop", registry_home=home,
++            metadata={"live_session_id": "other-ui"}, config={})
++        assert refusal is None
++        replacement.append(successor)
++        db.release_session_turn_lease("chat", holder)
++        return True
++
++    monkeypatch.setattr(active_sessions, "request_turn_handoff", request)
++    try:
++        result = server._take_over_durable_writer("r", "ui", session, db.session_turn_lease_owner("chat"))
++        assert result["error"]["data"]["reason"] == "SESSION_NOT_OWNED"
++        assert not active_sessions.turn_handoff_is_current(session["active_session_lease"], "original-cli")
++    finally:
++        for lease in replacement:
++            lease.release()
++
++
++def test_replacement_durable_writer_is_not_implicitly_taken_over(handoff, monkeypatch):
++    _, db, session = handoff
++    original_request = active_sessions.request_turn_handoff
++
++    def request(lease, holder):
++        assert original_request(lease, holder)
++        db.release_session_turn_lease("chat", holder)
++        assert db.try_acquire_session_turn_lease("chat", "replacement-cli")
++        return True
++
++    monkeypatch.setattr(active_sessions, "request_turn_handoff", request)
++    # Any wait on the replacement is a bug: the user targeted the original generation.
++    monkeypatch.setattr(server.time, "sleep", lambda *_: pytest.fail("waited on replacement writer"))
++    result = server._take_over_durable_writer("r", "ui", session, db.session_turn_lease_owner("chat"))
++    assert result["error"]["data"]["reason"] == "SESSION_NOT_OWNED"
++    assert db.session_turn_lease_owner("chat")["holder"] == "replacement-cli"
++    assert active_sessions.find_takeover_of("replacement-cli", registry_home=session["profile_home"]) is None
++
++
++def test_latch_follows_compression_after_interrupt_but_not_other_profile(handoff, tmp_path):
++    from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
++    _, db, _ = handoff
++    agent = SimpleNamespace(session_id="chat", _session_db=db, interrupt=lambda *a, **k: None,
++                            _liveness_activity_lock=lambda: threading.Lock())
++    lease = DurableTurnLease(agent, db, "chat", "original-cli")
++    lease.turn_active = True
++    lease._interrupt_turn("taken over", taken_over=True)
++    # Compression can finish after the interrupt latches the old id.
++    db.end_session("chat", "compression")
++    db.create_session("compressed", source="cli", parent_session_id="chat")
++    agent.session_id = "compressed"
++    lease.release()
++    admission = admit_durable_turn_lease(
++        agent, session_id="compressed", relay_turn_id="auto", task_context={"platform": "cli"},
++        conversation_history=[])
++    assert admission.lease is None
++    assert admission.early_result["failure_reason"] == "session_busy"
++    assert admission.early_result["api_calls"] == 0
++    assert db.session_turn_lease_owner("compressed") is None
++    cli = SimpleNamespace(agent=agent)
++    pending, _ = CLIChatTurnMixin._chat_resolve_interrupt(
++        cli, SimpleNamespace(result={"interrupted": True, "interrupt_message": "taken over"}),
++        threading.current_thread(), None, "")
++    assert pending is None
++    assert cli._last_turn_interrupted
++    db.create_session("unrelated", source="cli")
++    assert not turn_facade_lease.session_was_taken_over(agent, "unrelated")
++    other = SessionDB(tmp_path / "another-profile" / "state.db")
++    try:
++        other.create_session("chat", source="cli")
++        agent._session_db = other
++        assert not turn_facade_lease.session_was_taken_over(agent, "chat")
++    finally:
++        other.close()
+diff --git a/tests/tui_gateway/test_cli_takeover_full_turn.py b/tests/tui_gateway/test_cli_takeover_full_turn.py
+new file mode 100644
+index 0000000000..fedae4f6a1
+--- /dev/null
++++ b/tests/tui_gateway/test_cli_takeover_full_turn.py
+@@ -0,0 +1,168 @@
++"""Cross-process CLI -> Desktop handoff with real agent loops and SQLite writes.
++
++Only provider/tool discovery and presentation transports are replaced. Admission,
++interruption, finalization, persistence and Desktop RPC dispatch remain real.
++"""
++import json
++import os
++import subprocess
++import sys
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from hermes_state import SessionDB
++from tests.waiting import wait_until
++from tui_gateway import server
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++def _mock_response(content):
++    message = SimpleNamespace(content=content, tool_calls=None, reasoning=None,
++                              reasoning_content=None, reasoning_details=None)
++    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
++                           model="test/model", usage=None)
++
++
++def make_agent(home, platform):
++    # Worktrees may store their git metadata in the real Hermes installation.
++    # Update recovery is startup maintenance, not part of turn ownership.
++    with patch("hermes_cli._early_recovery.restore_interrupted_pull", return_value=False):
++        from run_agent import AIAgent
++    with (patch("model_tools.get_tool_definitions", return_value=[]),
++          patch("model_tools.check_toolset_requirements", return_value={}),
++          patch("agent.process_bootstrap.OpenAI")):
++        agent = AIAgent(
++            api_key="test-key", provider="openrouter",
++            base_url="https://openrouter.ai/api/v1", model="test/model",
++            quiet_mode=True, skip_context_files=True, skip_memory=True,
++            session_id="handoff", platform=platform, save_trajectories=False,
++            session_db=SessionDB(home / "state.db"), skip_background_review=True,
++        )
++    agent._owns_session_db = True
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.compression_enabled = False
++    return agent
++
++
++def cli_process(home):
++    from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
++    agent = make_agent(home, "cli")
++
++    def provider(**kwargs):
++        owner = agent._session_db.session_turn_lease_owner("handoff")
++        (home / "ready.tmp").write_text(json.dumps(owner))
++        (home / "ready.tmp").replace(home / "ready.json")
++        assert agent._hard_interrupt_requested.wait(30)
++        return _mock_response(content="CLI response after cancellation")
++
++    agent.client.chat.completions.create.side_effect = provider
++    first = agent.run_conversation("original CLI input exactly once")
++    # Exercise the actual CLI post-turn redirect decision: a handoff notice must
++    # not become a new user prompt. Then probe the shared gate independently of
++    # that loop (queued completions and one-shot continuations also enter here).
++    cli = SimpleNamespace(agent=agent)
++    pending, _ = CLIChatTurnMixin._chat_resolve_interrupt(
++        cli, SimpleNamespace(result=first), threading.current_thread(), None,
++        first.get("final_response", ""))
++    assert pending is None
++    assert cli._last_turn_interrupted
++    second = agent.run_conversation("automatic continuation must not write",
++                                    conversation_history=first["messages"])
++    assert second["failed"] and not second["failure_retryable"]
++    assert second["api_calls"] == 0
++    assert agent.client.chat.completions.create.call_count == 1
++    (home / "finished.json").write_text(json.dumps({"first": first, "second": second}, default=str))
++    agent.close()
++
++
++CHILD = """
++from pathlib import Path
++import sys
++from tests.tui_gateway.test_cli_takeover_full_turn import cli_process
++cli_process(Path(sys.argv[1]))
++"""
++
++
++def test_real_cli_turn_hands_off_to_visible_desktop_reply(tmp_path, monkeypatch):
++    home = tmp_path / "profile"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    db = SessionDB(home / "state.db")
++    db.create_session("handoff", source="cli")
++    desktop = make_agent(home, "desktop")
++    session = {
++        "agent": desktop, "session_key": "handoff", "profile_home": str(home),
++        "history": [], "history_lock": threading.Lock(), "history_version": 0,
++        "running": False, "source": "desktop", "attached_images": [],
++        "model_override": "test/model", "cwd": str(tmp_path),
++    }
++    sid = "full-turn-desktop"
++    monkeypatch.setitem(server._sessions, sid, session)
++    assert server._ensure_active_session_slot(sid, session) is None
++    events = []
++    monkeypatch.setattr(server, "_emit", lambda kind, sid, payload=None: events.append((kind, payload)))
++    # Keep model configuration pinned to the test provider; no production turn
++    # or persistence path is replaced.
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a: None)
++    monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a: None)
++    proc = subprocess.Popen([sys.executable, "-c", CHILD, str(home)], cwd=REPO,
++                            env=dict(os.environ), stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE, text=True)
++    try:
++        wait_until(lambda: (home / "ready.json").exists() or proc.poll() is not None, timeout=45)
++        assert proc.poll() is None, proc.communicate()
++        owner = json.loads((home / "ready.json").read_text())
++        assert owner["holder"].startswith(f"pid={proc.pid}:")
++        assert not db.try_acquire_session_turn_lease("handoff", "competitor")
++        before = db.get_messages("handoff")
++        refused = server._methods["prompt.submit"]("refused", {
++            "session_id": sid, "text": "Desktop follow-up exactly once"})
++        assert refused["error"]["data"]["reason"] == "SESSION_NOT_OWNED"
++        assert db.get_messages("handoff") == before
++        taken = server._methods["session.take_over"]("take", {"session_id": sid})
++        assert taken["result"]["acknowledged"] is True, taken
++        assert taken["result"]["previous_owner"]["pid"] == proc.pid
++        out, err = proc.communicate(timeout=30)
++        assert proc.returncode == 0, (out, err)
++        assert (home / "finished.json").exists()
++        assert db.session_turn_lease_owner("handoff") is None
++
++        def desktop_provider(**kwargs):
++            live = db.session_turn_lease_owner("handoff")
++            assert live["holder"] != owner["holder"]
++            assert "platform=desktop" in live["holder"]
++            assert not db.try_acquire_session_turn_lease("handoff", "competitor")
++            return _mock_response(content="Visible Desktop reply after CLI takeover")
++
++        desktop.client.chat.completions.create.side_effect = desktop_provider
++        submitted = server._methods["prompt.submit"]("accepted", {
++            "session_id": sid, "text": "Desktop follow-up exactly once"})
++        assert submitted["result"]["status"] == "streaming", submitted
++        wait_until(lambda: any(k == "message.complete" for k, _ in events), timeout=30)
++        session["_run_thread"].join(30)
++        complete = [p for k, p in events if k == "message.complete"]
++        assert len(complete) == 1
++        assert complete[0]["status"] == "complete", complete
++        assert complete[0]["text"] == "Visible Desktop reply after CLI takeover", complete
++        assert desktop.client.chat.completions.create.call_count == 1
++        rows = db.get_messages("handoff")
++        contents = [r["content"] for r in rows]
++        assert contents.count("original CLI input exactly once") == 1
++        assert contents.count("Desktop follow-up exactly once") == 1
++        assert contents.count("Visible Desktop reply after CLI takeover") == 1
++        assert "automatic continuation must not write" not in contents
++        assert db.session_turn_lease_owner("handoff") is None
++    finally:
++        if proc.poll() is None:
++            proc.terminate()
++            proc.communicate(timeout=10)
++        if session.get("_run_thread"):
++            session["_run_thread"].join(30)
++        server._release_active_session_slot(session)
++        desktop.close()
++        db.close()
+diff --git a/tests/tui_gateway/test_compute_host_borrowed_lease.py b/tests/tui_gateway/test_compute_host_borrowed_lease.py
+index aab8105e9e..267c11e83c 100644
+--- a/tests/tui_gateway/test_compute_host_borrowed_lease.py
++++ b/tests/tui_gateway/test_compute_host_borrowed_lease.py
+@@ -164,9 +164,11 @@ def test_isolated_turn_without_matching_vouch_still_fails_closed(isolated_env):
+     try:
+         frames, _ = _run_turn(_make_frame(
+             "s1", active_session_lease={"lease_id": parent.lease_id, "session_id": "stale-A"}))
+-        errors = [f["message"]["params"]["payload"]["message"] for f in frames
+-                  if f["type"] == "rpc" and (f["message"].get("params") or {}).get("type") == "error"]
+-        assert errors and "open in another Hermes window" in errors[0]
++        completed = [f["message"]["params"]["payload"] for f in frames
++                     if f["type"] == "rpc" and (f["message"].get("params") or {}).get("type") == "message.complete"]
++        assert completed and completed[0]["status"] == "error"
++        assert "open in another Hermes window" in completed[0]["error"]
++        assert completed[0]["error_surface"]["code"] == "SESSION_NOT_OWNED"
+         assert [e["lease_id"] for e in _registry()] == [parent.lease_id]
+     finally:
+         parent.release()
+diff --git a/tests/tui_gateway/test_durable_takeover_recovery.py b/tests/tui_gateway/test_durable_takeover_recovery.py
+new file mode 100644
+index 0000000000..7bc1412c6d
+--- /dev/null
++++ b/tests/tui_gateway/test_durable_takeover_recovery.py
+@@ -0,0 +1,98 @@
++"""Accepted Desktop sends survive a racing durable writer and takeover/reload exactly once."""
++
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from agent.turn_context import _stage_turn_user_message
++from agent.turn_facade_lease import admit_durable_turn_lease
++from hermes_cli.active_sessions import ActiveSessionRefusal, SESSION_NOT_OWNED
++from hermes_state import SessionDB
++from tests.tui_gateway.test_submit_time_user_row import _flush_agent
++from tui_gateway import server
++from tui_gateway.prompt_turn import _TurnRun
++
++
++@pytest.mark.parametrize("late", [False, True], ids=["gateway-admission", "durable-admission"])
++@pytest.mark.parametrize("refresh", [False, True], ids=["warm-reload", "refreshed-reload"])
++def test_takeover_retry_preserves_the_accepted_followup_once(monkeypatch, tmp_path, late, refresh):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    key = "takeover-recovery"
++    db.create_session(key, source="desktop")
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (
++        threading.Event(), SimpleNamespace(join=lambda: None)))
++    frames = []
++    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: frames.append((event, payload)))
++    agent = _flush_agent(db, key)
++    agent.platform = "desktop"
++    agent._emit_warning = lambda message: None
++    # Equal text is deliberate: recovery must address the new send, not the older identical ask.
++    prior = [{"role": "user", "content": "follow up"}, {"role": "assistant", "content": "first answer"}]
++    agent._flush_messages_to_session_db(prior, [])
++    session = {"agent": agent, "session_key": key, "history": prior[:], "history_version": 0,
++               "history_lock": threading.Lock(), "running": True, "cols": 80}
++    server._start_inflight_turn(session, "follow up")
++    server._persist_submit_user_row(session, "follow up", None)
++    accepted = session["_submit_user_row"]
++    accepted_id = accepted["_row_id"]
++    holder = "test-cli-writer"
++    assert db.acquire_session_turn_lease(key, holder, ttl_seconds=300, wait_seconds=0)
++    try:
++        if late:
++            def run_conversation(message, **kwargs):
++                admission = admit_durable_turn_lease(
++                    agent, session_id=(key), relay_turn_id="desktop-race",
++                    task_context={"platform": "desktop"}, conversation_history=kwargs["conversation_history"])
++                assert admission.lease is None
++                assert admission.early_result is not None
++                return admission.early_result
++
++            agent.run_conversation = run_conversation
++            st = _TurnRun(agent, None, None, False, history=prior[:], history_version=0)
++            server._invoke_agent("ui", session, st, "follow up", "follow up", None,
++                                 [], None, None, text="follow up")
++            server._absorb_turn_result("ui", session, st, "follow up", None, None)
++            payload, _, status = server._complete_turn_payload(session, st, None, 80)
++            assert status == "error"
++            assert agent._pending_cli_user_message is None
++        else:
++            monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: ActiveSessionRefusal(
++                "Another writer owns this chat", SESSION_NOT_OWNED))
++            assert server._admit_prompt_turn("ui", session, "follow up", [], None, None, None) is None
++            payload = next(payload for event, payload in frames if event == "message.complete")
++            assert session["running"] is False
++        assert payload["error_surface"] == {
++            "layer": "gateway", "code": "SESSION_NOT_OWNED", "retryable": False}
++        assert session["inflight_turn"]["error_surface"] == payload["error_surface"]
++        assert [row["_row_id"] for row in session["history"]] == [
++            prior[0]["_row_id"], prior[1]["_row_id"], accepted_id]
++        assert len(db.get_messages_as_conversation(key)) == 3
++        assert "_submit_user_row" not in session
++
++        # session.take_over waits for release. Desktop then refreshes and reloads via rewind;
++        # the failed-refresh fallback must also have the accepted row in warm history.
++        db.release_session_turn_lease(key, holder)
++        assert db.session_turn_lease_expires_at(key, holder) is None
++        if refresh:
++            session["history"] = db.get_messages_as_conversation(key, include_row_ids=True)
++        with session["history_lock"]:
++            prefix, live, _ = server._rewind_active_session_history(session, 1, require_retryable=True)
++        assert [row["_row_id"] for row in prefix] == [row["_row_id"] for row in prior]
++        assert live["content"] == "follow up"
++        server._persist_submit_user_row(session, live["content"], None)
++        server._adopt_submit_user_row(session, agent, live["content"], live["content"])
++        user, _ = _stage_turn_user_message(agent, live["content"], live["content"], None, None, None, None)
++        agent._persist_user_message_idx = len(prefix)
++        agent._flush_messages_to_session_db(prefix + [user, {"role": "assistant", "content": "followup answer"}], prefix)
++        rows = db.get_messages_as_conversation(key, include_row_ids=True)
++        assert [(row["role"], row["content"]) for row in rows] == [
++            ("user", "follow up"), ("assistant", "first answer"),
++            ("user", "follow up"), ("assistant", "followup answer")]
++        assert sum(row["_row_id"] == user["_row_id"] for row in rows) == 1
++    finally:
++        db.release_session_turn_lease(key, holder)
++        db.close()
+diff --git a/tests/tui_gateway/test_free_tier_task_done.py b/tests/tui_gateway/test_free_tier_task_done.py
+index 28b8329a6b..7a36a170d6 100644
+--- a/tests/tui_gateway/test_free_tier_task_done.py
++++ b/tests/tui_gateway/test_free_tier_task_done.py
+@@ -125,7 +125,9 @@ def test_prompt_submit_records_only_untouched_turns(monkeypatch, touch, recorded
+                     "messages": [{"role": "assistant", "content": "Here is your plan."}]}
+ 
+     from unittest.mock import MagicMock
+-    monkeypatch.setattr(server, "_get_db", lambda: MagicMock())
++    mock_db = MagicMock()
++    mock_db.session_turn_lease_owner.return_value = None
++    monkeypatch.setattr(server, "_get_db", lambda: mock_db)
+     recorded_at_complete: list[int] = []
+ 
+     def _emit(event, *a, **kw):
+diff --git a/tests/tui_gateway/test_lazy_session_regressions.py b/tests/tui_gateway/test_lazy_session_regressions.py
+index fdf8eaee1a..c0c41ddc50 100644
+--- a/tests/tui_gateway/test_lazy_session_regressions.py
++++ b/tests/tui_gateway/test_lazy_session_regressions.py
+@@ -122,6 +122,7 @@ class TestPendingTitleValueError:
+         from tui_gateway import server
+ 
+         mock_db = MagicMock()
++        mock_db.session_turn_lease_owner.return_value = None
+         mock_db.set_session_title.side_effect = ValueError("duplicate title")
+ 
+         class _Agent:
+diff --git a/tests/tui_gateway/test_tui_gateway_server.py b/tests/tui_gateway/test_tui_gateway_server.py
+index 33f6bf88cf..fd242b1235 100644
+--- a/tests/tui_gateway/test_tui_gateway_server.py
++++ b/tests/tui_gateway/test_tui_gateway_server.py
+@@ -21,21 +21,17 @@ from tui_gateway import server
+ from tui_gateway.transport import bind_transport, reset_transport
+ 
+ 
+-def _dispatch_sync(req: dict, transport=None) -> dict | None:
+-    """Run one RPC to completion synchronously, regardless of pool routing.
+-
+-    Voice RPCs (voice.toggle/record/tts) are in ``_LONG_HANDLERS`` so they run
+-    on the RPC pool and ``server.dispatch`` returns None — the pool worker
+-    writes the response via the bound transport. These tests exercise the
+-    handler's business logic, not the routing, so they drive the handler
+-    inline while preserving the transport-binding semantics ``dispatch``
+-    applies around a real request.
++from tests.tui_gateway.gateway_dispatch_helpers import dispatch_sync as _dispatch_sync
++
++
++@pytest.fixture(autouse=True)
++def _isolate_durable_writer_preflight(monkeypatch):
++    """These handler-unit tests supply partial/absent DBs for unrelated paths.
++
++    Cross-process durable ownership, unavailable-store fail-closed behavior and
++    takeover are exercised with real stores in test_cli_durable_takeover.py.
+     """
+-    token = bind_transport(transport)
+-    try:
+-        return server.handle_request(req)
+-    finally:
+-        reset_transport(token)
++    monkeypatch.setattr(server, "_foreign_turn_owner", lambda _session: None)
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/tui_gateway/test_tui_gateway_server_deep_truncate.py b/tests/tui_gateway/test_tui_gateway_server_deep_truncate.py
+index 629bc22c5a..43ddcc3718 100644
+--- a/tests/tui_gateway/test_tui_gateway_server_deep_truncate.py
++++ b/tests/tui_gateway/test_tui_gateway_server_deep_truncate.py
+@@ -5,9 +5,18 @@ anchor can still name the wrong, stale row)."""
+ import threading
+ import types
+ 
++import pytest
++
+ from tui_gateway import server
+ 
+ 
++@pytest.fixture(autouse=True)
++def _isolate_durable_writer_preflight(monkeypatch):
++    # These truncation-unit fixtures deliberately implement only transcript APIs.
++    # Real durable ownership and unavailable-store behavior have separate coverage.
++    monkeypatch.setattr(server, "_foreign_turn_owner", lambda _session: None)
++
++
+ def _session(agent=None, **extra):
+     return {
+         "agent": agent if agent is not None else types.SimpleNamespace(),
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 21b849aa5d..8f21c3a698 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -850,7 +850,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
+ 
+ from tools.terminal_tool_guards import (
+     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
+-    gateway_lifecycle_block, self_repo_block,
++    background_user_chat_block, gateway_lifecycle_block, self_repo_block,
+ )
+ from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
+ from tools.terminal_tool_result import finalize_foreground_result
+@@ -1085,6 +1085,12 @@ def _plan_execution(
+             f"Invalid command: expected string, got {type(command).__name__}", status="error",
+         ))
+ 
++    blocked = background_user_chat_block(
++        command, background=background or (timeout is not None and timeout > FOREGROUND_MAX_TIMEOUT),
++    )
++    if blocked:
++        raise _Rejected(blocked)
++
+     config = _get_env_config()
+     env_type = "local" if _host_local else config["env_type"]
+ 
+diff --git a/tools/terminal_tool_guards.py b/tools/terminal_tool_guards.py
+index da0e00f74d..94720a9d04 100644
+--- a/tools/terminal_tool_guards.py
++++ b/tools/terminal_tool_guards.py
+@@ -263,6 +263,102 @@ def gateway_lifecycle_block(
+     return None
+ 
+ 
++# This is an origin-footgun guard, not a shell sandbox. Reuse the existing
++# command-position scanner: quoted documentation/queries are not invocations.
++# Scripts, substitutions, remote SSH payloads and generated argv are deliberately
++# not interpreted here. Do not turn this into a blanket worker-CLI prohibition.
++_HERMES_VALUE_OPTIONS = frozenset({
++    "--profile", "-p", "--model", "-m", "--provider", "--reasoning",
++    "--skills", "-s", "--toolsets", "-t", "--query", "-q", "--query-file",
++    "--image", "--format", "--resume", "-r", "--in", "--max-turns",
++    "--run-budget", "--source",
++})
++
++
++def _is_titled_chat_upsert(argv: list[str]) -> bool:
++    """Recognize literal CLI options without mistaking option values for flags."""
++    chat = named_continue = create = False
++    i = 0
++    while i < len(argv):
++        token = argv[i]
++        if token == "--":
++            break
++        option, equals, value = token.partition("=")
++        if option in {"--help", "-h", "--version"}:
++            return False
++        if option in {"--continue", "-c"}:
++            if not equals and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
++                i += 1
++                value = argv[i]
++            named_continue = bool(value)
++        elif token == "--create-if-missing":
++            create = True
++        elif option in _HERMES_VALUE_OPTIONS:
++            if not equals:
++                i += 1
++        elif not token.startswith("-"):
++            # First positional must be the chat subcommand; other Hermes
++            # subcommands (including help text/search) must never match.
++            if not chat:
++                if token != "chat":
++                    return False
++                chat = True
++        i += 1
++    return chat and named_continue and create
++
++
++def background_user_chat_block(command: str, *, background: bool) -> Optional[str]:
++    """Reject agent background titled-chat upserts before acquiring any backend.
++
++    PTY/persistence/approval do not make a child CLI a Desktop-owned runtime.
++    Ordinary workers (-q, --query-file, --resume) remain supported. Foreground
++    CLI invocations remain unchanged. This also covers timeout promotion.
++    """
++    if not background:
++        return None
++    from cron.lifecycle_guard import (
++        _executed_command_index, _iter_command_segments, _iter_shell_command_payloads,
++    )
++
++    pending = [(strip_inert_heredoc_bodies(command), 0)]
++    while pending:
++        text, depth = pending.pop()
++        for segment in _iter_command_segments(text):
++            index = _executed_command_index(segment)
++            if index is None:
++                continue
++            name = Path(segment[index]).name
++            argv = segment[index + 1:]
++            # The lifecycle helper recognizes -c/--command, but not the
++            # common combined spelling -lc used by terminal launchers.
++            if depth < 4 and name in {"sh", "bash", "zsh", "dash", "ksh"}:
++                for j, flag in enumerate(argv[:-1]):
++                    if re.fullmatch(r"-[a-zA-Z]+", flag) and "c" in flag and flag != "-c":
++                        pending.append((argv[j + 1], depth + 1))
++                        break
++            if re.fullmatch(r"python(?:3(?:\.\d+)?)?", name) and argv[:2] == ["-m", "hermes_cli.main"]:
++                argv = argv[2:]
++            elif name not in {"hermes", "hermes.exe"}:
++                continue
++            if _is_titled_chat_upsert(argv):
++                return _blocked_json(
++                    "Blocked: a background `hermes chat --continue TITLE --create-if-missing` "
++                    "creates or takes over a named chat in an unattended CLI, not an interactive "
++                    "Desktop conversation. For an existing Desktop chat, use cross_session "
++                    "action=list then action=send with its exact target. For a new chat, create "
++                    "it in Desktop (the routed gateway API is session.create followed by "
++                    "prompt.submit on the returned session_id, on the same gateway/profile). "
++                    "If no Desktop creation route is available, ask the user to create the chat; "
++                    "do not substitute a detached CLI. For an independent worker, use "
++                    "`hermes chat -q ... --source tool` without the titled-chat upsert flags "
++                    "and report it as a worker, not a Desktop conversation.",
++                    "blocked",
++                )
++        if depth < 4:
++            pending.extend((payload, depth + 1) for payload in _iter_shell_command_payloads(text))
++    return None
++
++
+ def self_repo_block(
+     *,
+     command: str,
+diff --git a/tui_gateway/methods_session_takeover.py b/tui_gateway/methods_session_takeover.py
+index a37216e5e9..88257691b7 100644
+--- a/tui_gateway/methods_session_takeover.py
++++ b/tui_gateway/methods_session_takeover.py
+@@ -178,6 +178,54 @@ def _takeover_previous_owner(entry: dict | None) -> dict | None:
+             "started_at": float(started) if isinstance(started, (int, float)) else None}
+ 
+ 
++def _take_over_durable_writer(rid, sid: str, session: dict, owner: dict):
++    from pathlib import Path
++    from hermes_cli.active_sessions import (
++        request_turn_handoff, take_over_active_session, turn_handoff_is_current, _state_path)
++    # Bind to the store we inspected, not the RPC thread's ambient profile.
++    with _session_db(session) as db:
++        registry_home = Path(db.db_path).parent
++    lease = session.get("active_session_lease")
++    if lease is not None and Path(lease.state_path).resolve() != _state_path(registry_home).resolve():
++        return _err(rid, 4090, _SESSION_OWNERSHIP_UNAVAILABLE,
++                    {"reason": "SESSION_COORDINATION_UNAVAILABLE"})
++    if lease is None:
++        lease, _removed, refusal = take_over_active_session(
++            session_id=str(session.get("session_key") or ""), surface=_session_source(session),
++            metadata=_lease_metadata(sid), registry_home=registry_home,
++            config=_load_cfg(), track_liveness=True)
++        if refusal is not None:
++            return _err(rid, 4090, str(refusal), {"reason": getattr(refusal, "reason", None)})
++        _attach_lease(session, lease)
++    if not request_turn_handoff(lease, owner["holder"]):
++        return _err(rid, 4090, _SESSION_OWNERSHIP_UNAVAILABLE,
++                    {"reason": "SESSION_COORDINATION_UNAVAILABLE"})
++    deadline = time.monotonic() + max(0.0, env_float("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", 8.0))
++    while True:
++        current = _foreign_turn_owner(session)
++        if (session.get("active_session_lease") is not lease
++                or not turn_handoff_is_current(lease, owner["holder"])
++                or (current is not None and current["holder"] != owner["holder"])):
++            return _err(rid, 4090, "Ownership changed during handoff. Retry Take over here.",
++                        {"reason": "SESSION_NOT_OWNED"})
++        if current is None:
++            break
++        if time.monotonic() >= deadline:
++            return _err(rid, 4090,
++                        "The other writer has not released this chat. It may be an older Hermes CLI. "
++                        "Stop its turn in that terminal, then retry Take over here. No writer was forced out.",
++                        {"reason": "SESSION_NOT_OWNED"})
++        time.sleep(_TAKEOVER_ACK_POLL_S)
++    _reload_history_after_takeover(session)
++    holder = owner["holder"]
++    surface = holder.rsplit(":platform=", 1)[-1] if ":platform=" in holder else "unknown"
++    return _ok(rid, {"status": "taken_over", "acknowledged": True,
++                     "previous_owner": {"surface": surface,
++                                        "pid": int(holder.split(":", 1)[0][4:])
++                                        if holder.startswith("pid=") and holder.split(":", 1)[0][4:].isdigit() else None,
++                                        "started_at": owner["acquired_at"]}})
++
++
+ @method("session.take_over")
+ @_registry.profile_scoped
+ def _(rid, params: dict) -> dict:
+@@ -185,6 +233,14 @@ def _(rid, params: dict) -> dict:
+     if err:
+         return err
+     sid = str(params.get("session_id") or "")
++    try:
++        owner = _foreign_turn_owner(session)
++        if owner is not None:
++            return _take_over_durable_writer(rid, sid, session, owner)
++    except Exception:
++        logger.warning("Durable writer handoff failed", exc_info=True)
++        return _err(rid, 4090, _SESSION_OWNERSHIP_UNAVAILABLE,
++                    {"reason": "SESSION_COORDINATION_UNAVAILABLE"})
+     if session.get("active_session_lease") is not None:
+         return _ok(rid, {"status": "already_owner", "previous_owner": None, "acknowledged": True})
+     key = str(session.get("session_key") or "")
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 4a6dcb9bbc..91b089e25c 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -113,6 +113,20 @@ def _plan_goal_compression_recovery(
+         "Run /compress, then /goal resume to continue.")
+ 
+ 
++def _retain_unadmitted_submit_row(history: list, staged: Any) -> bool:
++    """Keep the accepted row address for takeover's existing reload/rewind path.
++
++    No new send or queue: the row already exists in SQLite. Losing it from warm history
++    makes a retry append a second user turn instead of rewinding this exact send.
++    """
++    if not isinstance(staged, dict) or _message_row_id(staged) is None:
++        return False
++    if any(_message_row_id(message) == _message_row_id(staged) for message in history):
++        return False
++    history.append(staged)
++    return True
++
++
+ def _admit_prompt_turn(
+     sid: str, session: dict, text: Any, image_paths: list[str] | None,
+     queued_prompt_generation: int | None, display_kind: str | None,
+@@ -129,8 +143,13 @@ def _admit_prompt_turn(
+             getattr(ownership_refusal, "reason", None) or "refused")
+         with session["history_lock"]:
+             session["running"] = False
+-            session.pop("_submit_user_row", None)  # no turn runs: the submit-time row stays as the send
+-        _emit("error", sid, {"message": str(ownership_refusal)})
++            staged = session.pop("_submit_user_row", None)
++            if _retain_unadmitted_submit_row(session["history"], staged):
++                session["history_version"] = int(session.get("history_version", 0)) + 1
++        reason = getattr(ownership_refusal, "reason", None) or "SESSION_COORDINATION_UNAVAILABLE"
++        _emit_terminal_turn_error(
++            sid, session, str(ownership_refusal),
++            error_surface={"layer": "gateway", "code": reason, "retryable": False})
+         return None
+     with session["history_lock"]:
+         if session.get("_closing") or (
+@@ -824,7 +843,11 @@ def _invoke_agent(
+             text, _resolve_agent_platform(_session_source(session)), agent.valid_tool_names, st.history)
+         if prelude is not None:
+             run_kwargs["prelude"] = prelude
++    submitted_row = session.get("_submit_user_row")
+     _adopt_submit_user_row(session, agent, run_kwargs["persist_user_message"], text)
++    # Only this invocation's adopted row is eligible; a prior turn's pending slot is not.
++    if getattr(agent, "_pending_cli_user_message", None) is not submitted_row:
++        submitted_row = None
+     # Live-rename hook: auto-titling fires inside the turn prologue.
+     _title_key = session.get("session_key") or sid
+     agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
+@@ -834,6 +857,12 @@ def _invoke_agent(
+         from agent.notification_presentation import notification_turn, event_presentation_muted
+         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
+             st.result = agent.run_conversation(run_message, **st.run_kwargs)
++        if isinstance(st.result, dict) and st.result.get("failure_reason") == "session_busy":
++            # Durable admission can lose a race after the gateway's ownership preflight.
++            # The facade has not staged this user row or run the model in that case.
++            _retain_unadmitted_submit_row(st.result["messages"], submitted_row)
++            if submitted_row is not None and getattr(agent, "_pending_cli_user_message", None) is submitted_row:
++                agent._pending_cli_user_message = None
+     finally:
+         # Stop AND join before anything emits: a tick surviving past message.complete would
+         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
+@@ -967,6 +996,8 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
+                 model=str(getattr(agent, "model", "") or ""))
+         except Exception:
+             _error_surface = None
++    if result.get("failure_reason") == "session_busy":
++        _error_surface = {"layer": "gateway", "code": "SESSION_NOT_OWNED", "retryable": False}
+     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
+     if _is_bot_mode_session(session):
+         raw = _bot_mode_delivery_text(raw, successful=status == "complete")
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 6b7f0f6ac6..5ec0c0622e 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -118,11 +118,43 @@ def _install_borrowed_lease(sid: str, session: dict, frame: dict) -> None:
+         surface=str(frame.get("source") or "desktop"), enabled=False)
+ 
+ 
++def _foreign_turn_owner(session: dict):
++    key = str(session.get("session_key") or "")
++    if not key:
++        return None
++    with _session_db(session) as db:
++        owner = db.session_turn_lease_owner(key)
++    own_holder = getattr(session.get("agent"), "_active_session_turn_lease_holder", None)
++    return owner if owner and owner["holder"] != own_holder else None
++
++
++def _durable_owner_refusal(session: dict):
++    from hermes_cli.active_sessions import ActiveSessionRefusal, SESSION_NOT_OWNED
++    try:
++        owner = _foreign_turn_owner(session)
++    except Exception:
++        logger.warning("Could not inspect durable turn owner", exc_info=True)
++        return _SESSION_OWNERSHIP_UNAVAILABLE
++    if owner is None:
++        return None
++    holder = owner["holder"]
++    surface = holder.rsplit(":platform=", 1)[-1] if ":platform=" in holder else "unknown"
++    return ActiveSessionRefusal(
++        "This chat is active in another Hermes window/terminal. Use Take over here "
++        "(session.take_over), or wait for that turn to finish.\n"
++        f"Details: session {owner['conversation_id']} opened by {surface}. "
++        f"Writer: {holder}", SESSION_NOT_OWNED)
++
++
+ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
+     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
+     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
+     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
+     inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream."""
++    # A registry slot is not the SQLite writer lease. Check even on a warm Desktop session.
++    # Its own running agent is excluded by exact holder, preserving ordinary steer/stop.
++    if (refusal := _durable_owner_refusal(session)) is not None:
++        return refusal
+     if session.get("active_session_lease") is not None:
+         return None
+     key = str(session.get("session_key") or "")
+-- 
+2.55.0
+

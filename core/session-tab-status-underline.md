@@ -30,7 +30,7 @@ Covers the accent on the real workspace and tile tab wrappers, the per-state col
 
 ## Applying
 
-Apply the ordered series with `git am -3` from the merge-base (see [README.md](README.md)); 0106 touches the sidebar row, so it is not an independent apply set.
+Apply the ordered series with `git am -3 --empty=keep` from the merge-base (see [README.md](README.md)); 0106 touches the sidebar row, so it is not an independent apply set.
 
 ## Gotchas
 

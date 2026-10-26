@@ -39,7 +39,7 @@ Untested: whether models actually follow the new wording. That is a prompt-quali
 ## Applying
 
 Standalone: it touches one schema constant and adds one test. Verified: the full 0001–0130 series applies with
-`git am -3` at merge-base `4957bbd0a0` (Oct 18, 2026 PT).
+`git am -3 --empty=keep` at merge-base `4957bbd0a0` (Oct 18, 2026 PT).
 
 ## Gotchas
 

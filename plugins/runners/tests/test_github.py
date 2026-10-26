@@ -37,6 +37,21 @@ class Harness:
         return item
 
 
+@pytest.mark.parametrize('raw_os,expected', [
+    ('Linux', 'linux'), ('macOS', 'macos'), ('Windows', 'windows'),
+    ('osx', 'macos'), ('win', 'windows'), ('linux', 'linux'),
+    (None, 'unknown'), ([], 'unknown'), ({}, 'unknown'),
+    (12, 'unknown'), ('unsupported', 'unknown'),
+])
+def test_provider_os_aliases_and_malformed_values(raw_os, expected):
+    raw = runner()
+    raw['os'] = raw_os
+    h = Harness([response([raw])])
+    result = h.api.enumerate(scope())
+    assert result.complete
+    assert result.rows[0]['observed_os'] == expected
+
+
 def test_pagination_parity_and_contract_rows():
     from plugins.runners.models import validate
     h = Harness([response([runner(i) for i in range(1, 101)], 101), response([runner(101)], 101)])
@@ -62,6 +77,73 @@ def test_http_fail_closed_without_secret_errors(status):
     r=h.api.enumerate(scope())
     assert not r.complete and not r.rows and r.error and r.total_count is None
     assert 'fictional-test-token' not in repr(r) and len(h.calls)==1
+
+
+@pytest.mark.parametrize('status,code', [(403, 'forbidden'), (404, 'not_found')])
+def test_permission_cooldown_is_scope_local_and_survives_restart(status, code):
+    denied = scope(name='example/denied')
+    allowed = scope(name='example/allowed')
+    h = Harness([response(status=status), response([runner()])])
+    assert h.api.enumerate(denied).error == code
+    state = h.api.export_state()
+    assert h.api.enumerate(allowed).complete
+    restarted = Harness([response([runner()])])
+    restarted.api.restore_state(state)
+    assert restarted.api.enumerate(denied).error == code
+    assert not restarted.calls
+    assert restarted.api.enumerate(allowed).complete
+    assert any(v.get('cause') == code and v['until'] > h.now for v in state.values())
+    assert 'fictional-test-token' not in repr(state)
+
+
+@pytest.mark.parametrize('headers,body', [
+    ({'Retry-After': '60'}, {}),
+    ({'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1100'}, {}),
+    ({}, {'message': 'You have exceeded a secondary rate limit.'}),
+])
+def test_throttled_403_remains_credential_wide(headers, body):
+    h = Harness([HTTPResponse(403, headers, body)])
+    assert h.api.enumerate(scope()).error == 'rate_limited'
+    state = h.api.export_state()
+    restarted = Harness([])
+    restarted.api.restore_state(state)
+    assert restarted.api.enumerate(scope(name='example/other')).error in ('backoff', 'rate_limited')
+    assert not restarted.calls
+    assert state[scope()['credential_ref']]['cause'] == 'rate_limited'
+
+
+def test_secondary_throttle_without_retry_after_waits_at_least_one_minute():
+    h = Harness([HTTPResponse(403, {}, {'message': 'You have exceeded a secondary rate limit.'}), response()])
+    assert h.api.enumerate(scope()).error == 'rate_limited'
+    state = h.api.export_state()
+    assert state[scope()['credential_ref']]['until'] >= h.now + 60
+    h.now += 59
+    assert h.api.enumerate(scope(name='example/other')).error == 'backoff'
+    assert len(h.calls) == 1
+    h.now += 1
+    assert h.api.enumerate(scope(name='example/other')).complete
+
+
+@pytest.mark.parametrize('status,code', [(403, 'forbidden'), (404, 'not_found'), (429, 'rate_limited')])
+def test_cooldown_result_exposes_sanitized_retry_eta_after_restart(status, code):
+    h = Harness([response(status=status, headers={'Retry-After': '10'} if status == 429 else {})])
+    result = h.api.enumerate(scope())
+    assert result.error == code
+    assert result.retry_after_seconds == (10 if status == 429 else 3)
+    restarted = Harness([])
+    restarted.api.restore_state(h.api.export_state())
+    restarted.now += 1
+    result = restarted.api.enumerate(scope())
+    assert result.retry_after_seconds == (9 if status == 429 else 2)
+    assert not restarted.calls
+
+
+def test_denied_resource_preserves_other_scope_etags():
+    h = Harness([response(headers={'ETag': '"allowed"'}), response(status=403), response(status=304)])
+    assert h.api.enumerate(scope(name='example/allowed')).complete
+    assert h.api.enumerate(scope(name='example/denied')).error == 'forbidden'
+    assert h.api.enumerate(scope(name='example/allowed')).complete
+    assert h.calls[-1][2]['headers']['If-None-Match'] == '"allowed"'
 
 
 def test_network_failure_is_not_offline():
@@ -127,7 +209,16 @@ def test_bounded_enrichment_only_allowlist_and_busy_recent():
     r=h.api.enrich_jobs(scope(), rows, allowed_repositories=['example/widget'], recent_runner_ids={'2'})
     assert r.complete and {row['runner_id'] for row in r.rows}=={'1','2'} and len(h.calls)==2
     assert all('/repos/example/widget/actions/' in c[1] for c in h.calls)
+    assert 'status=in_progress' in h.calls[0][1]
     assert h.api.enrich_jobs(scope(),rows,allowed_repositories=['example/widget']).error=='enrichment_cooldown'
+
+
+def test_recent_only_enrichment_reads_bounded_history():
+    h=Harness([response([dict(id=11)],key='workflow_runs'),
+               response([dict(id=21,runner_id=1,status='completed',conclusion='failure')],key='jobs')])
+    result=h.api.enrich_jobs(scope(),[runner(1)],allowed_repositories=['example/widget'],recent_runner_ids={'1'})
+    assert result.complete and result.rows[0]['conclusion']=='failure'
+    assert 'status=in_progress' not in h.calls[0][1]
 
 
 def test_enrichment_no_candidates_no_calls_and_hard_budget():

@@ -1,14 +1,14 @@
 # Core mirror verification
 
-## Full-series re-verification through 0265
+## Full-series re-verification through 0291
 
 The ordered non-merge `upstream/main..origin/main` export was regenerated on
 2026-10-25 with upstream `710fa8a073` and fork `8f4c3a23cd`. All 265 entries
 were already published; matching numbered filenames, the privacy substitutions
-in 0132/0174/0230, and the merge adaptation in 0242 were preserved. No additional
+in 0132/0174/0233, and the merge adaptation in 0251 were preserved. No additional
 runtime changes or unmerged PR patches were introduced.
 
-- All 265 patches applied successfully with `git am -3` in a fresh worktree at
+- All 265 patches applied successfully with `git am -3 --empty=keep` in a fresh worktree at
   merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63` (exit 0).
 - `python3 core/check_coverage.py` passed from the mirror repository root.
 - Full-series private-denylist scan returned zero matches.
@@ -19,21 +19,21 @@ runtime changes or unmerged PR patches were introduced.
   Desktop rendering. The earlier notifier/bootstrap failures below were not
   rerun in this batch and are not claimed resolved.
 
-## Earlier verification through 0255
+## Earlier verification through 0271
 
 ## Export
 
 Full ordered non-merge `upstream/main..origin/main` series regenerated through
 `0d1cfac0651c714313ff5a0d0953ba0397864996`: 255 patches.
 Existing numbered filenames and unchanged patch content were preserved, including
-privacy substitutions in 0132, 0174 and 0230. Patch 0242 retains its existing
-merge-adapted form: the raw single-commit export conflicts with 0239/0241,
+privacy substitutions in 0132, 0174 and 0233. Patch 0251 retains its existing
+merge-adapted form: the raw single-commit export conflicts with 0248/0250,
 while the committed adaptation applies and preserves the final guard-notice behavior.
 No new runtime implementation is introduced by this mirror.
 
 ## Executed verification
 
-- All 255 patches applied successfully with `git am -3` at merge-base
+- All 255 patches applied successfully with `git am -3 --empty=keep` at merge-base
   `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63` in an isolated worktree.
 - Full patch series private-denylist scan: zero matches.
 - Canonical Python runner, serial `-j 1`, on the applied series:

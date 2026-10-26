@@ -122,7 +122,7 @@ Related to 0113 ([kanban-timed-waits.md](kanban-timed-waits.md)): 0113 sends tim
 needs a human or cron to wake the card. `kanban_continue(resume_after_seconds=N)` is the self-waking variant for waits
 the worker can time.
 
-Verified: applies with `git am -3` on top of 0001–0120 at merge-base 4957bbd0a0, Oct 17 2026 PT.
+Verified: applies with `git am -3 --empty=keep` on top of 0001–0120 at merge-base 4957bbd0a0, Oct 17 2026 PT.
 
 ## Gotchas
 

@@ -1,0 +1,121 @@
+From f2bc2c38cfbb005da310f44742b946e9a3318151 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:51:23 +0000
+Subject: [PATCH] fix(kanban): prefer exact local open receipt associations
+ [daveey]
+
+---
+ hermes_cli/kanban_session_activity.py         | 30 ++++++++++-
+ .../test_kanban_local_receipt_authority.py    | 52 +++++++++++++++++++
+ 2 files changed, 80 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_local_receipt_authority.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 41fbcaf5b1..07449b8ba6 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -414,6 +414,31 @@ def _remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str
+         conn.close()
+ 
+ 
++def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
++                                   profile: str) -> list[dict[str, Any]]:
++    """Prefer exact local open associations, without inferring receipt release.
++
++    Terminal/missing tasks and receipt-only aliases remain obligations. This is
++    display deduplication only: it never updates or deletes the durable ledger.
++    """
++    local = [r for r in rows if (r.get('gateway'), r.get('profile')) == (gateway, profile)]
++    if not local:
++        return rows
++    boards = {_board_slug(p): p for p in _board_db_paths()}
++    represented = set()
++    for row in local:
++        path = boards.get(row['board'])
++        if path is None:
++            continue
++        aliases = {row['session'], row['origin_session']}
++        # Require coverage of every receipt alias, not just a matching task id.
++        if all(any(t['id'] == row['id'] for t in _read_session_tasks(path, [sid], LISTED_STATUSES))
++               for sid in aliases):
++            represented.add((row['key'], row['session'], row['origin_session']))
++    return [row for row in rows
++            if (row['key'], row['session'], row['origin_session']) not in represented]
++
++
+ def _remote_links() -> list[dict[str, Any]]:
+     """Shared origin-ledger projection, with preserved legacy associations."""
+     from hermes_constants import get_hermes_home
+@@ -428,8 +453,9 @@ def _remote_links() -> list[dict[str, Any]]:
+     # Configured identity remains available with no replica; corrupt identity
+     # must raise, not project another gateway's receipts.
+     missing = get_hermes_home() / 'kanban' / 'absent-replica.db'
+-    rows = project(ledger, replica=replica, gateway=_gateway(replica or missing),
+-                   profile=get_active_profile_name())
++    gateway, profile = _gateway(replica or missing), get_active_profile_name()
++    rows = project(ledger, replica=replica, gateway=gateway, profile=profile)
++    rows = _without_local_open_duplicates(rows, gateway=gateway, profile=profile)
+     legacy = _legacy_remote_links()
+     # A receipt proves its original and accepted tip aliases. Other aliases
+     # require the canonical compression predicate in this origin's state DB.
+diff --git a/tests/hermes_cli/test_kanban_local_receipt_authority.py b/tests/hermes_cli/test_kanban_local_receipt_authority.py
+new file mode 100644
+index 0000000000..4584621a66
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_local_receipt_authority.py
+@@ -0,0 +1,52 @@
++"""Local associations dominate their own qualified stale receipt duplicates."""
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_origin_adapter as adapter, kanban_origin_ledger as ledger, profiles
++from tests.hermes_cli.test_kanban_session_activity import _make_board
++import hermes_constants
++
++
++@pytest.mark.parametrize('status', ['running', 'blocked', 'scheduled'])
++def test_local_open_association_dominates_stale_receipt(tmp_path, monkeypatch, status):
++    home = tmp_path
++    (home / 'kanban').mkdir()
++    (home / 'kanban/origin-ledger.db').touch()
++    board = home / 'kanban.db'
++    _make_board(board, [('t_one', status, 's_one')])
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: home)
++    monkeypatch.setattr(adapter, '_gateway', lambda _: 'origin')
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(activity, '_board_db_paths', lambda: [board])
++    monkeypatch.setattr(activity, '_legacy_remote_links', list)
++    row = dict(gateway='origin', profile='default', board='default', id='t_one',
++               key='origin/default/default/t_one', session='s_one', origin_session='s_one',
++               origin_gateway='origin', origin_profile='default', status='unknown',
++               unfinished=True, stale=True)
++    monkeypatch.setattr(ledger, 'project', lambda *args, **kwargs: [row])
++    activity._reset_cache_for_tests()
++    cards = activity.session_tasks(['s_one'])
++    assert len(cards) == 1
++    assert cards[0]['status'] == status
++    assert activity.blocked_task_counts() == ({'s_one': 1} if status == 'blocked' else {})
++    assert activity.active_task_counts() == ({} if status == 'blocked' else {'s_one': 1})
++    # A different owner profile, board, unknown owner, or receipt-only origin
++    # association is not covered by the local association above.
++    for changed in ({'profile': 'other'}, {'board': 'other'}, {'profile': None},
++                    {'session': 's_other', 'origin_session': 's_other'}):
++        row.update(changed)
++        assert activity._remote_links() == [row]
++        row.update(profile='default', board='default', session='s_one', origin_session='s_one')
++    other = {**row, 'session': 's_other', 'origin_session': 's_other'}
++    monkeypatch.setattr(ledger, 'project', lambda *args, **kwargs: [row, other])
++    assert activity._remote_links() == [other]
++    # An arbitrary terminal status is not a verified durable release.
++    import sqlite3
++    with sqlite3.connect(board) as db:
++        db.execute("UPDATE tasks SET status='done'")
++    assert activity._remote_links() == [row, other]
++    board.unlink()
++    monkeypatch.setattr(activity, '_board_db_paths', list)
++    assert activity._remote_links() == [row, other]
++    activity._reset_cache_for_tests()
+-- 
+2.55.0
+

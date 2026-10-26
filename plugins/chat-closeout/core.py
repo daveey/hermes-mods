@@ -46,19 +46,33 @@ def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 # ---- cards -----------------------------------------------------------------------------------------------------
+def card_key(card: dict[str, Any]) -> str:
+    """Retain core's owner-qualified key; local boards live in this ledger's scope."""
+    if card.get('remote') or card.get('gateway'):
+        if all(card.get(k) for k in ('gateway', 'profile', 'board', 'id')):
+            return '/'.join(str(card[k]) for k in ('gateway', 'profile', 'board', 'id'))
+        # Legacy remote keys remain remote, never fall through to a local bare ID.
+        return str(card.get('key') or f"unknown/unknown/unknown/{card['id']}")
+    return f"{card.get('board') or 'default'}/{card['id']}"
+
+
 def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dict[str, Any]]:
     """``{id: {id, status, block_kind, title, summary, completed_at, board}}`` for the ids found on any board."""
     want = sorted({str(i) for i in ids if i})
     found: dict[str, dict[str, Any]] = {}
     if not want:
         return found
-    for path in board_paths:
-        left = [i for i in want if i not in found]
+    ambiguous: set[str] = set()
+    for path in dict.fromkeys(board_paths):
+        board = Path(path).parent.name if Path(path).parent.parent.name == 'boards' else 'default'
+        left = sorted({i.split('/')[-1] for i in want
+                       if '/' not in i or (i.count('/') == 1 and i.split('/')[0] == board)})
         if not left:
-            break
+            continue
         try:
             conn = ro_connect(Path(path))
         except sqlite3.Error:
+            ambiguous.update(i for i in want if '/' not in i)
             continue
         try:
             cols = _cols(conn, "tasks")
@@ -71,13 +85,18 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dic
             ph = ",".join("?" for _ in left)
             for r in conn.execute(f"SELECT t.id, t.status, t.title, {bk} AS block_kind, {comp} AS completed_at, "
                                   f"{summary} AS summary FROM tasks t WHERE t.id IN ({ph})", left):
-                board = Path(path).parent.name if Path(path).parent.parent.name == "boards" else "default"
-                found[r["id"]] = {**dict(r), "board": board}
+                card = {**dict(r), 'board': board}
+                for key in (r['id'], card_key(card)):
+                    if key in want:
+                        if key in found:
+                            ambiguous.add(key)
+                        found[key] = card
         except sqlite3.Error as exc:
+            ambiguous.update(i for i in want if '/' not in i)
             logger.debug("chat-closeout: card read failed on %s: %s", path, exc)
         finally:
             conn.close()
-    return found
+    return {key: card for key, card in found.items() if key not in ambiguous}
 
 
 def is_settled(card: Optional[dict[str, Any]]) -> bool:
@@ -86,6 +105,13 @@ def is_settled(card: Optional[dict[str, Any]]) -> bool:
     if card is None:
         return False
     status = card.get("status")
+    if card.get('remote'):
+        if card.get('stale') is not False:
+            return False
+        if status in DONE_STATUSES:
+            return card.get('unfinished') is False and card.get('via') == 'origin' and bool(card.get('binding_id'))
+        # Remote review is unfinished agent/verification work, not a human ask.
+        return status in ('blocked', 'triage') and card.get('block_kind') in ('needs_input', 'capability')
     if status in DONE_STATUSES or status in HUMAN_STATUSES:
         return True
     if status in ("blocked", "triage"):
@@ -129,7 +155,7 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     result gets a close-out; a covered card that is done/archived leaves the batch. Returns changed fields."""
     batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
     reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
-    gone = {i for i in covered & batch if (cards.get(i) or {}).get("status") in DONE_STATUSES}
+    gone = {i for i in covered & batch if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
     out: dict[str, Any] = {}
     if reopened or gone:
         out["covered"] = (covered - reopened) - gone
@@ -138,6 +164,109 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     if gone:
         out["batch"] = batch - gone
     return out
+
+
+def pending_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:
+    """THE close-out decision, shared by the sidebar, the pre_llm_call brief, the waker and the watchdog: the key of
+    the settled-but-unreported cards, unless a close-out turn already ended for exactly that key."""
+    key = closeout_key(row, cards)
+    return key if key and key != row.get("done_sig") else None
+
+
+def _notice_matches(text: str, tid: str) -> bool:
+    """Legacy notices are local-board scoped. Never strip a remote owner to a bare id."""
+    match = re.match(r"^\s*✔\s*\[([^\]]+)\]\s+@\S+\s+Kanban\s+(\S+)\s+(done|archived)(?:\s|$)", text)
+    if not match:
+        return False
+    board, named, _ = match.groups()
+    parts = str(tid).split('/')
+    if len(parts) == 4:
+        return named == tid and board == parts[2]
+    if len(parts) == 2:
+        return board == parts[0] and named == parts[1]
+    return len(parts) == 1 and board == 'default' and named == tid
+
+
+def reconcile_done(row: dict[str, Any], cards: dict[str, dict[str, Any]],
+                   proof: Optional[Callable[[str, dict[str, Any]], bool]] = None) -> dict[str, Any]:
+    """Settle a row whose ``done_sig`` equals its current key (so nothing would ever process it) by evidence:
+
+    - (when the batch is still partly working, only the transcript proof applies, per card)
+    - a done card finished at or before ``done_at``, or ``proof(id, card)`` shows a notice for it was delivered and
+      answered after it finished: acknowledged, so it is covered (and leaves the batch);
+    - a done card finished AFTER ``done_at`` with no such proof: the stamp belongs to an earlier state (the card
+      was reopened), so ``done_sig`` is cleared and the final handoff gets its close-out;
+    - anything else (no timestamps, remote or unknown state) is left exactly as it is.
+    Returns changed fields (empty when nothing is proven)."""
+    if row.get("closing") is not None:
+        return {}  # a close-out turn is running: its own turn end settles the row
+    key = closeout_key(row, cards)
+    stamped = bool(key) and key == row.get("done_sig")
+    done_at = float(row.get("done_at") or 0)
+    covered = set(row.get("covered") or [])
+    acked: set[str] = set()
+    stale = False
+    for tid in sorted(set(row.get("batch") or [])):
+        card = cards.get(tid)
+        if not card or not is_settled(card) or card.get("status") not in DONE_STATUSES or tid in covered:
+            continue
+        at = card.get("completed_at")
+        local = at is not None and not card.get("remote")
+        if stamped and local and float(at) <= done_at:
+            acked.add(tid)
+        elif proof is not None and proof(tid, card):
+            acked.add(tid)  # evidence beats the batch state: the final notice was shown and answered
+        elif stamped and local and float(at) > done_at:
+            stale = True
+    out: dict[str, Any] = {}
+    if acked:
+        covered = set(row.get("covered") or []) | acked
+        out["covered"] = covered - acked  # acked cards are done: they leave both sets
+        out["batch"] = set(row.get("batch") or []) - acked
+    if stale:
+        out.update(done_sig=None, claim_sig=None)
+    return out
+
+
+def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: float) -> bool:
+    """An owner-exact final notice followed by a successful final assistant reply.
+
+    Missing legacy completion metadata is ambiguous, not acknowledgement. Inactive,
+    commentary, failed, interrupted and tool-calling messages cannot close work.
+    """
+    ids = [i for i in dict.fromkeys(ids) if i]
+    if not ids or not tid:
+        return False
+    for path in state_dbs:
+        try:
+            conn = ro_connect(Path(path))
+        except sqlite3.Error:
+            continue
+        try:
+            required = {'display_kind', 'finish_reason', 'tool_calls', 'active'}
+            if not required.issubset(_cols(conn, 'messages')):
+                continue
+            ph = ",".join("?" for _ in ids)
+            rows = conn.execute(f"SELECT role, content, timestamp, display_kind, finish_reason, tool_calls "
+                                f"FROM messages WHERE session_id IN ({ph}) AND active=1 "
+                                f"AND timestamp >= ? ORDER BY timestamp", (*ids, float(since))).fetchall()
+            notice_at = None
+            for r in rows:
+                text = str(r["content"] or "")
+                if r['role'] == 'user':
+                    # A different user turn breaks the causal notice/reply pair.
+                    notice_at = float(r['timestamp']) if _notice_matches(text, tid) else None
+                elif (notice_at is not None and r['role'] == 'assistant' and text.strip()
+                      and float(r['timestamp']) > notice_at
+                      and r['display_kind'] in (None, '', 'final')
+                      and r['finish_reason'] in ('stop', 'end_turn')
+                      and r['tool_calls'] in (None, '', '[]', 'null')):
+                    return True
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+    return False
 
 
 # ---- the ledger ------------------------------------------------------------------------------------------------
@@ -289,13 +418,19 @@ class Ledger:
         return {sid: have[sid] for sid in current}
 
 
-def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict]) -> dict[str, list[str]]:
+def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
+                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None) -> dict[str, list[str]]:
     """``{session_id: batch ids}`` for chats whose whole batch has settled but whose close-out turn has not run for
-    that state: the sidebar keeps them grey "waiting" until the closing answer lands."""
+    that state: the sidebar keeps them grey "waiting" until the closing answer lands. Read-only; it applies the
+    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip."""
     out: dict[str, list[str]] = {}
     for row in ledger.pending():
-        if closeout_key(row, read(row["batch"])):
-            out[row["session_id"]] = sorted(row["batch"])
+        cards = read(row["batch"])
+        sid = row["session_id"]
+        fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
+        row = {**row, **fix}
+        if row["batch"] and pending_key(row, cards):
+            out[sid] = sorted(row["batch"])
     return out
 
 
@@ -343,11 +478,14 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
         fields.update(settled_sig=key, settled_at=now)  # the watchdog's "settled since" clock
     closing = bool(observed_sig) or row.get("closing") is not None
     if closing:
-        done = key or row.get("settled_sig")  # the waker covered the batch before the turn: its key was stamped
+        # The waker covered the batch before the turn, so its key was stamped. Only trust that stamp while the whole
+        # batch is still settled: a card reopened during the turn (reviewer -> running) makes the stamp stale, and
+        # stamping it as done would hide the card's final handoff forever.
+        done = key or (row.get("settled_sig") if settled_sig(batch, cards) else None)
         if done:
             fields.update(done_sig=done, done_at=now)
         covered |= {i for i in batch if is_settled(cards.get(i))}
-        gone = {i for i in covered if (cards.get(i) or {}).get("status") in DONE_STATUSES}
+        gone = {i for i in covered if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
         batch -= gone   # reported and finished; human-blocked cards stay (covered) until they move
         covered -= gone
         fields["closing"] = None
@@ -369,8 +507,8 @@ def closeout_due(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, unsee
     """The close-out key when this chat needs a close-out turn now, else None. Rules: every batch card settled
     and at least one not reported by an earlier close-out; nobody claimed this key; its notices were handed over
     (no unseen results); the user did not type here in the last 5 min; under the per-chat hourly wake cap."""
-    key = closeout_key(row, cards)
-    if not key or key == row.get("done_sig") or key == row.get("claim_sig"):
+    key = pending_key(row, cards)
+    if not key or key == row.get("claim_sig"):
         return None
     if unseen > 0 or now - (last_user_at or 0) < USER_QUIET_S:
         return None

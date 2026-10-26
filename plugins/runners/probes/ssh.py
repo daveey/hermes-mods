@@ -16,7 +16,7 @@ No sudo, service changes or remote file/cache writes. The gateway owns the
 15-minute in-memory tool cache. Collector owns cadence and global concurrency.
 Changing mappings requires explicit re-provisioning, not runtime substitution.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import json
 import math
@@ -28,7 +28,7 @@ import subprocess
 import time
 from types import MappingProxyType
 
-from . import linux, macos
+from . import linux, macos, lifecycle
 
 TOTAL_TIMEOUT = 15
 MAX_OUTPUT = 65536
@@ -102,6 +102,7 @@ class ProbeSpec:
     services: dict
     build_volume: str
     tools: tuple = ()
+    lifecycle_sources: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.platform not in TOOLS or not isinstance(self.services, dict) or not 1 <= len(self.services) <= 32:
@@ -118,6 +119,26 @@ class ProbeSpec:
             raise ValueError('invalid_tools')
         object.__setattr__(self, 'services', MappingProxyType(dict(self.services)))
         object.__setattr__(self, 'tools', tuple(self.tools))
+        sources = self.lifecycle_sources
+        if not isinstance(sources, dict) or not set(sources) <= set(self.services) or (sources and self.platform != 'linux'):
+            raise ValueError('invalid_lifecycle_sources')
+        for source in sources.values():
+            if not isinstance(source, dict) or not set(source) <= {'intentional_drain', 'admission_unit', 'lane', 'maintenance_marker', 'headroom', 'supervisor_log', 'runner'}:
+                raise ValueError('invalid_lifecycle_source')
+            for flag in ('intentional_drain', 'headroom'):
+                if flag in source and type(source[flag]) is not bool:
+                    raise ValueError('invalid_lifecycle_flag')
+            if ('admission_unit' in source) != ('lane' in source) or ('supervisor_log' in source) != ('runner' in source):
+                raise ValueError('incomplete_lifecycle_source')
+            if 'admission_unit' in source:
+                linux.validate_service(source['admission_unit'])
+                if not isinstance(source['lane'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', source['lane']):
+                    raise ValueError('invalid_lane')
+            for key in ('maintenance_marker', 'supervisor_log'):
+                if key in source: _path(source[key])
+            if 'runner' in source and (not isinstance(source['runner'], str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', source['runner'])):
+                raise ValueError('invalid_runner')
+        object.__setattr__(self, 'lifecycle_sources', MappingProxyType({k: MappingProxyType(dict(v)) for k,v in sources.items()}))
 
 
 @dataclass(frozen=True)
@@ -175,9 +196,32 @@ def main():
         except ProbeError:
             return None
     services = {}
+    service_text = {}
     for ref, argv in SERVICE_COMMANDS.items():
         text = check(argv)
+        service_text[ref] = text
         services[ref] = service_state(text) if text is not None else 'unknown'
+    operational_evidence = {}
+    journals = {}
+    def journal(unit):
+        if unit not in journals:
+            journals[unit] = check(['/usr/bin/journalctl', '--no-pager', '-n', '1', '-o', 'json', '-u', unit])
+        return journals[unit]
+    for ref, source in LIFECYCLE_SOURCES.items():
+        rows = []
+        now = time.time()
+        if source.get('intentional_drain'):
+            rows.append(service_evidence(service_text[ref], now, intentional_drain=True))
+        if 'admission_unit' in source:
+            rows.append(admission_evidence(journal(source['admission_unit']), source['lane']))
+        if source.get('headroom'):
+            rows.append(headroom_evidence(journal(SERVICE_TARGETS[ref])))
+        if 'maintenance_marker' in source:
+            rows.append(marker_evidence(source['maintenance_marker'], now))
+        if 'supervisor_log' in source:
+            text = check(['/usr/bin/tail', '-c', '8192', '--', source['supervisor_log']])
+            rows.append(label_evidence(text, source['runner'], now))
+        operational_evidence[ref] = rows
     try:
         disk = os.statvfs(BUILD_VOLUME)
         free = disk.f_bavail * disk.f_frsize
@@ -192,7 +236,10 @@ def main():
         for name, argv in TOOL_COMMANDS.items():
             text = check(argv)
             tools[name] = text.strip()[:512] if text is not None else None
-    print(json.dumps(dict(version=1, services=services, disk_free_bytes=free, load=load, tools=tools), allow_nan=False))
+    result = dict(version=1, services=services, disk_free_bytes=free, load=load, tools=tools)
+    if LIFECYCLE_SOURCES:
+        result['operational_evidence'] = operational_evidence
+    print(json.dumps(result, allow_nan=False))
 
 if __name__ == '__main__':
     main()
@@ -203,10 +250,16 @@ def render_script(spec):
     """Return standalone source for trusted provisioning; no remote I/O."""
     adapter = linux if spec.platform == 'linux' else macos
     commands = {ref: adapter.service_command(target) for ref, target in spec.services.items()}
+    for ref, source in spec.lifecycle_sources.items():
+        if source.get('intentional_drain'):
+            commands[ref] = ['/usr/bin/systemctl', 'show', '--no-pager', '--property=LoadState,ActiveState,UnitFileState', '--', spec.services[ref]]
     return ('# Fixed runner probe. Run with trusted python3 -I.\n'
             'import json, os, re, selectors, signal, subprocess, time\n'
             'class ProbeError(RuntimeError): pass\n' + inspect.getsource(_bounded_run) + '\n'
             + inspect.getsource(adapter.service_state) + '\n'
+            + inspect.getsource(lifecycle) + '\n'
+            + 'LIFECYCLE_SOURCES = ' + repr({k:dict(v) for k,v in spec.lifecycle_sources.items()}) + '\n'
+            + 'SERVICE_TARGETS = ' + repr(dict(spec.services)) + '\n'
             + 'SERVICE_COMMANDS = ' + repr(commands) + '\n'
             + 'BUILD_VOLUME = ' + repr(spec.build_volume) + '\n'
             + 'TOOL_COMMANDS = ' + repr({t: TOOLS[spec.platform][t] for t in spec.tools}) + '\n'
@@ -216,8 +269,16 @@ def render_script(spec):
 def _decode(raw, spec, include_tools):
     try:
         data = json.loads(raw)
-        if type(data) is not dict or set(data) != {'version', 'services', 'disk_free_bytes', 'load', 'tools'} or type(data['version']) is not int or data['version'] != 1:
+        required = {'version', 'services', 'disk_free_bytes', 'load', 'tools'}
+        if type(data) is not dict or not required <= set(data) or not set(data) <= required | {'operational_evidence'} or type(data['version']) is not int or data['version'] != 1:
             raise ValueError()
+        if 'operational_evidence' in data:
+            lifecycle.validate_wire(data['operational_evidence'], spec.lifecycle_sources)
+        elif spec.lifecycle_sources:
+            # Mixed-version probes have not observed configured checks yet.
+            data['operational_evidence'] = {ref: [lifecycle.evidence(kind, source)
+                for kind, source in lifecycle.expected_sources(config)]
+                for ref, config in spec.lifecycle_sources.items()}
         if type(data['services']) is not dict or set(data['services']) != set(spec.services) or any(v not in ('running', 'stopped', 'failed', 'missing', 'unknown') for v in data['services'].values()):
             raise ValueError()
         disk = data['disk_free_bytes']

@@ -3,13 +3,13 @@
 Patches:
 
 - `patches/0212-kanban-respawn-guard-posts-comment-Inbox-card-within.patch`: a held card gets one comment + Inbox card within 30 min.
-- `patches/0223-fix-kanban-explicit-check-False-on-respawn-guard-not.patch`: explicit `check=False` on the notice subprocesses (ruff PLW1510).
-- `patches/0225-refactor-kanban-respawn-guard-hold-notice-lives-in-k.patch`: notice code moves to `kanban_db_dispatch_guard_notice.py`.
-- `patches/0238-batch-pin-utf-8-decoding-in-dispatch-guard-gh-call-5.patch`: pin utf-8 decoding of the `gh` call output.
-- `patches/0239-fix-kanban-respawn-guard-releases-active_pr-once-PRs.patch`: `active_pr` hold lifts once every named PR is merged/closed; no Inbox card; one event per hold.
-- `patches/0241-refactor-kanban-move-active_pr-step-hold-event-dedup.patch`: PR step and hold-event dedupe move into guard siblings (code-health caps).
-- `patches/0242-kanban-guard-hold-notice-file-a-fix-card-for-default.patch`: the notice files a fix card for the default assignee instead of posting to the Inbox.
-- `patches/0274-fix-kanban-release-rejected-merge-queue-PRs-to-repai.patch`: completed merge-queue rejections release repair workers, with the rejection reason quoted once on the card.
+- `patches/0225-fix-kanban-explicit-check-False-on-respawn-guard-not.patch`: explicit `check=False` on the notice subprocesses (ruff PLW1510).
+- `patches/0227-refactor-kanban-respawn-guard-hold-notice-lives-in-k.patch`: notice code moves to `kanban_db_dispatch_guard_notice.py`.
+- `patches/0241-batch-pin-utf-8-decoding-in-dispatch-guard-gh-call-5.patch`: pin utf-8 decoding of the `gh` call output.
+- `patches/0248-fix-kanban-respawn-guard-releases-active_pr-once-PRs.patch`: `active_pr` hold lifts once every named PR is merged/closed; no Inbox card; one event per hold.
+- `patches/0250-refactor-kanban-move-active_pr-step-hold-event-dedup.patch`: PR step and hold-event dedupe move into guard siblings (code-health caps).
+- `patches/0251-kanban-guard-hold-notice-file-a-fix-card-for-default.patch`: the notice files a fix card for the default assignee instead of posting to the Inbox.
+- `patches/0312-fix-kanban-release-rejected-merge-queue-PRs-to-repai.patch`: completed merge-queue rejections release repair workers, with the rejection reason quoted once on the card.
 
 Extends `kanban-park-invariants.md` and `kanban-pr-unblock.md` (the respawn guard itself).
 
@@ -20,7 +20,7 @@ Extends `kanban-park-invariants.md` and `kanban-pr-unblock.md` (the respawn guar
   sit held for hours with nothing said.
 - Once a hold has lasted past `HERMES_KANBAN_GUARD_HOLD_NOTIFY_SECONDS` (default 30 min), the dispatcher posts ONE kanban
   comment naming the guard reason and, for `active_pr`, the PR and a one-line summary of its failing checks. It also
-  files ONE fix card for the default assignee (0212 first posted an Inbox card; 0239 dropped it; 0242 replaced it with
+  files ONE fix card for the default assignee (0212 first posted an Inbox card; 0248 dropped it; 0251 replaced it with
   a Kanban card because an unread Inbox poster gets muted). The notice does not restart the hold clock: the hold cap
   still fires.
 - The `active_pr` hold lifts when EVERY named PR is MERGED, CLOSED, or OPEN with a completed queue rejection.
@@ -52,15 +52,15 @@ next lookup. `kanban_db_dispatch_pr_rejection.py` parses the newest marker and d
 - `tests/hermes_cli/conftest.py`: keeps the PR-state lookup offline by default (`gh` "fails", so `active_pr` holds).
 - `tests/hermes_cli/test_kanban_pr_rejection.py`: rejected-open dispatch, quoted reason once, newest queued marker,
   incomplete/malformed/truncated markers, exit-2 alternative, ordinary comment, merged control, and requeue without stale cache.
-- Verified for 0274: 114 passing tests across rejection, park invariants, dispatch and both review lifecycle files;
+- Verified for 0312: 114 passing tests across rejection, park invariants, dispatch and both review lifecycle files;
   rejection regression observed failing before the fix. A real OPEN rejected PR response was fetched read-only and
   its rejection reason parsed. Production dispatcher deployment remains separate from these unit/parser proofs.
 
 ## Applying
 
-`git am -3` in order 0212, 0223, 0225, 0238, 0239, 0241, 0242 (the last four assume the `*_guard_notice` module from 0225).
+`git am -3 --empty=keep` in order 0212, 0225, 0227, 0241, 0248, 0250, 0251 (the last four assume the `*_guard_notice` module from 0227).
 
-## Five whys (0274)
+## Five whys (0312)
 
 Repair stalled because `active_pr` treated an OPEN rejected PR as active. The PR stayed open because queue rejection
 ends the merge attempt, not the PR. The guard queried only GitHub lifecycle state, so it could not distinguish
@@ -71,7 +71,7 @@ quote its repair reason, and test the full dispatcher release plus queued/merged
 ## Gotchas
 
 - Needs `gh` authenticated on the dispatcher host; without it holds simply never lift early.
-- Patch 0242 was authored on a branch without 0239/0241, so the linear series would not apply it; the mirrored 0242 is the conflict-resolved form (it yields the same files as the fork's `main`).
+- Patch 0251 was authored on a branch without 0248/0250, so the linear series would not apply it; the mirrored 0251 is the conflict-resolved form (it yields the same files as the fork's `main`).
 - The fix card goes to the `default` profile; a board without that profile would drop it.
 
 ## Plugin?

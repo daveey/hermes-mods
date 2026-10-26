@@ -55,7 +55,7 @@ These are component/API unit tests, not a live multi-gateway end-to-end test.
 
 ## Applying
 
-Apply the ordered series **0001–0108** with `git am -3` from the fork/upstream merge-base in a throwaway worktree; see [README.md](README.md). Patches share sidebar, SDK and Kanban files, so 0105/0107/0108 alone are not a verified independent apply set. Rebuild Desktop to load the UI changes and enable the bundled Kanban plugin.
+Apply the ordered series **0001–0108** with `git am -3 --empty=keep` from the fork/upstream merge-base in a throwaway worktree; see [README.md](README.md). Patches share sidebar, SDK and Kanban files, so 0105/0107/0108 alone are not a verified independent apply set. Rebuild Desktop to load the UI changes and enable the bundled Kanban plugin.
 
 ## Gotchas
 

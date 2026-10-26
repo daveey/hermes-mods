@@ -37,7 +37,7 @@ Patches: 0185 (delivery + reap warning), 0186 (`kanban_unseen` stripe input).
   transcript within ~1 s and `unread=True` after, nothing duplicated over further sweeps.
 
 ## Applying
-`git am -3` patches 0185 then 0186 (0186 only touches the row stamp and renderer; 0185 stands alone).
+`git am -3 --empty=keep` patches 0185 then 0186 (0186 only touches the row stamp and renderer; 0185 stands alone).
 
 ## Gotchas
 - The sweeper only handles chats found in a local state.db (launch store, then named profiles); a chat on another

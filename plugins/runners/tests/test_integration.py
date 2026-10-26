@@ -3,10 +3,14 @@ import json
 from dataclasses import asdict
 
 
-def test_registration_skeleton_has_no_tools_or_side_effects(tmp_path, monkeypatch):
+def test_registration_has_real_tools_and_no_inventory_side_effects(tmp_path, monkeypatch):
+    from types import SimpleNamespace
     monkeypatch.setenv('HERMES_HOME',str(tmp_path))
     plugin=importlib.import_module('plugins.runners')
-    plugin.register(object())
+    tools = []
+    plugin.register(SimpleNamespace(register_tool=lambda **kw: tools.append(kw)))
+    assert {t['name'] for t in tools} == {'runners_list', 'runners_inspect', 'runners_refresh', 'runners_repair', 'runners_verify'}
+    assert all(callable(t['handler']) for t in tools)
     assert list(tmp_path.iterdir())==[]
 
 

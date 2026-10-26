@@ -34,7 +34,7 @@ No live runner repair, real Desktop click, live provider/LLM, or separate collec
 
 ## Applying
 
-Core commit 7f8355d35ed9cb1aa2f86e4edc45b55da1a6a0be is on fork main. Apply in the ordered public patch series, or update to a fork main containing it. This mirror publishes it as patch 0261 in the full ordered series. No config flag changes or plugin activation are made by this core commit.
+Core commit 7f8355d35ed9cb1aa2f86e4edc45b55da1a6a0be is on fork main. Apply in the ordered public patch series, or update to a fork main containing it. This mirror publishes it as patch 0287 in the full ordered series. No config flag changes or plugin activation are made by this core commit.
 
 ## Gotchas
 
@@ -45,3 +45,41 @@ Merged and deployed are different. Mirror verification did not restart or deploy
 ## Why not a plugin alone?
 
 The prior creation key cache was process-local, and ordinary drafts deliberately had no durable row. Only core can atomically associate a visible session and first user turn before scheduling and adopt that row into its existing turn lifecycle. Plugins still own their domain policy, repair records and frontend actions.
+
+
+## Trusted metadata and authenticated SSH ownership (0376–0377)
+
+Source commits `5c31e92ca8` and `b598614d83` are merged. The following implementation test results are the source handoff, not a live rollout claim.
+
+### Behavior
+
+Trusted in-process resolvers can return StartIntent(title=..., text=..., source='desktop', metadata={'runner_repair_id': repair_id}). Metadata defaults to empty, accepts at most 32 string pairs, and bounds keys to 1–64 characters and values to 0–1024 characters. Construction snapshots the dictionary into an immutable mapping. RPC clients still supply only profile, namespace, and start_request_id; no client prompt, metadata, identity, or destination-session fields are accepted.
+
+The durable start ledger adds metadata_json with an empty-object default. Metadata, session, first transcript row and start mapping commit atomically. lookup/status return decoded metadata, including when status follows a compressed session's current ID. Nonempty metadata participates in intent conflict detection; empty metadata preserves the previous digest so old retries remain valid.
+
+A Desktop SSH backend launched using the validated private one-shot token file binds its stable ownership directory ID to the current credential. For loopback, ungated requests with that matching credential, REST attaches request.state.session with provider='desktop-ssh' and user_id=<32 lowercase hexadecimal ownership ID>. WebSocket admission stamps the equivalent auth_identity; RPC obtains principal desktop-ssh:<ownership ID>. Rotating token or spawn nonce does not change the ownership directory identity. Ordinary local/stdio callers, malformed bootstraps, public binds, and query-token-only downloads gain no new principal. Gated OAuth authentication retains its existing identity.
+
+Resuming an existing stored session preserves its persisted owner, including a NULL owner. It does not silently assign ownership to the current SSH transport. New authenticated starts still use the transport identity.
+
+### Code
+
+- tui_gateway/session_start_requests.py: validated immutable metadata, additive ledger migration, atomic accept and metadata lookup/status.
+- tui_gateway/contracts/sessions.py and generated shared contracts: metadata result field.
+- hermes_cli/main_dashboard.py and main.py: identity source from successfully validated token-file bootstrap.
+- hermes_cli/web_server.py and web_server_chat.py: credential-bound REST/WS stamping.
+- tui_gateway/methods_session.py and server.py: preservation of persisted ownership during cold/deferred/eager/lazy resume.
+- tui_gateway/methods_session_params.py: extracted parameter helpers, explicitly published into the server namespace.
+
+### Tests
+
+Focused combined suite: 111 passing tests, including metadata migration, rollback, immutable snapshots, bounded inputs, retry compatibility/conflicts, compression; actual middleware/WS upgrade identity parity and negative auth gates; bootstrap file validation; existing start service tests; typed-contract freshness; nine persisted-owner regressions covering all four resume paths and new transport-owned starts. All 12 scripts/check gates pass.
+
+The two dashboard middleware asset-guard failures reproduce identically on the implementation base (20 passed/2 failed) and head (20 passed/2 failed); these are not counted as passing. This is not a claim of a green full Python suite. Final independent static security review found no remaining blocking findings.
+
+### Applying and gotchas
+
+Update to a containing fork main or apply the corresponding ordered public patches. Back up state.db before activating new writers. Restart only through the supported safe deployment path: an imported Python module is not upgraded by a disk-plugin reload. No active gateway should be restarted to obtain acceptance.
+
+Metadata is a start-ledger contract, not a new arbitrary session-metadata database API. Plugins must use the core owner-local lookup/status service and keep their foreign repair-to-start association. The SSH identity is an authenticated Desktop ownership slot, not a human account or globally shared fake principal; it must not be reconstructed from untrusted request fields.
+
+Actual Desktop owner-route readback and real repair-chat duplicate-click acceptance are separate rollout gates. No live chat was started by these tests.

@@ -1,0 +1,355 @@
+From c7d417e43378851e7070109f5325d36ca5ba8f42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 11:51:56 +0000
+Subject: [PATCH] feat(kanban): persist validated origin binding receipts
+ [daveey]
+
+---
+ hermes_cli/kanban_origin_ledger.py            | 165 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_origin_ledger.py | 162 +++++++++++++++++
+ 2 files changed, 327 insertions(+)
+ create mode 100644 hermes_cli/kanban_origin_ledger.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_ledger.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+new file mode 100644
+index 0000000000..c1fe05289b
+--- /dev/null
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -0,0 +1,165 @@
++"""Durable origin obligations and readback receipts, independent of the hub replica.
++
++This module owns persistence, not transport. Callers supply the authenticated
++courier sender and the origin gateway/profile from local configuration. Request
++IDs are globally unique in that courier (its create API rejects envelope reuse).
++Binding IDs are task-owner-qualified; each binding is an immutable revision,
++not an update command. A version change requires a new binding ID. Observations,
++verified release, lineage refresh and integration with projections are separate
++lifecycle operations, not implied by an accepted binding receipt.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import sqlite3
++from contextlib import contextmanager
++from pathlib import Path
++from typing import Callable
++
++
++def _json(value) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++
++
++def validate_binding(binding: dict) -> None:
++    """Reject incomplete/ambiguous identities before writing an acknowledgement."""
++    try:
++        if set(binding) != {"binding_id", "version", "owner", "origin", "task_record_key", "publication_version"}:
++            raise ValueError
++        for field in ("version", "publication_version"):
++            if type(binding[field]) is not int or binding[field] < 1:
++                raise ValueError
++        for field, keys in (("owner", {"gateway", "profile", "board", "task_id"}),
++                            ("origin", {"gateway", "profile", "session"})):
++            if set(binding[field]) != keys:
++                raise ValueError
++            for value in binding[field].values():
++                if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", value):
++                    raise ValueError
++        if not isinstance(binding["binding_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", binding["binding_id"]):
++            raise ValueError
++        owner = binding["owner"]
++        if binding["task_record_key"] != f"{owner['profile']}/{owner['board']}/{owner['task_id']}":
++            raise ValueError
++    except (KeyError, TypeError, ValueError):
++        raise ValueError("origin_binding_invalid") from None
++
++
++def binding_hash(binding: dict) -> str:
++    validate_binding(binding)
++    return hashlib.sha256(_json(binding).encode()).hexdigest()
++
++
++@contextmanager
++def _db(path: Path):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path, timeout=5)
++    try:
++        conn.execute("""CREATE TABLE IF NOT EXISTS origin_obligations (
++            binding_id TEXT PRIMARY KEY, binding_hash TEXT NOT NULL,
++            binding_json TEXT NOT NULL, resolved_session TEXT NOT NULL,
++            task_json TEXT NOT NULL, observation_version INTEGER NOT NULL,
++            released INTEGER NOT NULL DEFAULT 0)""")
++        conn.execute("""CREATE TABLE IF NOT EXISTS origin_receipts (
++            request_id TEXT PRIMARY KEY NOT NULL, binding_hash TEXT NOT NULL,
++            receipt_json TEXT NOT NULL)""")
++        conn.commit()
++        yield conn
++    finally:
++        conn.close()
++
++
++def _binding_key(binding: dict) -> str:
++    # IDs belong to the task owner, not to a global unqualified namespace.
++    return _json([binding["owner"], binding["binding_id"]])
++
++
++def _read_receipt(conn: sqlite3.Connection, request_id: str) -> dict | None:
++    row = conn.execute("SELECT receipt_json FROM origin_receipts WHERE request_id=?", (request_id,)).fetchone()
++    if not row:
++        return None
++    ack = json.loads(row[0])
++    obligation = conn.execute("SELECT binding_hash FROM origin_obligations WHERE binding_id=?", (_binding_key(ack),)).fetchone()
++    if not obligation or obligation[0] != ack["binding_hash"]:
++        raise ValueError("origin_obligation_missing")
++    return ack
++
++
++def receipt(path: Path, request_id: str) -> dict | None:
++    with _db(path) as conn:
++        return _read_receipt(conn, request_id)
++
++
++def obligations(path: Path, *, gateway: str, profile: str, sessions: list[str]) -> list[dict]:
++    result = []
++    with _db(path) as conn:
++        for raw, resolved, task, version, released in conn.execute(
++                "SELECT binding_json,resolved_session,task_json,observation_version,released FROM origin_obligations"):
++            binding = json.loads(raw)
++            origin = binding["origin"]
++            if (origin["gateway"] == gateway and origin["profile"] == profile
++                    and (origin["session"] in sessions or resolved in sessions)):
++                result.append({**binding, "resolved_session": resolved, "task": json.loads(task),
++                               "observation_version": version, "unfinished": not bool(released)})
++    return result
++
++
++def accept_binding(*, path: Path, replica: Path, binding: dict, request_id: str,
++                   sender: str, gateway: str, profile: str,
++                   resolve_session: Callable[[str], str]) -> dict:
++    if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", request_id):
++        raise ValueError("origin_request_invalid")
++    digest = binding_hash(binding)
++    if (sender != f"gw:{binding['owner']['gateway']}"
++            or gateway != binding['origin']['gateway'] or profile != binding['origin']['profile']):
++        raise ValueError("origin_route_mismatch")
++    prior = receipt(path, request_id)
++    if prior:
++        if prior["binding_hash"] != digest:
++            raise ValueError("origin_binding_conflict")
++        return prior
++    if not replica.is_file():
++        return {"status": "pending", "code": "origin_publication_pending"}
++    from hermes_cli.kanban_origin import _ro
++    db = _ro(replica)
++    try:
++        row = db.execute("SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
++                         (binding["owner"]["gateway"], binding["task_record_key"])).fetchone()
++    finally:
++        db.close()
++    if not row or row[0] < binding["publication_version"]:
++        return {"status": "pending", "code": "origin_publication_pending"}
++    task = json.loads(row[1])
++    owner = binding["owner"]
++    if any(task.get(field) != owner[field] for field in ("gateway", "profile", "board")) or task.get("id") != owner["task_id"]:
++        raise ValueError("origin_publication_mismatch")
++    if binding not in task.get("origin_bindings", []):
++        return {"status": "pending", "code": "origin_publication_pending"}
++    resolved = resolve_session(binding["origin"]["session"])
++    if not isinstance(resolved, str) or not resolved:
++        raise ValueError("origin_session_missing")
++    ack = {"status": "accepted", "request_id": request_id, "binding_id": binding["binding_id"],
++           "binding_hash": digest, "origin": binding["origin"], "owner": binding["owner"],
++           "resolved_session": resolved, "publication_version": row[0]}
++    with _db(path) as conn, conn:
++        conn.execute("BEGIN IMMEDIATE")
++        existing = _read_receipt(conn, request_id)
++        if existing:
++            if existing["binding_hash"] != digest:
++                raise ValueError("origin_binding_conflict")
++            return existing
++        existing = conn.execute("SELECT binding_hash,resolved_session,observation_version FROM origin_obligations WHERE binding_id=?", (_binding_key(binding),)).fetchone()
++        if existing:
++            if existing[0] != digest:
++                raise ValueError("origin_binding_conflict")
++            # An immutable binding retry acknowledges what is actually durable,
++            # not a newer resolution that this transaction did not store.
++            ack["resolved_session"], ack["publication_version"] = existing[1], existing[2]
++        conn.execute("INSERT INTO origin_obligations (binding_id,binding_hash,binding_json,resolved_session,task_json,observation_version) VALUES (?,?,?,?,?,?) ON CONFLICT(binding_id) DO NOTHING",
++                     (_binding_key(binding), digest, _json(binding), resolved, _json(task), row[0]))
++        conn.execute("INSERT INTO origin_receipts VALUES (?,?,?)", (request_id, digest, _json(ack)))
++    readback = receipt(path, request_id)
++    assert readback is not None
++    return readback
+diff --git a/tests/hermes_cli/test_kanban_origin_ledger.py b/tests/hermes_cli/test_kanban_origin_ledger.py
+new file mode 100644
+index 0000000000..51b0436a6a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_ledger.py
+@@ -0,0 +1,162 @@
++"""The origin acknowledges a durable obligation, never a replaceable replica."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_origin_ledger as ledger
++
++
++@pytest.fixture
++def world(tmp_path):
++    replica = tmp_path / "hub.db"
++    with sqlite3.connect(replica) as db:
++        db.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, data TEXT)")
++    binding = {
++        "binding_id": "binding-0001", "version": 1,
++        "owner": {"gateway": "owner", "profile": "work", "board": "build", "task_id": "t_one"},
++        "origin": {"gateway": "origin", "profile": "default", "session": "s_old"},
++        "task_record_key": "work/build/t_one", "publication_version": 3,
++    }
++    return tmp_path / "origin-work.db", replica, binding
++
++
++def publish(replica, binding, **changes):
++    task = {**binding["owner"], "id": binding["owner"]["task_id"], "status": "running",
++            "origin_bindings": [binding], **changes}
++    with sqlite3.connect(replica) as db:
++        db.execute("DELETE FROM replica")
++        db.execute("INSERT INTO replica VALUES (?, 'tasks', ?, ?, ?)",
++                   (binding["owner"]["gateway"], binding["task_record_key"], 3, json.dumps(task)))
++
++
++def accept(world, **changes):
++    path, replica, binding = world
++    args = dict(path=path, replica=replica, binding=binding, request_id="request-0001",
++                sender="gw:owner", gateway="origin", profile="default",
++                resolve_session=lambda sid: "s_current")
++    args.update(changes)
++    return ledger.accept_binding(**args)
++
++
++@pytest.mark.parametrize("change", [
++    {"sender": "gw:impostor"}, {"gateway": "elsewhere"}, {"profile": "work"},
++])
++def test_wrong_authenticated_route_cannot_accept_or_replay(world, change):
++    path, replica, binding = world
++    publish(replica, binding)
++    with pytest.raises(ValueError, match="origin_route_mismatch"):
++        accept(world, **change)
++    assert ledger.receipt(path, "request-0001") is None
++    accept(world)
++    with pytest.raises(ValueError, match="origin_route_mismatch"):
++        accept(world, **change)
++
++
++@pytest.mark.parametrize("field,value", [
++    ("version", 0), ("version", True), ("publication_version", -1),
++    ("publication_version", "3"), ("binding_id", ""),
++    ("task_record_key", "default/build/t_one"),
++    ("owner", {"gateway": "owner", "board": "build", "task_id": "t_one"}),
++    ("origin", {"gateway": "origin", "profile": "../work", "session": "s_old"}),
++])
++def test_invalid_binding_is_rejected_before_storage(world, field, value):
++    from copy import deepcopy
++    binding = deepcopy(world[2])
++    binding[field] = value
++    publish(world[1], binding)
++    with pytest.raises(ValueError, match="origin_binding_invalid"):
++        accept(world, binding=binding)
++    assert not world[0].exists()
++
++
++def test_replay_conflict_and_concurrent_accept_are_atomic(world):
++    from concurrent.futures import ThreadPoolExecutor
++    from copy import deepcopy
++    path, replica, binding = world
++    publish(replica, binding)
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        replies = list(pool.map(lambda _: accept(world), range(8)))
++    assert all(r == replies[0] for r in replies)
++    altered = deepcopy(binding)
++    altered["origin"]["session"] = "s_other"
++    with pytest.raises(ValueError, match="origin_binding_conflict"):
++        accept(world, binding=altered)
++    # New request ID for the same binding is idempotent, not a duplicate obligation.
++    assert accept(world, request_id="request-0002")["binding_hash"] == replies[0]["binding_hash"]
++    altered["binding_id"] = binding["binding_id"]
++    publish(replica, altered)
++    with pytest.raises(ValueError, match="origin_binding_conflict"):
++        accept(world, binding=altered, request_id="request-0003")
++    assert ledger.receipt(path, "request-0003") is None
++    assert len(ledger.obligations(path, gateway="origin", profile="default", sessions=["s_old"])) == 1
++
++
++def test_receipt_cannot_outlive_its_obligation(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    with sqlite3.connect(path) as db:
++        db.execute("DELETE FROM origin_obligations")
++    with pytest.raises(ValueError, match="origin_obligation_missing"):
++        accept(world)
++
++
++@pytest.mark.parametrize("change", [{"profile": "other"}, {"id": "t_other"}, {"board": "other"}])
++def test_exact_task_identity_must_match_even_with_binding_marker(world, change):
++    publish(world[1], world[2], **change)
++    with pytest.raises(ValueError, match="origin_publication_mismatch"):
++        accept(world)
++    assert ledger.receipt(world[0], "request-0001") is None
++
++
++def test_missing_session_has_no_receipt(world):
++    publish(world[1], world[2])
++    with pytest.raises(ValueError, match="origin_session_missing"):
++        accept(world, resolve_session=lambda sid: None)
++    assert ledger.receipt(world[0], "request-0001") is None
++
++
++@pytest.mark.parametrize("request_id", [None, "", 123, "x" * 129])
++def test_bad_request_id_cannot_write(world, request_id):
++    publish(world[1], world[2])
++    with pytest.raises(ValueError, match="origin_request_invalid"):
++        accept(world, request_id=request_id)
++    assert not world[0].exists()
++
++
++def test_duplicate_binding_receipt_describes_persisted_projection(world):
++    publish(world[1], world[2])
++    first = accept(world)
++    second = accept(world, request_id="request-0002", resolve_session=lambda sid: "s_new")
++    assert second["resolved_session"] == first["resolved_session"]
++    assert len(ledger.obligations(world[0], gateway="origin", profile="default",
++                                  sessions=[second["resolved_session"]])) == 1
++
++
++def test_different_owners_can_reuse_binding_id(world):
++    from copy import deepcopy
++    publish(world[1], world[2])
++    accept(world)
++    other = deepcopy(world[2])
++    other["owner"]["gateway"] = "other"
++    publish(world[1], other)
++    accept(world, binding=other, sender="gw:other", request_id="request-0002")
++    assert len(ledger.obligations(world[0], gateway="origin", profile="default", sessions=["s_old"])) == 2
++
++
++def test_receipt_requires_publication_and_survives_replica_loss(world):
++    path, replica, binding = world
++    assert accept(world) == {"status": "pending", "code": "origin_publication_pending"}
++    publish(replica, binding)
++    receipt = accept(world)
++    assert receipt["status"] == "accepted"
++    assert receipt["binding_hash"] == ledger.binding_hash(binding)
++    replica.unlink()
++    # A different invocation/process reads durable acknowledgement and obligation.
++    assert accept(world) == receipt
++    rows = ledger.obligations(path, gateway="origin", profile="default", sessions=["s_current"])
++    assert len(rows) == 1
++    assert rows[0]["owner"] == binding["owner"]
++    assert rows[0]["unfinished"] is True
++    assert ledger.receipt(path, "request-0001") == receipt
+-- 
+2.55.0
+

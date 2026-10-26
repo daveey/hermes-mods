@@ -15,6 +15,7 @@ import uuid
 
 from .health import Sample, advance, Checks, Policy, disk_state
 from .models import validate
+from .probes.lifecycle import valid_timestamp
 
 
 def ident(prefix='obj'):
@@ -49,11 +50,53 @@ class OwnerLock(AbstractContextManager):
             self.fd = None
 
 
-def readiness(config, row, host_results, now):
+def operational_evidence(config, row, host_results, now, *, snapshot_current=True):
+    """Project only the verified service's evidence, never host-wide guesses.
+
+    Journal observation times belong to the source record, not the SSH poll.
+    Historical label events cannot assert a present hold, even if read today.
+    """
+    binding = next((b for b in config['bindings']
+                    if b['runner_id'] == row['id'] and b['host_id'] == row.get('host_id')), None)
+    if binding is None:
+        return []
+    host = host_results.get(binding['host_id'], {})
+    facts = host.get('facts', {})
+    ttl = config['thresholds']['host_stale_seconds']
+    host_at = host.get('at')
+    current = (valid_timestamp(host_at, ttl) and valid_timestamp(now)
+               and 0 <= now-host_at < ttl and snapshot_current)
+    rows = []
+    for item in facts.get('operational_evidence', {}).get(binding['service_ref'], []):
+        at = item['observed_at']
+        historical = item['kind'] == 'label_withdrawn'
+        recorded = item['recorded_at']
+        valid = ((at is None or valid_timestamp(at, 0 if historical else ttl))
+                 and (recorded is None or valid_timestamp(recorded)))
+        if not valid:
+            at = recorded = None
+        if historical:
+            freshness = 'unknown'
+        elif host.get('management') != 'reachable':
+            freshness = 'unavailable'
+        elif at is None:
+            freshness = 'unknown'
+        else:
+            freshness = 'fresh' if (current and 0 <= now-at < ttl
+                                    and (recorded is None or recorded <= now)) else 'stale'
+        rows.append(dict(kind=item['kind'], source=item['source'],
+                         state='unknown' if historical or not valid else item['state'], freshness=freshness,
+                         observed_at=iso(at) if at is not None else None,
+                         expires_at=iso(at+ttl) if at is not None and not historical else None,
+                         recorded_at=iso(recorded) if recorded is not None else None))
+    return rows
+
+
+def readiness(config, row, host_results, now, *, snapshot_current=True):
     """Only persisted authenticated host links may consume host evidence."""
     evidence=host_results.get(row.get('host_id'), {})
     binding=next((b for b in config['bindings'] if b['runner_id']==row['id'] and b['host_id']==row.get('host_id')),None)
-    if not binding or not evidence or evidence['management']!='reachable':
+    if not snapshot_current or not binding or not evidence or evidence['management']!='reachable':
         return Checks(), 'not_checked'
     at=evidence['at']; ttl=config['thresholds']['host_stale_seconds']
     if not 0<=now-at<=ttl:
@@ -66,9 +109,58 @@ def readiness(config, row, host_results, now):
     tools_at=facts.get('tools_observed_at',at)
     for tool,value in facts.get('tools',{}).items():
         statuses['tool:'+tool]=('pass' if value else 'fail') if tools_at is not None and 0<=now-tools_at<=900 else 'not_checked'
+    for item in operational_evidence(config, row, host_results, now):
+        if item['kind'] == 'label_withdrawn':
+            continue
+        # Unknown/expired configured checks cannot silently become clear.
+        key = 'operational:' + item['kind'] + ':' + item['source']
+        statuses[key] = ('fail' if item['state'] == 'held' else
+                         'pass' if item['state'] == 'clear' else 'not_checked') if item['freshness'] == 'fresh' else 'not_checked'
     checks=Checks(at=at,required=tuple(statuses),passed=tuple(k for k,v in statuses.items() if v=='pass'),failed=tuple(k for k,v in statuses.items() if v=='fail'),warned=tuple(k for k,v in statuses.items() if v=='warn'))
     state='fail' if checks.failed else ('warn' if checks.warned else ('pass' if set(checks.required)<=set(checks.passed) else 'not_checked'))
     return checks,state
+
+
+def readiness_evidence(config, row, host_results, now, checks, *, snapshot_current=True):
+    """Expose computed check causes without making another observation.
+
+    A drained/systemd held fact is emitted only by service_evidence after
+    proving configured intentional drain with loaded+disabled+inactive state.
+    Pair it with stopped (never failed/missing) for the exact bound service.
+    """
+    binding = next((b for b in config['bindings']
+                    if b['runner_id'] == row['id'] and b['host_id'] == row.get('host_id')), None)
+    if binding is None:
+        return None
+    host = host_results.get(binding['host_id'], {})
+    at = host.get('at')
+    ttl = config['thresholds']['host_stale_seconds']
+    if not valid_timestamp(at, ttl):
+        at = None
+    if not host or at is None:
+        freshness = 'unknown'
+    elif host.get('management') != 'reachable':
+        freshness = 'unavailable'
+    else:
+        freshness = 'fresh' if snapshot_current and 0 <= now-at < ttl else 'stale'
+    explained = []
+    if freshness == 'fresh':
+        for item in operational_evidence(config, row, host_results, now):
+            if item['state'] != 'held' or item['freshness'] != 'fresh':
+                continue
+            key = 'operational:' + item['kind'] + ':' + item['source']
+            if key not in checks.failed:
+                continue
+            explained.append(key)
+            if (item['kind'], item['source']) == ('drained', 'systemd'):
+                service = host.get('facts', {}).get('services', {}).get(binding['service_ref'])
+                if service == 'stopped' and 'service' in checks.failed:
+                    explained.append('service')
+    return dict(required=list(checks.required), passed=list(checks.passed),
+                failed=list(checks.failed), warned=list(checks.warned),
+                hold_explained_failures=[key for key in checks.failed if key in explained],
+                observed_at=iso(at) if at is not None else None,
+                expires_at=iso(at+ttl) if at is not None else None, freshness=freshness)
 
 
 def initialize(store):
@@ -82,8 +174,10 @@ def initialize(store):
 class Collector:
     def __init__(self, store, config, adapter, *, clock=time.time, host_probe=None,
                  max_scopes=16, tick_budget=20, monotonic=time.monotonic,
-                 job_repositories=None, max_job_scopes=2):
+                 job_repositories=None, max_job_scopes=2, repair_service=None):
         self.store, self.config, self.adapter, self.clock = store, config, adapter, clock
+        self.repair_service = repair_service
+        self._repair_checked_at = None
         if type(max_scopes) is not int or max_scopes < 1 or tick_budget <= 0:
             raise ValueError('invalid_collection_budget')
         self.max_scopes, self.tick_budget, self.monotonic = max_scopes, tick_budget, monotonic
@@ -103,8 +197,16 @@ class Collector:
         cached = store.connection.execute("SELECT payload FROM collector_cache WHERE key='snapshot'").fetchone()
         if cached:
             cached = json.loads(cached[0])
-            if cached.get('owner') not in (None, self.owner()):
-                raise RuntimeError('owner_conflict')
+            prior, owner = cached.get('owner'), self.owner()
+            if prior is not None and prior != owner:
+                # A newer CAS config revision for the same owner/epoch is a
+                # normal config edit: drop the old-revision observations and
+                # recollect. Foreign owners, epochs or older revisions refuse.
+                same = all(prior.get(k) == owner[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch'))
+                rev = prior.get('config_revision')
+                if not (same and type(rev) is int and rev < owner['config_revision']):
+                    raise RuntimeError('owner_conflict')
+                cached = {}
             self.host_results = cached.get('host_results', {})
             self.scope_results = cached.get('scope_results', {})
             self.refresh_progress = cached.get('refresh_progress', {})
@@ -144,7 +246,8 @@ class Collector:
         due = [h for h in self.config['hosts'] if h['id'] in force or now-self.host_results.get(h['id'], {}).get('at', -1e20)>=60]
         def collect(host):
             try:
-                facts=self.host_probe(host)
+                fresh_probe = getattr(self.host_probe, 'refresh', self.host_probe)
+                facts=(fresh_probe if host['id'] in force else self.host_probe)(host)
                 return host['id'], dict(at=self.clock(),management='reachable',facts=facts)
             except Exception:
                 return host['id'], dict(at=self.clock(),management='unreachable',facts={})
@@ -153,12 +256,21 @@ class Collector:
         return {h['id'] for h in due}
 
     def tick(self):
+        # Independent status-only lane: no provider I/O or runtime dispatch is
+        # required to reconcile a repair. Never infer completion from absence.
+        if (self.config['features']['observe'] and
+                self.config['features'].get('repair_sessions') and
+                self.repair_service is not None):
+            now = self.monotonic()
+            if self._repair_checked_at is None or now - self._repair_checked_at >= 30:
+                self.repair_service.reconcile_all()
+                self._repair_checked_at = now
         # A failed commit must not advance the in-memory scheduler or refresh
         # progress. Provider request budgets deliberately are NOT rolled back:
         # those requests happened even when persistence failed.
         previous = deepcopy((self.host_results, self.scope_results, self.refresh_progress, self.job_results, self.next_scope_lane))
         try:
-            return self._tick()
+            snapshot = self._tick()
         except BaseException:
             self.host_results, self.scope_results, self.refresh_progress, self.job_results, self.next_scope_lane = previous
             raise
@@ -167,6 +279,9 @@ class Collector:
             # failed. This does not persist credentials or ETag response caches.
             if hasattr(self.adapter, 'export_state') and not hasattr(self.adapter, 'state_sink'):
                 self._save_budget(self.adapter.export_state())
+        if self.repair_service is not None:
+            self.repair_service.reconcile_verifications()
+        return snapshot
 
     def _tick(self):
         if not self.config['features']['observe']:
@@ -179,6 +294,12 @@ class Collector:
             claimed = list(self.store.connection.execute("SELECT id,targets,created,state FROM collector_refresh WHERE state IN ('pending','running') ORDER BY created"))
             self.store.connection.executemany("UPDATE collector_refresh SET state='running' WHERE id=?", ((r[0],) for r in claimed))
         wanted, forced_hosts = set(), set()
+        if self.repair_service is not None:
+            targets = self.repair_service.verification_targets()
+            if targets:
+                ss, hh = self._targets(targets)
+                wanted.update(ss)
+                forced_hosts.update(hh)
         for key, targets, created, status in claimed:
             ss, hh = self._targets(json.loads(targets))
             progress=self.refresh_progress.get(key,{'scopes':[],'hosts':[]})
@@ -257,6 +378,10 @@ class Collector:
                       if row['scope_id'] == scope['id'] and row['activity'] == 'busy']
             jobs = self.adapter.enrich_jobs(scope, inventory.rows,
                 allowed_repositories=self.job_repositories[scope['id']], recent_runner_ids=recent)
+            # A cooldown is no new observation. Preserve original timestamps;
+            # do not replace useful evidence with an empty advisory result.
+            if jobs.error == 'enrichment_cooldown':
+                continue
             self.job_results[scope['id']] = dict(rows=list(jobs.rows), complete=jobs.complete,
                 error=jobs.error, observed_at=jobs.observed_at)
         probed=self._hosts(now, forced_hosts)
@@ -294,11 +419,14 @@ class Collector:
                     provenance=dict(source_id=sid, collection_id=cycle,
                                     observed_at=iso(result.observed_at), expires_at=iso(result.observed_at+ttl),
                                     state='fresh' if result.complete else 'unavailable', observation_ids=[]),
-                    error=result.error, complete=result.complete, observed_at=result.observed_at)
+                    error=result.error, retry_after_seconds=result.retry_after_seconds,
+                    complete=result.complete, observed_at=result.observed_at)
                 seen = set()
                 # Incomplete page sets cannot replace last-known evidence.
                 for row in result.rows if result.complete else ():
                     row = deepcopy(row)
+                    row.pop('readiness_evidence', None)
+                    row.pop('operational_evidence', None)
                     previous = identities.get((sid, row['provider_runner_id']))
                     row['host_id'] = None
                     if previous:
@@ -339,13 +467,25 @@ class Collector:
                 provenance.append(p)
                 complete &= saved['complete'] and fresh
                 if saved['error']:
-                    errors.append(dict(source_id=sid,code=saved['error'],retry_after_seconds=None,observed_at=iso(saved['attempted_at'])))
+                    errors.append(dict(source_id=sid,code=saved['error'],retry_after_seconds=saved.get('retry_after_seconds'),observed_at=iso(saved['attempted_at'])))
             rows = self.store.list('Runner')
+            # An investigation context is not a failure assertion. Persist its
+            # identity once so repeated clicks/reloads share the same context,
+            # including online or readiness-unverified registrations.
+            contexts = {i['entity_id']: i for i in self.store.list('Incident')
+                        if i['dimension'] == 'investigation' and not i['resolved_at']}
+            for entity_id in [r['id'] for r in rows] + [h['resource_id'] for h in self.config['hosts']]:
+                context = contexts.get(entity_id) or dict(id=ident('incident'),
+                    entity_id=entity_id, dimension='investigation', opened_at=iso(now),
+                    last_seen=iso(now), resolved_at=None, transitions=[])
+                context['last_seen'] = iso(now)
+                self.store.put('Incident', context, at=now)
             snapshot = dict(at=now, owner=self.owner(), scope_results=deepcopy(self.scope_results),
                             collection=dict(id=cycle,state='complete' if complete else 'partial',target_ids=[]),
                             host_results=deepcopy(self.host_results),
                             next_scope_lane=self.next_scope_lane,
-                            job_results=deepcopy(self.job_results),
+                            job_results={sid:dict(deepcopy(result), rows=[deepcopy(row) for row in result['rows'] if row['repository'] in self.job_repositories[sid]]) for sid,result in self.job_results.items() if self.job_repositories.get(sid)},
+                            job_monitoring_scopes=sorted(sid for sid,repos in self.job_repositories.items() if repos),
                             coverage=coverage, provenance=provenance, source_errors=errors,
                             runners=rows, states={r['id']:asdict(self.store.load_health(r['id'])) for r in rows})
             for key, targets, created, status in claimed:

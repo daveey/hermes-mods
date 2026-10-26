@@ -19,6 +19,47 @@ def seed_log(gate, sid, entry):
 
 
 # ---- detector -------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("text", [
+    "I couldn't restart it here, so it needs a manual nudge on the Kanban board to verify and close.",
+    "Decision for you:\n1. Approve that read-only lookup or give me the address.\n2. Should the project get a private repo?",
+])
+def test_week_1019_missed_handoff_shapes(gate, text):
+    assert gate.core.find_asks(text)
+
+
+def test_week_1019_decision_heading_keeps_both_steps(gate):
+    asks = gate.core.find_asks("Decision for you:\n1. Approve the lookup.\n2. Pick a repository name.")
+    assert len(asks) == 2
+
+
+@pytest.mark.parametrize("text", [
+    "None of them need you.", "None of the cards need you.",
+    "The motor needs a manual restart.",
+    "I will nudge the card on the board myself.",
+])
+def test_week_1019_non_handoffs(gate, text):
+    assert gate.core.find_asks(text) == []
+
+
+@pytest.mark.parametrize("text", [
+    "None of the cards need you, but please approve the separate production restart.",
+    "Please approve the restart; none of the tasks need you.",
+    "None of them need you, and can you confirm the separate change?",
+    "None of the tasks need you; please open the separate approval page.",
+])
+def test_week_1019_negative_status_preserves_independent_ask(gate, text):
+    assert gate.core.find_asks(text) == [text]
+
+
+@pytest.mark.parametrize("text", [
+    "None of the cards need you, and I will continue the deployment.",
+    "The work is proceeding; none of them need you.",
+    "None of the tasks need you for this release.",
+])
+def test_week_1019_negative_status_with_narration(gate, text):
+    assert gate.core.find_asks(text) == []
+
+
 @pytest.mark.parametrize("key", ["I0", "I1_I2", "I3", "I4"])
 def test_incident_replies_contain_asks(gate, key):
     assert gate.core.find_asks(FIX[key]["reply"]), key

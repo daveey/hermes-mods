@@ -1,6 +1,6 @@
 # Preserve Git-bearing Kanban scratch workspaces
 
-Patch: 0267. Fork commit: `20358a17bdec17ed5692d9be0f4b99b60c3c4ddf`.
+Patch: 0294. Fork commit: `20358a17bdec17ed5692d9be0f4b99b60c3c4ddf`.
 
 ## Behavior
 
@@ -26,7 +26,7 @@ Executed with the canonical `scripts/run_tests.sh` and a PM-provisioned test int
 - Broader scratch/database/retention suite: 98 passed, 1 platform skip.
 - An additional existing worktree teardown test encountered the real-home Git metadata guard in its bootstrap; not counted as passing or bypassed.
 - Bootstrapped public plugin `tests/runtime_fixture.py`: normal plugin discovery and registered callback, actual core tool success/rejection, all four worktree states, real Linux process scan, post-success safe removal. This is candidate-runtime verification, not proof an existing backend reloaded.
-- Full public mirror 0001–0267 applied with `git am -3` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`. Existing merge-adapted 0242 retained as documented in `mirror-verification.md`.
+- Full public mirror 0001–0294 applied with `git am -3 --empty=keep` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`. Existing merge-adapted 0251 retained as documented in `mirror-verification.md`.
 
 ## Applying
 

@@ -138,7 +138,7 @@ Order: `0040 → 0041 → 0045 → 0046 → 0047`.
 - 0045 extends `owner-follow.ts` from 0041. 0046 uses `repointSessionTileOwner` and `routedConnectionId` from 0045.
   0047 extends 0041's test file.
 
-Checked with `git am -3` on the fork's merge-base with upstream: `0023 0040 0041 0045 0046 0047` apply cleanly, and so
+Checked with `git am -3 --empty=keep` on the fork's merge-base with upstream: `0023 0040 0041 0045 0046 0047` apply cleanly, and so
 does the full series `0001`–`0047` in order. Without 0023, 0041 fails.
 
 Rebuild Desktop after applying (`hermes desktop --build-only --force-build`), and restart each gateway for 0040.

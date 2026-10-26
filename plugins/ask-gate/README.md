@@ -110,6 +110,10 @@ profiles whose scheduled reports go to the user, and L2 judges those like a chat
 
 ## Ask shapes (what `find_asks` catches)
 
+The weekly regression cases also cover indirect "needs a manual nudge on the Kanban board"
+handoffs and each numbered item under "Decision for you:". Explicit "None of them need you"
+status reports are not asks. These are detection rules, not permission to bypass approval gates.
+
 Beyond "Want me to...?" and "Needs you:": (a) an imperative to the reader: `please <verb>` always, and a bare leading verb only as a fallback/conditional
 step ("In that case, check ...") or a chain of steps; plain imperatives that merely mention "you" are not asks (they
 held 4.2% of replies). A line/sentence that starts

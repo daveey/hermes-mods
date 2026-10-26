@@ -1,0 +1,504 @@
+From b9b85d100959764b4d45cf584f52880e840c97df Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:21:21 +0000
+Subject: [PATCH] feat(kanban): preserve existing task state during origin
+ adoption [daveey]
+
+---
+ hermes_cli/kanban.py                          |   4 +-
+ hermes_cli/kanban_origin_creation.py          |  59 ++++++++
+ hermes_cli/kanban_origin_owner.py             |  29 +++-
+ hermes_cli/kanban_parser.py                   |   4 +
+ .../hermes_cli/test_kanban_origin_adoption.py | 139 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_origin_owner.py  |  74 +++++++++-
+ tools/kanban_tools.py                         |  29 +++-
+ tools/kanban_tools_schemas.py                 |  10 ++
+ 8 files changed, 338 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_adoption.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 67b736e6c9..d02d664eef 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -161,7 +161,7 @@ def kanban_command(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_origin_adapter import command
+         return command(args)
+ 
+-    if action == "origin-create":
++    if action in {"origin-create", "origin-adopt"}:
+         from hermes_cli.kanban_origin_owner import command
+         return command(args)
+ 
+@@ -234,7 +234,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review",
+-    "gc", "origin-bind", "origin-create",
++    "gc", "origin-bind", "origin-create", "origin-adopt",
+ })
+ 
+ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 78eedbd41d..1b2d55dd9f 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -67,3 +67,62 @@ def create_with_origin(conn, intent: dict, options: dict) -> str:
+         conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)",
+                      (intent["request_id"], immutable, task_id, _json(marker), "origin-bind-" + secrets.token_hex(16)))
+         return task_id
++
++
++def adopt_with_origin(conn, intent: dict, *, board: str) -> str:
++    """Attach a receipt intent to an exact existing card, never mutate its state.
++
++    The trusted owner adapter checks the effective gateway/profile/database.
++    This transaction verifies board/task identity and freezes the operation for
++    retries. Publication and origin acknowledgement remain separate gates.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_origin_ledger import validate_binding
++
++    try:
++        if not isinstance(intent, dict) or set(intent) != {"request_id", "owner", "origin"}:
++            raise ValueError
++        if not isinstance(intent["request_id"], str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", intent["request_id"]):
++            raise ValueError
++        owner = intent["owner"]
++        marker = {"binding_id": "validation", "version": 1,
++                  "owner": owner, "origin": intent["origin"],
++                  "task_record_key": f"{owner['profile']}/{owner['board']}/{owner['task_id']}"}
++        validate_binding({**marker, "publication_version": 1})
++        if owner["board"] != board:
++            raise ValueError
++    except (KeyError, TypeError, ValueError):
++        raise OriginError("origin_adoption_invalid", "invalid owner/origin adoption intent") from None
++
++    immutable = _json({"operation": "adopt", "intent": intent})
++    task_id = owner["task_id"]
++    with kb.write_txn(conn, allow_nested=True):
++        if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
++            raise OriginError("origin_task_missing", "exact owner task does not exist")
++        conn.execute("""CREATE TABLE IF NOT EXISTS origin_creation_intents (
++            request_id TEXT PRIMARY KEY NOT NULL,
++            intent_json TEXT NOT NULL,
++            task_id TEXT NOT NULL REFERENCES tasks(id),
++            binding_json TEXT NOT NULL,
++            child_request_id TEXT NOT NULL UNIQUE)""")
++        existing = conn.execute(
++            "SELECT intent_json,task_id FROM origin_creation_intents WHERE request_id=?",
++            (intent["request_id"],),
++        ).fetchone()
++        if existing:
++            if existing["intent_json"] != immutable:
++                raise OriginError("origin_creation_conflict", "request ID reused with a different origin intent")
++            return existing["task_id"]
++        for row in conn.execute("SELECT request_id,binding_json FROM origin_creation_intents WHERE task_id=?", (task_id,)):
++            try:
++                previous = json.loads(row["binding_json"])
++            except (TypeError, ValueError):
++                raise OriginError("origin_adoption_conflict", "existing task binding is unreadable") from None
++            if not isinstance(previous, dict):
++                raise OriginError("origin_adoption_conflict", "existing task binding is unreadable")
++            if previous.get("owner") == owner and previous.get("origin") == intent["origin"]:
++                raise OriginError("origin_already_bound", "retry existing origin request " + row["request_id"])
++        marker["binding_id"] = "binding-" + secrets.token_hex(16)
++        conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)",
++                     (intent["request_id"], immutable, task_id, _json(marker), "origin-bind-" + secrets.token_hex(16)))
++        return task_id
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index a09dc0071b..3828bda621 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -31,10 +31,11 @@ def receive(request: dict) -> dict:
+     if not isinstance(request, dict) or not isinstance(request.get('args'), dict):
+         raise ValueError('origin_request_invalid')
+     key = request.get('key')
+-    if not isinstance(key, str) or len(key.split('/')) != 2:
++    adopting = request.get('action') == 'origin-adopt'
++    if not isinstance(key, str) or len(key.split('/')) != (3 if adopting else 2):
+         raise ValueError('origin_route_mismatch')
+-    owner_profile, board = key.split('/')
+-    if (request.get('coll') != 'tasks' or request.get('action') != 'create'
++    owner_profile, board = key.split('/')[:2]
++    if (request.get('coll') != 'tasks' or request.get('action') not in {'create', 'origin-adopt'}
+             or request.get('to_gw') != gateway or owner_profile != profile
+             or kb._normalize_board_slug(board) != board
+             or not kb.board_exists(board)):
+@@ -53,6 +54,18 @@ def receive(request: dict) -> dict:
+     intent = {'request_id': request['id'],
+               'owner': {'gateway': gateway, 'profile': profile, 'board': board},
+               'origin': request['args']['origin']}
++    if adopting:
++        if set(request['args']) != {'origin'}:
++            raise ValueError('origin_request_invalid')
++        task_id = key.split('/')[2]
++        intent['owner']['task_id'] = task_id
++        validate_binding({'binding_id': 'validation', 'version': 1, 'publication_version': 1,
++                          'owner': intent['owner'], 'origin': origin, 'task_record_key': key})
++        if not registry.get_definitions({'kanban_origin_adopt'}, quiet=True):
++            return {'status': 'pending', 'code': 'kanban_tool_unavailable', 'handoff_complete': False}
++        raw_result = registry.dispatch('kanban_origin_adopt', {'task_id': task_id, 'board': board},
++                                       origin_intent=intent)
++        return _dispatch_result(raw_result)
+     create = request['args'].get('create')
+     if (set(request['args']) != {'origin', 'create'} or not isinstance(create, dict)
+             or not isinstance(create.get('session_id'), str)
+@@ -63,6 +76,10 @@ def receive(request: dict) -> dict:
+     if not registry.get_definitions({'kanban_create'}, quiet=True):
+         return {'status': 'pending', 'code': 'kanban_tool_unavailable', 'handoff_complete': False}
+     raw_result = registry.dispatch('kanban_create', args, origin_intent=intent)
++    return _dispatch_result(raw_result)
++
++
++def _dispatch_result(raw_result):
+     try:
+         result = json.loads(raw_result) if isinstance(raw_result, str) else None
+     except ValueError:
+@@ -77,7 +94,11 @@ def receive(request: dict) -> dict:
+ def command(args) -> int:
+     try:
+         raw = sys.stdin.read() if args.request_file == '-' else Path(args.request_file).read_text(encoding="utf-8-sig")
+-        result = receive(json.loads(raw))
++        request = json.loads(raw)
++        expected = {'origin-create': 'create', 'origin-adopt': 'origin-adopt'}.get(args.kanban_action)
++        if not isinstance(request, dict) or expected is None or request.get('action') != expected:
++            raise ValueError('origin_route_mismatch')
++        result = receive(request)
+     except (OSError, sqlite3.Error):
+         result = {'status': 'pending', 'code': 'origin_storage_unavailable', 'handoff_complete': False}
+     except (KeyError, TypeError, ValueError) as exc:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index d9d6fddd82..764afd12a8 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -172,6 +172,10 @@ _SPECS = [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+         _arg("--json", action="store_true", help="Return structured pending creation (always JSON)"),
+     ], help="Create owner work through registered tools, pending origin receipt"),
++    _cmd("origin-adopt", [
++        _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
++        _arg("--json", action="store_true", help="Return pending adoption (always JSON)"),
++    ], help="Attach existing owner work through registered tools, pending origin receipt"),
+     _cmd("origin-bind", [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+         _arg("--json", action="store_true", help="Return structured receipt (always JSON)"),
+diff --git a/tests/hermes_cli/test_kanban_origin_adoption.py b/tests/hermes_cli/test_kanban_origin_adoption.py
+new file mode 100644
+index 0000000000..37ffc27082
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_adoption.py
+@@ -0,0 +1,139 @@
++"""Existing-task adoption preserves owner state and reuses receipt publication."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect_closing
++from hermes_cli import kanban_origin_creation as creation
++from hermes_cli.kanban_origin import OriginError
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    kb.init_db()
++    with connect_closing() as conn:
++        tid = kb.create_task(conn, title="Existing", session_id="creator")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done',completed_at=123,result='original' WHERE id=?", (tid,))
++        yield conn, tid
++
++
++def intent(tid):
++    return {"request_id": "adoption-request-001",
++            "owner": {"gateway": "worker", "profile": "default", "board": "default", "task_id": tid},
++            "origin": {"gateway": "origin", "profile": "work", "session": "s_old"}}
++
++
++def test_adopt_done_task_without_creating_or_changing_owner_state(board):
++    conn, tid = board
++    before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    events = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
++    assert creation.adopt_with_origin(conn, intent(tid), board="default") == tid
++    row = conn.execute("SELECT * FROM origin_creation_intents").fetchone()
++    marker = json.loads(row["binding_json"])
++    assert marker["owner"] == intent(tid)["owner"]
++    assert marker["origin"] == intent(tid)["origin"]
++    assert marker["task_record_key"] == f"default/default/{tid}"
++    assert "publication_version" not in marker
++    assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events
++    assert creation.adopt_with_origin(conn, intent(tid), board="default") == tid
++    assert dict(conn.execute("SELECT * FROM origin_creation_intents").fetchone()) == dict(row)
++
++
++@pytest.mark.parametrize("change,code", [
++    ({"request_id": "bad"}, "origin_adoption_invalid"),
++    ({"origin": {}}, "origin_adoption_invalid"),
++    ({"extra": True}, "origin_adoption_invalid"),
++])
++def test_invalid_adoption_does_not_write(board, change, code):
++    conn, tid = board
++    with pytest.raises(OriginError) as exc:
++        creation.adopt_with_origin(conn, {**intent(tid), **change}, board="default")
++    assert exc.value.code == code
++    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_creation_intents'").fetchone()
++
++
++def test_exact_task_and_board_required(board):
++    conn, tid = board
++    for owner, code in [
++        ({**intent(tid)["owner"], "board": "other"}, "origin_adoption_invalid"),
++        ({**intent(tid)["owner"], "task_id": tid[:-1]}, "origin_task_missing"),
++    ]:
++        with pytest.raises(OriginError) as exc:
++            creation.adopt_with_origin(conn, {**intent(tid), "owner": owner}, board="default")
++        assert exc.value.code == code
++    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_creation_intents'").fetchone()
++
++
++def test_retry_archive_and_conflicting_request(board):
++    conn, tid = board
++    creation.adopt_with_origin(conn, intent(tid), board="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
++    assert creation.adopt_with_origin(conn, intent(tid), board="default") == tid
++    changed = {**intent(tid), "origin": {**intent(tid)["origin"], "session": "other"}}
++    with pytest.raises(OriginError) as exc:
++        creation.adopt_with_origin(conn, changed, board="default")
++    assert exc.value.code == "origin_creation_conflict"
++    with pytest.raises(OriginError) as exc:
++        creation.adopt_with_origin(conn, {**intent(tid), "request_id": "different-request"}, board="default")
++    assert exc.value.code == "origin_already_bound"
++    assert "adoption-request-001" in str(exc.value)
++    assert conn.execute("SELECT COUNT(*) FROM origin_creation_intents").fetchone()[0] == 1
++    assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "archived"
++
++
++def test_failed_adoption_insert_rolls_back_without_changing_task(board):
++    import sqlite3
++    conn, tid = board
++    before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    def deny(action, table, *args):
++        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_INSERT and table == "origin_creation_intents" else sqlite3.SQLITE_OK
++    conn.set_authorizer(deny)
++    try:
++        with pytest.raises(sqlite3.DatabaseError):
++            creation.adopt_with_origin(conn, intent(tid), board="default")
++    finally:
++        conn.set_authorizer(None)
++    assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_creation_intents'").fetchone()
++    assert creation.adopt_with_origin(conn, intent(tid), board="default") == tid
++
++
++def test_concurrent_adoption_replay_keeps_one_marker(board):
++    from concurrent.futures import ThreadPoolExecutor
++    from threading import Barrier
++    conn, tid = board
++    barrier = Barrier(2)
++    def adopt():
++        with connect_closing() as other:
++            barrier.wait(timeout=10)
++            return creation.adopt_with_origin(other, intent(tid), board="default")
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        futures = [pool.submit(adopt) for _ in range(2)]
++        assert [f.result(timeout=20) for f in futures] == [tid, tid]
++    assert conn.execute("SELECT COUNT(*) FROM origin_creation_intents").fetchone()[0] == 1
++
++
++def test_registered_adoption_tool_requires_trusted_context(board):
++    from tools import kanban_tools
++    from tools.registry import registry
++    conn, tid = board
++    result = json.loads(registry.dispatch("kanban_origin_adopt", {"task_id": tid, "board": "default"},
++                                         origin_intent=intent(tid)))
++    assert result.get("adopted") is True, result
++    assert result["created"] is False
++    assert result["handoff_complete"] is False
++    assert result["ok"] is False
++    assert result["origin_creation"]["binding"]["owner"] == intent(tid)["owner"]
++    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++    refused = json.loads(registry.dispatch("kanban_origin_adopt", {"task_id": tid, "board": "default"}))
++    assert refused.get("code") == "origin_context_required", refused
+diff --git a/tests/hermes_cli/test_kanban_origin_owner.py b/tests/hermes_cli/test_kanban_origin_owner.py
+index 9e0002280f..d6d8fffce9 100644
+--- a/tests/hermes_cli/test_kanban_origin_owner.py
++++ b/tests/hermes_cli/test_kanban_origin_owner.py
+@@ -30,9 +30,10 @@ def world(tmp_path, monkeypatch):
+                      'create': {'title': 'Build', 'assignee': 'default', 'session_id': 'creator'}}}
+ 
+ 
+-def invoke(request, monkeypatch, capsys):
++def invoke(request, monkeypatch, capsys, command=None):
+     parser = build_parser(argparse.ArgumentParser().add_subparsers())
+-    args = parser.parse_args(['origin-create', '--request-file', '-', '--json'])
++    action = command or ('origin-adopt' if request.get('action') == 'origin-adopt' else 'origin-create')
++    args = parser.parse_args([action, '--request-file', '-', '--json'])
+     monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(request)))
+     assert kanban.kanban_command(args) == 0
+     return json.loads(capsys.readouterr().out)
+@@ -138,3 +139,72 @@ def test_owner_entry_creates_once_and_never_claims_handoff(world, monkeypatch, c
+         assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+         assert kb.get_task(conn, result['task_id']).session_id == 'creator'
+         assert result['origin_creation']['binding']['origin'] == world['args']['origin']
++
++
++@pytest.mark.parametrize('command', ['origin-create', 'origin-adopt'])
++def test_owner_cli_operation_mismatch_is_rejected(world, monkeypatch, capsys, command):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Existing', session_id='creator')
++    request = world if command == 'origin-adopt' else {
++        **world, 'action': 'origin-adopt', 'key': 'default/default/' + tid,
++        'args': {'origin': world['args']['origin']}}
++    result = invoke(request, monkeypatch, capsys, command=command)
++    assert result.get('status') == 'rejected', result
++    assert result['code'] == 'origin_route_mismatch'
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_creation_intents'").fetchone()
++
++
++def test_owner_entry_adopts_existing_task_and_replays(world, monkeypatch, capsys):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Existing', session_id='original-creator')
++        before = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    request = {**world, 'action': 'origin-adopt', 'key': 'default/default/' + tid,
++               'args': {'origin': world['args']['origin']}}
++    result = invoke(request, monkeypatch, capsys)
++    assert result.get('adopted') is True, result
++    assert result['created'] is False
++    assert result['handoff_complete'] is False
++    assert invoke(request, monkeypatch, capsys)['origin_creation'] == result['origin_creation']
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++        assert dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == before
++
++
++@pytest.mark.parametrize('damage', ['sender', 'gateway', 'profile', 'task', 'args', 'pinned_db', 'tool_absent', 'delegated'])
++def test_adoption_entry_rejects_wrong_route_or_missing_capability(world, monkeypatch, capsys, tmp_path, damage):
++    from tools.registry import registry
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Existing', session_id='original-creator')
++    request = {**world, 'action': 'origin-adopt', 'key': 'default/default/' + tid,
++               'args': {'origin': world['args']['origin']}}
++    if damage == 'sender':
++        request['from'] = 'gw:impostor'
++    elif damage == 'gateway':
++        request['to_gw'] = 'other'
++    elif damage == 'profile':
++        request['key'] = 'other/default/' + tid
++    elif damage == 'task':
++        request['key'] = 'default/default/' + tid[:-1]
++    elif damage == 'args':
++        request['args']['create'] = {'title': 'Duplicate'}
++    elif damage == 'pinned_db':
++        monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'wrong.db'))
++        monkeypatch.setattr(kb, '_explicit_board_intent_pinned', lambda: True)
++    elif damage == 'tool_absent':
++        monkeypatch.setattr(registry, '_snapshot_entries', list)
++    else:
++        monkeypatch.setattr('agent.delegation_context.kanban_path_is_fenced', lambda path: True)
++        args = argparse.Namespace(kanban_action='origin-adopt', request_file='-')
++        assert kanban.kanban_command(args) != 0
++        return
++    result = invoke(request, monkeypatch, capsys)
++    assert result.get('handoff_complete') is False, result
++    assert result.get('adopted') is not True
++    if damage == 'tool_absent':
++        assert result['code'] == 'kanban_tool_unavailable'
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_creation_intents'").fetchone()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 56a97acab6..f2e4d52a07 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -23,7 +23,7 @@ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+     KANBAN_COMPLETE_SCHEMA, KANBAN_CONTINUE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
++    KANBAN_LIST_SCHEMA, KANBAN_ORIGIN_ADOPT_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+ 
+ logger = logging.getLogger(__name__)
+@@ -216,7 +216,7 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                     return _tag_rejection(e.args[0], e.rejection or "invalid_args")
+                 return e.args[0]
+             except Exception as e:
+-                if tool_name == "kanban_create" and kw.get("origin_intent") is not None:
++                if tool_name in {"kanban_create", "kanban_origin_adopt"} and kw.get("origin_intent") is not None:
+                     from hermes_cli.kanban_origin import OriginError
+                     if isinstance(e, OriginError):
+                         return tool_error(str(e), code=e.code, handoff_complete=False)
+@@ -1594,6 +1594,30 @@ def _handle_link(args: dict, **kw) -> str:
+                    **({"gated_by": parent_id} if gated else {}))
+ 
+ 
++@_kanban_handler("kanban_origin_adopt")
++def _handle_origin_adopt(args: dict, **kw) -> str:
++    _reject_delegated_child_mutation("kanban_origin_adopt")
++    intent = kw.get("origin_intent")
++    if intent is None:
++        return tool_error("authenticated origin courier context required", code="origin_context_required",
++                          handoff_complete=False)
++    from hermes_cli.kanban_origin import OriginError
++    from hermes_cli.kanban_origin_creation import adopt_with_origin
++    if (not isinstance(intent, dict) or not isinstance(intent.get("owner"), dict)
++            or intent["owner"].get("task_id") != args.get("task_id")
++            or intent["owner"].get("board") != args.get("board")):
++        raise OriginError("origin_adoption_invalid", "adoption route does not match task arguments")
++    with _board(args["board"]) as (_, conn):
++        tid = adopt_with_origin(conn, intent, board=args["board"])
++        row = conn.execute("SELECT binding_json,child_request_id FROM origin_creation_intents WHERE request_id=?",
++                           (intent["request_id"],)).fetchone()
++        return json.dumps({"ok": False, "created": False, "adopted": True, "task_id": tid,
++                           "code": "origin_bind_pending", "handoff_complete": False,
++                           "origin_creation": {"request_id": intent["request_id"],
++                                               "binding": json.loads(row["binding_json"]),
++                                               "child_request_id": row["child_request_id"]}})
++
++
+ # --- Registration (order preserved: it is the order tools appear in the schema) ---
+ 
+ # kanban_list / kanban_unblock route the board and are hidden from task workers.
+@@ -1613,6 +1637,7 @@ _TOOLS = (
+     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
+     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
+     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
++    ("kanban_origin_adopt", KANBAN_ORIGIN_ADOPT_SCHEMA, _handle_origin_adopt, "🔗"),
+     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+ 
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index be73c15804..6b3b97d41a 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -44,6 +44,16 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
+     }
+ 
+ 
++KANBAN_ORIGIN_ADOPT_SCHEMA = _schema(
++    "kanban_origin_adopt",
++    "Attach an existing exact owner task to an origin through the authenticated courier. "
++    "Requires trusted courier context; never creates or completes a task. A pending "
++    "result is not a successful handoff: wait for the origin-owned receipt.",
++    {"task_id": _prop("string", "Exact existing task ID, never a prefix.")},
++    ["task_id", "board"],
++)
++
++
+ KANBAN_SHOW_SCHEMA = _schema(
+     "kanban_show",
+     (
+-- 
+2.55.0
+

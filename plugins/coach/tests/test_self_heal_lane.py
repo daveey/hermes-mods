@@ -230,22 +230,109 @@ def test_recurrence_of_a_fixed_fingerprint_says_previous_fix_didnt_hold(store):
 
 
 # ── budget ──
-def test_over_the_dollar_cap_the_card_is_scheduled_for_the_next_utc_day(store):
+def test_over_the_dollar_cap_defers_evidence_without_creating_a_card(store):
     r = Runner()
     over = lambda board=None, now=None: {"usd": 25.4, "cap": 25.0, "running": 0, "ok_usd": False,
                                          "ok_running": True, "why": "selfheal lane spend today $25.40 >= $25 cap"}
     out = sh.file_defect(defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=over)
-    sched = [a for a, _ in r.calls if "schedule" in a]
-    assert out["scheduled"][0] == "2026-10-23T00:00:00Z"
-    assert sched and sched[0][-2] == "t_00000001" and sched[0][-1].startswith("SCHEDULED_UNTIL=2026-10-23T00:00:00Z")
+    assert out["action"] == "deferred"
+    assert out["retry_at"] == "2026-10-23T00:00:00Z"
+    assert not r.calls  # never create a dispatchable card before checking the cap
+    assert not sh.LaneState(store.root).read()
+    assert sh.retry_deferred(store, now=NOW, filer=lambda *a, **k: pytest.fail("too early")) == []
+    got = []
+    sh.retry_deferred(store, now=NOW + 86400,
+                      filer=lambda d, **kw: got.append(d) or {"action": "filed"})
+    assert got == [defect()]
 
 
-def test_three_running_cards_schedule_the_new_one_an_hour_out(store):
+def test_three_running_cards_defer_new_admission_an_hour_out(store):
     r = Runner()
     busy = lambda board=None, now=None: {"usd": 3.0, "cap": 25.0, "running": 3, "ok_usd": True,
                                          "ok_running": False, "why": ""}
     out = sh.file_defect(defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=busy)
-    assert out["scheduled"][0] == sh._iso(NOW + 3600)
+    assert out["action"] == "deferred" and out["retry_at"] == sh._iso(NOW + 3600)
+    assert not r.calls
+
+
+@pytest.mark.parametrize("denied", ["ok_usd", "ok_running"])
+def test_fix_cap_refuses_before_create_and_keeps_approval_retryable(store, denied):
+    d = defect()
+    lane = sh.LaneState(store.root)
+    before = lane.update(d["fingerprint"], status="proposed", component="desktop")
+    r = Runner()
+    b = {**OPEN(), denied: False}
+    result = sh.file_fix(d["fingerprint"], store=store, runner=r, now=NOW,
+                         budget_fn=lambda *a: b)
+    assert result["action"] == "deferred" and not r.calls
+    assert lane.get(d["fingerprint"]) == before
+
+
+@pytest.mark.parametrize("action", ["error", "deferred"])
+def test_deferred_investigation_retries_without_losing_payload(store, action):
+    d = defect(details="original evidence", platform="desktop")
+    r = Runner()
+    b = {**OPEN(), "ok_running": False}
+    sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB,
+                   budget_fn=lambda *a: b)
+    assert not r.calls
+    # Failure and renewed denial retain the pending record, then success removes it.
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda *a, **k: {"action": action})
+    got = []
+    sh.retry_deferred(store, now=NOW + 7201,
+                      filer=lambda d, **kw: got.append(d) or {"action": "filed"})
+    assert got == [d]
+    assert sh.retry_deferred(store, now=NOW + 7202, filer=lambda *a, **k: pytest.fail("duplicate")) == []
+
+
+@pytest.mark.parametrize("usd,cap", [(float("nan"), 25), (0, float("inf")), (-1, 25), (0, 0)])
+def test_invalid_accounting_values_fail_closed(monkeypatch, usd, cap):
+    eb = SimpleNamespace(snapshot=lambda **kw: {"lanes": {"selfheal": usd}, "caps": {"selfheal": cap}},
+                         check=lambda *a: (True, ""), engine_cards=lambda *a: [])
+    monkeypatch.setattr(sh, "_budget_mod", lambda: eb)
+    assert sh.budget(now=NOW)["available"] is False
+
+
+def test_pending_write_failure_never_starts_work(store, monkeypatch):
+    def broken(*a):
+        raise OSError("injected pending storage failure")
+    monkeypatch.setattr(sh, "_pending_db", broken)
+    r = Runner()
+    with pytest.raises(OSError):
+        sh.file_defect(defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB,
+                       budget_fn=lambda *a: {**OPEN(), "ok_running": False})
+    assert not r.calls
+
+
+def test_retry_preserves_newer_detection_and_rechecks_real_gate(store):
+    d = defect(details="initial")
+    r = Runner()
+    busy = lambda *a: {**OPEN(), "ok_running": False}
+    sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=busy)
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw:
+                      sh.file_defect(d, runner=r, cfg=HUB, budget_fn=busy, **kw))
+    assert not r.calls
+    newer = {**d, "details": "new evidence"}
+    def overlapping(d, **kw):
+        sh.file_defect(newer, store=store, m="live", runner=r, now=NOW + 7202,
+                       cfg=HUB, budget_fn=busy)
+        return {"action": "filed"}
+    sh.retry_deferred(store, now=NOW + 7202, filer=overlapping)
+    got = []
+    sh.retry_deferred(store, now=NOW + 10803,
+                      filer=lambda d, **kw: got.append(d) or {"action": "filed"})
+    assert got == [newer]
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "live"])
+def test_cron_retries_pending_only_when_live(store, monkeypatch, mode):
+    monkeypatch.setattr(sh, "mode", lambda: mode)
+    calls = []
+    monkeypatch.setattr(sh, "retry_deferred", lambda *a, **kw: calls.append(1) or [])
+    monkeypatch.setattr(sh, "sync", lambda *a, **kw: [])
+    monkeypatch.setattr(sh, "drain", lambda *a, **kw: [])
+    sh.cron(Path(store.root), store=store, now=NOW, backstop_fn=lambda *a: [])
+    assert calls == ([1] if mode == "live" else [])
 
 
 def test_engine_budget_selfheal_lane_has_its_own_25_cap_outside_the_total(tmp_path):

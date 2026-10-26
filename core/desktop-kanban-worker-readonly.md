@@ -3,7 +3,7 @@
 Patches:
 
 - `patches/0213-fix-desktop-open-Kanban-worker-sessions-read-only-an.patch`: a worker transcript opens read-only, no "Resume failed" toast.
-- `patches/0227-refactor-desktop-goneSessionSwitchInFlight-helper-of.patch`: `goneSessionSwitchInFlight` helper offsets the extra branch (code-health ratchet).
+- `patches/0229-refactor-desktop-goneSessionSwitchInFlight-helper-of.patch`: `goneSessionSwitchInFlight` helper offsets the extra branch (code-health ratchet).
 
 ## Behavior
 
@@ -16,7 +16,7 @@ visible, the transcript is marked read-only, and there is no toast and no retry 
 
 `owner-follow.ts` exports `KANBAN_WORKER_RESUME_REFUSED_CODE = 4132` and `isKanbanWorkerResumeRefusal(error)`. In
 `use-session-actions/index.ts`'s resume path, when the error matches and the REST fallback did not fail, it calls
-`markStoredTranscriptReadOnly(id)` and returns. 0227 moves the "known foreign owner or a switch in flight" test into
+`markStoredTranscriptReadOnly(id)` and returns. 0229 moves the "known foreign owner or a switch in flight" test into
 `gone-session-switch.ts` (`goneSessionSwitchInFlight(owner)`).
 
 ## Code
@@ -31,7 +31,7 @@ visible, the transcript is marked read-only, and there is no toast and no retry 
 
 ## Applying
 
-`git am -3` in order 0213, 0227.
+`git am -3 --empty=keep` in order 0213, 0229.
 
 ## Gotchas
 

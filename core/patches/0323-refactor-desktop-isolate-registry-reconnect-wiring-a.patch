@@ -1,0 +1,385 @@
+From e34da39b59e252d7960a32550f32b35cb1445092 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:24:44 +0000
+Subject: [PATCH] refactor(desktop): isolate registry reconnect wiring and
+ document safety contract [daveey]
+
+---
+ apps/desktop/electron/main.ts                 | 59 +++---------
+ .../registry-reconnect-service.test.ts        |  5 +-
+ .../registry-reconnect-wiring.test.ts         | 44 +++++++++
+ .../electron/registry-reconnect-wiring.ts     | 87 ++++++++++++++++++
+ .../registry-backend-reconnect.md             | 89 +++++++++++++++++++
+ 5 files changed, 233 insertions(+), 51 deletions(-)
+ create mode 100644 apps/desktop/electron/registry-reconnect-wiring.test.ts
+ create mode 100644 apps/desktop/electron/registry-reconnect-wiring.ts
+ create mode 100644 website/docs/developer-guide/registry-backend-reconnect.md
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 5662e731f3..1cf1564fd6 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -528,8 +528,7 @@ import {
+   createQuitTeardownCoordinator,
+   type QuitTeardownTask
+ } from './quit-teardown'
+-import { createRegistryReconnectService } from './registry-reconnect-service'
+-import { proveRegistryOwnerStopped } from './registry-stopped-owner'
++import { createSshReuseProbe, wireRegistryReconnect } from './registry-reconnect-wiring'
+ import * as remoteLifecycle from './remote-lifecycle'
+ import {
+   attachPowerResumeRemoteRevalidation,
+@@ -9853,20 +9852,6 @@ function sshRememberLog(chunk) {
+   rememberLog(redactSecrets(String(chunk == null ? '' : chunk)))
+ }
+ 
+-async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
+-  try {
+-    const proof: any = await fetchJson(`${baseUrl}/api/ssh/ownership`, token)
+-
+-    return remoteLifecycle.classifySshReuseProof(proof, spawnNonce)
+-  } catch (error: any) {
+-    if (/^(401|403|404):/.test(String(error?.message || ''))) {
+-      return 'authenticated-stale'
+-    }
+-
+-    throw error
+-  }
+-}
+-
+ async function teardownSshConnection(profile) {
+   const scope = sshScopeKey(profile)
+   registryReconnectService.assertCanStop(scope)
+@@ -10246,7 +10231,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
+       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
+       pickLocalPort,
+       waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token'),
+-      probeReuseProof: sshProbeReuseProof,
++      probeReuseProof: createSshReuseProbe(fetchJson),
+       adoptServedToken: adoptServedDashboardToken,
+       rememberLog: sshRememberLog,
+       guestOnboarding: GUEST_ONBOARDING,
+@@ -11309,9 +11294,7 @@ async function ensureRegistryBackend(
+     return ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation, opts)
+   }
+ 
+-  if (source.kind === 'ssh') {
+-    managedConnectionUpdateGate.assertCanDial(id, managedUpdateCorrelation)
+-  }
++  registryReconnectService.assertCanDial(source.kind, id, managedUpdateCorrelation)
+ 
+   const entry = {
+     process: null,
+@@ -16149,39 +16132,17 @@ ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePoli
+ ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
+ 
+ // ── v2 connection registry IPC (multi-source) ───────────────────────────────
+-// Storage-level CRUD for named agent sources. Routing/pooling consumption of
+-// the registry lands separately; these handlers only manage the persisted
+-// list, so they are safe to ship ahead of the switchover.
+-const registryReconnectService = createRegistryReconnectService({
+-  pool: backendPool,
+-  states: sshConnections,
+-  gate: managedConnectionUpdateGate,
+-  key: backendScopeKey,
+-  isSsh: id => readDesktopConnectionsRegistry().connections.some(source => source.id === id && source.kind === 'ssh'),
+-  inFlight: key => Boolean(backendDialClaims.inFlight(key) || poolStopper.inFlight(key) || sshBootstrapCoordinator.pending.has(key)),
++const registryReconnectService = wireRegistryReconnect({
++  ipcMain, pool: backendPool, states: sshConnections,
++  gate: managedConnectionUpdateGate, key: backendScopeKey,
++  readRegistry: readDesktopConnectionsRegistry,
++  dialClaims: backendDialClaims, poolStopper, bootstrap: sshBootstrapCoordinator,
+   request: (descriptor, requestPath, options) => fetchJsonForBackend(descriptor, requestPath, options),
+-  proveStopped: state => proveRegistryOwnerStopped(state.ssh, { ...state, profile: state.remoteProfile || '' }),
+-  terminate: async state => {
+-    const expected = { ...state, profile: state.remoteProfile || '' }
+-
+-    if (state.remotePlatform !== 'Linux') { throw new Error('Unsupported registry SSH platform') }
+-    await remoteLifecycle.terminateOwnedDashboardForUpdate(state.ssh, expected)
+-  },
+-  close: async (key, state) => {
+-    sshIsolatedKeepalives.stop(key)
+-    terminalIpc.disposeTerminalSessionsForSshScope(key)
+-    // The owned serve is already confirmed stopped. Closing its transport
+-    // must never fall back to generic remote disconnect/kill.
+-    await state.ssh.close().catch(error => sshRememberLog(`[registry-reconnect] transport close: ${String(error)}`))
+-  },
+-  onCleanupError: error => sshRememberLog(`[registry-reconnect] cleanup: ${String(error)}`),
++  keepalives: sshIsolatedKeepalives, disposeTerminals: key => terminalIpc.disposeTerminalSessionsForSshScope(key),
++  log: sshRememberLog,
+   reopen: (id, profile, correlation) => ensureRegistryBackend(id, profile, correlation)
+ })
+ 
+-ipcMain.handle('hermes:connections:reconnect-target', (_event, id, profile) =>
+-  registryReconnectService.target(id, profile))
+-ipcMain.handle('hermes:connections:reconnect', (_event, target) => registryReconnectService.run(target))
+-
+ ipcMain.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
+ ipcMain.handle('hermes:connections:save', async (_event, payload) => {
+   const saved = await saveRegistryConnection(payload)
+diff --git a/apps/desktop/electron/registry-reconnect-service.test.ts b/apps/desktop/electron/registry-reconnect-service.test.ts
+index 2becf1df1c..715443384b 100644
+--- a/apps/desktop/electron/registry-reconnect-service.test.ts
++++ b/apps/desktop/electron/registry-reconnect-service.test.ts
+@@ -3,17 +3,18 @@ import { expect, test, vi } from 'vitest'
+ import { ManagedConnectionUpdateGate } from './managed-ssh-update'
+ import { createPoolStopper } from './pool-stop'
+ import { createRegistryReconnectService } from './registry-reconnect-service'
++import type { createRegistryRetirementClient } from './registry-retirement-http'
+ 
+ function fixture() {
+   const descriptor = { baseUrl: 'http://hub', token: 'synthetic' }
+-  const primary = { process: null, connectionPromise: Promise.resolve({ baseUrl: 'http://local' }) }
++  const primary = { process: null, connectionPromise: Promise.resolve({ baseUrl: 'http://local', token: 'synthetic-local' }) }
+   const entry = { process: null, connectionPromise: Promise.resolve(descriptor) }
+   const state = { registryConnectionId: 'hub', primaryRegistryScope: false, spawnNonce: 'owned', remotePlatform: 'Linux' }
+   const pool = new Map([['default', primary], ['conn:hub::default', entry]])
+   const states = new Map([['conn:hub::default', state]])
+   const gate = new ManagedConnectionUpdateGate()
+ 
+-  const request = vi.fn(async (_descriptor, path, options) => path === '/api/ssh/ownership'
++  const request = vi.fn<Parameters<typeof createRegistryRetirementClient<typeof descriptor>>[0]>(async (_descriptor, path, options) => path === '/api/ssh/ownership'
+     ? { ok: true, protocolVersion: 1, sshOwnerNonce: 'owned', runtimeIntact: false }
+     : { ok: true, idle: true, token: 'permit', action: options.body?.action })
+ 
+diff --git a/apps/desktop/electron/registry-reconnect-wiring.test.ts b/apps/desktop/electron/registry-reconnect-wiring.test.ts
+new file mode 100644
+index 0000000000..a1bfe730d1
+--- /dev/null
++++ b/apps/desktop/electron/registry-reconnect-wiring.test.ts
+@@ -0,0 +1,44 @@
++import { expect, test, vi } from 'vitest'
++
++import { ManagedConnectionUpdateGate } from './managed-ssh-update'
++import { createSshReuseProbe, wireRegistryReconnect } from './registry-reconnect-wiring'
++
++test('wiring gates only new SSH dials with the exact correlation', () => {
++  const gate = new ManagedConnectionUpdateGate()
++  const handle = vi.fn()
++
++  const service = wireRegistryReconnect({
++    ipcMain: { handle }, pool: new Map(), states: new Map(), gate,
++    key: (id, profile) => `${id}:${profile}`,
++    readRegistry: () => ({ connections: [] }),
++    dialClaims: { inFlight: () => false }, poolStopper: { inFlight: () => false },
++    bootstrap: { pending: new Set<string>() }, request: async () => null,
++    keepalives: { stop: vi.fn() }, disposeTerminals: vi.fn(), log: vi.fn(), reopen: async () => {}
++  })
++
++  const owner = '11111111-1111-4111-8111-111111111111'
++  gate.claim('hub', owner)
++  expect(() => service.assertCanDial('ssh', 'hub', '')).toThrow()
++  expect(() => service.assertCanDial('ssh', 'hub', 'other')).toThrow()
++  expect(() => service.assertCanDial('ssh', 'hub', owner)).not.toThrow()
++  expect(() => service.assertCanDial('ssh', 'other', '')).not.toThrow()
++  expect(() => service.assertCanDial('remote', 'hub', '')).not.toThrow()
++  expect(() => service.assertCanDial('local', 'hub', '')).not.toThrow()
++  expect(handle.mock.calls.map(call => call[0])).toEqual([
++    'hermes:connections:reconnect-target', 'hermes:connections:reconnect'
++  ])
++  expect(handle.mock.calls[0][1](null, 'hub', 'default')).toBeNull()
++})
++
++test.each([401, 403, 404])('reuse probe classifies authenticated HTTP %s as stale', async status => {
++  const fetchJson = vi.fn(async () => { throw new Error(`${status}: unavailable`) })
++  await expect(createSshReuseProbe(fetchJson)('http://hub', 'token', 'nonce')).resolves.toBe('authenticated-stale')
++  expect(fetchJson).toHaveBeenCalledWith('http://hub/api/ssh/ownership', 'token')
++})
++
++test('reuse probe preserves transport errors and ownership classification', async () => {
++  const error = new Error('connection reset')
++  await expect(createSshReuseProbe(async () => { throw error })('http://hub', 'token', 'nonce')).rejects.toBe(error)
++  const probe = createSshReuseProbe(async () => ({ ok: true, sshOwnerNonce: 'nonce', protocolVersion: 1 }))
++  await expect(probe('http://hub', 'token', 'nonce')).resolves.toBe('authenticated-ok')
++})
+diff --git a/apps/desktop/electron/registry-reconnect-wiring.ts b/apps/desktop/electron/registry-reconnect-wiring.ts
+new file mode 100644
+index 0000000000..742acfc41f
+--- /dev/null
++++ b/apps/desktop/electron/registry-reconnect-wiring.ts
+@@ -0,0 +1,87 @@
++import type { IpcMain } from 'electron'
++
++import type { ManagedConnectionUpdateGate } from './managed-ssh-update'
++import { createRegistryReconnectService } from './registry-reconnect-service'
++import { proveRegistryOwnerStopped } from './registry-stopped-owner'
++import { classifySshReuseProof, terminateOwnedDashboardForUpdate } from './remote-lifecycle'
++
++interface RegistrySshState extends Omit<Parameters<typeof proveRegistryOwnerStopped>[1], 'profile'> {
++  registryConnectionId: string
++  primaryRegistryScope?: boolean
++  remotePlatform: string
++  remoteProfile?: string
++  ssh: Parameters<typeof proveRegistryOwnerStopped>[0] & { close: () => Promise<void> }
++}
++
++interface WiringDeps<D, E extends { connectionPromise: Promise<D> }> {
++  ipcMain: Pick<IpcMain, 'handle'>
++  pool: Map<string, E>
++  states: Map<string, RegistrySshState>
++  gate: ManagedConnectionUpdateGate
++  key: (id: string, profile: string) => string
++  readRegistry: () => { connections: { id: string; kind: string }[] }
++  dialClaims: { inFlight: (key: string) => unknown }
++  poolStopper: { inFlight: (key: string) => unknown }
++  bootstrap: { pending: { has: (key: string) => boolean } }
++  request: Parameters<typeof createRegistryReconnectService<D, E, RegistrySshState>>[0]['request']
++  keepalives: { stop: (key: string) => void }
++  disposeTerminals: (key: string) => void
++  log: (message: string) => void
++  reopen: (id: string, profile: string, correlation: string) => Promise<unknown>
++}
++
++/** Main-process adapters; ownership and generation checks remain in the service. */
++export function wireRegistryReconnect<D, E extends { connectionPromise: Promise<D> }>(deps: WiringDeps<D, E>) {
++  const service = createRegistryReconnectService({
++    pool: deps.pool,
++    states: deps.states,
++    gate: deps.gate,
++    key: deps.key,
++    isSsh: id => deps.readRegistry().connections.some(source => source.id === id && source.kind === 'ssh'),
++    inFlight: key => Boolean(deps.dialClaims.inFlight(key) || deps.poolStopper.inFlight(key) || deps.bootstrap.pending.has(key)),
++    request: deps.request,
++    proveStopped: state => proveRegistryOwnerStopped(state.ssh, { ...state, profile: state.remoteProfile || '' }),
++    terminate: async state => {
++      const expected = { ...state, profile: state.remoteProfile || '' }
++
++      if (state.remotePlatform !== 'Linux') { throw new Error('Unsupported registry SSH platform') }
++      await terminateOwnedDashboardForUpdate(state.ssh, expected)
++    },
++    close: async (key, state) => {
++      deps.keepalives.stop(key)
++      deps.disposeTerminals(key)
++      // The owned serve is already confirmed stopped. Closing its transport
++      // must never fall back to generic remote disconnect/kill.
++      await state.ssh.close().catch(error => deps.log(`[registry-reconnect] transport close: ${String(error)}`))
++    },
++    onCleanupError: error => deps.log(`[registry-reconnect] cleanup: ${String(error)}`),
++    reopen: deps.reopen
++  })
++
++  deps.ipcMain.handle('hermes:connections:reconnect-target', (_event, id, profile) => service.target(id, profile))
++  deps.ipcMain.handle('hermes:connections:reconnect', (_event, target) => service.run(target))
++
++  return {
++    ...service,
++    assertCanDial: (kind: string, id: string, correlation: string) => {
++      if (kind === 'ssh') { deps.gate.assertCanDial(id, correlation) }
++    }
++  }
++}
++
++/** Authenticated stale owners are replaceable; transport uncertainty is not. */
++export function createSshReuseProbe(fetchJson: (url: string, token: string) => Promise<unknown>) {
++  return async (baseUrl: string, token: string, spawnNonce: string) => {
++    try {
++      const proof = await fetchJson(`${baseUrl}/api/ssh/ownership`, token)
++
++      return classifySshReuseProof(proof, spawnNonce)
++    } catch (error) {
++      if (/^(401|403|404):/.test(String((error as Error)?.message || ''))) {
++        return 'authenticated-stale'
++      }
++
++      throw error
++    }
++  }
++}
+diff --git a/website/docs/developer-guide/registry-backend-reconnect.md b/website/docs/developer-guide/registry-backend-reconnect.md
+new file mode 100644
+index 0000000000..a1f819c916
+--- /dev/null
++++ b/website/docs/developer-guide/registry-backend-reconnect.md
+@@ -0,0 +1,89 @@
++---
++title: Registry SSH backend reconnect
++---
++
++# Registry SSH backend reconnect
++
++The Desktop preload exposes an explicit, generation-qualified reconnect for one
++registry-owned SSH backend. This is not the profile-only `recycleBackend` API and
++must not be replaced with a managed update or a generic remote process kill.
++
++## Requirements
++
++The running Desktop bundle must include the registry reconnect implementation
++introduced in fork PR [51](https://github.com/daveey/hermes/pull/51). A checkout on
++disk is not evidence that the running Electron main process includes it. Check
++for both preload methods below; older bundles do not implement this API.
++
++The already-running remote serve must support authenticated SSH ownership
++protocol version 1 and `/api/health/retirement` prepare/commit/cancel with the
++backend-owned admission fence (fork commit
++`98745df3b9cb10468b4e3018184ee3a030bf675d`). Missing capability, unknown idle state,
++and active work fail closed. An old serve cannot gain this capability merely
++because its checkout was updated.
++
++Only Linux remote targets are supported. The resident must be an owned,
++non-primary registry SSH backend with a spawn nonce and no pending bootstrap or
++stop. Windows and Darwin are refused before retirement preparation. Linux owned
++termination uses runtime-independent process identity checks; a deleted managed
++Python runtime is deliberately not a reason to refuse ownership proof.
++
++## Executable Desktop API
++
++Use the owning Desktop renderer, not a shell on the remote gateway:
++
++```javascript
++const connections = window.hermesDesktop?.connections
++if (!connections?.reconnectTarget || !connections?.reconnect) {
++  throw new Error('This running Desktop does not support scoped reconnect')
++}
++const target = await connections.reconnectTarget('hermes-hub', 'default')
++if (!target) throw new Error('No eligible owned registry backend')
++// Retain this exact object for any explicitly authorized recovery retry.
++const result = await connections.reconnect(target)
++if (!result.ok) throw new Error('Reconnect refused; do not use a broader fallback')
++console.log({ previousGeneration: target.generation, generation: result.generation })
++```
++
++`reconnectTarget(connectionId, profile)` returns
++`{ connectionId, profile, generation } | null`. It captures an opaque resident
++generation, not a PID and not a durable configuration version. It is discovery,
++not an idle assertion. `reconnect(target)` returns `{ ok: boolean, generation?:
++string }`, or rejects on transport/lifecycle failures. Success means an owned
++replacement was published; it does not prove an application-specific RPC works.
++
++Do not automatically loop on refusal or obtain a different generation to bypass
++an unresolved attempt. An ambiguous commit retains the exact-resident fence.
++An authorized retry with the same target reconciles it: a live owner must again
++prove ownership and commit retirement, or a read-only Linux process check must
++prove the captured owner has exited. Unknown/live process probes never authorize
++a kill. Replaced identity or generation fails closed. After successful retirement
++but failed replacement bootstrap, the fence is released so ordinary dialing can
++retry startup; that failure is not reported as successful reconnect.
++
++## Safety boundaries and evidence
++
++The connection gate prevents configuration mutation and new bootstrap publication
++during reconnect. Existing unrelated profile residents may continue dispatching.
++The coordinator and pool-stop guard protect the selected resident from concurrent
++teardown and generation replacement. The primary backend, gateway daemon, other
++connections and other profiles are not termination targets.
++
++The remote retirement endpoint checks work and freezes admission atomically using
++the same backend lock that admits a turn. A prepared fence can expire or be
++cancelled; a committed fence remains closed through termination. Reading an idle
++status beforehand or polling a lease table is not an equivalent fence.
++
++Regression coverage is in the Electron `registry-reconnect`,
++`registry-reconnect-service`, `registry-retirement-http`,
++`registry-stopped-owner`, and `registry-reconnect-wiring` suites, plus pool-stop
++and bootstrap suites. `tests/hermes_cli/test_backend_retirement.py` exercises the
++authenticated endpoint and a real threaded race between admission and freezing.
++The stopped-owner suite probes real local live/exited processes with synthetic
++SSH transport. These are automated tests, not live reconnect evidence.
++
++For rollout, record merged commit, released bundle, installed/running bundle,
++remote capability, and live operation separately. The designated live operator
++must perform only the approved target reconnect; a separate verification should
++then check authenticated owner-routed inventory/detail/refresh and latency.
++Never infer installation or live success from unit tests or a merged PR.
+-- 
+2.55.0
+

@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .collector import ident, iso, readiness
+from .collector import ident, iso, readiness, operational_evidence, readiness_evidence
 from .health import State, project, Policy
 from .models import validate
 
@@ -55,41 +55,127 @@ class Service:
     def inventory(self):
         if not self.config['features']['observe']:
             raise RuntimeError('feature_disabled')
-        snap=self._snapshot(); meta=self._meta(snap); c=self.config; rows=[]; projections=[]
+        return self._inventory(self._snapshot())
+
+    def _inventory(self, snap):
+        meta=self._meta(snap); c=self.config; rows=[]; projections=[]
+        hosts=deepcopy(c['hosts'])
+        db=connect(self.path)
+        try:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_maintenance'").fetchone():
+                overlay={r[0]:json.loads(r[1]) for r in db.execute('SELECT entity_id,payload FROM repair_domain_maintenance')}
+                for host in hosts:
+                    host['maintenance']=overlay.get(host['resource_id'],host['maintenance'])
+        finally:
+            db.close()
+        for host in hosts:
+            m=host['maintenance']
+            if m['state']=='active' and datetime.fromisoformat(m['expires_at'].replace('Z','+00:00')).timestamp()<=self.clock():
+                host['maintenance']=dict(state='inactive',reason=None,expires_at=None)
         policy=Policy(inventory_ttl=c['thresholds']['inventory_stale_seconds'],host_ttl=c['thresholds']['host_stale_seconds'])
         for row in snap['runners'] if snap else ():
             row=deepcopy(row)
-            checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock())
+            current = meta['freshness'] == 'fresh'
+            checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock(), snapshot_current=current)
+            # This is host projection data, never provider-supplied runner data.
+            row.pop('operational_evidence', None)
+            row.pop('readiness_evidence', None)
+            causes = readiness_evidence(c, row, snap.get('host_results', {}), self.clock(), checks, snapshot_current=current)
+            if causes is not None:
+                row['readiness_evidence'] = causes
+            operational = operational_evidence(c, row, snap.get('host_results', {}), self.clock(), snapshot_current=current)
+            if operational:
+                row['operational_evidence'] = operational
             host=snap.get('host_results',{}).get(row.get('host_id'),{})
-            p=project(State(**snap['states'][row['id']]),now=self.clock(),policy=policy,checks=checks,management=host.get('management','unknown'),host_at=host.get('at'))
+            maintenance=next((h['maintenance'] for h in hosts if h['id']==row.get('host_id')), {})
+            until=(datetime.fromisoformat(maintenance['expires_at'].replace('Z','+00:00')).timestamp()
+                   if maintenance.get('state')=='active' else None)
+            p=project(State(**snap['states'][row['id']]),now=self.clock(),policy=policy,checks=checks,management=host.get('management','unknown'),host_at=host.get('at'),maintenance_until=until)
             row.update(registration=p.registration,activity=p.activity,freshness=p.freshness,readiness=ready)
             rows.append(row); projections.append(p)
+            observed = snap['states'][row['id']]
+            at = observed.get('at')
+            if at is not None:
+                meta['provenance'].append(dict(
+                    source_id=row['id'], collection_id=observed['cycle'],
+                    observed_at=iso(at), expires_at=iso(at+policy.inventory_ttl),
+                    state='fresh' if p.freshness == 'fresh' and not observed.get('source_error') else 'stale',
+                    observation_ids=row['observation_ids']))
         for provenance in meta['provenance']:
             if provenance['state']=='fresh' and (meta['freshness']!='fresh' or self.clock()>datetime.fromisoformat(provenance['expires_at'].replace('Z','+00:00')).timestamp()): provenance['state']='stale'
-        count=dict(registrations=len(rows),online=sum(r.registration=='online' for r in projections),busy=sum(r.activity=='busy' for r in projections),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(r.registration=='online' and not r.ready for r in projections),issues=sum(r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
+        count=dict(registrations=len(rows),online=sum(r.registration=='online' for r in projections),busy=sum(r.activity=='busy' for r in projections),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(r.registration=='online' and not r.ready for r in projections),issues=sum('source_unavailable' in r.reasons or r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
         state='loading' if not snap else ('ready' if snap['collection']['state']=='complete' else 'partial')
         if snap and any(p['state']!='fresh' for p in meta['provenance']): state='partial'
         if not c['scopes']: state='not_configured'
         if snap and meta['freshness']=='stale': state='owner_disconnected'
-        hosts=deepcopy(c['hosts'])
         for host in hosts:
             evidence=(snap or {}).get('host_results',{}).get(host['id'])
-            if evidence and 0<=self.clock()-evidence['at']<=policy.host_ttl:
+            at = evidence['at'] if evidence else None
+            fresh = at is not None and 0 <= self.clock()-at <= policy.host_ttl
+            if fresh:
                 host['management']=evidence['management']
+            host['observation_ids'] = list(evidence.get('observation_ids', [])) if evidence else []
+            meta['provenance'].append(dict(
+                source_id=host['resource_id'], collection_id=None,
+                observed_at=iso(at) if at is not None else None,
+                expires_at=iso(at+policy.host_ttl) if at is not None else None,
+                state=('fresh' if evidence['management']=='reachable' else 'unavailable') if fresh else ('stale' if evidence else 'unknown'),
+                observation_ids=host['observation_ids']))
+        mapped_hosts={row['host_id'] for row in rows if row['host_id']}
+        count['issues'] += sum(host['id'] in mapped_hosts and host['management']=='unreachable' for host in hosts)
         data=dict(state=state,collection=snap['collection'] if snap else None,counts=count,hosts=hosts,runners=rows,scopes=c['scopes'],providers=c['providers'],targets=c['execution_targets'])
         return dict(meta=meta,data=data)
 
-    def inspect(self,runner_id,history_limit=100):
+    def inspect(self,runner_id,history_limit=100,*,principal=None):
         validate('InspectRequest',dict(runner_id=runner_id,history_limit=history_limit))
-        inventory=self.inventory()
+        if not self.config['features']['observe']:
+            raise RuntimeError('feature_disabled')
+        snap=self._snapshot()
+        inventory=self._inventory(snap)
         runner=next((r for r in inventory['data']['runners'] if r['id']==runner_id),None)
         if runner is None: raise KeyError('not_found')
         db=connect(self.path)
         try:
             # JSON filtering occurs before LIMIT; do not silently lose older matching rows.
             observations=[json.loads(r[0]) for r in db.execute("SELECT payload FROM runner_records WHERE kind='Observation' AND json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT ?",(runner_id,history_limit))]
+            incidents=[json.loads(r[0]) for r in db.execute("SELECT payload FROM runner_records WHERE kind='Incident' AND json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT 100",(runner_id,))]
+            repairs=[]
+            if principal and self.config['features']['repair_sessions'] and db.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_records'").fetchone():
+                scope='host:'+runner['host_id'] if runner.get('host_id') else 'runner:'+runner_id
+                owner=json.dumps(inventory['meta']['owner'],sort_keys=True,separators=(',',':'),ensure_ascii=True)
+                repairs=[json.loads(r[0]) for r in db.execute('SELECT payload FROM repair_domain_records WHERE scope=? AND principal=? AND owner=? ORDER BY rowid DESC LIMIT 100',(scope,principal,owner))]
         finally: db.close()
-        return dict(meta=inventory['meta'],data=dict(runner=runner,observations=observations,incidents=[],repairs=[],jobs=[]))
+        monitoring, jobs = self._job_evidence(snap, runner, history_limit)
+        return dict(meta=inventory['meta'],data=dict(runner=runner,observations=observations,incidents=incidents,repairs=repairs,jobs=[],job_monitoring=monitoring,observed_jobs=jobs))
+
+    def _job_evidence(self, snap, runner, limit):
+        """External observations are not dispatched Job records or health proof."""
+        sid=runner['scope_id']; evidence=snap.get('job_results', {}).get(sid)
+        configured=snap.get('job_monitoring_scopes')
+        at=evidence.get('observed_at') if evidence else None
+        ttl=self.config['thresholds']['inventory_stale_seconds']
+        fresh=at is not None and 0<=self.clock()-at<=ttl
+        state,reason='unknown','not_observed'
+        if configured is not None and sid not in configured:
+            state,reason='not_configured','not_configured'
+            evidence=None; at=None
+        elif evidence and configured is not None:
+            error=evidence.get('error')
+            if not fresh: state,reason='unknown','stale_evidence'
+            elif error=='forbidden': state,reason='forbidden',error
+            elif evidence['complete'] or error=='enrichment_truncated':
+                state,reason='configured',error or 'bounded_query_complete'
+            else: state,reason='unavailable',error or 'incomplete'
+        monitoring=dict(state=state,reason_code=reason,observed_at=iso(at) if at is not None else None,
+                        expires_at=iso(at+ttl) if at is not None else None)
+        rows=[]
+        for row in (evidence or {}).get('rows', []):
+            if row['runner_id'] != runner['provider_runner_id']:
+                continue
+            rows.append(dict(row, observed_at=iso(at), expires_at=iso(at+ttl),
+                url=f"https://github.com/{row['repository']}/actions/runs/{row['run_id']}/job/{row['job_id']}"))
+            if len(rows)>=limit: break
+        return monitoring, rows if limit else []
 
     def refresh(self,request):
         request=validate('RefreshRequest',request)
