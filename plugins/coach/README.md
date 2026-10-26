@@ -703,8 +703,13 @@ The same suite rejects successful URL readbacks predating newer human steering,
 then accepts a fresh post-steering readback through the native pending-recheck gate.
 This conservative verification epoch does not infer whether older results remain
 semantically applicable. Kanban current-scope reads reject queued UI receipts;
-a later genuine canonical user row is a separate positive control, not a claimed
-end-to-end queue-drain test. All fixtures use isolated state and no live repairs.
+a later genuine canonical user row is a separate positive control.
+`test_goal_queue_owner_acceptance.py` additionally connects native busy acceptance,
+queue draining and adopt/stage/flush persistence to the public owner guard and real
+scoped consumer health. Its five cases cover matching, mismatching, newer-request,
+Stop and consumer-loss boundaries. The worker launch is replaced with the existing
+native turn-body fixture: this is in-process integration, not a complete agent or
+serve/WebSocket ownership turn. All fixtures use isolated state and no live repairs.
 
 Native mid-turn steering now carries a process-local core attestation: the guard
 uses the original human text only when identity and content still match. Arbitrary
