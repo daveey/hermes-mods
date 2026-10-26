@@ -59,6 +59,11 @@ export const route = {
   profile: 'alias',
   targetProfile: 'example'
 }
+// Matches the authenticated backend /v1/enrollment response in test_api.py.
+export const enrollment = (profile = 'example') => ({
+  contract_version: 1, profile, enrolled: true,
+  capabilities: ['inventory', 'inspect', 'refresh']
+})
 export const host = {
   state: {
     gateways: atom([]),

@@ -24,7 +24,9 @@ from ..models import validate, runner_id
 
 
 class _Failure(Exception):
-    pass
+    def __init__(self, code, retry_after_seconds=None):
+        super().__init__(code)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class BudgetPersistenceError(RuntimeError):
@@ -39,6 +41,7 @@ class _Budget:
     until: float = 0
     failures: int = 0
     next_at: float = 0
+    cause: str | None = None
 
 
 class GitHubActions:
@@ -98,6 +101,8 @@ class GitHubActions:
                 if type(key) is not str or not key or len(key) > 256 or type(value) is not dict:
                     raise ValueError('invalid_budget_state')
                 budget = _Budget(**value)
+                if budget.cause not in (None, 'forbidden', 'not_found', 'rate_limited', 'unauthorized', 'server_error', 'network_error', 'unexpected_status'):
+                    raise ValueError('invalid_budget_state')
                 if budget.remaining is not None and (type(budget.remaining) is not int or budget.remaining < 0):
                     raise ValueError('invalid_budget_state')
                 if type(budget.failures) is not int or budget.failures < 0:
@@ -168,12 +173,19 @@ class GitHubActions:
                 raise _Failure('cycle_budget')
             self._cycle_remaining -= 1
         budget = self._budgets.setdefault(credential.key, _Budget())
+        # Permissions are resource-local; quota belongs to the credential.
+        prefix, action = path.split('/actions/', 1)
+        resource = prefix + '/actions/' + action.split('?', 1)[0].split('/', 1)[0]
+        permission_key = 'scope:' + hashlib.sha256((credential.key + '\0' + resource).encode()).hexdigest()
+        permission = self._budgets.get(permission_key)
+        if permission and now < permission.until:
+            raise _Failure(permission.cause, math.ceil(permission.until - now))
         if budget.remaining is not None and budget.remaining <= 0:
             if not budget.reset or now < budget.reset:
-                raise _Failure('rate_limited')
+                raise _Failure('rate_limited', math.ceil(budget.reset - now) if budget.reset > now else None)
             budget.remaining = None
         if now < budget.until:
-            raise _Failure('backoff')
+            raise _Failure('backoff', math.ceil(budget.until - now))
         key = (credential.key, hashlib.sha256(credential.token.encode()).digest(), path)
         cached = self._cache.get(key)
         headers = {'Authorization': 'Bearer ' + credential.token,
@@ -212,14 +224,35 @@ class GitHubActions:
             budget.next_at = max(now, budget.next_at) + max(0, budget.reset-now)/budget.remaining
         status = response.status
         if status not in (200, 304):
-            self._delay(budget, h)
+            code = {401:'unauthorized',403:'forbidden',404:'not_found',429:'rate_limited'}.get(status)
+            message = response.body.get('message', '') if type(response.body) is dict else ''
+            throttled = status == 403 and (
+                'retry-after' in h or budget.remaining == 0 or
+                (type(message) is str and any(marker in message.lower()
+                 for marker in ('secondary rate limit', 'rate limit exceeded', 'abuse detection'))))
+            if throttled:
+                code = 'rate_limited'
+            if status in (403, 404) and not throttled:
+                permission = self._budgets.setdefault(permission_key, _Budget())
+                permission.cause = code
+                self._delay(permission, h)
+            else:
+                budget.cause = code or ('server_error' if isinstance(status, int) and status >= 500 else 'unexpected_status')
+                self._delay(budget, h)
+                if throttled and 'retry-after' not in h:
+                    budget.until = max(budget.until, now + 60)
             # An authorization failure must invalidate cached authorization evidence.
-            if status in (401, 403, 404):
+            if status == 401:
                 self._cache = {k: v for k, v in self._cache.items() if k[0] != credential.key}
+            elif status in (403, 404) and not throttled:
+                self._cache = {k: v for k, v in self._cache.items()
+                               if k[0] != credential.key or not
+                               (k[2].split('?', 1)[0] == resource or k[2].startswith(resource + '/'))}
             if status == 401 and hasattr(self.credential_resolver, 'invalidate'):
                 self.credential_resolver.invalidate(key=credential.key)
-            code = {401:'unauthorized',403:'forbidden',404:'not_found',429:'rate_limited'}.get(status)
-            raise _Failure(code or ('server_error' if isinstance(status, int) and status >= 500 else 'unexpected_status'))
+            cooldown = permission if status in (403, 404) and not throttled else budget
+            raise _Failure(code or ('server_error' if isinstance(status, int) and status >= 500 else 'unexpected_status'),
+                           max(0, math.ceil(cooldown.until - self.clock())))
         if status == 304:
             if not cached:
                 raise _Failure('unbacked_304')
@@ -231,6 +264,8 @@ class GitHubActions:
                 self._cache[key] = (etag, deepcopy(body))
             else:
                 self._cache.pop(key, None)
+        self._budgets.pop(permission_key, None)
+        budget.cause = None
         budget.failures = 0
         budget.until = 0
         return body
@@ -260,7 +295,9 @@ class GitHubActions:
                    provider='github_actions', endpoint=self.ENDPOINT, scope_id=scope['id'],
                    provider_runner_id=rid, host_id=None, display_name=raw.get('name'),
                    labels=list(dict.fromkeys(x['name'] for x in labels)),
-                   observed_os={'osx':'macos','linux':'linux','win':'windows'}.get(raw.get('os'),'unknown'),
+                   observed_os={'osx':'macos', 'macos':'macos', 'linux':'linux',
+                                'win':'windows', 'windows':'windows'}.get(
+                                    raw['os'].lower() if type(raw.get('os')) is str else '', 'unknown'),
                    lifecycle='ephemeral' if raw.get('ephemeral') is True else 'unknown',
                    replacement_of=None, expected_expiry=None, registration=raw['status'],
                    activity='busy' if raw['busy'] else 'idle', readiness='not_checked',
@@ -304,7 +341,7 @@ class GitHubActions:
             except BudgetPersistenceError:
                 raise
             except _Failure as exc:
-                return ProviderResult(tuple(rows), False, str(exc), self.clock(), total)
+                return ProviderResult(tuple(rows), False, str(exc), self.clock(), total, exc.retry_after_seconds)
             except Exception:
                 return ProviderResult(tuple(rows), False, 'invalid_payload', self.clock(), total)
 
@@ -381,6 +418,6 @@ class GitHubActions:
             except BudgetPersistenceError:
                 raise
             except _Failure as exc:
-                return ProviderResult(tuple(rows), False, str(exc), self.clock(), None)
+                return ProviderResult(tuple(rows), False, str(exc), self.clock(), None, exc.retry_after_seconds)
             except Exception:
                 return ProviderResult(tuple(rows), False, 'invalid_payload', self.clock(), None)

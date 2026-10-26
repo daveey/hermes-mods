@@ -45,7 +45,58 @@ def test_atomic_collection_restart_and_cached_read(tmp_path):
         Collector(store,config(),adapter,clock=lambda:1031).tick()
         assert store.load_health(F['Runner']['id']).registration=='online'
         assert store.load_health(F['Runner']['id']).source_error=='auth'
-    assert Service(path,config(),clock=lambda:1032).inventory()['data']['state']=='partial'
+    result = Service(path,config(),clock=lambda:1032).inventory()
+    assert result['data']['state']=='partial'
+    provenance = next(p for p in result['meta']['provenance'] if p['source_id'] == F['Runner']['id'])
+    from plugins.runners.collector import iso
+    assert provenance['observed_at'] == iso(1000)
+    assert provenance['observed_at'] != result['meta']['observed_at']
+    assert provenance['state'] != 'fresh'
+    validate('InventoryResponse', result)
+
+def test_scope_error_persists_retry_eta_in_cached_api(tmp_path):
+    path = tmp_path / 'state.sqlite'
+    adapter = Adapter()
+    adapter.result = ProviderResult((), False, 'forbidden', 1000, None, 60)
+    with Store(path) as store:
+        Collector(store, config(), adapter, clock=lambda: 1000).tick()
+    response = Service(path, config(), clock=lambda: 1001).inventory()
+    error = response['meta']['source_errors'][0]
+    assert error['code'] == 'forbidden'
+    assert error['retry_after_seconds'] == 60
+    validate('InventoryResponse', response)
+
+
+@pytest.mark.parametrize('source_failure', [False, True])
+@pytest.mark.parametrize('registration,activity,now', [
+    ('online', 'idle', 1001), ('online', 'busy', 1001),
+    ('offline', 'idle', 1001), ('unknown', 'unknown', 1001),
+    ('online', 'idle', 1201),
+])
+def test_api_ui_counts_match_actual_snapshot(tmp_path, registration, activity, now, source_failure):
+    import subprocess
+    adapter = Adapter()
+    row = dict(F['Runner'], registration=registration, activity=activity)
+    adapter.result = ProviderResult((row,), True, None, 1000, 1)
+    path = tmp_path / 'state.sqlite'
+    with Store(path) as store:
+        Collector(store, config(), adapter, clock=lambda: 1000).tick()
+        if source_failure:
+            adapter.result = ProviderResult((), False, 'forbidden', 1031, None)
+            Collector(store, config(), adapter, clock=lambda: 1031).tick()
+            assert store.load_health(row['id']).source_error == 'forbidden'
+            now = max(now, 1032)
+    snapshot = Service(path, config(), clock=lambda: now).inventory()
+    root = Path(__file__).parents[3]
+    result = subprocess.run(['node', str(root / 'desktop-plugins/runners/tests/project-snapshot.mjs')],
+                            input=json.dumps(dict(snapshot=snapshot, now=now)),
+                            text=True, capture_output=True, check=True, timeout=15)
+    ui = json.loads(result.stdout)
+    api = snapshot['data']['counts']
+    assert ui == dict(registrations=api['registrations'], online=api['online'],
+                     busy=api['busy'], ready=api['verified_ready'],
+                     unverified=api['readiness_unverified'], issues=api['issues'])
+
 
 def test_hosts_once_concurrency_and_cache(tmp_path):
     from copy import deepcopy

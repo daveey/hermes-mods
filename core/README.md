@@ -21,6 +21,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 |---|---|---|
 | [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0276–0277, 0279 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
 | [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0280 | Orderly park releases PR guard; broker-aware PR-state reads |
+| [orphan-reaper-home-scope.md](orphan-reaper-home-scope.md) | 0281 | Orphan reaping requires proven home/UID ownership and fresh process identity |
 | [kanban-pr-broker-transport.md](kanban-pr-broker-transport.md) | 0278 | Profile-scoped GitHub broker execution and sanitized setup receipts |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0260 | AutomatedRow active-Kanban type coverage |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0262 | Failed-node retries and deflake cards |
@@ -97,6 +98,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-false-done-attention.md](kanban-false-done-attention.md) | 0194 | A chat whose kanban cards are all done stripes amber, not green, when a card finished in the last 24 h admits dropped work with no follow-up card (judged by a plugin-registered check, e.g. `plugins/kanban-honest-done`) |
 | [tool-search-defer-outside-worker.md](tool-search-defer-outside-worker.md) | 0145 | `tools.tool_search.defer_outside_kanban_worker` defers the listed tools (the Kanban worker-lifecycle tools on the fork) in chats, cron and one-shots only; dispatcher-spawned Kanban workers keep them direct, saving ~3.7k tokens per call elsewhere |
 | [plugin-archive-hotkey.md](plugin-archive-hotkey.md) | 0147, 0157 | Plugins can take over ⌘⇧A for sessions they own (`ctx.registerArchiveHotkeyHandler`); Inbox uses it to archive and open the next Inbox message. `ctx.openNextSession(id)` gives plugin buttons the same next-session step (Inbox last card) |
+| [delegate-route-conflicts.md](delegate-route-conflicts.md) | 0282 | Offline model/provider coherence preflight rejects incompatible delegated batches before spawning |
 | [model-tiers.md](model-tiers.md) | 0151 0152 0269 | Lazy selected-route preflight; per-task `model`/`provider` on delegate_task (`delegation.allow_task_model`); Kanban cards with no pinned model run on `kanban.default_model`, except reviews, retries after a failed run and keep-pattern matches (each run logs a `model_tier` event) |
 | [sidebar-exclude-sources.md](sidebar-exclude-sources.md) | 0154 | Per-profile `sessions.sidebar_exclude_sources` (e.g. `[api_server]`) keeps a machine profile's sessions out of the sidebar project tree |
 | [gemini-provider-defaults.md](gemini-provider-defaults.md) | 0156 0247 | `--provider gemini` without `-m` uses a Gemini model instead of sending your `claude-*` default (404); Gemini aux/title default is `gemini-3.8-flash` |

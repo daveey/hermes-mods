@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { React, host, route, snapshot, fixtures, loadPlugin, mount, button } from './sdk-mock.mjs'
+import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
 const p = await loadPlugin()
 test('job links require exact provider, scope, assignment, owner and numeric IDs', () => {
   const s = snapshot(),
@@ -39,7 +39,7 @@ test('known job appears only after bounded detail read and SDK opens its exact U
   const ui = await mount(
     React.createElement(p.Runners, {
       ctx: {
-        rest: async (path) => (path.includes('/runners/') ? d : s),
+        rest: async (path) => path.includes('/enrollment') ? enrollment() : (path.includes('/runners/') ? d : s),
         os: { openExternal: async (url) => links.push(url) }
       }
     })

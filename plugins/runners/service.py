@@ -61,12 +61,23 @@ class Service:
             row=deepcopy(row)
             checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock())
             host=snap.get('host_results',{}).get(row.get('host_id'),{})
-            p=project(State(**snap['states'][row['id']]),now=self.clock(),policy=policy,checks=checks,management=host.get('management','unknown'),host_at=host.get('at'))
+            maintenance=next((h['maintenance'] for h in c['hosts'] if h['id']==row.get('host_id')), {})
+            until=(datetime.fromisoformat(maintenance['expires_at'].replace('Z','+00:00')).timestamp()
+                   if maintenance.get('state')=='active' else None)
+            p=project(State(**snap['states'][row['id']]),now=self.clock(),policy=policy,checks=checks,management=host.get('management','unknown'),host_at=host.get('at'),maintenance_until=until)
             row.update(registration=p.registration,activity=p.activity,freshness=p.freshness,readiness=ready)
             rows.append(row); projections.append(p)
+            observed = snap['states'][row['id']]
+            at = observed.get('at')
+            if at is not None:
+                meta['provenance'].append(dict(
+                    source_id=row['id'], collection_id=observed['cycle'],
+                    observed_at=iso(at), expires_at=iso(at+policy.inventory_ttl),
+                    state='fresh' if p.freshness == 'fresh' and not observed.get('source_error') else 'stale',
+                    observation_ids=row['observation_ids']))
         for provenance in meta['provenance']:
             if provenance['state']=='fresh' and (meta['freshness']!='fresh' or self.clock()>datetime.fromisoformat(provenance['expires_at'].replace('Z','+00:00')).timestamp()): provenance['state']='stale'
-        count=dict(registrations=len(rows),online=sum(r.registration=='online' for r in projections),busy=sum(r.activity=='busy' for r in projections),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(r.registration=='online' and not r.ready for r in projections),issues=sum(r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
+        count=dict(registrations=len(rows),online=sum(r.registration=='online' for r in projections),busy=sum(r.activity=='busy' for r in projections),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(r.registration=='online' and not r.ready for r in projections),issues=sum('source_unavailable' in r.reasons or r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
         state='loading' if not snap else ('ready' if snap['collection']['state']=='complete' else 'partial')
         if snap and any(p['state']!='fresh' for p in meta['provenance']): state='partial'
         if not c['scopes']: state='not_configured'
@@ -76,6 +87,8 @@ class Service:
             evidence=(snap or {}).get('host_results',{}).get(host['id'])
             if evidence and 0<=self.clock()-evidence['at']<=policy.host_ttl:
                 host['management']=evidence['management']
+        mapped_hosts={row['host_id'] for row in rows if row['host_id']}
+        count['issues'] += sum(host['id'] in mapped_hosts and host['management']=='unreachable' for host in hosts)
         data=dict(state=state,collection=snap['collection'] if snap else None,counts=count,hosts=hosts,runners=rows,scopes=c['scopes'],providers=c['providers'],targets=c['execution_targets'])
         return dict(meta=meta,data=data)
 

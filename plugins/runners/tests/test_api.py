@@ -59,6 +59,37 @@ def api(monkeypatch, tmp_path):
 TOKEN = {'x-hermes-session-token': 'fictional-test-token'}
 
 
+def test_enrollment_discovery_missing_config_is_not_an_outage(disk_api):
+    _, client, path, _, _, _ = disk_api
+    path.unlink()
+    assert client.get(PREFIX + '/enrollment').status_code == 401
+    response = client.get(PREFIX + '/enrollment', headers=TOKEN)
+    assert response.status_code == 200
+    assert response.json() == {'contract_version': 1, 'profile': 'example', 'enrolled': False, 'capabilities': []}
+
+
+def test_enrollment_discovery_reports_owner_without_store(disk_api):
+    _, client, path, _, config, _ = disk_api
+    (path.parent / 'runners/state.sqlite').unlink()
+    response = client.get(PREFIX + '/enrollment', headers=TOKEN)
+    assert response.status_code == 200
+    assert response.json() == {'contract_version': 1, 'profile': 'example', 'enrolled': True,
+                               'capabilities': ['inventory', 'inspect', 'refresh']}
+    assert not (path.parent / 'runners/state.sqlite').exists()
+
+
+def test_enrollment_discovery_does_not_hide_invalid_config(disk_api):
+    _, client, path, _, _, _ = disk_api
+    path.write_text('schema_version: invalid\n')
+    assert client.get(PREFIX + '/enrollment', headers=TOKEN).status_code == 503
+
+
+def test_enrollment_discovery_fences_wrong_profile(disk_api, monkeypatch):
+    module, client, _, _, _, _ = disk_api
+    monkeypatch.setattr(module, 'active_profile', lambda: 'other')
+    assert client.get(PREFIX + '/enrollment', headers=TOKEN).status_code == 403
+
+
 def test_auth_and_cached_inventory(api):
     _, client, _ = api
     assert client.get(PREFIX + '/inventory').status_code == 401
