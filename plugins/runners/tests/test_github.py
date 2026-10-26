@@ -209,7 +209,16 @@ def test_bounded_enrichment_only_allowlist_and_busy_recent():
     r=h.api.enrich_jobs(scope(), rows, allowed_repositories=['example/widget'], recent_runner_ids={'2'})
     assert r.complete and {row['runner_id'] for row in r.rows}=={'1','2'} and len(h.calls)==2
     assert all('/repos/example/widget/actions/' in c[1] for c in h.calls)
+    assert 'status=in_progress' in h.calls[0][1]
     assert h.api.enrich_jobs(scope(),rows,allowed_repositories=['example/widget']).error=='enrichment_cooldown'
+
+
+def test_recent_only_enrichment_reads_bounded_history():
+    h=Harness([response([dict(id=11)],key='workflow_runs'),
+               response([dict(id=21,runner_id=1,status='completed',conclusion='failure')],key='jobs')])
+    result=h.api.enrich_jobs(scope(),[runner(1)],allowed_repositories=['example/widget'],recent_runner_ids={'1'})
+    assert result.complete and result.rows[0]['conclusion']=='failure'
+    assert 'status=in_progress' not in h.calls[0][1]
 
 
 def test_enrichment_no_candidates_no_calls_and_hard_budget():

@@ -62,6 +62,10 @@ GET. Empty rows do not imply monitoring is disabled. Older collector snapshots
 report unknown configuration; an explicit absent allowlist reports not_configured.
 Truncated bounded queries remain configured but identify their partial reason.
 Expired job evidence reports unknown/stale_evidence; cooldowns never renew its age.
+When any candidate is busy, bounded enrichment queries in-progress runs so newer
+queued/completed runs cannot exhaust the budget before active work is inspected.
+Recent-only candidates use the bounded unfiltered history query; neither mode
+claims exhaustive job history or turns a missing attribution into runner failure.
 
 Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/enrollment`, GET
 `/inventory`, GET `/runners/{id}`, POST `/refresh`. Enrollment returns the explicit
