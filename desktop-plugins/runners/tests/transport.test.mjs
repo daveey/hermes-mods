@@ -39,6 +39,58 @@ test('invalid enrollment or discovery failure cannot fall through to inventory',
     assert.equal(calls.length, 1)
   }
 })
+test('legacy enrollment 404 retains validated inventory as deployment-pending, never ready', async () => {
+  const calls = []
+  const a = p.createTransport({ rest: async (path) => {
+    calls.push(path)
+    if (path.includes('/enrollment')) throw Object.assign(Error('Not Found'), { status: 404 })
+    return snapshot()
+  } }, { profileRoutes: async () => [route] })
+  const sources = await a.inventory()
+  assert.ok(sources[0].snapshot)
+  assert.match(sources[0].error, /Deployment pending/)
+  assert.equal(calls.length, 2)
+  const fleet = p.projectFleet(sources)
+  assert.ok(fleet.rows.length > 0)
+  assert.equal(fleet.counts.ready, 0)
+  await assert.rejects(a.refresh(sources[0]), /disconnected/)
+})
+test('legacy fallback never adopts wrong-profile inventory or bypasses authorization', async () => {
+  for (const status of [401, 403, 503]) {
+    let reads = 0
+    const a = p.createTransport({ rest: async () => {
+      reads++
+      throw Object.assign(Error('private detail'), { status })
+    } }, { profileRoutes: async () => [route] })
+    assert.equal((await a.inventory())[0].snapshot, undefined)
+    assert.equal(reads, 1)
+  }
+  const wrong = snapshot()
+  wrong.meta.owner.profile = 'other'
+  const a = p.createTransport({ rest: async (path) => {
+    if (path.includes('/enrollment')) throw Object.assign(Error('Not Found'), { status: 404 })
+    return wrong
+  } }, { profileRoutes: async () => [route] })
+  const result = (await a.inventory())[0]
+  assert.equal(result.snapshot, undefined)
+  assert.match(result.error, /Owner identity/)
+})
+test('legacy fallback retains prior rows on unavailable inventory and recovers after upgrade', async () => {
+  let mode = 'legacy'
+  const a = p.createTransport({ rest: async (path) => {
+    if (path.includes('/enrollment')) {
+      if (mode !== 'upgraded') throw Object.assign(Error('Not Found'), { status: 404 })
+      return enrollment()
+    }
+    if (mode === 'unavailable') throw Object.assign(Error('Not Found'), { status: 404 })
+    return snapshot()
+  } }, { profileRoutes: async () => [route] })
+  const prior = (await a.inventory())[0].snapshot
+  mode = 'unavailable'
+  assert.equal((await a.inventory())[0].snapshot, prior)
+  mode = 'upgraded'
+  assert.equal((await a.inventory())[0].error, undefined)
+})
 test('same-owner epoch advance recovers inventory but old captured actions remain fenced', async () => {
   let s = snapshot()
   const a = p.createTransport({ rest: async (path) => path.includes('/enrollment') ? enrollment() : s }, { profileRoutes: async () => [route] })
