@@ -49,8 +49,9 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - A finished turn does not go green while the session's work still runs elsewhere. Its dot reads
   `background` (no stripe) when:
   - kanban tasks it created are still `todo`, `ready`, `running` or `scheduled` (`0044`). A turn that calls
-    `kanban_create` ends at once while workers run for hours. `blocked`, `review`, `done` and `archived`
-    tasks don't count.
+    `kanban_create` ends at once while workers run for hours. Since `0284`, blocked-only work also
+    keeps both dot paths unfinished; the stripe retains its blocked priority. `done` and `archived`
+    tasks don't count. See [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md).
   - its standing `/goal` is still `active` (`0051`): between goal turns, or parked on a judge `wait` timer.
     Paused, done and cleared goals don't count.
   - it owns a background process (`terminal` with `background=true`) whose PID is still alive, as the backend
@@ -130,7 +131,9 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - Blocked counts (`0063`): `_read_counts(path, statuses)` now takes the status set; `_all_counts()` reads
   `ACTIVE_STATUSES` and `BLOCKED_STATUSES = ("blocked",)` into two maps under one cache entry.
   `active_task_counts()` and the new `blocked_task_counts()` return each. `annotate_kanban_activity` stamps
-  `kanban_blocked` the same way as `kanban_active`. Blocked tasks do not make the session busy.
+  `kanban_blocked` the same way as `kanban_active`. Since `0284`, blocked counts also prevent a finished dot
+  in both Desktop paths. Database/WAL fingerprints invalidate the three-second cache on external writes;
+  see [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md) for verification and limits.
 - `app/chat/sidebar/gateway-device-icon.tsx`: `gatewayDevice(connection, localHostname)` picks the kind.
   `cloud` connections → cloud. Otherwise a name is matched (`mini` → Mac mini, `macbook|laptop|book` →
   laptop): the connection's label + ssh host + id, or for the `local` connection the backend hostname from
