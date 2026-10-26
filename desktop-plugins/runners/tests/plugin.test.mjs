@@ -16,6 +16,22 @@ test('node projection includes empty hosts and keeps unassigned registrations se
   assert.equal(v.nodes[1].activity.busy, null)
   assert.equal(v.nodes[1].freshness.observedAt, null)
 })
+test('host provenance supplies only actual probe age including empty nodes', () => {
+  const s = snapshot(), now = Date.now()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  const observed_at = new Date(now - 30000).toISOString()
+  const probe = { source_id: fixtures.Host.resource_id, observed_at, expires_at: new Date(now + 1000).toISOString(), state: 'fresh', observation_ids: ['probe'] }
+  s.meta.provenance.push(probe)
+  const node = () => p.projectNodes([source(s)], [], now).nodes[0]
+  assert.deepEqual(node().freshness, { state: 'fresh', observedAt: observed_at })
+  probe.expires_at = new Date(now - 1).toISOString()
+  assert.equal(node().freshness.state, 'stale')
+  probe.state = 'unavailable'
+  assert.equal(node().freshness.state, 'unavailable')
+  probe.observed_at = null
+  assert.equal(node().freshness.observedAt, null)
+  assert.notEqual(node().freshness.state, 'fresh')
+})
 test('node health never turns management reachability or busy activity into verified health', () => {
   const s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host)]

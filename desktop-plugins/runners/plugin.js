@@ -435,6 +435,13 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
     for (const host of snapshot.data.hosts) {
       const key = JSON.stringify([ownerKey(snapshot.meta.owner), host.id])
       if (nodes.has(key)) continue
+      const probe = snapshot.meta.provenance?.find(p => host.resource_id && p.source_id === host.resource_id)
+      const observedAt = Number.isFinite(Date.parse(probe?.observed_at)) ? probe.observed_at : null
+      const freshness = { observedAt, state: source.error ? 'stale'
+        : probe?.state === 'unavailable' ? 'unavailable'
+          : !observedAt ? 'unknown'
+            : probe?.state === 'stale' || Date.parse(probe?.expires_at) <= now ? 'stale'
+              : probe?.state === 'fresh' && Date.parse(probe?.expires_at) > now ? 'fresh' : 'unknown' }
       const runners = projectedRows.filter(r => r.hostKey === key)
       const unknown = runners.filter(r => r.stale || !['busy', 'idle'].includes(r.activity)).length
       nodes.set(key, {
@@ -464,7 +471,7 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
           idle: !runners.length || unknown ? null : runners.filter(r => r.activity === 'idle').length,
           unknown
         },
-        freshness: { state: source.error ? 'stale' : 'unknown', observedAt: null }
+        freshness
       })
     }
   }
