@@ -1158,6 +1158,10 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
           search.trim() || filter !== 'All' ? h('div', { 'data-filtered-cohort': true }, `Showing ${groups.filter(g => g.host).length} nodes · ${rows.length} registrations`) : null
         ),
         h(
+          'details',
+          { 'data-runners-diagnostics': true },
+          h('summary', { className: 'hermes-runners-muted' }, 'Source diagnostics'),
+          h(
           'div',
           { className: 'hermes-runners-muted' },
           `Collector heartbeat ${ago(
@@ -1190,6 +1194,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
             )
           )
         ),
+        ...view.messages.map((m) => h('p', { key: m, className: 'hermes-runners-note' }, m))
+        ),
         h(
           'div',
           {
@@ -1198,7 +1204,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
             style: { maxHeight: 100, overflow: 'auto', flexShrink: 0 }
           },
           q.isPending && !sources.length ? 'Loading inventory…' : null,
-          ...view.messages.map((m) => h('p', { key: m, className: 'hermes-runners-note' }, m))
+          ...selected.filter(s => s.enrolled !== false && (s.error || ['owner_disconnected', 'plugin_unavailable', 'owner_conflict'].includes(s.snapshot?.data.state))).map((s, i) =>
+            h('p', { key: i, className: 'hermes-runners-note' }, `Owner unavailable · ${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''}: ${s.error || STATES[s.snapshot.data.state]}`))
         ),
         actionError ? h('p', { role: 'alert' }, actionError) : null,
         h('input', {

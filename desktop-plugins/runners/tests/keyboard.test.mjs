@@ -25,6 +25,33 @@ test('physical nodes start collapsed including empty hosts; expand reveals lazy 
     assert.equal(calls.filter(p => p.includes('/runners/')).length, 1)
   } finally { await ui.close() }
 })
+test('source diagnostics are collapsed while material owner failure remains visible', async () => {
+  const s = snapshot()
+  s.data.state = 'owner_disconnected'
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    const diagnostics = document.querySelector('details[data-runners-diagnostics]')
+    assert.ok(diagnostics, 'source diagnostics disclosure exists')
+    assert.equal(diagnostics.open, false)
+    assert.match(diagnostics.textContent, /Collector heartbeat/)
+    const status = document.querySelector('[role="status"]')
+    assert.match(status.textContent, /Owner unavailable/)
+    assert.match(document.querySelector('[data-node-row]').textContent, /Owner unavailable/)
+  } finally { await ui.close() }
+})
+test('nonowner enrollment diagnostics remain secondary and do not become owner failures', async () => {
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async () => ({ contract_version: 1, profile: 'example', enrolled: false, capabilities: [] }) } }))
+  try {
+    await ui.click(button('Show runners'))
+    assert.match(document.querySelector('[data-runners-diagnostics]').textContent, /Not enrolled/)
+    assert.doesNotMatch(document.querySelector('[role="status"]').textContent, /Owner unavailable|Not enrolled/)
+    assert.equal(document.querySelectorAll('[data-node-row]').length, 0)
+  } finally { await ui.close() }
+})
 test('node detail shows explicit maintenance and enforced capacity without free-slot claims', async () => {
   const s = snapshot()
   s.data.hosts = [{ ...structuredClone(fixtures.Host), capacity: { enforced: true, declared_max_jobs: 4, observed_active_jobs: null }, maintenance: { state: 'active', reason: 'Inspection', expires_at: new Date(Date.now() + 60000).toISOString() } }]
