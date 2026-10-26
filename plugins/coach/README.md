@@ -596,8 +596,44 @@ an owned disposable process. This is a regression-fixture guard, not a security
 sandbox for hostile executables or direct syscalls. No production profile should be
 used for these tests. Full app reload, backend restart and all-gateway socket loss
 are not covered by the session-socket reconnect case. Production activation,
-remote/process owner adapters and exact-original replay remain separate requirements.
+remote owner adapters and exact-original replay remain separate requirements.
 
 `test_goal_process_ownership.py` verifies that cached process handles, notify flags
 and forged consumer assertions cannot certify ownership or release a prior hold.
-It is a conservative UNKNOWN regression, not a positive process owner adapter.
+Those conservative UNKNOWN regressions are retained. The native local adapter in
+`goal_process_ownership.py` accepts only exact `{gateway,profile,process_id}` routes,
+full process handles, immutable canonical message-UID/profile/session spawn bindings,
+a live local pipe Popen with matching kernel identity and reader, and a fresh native
+process-completion consumer receipt. It compares the latest canonical stored human
+row, not command text or cached ownership assertions. Guard reads never spawn, poll,
+drain, adopt, signal, repair, or write state.
+
+The deliberately narrow supported path requires an **actually admitted process
+completion within 15 seconds** on the same live TUI/serve session, profile and registry
+generation. An empty poll, Kanban receipt or a live thread does not qualify. Stop,
+teardown, lost/released lease, disabled notifications, retirement, stale receipts and
+late pre-Stop dispatch results reject ownership. This is point-in-time continuation,
+not a promise of eventual success or delivery. One-shot, other consumers, detached,
+retained, sandbox, PTY, systemd-wrapper, WSL, persistent and handed-off processes
+remain UNKNOWN. Steering/rotation does not rebind an old process to new scope.
+
+`test_goal_process_adapter.py` composes real native spawns/queue consumption and an
+isolated canonical state DB through the public gate (the admission result is substituted
+in its focused fixture). `test_goal_process_serve.py` additionally runs unpatched
+production serve and token-authenticated WebSocket requests with deterministic primary
+and judge replies over loopback HTTP: two real terminal spawns, exact-command fixture
+approval through the native request protocol, actual completion admission, positive
+ownership at the discovered coach gate, and the owned process's subsequent completion.
+No production configuration or external provider is used. It does not exercise Electron
+or certify other process consumers.
+
+Process-proof race checks re-read the canonical user row and require the same
+consumer receipt/revocation version after the final running-process snapshot.
+Stop, a new canonical request, or changed admission evidence observed during those
+reads rejects ownership. This is bounded point-in-time evidence, not an atomic
+transaction across process state, SQLite and the transport, or a future-delivery
+guarantee. The native batch consumer retains refused/unknown/exceptional process
+completion admissions for retry rather than relying on delegation-only release.
+Tests: `test_goal_process_independent_review.py` exercises native Stop, new canonical
+steering, and retry after false/unknown/exceptional admission; `test_goal_process_serve.py`
+exercises actual isolated serve, approval protocol, spawn and completion admission.

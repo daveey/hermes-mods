@@ -2,10 +2,16 @@
 
 Local scheduled ownership needs a native future wake, a fresh dispatcher receipt
 and a scoped result consumer. Dependency waits additionally require verified
-ongoing ancestors. Remote/process owners remain UNKNOWN.
+ongoing ancestors. Remote owners remain UNKNOWN; native local pipe processes use a separate adapter.
 Runtime liveness is a point-in-time observation, not a future delivery guarantee.
 """
 from pathlib import Path
+import importlib.util
+
+_process_spec = importlib.util.spec_from_file_location(
+    "_coach_goal_process_ownership", Path(__file__).with_name("goal_process_ownership.py"))
+_process = importlib.util.module_from_spec(_process_spec)
+_process_spec.loader.exec_module(_process)
 
 def _ro_connect(path):
     import sqlite3
@@ -50,6 +56,8 @@ def authoritative_owner(v, evidence, session_id):
     from hermes_cli.profiles import get_active_profile_name
 
     ref = v.get('continuation_ref')
+    if isinstance(ref, dict) and 'process_id' in ref:
+        return _process.authoritative_process(v, evidence, session_id, _ro_connect, _current_user_matches)
     if (not isinstance(ref, dict) or set(ref) != {'gateway', 'profile', 'board', 'task_id'}
             or any(not isinstance(x, str) or not x for x in ref.values())
             or not re.fullmatch(r't_[0-9a-f]{8}', ref['task_id'])
