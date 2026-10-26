@@ -52,6 +52,17 @@ const long=await page.evaluate(()=>{
 })
 assert.ok(long.scrolls && long.headerStable && long.height<=long.max,'long inventory scrolls inside bounded panel without moving header')
 report.longList=long
+// A crowded native status bar can put the trigger beyond a narrow viewport.
+// The panel must stay reachable rather than remain tethered to that trigger.
+await page.setViewportSize({width:390,height:900})
+await page.goto('file://'+process.cwd()+'/index.html')
+await page.locator('[data-slot=runners-chip]').evaluate(el=>{
+  el.style.position='fixed';el.style.left='600px';el.style.right='auto';el.click()
+})
+await page.locator('[data-node-row]').first().waitFor()
+const detached=await page.locator('[data-runners-panel]').evaluate(el=>el.getBoundingClientRect().toJSON())
+report.offscreenAnchor=detached
+assert.ok(detached.left>=0 && detached.right<=390,'panel stays inside viewport even when status trigger is offscreen')
 assert.deepEqual(report.errors,[])
 }finally{await writeFile('report.json',JSON.stringify(report,null,2));await browser.close()}
 console.log(JSON.stringify(report,null,2))
