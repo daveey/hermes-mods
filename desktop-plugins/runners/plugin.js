@@ -1,4 +1,4 @@
-// Native Observe surface. No credentials, ambient routing or repair mutations.
+// Native node-first surface. No credentials or ambient action routing.
 import {
   host,
   useValue,
@@ -168,7 +168,14 @@ export function createTransport(ctx, hostRef = host) {
             )
               throw safeError('Invalid inventory response')
             queryClient?.setQueryData(ownerQueryKey(snapshot.meta.owner), snapshot)
-            sources.set(key, { route, snapshot, ...(legacy ? { error: 'Deployment pending: enrollment unavailable; last-known inventory' } : {}) })
+            const features = { repair_sessions: enrollment?.features?.repair_sessions === true }
+            let repairs = []
+            if (features.repair_sessions) {
+              const response = await request(route, '/repairs', {}, snapshot.meta.owner)
+              if (!Array.isArray(response.data)) throw safeError('Invalid repair list')
+              repairs = response.data
+            }
+            sources.set(key, { route, snapshot, features, repairs, ...(legacy ? { error: 'Deployment pending: enrollment unavailable; last-known inventory' } : {}) })
           } catch (e) {
             sources.set(key, { ...prior, route, ...(enrollment?.enrolled === true ? { enrolled: true } : {}), error: failure(e) })
           }
@@ -201,7 +208,125 @@ export function createTransport(ctx, hostRef = host) {
       pending.delete(key)
     }
   }
-  return { inventory, request, refresh }
+  // Retain ambiguous attempts for this transport's lifetime. A retry queries
+  // status, never sends a prompt or schedules the first turn again.
+  const starts = new Set(), repairPending = new Map(), repairKeys = new Map()
+  async function assertRoute(route) {
+    if (!(await routes()).some(r => routeKey(r) === routeKey(route)))
+      throw safeError('Owner gateway disconnected: route removed')
+  }
+  async function openRepair(route, owner, repair) {
+    if (!repair?.owner || ownerKey(repair.owner) !== ownerKey(owner) ||
+        repair.owner.owner_epoch !== owner.owner_epoch ||
+        !ID_PATTERN.test(repair.session?.start_request_id || ''))
+      throw safeError('Invalid repair owner or start request')
+    if (typeof hostRef.requestProfile !== 'function' || typeof hostRef.openSession !== 'function')
+      throw safeError('Repair sessions unsupported: update Hermes Desktop')
+    const params = { profile: route.targetProfile, namespace: 'runners', start_request_id: repair.session.start_request_id }
+    async function status() {
+      const response = await request(route, `/repairs/${encodeURIComponent(repair.id)}`, {}, owner)
+      const current = response.data.repair
+      if (current?.owner?.gateway_id !== owner.gateway_id || current.owner.profile !== owner.profile)
+        throw safeError('Repair session owner identity mismatch')
+      return { gateway_id: current.owner.gateway_id, profile: current.owner.profile,
+        stored_session_id: current.session.stored_session_id, resolved_session_id: current.session.lineage_tip_id,
+        exists: !!current.session.stored_session_id, reconciliation: current.session.state }
+    }
+    const key = JSON.stringify([ownerKey(owner), owner.owner_epoch, params.start_request_id])
+    await assertRoute(route)
+    let result
+    if (starts.has(key)) {
+      try {
+        result = await status()
+      } catch {
+        throw safeError('Repair outcome unknown; status reconciliation unavailable. No prompt resent.')
+      }
+    } else {
+      starts.add(key)
+      try {
+        result = await hostRef.requestProfile(route, 'session.start_request', params, 10000, { spawnPriority: 'foreground' })
+      } catch {
+        await assertRoute(route)
+        try {
+          result = await status()
+        } catch {
+          throw safeError('Repair outcome unknown; status reconciliation unavailable. No prompt resent.')
+        }
+      }
+    }
+    // Only an authoritative owner status of reserved/queued permits recovery of
+    // a pre-create/pre-claim crash. Reuse the durable core ID, never send text.
+    if (['reserved', 'queued'].includes(result?.reconciliation)) {
+      await assertRoute(route)
+      result = await hostRef.requestProfile(route, 'session.start_request', params, 10000, { spawnPriority: 'foreground' })
+    }
+    await assertRoute(route)
+    if (result?.gateway_id !== owner.gateway_id || result.profile !== owner.profile)
+      throw safeError('Repair session owner identity mismatch')
+    const id = result.resolved_session_id || result.stored_session_id
+    if (!result.exists || !/^[A-Za-z0-9_-]{1,128}$/.test(id || ''))
+      throw safeError('Repair session outcome unknown; no session available to open')
+    await hostRef.openSession(id, { route: { ...route } })
+    return repair
+  }
+  async function repair(row) {
+    if (!row?.actionable || !row.source?.snapshot || row.source.error)
+      throw safeError('Owner gateway disconnected or ownership conflict')
+    if (!ID_PATTERN.test(row.id)) throw safeError('Invalid runner ID')
+    // Copy both routing and authority before the first await, not from the
+    // selected chat or a mutable source row after the network responds.
+    const route = { ...row.source.route }, owner = { ...row.source.snapshot.meta.owner }, entity = row.id
+    const key = JSON.stringify([ownerKey(owner), owner.owner_epoch, entity])
+    const related = new Set([entity, ...row.source.snapshot.data.runners
+      .filter(r => row.host_id && r.host_id === row.host_id).map(r => r.id)])
+    const mappedHost = row.source.snapshot.data.hosts.find(h => h.id === row.host_id)
+    if (ID_PATTERN.test(mappedHost?.resource_id || '')) related.add(mappedHost.resource_id)
+    if (repairPending.has(key)) return repairPending.get(key)
+    const run = async () => {
+      const detail = await request(route, `/runners/${encodeURIComponent(entity)}?history_limit=50`, {}, owner)
+      const existing = (detail.data.repairs || []).find(r =>
+        related.has(r.entity_id) && !['closed', 'failed'].includes(r.state))
+      if (existing) {
+        starts.add(JSON.stringify([ownerKey(owner), owner.owner_epoch, existing.session?.start_request_id]))
+        return openRepair(route, owner, existing)
+      }
+      const incident = (detail.data.incidents || []).find(i => i.entity_id === entity && !i.resolved_at && ID_PATTERN.test(i.id))
+      if (!incident) throw safeError('No current incident identity; refresh runner evidence before investigating')
+      const previous = (detail.data.repairs || []).find(r => related.has(r.entity_id))
+      const attempt = `${key}:${incident.id}:${previous?.id || 'first'}`
+      if (!repairKeys.has(attempt)) repairKeys.set(attempt, `repair_${crypto.randomUUID().replaceAll('-', '')}`)
+      const response = await request(route, '/repairs', { method: 'POST', body: {
+        entity_id: entity, incident_id: incident.id,
+        idempotency_key: repairKeys.get(attempt), mode: row.issue ? 'repair' : 'diagnose', expected_owner: owner
+      } }, owner)
+      // Backend route hints are not authority. The captured, verified registry
+      // route reaches this owner even when the runner host itself is dead.
+      if (!related.has(response.data.repair?.entity_id))
+        throw safeError('Invalid repair entity')
+      return openRepair(route, owner, response.data.repair)
+    }
+    const promise = run()
+    repairPending.set(key, promise)
+    try { return await promise } finally { repairPending.delete(key) }
+  }
+  async function maintenance(row, { state, reason, expires_at }) {
+    if (!row?.actionable || row.source?.error) throw safeError('Owner gateway disconnected or ownership conflict')
+    const entity = row.host?.resource_id
+    if (!ID_PATTERN.test(entity || '') || !['active', 'inactive'].includes(state) ||
+        typeof reason !== 'string' || !reason.trim() || reason.length > 512 ||
+        (state === 'active' && !(Date.parse(expires_at) > Date.now())))
+      throw safeError('Maintenance requires a mapped host, reason and future expiry')
+    const owner = { ...row.source.snapshot.meta.owner }
+    const route = { ...row.source.route }
+    const version = await request(route, '/maintenance', {}, owner)
+    if (!Number.isSafeInteger(version.data?.revision) || version.data.revision < 1)
+      throw safeError('Maintenance revision unavailable; refresh before retrying')
+    return request(route, '/maintenance', { method: 'POST', body: {
+      entity_id: entity, state, reason: reason.trim(), expires_at: state === 'active' ? expires_at : null,
+      expected_config_revision: version.data.revision, expected_owner: owner
+    } }, owner)
+  }
+  return { inventory, request, refresh, repair, maintenance }
 }
 
 function fresh(meta, now) {
@@ -335,6 +460,9 @@ export function projectFleet(sources = [], now = Date.now()) {
       const candidate = {
         ...r,
         ...rowState(r, source, hostRow, now),
+        repair: (source.repairs || []).some(repair => !['closed', 'failed'].includes(repair.state) &&
+          (repair.entity_id === r.id || (hostRow && (repair.entity_id === hostRow.resource_id ||
+            s.data.runners.some(sibling => sibling.id === repair.entity_id && sibling.host_id === r.host_id))))) ? 'active' : 'none',
         key,
         host: hostRow,
         scope,
@@ -755,6 +883,16 @@ function Details({ row, transport, visible, onData }) {
 function RunnerRow({ row, expanded, onExpand, transport, onError, visible, features, os, search = '' }) {
   const ref = useRef(null)
   const [detail, setDetail] = useState(null)
+  const [repairBusy, setRepairBusy] = useState(false)
+  const [openedRepair, setOpenedRepair] = useState(null)
+  const [maintenanceForm, setMaintenanceForm] = useState(false)
+  const [maintenanceReason, setMaintenanceReason] = useState('')
+  const [maintenanceExpiry, setMaintenanceExpiry] = useState('')
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false)
+  const queryClient = useQueryClient()
+  const repairState = openedRepair ? 'active' : row.repair
+  // A subsequent collector snapshot owns lifecycle state, including closure.
+  useEffect(() => setOpenedRepair(null), [row.source.snapshot])
   const job = detail?.jobs?.find((j) => j.status === 'running' && j.assigned_runner_id === row.id)
   const observedJob = detail?.observed_jobs?.find(j => j.status === 'in_progress' && observedJobURL(row, j))
   const currentJob = row.activity === 'busy' && !row.stale
@@ -775,7 +913,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
     )
   }
   const repairLabel =
-    row.repair === 'active'
+    repairState === 'active'
       ? 'Open repair session'
       : row.issue
         ? 'Repair in new session'
@@ -834,8 +972,8 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               null,
               `${row.maintenance ? 'Maintenance · ' : ''}${row.health} · ${row.activity}`,
               h('span', { className: 'hermes-runners-meta' }, ago(row.observed_at)),
-              !['none', 'closed'].includes(row.repair)
-                ? h('span', { className: 'hermes-runners-meta' }, `Repair ${row.repair}`)
+              !['none', 'closed'].includes(repairState)
+                ? h('span', { className: 'hermes-runners-meta' }, `Repair ${repairState}`)
                 : null
             )
           ),
@@ -862,7 +1000,33 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               `Open current job ${currentJobId}`
             )
           : null,
-        expanded ? h(Details, { row, transport, visible, onData: setDetail }) : null
+        expanded ? h(Details, { row, transport, visible, onData: setDetail }) : null,
+        maintenanceForm ? h('form', {
+          className: 'hermes-runners-detail',
+          onSubmit: async e => {
+            e.preventDefault()
+            if (maintenanceBusy) return
+            setMaintenanceBusy(true)
+            onError('')
+            try {
+              await transport.maintenance(row, {
+                state: row.maintenance ? 'inactive' : 'active', reason: maintenanceReason,
+                expires_at: row.maintenance ? null : new Date(maintenanceExpiry).toISOString()
+              })
+              await queryClient.invalidateQueries({ queryKey: ['runners'] })
+              setMaintenanceForm(false)
+            } catch (error) { onError(error instanceof RangeError ? 'Choose a future maintenance expiry' : failure(error)) }
+            finally { setMaintenanceBusy(false) }
+          }
+        },
+          h('p', null, 'Maintenance is a label only; it does not drain jobs or authorize restarts.'),
+          h('input', { 'aria-label': 'Maintenance reason', required: true, maxLength: 512, value: maintenanceReason,
+            onChange: e => setMaintenanceReason(e.target.value) }),
+          !row.maintenance ? h('input', { 'aria-label': 'Maintenance expiry', type: 'datetime-local', required: true,
+            value: maintenanceExpiry, onChange: e => setMaintenanceExpiry(e.target.value) }) : null,
+          h('button', { type: 'submit', disabled: maintenanceBusy }, row.maintenance ? 'End maintenance' : 'Save maintenance'),
+          h('button', { type: 'button', onClick: () => setMaintenanceForm(false) }, 'Cancel')
+        ) : null
       )
     ),
     h(
@@ -876,7 +1040,16 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
         onEscapeKeyDown: (e) => e.stopPropagation()
       },
       features.repair_sessions
-        ? h(ContextMenuItem, { disabled: true }, `${repairLabel} — not available yet`)
+        ? h(ContextMenuItem, {
+            disabled: !row.actionable || repairBusy,
+            onSelect: async () => {
+              setRepairBusy(true)
+              onError('')
+              try { setOpenedRepair(await transport.repair(row)) }
+              catch (e) { onError(failure(e)) }
+              finally { setRepairBusy(false) }
+            }
+          }, repairBusy ? 'Opening repair session…' : repairLabel)
         : null,
       h(
         ContextMenuItem,
@@ -916,14 +1089,15 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
       ),
       h(
         ContextMenuItem,
-        { disabled: true },
-        'Maintenance controls unavailable — does not drain jobs'
+        { disabled: !features.repair_sessions || !row.actionable || !ID_PATTERN.test(row.host?.resource_id || ''),
+          onSelect: () => setMaintenanceForm(true) },
+        features.repair_sessions ? (row.maintenance ? 'End maintenance…' : 'Mark maintenance…') : 'Maintenance controls unavailable — does not drain jobs'
       )
     )
   )
 }
 
-export function Runners({ ctx, features = { repair_sessions: false } }) {
+export function Runners({ ctx, features = null }) {
   const [open, setOpen] = useState(false),
     [search, setSearch] = useState(''),
     [filter, setFilter] = useState('All'),
@@ -1340,7 +1514,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                       transport,
                       onError: setActionError,
                       visible,
-                      features,
+                      features: features || row.source.features || { repair_sessions: false },
                       os: ctx.os
                     })
                   )

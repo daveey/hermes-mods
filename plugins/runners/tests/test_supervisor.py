@@ -32,6 +32,23 @@ def files(tmp_path):
     return cfg, config, private
 
 
+def test_explicit_core_root_rejects_missing_relative_and_partial_checkout(tmp_path):
+    for root in ('relative', tmp_path / 'missing', tmp_path):
+        with pytest.raises(RuntimeError, match='repair_core_unavailable'):
+            runtime.configure_core(root)
+
+
+def test_installer_forwards_explicit_core_root(tmp_path, monkeypatch):
+    _, config, private = files(tmp_path)
+    installs = []
+    monkeypatch.setattr(installer, 'install', lambda platform, argv: installs.append(argv))
+    root = tmp_path / 'core'
+    assert installer.main(['--install', '--python', sys.executable, '--config', str(config),
+        '--runtime', str(private), '--state-dir', str(tmp_path / 'state'), '--owner-gateway-id',
+        GATEWAY, '--owner-profile', 'example', '--owner-epoch', '1', '--core-root', str(root)]) == 0
+    assert installs[0][-2:] == ['--core-root', str(root)]
+
+
 @pytest.mark.parametrize('field', ['config_revision', 'owner_epoch', 'owner_profile', 'invalid'])
 def test_validate_every_tick_and_never_reset_fence(tmp_path, monkeypatch, field):
     cfg, config, private = files(tmp_path)
@@ -52,7 +69,7 @@ def test_validate_every_tick_and_never_reset_fence(tmp_path, monkeypatch, field)
     assert len(instances) == 1
 
 
-@pytest.mark.parametrize('flag', ['repair_sessions', 'management_operations', 'dispatch', 'workspace_jobs'])
+@pytest.mark.parametrize('flag', ['management_operations', 'dispatch', 'workspace_jobs'])
 def test_readonly_startup(tmp_path, flag):
     cfg, config, private = files(tmp_path)
     cfg['features'][flag] = True
@@ -110,7 +127,7 @@ def test_process_singleton_readers_sigterm_and_restart(tmp_path):
                 except Exception:
                     pass
             time.sleep(.05)
-        assert first.poll() is None
+        assert first.poll() is None, first.communicate(timeout=2)[1]
         second = subprocess.run(args, capture_output=True, timeout=5)
         assert second.returncode == 1
         assert b'collector_running' in second.stderr
