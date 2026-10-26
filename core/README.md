@@ -19,7 +19,9 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
-| [kanban-pr-broker-transport.md](kanban-pr-broker-transport.md) | 0276 | Profile-scoped GitHub broker execution and sanitized setup receipts |
+| [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0276–0277, 0279 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
+| [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0280 | Orderly park releases PR guard; broker-aware PR-state reads |
+| [kanban-pr-broker-transport.md](kanban-pr-broker-transport.md) | 0278 | Profile-scoped GitHub broker execution and sanitized setup receipts |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0260 | AutomatedRow active-Kanban type coverage |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0262 | Failed-node retries and deflake cards |
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0263 | CPU/shard-budget-aware workers |
