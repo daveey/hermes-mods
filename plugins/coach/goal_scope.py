@@ -8,12 +8,14 @@ from pathlib import Path
 def is_evidence_row(row):
     """Persistence identity is not synthetic content; unknown markers fail closed."""
     from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
+    from agent.steering_provenance import steering_content
     return (isinstance(row, dict)
             and not any(k.startswith('_') and k not in PERSISTENCE_ONLY_MESSAGE_FIELDS
                         and k != '_db_persisted' and row[k] for k in row)
             and not _queued_receipt(row)
             and not row.get('observed')
-            and not (row.get('role') == 'user' and row.get('display_kind')))
+            and not (row.get('role') == 'user' and row.get('display_kind')
+                     and steering_content(row) is None))
 
 def _queued_receipt(row):
     metadata = row.get('display_metadata') or {}
@@ -39,6 +41,11 @@ def _ro_connect(path):
     return conn
 
 def _user_row(row):
+    from agent.steering_provenance import steering_content
+    text = steering_content(row)
+    if text is not None:
+        return {'role': 'user', 'content': text, 'content_source': 'native_content',
+                'message_uid': row['message_uid']}
     metadata = row.get('display_metadata') or {}
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
@@ -251,3 +258,46 @@ def resolve_scope(session_id, contexts, turn_messages=None):
     if not rows or not isinstance(rows[-1].get('content'), str) or not rows[-1]['content']:
         raise ValueError('scope_current_request_unavailable')
     return recover_scope(session_id, rows[-1]['content'], rows[:-1])
+
+
+def align_observed(rows, turn_messages):
+    """Reinsert observed pairs at their live result positions, never after scope.
+
+    Tools missing from the current suffix stay in the captured prefix. The live
+    suffix provides chronology, not a replacement for observed result contents.
+    Duplicate/reordered ids are ambiguous and cannot certify closure.
+    """
+    calls, pairs = {}, {}
+    for row in rows:
+        if row.get('role') == 'assistant':
+            for call in row.get('tool_calls') or []:
+                cid = call.get('id')
+                if cid in calls:
+                    raise ValueError('duplicate_call_id')
+                calls[cid] = call
+        elif row.get('role') == 'tool':
+            cid = row.get('tool_call_id')
+            if cid in pairs or cid not in calls:
+                raise ValueError('ambiguous_observed_result')
+            pairs[cid] = [{'role': 'assistant', 'tool_calls': [calls[cid]]}, row]
+    live_ids = [r.get('tool_call_id') for r in turn_messages or []
+                if is_evidence_row(r) and r.get('role') == 'tool']
+    if len(set(live_ids)) != len(live_ids):
+        raise ValueError('duplicate_result')
+    present = set(live_ids) & pairs.keys()
+    if [cid for cid in live_ids if cid in pairs] != [cid for cid in pairs if cid in present]:
+        raise ValueError('observed_chronology_mismatch')
+    # Observed results absent from a live suffix must precede that suffix.
+    seen_present = False
+    for cid in pairs:
+        seen_present = seen_present or cid in present
+        if seen_present and cid not in present:
+            raise ValueError('observed_chronology_incomplete')
+    prefix = []
+    for row in rows:
+        if row.get('role') == 'tool' and row.get('tool_call_id') in present:
+            continue
+        if row.get('role') == 'assistant' and row.get('tool_calls'):
+            row = dict(row, tool_calls=[c for c in row['tool_calls'] if c.get('id') not in present])
+        prefix.append(row)
+    return prefix, pairs

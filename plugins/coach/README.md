@@ -705,3 +705,15 @@ This conservative verification epoch does not infer whether older results remain
 semantically applicable. Kanban current-scope reads reject queued UI receipts;
 a later genuine canonical user row is a separate positive control, not a claimed
 end-to-end queue-drain test. All fixtures use isolated state and no live repairs.
+
+Native mid-turn steering now carries a process-local core attestation: the guard
+uses the original human text only when identity and content still match. Arbitrary
+display rows and marker-shaped text cannot mint this proof. Observed tool results
+retain their captured payloads but are ordered at their live suffix positions;
+duplicate, reordered or incomplete observed suffixes fail unavailable rather than
+guessing freshness. `test_goal_run24_review.py` exercises native steering injection,
+capture/observe and pending evaluation with stale/fresh verification, repeated
+steering and spoofed tails. Core `test_steering_provenance.py` covers identity
+binding, copying, wire stripping and suffix preservation. These are native seam
+tests, not whole-transport steering acceptance. The attestation is not historical
+authentication after restart; compaction/restart retention remains unverified.

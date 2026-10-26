@@ -314,7 +314,8 @@ def build_gate(store):
                 rows = copy.deepcopy(contexts.get(key, []))
             if rows is None:
                 raise ValueError('context_limit')
-            observed_ids = {r.get('tool_call_id') for r in rows if r.get('role') == 'tool'}
+            rows, observed_pairs = _scope.align_observed(rows, turn_messages)
+            observed_ids = set(observed_pairs)
             for row in turn_messages or []:
                 if not _scope.is_evidence_row(row):
                     continue
@@ -327,6 +328,9 @@ def build_gate(store):
                                               r.get('content') == row['content'] for r in rows):
                         continue
                 if row.get('role') == 'tool' and row.get('tool_call_id') in observed_ids:
+                    pair = observed_pairs[row['tool_call_id']]
+                    if pair[1] not in rows:
+                        rows.extend(copy.deepcopy(pair))
                     continue
                 if row.get('role') == 'assistant' and row.get('tool_calls'):
                     row = dict(row, tool_calls=[c for c in row['tool_calls'] if c.get('id') not in observed_ids])
