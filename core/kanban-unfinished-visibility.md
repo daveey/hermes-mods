@@ -21,13 +21,14 @@ The Desktop store folds blocked counts into both the stored-session dot and row-
 
 ## Tests
 
-On the complete applied public series, run:
+From the source root at core commit `39cdabdc62` (or the complete applied public series), run these as separate invocations:
 
 ```sh
-bash scripts/run_tests.sh -p hermes_bootstrap tests/hermes_cli/test_kanban_session_activity.py tests/tools/test_kanban_tools.py -q -j1
+bash scripts/run_tests.sh tests/hermes_cli/test_kanban_session_activity.py -q -j1
+bash scripts/run_tests.sh -p hermes_bootstrap tests/tools/test_kanban_tools.py -q -j1
 ```
 
-Verified: 86 passed (22 activity tests, 64 tool tests). The first attempt timed out during environment provisioning/testing; the completed retry passed. Early bootstrap imports keep dependency provisioning outside the tests' real-home I/O guard.
+Verified separately on exact core commit `39cdabdc62`: 22 activity tests passed and 64 tool tests passed. The tool suite needs early bootstrap imports to keep dependency provisioning outside the tests' real-home I/O guard. Do not combine these commands: the activity suite imports the CLI, which interprets pytest's `-p hermes_bootstrap` as a profile selection and fails with `Profile 'hermes_bootstrap' does not exist`.
 
 The implementation owner's handoff additionally reports 87 passing Desktop state/row/archive-guard tests, including blocked-only dots and completed goals, plus TypeScript and ESLint checks. Those Desktop tests were not independently rerun for this mirror. Backend regression exercises archive cache invalidation; tool tests exercise rejection, deferred approval, and explicit immediate human action.
 
