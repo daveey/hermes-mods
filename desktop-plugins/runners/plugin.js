@@ -932,6 +932,20 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
   const view = projectFleet(selected),
     nodes = projectNodes(selected, view.rows),
     { groups, rows } = selectNodes(nodes, search, filter)
+  // Prune against the complete inventory, not the filtered/scope-visible cohort.
+  const inventory = projectFleet(sources)
+  const inventoryNodes = projectNodes(sources, inventory.rows)
+  const nodeIdentityKey = JSON.stringify([
+    ...inventoryNodes.nodes.map(n => n.key),
+    ...(inventoryNodes.unassigned.length ? ['unmapped'] : [])
+  ].sort())
+  useEffect(() => {
+    const present = new Set(JSON.parse(nodeIdentityKey))
+    setExpandedNodes(old => {
+      const next = new Set([...old].filter(key => present.has(key)))
+      return next.size === old.size ? old : next
+    })
+  }, [nodeIdentityKey])
   const refreshing = useRef(false)
   async function refresh() {
     if (refreshing.current) return

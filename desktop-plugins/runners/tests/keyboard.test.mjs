@@ -25,6 +25,35 @@ test('physical nodes start collapsed including empty hosts; expand reveals lazy 
     assert.equal(calls.filter(p => p.includes('/runners/')).length, 1)
   } finally { await ui.close() }
 })
+test('poll retains expanded nodes and detail but prunes removed identities before rediscovery', async () => {
+  let s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : structuredClone(s) } }))
+  const poll = async () => {
+    await React.act(async () => { await ui.client.invalidateQueries({ queryKey: ['runners'] }) })
+    await ui.flush()
+  }
+  try {
+    await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
+    await ui.click(document.querySelector('[data-runner-row]'))
+    s.data.hosts.push({ ...structuredClone(fixtures.Host), id: 'host_0000000000000002', display_name: 'New node' })
+    await poll()
+    let nodes = [...document.querySelectorAll('[data-node-row]')]
+    assert.equal(nodes[0].getAttribute('aria-expanded'), 'true')
+    assert.equal(nodes[1].getAttribute('aria-expanded'), 'false')
+    assert.ok(document.querySelector('.hermes-runners-detail'))
+    const original = s.data.hosts.shift()
+    s.data.runners = []
+    await poll()
+    s.data.hosts.unshift(original)
+    await poll()
+    nodes = [...document.querySelectorAll('[data-node-row]')]
+    assert.equal(nodes[0].getAttribute('aria-expanded'), 'false')
+  } finally { await ui.close() }
+})
 test('search narrows physical nodes, highlights a matching empty host and labels scope totals', async () => {
   const s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: '00000000-0000-4000-8000-000000000002', display_name: 'Quartz empty' }]
