@@ -44,7 +44,7 @@ Other read and snapshot contention paths still exist. A reported long-running en
 
 ## Snapshot and alias-read latency (0388–0390)
 
-An activity annotation now shares one scoped snapshot between counts and task inventory, rather than taking two snapshots. Receipt dedup resolves each local board's associations once per projection and reuses them for every receipt; its cache is request-scoped, not a cross-request stale-state cache. In the regression fixture, ten receipts require two connection reads instead of twenty-two. These changes reduce repeated work without weakening owner/profile/board or alias checks. Patch 0390 is the snapshot fixture lint follow-up.
+An activity annotation now shares one scoped snapshot between counts and task inventory, rather than taking two snapshots. Receipt dedup resolves each local board's associations once per projection and reuses them for every receipt; its cache is request-scoped, not a cross-request stale-state cache. The regression fixture asserts two session-task association reads across repeated receipts and preserves unmatched aliases and foreign profiles. These changes reduce repeated work without weakening owner/profile/board or alias checks. Patch 0390 is the snapshot fixture lint follow-up.
 
 Executed on the applied public series: `test_kanban_annotation_snapshot.py` and `test_kanban_local_dedup_cost.py` each pass. The former asserts one snapshot per annotation; the latter asserts bounded association reads across multiple receipts. The local-authority, remote-identity and contention suites also pass; see [390-patch verification](mirror-390-verification.md). These are deterministic read-count regressions, not a measured live REST latency guarantee.
 
