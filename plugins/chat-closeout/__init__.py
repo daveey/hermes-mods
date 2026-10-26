@@ -312,10 +312,12 @@ def _unseen_counts() -> Optional[dict[str, int]]:
 
 def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]] = None,
               unseen: Optional[dict[str, int]] = None, last_user: Optional[Callable[[list[str]], float]] = None,
-              read: Callable[[list[str]], dict] = read_cards,
+              read: Optional[Callable[[list[str]], dict]] = None,
               proof: Optional[Callable[[str, str, dict], bool]] = None) -> list[dict]:
-    """One close-out pass over the ledger. Returns what it did (for logs/tests)."""
+    """One close-out pass over the ledger. Returns what it did (for logs/tests). One remote-inventory read per
+    tick, shared by every pending row."""
     now = time.time() if now is None else now
+    read = read or _pass_reader()
     if wake is None:
         srv = _server()
         if srv is None:
@@ -389,16 +391,17 @@ def post_inbox(title: str, body: str, key: str) -> None:
 
 def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                   unseen: Optional[dict[str, int]] = None, post: Callable[[str, str, str], None] = post_inbox,
-                  force: bool = False, read: Callable[[list[str]], dict] = read_cards) -> list[str]:
+                  force: bool = False, read: Optional[Callable[[list[str]], dict]] = None) -> list[str]:
     """Flag stuck pipelines (once per chat+state): unseen kanban results > 30 min, or a settled batch with no
     close-out > 30 min. Conditions are observed every tick; flagging runs in one process per 15 min.
 
     Ages: the persisted wall-clock stamp must be > 30 min AND this process must have seen the condition for
     > 30 min of monotonic time, so a lid sleep (monotonic clock stops) or a restart never fakes a stale pipeline.
     The flag is recorded only after the Inbox post succeeded, so a failed post retries next run.
-    Returns the flag keys raised."""
+    Returns the flag keys raised. One remote-inventory read per tick, shared by every pending row."""
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
+    read = read or _pass_reader()
     led = ledger()
     unseen = _unseen_counts() if unseen is None else unseen
     if unseen is None:

@@ -65,3 +65,21 @@ def test_concurrent_polls_share_one_pass(pending):
         t.join()
     assert results == [expected] * 8
     assert calls['n'] == 1
+
+
+def test_waker_tick_reads_remote_inventory_once(pending):
+    calls, _ = pending
+    woken = []
+    plugin.wake_tick(now=10_000, wake=lambda sid, *a, **k: woken.append(sid) or 'busy', unseen={},
+                     last_user=lambda _: 0, proof=lambda *a: False)
+    assert len(woken) == 3  # every settled chat was considered for its close-out
+    assert calls['n'] == 1
+
+
+def test_watchdog_tick_reads_remote_inventory_once(pending, tmp_path):
+    calls, expected = pending
+    led = plugin.ledger()
+    for sid in expected:
+        led.write(sid, settled_sig=f'sig-{sid}', settled_at=1)
+    plugin.watchdog_tick(now=10_000, mono=10_000, unseen={}, post=lambda *a: None, force=True)
+    assert calls['n'] == 1
