@@ -22,9 +22,10 @@ any release tag, *contains* your commit.
 When a branch uses ONE serialized concurrency group (in-flight always finishes, only the newest pending waits), a
 pending run that keeps getting `cancelled` with zero jobs never started. Find the holder: `gh api
 "repos/R/actions/runs?branch=main&status=in_progress"` and look for an old run whose last job sat in a runner
-backlog. To time a full run (capacity acceptance), designate the first run that STARTS after the holder completes
-and measure from `run_started_at`, not `created_at`. A `workflow_dispatch` on that branch joins the same group, so
-dispatching doesn't help.
+backlog. To time a full run (capacity acceptance), designate the first run that STARTS after the holder completes,
+and record both `created_at`→completed (wall, queue included) and `run_started_at`→completed (exec). A "CI finishes in
+N min" target is judged on wall time unless the card says otherwise; exec time alone never closes it. A
+`workflow_dispatch` on that branch joins the same group, so dispatching doesn't help.
 
 ## Fixing the CI you wait on: use a worktree
 
@@ -96,6 +97,17 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 - Workflows with `paths:` filters don't run for every commit. Without `--workflow`, the script waits on the
   workflows that have a run on a commit containing yours. With `--workflow X`, when X never runs it reports a
   stall after the 3-minute startup grace period plus two idle polls.
+- A cancelled run can stay `queued` indefinitely: an aggregator job with `if: always()` ("All required checks
+  pass") still needs a runner, and on busy self-hosted runners it holds the PR's concurrency group, leaving the new
+  head's run `pending`. Read back `status`/`conclusion` after `gh run cancel` before reporting it done; if stuck,
+  `gh api -X POST repos/O/R/actions/runs/<id>/force-cancel`. When asked about one latched run, sweep the whole
+  queue with `scripts/ci_latch_sweep.py OWNER/REPO` (dry run, then `--apply`): it selects only superseded-head runs
+  whose open jobs are all gate/report jobs, re-reads each run before cancelling, and never touches re-runs
+  (`run_attempt>1`), runs with no jobs listed, or current-head runs; it exits 1 on any failed read or cancel. A `main` group
+  without cancel-in-progress serializes, so a superseded main run latched on its timing report blocks the next one.
+  Root fix: `if: ${{ !cancelled() }}` and run gate/report jobs on a light runner label; PRs pick it up only after
+  rebasing, so keep the sweep running until then. Before adding concurrency rules, grep the workflows; they may
+  already exist.
 - Release tags are the most reliable signal when a repo publishes them: a tag on a commit that contains yours
   means CI built and released your change, whichever run did it.
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
@@ -159,12 +171,23 @@ workers to stop chasing tests.
    daily hosted spend and non-Linux SKUs, posting to the Hermes Inbox itself because Desktop cron has no home
    channel (`deliver=all` fails with "no delivery target"). Run it with `--force` for live state.
 
-## Rescuing a session already stuck on a hand-rolled watcher
+## Rescuing a stalled merge watch
 
-Read its last background command (`ps -axo pid,etime,command | grep 'gh run'`). If it follows the newest run or one
-run id, check the commit with `--once`. When it has already shipped, kill the watcher. A `zsh -lic` loop ignores
-SIGTERM, so use `pkill -P <pid>; kill -9 <pid>` and confirm with `ps -p`. Then send the session the facts: which run
-or tag contains its commit, and what to do next. Also tell it to use this script next time.
+For an open PR, inspect blockers before restarting a watcher:
+`gh pr view N --repo OWNER/REPO --json state,headRefOid,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,autoMergeRequest`.
+A loop checking only OPEN/MERGED/CLOSED cannot detect conflicts or failed checks; approval and auto-merge are not
+proof of progress. If the watcher repeatedly dies on restarts, move follow-through to a durable task with scheduled
+one-shot checks, not another long-lived shell loop.
+
+- `DIRTY`/`CONFLICTING`: fetch the base and reproduce with `git merge-tree --write-tree HEAD origin/main` in the
+  PR worktree. Resolve both sides' changes, test, and push; verify GitHub now reports `MERGEABLE`. Re-read review
+  and check status on the new head—rebasing can invalidate approval. Never present conflict repair as deployment.
+- Generic `BLOCKED`: inspect required checks and review rules; do not infer a specific policy failure or propose
+  an admin override from that label alone. A refusal of an override does not prohibit fixing conflicts normally.
+- For a CI/release watcher following the newest run or one run id (`ps -axo pid,etime,command | grep 'gh run'`),
+  check the commit with `--once` instead. If already shipped, stop the obsolete watcher: a `zsh -lic` loop ignores
+  SIGTERM, so use `pkill -P <pid>; kill -9 <pid>` and confirm with `ps -p`. Report the containing run/tag to the
+  session and tell it to use this script next time.
 
 ## Adding helper scripts to a repo
 
