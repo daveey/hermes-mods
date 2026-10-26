@@ -609,6 +609,18 @@ export function jobURL(row, job) {
     return null
   return `https://github.com/${row.scope.name}/actions/runs/${job.provider_run_id}/job/${job.provider_job_id}`
 }
+export function observedJobURL(row, job, now = Date.now()) {
+  if (!job || row.stale || !row.actionable || !settingsURL(row) ||
+      job.runner_id !== row.provider_runner_id ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(job.repository || '') ||
+      !/^\d+$/.test(job.run_id || '') || !/^\d+$/.test(job.job_id || '') ||
+      !(Date.parse(job.observed_at) <= now) || !(Date.parse(job.expires_at) > now)) return null
+  const scopeMatches = row.scope.kind === 'repository' ? job.repository === row.scope.name
+    : row.scope.kind === 'organization' && job.repository.split('/')[0] === row.scope.name
+  if (!scopeMatches) return null
+  const url = `https://github.com/${job.repository}/actions/runs/${job.run_id}/job/${job.job_id}`
+  return job.url === url ? url : null
+}
 export function diagnosticSummary(row) {
   return `${text(row.display_name)}\n${text(row.scope?.name)} · ${row.provider}\n${row.health} · ${row.activity}\n${row.reason}\nObserved ${row.observed_at || 'unknown'}\nOwner ${row.source.snapshot.meta.owner.gateway_id} / ${row.source.snapshot.meta.owner.profile}`
 }
@@ -728,6 +740,9 @@ function Details({ row, transport, visible, onData }) {
               `${text(j.provider_run_id)} · ${text(j.status)} · ${text(j.conclusion)}`
             )
           ),
+          h('p', null, `Provider job observations: ${(d.observed_jobs || []).length}`),
+          ...(d.observed_jobs || []).map(j => h('p', { key: `${j.repository}/${j.job_id}` },
+            `${text(j.repository)} · ${text(j.job_id)} · ${text(j.status)} · ${text(j.conclusion)} · ${ago(j.observed_at)} · ${Date.parse(j.expires_at) > Date.now() ? 'current' : 'stale'}`)),
           h('p', null, `Repair history: ${(d.repairs || []).length}`),
           ...(d.repairs || []).map((r) =>
             h('p', { key: r.id }, `${text(r.state)} · ${text(r.mode)}`)
@@ -741,7 +756,10 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
   const ref = useRef(null)
   const [detail, setDetail] = useState(null)
   const job = detail?.jobs?.find((j) => j.status === 'running' && j.assigned_runner_id === row.id)
-  const currentJob = row.activity === 'busy' && !row.stale && job ? jobURL(row, job) : null
+  const observedJob = detail?.observed_jobs?.find(j => j.status === 'in_progress' && observedJobURL(row, j))
+  const currentJob = row.activity === 'busy' && !row.stale
+    ? (observedJob ? observedJobURL(row, observedJob) : job ? jobURL(row, job) : null) : null
+  const currentJobId = observedJob?.job_id || job?.provider_job_id
   function openMenu(e) {
     e.preventDefault()
     e.stopPropagation()
@@ -808,7 +826,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
               h(
                 'span',
                 { className: 'hermes-runners-meta' },
-                currentJob ? `Busy — job ${job.provider_job_id}` : row.reason
+                currentJob ? `Busy — job ${currentJobId}` : row.reason
               )
             ),
             h(
@@ -841,7 +859,7 @@ function RunnerRow({ row, expanded, onExpand, transport, onError, visible, featu
                 className: 'hermes-runners-muted',
                 onClick: () => os?.openExternal?.(currentJob)
               },
-              `Open current job ${job.provider_job_id}`
+              `Open current job ${currentJobId}`
             )
           : null,
         expanded ? h(Details, { row, transport, visible, onData: setDetail }) : null
