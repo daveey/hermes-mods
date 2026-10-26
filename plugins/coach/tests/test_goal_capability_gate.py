@@ -59,7 +59,9 @@ def test_unproven_boundary_cannot_clear_confirmed_hold(monkeypatch):
 def test_current_boundary_is_logged(monkeypatch):
     events = []
     monkeypatch.setattr(gd, 'settings', lambda: {'mode': 'enforce'})
-    monkeypatch.setattr(gd, 'aux_judge', lambda *_: verdict())
+    monkeypatch.setattr(gd, 'aux_judge', lambda system, _: verdict() if system == gd.SYSTEM else {
+        'relation': 'required', 'evidence_refs': ['user:0', 'tool:c'],
+        'rationale': 'The requested management endpoint requires access.', 'confidence': .99})
     gate = gd.build_gate(SimpleNamespace(log=events.append))
     assert gate(final_response='Missing access', turn_messages=rows()) is None
     assert events[-1]['disposition'] == 'capability_boundary'

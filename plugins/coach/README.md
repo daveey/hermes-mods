@@ -559,8 +559,20 @@ actual-profile activation. The original private incident replay remains unresolv
 `tests/test_goal_approval_consistency.py` rejects pending-approval evidence that
 simultaneously claims success, a zero exit, or a successful HTTP status. Its core
 recheck test proves this cannot clear a confirmed hold. Exact literal action
-binding is not semantic proof that the action is necessary for the requested goal;
-the explicitly named relevance characterization remains a limitation.
+binding alone is not semantic proof that the action is necessary for the requested
+goal. After structural validation, `goal_relevance.py` independently judges the
+operation's necessity from user/evidence scope, without the main verdict. It requires
+the latest real user steering and operation-source citations, finite high confidence
+and a supported dependency. Unrelated, uncertain, omitted or malformed evidence
+becomes UNKNOWN; it cannot clear an existing hold or authorize bypass. Initial
+UNKNOWN remains fail-open. This is semantic defense in depth, not deterministic
+entailment, and adds one bounded auxiliary call for a structurally valid boundary.
+
+`test_goal_boundary_relevance.py` and `test_goal_relevance_review.py` exercise the
+real core recheck, latest versus stale user citations, timeout, synthetic scope,
+omission, and genuine necessary boundary controls. The opt-in
+`test_goal_boundary_relevance_live.py` checks actual-model necessity judgments;
+these authored cases are not a blind holdout.
 
 `tests/test_goal_electron_acceptance.py` drives a built Electron renderer under
 Linux Xvfb through its composer and actual production serve/token-auth transport.

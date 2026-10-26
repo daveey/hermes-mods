@@ -81,6 +81,9 @@ def auxiliary(*args, **kwargs):
         verdict.update(disposition='authorization_boundary', boundary_kind='denial',
                        proof={'action': 'restart the service', 'source_ref': 'user:0',
                               'approval_path': 'user_explicit_direction'})
+    if task == 'coach_goal_disposition' and 'operation' in json.loads(kwargs['messages'][-1]['content']):
+        verdict = dict(relation='required', evidence_refs=['user:0'],
+                       rationale='The latest explicit scope prohibits the exact operation.', confidence=.99)
     content = json.dumps(verdict) if task == 'coach_goal_disposition' else 'Local test title'
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 

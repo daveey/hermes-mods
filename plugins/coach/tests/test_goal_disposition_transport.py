@@ -173,7 +173,9 @@ def test_guard_over_transport(tmp_path, route, case):
         assert observed == {'candidate_exposed_on_wire': False, 'successful_closeout': False}
     else:
         assert len(primary) == 1, calls
-        assert len(judge) == 1, calls
+        assert len(judge) == (2 if case == 'stop' else 1), calls
+        if case == 'stop':
+            assert 'operation' in json.loads(judge[-1]['value']['messages'][-1]['content'])
         assert TEXTS[case] in wire
         assert TEXTS[case] in persisted
         assert 'Unresolved goal' not in wire

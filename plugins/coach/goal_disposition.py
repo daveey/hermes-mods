@@ -232,6 +232,9 @@ _ro_connect = _ownership._ro_connect
 _restriction_spec = importlib.util.spec_from_file_location('_coach_goal_restrictions', Path(__file__).with_name('goal_restrictions.py'))
 _restrictions = importlib.util.module_from_spec(_restriction_spec)
 _restriction_spec.loader.exec_module(_restrictions)
+_relevance_spec = importlib.util.spec_from_file_location('_coach_goal_relevance', Path(__file__).with_name('goal_relevance.py'))
+_relevance = importlib.util.module_from_spec(_relevance_spec)
+_relevance_spec.loader.exec_module(_relevance)
 
 
 def _profile_key():
@@ -331,6 +334,7 @@ def build_gate(store):
                 return None
             v = validate_disposition(validate(aux_judge(SYSTEM, json.dumps({
                 'evidence': evidence})), evidence), evidence, session_id=session_id)
+            _relevance.check(v, evidence, aux_judge)
             store.log({'event': 'goal_disposition', 'session_id': session_id, 'attempt': attempt,
                        'disposition': v['disposition'], 'confidence': v['confidence'], 'mode': cfg['mode']})
             if (v['disposition'] == 'unknown' or v['confidence'] < .85) and cfg['mode'] == 'enforce' and attempt:
