@@ -1,0 +1,283 @@
+From ca145ec36e04a7db3271e2df91622dc7adbd91a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:51:26 +0000
+Subject: [PATCH] fix(kanban): support profile-scoped GitHub broker execution
+ [daveey]
+
+---
+ hermes_cli/config_defaults.py                |  6 +-
+ hermes_cli/kanban_pr_acceptance.py           | 51 ++++++++++-
+ hermes_platform/resolver/github.py           | 10 ++
+ tests/hermes_cli/test_kanban_pr_transport.py | 96 ++++++++++++++++++++
+ website/docs/user-guide/features/kanban.md   | 28 ++++++
+ 5 files changed, 186 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_platform/resolver/github.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_transport.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index e01c7b313e..174396c8b7 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1894,10 +1894,10 @@ DEFAULT_CONFIG = {
+         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
+         "failure_repeat_alert_hours": 6,
+     },
+-    # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
+-    # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
+-    # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
++    # Kanban coordination: one dispatcher per board reclaims, promotes, and spawns workers.
+     "kanban": {
++        # Opt-in per-profile broker argv before gh (empty = ordinary login); never include tokens.
++        "pr_acceptance": {"gh_command_prefix": []},
+         # Calendar retention for terminal worktrees; archive commits to recovery
+         # refs before reaping. 0 disables age-based archival/startup sweeping.
+         "worktree_retention_days": 7,
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index c7674a7086..cea7808807 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -30,7 +30,13 @@ def validate_contract(value: str | None) -> str:
+ 
+ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+          profile_home: str | None = None):
+-    command = ["gh", "api", endpoint, "--hostname", "github.com"]
++    from hermes_platform.resolver.github import resolve_gh
++    env = _gh_env(profile_home)
++    resolved = resolve_gh(env.get("PATH") if env is not None else None)
++    if not resolved.found:
++        raise _GateSetupError("gh executable not found; install GitHub CLI on PATH or in ~/bin")
++    command = [*_gh_command_prefix(profile_home), *resolved.command,
++               "api", endpoint, "--hostname", "github.com"]
+     if query is not None:
+         command += ["-f", "query=" + query]
+     if paginate:
+@@ -38,7 +44,7 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+     try:
+         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=30,
+-                                check=True, env=_gh_env(profile_home))
++                                check=True, env=env)
+     except subprocess.CalledProcessError as exc:
+         # 401/403/404 = the login cannot see this repository (wrong profile identity
+         # or missing grant), not a transient API failure. Persist only the status
+@@ -55,12 +61,50 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+     return value
+ 
+ 
++class _GateSetupError(RuntimeError):
++    """The acceptance transport is not installed or configured correctly."""
++
++
+ class _GateAuthError(RuntimeError):
+     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
+     this profile's login cannot see the repo — an identity problem to fix, not
+     an infrastructure blip to retry."""
+ 
+ 
++def _gh_command_prefix(profile_home: str | None) -> list[str]:
++    """Explicit per-assignee exec wrapper; secrets never return to this process.
++
++    The wrapper receives the resolved gh argv and the already-isolated child env.
++    This supports credential brokers without inheriting a supervisor's tokens.
++    """
++    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
++    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
++    from hermes_cli.config_effective import load_user_config_effective
++    from hermes_platform.resolver import locate_command
++    from ruamel.yaml.error import YAMLError
++
++    home = Path(profile_home) if profile_home else get_hermes_home()
++    token = set_hermes_home_override(home)
++    scope_token = None
++    try:
++        scope_token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
++        config = load_user_config_effective(home / "config.yaml", fail_closed=True)
++        prefix = config.get("kanban", {}).get("pr_acceptance", {}).get("gh_command_prefix", [])
++    except (OSError, ValueError, TypeError, AttributeError, YAMLError):
++        # Parser/config errors can contain interpolated credentials. Persist no raw text.
++        raise _GateSetupError("Cannot read kanban.pr_acceptance configuration; check profile config.yaml") from None
++    finally:
++        if scope_token is not None:
++            reset_secret_scope(scope_token)
++        reset_hermes_home_override(token)
++    if not isinstance(prefix, list) or any(not isinstance(s, str) or not s or "\x00" in s for s in prefix):
++        raise _GateSetupError("kanban.pr_acceptance.gh_command_prefix must be an argv list")
++    if prefix:
++        if not Path(prefix[0]).is_absolute() or not locate_command(prefix[0]).found:
++            raise _GateSetupError("gh_command_prefix requires an installed absolute executable path")
++    return prefix
++
++
+ def _gh_env(profile_home: str | None) -> dict[str, str] | None:
+     """Child env for ``gh``: the card's profile identity when one is resolvable.
+ 
+@@ -194,6 +238,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
+         receipt["ok"] = receipt["classification"] == "success"
+         return receipt
++    except _GateSetupError as exc:
++        receipt.update(classification="setup", detail=str(exc))
++        return receipt
+     except _GateAuthError as exc:
+         login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
+         receipt.update(classification="auth",
+diff --git a/hermes_platform/resolver/github.py b/hermes_platform/resolver/github.py
+new file mode 100644
+index 0000000000..768b6daa15
+--- /dev/null
++++ b/hermes_platform/resolver/github.py
+@@ -0,0 +1,10 @@
++"""GitHub CLI lookup for service processes with a minimal PATH."""
++from pathlib import Path
++
++from hermes_platform.resolver import LookupContext, locate_command
++
++
++def resolve_gh(path: str | None = None):
++    return locate_command("gh", LookupContext(path=path), known_dirs=(
++        str(Path.home() / "bin"), str(Path.home() / ".local" / "bin"),
++    ))
+diff --git a/tests/hermes_cli/test_kanban_pr_transport.py b/tests/hermes_cli/test_kanban_pr_transport.py
+new file mode 100644
+index 0000000000..f9abc9a154
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_transport.py
+@@ -0,0 +1,96 @@
++"""Acceptance transport setup and ephemeral credential wrappers."""
++import json
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as gate
++
++
++def test_missing_gh_is_setup(tmp_path, monkeypatch):
++    monkeypatch.setenv("PATH", "")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    receipt = gate.collect_acceptance("https://github.com/acme/repo/pull/7", None)
++    assert receipt["classification"] == "setup"
++    assert "gh" in receipt["detail"]
++
++
++@pytest.mark.platforms("posix")
++def test_gh_in_user_bin(tmp_path, monkeypatch):
++    monkeypatch.setenv("PATH", "")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    folder = tmp_path / "bin"
++    folder.mkdir()
++    gh = folder / "gh"
++    gh.write_text(f"#!{sys.executable}\nprint('{{}}')\n")
++    gh.chmod(0o755)
++    assert gate._api("graphql") == {}
++
++
++@pytest.mark.platforms("posix")
++def test_profile_wrapper_vends_only_to_gh(tmp_path, monkeypatch):
++    import os
++
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    gh = tmp_path / "gh"
++    gh.write_text(f"#!{sys.executable}\nimport os,json\n"
++                  "print(json.dumps({'vended': os.environ.get('GH_TOKEN') == 'synthetic-token'}))\n")
++    gh.chmod(0o755)
++    wrapper = tmp_path / "broker.py"
++    wrapper.write_text("import os,sys\nos.environ['GH_TOKEN']='synthetic-token'\n"
++                       "os.execv(sys.argv[1], sys.argv[1:])\n")
++    (home / "config.yaml").write_text(json.dumps({"kanban": {"pr_acceptance": {
++        "gh_command_prefix": [sys.executable, str(wrapper)]}}}))
++    monkeypatch.setenv("PATH", str(tmp_path))
++    monkeypatch.delenv("GH_TOKEN", raising=False)
++    assert gate._api("graphql", profile_home=str(home)) == {"vended": True}
++    assert "GH_TOKEN" not in os.environ
++    # The launch profile's broker opt-in must never be inherited by a routed profile.
++    other = home / "profiles" / "other"
++    other.mkdir(parents=True)
++    (other / "config.yaml").write_text("{}")
++    assert gate._api("graphql", profile_home=str(other)) == {"vended": False}
++    # Auth refusals must remain auth, with no captured stderr in durable receipts.
++    gh.write_text(f"#!{sys.executable}\nimport sys\n"
++                  "print('HTTP 403 synthetic-secret', file=sys.stderr)\nsys.exit(1)\n")
++    receipt = gate.collect_acceptance("https://github.com/acme/repo/pull/7", None)
++    assert receipt["classification"] == "auth"
++    assert "synthetic-secret" not in json.dumps(receipt)
++
++
++@pytest.mark.parametrize("prefix", ["shell command", ["relative-broker"], ["/missing/broker"], [1]])
++def test_invalid_wrapper_is_setup(tmp_path, monkeypatch, prefix):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    (home / "config.yaml").write_text(json.dumps({"kanban": {"pr_acceptance": {
++        "gh_command_prefix": prefix}}}))
++    with pytest.raises(gate._GateSetupError):
++        gate._gh_command_prefix(str(home))
++
++
++@pytest.mark.parametrize("text", ['kanban: {pr_acceptance: null}', 'kanban: null', 'kanban: ['])
++def test_broken_transport_config_is_sanitized_setup(tmp_path, monkeypatch, text):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    (tmp_path / "config.yaml").write_text(text)
++    with pytest.raises(gate._GateSetupError):
++        gate._gh_command_prefix(str(tmp_path))
++
++
++def test_wrapper_interpolation_uses_assignee_scope(tmp_path, monkeypatch):
++    from agent.secret_scope import set_secret_scope, reset_secret_scope
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "launch"))
++    target = tmp_path / "other"
++    target.mkdir()
++    (target / ".env").write_text("BROKER_SCOPE=target-scope\n")
++    (target / "config.yaml").write_text(json.dumps({"kanban": {"pr_acceptance": {
++        "gh_command_prefix": [sys.executable, "${BROKER_SCOPE}"]}}}))
++    token = set_secret_scope({"BROKER_SCOPE": "launch-scope"})
++    try:
++        assert gate._gh_command_prefix(str(target)) == [sys.executable, "target-scope"]
++    finally:
++        reset_secret_scope(token)
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 9a90f6d1d9..2fe0a1d3ae 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -78,6 +78,34 @@ login. A login that cannot see the repository is rejected with
+ `classification=auth`, naming the profile and repository, instead of a
+ retryable infra failure.
+ 
++On short-lived credential-broker hosts, opt in separately in each assignee's
++config with `kanban.pr_acceptance.gh_command_prefix`, an argv list prepended to
++all gate `gh` commands. For example:
++
++```yaml
++kanban:
++  pr_acceptance:
++    gh_command_prefix:
++      - /absolute/path/to/token-broker
++      - exec
++      - --scope
++      - user/github
++      - --reason
++      - Kanban PR acceptance
++      - --
++```
++
++The first element must be an installed absolute executable path. No shell is
++used. The wrapper receives the isolated profile environment and must exec the
++appended command, preserve its exit status, and emit only the command's JSON on
++stdout. It must vend credentials into that child's environment, never print or
++persist tokens. Use noninteractive/already-approved scopes: the whole read has
++a 30-second timeout. Do not put credentials in this setting. The default is an
++empty list (ordinary profile-isolated login); routed profiles do not inherit the
++launch profile's wrapper. `gh` is resolved on the child PATH, then in `~/bin` and
++`~/.local/bin`; a missing CLI or invalid wrapper setting is a `setup` rejection,
++not a transient infrastructure failure.
++
+ Rejection retains the active card and workspace. Durable `pr_acceptance` events
+ store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
+ instructions; `last_failure_error` surfaces the next step. Fix failures, rerun
+-- 
+2.55.0
+
