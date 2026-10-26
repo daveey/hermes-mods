@@ -418,6 +418,39 @@ export function projectFleet(sources = [], now = Date.now()) {
             : 'muted'
   }
 }
+export function projectNodes(sources = [], projectedRows = [], now = Date.now()) {
+  const nodes = new Map()
+  for (const source of sources) {
+    const snapshot = source.snapshot
+    if (!snapshot) continue
+    for (const host of snapshot.data.hosts) {
+      const key = JSON.stringify([ownerKey(snapshot.meta.owner), host.id])
+      if (nodes.has(key)) continue
+      const runners = projectedRows.filter(r => r.hostKey === key)
+      const unknown = runners.filter(r => r.stale || !['busy', 'idle'].includes(r.activity)).length
+      nodes.set(key, {
+        key, host, owner: snapshot.meta.owner, source, runners,
+        registrationCount: runners.length,
+        monitoring: host.management || 'unknown',
+        health: {
+          state: 'unknown',
+          reason: host.management === 'reachable'
+            ? 'Reachable · health unverified'
+            : host.management === 'unreachable'
+              ? 'Management probe unavailable — not proof of a node outage'
+              : 'Monitoring unavailable · health unverified'
+        },
+        activity: {
+          busy: !runners.length || unknown ? null : runners.filter(r => r.activity === 'busy').length,
+          idle: !runners.length || unknown ? null : runners.filter(r => r.activity === 'idle').length,
+          unknown
+        },
+        freshness: { state: 'unknown', observedAt: null }
+      })
+    }
+  }
+  return { nodes: [...nodes.values()], unassigned: projectedRows.filter(r => !nodes.has(r.hostKey)) }
+}
 export function selectRows(rows, search = '', filter = 'All') {
   const terms = search.toLowerCase().trim().split(/\s+/).filter(Boolean)
   return rows
@@ -813,7 +846,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
     [filter, setFilter] = useState('All'),
     [scope, setScope] = useState('all'),
     [expanded, setExpanded] = useState(null),
-    [collapsed, setCollapsed] = useState(new Set()),
+    [expandedNodes, setExpandedNodes] = useState(new Set()),
     [actionError, setActionError] = useState('')
   const visible = useVisible(),
     client = useQueryClient(),
@@ -844,7 +877,11 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
     scope === 'all' ? sources : sources.filter((s) => s.route && routeKey(s.route) === scope)
   const view = projectFleet(selected),
     rows = selectRows(view.rows, search, filter),
-    groups = groupRows(rows)
+    nodes = projectNodes(selected, view.rows),
+    groups = [
+      ...nodes.nodes.map(n => ({ ...n, name: n.host.display_name, rows: n.runners.filter(r => rows.includes(r)) })),
+      ...(nodes.unassigned.length ? [{ key: 'unmapped', name: 'Unassigned runners', rows: nodes.unassigned.filter(r => rows.includes(r)) }] : [])
+    ]
   const refreshing = useRef(false)
   async function refresh() {
     if (refreshing.current) return
@@ -1106,19 +1143,23 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                 {
                   type: 'button',
                   className: 'hermes-runners-host',
-                  'aria-expanded': !collapsed.has(g.key),
+                  'data-node-row': g.key,
+                  'aria-expanded': expandedNodes.has(g.key),
                   onClick: () =>
-                    setCollapsed((old) => {
+                    setExpandedNodes((old) => {
                       const n = new Set(old)
                       n.has(g.key) ? n.delete(g.key) : n.add(g.key)
                       return n
                     })
                 },
-                h('b', null, `${collapsed.has(g.key) ? '▸' : '▾'} ${text(g.name)}`),
-                h('small', null, g.capacity)
+                h('span', null,
+                  h('b', null, `${expandedNodes.has(g.key) ? '▾' : '▸'} ${text(g.name)}`),
+                  g.host ? h('span', { className: 'hermes-runners-meta' }, `${text(g.host.os)} ${text(g.host.arch)} · ${g.registrationCount ? `${g.registrationCount} registrations` : 'No mapped runners'}`) : null,
+                  g.activity ? h('span', { className: 'hermes-runners-meta' }, `${g.activity.busy == null ? 'Activity unknown' : `${g.activity.busy} busy · ${g.activity.idle} idle`} · Not observed`) : null
+                ),
+                h('small', null, g.health?.reason || `${g.rows.length} · mapping needed`)
               ),
-              g.issue ? h('p', { className: 'hermes-runners-note' }, g.issue) : null,
-              !collapsed.has(g.key)
+              expandedNodes.has(g.key)
                 ? g.rows.map((row) =>
                     h(RunnerRow, {
                       key: row.key,

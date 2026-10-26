@@ -46,6 +46,7 @@ test('known job appears only after bounded detail read and SDK opens its exact U
   )
   try {
     await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
     assert.match(document.body.textContent, /Busy — job not identified/)
     await ui.click(document.querySelector('[data-runner-row]'))
     await ui.click(button('Open current job 456'))

@@ -1,7 +1,30 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { React, host, route, snapshot, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
+import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
 const p = await loadPlugin()
+test('physical nodes start collapsed including empty hosts; expand reveals lazy runner details', async () => {
+  const s = snapshot(), calls = []
+  s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: '00000000-0000-4000-8000-000000000002', display_name: 'Empty node' }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  host.profileRoutes = async () => [route]
+  const ctx = { rest: async (path) => { calls.push(path); return path.includes('/enrollment') ? enrollment() : s } }
+  const ui = await mount(React.createElement(p.Runners, { ctx }))
+  try {
+    await ui.click(button('Show runners'))
+    const nodes = [...document.querySelectorAll('[data-node-row]')]
+    assert.equal(nodes.length, 2)
+    assert.ok(nodes.every(n => n.getAttribute('aria-expanded') === 'false'))
+    assert.equal(document.querySelector('[data-runner-row]'), null)
+    assert.match(document.body.textContent, /Empty node/)
+    assert.match(document.body.textContent, /health unverified/)
+    assert.equal(calls.filter(p => p.includes('/runners/')).length, 0)
+    await ui.click(nodes[0])
+    assert.equal(document.querySelectorAll('[data-runner-row]').length, 1)
+    assert.equal(calls.filter(p => p.includes('/runners/')).length, 0)
+    await ui.click(document.querySelector('[data-runner-row]'))
+    assert.equal(calls.filter(p => p.includes('/runners/')).length, 1)
+  } finally { await ui.close() }
+})
 test('native menu right click, overflow, Shift+F10, Escape preserve details and owner refresh', async () => {
   const s = snapshot(),
     calls = [],
@@ -28,6 +51,7 @@ test('native menu right click, overflow, Shift+F10, Escape preserve details and 
   )
   try {
     await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
     const row = document.querySelector('[data-runner-row]')
     await ui.click(row)
     for (const kind of ['right', 'overflow', 'keyboard']) {

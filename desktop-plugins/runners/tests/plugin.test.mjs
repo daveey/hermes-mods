@@ -2,6 +2,36 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
 const p = await loadPlugin()
+test('node projection includes empty hosts and keeps unassigned registrations separate', () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: 'host_0000000000000002', display_name: 'Empty node' }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  s.data.runners.push({ ...s.data.runners[0], id: 'runner_0000000000000002', provider_runner_id: '2', host_id: null })
+  const sources = [source(s)]
+  const v = p.projectNodes(sources, p.projectFleet(sources).rows)
+  assert.equal(v.nodes.length, 2)
+  assert.deepEqual(v.nodes.map(n => n.registrationCount), [1, 0])
+  assert.equal(v.unassigned.length, 1)
+  assert.equal(v.nodes[0].runners[0].source.route, route)
+  assert.equal(v.nodes[1].activity.busy, null)
+  assert.equal(v.nodes[1].freshness.observedAt, null)
+})
+test('node health never turns management reachability or busy activity into verified health', () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  s.data.runners[0].activity = 'busy'
+  const sources = [source(s)]
+  let n = p.projectNodes(sources, p.projectFleet(sources).rows).nodes[0]
+  assert.equal(n.health.state, 'unknown')
+  assert.match(n.health.reason, /Reachable.*health unverified/)
+  assert.equal(n.freshness.observedAt, null)
+  s.data.hosts[0].management = 'unreachable'
+  n = p.projectNodes(sources, p.projectFleet(sources).rows).nodes[0]
+  assert.match(n.health.reason, /not proof of.*outage/)
+  assert.equal(n.health.state, 'unknown')
+  assert.equal(n.monitoring, 'unreachable')
+})
 test('status chip cannot wrap or shrink below its reduced label', () => {
   assert.match(p.CSS, /\[data-slot=runners-chip\]\{flex-shrink:0;white-space:nowrap\}/)
 })
@@ -193,6 +223,7 @@ test('render 100 registrations with no per-row request amplification, native pop
   try {
     assert.ok(button('Show runners'))
     await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
     assert.equal(document.querySelectorAll('[data-runner-row]').length, 100)
     assert.match(document.body.textContent, /Collector heartbeat/)
     assert.equal(calls.filter(([x]) => x.includes('/inventory')).length, 1)
@@ -216,6 +247,7 @@ test('keyboard slash, arrows, Enter, Escape details then popover and focus resto
   const ui = await mount(React.createElement(p.Runners, { ctx }))
   try {
     await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
     await ui.key(document.querySelector('[data-runners-panel]'), '/')
     assert.equal(document.activeElement.getAttribute('aria-label'), 'Search runners')
     await ui.key(document.activeElement, 'ArrowDown')
