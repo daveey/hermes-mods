@@ -180,6 +180,15 @@ Semantic judges are injected; scope negatives test routing, not model classifica
 `test_goal_ownership.py` also exercises real isolated Kanban tables through discovered agent text
 stops, scope/liveness/return-route rejection, and read-only WAL fallback without creating databases.
 
+Additional native process-return certification: `test_goal_process_profiles.py` exercises
+real temporary named-profile homes and concurrent multiplex profile scopes, real child exits,
+native watcher/busy-queue admission and the public ownership gate. It verifies same-chat profile
+isolation and targeted Stop/new-user/adapter-loss revocation. Adapter maps and watcher descriptors
+are fixture-assembled: startup discovery, shared-bot satellites and cross-gateway delivery remain
+unverified. `test_goal_process_run21_review.py` verifies route-component source replacement at
+admission/readback fails closed, while equivalent copies and nonrouting changes preserve proof.
+These tests do not establish production activation or satisfy the historical incident replay gate.
+
 ### Fix loops across turns (`pre_llm_call` + `post_llm_call`)
 
 `post_llm_call` remembers each turn's final answer and tool log. On the next user message, `fix_loop.py`
