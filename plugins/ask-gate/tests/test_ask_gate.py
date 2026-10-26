@@ -19,6 +19,28 @@ def seed_log(gate, sid, entry):
 
 
 # ---- detector -------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("text", [
+    "I couldn't restart it here, so it needs a manual nudge on the Kanban board to verify and close.",
+    "Decision for you:\n1. Approve that read-only lookup or give me the address.\n2. Should the project get a private repo?",
+])
+def test_week_1019_missed_handoff_shapes(gate, text):
+    assert gate.core.find_asks(text)
+
+
+def test_week_1019_decision_heading_keeps_both_steps(gate):
+    asks = gate.core.find_asks("Decision for you:\n1. Approve the lookup.\n2. Pick a repository name.")
+    assert len(asks) == 2
+
+
+@pytest.mark.parametrize("text", [
+    "None of them need you.", "None of the cards need you.",
+    "The motor needs a manual restart.",
+    "I will nudge the card on the board myself.",
+])
+def test_week_1019_non_handoffs(gate, text):
+    assert gate.core.find_asks(text) == []
+
+
 @pytest.mark.parametrize("key", ["I0", "I1_I2", "I3", "I4"])
 def test_incident_replies_contain_asks(gate, key):
     assert gate.core.find_asks(FIX[key]["reply"]), key
