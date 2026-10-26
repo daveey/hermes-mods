@@ -984,9 +984,17 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
     })
   }, [nodeIdentityKey])
   const [jumpFocus, setJumpFocus] = useState(null)
+  const { groups: paletteGroups } = selectNodes(inventoryNodes, '', 'All')
+  // Observations refresh frequently; only contribution identity, labels or routing
+  // changes should replace entries while the native palette is open.
+  const paletteKey = JSON.stringify(paletteGroups.map(group => [
+    group.key, group.name, group.source?.route, group.host?.os, group.host?.arch,
+    group.rows.map(row => [row.key, row.display_name, row.source.route,
+      row.observed_os, row.host?.arch, row.scope?.name, settingsURL(row)])
+  ]))
   useEffect(() => {
-    if (!ctx.register || !q.data) return
-    const { groups: allGroups } = selectNodes(inventoryNodes, '', 'All')
+    if (!ctx.register) return
+    const allGroups = paletteGroups
     const disposers = []
     for (const group of allGroups) {
       const jump = (row = null) => {
@@ -1019,7 +1027,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
       }
     }
     return () => disposers.forEach(dispose => dispose?.())
-  }, [ctx, q.data])
+  }, [ctx, paletteKey])
   useEffect(() => {
     if (!open || !jumpFocus) return
     const frame = requestAnimationFrame(() => {
@@ -1245,8 +1253,11 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
             style: { maxHeight: 100, overflow: 'auto', flexShrink: 0 }
           },
           q.isPending && !sources.length ? 'Loading inventory…' : null,
-          ...selected.filter(s => s.enrolled !== false && (s.error || ['owner_disconnected', 'plugin_unavailable', 'owner_conflict'].includes(s.snapshot?.data.state))).map((s, i) =>
-            h('p', { key: i, className: 'hermes-runners-note' }, `Owner unavailable · ${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''}: ${s.error || STATES[s.snapshot.data.state]}`))
+          ...selected.filter(s => s.enrolled !== false && (
+            (s.error && (s.snapshot || /Owner (gateway disconnected|identity mismatch)/.test(s.error))) ||
+            ['owner_disconnected', 'owner_conflict'].includes(s.snapshot?.data.state)
+          )).map((s, i) =>
+            h('p', { key: i, className: 'hermes-runners-note' }, `${['owner_disconnected', 'owner_conflict'].includes(s.snapshot?.data.state) ? 'Owner unavailable · ' : ''}${s.error || STATES[s.snapshot.data.state]} · ${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''}`))
         ),
         actionError ? h('p', { role: 'alert' }, actionError) : null,
         h('input', {

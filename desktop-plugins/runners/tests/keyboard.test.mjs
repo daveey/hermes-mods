@@ -53,6 +53,21 @@ test('nonowner enrollment diagnostics remain secondary and do not become owner f
     assert.equal(document.querySelectorAll('[data-node-row]').length, 0)
   } finally { await ui.close() }
 })
+test('missing plugins on nonowner profiles stay secondary beside a healthy owner', async () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  host.profileRoutes = async () => [route, { ...route, targetProfile: 'absent-one' }, { ...route, targetProfile: 'absent-two' }]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => {
+    if (path.includes('profile=absent-')) throw Object.assign(new Error('404'), { status: 404 })
+    return path.includes('/enrollment') ? enrollment() : s
+  } } }))
+  try {
+    await ui.click(button('Show runners'))
+    assert.match(document.querySelector('[data-runners-diagnostics]').textContent, /Plugin unavailable/)
+    assert.doesNotMatch(document.querySelector('[role="status"]').textContent, /Owner unavailable|Plugin unavailable/)
+    assert.equal(document.querySelectorAll('[data-node-row]').length, 2)
+  } finally { await ui.close() }
+})
 test('node detail shows explicit maintenance and enforced capacity without free-slot claims', async () => {
   const s = snapshot()
   s.data.hosts = [{ ...structuredClone(fixtures.Host), capacity: { enforced: true, declared_max_jobs: 4, observed_active_jobs: null }, maintenance: { state: 'active', reason: 'Inspection', expires_at: new Date(Date.now() + 60000).toISOString() } }]
@@ -168,6 +183,29 @@ test('runner settings palette aliases use the validated scope URL', async () => 
     settings.data.run()
     assert.deepEqual(opened, ['https://github.com/example/project/settings/actions/runners'])
   } finally { await ui.close() }
+})
+test('inventory observations do not churn unchanged palette registrations', async () => {
+  const s = snapshot(), entries = new Map()
+  let registrations = 0
+  host.profileRoutes = async () => [route]
+  const ctx = {
+    register: entry => { registrations++; entries.set(entry.id, entry); return () => entries.delete(entry.id) },
+    rest: async path => path.includes('/enrollment') ? enrollment() : structuredClone(s)
+  }
+  const ui = await mount(React.createElement(p.Runners, { ctx }))
+  try {
+    const initial = registrations
+    assert.ok(initial > 0)
+    s.meta.generated_at = new Date(Date.now() + 1000).toISOString()
+    await React.act(async () => ui.client.invalidateQueries({ queryKey: ['runners'] }))
+    await ui.flush()
+    assert.equal(registrations, initial, 'observation-only poll keeps palette entries intact')
+    s.data.runners[0].display_name = 'Renamed runner'
+    await React.act(async () => ui.client.invalidateQueries({ queryKey: ['runners'] }))
+    await ui.flush()
+    assert.ok([...entries.values()].some(e => e.data.label === 'Show runner: Renamed runner'))
+  } finally { await ui.close() }
+  assert.equal(entries.size, 0)
 })
 test('native palette jumps to owner-qualified nodes and runners and removes stale contributions', async () => {
   let s = snapshot()
