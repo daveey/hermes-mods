@@ -184,8 +184,13 @@ Additional native process-return certification: `test_goal_process_profiles.py` 
 real temporary named-profile homes and concurrent multiplex profile scopes, real child exits,
 native watcher/busy-queue admission and the public ownership gate. It verifies same-chat profile
 isolation and targeted Stop/new-user/adapter-loss revocation. Adapter maps and watcher descriptors
-are fixture-assembled: startup discovery, shared-bot satellites and cross-gateway delivery remain
-unverified. `test_goal_process_run21_review.py` verifies route-component source replacement at
+are fixture-assembled in that suite. `test_goal_process_native_terminal.py` additionally
+exercises registered terminal dispatch on worker threads, native watcher registration and
+loop arming, and shared-bot satellite/own-bot routing through real profile scopes and busy
+admission. Receiving-bot loss revokes proof even when another bot remains alive. Adapter
+startup state remains fixture-installed; no authenticated transport, model turn, service
+restart or cross-gateway delivery is certified. `test_goal_process_run21_review.py`
+verifies route-component source replacement at
 admission/readback fails closed, while equivalent copies and nonrouting changes preserve proof.
 These tests do not establish production activation or satisfy the historical incident replay gate.
 
