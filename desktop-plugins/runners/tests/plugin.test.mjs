@@ -54,6 +54,17 @@ test('node projection tolerates unavailable directory entries without routes', (
   const result = p.projectNodes([{ error: 'Directory unavailable' }, { error: 'No routes' }])
   assert.deepEqual(result, { nodes: [], unassigned: [] })
 })
+test('node projection treats owner state failures as stale even without transport errors', () => {
+  for (const state of ['owner_disconnected', 'plugin_unavailable', 'owner_conflict']) {
+    const s = snapshot()
+    s.data.state = state
+    s.data.hosts = [structuredClone(fixtures.Host)]
+    const node = p.projectNodes([source(s)]).nodes[0]
+    assert.equal(node.monitoring, 'unknown')
+    assert.equal(node.freshness.state, 'stale')
+    assert.match(node.health.reason, /Owner unavailable/)
+  }
+})
 test('node capacity uses enforced limits and maintenance expires without inventing draining', () => {
   const s = snapshot(), now = Date.now()
   s.data.hosts = [{ ...structuredClone(fixtures.Host), capacity: { enforced: false, declared_max_jobs: 8, observed_active_jobs: null }, maintenance: { state: 'active', reason: 'Inspection', expires_at: new Date(now - 1).toISOString() } }]

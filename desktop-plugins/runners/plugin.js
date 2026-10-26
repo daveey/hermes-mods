@@ -422,7 +422,10 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
   const nodes = new Map()
   // Select a usable owner response before recency, with stable route tie-breaking.
   // Envelope time selects the response only; it is never node observation age.
-  const ordered = sources.filter(s => s.snapshot).sort((a, b) =>
+  const ordered = sources.filter(s => s.snapshot).map(entry => ({
+    ...entry,
+    error: entry.error || (['owner_disconnected', 'plugin_unavailable', 'owner_conflict'].includes(entry.snapshot.data.state) ? STATES[entry.snapshot.data.state] : null)
+  })).sort((a, b) =>
     Number(!b.error) - Number(!a.error) ||
     (Date.parse(b.snapshot?.meta.observed_at) || 0) - (Date.parse(a.snapshot?.meta.observed_at) || 0) ||
     routeKey(a.route).localeCompare(routeKey(b.route)))
