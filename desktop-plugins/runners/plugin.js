@@ -16,7 +16,7 @@ import {
   ContextMenuItem,
   ContextMenuSeparator
 } from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect, useRef } from 'react'
+import { createElement as h, useState, useEffect, useLayoutEffect, useRef } from 'react'
 
 const BAR =
   'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
@@ -619,8 +619,8 @@ export const CSS = `
 .hermes-runners-filters button[aria-pressed=true],.hermes-runners button:hover{background:var(--chrome-action-hover)}
 .hermes-runners-scroll{min-height:0;overflow:auto;overscroll-behavior:contain}
 .hermes-runners-group{border-top:1px solid var(--ui-stroke-secondary);padding-top:6px;margin-top:6px}
-.hermes-runners-host{display:flex;flex-wrap:wrap;text-align:left;width:100%;gap:8px;padding:4px}
-.hermes-runners-host small{margin-left:auto}.hermes-runners-rowwrap{display:flex;align-items:start;gap:2px}
+.hermes-runners-host{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,auto);align-items:start;text-align:left;width:100%;gap:8px;padding:4px}
+.hermes-runners-host>span{min-width:0;overflow-wrap:anywhere}.hermes-runners-host small{max-width:160px;text-align:right;overflow-wrap:anywhere}.hermes-runners-rowwrap{display:flex;align-items:start;gap:2px}
 .hermes-runners-row{flex:1;min-width:0;display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:6px;text-align:left;padding:6px;border-radius:4px}
 .hermes-runners-row span{min-width:0;overflow-wrap:anywhere}.hermes-runners-name{display:block;font-weight:500}.hermes-runners-meta{display:block;font-size:11px;color:var(--ui-text-secondary)}
 .hermes-runners-overflow{padding:6px;flex:none}.hermes-runners-detail{margin:2px 8px 8px 20px;font-size:11px;overflow-wrap:anywhere}
@@ -910,7 +910,14 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
     transportRef = useRef(null),
     trigger = useRef(null),
     panel = useRef(null),
-    searchRef = useRef(null)
+    searchRef = useRef(null),
+    searchHandoff = useRef(false)
+  useLayoutEffect(() => {
+    if (!searchHandoff.current) return
+    searchHandoff.current = false
+    searchRef.current?.focus()
+    searchRef.current?.setSelectionRange(search.length, search.length)
+  }, [search])
   if (!transportRef.current) transportRef.current = createTransport(ctx)
   const transport = transportRef.current
   const gateways = useValue(host.state.gateways || host.state.connectionId),
@@ -1082,9 +1089,8 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         !e.target.isContentEditable && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
       e.preventDefault()
       const next = search + e.key
+      searchHandoff.current = true
       setSearch(next)
-      searchRef.current?.focus()
-      requestAnimationFrame(() => searchRef.current?.setSelectionRange(next.length, next.length))
     }
     if (e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing &&
         !e.target.isContentEditable && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
