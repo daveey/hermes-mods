@@ -8,15 +8,26 @@ default-off gate: enable only after live owner-routed duplicate-click acceptance
 
 ## Collector and API deployment
 
-Install PyYAML and `jsonschema[format]` into a dedicated production interpreter.
-Repair reconciliation additionally requires a compatible Hermes core with trusted
-`StartIntent.metadata`, plus its status-layer dependencies (`python-dotenv` and
-`ruamel.yaml` in the tested runtime). For an isolated interpreter, pass an absolute
-`--core-root /path/to/hermes-core` to `scripts/install_service.py`; the supervisor
-loads that checkout after the plugin namespace, checks the metadata interface,
-and fails closed on missing/conflicting core. It never installs dependencies or
-starts a gateway. Validate with the actual supervisor interpreter before enabling
-repairs; test-environment imports alone do not establish production readiness.
+For repair reconciliation, prefer `scripts/install_service.py --install
+--hermes-launcher /absolute/hermes --core-root /path/to/hermes-core` (plus the
+owner/config arguments below). The installer discovers the interpreter through
+`hermes --print-runtime-command`; the isolated worker activates the installed PM
+dependency generation, including its process-lifetime lease. It does not run the
+full CLI bootstrap, install dependencies, finish source updates or start gateways.
+PM activation may recover its publication journal. Re-run installation after a
+runtime interpreter replacement; the service pins the discovered executable.
+Validate before rollout with that executable:
+`/absolute/runtime-python -I scripts/runtime_collector.py --core-root
+/path/to/hermes-core --check-core`. This checks activation/imports without runner
+config, credentials or collection, and reports sanitized error class/module names.
+A compatible core must support `StartIntent.metadata`.
+
+For a separately managed interpreter, install PyYAML, `jsonschema[format]` and
+core's status-layer dependencies (including `python-dotenv` and `ruamel.yaml`),
+then use `--python /absolute/python --core-root /path/to/hermes-core` instead.
+This path does not activate PM dependencies. Both paths load core after the plugin
+namespace and fail closed on missing/conflicting core. Test-environment imports
+alone do not establish production readiness.
 Create a private mode-0600 runtime JSON with `credentials` mapping opaque refs to
 `{scope, env_var, key}` broker references (never token values), and `probes` mapping
 opaque SSH refs to `{target, spec}`. Credential aliases sharing a provider quota

@@ -80,6 +80,10 @@ def load_runtime(path):
         raise RuntimeError('invalid_runtime_configuration') from None
 
 
+class CoreUnavailable(RuntimeError):
+    """Sanitized dependency diagnostic, safe for supervisor stderr."""
+
+
 def configure_core(root):
     """Explicit supervisor-owned checkout; never infer from an ambient cwd.
 
@@ -102,6 +106,13 @@ def configure_core(root):
             raise ValueError('conflicting_core')
         if 'metadata' not in core.StartIntent.__dataclass_fields__:
             raise ValueError('unsupported_core')
+    except ImportError as exc:
+        # Class and validated module name only; exception text can contain secrets.
+        name = exc.name or 'unknown'
+        if len(name) > 160 or not all(part.isidentifier() for part in name.split('.')):
+            name = 'unknown'
+        kind = 'ModuleNotFoundError' if isinstance(exc, ModuleNotFoundError) else 'ImportError'
+        raise CoreUnavailable(f'repair_core_unavailable:{kind}:{name}') from None
     except Exception:
         raise RuntimeError('repair_core_unavailable') from None
 
@@ -205,6 +216,8 @@ def main(argv=None):
     except Exception as exc:
         # Never emit config, broker output, remote payloads, or arbitrary errors.
         reason = str(exc) if str(exc) in {'collector_running', 'owner_conflict', 'configuration_changed', 'observe_only_required', 'invalid_runtime_configuration', 'missing_credential_mapping', 'missing_probe_mapping', 'repair_core_unavailable'} else 'collector_failed'
+        if isinstance(exc, CoreUnavailable):
+            reason = str(exc)
         print(reason, file=sys.stderr)
         return 1
     finally:
