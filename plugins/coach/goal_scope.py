@@ -11,8 +11,16 @@ def is_evidence_row(row):
     return (isinstance(row, dict)
             and not any(k.startswith('_') and k not in PERSISTENCE_ONLY_MESSAGE_FIELDS
                         and k != '_db_persisted' and row[k] for k in row)
+            and not _queued_receipt(row)
             and not row.get('observed')
             and not (row.get('role') == 'user' and row.get('display_kind')))
+
+def _queued_receipt(row):
+    metadata = row.get('display_metadata') or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    return isinstance(metadata, dict) and metadata.get('_queued_prompt') is True
+
 
 def _ro_connect(path):
     import sqlite3
@@ -98,6 +106,10 @@ def recover_scope(session_id, user_message, history, *, canonical_user_content=N
                 if current.get('profile_name') != get_active_profile_name():
                     raise ValueError('scope_profile_mismatch')
                 clean = "role='user' AND COALESCE(_compressed_summary,0)=0 AND COALESCE(observed,0)=0 AND display_kind IS NULL"
+                # Queue receipts are durable UI placeholders, not executed turns.
+                # Exclude only the native boolean marker, not human text or other metadata.
+                clean += (" AND CASE WHEN json_valid(display_metadata) THEN "
+                          "COALESCE(json_type(display_metadata, '$._queued_prompt'), '') != 'true' ELSE 1 END")
                 anchors = conn.execute('SELECT id FROM messages WHERE session_id=? AND ' + clean +
                                        ' AND content=? LIMIT 2', (session_id, user_message)).fetchall()
                 if len(anchors) > 1:

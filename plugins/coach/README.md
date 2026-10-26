@@ -128,6 +128,10 @@ native wait producers and release operations; `test_goal_owner_user_provenance.p
 these origin exclusions and the public gate's UNKNOWN telemetry.
 Scope recovery reads only real user rows through bounded, profile-qualified compression ancestry.
 Rotation transfers captured restrictions/tool pairs; restart requires a unique current request anchor.
+Native boolean `_queued_prompt` receipts are excluded from both history and durable recovery:
+they are unexecuted queue placeholders, not current anchors or new authority. False markers
+and ordinary executed repeated requests are not excluded. `test_goal_scope_queued.py` verifies
+queue duplicates cannot poison the anchor or add unexecuted permission.
 Before core persists that request, its runtime-stamped message timestamp bounds recovery instead.
 Unknown profiles, ambiguous anchors and unsupported lineage fail UNKNOWN. Captures are isolated by
 profile home and session; persistence metadata is not mistaken for synthetic content. Complete
@@ -167,7 +171,11 @@ whole-turn veto: an entire latest user row such as "Stop.", "Cancel.", "Analysis
 "Do not execute anything." cannot be overridden by a mistaken abandonment verdict. Quotes,
 partial action restrictions and compound instructions do not match this literal veto; broader
 scope remains semantic, and lack of a veto is never permission.
-These are backend tests, not Electron UI or production activation proof.
+`test_goal_serve_acceptance.py` runs actual isolated `hermes serve` startup on loopback,
+with synthetic token authentication and a network-fenced local primary/judge HTTP endpoint.
+It verifies missing/wrong tokens are denied, held candidates stay off wire/logs/persistence,
+and ordinary plus deterministically queued analysis-only next turns are assessed and complete.
+These are backend tests, not Electron UI, public OAuth or production activation proof.
 Semantic judges are injected; scope negatives test routing, not model classification accuracy.
 `test_goal_ownership.py` also exercises real isolated Kanban tables through discovered agent text
 stops, scope/liveness/return-route rejection, and read-only WAL fallback without creating databases.
