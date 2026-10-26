@@ -19,6 +19,13 @@ The run that actually builds your commit is often one started by someone else's 
 watchers miss it and wait for hours while the session looks idle. Ask instead whether any successful run, or
 any release tag, *contains* your commit.
 
+When a branch uses ONE serialized concurrency group (in-flight always finishes, only the newest pending waits), a
+pending run that keeps getting `cancelled` with zero jobs never started. Find the holder: `gh api
+"repos/R/actions/runs?branch=main&status=in_progress"` and look for an old run whose last job sat in a runner
+backlog. To time a full run (capacity acceptance), designate the first run that STARTS after the holder completes
+and measure from `run_started_at`, not `created_at`. A `workflow_dispatch` on that branch joins the same group, so
+dispatching doesn't help.
+
 ## Fixing the CI you wait on: use a worktree
 
 A CI fix (or any branch work) goes in its own worktree: `git worktree add <dir> -b <fix-branch> origin/main`, then
