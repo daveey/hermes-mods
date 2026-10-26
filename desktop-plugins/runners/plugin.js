@@ -698,6 +698,7 @@ function Details({ row, transport, visible, onData }) {
             )
           ),
           h('p', null, `Recent jobs: ${(d.jobs || []).length}`),
+          !d.jobs?.length ? h('p', null, 'Job attribution unavailable') : null,
           ...(d.jobs || []).map((j) =>
             h(
               'p',

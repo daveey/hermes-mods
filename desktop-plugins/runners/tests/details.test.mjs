@@ -22,6 +22,23 @@ test('job links require exact provider, scope, assignment, owner and numeric IDs
     assert.equal(p.jobURL(row, invalid), null)
   assert.equal(p.jobURL({ ...row, endpoint: 'https://evil.example' }, job), null)
 })
+test('empty job data does not claim idle or unconfigured monitoring', async () => {
+  const s = snapshot()
+  s.data.runners[0].activity = 'busy'
+  const d = { ...s, data: { ...fixtures.RunnerDetail, runner: s.data.runners[0], jobs: [] } }
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: {
+    rest: async path => path.includes('/enrollment') ? enrollment() : path.includes('/runners/') ? d : s
+  } }))
+  try {
+    await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
+    await ui.click(document.querySelector('[data-runner-row]'))
+    const detail = document.querySelector('.hermes-runners-detail')
+    assert.match(detail.textContent, /Job attribution unavailable/)
+    assert.doesNotMatch(detail.textContent, /not configured|Current job not identified|idle/i)
+  } finally { await ui.close() }
+})
 test('known job appears only after bounded detail read and SDK opens its exact URL', async () => {
   const s = snapshot()
   s.data.runners[0].activity = 'busy'
