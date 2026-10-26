@@ -1,6 +1,6 @@
 # Preserve owner-routed foreign Desktop tiles
 
-Patch: 0291.
+Patch: 0359.
 
 ## Behavior
 
@@ -20,7 +20,7 @@ The implementation commit reports 255 targeted tests across 10 files plus ESLint
 
 ## Applying
 
-Apply the full ordered patch series through 0291 at its merge-base; rebuild Desktop separately.
+Apply the full ordered patch series through 0359 at its merge-base; rebuild Desktop separately.
 
 ## Gotchas
 

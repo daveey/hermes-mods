@@ -169,11 +169,21 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
     (another Mac's Desktop) gets nothing while this gateway's own Desktop courier is alive."""
     base = base or root()
     device = register_courier(base, courier, aliases, reach or (), home) if courier else ""
-    if not home and home_courier_alive(base):
+    home_alive = (not home) and home_courier_alive(base)
+    if home_alive and not device:
         sweep(base)
         return []
     reach_list = None if reach is None else sorted(set(names(reach)) | set(names(aliases)) | ({device} - {""}))
     couriers = live_couriers(base)
+    # While this gateway's own Desktop courier is alive, another Mac's Desktop may still claim a request
+    # that ONLY it can serve: addressed to that Mac itself, or to a gateway the home courier cannot reach.
+    # Otherwise the home courier skips it ("that Mac answers for itself") and the request is stranded.
+    home_names = set()
+    if home_alive:
+        for c in couriers:
+            if c.get("home"):
+                home_names |= set(names(c.get("reach") or ())) | set(names(c.get("aliases") or ())) | {norm_name(c.get("device"))}
+        home_names.discard("")
     out = []
     now = time.time()
     for path in sorted((base / "outbox").glob("*.json"), key=lambda p: p.stat().st_mtime):
@@ -183,6 +193,11 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
             peek = {}
         if isinstance(peek, dict) and not may_claim(peek, home=home, courier=device, reach=reach_list, couriers=couriers):
             continue
+        if home_alive:
+            route = norm_name(peek.get("route")) if isinstance(peek, dict) else ""
+            mine = set(names(aliases)) | ({device} - {""})
+            if not route or route in LOCAL_ALIASES or not (route in mine or route not in home_names):
+                continue
         target = base / "claimed" / path.name
         try:
             os.replace(path, target)  # atomic claim: a second drainer loses the race

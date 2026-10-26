@@ -1,0 +1,399 @@
+From 7850ff0cf3ce9b15a251ca2b119f3710363c90d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:11:38 +0000
+Subject: [PATCH] fix(desktop): recover stopped owners after ambiguous
+ reconnect commit [daveey]
+
+---
+ apps/desktop/electron/main.ts                 |  2 +
+ .../registry-reconnect-service.test.ts        | 40 ++++++++++++-
+ .../electron/registry-reconnect-service.ts    | 41 ++++++++------
+ .../electron/registry-reconnect.test.ts       | 26 +++++++++
+ apps/desktop/electron/registry-reconnect.ts   | 11 +++-
+ .../electron/registry-stopped-owner.test.ts   | 56 +++++++++++++++++++
+ .../electron/registry-stopped-owner.ts        | 51 +++++++++++++++++
+ apps/desktop/electron/remote-lifecycle.ts     |  1 +
+ 8 files changed, 207 insertions(+), 21 deletions(-)
+ create mode 100644 apps/desktop/electron/registry-stopped-owner.test.ts
+ create mode 100644 apps/desktop/electron/registry-stopped-owner.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index a4e0120580..5662e731f3 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -529,6 +529,7 @@ import {
+   type QuitTeardownTask
+ } from './quit-teardown'
+ import { createRegistryReconnectService } from './registry-reconnect-service'
++import { proveRegistryOwnerStopped } from './registry-stopped-owner'
+ import * as remoteLifecycle from './remote-lifecycle'
+ import {
+   attachPowerResumeRemoteRevalidation,
+@@ -16159,6 +16160,7 @@ const registryReconnectService = createRegistryReconnectService({
+   isSsh: id => readDesktopConnectionsRegistry().connections.some(source => source.id === id && source.kind === 'ssh'),
+   inFlight: key => Boolean(backendDialClaims.inFlight(key) || poolStopper.inFlight(key) || sshBootstrapCoordinator.pending.has(key)),
+   request: (descriptor, requestPath, options) => fetchJsonForBackend(descriptor, requestPath, options),
++  proveStopped: state => proveRegistryOwnerStopped(state.ssh, { ...state, profile: state.remoteProfile || '' }),
+   terminate: async state => {
+     const expected = { ...state, profile: state.remoteProfile || '' }
+ 
+diff --git a/apps/desktop/electron/registry-reconnect-service.test.ts b/apps/desktop/electron/registry-reconnect-service.test.ts
+index c3fe344520..2becf1df1c 100644
+--- a/apps/desktop/electron/registry-reconnect-service.test.ts
++++ b/apps/desktop/electron/registry-reconnect-service.test.ts
+@@ -18,6 +18,7 @@ function fixture() {
+     : { ok: true, idle: true, token: 'permit', action: options.body?.action })
+ 
+   const terminate = vi.fn(async () => {})
++  const proveStopped = vi.fn(async () => false)
+   const close = vi.fn(async () => {})
+ 
+   const reopen = vi.fn(async (id, profile, correlation) => {
+@@ -27,14 +28,14 @@ function fixture() {
+   })
+ 
+   const service = createRegistryReconnectService({
+-    pool, states, gate, request, terminate, close, reopen,
++    pool, states, gate, request, terminate, close, reopen, proveStopped,
+     onCleanupError: vi.fn(),
+     key: (id, profile) => `conn:${id}::${profile}`,
+     isSsh: id => id === 'hub',
+     inFlight: () => false
+   })
+ 
+-  return { service, pool, states, entry, state, primary, gate, request, terminate, reopen, close }
++  return { service, pool, states, entry, state, primary, gate, request, terminate, reopen, close, proveStopped }
+ }
+ 
+ test('composed reconnect repairs a deleted runtime without touching local default', async () => {
+@@ -50,6 +51,41 @@ test('composed reconnect repairs a deleted runtime without touching local defaul
+   expect(f.gate.owner('hub')).toBeNull()
+ })
+ 
++test.each(['stopped', 'replacement', 'live', 'unknown'] as const)('ambiguous commit recovery: %s', async verdict => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  const request = f.request.getMockImplementation()!
++  f.request.mockImplementation(async (descriptor, path, options) => {
++    if (options.body?.action === 'commit') { throw new Error('response lost') }
++
++    return request(descriptor, path, options)
++  })
++  await expect(f.service.run(target)).rejects.toThrow('response lost')
++  f.request.mockRejectedValue(new Error('HTTP offline'))
++  f.proveStopped.mockImplementation(async () => {
++    if (verdict === 'unknown') { throw new Error('SSH offline') }
++
++    if (verdict === 'replacement') { f.entry.connectionPromise = Promise.resolve({ baseUrl: 'http://replacement', token: 'new' }) }
++
++    return verdict !== 'live'
++  })
++
++  if (verdict === 'stopped') {
++    expect((await f.service.run(target)).ok).toBe(true)
++    expect(f.close).toHaveBeenCalledOnce()
++    expect(f.gate.owner('hub')).toBeNull()
++  } else {
++    await expect(f.service.run(target)).rejects.toThrow(/offline|changed/)
++    expect(f.close).not.toHaveBeenCalled()
++    expect(f.reopen).not.toHaveBeenCalled()
++    expect(f.gate.owner('hub')).not.toBeNull()
++    expect(f.pool.get('conn:hub::default')).toBe(f.entry)
++  }
++
++  expect(f.terminate).not.toHaveBeenCalled()
++  expect(f.pool.get('default')).toBe(f.primary)
++})
++
+ test('a second profile cannot borrow a pending reconnect claim', async () => {
+   const f = fixture()
+   f.pool.set('conn:hub::other', { process: null, connectionPromise: f.entry.connectionPromise })
+diff --git a/apps/desktop/electron/registry-reconnect-service.ts b/apps/desktop/electron/registry-reconnect-service.ts
+index 6eaa7bcd5f..0948f57e80 100644
+--- a/apps/desktop/electron/registry-reconnect-service.ts
++++ b/apps/desktop/electron/registry-reconnect-service.ts
+@@ -19,6 +19,7 @@ interface ServiceDeps<D, E extends PoolEntry<D>, S extends OwnedState> {
+   isSsh: (connectionId: string) => boolean
+   inFlight: (key: string) => boolean
+   request: Parameters<typeof createRegistryRetirementClient<D>>[0]
++  proveStopped: (state: S) => Promise<boolean>
+   terminate: (state: S) => Promise<void>
+   close: (key: string, state: S) => Promise<void>
+   onCleanupError: (error: unknown) => void
+@@ -60,6 +61,22 @@ export function createRegistryReconnectService<D, E extends PoolEntry<D>, S exte
+     return resident
+   }
+ 
++  async function cleanup(resident: Resident) {
++    if (deps.pool.get(resident.key) !== resident.entry || deps.states.get(resident.key) !== resident.state ||
++        resident.entry.connectionPromise !== resident.descriptor) {
++      throw new Error('Registry backend changed during termination')
++    }
++
++    deps.pool.delete(resident.key)
++    deps.states.delete(resident.key)
++
++    try {
++      await deps.close(resident.key, resident.state)
++    } catch (error) {
++      deps.onCleanupError(error)
++    }
++  }
++
+   const coordinator = createRegistryReconnector<Resident>({
+     current,
+     generation: resident => resident.generation,
+@@ -67,25 +84,15 @@ export function createRegistryReconnectService<D, E extends PoolEntry<D>, S exte
+     prepare: async resident => client.prepare(await resident.descriptor),
+     commit: async (resident, token) => client.commit(await resident.descriptor, token),
+     cancel: async (resident, token) => client.cancel(await resident.descriptor, token),
++    recoverStopped: async resident => {
++      if (!(await deps.proveStopped(resident.state))) { return false }
++      await cleanup(resident)
++
++      return true
++    },
+     terminate: async resident => {
+       await deps.terminate(resident.state)
+-
+-      // Only remove the captured resident. Close is transport-only, never a
+-      // generic teardown that could signal a replacement process.
+-      if (deps.pool.get(resident.key) !== resident.entry || deps.states.get(resident.key) !== resident.state) {
+-        throw new Error('Registry backend changed during termination')
+-      }
+-
+-      deps.pool.delete(resident.key)
+-      deps.states.delete(resident.key)
+-
+-      // Exit is already confirmed. A transport-only cleanup error cannot
+-      // retain an uncertain-process fence after its resident was removed.
+-      try {
+-        await deps.close(resident.key, resident.state)
+-      } catch (error) {
+-        deps.onCleanupError(error)
+-      }
++      await cleanup(resident)
+     },
+     reopen: async (connectionId, profile) => {
+       await deps.reopen(connectionId, profile, correlations.get(connectionId)!)
+diff --git a/apps/desktop/electron/registry-reconnect.test.ts b/apps/desktop/electron/registry-reconnect.test.ts
+index d1f7304b15..b865e6cdb4 100644
+--- a/apps/desktop/electron/registry-reconnect.test.ts
++++ b/apps/desktop/electron/registry-reconnect.test.ts
+@@ -12,6 +12,7 @@ function fixture() {
+     prepare: vi.fn(async (): Promise<string | null> => 'permit'),
+     commit: vi.fn(async () => true),
+     cancel: vi.fn(async () => {}),
++    recoverStopped: vi.fn(async () => false),
+     terminate: vi.fn(async () => {}),
+     reopen: vi.fn(async () => 'hub-2')
+   }
+@@ -105,6 +106,30 @@ test('an ambiguous commit keeps the scope fenced for retry, never cancelling a p
+   expect(() => reconnect.assertCanDial('hub', 'default')).not.toThrow()
+ })
+ 
++test('lost commit plus serve exit recovers without invoking any live terminator', async () => {
++  const { deps, reconnect } = fixture()
++  deps.commit.mockRejectedValueOnce(new Error('response lost'))
++  await expect(reconnect.run(target)).rejects.toThrow('response lost')
++  deps.proveOwned.mockRejectedValue(new Error('HTTP offline'))
++  deps.recoverStopped.mockResolvedValue(true)
++  expect(await reconnect.run(target)).toEqual({ ok: true, generation: 'hub-2' })
++  expect(deps.terminate).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).not.toThrow()
++})
++
++test.each(['live', 'unknown'] as const)('uncertain %s owner never grants kill authority', async status => {
++  const { deps, reconnect } = fixture()
++  deps.commit.mockRejectedValueOnce(new Error('response lost'))
++  await expect(reconnect.run(target)).rejects.toThrow('response lost')
++  deps.proveOwned.mockRejectedValue(new Error('HTTP offline'))
++
++  if (status === 'unknown') { deps.recoverStopped.mockRejectedValue(new Error('SSH offline')) }
++  await expect(reconnect.run(target)).rejects.toThrow(/offline/)
++  expect(deps.terminate).not.toHaveBeenCalled()
++  expect(deps.reopen).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).toThrow()
++})
++
+ test('an uncertain committed resident cannot grant retry authority over a replacement', async () => {
+   const { deps, reconnect, replace } = fixture()
+   deps.commit.mockRejectedValueOnce(new Error('response lost'))
+@@ -154,6 +179,7 @@ test('reconnects only the generation-qualified registry default, never the prima
+     current: (connectionId: string, profile: string) => entries.get(`conn:${connectionId}::${profile}`),
+     generation: (entry: typeof target) => entry.generation,
+     proveOwned: async () => true,
++    recoverStopped: async () => false,
+     prepare, commit, cancel, terminate,
+     reopen
+   })
+diff --git a/apps/desktop/electron/registry-reconnect.ts b/apps/desktop/electron/registry-reconnect.ts
+index 635552c096..fc1924ea54 100644
+--- a/apps/desktop/electron/registry-reconnect.ts
++++ b/apps/desktop/electron/registry-reconnect.ts
+@@ -11,6 +11,7 @@ export interface RegistryReconnectDeps<E> {
+   prepare: (entry: E) => Promise<string | null>
+   commit: (entry: E, token: string) => Promise<boolean>
+   cancel: (entry: E, token: string) => Promise<void>
++  recoverStopped: (entry: E) => Promise<boolean>
+   terminate: (entry: E) => Promise<void>
+   reopen: (connectionId: string, profile: string, entry: E) => Promise<string>
+ }
+@@ -21,8 +22,8 @@ export function createRegistryReconnector<E>(deps: RegistryReconnectDeps<E>) {
+   const committed = new Map<string, E>()
+   const keyFor = (connectionId: string, profile: string) => JSON.stringify([connectionId, profile])
+ 
+-  async function finish(target: RegistryReconnectTarget, key: string, entry: E) {
+-    await deps.terminate(entry)
++  async function finish(target: RegistryReconnectTarget, key: string, entry: E, stopped = false) {
++    if (!stopped) { await deps.terminate(entry) }
+     uncertain.delete(key)
+     committed.delete(key)
+ 
+@@ -52,6 +53,12 @@ export function createRegistryReconnector<E>(deps: RegistryReconnectDeps<E>) {
+     // exact SSH process identity or confirms that captured owner has exited.
+     if (committed.get(key) === entry) { return finish(target, key, entry) }
+ 
++    // Ambiguity never grants live termination authority. This path only
++    // removes the captured resident after read-only proof it has stopped.
++    if (uncertain.get(key) === entry && await deps.recoverStopped(entry)) {
++      return finish(target, key, entry, true)
++    }
++
+     if (!(await deps.proveOwned(entry))) { return { ok: false } }
+ 
+     const token = await deps.prepare(entry)
+diff --git a/apps/desktop/electron/registry-stopped-owner.test.ts b/apps/desktop/electron/registry-stopped-owner.test.ts
+new file mode 100644
+index 0000000000..1a5d05e99b
+--- /dev/null
++++ b/apps/desktop/electron/registry-stopped-owner.test.ts
+@@ -0,0 +1,56 @@
++import { execSync, spawn } from 'node:child_process'
++
++import { expect, test, vi } from 'vitest'
++
++import { proveRegistryOwnerStopped } from './registry-stopped-owner'
++import { fingerprintToken, spawnLogPath } from './remote-lifecycle'
++
++const ownershipId = '0123456789abcdef0123456789abcdef'
++const spawnNonce = 'abcdef0123456789'
++
++const owner = {
++  schemaVersion: 2, protocolVersion: 1, ownershipId, spawnNonce,
++  pid: 333, port: 40000, profile: '', hermesPath: '~/.local/bin/hermes', hermesHome: '~/.hermes',
++  logPath: spawnLogPath(ownershipId, spawnNonce), tokenFingerprint: fingerprintToken('synthetic'),
++  startedAt: '2026-07-14T00:00:00.000Z', creationTime: 'linux:123456'
++}
++
++test.each(['STOPPED', 'LIVE', 'UNKNOWN', '', 'STOPPED\nnoise'])('requires positive stopped proof: %j', async verdict => {
++  const ssh = { exec: vi.fn(async (cmd: string) => cmd.includes('cat ') ? JSON.stringify(owner) : verdict) }
++  expect(await proveRegistryOwnerStopped(ssh, owner)).toBe(verdict === 'STOPPED')
++})
++
++test('replacement during stopped proof refuses cleanup', async () => {
++  let reads = 0
++
++  const ssh = { exec: vi.fn(async (cmd: string) => cmd.includes('cat ')
++    ? JSON.stringify(++reads === 1 ? owner : { ...owner, spawnNonce: 'fedcba9876543210' })
++    : 'STOPPED') }
++
++  expect(await proveRegistryOwnerStopped(ssh, owner)).toBe(false)
++})
++
++test('transport failure propagates without stopped authority', async () => {
++  const ssh = { exec: vi.fn(async (cmd: string) => {
++    if (cmd.includes('cat ')) { return JSON.stringify(owner) }
++    throw new Error('SSH offline')
++  }) }
++
++  await expect(proveRegistryOwnerStopped(ssh, owner)).rejects.toThrow('SSH offline')
++})
++
++test.skipIf(process.platform !== 'linux')('real read-only probe preserves a live process and recognizes an exited one', async () => {
++  const child = spawn('python3', ['-c', 'pass'])
++  const exitedPid = child.pid!
++  await new Promise<void>((resolve, reject) => { child.once('exit', () => resolve()); child.once('error', reject) })
++
++  for (const pid of [process.pid, exitedPid]) {
++    const expected = { ...owner, pid }
++
++    const ssh = { exec: async (cmd: string) => cmd.includes('cat ')
++      ? JSON.stringify(expected)
++      : execSync(cmd, { encoding: 'utf8', timeout: 3000 }) }
++
++    expect(await proveRegistryOwnerStopped(ssh, expected)).toBe(pid !== process.pid)
++  }
++})
+diff --git a/apps/desktop/electron/registry-stopped-owner.ts b/apps/desktop/electron/registry-stopped-owner.ts
+new file mode 100644
+index 0000000000..4c50791743
+--- /dev/null
++++ b/apps/desktop/electron/registry-stopped-owner.ts
+@@ -0,0 +1,51 @@
++import { lockMatchesManagedUpdateScope, readLockfile, shq } from './remote-lifecycle'
++
++interface ExpectedOwner {
++  ownershipId: string
++  pid: number
++  spawnNonce: string
++  startedAt: string
++  creationTime: string
++  profile: string
++  hermesPath: string
++  hermesHome: string
++}
++
++/** Read-only recovery for an ambiguous retirement commit. Never reuse the
++ * live terminator: absence of an HTTP response grants no signal authority.
++ * System Python remains usable after the managed runtime has been deleted.
++ */
++export async function proveRegistryOwnerStopped(
++  ssh: { exec: (command: string) => Promise<string> }, expected: ExpectedOwner
++): Promise<boolean> {
++  if (!Number.isSafeInteger(expected.pid) || expected.pid <= 0 || !expected.creationTime?.startsWith('linux:')) {
++    return false
++  }
++
++  const lock = await readLockfile(ssh, expected.ownershipId)
++
++  if (!lockMatchesManagedUpdateScope(lock, expected)) { return false }
++
++  // Unlike shell `kill -0 || DEAD`, EPERM and all other unknown errors must
++  // fail closed. Signal zero only probes; no process can be terminated here.
++  const script = `import os,sys
++if not sys.platform.startswith('linux'):
++ print('UNKNOWN')
++else:
++ try:
++  os.kill(${expected.pid}, 0)
++  print('LIVE')
++ except ProcessLookupError:
++  print('STOPPED')
++ except OSError:
++  print('UNKNOWN')
++`
++
++  const verdict = String(await ssh.exec(`python3 -c ${shq(script)}`)).trim()
++
++  if (verdict !== 'STOPPED') { return false }
++
++  // A replacement ownership record during the process probe must not be
++  // cleaned up as the old resident, even when its old PID is dead.
++  return lockMatchesManagedUpdateScope(await readLockfile(ssh, expected.ownershipId), expected)
++}
+diff --git a/apps/desktop/electron/remote-lifecycle.ts b/apps/desktop/electron/remote-lifecycle.ts
+index ded38f2a6a..72fb94d6f3 100644
+--- a/apps/desktop/electron/remote-lifecycle.ts
++++ b/apps/desktop/electron/remote-lifecycle.ts
+@@ -1825,6 +1825,7 @@ export {
+   locateHermes,
+   LOCKFILE_SCHEMA_VERSION,
+   lockfilePath,
++  lockMatchesManagedUpdateScope,
+   MIN_READY_TIMEOUT_MS,
+   mintToken,
+   openForward,
+-- 
+2.55.0
+

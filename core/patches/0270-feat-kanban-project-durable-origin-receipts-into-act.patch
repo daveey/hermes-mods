@@ -1,0 +1,487 @@
+From d46e1166849b8e2ac50a2cb0e62957a01e68939f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:07:41 +0000
+Subject: [PATCH] feat(kanban): project durable origin receipts into activity
+ readers [daveey]
+
+
+Public-series adaptation: preserve merged preceding changes.
+
+---
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 168015320b..e5b465733c 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -150,6 +150,76 @@ def refresh_observations(path: Path, replica: Path) -> None:
+         source.close()
+ 
+ 
++def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
++            now: float | None = None) -> list[dict]:
++    """Owner-qualified receipt rows, including explicit unknown and released rows.
++
++    Consumers filter this single projection, never infer release from an absent
++    replica row. Old and resolved session aliases remain available for lineage
++    joins. Replica failures are stale observations; ledger failures propagate.
++    """
++    import time
++    from hermes_cli.kanban_origin import _ro
++
++    if not path.exists():
++        return []
++    now = time.time() if now is None else now
++    source = None
++    fresh = False
++    last_ok = None
++    try:
++        if replica is not None and replica.is_file():
++            refresh_observations(path, replica)
++            source = _ro(replica)
++            meta = dict(source.execute("SELECT k,v FROM meta"))
++            last_ok = float(meta.get('last_ok') or 0)
++            fresh = (0 <= now - last_ok <= 180 and not meta.get('offline_since'))
++    except (OSError, sqlite3.Error, ValueError, TypeError):
++        # A failed refresh never erases a receipt. Reading the ledger below
++        # still raises if the authoritative store itself is broken.
++        fresh = False
++    result = []
++    try:
++        with _db(path) as conn:
++            for raw, resolved, payload, version, released in conn.execute(
++                    "SELECT binding_json,resolved_session,task_json,observation_version,released FROM origin_obligations"):
++                binding = json.loads(raw)
++                validate_binding(binding)
++                origin, owner = binding['origin'], binding['owner']
++                if (origin['gateway'], origin['profile']) != (gateway, profile):
++                    continue
++                task = json.loads(payload)
++                current = False
++                if fresh and source is not None:
++                    row = source.execute(
++                        "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
++                        (owner['gateway'], binding['task_record_key'])).fetchone()
++                    current = bool(row and row[0] == version and json.loads(row[1]) == task)
++                status = task.get('status')
++                # Acceptance alone is not a release, including an initially
++                # terminal publication. Unknown status also remains unfinished.
++                known = status in ('todo', 'ready', 'running', 'scheduled', 'review',
++                                   'blocked', 'triage', 'done', 'archived')
++                if not current or not known or (status in ('done', 'archived') and not released):
++                    status = 'unknown'
++                result.append({
++                    **{k: task.get(k) for k in ('title', 'assignee', 'block_kind', 'created_at', 'started_at', 'priority')},
++                    **owner, 'id': owner['task_id'],
++                    'key': '/'.join(owner[k] for k in ('gateway', 'profile', 'board', 'task_id')),
++                    'session': resolved, 'origin_session': origin['session'],
++                    'origin_profile': origin['profile'], 'origin_gateway': origin['gateway'],
++                    'binding_id': binding['binding_id'], 'observation_version': version,
++                    'status': status, 'reported_status': task.get('status'),
++                    'unfinished': not (current and released and status in ('done', 'archived')),
++                    'stale': not current, 'synced_at': last_ok,
++                    'remote': True, 'via': 'origin',
++                })
++        return result
++    finally:
++        if source is not None:
++            source.close()
++
++
+ def accept_binding(*, path: Path, replica: Path, binding: dict, request_id: str,
+                    sender: str, gateway: str, profile: str,
+                    resolve_session: Callable[[str], str]) -> dict:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 5b3f8d4cb8..57bf528894 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -121,8 +121,10 @@ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dic
+     ``COUNTED_SUB_REASONS``): it is just as "still working" until they land.
+     A touch-only sub (one comment on someone else's card) does not count.
+     Each (session, task) pair counts once."""
+-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++    conn = _open_ro(path)
+     try:
++        if "session_id" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++            return {}  # explicitly supported pre-session schema, not a failed read
+         match, params = _status_filter(conn, statuses)
+         pairs: set[tuple[str, str]] = {
+             (str(sid), str(tid)) for sid, tid in conn.execute(
+@@ -215,6 +217,8 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+     """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards."""
+     status, kind = task.get("status"), task.get("block_kind")
+     human = kind is None or kind in HUMAN_BLOCK_KINDS
++    if status == 'unknown' and task.get('unfinished'):
++        return 'active'
+     if (status in ACTIVE_STATUSES or (status == "blocked" and not human)
+             or (status == "triage" and kind not in HUMAN_BLOCK_KINDS)):
+         return "active"
+@@ -303,11 +307,74 @@ def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, A
+     return list(found.values())
+ 
+ 
++def _remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
++    """Durable last-known origin obligations, separate from the replaceable hub replica.
++
++    A transaction replaces the snapshot atomically; failed writes propagate rather than
++    claiming a durable association. This is a projection cache, not a second transport.
++    """
++    from hermes_cli import kanban_db
++
++    path = kanban_db.kanban_home() / "origin-work.db"
++    if cards is None:
++        if not path.exists():
++            return None
++        conn = _open_ro(path)
++    else:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        conn = sqlite3.connect(path, timeout=0.5)
++    try:
++        if cards is not None:
++            with conn:
++                conn.execute("CREATE TABLE IF NOT EXISTS snapshot (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)")
++                conn.execute("INSERT OR REPLACE INTO snapshot VALUES (1, ?)", (json.dumps(cards),))
++            return cards
++        row = conn.execute("SELECT data FROM snapshot WHERE id=1").fetchone()
++        if row is None:
++            raise ValueError("origin-work snapshot is missing")
++        saved = json.loads(row[0])
++        if not isinstance(saved, list) or any(not isinstance(c, dict) or not c.get("session") or not c.get("id") for c in saved):
++            raise ValueError("invalid origin-work snapshot")
++        return saved
++    finally:
++        conn.close()
++
++
+ def _remote_links() -> list[dict[str, Any]]:
++    """Shared origin-ledger projection, with preserved legacy associations."""
++    from hermes_constants import get_hermes_home
++    from hermes_cli.kanban_origin_adapter import _gateway
++    from hermes_cli.kanban_origin_ledger import project
++    from hermes_cli.profiles import get_active_profile_name
++
++    ledger = get_hermes_home() / 'kanban' / 'origin-ledger.db'
++    if not ledger.exists():
++        return _legacy_remote_links()
++    replica = _hub_db_path()
++    # Configured identity remains available with no replica; corrupt identity
++    # must raise, not project another gateway's receipts.
++    missing = get_hermes_home() / 'kanban' / 'absent-replica.db'
++    rows = project(ledger, replica=replica, gateway=_gateway(replica or missing),
++                   profile=get_active_profile_name())
++    legacy = _legacy_remote_links()
++    # Only exact qualified ownership can supersede a legacy projection. An
++    # unqualified historical row remains unresolved, never guessed as default.
++    owned = {(r['session'], r['key']) for r in rows}
++    merged = {(r['session'], r['key']): r for r in legacy
++              if (r['session'], r['key']) not in owned}
++    for row in rows:
++        if row['unfinished']:
++            merged[(row['session'], row['key'])] = row
++    return list(merged.values())
++
++
++def _legacy_remote_links() -> list[dict[str, Any]]:
+     """``_read_remote_links`` of this gateway's replica. A failed read (corrupt/locked/vanished hub.db) is not
+     "no remote work": it returns the last good answer with every row marked stale, so a session never paints
+     done because the replica could not be read. No replica ever seen = not installed = []."""
+     global _remote_last
++    if _remote_last is None:
++        _remote_last = _remote_snapshot()
+     path = _hub_db_path()
+     try:
+         if path is None:
+@@ -316,10 +383,17 @@ def _remote_links() -> list[dict[str, Any]]:
+     except Exception as exc:  # a broken replica must never break the sidebar
+         if _remote_last is None:
+             if path is not None:
+-                _log.debug("hermes-hub replica read failed: %s", exc)
++                # Cold-start failures have no safe last-known answer. Propagate so the
++                # row annotator marks unknown and the task API fails, rather than []
++                # masquerading as a successful empty work list.
++                raise
+             return []
+         _log.warning("hermes-hub replica read failed, keeping last known remote cards (stale): %s", exc)
+         return [{**c, "stale": True} for c in _remote_last]
++    present = {(c["session"], c["key"]) for c in cards}
++    cards.extend({**c, "stale": True} for c in (_remote_last or [])
++                 if (c["session"], c["key"]) not in present)
++    _remote_snapshot(cards)
+     _remote_last = cards
+     return cards
+ 
+@@ -375,11 +449,8 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+         except sqlite3.Error as exc:
+             _log.debug("kanban unseen read failed for %s: %s", path, exc)
+         for statuses, into in ((ACTIVE_STATUSES, active), (BLOCKED_STATUSES, blocked)):
+-            try:
+-                for sid, n in _read_counts(path, statuses).items():
+-                    into[sid] = into.get(sid, 0) + n
+-            except sqlite3.Error as exc:  # an old schema without session_id, a locked file
+-                _log.debug("kanban activity read failed for %s: %s", path, exc)
++            for sid, n in _read_counts(path, statuses).items():
++                into[sid] = into.get(sid, 0) + n
+ 
+ 
+ # [daveey] Extra "this chat still waits" sources (plugins): name -> fn() -> {session_id: iterable of task ids}. A
+@@ -440,10 +511,12 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+     of, in ``statuses`` — the same pairs ``_read_counts`` counts."""
+     sid_ph = ",".join("?" for _ in ids)
+     st_ph = ",".join("?" for _ in statuses)
+-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++    conn = _open_ro(path)
+     conn.row_factory = sqlite3.Row
+     try:
+         cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++        if "session_id" not in cols:
++            return []  # explicitly supported pre-session schema
+         select = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in _TASK_FIELDS)
+         run_start = "NULL"
+         if "current_run_id" in cols and conn.execute(
+@@ -471,24 +544,23 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES) -> list[dict[str, Any]]:
+     """Every open/blocked/review task across all boards that the given session
+     ids (one compression lineage) created or shepherd — exactly the cards the
+-    sidebar row's ``kanban_active``/``kanban_blocked`` counts cover. Never
+-    raises on a bad board; skips it."""
++    sidebar row's ``kanban_active``/``kanban_blocked`` counts cover. Failed
++    reads propagate: an unavailable board is not a successful empty task list."""
+     ids = [s for s in dict.fromkeys(str(s) for s in session_ids if s)]
+     if not ids:
+         return []
+     out: list[dict[str, Any]] = []
+     for path in _board_db_paths():
+-        try:
+-            out.extend(_read_session_tasks(path, ids, statuses))
+-        except sqlite3.Error as exc:
+-            _log.debug("kanban session tasks read failed for %s: %s", path, exc)
++        out.extend(_read_session_tasks(path, ids, statuses))
+     for t in out:
+         t.setdefault("key", f"{t['board']}/{t['id']}")
+     # [daveey] Cards on other gateways this lineage owns: the same rows the counts use, owner-qualified
+     # (gateway/board/id), with ``stale``/``synced_at`` from the replica. One row per card.
+     wanted, seen = set(ids), set()
+     for card in _remote_links():
+-        if card["session"] in wanted and card.get("status") in statuses and card["key"] not in seen:
++        belongs = card['session'] in wanted or card.get('origin_session') in wanted
++        listed = card.get('status') in statuses or (card.get('status') == 'unknown' and card.get('unfinished'))
++        if belongs and listed and card['key'] not in seen:
+             seen.add(card["key"])
+             out.append({**card, "session_id": card["session"]})
+     return out
+@@ -618,7 +690,13 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         waiting = waiting_on_task_ids()
+         extra = _extra_waiting()
+     except Exception:
+-        _log.debug("kanban activity unavailable", exc_info=True)
++        # [daveey] A failed read is "unknown", never "no work": stamp ``kanban_unknown`` (the sidebar keeps the
++        # row off done) and drop the counts rather than present them as fresh.
++        _log.warning("kanban activity unavailable; rows marked kanban_unknown", exc_info=True)
++        for row in rows:
++            for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale"):
++                row.pop(key, None)
++            row["kanban_unknown"] = True
+         return rows
+     try:
+         attention = attention_task_counts()
+@@ -626,6 +704,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         _log.debug("kanban attention unavailable", exc_info=True)
+         attention = {}
+     for row in rows:
++        row.pop("kanban_unknown", None)
+         ids = list(_row_ids(row))
+         for key, counts in (("kanban_active", active), ("kanban_blocked", blocked), ("kanban_unseen", unseen),
+                             ("kanban_attention", attention), ("kanban_remote_stale", remote_stale)):
+diff --git a/tests/hermes_cli/test_kanban_origin_projection.py b/tests/hermes_cli/test_kanban_origin_projection.py
+new file mode 100644
+index 0000000000..3649443fdb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_projection.py
+@@ -0,0 +1,90 @@
++"""Authoritative receipt projections survive replica loss and isolate owners."""
++import sqlite3
++
++from tests.hermes_cli.test_kanban_origin_ledger import world, publish, accept
++from hermes_cli import kanban_origin_ledger as ledger
++
++
++def test_task_list_and_counts_share_durable_projection(world, monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli import kanban_origin_adapter as adapter
++    from hermes_cli import profiles
++    import hermes_constants
++
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    home = path.parent
++    destination = home / 'kanban' / 'origin-ledger.db'
++    destination.parent.mkdir()
++    path.rename(destination)
++    replica.unlink()
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: home)
++    monkeypatch.setattr(adapter, '_gateway', lambda _: 'origin')
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(activity, '_board_db_paths', list)
++    monkeypatch.setattr(activity, '_remote_snapshot', lambda *args: None)
++    monkeypatch.setattr(activity, '_remote_last', None)
++    monkeypatch.setattr(activity, '_cache', None)
++    cards = activity.session_tasks(['s_old', 's_current'])
++    assert len(cards) == 1
++    assert cards[0]['key'] == 'owner/work/build/t_one'
++    assert cards[0]['status'] == 'unknown'
++    assert activity.active_task_counts() == {'s_current': 1}
++    assert activity.blocked_task_counts() == {}
++
++
++def test_projection_retains_receipt_after_replica_disappears(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    replica.unlink()
++    rows = ledger.project(path, replica=replica, gateway='origin', profile='default')
++    assert len(rows) == 1
++    row = rows[0]
++    assert row['key'] == 'owner/work/build/t_one'
++    assert row['profile'] == 'work'
++    assert row['session'] == 's_current'
++    assert row['origin_session'] == 's_old'
++    assert row['unfinished'] and row['stale']
++    assert row['status'] == 'unknown'
++    assert row['reported_status'] == 'running'
++    assert ledger.project(path, replica=replica, gateway='origin', profile='other') == []
++
++
++def test_projection_unavailable_replica_never_exposes_released_as_done(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    publish(replica, binding, status='done')
++    with sqlite3.connect(replica) as db:
++        db.execute('UPDATE replica SET version=4')
++    ledger.refresh_observations(path, replica)
++    replica.write_bytes(b'not sqlite')
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default')[0]
++    assert row['unfinished'] and row['stale']
++    assert row['status'] == 'unknown'
++    assert row['reported_status'] == 'done'
++
++
++def test_projection_current_release_and_reopen(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    with sqlite3.connect(replica) as db:
++        db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++        db.execute("INSERT INTO meta VALUES ('last_ok','1000')")
++    def rows():
++        return ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++    assert rows()[0]['status'] == 'running'
++    publish(replica, binding, status='done')
++    with sqlite3.connect(replica) as db:
++        db.execute('UPDATE replica SET version=4')
++    assert rows()[0]['unfinished'] is False
++    assert rows()[0]['status'] == 'done'
++    publish(replica, binding, status='running')
++    with sqlite3.connect(replica) as db:
++        db.execute('UPDATE replica SET version=5')
++    assert rows()[0]['unfinished'] is True
++    assert rows()[0]['status'] == 'running'
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 80effd13e7..73736980b2 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -62,6 +62,15 @@ def test_annotates_rows_by_whole_compression_lineage(kanban_root):
+     assert "kanban_active" not in rows[2]
+ 
+ 
++def test_corrupt_local_board_is_unknown_not_successful_empty(kanban_root):
++    (kanban_root / "kanban.db").write_bytes(b"not a database" * 100)
++    rows = [{"id": "s1"}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0].get("kanban_unknown") is True
++    with pytest.raises(sqlite3.DatabaseError):
++        ksa.session_tasks(["s1"])
++
++
+ def test_missing_or_old_board_never_breaks_the_list(kanban_root):
+     old = kanban_root / "kanban.db"
+     conn = sqlite3.connect(old)
+@@ -280,7 +289,7 @@ def test_replica_counts_add_to_local_boards_and_follow_lineage(kanban_root):
+     assert "kanban_blocked" not in rows[0]
+ 
+ 
+-def test_missing_or_corrupt_replica_is_harmless(kanban_root):
++def test_absent_replica_is_optional_but_corrupt_replica_is_unknown(kanban_root):
+     _make_board(kanban_root / "kanban.db", [("t1", "running", "s1")])
+     rows = [{"id": "s1"}]
+     ksa.annotate_kanban_activity(rows)  # no hub-state dir at all
+@@ -291,7 +300,10 @@ def test_missing_or_corrupt_replica_is_harmless(kanban_root):
+     ksa._reset_cache_for_tests()
+     rows = [{"id": "s1"}]
+     ksa.annotate_kanban_activity(rows)
+-    assert rows[0]["kanban_active"] == 1
++    assert rows[0].get("kanban_unknown") is True
++    assert "kanban_active" not in rows[0]
++    with pytest.raises(sqlite3.DatabaseError):
++        ksa.session_tasks(["s1"])
+     # a replica row with junk data is skipped, not fatal
+     (kanban_root / "hub-state" / "hub.db").unlink()
+     path = _make_replica(kanban_root / "hub-state", "macbook", [
+@@ -414,6 +426,36 @@ def test_failed_replica_read_keeps_the_last_good_answer_never_zero(kanban_root):
+     assert all(r["stale"] for r in ksa.session_tasks(["s_origin"]))
+ 
+ 
++def test_missing_replica_after_restart_retains_origin_work(kanban_root):
++    path = _make_replica(kanban_root / "hub-state", "macbook", _dispatch_graph())
++    import time as _time
++    _set_meta(path, last_ok=_time.time())
++    assert len(ksa.session_tasks(["s_origin"])) == 13
++    path.unlink()
++    ksa._reset_cache_for_tests()  # all process memory gone, as after restart
++    rows = [{"id": "s_origin"}, {"id": "s_unrelated"}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0].get("kanban_active") == 13
++    assert rows[0].get("kanban_remote_stale") == 13
++    assert rows[1] == {"id": "s_unrelated"}
++    cards = ksa.session_tasks(["s_origin"])
++    assert len(cards) == 13
++    assert all(card["stale"] for card in cards)
++
++
++def test_empty_replica_does_not_erase_obligations_after_restart(kanban_root):
++    path = _make_replica(kanban_root / "hub-state", "macbook", _dispatch_graph())
++    import time as _time
++    _set_meta(path, last_ok=_time.time())
++    assert len(ksa.session_tasks(["s_origin"])) == 13
++    with sqlite3.connect(path) as conn:
++        conn.execute("DELETE FROM replica")
++    ksa._reset_cache_for_tests()
++    cards = ksa.session_tasks(["s_origin"])
++    assert len(cards) == 13
++    assert all(card["stale"] for card in cards)
++
++
+ def test_final_completion_clears_the_origin_and_other_sessions_finish_normally(kanban_root):
+     graph = _dispatch_graph(root_status="done")
+     for c in graph:
+@@ -521,3 +563,20 @@ def test_legacy_non_owner_subscription_without_a_reason_stops_counting(kanban_ro
+ 
+     assert ksa.active_task_counts() == {"s_owner": 1}
+     assert ksa.blocked_task_counts() == {"s_owner": 1}
++
++
++def test_failed_activity_read_stamps_unknown_not_idle(kanban_root, monkeypatch):
++    """A failed kanban read is not "no work": the row says ``kanban_unknown`` so the sidebar can't paint it
++    done, and the stamp clears once a read succeeds. [daveey]"""
++    def boom():
++        raise RuntimeError("replica and boards unreadable")
++
++    monkeypatch.setattr(ksa, "_all_counts", boom)
++    rows = [{"id": "s1", "kanban_active": 3}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0].get("kanban_unknown") is True
++    assert "kanban_active" not in rows[0]  # no stale count presented as fresh
++    monkeypatch.undo()
++    ksa._reset_cache_for_tests()
++    ksa.annotate_kanban_activity(rows)
++    assert "kanban_unknown" not in rows[0]

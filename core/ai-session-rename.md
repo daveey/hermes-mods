@@ -332,7 +332,7 @@ npx vitest run src/i18n/overlay-completeness.test.ts
 
 ## Applying
 
-On current `upstream/main`, `git am -3` of 0020 **alone fails**. The patches it textually needs are:
+On current `upstream/main`, `git am -3 --empty=keep` of 0020 **alone fails**. The patches it textually needs are:
 
 - **0002**: the `navCollapsed` code in `sidebar/index.tsx` that 0020 reformats.
 - **0004**, a prerequisite of 0018 (`store/projects.ts`).
@@ -345,10 +345,10 @@ On current `upstream/main`, `git am -3` of 0020 **alone fails**. The patches it 
 ```sh
 cd ~/.hermes/hermes-agent   # your hermes-agent checkout
 for n in 0002 0004 0018 0020; do
-  git am -3 /path/to/hermes-mods/core/patches/$n-*.patch || break
+  git am -3 --empty=keep /path/to/hermes-mods/core/patches/$n-*.patch || break
 done
 # or the whole series (0013 conflicts in tui_gateway/server.py: resolve it, or `git am --skip`):
-git am -3 /path/to/hermes-mods/core/patches/00*.patch
+git am -3 --empty=keep /path/to/hermes-mods/core/patches/00*.patch
 ```
 
 Later patches that add neighbouring keybind actions (0021, 0022, 0026) expect 0020's lines as context. Apply them

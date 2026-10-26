@@ -4,7 +4,7 @@ A session that follows a card on another gateway owns that work, but the sidebar
 gateway, so the row painted green while the remote card ran. When cross_task reads or comments on a task that the
 local hermes-hub replica places on ANOTHER gateway, queue
 
-    hermes-hub request <gw> tasks <board>/<task_id> shepherd --arg session=<sid> --arg profile=<profile>
+    hermes-hub request <gw> tasks <owner_profile>/<board>/<task_id> shepherd --arg session=<sid> --arg profile=<sender_profile>
 
 The owning gateway records a ``rel: shepherd`` session link on the card, and this gateway's sidebar counts it (and
 its children) as the session's work. Fire-and-forget: deduped per (session, task) in
@@ -65,7 +65,7 @@ def _ro(path: Path) -> sqlite3.Connection:
 
 
 def locate(task_id: str, board: str | None, db: Path) -> tuple[str, str] | None:
-    """``(gw, board)`` of a card that lives on ANOTHER gateway, from the hermes-hub replica (None if local/unknown)."""
+    """Unique ``(gw, owner_profile/board)`` from the replica; None if local/unknown/ambiguous."""
     conn = _ro(db)
     try:
         row = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
@@ -74,12 +74,22 @@ def locate(task_id: str, board: str | None, db: Path) -> tuple[str, str] | None:
                             ("%/" + task_id.replace("_", "\\_"),)).fetchall()
     finally:
         conn.close()
-    hits = [(str(gw), str(key).rsplit("/", 1)[0]) for gw, key in hits if str(key).rsplit("/", 1)[-1] == task_id]
-    if board:
-        hits = [h for h in hits if h[1] == board] or hits
-    if not hits or any(gw == me for gw, _ in hits):
-        return None  # unknown, or a card on this gateway (the local board already counts it)
-    return hits[0]
+    routes = set()
+    for gw, key in hits:
+        parts = str(key).split("/")
+        if len(parts) == 2:
+            parts.insert(0, "default")  # legacy ownership, never the sender's profile
+        if len(parts) != 3 or not all(_SAFE.fullmatch(p) and p not in (".", "..") for p in parts):
+            continue
+        if parts[2] != task_id or (board is not None and parts[1] != board):
+            continue  # explicit board is a constraint, not a preference
+        if not _SAFE.fullmatch(str(gw)) or str(gw) in (".", ".."):
+            continue
+        routes.add((str(gw), "/".join(parts[:2])))
+    if len(routes) != 1:
+        return None  # unknown or ambiguous across gateways/profiles/boards
+    route = next(iter(routes))
+    return route if route[0] != me else None
 
 
 def _load(path: Path) -> dict:

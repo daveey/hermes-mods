@@ -1,12 +1,12 @@
 # CI determinism, contributor attribution and source mirrors
 
-Patches: 0247, 0260, 0282, 0284–0285, 0287.
+Patches: 0256, 0284, 0341, 0350–0351, 0353.
 
 ## Behavior
 
-0247 waits for the spawned dead checkout claimant's exit before asserting R5 acknowledgment, removing a test race without changing runtime ownership. 0260 records owner attribution for an automation contributor; the public patch substitutes example identifiers for private contributor details.
+0256 waits for the spawned dead checkout claimant's exit before asserting R5 acknowledgment, removing a test race without changing runtime ownership. 0284 records owner attribution for an automation contributor; the public patch substitutes example identifiers for private contributor details.
 
-0282 bounds optional Python bytecode warmup to one worker and skips splitting shebang-free or binary files, while still detecting late embedded nonportable shebangs. 0284–0285 replaces only the libtirpc 1.3.7 source URL with a content-addressed mirror, preserving the pinned hash. 0287 drains assertion pipelines under pipefail so an early successful match does not give the producer SIGPIPE.
+0341 bounds optional Python bytecode warmup to one worker and skips splitting shebang-free or binary files, while still detecting late embedded nonportable shebangs. 0350–0351 replaces only the libtirpc 1.3.7 source URL with a content-addressed mirror, preserving the pinned hash. 0353 drains assertion pipelines under pipefail so an early successful match does not give the producer SIGPIPE.
 
 ## How it works
 
@@ -25,7 +25,7 @@ The checkout test awaits the child's exit event. Contributor attribution is a da
 
 ## Applying
 
-Apply the complete ordered series from its recorded merge-base. Take 0284 and 0285 together: 0285 corrects the fetcher override in 0284. Attribution is intentionally not byte-identical to the private tree; adapt the example mapping for your own contributors.
+Apply the complete ordered series from its recorded merge-base. Take 0350 and 0351 together: 0351 corrects the fetcher override in 0350. Attribution is intentionally not byte-identical to the private tree; adapt the example mapping for your own contributors.
 
 ## Gotchas
 

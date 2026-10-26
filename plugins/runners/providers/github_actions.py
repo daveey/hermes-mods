@@ -365,10 +365,13 @@ class GitHubActions:
                     raise _Failure('invalid_allowlist')
                 recent = {str(x) for x in recent_runner_ids}
                 candidates = set()
+                busy_candidates = set()
                 for r in runners:
                     rid = str(r.get('provider_runner_id', r.get('id')))
                     if re.fullmatch(r'[1-9][0-9]{0,19}', rid) and (r.get('busy') is True or r.get('activity') == 'busy' or rid in recent):
                         candidates.add(rid)
+                        if r.get('busy') is True or r.get('activity') == 'busy':
+                            busy_candidates.add(rid)
                 if not candidates or not repos:
                     return ProviderResult((), True, None, self.clock(), None)
                 c = self._credential(s)
@@ -385,7 +388,12 @@ class GitHubActions:
                     requests += 1
                     return self._get(c, path)
                 for repo in repos:
-                    count, runs = self._page(get(f'/repos/{repo}/actions/runs?per_page=100&page=1'), 'workflow_runs')
+                    # A busy job can predate hundreds of newly queued/completed
+                    # runs. Spend the fixed budget on active runs first, not the
+                    # newest runs irrespective of status. Recent-only lookups
+                    # retain the bounded unfiltered query.
+                    status_filter = 'status=in_progress&' if busy_candidates else ''
+                    count, runs = self._page(get(f'/repos/{repo}/actions/runs?{status_filter}per_page=100&page=1'), 'workflow_runs')
                     if count < len(runs):
                         raise _Failure('count_mismatch')
                     truncated |= count > len(runs) or len(runs) > self.max_runs

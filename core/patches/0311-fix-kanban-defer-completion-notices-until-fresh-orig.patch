@@ -1,0 +1,543 @@
+From 86002fa59468a07079c134f199c5802df83cb2ba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:32:19 +0000
+Subject: [PATCH] fix(kanban): defer completion notices until fresh origin
+ release [daveey]
+
+---
+ .../completion-boundaries.test.tsx            |  14 ++
+ .../session/hooks/use-message-stream/index.ts |   4 +-
+ .../src/store/native-notifications.test.ts    | 155 +++++++++++++++++-
+ .../desktop/src/store/native-notifications.ts | 135 ++++++++++++++-
+ apps/desktop/src/types/hermes.ts              |   2 +
+ hermes_cli/kanban_session_activity.py         |   5 +
+ .../test_kanban_session_activity.py           |  26 ++-
+ 7 files changed, 328 insertions(+), 13 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/completion-boundaries.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/completion-boundaries.test.tsx
+index de6d09b7fc..3ce2a30a1f 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/completion-boundaries.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/completion-boundaries.test.tsx
+@@ -10,6 +10,7 @@ import {
+   readInFlightTurnJournal,
+   recoverInFlightTurnJournal
+ } from '@/lib/inflight-turn-journal'
++import * as nativeNotifications from '@/store/native-notifications'
+ import { $messages, setActiveSessionId, setMessages } from '@/store/session'
+ import { $sessionStates } from '@/store/session-states'
+ 
+@@ -107,6 +108,19 @@ function mount(rpc = requestGateway) {
+   }
+ }
+ 
++it('requires a post-completion origin observation for the native completion notice', async () => {
++  const notify = vi.spyOn(nativeNotifications, 'dispatchNativeNotification').mockReturnValue(false)
++  const h = mount()
++  await h.submit()
++  await h.send('message.start')
++  const endedAt = Date.now() / 1000
++  await h.send('message.complete', { text: ANSWER })
++  expect(notify).toHaveBeenCalledWith(expect.objectContaining({
++    kind: 'turnDone', sessionId: SID, projectionAfter: endedAt, refreshProjection: noop
++  }))
++  h.dispose()
++})
++
+ it('binds a late submit acknowledgement to its exact optimistic prompt without reviving the turn', async () => {
+   const laterUser: ChatMessage = { id: 'later-user', role: 'user', parts: [{ type: 'text', text: 'Give the answer.' }] }
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+index fce0fabcbb..64cd0c27ef 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+@@ -1119,11 +1119,13 @@ export function useMessageStream({
+       dispatchNativeNotification({
+         body: turnDoneNotificationBody(text, translateNow('notifications.native.turnDoneBody')),
+         kind: 'turnDone',
++        projectionAfter: Date.now() / 1000,
++        refreshProjection: refreshSessions,
+         sessionId,
+         title: translateNow('notifications.native.turnDoneTitle')
+       })
+     },
+-    [hydrateFromStoredSession, scheduleSessionsRefresh, updateSessionState]
++    [hydrateFromStoredSession, refreshSessions, scheduleSessionsRefresh, updateSessionState]
+   )
+ 
+   const failAssistantMessage = useCallback(
+diff --git a/apps/desktop/src/store/native-notifications.test.ts b/apps/desktop/src/store/native-notifications.test.ts
+index 73b98f73ea..00eecd8d33 100644
+--- a/apps/desktop/src/store/native-notifications.test.ts
++++ b/apps/desktop/src/store/native-notifications.test.ts
+@@ -19,7 +19,7 @@ import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from '.
+ import { $approvalRequest, APPROVAL_RESPOND_REQUEST_TIMEOUT_MS, clearAllPrompts, setApprovalRequest } from './prompts'
+ import { markSessionGone, resetBackgroundPollingGuard } from './runtime-gone'
+ import { setActiveSessionId, setSessions } from './session'
+-import { dropSessionState, publishSessionState } from './session-states'
++import { dropSessionState, publishSessionState, recordSessionEventScope } from './session-states'
+ 
+ const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
+ const initialHermesDesktop = desktopWindow.hermesDesktop
+@@ -83,6 +83,154 @@ it('captures durable navigation identity while keeping the runtime id for approv
+ })
+ 
+ describe('dispatchNativeNotification focus gating', () => {
++  it.each(['missing', 'unstamped', 'stale', 'future', 'ambiguous'])('fails closed on %s projection', state => {
++    const sessionId = freshSession()
++    setActiveSessionId(sessionId)
++    const observed = Date.now() / 1000
++    const row = { id: sessionId, kanban_observed_at: observed }
++    setSessions((state === 'missing' ? [] : state === 'unstamped' ? [{ id: sessionId }]
++      : state === 'ambiguous' ? [row, { ...row, profile: 'other' }]
++        : [{ ...row, kanban_observed_at: observed + (state === 'future' ? 60 : -181) }]) as never)
++    expect(dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done' })).toBe(false)
++    expect(notify).not.toHaveBeenCalled()
++  })
++
++  it('delivers once when a post-turn projection verifies release, not on an older zero', () => {
++    vi.useFakeTimers()
++    const runtime = freshSession()
++    const stored = `${runtime}-stored`
++    publishSessionState(runtime, createClientSessionState(stored))
++    setActiveSessionId(runtime)
++    const endedAt = Date.now() / 1000
++
++    try {
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: endedAt - 1 } as never])
++      expect(dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done',
++        projectionAfter: endedAt } as never)).toBe(false)
++      expect(notify).not.toHaveBeenCalled()
++      vi.advanceTimersByTime(5000)
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: Date.now() / 1000,
++        kanban_active: 1 } as never])
++      expect(notify).not.toHaveBeenCalled()
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: Date.now() / 1000 } as never])
++      expect(notify).toHaveBeenCalledTimes(1)
++      vi.advanceTimersByTime(5000)
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: Date.now() / 1000 } as never])
++      expect(notify).toHaveBeenCalledTimes(1)
++    } finally {
++      dropSessionState(runtime)
++      setSessions([])
++      vi.useRealTimers()
++    }
++  })
++
++  it('refreshes the projection while backgrounded until verified release', async () => {
++    vi.useFakeTimers()
++    const runtime = freshSession()
++    const stored = `${runtime}-stored`
++    publishSessionState(runtime, createClientSessionState(stored))
++    setActiveSessionId(runtime)
++    const endedAt = Date.now() / 1000
++
++    const refreshProjection = vi.fn(async () => {
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: Date.now() / 1000 } as never])
++    })
++
++    try {
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: endedAt - 1 } as never])
++      dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done',
++        projectionAfter: endedAt, refreshProjection } as never)
++      await vi.advanceTimersByTimeAsync(15000)
++      expect(refreshProjection).toHaveBeenCalledTimes(1)
++      expect(notify).toHaveBeenCalledTimes(1)
++      await vi.advanceTimersByTimeAsync(30000)
++      expect(refreshProjection).toHaveBeenCalledTimes(1)
++    } finally {
++      dropSessionState(runtime)
++      setSessions([])
++      vi.useRealTimers()
++    }
++  })
++
++  it('keeps a failed background read unfinished and retries without duplicate delivery', async () => {
++    vi.useFakeTimers()
++    const runtime = freshSession()
++    const stored = `${runtime}-stored`
++    publishSessionState(runtime, createClientSessionState(stored))
++    setActiveSessionId(runtime)
++    const endedAt = Date.now() / 1000
++
++    const refreshProjection = vi.fn().mockRejectedValueOnce(new Error('owner offline')).mockImplementation(async () => {
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: Date.now() / 1000 } as never])
++    })
++
++    try {
++      setSessions([{ id: stored, profile: 'default', kanban_unknown: true } as never])
++      dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done',
++        projectionAfter: endedAt, refreshProjection })
++      await vi.advanceTimersByTimeAsync(15000)
++      expect(notify).not.toHaveBeenCalled()
++      await vi.advanceTimersByTimeAsync(15000)
++      expect(refreshProjection).toHaveBeenCalledTimes(2)
++      expect(notify).toHaveBeenCalledTimes(1)
++    } finally {
++      dropSessionState(runtime)
++      setSessions([])
++      vi.useRealTimers()
++    }
++  })
++
++  it('retains a missing projection using the independently recorded runtime owner', () => {
++    const runtime = freshSession()
++    const stored = `${runtime}-stored`
++    publishSessionState(runtime, createClientSessionState(stored))
++    recordSessionEventScope({ session_id: runtime, connectionId: 'owner-a', profile: 'work' })
++    setActiveSessionId(runtime)
++    const endedAt = Date.now() / 1000
++
++    try {
++      setSessions([])
++      expect(dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done',
++        projectionAfter: endedAt })).toBe(false)
++      setSessions([{ id: stored, profile: 'work', connection_id: 'owner-a', kanban_observed_at: endedAt } as never])
++      expect(notify).toHaveBeenCalledTimes(1)
++    } finally {
++      dropSessionState(runtime)
++      setSessions([])
++    }
++  })
++
++  it.each(['new-turn', 'owner-change', 'runtime-gone'])('cancels a deferred completion on %s', reason => {
++    const runtime = freshSession()
++    const stored = `${runtime}-stored`
++    const state = createClientSessionState(stored)
++    publishSessionState(runtime, state)
++    setActiveSessionId(runtime)
++    const endedAt = Date.now() / 1000
++
++    try {
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: endedAt,
++        kanban_active: 1 } as never])
++      dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done', projectionAfter: endedAt })
++
++      if (reason === 'new-turn') {
++        publishSessionState(runtime, { ...state, busy: true, turnLive: true })
++        publishSessionState(runtime, state)
++      } else if (reason === 'runtime-gone') {
++        dropSessionState(runtime)
++        publishSessionState(runtime, state)
++      } else {
++        setSessions([{ id: stored, profile: 'other', kanban_observed_at: endedAt } as never])
++      }
++
++      setSessions([{ id: stored, profile: 'default', kanban_observed_at: endedAt } as never])
++      expect(notify).not.toHaveBeenCalled()
++    } finally {
++      dropSessionState(runtime)
++      setSessions([])
++    }
++  })
++
+   it.each([
+     { kanban_active: 1 },
+     { kanban_blocked: 1 },
+@@ -100,7 +248,7 @@ describe('dispatchNativeNotification focus gating', () => {
+       expect(notify).not.toHaveBeenCalled()
+       // A later authoritative release is eligible; suppression must not consume
+       // the notification throttle. Error/attention paths remain independent.
+-      setSessions([{ id: stored } as never])
++      setSessions([{ id: stored, kanban_observed_at: Date.now() / 1000 } as never])
+       expect(dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done' })).toBe(true)
+       expect(notify).toHaveBeenCalledTimes(1)
+     } finally {
+@@ -112,6 +260,7 @@ describe('dispatchNativeNotification focus gating', () => {
+   it('fires a completion notification for the active session when the window is hidden', () => {
+     const sessionId = freshSession()
+     setActiveSessionId(sessionId)
++    setSessions([{ id: sessionId, kanban_observed_at: Date.now() / 1000 } as never])
+     dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done' })
+     expect(notify).toHaveBeenCalledTimes(1)
+   })
+@@ -119,6 +268,7 @@ describe('dispatchNativeNotification focus gating', () => {
+   it('fires a completion notification when the window is visible but unfocused (alt-tab)', () => {
+     const sessionId = freshSession()
+     setActiveSessionId(sessionId)
++    setSessions([{ id: sessionId, kanban_observed_at: Date.now() / 1000 } as never])
+     setWindowState({ focused: false, hidden: false })
+     dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done' })
+     expect(notify).toHaveBeenCalledTimes(1)
+@@ -311,6 +461,7 @@ describe('dispatchNativeNotification throttle', () => {
+   it('collapses duplicate kind+session within the throttle window', () => {
+     const sessionId = freshSession()
+     setActiveSessionId(sessionId)
++    setSessions([{ id: sessionId, kanban_observed_at: Date.now() / 1000 } as never])
+     dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done' })
+     dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done again' })
+     expect(notify).toHaveBeenCalledTimes(1)
+diff --git a/apps/desktop/src/store/native-notifications.ts b/apps/desktop/src/store/native-notifications.ts
+index 3070b09e9c..6b7b55dd1a 100644
+--- a/apps/desktop/src/store/native-notifications.ts
++++ b/apps/desktop/src/store/native-notifications.ts
+@@ -15,8 +15,11 @@ import {
+   sessionApprovalRequests
+ } from './prompts'
+ import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone } from './runtime-gone'
+-import { $activeSessionId, ownerLookupSessionRows, sessionMatchesStoredId } from './session'
+-import { storedSessionIdForRuntimeId } from './session-states'
++import {
++  $activeSessionId, $cronSessions, $messagingSessions, $sessions,
++  ownerLookupSessionRows, sessionMatchesStoredId
++} from './session'
++import { $sessionStates, knownOwnerForSession, storedSessionIdForRuntimeId } from './session-states'
+ 
+ export type { HermesOpenTarget }
+ 
+@@ -194,6 +197,10 @@ export interface NativeNotificationInput {
+   title: string
+   body?: string
+   sessionId?: null | string
++  /** Wait for an origin projection observed after this turn ended (epoch seconds). */
++  projectionAfter?: number
++  /** Existing session-list refresh, retained for background release checks. */
++  refreshProjection?: () => Promise<void>
+   /**
+    * Not tied to a chat session (e.g. pet generation). Fires whenever the user
+    * is away, bypassing the session-match gate that completion kinds normally
+@@ -219,6 +226,101 @@ export interface NativeNotificationInput {
+   notifyId?: string
+ }
+ 
++type DeferredCompletion = { input: NativeNotificationInput; storedId: string; owner: string }
++const deferredCompletions = new Map<string, DeferredCompletion>()
++let stopCompletionWatch: (() => void) | undefined
++
++function projectionOwner(row: { connection_id?: string; profile?: string }): string {
++  return JSON.stringify([row.connection_id ?? null, row.profile ?? null])
++}
++
++function deferCompletion(input: NativeNotificationInput, storedId: string, owner: string): void {
++  const runtime = input.sessionId
++
++  if (!runtime || !$sessionStates.get()[runtime]) {
++    return
++  }
++
++  // Bounded, in-memory pending notices; never restore an old turn on app restart.
++  if (deferredCompletions.size >= 128 && !deferredCompletions.has(runtime)) {
++    return
++  }
++
++  deferredCompletions.set(runtime, { input: { ...input }, storedId, owner })
++
++  if (stopCompletionWatch) {
++    return
++  }
++
++  const retry = () => {
++    for (const [id, pending] of [...deferredCompletions]) {
++      const state = $sessionStates.get()[id]
++
++      if (!state || state.busy || state.awaitingResponse || state.turnLive ||
++          storedSessionIdForRuntimeId(id) !== pending.storedId) {
++        deferredCompletions.delete(id)
++
++        continue
++      }
++
++      const rows = ownerLookupSessionRows().filter(row => sessionMatchesStoredId(row, pending.storedId))
++
++      if (rows.length !== 1) {
++        continue
++      }
++
++      if (projectionOwner(rows[0]) !== pending.owner) {
++        deferredCompletions.delete(id)
++
++        continue
++      }
++
++      // Delete before dispatch: it may requeue only if the projection is still
++      // unfinished. Preference/focus changes intentionally discard the notice.
++      deferredCompletions.delete(id)
++      dispatchNativeNotification(pending.input)
++    }
++
++    if (!deferredCompletions.size) {
++      stopCompletionWatch?.()
++      stopCompletionWatch = undefined
++    }
++  }
++
++  const stops = [$sessions.listen(retry), $cronSessions.listen(retry),
++    $messagingSessions.listen(retry), $sessionStates.listen(retry)]
++
++  let stopped = false
++  let timer: ReturnType<typeof setTimeout>
++
++  const refresh = async () => {
++    retry()
++
++    if (stopped) {
++      return
++    }
++
++    const callbacks = new Set([...deferredCompletions.values()].map(p => p.input.refreshProjection))
++    await Promise.allSettled([...callbacks].filter(Boolean).map(callback => Promise.resolve().then(() => callback?.())))
++
++    if (!stopped) {
++      retry()
++
++      if (!stopped) {
++        timer = setTimeout(() => { void refresh() }, 15000)
++      }
++    }
++  }
++
++  timer = setTimeout(() => { void refresh() }, 15000)
++
++  stopCompletionWatch = () => {
++    stopped = true
++    clearTimeout(timer)
++    stops.forEach(stop => stop())
++  }
++}
++
+ /** Returns true when the notification passed every guard and was handed to the
+  *  OS bridge — callers registering per-notification state (plugin handlers)
+  *  must only do so on true, or suppressed/throttled notifications leak it. */
+@@ -244,15 +346,34 @@ export function dispatchNativeNotification(input: NativeNotificationInput): bool
+   if (input.kind === 'turnDone' && input.sessionId) {
+     const storedId = storedSessionIdForRuntimeId(input.sessionId) ?? input.sessionId
+ 
+-    const unfinished = ownerLookupSessionRows().some(row =>
+-      sessionMatchesStoredId(row, storedId) &&
+-      (row.kanban_unknown === true || (row.kanban_active ?? 0) > 0 ||
+-        (row.kanban_blocked ?? 0) > 0 || (row.kanban_remote_stale ?? 0) > 0)
+-    )
++    const rows = ownerLookupSessionRows().filter(row => sessionMatchesStoredId(row, storedId))
++    const row = rows.length === 1 ? rows[0] : undefined
++    const observed = row?.kanban_observed_at
++    const age = typeof observed === 'number' ? Date.now() / 1000 - observed : NaN
++
++    const known = Number.isFinite(age) && age >= 0 && age <= 180 &&
++      (input.projectionAfter === undefined || (typeof observed === 'number' && observed >= input.projectionAfter))
++
++    const unfinished = !row || !known || row.kanban_unknown === true ||
++      (row.kanban_active ?? 0) > 0 || (row.kanban_blocked ?? 0) > 0 ||
++      (row.kanban_remote_stale ?? 0) > 0
+ 
+     if (unfinished) {
++      if (input.projectionAfter !== undefined) {
++        const owner = knownOwnerForSession(input.sessionId)
++
++        const pin = row ? projectionOwner(row) : owner && typeof owner === 'object'
++          ? projectionOwner({ connection_id: owner.connectionId, profile: owner.profile }) : undefined
++
++        if (pin !== undefined) {
++          deferCompletion(input, storedId, pin)
++        }
++      }
++
+       return false
+     }
++
++    deferredCompletions.delete(input.sessionId)
+   }
+ 
+   if (throttled(`${input.kind}:${input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`, Date.now())) {
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 9d1d956961..ce4cbb099b 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -644,6 +644,8 @@ export interface SessionInfo {
+    *  not "no work": the row stays off done until a read succeeds. Absent when
+    *  the read worked. */
+   kanban_unknown?: boolean
++  /** Origin projection observation lower bound (epoch seconds), including known zero work. */
++  kanban_observed_at?: number
+   /** [daveey] How many of `kanban_active`/`kanban_blocked` are cards on another
+    *  gateway known only from a stale hermes-hub replica (last-known status).
+    *  Absent when zero. */
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8d43424a06..a5269237ba 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -650,6 +650,9 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+     render without them."""
+     if not rows:
+         return rows
++    # Conservative lower bound: counts may come from the short monotonic cache.
++    # Never re-date a cached zero as a new owner observation.
++    observed_at = time.time() - _CACHE_TTL_S
+     try:
+         active, blocked, unseen, remote_stale = _all_counts()
+     except Exception:
+@@ -659,6 +662,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         for row in rows:
+             for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale"):
+                 row.pop(key, None)
++            row.pop("kanban_observed_at", None)
+             row["kanban_unknown"] = True
+         return rows
+     try:
+@@ -667,6 +671,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         _log.debug("kanban attention unavailable", exc_info=True)
+         attention = {}
+     for row in rows:
++        row["kanban_observed_at"] = observed_at
+         row.pop("kanban_unknown", None)
+         ids = list(_row_ids(row))
+         for key, counts in (("kanban_active", active), ("kanban_blocked", blocked), ("kanban_unseen", unseen),
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 1385387a39..9d4f1953a5 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -26,6 +26,22 @@ def kanban_root(tmp_path, monkeypatch):
+     ksa._reset_cache_for_tests()
+ 
+ 
++def test_successful_empty_projection_has_explicit_observation_time(kanban_root, monkeypatch):
++    monkeypatch.setattr(ksa.time, 'time', lambda: 1234.5)
++    rows = [{'id': 's_empty'}]
++    ksa.annotate_kanban_activity(rows)
++    assert 1234.5 - ksa._CACHE_TTL_S <= rows[0]['kanban_observed_at'] <= 1234.5
++    assert 'kanban_unknown' not in rows[0]
++
++
++def test_failed_projection_clears_previous_observation_time(kanban_root):
++    (kanban_root / 'kanban.db').write_bytes(b'not sqlite')
++    rows = [{'id': 's_empty', 'kanban_observed_at': 1234.5}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0]['kanban_unknown'] is True
++    assert 'kanban_observed_at' not in rows[0]
++
++
+ def test_counts_only_pending_and_running_tasks_across_boards(kanban_root):
+     _make_board(kanban_root / "kanban.db", [
+         ("t1", "running", "s_parent"),
+@@ -78,7 +94,10 @@ def test_missing_or_old_board_never_breaks_the_list(kanban_root):
+     conn.close()
+     rows = [{"id": "s1"}]
+ 
+-    assert ksa.annotate_kanban_activity(rows) == [{"id": "s1"}]
++    assert ksa.annotate_kanban_activity(rows) is rows
++    assert rows[0]['id'] == 's1'
++    assert 'kanban_observed_at' in rows[0]
++    assert 'kanban_unknown' not in rows[0]
+ 
+ 
+ def test_counts_tasks_a_session_subscribed_to_but_did_not_create(kanban_root):
+@@ -435,7 +454,7 @@ def test_missing_replica_after_restart_retains_origin_work(kanban_root):
+     ksa.annotate_kanban_activity(rows)
+     assert rows[0].get("kanban_active") == 13
+     assert rows[0].get("kanban_remote_stale") == 13
+-    assert rows[1] == {"id": "s_unrelated"}
++    assert {k: v for k, v in rows[1].items() if k != 'kanban_observed_at'} == {"id": "s_unrelated"}
+     cards = ksa.session_tasks(["s_origin"])
+     assert len(cards) == 13
+     assert all(card["stale"] for card in cards)
+@@ -462,7 +481,8 @@ def test_final_completion_clears_the_origin_and_other_sessions_finish_normally(k
+     _make_board(kanban_root / "kanban.db", [("t_x", "done", "s_other")])
+     ann = [{"id": "s_origin"}, {"id": "s_other"}]
+     ksa.annotate_kanban_activity(ann)
+-    assert ann == [{"id": "s_origin"}, {"id": "s_other"}]
++    assert [{k: v for k, v in row.items() if k != 'kanban_observed_at'} for row in ann] == [
++        {"id": "s_origin"}, {"id": "s_other"}]
+     assert ksa.session_tasks(["s_origin"]) == []
+ 
+ 
+-- 
+2.55.0
+

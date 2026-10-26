@@ -55,7 +55,7 @@ Run from a plain clone (a `hermes-core-wt` worktree trips the real-home guard):
 
 ## Applying
 
-`git am -3` the patch. It touches only `hermes_cli/main.py` and the test file.
+`git am -3 --empty=keep` the patch. It touches only `hermes_cli/main.py` and the test file.
 
 ## Gotchas
 

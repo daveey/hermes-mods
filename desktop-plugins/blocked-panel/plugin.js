@@ -151,11 +151,12 @@ export function latestBlock(events) {
 
 const NO_HUMAN_RE = /^\s*(no human action (is )?(needed|required)|nothing (is )?needed from you|waiting on time)/i
 
-/** Does this block need a person? transient → clears itself; "no human action
- *  needed" text → a time wait. Everything else (needs_input, capability, unset) does. */
+/** Does this block need a person? transient / dependency / time → clears itself (a retry, a parent, a
+ *  clock or an external event); "no human action needed" text → a time wait. Everything else (needs_input,
+ *  capability, unset) does. Matches core's HUMAN_BLOCK_KINDS (kanban_session_activity). */
 export function needsHuman(block) {
   if (!block) return true
-  if (block.kind === 'transient' || block.kind === 'dependency') return false
+  if (block.kind === 'transient' || block.kind === 'dependency' || block.kind === 'time') return false
   return !NO_HUMAN_RE.test(block.reason || '')
 }
 

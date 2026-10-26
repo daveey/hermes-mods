@@ -349,9 +349,13 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
 - **Recurrence**: a fixed fingerprint that comes back files `selfheal:<fp>:r<n>`, whose brief says "previous fix <id>
   didn't hold" and requires a detection-level guard.
 - **Budget**: engine_budget lane `selfheal` ($25/UTC day, its own cap outside the $20 engine total; spend = these
-  cards' worker sessions), ≤ 3 running, ≤ 1 filing per fingerprint per UTC day. Over the $ cap the card is created
-  and scheduled to the next UTC midnight; at 3 running, 1 h out. Each card body carries a `Budget for this card` line
-  ($8 investigation, $15 fix) for the engine watchdog.
+  cards' worker sessions), ≤ 3 running, ≤ 1 filing per fingerprint per UTC day. A known spend/concurrency denial
+  creates **no card**: investigations persist in `coach/selfheal_pending.sqlite`, retried through admission by the
+  live cron after midnight / one hour; failed retries retain their full evidence. Fixes remain proposed so Inbox
+  sync retries the existing Do-it outcome. Unavailable or invalid accounting refuses admission. Each card body
+  carries a `Budget for this card` line ($8 investigation, $15 fix) for the engine watchdog.
+  This is not a strict monetary reservation system: queued/concurrent admissions, cross-board accounting,
+  detector costs and watchdog overshoot still need separate enforcement before claiming a hard cap.
 - **Hub cron** (`~/.hermes/scripts/selfheal_lane.py` → `self_heal.cron`, every 5 min, no agent): Inbox sync, queue drain, and every 25+ min the digest backstop (the complaint detector over
   new user turns of interactive sessions in the coach digests, per-session cursor; the judge gets each turn's `prev`
   agent reply from digest v6 plus the session title and the 3 earlier user turns, since without them the strict stage

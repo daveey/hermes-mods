@@ -3,7 +3,7 @@
 Patches:
 
 - `patches/0214-fix-api_server-flush-worker-thread-hops-before-assis.patch`: track and await thread hops before terminal events.
-- `patches/0226-refactor-api_server-worker-thread-hops-in-api_server.patch`: the hop tracker moves to `api_server_thread_hops.py`; EOS via `call_later`, no dangling task.
+- `patches/0228-refactor-api_server-worker-thread-hops-in-api_server.patch`: the hop tracker moves to `api_server_thread_hops.py`; EOS via `call_later`, no dangling task.
 
 ## Behavior
 
@@ -29,7 +29,7 @@ with `call_later` rather than spawning an unreferenced task), plus a queue class
 
 ## Applying
 
-`git am -3` in order 0214, 0226.
+`git am -3 --empty=keep` in order 0214, 0228.
 
 ## Gotchas
 

@@ -410,13 +410,13 @@ evenly. Don't put the floor back as a Tailwind `min-w-*` class: a fixed floor wi
 
 All seven are independent; none touches files changed by another, and none depends on any other patch in
 `core/patches/`. Verified on a scratch clone of current `upstream/main`: each patch passes
-`git apply --check -3` on its own, and all six `git am -3` cleanly in sequence. After applying, the three Python
+`git apply --check -3` on its own, and all six `git am -3 --empty=keep` cleanly in sequence. After applying, the three Python
 test files pass (22 tests), the two changed vitest files pass (13 tests), and desktop `tsc -p . --noEmit` is clean.
 
 ```sh
 cd ~/.hermes/hermes-agent            # or your checkout
-git am -3 ~/code/hermes-mods/core/patches/0005-*.patch   # any subset, any order
-git am -3 ~/code/hermes-mods/core/patches/{0001,0002,0003,0005,0006,0009,0053}-*.patch
+git am -3 --empty=keep ~/code/hermes-mods/core/patches/0005-*.patch   # any subset, any order
+git am -3 --empty=keep ~/code/hermes-mods/core/patches/{0001,0002,0003,0005,0006,0009,0053}-*.patch
 ```
 
 After that:

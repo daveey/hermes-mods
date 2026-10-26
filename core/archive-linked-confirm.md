@@ -53,7 +53,7 @@ Plugin: `node --test desktop-plugins/session-tasks/test/projections.test.mjs`.
 
 ## Applying
 
-`git am -3` patch 0110 on top of the series (it needs the fork's `kanban_active`/`kanban_blocked` row fields from
+`git am -3 --empty=keep` patch 0110 on top of the series (it needs the fork's `kanban_active`/`kanban_blocked` row fields from
 the kanban-session-links patches, or the Kanban line never shows). Then rebuild Desktop. The session-tasks plugin
 hot-reloads, but its guard only takes effect once the rebuilt Desktop provides `registerArchiveGuard`.
 

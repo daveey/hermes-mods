@@ -26,11 +26,11 @@ Patches:
 - `patches/0207-ci-unbreak-main-on-hub-runners-container-test-seam-d.patch`: unbreaks main on hub runners: `TestIsContainer` restores the real `_detect_container`; documents `sessions.automated_sources` / `interactive_sources` / `sidebar_profiles` (docs-drift ratchet); js-tests timeout 30 -> 60 min; `termux-verify` jobs move to `[self-hosted, hermes-hub]`.
 - `patches/0209-ci-nix-add-workflow_dispatch-so-the-flake-check-can-.patch`: `nix.yml` gets `workflow_dispatch`, so the flake check can be re-run on demand (the workflow had been disabled, so it never re-ran on main).
 - `patches/0218-ci-lint-workflows-with-actionlint-move-remaining-aut.patch`: adds an `actionlint` workflow (`.github/actionlint.yaml` ignores a few known non-bug findings, each pattern narrow) and moves the remaining auto-triggered jobs (archive-inputs, install-e2e-red, label-rerun, osv-scanner, plugin-catalog-ci, pm-bundle, ...) to the self-hosted runner.
-- `patches/0222-fix-utf-8-sig-reads-in-plugins_discovery-kanban_sess.patch`: `utf-8-sig` reads in `plugins_discovery` and `kanban_session_activity`, so the blocking Windows-footguns lint passes on main.
-- `patches/0224-test-f-string-check-False-in-delegate-marker-probe-s.patch`: f-string + `check=False` in the delegate-marker probe test, so blocking `ruff check .` passes (UP031, PLW1510).
-- `patches/0228-ci-main-pushes-share-one-concurrency-group-per-CI-Ni.patch`: pushes to `main` share one concurrency group per workflow (`ci-main`, `nix-main`, `actionlint-main`): the run in flight finishes and only the newest pending push waits (a per-run group queued a full suite per push and saturated the hub runners). Refines 0205.
-- `patches/0240-test-publish-LSP-descendant-readiness-atomically-dav.patch`: the mock LSP server publishes its child PID by write-then-rename, so file existence implies a complete PID.
-- `patches/0243-test-remove-shared-runner-timing-assumptions-daveey.patch`: the bundle-smoke JS test gets a 60 s budget (ten real Node CLIs share the runner) and the goal-parked-resume idle-hook test pins `time.time` so a slow `cli` import cannot outlast its one-second barrier.
+- `patches/0224-fix-utf-8-sig-reads-in-plugins_discovery-kanban_sess.patch`: `utf-8-sig` reads in `plugins_discovery` and `kanban_session_activity`, so the blocking Windows-footguns lint passes on main.
+- `patches/0226-test-f-string-check-False-in-delegate-marker-probe-s.patch`: f-string + `check=False` in the delegate-marker probe test, so blocking `ruff check .` passes (UP031, PLW1510).
+- `patches/0230-ci-main-pushes-share-one-concurrency-group-per-CI-Ni.patch`: pushes to `main` share one concurrency group per workflow (`ci-main`, `nix-main`, `actionlint-main`): the run in flight finishes and only the newest pending push waits (a per-run group queued a full suite per push and saturated the hub runners). Refines 0205.
+- `patches/0249-test-publish-LSP-descendant-readiness-atomically-dav.patch`: the mock LSP server publishes its child PID by write-then-rename, so file existence implies a complete PID.
+- `patches/0252-test-remove-shared-runner-timing-assumptions-daveey.patch`: the bundle-smoke JS test gets a 60 s budget (ten real Node CLIs share the runner) and the goal-parked-resume idle-hook test pins `time.time` so a slow `cli` import cannot outlast its one-second barrier.
 
 What you see: the private fork's CI runs (and passes) without GitHub-hosted minutes. None of this changes runtime
 behavior; it is workflow wiring and test isolation.
@@ -52,8 +52,8 @@ behavior; it is workflow wiring and test isolation.
 - `test_git_pack_tidy` skips the `multi-pack-index write --incremental` case on git < 2.47 (exit 129 there).
 - `tests/fixtures/resolution_allowlist.json` lists `_prebuilt_desktop_app_mismatch`, `_prebuilt_signature_error`
   (macOS `codesign`) and `review_session_activity._gh` (`gh` with homebrew fallbacks) as reviewed bare-`which` sites.
-- `.github/workflows/actionlint.yml` lints every workflow on PRs and main (0218). Pushes to main in `ci.yaml`, `nix.yml` and `actionlint.yml` share one concurrency group each: the run in flight is never cancelled, only the newest pending push waits (0228).
-- Lint-only fixes (0222, 0224) and test-isolation fixes (0240, 0243) keep blocking `ruff check .` and the windows-footgun scan green on main; no runtime change.
+- `.github/workflows/actionlint.yml` lints every workflow on PRs and main (0218). Pushes to main in `ci.yaml`, `nix.yml` and `actionlint.yml` share one concurrency group each: the run in flight is never cancelled, only the newest pending push waits (0230).
+- Lint-only fixes (0224, 0226) and test-isolation fixes (0249, 0252) keep blocking `ruff check .` and the windows-footgun scan green on main; no runtime change.
 
 ## How it works
 
@@ -68,12 +68,12 @@ Pure workflow/test edits; no production code path changes.
 
 ## Tests
 
-These patches are the tests (0222 is covered by the windows-footgun scan, 0224/0240/0243 edit `tests/agent/test_delegate_marker_owner_binding.py`, `tests/agent/lsp/_mock_lsp_server.py`, `tests-js/bundle-smoke-metadata.test.mjs`, `tests/hermes_cli/test_cli_goal_parked_resume.py`; 0218/0228 are workflow files proven only by CI). Verified by the fork's CI going green on the runners; each edited file was run with
+These patches are the tests (0224 is covered by the windows-footgun scan, 0226/0249/0252 edit `tests/agent/test_delegate_marker_owner_binding.py`, `tests/agent/lsp/_mock_lsp_server.py`, `tests-js/bundle-smoke-metadata.test.mjs`, `tests/hermes_cli/test_cli_goal_parked_resume.py`; 0218/0230 are workflow files proven only by CI). Verified by the fork's CI going green on the runners; each edited file was run with
 `scripts/run_tests.sh <file>` when written. Not re-run when this doc was written (untested here).
 
 ## Applying
 
-`git am -3` in order. 0173 is only useful if you run your own runners; replace the label in the script. The
+`git am -3 --empty=keep` in order. 0173 is only useful if you run your own runners; replace the label in the script. The
 mirror's `runs-on` label is whatever your runners register.
 
 ## Gotchas

@@ -1,6 +1,6 @@
 # Orphan reaping requires proven home and process identity
 
-Patch: **0286**, source `4982888f5d430f8e5e966d643a2e88cc662905c5`.
+Patch: **0352**, source `4982888f5d430f8e5e966d643a2e88cc662905c5`.
 
 ## Behavior
 
@@ -28,7 +28,7 @@ scripts/run_tests.sh -j 1 tests/hermes_cli/test_orphan_desktop_serve_reap.py tes
 
 Result: **26 passed, 0 failed**. Tests cover topology/locks, foreign/missing/relative/unreadable homes, UID mismatch/access denial, SSH markers, profile overrides, recycled roots and foreign descendants. A real disposable subprocess with a foreign home survives the isolated reaper; discovery is restricted to that child, not live host processes.
 
-The complete **281-patch** series applied with `git am -3` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, exported against upstream `5b32cfc230078417fc523e12b9aabbc9b59f684b` and fork `4982888f5d430f8e5e966d643a2e88cc662905c5`. This verifies kernel/helper behavior, not a live Desktop boot, macOS execution or deployment.
+The complete **281-patch** series applied with `git am -3 --empty=keep` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, exported against upstream `5b32cfc230078417fc523e12b9aabbc9b59f684b` and fork `4982888f5d430f8e5e966d643a2e88cc662905c5`. This verifies kernel/helper behavior, not a live Desktop boot, macOS execution or deployment.
 
 ## Applying
 

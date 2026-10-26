@@ -35,7 +35,7 @@ This is a class/DOM unit test; jsdom does not evaluate the hover CSS.
 
 ## Applying
 
-Apply the ordered series with `git am -3` from the merge-base (see [README.md](README.md)). It builds on 0105 (`sidebar.sections`). Rebuild Desktop.
+Apply the ordered series with `git am -3 --empty=keep` from the merge-base (see [README.md](README.md)). It builds on 0105 (`sidebar.sections`). Rebuild Desktop.
 
 ## Gotchas
 

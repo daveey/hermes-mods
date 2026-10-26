@@ -72,7 +72,7 @@ covers history hydration only).
 
 Standalone: new code in `methods_session_interrupt.py`, one call in `prompt_turn.py`, and three small Desktop edits.
 It relies on `_transport_auth_user_id`, `_submit_row_target_key` and the `display_kind`/`display_metadata` message
-columns already present at the fork's merge-base. Verified: applies with `git am -3` on top of 0001–0125 at
+columns already present at the fork's merge-base. Verified: applies with `git am -3 --empty=keep` on top of 0001–0125 at
 merge-base `4957bbd0a0` (Oct 17, 2026 PT).
 
 ## Gotchas

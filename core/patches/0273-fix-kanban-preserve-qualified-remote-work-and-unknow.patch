@@ -1,0 +1,239 @@
+From f2cc20d41f4837b374b36ae56663526699dc005c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:24:00 +0000
+Subject: [PATCH] fix(kanban): preserve qualified remote work and unknown
+ legacy ownership [daveey]
+
+---
+ hermes_cli/kanban_session_activity.py         | 52 +++++++++----
+ .../hermes_cli/test_kanban_remote_identity.py | 75 +++++++++++++++++++
+ .../test_kanban_session_activity.py           | 10 +--
+ 3 files changed, 119 insertions(+), 18 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_remote_identity.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 9c341ca1cb..37cdb8d9dc 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -196,7 +196,8 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+ # owner stores it as a ``platform='hub'`` notify subscription: ``hermes-hub create-task`` origin, a
+ # ``shepherd`` request, or ``kanban_create`` run with an origin session); every descendant of that card
+ # (``children``, transitively, on the owner's same board) is the session's work too. Rows are qualified
+-# by gateway/board/id: the same ``t_`` id on two gateways is two cards.
++# by gateway/profile/board/id: equal task IDs in different owner profiles are separate cards.
++# Historical board/id records retain unknown ownership rather than default-profile inference.
+ HUB_STALE_AFTER_S = 180.0  # same as the hub-sync plugin: no successful hub sync for this long = stale
+ _REMOTE_FIELDS = ("title", "status", "block_kind", "assignee", "created_at", "started_at", "priority")
+ _remote_last: list[dict[str, Any]] | None = None  # last good read (process lifetime)
+@@ -217,27 +218,48 @@ def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, A
+         me = _self_gateway(conn)
+         if not me:
+             return []
+-        rows = conn.execute("SELECT gw, data, updated_at FROM replica WHERE coll = 'tasks' AND gw != ?",
++        rows = conn.execute("SELECT gw, key, data, updated_at FROM replica WHERE coll = 'tasks' AND gw != ?",
+                             (me,)).fetchall()
+         last_ok, offline = _meta_float(conn, "last_ok"), _meta_float(conn, "offline_since")
+     finally:
+         conn.close()
+     now = time.time() if now is None else now
+     stale = offline is not None or last_ok is None or now - last_ok > HUB_STALE_AFTER_S
+-    tasks: dict[tuple[str, str, str], dict[str, Any]] = {}
++    tasks: dict[tuple[str, str | None, str, str], dict[str, Any]] = {}
+     seen_at: dict[str, float] = {}
+-    for gw, data, updated in rows:
++    for gw, record_key, data, updated in rows:
+         try:
+             t = json.loads(data)
+-        except (TypeError, ValueError):
+-            continue
++        except (TypeError, ValueError) as exc:
++            raise ValueError('invalid replica task data') from exc
++        if not isinstance(t, dict) or not t.get('id'):
++            raise ValueError('invalid replica task data')
+         if isinstance(t, dict) and t.get("id"):
+             seen_at[str(gw)] = max(seen_at.get(str(gw), 0.0), (updated or 0) / 1000.0)
+-            tasks[(str(gw), str(t.get("board") or "default"), str(t["id"]))] = t
++            parts = str(record_key).split('/')
++            if len(parts) == 3:
++                owner_profile, board, tid = parts
++            elif len(parts) == 2:
++                owner_profile = None
++                board, tid = parts
++            else:
++                raise ValueError('invalid replica task key')
++            if not all(parts) or tid != str(t['id']):
++                raise ValueError('replica task identity mismatch')
++            if owner_profile is None:
++                # Historical keys lack provenance; even a terminal report cannot
++                # prove that a colliding qualified task replaced this obligation.
++                t = {**t, 'reported_status': t.get('status'), 'status': 'unknown', 'unfinished': True}
++            tasks[(str(gw), owner_profile, board, tid)] = t
++    from hermes_cli.profiles import get_active_profile_name
++
++    origin_profile = get_active_profile_name()
+     found: dict[tuple[str, str], dict[str, Any]] = {}
+-    for (gw, board, tid), t in tasks.items():
++    for (gw, owner_profile, board, tid), t in tasks.items():
+         links = t.get("sessions") if isinstance(t.get("sessions"), list) else []
+-        sids = {str(l["session"]) for l in links if isinstance(l, dict) and l.get("session") and l.get("gw") == me}
++        sids = {str(link['session']) for link in links
++                if isinstance(link, dict) and link.get('session') and link.get('gw') == me
++                and link.get('profile') == origin_profile and link.get('rel') == 'shepherd'}
+         if not sids:
+             continue
+         owner_seen = seen_at.get(gw) or None
+@@ -249,11 +271,12 @@ def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, A
+             if cur in done:
+                 continue
+             done.add(cur)
+-            card = tasks.get((gw, board, cur))
++            card = tasks.get((gw, owner_profile, board, cur))
+             if card is None:
+                 continue
+-            if card.get("status") in LISTED_STATUSES:
+-                ref = f"{gw}/{board}/{cur}"
++            if card.get("status") in LISTED_STATUSES or card.get('unfinished'):
++                prefix = f'{gw}/{owner_profile}/{board}' if owner_profile is not None else f'{gw}/{board}'
++                ref = f'{prefix}/{cur}'
+                 via = "shepherd" if cur == tid else "descendant"
+                 for sid in sids:
+                     prev = found.get((sid, ref))
+@@ -261,7 +284,10 @@ def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, A
+                         found[(sid, ref)] = {
+                             **{f: card.get(f) for f in _REMOTE_FIELDS},
+                             "id": cur, "board": board, "gateway": gw, "key": ref, "session": sid,
+-                            "via": via, "root": f"{gw}/{board}/{tid}", "remote": True,
++                            "via": via, "root": f"{prefix}/{tid}", "remote": True,
++                            "profile": owner_profile, "owner_profile": owner_profile,
++                            "ownership_state": 'unknown' if owner_profile is None else 'qualified',
++                            "unfinished": True, "reported_status": card.get('reported_status', card.get('status')),
+                             "synced_at": synced, "stale": stale,
+                         }
+             kids = card.get("children") if isinstance(card.get("children"), list) else []
+diff --git a/tests/hermes_cli/test_kanban_remote_identity.py b/tests/hermes_cli/test_kanban_remote_identity.py
+new file mode 100644
+index 0000000000..4a5010f680
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_identity.py
+@@ -0,0 +1,75 @@
++"""Remote session work never joins task identities across owner profiles."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++
++
++def replica(tmp_path, records):
++    path = tmp_path / 'hub.db'
++    with sqlite3.connect(path) as db:
++        db.executescript('CREATE TABLE meta(k TEXT PRIMARY KEY,v TEXT);'
++                         'CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT,updated_at INTEGER);')
++        db.executemany('INSERT INTO meta VALUES (?,?)', [('gateway', 'origin'), ('last_ok', '100')])
++        for key, data in records:
++            db.execute("INSERT INTO replica VALUES ('owner','tasks',?,?,100000)", (key, json.dumps(data)))
++    return path
++
++
++def card(profile, **extra):
++    return {'id': 't_same', 'board': 'default', 'profile': profile, 'status': 'running',
++            'sessions': [{'gw': 'origin', 'profile': 'default', 'session': 's1', 'rel': 'shepherd'}], **extra}
++
++
++def test_qualified_profiles_cannot_overwrite_each_other(tmp_path):
++    path = replica(tmp_path, [('default/default/t_same', card('default')),
++                              ('work/default/t_same', card('work'))])
++    rows = activity._read_remote_links(path, now=100)
++    assert {r['key'] for r in rows} == {'owner/default/default/t_same', 'owner/work/default/t_same'}
++    assert {r['profile'] for r in rows} == {'default', 'work'}
++
++
++def test_legacy_terminal_record_is_unknown_not_superseded_by_qualified_collision(tmp_path):
++    path = replica(tmp_path, [('default/t_same', card('default', status='done')),
++                              ('default/default/t_same', card('default', status='done'))])
++    rows = activity._read_remote_links(path, now=100)
++    assert len(rows) == 1
++    assert rows[0]['key'] == 'owner/default/t_same'
++    assert rows[0]['profile'] is None
++    assert rows[0]['ownership_state'] == 'unknown'
++    assert rows[0]['status'] == 'unknown'
++    assert rows[0]['reported_status'] == 'done'
++    assert activity._replica_bucket(rows[0]) == 'active'
++
++
++def test_origin_profile_and_relation_are_part_of_the_session_join(tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    links = [{'gw': 'origin', 'profile': 'work', 'session': 'foreign', 'rel': 'shepherd'},
++             {'gw': 'origin', 'profile': 'default', 'session': 'creator', 'rel': 'created'},
++             {'gw': 'origin', 'profile': None, 'session': 'ambiguous', 'rel': 'shepherd'},
++             {'gw': 'origin', 'profile': 'default', 'session': 's1', 'rel': 'shepherd'}]
++    path = replica(tmp_path, [('work/default/t_same', card('work', sessions=links))])
++    assert {r['session'] for r in activity._read_remote_links(path, now=100)} == {'s1'}
++
++
++def test_descendants_stay_in_the_roots_owner_profile(tmp_path):
++    path = replica(tmp_path, [
++        ('work/default/t_root', card('work', id='t_root', children=['t_same'])),
++        ('work/default/t_same', card('work', sessions=[])),
++        ('default/default/t_same', card('default', sessions=[], status='blocked', block_kind='needs_input')),
++    ])
++    rows = activity._read_remote_links(path, now=100)
++    assert {r['key'] for r in rows} == {'owner/work/default/t_root', 'owner/work/default/t_same'}
++    assert all(r['status'] == 'running' for r in rows)
++
++
++@pytest.mark.parametrize('payload', ['not json', '[]', '{}', 'null'])
++def test_malformed_replica_row_cannot_be_a_successful_empty_projection(tmp_path, payload):
++    path = replica(tmp_path, [])
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO replica VALUES ('owner','tasks','work/default/t_same',?,100000)", (payload,))
++    with pytest.raises(ValueError):
++        activity._read_remote_links(path, now=100)
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index a82bf296cb..1385387a39 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -236,9 +236,9 @@ def _make_replica(state_dir: Path, me: str, tasks: list[dict]) -> Path:
+     conn.execute("INSERT INTO meta VALUES ('gateway', ?)", (me,))
+     for t in tasks:
+         gw = t.pop("_gw")
+-        data = {"board": "default", "children": [], "parents": [], "sessions": [], "block_kind": None, **t}
++        data = {"profile": "default", "board": "default", "children": [], "parents": [], "sessions": [], "block_kind": None, **t}
+         conn.execute("INSERT INTO replica VALUES (?, 'tasks', ?, 1, 1, ?, 0)",
+-                     (gw, f"{data['board']}/{data['id']}", _json.dumps(data, sort_keys=True)))
++                     (gw, f"{data['profile']}/{data['board']}/{data['id']}", _json.dumps(data, sort_keys=True)))
+     conn.commit()
+     conn.close()
+     return path
+@@ -302,7 +302,7 @@ def test_absent_replica_is_optional_but_corrupt_replica_is_unknown(kanban_root):
+     assert "kanban_active" not in rows[0]
+     with pytest.raises(sqlite3.DatabaseError):
+         ksa.session_tasks(["s1"])
+-    # a replica row with junk data is skipped, not fatal
++    # Junk data is an unknown projection, never a successful partial list.
+     (kanban_root / "hub-state" / "hub.db").unlink()
+     path = _make_replica(kanban_root / "hub-state", "macbook", [
+         {"_gw": "hub", "id": "t_ok", "status": "running", "sessions": [_shep("s1")]}])
+@@ -313,7 +313,7 @@ def test_absent_replica_is_optional_but_corrupt_replica_is_unknown(kanban_root):
+     ksa._reset_cache_for_tests()
+     rows = [{"id": "s1"}]
+     ksa.annotate_kanban_activity(rows)
+-    assert rows[0]["kanban_active"] == 2
++    assert rows[0].get("kanban_unknown") is True
+ 
+ 
+ def test_hub_platform_subscription_on_a_local_board_is_not_a_tui_shepherd(kanban_root):
+@@ -358,7 +358,7 @@ def test_remote_dispatch_graph_lists_every_owner_qualified_row_and_counts_the_sa
+     root = next(r for r in rows if r["id"] == "t_root")
+     assert root["remote"] is True and root["via"] == "shepherd" and root["status"] == "running"
+     assert next(r for r in rows if r["id"] == "t_c00")["via"] == "descendant"
+-    assert all(r["key"] == f"hub/default/{r['id']}" for r in rows)
++    assert all(r["key"] == f"hub/default/default/{r['id']}" for r in rows)
+     ann = [{"id": "s_origin"}]
+     ksa.annotate_kanban_activity(ann)
+     assert ann[0]["kanban_active"] == 13
+-- 
+2.55.0
+

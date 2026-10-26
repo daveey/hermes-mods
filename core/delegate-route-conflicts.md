@@ -1,6 +1,6 @@
 # Reject certain delegated model/provider conflicts
 
-Patch: **0288**, source `78c05251a087b61b3f95b863c76f37b285a2bfd7`. Extends [model tiers and per-task routing](model-tiers.md).
+Patch: **0355**, source `78c05251a087b61b3f95b863c76f37b285a2bfd7`. Extends [model tiers and per-task routing](model-tiers.md).
 
 ## Behavior
 
@@ -32,7 +32,7 @@ The initial run without early bootstrap import had 23 setup errors: lazy bootstr
 
 ## Applying
 
-Apply the full ordered series, not this patch alone. All **282 patches** applied successfully with `git am -3` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, using upstream `765933299d885e850390ed1d8e4fd4d37fae8342` and fork `78c05251a087b61b3f95b863c76f37b285a2bfd7`. Existing privacy scrubs and the merge-adapted patch 0242 are retained.
+Apply the full ordered series, not this patch alone. All **282 patches** applied successfully with `git am -3 --empty=keep` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, using upstream `765933299d885e850390ed1d8e4fd4d37fae8342` and fork `78c05251a087b61b3f95b863c76f37b285a2bfd7`. Existing privacy scrubs and the merge-adapted patch 0251 are retained.
 
 ## Gotchas / plugin alternative
 

@@ -61,7 +61,7 @@ not covered by any test in this patch.
 Needs `$openTaskRequest` in `open-task.ts` and its consumer in `board.tsx` (present at the fork's merge-base plus the
 toast/blocked-section patches, [kanban-toast-status-icon.md](kanban-toast-status-icon.md) and
 [kanban-blocked-sidebar.md](kanban-blocked-sidebar.md)), and `taskOwners` in `api.ts` from
-[kanban-all-gateways.md](kanban-all-gateways.md) (0090). Verified: applies with `git am -3` on top of 0001–0126 at
+[kanban-all-gateways.md](kanban-all-gateways.md) (0090). Verified: applies with `git am -3 --empty=keep` on top of 0001–0126 at
 merge-base `4957bbd0a0` (Oct 17, 2026 PT). Desktop needs a rebuild.
 
 ## Gotchas

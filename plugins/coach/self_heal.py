@@ -621,8 +621,8 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #   backstop (cron)   runs the complaint detector over new user turns in the coach digests (chats where the
 #                     in-process hook did not fire).
 #   budget            engine_budget lane `selfheal`: $25/UTC day (its own cap, outside the $20 engine total), <= 3
-#                     running cards, <= 1 filing per fingerprint per UTC day. Over the $ cap the card is created and
-#                     scheduled to the next UTC midnight; at 3 running it is scheduled 1 h out.
+#                     running cards, <= 1 filing per fingerprint per UTC day. Known cap denials never create a card;
+#                     investigations persist for admission retry, and fixes keep the Do-it outcome retryable.
 # Events (coach log.jsonl, read by coach_weekly's self-heal section): selfheal_would_file, selfheal_filed,
 # selfheal_recurrence, selfheal_skip, selfheal_proposed, selfheal_approved, selfheal_fixed, selfheal_reverted,
 # selfheal_not_defect, selfheal_declined.
@@ -942,6 +942,10 @@ def budget(board: Optional[str] = None, now: Optional[float] = None) -> dict:
         snap = eb.snapshot(home=home, board=b, now=now)
         usd = snap["lanes"]["selfheal"]
         cap = snap["caps"]["selfheal"]
+        import math
+        if (not isinstance(usd, (int, float)) or not isinstance(cap, (int, float))
+                or not math.isfinite(usd) or not math.isfinite(cap) or usd < 0 or cap <= 0):
+            raise ValueError("invalid self-heal spend or cap")
         ok, why = eb.check(snap, "selfheal")
         running = sum(1 for c in eb.engine_cards(home, b, ("running",)) if c["lane"] == "selfheal")
         # Commit the observation only after BOTH reads succeed. Unknown is not zero spend.
@@ -959,6 +963,68 @@ def _budget_unavailable(b: dict, fp: str, store) -> Optional[dict]:
     why = b.get("why") or "budget unavailable"
     store.log({"event": "selfheal_budget_unavailable", "fingerprint": fp, "why": why})
     return {"action": "error", "why": why}
+
+
+def _admission_denied(b: dict, now: float) -> Optional[dict]:
+    """A known denial must never create a dispatchable card, even briefly."""
+    if not b["ok_usd"]:
+        return {"action": "deferred", "retry_at": _next_utc_midnight(now),
+                "why": b.get("why") or "self-heal daily cap reached"}
+    if not b["ok_running"]:
+        return {"action": "deferred", "retry_at": _iso(now + 3600),
+                "why": "self-heal concurrency limit reached"}
+    return None
+
+
+def _pending_db(store):
+    import sqlite3
+    store.root.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(Path(store.root) / "selfheal_pending.sqlite", timeout=10)
+    db.execute("CREATE TABLE IF NOT EXISTS pending (fp TEXT PRIMARY KEY, payload TEXT NOT NULL, "
+               "retry REAL NOT NULL, version TEXT NOT NULL)")
+    return db
+
+
+def _defer_investigation(d: dict, result: dict, store):
+    """Persist before acknowledging a denial; all producers may advance their cursors afterward."""
+    import datetime
+    import uuid
+    retry = datetime.datetime.fromisoformat(result["retry_at"].replace("Z", "+00:00")).timestamp()
+    db = _pending_db(store)
+    try:
+        with db:
+            db.execute("INSERT INTO pending VALUES (?, ?, ?, ?) ON CONFLICT(fp) DO UPDATE SET "
+                       "payload=excluded.payload, retry=excluded.retry, version=excluded.version",
+                       (d["fingerprint"], json.dumps(d), retry, uuid.uuid4().hex))
+    finally:
+        db.close()
+    store.log({"event": "selfheal_deferred", "fingerprint": d["fingerprint"], **result})
+    return result
+
+
+def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
+    """Recheck due investigations through normal admission, never automatically release a card."""
+    store = _store(store)
+    now = now or time.time()
+    if not (Path(store.root) / "selfheal_pending.sqlite").exists():
+        return []
+    db = _pending_db(store)
+    out = []
+    try:
+        rows = db.execute("SELECT fp, payload, version FROM pending WHERE retry <= ?", (now,)).fetchall()
+        for fp, payload, version in rows:
+            try:
+                result = (filer or file_defect)(json.loads(payload), store=store, m="live", now=now)
+            except Exception as exc:
+                result = {"action": "error", "why": str(exc)[:300]}
+            out.append(result)
+            if result.get("action") in ("filed", "skip"):
+                with db:
+                    # Do not erase a newer detection written while this retry was executing.
+                    db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
+    finally:
+        db.close()
+    return out
 
 
 def generation(st: dict) -> int:
@@ -1100,6 +1166,9 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
         return unavailable
+    denied = _admission_denied(b, now)
+    if denied:
+        return _defer_investigation(d, denied, store)
     known, gen = known_cards(st), dec["gen"]
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
@@ -1114,9 +1183,6 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
         why = (err or out).strip()[-300:] if not tid else f"idempotency keys keep returning earlier card {tid}"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
         return {"action": "error", "why": why}
-    if sched:
-        bargs = ["hermes", "kanban"] + (["--board", args["board"]] if args.get("board") else [])
-        _run(bargs + ["schedule", tid, f"SCHEDULED_UNTIL={sched[0]} — {sched[1]}"], runner)
     prev = dec.get("previous")
     kw: dict = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
               filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
@@ -1158,6 +1224,11 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
         return unavailable
+    denied = _admission_denied(b, now)
+    if denied:
+        # Keep status=proposed: sync rereads the same Do-it outcome and retries admission.
+        store.log({"event": "selfheal_fix_deferred", "fingerprint": fp, **denied})
+        return denied
     rc, out, err = _run(kanban_argv(args), runner)
     tid = _task_id(out) if rc == 0 else None
     if not tid:
@@ -1167,13 +1238,6 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
         return {"action": "error", "why": why}
     sched = None
-    if not b["ok_usd"]:
-        sched = _next_utc_midnight(now)
-    elif not b["ok_running"]:
-        sched = _iso(now + 3600)
-    if sched:
-        bargs = ["hermes", "kanban"] + (["--board", args["board"]] if args.get("board") else [])
-        _run(bargs + ["schedule", tid, f"SCHEDULED_UNTIL={sched} — self-heal lane budget/concurrency"], runner)
     lane.update(fp, status="approved", fix_card=tid, approved_at=now, cards=sorted(known_cards(st) | {tid}))
     store.log({"event": "selfheal_approved", "fingerprint": fp, "card": tid, "component": st.get("component"),
                "trigger": trigger, "scheduled": sched})
@@ -1465,6 +1529,9 @@ def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: fl
         return lines
     store = _store(store)
     now = now or time.time()
+    if mode() == "live":
+        for r in retry_deferred(store, now=now):
+            lines.append(f"deferred: {json.dumps(r)[:300]}")
     for fp, what in sync(store, now=now):
         lines.append(f"inbox: {fp} {what}")
     for r in drain(store):

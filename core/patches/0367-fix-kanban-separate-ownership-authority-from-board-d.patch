@@ -1,0 +1,369 @@
+From 35df1980314b2ad4937d57cdbb351b2495b8297c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:48:44 +0000
+Subject: [PATCH] fix(kanban): separate ownership authority from board display
+ metadata [daveey]
+
+---
+ hermes_cli/kanban_db_boards.py                |   8 +-
+ hermes_cli/kanban_dispatch_owner.py           |  19 +--
+ hermes_cli/kanban_transfer.py                 |   1 +
+ .../hermes_cli/test_kanban_dispatch_owner.py  |   9 +-
+ .../test_kanban_dispatch_owner_lifecycle.py   | 135 ++++++++++++++++++
+ .../test_kanban_dispatch_owner_regressions.py |  10 +-
+ .../kanban-dispatch-ownership.md              |  32 +++--
+ 7 files changed, 174 insertions(+), 40 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
+
+diff --git a/hermes_cli/kanban_db_boards.py b/hermes_cli/kanban_db_boards.py
+index 35382d018e..f6bc12c351 100644
+--- a/hermes_cli/kanban_db_boards.py
++++ b/hermes_cli/kanban_db_boards.py
+@@ -26,12 +26,8 @@ def _dir_holds_board(d: Path) -> bool:
+ 
+ 
+ def board_metadata_path(board: Optional[str] = None) -> Path:
+-    """Metadata authority follows the board's canonical DB, not the caller home."""
+-    from hermes_cli.kanban_dispatch_owner import metadata_path
+-    slug = _kb._slug_or_default(board)
+-    path = (_kb.kanban_home() / "kanban.db" if slug == _kb.DEFAULT_BOARD
+-            else _kb.board_dir(slug) / "kanban.db")
+-    return metadata_path(path)
++    """Display/discovery metadata stays at its original board-local path."""
++    return _kb.board_dir(_kb._slug_or_default(board)) / "board.json"
+ 
+ 
+ def _default_board_display_name(slug: str) -> str:
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 22040ce88f..cb09b44082 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -17,26 +17,19 @@ def connection_db_path(conn: sqlite3.Connection) -> Path:
+ 
+ 
+ def metadata_path(db_path: Path) -> Path:
+-    # Pure canonical-path mapping: no caller home or existence-dependent branch.
+-    # Nonstandard filenames need distinct sidecars even in the same directory.
++    # Ownership follows the DB, not board display/discovery metadata. Including
++    # the filename keeps distinct DBs in one directory independent. No layout
++    # heuristics: symlinked roots and built-in archive moves retain authority.
+     path = Path(db_path).resolve()
+-    if path.name != "kanban.db":
+-        return path.with_name(path.name + ".board.json")
+-    if path.parent.parent.name == "boards" and path.parent.parent.parent.name == "kanban":
+-        # default/board.json already belongs to the legacy root DB. A separate
+-        # DB placed inside that reserved directory must not share its owner.
+-        if path.parent.name == "default":
+-            return path.with_name(path.name + ".board.json")
+-        return path.parent / "board.json"
+-    return path.parent / "kanban" / "boards" / "default" / "board.json"
++    return path.with_name(path.name + ".dispatch-owner.json")
+ 
+ 
+ def read_metadata(path: Path) -> dict:
+     try:
+         raw = json.loads(path.read_text(encoding="utf-8-sig"))
+     except FileNotFoundError:
+-        # Legacy boards predate board.json. A dangling link is not legacy.
+-        if path.is_symlink():
++        # Absence is legacy only when no dangling path component hides data.
++        if any(p.is_symlink() and not p.exists() for p in (path, *path.parents)):
+             raise ValueError("dangling board metadata link")
+         return {}
+     if not isinstance(raw, dict):
+diff --git a/hermes_cli/kanban_transfer.py b/hermes_cli/kanban_transfer.py
+index cd1dca4c13..2a1efe3e05 100644
+--- a/hermes_cli/kanban_transfer.py
++++ b/hermes_cli/kanban_transfer.py
+@@ -148,6 +148,7 @@ def export_board(
+         # Both name a location on the exporting machine; the importer
+         # resolves its own.
+         meta.pop("db_path", None)
++        meta.pop("dispatch_owner", None)  # Runtime-local, never portable authority.
+         meta["default_workdir"] = None
+         meta["project_id"] = None
+         _write_json(staged / "board.json", meta)
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner.py b/tests/hermes_cli/test_kanban_dispatch_owner.py
+index b59ce13474..e425c8c578 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_owner.py
++++ b/tests/hermes_cli/test_kanban_dispatch_owner.py
+@@ -24,8 +24,7 @@ def board_db(tmp_path, monkeypatch):
+     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+     path = home / "kanban.db"
+-    metadata = home / "kanban" / "boards" / "default" / "board.json"
+-    metadata.parent.mkdir(parents=True)
++    metadata = path.with_name(path.name + ".dispatch-owner.json")
+     conn = kbc.connect(path)
+     yield conn, path, metadata
+     conn.close()
+@@ -121,7 +120,7 @@ def test_connection_path_not_board_alias_controls_ownership(board_db, tmp_path,
+     _metadata(metadata, {})
+     actual = tmp_path / "actual" / "board.db"
+     actual.parent.mkdir()
+-    _metadata(actual.with_name(actual.name + ".board.json"), {"dispatch_owner": "owner"})
++    _metadata(actual.with_name(actual.name + ".dispatch-owner.json"), {"dispatch_owner": "owner"})
+     if alias in ("pinned", "both"):
+         monkeypatch.setenv("HERMES_KANBAN_DB", str(default_path))
+     with kbc.connect_closing(actual) as conn:
+@@ -153,7 +152,7 @@ def test_set_read_clear_preserves_other_metadata(board_db, tmp_path, layout):
+     _, path, metadata = board_db
+     if layout == "adjacent":
+         path = tmp_path / "custom" / "board.db"
+-        metadata = path.with_name(path.name + ".board.json")
++        metadata = path.with_name(path.name + ".dispatch-owner.json")
+     _metadata(metadata, {"title": "Generic board", "custom": {"keep": True}})
+     with kbc.connect_closing(path):
+         pass
+@@ -199,7 +198,7 @@ def test_real_pinned_resolution_and_foreign_default(board_db, tmp_path, monkeypa
+     foreign = tmp_path / "foreign"
+     foreign.mkdir()
+     path = foreign / "kanban.db"
+-    _metadata(foreign / "kanban" / "boards" / "default" / "board.json",
++    _metadata(path.with_name(path.name + ".dispatch-owner.json"),
+               {"dispatch_owner": "foreign-worker"})
+     with kbc.connect_closing(path):
+         pass
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py b/tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
+new file mode 100644
+index 0000000000..ab80384dd4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
+@@ -0,0 +1,135 @@
++"""Ownership must not alter display identity, and must survive native moves."""
++import json
++import sqlite3
++import tarfile
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_dispatch import DispatchResult
++from hermes_cli.kanban_dispatch_owner import (
++    get_dispatch_owner, metadata_path, run_owned_tick, set_dispatch_owner,
++)
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    root = tmp_path / "home"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    return root
++
++
++@pytest.mark.parametrize("layout", ["root-link", "db-link"])
++def test_symlink_layout_preserves_discovery_and_display(home, tmp_path, layout):
++    external = tmp_path / "storage"
++    external.mkdir()
++    if layout == "root-link":
++        (home / "kanban").symlink_to(external, target_is_directory=True)
++    else:
++        directory = kb.board_dir("sample")
++        directory.mkdir(parents=True)
++        with sqlite3.connect(external / "board.db"):
++            pass
++        (directory / "kanban.db").symlink_to(external / "board.db")
++    kb.create_board("sample", name="Display name", default_workdir=str(tmp_path), project_id="project")
++    path = kb.board_dir("sample") / "kanban.db"
++    set_dispatch_owner(path, "dedicated")
++    assert "sample" in {row["slug"] for row in kb.list_boards(include_archived=False)}
++    meta = kb.read_board_metadata("sample")
++    assert (meta["name"], meta["default_workdir"], meta["project_id"]) == (
++        "Display name", str(tmp_path), "project")
++    kb.write_board_metadata("sample", description="Edited")
++    assert get_dispatch_owner(path) == "dedicated"
++    assert (kb.board_dir("sample") / "board.json").is_file()
++
++
++@pytest.mark.parametrize("external", [False, True])
++def test_archive_preserves_owner_for_direct_dispatch(home, tmp_path, external):
++    kb.create_board("sample")
++    path = kb.board_dir("sample") / "kanban.db"
++    if external:
++        destination = tmp_path / "external.db"
++        path.rename(destination)
++        path.symlink_to(destination)
++    set_dispatch_owner(path, "dedicated")
++    result = kb.remove_board("sample")
++    archived = Path(result["new_path"]) / "kanban.db"
++    assert get_dispatch_owner(archived) == "dedicated"
++    with sqlite3.connect(archived) as conn:
++        tick = Mock(return_value=DispatchResult())
++        assert run_owned_tick(conn, tick, None, "sample", False).skipped_owned
++        tick.assert_not_called()
++    kb.create_board("sample")
++    assert get_dispatch_owner(kb.board_dir("sample") / "kanban.db") is None
++
++
++def test_dangling_owner_link_through_missing_ancestor_denies(home, tmp_path):
++    path = home / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        target_dir = tmp_path / "owner-data"
++        target_dir.mkdir()
++        target = target_dir / "owner.json"
++        target.write_text('{"dispatch_owner":"dedicated"}')
++        metadata = metadata_path(path)
++        metadata.parent.mkdir(parents=True, exist_ok=True)
++        metadata.symlink_to(target)
++        assert get_dispatch_owner(path) == "dedicated"
++        target_dir.rename(tmp_path / "moved-data")
++        tick = Mock(return_value=DispatchResult())
++        assert run_owned_tick(conn, tick, None, "default", False).skipped_owned
++        tick.assert_not_called()
++
++
++def test_moving_db_does_not_move_display_metadata(home, tmp_path):
++    kb.create_board("sample", name="Original display", default_workdir=str(tmp_path), project_id="project")
++    path = kb.board_dir("sample") / "kanban.db"
++    target = tmp_path / "external.db"
++    path.rename(target)
++    path.symlink_to(target)
++    meta = kb.read_board_metadata("sample")
++    assert (meta["name"], meta["default_workdir"], meta["project_id"]) == (
++        "Original display", str(tmp_path), "project")
++    set_dispatch_owner(path, "dedicated")
++    assert get_dispatch_owner(target) == "dedicated"
++
++
++def test_export_import_does_not_transfer_ownership(home, tmp_path):
++    from hermes_cli import kanban_transfer as transfer
++    kb.create_board("sample")
++    path = kb.board_dir("sample") / "kanban.db"
++    set_dispatch_owner(path, "dedicated")
++    # Even a manually-added display field must not leak in a portable archive.
++    display = kb.board_metadata_path("sample")
++    raw = json.loads(display.read_text())
++    raw["dispatch_owner"] = "private-worker"
++    display.write_text(json.dumps(raw))
++    archive = transfer.export_board("sample", str(tmp_path / "export"))["archive"]
++    with tarfile.open(archive) as bundle:
++        assert not any(name.endswith(".dispatch-owner.json") for name in bundle.getnames())
++        member = bundle.extractfile("sample/board.json")
++        assert member is not None
++        assert "dispatch_owner" not in json.load(member)
++    transfer.import_board(archive, slug="imported")
++    assert get_dispatch_owner(kb.board_dir("imported") / "kanban.db") is None
++    assert get_dispatch_owner(path) == "dedicated"
++
++
++def test_broken_display_ancestor_cannot_hide_owner(home, tmp_path):
++    path = home / "kanban.db"
++    display = kb.board_dir("default")
++    display.parent.mkdir(parents=True)
++    backing = tmp_path / "display"
++    backing.mkdir()
++    display.symlink_to(backing, target_is_directory=True)
++    with sqlite3.connect(path) as conn:
++        set_dispatch_owner(path, "dedicated")
++        backing.rename(tmp_path / "moved-display")
++        tick = Mock(return_value=DispatchResult())
++        assert run_owned_tick(conn, tick, None, "default", False).skipped_owned
++        tick.assert_not_called()
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py b/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+index 478884115d..5a25876e15 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+@@ -34,7 +34,7 @@ def test_foreign_default_owner_survives_home_switch_and_display_edit(home, tmp_p
+         tick.assert_not_called()
+         kb.write_board_metadata("default", description="Edited")
+         assert get_dispatch_owner(path) == "dedicated"
+-        assert kb.read_board_metadata("default")["dispatch_owner"] == "dedicated"
++        assert kb.read_board_metadata("default")["description"] == "Edited"
+ 
+ 
+ def test_default_symlink_to_named_board_cannot_hide_owner(home, tmp_path, monkeypatch):
+@@ -48,7 +48,7 @@ def test_default_symlink_to_named_board_cannot_hide_owner(home, tmp_path, monkey
+         tick = Mock(return_value=DispatchResult())
+         assert run_owned_tick(conn, tick, None, "default", False).skipped_owned
+         tick.assert_not_called()
+-    assert kb.read_board_metadata("default")["dispatch_owner"] == "dedicated"
++    assert get_dispatch_owner(home / "kanban.db") == "dedicated"
+     kb.write_board_metadata("default", description="Alias edit")
+     assert get_dispatch_owner(path) == "dedicated"
+ 
+@@ -66,8 +66,7 @@ def test_distinct_db_filenames_never_share_owner(home):
+ 
+ def test_deep_metadata_denies_without_traceback(home):
+     path = home / "kanban.db"
+-    metadata = home / "kanban/boards/default/board.json"
+-    metadata.parent.mkdir(parents=True)
++    metadata = path.with_name(path.name + ".dispatch-owner.json")
+     metadata.write_text('[' * 2000 + ']' * 2000)
+     with sqlite3.connect(path) as conn:
+         tick = Mock()
+@@ -99,7 +98,8 @@ def test_gateway_decompose_and_health_obey_owner(home, monkeypatch, raw):
+     from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
+     from hermes_cli import kanban_decompose as decomp, kanban_db_dispatch as kbd
+     kb.create_board("sample")
+-    metadata = kb.board_metadata_path("sample")
++    path = kb.board_dir("sample") / "kanban.db"
++    metadata = path.with_name(path.name + ".dispatch-owner.json")
+     metadata.write_text(json.dumps(raw))
+     settings = _DispatcherSettings(60, None, None, 2, 0, True, None, None)
+     dispatcher = _KanbanDispatcher(kb, settings)
+diff --git a/website/docs/developer-guide/kanban-dispatch-ownership.md b/website/docs/developer-guide/kanban-dispatch-ownership.md
+index b214cfc9d8..77943b5316 100644
+--- a/website/docs/developer-guide/kanban-dispatch-ownership.md
++++ b/website/docs/developer-guide/kanban-dispatch-ownership.md
+@@ -48,7 +48,10 @@ with kb.connect_closing(board="example") as conn:
+ 
+ The ID is an explicit Python keyword, not an environment variable or a worker
+ grant. Stock CLI, daemon, and embedded gateway callers omit it and cannot dispatch
+-owned boards. No plugin monkeypatch or lock bypass is necessary.
++owned boards. No plugin monkeypatch or lock bypass is necessary. The dedicated
++runtime must supply its own triage decomposition and health telemetry: the stock
++gateway excludes owned boards from both, and no CLI/daemon/gateway config grants
++an identity implicitly.
+ 
+ ## Invariants
+ 
+@@ -59,15 +62,20 @@ owned boards. No plugin monkeypatch or lock bypass is necessary.
+ * The actual SQLite main database path selects metadata and the dispatch lock;
+   an explicit board label or `HERMES_KANBAN_DB` alias cannot select a different
+   owner's metadata. Symlinks resolve to their target, independent of the caller's
+-  home or which metadata files happen to exist. For canonical paths:
+-  * `.../kanban/boards/<slug>/kanban.db` uses adjacent `board.json`, except
+-    a DB placed inside the reserved `default` directory uses `kanban.db.board.json`
+-    (that directory's `board.json` already belongs to the legacy root DB).
+-  * Other `.../kanban.db` paths use `.../kanban/boards/default/board.json`.
+-  * Other filenames use `<database filename>.board.json` alongside the DB, so
+-    separate databases in one directory never share ownership.
+-  Board display reads/edits follow this same mapping; operator readback reports
+-  the canonical DB path. Moving a DB requires moving its metadata as well.
++  home or which metadata files happen to exist. Every DB uses the adjacent
++  `<database filename>.dispatch-owner.json` sidecar (JSON object with optional
++  `dispatch_owner`). There are no directory-name heuristics. Display/discovery
++  `board.json` keeps its original board-local location and is not ownership
++  authority; use the operator command/API above for strict owner readback.
++  Earlier unreleased candidates stored owners in display metadata; those files
++  are not migrated automatically. This feature must not have been activated
++  before the final reviewed storage contract.
++* Move the ownership sidecar with its DB. Native board archive moves both in the
++  same directory rename; an external symlink target and its sidecar stay together
++  outside the archive. Recreating the archived slug starts a new unowned DB.
++  Export/import intentionally does not copy runtime ownership. Hard-link aliases
++  and independently relocated/bind-mounted DB files without their sidecars are
++  unsupported; all runtimes must share a canonical DB and its adjacent sidecar.
+ * Under the same lock, invalid/unreadable metadata or a mismatched identity returns
+   `skipped_owned=True` before reconciliation, reclaim, promotion, claim, spawn,
+   checkpoint, or dispatch observers. A valid owner appears in `dispatch_owner`;
+@@ -91,7 +99,9 @@ owned boards. No plugin monkeypatch or lock bypass is necessary.
+ 
+ Run `scripts/run_tests.sh tests/hermes_cli/test_kanban_dispatch_owner.py
+  tests/hermes_cli/test_kanban_dispatch_owner_operator.py
+- tests/hermes_cli/test_kanban_dispatch_owner_regressions.py` (one shell command).
++ tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
++ tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
++ tests/gateway/test_kanban_pre_dispatch_isolation.py` (one shell command).
+ These exercise native dispatch, CLI and embedded-gateway denial, strict metadata,
+ actual-connection identity, alias/symlink handling, operator set/read/clear,
+ allowed scoped spawning, and owner/display edits attempted inside a live tick.
+-- 
+2.55.0
+

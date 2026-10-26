@@ -1,0 +1,357 @@
+From aecb682db3c9e79e5a0ae6ad2670b7a65eee4531 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 12:09:27 +0000
+Subject: [PATCH] feat(kanban): accept origin receipts through strict courier
+ CLI [daveey]
+
+---
+ hermes_cli/kanban.py                          |  11 +-
+ hermes_cli/kanban_origin_adapter.py           |  97 +++++++++++
+ hermes_cli/kanban_origin_ledger.py            |   4 +-
+ hermes_cli/kanban_parser.py                   |   4 +
+ .../hermes_cli/test_kanban_origin_adapter.py  | 157 ++++++++++++++++++
+ 5 files changed, 270 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_adapter.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_adapter.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a248c5e365..fe93152741 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -155,6 +155,12 @@ def kanban_command(args: argparse.Namespace) -> int:
+         return _err(delegated_child_refusal(
+             "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI"))
+ 
++    # Origin obligations are profile-local, not current-board state; do not
++    # auto-initialize a board or route by a worker's inherited board override.
++    if action == "origin-bind":
++        from hermes_cli.kanban_origin_adapter import command
++        return command(args)
++
+     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
+     # the `--board` routing override (else `--board beta boards show` reports beta).
+     if action == "boards":
+@@ -224,7 +230,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review",
+-    "gc",
++    "gc", "origin-bind",
+ })
+ 
+ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+@@ -242,6 +248,9 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+         return False
+     from agent.delegation_context import kanban_path_is_fenced
+ 
++    if action == "origin-bind":
++        from hermes_constants import get_hermes_home
++        return kanban_path_is_fenced(get_hermes_home() / "kanban/origin-ledger.db")
+     return kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(kb.kanban_db_path())
+ 
+ 
+diff --git a/hermes_cli/kanban_origin_adapter.py b/hermes_cli/kanban_origin_adapter.py
+new file mode 100644
+index 0000000000..1fb2360168
+--- /dev/null
++++ b/hermes_cli/kanban_origin_adapter.py
+@@ -0,0 +1,97 @@
++"""Trusted local courier entry for durable origin receipts (no network auth here).
++
++The hub client supplies a server-stamped envelope over stdin. This CLI is not a
++public endpoint: possession of local OS access is its trust boundary. Destination
++identity comes from local configuration, never from that envelope.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import sqlite3
++import sys
++from pathlib import Path
++
++from hermes_cli.kanban_origin import _ro
++from hermes_cli.kanban_origin_ledger import accept_binding, validate_binding
++
++
++def _gateway(replica: Path) -> str:
++    cfg = Path(os.environ.get('HERMES_MAIL_CONFIG') or Path.home() / '.config/hermes-mail/config.json')
++    config = json.loads(cfg.read_text())
++    gateway = config.get('gateway') if isinstance(config, dict) else None
++    if not isinstance(gateway, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}', gateway):
++        raise ValueError('origin_gateway_invalid')
++    if replica.exists():
++        db = _ro(replica)
++        try:
++            row = db.execute("SELECT v FROM meta WHERE k='gateway'").fetchone()
++            if not row or row[0] != gateway:
++                raise ValueError('origin_gateway_conflict')
++        finally:
++            db.close()
++    return gateway
++
++
++def _resolve_session(path: Path, session: str) -> str:
++    # Use the canonical continuation predicate but refuse cycles/cap exhaustion;
++    # the UI convenience get_compression_chain intentionally truncates both.
++    from hermes_state_compression import _CHAIN_CAP, _CHAIN_STEP_SQL
++    db = _ro(path)
++    try:
++        db.execute('BEGIN')
++        if not db.execute('SELECT 1 FROM sessions WHERE id=?', (session,)).fetchone():
++            raise ValueError('origin_session_missing')
++        seen = {session}
++        for _ in range(_CHAIN_CAP):
++            row = db.execute(_CHAIN_STEP_SQL, (session,)).fetchone()
++            if row is None:
++                return session
++            session = row[0]
++            if session in seen:
++                raise ValueError('origin_lineage_invalid')
++            seen.add(session)
++        raise ValueError('origin_lineage_invalid')
++    finally:
++        db.close()
++
++
++def receive(request: dict) -> dict:
++    from hermes_constants import get_hermes_home
++    from hermes_cli.profiles import get_active_profile_name
++    home = get_hermes_home()
++    profile = get_active_profile_name()
++    if profile == 'custom':
++        raise ValueError('origin_profile_unknown')
++    replica = Path(os.environ.get('HERMES_HUB_STATE') or Path.home() / '.local/state/hermes-hub') / 'hub.db'
++    gateway = _gateway(replica)
++    if not isinstance(request, dict) or not isinstance(request.get('args'), dict):
++        raise ValueError('origin_request_invalid')
++    binding = request['args'].get('binding')
++    validate_binding(binding)
++    if (request.get('coll') != 'sessions' or request.get('action') != 'origin-bind'
++            or request.get('to_gw') != gateway
++            or request.get('key') != f"{profile}/{binding['origin']['session']}"):
++        raise ValueError('origin_route_mismatch')
++    return accept_binding(path=home / 'kanban/origin-ledger.db', replica=replica,
++                          binding=binding, request_id=request.get('id'),
++                          sender=request.get('from'), gateway=gateway, profile=profile,
++                          resolve_session=lambda sid: _resolve_session(home / 'state.db', sid))
++
++
++def command(args) -> int:
++    try:
++        raw = sys.stdin.read() if args.request_file == '-' else Path(args.request_file).read_text()
++        result = receive(json.loads(raw))
++    except (OSError, sqlite3.Error):
++        # Availability is not terminal rejection. Do not print paths or private
++        # config content into courier results.
++        result = {'status': 'pending', 'code': 'origin_storage_unavailable', 'handoff_complete': False}
++    except (ValueError, TypeError) as exc:
++        code = str(exc)
++        if not re.fullmatch(r'origin_[a-z_]+', code):
++            code = 'origin_request_invalid'
++        result = {'status': 'rejected', 'code': code, 'handoff_complete': False}
++    print(json.dumps(result))
++    return 0
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 62f18da556..e7818bbf2e 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -26,14 +26,14 @@ def _json(value) -> str:
+ def validate_binding(binding: dict) -> None:
+     """Reject incomplete/ambiguous identities before writing an acknowledgement."""
+     try:
+-        if set(binding) != {"binding_id", "version", "owner", "origin", "task_record_key", "publication_version"}:
++        if not isinstance(binding, dict) or set(binding) != {"binding_id", "version", "owner", "origin", "task_record_key", "publication_version"}:
+             raise ValueError
+         for field in ("version", "publication_version"):
+             if type(binding[field]) is not int or binding[field] < 1:
+                 raise ValueError
+         for field, keys in (("owner", {"gateway", "profile", "board", "task_id"}),
+                             ("origin", {"gateway", "profile", "session"})):
+-            if set(binding[field]) != keys:
++            if not isinstance(binding[field], dict) or set(binding[field]) != keys:
+                 raise ValueError
+             for value in binding[field].values():
+                 if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", value):
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index c4adec8452..f5f9761588 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -149,6 +149,10 @@ _BOARD_SPECS = [
+ # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
+ _SPECS = [
+     _cmd("init", help="Create kanban.db if missing (idempotent)"),
++    _cmd("origin-bind", [
++        _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
++        _arg("--json", action="store_true", help="Return structured receipt (always JSON)"),
++    ], help="Accept a courier origin obligation and read back its durable receipt"),
+     _cmd("boards", children=("boards_action", _BOARD_SPECS),
+          help="Manage kanban boards (one board per project / workstream)",
+          description=(
+diff --git a/tests/hermes_cli/test_kanban_origin_adapter.py b/tests/hermes_cli/test_kanban_origin_adapter.py
+new file mode 100644
+index 0000000000..8e5564547a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_adapter.py
+@@ -0,0 +1,157 @@
++"""Exercise the registered courier entry with actual session/replica/ledger DBs."""
++import argparse
++import io
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban, profiles
++from hermes_cli.kanban_parser import build_parser
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    home = tmp_path / 'hermes'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(profiles, '_get_default_hermes_home', lambda: home)
++    monkeypatch.setenv('HERMES_PROFILE_NAME', 'wrong-inherited-pin')
++    hub = tmp_path / 'hub'
++    hub.mkdir()
++    monkeypatch.setenv('HERMES_HUB_STATE', str(hub))
++    cfg = tmp_path / 'mail.json'
++    cfg.write_text(json.dumps({'gateway': 'origin'}))
++    monkeypatch.setenv('HERMES_MAIL_CONFIG', str(cfg))
++    binding = {
++        'binding_id': 'binding-0001', 'version': 1,
++        'owner': {'gateway': 'owner', 'profile': 'work', 'board': 'build', 'task_id': 't_one'},
++        'origin': {'gateway': 'origin', 'profile': 'default', 'session': 's_old'},
++        'task_record_key': 'work/build/t_one', 'publication_version': 3,
++    }
++    with sqlite3.connect(hub / 'hub.db') as db:
++        db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++        db.execute("INSERT INTO meta VALUES ('gateway', 'origin')")
++        db.execute('CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, data TEXT)')
++        task = {**binding['owner'], 'id': 't_one', 'status': 'running',
++                'origin_bindings': [{k: v for k, v in binding.items() if k != 'publication_version'}]}
++        db.execute("INSERT INTO replica VALUES ('owner','tasks','work/build/t_one',3,?)", (json.dumps(task),))
++    db = SessionDB(db_path=home / 'state.db')
++    db.create_session('s_old', 'cli')
++    db.end_session('s_old', 'compression')
++    db.create_session('s_new', 'cli', parent_session_id='s_old')
++    db.close()
++    request = {'id': 'request-0001', 'from': 'gw:owner', 'to_gw': 'origin',
++               'coll': 'sessions', 'key': 'default/s_old', 'action': 'origin-bind',
++               'args': {'binding': binding}}
++    return home, hub, cfg, request
++
++
++def invoke(world, monkeypatch, capsys):
++    wrap = argparse.ArgumentParser()
++    parser = build_parser(wrap.add_subparsers())
++    args = parser.parse_args(['origin-bind', '--request-file', '-', '--json'])
++    monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(world[3])))
++    # This entry has its own ledger; an unrelated broken current board must not
++    # interfere, nor may receipt acceptance initialize an empty board.
++    monkeypatch.setattr(kanban.kb, 'init_db', lambda: pytest.fail('unexpected board initialization'))
++    assert kanban.kanban_command(args) == 0
++    return json.loads(capsys.readouterr().out)
++
++
++def test_registered_adapter_accepts_and_replays_durable_receipt(world, monkeypatch, capsys):
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] == 'accepted'
++    assert result['resolved_session'] == 's_new'
++    assert result['origin']['profile'] == 'default'
++    assert ledger.receipt(world[0] / 'kanban' / 'origin-ledger.db', 'request-0001') == result
++    with sqlite3.connect(world[1] / 'hub.db') as db:
++        db.execute('DELETE FROM replica')
++    assert invoke(world, monkeypatch, capsys) == result
++
++
++def test_delegated_child_cannot_accept_obligations(world, monkeypatch, capsys):
++    monkeypatch.setattr('agent.delegation_context.kanban_path_is_fenced', lambda path: True)
++    args = argparse.Namespace(kanban_action='origin-bind', request_file='-')
++    assert kanban.kanban_command(args) != 0
++    assert not (world[0] / 'kanban/origin-ledger.db').exists()
++
++
++def test_delegated_fence_checks_actual_ledger_not_board_override(world, monkeypatch, capsys):
++    home = world[0]
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(home.parent / 'scratch-board'))
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++    monkeypatch.setattr('agent.delegation_context.kanban_path_is_fenced',
++                        lambda path: path == home / 'kanban/origin-ledger.db')
++    args = argparse.Namespace(kanban_action='origin-bind', request_file='-')
++    assert kanban.kanban_command(args) != 0
++    assert not (home / 'kanban/origin-ledger.db').exists()
++
++
++def test_malformed_nested_identity_returns_structured_rejection(world, monkeypatch, capsys):
++    world[3]['args']['binding']['owner'] = ['gateway', 'profile', 'board', 'task_id']
++    result = invoke(world, monkeypatch, capsys)
++    assert result == {'status': 'rejected', 'code': 'origin_binding_invalid', 'handoff_complete': False}
++
++
++@pytest.mark.parametrize('field,value', [
++    ('to_gw', 'other'), ('from', 'gw:impostor'), ('coll', 'tasks'),
++    ('action', 'archive'), ('key', 'work/s_old'), ('key', 'default/s_new'),
++])
++def test_envelope_cannot_retarget_local_identity(world, monkeypatch, capsys, field, value):
++    world[3][field] = value
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] == 'rejected'
++    assert result['code'] == 'origin_route_mismatch'
++    assert not (world[0] / 'kanban/origin-ledger.db').exists()
++
++
++@pytest.mark.parametrize('damage', ['conflict', 'missing', 'corrupt'])
++def test_gateway_identity_is_fail_closed(world, monkeypatch, capsys, damage):
++    if damage == 'conflict':
++        world[2].write_text(json.dumps({'gateway': 'elsewhere'}))
++    elif damage == 'missing':
++        world[2].unlink()
++    else:
++        (world[1] / 'hub.db').write_bytes(b'not sqlite')
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] in ('pending', 'rejected')
++    assert result['handoff_complete'] is False
++    assert not (world[0] / 'kanban/origin-ledger.db').exists()
++
++
++@pytest.mark.parametrize('damage', ['missing_session', 'missing_db', 'cycle', 'cap', 'corrupt'])
++def test_bad_lineage_never_acknowledges(world, monkeypatch, capsys, damage):
++    path = world[0] / 'state.db'
++    if damage == 'missing_db':
++        path.unlink()
++    elif damage == 'corrupt':
++        path.write_bytes(b'not sqlite')
++    elif damage == 'cap':
++        monkeypatch.setattr('hermes_state_compression._CHAIN_CAP', 1)
++    else:
++        with sqlite3.connect(path) as db:
++            if damage == 'cycle':
++                db.execute("UPDATE sessions SET parent_session_id='s_new' WHERE id='s_old'")
++                db.execute("UPDATE sessions SET end_reason='compression', ended_at=1 WHERE id='s_new'")
++            else:
++                db.execute("DELETE FROM sessions WHERE id='s_old'")
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] in ('pending', 'rejected')
++    assert result['handoff_complete'] is False
++    assert ledger.receipt(world[0] / 'kanban/origin-ledger.db', 'request-0001') is None
++    if damage == 'missing_db':
++        assert not path.exists()
++
++
++@pytest.mark.parametrize('kind', ['branch', 'delegate', 'tool', 'reset'])
++def test_canonical_lineage_does_not_bind_to_unrelated_child(world, monkeypatch, capsys, kind):
++    db = SessionDB(db_path=world[0] / 'state.db')
++    config = {'_branched_from': 's_old'} if kind == 'branch' else ({'_delegate_from': 's_old'} if kind == 'delegate' else {})
++    db.create_session('s_unrelated', 'tool' if kind == 'tool' else 'cli', parent_session_id='s_old', model_config=config)
++    if kind == 'reset':
++        db.end_session('s_unrelated', 'reset')
++    db.close()
++    assert invoke(world, monkeypatch, capsys)['resolved_session'] == 's_new'
+-- 
+2.55.0
+

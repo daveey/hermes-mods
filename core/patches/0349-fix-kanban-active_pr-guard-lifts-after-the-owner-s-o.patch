@@ -1,0 +1,193 @@
+From 1a2ba03afccbee694b5dcb1adee73e85bb42be3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 02:08:04 +0000
+Subject: [PATCH] fix(kanban): active_pr guard lifts after the owner's own
+ park, and reads PR state through the broker gh [daveey]
+
+Two causes kept cards held 'ready' under active_pr on a service host:
+- A worker that names its PR in a checkpoint and then parks itself
+  (continued / scheduled) was treated like a context-free respawn on wake.
+  An orderly park after the PR comment now counts as a handoff, like unblocked.
+  Crash/reclaim still guards; a newer PR comment re-arms the hold.
+- The PR-state lookup ran bare 'gh' with the service PATH and no login, so every
+  lookup failed closed and even merged PRs held for the 6 h cap. It now uses
+  kanban.pr_acceptance.gh_command_prefix (credential broker) and resolve_gh(),
+  falling back to bare gh (still fail-closed) on setup errors.
+
+Public-series adaptation: preserve merged preceding changes.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 2182c1f577..96ef3de302 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -35,10 +35,31 @@ _cache: dict[str, tuple[Optional[str], Optional[float]]] = {}
+ _rejections: dict[str, str] = {}
+ 
+ 
++def _gh_argv() -> Optional[list[str]]:
++    """``gh`` argv for the dispatcher's PR-state read, or None when it cannot be built.
++
++    Reuses the dispatcher home's ``kanban.pr_acceptance.gh_command_prefix`` (a credential
++    broker wrapper such as ``token-broker exec --scope user/github --``) and resolves ``gh``
++    from ~/bin / ~/.local/bin as the PR-acceptance gate does: a service process has a minimal
++    PATH and often no ambient ``gh`` login, and without either every lookup failed closed, so
++    merged PRs held their cards for the full 6 h hold cap. [daveey]"""
++    try:
++        from hermes_cli.kanban_pr_acceptance import _gh_command_prefix
++        from hermes_platform.resolver.github import resolve_gh
++        resolved = resolve_gh()
++        if not resolved.found:
++            return None
++        return [*_gh_command_prefix(None), *resolved.command]
++    except Exception:  # config/setup errors may carry credentials: log no text
++        logger.debug("kanban: gh argv for PR state unavailable")
++        return None
++
++
+ def _gh_pr_state(url: str) -> Optional[str]:
+     """GitHub state, ``REJECTED`` for a completed queue rejection, or None on failure."""
++    gh = _gh_argv() or ["gh"]
+     try:
+-        proc = subprocess.run(["gh", "pr", "view", url, "--json", "state,comments"], stdin=subprocess.DEVNULL,
++        proc = subprocess.run([*gh, "pr", "view", url, "--json", "state,comments"], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=GH_TIMEOUT_SECONDS, check=False)
+     except (OSError, subprocess.SubprocessError):
+@@ -124,11 +145,13 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     changes_requested, review reopen) names the profile that must now work on THAT PR — a
+     closer or the implementer finishing it, not a duplicate implementation (#111910). So does
+     an ``unblocked`` event: a worker that opened its PR and blocked itself waiting for the
+-    merge is resumed by that unblock to ship/verify THAT PR. A crash/reclaim is not a
+-    handoff, so the worker that opened the PR is still not re-spawned against it.
+-    A latest immediate checkpoint explicitly resumes unfinished work on that PR;
+-    scheduled/external waits do not. Dispatcher guard notices are diagnostic, not
+-    new PR publication evidence, and cannot invalidate an existing handoff.
++    merge is resumed by that unblock to ship/verify THAT PR. So does an orderly park AFTER the
++    PR comment (``continued`` checkpoint or ``scheduled`` timed wait): the owner parked knowing
++    its PR, and the wake resumes it from that checkpoint, not a context-free respawn. A
++    crash/reclaim is not a handoff, so the worker that opened the PR is still not re-spawned
++    against it.
++    A latest immediate checkpoint also resumes unfinished work on that PR.
++    Dispatcher guard notices are diagnostic, not new PR publication evidence.
+     Also lifted once EVERY PR named in those comments is MERGED or CLOSED (gh, cached; any
+     gh failure keeps the hold), or has a completed queue rejection requiring repair. [daveey]
+     """
+@@ -153,7 +176,8 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     # Strictly after: a same-second handoff tie stays guarded (fail closed).
+     if any(_kbd._is_handoff_event(e["kind"], e["payload"]) for _, e in _kbd._rows_since(
+             conn, "task_events", task_id, max(pr_times),
+-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')",
++            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked', "
++            "'continued', 'scheduled')",
+             cols=", kind, payload", strict=True)):
+         return None
+     states = {u: pr_state(u) for u in dict.fromkeys(pr_urls)}
+diff --git a/tests/hermes_cli/test_kanban_park_invariants.py b/tests/hermes_cli/test_kanban_park_invariants.py
+index 6c2b548ce7..e209abd95a 100644
+--- a/tests/hermes_cli/test_kanban_park_invariants.py
++++ b/tests/hermes_cli/test_kanban_park_invariants.py
+@@ -452,7 +452,7 @@ def _gh_states(monkeypatch, states):
+ 
+     def _run(cmd, *a, **k):
+         calls.append(cmd)
+-        st = states[cmd[3]]
++        st = states[cmd[cmd.index("view") + 1]]
+         if isinstance(st, BaseException):
+             raise st
+         if isinstance(st, int):
+@@ -483,7 +483,7 @@ def test_active_pr_guard_checks_pr_state(kanban_home, monkeypatch, states, expec
+         tid = kb.create_task(conn, title="pr card", assignee="a")
+         kb.add_comment(conn, tid, "a", "opened " + " and ".join(states))
+         assert kbd.check_respawn_guard(conn, tid) == expected
+-        assert {c[3] for c in calls} <= set(states)
++        assert {c[c.index("view") + 1] for c in calls} <= set(states)
+ 
+ 
+ def test_pr_state_is_cached(kanban_home, monkeypatch):
+@@ -507,3 +507,35 @@ def test_merged_pr_card_gets_a_worker(kanban_home, monkeypatch, all_assignees_sp
+         res = kbd.dispatch_once(conn, spawn_fn=lambda task, *a, **k: spawned.append(task.id) or 1)
+         assert tid not in dict(res.respawn_guarded)
+         assert spawned == [tid]
++
++
++def test_pr_state_lookup_uses_broker_prefix_and_resolved_gh(kanban_home, monkeypatch):
++    """A service dispatcher has a minimal PATH and no ambient gh login; the PR-state read must
++    use the configured ``kanban.pr_acceptance.gh_command_prefix`` and ~/bin gh, or every lookup
++    fails closed and a merged PR holds its card for the whole hold cap. [daveey]"""
++    import types
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++    from hermes_cli import kanban_pr_acceptance as kpa
++    from hermes_platform.resolver import github as ghres
++
++    monkeypatch.setattr(prs, "_gh_pr_state", _REAL_GH_PR_STATE)
++    prs.clear_cache()
++    prefix = ["/opt/broker", "exec", "--scope", "user/github", "--"]
++    monkeypatch.setattr(kpa, "_gh_command_prefix", lambda home: list(prefix))
++    monkeypatch.setattr(ghres, "resolve_gh",
++                        lambda path=None: types.SimpleNamespace(found=True, command=["/home/x/bin/gh"]))
++    calls = []
++    monkeypatch.setattr(prs.subprocess, "run",
++                        lambda cmd, *a, **k: calls.append(cmd) or _Proc(0, json.dumps({"state": "MERGED"})))
++    assert prs.pr_state(PR_A) == "MERGED"
++    assert calls == [[*prefix, "/home/x/bin/gh", "pr", "view", PR_A, "--json", "state,comments"]]
++
++    # Broken broker config: fall back to bare gh (still fail-closed on error), never raise.
++    prs.clear_cache()
++    calls.clear()
++    def _boom(home):
++        raise kpa._GateSetupError("bad config")
++    monkeypatch.setattr(kpa, "_gh_command_prefix", _boom)
++    monkeypatch.setattr(prs.subprocess, "run", lambda cmd, *a, **k: calls.append(cmd) or _Proc(1))
++    assert prs.pr_state(PR_A) is None
++    assert calls[0][:4] == ["gh", "pr", "view", PR_A]
+diff --git a/tests/hermes_cli/test_kanban_review_lifecycle.py b/tests/hermes_cli/test_kanban_review_lifecycle.py
+index 88a13c3893..62f578598c 100644
+--- a/tests/hermes_cli/test_kanban_review_lifecycle.py
++++ b/tests/hermes_cli/test_kanban_review_lifecycle.py
+@@ -966,3 +966,45 @@ def test_active_pr_guard_lifts_when_the_card_is_unblocked_after_the_pr(
+ 
+         kb.add_comment(conn, tid, author="dev", body="Opened https://github.com/example/repo/pull/301")
+         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
++
++
++def test_active_pr_guard_lifts_after_owner_parks_with_its_pr(
++    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A worker names its open PR in a checkpoint, then parks itself (``continued`` or a
++    timed ``scheduled`` wait) to keep working on independent slices. The wake resumes the
++    same owner from that checkpoint, not a context-free respawn, so ``active_pr`` must not
++    hold it (a resumed card sat ``ready`` after every continuation). A crash after the PR still
++    guards, and a newer PR comment after the park guards again. [daveey]
++    """
++    import hermes_cli.config as cfgmod
++    import hermes_cli.profiles as profmod
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli.kanban_db_schedule import schedule_task
++
++    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
++    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
++    pr_comment = "Checkpoint: PR #300 (https://github.com/example/repo/pull/300) queued; next slice is mine."
++    with kbc.connect() as conn:
++        cont = kb.create_task(conn, title="continued with own pr", assignee="dev")
++        assert kb.claim_task(conn, cont) is not None
++        kb.add_comment(conn, cont, author="dev", body=pr_comment)
++        _backdate_comments(conn, cont)
++        assert kbd.check_respawn_guard(conn, cont) == "active_pr"  # RED before the park
++        assert kc.continue_task(conn, cont, checkpoint="next slice")["ok"]
++        assert kbd.check_respawn_guard(conn, cont) is None
++
++        sched = kb.create_task(conn, title="scheduled with own pr", assignee="dev")
++        assert kb.claim_task(conn, sched) is not None
++        kb.add_comment(conn, sched, author="dev", body=pr_comment)
++        _backdate_comments(conn, sched)
++        assert schedule_task(conn, sched, reason="waiting on CI", clock_only=True)
++        assert kbd.check_respawn_guard(conn, sched) is None
++
++        control = kb.create_task(conn, title="crashed after pr", assignee="dev")
++        kb.add_comment(conn, control, author="dev", body=pr_comment)
++        _backdate_comments(conn, control)
++        assert kbd.check_respawn_guard(conn, control) == "active_pr"
++
++        kb.add_comment(conn, cont, author="dev", body="Opened https://github.com/example/repo/pull/301")
++        assert kbd.check_respawn_guard(conn, cont) == "active_pr"

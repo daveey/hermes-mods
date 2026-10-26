@@ -1,0 +1,169 @@
+From 09986d917e3277f15bdd6f6c1d37f2c71edc679f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:09:45 +0000
+Subject: [PATCH] fix(kanban): resume explicit PR checkpoints without
+ self-rearming holds [daveey]
+
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     | 39 ++++++++-
+ .../hermes_cli/test_kanban_pr_continuation.py | 79 +++++++++++++++++++
+ 2 files changed, 115 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pr_continuation.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 3772f713e2..2182c1f577 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -92,6 +92,31 @@ def all_prs_finished(urls: Iterable[str]) -> bool:
+     return all(pr_state(u) in TERMINAL_STATES for u in seen.values())
+ 
+ 
++def _immediate_checkpoint_after(conn: sqlite3.Connection, task_id: str, since: int) -> bool:
++    """Only the latest completed run may authorize continuing its existing PR.
++
++    Scheduled checkpoints and crash retries retain the duplicate-work guard.
++    Same-second PR reporting and checkpointing is normal within one worker run.
++    """
++    from hermes_cli import kanban_db as kb
++
++    run = conn.execute(
++        "SELECT outcome, ended_at, metadata FROM task_runs "
++        "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if run is None or run["outcome"] != "continued":
++        return False
++    ended_at = kb._to_epoch(run["ended_at"])
++    meta = kb._json_dict(run["metadata"])
++    return bool(
++        ended_at is not None and ended_at >= since
++        and meta.get("checkpoint") and meta.get("resume_after_seconds") == 0
++        and meta.get("resume_status") in ("ready", "review")
++        and not meta.get("wake_at") and not meta.get("blocker_id")
++    )
++
++
+ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
+     """Respawn-guard step 4: ``"active_pr"`` when a comment in the last 24 h names a PR, else None.
+ 
+@@ -101,6 +126,9 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     an ``unblocked`` event: a worker that opened its PR and blocked itself waiting for the
+     merge is resumed by that unblock to ship/verify THAT PR. A crash/reclaim is not a
+     handoff, so the worker that opened the PR is still not re-spawned against it.
++    A latest immediate checkpoint explicitly resumes unfinished work on that PR;
++    scheduled/external waits do not. Dispatcher guard notices are diagnostic, not
++    new PR publication evidence, and cannot invalidate an existing handoff.
+     Also lifted once EVERY PR named in those comments is MERGED or CLOSED (gh, cached; any
+     gh failure keeps the hold), or has a completed queue rejection requiring repair. [daveey]
+     """
+@@ -110,14 +138,19 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     pr_times: list[int] = []
+     pr_urls: list[str] = []
+     for t, c in _kbd._rows_since(conn, "task_comments", task_id, now - _kbd._RESPAWN_GUARD_PR_WINDOW,
+-                                 cols=", body", unreadable=now):  # duplicate-PR risk: fail closed
+-        urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(_kb._lossy_text(c["body"]) or "")
++                                 cols=", body, author", unreadable=now):  # duplicate-PR risk: fail closed
++        body = _kb._lossy_text(c["body"]) or ""
++        if c["author"] == "kanban-dispatcher" and body.startswith("[respawn-guard]"):
++            continue  # a diagnostic must not rearm its own handoff barrier
++        urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(body)
+         if urls:
+             pr_times.append(t)
+             pr_urls.extend(urls)
+     if not pr_times:
+         return None
+-    # Strictly after: a same-second tie stays guarded (fail closed).
++    if _immediate_checkpoint_after(conn, task_id, max(pr_times)):
++        return None
++    # Strictly after: a same-second handoff tie stays guarded (fail closed).
+     if any(_kbd._is_handoff_event(e["kind"], e["payload"]) for _, e in _kbd._rows_since(
+             conn, "task_events", task_id, max(pr_times),
+             "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')",
+diff --git a/tests/hermes_cli/test_kanban_pr_continuation.py b/tests/hermes_cli/test_kanban_pr_continuation.py
+new file mode 100644
+index 0000000000..de826423e5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_continuation.py
+@@ -0,0 +1,79 @@
++"""An explicit checkpoint resumes owned PR work; guard notices cannot rearm holds."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli.test_kanban_park_invariants import kanban_home
++
++__all__ = ["kanban_home"]  # register the shared isolated-board fixture
++pytestmark = pytest.mark.usefixtures("kanban_home")
++
++URL = "https://github.com/example/project/pull/12"
++
++
++@pytest.fixture(autouse=True)
++def open_pr(monkeypatch):
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++
++
++def test_immediate_checkpoint_with_open_pr_dispatches(monkeypatch, all_assignees_spawnable):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    spawned = []
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++        kb.claim_task(conn, tid)
++        kb.add_comment(conn, tid, "a", f"Draft work remains: {URL}")
++        result = kc.continue_task(conn, tid, checkpoint="Continue implementation of existing PR")
++        assert result["ok"] and result["status"] == "ready"
++        monkeypatch.setattr(time, "time", lambda: now + 1)
++        kb.add_comment(conn, tid, "kanban-dispatcher", f"[respawn-guard] Held on {URL}")
++        dispatched = kbd.dispatch_once(conn, spawn_fn=lambda task, *a, **k: spawned.append(task.id) or 1)
++        assert tid not in dict(dispatched.respawn_guarded)
++        assert spawned == [tid]
++        assert "Continue implementation of existing PR" in kb.build_worker_context(conn, tid)
++
++
++def test_guard_notice_cannot_supersede_real_handoff(monkeypatch):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="review fixes", assignee="a")
++        kb.add_comment(conn, tid, "a", f"PR {URL}")
++        monkeypatch.setattr(time, "time", lambda: now + 1)
++        kb._append_event(conn, tid, "unblocked", {"reason": "finish this PR"})
++        monkeypatch.setattr(time, "time", lambda: now + 2)
++        kb.add_comment(conn, tid, "kanban-dispatcher", f"[respawn-guard] Held on {URL}")
++        assert kbd.check_respawn_guard(conn, tid) is None
++        # An actual later work report still forms a new barrier.
++        kb.add_comment(conn, tid, "a", f"Waiting for external owner: {URL}")
++        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
++
++
++@pytest.mark.parametrize("mode", ["scheduled", "crashed", "new_pr_report", "missing_checkpoint"])
++def test_non_immediate_or_superseded_continuation_still_guards(monkeypatch, mode):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="external wait", assignee="a")
++        kb.claim_task(conn, tid)
++        kb.add_comment(conn, tid, "a", f"PR {URL}")
++        result = kc.continue_task(conn, tid, checkpoint="Existing PR",
++                                  resume_after_seconds=60 if mode == "scheduled" else 0)
++        assert result["ok"]
++        if mode == "scheduled":
++            kc.wake_due_continuations(conn, now=now + 61)
++        elif mode == "crashed":
++            kb.claim_task(conn, tid)
++            kb._end_run(conn, tid, outcome="crashed", status="crashed", summary="worker failed")
++        elif mode == "new_pr_report":
++            monkeypatch.setattr(time, "time", lambda: now + 1)
++            kb.add_comment(conn, tid, "a", f"External PR remains: {URL}")
++        else:
++            conn.execute("UPDATE task_runs SET metadata='{}' WHERE id=?", (result["run_id"],))
++        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+-- 
+2.55.0
+

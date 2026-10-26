@@ -103,7 +103,7 @@ the call sites are one-line additions.
 
 ## Applying
 
-`git am -3 core/patches/0143-*.patch`. It edits the same `sessionStatusStripe` signature and the three callers as
+`git am -3 --empty=keep core/patches/0143-*.patch`. It edits the same `sessionStatusStripe` signature and the three callers as
 the earlier stripe patches (`sidebar-status-stripe.md`: blocked Kanban count, ⌘B, periodic cron) and the
 `annotate_*` chain in `web_routers/profiles.py` from the background-activity patches, so apply the series in order.
 A running backend keeps the old router until it restarts, and the Desktop needs a rebuild.

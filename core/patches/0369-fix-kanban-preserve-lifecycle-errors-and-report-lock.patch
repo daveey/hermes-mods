@@ -1,0 +1,285 @@
+From 0bffca219297e72c5f5c906905632c373e17f528 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 12:29:48 +0000
+Subject: [PATCH] fix(kanban): preserve lifecycle errors and report lock
+ contention [daveey]
+
+---
+ gateway/kanban_watchers_dispatcher.py         |  5 ++-
+ hermes_cli/kanban_boards.py                   |  5 ++-
+ hermes_cli/kanban_db_boards.py                |  5 ++-
+ hermes_cli/kanban_db_connect.py               |  5 ++-
+ hermes_cli/kanban_dispatch_owner.py           |  3 ++
+ plugins/kanban/dashboard/plugin_api.py        | 17 +++++---
+ .../test_kanban_dispatch_owner_busy.py        | 39 +++++++++++++++++++
+ .../test_kanban_dispatch_owner_connection.py  |  7 ++--
+ .../test_kanban_board_lifecycle_api.py        | 20 ++++++++++
+ .../kanban-dispatch-ownership.md              | 10 ++++-
+ 10 files changed, 102 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_owner_busy.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 4fff112f41..4b452f3966 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -231,7 +231,10 @@ class _KanbanDispatcher:
+                     connection_db_path(conn)
+                     if get_dispatch_owner(path) is None:
+                         allowed = conn
+-            except (OSError, ValueError, UnicodeError, RecursionError, sqlite3.Error) as exc:
++            except (OSError, ValueError, UnicodeError, RecursionError, sqlite3.Error,
++                    _kbc().KanbanDbCorruptError) as exc:
++                # tick_once owns corruption quarantine and its actionable log;
++                # pre-work must not emit a traceback on every probe.
+                 logger.debug("kanban dispatcher: pre-dispatch work denied on %s (%s)", slug, exc)
+             yield allowed
+ 
+diff --git a/hermes_cli/kanban_boards.py b/hermes_cli/kanban_boards.py
+index 7045950e0a..a498cd3427 100644
+--- a/hermes_cli/kanban_boards.py
++++ b/hermes_cli/kanban_boards.py
+@@ -19,7 +19,10 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
+     handler = _BOARD_HANDLERS.get(sub)
+     if handler is None:
+         return _err(f"kanban boards: unknown action {sub!r}", 2)
+-    return handler(args)
++    try:
++        return handler(args)
++    except (ValueError, RuntimeError) as exc:
++        return _err(f"kanban boards {sub}: {exc}")
+ 
+ 
+ def _board_task_counts(slug: str) -> dict[str, int]:
+diff --git a/hermes_cli/kanban_db_boards.py b/hermes_cli/kanban_db_boards.py
+index f6bc12c351..ec42eda367 100644
+--- a/hermes_cli/kanban_db_boards.py
++++ b/hermes_cli/kanban_db_boards.py
+@@ -161,11 +161,14 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
+ def remove_board(slug: str, *, archive: bool = True) -> dict:
+     """Refuse busy boards before moving anything, including the current pointer."""
+     from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    _kb._assert_not_delegated_child_mutation()
+     normed = _kb._require_slug(slug)
+     if normed == _kb.DEFAULT_BOARD:
+         raise ValueError("the 'default' board cannot be removed")
++    if not _kb.board_dir(normed).exists():
++        raise ValueError(f"board {normed!r} does not exist")
+     path = (_kb.board_dir(normed) / "kanban.db").resolve()
+-    with _dispatch_tick_lock(path) as held:
++    with _dispatch_tick_lock(path, create_parent=False) as held:
+         if not held:
+             raise ValueError("board dispatcher is busy; retry removal")
+         return _remove_board_locked(normed, archive=archive)
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index fd9eae91ec..5a0d34c4e6 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -160,7 +160,7 @@ def _cross_process_init_lock(path: Path):
+ 
+ 
+ @contextlib.contextmanager
+-def _dispatch_tick_lock(db_path: Path):
++def _dispatch_tick_lock(db_path: Path, *, create_parent: bool = True):
+     """Non-blocking single-writer guard around one dispatcher tick; yields
+     ``True`` if this process holds the board's ``.dispatch.lock``, else
+     ``False`` (caller skips the tick).
+@@ -183,7 +183,8 @@ def _dispatch_tick_lock(db_path: Path):
+     handle = None
+     acquired = False
+     try:
+-        lock_path.parent.mkdir(parents=True, exist_ok=True)
++        if create_parent:
++            lock_path.parent.mkdir(parents=True, exist_ok=True)
+         handle = lock_path.open("a+b")
+         try:
+             acquired = _try_lock_nb(handle)
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 16f2b450ee..364b55876c 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -21,6 +21,7 @@ def connect_with_identity(path, **kwargs):
+         try:
+             stat = canonical.stat() if held else None
+             conn._dispatch_identity = (stat.st_dev, stat.st_ino) if stat else None
++            conn._dispatch_open_contended = not held
+             return conn
+         except BaseException:
+             conn.close()
+@@ -99,6 +100,8 @@ def run_owned_tick(conn, tick, dispatcher_id, board, dry_run):
+     """All tick effects are behind the identity read, under the canonical lock."""
+     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+     from hermes_cli.kanban_db_dispatch import DispatchResult
++    if getattr(conn, "_dispatch_open_contended", False):
++        return DispatchResult(skipped_locked=True)
+     try:
+         db_path = connection_db_path(conn, validate=False)
+     except (OSError, ValueError, sqlite3.Error) as exc:
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index ac64489c29..9a6823acba 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -1533,9 +1533,12 @@ def create_board_endpoint(payload: CreateBoardBody):
+     project_id, _pname, primary_path = _resolve_project(payload.project_id)
+     if primary_path and not default_workdir:
+         default_workdir = primary_path
+-    with _value_error_400():
+-        meta = kanban_db.create_board(
+-            payload.slug, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
++    try:
++        with _value_error_400():
++            meta = kanban_db.create_board(
++                payload.slug, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
++    except RuntimeError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
+     if payload.switch:
+         with _value_error_400():
+             kanban_db.set_current_board(meta["slug"])
+@@ -1560,8 +1563,12 @@ def rename_board(slug: str, payload: RenameBoardBody):
+                 default_workdir = primary_path
+         else:
+             project_id = ""  # clear the scope
+-    meta = kanban_db.write_board_metadata(
+-        normed, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
++    try:
++        with _value_error_400():
++            meta = kanban_db.write_board_metadata(
++                normed, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
++    except RuntimeError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
+     return {"board": _annotate_board_meta(meta)}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_busy.py b/tests/hermes_cli/test_kanban_dispatch_owner_busy.py
+new file mode 100644
+index 0000000000..eac9035819
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_busy.py
+@@ -0,0 +1,39 @@
++"""Lifecycle refusal and actionable operator errors under dispatch contention."""
++import argparse
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli.kanban_boards import _dispatch_boards
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    return tmp_path
++
++
++@pytest.mark.parametrize("archive", [True, False])
++def test_missing_board_removal_creates_nothing(home, archive):
++    with pytest.raises(ValueError, match="does not exist"):
++        kb.remove_board("missing", archive=archive)
++    assert not kb.board_dir("missing").exists()
++    assert not (kb.boards_root() / "_archived").exists()
++    assert not kb.board_exists("missing")
++
++
++@pytest.mark.parametrize("action", ["create", "rename", "set-default-workdir"])
++def test_cli_busy_metadata_is_actionable_error(home, capsys, action):
++    kb.create_board("sample")
++    path = kb.board_dir("sample") / "kanban.db"
++    args = argparse.Namespace(boards_action=action, slug="sample", name="New", path=str(home),
++                              description=None, icon=None, color=None, default_workdir=None,
++                              project=None, switch=False, json=False)
++    with kbc._dispatch_tick_lock(path) as held:
++        assert held
++        assert _dispatch_boards(args) != 0
++    assert "busy" in capsys.readouterr().err
++    assert kb.read_board_metadata("sample")["name"] != "New"
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_connection.py b/tests/hermes_cli/test_kanban_dispatch_owner_connection.py
+index fc5e48b1a3..db2bd98af8 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_owner_connection.py
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_connection.py
+@@ -46,13 +46,13 @@ def test_gateway_checks_identity_after_lock_acquisition(board, monkeypatch):
+     replaced = False
+ 
+     @contextmanager
+-    def interleave(path):
++    def interleave(path, **kwargs):
+         nonlocal replaced
+         if not replaced:
+             replaced = True
+             kb.remove_board("sample")
+             kb.create_board("sample")
+-        with original(path) as held:
++        with original(path, **kwargs) as held:
+             yield held
+ 
+     dispatcher = _KanbanDispatcher.__new__(_KanbanDispatcher)
+@@ -74,7 +74,8 @@ def test_contended_open_requires_reconnect_before_dispatch(board):
+     with closing(conn):
+         callback = Mock(return_value=DispatchResult())
+         result = run_owned_tick(conn, callback, "dedicated", "sample", False)
+-        assert result.skipped_owned and result.ownership_error
++        assert result.skipped_locked
++        assert not result.skipped_owned and not result.ownership_error
+         callback.assert_not_called()
+     with closing(kbc.connect(board)) as fresh:
+         callback = Mock(return_value=DispatchResult())
+diff --git a/tests/plugins/test_kanban_board_lifecycle_api.py b/tests/plugins/test_kanban_board_lifecycle_api.py
+index f1072f08ca..a3adc27f5d 100644
+--- a/tests/plugins/test_kanban_board_lifecycle_api.py
++++ b/tests/plugins/test_kanban_board_lifecycle_api.py
+@@ -88,3 +88,23 @@ def test_delete_default_board_is_refused(client):
+     r = client.delete("/api/plugins/kanban/boards/default")
+     assert r.status_code == 400
+     assert "default" in r.json()["detail"]
++
++
++@pytest.mark.parametrize("method", ["post", "patch"])
++def test_busy_board_metadata_returns_conflict(client, method):
++    from hermes_cli import kanban_db_connect as kbc
++    kb.create_board("sample")
++    path = kb.board_dir("sample") / "kanban.db"
++    url = "/api/plugins/kanban/boards" + ("/sample" if method == "patch" else "")
++    with kbc._dispatch_tick_lock(path) as held:
++        assert held
++        response = getattr(client, method)(url, json={"slug": "sample", "name": "New"})
++    assert response.status_code == 409
++    assert "busy" in response.json()["detail"]
++    assert kb.read_board_metadata("sample")["name"] != "New"
++
++
++def test_missing_board_delete_is_refused_without_stub(client):
++    response = client.delete("/api/plugins/kanban/boards/missing")
++    assert response.status_code == 400
++    assert not kb.board_dir("missing").exists()
+diff --git a/website/docs/developer-guide/kanban-dispatch-ownership.md b/website/docs/developer-guide/kanban-dispatch-ownership.md
+index 252f777b3e..ee09007b05 100644
+--- a/website/docs/developer-guide/kanban-dispatch-ownership.md
++++ b/website/docs/developer-guide/kanban-dispatch-ownership.md
+@@ -99,7 +99,12 @@ an identity implicitly.
+   replacement's owner. Raw SQLite and in-memory handles fail closed. A native
+   connection opened while that lock is busy remains usable for ordinary task
+   APIs, but must be closed and reopened before dispatch (even after contention
+-  clears). This intentional API tightening applies to unowned boards too.
++  clears). This returns `skipped_locked`, not an ownership error. Native opens
++  briefly take the same nonblocking lock as ticks and edits; under heavy connection
++  traffic even an unowned board can report busy. This intentional serialization
++  prevents stale-handle ownership bypasses and applies to unowned boards too.
++  CLI metadata commands report a retryable error rather than a traceback; dashboard
++  create/update returns HTTP 409 on lock contention. Retry with a fresh connection.
+ * Direct task APIs are not changed: this coordinates dispatchers, not arbitrary
+   same-UID database writers. Replacing a DB manually without removing its sidecar
+   retains ownership, including corruption recovery; clear ownership explicitly
+@@ -113,6 +118,9 @@ Run `scripts/run_tests.sh tests/hermes_cli/test_kanban_dispatch_owner.py
+  tests/hermes_cli/test_kanban_dispatch_owner_operator.py
+  tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+  tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
++ tests/hermes_cli/test_kanban_dispatch_owner_connection.py
++ tests/hermes_cli/test_kanban_dispatch_owner_busy.py
++ tests/plugins/test_kanban_board_lifecycle_api.py
+  tests/gateway/test_kanban_pre_dispatch_isolation.py` (one shell command).
+ These exercise native dispatch, CLI and embedded-gateway denial, strict metadata,
+ actual-connection identity, alias/symlink handling, operator set/read/clear,
+-- 
+2.55.0
+

@@ -35,7 +35,7 @@ lane, disabled) and `drawer.test.tsx` ("attaches files dropped anywhere on the t
 
 ## Applying
 
-`git am -3 0057-*.patch`. Independent of the other patches.
+`git am -3 --empty=keep 0057-*.patch`. Independent of the other patches.
 
 ## Gotchas
 

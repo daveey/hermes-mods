@@ -81,7 +81,7 @@ Untested: card creation from the dashboard/Desktop board REST route and `kanban 
 
 Standalone in code: touches the kanban workspace resolver, `create_task`, the CLI and tool create paths and the
 dispatcher's spawn-failure handler. A rebase conflict usually lands in `create_task`'s long keyword list or in
-`_cmd_create`'s `create_task(...)` call. Verified: applies with `git am -3` on top of 0001–0121 at merge-base
+`_cmd_create`'s `create_task(...)` call. Verified: applies with `git am -3 --empty=keep` on top of 0001–0121 at merge-base
 `4957bbd0a0` (Oct 17, 2026 PT).
 
 ## Gotchas

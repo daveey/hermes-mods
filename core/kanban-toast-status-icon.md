@@ -62,8 +62,8 @@ The board-side effect in `board.tsx` has no test of its own.
 
 ## Applying
 
-`git am -3 0058-*.patch 0062-*.patch`, in that order: `0062`'s context lines in `completion-notify.ts` include
-`0058`'s changes. I did not check whether `0058` depends on earlier fork patches to `completion-notify.ts` or `board.tsx`; use `git am -3`.
+`git am -3 --empty=keep 0058-*.patch 0062-*.patch`, in that order: `0062`'s context lines in `completion-notify.ts` include
+`0058`'s changes. I did not check whether `0058` depends on earlier fork patches to `completion-notify.ts` or `board.tsx`; use `git am -3 --empty=keep`.
 
 ## Gotchas
 

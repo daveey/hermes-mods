@@ -1,6 +1,6 @@
 # Profile-scoped PR acceptance transport
 
-Patch: **0280**, source commit `ca145ec36e04a7db3271e2df91622dc7adbd91a2`.
+Patch: **0335**, source commit `ca145ec36e04a7db3271e2df91622dc7adbd91a2`.
 
 ## Behavior
 
@@ -23,7 +23,7 @@ Missing executables and malformed wrapper configuration produce sanitized `setup
 
 On Linux, the applied public series passed all **11 tests** in `tests/hermes_cli/test_kanban_pr_transport.py`, using `bash scripts/run_tests.sh tests/hermes_cli/test_kanban_pr_transport.py -j1` in an isolated standalone clone. Cases cover missing CLI, actual executable lookup in user bin, synthetic child-only credential vending, cross-profile isolation, auth receipt redaction, invalid wrappers, malformed configuration and assignee-scoped interpolation.
 
-Full ordered **276-patch** `git am -3` succeeded at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, with upstream `0c771d7a5ba7742bd336adb98d30058ba545e327` and fork `ca145ec36e04a7db3271e2df91622dc7adbd91a2`. Existing privacy scrubs and patch 0242 adaptation were retained. This mirror run did not test live credentials, Desktop rendering, Windows, or the full suite.
+Full ordered **276-patch** `git am -3 --empty=keep` succeeded at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, with upstream `0c771d7a5ba7742bd336adb98d30058ba545e327` and fork `ca145ec36e04a7db3271e2df91622dc7adbd91a2`. Existing privacy scrubs and patch 0251 adaptation were retained. This mirror run did not test live credentials, Desktop rendering, Windows, or the full suite.
 
 ## Applying
 

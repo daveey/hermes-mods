@@ -2,9 +2,9 @@
 
 Patches:
 
-- `patches/0244-feat-kanban-rows-carry-kanban_waiting_on-ids-server..patch`: session rows carry `kanban_waiting_on`; `server._wake_session_turn` runs one turn in an unloaded chat.
-- `patches/0245-feat-desktop-grey-waiting-stripe-card-glyph-while-a-.patch`: the sidebar's grey `waiting` stripe (card glyph).
-- `patches/0246-feat-kanban-plugin-waiting-sources-keep-a-chat-grey-.patch`: `register_waiting_source` for plugins; the wake goes through the shared turn admission.
+- `patches/0253-feat-kanban-rows-carry-kanban_waiting_on-ids-server..patch`: session rows carry `kanban_waiting_on`; `server._wake_session_turn` runs one turn in an unloaded chat.
+- `patches/0254-feat-desktop-grey-waiting-stripe-card-glyph-while-a-.patch`: the sidebar's grey `waiting` stripe (card glyph).
+- `patches/0255-feat-kanban-plugin-waiting-sources-keep-a-chat-grey-.patch`: `register_waiting_source` for plugins; the wake goes through the shared turn admission.
 
 These are the two core seams the public plugin `plugins/chat-closeout` uses: a chat that hands work to Kanban cards
 stays visibly "waiting" until it has closed the work out, and the plugin can start that close-out turn without the
@@ -63,8 +63,8 @@ shows for an automated turn. A refused or failed owner slot releases the claim.
 
 ## Applying
 
-`git am -3` in order, after 0231 (it extends the activity module that 0215 and 0231 changed). Run
-`npm run i18n:keys` after taking 0245 if `en.ts` conflicts.
+`git am -3 --empty=keep` in order, after 0234 (it extends the activity module that 0215 and 0234 changed). Run
+`npm run i18n:keys` after taking 0254 if `en.ts` conflicts.
 
 ## Gotchas
 

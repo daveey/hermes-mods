@@ -1,0 +1,185 @@
+From 3e5295d3bd50b3eb71c7d746ae16a3f6e815a407 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:42:33 +0000
+Subject: [PATCH] fix(desktop): retain unknown work and expose profile-pinned
+ plugin REST [daveey]
+
+
+Public-series adaptation: preserve merged preceding changes.
+
+---
+diff --git a/apps/desktop/src/api/plugins.test.ts b/apps/desktop/src/api/plugins.test.ts
+index 9a06752107..75c17d3acb 100644
+--- a/apps/desktop/src/api/plugins.test.ts
++++ b/apps/desktop/src/api/plugins.test.ts
+@@ -2,7 +2,50 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { setApiRequestConnection, setApiRequestProfile } from '@/hermes'
+ 
+-import { activeConnection } from './plugins'
++import { activeConnection, pluginRest } from './plugins'
++
++// Owner pins must survive an ambient profile/gateway change.
++describe('plugin REST qualified owner', () => {
++  afterEach(() => {
++    setApiRequestConnection(null)
++    setApiRequestProfile(null)
++    Reflect.deleteProperty(window, 'hermesDesktop')
++  })
++
++  it.each([
++    { opts: {}, expected: { connectionId: 'ambient-gw', profile: 'ambient' } },
++    { opts: { connectionId: 'owner' }, expected: { connectionId: 'owner' } },
++    { opts: { connectionId: 'owner', profile: null }, expected: { connectionId: 'owner' } },
++    { opts: { profile: null }, expected: { connectionId: 'ambient-gw' } },
++    { opts: { profile: 'worker' }, expected: { connectionId: 'ambient-gw', priority: 'foreground', profile: 'worker' } }
++  ])('preserves scoped semantics for $opts', async ({ opts, expected }) => {
++    const api = vi.fn().mockResolvedValue({ ok: true })
++    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
++    setApiRequestConnection('ambient-gw')
++    setApiRequestProfile('ambient')
++    await pluginRest('kanban', '/tasks/t_one', opts)
++    expect(api.mock.calls[0][0]).toEqual({
++      body: undefined, method: undefined, path: '/api/plugins/kanban/tasks/t_one',
++      timeoutMs: undefined, upload: undefined, ...expected
++    })
++  })
++
++  it('carries the explicit profile to its owner gateway, including multipart writes', async () => {
++    const api = vi.fn().mockResolvedValue({ ok: true })
++    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { api } })
++    setApiRequestConnection('other')
++    setApiRequestProfile('ambient')
++    const upload = { bytes: new ArrayBuffer(0), filename: 'proof.txt' }
++    await pluginRest('kanban', '/tasks/t_one/attachments?board=ops', {
++      connectionId: 'owner', method: 'POST', profile: 'worker', upload
++    })
++    expect(api).toHaveBeenCalledWith({
++      body: undefined, connectionId: 'owner', method: 'POST',
++      path: '/api/plugins/kanban/tasks/t_one/attachments?board=ops',
++      priority: 'foreground', profile: 'worker', timeoutMs: undefined, upload
++    })
++  })
++})
+ 
+ // desktop.getConnection/getConnectionFor are IPC round-trips into the main
+ // process with no timeout of their own (#93454). A wedged main-process
+diff --git a/apps/desktop/src/api/plugins.ts b/apps/desktop/src/api/plugins.ts
+index ec51071303..05ddd6c239 100644
+--- a/apps/desktop/src/api/plugins.ts
++++ b/apps/desktop/src/api/plugins.ts
+@@ -52,6 +52,9 @@ export interface PluginRestOptions {
+    *  Kanban board). The ambient profile is NOT carried: a profile name belongs
+    *  to its own gateway, so the target's default profile answers. */
+   connectionId?: string
++  /** Explicit owner profile on the selected connection. null chooses its
++   * default; omitted preserves existing ambient/connection-only semantics. */
++  profile?: null | string
+ }
+ 
+ // Normalize `path` to a leading-slash suffix relative to `/api/plugins/<id>`.
+@@ -87,7 +90,8 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
+     body: opts.body,
+     upload: opts.upload,
+     timeoutMs: opts.timeoutMs,
+-    ...(opts.connectionId ? { connectionId: opts.connectionId } : profileScoped())
++    ...(opts.connectionId ? { connectionId: opts.connectionId } : {}),
++    ...(opts.profile !== undefined ? profileScoped(opts.profile) : opts.connectionId ? {} : profileScoped())
+   })
+ }
+ 
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 6b5208cdd2..3cfc5d054c 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -376,6 +376,21 @@ describe('kanban work in flight ($kanbanBusySessionIds)', () => {
+     expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBe('done')
+   })
+ 
++  it('keeps a row whose kanban read failed (kanban_unknown) off done, and a stale remote count busy', () => {
++    setSessions([
++      storedRow('s1', { kanban_unknown: true, unread: true }),
++      storedRow('s2', { kanban_active: 13, kanban_remote_stale: 13 }),
++      storedRow('s3')
++    ])
++
++    expect($kanbanBusySessionIds.get()).toEqual(['s1', 's2'])
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBeNull()
++    expect(sessionStatusStripe($sessionDotStateById.get()['s2'] ?? 'idle', true)).toBeNull()
++    expect(withRowActivity('idle', { kanban_unknown: true })).toBe('background')
++    // Control: a session with no kanban stamps still finishes green.
++    expect(sessionStatusStripe($sessionDotStateById.get()['s3'] ?? 'idle', true)).toBe('done')
++  })
++
+   it('yields to a live turn', () => {
+     setSessions([storedRow('s1', { kanban_active: 1 })])
+     publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 52c6be5b8a..48e0759c47 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -79,7 +79,9 @@ export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions], (
+ 
+   for (const rows of [sessions, messaging]) {
+     for (const row of rows) {
+-      if ((row.kanban_active ?? 0) > 0) {
++      // [daveey] `kanban_unknown`: the backend could not read the session's cards (local boards or another
++      // gateway's replica). Unknown is not "no work", so the row stays off done until a read succeeds.
++      if ((row.kanban_active ?? 0) > 0 || row.kanban_unknown === true) {
+         ids.push(row.id)
+       }
+     }
+@@ -278,10 +280,13 @@ export const sessionStatusStripe = (
+ export const withRowActivity = (
+   state: SessionDotState,
+   row: Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active'> &
+-    Partial<Pick<SessionInfo, 'kanban_unseen'>>
++    Partial<Pick<SessionInfo, 'kanban_unknown' | 'kanban_unseen'>>
+ ): SessionDotState =>
+   (state === 'idle' || state === 'unread' || state === 'draft') &&
+-  (row.goal_active === true || (row.kanban_active ?? 0) > 0 || (row.background_active ?? 0) > 0)
++  (row.goal_active === true ||
++    (row.kanban_active ?? 0) > 0 ||
++    row.kanban_unknown === true ||
++    (row.background_active ?? 0) > 0)
+     ? 'background'
+     : (state === 'idle' || state === 'draft') && (row.kanban_unseen ?? 0) > 0
+     ? 'unread'
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index bf4d3eda65..983370d343 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -641,6 +641,15 @@ export interface SessionInfo {
+   kanban_active?: number
+   /** [daveey] Open card ids (queued/running + waiting on a human) the chat waits on, over the lineage. */
+   kanban_waiting_on?: string[]
++  /** [daveey] The backend could not read this conversation's kanban cards (a
++   *  local board or another gateway's hermes-hub replica failed). Unknown is
++   *  not "no work": the row stays off done until a read succeeds. Absent when
++   *  the read worked. */
++  kanban_unknown?: boolean
++  /** [daveey] How many of `kanban_active`/`kanban_blocked` are cards on another
++   *  gateway known only from a stale hermes-hub replica (last-known status).
++   *  Absent when zero. */
++  kanban_remote_stale?: number
+   /** [daveey] Kanban tasks of this conversation (created or subscribed) that
+    *  are blocked on a human, summed over its compression lineage. Shown next
+    *  to the open count on the sidebar row. Absent when zero. */
+diff --git a/website/docs/developer-guide/desktop-plugin-sdk.md b/website/docs/developer-guide/desktop-plugin-sdk.md
+index a6c73b4235..d66a81fcff 100644
+--- a/website/docs/developer-guide/desktop-plugin-sdk.md
++++ b/website/docs/developer-guide/desktop-plugin-sdk.md
+@@ -1869,7 +1869,12 @@ register(ctx) {
+ 
+ `ctx.rest` is profile-aware and rejects path traversal (`..`) so you can never
+ address another plugin's API or a core route through it. `PluginRestOptions` is
+-`{ method?, body?, upload?: { filename, contentType?, bytes }, timeoutMs? }`.
++`{ method?, body?, upload?: { filename, contentType?, bytes }, timeoutMs?, connectionId?, profile? }`.
++An explicit `connectionId` pins the registry gateway and does not inherit the
++ambient profile. Pair it with `profile: 'worker'` to target that gateway's named
++profile; `profile: null` deliberately selects its default. With neither option,
++existing ambient connection/profile routing is unchanged. These options apply to
++reads, JSON writes and multipart uploads alike; they do not widen the namespace.
+ 
+ `ctx.socket` auto-reconnects with backoff until disposed. **It resolves to a no-op
+ on OAuth remotes** (single-use WS tickets are core-managed) — treat the socket as

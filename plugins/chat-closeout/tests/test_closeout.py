@@ -56,7 +56,7 @@ def test_wake_once_and_quiet_period(tmp_path, monkeypatch):
 
 
 def test_lint_only_passes_actual_backing(monkeypatch):
-    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+    monkeypatch.setattr(plugin, '_eligible', lambda *args, **kwargs: True)
     monkeypatch.setattr(plugin, '_backed', lambda _: False)
     assert plugin.pre_final_gate(session_id='chat', final_response="I'll report back")['hold']
     monkeypatch.setattr(plugin, '_backed', lambda _: True)
@@ -191,7 +191,7 @@ def test_wrong_backend_missing_does_not_discard_batch(tmp_path, monkeypatch):
 
 
 def test_hooks_only_acknowledge_handoff_seen_at_start(tmp_path, monkeypatch):
-    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+    monkeypatch.setattr(plugin, '_eligible', lambda *args, **kwargs: True)
     led = core.Ledger(tmp_path / 'ledger.db')
     monkeypatch.setattr(plugin, 'ledger', lambda: led)
     monkeypatch.setattr(plugin, 'open_card_ids', lambda _: [])
@@ -307,7 +307,7 @@ def test_hourly_wake_cap(tmp_path, monkeypatch, caplog):
 
 def test_live_notice_turn_creating_blocked_card_is_not_rebriefed(tmp_path, monkeypatch):
     """The pre_llm_call path (open chat, kanban notice turn) follows the same coverage rules."""
-    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+    monkeypatch.setattr(plugin, '_eligible', lambda *args, **kwargs: True)
     led = core.Ledger(tmp_path / 'ledger.db')
     monkeypatch.setattr(plugin, 'ledger', lambda: led)
     cards = {'t_one': {'status': 'done'}}

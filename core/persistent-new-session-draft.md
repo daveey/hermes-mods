@@ -45,7 +45,7 @@ because they rotate keys that are empty.
 
 ## Applying
 
-Applies on its own: `git am -3 core/patches/0036-*.patch` (0170 after it), then rebuild the desktop app.
+Applies on its own: `git am -3 --empty=keep core/patches/0036-*.patch` (0170 after it), then rebuild the desktop app.
 
 ## Gotchas
 

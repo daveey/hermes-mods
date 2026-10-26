@@ -1,0 +1,234 @@
+From 6f31f2a04d8fa7f8b846d7645b995469fe0cc5f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:55:01 +0000
+Subject: [PATCH] fix(kanban): wake terminal PR waits for reconciliation
+ [daveey]
+
+---
+ hermes_cli/kanban_pr_wake.py               |  53 ++++++++++
+ tests/hermes_cli/test_kanban_pr_wake.py    | 117 +++++++++++++++++++++
+ website/docs/user-guide/features/kanban.md |  24 +++++
+ 3 files changed, 194 insertions(+)
+ create mode 100644 hermes_cli/kanban_pr_wake.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_wake.py
+
+diff --git a/hermes_cli/kanban_pr_wake.py b/hermes_cli/kanban_pr_wake.py
+new file mode 100644
+index 0000000000..9a5d1e43a5
+--- /dev/null
++++ b/hermes_cli/kanban_pr_wake.py
+@@ -0,0 +1,53 @@
++"""Read-only terminal-PR wake probe; waking is never delivery acceptance.
++
++Run under the task's Hermes environment with an exact GitHub PR URL. Uses the
++same profile-scoped transport/broker configuration as PR acceptance. [daveey]
++"""
++from __future__ import annotations
++
++import argparse
++import subprocess
++
++
++def inspect_pr(url: str) -> tuple[int, str]:
++    """Return the existing wake contract: inspect now=0, pending=1, error=2."""
++    from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_pr_acceptance as acceptance
++
++    match = acceptance._PR.fullmatch(url)
++    if not match:
++        return 2, "PR probe: invalid exact GitHub PR URL"
++    try:
++        data = acceptance._api(f"repos/{match[1]}/pulls/{match[2]}",
++                               profile_home=str(get_hermes_home()))
++        if (not isinstance(data, dict) or data.get("html_url") != url
++                or type(data.get("merged")) is not bool):
++            raise ValueError("incomplete PR evidence")
++        state, merged = data.get("state"), data["merged"]
++        if state == "open" and not merged:
++            return 1, "PR probe: pending (OPEN)"
++        if state == "closed" and merged:
++            return 0, ("PR probe: merged; wake for integration and required CI verification, "
++                       "not acceptance or permission to deploy.")
++        if state == "closed" and not merged:
++            return 0, ("PR probe: reconcile CLOSED/unmerged wait; not acceptance. "
++                       "Distinguish abandonment from verified supersession using containing-main "
++                       "commit and exact successful CI evidence. Preserve all delivery gates.")
++        raise ValueError("unknown PR state")
++    except (OSError, subprocess.SubprocessError, ValueError, TypeError,
++            acceptance._GateAuthError, acceptance._GateSetupError):
++        # No provider bodies, command args, tokens, or raw exception text in events.
++        return 2, "PR probe: evidence unavailable; inspect profile transport/config, not a pending result"
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("pr_url", help="Exact https://github.com/OWNER/REPO/pull/NUMBER URL")
++    args = parser.parse_args(argv)
++    rc, message = inspect_pr(args.pr_url)
++    print(message)
++    return rc
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_kanban_pr_wake.py b/tests/hermes_cli/test_kanban_pr_wake.py
+new file mode 100644
+index 0000000000..ed732eccbf
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_wake.py
+@@ -0,0 +1,117 @@
++"""PR terminal states wake reconciliation, never certify delivery."""
++from __future__ import annotations
++
++import json
++import os
++import shlex
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_pr_acceptance as acceptance
++from hermes_cli import kanban_wake_check as wakes
++
++URL = "https://github.com/example/project/pull/44"
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def probe(tmp_path, monkeypatch):
++    # Actual subprocess transport; only GitHub is replaced, never board lifecycle.
++    gh = tmp_path / "gh"
++    response = tmp_path / "response.json"
++    response.write_text(json.dumps({"state": "open", "merged": False, "html_url": URL}))
++    gh.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nprint(Path({str(response)!r}).read_text())\n")
++    gh.chmod(0o700)
++    monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ["PATH"])
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_platform.resolver import github
++    from hermes_platform.resolver import locate_command
++    monkeypatch.setattr(github, "resolve_gh", lambda *args: locate_command(str(gh)))
++    monkeypatch.setattr(acceptance, "_gh_command_prefix", lambda home: [])
++    monkeypatch.setattr(acceptance, "_gh_env", lambda home: None)
++    yield response, gh
++    wakes._shutdown_for_tests()
++
++
++def _run():
++    from hermes_cli.kanban_pr_wake import inspect_pr
++    return inspect_pr(URL)
++
++
++@pytest.mark.parametrize("state,merged,rc,marker", [
++    ("open", False, 1, "pending"),
++    ("closed", True, 0, "merged"),
++    ("closed", False, 0, "reconcile"),
++])
++def test_transport_states(probe, state, merged, rc, marker):
++    response, _ = probe
++    response.write_text(json.dumps({"state": state, "merged": merged, "html_url": URL}))
++    actual, message = _run()
++    assert actual == rc
++    assert marker in message
++    if not rc:
++        assert "not acceptance" in message
++
++
++@pytest.mark.parametrize("body", ["oops", "[]", "{}", json.dumps({"state": "closed", "merged": "false", "html_url": URL}), json.dumps({"state": "open", "merged": True, "html_url": URL}), json.dumps({"state": "closed", "merged": False, "html_url": URL + "0"})])
++def test_unreadable_or_mismatched_evidence_is_error(probe, body):
++    probe[0].write_text(body)
++    assert _run()[0] == 2
++
++
++def test_failed_transport_does_not_log_stderr(probe):
++    probe[1].write_text(f"#!{sys.executable}\nimport sys\nprint('SENSITIVE_TOKEN', file=sys.stderr)\nsys.exit(4)\n")
++    rc, message = _run()
++    assert rc == 2 and "SENSITIVE_TOKEN" not in message
++
++
++@pytest.mark.parametrize("url", [URL + "/", URL + "?token=SECRET", "http://github.com/example/project/pull/44", "https://evil.invalid/example/project/pull/44", URL.replace("44", "044")])
++def test_invalid_identifiers_are_not_normalized(probe, url, monkeypatch):
++    from hermes_cli.kanban_pr_wake import inspect_pr
++    monkeypatch.setattr(acceptance, "_api", lambda *a, **kw: pytest.fail("invalid URL reached transport"))
++    rc, message = inspect_pr(url)
++    assert rc == 2 and url not in message
++
++
++def test_timeout_remains_error_without_detail(probe, monkeypatch):
++    def timeout(*a, **kw):
++        raise subprocess.TimeoutExpired("SENSITIVE_TOKEN", 30)
++    monkeypatch.setattr(acceptance, "_api", timeout)
++    rc, message = _run()
++    assert rc == 2 and "SENSITIVE_TOKEN" not in message
++
++
++def test_closed_pr_wakes_real_board_but_does_not_complete(probe, tmp_path, monkeypatch):
++    from hermes_cli.kanban_pr_wake import inspect_pr
++    probe[0].write_text(json.dumps({"state": "closed", "merged": False, "html_url": URL}))
++    assert inspect_pr(URL)[0] == 0
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        assert Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent == tmp_path / "home"
++        tid = kb.create_task(conn, title="isolated reconciliation", assignee="fixture-no-dispatch")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        assert kb.claim_task(conn, tid, claimer="fixture-no-dispatch")
++        command = (f"PYTHONPATH={shlex.quote(str(Path(kb.__file__).resolve().parents[1]))} "
++                   f"PATH={shlex.quote(str(tmp_path) + ':' + os.environ['PATH'])} "
++                   f"{shlex.quote(sys.executable)} -m hermes_cli.kanban_pr_wake {URL}")
++        monkeypatch.setattr(wakes, "_profile_home", lambda task: str(tmp_path / "home"))
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", wake_check=command, check_every=120)
++        wakes.run_due_wake_checks(conn, now=int(time.time()), wait=True)
++        assert kb.get_task(conn, tid).status == "ready", wakes.get_state(conn, tid)["last_out"]
++        context = kb.build_worker_context(conn, tid)
++        assert "reconcile" in context and "not acceptance" in context
++        # Abandoned and superseded PRs are identical until independent evidence exists.
++        monkeypatch.setattr(acceptance, "_api", lambda *a, **kw: {"data": {"repository": {"pullRequest": {"state": "CLOSED", "headRefOid": "a" * 40, "baseRefName": "main"}}}})
++        receipt = acceptance.collect_acceptance(URL, URL)
++        assert not receipt["ok"] and receipt["classification"] == "closed_unmerged"
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2fe0a1d3ae..ba4c104af7 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -420,6 +420,30 @@ Probe state is in the `task_wake_checks` table and shown by `kanban show`,
+ the worker context and the board API; `kanban diagnostics` flags failing or
+ overdue probes, and parks more than 2 h out that have neither.
+ 
++For an external GitHub PR wait, use the installed runtime's read-only probe:
++
++```text
++hermes --run-module hermes_cli.kanban_pr_wake https://github.com/OWNER/REPO/pull/NUMBER
++```
++
++Set this as `wake_check` only when the task is waiting for that PR to reach a
++terminal state. The probe uses the current task profile's GitHub transport and
++`kanban.pr_acceptance.gh_command_prefix` configuration. OPEN returns 1;
++MERGED returns 0 to resume integration/verification; CLOSED without merge also
++returns 0, but explicitly requests **reconciliation, not acceptance**. A closed
++PR may be abandoned or superseded: verify the replacement's containing-main
++commit and exact successful CI evidence before changing dependencies or claiming
++delivery. All existing completion/CI/consent gates remain in force. API, auth or
++malformed-response failures return 2 (or the outer probe timeout), never pending.
++
++Do not use `test "$(gh ... --jq .state)" = MERGED`: it treats API failures as
++pending and waits forever when a PR is intentionally superseded. Existing stored
++shell probes are not rewritten automatically; the owning worker/supervisor must
++adopt the terminal-state probe on the next explicit park. This is not a CI-ready
++probe: an OPEN PR still waits even if checks finish. Use a separate exact-head
++CI probe when the next action is review/landing rather than an external merge.
++
++
+ Continuations leave `consecutive_failures` and the unblock-loop counter
+ untouched, so they never trip the give-up or block-loop limits. Their own
+ bound is `kanban.max_continuations` (default 12) consecutive `continued` runs.
+-- 
+2.55.0
+

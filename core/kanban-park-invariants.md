@@ -4,6 +4,8 @@ Patches:
 
 - `patches/0169-fix-kanban-cards-never-park-forever-without-showing-.patch`: parts 1-4 below (part 5 is the env scrub,
   documented in [top-level-env-scrub.md](top-level-env-scrub.md)).
+- Patch **0335**, fork commit `ca145ec36e04a7db3271e2df91622dc7adbd91a2`:
+  profile-scoped GitHub broker execution for PR acceptance.
 
 Root cause: a board with cards "not running, not blocked". Three separate holes let a card park with nothing on the
 board saying why: the respawn guard held `ready` cards forever, a closed-unmerged PR binding could never be replaced,
@@ -26,6 +28,11 @@ and `scheduled` parks could carry no wake time (or hide a question for a human).
    phase and exception type instead of "check gh authentication" (that wording used to match the guard's auth regex).
    A binding to a closed-unmerged PR may be replaced by a new `published_pr` in the same repo (`pr_rebound` event);
    rebinding happens only on GitHub's positive "closed, not merged" answer, and never while the bound PR is open.
+   Patch 0335 adds optional per-profile `kanban.pr_acceptance.gh_command_prefix`
+   (default `[]`): an argv prefix, not a shell command. Routed profiles do not
+   inherit the launch profile's wrapper. Missing `gh`, invalid wrapper values and
+   unreadable configuration return a sanitized `setup` rejection; HTTP auth
+   refusals remain `auth`, without captured stderr in durable receipts.
 3. **Scheduled wake invariant.** Every `kanban_schedule` park carries `wake_at` (the `SCHEDULED_UNTIL=` marker, else
    now + 24 h). A card awaiting a human answer (`needs_input`/`capability` with an unanswered block) cannot be
    scheduled; the tool says it stays blocked. For legacy wake-less parks the dispatcher wakes the card at its implied
@@ -43,6 +50,10 @@ and `scheduled` parks could carry no wake time (or hide a question for a human).
   the card lands in `result.auto_blocked`).
 - `hermes_cli/kanban_pr_acceptance.py`: `phase` tracking, `closed_unmerged`, `pr_closed_unmerged(url, assignee)`;
   `kanban_pr_acceptance_store.py` does the rebind.
+  For 0335, effective configuration/interpolation is bound to the assignee's home
+  and secret scope. The wrapper receives the isolated environment and resolved
+  `gh` argv. `hermes_platform/resolver/github.py` searches child PATH, then
+  `~/bin` and `~/.local/bin`. No credential is returned to the parent process.
 - `hermes_cli/kanban_timed_park.py`: `scheduled_payload` always has `wake_at`; `implied_wake`.
   `hermes_cli/kanban_continuation.py`: `missing_wake`, `_enforce_wake_invariant`, called from `wake_due_continuations`.
   `hermes_cli/kanban_db.py`: `schedule_task` refuses via `_awaiting_human_answer`; `board_stats` adds the waiting
@@ -56,6 +67,9 @@ and `scheduled` parks could carry no wake time (or hide a question for a human).
 `hermes_cli/kanban_db_dispatch.py`, `hermes_cli/kanban_pr_acceptance.py`, `hermes_cli/kanban_pr_acceptance_store.py`,
 `hermes_cli/kanban_timed_park.py`, `hermes_cli/kanban_continuation.py`, `hermes_cli/kanban_db.py`,
 `hermes_cli/kanban_diagnostics.py`, `hermes_cli/kanban.py`, `tools/kanban_tools.py`.
+Patch 0335 also changes `hermes_cli/config_defaults.py`, adds
+`hermes_platform/resolver/github.py`, and documents configuration in
+`website/docs/user-guide/features/kanban.md`.
 
 ## Tests
 
@@ -71,18 +85,48 @@ and `scheduled` parks could carry no wake time (or hide a question for a human).
 `test_kanban_db.py`, `test_kanban_diagnostics.py`, `test_kanban_timed_park.py`.
 Untested: the `waiting_behind_user` diagnostic and the `kanban stats` "Waiting on you" line.
 
+Historical verification (broker numbered 0312 in that snapshot) on integrated core `54716420ff7c58cf1ab34fbfb22ef9e878f87cd3`:
+canonical `scripts/run_tests.sh tests/hermes_cli/test_kanban_pr_transport.py
+tests/hermes_cli/test_kanban_pr_acceptance.py -j 2 --file-retries 0` passed
+16 tests (11 transport, five acceptance). The existing PM interpreter ran in a
+disposable clone with only runner scratch allocation redirected. Transport cases
+exercise actual synthetic executable children: missing CLI, user-bin discovery,
+child-only token vending, noninheritance, auth refusal sanitization, invalid argv,
+malformed config and assignee-scoped interpolation. No real credentials, live
+GitHub acceptance, dispatcher deployment or UI entry was exercised by this suite.
+
 ## Applying
 
 Apply in series after [kanban-timed-waits.md](kanban-timed-waits.md) (0113 0153 0155), whose `pending_wake`,
 `kanban_timed_park` and `wake_due_continuations` it extends, and after [kanban-block-loop-escalation.md](kanban-block-loop-escalation.md)
 and [kanban-escalated-triage-red.md](kanban-escalated-triage-red.md) (0161). Needs the PR-acceptance gate
 (`completion_contract`).
+Current ordering: broker patch 0335 follows the preserved series through 0331.
+The published baseline contains patches 0001–0360; Chrome patches 0370–0372
+follow it and are not broker dependencies. Apply the ordered series, not an
+isolated broker patch. Patch 0330 now covers CI review-comment poll routing.
+
+Historical recovered-CI ordering used broker 0330 after 0329, baseline
+0001–0350 and Chrome 0351–0353; 0312 covered CI poll routing in that snapshot.
+The newer published merged topology moved the same broker commit to 0335;
+its published patch bytes are unchanged.
+
+Historical application receipt for core `54716420ff7c58cf1ab34fbfb22ef9e878f87cd3`:
+the broker was numbered 0312 after the preserved series through 0306. Full ordered
+279-patch application from merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`
+passed; all five broker paths match the integrated core. The last three patches in that historical 279-patch snapshot
+were the separate experimental Chrome feature, not broker dependencies.
 
 ## Gotchas
 
 - A `scheduled` park no longer waits for a cron/human forever: with no marker it wakes after 24 h and the run re-checks.
 - Hold caps block with the guard reason; after fixing the cause (credentials, quota, PR binding) `unblock` the card.
 - `kanban_schedule` now fails on a card waiting on a human answer; use `kanban_block`.
+- The broker prefix must start with an installed absolute executable path, exec
+  the appended command, preserve its exit status and emit only that command's
+  JSON on stdout. Use an already-approved noninteractive scope: reads time out
+  after 30 seconds. Never put credentials in the argv/config or print/persist
+  tokens. Ordinary profile-isolated login remains the empty-prefix default.
 
 ## Plugin?
 

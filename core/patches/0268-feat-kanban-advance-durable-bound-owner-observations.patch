@@ -1,0 +1,124 @@
+From 2212219dd811b0eabd10bbcb9dada55fd8e82686 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:00:26 +0000
+Subject: [PATCH] feat(kanban): advance durable bound owner observations
+ [daveey]
+
+---
+ hermes_cli/kanban_origin_ledger.py            | 44 +++++++++++++++++
+ .../test_kanban_origin_observation.py         | 48 +++++++++++++++++++
+ 2 files changed, 92 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_observation.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index e7818bbf2e..168015320b 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -106,6 +106,50 @@ def obligations(path: Path, *, gateway: str, profile: str, sessions: list[str])
+     return result
+ 
+ 
++def refresh_observations(path: Path, replica: Path) -> None:
++    """Advance durable observations only from newer, exactly bound owner records.
++
++    Disappearance is not completion. Corrupt/unreadable stores raise to let callers
++    display unknown, rather than returning an empty successful projection. A newer
++    nonterminal publication reopens a previously released obligation.
++    """
++    if not path.is_file() or not replica.is_file():
++        return
++    from hermes_cli.kanban_origin import _ro
++
++    source = _ro(replica)
++    try:
++        with _db(path) as conn, conn:
++            conn.execute("BEGIN IMMEDIATE")
++            for key, raw, observed in conn.execute(
++                    "SELECT binding_id,binding_json,observation_version FROM origin_obligations").fetchall():
++                binding = json.loads(raw)
++                validate_binding(binding)
++                row = source.execute(
++                    "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
++                    (binding['owner']['gateway'], binding['task_record_key'])).fetchone()
++                if not row or type(row[0]) is not int or row[0] <= observed:
++                    continue
++                task = json.loads(row[1])
++                owner = binding['owner']
++                if (not isinstance(task, dict)
++                        or any(task.get(f) != owner[f] for f in ('gateway', 'profile', 'board'))
++                        or task.get('id') != owner['task_id']):
++                    continue
++                marker = {k: v for k, v in binding.items() if k != 'publication_version'}
++                markers = task.get('origin_bindings')
++                if not isinstance(markers, list) or marker not in [
++                        {k: v for k, v in m.items() if k != 'publication_version'}
++                        for m in markers if isinstance(m, dict)]:
++                    continue
++                released = task.get('status') in ('done', 'archived')
++                conn.execute(
++                    "UPDATE origin_obligations SET task_json=?,observation_version=?,released=? WHERE binding_id=?",
++                    (_json(task), row[0], int(released), key))
++    finally:
++        source.close()
++
++
+ def accept_binding(*, path: Path, replica: Path, binding: dict, request_id: str,
+                    sender: str, gateway: str, profile: str,
+                    resolve_session: Callable[[str], str]) -> dict:
+diff --git a/tests/hermes_cli/test_kanban_origin_observation.py b/tests/hermes_cli/test_kanban_origin_observation.py
+new file mode 100644
+index 0000000000..2d980b2794
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_observation.py
+@@ -0,0 +1,48 @@
++"""Versioned owner observations must not erase durable origin obligations."""
++import sqlite3
++
++from tests.hermes_cli.test_kanban_origin_ledger import world, publish, accept
++from hermes_cli import kanban_origin_ledger as ledger
++
++
++def test_verified_terminal_observation_releases_and_newer_reopen_restores(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    publish(replica, binding, status='done')
++    with sqlite3.connect(replica) as db:
++        db.execute('UPDATE replica SET version=4')
++    ledger.refresh_observations(path, replica)
++    rows = ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])
++    assert rows[0]['unfinished'] is False
++    assert rows[0]['observation_version'] == 4
++    publish(replica, binding, status='running')
++    with sqlite3.connect(replica) as db:
++        db.execute('UPDATE replica SET version=5')
++    ledger.refresh_observations(path, replica)
++    assert ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]['unfinished']
++
++
++def test_missing_replica_preserves_obligation(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    replica.unlink()
++    ledger.refresh_observations(path, replica)
++    assert ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]['unfinished']
++
++
++def test_unproven_or_regressed_completion_cannot_release(world):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    for changes, version in [({'status': 'done'}, 2), ({'status': 'done'}, 3),
++                             ({'status': 'done', 'origin_bindings': []}, 4),
++                             ({'status': 'done', 'profile': 'other'}, 4)]:
++        publish(replica, binding, **changes)
++        with sqlite3.connect(replica) as db:
++            db.execute('UPDATE replica SET version=?', (version,))
++        ledger.refresh_observations(path, replica)
++        row = ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]
++        assert row['unfinished']
++        assert row['observation_version'] == 3
+-- 
+2.55.0
+

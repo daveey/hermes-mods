@@ -1,0 +1,219 @@
+From e1ed46288ce39d3f77f17d3b468435b36898e299 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:36:38 +0000
+Subject: [PATCH] fix(kanban): preserve budget recovery after agent triage
+ [daveey]
+
+---
+ hermes_cli/kanban_db.py                         | 17 ++++++++++++-----
+ .../test_kanban_agent_stop_routing.py           |  2 ++
+ tests/hermes_cli/test_kanban_park_invariants.py |  9 ++++-----
+ .../test_kanban_review_lifecycle_complete.py    |  4 ++--
+ .../test_kanban_worker_exit_trailer.py          |  6 +++---
+ .../test_kanban_worker_scope_failure.py         |  4 +++-
+ .../test_kanban_worktree_create_validation.py   |  4 ++--
+ 7 files changed, 28 insertions(+), 18 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 9fc611ed86..7062f30067 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2092,9 +2092,12 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+ 
+ 
+ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
+-    """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
++    """Promote dependency waits and recoverable failure stops;
+     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+ 
++    Agent-triage failure-budget stops retain the same recovery as legacy blocked
++    stops. Guard holds and other triage reasons still require explicit resolution.
++
+     ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
+     ``consecutive_failures`` reached the limit (else the breaker could never
+     trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
+@@ -2109,12 +2112,16 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+     with write_txn(conn):
+         todo_rows = conn.execute(
+             "SELECT id, status, consecutive_failures, max_retries "
+-            "FROM tasks WHERE status IN ('todo', 'blocked')"
++            "FROM tasks WHERE status IN ('todo', 'blocked') OR ("
++            "status = 'triage' AND block_kind = 'transient' AND 'gave_up' = ("
++            "SELECT kind FROM task_events WHERE task_id = tasks.id AND kind IN ("
++            "'gave_up', 'blocked', 'block_loop_detected', 'supervisor_escalated', 'status') "
++            "ORDER BY id DESC LIMIT 1))"
+         ).fetchall()
+         for row in todo_rows:
+             task_id = row["id"]
+             cur_status = row["status"]
+-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
++            if cur_status in ("blocked", "triage") and _has_sticky_block(conn, task_id):
+                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
+                 continue
+             parents = conn.execute(
+@@ -2124,7 +2131,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+             ).fetchall()
+             if all(p["status"] in ("done", "archived") for p in parents):
+                 resume_status = _resume_status_from_events(conn, task_id)
+-                if cur_status == "blocked":
++                if cur_status in ("blocked", "triage"):
+                     # At the breaker limit, no auto-recovery (else block ->
+                     # recover -> respawn -> exhaust -> block forever). The
+                     # counter is preserved so it accumulates across cycles.
+@@ -2138,7 +2145,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+                         continue
+                     conn.execute(
+                         "UPDATE tasks SET status = ? "
+-                        "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
++                        "WHERE id = ? AND status = ?", (resume_status, task_id, cur_status),
+                     )
+                 else:
+                     conn.execute(
+diff --git a/tests/hermes_cli/test_kanban_agent_stop_routing.py b/tests/hermes_cli/test_kanban_agent_stop_routing.py
+index 19b98fc4bf..42afbe4966 100644
+--- a/tests/hermes_cli/test_kanban_agent_stop_routing.py
++++ b/tests/hermes_cli/test_kanban_agent_stop_routing.py
+@@ -38,6 +38,7 @@ def test_guard_hold_is_agent_triage(board, monkeypatch, reason):
+     tid = kb.create_task(conn, title="Guard hold", assignee="default", session_id="owner")
+     monkeypatch.setattr(dispatch, "_guard_hold_started_at", lambda *args: 1)
+     assert dispatch._block_if_guard_hold_capped(conn, tid, reason)
++    assert kb.recompute_ready(conn, failure_limit=100) == 0
+     assert_agent(conn, path, tid)
+ 
+ 
+@@ -51,6 +52,7 @@ def test_repeated_agent_block_stays_agent_but_approval_stays_human(board):
+             if kb.get_task(conn, tid).status != "triage":
+                 assert kb.unblock_task(conn, tid)
+         if kind == "transient":
++            assert kb.recompute_ready(conn, failure_limit=100) == 0
+             assert_agent(conn, path, tid)
+         else:
+             assert kb.get_task(conn, tid).block_kind == "needs_input"
+diff --git a/tests/hermes_cli/test_kanban_park_invariants.py b/tests/hermes_cli/test_kanban_park_invariants.py
+index e209abd95a..e18fb4dfa1 100644
+--- a/tests/hermes_cli/test_kanban_park_invariants.py
++++ b/tests/hermes_cli/test_kanban_park_invariants.py
+@@ -72,8 +72,7 @@ def test_provider_auth_failure_still_guards(kanban_home):
+ 
+ 
+ def test_guard_hold_is_capped_and_auto_blocks_with_reason(kanban_home, monkeypatch, all_assignees_spawnable):
+-    """A card held by the guard past the cap leaves ``ready`` for ``blocked`` with the reason,
+-    so it shows as waiting on someone instead of silently parking forever."""
++    """A capped guard hold reaches agent triage with its reason, not a human ask."""
+     monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", "600")
+     spawned = []
+     with kbc.connect() as conn:
+@@ -92,9 +91,9 @@ def test_guard_hold_is_capped_and_auto_blocks_with_reason(kanban_home, monkeypat
+         monkeypatch.setattr(kb.time, "time", lambda: now + 700)
+         res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
+         task = kb.get_task(conn, tid)
+-        assert task.status == "blocked"
++        assert (task.status, task.block_kind) == ("triage", "transient")
+         assert tid in res.auto_blocked
+-        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='supervisor_escalated' "
+                           "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+         reason = json.loads(ev["payload"])["reason"]
+         assert "blocker_auth" in reason and "provider authentication failed" in reason
+@@ -420,7 +419,7 @@ def test_guard_hold_posts_one_comment_and_no_inbox_card_naming_pr_and_checks(
+         # The notice must not restart the hold clock: the 6 h cap still blocks.
+         monkeypatch.setattr(kb.time, "time", lambda: now + 6 * 3600 + 100)
+         res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+-        assert kb.get_task(conn, tid).status == "blocked"
++        assert kb.get_task(conn, tid).status == "triage"
+ 
+ 
+ def test_guard_event_relogged_after_hold_is_broken(kanban_home, monkeypatch, all_assignees_spawnable):
+diff --git a/tests/hermes_cli/test_kanban_review_lifecycle_complete.py b/tests/hermes_cli/test_kanban_review_lifecycle_complete.py
+index 037adafc98..b403ec2250 100644
+--- a/tests/hermes_cli/test_kanban_review_lifecycle_complete.py
++++ b/tests/hermes_cli/test_kanban_review_lifecycle_complete.py
+@@ -472,7 +472,7 @@ def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
+     )
+     blocked = kb.get_task(conn, task_id)
+     assert blocked is not None
+-    assert blocked.status == "blocked"
++    assert (blocked.status, blocked.block_kind) == ("triage", "transient")
+     gave_up = _event(kb.list_events(conn, task_id), "gave_up")
+     assert gave_up.payload is not None
+     assert gave_up.payload["retry_status"] == "review"
+@@ -780,7 +780,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
+     )
+     assert tripped is True
+     assert _failures(conn, task_id) == 2
+-    assert kb.get_task(conn, task_id).status == "blocked"
++    assert kb.get_task(conn, task_id).status == "triage"
+ 
+     # Sanity: complete_task's success path still clears the counter.
+     ok_id = kb.create_task(conn, title="healthy", assignee="builder")
+diff --git a/tests/hermes_cli/test_kanban_worker_exit_trailer.py b/tests/hermes_cli/test_kanban_worker_exit_trailer.py
+index 85a86b1857..9ab14a3885 100644
+--- a/tests/hermes_cli/test_kanban_worker_exit_trailer.py
++++ b/tests/hermes_cli/test_kanban_worker_exit_trailer.py
+@@ -94,7 +94,7 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
+             kbd.detect_crashed_workers(conn)
+             kb.recompute_ready(conn, failure_limit=10)
+         task = kb.get_task(conn, tid)
+-        assert task.status == "blocked"
++        assert (task.status, task.block_kind) == ("triage", "transient")
+         assert task.consecutive_failures < 10
+ 
+         kb.unblock_task(conn, tid)
+@@ -115,7 +115,7 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
+                     conn, tid, error=f"boom{i}", outcome="crashed", failure_limit=2,
+                     release_claim=False, end_run=False,
+                 )
+-            assert kb.get_task(conn, tid).status == "blocked"
++            assert kb.get_task(conn, tid).status == "triage"
+         assert kb.recompute_ready(conn, failure_limit=2) == 0
+ 
+         assert kb.recompute_ready(conn, failure_limit=5) == 2
+@@ -126,7 +126,7 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
+                 conn, tids[1], error=f"again{i}", outcome="crashed", failure_limit=2,
+                 release_claim=False, end_run=False,
+             )
+-        assert kb.get_task(conn, tids[1]).status == "blocked"
++        assert kb.get_task(conn, tids[1]).status == "triage"
+         kb.assign_task(conn, tids[1], "other-profile")
+         assert kb.recompute_ready(conn, failure_limit=2) == 1
+         assert kb.get_task(conn, tids[1]).status == "ready"
+diff --git a/tests/hermes_cli/test_kanban_worker_scope_failure.py b/tests/hermes_cli/test_kanban_worker_scope_failure.py
+index f58d0aff43..0ddbb92b0a 100644
+--- a/tests/hermes_cli/test_kanban_worker_scope_failure.py
++++ b/tests/hermes_cli/test_kanban_worker_scope_failure.py
+@@ -51,7 +51,9 @@ def test_scope_failure_overrides_clean_exit_and_reaches_retry_context(kanban_hom
+             assert kbd._protocol_violation_streak(conn, tid) == 0
+             task = kb.get_task(conn, tid)
+             assert task.consecutive_failures == attempt + 1
+-            assert task.status == ("ready" if attempt == 0 else "blocked")
++            assert task.status == ("ready" if attempt == 0 else "triage")
++            if attempt:
++                assert task.block_kind == "transient"
+             assert "protocol violation" not in task.last_failure_error
+             if result == "oom-kill":
+                 assert "OOM-killed at 64 MiB" in task.last_failure_error
+diff --git a/tests/hermes_cli/test_kanban_worktree_create_validation.py b/tests/hermes_cli/test_kanban_worktree_create_validation.py
+index 1240db3fba..1905151827 100644
+--- a/tests/hermes_cli/test_kanban_worktree_create_validation.py
++++ b/tests/hermes_cli/test_kanban_worktree_create_validation.py
+@@ -151,7 +151,7 @@ def test_dispatcher_blocks_config_error_on_first_failure(kanban_home, code_dir,
+         kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1234, failure_limit=3)
+         task = kb.get_task(conn, tid)
+         assert spawned == []
+-        assert task.status == "blocked"
++        assert (task.status, task.block_kind) == ("triage", "transient")
+         assert task.consecutive_failures == 1
+         assert "not inside a git repo" in task.last_failure_error
+         assert "Fix: use workspace_path=" in task.last_failure_error
+@@ -160,7 +160,7 @@ def test_dispatcher_blocks_config_error_on_first_failure(kanban_home, code_dir,
+         assert gave_up[-1].payload.get("workspace_config_error") is True
+         # Sticky: recompute_ready must not auto-resume it.
+         kb.recompute_ready(conn)
+-        assert kb.get_task(conn, tid).status == "blocked"
++        assert kb.get_task(conn, tid).status == "triage"
+ 
+ 
+ def test_dispatcher_transient_workspace_error_still_retries(
+-- 
+2.55.0
+

@@ -55,7 +55,10 @@ class Service:
     def inventory(self):
         if not self.config['features']['observe']:
             raise RuntimeError('feature_disabled')
-        snap=self._snapshot(); meta=self._meta(snap); c=self.config; rows=[]; projections=[]
+        return self._inventory(self._snapshot())
+
+    def _inventory(self, snap):
+        meta=self._meta(snap); c=self.config; rows=[]; projections=[]
         policy=Policy(inventory_ttl=c['thresholds']['inventory_stale_seconds'],host_ttl=c['thresholds']['host_stale_seconds'])
         for row in snap['runners'] if snap else ():
             row=deepcopy(row)
@@ -85,8 +88,17 @@ class Service:
         hosts=deepcopy(c['hosts'])
         for host in hosts:
             evidence=(snap or {}).get('host_results',{}).get(host['id'])
-            if evidence and 0<=self.clock()-evidence['at']<=policy.host_ttl:
+            at = evidence['at'] if evidence else None
+            fresh = at is not None and 0 <= self.clock()-at <= policy.host_ttl
+            if fresh:
                 host['management']=evidence['management']
+            host['observation_ids'] = list(evidence.get('observation_ids', [])) if evidence else []
+            meta['provenance'].append(dict(
+                source_id=host['resource_id'], collection_id=None,
+                observed_at=iso(at) if at is not None else None,
+                expires_at=iso(at+policy.host_ttl) if at is not None else None,
+                state=('fresh' if evidence['management']=='reachable' else 'unavailable') if fresh else ('stale' if evidence else 'unknown'),
+                observation_ids=host['observation_ids']))
         mapped_hosts={row['host_id'] for row in rows if row['host_id']}
         count['issues'] += sum(host['id'] in mapped_hosts and host['management']=='unreachable' for host in hosts)
         data=dict(state=state,collection=snap['collection'] if snap else None,counts=count,hosts=hosts,runners=rows,scopes=c['scopes'],providers=c['providers'],targets=c['execution_targets'])
@@ -94,7 +106,10 @@ class Service:
 
     def inspect(self,runner_id,history_limit=100):
         validate('InspectRequest',dict(runner_id=runner_id,history_limit=history_limit))
-        inventory=self.inventory()
+        if not self.config['features']['observe']:
+            raise RuntimeError('feature_disabled')
+        snap=self._snapshot()
+        inventory=self._inventory(snap)
         runner=next((r for r in inventory['data']['runners'] if r['id']==runner_id),None)
         if runner is None: raise KeyError('not_found')
         db=connect(self.path)
@@ -102,7 +117,37 @@ class Service:
             # JSON filtering occurs before LIMIT; do not silently lose older matching rows.
             observations=[json.loads(r[0]) for r in db.execute("SELECT payload FROM runner_records WHERE kind='Observation' AND json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT ?",(runner_id,history_limit))]
         finally: db.close()
-        return dict(meta=inventory['meta'],data=dict(runner=runner,observations=observations,incidents=[],repairs=[],jobs=[]))
+        monitoring, jobs = self._job_evidence(snap, runner, history_limit)
+        return dict(meta=inventory['meta'],data=dict(runner=runner,observations=observations,incidents=[],repairs=[],jobs=[],job_monitoring=monitoring,observed_jobs=jobs))
+
+    def _job_evidence(self, snap, runner, limit):
+        """External observations are not dispatched Job records or health proof."""
+        sid=runner['scope_id']; evidence=snap.get('job_results', {}).get(sid)
+        configured=snap.get('job_monitoring_scopes')
+        at=evidence.get('observed_at') if evidence else None
+        ttl=self.config['thresholds']['inventory_stale_seconds']
+        fresh=at is not None and 0<=self.clock()-at<=ttl
+        state,reason='unknown','not_observed'
+        if configured is not None and sid not in configured:
+            state,reason='not_configured','not_configured'
+            evidence=None; at=None
+        elif evidence and configured is not None:
+            error=evidence.get('error')
+            if not fresh: state,reason='unknown','stale_evidence'
+            elif error=='forbidden': state,reason='forbidden',error
+            elif evidence['complete'] or error=='enrichment_truncated':
+                state,reason='configured',error or 'bounded_query_complete'
+            else: state,reason='unavailable',error or 'incomplete'
+        monitoring=dict(state=state,reason_code=reason,observed_at=iso(at) if at is not None else None,
+                        expires_at=iso(at+ttl) if at is not None else None)
+        rows=[]
+        for row in (evidence or {}).get('rows', []):
+            if row['runner_id'] != runner['provider_runner_id']:
+                continue
+            rows.append(dict(row, observed_at=iso(at), expires_at=iso(at+ttl),
+                url=f"https://github.com/{row['repository']}/actions/runs/{row['run_id']}/job/{row['job_id']}"))
+            if len(rows)>=limit: break
+        return monitoring, rows if limit else []
 
     def refresh(self,request):
         request=validate('RefreshRequest',request)
