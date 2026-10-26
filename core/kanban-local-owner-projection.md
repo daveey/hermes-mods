@@ -2,7 +2,7 @@
 
 ## Behavior
 
-Patches 0381–0384 repair the Python session-task projection used by task inventories. Exact gateway/profile/board/task identity is required for local authority. A local open task suppresses a duplicate receipt only when local associations cover every original/resolved session alias. Other profiles and unknown owners remain distinct unfinished obligations; genuine human blockers remain visible.
+Patches 0384–0387 repair the Python session-task projection used by task inventories. Exact gateway/profile/board/task identity is required for local authority. A local open task suppresses a duplicate receipt only when local associations cover every original/resolved session alias. Other profiles and unknown owners remain distinct unfinished obligations; genuine human blockers remain visible.
 
 Local terminal evidence can release an obligation only with an exact durable creation marker and the existing lifecycle completion rules. A reopened local task overrides stale terminal evidence. Unreadable or ambiguously routed local state becomes unknown, not completed.
 
@@ -34,13 +34,19 @@ These exercise backend functions. Live REST timing, installed process revision, 
 
 Prefer the normal supported fork update containing `b47371bdf826a63b7273235ddacb7a88c3cd6ac6`. These are core Python changes, not a hot-reloadable disk plugin. Apply through the normal idle update mechanism; never move or rebuild a checkout under active workers. A Desktop reload alone does not prove the update applied.
 
-For reproduction in an isolated checkout at `f63cdf362c`, apply patches 0381–0384 in order with `git am -3`. They depend on the preceding origin-ledger implementation; they are not standalone patches for arbitrary upstream versions. Verify loaded code ancestry, then the owner-pinned task endpoint and actual rendered task identities/counts after activation.
+For reproduction in an isolated checkout at `f63cdf362c`, apply patches 0384–0387 in order with `git am -3`. They depend on the preceding origin-ledger implementation; they are not standalone patches for arbitrary upstream versions. Verify loaded code ancestry, then the owner-pinned task endpoint and actual rendered task identities/counts after activation.
 
 ## Gotchas
 
 Ownerless legacy records cannot be retired solely because a qualified row has the same task ID. Missing owner provenance is not proof of duplication. This repair neither deletes replica records nor invents a migration. Such obligations remain unknown/non-human until an authoritative supported reconciliation can establish ownership.
 
 Other read and snapshot contention paths still exist. A reported long-running endpoint timeout must be attributed using the actual loaded backend and thread stacks; the demonstrated writer hazard is not proof of its entire cause. No live runtime restart or database reconciliation is part of this patch set.
+
+## Snapshot and alias-read latency (0388–0390)
+
+An activity annotation now shares one scoped snapshot between counts and task inventory, rather than taking two snapshots. Receipt dedup resolves each local board's associations once per projection and reuses them for every receipt; its cache is request-scoped, not a cross-request stale-state cache. In the regression fixture, ten receipts require two connection reads instead of twenty-two. These changes reduce repeated work without weakening owner/profile/board or alias checks. Patch 0390 is the snapshot fixture lint follow-up.
+
+Executed on the applied public series: `test_kanban_annotation_snapshot.py` and `test_kanban_local_dedup_cost.py` each pass. The former asserts one snapshot per annotation; the latter asserts bounded association reads across multiple receipts. The local-authority, remote-identity and contention suites also pass; see [390-patch verification](mirror-390-verification.md). These are deterministic read-count regressions, not a measured live REST latency guarantee.
 
 ## Why not a plugin?
 
