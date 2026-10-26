@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS unmutes (
 """
 # Added with card types; ALTERed into older sidecars on open (idempotent).
 _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
-            ("outcome_value", "TEXT"), ("resolved_at", "REAL"), ("outcome_task", "TEXT"))
+            ("outcome_value", "TEXT"), ("resolved_at", "REAL"), ("outcome_task", "TEXT"),
+            ("cwd_explicit", "INTEGER"))  # NULL = legacy/unknown; never infer intent from a path
 # Not "types.py": a sibling named like the stdlib module shadows it whenever this dir is on sys.path.
 _TYPES = Path(__file__).resolve().parent / "card_types.py"
 
@@ -230,12 +231,12 @@ class Inbox:
         return self.path.exists()
 
     # ── social routing backfill ─────────────────────────────────────────────
-    QUIET_S = 900  # a session active within this window may be a running worker: never moved
-
     def backfill_social(self, *, apply: bool = False, include_archived: bool = False) -> list[dict[str, Any]]:
         """Move clearly-social cards sitting in the generic fallback cwd (the home dir, or none) into
-        this host's `pr` project folder. Skips cards whose cwd was chosen (any other directory), live
-        or recently active sessions, and archived cards unless asked. Dry run unless ``apply``."""
+        this host's `pr` project folder, only with recorded non-explicit cwd provenance and an
+        authoritative session ``ended_at``. Legacy unknown provenance and unended/missing sessions
+        fail closed regardless of age or message count. Explicit home is a choice too. Other
+        directories and archived cards (unless asked) stay put. Dry run unless ``apply``."""
         rt = routing_module()
         target = rt.project_path(self.home)
         out: list[dict[str, Any]] = []
@@ -243,7 +244,7 @@ class Inbox:
             return out
         side, db = self._side(), self._sessions()
         try:
-            rows = side.execute("SELECT session_id, key, title, poster, type FROM items").fetchall()
+            rows = side.execute("SELECT session_id, key, title, poster, type, cwd_explicit FROM items").fetchall()
             for r in rows:
                 if not rt.is_social(key=r["key"], type=r["type"], title=r["title"] or "", poster=r["poster"]):
                     continue
@@ -254,17 +255,25 @@ class Inbox:
                     rec["action"] = "already"
                 elif s.get("archived") and not include_archived:
                     rec["action"] = "skip:archived"
+                elif r["cwd_explicit"] is None:
+                    rec["action"] = "skip:unknown-cwd-provenance"
+                elif r["cwd_explicit"] != 0:
+                    rec["action"] = "skip:explicit-cwd"
                 elif cwd and os.path.normpath(cwd) != os.path.normpath(str(Path.home())):
                     rec["action"] = "skip:explicit-cwd"
-                elif s.get("ended_at") is None and (self.clock() - float(
-                        s.get("last_activity_at") or s.get("started_at") or 0)) < self.QUIET_S and \
-                        (s.get("message_count") or 0) > 1:
+                elif s.get("ended_at") is None:
                     rec["action"] = "skip:active"
                 else:
                     rec["action"] = "moved" if apply else "would-move"
                     if apply:
-                        db._execute_write(lambda c, sid=r["session_id"]: c.execute(
-                            "UPDATE sessions SET cwd=? WHERE id=?", (target, sid)))
+                        # Recheck lifecycle + cwd in the write transaction: a concurrent resume
+                        # or cwd change must not be overwritten after the eligibility read.
+                        changed = db._execute_write(lambda c, sid=r["session_id"]: c.execute(
+                            "UPDATE sessions SET cwd=? WHERE id=? AND ended_at=? AND cwd IS ? "
+                            "AND (? OR COALESCE(archived, 0)=0)",
+                            (target, sid, s["ended_at"], s.get("cwd"), include_archived)).rowcount)
+                        if not changed:
+                            rec["action"] = "skip:changed"
                 out.append(rec)
             return out
         finally:
@@ -278,7 +287,8 @@ class Inbox:
              type: Optional[str] = None, fields: Optional[dict] = None,
              inherited_cwd: Optional[str] = None) -> dict[str, Any]:
         """``cwd`` is an explicit caller choice and always wins; ``inherited_cwd`` is the posting
-        session's own cwd, which social cards replace with this host's `pr` project folder."""
+        session's own cwd, which social cards replace with this host's `pr` project folder.
+        New cards persist cwd_explicit (including explicit home); reposts retain original provenance."""
         ct = types_module()
         title = " ".join(str(title or "").split())[:MAX_TITLE]
         prompt_label = " ".join(str(prompt_label or "").split())[:200] or None
@@ -340,6 +350,7 @@ class Inbox:
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 rt = routing_module()
+                cwd_explicit = int(cwd is not None)
                 cwd = rt.route_cwd(self.home, explicit=cwd, inherited=inherited_cwd, social=rt.is_social(
                     key=key, type=type, title=title, body=body, poster=poster))
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
@@ -350,8 +361,8 @@ class Inbox:
                 _set_title(db, sid, title)
                 db.set_session_read(sid, False)
                 side.execute("INSERT INTO items(session_id,key,title,poster,accept_prompt,created_at,updated_at,state,"
-                             "type,fields_json,actions_json) VALUES (?,?,?,?,?,?,?, 'open',?,?,?)",
-                             (sid, key, title, poster, accept_prompt, now, now, tname, fjson, ajson))
+                             "type,fields_json,actions_json,cwd_explicit) VALUES (?,?,?,?,?,?,?, 'open',?,?,?,?)",
+                             (sid, key, title, poster, accept_prompt, now, now, tname, fjson, ajson, cwd_explicit))
                 side.commit()
                 self._enforce_cap(side, db)
                 return {"session_id": sid, "updated": False}

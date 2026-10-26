@@ -32,9 +32,15 @@ _ACTION = re.compile(
     r"\b(post(?:ing|ed|s)?|repl(?:y|ies|ying)|dms?|direct\s+messages?|drafts?|tweet(?:s|ed|ing)?|"
     r"engag(?:e|ement|ing)|mentions?|quote[- ]?(?:tweet|post)|thread|publish(?:ing|ed)?|"
     r"approve|approval|schedule[ds]?)\b", re.I)
-# Hard negatives: coding-review vocabulary where "PR" means pull request.
-_CODING_PR = re.compile(r"\b(pull\s+requests?|merge\s+(?:the\s+)?pr|pr\s*#\d+|ci\b.*\bpr\b|\bpr\b.*\b(?:ci|review comments?|checks?)\b)",
-                        re.I)
+# Classify the requested work, not its subject: coding tasks often mention social APIs.
+# Conversely, a genuine draft can be ABOUT a pull request, so PR # alone is not a veto.
+_CODING_TASK = re.compile(
+    r"^\s*(?:please\s+)?(?:fix|debug|implement|refactor|merge|deploy|test|"
+    r"review\s+(?:(?:the|a)\s+)?(?:pull\s+request|pr\b)|"
+    r"(?:pull\s+request|pr\s*#?\d*)\s+review)\b", re.I)
+_CODING_OBJECT = re.compile(r"\b(?:parser|api|scheduler|bug|code|unit\s+tests?)\b", re.I)
+_PUBLISH_INTENT = re.compile(
+    r"^\s*(?:please\s+)?(?:draft|write|publish|post|tweet|approve|schedule|reply)\b", re.I)
 
 
 def is_social(*, key: Optional[str] = None, type: Optional[str] = None, title: str = "",
@@ -44,14 +50,14 @@ def is_social(*, key: Optional[str] = None, type: Optional[str] = None, title: s
         return True
     if key and _SOCIAL_KEY.match(key):
         return True
+    # Workflow-owned keys/types above are explicit signals. Free text is conservative;
+    # neither a platform name nor a social poster overrides a coding task in the title.
+    if _CODING_TASK.search(title):
+        return False
+    if _CODING_OBJECT.search(title) and not _PUBLISH_INTENT.search(title):
+        return False
     head = f"{title}\n{poster or ''}"
-    if _PLATFORM.search(head) and _ACTION.search(head):
-        return not (_CODING_PR.search(head) and not _strong_platform(head))
-    return False
-
-
-def _strong_platform(text: str) -> bool:
-    return bool(re.search(r"\b(twitter|tweets?|bluesky|bsky|x\.com)\b", text, re.I))
+    return bool(_PLATFORM.search(head) and _ACTION.search(head))
 
 
 def _ro(path: Path) -> sqlite3.Connection:

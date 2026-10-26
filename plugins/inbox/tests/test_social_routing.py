@@ -56,6 +56,8 @@ def cwd_of(db, r):
     dict(key="k2", title="Approve Bluesky post for Tuesday"),
     dict(key="k3", title="Draft tweet about the Coworld launch"),
     dict(key="k4", title="Bluesky DM monitoring: 2 new messages"),
+    dict(key="k5", title="Draft a Bluesky post about PR #123"),
+    dict(key="k6", title="Draft an X post about fixing the reply API bug"),
 ])
 def test_social_positive_goes_to_pr(env, kw):
     inbox, db, pr = env
@@ -70,9 +72,15 @@ def test_social_positive_goes_to_pr(env, kw):
     "PR review comments need replies",
     "Deploy the hub",
     "X is the variable name in the parser",
+    "Review pull request: fix Bluesky reply parser",
+    "Merge PR #123 for Twitter post scheduler",
+    "Fix X reply API retry bug",
+    "Bluesky reply parser needs a fix",
 ])
 def test_non_social_pr_text_not_routed(env, title):
     inbox, db, pr = env
+    assert not rt.is_social(title=title)
+    assert not rt.is_social(title=title, poster="Twitter post monitor")
     r = inbox.post(title, "b", "p", cwd="/tmp/work", key="coding:1")
     assert cwd_of(db, r) == "/tmp/work"
     r2 = inbox.post(title + " again", "b", "p", key="coding:2", inherited_cwd="/Users/me/code/hermes")
@@ -132,11 +140,13 @@ def test_tool_passes_inherited_cwd_separately(tmp_path, monkeypatch):
 def test_backfill_moves_only_fallback_cwd_and_is_idempotent(env, monkeypatch):
     inbox, db, pr = env
     home = str(Path.home())
-    a = inbox.post("X post pending", "b", "p", key="x-post:A", cwd=home)      # old fallback -> moves
-    # emulate cards created before routing existed
+    # A known non-explicit fallback can occur before a pr project is configured.
+    with monkeypatch.context() as m:
+        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        a = inbox.post("X post pending", "b", "p", key="x-post:A")
     b = inbox.post("X post pending", "b", "p", key="x-post:B", cwd="/Users/me/code/writing")  # chosen -> stays
     c = inbox.post("Merge PR #4", "b", "p", key="coding:1", cwd=home)         # not social -> stays
-    # route-at-creation put `a` into pr only if cwd omitted; here cwd explicit, so it stays at home
+    db.end_session(a["session_id"], "completed")
     dry = {r["key"]: r["action"] for r in inbox.backfill_social()}
     assert dry == {"x-post:A": "would-move", "x-post:B": "skip:explicit-cwd"}
     assert cwd_of(db, a) == home
@@ -145,6 +155,94 @@ def test_backfill_moves_only_fallback_cwd_and_is_idempotent(env, monkeypatch):
     assert cwd_of(db, a) == pr and cwd_of(db, b) == "/Users/me/code/writing" and cwd_of(db, c) == home
     again = {r["key"]: r["action"] for r in inbox.backfill_social(apply=True)}
     assert again["x-post:A"] == "already"
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_provenance_survives_repost_and_reopen(env, explicit):
+    inbox, db, pr = env
+    home = str(Path.home())
+    r = inbox.post("X post pending", "b", "p", key="x-post:A", cwd=home if explicit else None)
+    assert inbox.get(r["session_id"])["cwd_explicit"] == int(explicit)
+    inbox.post("X post updated", "b", "p", key="x-post:A", cwd=None if explicit else home)
+    fresh = store.Inbox(home=inbox.home, db_factory=lambda: db)
+    assert fresh.get(r["session_id"])["cwd_explicit"] == int(explicit)
+    db.end_session(r["session_id"], "completed")
+    action = fresh.backfill_social(apply=True)[0]["action"]
+    assert action == ("skip:explicit-cwd" if explicit else "already")
+    assert cwd_of(db, r) == (home if explicit else pr)
+
+
+def test_legacy_schema_migration_leaves_provenance_unknown(env):
+    inbox, db, pr = env
+    home = str(Path.home())
+    r = inbox.post("X post pending", "b", "p", key="x-post:A", cwd=home)
+    db.end_session(r["session_id"], "completed")
+    with sqlite3.connect(inbox.path) as side:
+        side.execute("ALTER TABLE items DROP COLUMN cwd_explicit")
+    assert inbox.get(r["session_id"])["cwd_explicit"] is None
+    assert inbox.backfill_social(apply=True)[0]["action"] == "skip:unknown-cwd-provenance"
+    assert cwd_of(db, r) == home
+
+
+@pytest.mark.parametrize("message_count", [1, 8])
+@pytest.mark.parametrize("age", [1, 100_000])
+def test_backfill_unended_sessions_fail_closed(env, monkeypatch, message_count, age):
+    inbox, db, pr = env
+    with monkeypatch.context() as m:
+        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        r = inbox.post("X post pending", "b", "p", key="x-post:A")
+    db._execute_write(lambda c: c.execute(
+        "UPDATE sessions SET started_at=?, last_activity_at=?, message_count=? WHERE id=?",
+        (inbox.clock() - age, inbox.clock() - age, message_count, r["session_id"])))
+    assert inbox.backfill_social(apply=True)[0]["action"] == "skip:active"
+    assert cwd_of(db, r) == str(Path.home())
+
+
+@pytest.mark.parametrize("change", ["resume", "cwd", "archive"])
+def test_backfill_rechecks_session_at_write(env, monkeypatch, change):
+    inbox, db, pr = env
+    with monkeypatch.context() as m:
+        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        r = inbox.post("X post pending", "b", "p", key="x-post:A")
+    db.end_session(r["session_id"], "completed")
+    write = db._execute_write
+
+    def raced_write(fn):
+        sql = {"resume": "ended_at=NULL", "cwd": "cwd='/chosen'", "archive": "archived=1"}[change]
+        write(lambda c: c.execute(f"UPDATE sessions SET {sql} WHERE id=?", (r["session_id"],)))
+        return write(fn)
+
+    monkeypatch.setattr(db, "_execute_write", raced_write)
+    assert inbox.backfill_social(apply=True)[0]["action"] == "skip:changed"
+    assert cwd_of(db, r) == ("/chosen" if change == "cwd" else str(Path.home()))
+
+
+@pytest.mark.parametrize("missing", ["session", "ended_at"])
+def test_backfill_missing_lifecycle_evidence_fails_closed(env, monkeypatch, missing):
+    inbox, db, pr = env
+    with monkeypatch.context() as m:
+        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        r = inbox.post("X post pending", "b", "p", key="x-post:A")
+    get_session = db.get_session
+    snapshot = get_session(r["session_id"])
+    snapshot.pop("ended_at", None)
+    with monkeypatch.context() as m:
+        m.setattr(db, "get_session", lambda sid: None if missing == "session" else snapshot)
+        assert inbox.backfill_social(apply=True)[0]["action"] == "skip:active"
+    assert cwd_of(db, r) == str(Path.home())
+
+
+def test_backfill_archived_opt_in_still_requires_ended_session(env, monkeypatch):
+    inbox, db, pr = env
+    with monkeypatch.context() as m:
+        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        r = inbox.post("X post pending", "b", "p", key="x-post:A")
+    db.set_session_archived(r["session_id"], True)
+    assert inbox.backfill_social(apply=True)[0]["action"] == "skip:archived"
+    assert inbox.backfill_social(apply=True, include_archived=True)[0]["action"] == "skip:active"
+    db.end_session(r["session_id"], "completed")
+    assert inbox.backfill_social(apply=True, include_archived=True)[0]["action"] == "moved"
+    assert cwd_of(db, r) == pr
 
 
 def test_card_type_alone_classifies():

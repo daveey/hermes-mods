@@ -191,13 +191,26 @@ def handle_types(args: dict, **_) -> str:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
 
-def _pre_llm_call(session_id=None, **_):
+def _pre_llm_call(session_id=None, **context):
+    routed = None
+    try:
+        path = Path(__file__).resolve().parent / "chat_routing.py"
+        key = f"_hermes_inbox_chat_routing_{path.stat().st_mtime_ns}"
+        mod = sys.modules.get(key)
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(key, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod = sys.modules.setdefault(key, mod)
+        routed = mod.route_first_turn(store_module().routing_module(), session_id=session_id, **context)
+    except Exception:
+        log.warning("inbox: first-turn project routing failed", exc_info=True)
     try:
         if session_id and store_module().Inbox().on_user_turn(session_id):
             log.info("inbox: %s accepted by a user turn", session_id)
     except Exception:
         log.debug("inbox: accept hook failed", exc_info=True)
-    return None
+    return routed
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
