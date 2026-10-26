@@ -337,7 +337,7 @@ A stock `hermes update` won't merge upstream into a fork that already has commit
 ```sh
 cd ~/.hermes/hermes-agent
 git fetch upstream && git merge upstream/main
-git am -3 ~/code/hermes-mods/core/patches/0007-*.patch \
+git am -3 --empty=keep ~/code/hermes-mods/core/patches/0007-*.patch \
           ~/code/hermes-mods/core/patches/0011-*.patch \
           ~/code/hermes-mods/core/patches/0012-*.patch \
           ~/code/hermes-mods/core/patches/0016-*.patch

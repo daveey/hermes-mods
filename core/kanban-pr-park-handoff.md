@@ -1,6 +1,6 @@
 # PR guard handoff after an orderly park
 
-Patch: **0283**, source `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`.
+Patch: **0349**, source `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`.
 
 ## Behavior
 
@@ -28,11 +28,11 @@ bash scripts/run_tests.sh tests/hermes_cli/test_kanban_park_invariants.py tests/
 
 Tests ran in an isolated standalone clone of the applied series. Broker subprocess calls were mocked; live credentials, actual dispatcher deployment and Desktop rendering were not tested by this mirror run.
 
-The full ordered **277-patch** `git am -3` succeeded at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, with upstream `749cb638ff43f9ce5333c186a1e4f67d473aa4f2` and fork `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`. Prior privacy scrubs and patch 0242's merge adaptation were retained. This patch additionally generalizes private incident details in prose without changing behavior.
+The full ordered **277-patch** `git am -3 --empty=keep` succeeded at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, with upstream `749cb638ff43f9ce5333c186a1e4f67d473aa4f2` and fork `1a2ba03afccbee694b5dcb1adee73e85bb42be3d`. Prior privacy scrubs and patch 0251's merge adaptation were retained. This patch additionally generalizes private incident details in prose without changing behavior.
 
 ## Applying
 
-Apply the complete ordered series from its merge-base. This depends on the earlier PR guard and broker transport work, including patch 0280.
+Apply the complete ordered series from its merge-base. This depends on the earlier PR guard and broker transport work, including patch 0335.
 
 ## Gotchas
 

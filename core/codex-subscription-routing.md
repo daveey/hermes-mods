@@ -2,11 +2,11 @@
 
 Patches:
 
-- `patches/0233-fix-models-Astra-routes-via-Codex-subscription-catal.patch`: catalog spans all pool entries, plan-gated lease, metered rows labeled.
-- `patches/0234-fix-models-honor-explicit-billed-picks-and-guard-sub.patch`: explicit billed picks honored; subscription defaults guarded end to end.
-- `patches/0235-fix-auth-carry-model-entitlement-through-every-pool-.patch`: entitlement carried through every credential-pool retry branch.
-- `patches/0236-test-models-exercise-subscription-picker-through-gat.patch`: picker exercised through the gateway RPC harness.
-- `patches/0237-refactor-auth-isolate-Codex-entitlement-policy-and-k.patch`: policy moved to `agent/codex_entitlements.py`.
+- `patches/0236-fix-models-Astra-routes-via-Codex-subscription-catal.patch`: catalog spans all pool entries, plan-gated lease, metered rows labeled.
+- `patches/0237-fix-models-honor-explicit-billed-picks-and-guard-sub.patch`: explicit billed picks honored; subscription defaults guarded end to end.
+- `patches/0238-fix-auth-carry-model-entitlement-through-every-pool-.patch`: entitlement carried through every credential-pool retry branch.
+- `patches/0239-test-models-exercise-subscription-picker-through-gat.patch`: picker exercised through the gateway RPC harness.
+- `patches/0240-refactor-auth-isolate-Codex-entitlement-policy-and-k.patch`: policy moved to `agent/codex_entitlements.py`.
 
 ## Behavior
 
@@ -25,7 +25,7 @@ never silently on the metered OpenAI API and never on a free-plan pool entry.
 
 ## How it works
 
-`agent/codex_entitlements.py` (0237) holds `codex_plan_type(token)` (the `chatgpt_plan_type` JWT claim) and
+`agent/codex_entitlements.py` (0240) holds `codex_plan_type(token)` (the `chatgpt_plan_type` JWT claim) and
 `codex_entry_entitled_for_model`. `hermes_cli/codex_models.py` builds `codex_catalog_credentials()` and the union catalog,
 with a cache key from the credential set (not the cursor). `agent/credential_pool.py` applies the entitlement check at
 selection and in `_rotate_unmatched`; `hermes_cli/models.py`/`inventory.py` mark rows (`SUBSCRIPTION_PROVIDERS`,
@@ -44,7 +44,7 @@ re-route and guard the final token.
 
 ## Applying
 
-`git am -3` in order 0233-0237. 0237 assumes the helpers 0233 first put inside `credential_pool.py`/`codex_models.py`.
+`git am -3 --empty=keep` in order 0236-0240. 0240 assumes the helpers 0236 first put inside `credential_pool.py`/`codex_models.py`.
 
 ## Gotchas
 

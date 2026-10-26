@@ -42,7 +42,7 @@ Not re-run when this doc was written (untested here).
 
 ## Applying
 
-`git am -3`. Touches i18n files shared with other patches; resolve by keeping both sets of keys, then
+`git am -3 --empty=keep`. Touches i18n files shared with other patches; resolve by keeping both sets of keys, then
 `npm run i18n:keys`.
 
 ## Gotchas

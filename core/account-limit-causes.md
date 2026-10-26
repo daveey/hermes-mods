@@ -17,6 +17,24 @@ chip (desktop plugin `account-usage` in this repo) shows red only for an account
 amber for a temporary cooldown. Each row says why ("cooling down · rate limited · back 23m"). A Codex
 `usage_limit_reached` with the provider's reset date stays red until that date.
 
+## Unavailable Anthropic pool diagnostics (0340)
+
+When token resolution fails, distinguish an absent pool from existing exhausted/dead credentials or an
+unreadable pool. Exhausted entries advise inspecting reset times; entirely dead entries advise inspecting
+and, if required, reauthenticating the affected account. Mixed/unknown entries report unavailable rather
+than falsely asserting that no credentials exist.
+
+`hermes_cli/runtime_provider_anthropic_diagnostics.py` reads persisted provider statuses using canonical
+profile/root paths and provider-level precedence; `runtime_provider.py` uses the resulting non-secret
+message. It does not refresh/select credentials, clear cooldowns, rewrite stores or change model/provider pins.
+Unreadable/corrupt stores produce a conservative diagnostic without exposing row details.
+
+Source `tests/hermes_cli/test_anthropic_unavailable_diagnostics.py` covers this diagnostic boundary;
+it was not run in this documentation pass. Run it with `bash scripts/run_tests.sh` in the isolated
+applied checkout. Full-series verification is pending the mirror owner, and no live authentication
+was attempted. Apply 0340 in ordered-series context. This runtime-provider change is core, not the
+account-usage display plugin; a message is not proof that a credential will work on retry.
+
 ## Behavior
 
 - **Generic Anthropic 429 on an auxiliary call (sync `call_llm` and async `async_call_llm`):** the pool benches
@@ -60,6 +78,9 @@ amber for a temporary cooldown. Each row says why ("cooling down · rate limited
 - `tui_gateway/contracts/config_free_tier_control.py`: additive optional fields; contract files regenerated.
 
 ## Tests
+
+- 0340: source `tests/hermes_cli/test_anthropic_unavailable_diagnostics.py`; not run in this
+  documentation pass. No live credentials or authentication were exercised.
 
 - `tests/agent/test_auxiliary_pool_model_scoped_rotation.py` (new):
   - `test_initial_429_reports_failed_model_and_credential[sync|async]`: real `call_llm` / `async_call_llm` ladder;

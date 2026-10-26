@@ -304,8 +304,8 @@ What the tests cover:
 From a hermes-agent checkout on current `upstream/main`:
 
 ```bash
-git am -3 ~/code/hermes-mods/core/patches/0008-feat-desktop-desktop.auto_continue.resume_on_startup.patch
-git am -3 ~/code/hermes-mods/core/patches/0010-fix-desktop-a-turn-stopped-by-backend-shutdown-keeps.patch
+git am -3 --empty=keep ~/code/hermes-mods/core/patches/0008-feat-desktop-desktop.auto_continue.resume_on_startup.patch
+git am -3 --empty=keep ~/code/hermes-mods/core/patches/0010-fix-desktop-a-turn-stopped-by-backend-shutdown-keeps.patch
 ```
 
 - Both apply cleanly on current upstream/main, in order.
@@ -338,7 +338,7 @@ git am -3 ~/code/hermes-mods/core/patches/0010-fix-desktop-a-turn-stopped-by-bac
 - **Sweep also runs under `hermes dashboard`.** It hooks `web_server._lifespan`, which isn't Desktop-only. It
   only acts on Desktop turn markers, and only when the config is on.
 - **`hermes update` with local commits.** These are local commits on top of upstream; a plain update that resets
-  to upstream drops them. Re-apply with `git am -3` (or use a fork-merge flow like patch 0007).
+  to upstream drops them. Re-apply with `git am -3 --empty=keep` (or use a fork-merge flow like patch 0007).
 
 ## Could this be a plugin instead?
 

@@ -105,7 +105,7 @@ exercises.
 
 ## Applying
 
-`git am -3 core/patches/0141-*.patch` after 0140 (both edit `tools/kanban_tools.py`). It also relies on
+`git am -3 --empty=keep core/patches/0141-*.patch` after 0140 (both edit `tools/kanban_tools.py`). It also relies on
 earlier fork Kanban patches: `kanban_continue` (`kanban-soft-deadline.md`, 0121), the block-kind routing and
 unblock-loop triage (`kanban-block-loop-escalation.md`), and the `KANBAN_GUIDANCE` text from
 `kanban-timed-waits.md`. Apply the series in order.

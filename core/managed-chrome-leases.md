@@ -31,8 +31,8 @@ bootstrap a stopped launchd job or execute an inferred wake helper.
 
 ## Code
 
-Proposed appended patches **0293–0295**, after the preserved published series
-through 0292 (including profile-scoped GitHub broker patch 0280):
+Proposed appended patches **0370–0372**, after the preserved published series
+through 0360 (including profile-scoped GitHub broker patch 0335):
 
 - `tools/browser_agent_lifecycle.py`: route validation, acquire/complete/release,
   owner-specific daemon and vault identity, bounded cleanup retry.
@@ -86,28 +86,28 @@ See the lifecycle acceptance section for the failed-first-probe qualification.
 ## Applying
 
 These three patches are feature-branch proposals, not a released installation.
-Apply in order after 0292; do not renumber existing siblings. The full mirror uses
+Apply in order after 0360; do not renumber existing siblings. The full mirror uses
 the fork/upstream merge-base, not the newer upstream tip. Existing public privacy
-substitutions and the merge-adapted patch 0242 must be preserved. The documentation
-correction verification applied all 266 patches with `git am -3` from merge-base
+substitutions and the merge-adapted patch 0251 must be preserved. The documentation
+correction verification applied all 266 patches with `git am -3 --empty=keep` from merge-base
 `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63` in a disposable clone; all ten
 feature-path blobs matched core head `6add72d407e8cc47fabc01b1f2a468828f4c1578`.
-Patches 0001–0265 were
+Patches 0001–0289 were
 preserved byte-for-byte. This application check is not a full-suite CI result.
 
 The subsequent integration onto fork main `f51c577542` moves only these three
-feature patches to 0268–0270. All 267 existing main patches, including privacy
-adaptations and 0242, remain byte-for-byte intact. All 270 patches applied with
-`git am -3` from the same merge-base in a disposable clone; all ten feature-path
+feature patches to 0292–0298. All 267 existing main patches, including privacy
+adaptations and 0251, remain byte-for-byte intact. All 270 patches applied with
+`git am -3 --empty=keep` from the same merge-base in a disposable clone; all ten feature-path
 blobs matched integrated core `b27b88b0dc67c27b8a4724905a6ff3dce13ecbf1`.
 Both the 266- and 270-patch receipts above are historical, not the current apply order.
 
 The earlier final pinned-base integration uses fork main `ca145ec36e04a7db3271e2df91622dc7adbd91a2`
 and public main `1414cbbb0ca02b30bd7b0159a0a7c1a43a42a4aa`. It preserves all 275
 public main patches byte-for-byte, including historical privacy substitutions and
-adapted 0242. The already-published topology renumbering is retained, not repeated.
-Patch 0276 mirrors the single additional landed Kanban broker commit; these Chrome
-patches follow as 0277–0279. The complete 279-patch series applied with `git am -3`
+adapted 0251. The already-published topology renumbering is retained, not repeated.
+Patch 0312 mirrors the single additional landed Kanban broker commit; these Chrome
+patches follow as 0329–0331. The complete 279-patch series applied with `git am -3 --empty=keep`
 from the same merge-base; all ten Chrome paths and all five broker paths match
 integrated core `54716420ff7c58cf1ab34fbfb22ef9e878f87cd3` (the config path overlaps).
 The 189 core tests, two documentation-drift tests and 16 broker/acceptance tests
@@ -120,7 +120,7 @@ imply a new native run. Full remote CI and independent exact-delta review remain
 The historical recovered-CI integration pins core `39cdabdc623caf3661406446efc4610640b81107`
 and published public main `44ec0cd377b6afba7b656107eb29c1e13d3d4b9a`.
 All 284 published patches are preserved byte-for-byte; the three unchanged Chrome
-commits occupied 0285–0287 in that snapshot. The complete 287-patch series applied with `git am -3`
+commits occupied 0351–0353 in that snapshot. The complete 287-patch series applied with `git am -3 --empty=keep`
 from the same merge-base. All ten Chrome paths match integrated core
 `6d2434b45db1a4f2c0a6206930504cce1c4549db`; the 24 newly integrated sibling paths
 also match except the preserved published task-identifier substitution in a Kanban
@@ -136,9 +136,9 @@ The subsequent published-baseline reconciliation pins core
 `b25626626475551ffd4a4b7dcd39cbb41048315b`. Its already-published mirror contains
 292 patches, including merged commits inserted earlier in the ordered history.
 All 292 published patch files are preserved byte-for-byte, including adapted
-0242 and the published attribution/test-fixture privacy substitutions. The broker
-is now 0280 (0278 in the recovered-CI snapshot); Chrome follows as 0293–0295.
-All 295 patches applied with `git am -3` from the same merge-base. The ten Chrome
+0251 and the published attribution/test-fixture privacy substitutions. The broker
+is now 0335 (0330 in the recovered-CI snapshot); Chrome follows as 0370–0372.
+All 295 patches applied with `git am -3 --empty=keep` from the same merge-base. The ten Chrome
 blobs match integrated core `5b105d0a1ffd01da75885373d3d39a69270abb33`, and feature
 application preserves every sibling tree entry from the applied public baseline.
 All three Chrome commits remain patch-equivalent to the recovered-CI candidate.

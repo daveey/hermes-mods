@@ -1,0 +1,459 @@
+From 6a22648682c17d1f620ca632f5867cafcbf58051 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 06:32:23 +0000
+Subject: [PATCH] feat(kanban): add owner evidence projection foundation
+ [daveey]
+
+---
+ .../src/store/native-notifications.test.ts    |  28 ++-
+ .../desktop/src/store/native-notifications.ts |  18 ++
+ hermes_cli/kanban_origin_ledger.py            |  57 +++++-
+ .../hermes_cli/test_kanban_origin_evidence.py | 168 ++++++++++++++++++
+ .../test_kanban_origin_observation.py         |   4 +-
+ .../test_kanban_origin_projection.py          |  53 +++---
+ 6 files changed, 300 insertions(+), 28 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_evidence.py
+
+diff --git a/apps/desktop/src/store/native-notifications.test.ts b/apps/desktop/src/store/native-notifications.test.ts
+index 550ab44fb7..73b98f73ea 100644
+--- a/apps/desktop/src/store/native-notifications.test.ts
++++ b/apps/desktop/src/store/native-notifications.test.ts
+@@ -18,7 +18,7 @@ import {
+ import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from './notify-baseline'
+ import { $approvalRequest, APPROVAL_RESPOND_REQUEST_TIMEOUT_MS, clearAllPrompts, setApprovalRequest } from './prompts'
+ import { markSessionGone, resetBackgroundPollingGuard } from './runtime-gone'
+-import { setActiveSessionId } from './session'
++import { setActiveSessionId, setSessions } from './session'
+ import { dropSessionState, publishSessionState } from './session-states'
+ 
+ const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
+@@ -83,6 +83,32 @@ it('captures durable navigation identity while keeping the runtime id for approv
+ })
+ 
+ describe('dispatchNativeNotification focus gating', () => {
++  it.each([
++    { kanban_active: 1 },
++    { kanban_blocked: 1 },
++    { kanban_unknown: true },
++    { kanban_remote_stale: 1 }
++  ])('does not announce finished while the origin projection is unresolved: %o', stamp => {
++    const runtime = freshSession()
++    const stored = `${runtime}-stored`
++    setActiveSessionId(runtime)
++    publishSessionState(runtime, createClientSessionState(stored))
++
++    try {
++      setSessions([{ id: stored, ...stamp } as never])
++      expect(dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done' })).toBe(false)
++      expect(notify).not.toHaveBeenCalled()
++      // A later authoritative release is eligible; suppression must not consume
++      // the notification throttle. Error/attention paths remain independent.
++      setSessions([{ id: stored } as never])
++      expect(dispatchNativeNotification({ kind: 'turnDone', sessionId: runtime, title: 'done' })).toBe(true)
++      expect(notify).toHaveBeenCalledTimes(1)
++    } finally {
++      dropSessionState(runtime)
++      setSessions([])
++    }
++  })
++
+   it('fires a completion notification for the active session when the window is hidden', () => {
+     const sessionId = freshSession()
+     setActiveSessionId(sessionId)
+diff --git a/apps/desktop/src/store/native-notifications.ts b/apps/desktop/src/store/native-notifications.ts
+index cd0e0c2af6..3070b09e9c 100644
+--- a/apps/desktop/src/store/native-notifications.ts
++++ b/apps/desktop/src/store/native-notifications.ts
+@@ -237,6 +237,24 @@ export function dispatchNativeNotification(input: NativeNotificationInput): bool
+     return false
+   }
+ 
++  // A turn ending is not completion of the work it dispatched. These stamps
++  // are the backend's shared origin-ledger projection, also consumed by the
++  // task strip, sidebar finish state and archive guard. Never reconstruct owner
++  // status from a terminal event or from an absent replica row here.
++  if (input.kind === 'turnDone' && input.sessionId) {
++    const storedId = storedSessionIdForRuntimeId(input.sessionId) ?? input.sessionId
++
++    const unfinished = ownerLookupSessionRows().some(row =>
++      sessionMatchesStoredId(row, storedId) &&
++      (row.kanban_unknown === true || (row.kanban_active ?? 0) > 0 ||
++        (row.kanban_blocked ?? 0) > 0 || (row.kanban_remote_stale ?? 0) > 0)
++    )
++
++    if (unfinished) {
++      return false
++    }
++  }
++
+   if (throttled(`${input.kind}:${input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`, Date.now())) {
+     return false
+   }
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index b33a16a036..5a439ba95a 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -101,11 +101,53 @@ def obligations(path: Path, *, gateway: str, profile: str, sessions: list[str])
+             origin = binding["origin"]
+             if (origin["gateway"] == gateway and origin["profile"] == profile
+                     and (origin["session"] in sessions or resolved in sessions)):
+-                result.append({**binding, "resolved_session": resolved, "task": json.loads(task),
+-                               "observation_version": version, "unfinished": not bool(released)})
++                payload = json.loads(task)
++                released = bool(released and _owner_evidence(payload).get('verified') is True)
++                result.append({**binding, "resolved_session": resolved, "task": payload,
++                               "observation_version": version, "unfinished": not released})
+     return result
+ 
+ 
++def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> dict:
++    """Attach owner evidence during the collector's existing read transaction.
++
++    The collector must call this on the owner, never on a replica. A completion
++    event is evidence of the core lifecycle gate; status alone (including an
++    archive) is not. Goal-mode lacks a persisted judge-success record today, so
++    those completions deliberately remain unverified.
++    """
++    row = conn.execute(
++        "SELECT status,completed_at,current_run_id,goal_mode,completion_contract FROM tasks WHERE id=?",
++        (task['id'],)).fetchone()
++    if row is None or row[0] != task.get('status'):
++        raise ValueError('origin_observation_task_changed')
++    event = conn.execute(
++        "SELECT id,run_id,created_at FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
++        (task['id'],)).fetchone()
++    run = conn.execute(
++        "SELECT id,status,outcome,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++        (task['id'],)).fetchone()
++    verified = bool(row[0] == 'done' and row[2] is None and not row[3] and row[4] == 'local-only'
++                    and event and run and event[1] == run[0] and run[1] in ('done', 'completed') and run[2] == 'completed'
++                    and row[1] is not None and event[2] >= row[1] and run[3] is not None and run[3] >= row[1])
++    payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    return {**payload, 'origin_observation': {
++        'schema': 1, 'observed_at': now,
++        'task_hash': hashlib.sha256(_json(payload).encode()).hexdigest(),
++        'verified': verified,
++    }}
++
++
++def _owner_evidence(task: dict) -> dict:
++    evidence = task.get('origin_observation')
++    if not isinstance(evidence, dict) or type(evidence.get('schema')) is not int or evidence['schema'] != 1:
++        return {}
++    payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    if evidence.get('task_hash') != hashlib.sha256(_json(payload).encode()).hexdigest():
++        return {}
++    return evidence
++
++
+ def refresh_observations(path: Path, replica: Path) -> None:
+     """Advance durable observations only from newer, exactly bound owner records.
+ 
+@@ -142,7 +184,8 @@ def refresh_observations(path: Path, replica: Path) -> None:
+                         {k: v for k, v in m.items() if k != 'publication_version'}
+                         for m in markers if isinstance(m, dict)]:
+                     continue
+-                released = task.get('status') in ('done', 'archived')
++                released = (task.get('status') in ('done', 'archived')
++                            and _owner_evidence(task).get('verified') is True)
+                 conn.execute(
+                     "UPDATE origin_obligations SET task_json=?,observation_version=?,released=? WHERE binding_id=?",
+                     (_json(task), row[0], int(released), key))
+@@ -189,6 +232,9 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                 if (origin['gateway'], origin['profile']) != (gateway, profile):
+                     continue
+                 task = json.loads(payload)
++                # Old ledgers set released from status alone. Recheck evidence
++                # even when the replica version has not advanced.
++                released = bool(released and _owner_evidence(task).get('verified') is True)
+                 current = False
+                 if fresh and source is not None:
+                     row = source.execute(
+@@ -212,7 +258,10 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                                     and matching[0].get('state') == 'ok')
+                     except (ValueError, TypeError, AttributeError):
+                         readable = False
+-                    current = current and readable
++                    evidence = _owner_evidence(task)
++                    observed_at = evidence.get('observed_at')
++                    live = (type(observed_at) in (int, float) and 0 <= now - observed_at <= 180)
++                    current = current and readable and live
+                 status = task.get('status')
+                 # Acceptance alone is not a release, including an initially
+                 # terminal publication. Unknown status also remains unfinished.
+diff --git a/tests/hermes_cli/test_kanban_origin_evidence.py b/tests/hermes_cli/test_kanban_origin_evidence.py
+new file mode 100644
+index 0000000000..39860b7c08
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_evidence.py
+@@ -0,0 +1,168 @@
++"""Owner evidence is derived from real lifecycle writes, not reported status."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_ledger as ledger
++from tests.hermes_cli.test_kanban_origin_creation import board
++from tests.hermes_cli.test_kanban_origin_ledger import world, publish, accept
++
++
++def publish_observed(conn, replica, binding, *, version, now=1000):
++    status = conn.execute('SELECT status FROM tasks WHERE id=?', (binding['owner']['task_id'],)).fetchone()[0]
++    publish(replica, binding, status=status)
++    with sqlite3.connect(replica) as db:
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks'").fetchone()[0])
++        task = ledger.observe_owner_task(conn, task, now=now)
++        db.execute("UPDATE replica SET version=?,data=? WHERE coll='tasks'", (version, json.dumps(task)))
++        db.execute('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)')
++        db.execute("INSERT OR REPLACE INTO meta VALUES ('last_ok',?)", (str(now),))
++        db.execute("INSERT INTO replica VALUES ('owner','gateway','info',6,?)",
++                   (json.dumps({'gateway': 'owner', 'task_scopes': [
++                       {'profile': 'work', 'board': 'build', 'state': 'ok'}]}),))
++
++
++def test_current_owner_verified_completion_releases(world, board):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', completion_contract='local-only')
++        binding['owner']['task_id'] = tid
++        binding['task_record_key'] = f'work/build/{tid}'
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, replica, binding, version=4)
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
++    assert row['status'] == 'done'
++    assert row['unfinished'] is False
++    assert row['stale'] is False
++
++
++
++@pytest.mark.parametrize('terminal', [False, True])
++def test_fresh_transport_cannot_refresh_an_offline_owner(world, board, terminal):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', completion_contract='local-only')
++        binding['owner']['task_id'] = tid
++        binding['task_record_key'] = f'work/build/{tid}'
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        if terminal:
++            assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, replica, binding, version=4)
++    assert ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]['stale'] is False
++    with sqlite3.connect(replica) as db:
++        db.execute("UPDATE meta SET v='1500' WHERE k='last_ok'")
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1501)[0]
++    assert row['status'] == 'unknown'
++    assert row['unfinished'] and row['stale']
++
++
++@pytest.mark.parametrize('migrated_release', [False, True])
++@pytest.mark.parametrize('goal_mode', [False, True])
++def test_complete_but_unverified_stays_unfinished(world, board, goal_mode, migrated_release):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', completion_contract='local-only', goal_mode=goal_mode)
++        binding['owner']['task_id'] = tid
++        binding['task_record_key'] = f'work/build/{tid}'
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        if goal_mode:
++            # Direct core completion bypasses the CLI/tool judge. A completed
++            # event alone cannot prove that the goal judge actually ran.
++            assert kb.complete_task(conn, tid, summary='Claims completion')
++        else:
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        publish_observed(conn, replica, binding, version=4)
++    if migrated_release:
++        ledger.refresh_observations(path, replica)
++        with sqlite3.connect(path) as db:
++            db.execute('UPDATE origin_obligations SET released=1')
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
++    assert row['reported_status'] == 'done'
++    assert row['status'] == 'unknown'
++    assert row['unfinished'] is True
++    assert row['stale'] is False
++    assert ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]['unfinished']
++
++
++def test_activity_consumers_share_live_verified_release(world, board, monkeypatch):
++    import hermes_constants
++    from hermes_cli import kanban_session_activity as activity, kanban_origin_adapter as adapter, profiles
++
++    path, replica, binding = world
++    destination = path.parent / 'kanban' / 'origin-ledger.db'
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: path.parent)
++    monkeypatch.setattr(adapter, '_gateway', lambda _: 'origin')
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: replica)
++    monkeypatch.setattr(activity, '_board_db_paths', list)
++    monkeypatch.setattr(activity, '_legacy_remote_links', list)
++    monkeypatch.setattr(activity.time, 'time', lambda: 1001)
++
++    def read():
++        activity._reset_cache_for_tests()
++        cards = activity.session_tasks(['s_old', 's_current'])
++        stamped = activity.annotate_kanban_activity([{'id': 's_current', '_lineage_ids': ['s_old']}])[0]
++        return cards, stamped
++
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', completion_contract='local-only')
++        binding['owner']['task_id'] = tid
++        binding['task_record_key'] = f'work/build/{tid}'
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        destination.parent.mkdir(exist_ok=True)
++        path.rename(destination)
++        cards, stamped = read()
++        assert len(cards) == stamped['kanban_active'] == 1
++        # A claimed completion without a lifecycle event stays unfinished.
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        publish_observed(conn, replica, binding, version=4)
++        cards, stamped = read()
++        assert len(cards) == stamped['kanban_active'] == 1
++        assert cards[0]['status'] == 'unknown'
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        conn.commit()
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, replica, binding, version=5)
++        cards, stamped = read()
++        assert cards == []
++        assert not stamped.get('kanban_active')
++        # Origin transport stays healthy after the owner's last observation expires.
++        monkeypatch.setattr(activity.time, 'time', lambda: 1501)
++        with sqlite3.connect(replica) as db:
++            db.execute("UPDATE meta SET v='1500' WHERE k='last_ok'")
++        cards, stamped = read()
++        assert len(cards) == stamped['kanban_active'] == stamped['kanban_remote_stale'] == 1
++        assert cards[0]['status'] == 'unknown'
++
++
++def test_missing_run_end_is_unverified_not_a_collection_error(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', completion_contract='local-only')
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        conn.execute('UPDATE task_runs SET ended_at=NULL WHERE task_id=?', (tid,))
++        task = {'id': tid, 'status': 'done', 'gateway': 'owner', 'profile': 'default', 'board': 'default'}
++        assert ledger.observe_owner_task(conn, task, now=1000)['origin_observation']['verified'] is False
++
++
++def test_owner_observation_proves_current_local_completion(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', completion_contract='local-only')
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        task = {'id': tid, 'status': 'done', 'gateway': 'owner', 'profile': 'default', 'board': 'default'}
++        observe = getattr(ledger, 'observe_owner_task', None)
++        assert callable(observe), 'owner observation producer is missing'
++        observed = observe(conn, task, now=1000)
++        assert observed['origin_observation']['verified'] is True, (
++            tuple(conn.execute('SELECT status,completed_at,current_run_id,goal_mode,completion_contract FROM tasks WHERE id=?', (tid,)).fetchone()),
++            [tuple(r) for r in conn.execute('SELECT id,status,outcome,ended_at FROM task_runs WHERE task_id=?', (tid,))],
++            [tuple(r) for r in conn.execute("SELECT id,run_id,created_at FROM task_events WHERE task_id=? AND kind='completed'", (tid,))],
++        )
++        assert observed['origin_observation']['observed_at'] == 1000
++        assert task.get('origin_observation') is None
+diff --git a/tests/hermes_cli/test_kanban_origin_observation.py b/tests/hermes_cli/test_kanban_origin_observation.py
+index 2d980b2794..60537496c1 100644
+--- a/tests/hermes_cli/test_kanban_origin_observation.py
++++ b/tests/hermes_cli/test_kanban_origin_observation.py
+@@ -5,7 +5,7 @@ from tests.hermes_cli.test_kanban_origin_ledger import world, publish, accept
+ from hermes_cli import kanban_origin_ledger as ledger
+ 
+ 
+-def test_verified_terminal_observation_releases_and_newer_reopen_restores(world):
++def test_unverified_terminal_observation_retained_and_newer_reopen_restores(world):
+     path, replica, binding = world
+     publish(replica, binding)
+     accept(world)
+@@ -14,7 +14,7 @@ def test_verified_terminal_observation_releases_and_newer_reopen_restores(world)
+         db.execute('UPDATE replica SET version=4')
+     ledger.refresh_observations(path, replica)
+     rows = ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])
+-    assert rows[0]['unfinished'] is False
++    assert rows[0]['unfinished'] is True  # a newer done report is not verification
+     assert rows[0]['observation_version'] == 4
+     publish(replica, binding, status='running')
+     with sqlite3.connect(replica) as db:
+diff --git a/tests/hermes_cli/test_kanban_origin_projection.py b/tests/hermes_cli/test_kanban_origin_projection.py
+index 05d529d93c..3cc1c16677 100644
+--- a/tests/hermes_cli/test_kanban_origin_projection.py
++++ b/tests/hermes_cli/test_kanban_origin_projection.py
+@@ -4,6 +4,7 @@ import json
+ import pytest
+ 
+ from tests.hermes_cli.test_kanban_origin_ledger import world, publish, accept
++from tests.hermes_cli.test_kanban_origin_creation import board
+ from hermes_cli import kanban_origin_ledger as ledger
+ 
+ 
+@@ -70,33 +71,43 @@ def test_projection_unavailable_replica_never_exposes_released_as_done(world):
+     assert row['reported_status'] == 'done'
+ 
+ 
+-def test_projection_current_release_and_reopen(world):
++def test_projection_current_release_and_reopen(world, board):
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    from tests.hermes_cli.test_kanban_origin_evidence import publish_observed
++
++    path, replica, binding = world
++    def rows():
++        return ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', completion_contract='local-only')
++        binding['owner']['task_id'] = tid
++        binding['task_record_key'] = f'work/build/{tid}'
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        assert rows()[0]['status'] == 'ready'
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, replica, binding, version=4)
++        assert rows()[0]['unfinished'] is False
++        assert rows()[0]['status'] == 'done'
++        conn.execute("UPDATE tasks SET status='running',completed_at=NULL WHERE id=?", (tid,))
++        publish_observed(conn, replica, binding, version=5)
++        assert rows()[0]['unfinished'] is True
++        assert rows()[0]['status'] == 'running'
++
++
++def test_readable_inventory_without_owner_liveness_is_unknown(world):
+     path, replica, binding = world
+     publish(replica, binding)
+     accept(world)
+     with sqlite3.connect(replica) as db:
+         db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
+         db.execute("INSERT INTO meta VALUES ('last_ok','1000')")
+-    def rows():
+-        # Source contract: collect_all publishes scope health at gateway/info.
+-        # publish() replaces the replica, so restore inventory on each observation.
+-        with sqlite3.connect(replica) as db:
+-            db.execute("DELETE FROM replica WHERE coll='gateway'")
+-            db.execute("INSERT INTO replica VALUES ('owner','gateway','info',6,?)",
+-                       (json.dumps({'gateway': 'owner', 'task_scopes': [
+-                           {'profile': 'work', 'board': 'build', 'state': 'ok'}]}),))
+-        return ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
+-    assert rows()[0]['status'] == 'running'
+-    publish(replica, binding, status='done')
+-    with sqlite3.connect(replica) as db:
+-        db.execute('UPDATE replica SET version=4')
+-    assert rows()[0]['unfinished'] is False
+-    assert rows()[0]['status'] == 'done'
+-    publish(replica, binding, status='running')
+-    with sqlite3.connect(replica) as db:
+-        db.execute('UPDATE replica SET version=5')
+-    assert rows()[0]['unfinished'] is True
+-    assert rows()[0]['status'] == 'running'
++        db.execute("INSERT INTO replica VALUES ('owner','gateway','info',5,?)",
++                   (json.dumps({'gateway': 'owner', 'task_scopes': [
++                       {'profile': 'work', 'board': 'build', 'state': 'ok'}]}),))
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
++    assert row['status'] == 'unknown'
++    assert row['unfinished'] and row['stale']
+ 
+ 
+ @pytest.mark.parametrize('scopes', [None, [], [{'profile': 'work', 'board': 'build', 'state': 'unknown'}],
+-- 
+2.55.0
+

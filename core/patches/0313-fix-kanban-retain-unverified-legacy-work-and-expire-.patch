@@ -1,0 +1,374 @@
+From eb3979e02b46fcf7aa9ec9b27d0d321009e05a62 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:51:10 +0000
+Subject: [PATCH] fix(kanban): retain unverified legacy work and expire
+ consumer evidence [daveey]
+
+
+Public-series adaptation: preserve merged preceding changes.
+
+---
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+index 917bf52906..df9188c108 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+@@ -158,6 +158,7 @@ function makeSession(overrides: Partial<SessionInfo> & { title: string }): Sessi
+     handoff_platform: null,
+     handoff_state: null,
+     id: 's1',
++    kanban_observed_at: Date.now() / 1000,
+     last_active: 0,
+     profile: 'default',
+     started_at: 0,
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+index e068610195..233c5fd6c5 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -38,6 +38,7 @@ function row(overrides: Partial<SessionInfo> = {}): SessionInfo {
+     id: 's-1',
+     input_tokens: 0,
+     is_active: false,
++    kanban_observed_at: Date.now() / 1000,
+     last_active: 1,
+     message_count: 2,
+     model: null,
+@@ -141,8 +142,12 @@ describe('archiveSession linked-work confirmation', () => {
+     expect($sessions.get().map(session => session.id)).toEqual(['s-1'])
+   })
+ 
+-  it('asks when remote task status is unknown despite zero known counts', async () => {
+-    setSessions([row({ kanban_unknown: true, kanban_active: 0, kanban_blocked: 0 })])
++  it.each([
++    { kanban_unknown: true },
++    { kanban_observed_at: undefined },
++    { kanban_observed_at: 1 }
++  ])('asks when remote task status is unknown despite zero known counts: %j', async evidence => {
++    setSessions([row({ ...evidence, kanban_active: 0, kanban_blocked: 0 })])
+     const handle = await mountHarness()
+     let done: Promise<void> | undefined
+     act(() => { done = handle.archiveSession('s-1') })
+diff --git a/apps/desktop/src/store/archive-guards.test.ts b/apps/desktop/src/store/archive-guards.test.ts
+index 13035346ef..2994ba0f6f 100644
+--- a/apps/desktop/src/store/archive-guards.test.ts
++++ b/apps/desktop/src/store/archive-guards.test.ts
+@@ -73,11 +73,17 @@ describe('archive guards', () => {
+     ])
+   })
+ 
++  it.each([undefined, {}, { kanban_observed_at: 1 }, { kanban_observed_at: Infinity },
++    { kanban_observed_at: Date.now() / 1000 + 60 }])('warns when zero-work evidence is absent or stale: %j', session => {
++    const copy = { label: 'Kanban tasks', unknown: 'Status unavailable', value: () => 'counts' }
++
++    expect(kanbanArchiveLinks(session as never, copy)).toEqual([{ label: copy.label, value: copy.unknown }])
++  })
++
+   it('kanbanArchiveLinks reads the row counts', () => {
+     const copy = { label: 'Kanban tasks', unknown: 'Status unavailable', value: (open: number, blocked: number) => `${open}/${blocked}` }
+ 
+-    expect(kanbanArchiveLinks(undefined, copy)).toEqual([])
+-    expect(kanbanArchiveLinks({ kanban_active: 0 } as never, copy)).toEqual([])
++    expect(kanbanArchiveLinks({ kanban_active: 0, kanban_observed_at: Date.now() / 1000 } as never, copy)).toEqual([])
+     expect(kanbanArchiveLinks({ kanban_active: 2, kanban_blocked: 1 } as never, copy)).toEqual([
+       { label: 'Kanban tasks', value: '2/1' }
+     ])
+diff --git a/apps/desktop/src/store/archive-guards.ts b/apps/desktop/src/store/archive-guards.ts
+index 6d8697cd7d..4a44a66cd9 100644
+--- a/apps/desktop/src/store/archive-guards.ts
++++ b/apps/desktop/src/store/archive-guards.ts
+@@ -13,6 +13,8 @@
+ 
+ import type { SessionInfo } from '@/types/hermes'
+ 
++import { hasFreshKanbanObservation } from './kanban-observation'
++
+ /** One line in the confirm dialog: `label` = the kind ("Kanban tasks"),
+  *  `value` = what's linked ("3 open, 1 blocked"). */
+ export interface ArchiveLinkedItem {
+@@ -112,7 +114,8 @@ export function kanbanArchiveLinks(
+   const blocked = Math.max(0, Number(session?.kanban_blocked) || 0)
+ 
+   if (open + blocked === 0) {
+-    return []
++    return hasFreshKanbanObservation(session) && !(session?.kanban_remote_stale ?? 0)
++      ? [] : [{ label: copy.label, value: copy.unknown }]
+   }
+ 
+   return [{ label: copy.label, value: copy.value(open, blocked) }]
+diff --git a/apps/desktop/src/store/kanban-observation.ts b/apps/desktop/src/store/kanban-observation.ts
+new file mode 100644
+index 0000000000..6031dd7d43
+--- /dev/null
++++ b/apps/desktop/src/store/kanban-observation.ts
+@@ -0,0 +1,21 @@
++import { atom, onMount } from 'nanostores'
++
++import type { SessionInfo } from '@/types/hermes'
++
++// Expire cached zero-work projections even when the owner stops answering.
++// Mount-scoped so unused stores do not leave a permanent background timer.
++export const $kanbanObservationTick = atom(0)
++onMount($kanbanObservationTick, () => {
++  const timer = setInterval(() => $kanbanObservationTick.set($kanbanObservationTick.get() + 1), 15_000)
++
++  return () => clearInterval(timer)
++})
++
++/** A successful empty read is evidence; an absent/expired stamp is not. */
++export function hasFreshKanbanObservation(session: Pick<SessionInfo, 'kanban_observed_at'> | undefined, after?: number): boolean {
++  const observed = session?.kanban_observed_at
++  const age = typeof observed === 'number' ? Date.now() / 1000 - observed : NaN
++
++  return Number.isFinite(age) && age >= 0 && age <= 180 &&
++    (after === undefined || (typeof observed === 'number' && observed >= after))
++}
+diff --git a/apps/desktop/src/store/native-notifications.ts b/apps/desktop/src/store/native-notifications.ts
+index 6b7b55dd1a..0db75584df 100644
+--- a/apps/desktop/src/store/native-notifications.ts
++++ b/apps/desktop/src/store/native-notifications.ts
+@@ -6,6 +6,7 @@ import { persistString, storedString } from '@/lib/storage'
+ 
+ import { recordFeatureToggle } from './desktop-metrics'
+ import { $gateway } from './gateway'
++import { hasFreshKanbanObservation } from './kanban-observation'
+ import { withinNativeNotifyBaseline } from './notify-baseline'
+ import {
+   answerApproval,
+@@ -348,11 +349,7 @@ export function dispatchNativeNotification(input: NativeNotificationInput): bool
+ 
+     const rows = ownerLookupSessionRows().filter(row => sessionMatchesStoredId(row, storedId))
+     const row = rows.length === 1 ? rows[0] : undefined
+-    const observed = row?.kanban_observed_at
+-    const age = typeof observed === 'number' ? Date.now() / 1000 - observed : NaN
+-
+-    const known = Number.isFinite(age) && age >= 0 && age <= 180 &&
+-      (input.projectionAfter === undefined || (typeof observed === 'number' && observed >= input.projectionAfter))
++    const known = hasFreshKanbanObservation(row, input.projectionAfter)
+ 
+     const unfinished = !row || !known || row.kanban_unknown === true ||
+       (row.kanban_active ?? 0) > 0 || (row.kanban_blocked ?? 0) > 0 ||
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 3cfc5d054c..892100f6d4 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -1,8 +1,10 @@
+-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { cleanStores } from 'nanostores'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { createClientSessionState } from '@/lib/chat-runtime'
+ import type { SessionInfo } from '@/types/hermes'
+ 
++import { $kanbanObservationTick } from './kanban-observation'
+ import {
+   $cronSessions,
+   $messagingSessions,
+@@ -206,7 +208,7 @@ describe('$delegatingSessionIds', () => {
+ })
+ 
+ const storedRow = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
+-  ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
++  ({ id, kanban_observed_at: Date.now() / 1000, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
+ 
+ describe('persisted unread (backend watermark)', () => {
+   beforeEach(() => {
+@@ -368,6 +370,33 @@ describe('kanban work in flight ($kanbanBusySessionIds)', () => {
+     expect(sessionStatusStripe($sessionDotStateById.get()['s2'] ?? 'idle', true)).toBe('done')
+   })
+ 
++  it.each([undefined, 1, Infinity, Date.now() / 1000 + 60])('keeps absent or stale observations off done: %s', observed => {
++    setSessions([storedRow('s1', { kanban_observed_at: observed })])
++
++    expect($kanbanBusySessionIds.get()).toContain('s1')
++    expect(withRowActivity('idle', { kanban_observed_at: observed } as never)).toBe('background')
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBeNull()
++  })
++
++  it('expires a zero-work observation even when no list refresh arrives', () => {
++    // Earlier get() calls mount real timers until nanostores' delayed unmount.
++    // Remount under the fake clock; isolated execution already passes.
++    cleanStores($kanbanBusySessionIds, $kanbanObservationTick)
++    vi.useFakeTimers()
++    const stop = $kanbanBusySessionIds.subscribe(() => {})
++
++    try {
++      setSessions([storedRow('s1')])
++      expect($kanbanBusySessionIds.get()).toEqual([])
++      vi.advanceTimersByTime(200_000)
++      expect($kanbanBusySessionIds.get()).toContain('s1')
++    } finally {
++      stop()
++      vi.advanceTimersByTime(2_000)
++      vi.useRealTimers()
++    }
++  })
++
+   it('goes back to done once the tasks finish', () => {
+     setSessions([storedRow('s1', { kanban_active: 1 })])
+     setSessions([storedRow('s1', { kanban_active: 0 })])
+@@ -547,7 +576,7 @@ describe('withRowActivity', () => {
+       expect(withRowActivity(state, { goal_active: true })).toBe(state)
+     }
+ 
+-    expect(withRowActivity('idle', { goal_active: false, kanban_active: 0 })).toBe('idle')
++    expect(withRowActivity('idle', { goal_active: false, kanban_active: 0, kanban_observed_at: Date.now() / 1000 })).toBe('idle')
+   })
+ })
+ 
+@@ -591,8 +620,8 @@ describe('kanban results waiting for an unloaded session ($kanbanUnseenSessionId
+   })
+ 
+   it('withRowActivity turns an idle project-tree row with a waiting result green', () => {
+-    expect(withRowActivity('idle', { kanban_active: 0, kanban_unseen: 1 })).toBe('unread')
++    expect(withRowActivity('idle', { kanban_active: 0, kanban_unseen: 1, kanban_observed_at: Date.now() / 1000 })).toBe('unread')
+     expect(withRowActivity('idle', { kanban_active: 1, kanban_unseen: 1 })).toBe('background')
+-    expect(withRowActivity('idle', { kanban_active: 0 })).toBe('idle')
++    expect(withRowActivity('idle', { kanban_active: 0, kanban_observed_at: Date.now() / 1000 })).toBe('idle')
+   })
+ })
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 48e0759c47..5fe3dab84c 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -29,6 +29,7 @@ import { stableArray, stableRecord } from '@/lib/stable-array'
+ import type { SessionBackgroundProcess, SessionInfo } from '@/types/hermes'
+ 
+ import { $backgroundRunningSessionIds } from './composer-status'
++import { $kanbanObservationTick, hasFreshKanbanObservation } from './kanban-observation'
+ import { $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
+ import {
+   $attentionSessionIds,
+@@ -74,14 +75,15 @@ export const $delegatingSessionIds = computed(
+ // the session as done (green stripe) while its workers were still going. The
+ // backend stamps `kanban_active` on every list row (summed over the lineage).
+ let kanbanBusyIds: readonly string[] = []
+-export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions], (sessions, messaging) => {
++export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions, $kanbanObservationTick], (sessions, messaging) => {
+   const ids: string[] = []
+ 
+   for (const rows of [sessions, messaging]) {
+     for (const row of rows) {
+       // [daveey] `kanban_unknown`: the backend could not read the session's cards (local boards or another
+       // gateway's replica). Unknown is not "no work", so the row stays off done until a read succeeds.
+-      if ((row.kanban_active ?? 0) > 0 || row.kanban_unknown === true) {
++      if ((row.kanban_active ?? 0) > 0 || row.kanban_unknown === true ||
++          (row.kanban_remote_stale ?? 0) > 0 || !hasFreshKanbanObservation(row)) {
+         ids.push(row.id)
+       }
+     }
+@@ -280,12 +282,14 @@ export const sessionStatusStripe = (
+ export const withRowActivity = (
+   state: SessionDotState,
+   row: Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active'> &
+-    Partial<Pick<SessionInfo, 'kanban_unknown' | 'kanban_unseen'>>
++    Partial<Pick<SessionInfo, 'kanban_observed_at' | 'kanban_remote_stale' | 'kanban_unknown' | 'kanban_unseen'>>
+ ): SessionDotState =>
+   (state === 'idle' || state === 'unread' || state === 'draft') &&
+   (row.goal_active === true ||
+     (row.kanban_active ?? 0) > 0 ||
+     row.kanban_unknown === true ||
++    (row.kanban_remote_stale ?? 0) > 0 ||
++    !hasFreshKanbanObservation(row) ||
+     (row.background_active ?? 0) > 0)
+     ? 'background'
+     : (state === 'idle' || state === 'draft') && (row.kanban_unseen ?? 0) > 0
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index be6c520c88..bbb99291b5 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -297,9 +297,10 @@ def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, A
+                 raise ValueError('invalid replica task key')
+             if not all(parts) or tid != str(t['id']):
+                 raise ValueError('replica task identity mismatch')
+-            if owner_profile is None:
+-                # Historical keys lack provenance; even a terminal report cannot
+-                # prove that a colliding qualified task replaced this obligation.
++            if owner_profile is None or t.get('status') not in LISTED_STATUSES:
++                # Legacy links carry no authoritative release receipt. Preserve
++                # terminal/unknown reports even on cold start; only the exact
++                # qualified ledger projection may supersede this obligation.
+                 t = {**t, 'reported_status': t.get('status'), 'status': 'unknown', 'unfinished': True}
+             tasks[(str(gw), owner_profile, board, tid)] = t
+     from hermes_cli.profiles import get_active_profile_name
+diff --git a/tests/hermes_cli/test_kanban_remote_identity.py b/tests/hermes_cli/test_kanban_remote_identity.py
+index 4a5010f680..f8ff836b21 100644
+--- a/tests/hermes_cli/test_kanban_remote_identity.py
++++ b/tests/hermes_cli/test_kanban_remote_identity.py
+@@ -35,13 +35,12 @@ def test_legacy_terminal_record_is_unknown_not_superseded_by_qualified_collision
+     path = replica(tmp_path, [('default/t_same', card('default', status='done')),
+                               ('default/default/t_same', card('default', status='done'))])
+     rows = activity._read_remote_links(path, now=100)
+-    assert len(rows) == 1
+-    assert rows[0]['key'] == 'owner/default/t_same'
+-    assert rows[0]['profile'] is None
+-    assert rows[0]['ownership_state'] == 'unknown'
+-    assert rows[0]['status'] == 'unknown'
+-    assert rows[0]['reported_status'] == 'done'
+-    assert activity._replica_bucket(rows[0]) == 'active'
++    assert len(rows) == 2
++    assert {r['key'] for r in rows} == {'owner/default/t_same', 'owner/default/default/t_same'}
++    assert all(r['status'] == 'unknown' and r['reported_status'] == 'done' for r in rows)
++    assert all(activity._replica_bucket(r) == 'active' for r in rows)
++    legacy = next(r for r in rows if r['profile'] is None)
++    assert legacy['ownership_state'] == 'unknown'
+ 
+ 
+ def test_origin_profile_and_relation_are_part_of_the_session_join(tmp_path, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 35b5443ea4..3b960f6350 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -279,7 +279,7 @@ def test_replica_card_shepherded_by_a_local_session_keeps_it_busy(kanban_root):
+     ])
+     rows = [{"id": "s_mac"}, {"id": "hub_oneshot"}]
+     ksa.annotate_kanban_activity(rows)
+-    assert rows[0]["kanban_active"] == 2
++    assert rows[0]["kanban_active"] == 3  # includes unverified terminal shepherd
+     assert rows[0]["kanban_blocked"] == 1
+     assert "kanban_active" not in rows[1]  # a session on the owning gateway is not ours
+ 
+@@ -388,10 +388,12 @@ def test_remote_dispatch_graph_lists_every_owner_qualified_row_and_counts_the_sa
+ def test_done_root_still_lists_unfinished_descendants(kanban_root):
+     _make_replica(kanban_root / "hub-state", "macbook", _dispatch_graph(root_status="done"))
+     rows = ksa.session_tasks(["s_origin"])
+-    assert sorted(r["id"] for r in rows) == [f"t_c{i:02d}" for i in range(12)]
++    assert sorted(r["id"] for r in rows) == [f"t_c{i:02d}" for i in range(12)] + ["t_root"]
++    root = next(r for r in rows if r['id'] == 't_root')
++    assert root['status'] == 'unknown' and root['reported_status'] == 'done'
+     ann = [{"id": "s_origin"}]
+     ksa.annotate_kanban_activity(ann)
+-    assert ann[0]["kanban_active"] == 12
++    assert ann[0]["kanban_active"] == 13
+ 
+ 
+ def test_review_is_unfinished_on_local_and_remote_cards(kanban_root):
+@@ -475,17 +477,24 @@ def test_empty_replica_does_not_erase_obligations_after_restart(kanban_root):
+     assert all(card["stale"] for card in cards)
+ 
+ 
+-def test_final_completion_clears_the_origin_and_other_sessions_finish_normally(kanban_root):
+-    graph = _dispatch_graph(root_status="done")
++@pytest.mark.parametrize('terminal_status', ['done', 'archived', 'unexpected', None])
++def test_unverified_completion_keeps_origin_and_other_sessions_finish_normally(kanban_root, terminal_status):
++    import time
++    graph = _dispatch_graph(root_status=terminal_status)
+     for c in graph:
+-        c["status"] = "done"
+-    _make_replica(kanban_root / "hub-state", "macbook", graph)
++        c["status"] = terminal_status
++    path = _make_replica(kanban_root / "hub-state", "macbook", graph)
++    _set_meta(path, last_ok=time.time())
+     _make_board(kanban_root / "kanban.db", [("t_x", "done", "s_other")])
+     ann = [{"id": "s_origin"}, {"id": "s_other"}]
+     ksa.annotate_kanban_activity(ann)
+     assert [{k: v for k, v in row.items() if k != 'kanban_observed_at'} for row in ann] == [
+-        {"id": "s_origin"}, {"id": "s_other"}]
+-    assert ksa.session_tasks(["s_origin"]) == []
++        {"id": "s_origin", "kanban_active": 13}, {"id": "s_other"}]
++    cards = ksa.session_tasks(["s_origin"])
++    assert len(cards) == 13
++    assert all(c['status'] == 'unknown' and c['reported_status'] == terminal_status for c in cards)
++
++
+ def test_rows_carry_the_open_card_ids_the_chat_waits_on(kanban_root):
+     """``kanban_waiting_on``: the open (queued/running + human-blocked) card ids over the lineage, the set the
+     sidebar's "waiting on N cards" and the chat-closeout ledger read. Done cards drop out. [daveey]"""

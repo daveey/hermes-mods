@@ -400,11 +400,11 @@ Apply the whole series in numeric order from the hermes-agent repo root:
 
 ```sh
 cd ~/.hermes/hermes-agent            # your checkout
-git am -3 /path/to/hermes-mods/core/patches/00{19,20,21,22,23}-*.patch
-git am -3 /path/to/hermes-mods/core/patches/0026-*.patch
+git am -3 --empty=keep /path/to/hermes-mods/core/patches/00{19,20,21,22,23}-*.patch
+git am -3 --empty=keep /path/to/hermes-mods/core/patches/0026-*.patch
 ```
 
-If you skip 0020, expect `git am -3` conflicts in 0021. Resolve them by keeping both sides (drop the
+If you skip 0020, expect `git am -3 --empty=keep` conflicts in 0021. Resolve them by keeping both sides (drop the
 `session.rename` entries), or re-implement 0021 from the **Code** section. Nothing here touches Python or the
 gateway RPC contract, so there's nothing to regenerate.
 

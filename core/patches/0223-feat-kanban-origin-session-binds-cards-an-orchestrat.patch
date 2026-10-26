@@ -1,0 +1,549 @@
+From 1be5b2dc7fcda16cff3d877858ccf40cae4f95fe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 05:48:36 +0000
+Subject: [PATCH] feat(kanban): --origin-session binds cards an orchestrator
+ creates to a chat on another gateway; missing kanban tool is a typed
+ preflight failure [daveey]
+
+A chat on gateway A handed a build to an orchestrator session on B. B's chat profile had no kanban
+toolset, so the agent called the private kanban_create handler from a script; the cards were stamped
+with B's one-shot session and A's chat lost them (empty task list, green row).
+
+hermes chat --origin-session <ref> (or HERMES_ORIGIN_SESSION) now:
+- registers the kanban toolset for that session (like dispatcher workers), so the real tool is there;
+- validates the ref before anything runs: malformed, hub missing or a gateway hermes-hub does not know
+  exit 2 with origin_ref_invalid / hub_not_installed / origin_gateway_unknown;
+- preflight in tool assembly raises kanban_tool_unavailable instead of letting the agent fall back.
+kanban_create (tool, new origin_session arg) and hermes kanban create (--origin-session) validate before
+the card exists and add a platform='hub' subscription <gw>/<profile>/<session> (idempotent; children
+inherit it), which hermes-hub publishes as rel:shepherd. The card's own session_id is not rewritten.
+The result carries origin_binding {readback: pending, verify_on_origin: hermes-hub links ... --expect}.
+---
+ hermes_cli/_parser.py                  |   2 +
+ hermes_cli/kanban.py                   |  18 ++-
+ hermes_cli/kanban_origin.py            | 166 +++++++++++++++++++++++++
+ hermes_cli/kanban_parser.py            |   3 +
+ hermes_cli/main.py                     |  13 +-
+ model_tools.py                         |  11 ++
+ tests/hermes_cli/test_kanban_origin.py | 140 +++++++++++++++++++++
+ tools/kanban_tools.py                  |  17 ++-
+ tools/kanban_tools_schemas.py          |   8 ++
+ 9 files changed, 375 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin.py
+
+diff --git a/hermes_cli/_parser.py b/hermes_cli/_parser.py
+index 624f955d2e..d4c02bf879 100644
+--- a/hermes_cli/_parser.py
++++ b/hermes_cli/_parser.py
+@@ -308,6 +308,8 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
+               help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.")
+     add("--source", default=None,
+         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.")
++    add("--origin-session", default=None,
++        help="This session works for a chat on ANOTHER gateway (@session:<profile>@<gateway>/<id>): it gets the kanban tools and every card it creates shows in that chat's task list. Exits 2 with a typed error if the binding could never be read back there.")
+     inherited(chat_parser, "--tui", action="store_true", default=SUPPRESS,
+               help="Launch the modern TUI instead of the classic REPL")
+     inherited(chat_parser, "--native", "--tui-native", dest="tui_native", action="store_true", default=SUPPRESS,
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 88a0d5c62c..a248c5e365 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -386,6 +386,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         session_id = (_persisted_session_id(session_key)
+                       or _persisted_session_id(os.environ.get("HERMES_SESSION_ID")))
+     idem_key = getattr(args, "idempotency_key", None)
++    # [daveey] Bind cards made for a chat on another gateway ($HERMES_ORIGIN_SESSION / --origin-session),
++    # validated before the card exists. See hermes_cli/kanban_origin.py.
++    from hermes_cli import kanban_origin
++    try:
++        origin = kanban_origin.resolve(getattr(args, "origin_session", None))
++    except kanban_origin.OriginError as exc:
++        return _err(f"kanban: {exc.code}: {exc}", 2)
++    origin_binding = None
+     with kbc.connect_closing() as conn:
+         # An --idempotency-key hit returns an existing card: never re-stamp/re-subscribe it.
+         idem_hit = bool(idem_key) and conn.execute(
+@@ -418,6 +426,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             # that shelled out hears when the card lands (and its row stays busy).
+             from tools.kanban_tools import _maybe_auto_subscribe
+             _maybe_auto_subscribe(conn, task_id)
++        if origin is not None:  # idempotent, so a retried create still (re)binds
++            origin_binding = kanban_origin.bind(conn, task_id, origin, board=getattr(args, "board", None))
+         task = kb.get_task(conn, task_id)
+     if not in_worker and not session_id and not idem_hit and _agent_invoked():
+         # An agent shelled out but no chat could be stamped (unknown/missing session env:
+@@ -429,9 +439,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
+               f"hermes kanban notify-subscribe {task_id} --platform tui --chat-id <session_id>",
+               file=sys.stderr)
+     if getattr(args, "json", False):
+-        _print_json(_task_to_dict(task))
++        out = _task_to_dict(task)
++        if origin_binding:
++            out["origin_binding"] = origin_binding
++        _print_json(out)
+     else:
+         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
++        if origin_binding:
++            print(f"Bound to {origin_binding['origin']} (readback pending: on the origin gateway run "
++                  f"`{origin_binding['verify_on_origin']}`)")
+         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
+         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
+         if task.status == "ready" and task.assignee:
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+new file mode 100644
+index 0000000000..a5db29e2a6
+--- /dev/null
++++ b/hermes_cli/kanban_origin.py
+@@ -0,0 +1,166 @@
++"""Origin binding for cards created on behalf of a session on ANOTHER gateway. [daveey]
++
++A chat on gateway A often hands a whole job to an orchestrator session on gateway B (``hermes chat -q`` over
++SSH, a mailbox task, ...), which then creates the real Kanban cards on B. Those cards carry B's orchestrator as
++``session_id``, so A's chat lost them: its task list was empty and its sidebar row painted done while B ran the
++work for hours.
++
++The origin is declared once, when the orchestrator starts: ``hermes chat --origin-session <ref>`` (or
++``HERMES_ORIGIN_SESSION=<ref>``). Every card it then creates through the supported paths (the ``kanban_create``
++tool, ``hermes kanban create``) gets a ``platform='hub'`` notify subscription ``<gw>/<profile>/<session>`` for
++that origin. hermes-hub publishes it as a ``rel: shepherd`` session link, children inherit it
++(``_inherit_notify_subs``), and gateway A's ``kanban_session_activity`` reads it from its replica for the task
++list, the sidebar counts and the archive guard alike. The card's own ``session_id`` (B's creator) is never
++rewritten.
++
++Binding is not handoff: the result says ``readback: pending`` until gateway A has seen the link
++(``hermes-hub links <session> --expect <gw>/<board>/<id>`` on A exits 0 only then).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import sqlite3
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++ENV = "HERMES_ORIGIN_SESSION"
++
++_NAME = r"[A-Za-z0-9_.-]{1,128}"
++_REF_FORMS = (
++    re.compile(rf"^@session:(?P<profile>{_NAME})@(?P<gw>{_NAME})/(?P<session>{_NAME})$"),
++    re.compile(rf"^(?P<gw>{_NAME})/(?P<profile>{_NAME})/(?P<session>{_NAME})$"),
++    re.compile(rf"^(?P<gw>{_NAME}):(?P<session>{_NAME})$"),
++)
++
++
++class OriginError(ValueError):
++    """A typed setup failure: ``code`` is machine-readable, ``str()`` says what to do."""
++
++    def __init__(self, code: str, message: str):
++        super().__init__(message)
++        self.code = code
++
++
++@dataclass(frozen=True)
++class Origin:
++    gateway: str
++    profile: str
++    session: str
++
++    @property
++    def chat_id(self) -> str:
++        return f"{self.gateway}/{self.profile}/{self.session}"
++
++    @property
++    def ref(self) -> str:
++        return f"@session:{self.profile}@{self.gateway}/{self.session}"
++
++
++def parse_origin(text: str) -> Origin:
++    """``@session:<profile>@<gw>/<id>``, ``<gw>/<profile>/<id>`` or ``<gw>:<id>`` (profile default)."""
++    raw = str(text or "").strip()
++    for form in _REF_FORMS:
++        m = form.match(raw)
++        if m:
++            d = m.groupdict()
++            return Origin(d["gw"], d.get("profile") or "default", d["session"])
++    raise OriginError("origin_ref_invalid",
++                      f"origin session {raw!r} is not @session:<profile>@<gateway>/<id>, "
++                      "<gateway>/<profile>/<id> or <gateway>:<id>")
++
++
++def ambient_origin_ref() -> str:
++    return (os.environ.get(ENV) or "").strip()
++
++
++def _hub_db() -> Optional[Path]:
++    base = os.environ.get("HERMES_HUB_STATE") or str(Path.home() / ".local" / "state" / "hermes-hub")
++    p = Path(base) / "hub.db"
++    return p if p.is_file() else None
++
++
++def _ro(path: Path) -> sqlite3.Connection:
++    try:
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
++        return conn
++    except sqlite3.OperationalError:
++        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=0.5)
++        conn.execute("PRAGMA query_only = ON")
++        return conn
++
++
++def gateway_names() -> tuple[str, set[str]]:
++    """``(this gateway, every gateway hermes-hub knows)`` from the local hub.db; ("", set()) without one."""
++    me, known = "", set()
++    path = _hub_db()
++    if path is not None:
++        try:
++            conn = _ro(path)
++            try:
++                row = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
++                me = str(row[0]) if row and row[0] else ""
++                known = {str(r[0]) for r in conn.execute("SELECT DISTINCT gw FROM replica") if r[0]}
++            finally:
++                conn.close()
++        except sqlite3.Error:
++            pass
++    if not me:
++        try:
++            cfg = Path(os.environ.get("HERMES_MAIL_CONFIG") or Path.home() / ".config" / "hermes-mail" / "config.json")
++            me = str(json.loads(cfg.read_text()).get("gateway") or "")
++        except (OSError, ValueError, AttributeError):
++            me = ""
++    if me:
++        known.add(me)
++    return me, known
++
++
++def resolve(explicit: Optional[str] = None) -> Optional[Origin]:
++    """The origin to bind new cards to (explicit arg, else ``$HERMES_ORIGIN_SESSION``), validated; None if neither
++    is set or it names this gateway (a same-gateway chat already owns its cards through ``session_id``/tui subs).
++    Raises ``OriginError`` when the ref is malformed or names a gateway hermes-hub does not know: such a binding
++    could never be read back on the origin, which is exactly the silent failure this exists to stop."""
++    raw = (explicit or "").strip() or ambient_origin_ref()
++    if not raw:
++        return None
++    origin = parse_origin(raw)
++    me, known = gateway_names()
++    if not me:
++        raise OriginError("hub_not_installed",
++                          "this gateway has no hermes-hub client (no hub.db / hermes-mail config), so a card created "
++                          f"here can never show in {origin.ref}; install hermes-hub or create the cards on that gateway")
++    if origin.gateway == me:
++        return None
++    if origin.gateway not in known:
++        raise OriginError("origin_gateway_unknown",
++                          f"gateway {origin.gateway!r} is not a hermes-hub gateway (known: {', '.join(sorted(known))}); "
++                          "use the hermes-hub gateway name in the origin ref")
++    return origin
++
++
++def bind(conn: Any, task_id: str, origin: Origin, *, board: Optional[str] = None) -> dict[str, Any]:
++    """Subscribe ``origin`` to ``task_id`` (platform 'hub'); idempotent. Returns the binding receipt."""
++    from hermes_cli import kanban_db_notify as kbn
++
++    kbn.add_notify_sub(conn, task_id=task_id, platform="hub", chat_id=origin.chat_id)
++    me, _ = gateway_names()
++    target = f"{me}/{board or 'default'}/{task_id}"
++    return {"origin": origin.ref, "chat_id": origin.chat_id, "task": target, "readback": "pending",
++            "verify_on_origin": f"hermes-hub links {origin.session} --expect {target}"}
++
++
++def preflight(tool_names: Iterable[str]) -> None:
++    """A session started with an origin must be able to create bound cards through the real tool. Raises
++    ``OriginError('kanban_tool_unavailable')`` instead of letting the agent fall back to private handlers."""
++    if not ambient_origin_ref():
++        return
++    resolve()
++    if "kanban_create" not in set(tool_names):
++        raise OriginError("kanban_tool_unavailable",
++                          f"{ENV} is set but the kanban_create tool is not available in this session; enable the "
++                          "'kanban' toolset (hermes tools enable kanban) and start the session again")
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 83aa80e1f5..c4adec8452 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -181,6 +181,9 @@ _SPECS = [
+         _arg("--idempotency-key",
+              help="Dedup key. If a non-archived task with this key exists, "
+                   "its id is returned instead of creating a duplicate."),
++        _arg("--origin-session", default=None,
++             help="Chat on ANOTHER gateway this card is work for (@session:<profile>@<gateway>/<id>; "
++                  "default $HERMES_ORIGIN_SESSION). It then shows in that chat's task list."),
+         _arg("--max-runtime",
+              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
+                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index d38f86eff6..07a4894bdd 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -1802,7 +1802,18 @@ def cmd_chat(args):
+         # Explicit flag, not a label inherited from a parent TUI/Desktop session — one-shot
+         # runs must keep it (see agent.session_source.session_source_for).
+         os.environ["HERMES_SESSION_SOURCE_EXPLICIT"] = "1"
+-
++    # [daveey] --origin-session: this session works for a chat on ANOTHER gateway; every card it creates is
++    # bound to that chat (hermes_cli/kanban_origin.py). Validate up front: a typed setup failure beats cards
++    # the origin can never see.
++    if getattr(args, "origin_session", None):
++        os.environ["HERMES_ORIGIN_SESSION"] = str(args.origin_session).strip()
++    if os.environ.get("HERMES_ORIGIN_SESSION"):
++        from hermes_cli import kanban_origin
++        try:
++            kanban_origin.resolve()
++        except kanban_origin.OriginError as exc:
++            print(f"error: {exc.code}: {exc}", file=sys.stderr)
++            sys.exit(2)
+     _pin_kanban_board_env()
+     from hermes_cli.observability.shared_metrics_consent import offer_consent_before_chat
+ 
+diff --git a/model_tools.py b/model_tools.py
+index 6cd28982d8..509a6cc834 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -312,6 +312,7 @@ def _tool_defs_cache_key(
+         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
+         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
++        bool(os.environ.get("HERMES_ORIGIN_SESSION")),
+         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+     )
+ 
+@@ -359,6 +360,11 @@ def _select_tool_names(enabled_toolsets: Optional[list[str]], disabled_toolsets:
+         if (os.environ.get("HERMES_KANBAN_TASK") and not _is_delegated_child_context()
+                 and _is_dispatcher_owned_worker() and "kanban" not in enabled):
+             enabled.append("kanban")
++        # [daveey] Same for a session started for a chat on another gateway (``--origin-session``): it
++        # creates that chat's cards, so it gets the real kanban tools (origin preserved) — see kanban_origin.
++        if (os.environ.get("HERMES_ORIGIN_SESSION") and not _is_delegated_child_context()
++                and "kanban" not in enabled):
++            enabled.append("kanban")
+         _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
+     else:
+         from toolsets import TOOLSET_SESSION_PLATFORMS, get_all_toolsets
+@@ -544,6 +550,11 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
+         filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
+     global _last_resolved_tool_names
+     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
++    if os.environ.get("HERMES_ORIGIN_SESSION") and not _is_delegated_child_context():
++        # [daveey] Typed setup failure, before the first model call, when this origin session could only
++        # create cards that its origin chat would never see (no kanban tool, bad ref, unknown gateway).
++        from hermes_cli.kanban_origin import preflight
++        preflight(_last_resolved_tool_names)
+ 
+     if not quiet_mode:
+         print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
+diff --git a/tests/hermes_cli/test_kanban_origin.py b/tests/hermes_cli/test_kanban_origin.py
+new file mode 100644
+index 0000000000..0b4b32bc9c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin.py
+@@ -0,0 +1,140 @@
++"""Cards an orchestrator creates for a chat on ANOTHER gateway stay bound to that chat. [daveey]
++
++Scenario: a chat on 'macbook' hands a build to an orchestrator session on 'hub' (``hermes chat
++--origin-session @session:default@macbook/<id>``). Every card the orchestrator creates through the
++supported paths (the kanban_create tool, ``hermes kanban create``) gets a platform='hub' subscription
++for that origin, which hermes-hub publishes as a rel:shepherd link the origin gateway reads. The card's
++own session_id (the orchestrator) is not rewritten. A missing kanban tool or an unusable origin is a
++typed setup failure, not a silent fallback.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_origin as ko
++
++ORIGIN = "@session:default@macbook/20261022_204322_aaaaaa"
++
++
++@pytest.fixture
++def hub_gateway(tmp_path, monkeypatch):
++    """This process is gateway 'hub'; hermes-hub knows 'macbook' and 'mini'."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    conn = sqlite3.connect(state / "hub.db")
++    conn.executescript("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);"
++                       "CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT,"
++                       " updated_at INTEGER, PRIMARY KEY (gw, coll, key));")
++    conn.execute("INSERT INTO meta VALUES ('gateway', 'hub')")
++    conn.executemany("INSERT INTO replica VALUES (?, 'gateway', 'info', 1, 1, '{}', 0)", [("macbook",), ("mini",)])
++    conn.commit()
++    conn.close()
++    for var in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", ko.ENV):
++        monkeypatch.delenv(var, raising=False)
++    kb.init_db()
++    return tmp_path
++
++
++def _hub_subs(task_id):
++    with kbc.connect_closing() as conn:
++        return [s["chat_id"] for s in kn.list_notify_subs(conn, task_id) if s["platform"] == "hub"]
++
++
++def test_parse_origin_forms_and_rejects_junk():
++    assert ko.parse_origin(ORIGIN).chat_id == "macbook/default/20261022_204322_aaaaaa"
++    assert ko.parse_origin("macbook/work/s1") == ko.Origin("macbook", "work", "s1")
++    assert ko.parse_origin("macbook:s1") == ko.Origin("macbook", "default", "s1")
++    for bad in ("", "s1", "@session:a@b", "a/b/c/d", "mac book:s1"):
++        with pytest.raises(ko.OriginError) as e:
++            ko.parse_origin(bad)
++        assert e.value.code == "origin_ref_invalid"
++
++
++def test_tool_create_binds_origin_without_rewriting_the_creator(hub_gateway, monkeypatch):
++    from tools import kanban_tools as kt
++
++    monkeypatch.setenv(ko.ENV, ORIGIN)
++    res = json.loads(kt._handle_create({"title": "P0", "assignee": "default", "idempotency_key": "k-p0"}))
++    assert res["ok"], res
++    tid = res["task_id"]
++    assert _hub_subs(tid) == ["macbook/default/20261022_204322_aaaaaa"]
++    assert res["origin_binding"]["readback"] == "pending"
++    assert res["origin_binding"]["verify_on_origin"] == f"hermes-hub links 20261022_204322_aaaaaa --expect hub/default/{tid}"
++    # idempotent: a retried create returns the same card and does not duplicate the binding
++    again = json.loads(kt._handle_create({"title": "P0", "assignee": "default", "idempotency_key": "k-p0"}))
++    assert again["task_id"] == tid and _hub_subs(tid) == ["macbook/default/20261022_204322_aaaaaa"]
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).session_id != "20261022_204322_aaaaaa"  # creator identity kept
++        child = kb.create_task(conn, title="P1", parents=(tid,))
++    assert _hub_subs(child) == ["macbook/default/20261022_204322_aaaaaa"]  # descendants inherit it
++
++
++def test_explicit_origin_argument_and_same_gateway_origin(hub_gateway):
++    from tools import kanban_tools as kt
++
++    res = json.loads(kt._handle_create({"title": "x", "assignee": "default", "origin_session": "mini/default/s9"}))
++    assert res["ok"] and _hub_subs(res["task_id"]) == ["mini/default/s9"]
++    same = json.loads(kt._handle_create({"title": "y", "assignee": "default", "origin_session": "hub:s_local"}))
++    assert same["ok"] and _hub_subs(same["task_id"]) == [] and "origin_binding" not in same
++
++
++def test_unknown_origin_gateway_fails_before_any_card_exists(hub_gateway, monkeypatch):
++    from tools import kanban_tools as kt
++
++    monkeypatch.setenv(ko.ENV, "@session:default@hub-ec2/s1")  # a Desktop connection label, not a hub gateway
++    res = json.loads(kt._handle_create({"title": "orphan", "assignee": "default"}))
++    assert not res.get("ok") and "origin_gateway_unknown" in json.dumps(res)
++    with kbc.connect_closing() as conn:
++        assert [t.title for t in kb.list_tasks(conn)] == []
++
++
++def test_cli_create_binds_origin_too(hub_gateway, monkeypatch, capsys):
++    from hermes_cli import kanban as kc
++
++    monkeypatch.setenv(ko.ENV, ORIGIN)
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    assert kc._cmd_create(root.parse_args(["kanban", "create", "via cli", "--json"])) == 0
++    out = json.loads(capsys.readouterr().out)
++    assert _hub_subs(out["id"]) == ["macbook/default/20261022_204322_aaaaaa"]
++    assert out["origin_binding"]["readback"] == "pending"
++
++
++def test_origin_makes_the_kanban_tools_visible_and_preflight_is_typed(hub_gateway, monkeypatch):
++    from tools import kanban_tools as kt
++
++    monkeypatch.setattr(kt, "_profile_has_kanban_toolset", lambda: False)
++    assert kt._check_kanban_mode() is False
++    monkeypatch.setenv(ko.ENV, ORIGIN)
++    assert kt._check_kanban_mode() is True and kt._check_kanban_orchestrator_mode() is True
++    ko.preflight(["terminal", "kanban_create"])
++    with pytest.raises(ko.OriginError) as e:
++        ko.preflight(["terminal"])
++    assert e.value.code == "kanban_tool_unavailable"
++    monkeypatch.setenv(ko.ENV, "nonsense")
++    with pytest.raises(ko.OriginError) as e:
++        ko.preflight(["kanban_create"])
++    assert e.value.code == "origin_ref_invalid"
++
++
++def test_get_tool_definitions_registers_kanban_for_an_origin_session(hub_gateway, monkeypatch):
++    """The real registration path: a session whose platform toolsets lack 'kanban' still gets kanban_create
++    when it was started with an origin (as dispatcher workers do), so it never needs a private handler."""
++    import model_tools
++
++    monkeypatch.setenv(ko.ENV, ORIGIN)
++    model_tools.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
++    # kanban_create may sit behind tool_search, but it is registered (pre-assembly selection)
++    assert "kanban_create" in model_tools._last_resolved_tool_names
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index a34c729961..24273b8e7e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -87,6 +87,11 @@ def _visible(*, to_env_worker: bool) -> bool:
+         return False
+     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
+         return to_env_worker
++    # [daveey] A session started for a chat on another gateway (``hermes chat --origin-session``) exists to
++    # create that chat's cards: it always gets the real tools, never a private-handler fallback.
++    from hermes_cli.kanban_origin import ambient_origin_ref
++    if ambient_origin_ref():
++        return True
+     return _profile_has_kanban_toolset()
+ 
+ 
+@@ -1280,6 +1285,13 @@ def _handle_create(args: dict, **kw) -> str:
+     model_override, provider_override = args.get("model"), args.get("provider")
+     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
++    # [daveey] Validate the origin binding BEFORE the card exists: a binding the origin gateway can never
++    # read back is the silent "cards exist but the chat shows none" failure.
++    from hermes_cli import kanban_origin
++    try:
++        origin = kanban_origin.resolve(args.get("origin_session"))
++    except kanban_origin.OriginError as exc:
++        return tool_error(f"{exc.code}: {exc}")
+     with _board(args.get("board")) as (kb, conn):
+         from gateway.session_context import get_session_env
+         from tools.async_delegation import _current_origin_session_id
+@@ -1320,8 +1332,11 @@ def _handle_create(args: dict, **kw) -> str:
+         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
++        extra = {}
++        if origin is not None:
++            extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
+         return _ok(task_id=new_tid, **landed, **gate,
+-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
++                   subscribed=_maybe_auto_subscribe(conn, new_tid), **extra)
+ 
+ 
+ def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index f0375c96f9..85e2be908e 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -532,6 +532,14 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "exists, return that task's id instead of creating "
+                 "a duplicate. Useful for retry-safe automation."
+         )),
++        "origin_session": _prop("string", (
++                "Chat on ANOTHER gateway this card is work for "
++                "(@session:<profile>@<gateway>/<id>). Defaults to the "
++                "session's $HERMES_ORIGIN_SESSION. The card (and its "
++                "children) then shows in that chat's task list and keeps "
++                "it unfinished; the result's origin_binding says how to "
++                "read the binding back on the origin gateway."
++        )),
+         "max_runtime_seconds": _prop("integer", (
+                 "Per-task runtime cap. When exceeded, the "
+                 "dispatcher SIGTERMs the worker and re-queues the "
+-- 
+2.55.0
+

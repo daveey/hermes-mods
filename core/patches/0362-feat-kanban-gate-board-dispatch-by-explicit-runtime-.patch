@@ -1,0 +1,829 @@
+From 4c92b2be56968968d8ba10ffb53720bc30464dee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:00:22 +0000
+Subject: [PATCH] feat(kanban): gate board dispatch by explicit runtime
+ ownership [daveey]
+
+---
+ hermes_cli/kanban.py                          |   2 +-
+ hermes_cli/kanban_boards.py                   |  22 ++
+ hermes_cli/kanban_db_boards.py                |  23 +-
+ hermes_cli/kanban_db_connect.py               |   7 +-
+ hermes_cli/kanban_db_dispatch.py              |  26 +-
+ hermes_cli/kanban_dispatch_owner.py           | 125 +++++++++
+ hermes_cli/kanban_ops.py                      |   6 +
+ hermes_cli/kanban_parser.py                   |   6 +
+ .../hermes_cli/test_kanban_dispatch_owner.py  | 246 ++++++++++++++++++
+ .../test_kanban_dispatch_owner_operator.py    |  89 +++++++
+ .../kanban-dispatch-ownership.md              |  74 ++++++
+ website/docs/user-guide/features/kanban.md    |   5 +
+ 12 files changed, 604 insertions(+), 27 deletions(-)
+ create mode 100644 hermes_cli/kanban_dispatch_owner.py
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_owner.py
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_owner_operator.py
+ create mode 100644 website/docs/developer-guide/kanban-dispatch-ownership.md
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index c24aad2af7..371cc07fbd 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -229,7 +229,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+ 
+ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
+-    "set-default-workdir", "import",
++    "set-default-workdir", "dispatch-owner", "import",
+ })
+ 
+ 
+diff --git a/hermes_cli/kanban_boards.py b/hermes_cli/kanban_boards.py
+index ab5a1426ee..7045950e0a 100644
+--- a/hermes_cli/kanban_boards.py
++++ b/hermes_cli/kanban_boards.py
+@@ -160,6 +160,27 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _cmd_boards_dispatch_owner(args: argparse.Namespace) -> int:
++    from hermes_cli.kanban_dispatch_owner import get_dispatch_owner, set_dispatch_owner
++    slug, rc = _board_slug_arg(args, "dispatch-owner", must_exist=True)
++    if rc:
++        return rc
++    if args.clear and args.owner is not None:
++        return _err("Specify owner or --clear, not both", 2)
++    path = (kb.kanban_home() / "kanban.db" if slug == kb.DEFAULT_BOARD
++            else kb.board_dir(slug) / "kanban.db")
++    try:
++        if args.clear or args.owner is not None:
++            set_dispatch_owner(path, None if args.clear else args.owner)
++        owner = get_dispatch_owner(path)
++    except (OSError, ValueError, RuntimeError) as exc:
++        return _err(f"kanban boards dispatch-owner: {exc}")
++    result = {"slug": slug, "db_path": str(path.resolve()), "dispatch_owner": owner}
++    if not _json_out(args, result):
++        print(f"Board {slug!r} dispatch owner: {owner or '(unowned)'}")
++    return 0
++
++
+ def _cmd_boards_export(args: argparse.Namespace) -> int:
+     from hermes_cli import kanban_transfer
+     from hermes_cli.sizefmt import format_bytes
+@@ -214,6 +235,7 @@ _BOARD_HANDLERS = {
+     "show": _cmd_boards_show, "current": _cmd_boards_show,
+     "rename": _cmd_boards_rename,
+     "set-default-workdir": _cmd_boards_set_default_workdir,
++    "dispatch-owner": _cmd_boards_dispatch_owner,
+     "export": _cmd_boards_export,
+     "import": _cmd_boards_import,
+ }
+diff --git a/hermes_cli/kanban_db_boards.py b/hermes_cli/kanban_db_boards.py
+index efe8cdad23..8659d7b309 100644
+--- a/hermes_cli/kanban_db_boards.py
++++ b/hermes_cli/kanban_db_boards.py
+@@ -66,7 +66,20 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
+     return meta
+ 
+ 
+-def write_board_metadata(
++def write_board_metadata(board: Optional[str], **changes) -> dict:
++    """Serialize display edits with dispatch/ownership changes; preserve owner."""
++    from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    slug = _kb._slug_or_default(board)
++    # Metadata operations name a board, independent of worker DB env pins.
++    db_path = (_kb.kanban_home() / "kanban.db" if slug == _kb.DEFAULT_BOARD
++               else _kb.board_dir(slug) / "kanban.db").resolve()
++    with _dispatch_tick_lock(db_path) as held:
++        if not held:
++            raise RuntimeError("board dispatcher is busy; retry metadata change")
++        return _write_board_metadata_locked(board, **changes)
++
++
++def _write_board_metadata_locked(
+     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
+     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
+     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+@@ -75,8 +88,12 @@ def write_board_metadata(
+     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
+     "" = clear (``project_id`` is not validated here)."""
+     _kb._assert_not_delegated_child_mutation()
++    from hermes_cli.kanban_dispatch_owner import read_metadata, atomic_metadata_write
+     slug = _kb._slug_or_default(board)
++    raw = read_metadata(board_metadata_path(slug))
+     meta = read_board_metadata(slug)
++    meta.update(raw)
++    meta["slug"] = slug
+     # db_path is derived on every read; never persist it into board.json.
+     meta.pop("db_path", None)
+     if name is not None:
+@@ -93,9 +110,7 @@ def write_board_metadata(
+         meta["created_at"] = int(time.time())
+     path = board_metadata_path(slug)
+     path.parent.mkdir(parents=True, exist_ok=True)
+-    path.write_text(
+-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+-    )
++    atomic_metadata_write(path, meta)
+     meta["db_path"] = str(_kb.kanban_db_path(slug))
+     return meta
+ 
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 7d68b7da51..8a9f085a47 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -168,7 +168,7 @@ def _dispatch_tick_lock(db_path: Path):
+     multi-writer corruption; this is defense-in-depth behind
+     ``_guard_supervised_gateway_conflict``. Non-blocking on purpose: the
+     gateway's async watcher must never stall; the loser retries next interval.
+-    Without ``fcntl``/``msvcrt`` it degrades to a no-op (yields ``True``).
++    An unavailable lock refuses the tick (yields ``False``).
+ 
+     Motivation (issue #35240): a ``hermes gateway run --replace`` / ``gateway restart`` invoked from a shell
+     on a systemd/launchd host can leave an orphan gateway whose dispatcher escapes the service cgroup,
+@@ -188,9 +188,8 @@ def _dispatch_tick_lock(db_path: Path):
+         except (OSError, AttributeError):
+             acquired = False
+     except OSError:
+-        # Can't even open the lock file (permissions, read-only FS): degrade to
+-        # a no-op so a probe failure never blocks dispatch.
+-        acquired = True
++        # A failed lock is not permission to dispatch or change ownership.
++        acquired = False
+         handle = None
+     try:
+         yield acquired
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 995e722704..f6cbe30563 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -151,6 +151,9 @@ class DispatchResult:
+     is
+     """
+ 
++    skipped_owned: bool = False
++    dispatch_owner: Optional[str] = None
++    ownership_error: Optional[str] = None
+     reclaimed: int = 0
+     promoted: int = 0
+     reconciled_orphans: list[str] = field(default_factory=list)
+@@ -232,6 +235,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
+             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+         if res.skipped_locked:
+             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
++        if res.skipped_owned:
++            counts["skipped_owned"] = counts.get("skipped_owned", 0) + 1
+         if res.memory_pressure:
+             pressure = res.memory_pressure
+     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+@@ -2127,6 +2132,7 @@ def dispatch_once(
+     default_assignee: Optional[str] = None,
+     max_in_progress_per_profile: Optional[int] = None,
+     reconcile_orphans: bool = True,
++    dispatcher_id: Optional[str] = None,
+ ) -> DispatchResult:
+     """Run one dispatcher tick under the board's single-writer lock.
+ 
+@@ -2152,24 +2158,8 @@ def dispatch_once(
+             reconcile_orphans=reconcile_orphans,
+         )
+ 
+-    try:
+-        db_path = _kb.kanban_db_path(board=board)
+-    except Exception:
+-        # Must not lose the tick — fall through to an unguarded dispatch.
+-        result = _locked_tick()
+-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+-        return result
+-    with _kbc._dispatch_tick_lock(db_path) as held:
+-        if not held:
+-            result = DispatchResult(skipped_locked=True)
+-        else:
+-            result = _locked_tick()
+-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
+-            _kbc._maybe_checkpoint_wal(conn, db_path)
+-    # Lock released. Fire the tick observer strictly OUTSIDE the critical
+-    # section: a slow subscriber must never stall a sibling dispatcher's tick.
+-    _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+-    return result
++    from hermes_cli.kanban_dispatch_owner import run_owned_tick
++    return run_owned_tick(conn, _locked_tick, dispatcher_id, board, dry_run)
+ 
+ 
+ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+new file mode 100644
+index 0000000000..331775faa8
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -0,0 +1,125 @@
++"""Native per-board dispatcher coordination (not a same-UID security boundary)."""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import sqlite3
++import tempfile
++
++
++def connection_db_path(conn: sqlite3.Connection) -> Path:
++    """Use the opened database, never an enumerated board alias or env pin."""
++    for row in conn.execute("PRAGMA database_list"):
++        if row[1] == "main" and row[2]:
++            return Path(row[2]).resolve(strict=True)
++    raise ValueError("dispatcher requires an identifiable on-disk database")
++
++
++def metadata_path(db_path: Path) -> Path:
++    from hermes_cli import kanban_db as kb
++    path = Path(db_path).resolve(strict=True)
++    default_meta = path.parent / "kanban" / "boards" / "default" / "board.json"
++    if path == (kb.kanban_home() / "kanban.db").resolve():
++        return default_meta
++    # Detect a foreign root's legacy default layout without treating an
++    # unreadable configured metadata path as absent (Path.exists hides errors).
++    if path.name == "kanban.db":
++        try:
++            default_meta.lstat()
++        except FileNotFoundError:
++            pass
++        else:
++            return default_meta
++    return path.parent / "board.json"
++
++
++def read_metadata(path: Path) -> dict:
++    try:
++        raw = json.loads(path.read_text(encoding="utf-8-sig"))
++    except FileNotFoundError:
++        # Legacy boards predate board.json. A dangling link is not legacy.
++        if path.is_symlink():
++            raise ValueError("dangling board metadata link")
++        return {}
++    if not isinstance(raw, dict):
++        raise ValueError("board metadata must be an object")
++    return raw
++
++
++def validate_owner(owner: str) -> str:
++    from hermes_cli import kanban_db as kb
++    if not isinstance(owner, str) or not kb._BOARD_SLUG_RE.fullmatch(owner):
++        raise ValueError("dispatch_owner must be a nonempty lowercase board slug")
++    return owner
++
++
++def get_dispatch_owner(db_path: Path) -> str | None:
++    """Strict read: malformed/unreadable metadata must never mean unowned."""
++    raw = read_metadata(metadata_path(db_path))
++    return validate_owner(raw["dispatch_owner"]) if "dispatch_owner" in raw else None
++
++
++def atomic_metadata_write(path: Path, raw: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, temporary = tempfile.mkstemp(prefix=".board-", dir=path.parent)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as stream:
++            json.dump(raw, stream, indent=2, ensure_ascii=False)
++            stream.write("\n")
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, path)
++    finally:
++        if os.path.exists(temporary):
++            os.unlink(temporary)
++
++
++def run_owned_tick(conn, tick, dispatcher_id, board, dry_run):
++    """All tick effects are behind the identity read, under the canonical lock."""
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    from hermes_cli.kanban_db_dispatch import DispatchResult
++    try:
++        db_path = connection_db_path(conn)
++    except (OSError, ValueError, sqlite3.Error) as exc:
++        return DispatchResult(skipped_owned=True, ownership_error=str(exc))
++    with kbc._dispatch_tick_lock(db_path) as held:
++        if not held:
++            return DispatchResult(skipped_locked=True)
++        try:
++            owner = get_dispatch_owner(db_path)
++        except (OSError, ValueError, UnicodeError) as exc:
++            return DispatchResult(skipped_owned=True, ownership_error=str(exc))
++        if owner is not None and dispatcher_id != owner:
++            return DispatchResult(skipped_owned=True, dispatch_owner=owner)
++        result = tick()
++        result.dispatch_owner = owner
++        kbc._maybe_checkpoint_wal(conn, db_path)
++    # Denied ticks deliberately don't invoke observers, which may mutate state.
++    kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
++    return result
++
++
++def set_dispatch_owner(db_path: Path, owner: str | None) -> str | None:
++    """Operator API: set exact slug, or explicitly clear with None.
++
++    No dispatcher ID is inherited by workers. This API coordinates cooperative
++    same-UID runtimes; it does not authenticate callers or authorize task work.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    kb._assert_not_delegated_child_mutation()
++    if owner is not None:
++        validate_owner(owner)
++    path = Path(db_path).resolve(strict=True)
++    with _dispatch_tick_lock(path) as held:
++        if not held:
++            raise RuntimeError("board dispatcher is busy; retry owner change")
++        target = metadata_path(path)
++        raw = read_metadata(target)
++        if owner is None:
++            raw.pop("dispatch_owner", None)
++        else:
++            raw["dispatch_owner"] = owner
++        atomic_metadata_write(target, raw)
++        return get_dispatch_owner(path)
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 7ca8094de4..f07b3d7372 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -113,6 +113,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+             "rate_limited": res.rate_limited,
+             "shared_blocker_released": res.shared_blocker_released,
+             "skipped_locked": res.skipped_locked,
++            "skipped_owned": res.skipped_owned,
++            "dispatch_owner": res.dispatch_owner,
++            "ownership_error": res.ownership_error,
+             "memory_pressure": res.memory_pressure,
+         }, ascii=True)
+         return 0
+@@ -155,6 +158,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+         print(f"Released (shared blocker cleared): {', '.join(res.shared_blocker_released)}")
+     if res.skipped_locked:
+         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
++    if res.skipped_owned:
++        print(f"Skipped: dispatch owner {res.dispatch_owner or '(unknown)'}; "
++              f"{res.ownership_error or 'dispatcher identity does not match'}")
+     if res.memory_pressure:
+         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+     return 0
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 26db84c465..2b90f2ebb2 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -131,6 +131,12 @@ _BOARD_SPECS = [
+     _cmd("show", aliases=["current"], help="Print the currently-active board slug"),
+     _cmd("rename", [_SLUG, _arg("name", help="New display name")],
+          help="Change a board's human-readable display name (slug is immutable)"),
++    _cmd("dispatch-owner", [
++        _SLUG,
++        _arg("owner", nargs="?", help="Exact dispatcher slug to set; omit to read"),
++        _arg("--clear", action="store_true", help="Explicitly remove dispatch ownership"),
++        _json_flag(),
++    ], help="Read/set native board dispatch ownership (same-UID coordination)"),
+     _cmd("set-default-workdir", [
+         _SLUG,
+         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner.py b/tests/hermes_cli/test_kanban_dispatch_owner.py
+new file mode 100644
+index 0000000000..d75da0e2a1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_owner.py
+@@ -0,0 +1,246 @@
++"""Board dispatch ownership is coordination, enforced before any tick effects."""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def board_db(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    path = home / "kanban.db"
++    metadata = home / "kanban" / "boards" / "default" / "board.json"
++    metadata.parent.mkdir(parents=True)
++    conn = kbc.connect(path)
++    yield conn, path, metadata
++    conn.close()
++
++
++def _metadata(path, value):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(value), encoding="utf-8")
++
++
++def _deny_without_effects(conn, monkeypatch, **kwargs):
++    """The entire DB, not only the candidate card, must remain untouched."""
++    before = list(conn.iterdump())
++    changes = conn.total_changes
++    spawn = Mock(side_effect=AssertionError("denied dispatch spawned a worker"))
++    # Reaping is a process side effect even when it leaves the DB unchanged.
++    reapers = []
++    for name in ("reap_worker_zombies", "reap_terminal_workers"):
++        spy = Mock(side_effect=AssertionError("denied dispatch reaped workers"))
++        monkeypatch.setattr(kbd, name, spy)
++        reapers.append(spy)
++    result = kbd.dispatch_once(conn, spawn_fn=spawn, **kwargs)
++    assert result.skipped_owned is True
++    assert result.spawned == []
++    assert list(conn.iterdump()) == before
++    assert conn.total_changes == changes
++    spawn.assert_not_called()
++    for spy in reapers:
++        spy.assert_not_called()
++    return result
++
++
++@pytest.mark.parametrize("identity", [None, "other-worker", "", "OWNER", "owner\n"])
++def test_owned_board_denies_default_mismatch_and_invalid_identity(board_db, monkeypatch, identity):
++    conn, _, metadata = board_db
++    _metadata(metadata, {"dispatch_owner": "owner"})
++    promotable = kb.create_task(conn, title="Promotable card", assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (promotable,))
++    stale = kb.create_task(conn, title="Expired claim", assignee="default")
++    assert kb.claim_task(conn, stale, ttl_seconds=-1)
++    result = _deny_without_effects(conn, monkeypatch, dispatcher_id=identity)
++    assert result.dispatch_owner == "owner"
++
++
++@pytest.mark.parametrize("raw", [
++    '{"dispatch_owner": null}', '{"dispatch_owner": ""}',
++    '{"dispatch_owner": 1}', '{"dispatch_owner": false}',
++    '{"dispatch_owner": []}', '{"dispatch_owner": {}}',
++    '{"dispatch_owner": "Owner"}', '{"dispatch_owner": "owner\\n"}',
++    '{"dispatch_owner": " owner"}', '{"dispatch_owner": "a/b"}',
++    '{"dispatch_owner": "-owner"}', '{broken', '[]', 'null',
++])
++def test_invalid_metadata_denies_and_strict_reader_raises(board_db, monkeypatch, raw):
++    from hermes_cli.kanban_dispatch_owner import get_dispatch_owner
++
++    conn, path, metadata = board_db
++    metadata.write_text(raw, encoding="utf-8")
++    kb.create_task(conn, title="Must not promote", assignee="default")
++    with pytest.raises((ValueError, OSError, RuntimeError)):
++        get_dispatch_owner(path)
++    result = _deny_without_effects(conn, monkeypatch, dispatcher_id="owner")
++    assert result.ownership_error
++
++
++@pytest.mark.parametrize("kind", ["missing", "unowned", "owned"])
++def test_allowed_tick_really_claims_and_spawns(board_db, monkeypatch, kind):
++    conn, _, metadata = board_db
++    if kind != "missing":
++        _metadata(metadata, {"dispatch_owner": "owner"} if kind == "owned" else {})
++    # Only OS process effects are replaced: claim, promotion, workspace and run
++    # persistence remain real, inside the temporary home.
++    monkeypatch.setattr(kbd, "reap_worker_zombies", lambda: None)
++    monkeypatch.setattr(kbd, "reap_terminal_workers", lambda conn: [])
++    tid = kb.create_task(conn, title="Dispatchable card", assignee="default")
++    spawn = Mock(return_value=None)
++    result = kbd.dispatch_once(conn, dispatcher_id="owner" if kind == "owned" else None,
++                               spawn_fn=spawn, reconcile_orphans=False)
++    assert result.skipped_owned is False
++    assert result.ownership_error is None
++    assert result.dispatch_owner == ("owner" if kind == "owned" else None)
++    assert [row[0] for row in result.spawned] == [tid]
++    assert spawn.call_count == 1
++    task = kb.get_task(conn, tid)
++    assert task is not None
++    assert task.status == "running"
++    assert task.current_run_id is not None
++
++
++@pytest.mark.parametrize("alias", ["explicit", "pinned", "both"])
++def test_connection_path_not_board_alias_controls_ownership(board_db, tmp_path, monkeypatch, alias):
++    default_conn, default_path, metadata = board_db
++    _metadata(metadata, {})
++    actual = tmp_path / "actual" / "board.db"
++    actual.parent.mkdir()
++    _metadata(actual.parent / "board.json", {"dispatch_owner": "owner"})
++    if alias in ("pinned", "both"):
++        monkeypatch.setenv("HERMES_KANBAN_DB", str(default_path))
++    with kbc.connect_closing(actual) as conn:
++        kb.create_task(conn, title="Owned despite alias", assignee="default")
++        result = _deny_without_effects(
++            conn, monkeypatch, dispatcher_id="other-worker",
++            **({"board": "default"} if alias in ("explicit", "both") else {}),
++        )
++    assert result.dispatch_owner == "owner"
++    assert default_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++def test_metadata_read_error_fails_closed(board_db, monkeypatch):
++    from hermes_cli.kanban_dispatch_owner import get_dispatch_owner
++
++    conn, path, metadata = board_db
++    # Deterministic read failure even under root; chmod-based tests are not.
++    metadata.mkdir()
++    with pytest.raises((OSError, ValueError, RuntimeError)):
++        get_dispatch_owner(path)
++    result = _deny_without_effects(conn, monkeypatch, dispatcher_id="owner")
++    assert result.ownership_error
++
++
++@pytest.mark.parametrize("layout", ["default", "adjacent"])
++def test_set_read_clear_preserves_other_metadata(board_db, tmp_path, layout):
++    from hermes_cli.kanban_dispatch_owner import get_dispatch_owner, set_dispatch_owner
++
++    _, path, metadata = board_db
++    if layout == "adjacent":
++        path = tmp_path / "custom" / "board.db"
++        metadata = path.parent / "board.json"
++    _metadata(metadata, {"title": "Generic board", "custom": {"keep": True}})
++    with kbc.connect_closing(path):
++        pass
++    set_dispatch_owner(path, "worker-1")
++    assert get_dispatch_owner(path) == "worker-1"
++    saved = json.loads(metadata.read_text(encoding="utf-8"))
++    assert saved["title"] == "Generic board"
++    assert saved["custom"] == {"keep": True}
++    set_dispatch_owner(path, None)
++    assert get_dispatch_owner(path) is None
++    assert "dispatch_owner" not in json.loads(metadata.read_text(encoding="utf-8"))
++
++
++@pytest.mark.parametrize("owner", ["", "Owner", "owner\n", " owner", "a/b", 42, False, [], {}])
++def test_setter_rejects_invalid_owner_without_changing_metadata(board_db, owner):
++    from hermes_cli.kanban_dispatch_owner import set_dispatch_owner
++
++    _, path, metadata = board_db
++    _metadata(metadata, {"dispatch_owner": "owner", "title": "Keep"})
++    before = metadata.read_bytes()
++    with pytest.raises((TypeError, ValueError)):
++        set_dispatch_owner(path, owner)
++    assert metadata.read_bytes() == before
++
++
++@pytest.mark.parametrize("new_owner", ["other-worker", None])
++def test_setter_cannot_change_owner_while_dispatch_lock_held(board_db, new_owner):
++    from hermes_cli.kanban_dispatch_owner import get_dispatch_owner, set_dispatch_owner
++
++    _, path, metadata = board_db
++    _metadata(metadata, {"dispatch_owner": "owner"})
++    with kbc._dispatch_tick_lock(path) as held:
++        assert held
++        with pytest.raises(RuntimeError):
++            set_dispatch_owner(path, new_owner)
++        assert get_dispatch_owner(path) == "owner"
++    set_dispatch_owner(path, new_owner)
++    assert get_dispatch_owner(path) == new_owner
++
++
++def test_real_pinned_resolution_and_foreign_default(board_db, tmp_path, monkeypatch):
++    _, _, _ = board_db
++    foreign = tmp_path / "foreign"
++    foreign.mkdir()
++    path = foreign / "kanban.db"
++    _metadata(foreign / "kanban" / "boards" / "default" / "board.json",
++              {"dispatch_owner": "foreign-worker"})
++    with kbc.connect_closing(path):
++        pass
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
++    with kb.pin_first_board_resolution():
++        with kbc.connect_closing(board="default") as conn:
++            result = _deny_without_effects(conn, monkeypatch, board="default")
++            assert result.dispatch_owner == "foreign-worker"
++
++
++def test_gateway_dispatch_cannot_bypass_ownership(board_db, monkeypatch):
++    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
++
++    conn, _, metadata = board_db
++    _metadata(metadata, {"dispatch_owner": "owner"})
++    kb.create_task(conn, title="Gateway must leave alone", assignee="default")
++    before = list(conn.iterdump())
++    spawn = Mock(side_effect=AssertionError("gateway spawned on owned board"))
++    monkeypatch.setattr(kbd, "_default_spawn", spawn)
++    settings = _DispatcherSettings(
++        interval=60, max_spawn=None, max_in_progress=None, failure_limit=2,
++        stale_timeout_seconds=0, reconcile_orphans=True,
++        default_assignee=None, max_in_progress_per_profile=None,
++    )
++    result = _KanbanDispatcher(kb, settings).tick_once_for_board("default")
++    assert result is not None
++    assert result.skipped_owned is True
++    assert result.dispatch_owner == "owner"
++    assert list(conn.iterdump()) == before
++    spawn.assert_not_called()
++
++
++def test_cli_dispatch_cannot_bypass_ownership(board_db, monkeypatch):
++    from hermes_cli import kanban as cli
++
++    conn, _, metadata = board_db
++    _metadata(metadata, {"dispatch_owner": "owner"})
++    kb.create_task(conn, title="CLI must leave alone", assignee="default")
++    before = list(conn.iterdump())
++    spawn = Mock(side_effect=AssertionError("CLI spawned on owned board"))
++    monkeypatch.setattr(kbd, "_default_spawn", spawn)
++    cli._cmd_dispatch(argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=True))
++    assert list(conn.iterdump()) == before
++    spawn.assert_not_called()
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_operator.py b/tests/hermes_cli/test_kanban_dispatch_owner_operator.py
+new file mode 100644
+index 0000000000..0f02a1a907
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_operator.py
+@@ -0,0 +1,89 @@
++"""Operator changes serialize with real ticks and preserve ownership on rename."""
++import argparse
++import json
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as kbd
++from hermes_cli.kanban_boards import _dispatch_boards
++from hermes_cli.kanban_dispatch_owner import get_dispatch_owner, set_dispatch_owner
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    kb.create_board("sample")
++    return Path(kb.kanban_db_path("sample"))
++
++
++def test_operator_set_read_clear_and_rename(board, capsys):
++    def command(owner=None, clear=False):
++        return _dispatch_boards(argparse.Namespace(
++            boards_action="dispatch-owner", slug="sample", owner=owner, clear=clear, json=True))
++    assert command("worker") == 0
++    assert json.loads(capsys.readouterr().out)["dispatch_owner"] == "worker"
++    kb.write_board_metadata("sample", name="Changed")
++    assert command() == 0
++    assert json.loads(capsys.readouterr().out)["dispatch_owner"] == "worker"
++    assert command(clear=True) == 0
++    assert json.loads(capsys.readouterr().out)["dispatch_owner"] is None
++
++
++def test_owner_change_and_display_write_refused_during_tick(board, monkeypatch):
++    set_dispatch_owner(board, "worker")
++    with kbc.connect_closing(board) as conn:
++        task = kb.create_task(conn, title="One scoped spawn", assignee="default")
++        def spawn(task, workspace, board=None):
++            path = kb.kanban_db_path("sample")
++            with pytest.raises(RuntimeError):
++                set_dispatch_owner(path, "other")
++            with pytest.raises(RuntimeError):
++                kb.write_board_metadata("sample", name="Race")
++            assert get_dispatch_owner(path) == "worker"
++        monkeypatch.setattr(kbd, "reap_worker_zombies", lambda: None)
++        result = kbd.dispatch_once(conn, board="sample", dispatcher_id="worker", spawn_fn=spawn)
++        assert [entry[0] for entry in result.spawned] == [task]
++    set_dispatch_owner(board, "other")
++    assert get_dispatch_owner(board) == "other"
++
++
++def test_unreadable_metadata_not_erased_by_display_edit(board):
++    metadata = board.parent / "board.json"
++    metadata.write_text("{broken")
++    with pytest.raises(ValueError):
++        kb.write_board_metadata("sample", name="Should fail")
++    assert metadata.read_text() == "{broken"
++
++
++def test_unavailable_lock_never_dispatches(board, monkeypatch):
++    set_dispatch_owner(board, "worker")
++    original = Path.open
++    def fail_lock(path, *args, **kwargs):
++        if path.name.endswith(".dispatch.lock"):
++            raise PermissionError("lock unavailable")
++        return original(path, *args, **kwargs)
++    monkeypatch.setattr(Path, "open", fail_lock)
++    with kbc.connect_closing(board) as conn:
++        spawn = Mock()
++        result = kbd.dispatch_once(conn, board="sample", dispatcher_id="worker", spawn_fn=spawn)
++        assert result.skipped_locked
++        spawn.assert_not_called()
++    with pytest.raises(RuntimeError):
++        set_dispatch_owner(board, None)
++
++
++def test_alias_symlink_uses_actual_owner(board, tmp_path, monkeypatch):
++    set_dispatch_owner(board, "worker")
++    alias = tmp_path / "alias.db"
++    alias.symlink_to(board)
++    with kbc.connect_closing(alias) as conn:
++        spawn = Mock()
++        result = kbd.dispatch_once(conn, board="default", spawn_fn=spawn)
++        assert result.skipped_owned
++        assert result.dispatch_owner == "worker"
++        spawn.assert_not_called()
+diff --git a/website/docs/developer-guide/kanban-dispatch-ownership.md b/website/docs/developer-guide/kanban-dispatch-ownership.md
+new file mode 100644
+index 0000000000..293426ab1d
+--- /dev/null
++++ b/website/docs/developer-guide/kanban-dispatch-ownership.md
+@@ -0,0 +1,74 @@
++# Per-board dispatch ownership
++
++`dispatch_owner` is optional board metadata for cooperative, same-UID runtime
++coordination. It is not a credential, authorization check, or security boundary.
++A host must still validate task provenance/generation and authorize its scoped
++spawn function. Anyone who can modify these files or execute arbitrary Python
++as the same user can change ownership. Do not give task workers a dispatcher ID.
++
++## Operator commands
++
++After upgrading every dispatcher that can access the board:
++
++```sh
++hermes kanban boards dispatch-owner example dedicated-worker --json
++hermes kanban boards dispatch-owner example --json
++# Explicitly restore stock dispatcher eligibility:
++hermes kanban boards dispatch-owner example --clear --json
++```
++
++The command targets the named board's canonical database, not a worker's env pin.
++It refuses a busy dispatch lock: retry after that tick completes. It does not
++terminate workers already running, start a service, or change profiles. Draining
++old workers and upgrading older dispatchers are deployment responsibilities.
++Older releases do not enforce this field; writing metadata alone is NOT rollout.
++
++The Python operator API is `hermes_cli.kanban_dispatch_owner.set_dispatch_owner(
++db_path, owner)`; pass `None` to remove the key. `get_dispatch_owner(db_path)` is
++the strict readback. Both operate on existing on-disk DB paths. Other metadata
++edits preserve ownership and serialize with ticks; malformed metadata must be
++repaired explicitly rather than silently replaced by display defaults.
++
++## Dedicated runtime
++
++Call the native boundary with a constant ID and your scoped spawn function:
++
++```python
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_dispatch import dispatch_once
++
++with kb.connect_closing(board="example") as conn:
++    result = dispatch_once(conn, board="example", dispatcher_id="dedicated-worker",
++                           spawn_fn=scoped_spawn)
++```
++
++The ID is an explicit Python keyword, not an environment variable or a worker
++grant. Stock CLI, daemon, and embedded gateway callers omit it and cannot dispatch
++owned boards. No plugin monkeypatch or lock bypass is necessary.
++
++## Invariants
++
++* Missing `dispatch_owner` retains stock eligibility. Legacy missing metadata is
++  unowned. A present empty/null/non-string/non-slug value is invalid, not cleared.
++* Slugs are exact lowercase alphanumeric/hyphen/underscore strings, 1–64 chars,
++  beginning with an alphanumeric. No trimming, case folding, or coercion.
++* The actual SQLite main database path selects metadata and the dispatch lock;
++  an explicit board label or `HERMES_KANBAN_DB` alias cannot select a different
++  owner's metadata. Symlinks resolve to their target. Default-board metadata
++  lives under `kanban/boards/default/board.json`; other DB metadata is adjacent.
++* Under the same lock, invalid/unreadable metadata or a mismatched identity returns
++  `skipped_owned=True` before reconciliation, reclaim, promotion, claim, spawn,
++  checkpoint, or dispatch observers. A valid owner appears in `dispatch_owner`;
++  read/validation failures appear in `ownership_error`.
++* An unavailable lock refuses dispatch and owner changes. Owner changes and
++  display metadata edits use atomic replacement while holding that lock.
++* In-memory/unidentifiable connections fail closed. Direct task APIs are not
++  changed: this coordinates dispatchers, not arbitrary same-UID database writers.
++
++## Tests
++
++Run `scripts/run_tests.sh tests/hermes_cli/test_kanban_dispatch_owner.py
++ tests/hermes_cli/test_kanban_dispatch_owner_operator.py` (one shell command).
++These exercise native dispatch, CLI and embedded-gateway denial, strict metadata,
++actual-connection identity, alias/symlink handling, operator set/read/clear,
++allowed scoped spawning, and owner/display edits attempted inside a live tick.
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2fe0a1d3ae..c2fc3d9cb8 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -168,6 +168,11 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
+ 
+ ## Boards (multi-project)
+ 
++Dedicated supervised runtimes can reserve a board with the optional native
++`dispatch_owner` field. See [per-board dispatch ownership](../../developer-guide/kanban-dispatch-ownership.md)
++for operator set/read/clear commands, the Python dispatcher ID contract, and
++safe rollout. This is same-UID coordination, not an authentication boundary.
++
+ Boards let you separate unrelated streams of work — one per project, repo,
+ or domain — into isolated queues. A new install has exactly one board
+ called `default` (DB at `~/.hermes/kanban.db` for back-compat). Users who
+-- 
+2.55.0
+

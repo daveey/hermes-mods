@@ -1,0 +1,249 @@
+From f7624226dc0bc95e27022d6d827a6ba3feed9708 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 12:28:15 +0000
+Subject: [PATCH] feat(kanban): persist atomic origin creation intents [daveey]
+
+---
+ hermes_cli/kanban_db.py                       |  14 +++
+ hermes_cli/kanban_origin_creation.py          |  69 +++++++++++
+ .../hermes_cli/test_kanban_origin_creation.py | 117 ++++++++++++++++++
+ 3 files changed, 200 insertions(+)
+ create mode 100644 hermes_cli/kanban_origin_creation.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_creation.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 65662b05d0..877257ae4d 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1198,9 +1198,13 @@ def create_task(
+     creator_task_id: Optional[str] = None,
+     completion_contract: Optional[str] = None,
+     validate_workspace: bool = False,
++    origin_intent: Optional[dict] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
++    ``origin_intent`` opts into atomic receipt-workflow creation: immutable
++    request ID/options, task and publication marker commit together. This is
++    owner-side persistence only, never proof of an origin readback or handoff.
+     ``validate_workspace=True`` (agent/CLI create surfaces) rejects a non-project
+     ``worktree`` workspace that could never resolve at spawn with
+     ``WorktreeWorkspaceConfigError`` naming the fix, instead of letting the
+@@ -1219,6 +1223,16 @@ def create_task(
+     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
+     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+     """
++    if origin_intent is not None:
++        # Capture the full immutable caller intent before defaults/derived state
++        # mutate it. New create options automatically participate in retry checks.
++        creation_options = dict(locals())
++        creation_options.pop("conn")
++        creation_options.pop("origin_intent")
++        from hermes_cli.kanban_origin_creation import create_with_origin
++
++        return create_with_origin(conn, origin_intent, creation_options)
++
+     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+     from hermes_cli.kanban_pr_acceptance import validate_contract
+ 
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+new file mode 100644
+index 0000000000..78eedbd41d
+--- /dev/null
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -0,0 +1,69 @@
++"""Atomic owner-side creation intents; publication/receipt transport runs later.
++
++The request ID, card and immutable publication marker commit in the same board
++transaction. No network I/O is allowed here. Ordinary (non-origin) creation keeps
++its legacy idempotency semantics; receipt workflows use this stricter ledger.
++"""
++from __future__ import annotations
++
++import json
++import re
++import secrets
++
++from hermes_cli.kanban_origin import OriginError
++
++
++def _json(value):
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++def create_with_origin(conn, intent: dict, options: dict) -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_origin_ledger import validate_binding
++
++    try:
++        if not isinstance(intent, dict) or set(intent) != {"request_id", "owner", "origin"}:
++            raise ValueError
++        if not isinstance(intent["request_id"], str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", intent["request_id"]):
++            raise ValueError
++        if not isinstance(intent["owner"], dict) or set(intent["owner"]) != {"gateway", "profile", "board"}:
++            raise ValueError
++        owner = intent["owner"]
++        if owner["board"] != (options["board"] or kb.get_current_board()):
++            raise ValueError
++        validate_binding({"binding_id": "validation", "version": 1, "publication_version": 1,
++                          "owner": {**owner, "task_id": "validation"}, "origin": intent["origin"],
++                          "task_record_key": f"{owner['profile']}/{owner['board']}/validation"})
++    except (KeyError, TypeError, ValueError):
++        raise OriginError("origin_creation_invalid", "invalid owner/origin creation intent") from None
++
++    options = dict(options)
++    options["parents"] = list(options["parents"])
++    if options["skills"] is not None:
++        options["skills"] = list(options["skills"])
++    immutable = _json({"intent": intent, "options": options})
++    with kb.write_txn(conn, allow_nested=True):
++        conn.execute("""CREATE TABLE IF NOT EXISTS origin_creation_intents (
++            request_id TEXT PRIMARY KEY NOT NULL,
++            intent_json TEXT NOT NULL,
++            task_id TEXT NOT NULL REFERENCES tasks(id),
++            binding_json TEXT NOT NULL,
++            child_request_id TEXT NOT NULL UNIQUE)""")
++        existing = conn.execute(
++            "SELECT intent_json,task_id FROM origin_creation_intents WHERE request_id=?",
++            (intent["request_id"],),
++        ).fetchone()
++        if existing:
++            if existing["intent_json"] != immutable:
++                raise OriginError("origin_creation_conflict", "request ID reused with a different creation intent")
++            return existing["task_id"]
++        # The receipt request ID, not legacy best-effort idempotency, owns this
++        # creation. Never adopt an unrelated existing task by its legacy key.
++        options["idempotency_key"] = None
++        task_id = kb.create_task(conn, **options)
++        marker = {"binding_id": "binding-" + secrets.token_hex(16), "version": 1,
++                  "owner": {**intent["owner"], "task_id": task_id}, "origin": intent["origin"],
++                  "task_record_key": f"{intent['owner']['profile']}/{intent['owner']['board']}/{task_id}"}
++        conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)",
++                     (intent["request_id"], immutable, task_id, _json(marker), "origin-bind-" + secrets.token_hex(16)))
++        return task_id
+diff --git a/tests/hermes_cli/test_kanban_origin_creation.py b/tests/hermes_cli/test_kanban_origin_creation.py
+new file mode 100644
+index 0000000000..005e5285e1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_creation.py
+@@ -0,0 +1,117 @@
++"""Owner creation must durably retain its receipt intent with the actual card."""
++import json
++from concurrent.futures import ThreadPoolExecutor
++from threading import Barrier
++
++from hermes_cli.kanban_origin import OriginError
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    kb.init_db()
++    return tmp_path
++
++
++def intent():
++    return {"request_id": "request-create-001",
++            "owner": {"gateway": "worker", "profile": "default", "board": "default"},
++            "origin": {"gateway": "origin", "profile": "work", "session": "s_old"}}
++
++
++def test_creation_commits_task_and_immutable_publication_marker_together(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Build", session_id="creator", origin_intent=intent())
++        row = conn.execute("SELECT task_id,binding_json,child_request_id FROM origin_creation_intents").fetchone()
++        assert row["task_id"] == tid
++        marker = json.loads(row["binding_json"])
++        assert marker["owner"] == {**intent()["owner"], "task_id": tid}
++        assert marker["origin"] == intent()["origin"]
++        assert marker["task_record_key"] == f"default/default/{tid}"
++        assert marker["version"] == 1
++        assert "publication_version" not in marker
++        assert row["child_request_id"]
++        assert kb.get_task(conn, tid).session_id == "creator"
++    with kbc.connect_closing() as conn:
++        assert kb.create_task(conn, title="Build", session_id="creator", origin_intent=intent()) == tid
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++        assert conn.execute("SELECT child_request_id FROM origin_creation_intents").fetchone()[0] == row["child_request_id"]
++
++
++@pytest.mark.parametrize("change", [
++    {"request_id": ""}, {"request_id": None}, {"extra": True},
++    {"owner": {"gateway": "worker", "profile": "../work", "board": "default"}},
++    {"origin": {"gateway": "origin", "profile": "work"}},
++    {"owner": {"gateway": "worker", "profile": "default", "board": "different"}},
++])
++def test_invalid_identity_fails_typed_before_creation(board, change):
++    with kbc.connect_closing() as conn:
++        with pytest.raises(OriginError) as err:
++            kb.create_task(conn, title="Build", origin_intent={**intent(), **change})
++        assert err.value.code == "origin_creation_invalid"
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++def test_archived_retry_and_changed_options(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Build", origin_intent=intent())
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
++        assert kb.create_task(conn, title="Build", origin_intent=intent()) == tid
++        for changes in ({"title": "Different"}, {"session_id": "another"}, {"priority": 1}):
++            with pytest.raises(OriginError) as err:
++                kb.create_task(conn, **{"title": "Build", **changes}, origin_intent=intent())
++            assert err.value.code == "origin_creation_conflict"
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
++def test_parallel_retry_creates_one_card(board):
++    barrier = Barrier(2)
++    def create():
++        with kbc.connect_closing() as conn:
++            barrier.wait(timeout=10)
++            return kb.create_task(conn, title="Build", origin_intent=intent())
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        futures = [pool.submit(create) for _ in range(2)]
++        ids = [f.result(timeout=20) for f in futures]
++    assert ids[0] == ids[1]
++    with kbc.connect_closing() as conn:
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
++def test_named_current_board_is_part_of_intent(board):
++    kb.create_board("work")
++    kb.set_current_board("work")
++    routed = {**intent(), "owner": {**intent()["owner"], "board": "work"}}
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Build", origin_intent=routed)
++        marker = json.loads(conn.execute("SELECT binding_json FROM origin_creation_intents").fetchone()[0])
++        assert marker["task_record_key"] == f"default/work/{tid}"
++        with pytest.raises(OriginError) as err:
++            kb.create_task(conn, title="Build", origin_intent=intent())
++        assert err.value.code == "origin_creation_invalid"
++
++
++def test_failed_intent_insert_rolls_back_task_and_events(board):
++    with kbc.connect_closing() as conn:
++        # Authorizer denies the final ledger INSERT, after nested create returns.
++        import sqlite3
++        def deny_insert(action, table, *args):
++            if action == sqlite3.SQLITE_INSERT and table == "origin_creation_intents":
++                return sqlite3.SQLITE_DENY
++            return sqlite3.SQLITE_OK
++        conn.set_authorizer(deny_insert)
++        with pytest.raises(sqlite3.DatabaseError):
++            kb.create_task(conn, title="Build", origin_intent=intent())
++        conn.set_authorizer(None)
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
++        tid = kb.create_task(conn, title="Build", origin_intent=intent())
++        assert kb.get_task(conn, tid).title == "Build"
+-- 
+2.55.0
+

@@ -1,0 +1,329 @@
+From 8bcc8df25ee865b434e33384192daa8dac24228b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:58:58 +0000
+Subject: [PATCH] fix(kanban): reject incompatible worker model pins and route
+ repairs [daveey]
+
+---
+ hermes_cli/kanban_assignment_routing.py       |   2 +
+ hermes_cli/kanban_db.py                       |   8 +-
+ hermes_cli/kanban_db_dispatch.py              |   6 +-
+ hermes_cli/kanban_model_assignment.py         |  77 +++++++++++
+ .../test_kanban_model_assignment.py           | 128 ++++++++++++++++++
+ tools/kanban_tools.py                         |   3 +-
+ 6 files changed, 217 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_model_assignment.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_assignment.py
+
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index 6d88f565b3..bbe56299ad 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -90,6 +90,8 @@ def validate_repair_completion(conn, task_id):
+     validate_assignment(original.assignee, requires=original.requires,
+                         workspace_kind=original.workspace_kind,
+                         workspace_path=original.workspace_path)
++    from hermes_cli.kanban_model_assignment import validate_model_assignment
++    validate_model_assignment(original.assignee, original.model_override, original.provider_override)
+ 
+ 
+ def route(conn, task, payload):
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 395388b1f5..1b4f7f87a2 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1306,6 +1306,8 @@ def create_task(
+     from hermes_cli.kanban_capabilities import validate_assignment
+     required = validate_assignment(assignee, requires=requires, workspace_kind=workspace_kind,
+                                    workspace_path=workspace_path)
++    from hermes_cli.kanban_model_assignment import validate_model_assignment
++    validate_model_assignment(assignee, model_override, provider_override)
+ 
+     # Retry once on the extremely unlikely id collision.
+     for attempt in range(2):
+@@ -3252,7 +3254,7 @@ def block_task(
+                 assignment_routing.route(conn, get_task(conn, task_id), payload)
+             _append_event(conn, task_id, "blocked", payload)
+             return True
+-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
++        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else cur_row["status"]
+         requested_kind, rekind_reason = kind, None
+         if kind in {"capability", "assignment"} and not blocker_id:
+             kind, rekind_reason = assignment_routing.classify(get_task(conn, task_id), kind, reason)
+@@ -3303,9 +3305,9 @@ def block_task(
+                        worker_pid    = NULL,
+                        {set_sql}
+                  WHERE id = ?
+-                   AND status IN ('running', 'ready')
++                   AND (status IN ('running', 'ready') OR (status = 'review' AND ? = 'assignment'))
+                 """
+-        params = (*params, task_id)
++        params = (*params, task_id, kind)
+         if expected_run_id is not None:
+             sql += " AND current_run_id = ?"
+             params = (*params, int(expected_run_id))
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 995e722704..b1b406c589 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -94,7 +94,7 @@ _COMPLETION_GATE_ERROR_PREFIXES = ("PR acceptance ",)
+ DEFAULT_GUARD_HOLD_CAP_SECONDS = 30 * 60
+ DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS = 6 * 3600
+ _GUARD_HOLD_SHORT_CAP_REASONS = frozenset({"blocker_auth"})
+-_GUARD_HOLD_EXEMPT_REASONS = frozenset({"shared_blocker"})
++_GUARD_HOLD_EXEMPT_REASONS = frozenset({"shared_blocker", "model_provider_mismatch"})
+ 
+ 
+ def _env_seconds(name: str, default: int) -> int:
+@@ -113,7 +113,6 @@ def guard_hold_cap_seconds(reason: str) -> Optional[int]:
+     return _env_seconds("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS)
+ 
+ 
+-
+ def _is_completion_gate_error(err: str) -> bool:
+     return err.lstrip().startswith(_COMPLETION_GATE_ERROR_PREFIXES)
+ 
+@@ -2233,7 +2232,8 @@ def _dispatch_lane_task(
+         if current >= per_profile_cap:
+             result.skipped_per_profile_capped.append((task_id, assignee, current))
+             return False
+-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
++    from hermes_cli.kanban_model_assignment import dispatch_guard
++    guard_reason = dispatch_guard(conn, task_id, lane=lane, dry_run=dry_run)
+     if guard_reason is not None:
+         result.respawn_guarded.append((task_id, guard_reason))
+         # Event so ``hermes kanban tail`` shows why the task looks stuck.
+diff --git a/hermes_cli/kanban_model_assignment.py b/hermes_cli/kanban_model_assignment.py
+new file mode 100644
+index 0000000000..61e46ed394
+--- /dev/null
++++ b/hermes_cli/kanban_model_assignment.py
+@@ -0,0 +1,77 @@
++"""Reject proven model/provider family mismatches without a stale model allowlist."""
++from contextlib import ExitStack
++from pathlib import Path
++
++
++class ModelProviderMismatchError(ValueError):
++    code = 'model_provider_mismatch'
++
++    def __init__(self, model, provider):
++        super().__init__(f'{self.code}: model {model!r} cannot run on provider {provider!r}; '
++                         'set a compatible model/provider pair before dispatch')
++
++
++def validate_model_assignment(assignee, model, provider):
++    """Validate pinned models only; unknown/custom providers and models remain supported.
++
++    This is configuration validation, not an entitlement or credential probe. Never
++    automatically select a paid provider to repair an incompatible subscription pin.
++    """
++    if not model:
++        return
++    if not provider and assignee:
++        from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
++        from hermes_cli.config_effective import load_user_config_effective
++        from hermes_cli.profiles import resolve_profile_env
++        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++        try:
++            home = Path(resolve_profile_env(assignee))
++        except ValueError:
++            # Non-profile lanes are supported; their executor owns provider selection.
++            return
++        with ExitStack() as stack:
++            stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
++            stack.callback(reset_secret_scope, set_secret_scope(build_profile_secret_scope(home)))
++            config = load_user_config_effective(home / 'config.yaml', fail_closed=True)
++        model_config = config.get('model', {})
++        provider = model_config.get('provider') if isinstance(model_config, dict) else None
++    provider = (provider or '').strip().lower()
++    model = model.strip().lower()
++    # Native-only transports cannot serve these other vendors' model families.
++    # Aggregators/custom endpoints intentionally have no family restriction.
++    incompatible = {
++        'openai-codex': ('claude-', 'anthropic/', 'gemini-', 'google/'),
++        'anthropic': ('gpt-', 'openai/', 'gemini-', 'google/'),
++    }
++    if model.startswith(incompatible.get(provider, ())):
++        raise ModelProviderMismatchError(model, provider)
++
++
++def dispatch_guard(conn, task_id, *, lane, dry_run=False):
++    """Check pins before quota/history guards can hide a repairable mismatch."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_dispatch import check_respawn_guard
++
++    return (route_model_mismatch(conn, kb.get_task(conn, task_id), dry_run=dry_run)
++            or check_respawn_guard(conn, task_id, lane=lane))
++
++
++def route_model_mismatch(conn, task, *, dry_run=False):
++    """Return a typed guard reason when dispatch needs durable supervisor repair."""
++    from hermes_cli import kanban_db as kb
++
++    try:
++        validate_model_assignment(task.assignee, task.model_override, task.provider_override)
++    except ModelProviderMismatchError as exc:
++        if not dry_run:
++            from hermes_cli.kanban_assignment_routing import AssignmentRoutingError
++            try:
++                kb.block_task(conn, task.id, reason=str(exc), kind='assignment',
++                              expected_run_id=task.current_run_id)
++            except AssignmentRoutingError as routing_error:
++                # One invalid card must not starve the rest of the board. The
++                # dispatcher records this guard hold; leave recovery agent-owned.
++                kb._log.warning('kanban: model assignment repair for %s: %s', task.id, routing_error)
++        return exc.code
++    return None
+diff --git a/tests/hermes_cli/test_kanban_model_assignment.py b/tests/hermes_cli/test_kanban_model_assignment.py
+new file mode 100644
+index 0000000000..a9d859abaf
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_assignment.py
+@@ -0,0 +1,128 @@
++"""Pinned models must not inherit a known incompatible worker provider."""
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / '.hermes'
++    home.mkdir()
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: supervisor\n')
++    for name in ('worker', 'supervisor'):
++        profile = home / 'profiles' / name
++        profile.mkdir(parents=True)
++        (profile / 'config.yaml').write_text(
++            'model:\n  default: gpt-5\n  provider: openai-codex\n'
++            'platform_toolsets:\n  cli: [terminal, file, kanban]\nterminal:\n  backend: local\n')
++    kb.init_db()
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        yield conn, home
++
++
++@pytest.mark.parametrize('provider', [None, 'openai-codex'])
++def test_create_rejects_claude_on_codex_before_inserting(board, provider):
++    conn, _ = board
++    with pytest.raises(ValueError, match='model_provider_mismatch'):
++        kb.create_task(conn, title='Review', assignee='worker',
++                       model_override='claude-opus-5-5', provider_override=provider)
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
++
++
++@pytest.mark.parametrize('provider', ['anthropic', 'openrouter', 'custom'])
++def test_compatible_or_open_model_provider_is_preserved(board, provider):
++    conn, _ = board
++    tid = kb.create_task(conn, title='Review', assignee='worker',
++                         model_override='claude-opus-5-5', provider_override=provider)
++    task = kb.get_task(conn, tid)
++    assert (task.model_override, task.provider_override) == ('claude-opus-5-5', provider)
++
++
++def test_worker_created_child_has_typed_model_rejection(board, monkeypatch):
++    import json
++    from tools import kanban_tools as tools
++    conn, _ = board
++    parent = kb.create_task(conn, title='Parent', assignee='worker')
++    monkeypatch.setenv('HERMES_KANBAN_TASK', parent)
++    monkeypatch.setattr(tools, '_persisted_identity', lambda: 'worker')
++    result = json.loads(tools._handle_create({'title': 'Review child',
++                                             'model': 'claude-opus-5-5'}))
++    assert result['code'] == 'model_provider_mismatch'
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_dispatch_routes_legacy_incompatible_pin_without_spawning(board, monkeypatch, lane):
++    from hermes_cli import kanban_session_activity as activity
++    conn, _ = board
++    tid = kb.create_task(conn, title='Legacy review', assignee='worker', session_id='chat')
++    conn.execute('UPDATE tasks SET model_override=?, status=? WHERE id=?', ('claude-opus-5-5', lane, tid))
++    conn.commit()
++    spawned = []
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args), max_spawn=1)
++    assert spawned == []
++    task = kb.get_task(conn, tid)
++    assert task.status == 'todo'
++    assert task.block_kind == 'assignment'
++    assert task.assignee == 'supervisor'
++    repair = conn.execute('SELECT parent_id FROM task_links WHERE child_id=?', (tid,)).fetchone()[0]
++    assert kb.get_task(conn, repair).status == 'ready'
++    assert activity._replica_bucket({'status': task.status, 'block_kind': task.block_kind}) == 'active'
++    with pytest.raises(ValueError, match='model_provider_mismatch'):
++        kb.complete_task(conn, repair, result='Not repaired yet')
++    kb.set_model_override(conn, tid, 'gpt-5', provider='openai-codex')
++    assert kb.complete_task(conn, repair, result='Repaired with subscription model')
++    kb.recompute_ready(conn)
++    assert kb.get_task(conn, tid).status == lane
++
++
++def test_unavailable_supervisor_does_not_abort_unrelated_dispatch(board):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    conn, home = board
++    (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: missing\n')
++    bad = kb.create_task(conn, title='Bad pin', assignee='worker', priority=100)
++    good = kb.create_task(conn, title='Good', assignee='worker')
++    conn.execute('UPDATE tasks SET model_override=? WHERE id=?', ('claude-opus-5-5', bad))
++    conn.commit()
++    spawned = []
++    dispatch_once(conn, spawn_fn=lambda task, *_args: spawned.append(task.id), max_spawn=1)
++    assert spawned == [good]
++    assert kb.get_task(conn, bad).status == 'ready'
++    from hermes_cli.kanban_db_dispatch import guard_hold_cap_seconds
++    assert guard_hold_cap_seconds('model_provider_mismatch') is None
++
++
++def test_dry_run_reports_mismatch_without_writing(board):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    conn, _ = board
++    tid = kb.create_task(conn, title='Legacy pin', assignee='worker')
++    conn.execute('UPDATE tasks SET model_override=? WHERE id=?', ('claude-opus-5-5', tid))
++    conn.commit()
++    before = list(conn.iterdump())
++    result = dispatch_once(conn, dry_run=True)
++    assert (tid, 'model_provider_mismatch') in result.respawn_guarded
++    assert list(conn.iterdump()) == before
++
++
++
++@pytest.mark.parametrize('backend,toolsets', [('local', '[web]'), ('docker', '[terminal, file, kanban]')])
++def test_worker_child_cannot_assign_host_repo_to_incapable_profile(board, monkeypatch, backend, toolsets):
++    import json
++    from tools import kanban_tools as tools
++    conn, home = board
++    (home / 'profiles/supervisor/config.yaml').write_text(
++        f'platform_toolsets:\n  cli: {toolsets}\nterminal:\n  backend: {backend}\n')
++    parent = kb.create_task(conn, title='Parent', assignee='worker')
++    monkeypatch.setenv('HERMES_KANBAN_TASK', parent)
++    monkeypatch.setattr(tools, '_persisted_identity', lambda: 'worker')
++    result = json.loads(tools._handle_create({'title': 'Host repo child', 'assignee': 'supervisor',
++                                             'requires': ['terminal', 'file', 'git', 'host_repo']}))
++    assert result['code'] == 'assignee_capability_mismatch'
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index f958af6975..c00b90b86a 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -213,7 +213,8 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+             except Exception as e:
+                 from hermes_cli.kanban_capabilities import CapabilityMismatchError
+                 from hermes_cli.kanban_assignment_routing import AssignmentRoutingError
+-                if isinstance(e, AssignmentRoutingError):
++                from hermes_cli.kanban_model_assignment import ModelProviderMismatchError
++                if isinstance(e, (AssignmentRoutingError, ModelProviderMismatchError)):
+                     return tool_error(str(e), code=e.code)
+                 if isinstance(e, CapabilityMismatchError):
+                     return tool_error(str(e), code=e.code, assignee=e.assignee, missing=e.missing)
+-- 
+2.55.0
+

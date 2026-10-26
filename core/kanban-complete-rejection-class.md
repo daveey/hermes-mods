@@ -82,7 +82,7 @@ Passed on the full 0001–0143 series at merge-base `4957bbd0a0` (Oct 19, 2026 P
 
 ## Applying
 
-`git am -3 core/patches/0140-*.patch`. Only `tools/kanban_tools.py` changes, but its hunk context includes
+`git am -3 --empty=keep core/patches/0140-*.patch`. Only `tools/kanban_tools.py` changes, but its hunk context includes
 `_goal_gate` and the `kanban_complete` refusals from earlier Kanban patches (goal judge, phantom cards, empty
 completions). Take it after those. 0141 edits the same file right after this patch's hunks, so apply 0140 first.
 

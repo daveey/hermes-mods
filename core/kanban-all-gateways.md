@@ -50,7 +50,7 @@ Mac mini glyphs, the filter narrows correctly, and the unreachable nous-1 is fla
 
 ## Applying
 
-`git am -3 0090-*.patch`. It touches the same kanban files as `0057` (drop attachments), so apply that one first.
+`git am -3 --empty=keep 0090-*.patch`. It touches the same kanban files as `0057` (drop attachments), so apply that one first.
 
 ## Gotchas
 

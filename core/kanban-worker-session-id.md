@@ -32,7 +32,7 @@ that file). The Desktop click path is not covered here.
 
 ## Applying
 
-`git am -3` in order (after 0117).
+`git am -3 --empty=keep` in order (after 0117).
 
 ## Plugin?
 

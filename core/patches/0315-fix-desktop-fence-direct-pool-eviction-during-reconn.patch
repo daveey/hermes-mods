@@ -1,0 +1,124 @@
+From 8e48f5c2c6eb27f21b63ea2797c7c543c9090af7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:03:39 +0000
+Subject: [PATCH] fix(desktop): fence direct pool eviction during reconnect
+ [daveey]
+
+---
+ apps/desktop/electron/main.ts                 |  1 +
+ apps/desktop/electron/pool-stop.ts            |  3 ++
+ .../registry-reconnect-service.test.ts        | 40 +++++++++++++++++--
+ 3 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index e112708b7e..a4e0120580 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -12413,6 +12413,7 @@ async function runPoolBackendStart(
+ // SIGTERM + immediate entry delete dropped the handle and a slow child
+ // survived detached under PID 1.
+ const poolStopper = createPoolStopper({
++  assertCanStop: key => registryReconnectService.assertCanStop(key),
+   pool: backendPool,
+   // localBackendLifecycle is the single owner of local child stop semantics:
+   // stopChild triggers its stop (stop + bounded exit wait + slot release);
+diff --git a/apps/desktop/electron/pool-stop.ts b/apps/desktop/electron/pool-stop.ts
+index 6c5b1b6a50..1f68c05fdf 100644
+--- a/apps/desktop/electron/pool-stop.ts
++++ b/apps/desktop/electron/pool-stop.ts
+@@ -40,6 +40,8 @@ export interface PoolStopperDeps {
+    * Held on the same in-flight promise as child exit (SSH teardown, etc.).
+    */
+   afterStop?: (key: string) => Promise<void>
++  /** Refuse conflicting lifecycle operations before any synchronous eviction. */
++  assertCanStop?: (key: string) => void
+ }
+ 
+ export interface PoolStopper {
+@@ -63,6 +65,7 @@ export function createPoolStopper(deps: PoolStopperDeps): PoolStopper {
+       return inFlight
+     }
+ 
++    deps.assertCanStop?.(key)
+     const entry = deps.pool.get(key)
+ 
+     if (!entry) {
+diff --git a/apps/desktop/electron/registry-reconnect-service.test.ts b/apps/desktop/electron/registry-reconnect-service.test.ts
+index 40aed6d9e4..c3fe344520 100644
+--- a/apps/desktop/electron/registry-reconnect-service.test.ts
++++ b/apps/desktop/electron/registry-reconnect-service.test.ts
+@@ -1,12 +1,13 @@
+ import { expect, test, vi } from 'vitest'
+ 
+ import { ManagedConnectionUpdateGate } from './managed-ssh-update'
++import { createPoolStopper } from './pool-stop'
+ import { createRegistryReconnectService } from './registry-reconnect-service'
+ 
+ function fixture() {
+   const descriptor = { baseUrl: 'http://hub', token: 'synthetic' }
+-  const primary = { connectionPromise: Promise.resolve({ baseUrl: 'http://local' }) }
+-  const entry = { connectionPromise: Promise.resolve(descriptor) }
++  const primary = { process: null, connectionPromise: Promise.resolve({ baseUrl: 'http://local' }) }
++  const entry = { process: null, connectionPromise: Promise.resolve(descriptor) }
+   const state = { registryConnectionId: 'hub', primaryRegistryScope: false, spawnNonce: 'owned', remotePlatform: 'Linux' }
+   const pool = new Map([['default', primary], ['conn:hub::default', entry]])
+   const states = new Map([['conn:hub::default', state]])
+@@ -21,7 +22,7 @@ function fixture() {
+ 
+   const reopen = vi.fn(async (id, profile, correlation) => {
+     gate.assertCanDial(id, correlation)
+-    pool.set(`conn:${id}::${profile}`, { connectionPromise: Promise.resolve(descriptor) })
++    pool.set(`conn:${id}::${profile}`, { process: null, connectionPromise: Promise.resolve(descriptor) })
+     states.set(`conn:${id}::${profile}`, { ...state, spawnNonce: 'new-owned' })
+   })
+ 
+@@ -51,7 +52,7 @@ test('composed reconnect repairs a deleted runtime without touching local defaul
+ 
+ test('a second profile cannot borrow a pending reconnect claim', async () => {
+   const f = fixture()
+-  f.pool.set('conn:hub::other', { connectionPromise: f.entry.connectionPromise })
++  f.pool.set('conn:hub::other', { process: null, connectionPromise: f.entry.connectionPromise })
+   f.states.set('conn:hub::other', { ...f.state })
+   const first = f.service.target('hub', 'default')!
+   const second = f.service.target('hub', 'other')!
+@@ -69,6 +70,37 @@ test('a second profile cannot borrow a pending reconnect claim', async () => {
+   await running
+ })
+ 
++test('direct profile deletion cannot evict a resident during reconnect commit', async () => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  let commit!: () => void
++  const request = f.request.getMockImplementation()!
++  f.request.mockImplementation(async (descriptor, path, options) => {
++    if (options.body?.action === 'commit') {
++      await new Promise<void>(resolve => { commit = resolve })
++    }
++
++    return request(descriptor, path, options)
++  })
++  const stopChild = vi.fn()
++
++  const stopper = createPoolStopper({
++    pool: f.pool,
++    assertCanStop: key => f.service.assertCanStop(key),
++    stopChild,
++    waitForExit: async () => {}
++  })
++
++  const running = f.service.run(target)
++  await vi.waitFor(() => expect(commit).toBeTypeOf('function'))
++  expect(() => stopper.stop('conn:hub::default')).toThrow('reconnect in progress')
++  expect(f.pool.get('conn:hub::default')).toBe(f.entry)
++  expect(stopChild).not.toHaveBeenCalled()
++  commit()
++  expect((await running).ok).toBe(true)
++  expect(f.gate.owner('hub')).toBeNull()
++})
++
+ test('a primary alias cannot acquire retirement authority', async () => {
+   const f = fixture()
+   f.state.primaryRegistryScope = true
+-- 
+2.55.0
+

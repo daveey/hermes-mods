@@ -1,0 +1,351 @@
+From cf317c0e688d55d3cc010ae4e23ab4b45a94890e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 07:45:46 +0000
+Subject: [PATCH] fix(kanban): bind goal release to successful handoff judge
+ [daveey]
+
+---
+ hermes_cli/kanban.py                         | 16 ++--
+ hermes_cli/kanban_db.py                      |  8 +-
+ hermes_cli/kanban_goal_receipt.py            | 35 ++++++++
+ hermes_cli/kanban_origin_ledger.py           | 23 ++++-
+ tests/hermes_cli/test_kanban_goal_receipt.py | 90 ++++++++++++++++++++
+ tools/kanban_tools.py                        | 13 +--
+ 6 files changed, 171 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_goal_receipt.py
+ create mode 100644 tests/hermes_cli/test_kanban_goal_receipt.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index d75a5f51f4..fdc5986f21 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -904,7 +904,7 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
+ 
+ 
+ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
+-                                 handoff_tool: str = "kanban_complete"):
++                                 handoff_tool: str = "kanban_complete", *, verified=None):
+     """Goal judge for every terminal worker handoff (including review).
+ 
+     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
+@@ -936,7 +936,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
+         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
+         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
+         try:
+-            verdict, reason, _, _, transport_failed = judge_goal(
++            verdict, reason, parse_failed, _, transport_failed = judge_goal(
+                 goal=handoff_judge_goal(task.title, task.body, handoff_tool),
+                 last_response=evidence.strip())
+         finally:
+@@ -947,6 +947,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
+ 
+         _logging.getLogger(__name__).warning("goal judge check failed, allowing lifecycle handoff: %s",
+                                              judge_exc, exc_info=True)
++        return ("done", None)
+     if transport_failed:
+         # ``judge_goal`` fails open to ``continue`` on transport errors (relay 400, auth, timeout);
+         # an unreachable judge is not a human "not done" and must not reject the handoff (#83610).
+@@ -954,16 +955,19 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
+ 
+         _logging.getLogger(__name__).warning("goal judge unreachable (%s), allowing lifecycle handoff", reason)
+         return ("done", None)
++    if verdict == 'done' and not parse_failed and verified is not None and handoff_tool == 'kanban_complete':
++        from hermes_cli.kanban_goal_receipt import GoalVerification
++        verified.append(GoalVerification.for_handoff(task, evidence))
+     return (verdict, None if verdict == "done" else reason)
+ 
+ 
+ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
+-                     continue_hint: str) -> Optional[str]:
++                     continue_hint: str, *, verified=None) -> Optional[str]:
+     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
+     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
+     None to allow."""
+     tool = "kanban_request_review" if handoff.startswith("review") else "kanban_complete"
+-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, tool)
++    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, tool, verified=verified)
+     if verdict == "blocked":
+         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
+                 f"the goal unachievable — {rejection}. {blocked_hint}")
+@@ -990,16 +994,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+     fail_msg: dict[str, str] = {}
+     with kbc.connect_closing() as conn:
+         def op(tid):
++            verified = []
+             gate_err = _goal_gate_error(
+                 conn, tid, (summary or args.result or "").strip(), "completion",
+                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
+-                "Provide evidence matching the task's acceptance criteria.")
++                "Provide evidence matching the task's acceptance criteria.", verified=verified)
+             if gate_err:
+                 fail_msg[tid] = gate_err
+                 return False
+             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
+             try:
+                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
++                                        goal_verification=verified[0] if verified else None,
+                                         expected_run_id=_worker_run_id_for(tid),
+                                         force=bool(getattr(args, "force", False)))
+             except kb.LiveClaimError:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 3419b6f1a2..708c85ace2 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2694,7 +2694,7 @@ def complete_task(
+     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
+     summary: Optional[str] = None, metadata: Optional[dict] = None,
+     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
+-    fire_lifecycle_hook: bool = True, force: bool = False,
++    fire_lifecycle_hook: bool = True, force: bool = False, goal_verification=None,
+ ) -> bool:
+     """``running|ready|blocked|review -> done``; records ``result``.
+ 
+@@ -2732,6 +2732,8 @@ def complete_task(
+         # reopened while this task waited.
+         if not _parents_satisfied(conn, task_id):
+             return False
++        from hermes_cli.kanban_goal_receipt import record as record_goal
++        goal_event_id = record_goal(conn, task_id, goal_verification, (summary or result or '').strip())
+         acceptance_event_id = record_acceptance(conn, task_id, acceptance) if acceptance is not None else None
+         if acceptance is not None and not acceptance_event_id:
+             return False
+@@ -2783,6 +2785,10 @@ def complete_task(
+         if prior_status == "review" and not event_summary:
+             event_summary = _REVIEW_APPROVED_NOTE
+         completion_payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
++        if goal_event_id is not None:
++            conn.execute('UPDATE task_events SET run_id=? WHERE id=? AND task_id=?',
++                         (run_id, goal_event_id, task_id))
++            completion_payload['goal_verified_event_id'] = goal_event_id
+         if acceptance_event_id is not None:
+             conn.execute("UPDATE task_events SET run_id=? WHERE id=? AND task_id=?",
+                          (run_id, acceptance_event_id, task_id))
+diff --git a/hermes_cli/kanban_goal_receipt.py b/hermes_cli/kanban_goal_receipt.py
+new file mode 100644
+index 0000000000..a8f754f5ad
+--- /dev/null
++++ b/hermes_cli/kanban_goal_receipt.py
+@@ -0,0 +1,35 @@
++"""Internal judge-success capability; never accepted from worker metadata."""
++from dataclasses import dataclass
++import hashlib
++import json
++
++
++def subject(task, evidence):
++    return {'task_id': task.id, 'title': task.title, 'body': task.body,
++            'contract': getattr(task, 'completion_contract', None), 'run_id': getattr(task, 'current_run_id', None),
++            'status': getattr(task, 'status', None), 'evidence': evidence.strip()}
++
++
++def digest(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++
++
++@dataclass(frozen=True)
++class GoalVerification:
++    snapshot: str
++
++    @classmethod
++    def for_handoff(cls, task, evidence):
++        return cls(digest(subject(task, evidence)))
++
++
++def record(conn, task_id, proof, evidence):
++    from hermes_cli import kanban_db as kb
++    task = kb.get_task(conn, task_id)
++    if (not task or not task.goal_mode or not isinstance(proof, GoalVerification)
++            or proof.snapshot != digest(subject(task, evidence))):
++        return None
++    kb._append_event(conn, task_id, 'goal_verified',
++                     {'subject': subject(task, evidence), 'snapshot': proof.snapshot},
++                     run_id=task.current_run_id)
++    return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 94bb80a2b2..af56cc31c0 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -113,8 +113,8 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+ 
+     The collector must call this on the owner, never on a replica. A completion
+     event is evidence of the core lifecycle gate; status alone (including an
+-    archive) is not. Goal-mode lacks a persisted judge-success record today, so
+-    those completions deliberately remain unverified.
++    archive) is not. Goal-mode also requires a current, completion-bound
++    judge-success receipt; unavailable judges never supply release evidence.
+     """
+     if not conn.in_transaction:
+         raise ValueError('origin_observation_snapshot_required')
+@@ -161,7 +161,24 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+                                      and receipt.get('pr_url') == row[4]
+                                      and isinstance(receipt.get('head_sha'), str)
+                                      and re.fullmatch(r'[0-9a-f]{40}', receipt['head_sha']))
+-    verified = bool(terminal and row[2] is None and not row[3] and contract_verified
++    goal_verified = not row[3]
++    if row[3] and event:
++        completed = json.loads(event[3] or '{}')
++        receipt_id = completed.get('goal_verified_event_id') if isinstance(completed, dict) else None
++        receipt = conn.execute(
++            "SELECT payload,run_id FROM task_events WHERE id=? AND task_id=? AND kind='goal_verified' AND id<?",
++            (receipt_id, task['id'], event[0])).fetchone() if type(receipt_id) is int else None
++        if receipt and receipt[1] is not None and receipt[1] == event[1]:
++            from hermes_cli.kanban_goal_receipt import digest
++            proof = json.loads(receipt[0] or '{}')
++            subject = proof.get('subject') if isinstance(proof, dict) else None
++            current = conn.execute('SELECT title,body FROM tasks WHERE id=?', (task['id'],)).fetchone()
++            goal_verified = bool(isinstance(subject, dict) and proof.get('snapshot') == digest(subject)
++                                 and subject.get('task_id') == task['id']
++                                 and subject.get('title') == current[0] and subject.get('body') == current[1]
++                                 and subject.get('contract') == row[4]
++                                 and subject.get('evidence') == (completed.get('summary') or completed.get('result') or '').strip())
++    verified = bool(terminal and row[2] is None and goal_verified and contract_verified
+                     and event and run and event[1] == run[0] and run[1] in ('done', 'completed') and run[2] == 'completed'
+                     and row[1] is not None and event[2] >= row[1] and run[3] is not None and run[3] >= row[1])
+     payload = {k: v for k, v in task.items() if k != 'origin_observation'}
+diff --git a/tests/hermes_cli/test_kanban_goal_receipt.py b/tests/hermes_cli/test_kanban_goal_receipt.py
+new file mode 100644
+index 0000000000..e82128a82b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_goal_receipt.py
+@@ -0,0 +1,90 @@
++"""Only a successful judge of the current handoff releases goal work."""
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban as cli
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_ledger as ledger
++from tests.hermes_cli.test_kanban_origin_creation import board
++from tools import kanban_tools
++
++
++def test_successful_goal_gate_releases_completed_work(board, monkeypatch):
++    monkeypatch.setattr(kanban_tools, '_goal_judge_available', lambda: True)
++    monkeypatch.setattr(kanban_tools, 'judge_goal', lambda **kw: ('done', 'verified', None, None, False))
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', goal_mode=True,
++                             completion_contract='local-only')
++        proof = kanban_tools._goal_gate('kanban_complete', kb.get_task(conn, tid), tid, 'Tested')
++        assert kb.complete_task(conn, tid, summary='Tested', goal_verification=proof)
++        conn.execute('BEGIN')
++        observed = ledger.observe_owner_task(conn, {'id': tid, 'status': 'done'}, now=1000)
++        assert observed['origin_observation']['verified'] is True
++
++
++@pytest.mark.parametrize('entry', ['tool', 'cli'])
++@pytest.mark.parametrize('failure', ['parse', 'transport', 'exception', 'unavailable', 'review'])
++def test_no_verification_from_failed_judge_or_review(board, monkeypatch, entry, failure):
++    monkeypatch.setattr(kanban_tools, '_goal_judge_available', lambda: failure != 'unavailable')
++    monkeypatch.setattr('agent.auxiliary_client.get_text_auxiliary_client',
++                        lambda *a: (None, None) if failure == 'unavailable' else (object(), 'judge'))
++    def judge(**kw):
++        if failure == 'exception':
++            raise RuntimeError('offline')
++        return ('done', 'result', failure == 'parse', None, failure == 'transport')
++    monkeypatch.setattr(kanban_tools, 'judge_goal', judge)
++    monkeypatch.setattr('hermes_cli.goals.judge_goal', judge)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', goal_mode=True, completion_contract='local-only')
++        task = kb.get_task(conn, tid)
++        handoff = 'kanban_request_review' if failure == 'review' else 'kanban_complete'
++        if entry == 'tool':
++            proof = kanban_tools._goal_gate(handoff, task, tid, 'Tested')
++        else:
++            verified = []
++            assert cli._goal_mode_handoff_rejection(task, 'Tested', handoff, verified=verified) == ('done', None)
++            proof = verified[0] if verified else None
++        assert kb.complete_task(conn, tid, summary='Tested', goal_verification=proof)
++        conn.execute('BEGIN')
++        assert not ledger.observe_owner_task(conn, {'id': tid, 'status': 'done'}, now=1000)['origin_observation']['verified']
++
++
++@pytest.mark.parametrize('change', ['title', 'body', 'evidence', 'status', 'metadata'])
++def test_changed_subject_or_worker_metadata_cannot_release(board, monkeypatch, change):
++    monkeypatch.setattr(kanban_tools, '_goal_judge_available', lambda: True)
++    monkeypatch.setattr(kanban_tools, 'judge_goal', lambda **kw: ('done', 'verified', False, None, False))
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', goal_mode=True, completion_contract='local-only')
++        proof = kanban_tools._goal_gate('kanban_complete', kb.get_task(conn, tid), tid, 'Tested')
++        if change in ('title', 'body'):
++            conn.execute(f'UPDATE tasks SET {change}=? WHERE id=?', ('Changed', tid))
++        elif change == 'status':
++            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        conn.commit()
++        evidence = 'Different' if change == 'evidence' else 'Tested'
++        assert kb.complete_task(conn, tid, summary=evidence,
++                                goal_verification=None if change == 'metadata' else proof,
++                                metadata={'goal_verified_event_id': 1, 'goal_verified': True})
++        conn.execute('BEGIN')
++        assert not ledger.observe_owner_task(conn, {'id': tid, 'status': 'done'}, now=1000)['origin_observation']['verified']
++
++
++@pytest.mark.parametrize('entry', ['tool', 'cli'])
++def test_completion_entry_records_real_goal_success(board, monkeypatch, entry):
++    monkeypatch.setattr(kanban_tools, '_goal_judge_available', lambda: True)
++    monkeypatch.setattr(kanban_tools, 'judge_goal', lambda **kw: ('done', 'verified', False, None, False))
++    monkeypatch.setattr('agent.auxiliary_client.get_text_auxiliary_client', lambda *a: (object(), 'judge'))
++    monkeypatch.setattr('hermes_cli.goals.judge_goal', lambda **kw: ('done', 'verified', False, None, False))
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', goal_mode=True,
++                             completion_contract='local-only')
++    if entry == 'cli':
++        assert cli._cmd_complete(argparse.Namespace(task_ids=[tid], summary='Tested', result=None, metadata=None)) == 0
++    else:
++        assert json.loads(kanban_tools._handle_complete({'task_id': tid, 'summary': 'Tested'}))['ok']
++    with kbc.connect_closing() as conn:
++        conn.execute('BEGIN')
++        assert ledger.observe_owner_task(conn, {'id': tid, 'status': 'done'}, now=1000)['origin_observation']['verified']
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index f7a2c8622e..21e2955f36 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -541,7 +541,7 @@ _GOAL_GATE_MESSAGES = {
+             "matching the card before requesting review.")}}
+ 
+ 
+-def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
++def _goal_gate(tool_name: str, task, tid: str, evidence: str):
+     """Goal-mode pre-handoff judge gate: a worker must not complete / request
+     review before acceptance criteria are met. ``blocked`` gets its own
+     guidance; any other non-``done`` verdict gets the ``continue`` guidance.
+@@ -554,7 +554,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
+         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
+         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
+         try:
+-            verdict, reason, _, _, transport_failed = judge_goal(
++            verdict, reason, parse_failed, _, transport_failed = judge_goal(
+                 goal=handoff_judge_goal(task.title, task.body, tool_name),
+                 last_response=evidence.strip())
+         finally:
+@@ -570,7 +570,10 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
+         logger.warning("goal judge unreachable (%s), allowing lifecycle handoff", reason)
+         return
+     if verdict == "done":
+-        return
++        if parse_failed or tool_name != 'kanban_complete':
++            return
++        from hermes_cli.kanban_goal_receipt import GoalVerification
++        return GoalVerification.for_handoff(task, evidence)
+     key = "blocked" if verdict == "blocked" else "continue"
+     raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid), "goal_judge")
+ 
+@@ -861,11 +864,11 @@ def _handle_complete(args: dict, **kw) -> str:
+         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
+         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+         task = kb.get_task(conn, tid)
+-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
++        goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+         try:
+             ok = kb.complete_task(
+                 conn, tid, result=result, summary=summary, metadata=metadata,
+-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
++                created_cards=created_cards, expected_run_id=_worker_run_id(tid), goal_verification=goal_verification)
+         except kb.ArtifactPreservationError as artifact_err:
+             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
+             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
+-- 
+2.55.0
+

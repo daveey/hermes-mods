@@ -407,7 +407,7 @@ Verified on current `upstream/main`:
 
 ## Applying
 
-Order and dependencies (checked with `git am -3` on a clean `upstream/main` checkout):
+Order and dependencies (checked with `git am -3 --empty=keep` on a clean `upstream/main` checkout):
 
 | Patch | Needs | Why |
 |---|---|---|
@@ -424,10 +424,10 @@ cd ~/.hermes/hermes-agent        # or your hermes-agent checkout
 M=~/code/hermes-mods/core/patches
 
 # ⌘⇧P move only (no "Create project"):
-git am -3 $M/0004-*.patch $M/0018-*.patch
+git am -3 --empty=keep $M/0004-*.patch $M/0018-*.patch
 
 # full feature, including Create project:
-git am -3 $M/0004-*.patch $M/0018-*.patch $M/0024-*.patch $M/0025-*.patch $M/0028-*.patch $M/0030-*.patch
+git am -3 --empty=keep $M/0004-*.patch $M/0018-*.patch $M/0024-*.patch $M/0025-*.patch $M/0028-*.patch $M/0030-*.patch
 ```
 
 Applying the whole series in order also works. The only patch that conflicts on upstream is 0013,

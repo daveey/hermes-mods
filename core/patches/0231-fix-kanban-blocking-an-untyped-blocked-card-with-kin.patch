@@ -1,0 +1,97 @@
+From 70642436f4b28f72004d4578ad6a1ca45f92323f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 05:56:59 +0000
+Subject: [PATCH] fix(kanban): blocking an untyped blocked card with kind=time
+ parks it scheduled, not a human block [daveey]
+
+A tracking card created blocked and then kanban_block'ed with kind=time ('external-event wait') went
+through classify-in-place: block_kind=time was stamped but status stayed blocked, before the timed-park
+routing ran. The Desktop then listed it under For you with an unblock button. Classify-in-place now
+takes the same timed-park route as a running/ready card (scheduled + wake, no block_kind); needs_input/
+capability still classify in place and stay visible human asks.
+---
+ hermes_cli/kanban_db.py                    |  7 ++++++
+ hermes_cli/kanban_timed_park.py            |  9 +++++---
+ tests/hermes_cli/test_kanban_timed_park.py | 25 ++++++++++++++++++++++
+ 3 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 267bbda241..65662b05d0 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3199,6 +3199,13 @@ def block_task(
+         if cur_row["status"] == "blocked":
+             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
+                 return False
++            # [daveey] A wait on a clock is never a human block, here too: the untyped card parks
++            # ``scheduled`` like a running/ready one would (it stayed ``blocked`` + kind=time, and the
++            # Desktop listed it under "For you" with an unblock button).
++            from hermes_cli import kanban_timed_park as ktp
++            if not blocker_id and ktp.is_timed_park(kind, reason, parents_satisfied=_parents_satisfied(conn, task_id)):
++                return ktp.park(conn, task_id, reason=reason, requested_kind=kind, source_status="ready",
++                                from_untyped_block=True)
+             classified = conn.execute(
+                 "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index acef783968..94ac95e960 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -82,15 +82,18 @@ def is_timed_park(kind: Optional[str], reason: Optional[str], *, parents_satisfi
+ 
+ def park(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str], requested_kind: Optional[str],
+-    source_status: str = "ready", expected_run_id: Optional[int] = None,
++    source_status: str = "ready", expected_run_id: Optional[int] = None, from_untyped_block: bool = False,
+ ) -> bool:
+-    """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn."""
++    """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn.
++    ``from_untyped_block``: an untyped ``blocked`` card with no live run (classify-in-place) instead. [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
+     now = int(time.time())
+     wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
++    guard = ("status = 'blocked' AND block_kind IS NULL AND current_run_id IS NULL" if from_untyped_block
++             else "status IN ('running', 'ready')")
+     sql = ("UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
+-           "worker_pid = NULL WHERE id = ? AND status IN ('running', 'ready')")
++           f"worker_pid = NULL WHERE id = ? AND {guard}")
+     params: tuple = (task_id,)
+     if expected_run_id is not None:
+         sql += " AND current_run_id = ?"
+diff --git a/tests/hermes_cli/test_kanban_timed_park.py b/tests/hermes_cli/test_kanban_timed_park.py
+index bf2937cf77..a580426e24 100644
+--- a/tests/hermes_cli/test_kanban_timed_park.py
++++ b/tests/hermes_cli/test_kanban_timed_park.py
+@@ -149,3 +149,28 @@ def test_sidebar_counts_only_human_blocks_as_blocked(kanban_home: Path, monkeypa
+     active, blocked = _sidebar_counts(kanban_home)
+     assert blocked == {"s_human": 1, "s_untyped": 1}
+     assert active.get("s_timed") == 1 and active.get("s_flaky") == 1
++
++
++def test_untyped_blocked_card_classified_as_time_parks_scheduled_not_blocked(kanban_home: Path) -> None:
++    """[daveey] A card created blocked (or parked untyped by the breaker) that is then blocked with
++    kind='time' is a wait on a clock: it must leave ``blocked`` for ``scheduled`` (classify-in-place used to
++    stamp block_kind and keep it ``blocked``, which the Desktop showed under For you with an unblock button)."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="tracker", assignee=None, initial_status="blocked", session_id="s1")
++        assert kb.get_task(conn, tid).status == "blocked" and kb.get_task(conn, tid).block_kind is None
++        assert kb.block_task(conn, tid, reason="External-event wait while the remote graph executes", kind="time")
++        task = kb.get_task(conn, tid)
++        assert task.status == "scheduled" and task.block_kind is None
++        park = _last(conn, tid, "scheduled")
++        assert park["timed_park"] and park["requested_kind"] == "time"
++    ksa._reset_cache_for_tests()
++    assert ksa.blocked_task_counts().get("s1", 0) == 0
++    assert ksa.active_task_counts().get("s1") == 1  # still unfinished
++
++
++def test_untyped_blocked_card_classified_as_needs_input_stays_a_human_block(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="ask", assignee=None, initial_status="blocked", session_id="s2")
++        assert kb.block_task(conn, tid, reason="Pick option A or B", kind="needs_input")
++        task = kb.get_task(conn, tid)
++        assert task.status == "blocked" and task.block_kind == "needs_input"
+-- 
+2.55.0
+

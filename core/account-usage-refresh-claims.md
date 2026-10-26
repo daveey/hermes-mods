@@ -70,7 +70,7 @@ The diagnostic RPC is there to confirm the next occurrence.
 
 ## Applying
 
-`git am -3 core/patches/0139-*.patch`. It touches `tui_gateway/contracts/config_free_tier_control.py` and the two
+`git am -3 --empty=keep core/patches/0139-*.patch`. It touches `tui_gateway/contracts/config_free_tier_control.py` and the two
 generated contract files, which other contract patches also touch. If they conflict, regenerate the generated files
 with `scripts/gen_gateway_contracts.py`. A running backend keeps the old module until it restarts.
 

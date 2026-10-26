@@ -157,7 +157,7 @@ for it.
 - 0118 applies on top of 0001–0117. Its context includes 0015's background preview routing
   (`backgroundPreviewTabFor` in `server-requests.ts`), so apply 0015 first.
 - 0119 needs 0118. It edits 0118's `previewOpen`, `initiallyParked` and `KeepAlivePanes` code.
-- verified: applies with git am -3 on top of 0001–0118 at merge-base 4957bbd0a0, Oct 17 2026 PT.
+- verified: applies with git am -3 --empty=keep on top of 0001–0118 at merge-base 4957bbd0a0, Oct 17 2026 PT.
 
 ## Gotchas
 

@@ -20,7 +20,7 @@ hard-coded keydown check now matches Cmd/Ctrl+Alt+K via `event.code === 'KeyK'` 
 Existing suites: `npx vitest run src/plugins/kanban src/lib/keybinds src/app/chat/composer` (129 pass); `tsc --noEmit`, eslint.
 
 ## Applying
-`git am -3 core/patches/0056-*.patch`. The Kanban desktop plugin must be enabled (Capabilities ▸ Plugins), otherwise
+`git am -3 --empty=keep core/patches/0056-*.patch`. The Kanban desktop plugin must be enabled (Capabilities ▸ Plugins), otherwise
 ⌘⇧K does nothing.
 
 ## Gotchas

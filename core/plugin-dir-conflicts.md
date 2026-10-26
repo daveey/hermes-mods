@@ -37,7 +37,7 @@ warns / stays quiet. Not re-run when this doc was written (untested here).
 
 ## Applying
 
-`git am -3` in order.
+`git am -3 --empty=keep` in order.
 
 ## Gotchas
 

@@ -1,0 +1,103 @@
+From d46d95f1d01e71df2ccb47aba23c7e7319234ff4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 22:58:16 +0000
+Subject: [PATCH] fix(deadline): kill_process_tree re-reads the live tree when
+ the stop budget is exhausted
+
+On a loaded host the 1s stop budget could expire mid-snapshot; the TimeoutError path then
+signalled the stale first snapshot, so a descendant forked during the stop escaped
+(cron_timeout_fork_race: late child left running). Raise the budget to 5s (it guards
+uninterruptible sleep, not scheduling latency) and, on expiry, merge a fresh live-tree rescan.
+The probe gains a stop-budget-exhausted mode; that test fails deterministically without the fix.
+The JS channel-smoke timeout and the LSP flake were already fixed on main (f1e1ba1066, 1f2b9e0864).
+---
+ agent/deadline.py                      | 19 ++++++++++++++++++-
+ evals/cron_timeout_fork_race.py        |  5 +++++
+ tests/agent/test_deadline_fork_race.py |  8 ++++++--
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/agent/deadline.py b/agent/deadline.py
+index 82025d9819..25874505a2 100644
+--- a/agent/deadline.py
++++ b/agent/deadline.py
+@@ -361,6 +361,12 @@ def run_bounded_sync(
+ # --- Whole-tree process termination --------------------------------------------
+ 
+ 
++# Budget for stopping a hard-kill target tree. It bounds a target stuck in
++# uninterruptible sleep, not scheduling latency: on a loaded or CPU-throttled host a
++# runnable target can take well over a second to be scheduled and act on SIGSTOP.
++_TREE_STOP_DEADLINE_S = 5.0
++
++
+ @contextmanager
+ def _process_tree_snapshot(pid: int, *, hard_kill: bool):
+     """Stop each hard-kill target before discovering its children: a running
+@@ -379,7 +385,7 @@ def _process_tree_snapshot(pid: int, *, hard_kill: bool):
+                 pending = [root]
+                 seen = {os.getpid()}
+                 known = {process.pid: process for process in descendants}
+-                stop_deadline = time.monotonic() + 1.0
++                stop_deadline = time.monotonic() + _TREE_STOP_DEADLINE_S
+                 while pending:
+                     for process in pending:
+                         if process.pid in seen:
+@@ -410,6 +416,17 @@ def _process_tree_snapshot(pid: int, *, hard_kill: bool):
+             # Preserve the existing best-effort group fallback when discovery or
+             # stopping is unavailable; never strand a successfully stopped target.
+             logger.debug("kill_process_tree: snapshot incomplete for pid %s", pid, exc_info=True)
++            # Never fall back to the stale first snapshot: a descendant forked while we
++            # were stopping the tree would escape the signal (and a detached one escapes
++            # the group sweep too). Re-read the live tree, merging what we already know.
++            try:
++                import psutil
++                known = {process.pid: process for process in descendants}
++                for process in psutil.Process(pid).children(recursive=True):
++                    known.setdefault(process.pid, process)
++                descendants = list(known.values())
++            except Exception:
++                logger.debug("kill_process_tree: fallback rescan failed for pid %s", pid, exc_info=True)
+         yield descendants
+     finally:
+         for process in stopped:
+diff --git a/evals/cron_timeout_fork_race.py b/evals/cron_timeout_fork_race.py
+index 2e3c7bd549..e6f8eb7e22 100644
+--- a/evals/cron_timeout_fork_race.py
++++ b/evals/cron_timeout_fork_race.py
+@@ -24,6 +24,11 @@ def main():
+         os.environ["HERMES_CRON_SCRIPT_TIMEOUT"] = "2"
+         from cron.scheduler_script import _run_job_script
+ 
++        starved = os.environ.get("CRON_FORK_RACE_STOP_DEADLINE_S")
++        if starved is not None:  # model a host too loaded to stop the tree in time
++            import agent.deadline
++            agent.deadline._TREE_STOP_DEADLINE_S = float(starved)
++
+         scripts = Path(root, "scripts")
+         scripts.mkdir()
+         release, marker = Path(root, "release"), Path(root, "pids.json")
+diff --git a/tests/agent/test_deadline_fork_race.py b/tests/agent/test_deadline_fork_race.py
+index dad679eda6..1e784a305a 100644
+--- a/tests/agent/test_deadline_fork_race.py
++++ b/tests/agent/test_deadline_fork_race.py
+@@ -10,11 +10,15 @@ import pytest
+ 
+ 
+ @pytest.mark.platforms("linux")
+-def test_cron_timeout_closes_the_descendant_snapshot_fork_window(tmp_path):
++@pytest.mark.parametrize("stop_deadline", [None, "0"], ids=["normal", "stop-budget-exhausted"])
++def test_cron_timeout_closes_the_descendant_snapshot_fork_window(tmp_path, stop_deadline):
++    # "0" exhausts the stop budget immediately, as a loaded host does: the fallback must
++    # still re-read the live tree rather than signal a stale snapshot.
++    extra = {} if stop_deadline is None else {"CRON_FORK_RACE_STOP_DEADLINE_S": stop_deadline}
+     probe = Path(__file__).resolve().parents[2] / "evals" / "cron_timeout_fork_race.py"
+     result = subprocess.run(
+         [sys.executable, str(probe)],
+-        env={**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(tmp_path)},
++        env={**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(tmp_path), **extra},
+         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=35,
+         check=False,
+     )
+-- 
+2.55.0
+

@@ -1,0 +1,625 @@
+From 5c31e92ca8a4b5e15995de656520b55979bc774d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:06:01 +0000
+Subject: [PATCH] feat(sessions): persist trusted start metadata and bind SSH
+ Desktop principals [daveey]
+
+---
+ apps/shared/src/gateway-contract.generated.ts |   1 +
+ apps/shared/src/gateway-contract.openrpc.json |   7 +
+ hermes_cli/main.py                            |   7 +-
+ hermes_cli/main_dashboard.py                  |  17 ++
+ hermes_cli/web_server.py                      |  41 ++++
+ hermes_cli/web_server_chat.py                 |   6 +
+ .../test_ssh_bootstrap_auth_identity.py       | 206 ++++++++++++++++++
+ tests/tui_gateway/test_start_metadata.py      |  81 +++++++
+ tui_gateway/contracts/sessions.py             |   1 +
+ tui_gateway/session_start_requests.py         |  44 +++-
+ 10 files changed, 398 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_ssh_bootstrap_auth_identity.py
+ create mode 100644 tests/tui_gateway/test_start_metadata.py
+
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 26dbe841e2..aed511749a 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -3059,6 +3059,7 @@ export interface SessionStartRequestResult {
+   archived: boolean
+   active_turn: boolean
+   reconciliation: StartReconciliation
++  metadata?: Record<string, string>
+ }
+ export type FirstTurnState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+ export type StartReconciliation = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown_outcome'
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 906eaf4bd0..97088b58ef 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -32958,6 +32958,13 @@
+           },
+           "reconciliation": {
+             "$ref": "#/components/schemas/StartReconciliation"
++          },
++          "metadata": {
++            "additionalProperties": {
++              "type": "string"
++            },
++            "title": "Metadata",
++            "type": "object"
+           }
+         },
+         "required": [
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index d38f86eff6..387f0be446 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -817,6 +817,7 @@ from hermes_cli.main_dashboard import (
+     _is_electron_packaged_web_dist,
+     _maybe_setup_dashboard_auth_interactively,
+     _read_ssh_session_token_file,
++    _ssh_bootstrap_server_kwargs,
+     _report_dashboard_status,
+     _resolve_dashboard_web_dist,
+     _route_named_profile_dashboard,
+@@ -2773,7 +2774,6 @@ def cmd_dashboard(args):
+     _ssh_session_token = _read_ssh_session_token_file(_token_file) if _token_file else None
+     _mcp_discovery_after_bind = _dashboard_prepare_runtime(args, _headless_backend)
+ 
+-    from hermes_cli.dashboard_procs import BACKEND_LOCK_NAME
+     from hermes_cli.web_server import start_server
+ 
+     # Interactive auth setup: if this bind will engage the auth gate but no
+@@ -2796,11 +2796,8 @@ def cmd_dashboard(args):
+         initial_profile=getattr(args, "open_profile", "") or "",
+         headless=_headless_backend,
+         isolated=getattr(args, "isolated", False),
+-        ssh_session_token=_ssh_session_token,
+-        ssh_owner_nonce=_ssh_owner_nonce,
++        **_ssh_bootstrap_server_kwargs(_token_file, _ssh_session_token, _ssh_owner_nonce),
+         start_mcp_discovery_after_bind=_mcp_discovery_after_bind,
+-        # The validated token file lives in desktop-ssh/<ownershipId>/, next to the Desktop's lock.
+-        ssh_lock_path=Path(_token_file).parent / BACKEND_LOCK_NAME if _token_file else None,
+     )
+ 
+ 
+diff --git a/hermes_cli/main_dashboard.py b/hermes_cli/main_dashboard.py
+index a2d2cd2659..c8260662e4 100644
+--- a/hermes_cli/main_dashboard.py
++++ b/hermes_cli/main_dashboard.py
+@@ -764,6 +764,23 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
+     print("    Sign in at the dashboard with these credentials.\n")
+ 
+ 
++def _ssh_bootstrap_server_kwargs(token_file, token, owner_nonce):
++    """Server launch binding, called only after the private token file validates.
++
++    The ownership directory survives token rotation. Neither it nor the nonce
++    alone grants an identity: the server also requires the verified credential.
++    """
++    from hermes_cli.dashboard_procs import BACKEND_LOCK_NAME
++
++    directory = Path(token_file).parent if token_file else None
++    return {
++        "ssh_session_token": token,
++        "ssh_owner_nonce": owner_nonce,
++        "ssh_ownership_id": directory.name if directory else None,
++        "ssh_lock_path": directory / BACKEND_LOCK_NAME if directory else None,
++    }
++
++
+ def _read_ssh_session_token_file(path: str) -> str:
+     """Read and unlink a Desktop SSH token from its private runtime directory."""
+     if sys.platform == "win32":
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 55961b5417..a83bb8a271 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -417,6 +417,36 @@ def _apply_ssh_session_token(token: str) -> None:
+         _SESSION_TOKEN = token
+ 
+ 
++def _configure_ssh_bootstrap_identity(
++    host: str, token: Optional[str], ownership_id: Optional[str],
++) -> None:
++    """Bind the validated Desktop SSH ownership slot to this startup only.
++
++    Arguments come from main's token-file validator, never requests or env.
++    Reset on every startup; a replacement token must not inherit the scope.
++    """
++    app.state.ssh_bootstrap_identity = None
++    if (host in _LOOPBACK_HOST_VALUES and token and ownership_id
++            and re.fullmatch(r"[0-9a-f]{32}", ownership_id)):
++        app.state.ssh_bootstrap_identity = (token, ownership_id)
++
++
++def _ssh_bootstrap_session():
++    """Identity for an ALREADY verified legacy credential; never authenticates."""
++    binding = getattr(app.state, "ssh_bootstrap_identity", None)
++    if (not binding or getattr(app.state, "auth_required", False)
++            or getattr(app.state, "bound_host", None) not in _LOOPBACK_HOST_VALUES
++            or not hmac.compare_digest(binding[0].encode(), _SESSION_TOKEN.encode())):
++        return None
++    from hermes_cli.dashboard_auth.base import Session
++
++    # Process-lifetime identity, not OAuth: no token/refresh material is exposed
++    # and this session is never persisted in the auth cookie jar.
++    return Session(user_id=binding[1], provider="desktop-ssh", email="",
++                   display_name="", org_id="", expires_at=0,
++                   access_token="", refresh_token="")
++
++
+ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
+     global _SSH_OWNER_NONCE, _SSH_RUNTIME_PURELIB, _SSH_RUNTIME_MARKER
+     _SSH_OWNER_NONCE = nonce
+@@ -738,6 +768,12 @@ async def auth_middleware(request: Request, call_next):
+         and not _has_valid_query_token(request, path)
+     ):
+         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
++    if (not getattr(request.state, "token_authenticated", False)
++            and not getattr(request.app.state, "auth_required", False)
++            and _has_valid_session_token(request)):
++        session = _ssh_bootstrap_session()
++        if session is not None:
++            request.state.session = session
+     return await call_next(request)
+ 
+ 
+@@ -1621,6 +1657,7 @@ def start_server(
+     ssh_owner_nonce: Optional[str] = None,
+     start_mcp_discovery_after_bind: bool = False,
+     ssh_lock_path: Optional[Path] = None,
++    ssh_ownership_id: Optional[str] = None,
+ ):
+     """Start the web UI server.
+ 
+@@ -1632,11 +1669,15 @@ def start_server(
+     ``ssh_session_token``/``ssh_owner_nonce`` are process-local Desktop SSH
+     bootstrap state, never persisted or exported to children; ``ssh_lock_path`` is the
+     Desktop's ``backend.lock.json`` for that ownership slot (supersession watchdog).
++    ``ssh_ownership_id`` is the stable directory name from the successfully
++    validated SSH token file, not the rotating nonce. Only loopback, ungated
++    requests with the matching credential receive this process-local identity.
+     ``start_mcp_discovery_after_bind`` (Desktop ``serve``) defers MCP discovery
+     until the ready sentinel is written so its SDK import can't hold the GIL
+     against the pre-bind path.
+     """
+     _apply_ssh_session_token(ssh_session_token or "")
++    _configure_ssh_bootstrap_identity(host, ssh_session_token, ssh_ownership_id)
+     _apply_ssh_owner_nonce(ssh_owner_nonce)
+ 
+     # Dashboard-mode starts don't route through main.py's `serve` path, which
+diff --git a/hermes_cli/web_server_chat.py b/hermes_cli/web_server_chat.py
+index 3ec2fe4183..943ae0614e 100644
+--- a/hermes_cli/web_server_chat.py
++++ b/hermes_cli/web_server_chat.py
+@@ -370,6 +370,12 @@ def _ws_auth_reason(ws: WebSocket) -> tuple[Optional[str], str]:
+     if not token:
+         return "no_credential", "none"
+     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
++        from hermes_cli.web_server import _ssh_bootstrap_session
++
++        session = _ssh_bootstrap_session()
++        if session is not None:
++            ws._hermes_auth_identity = {
++                "user_id": session.user_id, "provider": session.provider}
+         return None, "token"
+     return "token_mismatch", "token"
+ 
+diff --git a/tests/hermes_cli/test_ssh_bootstrap_auth_identity.py b/tests/hermes_cli/test_ssh_bootstrap_auth_identity.py
+new file mode 100644
+index 0000000000..e02e3919a1
+--- /dev/null
++++ b/tests/hermes_cli/test_ssh_bootstrap_auth_identity.py
+@@ -0,0 +1,206 @@
++"""Only validated SSH Desktop startup credentials confer a stable principal."""
++from types import SimpleNamespace
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++import pytest
++from starlette.requests import Request
++from starlette.responses import JSONResponse
++from starlette.websockets import WebSocket
++
++from hermes_cli import web_server as server
++from hermes_cli.web_server_chat import _ws_auth_reason
++from hermes_cli.main_dashboard import _read_ssh_session_token_file
++
++
++@pytest.fixture(autouse=True)
++def state(monkeypatch):
++    monkeypatch.setattr(server, "_SESSION_TOKEN", "b" * 64)
++    monkeypatch.setattr(server.app.state, "auth_required", False, raising=False)
++    monkeypatch.setattr(server.app.state, "bound_host", "127.0.0.1", raising=False)
++    monkeypatch.setattr(server.app.state, "ssh_bootstrap_identity", None, raising=False)
++
++
++def bootstrap(owner="a" * 32, token="b" * 64, host="127.0.0.1"):
++    server._configure_ssh_bootstrap_identity(host, token, owner)
++
++
++async def rest(token):
++    request = Request({"type": "http", "method": "POST", "path": "/api/sessions/start",
++                       "headers": [(b"x-hermes-session-token", token.encode())],
++                       "query_string": b"user_id=attacker&provider=attacker", "app": server.app})
++    async def downstream(request):
++        session = getattr(request.state, "session", None)
++        return JSONResponse({"identity": None if session is None else
++                             {"provider": session.provider, "user_id": session.user_id}})
++    response = await server.auth_middleware(request, downstream)
++    import json
++    return response.status_code, json.loads(response.body)
++
++
++def ws(token):
++    socket = WebSocket({"type": "websocket", "path": "/api/ws", "headers": [],
++                        "query_string": f"token={token}&user_id=attacker".encode(),
++                        "app": server.app, "scheme": "ws", "server": ("127.0.0.1", 9119)}, receive=None, send=None)
++    reason, _ = _ws_auth_reason(socket)
++    return reason, getattr(socket, "_hermes_auth_identity", None)
++
++
++@pytest.mark.asyncio
++async def test_actual_rest_ws_identity_parity():
++    bootstrap()
++    expected = {"provider": "desktop-ssh", "user_id": "a" * 32}
++    assert await rest("b" * 64) == (200, {"identity": expected})
++    assert ws("b" * 64) == (None, expected)
++
++
++@pytest.mark.asyncio
++async def test_legacy_no_bootstrap_has_no_identity():
++    assert await rest("b" * 64) == (200, {"identity": None})
++    assert ws("b" * 64) == (None, None)
++
++
++@pytest.mark.asyncio
++async def test_wrong_or_missing_token_has_no_identity():
++    bootstrap()
++    for token in ("wrong", ""):
++        assert (await rest(token))[0] == 401
++        assert ws(token)[0] is not None
++        assert ws(token)[1] is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("host", ["0.0.0.0", "example.com", ""])
++async def test_nonloopback_bootstrap_has_no_identity(host):
++    bootstrap(host=host)
++    assert await rest("b" * 64) == (200, {"identity": None})
++    assert ws("b" * 64) == (None, None)
++
++
++@pytest.mark.asyncio
++async def test_gating_never_uses_ssh_identity(monkeypatch):
++    bootstrap()
++    monkeypatch.setattr(server.app.state, "auth_required", True)
++    monkeypatch.setattr("hermes_cli.dashboard_auth.middleware._verify_access_token", lambda *a, **k: None)
++    assert await rest("b" * 64) == (200, {"identity": None})  # outer OAuth gate owns rejection
++    assert ws("b" * 64) == ("token_invalid", None)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("owner,token", [(None, "b" * 64), ("a" * 32, None),
++                                         ("attacker", "b" * 64)])
++async def test_incomplete_or_malformed_startup_has_no_identity(owner, token):
++    bootstrap(owner=owner, token=token)
++    assert await rest("b" * 64) == (200, {"identity": None})
++    assert ws("b" * 64) == (None, None)
++
++
++@pytest.mark.asyncio
++async def test_startup_reset_and_token_replacement(monkeypatch):
++    bootstrap()
++    bootstrap(owner=None, token=None)
++    assert ws("b" * 64) == (None, None)
++    bootstrap()
++    monkeypatch.setattr(server, "_SESSION_TOKEN", "c" * 64)
++    assert await rest("c" * 64) == (200, {"identity": None})
++    assert ws("c" * 64) == (None, None)
++
++
++@pytest.mark.platforms("posix")
++def test_validated_ownership_stable_across_nonce_and_token_rotation(tmp_path, monkeypatch):
++    monkeypatch.setenv("HOME", str(tmp_path))
++    identities = []
++    for owner, nonce, token in [("a" * 32, "1" * 16, "b" * 64),
++                                ("a" * 32, "2" * 16, "c" * 64),
++                                ("d" * 32, "3" * 16, "e" * 64)]:
++        directory = tmp_path / ".hermes" / "desktop-ssh" / owner
++        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
++        path = directory / (nonce + ".token")
++        path.write_text(token)
++        path.chmod(0o600)
++        validated = _read_ssh_session_token_file(str(path))
++        assert not path.exists()
++        monkeypatch.setattr(server, "_SESSION_TOKEN", validated)
++        bootstrap(owner=path.parent.name, token=validated)
++        identities.append(ws(validated)[1])
++    assert identities[0] is not None
++    assert identities[0] == identities[1]
++    assert identities[0] != identities[2]
++
++
++def test_asgi_middleware_and_websocket_upgrade_parity():
++    bootstrap()
++    app = FastAPI()
++    app.middleware("http")(server.auth_middleware)
++
++    @app.post("/api/probe")
++    async def probe(request: Request):
++        session = request.state.session
++        return {"provider": session.provider, "user_id": session.user_id}
++
++    @app.websocket("/api/ws")
++    async def socket(ws: WebSocket):
++        reason, _ = _ws_auth_reason(ws)
++        if reason:
++            await ws.close(code=1008)
++            return
++        await ws.accept()
++        await ws.send_json(ws._hermes_auth_identity)
++        await ws.close()
++
++    client = TestClient(app)
++    response = client.post("/api/probe", headers={"X-Hermes-Session-Token": "b" * 64})
++    assert response.status_code == 200
++    with client.websocket_connect("/api/ws?token=" + "b" * 64) as connection:
++        assert connection.receive_json() == response.json()
++    assert client.post("/api/probe", headers={"X-Hermes-Session-Token": "wrong"}).status_code == 401
++
++
++def test_start_server_resets_binding_on_each_start(monkeypatch):
++    class StopStartup(Exception):
++        pass
++
++    def stop(*args):
++        raise StopStartup
++
++    monkeypatch.setattr(server, "_apply_ssh_owner_nonce", stop)
++    with pytest.raises(StopStartup):
++        server.start_server(ssh_session_token="b" * 64, ssh_ownership_id="a" * 32)
++    assert ws("b" * 64)[1] == {"provider": "desktop-ssh", "user_id": "a" * 32}
++    with pytest.raises(StopStartup):
++        server.start_server()
++    assert ws("b" * 64) == (None, None)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("safe", [True, False])
++def test_cmd_dashboard_only_passes_ownership_after_file_validation(tmp_path, monkeypatch, safe):
++    # Bootstrap recovery resolves worktree git metadata outside HERMES_HOME;
++    # this command-wiring test must never inspect or recover the live checkout.
++    monkeypatch.setattr("hermes_cli._early_recovery.restore_interrupted_pull", lambda *a: False)
++    from hermes_cli import main
++
++    monkeypatch.setenv("HOME", str(tmp_path))
++    directory = tmp_path / ".hermes" / "desktop-ssh" / ("a" * 32)
++    directory.mkdir(parents=True, mode=0o700)
++    path = directory / ("1" * 16 + ".token")
++    path.write_text("b" * 64)
++    path.chmod(0o600 if safe else 0o644)
++    for name in ("_dashboard_lifecycle_flags", "_dashboard_validate_serve_args",
++                 "_dashboard_sanitize_desktop_env", "_attach_to_host_backend",
++                 "_route_named_profile_dashboard", "_dashboard_prepare_runtime",
++                 "_maybe_setup_dashboard_auth_interactively"):
++        monkeypatch.setattr(main, name, lambda *a, **k: None)
++    monkeypatch.setattr("hermes_cli.resource_limits.apply_nofile_soft_limit", lambda: None)
++    calls = []
++    monkeypatch.setattr(server, "start_server", lambda **kwargs: calls.append(kwargs))
++    args = SimpleNamespace(ssh_session_token_file=str(path), host="127.0.0.1", port=9119, no_open=True)
++    if not safe:
++        with pytest.raises(SystemExit, match="unsafe permissions"):
++            main.cmd_dashboard(args)
++        assert not calls
++    else:
++        main.cmd_dashboard(args)
++        assert calls[0]["ssh_ownership_id"] == "a" * 32
++        assert calls[0]["ssh_session_token"] == "b" * 64
++        assert not path.exists()
+diff --git a/tests/tui_gateway/test_start_metadata.py b/tests/tui_gateway/test_start_metadata.py
+new file mode 100644
+index 0000000000..6853c89116
+--- /dev/null
++++ b/tests/tui_gateway/test_start_metadata.py
+@@ -0,0 +1,81 @@
++"""Server-owned metadata is durable, bounded and isolated from clients."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway.session_start_requests import StartIntent, StartOwner, StartStore
++
++
++@pytest.fixture
++def store(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    yield StartStore(db)
++    db.close()
++
++
++OWNER = StartOwner("example-gateway", "default", "example:user")
++
++
++def accept(store, metadata=None):
++    return store.accept(owner=OWNER, namespace="example", request_id="request",
++                        intent=StartIntent("Title", "Inspect only", metadata=metadata))
++
++
++def test_metadata_durable_retry_conflict_and_compression(store):
++    row = accept(store, {"runner_repair_id": "repair-example"})
++    assert accept(store, {"runner_repair_id": "repair-example"}) == row
++    with pytest.raises(ValueError, match="conflict"):
++        accept(store, {"runner_repair_id": "different"})
++    sid = row["stored_session_id"]
++    store.db.end_session(sid, "compression")
++    store.db.create_session("child-example", source="desktop", parent_session_id=sid)
++    with SessionDB(store.db.db_path) as reopened:
++        status = StartStore(reopened).status(OWNER, "example", "request")
++    assert status["resolved_session_id"] == "child-example"
++    assert status["metadata"] == {"runner_repair_id": "repair-example"}
++    assert store.lookup(StartOwner("example-gateway", "default", "other"), "example", "request") is None
++
++
++@pytest.mark.parametrize("bad", [[], "text", {"k": 1}, {1: "v"}, {"": "v"}, {"x" * 65: "v"},
++                                 {"k": "x" * 1025}, {str(i): "v" for i in range(33)}])
++def test_metadata_validation(bad):
++    with pytest.raises(ValueError, match="metadata"):
++        StartIntent("Title", "Inspect", metadata=bad)
++
++
++def test_metadata_cannot_mutate_after_validation():
++    supplied = {"runner_repair_id": "original"}
++    intent = StartIntent("Title", "Inspect", metadata=supplied)
++    supplied["runner_repair_id"] = "changed"
++    assert intent.metadata["runner_repair_id"] == "original"
++    with pytest.raises(TypeError):
++        intent.metadata["runner_repair_id"] = "changed"
++
++
++def test_empty_metadata_preserves_old_digest(store):
++    row = accept(store)
++    old_digest = hashlib.sha256(json.dumps(dict(title="Title", text="Inspect only", source="desktop"),
++                                          sort_keys=True, ensure_ascii=True).encode()).hexdigest()
++    assert row["intent_digest"] == old_digest
++    assert row["metadata"] == {}
++
++
++def test_upgrade_existing_ledger_keeps_retry_identity(store):
++    row = accept(store)
++    store.db._execute_write(lambda conn: conn.execute(
++        "ALTER TABLE session_start_requests DROP COLUMN metadata_json"))
++    upgraded = StartStore(store.db)
++    assert accept(upgraded) == row
++    assert upgraded.status(OWNER, "example", "request")["metadata"] == {}
++
++
++def test_metadata_atomic_rollback(store, monkeypatch):
++    def fail(*a, **kw):
++        raise RuntimeError("rollback")
++    monkeypatch.setattr(store.db, "_bump_session_counters", fail)
++    with pytest.raises(RuntimeError, match="rollback"):
++        accept(store, {"runner_repair_id": "example"})
++    assert store.lookup(OWNER, "example", "request") is None
++    assert store.db._read_one("SELECT count(*) FROM sessions")[0] == 0
+diff --git a/tui_gateway/contracts/sessions.py b/tui_gateway/contracts/sessions.py
+index d6ec2d1a19..3f1425b8b4 100644
+--- a/tui_gateway/contracts/sessions.py
++++ b/tui_gateway/contracts/sessions.py
+@@ -52,6 +52,7 @@ class SessionStartRequestResult(Result):
+     archived: bool
+     active_turn: bool
+     reconciliation: StartReconciliation
++    metadata: dict[str, str] = Field(default_factory=dict)
+ 
+ 
+ method("session.start_request", params=SessionStartRequestParams, result=SessionStartRequestResult)
+diff --git a/tui_gateway/session_start_requests.py b/tui_gateway/session_start_requests.py
+index 229d3e2a30..0996081701 100644
+--- a/tui_gateway/session_start_requests.py
++++ b/tui_gateway/session_start_requests.py
+@@ -5,7 +5,8 @@ adapters must claim before scheduling and never replay a claimed turn on recover
+ """
+ from __future__ import annotations
+ 
+-from dataclasses import asdict, dataclass
++from dataclasses import dataclass
++from types import MappingProxyType
+ import hashlib
+ import json
+ import time
+@@ -183,6 +184,7 @@ class StartIntent:
+     title: str
+     text: str
+     source: str = "desktop"
++    metadata: dict[str, str] | None = None
+ 
+     def __post_init__(self):
+         if not isinstance(self.title, str) or not 1 <= len(self.title) <= 500:
+@@ -191,6 +193,12 @@ class StartIntent:
+             raise ValueError("start text must contain 1–100000 characters")
+         if self.source not in ("desktop", "tui"):
+             raise ValueError("unsupported start source")
++        metadata = {} if self.metadata is None else self.metadata
++        if (not isinstance(metadata, dict) or len(metadata) > 32
++                or any(not isinstance(k, str) or not 1 <= len(k) <= 64
++                       or not isinstance(v, str) or len(v) > 1024 for k, v in metadata.items())):
++            raise ValueError("start metadata must have at most 32 string pairs (keys 1–64, values 0–1024)")
++        object.__setattr__(self, "metadata", MappingProxyType(dict(metadata)))
+ 
+ 
+ _SCHEMA = """
+@@ -231,16 +239,32 @@ class StartStore:
+     """
+     def __init__(self, db):
+         self.db = db
+-        db._execute_write(lambda conn: conn.execute(_SCHEMA))
++        def initialize(conn):
++            conn.execute(_SCHEMA)
++            columns = {row[1] for row in conn.execute("PRAGMA table_info(session_start_requests)")}
++            if "metadata_json" not in columns:
++                conn.execute("ALTER TABLE session_start_requests ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
++        db._execute_write(initialize)
++
++    @staticmethod
++    def _decode(row):
++        result = dict(row)
++        result["metadata"] = json.loads(result.pop("metadata_json"))
++        return result
+ 
+     def lookup(self, owner: StartOwner, namespace: str, request_id: str) -> dict | None:
+         row = self.db._read_one("SELECT * FROM session_start_requests WHERE " + _WHERE,
+                                 _key(owner, namespace, request_id))
+-        return dict(row) if row is not None else None
++        return self._decode(row) if row is not None else None
+ 
+     def accept(self, *, owner: StartOwner, namespace: str, request_id: str, intent: StartIntent) -> dict:
+         key = _key(owner, namespace, request_id)
+-        digest = hashlib.sha256(json.dumps(asdict(intent), sort_keys=True, ensure_ascii=True).encode()).hexdigest()
++        payload = dict(title=intent.title, text=intent.text, source=intent.source)
++        metadata = dict(intent.metadata)
++        # Preserve the original digest for old callers and pre-migration starts.
++        if metadata:
++            payload["metadata"] = metadata
++        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+         session_id, turn_id = uuid.uuid4().hex, uuid.uuid4().hex
+         now = time.time()
+         # Use the canonical transcript serializer and counters, in the SAME
+@@ -254,7 +278,7 @@ class StartStore:
+             if existing is not None:
+                 if existing["intent_digest"] != digest:
+                     raise ValueError("start request idempotency conflict")
+-                return dict(existing)
++                return self._decode(existing)
+             from hermes_state_titles import next_title_in_lineage
+             title = next_title_in_lineage(conn, self.db.sanitize_title(intent.title) or "Session")
+             conn.execute(
+@@ -263,9 +287,12 @@ class StartStore:
+             row_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+             self.db._bump_session_counters(conn, session_id, 1, 0, unit=True)
+             conn.execute(
+-                "INSERT INTO session_start_requests VALUES (?,?,?,?,?,?,?,?,?,'queued',NULL,?,?)",
+-                (*key, digest, session_id, turn_id, row_id, now, now))
+-            return dict(conn.execute("SELECT * FROM session_start_requests WHERE " + _WHERE, key).fetchone())
++                "INSERT INTO session_start_requests "
++                "(gateway_id,profile,principal,namespace,request_id,intent_digest,stored_session_id,"
++                "first_turn_id,user_row_id,state,runtime_token,created_at,updated_at,metadata_json) "
++                "VALUES (?,?,?,?,?,?,?,?,?,'queued',NULL,?,?,?)",
++                (*key, digest, session_id, turn_id, row_id, now, now, json.dumps(metadata, sort_keys=True)))
++            return self._decode(conn.execute("SELECT * FROM session_start_requests WHERE " + _WHERE, key).fetchone())
+         return self.db._execute_write(write, patience_s=self.db._TRANSCRIPT_WRITE_PATIENCE_S)
+ 
+     def status(self, owner: StartOwner, namespace: str, request_id: str) -> dict | None:
+@@ -291,6 +318,7 @@ class StartStore:
+             "first_turn_id": start["first_turn_id"], "first_turn_state": state,
+             "exists": row is not None, "archived": bool(row and row.get("archived")),
+             "active_turn": active,
++            "metadata": start["metadata"],
+             "reconciliation": "unknown_outcome" if state == "running" and not active else state,
+         }
+ 
+-- 
+2.55.0
+

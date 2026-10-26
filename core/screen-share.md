@@ -24,7 +24,7 @@ Plugin React/jsdom tests and their dependency setup are in its README. They prov
 
 ## Applying
 
-Apply patch 0109 atop the preceding fork patch series with `git am -3`, rebuild Desktop, and install the screen-share disk plugin. The plugin can hot-load, but the main-process core capability requires an updated Desktop build. Do not restart an active user's app to activate it without permission.
+Apply patch 0109 atop the preceding fork patch series with `git am -3 --empty=keep`, rebuild Desktop, and install the screen-share disk plugin. The plugin can hot-load, but the main-process core capability requires an updated Desktop build. Do not restart an active user's app to activate it without permission.
 
 ## Gotchas
 

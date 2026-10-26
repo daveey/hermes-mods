@@ -2,14 +2,14 @@
 
 ## Behavior
 
-- 0262 (`df1f0f4d`): includes `kanban_active` in the AutomatedRow type; the regression keeps waiting automated rows hidden unless human attention is needed. Desktop rendering is not verified here.
-- 0264 (`9b7e8f26`): retries failing pytest node IDs rather than every test in a file; collection errors/crashes retain file fallback. Passing retries remain FLAKY; a second failure stays red. The CI helper deduplicates deflake cards and links recurrences after closure.
-- 0265 (`90bd2dc9`): sizes test workers from configured slice CPU/shard budgets, capped by runner quota, with the existing fallback when budgets are absent.
-- 0266 (`b60f11ae`): replaces short load-sensitive waits in redirect and hosted-room stop tests with bounded event synchronization; lease expiry is not the stop-retry behavior under test.
-- 0267 (`da239bd1`): transports flaky IDs in GitHub warning annotations instead of artifact uploads; the helper reads completed-run annotations.
-- 0268 (`120f04d4`): extracts runner reporting helpers for code-health budgets, uses UTF-8 BOM-aware reads, and carries the AutomatedRow type correction. This patch overlaps 0262 and applies through three-way merging.
-- 0274 (`4ccd362a`): runs the live Git-config guard after monkeypatch teardown and pins UTF-8 decoding for worker-scope systemctl output.
-- 0275 (`88a905ed`): aligns the LSP completion regression with preservation of Git-bearing scratch workspaces and their language servers.
+- 0286 (`df1f0f4d`): includes `kanban_active` in the AutomatedRow type; the regression keeps waiting automated rows hidden unless human attention is needed. Desktop rendering is not verified here.
+- 0288 (`9b7e8f26`): retries failing pytest node IDs rather than every test in a file; collection errors/crashes retain file fallback. Passing retries remain FLAKY; a second failure stays red. The CI helper deduplicates deflake cards and links recurrences after closure.
+- 0289 (`90bd2dc9`): sizes test workers from configured slice CPU/shard budgets, capped by runner quota, with the existing fallback when budgets are absent.
+- 0290 (`b60f11ae`): replaces short load-sensitive waits in redirect and hosted-room stop tests with bounded event synchronization; lease expiry is not the stop-retry behavior under test.
+- 0291 (`da239bd1`): transports flaky IDs in GitHub warning annotations instead of artifact uploads; the helper reads completed-run annotations.
+- 0292 (`120f04d4`): extracts runner reporting helpers for code-health budgets, uses UTF-8 BOM-aware reads, and carries the AutomatedRow type correction. This patch overlaps 0286 and applies through three-way merging.
+- 0305 (`4ccd362a`): runs the live Git-config guard after monkeypatch teardown and pins UTF-8 decoding for worker-scope systemctl output.
+- 0306 (`88a905ed`): aligns the LSP completion regression with preservation of Git-bearing scratch workspaces and their language servers.
 
 ## How it works
 
@@ -34,11 +34,11 @@ Total: 67 passed, 2 failed. Platform-only cases were skipped by the Linux runner
 
 ## Applying
 
-Apply the full ordered series from merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, not these patches independently. The 275-patch `git am -3` verification passed against the export of fork `db355bde416089cc5d955d4b94ab1536de2b1da1` with upstream `1f91da2a27`. Existing privacy substitutions and the 0242 merge adaptation were retained.
+Apply the full ordered series from merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, not these patches independently. The 275-patch `git am -3 --empty=keep` verification passed against the export of fork `db355bde416089cc5d955d4b94ab1536de2b1da1` with upstream `1f91da2a27`. Existing privacy substitutions and the 0251 merge adaptation were retained.
 
 ## Gotchas
 
-Merge topology inserted eight entries before previously published patches. Existing numbers shifted: 0262→0263, 0263→0269, 0264→0270, 0265→0271, 0266→0272, 0267→0273, 0268→0276, 0269→0277. Consult feature docs by name, not old patch numbers. Earlier verification records describe historical series sizes. No unmerged continuation-guard or Chrome ownership changes are included.
+Merge topology inserted eight entries before previously published patches. Existing numbers shifted: 0286→0287, 0287→0294, 0288→0298, 0289→0302, 0290→0303, 0291→0304, 0292→0312, 0294→0329. Consult feature docs by name, not old patch numbers. Earlier verification records describe historical series sizes. No unmerged continuation-guard or Chrome ownership changes are included.
 
 ## Plugin?
 

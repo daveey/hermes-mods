@@ -47,7 +47,7 @@ wording is English-only), and real-delivery to Telegram/Slack adapters beyond th
 
 ## Applying
 
-`git am -3` in order, 0216 then 0217.
+`git am -3 --empty=keep` in order, 0216 then 0217.
 
 ## Gotchas
 

@@ -81,7 +81,7 @@ Apply the ordered patch prefix `0001–0098` from this mirror (or the complete
 `0001–0105` series) to the fork's documented merge-base in a disposable checkout.
 This feature is patch `0098`; isolated application is not claimed or tested here. `0125` builds on `0098`'s
 over-budget failure class and on the fork's staged-proposal review gate (unattended reviews stage `patch`/`remove`);
-verified: 0001–0127 apply with `git am -3` at merge-base `4957bbd0a0` (Oct 17, 2026 PT).
+verified: 0001–0127 apply with `git am -3 --empty=keep` at merge-base `4957bbd0a0` (Oct 17, 2026 PT).
 Run the tests above from the resulting Hermes source root, not this mods repository.
 
 ## Gotchas

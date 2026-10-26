@@ -1,0 +1,230 @@
+From 5b23645e92de2bc6ac2a40af93eb4e7732d5d410 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 08:05:17 +0000
+Subject: [PATCH] fix(ci): synchronize stream cancellation and test handoffs
+ [daveey]
+
+---
+ agent/chat_completion_helpers.py              | 21 +++---
+ agent/chat_completion_stream_monitor.py       | 14 ++++
+ .../test_cancelled_stream_transport_error.py  | 70 +++++++++++++++++++
+ tests/gateway/test_buzz_websocket.py          | 28 ++++----
+ tests/hermes_cli/test_update_lock_protocol.py |  3 +-
+ 5 files changed, 111 insertions(+), 25 deletions(-)
+ create mode 100644 tests/agent/test_cancelled_stream_transport_error.py
+
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 01c26afe7a..35a2542486 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2814,23 +2814,11 @@ class _StreamingCall(StreamingWaitMonitor):
+         self.result["partial_tool_names"] = []
+         return attempt_id
+ 
+-    def _cancel_current_stream_attempt(self, reason: str) -> None:
+-        with self.stream_attempt_lock:
+-            current = int(self.stream_attempt_state["current"])
+-            if current:
+-                self.stream_attempt_state["cancelled"].add(current)
+-        if current:
+-            logger.debug("Marked stream attempt %s cancelled: %s", current, reason)
+-
+     def _stream_attempt_is_active(self, stream_attempt_id: int) -> bool:
+         with self.stream_attempt_lock:
+             state = self.stream_attempt_state
+             return stream_attempt_id == int(state["current"]) and stream_attempt_id not in state["cancelled"]
+ 
+-    def _stream_attempt_was_cancelled(self, stream_attempt_id: int) -> bool:
+-        with self.stream_attempt_lock:
+-            return stream_attempt_id in self.stream_attempt_state["cancelled"]
+-
+     def _discard_stale_stream_chunk(self, stream_attempt_id: int, chunk) -> None:
+         try:
+             chunk_bytes = len(repr(chunk))
+@@ -3758,6 +3746,15 @@ class _StreamingCall(StreamingWaitMonitor):
+                     return  # success
+                 except Exception as e:
+                     self._close_managed_stream()
++                    import httpx as _httpx
++                    # Socket shutdown can unwind as EOF or a read/reset error. Report
++                    # the captured attempt's cancellation identically in either case.
++                    if (not self._request_cancelled["value"]
++                            and self._stream_attempt_was_cancelled(stream_attempt_id)
++                            and isinstance(e, _httpx.TransportError)):
++                        cancelled = _httpx.RemoteProtocolError(f"stream attempt {stream_attempt_id} was superseded")
++                        cancelled.__cause__ = e
++                        e = cancelled
+                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
+                         return
+                     if self._route_switched_under_request():
+diff --git a/agent/chat_completion_stream_monitor.py b/agent/chat_completion_stream_monitor.py
+index fa129b5e97..4335098c8f 100644
+--- a/agent/chat_completion_stream_monitor.py
++++ b/agent/chat_completion_stream_monitor.py
+@@ -8,6 +8,20 @@ from agent.model_metadata import is_local_endpoint
+ 
+ 
+ class StreamingWaitMonitor:
++    def _cancel_current_stream_attempt(self, reason: str) -> None:
++        from agent.chat_completion_helpers import logger
++
++        with self.stream_attempt_lock:
++            current = int(self.stream_attempt_state["current"])
++            if current:
++                self.stream_attempt_state["cancelled"].add(current)
++        if current:
++            logger.debug("Marked stream attempt %s cancelled: %s", current, reason)
++
++    def _stream_attempt_was_cancelled(self, stream_attempt_id: int) -> bool:
++        with self.stream_attempt_lock:
++            return stream_attempt_id in self.stream_attempt_state["cancelled"]
++
+     def _poll_local_load_notice(self, now: float) -> bool:
+         """Managed local server: surface a cold model's weight-load progress
+         instead of the 60s neutral "waiting on <model>" notice. Polled ~1s only while no
+diff --git a/tests/agent/test_cancelled_stream_transport_error.py b/tests/agent/test_cancelled_stream_transport_error.py
+new file mode 100644
+index 0000000000..92e832508e
+--- /dev/null
++++ b/tests/agent/test_cancelled_stream_transport_error.py
+@@ -0,0 +1,70 @@
++"""Stale stream cancellation has one outcome regardless of socket unwind mode."""
++
++import httpx
++import pytest
++
++import run_agent
++from agent import chat_completion_helpers as helpers
++
++
++@pytest.mark.parametrize(
++    "ending,cancelled,interrupted",
++    [
++        ("eof", True, False),
++        ("reset", True, False),
++        ("protocol", True, False),
++        ("reset", False, False),
++        ("validation", True, False),
++        ("reset", True, True),
++    ],
++)
++def test_cancelled_stream_transport_outcome(monkeypatch, ending, cancelled, interrupted):
++    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
++    agent = run_agent.AIAgent(
++        api_key="test-key", base_url="http://127.0.0.1:1/v1", model="m", provider="custom",
++        quiet_mode=True, skip_context_files=True, skip_memory=True, enabled_toolsets=[], max_iterations=1,
++    )
++    call = helpers._StreamingCall(agent, {"model": "m", "messages": [{"role": "user", "content": "hi"}]}, None)
++    call._stream_stale_timeout = 5.0
++    call.worker = None
++    call._monitor_interrupted = {"yes": False}
++    original = {
++        "reset": httpx.ReadError("connection reset by peer"),
++        "protocol": httpx.RemoteProtocolError("incomplete chunked read"),
++        "validation": ValueError("invalid provider payload"),
++        "eof": None,
++    }[ending]
++    closed = []
++
++    def stream():
++        try:
++            # Drive the real cancellation transition at a deterministic read boundary;
++            # no watchdog timing or OS-dependent socket shutdown outcome is involved.
++            if cancelled:
++                call._kill_stale_stream(5.0)
++            if interrupted:
++                agent._interrupt_requested = True
++                call._abort_for_interrupt(5.0)
++            if original is not None:
++                raise original
++            yield from ()
++        finally:
++            closed.append(True)
++
++    monkeypatch.setattr(call, "_open_chat_stream", lambda _kwargs: stream())
++    call._call()
++
++    assert closed == [True]
++    assert call.result["response"] is None
++    error = call.result["error"]
++    if interrupted:
++        # The monitor owns the InterruptedError; the worker must not report a drop.
++        assert call._monitor_interrupted["yes"]
++        assert error is None
++    elif cancelled and ending != "validation":
++        assert type(error) is httpx.RemoteProtocolError
++        assert str(error) == "stream attempt 1 was superseded"
++        if original is not None:
++            assert error.__cause__ is original
++    else:
++        assert error is original
+diff --git a/tests/gateway/test_buzz_websocket.py b/tests/gateway/test_buzz_websocket.py
+index db052a0c48..aaf180637a 100644
+--- a/tests/gateway/test_buzz_websocket.py
++++ b/tests/gateway/test_buzz_websocket.py
+@@ -628,6 +628,7 @@ async def test_closed_membership_phrases_prune_without_reconnect(detail):
+     sub_id = "hermes-buzz-0"
+     messages = [json.dumps(["CLOSED", sub_id, detail])]
+     idx = 0
++    processed = asyncio.Event()
+ 
+     class _FakeWs:
+         async def send(self, raw):
+@@ -642,7 +643,8 @@ async def test_closed_membership_phrases_prune_without_reconnect(detail):
+                 val = messages[idx]
+                 idx += 1
+                 return val
+-            await asyncio.sleep(10)
++            processed.set()
++            await asyncio.Event().wait()
+             raise StopAsyncIteration
+ 
+     @asynccontextmanager
+@@ -666,17 +668,19 @@ async def test_closed_membership_phrases_prune_without_reconnect(detail):
+         adapter._ws_ready = asyncio.Event()
+         adapter._ws_ready.set()
+         task = asyncio.create_task(adapter._websocket_loop())
+-        await asyncio.sleep(0.1)
+-
+-    assert CHANNEL in adapter._restricted_channels
+-    assert CHANNEL not in adapter._channel_state
+-    assert not task.done(), "membership rejection must not reconnect the socket"
+-
+-    task.cancel()
+-    try:
+-        await task
+-    except (asyncio.CancelledError, Exception):
+-        pass
++        try:
++            # The next receive starts only after CLOSED has been handled. A fixed
++            # delay can expire before that on a loaded runner.
++            await asyncio.wait_for(processed.wait(), timeout=5.0)
++            assert CHANNEL in adapter._restricted_channels
++            assert CHANNEL not in adapter._channel_state
++            assert not task.done(), "membership rejection must not reconnect the socket"
++        finally:
++            task.cancel()
++            try:
++                await task
++            except asyncio.CancelledError:
++                pass
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/hermes_cli/test_update_lock_protocol.py b/tests/hermes_cli/test_update_lock_protocol.py
+index 33b01f2571..4b4ba97e4e 100644
+--- a/tests/hermes_cli/test_update_lock_protocol.py
++++ b/tests/hermes_cli/test_update_lock_protocol.py
+@@ -353,7 +353,8 @@ def test_the_source_build_keeps_checkout_custody_after_its_updater_is_killed(tmp
+     bin_dir.mkdir()
+     node = bin_dir / "node"
+     node.write_text(f"#!{sys.executable}\nimport os, time\nfrom pathlib import Path\nr = Path({str(tmp_path)!r})\n"
+-                    "(r / 'node').write_text(str(os.getpid()))\n"
++                    "(r / 'node.pending').write_text(str(os.getpid()))\n"
++                    "(r / 'node.pending').replace(r / 'node')\n"
+                     "while not (r / 'go').exists(): time.sleep(0.02)\n")
+     node.chmod(0o700)
+     owner = _python(tmp_path, _BUILD_OWNER, root, bin_dir)
+-- 
+2.55.0
+

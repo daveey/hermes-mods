@@ -1,6 +1,6 @@
 # Separate CI polling from test execution
 
-Patches: **0278**, **0279**, **0281**.
+Patches: **0330**, **0331**, **0338**.
 
 ## Behavior
 
@@ -19,9 +19,9 @@ These are workflow configuration changes, not runner provisioning. The labels ar
 
 | Patch | Source | Scope |
 |---|---|---|
-| 0278 | `3ffbbbee9b26ad65b2206f1a95801983a02fc2fc` | Review poller workflow and fork routing script |
-| 0279 | `52e8ce804dc8d41e911c7028fc64865ea36ef46d` | Actionlint label registration |
-| 0281 | `4a97e9b694d9fadd18379a0dcad900e6d8c030d6` | CI/supply-chain aggregators, Detect timeout, routing script and tests |
+| 0330 | `3ffbbbee9b26ad65b2206f1a95801983a02fc2fc` | Review poller workflow and fork routing script |
+| 0331 | `52e8ce804dc8d41e911c7028fc64865ea36ef46d` | Actionlint label registration |
+| 0338 | `4a97e9b694d9fadd18379a0dcad900e6d8c030d6` | CI/supply-chain aggregators, Detect timeout, routing script and tests |
 
 ## Tests
 
@@ -33,11 +33,11 @@ bash scripts/run_tests.sh tests/ci/test_fork_runner_routing.py -j1
 
 The suite parses workflow configuration to check that no `always()` job targets a heavy runner, all three named aggregates use poll-only routing and skip cancellation, Detect allows at least five minutes, and actionlint registers the label. Poller routing and script rewrites were inspected; script replay/idempotence and actual GitHub cancellation/scheduling were not exercised by this mirror run. No runner deployment or live capacity claim is made.
 
-The full **280-patch** series applied successfully using `git am -3` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, through fork `98b35b76a1`. Existing privacy scrubs and patch 0242's merge adaptation were retained. Incident-specific prose was removed from the poller commit message.
+The full **280-patch** series applied successfully using `git am -3 --empty=keep` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, through fork `98b35b76a1`. Existing privacy scrubs and patch 0251's merge adaptation were retained. Incident-specific prose was removed from the poller commit message.
 
 ## Applying
 
-Apply the full ordered series from its merge-base. This merged branch inserts commits before previously published entries: broker transport is now 0280 and PR park handoff is now 0283. The existing patches were moved without changing their bytes, and their documentation references were updated.
+Apply the full ordered series from its merge-base. This merged branch inserts commits before previously published entries: broker transport is now 0335 and PR park handoff is now 0349. The existing patches were moved without changing their bytes, and their documentation references were updated.
 
 ## Gotchas
 

@@ -1,6 +1,6 @@
 # Advertise the one-shot delegation budget
 
-Patch: **0289**, source `d906269336ccb62b554afad513fb316d2deb3176`.
+Patch: **0356**, source `d906269336ccb62b554afad513fb316d2deb3176`.
 
 ## Behavior
 
@@ -29,7 +29,7 @@ Result: **8 passed, 0 failed**. Bootstrap is preloaded before the real-home isol
 
 ## Applying
 
-Apply the complete ordered series, not this patch alone. All **283 patches** applied with `git am -3` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, after fresh upstream and fork fetches, through fork `d906269336ccb62b554afad513fb316d2deb3176`. All 282 previous patch files are unchanged, including privacy scrubs and the merge-adapted patch 0242.
+Apply the complete ordered series, not this patch alone. All **283 patches** applied with `git am -3 --empty=keep` at merge-base `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`, after fresh upstream and fork fetches, through fork `d906269336ccb62b554afad513fb316d2deb3176`. All 282 previous patch files are unchanged, including privacy scrubs and the merge-adapted patch 0251.
 
 ## Gotchas / plugin alternative
 

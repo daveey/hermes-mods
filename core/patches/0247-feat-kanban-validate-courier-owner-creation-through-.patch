@@ -1,0 +1,335 @@
+From 80f3e821215e46d5d9441c34db2a88197c4e153d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 12:46:45 +0000
+Subject: [PATCH] feat(kanban): validate courier owner creation through
+ registered tools [daveey]
+
+---
+ hermes_cli/kanban.py                          |   6 +-
+ hermes_cli/kanban_origin_owner.py             |  89 +++++++++++
+ hermes_cli/kanban_parser.py                   |   4 +
+ .../test_kanban_create_entry_parity.py        |  25 +++-
+ tests/hermes_cli/test_kanban_origin_owner.py  | 140 ++++++++++++++++++
+ 5 files changed, 262 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_owner.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_owner.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index fe93152741..d75a5f51f4 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -161,6 +161,10 @@ def kanban_command(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_origin_adapter import command
+         return command(args)
+ 
++    if action == "origin-create":
++        from hermes_cli.kanban_origin_owner import command
++        return command(args)
++
+     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
+     # the `--board` routing override (else `--board beta boards show` reports beta).
+     if action == "boards":
+@@ -230,7 +234,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review",
+-    "gc", "origin-bind",
++    "gc", "origin-bind", "origin-create",
+ })
+ 
+ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+new file mode 100644
+index 0000000000..5a2229a022
+--- /dev/null
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -0,0 +1,89 @@
++"""Local trusted-courier owner entry; creation is not origin acknowledgement.
++
++The OS-local caller supplies the authenticated hub envelope. No network endpoint
++or alternate direct-handler dispatch is provided here.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import sqlite3
++import sys
++from pathlib import Path
++
++from hermes_cli.kanban_origin_adapter import _gateway
++
++
++def receive(request: dict) -> dict:
++    from hermes_cli.profiles import get_active_profile_name
++    from tools import kanban_tools  # built-in self-registration
++    from tools.registry import registry
++
++    del kanban_tools
++    profile = get_active_profile_name()
++    replica = Path(os.environ.get('HERMES_HUB_STATE') or Path.home() / '.local/state/hermes-hub') / 'hub.db'
++    gateway = _gateway(replica)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_origin_ledger import validate_binding
++    if profile == 'custom':
++        raise ValueError('origin_profile_unknown')
++    if not isinstance(request, dict) or not isinstance(request.get('args'), dict):
++        raise ValueError('origin_request_invalid')
++    key = request.get('key')
++    if not isinstance(key, str) or len(key.split('/')) != 2:
++        raise ValueError('origin_route_mismatch')
++    owner_profile, board = key.split('/')
++    if (request.get('coll') != 'tasks' or request.get('action') != 'create'
++            or request.get('to_gw') != gateway or owner_profile != profile
++            or kb._normalize_board_slug(board) != board
++            or not kb.board_exists(board)):
++        raise ValueError('origin_route_mismatch')
++    from hermes_constants import get_hermes_home
++    home = get_hermes_home().resolve()
++    expected = home / 'kanban.db' if board == 'default' else home / 'kanban/boards' / board / 'kanban.db'
++    if kb.kanban_home().resolve() != home or kb.kanban_db_path(board).resolve() != expected:
++        raise ValueError('origin_route_mismatch')
++    origin = request['args'].get('origin')
++    validate_binding({'binding_id': 'validation', 'version': 1, 'publication_version': 1,
++                      'owner': {'gateway': gateway, 'profile': profile, 'board': board, 'task_id': 'validation'},
++                      'origin': origin, 'task_record_key': f'{profile}/{board}/validation'})
++    if request.get('from') != f"gw:{origin['gateway']}":
++        raise ValueError('origin_route_mismatch')
++    intent = {'request_id': request['id'],
++              'owner': {'gateway': gateway, 'profile': profile, 'board': board},
++              'origin': request['args']['origin']}
++    create = request['args'].get('create')
++    if (set(request['args']) != {'origin', 'create'} or not isinstance(create, dict)
++            or not isinstance(create.get('session_id'), str)
++            or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}', create['session_id'])
++            or ('board' in create and create['board'] != board)):
++        raise ValueError('origin_request_invalid')
++    args = {**create, 'board': board}
++    if not registry.get_definitions({'kanban_create'}, quiet=True):
++        return {'status': 'pending', 'code': 'kanban_tool_unavailable', 'handoff_complete': False}
++    raw_result = registry.dispatch('kanban_create', args, origin_intent=intent)
++    try:
++        result = json.loads(raw_result) if isinstance(raw_result, str) else None
++    except ValueError:
++        result = None
++    if not isinstance(result, dict) or result.get('handoff_complete') is not False:
++        # Dispatch catches exceptions itself. An untyped error may follow a
++        # committed write: keep the exact request retryable, never infer absence.
++        return {'status': 'pending', 'code': 'origin_dispatch_pending', 'handoff_complete': False}
++    return result
++
++
++def command(args) -> int:
++    try:
++        raw = sys.stdin.read() if args.request_file == '-' else Path(args.request_file).read_text()
++        result = receive(json.loads(raw))
++    except (OSError, sqlite3.Error):
++        result = {'status': 'pending', 'code': 'origin_storage_unavailable', 'handoff_complete': False}
++    except (KeyError, TypeError, ValueError) as exc:
++        code = str(exc)
++        if not re.fullmatch(r'origin_[a-z_]+', code):
++            code = 'origin_request_invalid'
++        result = {'status': 'rejected', 'code': code, 'handoff_complete': False}
++    print(json.dumps(result))
++    return 0
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index f5f9761588..89c10df0d1 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -149,6 +149,10 @@ _BOARD_SPECS = [
+ # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
+ _SPECS = [
+     _cmd("init", help="Create kanban.db if missing (idempotent)"),
++    _cmd("origin-create", [
++        _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
++        _arg("--json", action="store_true", help="Return structured pending creation (always JSON)"),
++    ], help="Create owner work through registered tools, pending origin receipt"),
+     _cmd("origin-bind", [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+         _arg("--json", action="store_true", help="Return structured receipt (always JSON)"),
+diff --git a/tests/hermes_cli/test_kanban_create_entry_parity.py b/tests/hermes_cli/test_kanban_create_entry_parity.py
+index 73ea027c92..22bae969a4 100644
+--- a/tests/hermes_cli/test_kanban_create_entry_parity.py
++++ b/tests/hermes_cli/test_kanban_create_entry_parity.py
+@@ -100,7 +100,30 @@ def _via_execute_code(title: str, monkeypatch) -> str:
+     return _run_cli_in(env, title, monkeypatch)
+ 
+ 
+-PATHS = {"kanban_create tool": _via_tool, "terminal: hermes kanban create": _via_terminal,
++def _via_origin_courier(title: str, monkeypatch) -> str:
++    import io
++    from hermes_constants import get_hermes_home
++    from tools import kanban_tools
++    home = get_hermes_home()
++    cfg = home / 'mail.json'
++    cfg.write_text(json.dumps({'gateway': 'owner'}))
++    monkeypatch.setenv('HERMES_MAIL_CONFIG', str(cfg))
++    monkeypatch.setenv('HERMES_HUB_STATE', str(home / 'hub'))
++    monkeypatch.setattr(kanban_tools, '_profile_has_kanban_toolset', lambda: True)
++    request = {'id': 'request-parity-001', 'from': 'gw:origin', 'to_gw': 'owner',
++               'coll': 'tasks', 'key': 'default/default', 'action': 'create',
++               'args': {'origin': {'gateway': 'origin', 'profile': 'default', 'session': 'original'},
++                        'create': {'title': title, 'assignee': 'default', 'session_id': SID}}}
++    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps(request)))
++    root = argparse.ArgumentParser(prog='hermes')
++    kc.build_parser(root.add_subparsers())
++    assert kc.kanban_command(root.parse_args(['kanban', 'origin-create', '--request-file', '-'])) == 0
++    with kbc.connect_closing() as conn:
++        return next(t for t in kb.list_tasks(conn) if t.title == title).id
++
++
++PATHS = {"origin courier CLI": _via_origin_courier,
++         "kanban_create tool": _via_tool, "terminal: hermes kanban create": _via_terminal,
+          "execute_code: hermes kanban create": _via_execute_code}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_origin_owner.py b/tests/hermes_cli/test_kanban_origin_owner.py
+new file mode 100644
+index 0000000000..9e0002280f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_owner.py
+@@ -0,0 +1,140 @@
++"""Owner courier entry must use the registered tool and retain receipt gating."""
++import argparse
++import io
++import json
++
++import pytest
++
++from hermes_cli import kanban, profiles, kanban_db as kb
++from hermes_cli.kanban_parser import build_parser
++from hermes_cli import kanban_db_connect as kbc
++from tools import kanban_tools
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_TASK', 'HERMES_ORIGIN_SESSION'):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(profiles, '_get_default_hermes_home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_HUB_STATE', str(tmp_path / 'hub'))
++    cfg = tmp_path / 'mail.json'
++    cfg.write_text(json.dumps({'gateway': 'owner'}))
++    monkeypatch.setenv('HERMES_MAIL_CONFIG', str(cfg))
++    monkeypatch.setattr(kanban_tools, '_profile_has_kanban_toolset', lambda: True)
++    kb.init_db()
++    return {'id': 'request-owner-001', 'from': 'gw:origin', 'to_gw': 'owner',
++            'coll': 'tasks', 'action': 'create', 'key': 'default/default',
++            'args': {'origin': {'gateway': 'origin', 'profile': 'work', 'session': 'original'},
++                     'create': {'title': 'Build', 'assignee': 'default', 'session_id': 'creator'}}}
++
++
++def invoke(request, monkeypatch, capsys):
++    parser = build_parser(argparse.ArgumentParser().add_subparsers())
++    args = parser.parse_args(['origin-create', '--request-file', '-', '--json'])
++    monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(request)))
++    assert kanban.kanban_command(args) == 0
++    return json.loads(capsys.readouterr().out)
++
++
++def test_real_cli_process_replays_persisted_creation(world, tmp_path):
++    import os
++    from pathlib import Path
++    import subprocess
++    import sys
++
++    (tmp_path / 'config.yaml').write_text('platform_toolsets:\n  cli: [kanban]\n')
++    command = [sys.executable, '-m', 'hermes_cli.main', '-p', 'default',
++               'kanban', 'origin-create', '--request-file', '-', '--json']
++    results = []
++    for _ in range(2):
++        run = subprocess.run(command, input=json.dumps(world), text=True, capture_output=True,
++                             cwd=Path(__file__).parents[2], env=dict(os.environ), timeout=60, check=False)
++        assert run.returncode == 0, run.stderr
++        result = json.loads(run.stdout)
++        assert result.get('created') is True, result
++        assert result['handoff_complete'] is False
++        results.append(result)
++    assert results[0]['origin_creation'] == results[1]['origin_creation']
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('damage', ['pinned_db', 'foreign_home', 'corrupt_board'])
++def test_effective_route_and_storage_fail_closed(world, tmp_path, monkeypatch, capsys, damage):
++    if damage == 'pinned_db':
++        monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'wrong.db'))
++        monkeypatch.setattr(kb, '_explicit_board_intent_pinned', lambda: True)
++    elif damage == 'foreign_home':
++        monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path / 'foreign'))
++    else:
++        (tmp_path / 'kanban.db').write_bytes(b'not sqlite')
++    result = invoke(world, monkeypatch, capsys)
++    assert result.get('handoff_complete') is False
++    assert result['code'] == ('origin_dispatch_pending' if damage == 'corrupt_board' else 'origin_route_mismatch')
++    assert not (tmp_path / 'wrong.db').exists()
++    assert not (tmp_path / 'foreign/kanban.db').exists()
++
++
++@pytest.mark.parametrize('change', ['missing_creator', 'board_override', 'malformed_create', 'extra_args'])
++def test_invalid_creation_arguments_create_nothing(world, monkeypatch, capsys, change):
++    if change == 'missing_creator':
++        world['args']['create'].pop('session_id')
++    elif change == 'board_override':
++        world['args']['create']['board'] = 'other'
++    elif change == 'malformed_create':
++        world['args']['create'] = []
++    else:
++        world['args']['ignored'] = True
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] == 'rejected'
++    assert result['handoff_complete'] is False
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
++
++
++@pytest.mark.parametrize('field,value', [
++    ('to_gw', 'elsewhere'), ('from', 'gw:impostor'), ('coll', 'sessions'),
++    ('action', 'archive'), ('key', 'other/default'), ('key', 'default/default/extra'),
++    ('key', 'default/../bad'), ('key', ('default/missing')),
++])
++def test_wrong_route_creates_nothing(world, monkeypatch, capsys, field, value):
++    world[field] = value
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] == 'rejected'
++    assert result['handoff_complete'] is False
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
++
++
++def test_delegated_cli_fence_applies(world, monkeypatch, capsys):
++    monkeypatch.setattr('agent.delegation_context.kanban_path_is_fenced', lambda path: True)
++    args = argparse.Namespace(kanban_action='origin-create', request_file='-')
++    assert kanban.kanban_command(args) != 0
++
++
++@pytest.mark.parametrize('available', [False, 'absent'])
++def test_missing_tool_is_typed_preflight_without_cards(world, monkeypatch, capsys, available):
++    from tools.registry import registry
++    if available == 'absent':
++        monkeypatch.setattr(registry, '_snapshot_entries', list)
++    else:
++        monkeypatch.setattr(kanban_tools, '_profile_has_kanban_toolset', lambda: False)
++    result = invoke(world, monkeypatch, capsys)
++    assert result == {'status': 'pending', 'code': 'kanban_tool_unavailable', 'handoff_complete': False}
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
++
++
++def test_owner_entry_creates_once_and_never_claims_handoff(world, monkeypatch, capsys):
++    result = invoke(world, monkeypatch, capsys)
++    assert result['created'] is True
++    assert result['ok'] is False
++    assert result['handoff_complete'] is False
++    assert result['code'] == 'origin_bind_pending'
++    assert invoke(world, monkeypatch, capsys)['origin_creation'] == result['origin_creation']
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++        assert kb.get_task(conn, result['task_id']).session_id == 'creator'
++        assert result['origin_creation']['binding']['origin'] == world['args']['origin']
+-- 
+2.55.0
+

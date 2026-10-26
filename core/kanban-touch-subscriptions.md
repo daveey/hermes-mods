@@ -1,6 +1,6 @@
 # Touch subscriptions do not own work
 
-Patches: 0250.
+Patches: 0260.
 
 ## Behavior
 
@@ -22,7 +22,7 @@ Test files above are shipped regression coverage, not a claim that every suite w
 
 ## Applying
 
-Apply the ordered core series through the last listed patch using `git am -3`, starting at the fork/upstream merge-base; these are not independent patches.
+Apply the ordered core series through the last listed patch using `git am -3 --empty=keep`, starting at the fork/upstream merge-base; these are not independent patches.
 
 ## Gotchas
 

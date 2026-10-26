@@ -8,29 +8,25 @@ Seams for the chat-closeout plugin: a chat that handed its work to cards
 shows what it waits on, and gets one close-out turn when they finish even
 if no backend holds it (session.resume in-process, like the re-adopted-exit
 waker).
----
- hermes_cli/kanban_session_activity.py         |  71 ++++++++++--
- .../test_kanban_session_activity.py           |  23 ++++
- tests/tui_gateway/test_session_wake_turn.py   | 105 ++++++++++++++++++
- tui_gateway/session_notifications.py          |  70 ++++++++++++
- 4 files changed, 257 insertions(+), 12 deletions(-)
- create mode 100644 tests/tui_gateway/test_session_wake_turn.py
 
+Public-series adaptation: preserve merged preceding changes.
+
+---
 diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
-index 8bd161b836..bef2f1ea0f 100644
+index 9c24d9315d..2182752813 100644
 --- a/hermes_cli/kanban_session_activity.py
 +++ b/hermes_cli/kanban_session_activity.py
-@@ -43,6 +43,9 @@ HUMAN_BLOCK_KINDS = ("needs_input", "capability")
+@@ -44,6 +44,9 @@ HUMAN_BLOCK_KINDS = ("needs_input", "capability")
  _CACHE_TTL_S = 3.0
  _cache_lock = threading.Lock()
- _cache: tuple[float, dict[str, int], dict[str, int], dict[str, int]] | None = None
+ _cache: tuple[float, dict[str, int], dict[str, int], dict[str, int], dict[str, int]] | None = None
 +_waiting_cache: list[dict[str, frozenset[str]]] = [{}]
 +_pairs_lock = threading.Lock()
 +WAITING_ON_CAP = 50
  
  
  def _board_db_paths() -> list[Path]:
-@@ -84,6 +87,11 @@ def _status_filter(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> tuple
+@@ -85,6 +88,11 @@ def _status_filter(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> tuple
              (*statuses, *HUMAN_BLOCK_KINDS, *HUMAN_BLOCK_KINDS))
  
  
@@ -42,7 +38,7 @@ index 8bd161b836..bef2f1ea0f 100644
  def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dict[str, int]:
      """Tasks per session in ``statuses``: tasks the session created, plus tasks
      it is a ``tui`` notify subscriber of (a session asked to shepherd someone
-@@ -114,6 +122,8 @@ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dic
+@@ -115,6 +123,8 @@ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dic
      counts: dict[str, int] = {}
      for sid, _tid in pairs:
          counts[sid] = counts.get(sid, 0) + 1
@@ -51,27 +47,27 @@ index 8bd161b836..bef2f1ea0f 100644
      return counts
  
  
-@@ -249,6 +259,39 @@ def _all_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-     active: dict[str, int] = {}
+@@ -302,6 +312,39 @@ def _all_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[
      blocked: dict[str, int] = {}
      unseen: dict[str, int] = {}
+     stale: dict[str, int] = {}
 +    pairs = _read_local_pairs_into(active, blocked, unseen)
 +    waiting: dict[str, set[str]] = {}
 +    for sid, tid in pairs:
 +        waiting.setdefault(sid, set()).add(tid)
-+    try:
-+        hub = _hub_db_path()
-+        if hub is not None:
-+            r_active, r_blocked = _read_hub_replica(hub)
-+            for src, into in ((r_active, active), (r_blocked, blocked)):
-+                for sid, n in src.items():
-+                    into[sid] = into.get(sid, 0) + n
-+    except Exception as exc:  # a corrupt/locked replica must never break the sidebar
-+        _log.debug("hermes-hub replica read failed: %s", exc)
++    for card in _remote_links():
++        bucket = _replica_bucket(card)
++        into = active if bucket == "active" else blocked if bucket == "blocked" else None
++        if into is None:
++            continue
++        sid = card["session"]
++        into[sid] = into.get(sid, 0) + 1
++        if card.get("stale"):
++            stale[sid] = stale.get(sid, 0) + 1
 +    with _cache_lock:
-+        _cache = (now + _CACHE_TTL_S, active, blocked, unseen)
++        _cache = (now + _CACHE_TTL_S, active, blocked, unseen, stale)
 +        _waiting_cache[0] = {sid: frozenset(ids) for sid, ids in waiting.items()}
-+    return active, blocked, unseen
++    return active, blocked, unseen, stale
 +
 +
 +def _read_local_pairs_into(active: dict[str, int], blocked: dict[str, int],
@@ -91,19 +87,19 @@ index 8bd161b836..bef2f1ea0f 100644
      for path in _board_db_paths():
          try:
              for sid, n in _read_unseen(path).items():
-@@ -261,18 +304,14 @@ def _all_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+@@ -314,18 +357,14 @@ def _all_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[
                      into[sid] = into.get(sid, 0) + n
              except sqlite3.Error as exc:  # an old schema without session_id, a locked file
                  _log.debug("kanban activity read failed for %s: %s", path, exc)
--    try:
--        hub = _hub_db_path()
--        if hub is not None:
--            r_active, r_blocked = _read_hub_replica(hub)
--            for src, into in ((r_active, active), (r_blocked, blocked)):
--                for sid, n in src.items():
--                    into[sid] = into.get(sid, 0) + n
--    except Exception as exc:  # a corrupt/locked replica must never break the sidebar
--        _log.debug("hermes-hub replica read failed: %s", exc)
+-    for card in _remote_links():
+-        bucket = _replica_bucket(card)
+-        into = active if bucket == "active" else blocked if bucket == "blocked" else None
+-        if into is None:
+-            continue
+-        sid = card["session"]
+-        into[sid] = into.get(sid, 0) + 1
+-        if card.get("stale"):
+-            stale[sid] = stale.get(sid, 0) + 1
 +
 +
 +def waiting_on_task_ids() -> dict[str, frozenset[str]]:
@@ -111,13 +107,13 @@ index 8bd161b836..bef2f1ea0f 100644
 +    created or shepherded by the session — what the chat is waiting on. Same cache as the counts. [daveey]"""
 +    _all_counts()
      with _cache_lock:
--        _cache = (now + _CACHE_TTL_S, active, blocked, unseen)
--    return active, blocked, unseen
+-        _cache = (now + _CACHE_TTL_S, active, blocked, unseen, stale)
+-    return active, blocked, unseen, stale
 +        return dict(_waiting_cache[0])
  
  
  def active_task_counts() -> dict[str, int]:
-@@ -457,7 +496,7 @@ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
+@@ -519,7 +558,7 @@ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
  
  
  def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -126,15 +122,15 @@ index 8bd161b836..bef2f1ea0f 100644
      session has not been handed yet) and ``kanban_attention`` (done cards a registered check flags) on each session row
      (summed over its whole compression lineage). Never raises: the list must
      render without them."""
-@@ -465,6 +504,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+@@ -527,6 +566,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
          return rows
      try:
-         active, blocked, unseen = _all_counts()
+         active, blocked, unseen, remote_stale = _all_counts()
 +        waiting = waiting_on_task_ids()
      except Exception:
          _log.debug("kanban activity unavailable", exc_info=True)
          return rows
-@@ -482,6 +522,12 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+@@ -544,6 +584,12 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                  row[key] = n
              else:
                  row.pop(key, None)
@@ -147,21 +143,19 @@ index 8bd161b836..bef2f1ea0f 100644
      return rows
  
  
-@@ -490,3 +536,4 @@ def _reset_cache_for_tests() -> None:
-     with _cache_lock:
-         _cache = None
+@@ -554,3 +600,4 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
          _attention_cache = None
+         if not keep_remote:
+             _remote_last = None
 +        _waiting_cache[0] = {}
 diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
-index 77cef5f97e..e97f8cd04b 100644
+index 43a042c2c9..950756ec7f 100644
 --- a/tests/hermes_cli/test_kanban_session_activity.py
 +++ b/tests/hermes_cli/test_kanban_session_activity.py
-@@ -313,3 +313,26 @@ def test_hub_platform_subscription_on_a_local_board_is_not_a_tui_shepherd(kanban
-     conn.commit()
-     conn.close()
-     assert ksa.active_task_counts() == {}
-+
-+
+@@ -422,3 +422,24 @@ def test_final_completion_clears_the_origin_and_other_sessions_finish_normally(k
+     ksa.annotate_kanban_activity(ann)
+     assert ann == [{"id": "s_origin"}, {"id": "s_other"}]
+     assert ksa.session_tasks(["s_origin"]) == []
 +def test_rows_carry_the_open_card_ids_the_chat_waits_on(kanban_root):
 +    """``kanban_waiting_on``: the open (queued/running + human-blocked) card ids over the lineage, the set the
 +    sidebar's "waiting on N cards" and the chat-closeout ledger read. Done cards drop out. [daveey]"""
@@ -375,6 +369,3 @@ index 05e0b5433e..d2d9366f7f 100644
  def _install_readopted_exit_waker(registry=None) -> None:
      """Desktop backend boot: route re-adopted jobs' unknown exits through ``_readopted_exit_deliver``."""
      if registry is None:
--- 
-2.54.0 (Apple Git-157)
-

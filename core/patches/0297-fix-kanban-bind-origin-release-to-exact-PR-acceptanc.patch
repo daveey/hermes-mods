@@ -1,0 +1,142 @@
+From 6d1862520ab8c0d62768793e9968aef795edc64b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 06:59:30 +0000
+Subject: [PATCH] fix(kanban): bind origin release to exact PR acceptance run
+ [daveey]
+
+---
+ hermes_cli/kanban_db.py                       | 11 ++++--
+ hermes_cli/kanban_origin_ledger.py            | 18 ++++++++-
+ hermes_cli/kanban_pr_acceptance_store.py      |  3 +-
+ tests/hermes_cli/test_kanban_pr_acceptance.py | 38 +++++++++++++++++++
+ 4 files changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e65890a88a..3419b6f1a2 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2732,7 +2732,8 @@ def complete_task(
+         # reopened while this task waited.
+         if not _parents_satisfied(conn, task_id):
+             return False
+-        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
++        acceptance_event_id = record_acceptance(conn, task_id, acceptance) if acceptance is not None else None
++        if acceptance is not None and not acceptance_event_id:
+             return False
+         trow = conn.execute(
+             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+@@ -2781,9 +2782,13 @@ def complete_task(
+         event_summary = handoff_summary
+         if prior_status == "review" and not event_summary:
+             event_summary = _REVIEW_APPROVED_NOTE
++        completion_payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
++        if acceptance_event_id is not None:
++            conn.execute("UPDATE task_events SET run_id=? WHERE id=? AND task_id=?",
++                         (run_id, acceptance_event_id, task_id))
++            completion_payload["pr_acceptance_event_id"] = acceptance_event_id
+         _append_event(
+-            conn, task_id, "completed",
+-            _completed_event_payload(result, event_summary, verified_cards, metadata),
++            conn, task_id, "completed", completion_payload,
+             run_id=run_id,
+         )
+     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 86a4d645d3..94bb80a2b2 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -134,7 +134,7 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+                                        'task_id': task['id']} for m in authoritative)):
+         raise ValueError('origin_observation_binding_changed')
+     event = conn.execute(
+-        "SELECT id,run_id,created_at FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
++        "SELECT id,run_id,created_at,payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+         (task['id'],)).fetchone()
+     run = conn.execute(
+         "SELECT id,status,outcome,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+@@ -147,7 +147,21 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+         archive_payload = json.loads(archived[1] or '{}') if archived else None
+         terminal = bool(archived and archived[0] > event[0] and isinstance(archive_payload, dict)
+                         and archive_payload.get('source_status') == 'done')
+-    verified = bool(terminal and row[2] is None and not row[3] and row[4] == 'local-only'
++    contract_verified = row[4] == 'local-only'
++    if event and not contract_verified:
++        completed = json.loads(event[3] or '{}')
++        acceptance_id = completed.get('pr_acceptance_event_id') if isinstance(completed, dict) else None
++        acceptance = conn.execute(
++            "SELECT payload,run_id FROM task_events WHERE id=? AND task_id=? AND kind='pr_acceptance' AND id<?",
++            (acceptance_id, task['id'], event[0])).fetchone() if type(acceptance_id) is int else None
++        if acceptance and acceptance[1] is not None and acceptance[1] == event[1]:
++            receipt = json.loads(acceptance[0] or '{}')
++            contract_verified = bool(isinstance(receipt, dict) and receipt.get('ok') is True
++                                     and receipt.get('classification') == 'success'
++                                     and receipt.get('pr_url') == row[4]
++                                     and isinstance(receipt.get('head_sha'), str)
++                                     and re.fullmatch(r'[0-9a-f]{40}', receipt['head_sha']))
++    verified = bool(terminal and row[2] is None and not row[3] and contract_verified
+                     and event and run and event[1] == run[0] and run[1] in ('done', 'completed') and run[2] == 'completed'
+                     and row[1] is not None and event[2] >= row[1] and run[3] is not None and run[3] >= row[1])
+     payload = {k: v for k, v in task.items() if k != 'origin_observation'}
+diff --git a/hermes_cli/kanban_pr_acceptance_store.py b/hermes_cli/kanban_pr_acceptance_store.py
+index 0dc90efa1a..162a5a3189 100644
+--- a/hermes_cli/kanban_pr_acceptance_store.py
++++ b/hermes_cli/kanban_pr_acceptance_store.py
+@@ -62,4 +62,5 @@ def record_acceptance(conn, task_id, acceptance):
+     if not receipt["ok"]:
+         detail = f"PR acceptance {receipt['classification']}: {receipt.get('detail', '')} {receipt['recovery']}"
+         conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", (detail, task_id))
+-    return receipt["ok"]
++    # Capture the exact core event, not a worker-provided receipt identifier.
++    return conn.execute("SELECT last_insert_rowid()").fetchone()[0] if receipt["ok"] else False
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance.py b/tests/hermes_cli/test_kanban_pr_acceptance.py
+index a31fbac7af..6509b6bfda 100644
+--- a/tests/hermes_cli/test_kanban_pr_acceptance.py
++++ b/tests/hermes_cli/test_kanban_pr_acceptance.py
+@@ -131,6 +131,44 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
+             github.pop("race")
+ 
+ 
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("claimed", [False, True])
++def test_origin_release_requires_completion_bound_pr_receipt(github, claimed):
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
++        run = kb.claim_task(conn, tid).current_run_id if claimed else None
++        assert kb.complete_task(conn, tid, summary="verified", expected_run_id=run,
++                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
++
++        def verified():
++            conn.execute("SAVEPOINT observation")
++            try:
++                return observe_owner_task(conn, {"id": tid, "status": "done"}, now=123)["origin_observation"]["verified"]
++            finally:
++                conn.execute("RELEASE observation")
++
++        assert verified()
++        event = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()
++        payload = json.loads(event["payload"])
++        receipt_id = payload["pr_acceptance_event_id"]
++        receipt = conn.execute("SELECT payload FROM task_events WHERE id=?", (receipt_id,)).fetchone()
++        assert json.loads(receipt[0])["head_sha"] == "a" * 40
++        conn.execute("UPDATE task_events SET run_id=NULL WHERE id=?", (receipt_id,))
++        assert not verified()  # even synthesized completion runs must own their receipt
++        completion_run = conn.execute("SELECT run_id FROM task_events WHERE id=?", (event["id"],)).fetchone()[0]
++        conn.execute("UPDATE task_events SET run_id=? WHERE id=?", (completion_run, receipt_id))
++        assert verified()
++        conn.execute("UPDATE tasks SET completion_contract='https://github.com/acme/repo/pull/8' WHERE id=?", (tid,))
++        assert not verified()
++        conn.execute("UPDATE tasks SET completion_contract='https://github.com/acme/repo/pull/7' WHERE id=?", (tid,))
++        assert verified()
++        payload.pop("pr_acceptance_event_id")
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event["id"]))
++        assert not verified()  # legacy completions cannot borrow a nearby receipt
++
++
+ # --- #122689: acceptance must read the repo as the ASSIGNEE profile's gh login ---
+ 
+ @pytest.mark.platforms("posix")
+-- 
+2.55.0
+

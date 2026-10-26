@@ -1,0 +1,461 @@
+From d8dbb31019d76fcc7c665dfde4aba1201e881b21 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:20:47 +0000
+Subject: [PATCH] fix(kanban): bind ownership to stable DB metadata and gate
+ decomposition [daveey]
+
+---
+ gateway/kanban_watchers_dispatcher.py         |  60 ++++---
+ hermes_cli/kanban_db_boards.py                |  23 ++-
+ hermes_cli/kanban_dispatch_owner.py           |  29 ++--
+ .../hermes_cli/test_kanban_dispatch_owner.py  |   4 +-
+ .../test_kanban_dispatch_owner_regressions.py | 163 ++++++++++++++++++
+ .../kanban-dispatch-ownership.md              |  35 +++-
+ 6 files changed, 265 insertions(+), 49 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index bd129f7b5e..e74d2ef7dc 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -217,6 +217,22 @@ class _KanbanDispatcher:
+         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+ 
++    @contextlib.contextmanager
++    def _unowned_board_work(self, slug):
++        """Hold the same canonical lock for pre-dispatch work and owner changes."""
++        from hermes_cli.kanban_dispatch_owner import connection_db_path, get_dispatch_owner
++        with contextlib.ExitStack() as stack:
++            allowed = None
++            try:
++                conn = stack.enter_context(_kbc().connect_closing(board=slug))
++                path = connection_db_path(conn)
++                held = stack.enter_context(_kbc()._dispatch_tick_lock(path))
++                if held and get_dispatch_owner(path) is None:
++                    allowed = conn
++            except (OSError, ValueError, UnicodeError, RecursionError, sqlite3.Error) as exc:
++                logger.debug("kanban dispatcher: pre-dispatch work denied on %s (%s)", slug, exc)
++            yield allowed
++
+     def ready_nonempty(self) -> bool:
+         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
+ 
+@@ -231,17 +247,10 @@ class _KanbanDispatcher:
+         from hermes_cli import kanban_db as _kb
+         with _kb.pin_first_board_resolution():
+             for slug in self._board_slugs():
+-                conn = None
+-                try:
+-                    conn = _kbc().connect(board=slug)
+-                    if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
++                with self._unowned_board_work(slug) as conn:
++                    if conn is not None and (kbd.has_spawnable_ready(conn) or (
++                            _review_probe and kbd.has_spawnable_review(conn))):
+                         return True
+-                except Exception:
+-                    continue
+-                finally:
+-                    if conn is not None:
+-                        with contextlib.suppress(Exception):
+-                            conn.close()
+         return False
+ 
+     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
+@@ -267,18 +276,11 @@ class _KanbanDispatcher:
+                 prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+                 try:
+                     os.environ["HERMES_KANBAN_BOARD"] = slug
+-                    try:
+-                        # Cards a block loop escalated for a human stay put until
+-                        # a human adds input; re-specifying them restarts the loop.
+-                        triage_ids = _decomp.list_triage_ids(skip_awaiting_human=True)
+-                    except Exception as exc:
+-                        logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
+-                        triage_ids = []
+-                    for tid in triage_ids:
+-                        if attempted >= auto_decompose_per_tick:
+-                            break
+-                        attempted += 1
+-                        successes += self._decompose_one(_decomp, slug, tid)
++                    with self._unowned_board_work(slug) as conn:
++                        if conn is not None:
++                            used, done = self._decompose_board(_decomp, slug, auto_decompose_per_tick - attempted)
++                            attempted += used
++                            successes += done
+                 finally:
+                     if prev_env is None:
+                         os.environ.pop("HERMES_KANBAN_BOARD", None)
+@@ -286,6 +288,20 @@ class _KanbanDispatcher:
+                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
+         return successes
+ 
++    def _decompose_board(self, decomp, slug, budget):
++        try:
++            triage_ids = decomp.list_triage_ids(skip_awaiting_human=True)
++        except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
++            logger.exception("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
++            return 0, 0
++        attempted = successes = 0
++        for tid in triage_ids:
++            if attempted >= budget:
++                break
++            attempted += 1
++            successes += self._decompose_one(decomp, slug, tid)
++        return attempted, successes
++
+     @staticmethod
+     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
+         """Decompose one triage task; returns 1 on success, 0 otherwise."""
+diff --git a/hermes_cli/kanban_db_boards.py b/hermes_cli/kanban_db_boards.py
+index 8659d7b309..35382d018e 100644
+--- a/hermes_cli/kanban_db_boards.py
++++ b/hermes_cli/kanban_db_boards.py
+@@ -26,8 +26,12 @@ def _dir_holds_board(d: Path) -> bool:
+ 
+ 
+ def board_metadata_path(board: Optional[str] = None) -> Path:
+-    """``board.json`` path — display metadata only; the directory slug is the identity."""
+-    return _kb.board_dir(_kb._slug_or_default(board)) / "board.json"
++    """Metadata authority follows the board's canonical DB, not the caller home."""
++    from hermes_cli.kanban_dispatch_owner import metadata_path
++    slug = _kb._slug_or_default(board)
++    path = (_kb.kanban_home() / "kanban.db" if slug == _kb.DEFAULT_BOARD
++            else _kb.board_dir(slug) / "kanban.db")
++    return metadata_path(path)
+ 
+ 
+ def _default_board_display_name(slug: str) -> str:
+@@ -159,6 +163,19 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
+ 
+ 
+ def remove_board(slug: str, *, archive: bool = True) -> dict:
++    """Refuse busy boards before moving anything, including the current pointer."""
++    from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    normed = _kb._require_slug(slug)
++    if normed == _kb.DEFAULT_BOARD:
++        raise ValueError("the 'default' board cannot be removed")
++    path = (_kb.board_dir(normed) / "kanban.db").resolve()
++    with _dispatch_tick_lock(path) as held:
++        if not held:
++            raise ValueError("board dispatcher is busy; retry removal")
++        return _remove_board_locked(normed, archive=archive)
++
++
++def _remove_board_locked(slug: str, *, archive: bool = True) -> dict:
+     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
+     ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+     _kb._assert_not_delegated_child_mutation()
+@@ -194,7 +211,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
+         # tabs / gateway pollers can keep calling connect(board=slug) after the
+         # archive; without a marker the resurrect-guard cannot tell an archived
+         # slug from a brand-new one and an empty board would reappear (#43243).
+-        write_board_metadata(
++        _write_board_metadata_locked(
+             normed,
+             name=prior_meta.get("name"),
+             description=prior_meta.get("description"),
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 331775faa8..22040ce88f 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -17,21 +17,18 @@ def connection_db_path(conn: sqlite3.Connection) -> Path:
+ 
+ 
+ def metadata_path(db_path: Path) -> Path:
+-    from hermes_cli import kanban_db as kb
+-    path = Path(db_path).resolve(strict=True)
+-    default_meta = path.parent / "kanban" / "boards" / "default" / "board.json"
+-    if path == (kb.kanban_home() / "kanban.db").resolve():
+-        return default_meta
+-    # Detect a foreign root's legacy default layout without treating an
+-    # unreadable configured metadata path as absent (Path.exists hides errors).
+-    if path.name == "kanban.db":
+-        try:
+-            default_meta.lstat()
+-        except FileNotFoundError:
+-            pass
+-        else:
+-            return default_meta
+-    return path.parent / "board.json"
++    # Pure canonical-path mapping: no caller home or existence-dependent branch.
++    # Nonstandard filenames need distinct sidecars even in the same directory.
++    path = Path(db_path).resolve()
++    if path.name != "kanban.db":
++        return path.with_name(path.name + ".board.json")
++    if path.parent.parent.name == "boards" and path.parent.parent.parent.name == "kanban":
++        # default/board.json already belongs to the legacy root DB. A separate
++        # DB placed inside that reserved directory must not share its owner.
++        if path.parent.name == "default":
++            return path.with_name(path.name + ".board.json")
++        return path.parent / "board.json"
++    return path.parent / "kanban" / "boards" / "default" / "board.json"
+ 
+ 
+ def read_metadata(path: Path) -> dict:
+@@ -88,7 +85,7 @@ def run_owned_tick(conn, tick, dispatcher_id, board, dry_run):
+             return DispatchResult(skipped_locked=True)
+         try:
+             owner = get_dispatch_owner(db_path)
+-        except (OSError, ValueError, UnicodeError) as exc:
++        except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+             return DispatchResult(skipped_owned=True, ownership_error=str(exc))
+         if owner is not None and dispatcher_id != owner:
+             return DispatchResult(skipped_owned=True, dispatch_owner=owner)
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner.py b/tests/hermes_cli/test_kanban_dispatch_owner.py
+index d75da0e2a1..b59ce13474 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_owner.py
++++ b/tests/hermes_cli/test_kanban_dispatch_owner.py
+@@ -121,7 +121,7 @@ def test_connection_path_not_board_alias_controls_ownership(board_db, tmp_path,
+     _metadata(metadata, {})
+     actual = tmp_path / "actual" / "board.db"
+     actual.parent.mkdir()
+-    _metadata(actual.parent / "board.json", {"dispatch_owner": "owner"})
++    _metadata(actual.with_name(actual.name + ".board.json"), {"dispatch_owner": "owner"})
+     if alias in ("pinned", "both"):
+         monkeypatch.setenv("HERMES_KANBAN_DB", str(default_path))
+     with kbc.connect_closing(actual) as conn:
+@@ -153,7 +153,7 @@ def test_set_read_clear_preserves_other_metadata(board_db, tmp_path, layout):
+     _, path, metadata = board_db
+     if layout == "adjacent":
+         path = tmp_path / "custom" / "board.db"
+-        metadata = path.parent / "board.json"
++        metadata = path.with_name(path.name + ".board.json")
+     _metadata(metadata, {"title": "Generic board", "custom": {"keep": True}})
+     with kbc.connect_closing(path):
+         pass
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py b/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+new file mode 100644
+index 0000000000..478884115d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+@@ -0,0 +1,163 @@
++"""Ownership authority must be invariant across homes and DB aliases."""
++import json
++import sqlite3
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli.kanban_dispatch_owner import get_dispatch_owner, run_owned_tick, set_dispatch_owner
++from hermes_cli.kanban_db_dispatch import DispatchResult
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    root = tmp_path / "home"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    return root
++
++
++def test_foreign_default_owner_survives_home_switch_and_display_edit(home, tmp_path, monkeypatch):
++    foreign = tmp_path / "foreign"
++    foreign.mkdir()
++    path = foreign / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        set_dispatch_owner(path, "dedicated")
++        monkeypatch.setenv("HERMES_KANBAN_HOME", str(foreign))
++        tick = Mock(return_value=DispatchResult())
++        assert run_owned_tick(conn, tick, None, "default", False).skipped_owned
++        tick.assert_not_called()
++        kb.write_board_metadata("default", description="Edited")
++        assert get_dispatch_owner(path) == "dedicated"
++        assert kb.read_board_metadata("default")["dispatch_owner"] == "dedicated"
++
++
++def test_default_symlink_to_named_board_cannot_hide_owner(home, tmp_path, monkeypatch):
++    path = tmp_path / "foreign" / "kanban" / "boards" / "sample" / "kanban.db"
++    path.parent.mkdir(parents=True)
++    with sqlite3.connect(path):
++        pass
++    set_dispatch_owner(path, "dedicated")
++    (home / "kanban.db").symlink_to(path)
++    with sqlite3.connect(home / "kanban.db") as conn:
++        tick = Mock(return_value=DispatchResult())
++        assert run_owned_tick(conn, tick, None, "default", False).skipped_owned
++        tick.assert_not_called()
++    assert kb.read_board_metadata("default")["dispatch_owner"] == "dedicated"
++    kb.write_board_metadata("default", description="Alias edit")
++    assert get_dispatch_owner(path) == "dedicated"
++
++
++def test_distinct_db_filenames_never_share_owner(home):
++    paths = [home / "first.db", home / "second.db"]
++    for path in paths:
++        with sqlite3.connect(path):
++            pass
++    set_dispatch_owner(paths[0], "first")
++    assert get_dispatch_owner(paths[1]) is None
++    set_dispatch_owner(paths[1], "second")
++    assert [get_dispatch_owner(p) for p in paths] == ["first", "second"]
++
++
++def test_deep_metadata_denies_without_traceback(home):
++    path = home / "kanban.db"
++    metadata = home / "kanban/boards/default/board.json"
++    metadata.parent.mkdir(parents=True)
++    metadata.write_text('[' * 2000 + ']' * 2000)
++    with sqlite3.connect(path) as conn:
++        tick = Mock()
++        result = run_owned_tick(conn, tick, None, "default", False)
++        assert result.skipped_owned and result.ownership_error
++        tick.assert_not_called()
++
++
++@pytest.mark.parametrize("owned", [True, False])
++def test_lock_failure_is_closed_even_for_unowned_board(home, monkeypatch, owned):
++    path = home / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        if owned:
++            set_dispatch_owner(path, "dedicated")
++        original = Path.open
++        def fail_lock(p, *args, **kwargs):
++            if p.name.endswith(".dispatch.lock"):
++                raise PermissionError("lock unavailable")
++            return original(p, *args, **kwargs)
++        monkeypatch.setattr(Path, "open", fail_lock)
++        tick = Mock()
++        result = run_owned_tick(conn, tick, None, "default", False)
++        assert result.skipped_locked
++        tick.assert_not_called()
++
++
++@pytest.mark.parametrize("raw", [{"dispatch_owner": "dedicated"}, {"dispatch_owner": None}, {}])
++def test_gateway_decompose_and_health_obey_owner(home, monkeypatch, raw):
++    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
++    from hermes_cli import kanban_decompose as decomp, kanban_db_dispatch as kbd
++    kb.create_board("sample")
++    metadata = kb.board_metadata_path("sample")
++    metadata.write_text(json.dumps(raw))
++    settings = _DispatcherSettings(60, None, None, 2, 0, True, None, None)
++    dispatcher = _KanbanDispatcher(kb, settings)
++    monkeypatch.setattr(dispatcher, "_board_slugs", lambda: ["sample"])
++    listed = Mock(return_value=["test-card"])
++    decomposed = Mock(return_value=1)
++    monkeypatch.setattr(decomp, "list_triage_ids", listed)
++    monkeypatch.setattr(dispatcher, "_decompose_one", decomposed)
++    monkeypatch.setattr(kbd, "has_spawnable_ready", lambda conn: True)
++    permitted = not raw
++    assert dispatcher.auto_decompose_tick(1) == int(permitted)
++    assert dispatcher.ready_nonempty() is permitted
++    assert listed.call_count == int(permitted)
++    assert decomposed.call_count == int(permitted)
++
++
++def test_gateway_holds_owner_lock_through_decompose(home, monkeypatch):
++    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
++    from hermes_cli import kanban_decompose as decomp
++    kb.create_board("sample")
++    path = kb.kanban_db_path("sample")
++    dispatcher = _KanbanDispatcher(kb, _DispatcherSettings(60, None, None, 2, 0, True, None, None))
++    monkeypatch.setattr(dispatcher, "_board_slugs", lambda: ["sample"])
++    monkeypatch.setattr(decomp, "list_triage_ids", lambda **kwargs: ["test-card"])
++    def decompose(*args):
++        with pytest.raises(RuntimeError):
++            set_dispatch_owner(path, "dedicated")
++        return 1
++    monkeypatch.setattr(dispatcher, "_decompose_one", decompose)
++    assert dispatcher.auto_decompose_tick(1) == 1
++    set_dispatch_owner(path, "dedicated")
++    assert dispatcher.auto_decompose_tick(1) == 0
++
++
++def test_reserved_default_directory_db_does_not_share_root_owner(home):
++    root = home / "kanban.db"
++    nested = home / "kanban/boards/default/kanban.db"
++    nested.parent.mkdir(parents=True)
++    for path in (root, nested):
++        with sqlite3.connect(path):
++            pass
++    set_dispatch_owner(root, "root-owner")
++    assert get_dispatch_owner(nested) is None
++    set_dispatch_owner(nested, "nested-owner")
++    assert get_dispatch_owner(root) == "root-owner"
++
++
++@pytest.mark.parametrize("archive", [True, False])
++def test_remove_busy_board_leaves_directory_and_current_intact(home, archive):
++    kb.create_board("sample")
++    kb.set_current_board("sample")
++    path = kb.kanban_db_path("sample")
++    with kbc._dispatch_tick_lock(path) as held:
++        assert held
++        with pytest.raises(ValueError, match="busy"):
++            kb.remove_board("sample", archive=archive)
++        assert kb.get_current_board() == "sample"
++        assert path.exists()
++        assert not kb.read_board_metadata("sample")["archived"]
++    kb.remove_board("sample", archive=archive)
++    assert kb.get_current_board() == "default"
+diff --git a/website/docs/developer-guide/kanban-dispatch-ownership.md b/website/docs/developer-guide/kanban-dispatch-ownership.md
+index 293426ab1d..b214cfc9d8 100644
+--- a/website/docs/developer-guide/kanban-dispatch-ownership.md
++++ b/website/docs/developer-guide/kanban-dispatch-ownership.md
+@@ -8,7 +8,11 @@ as the same user can change ownership. Do not give task workers a dispatcher ID.
+ 
+ ## Operator commands
+ 
+-After upgrading every dispatcher that can access the board:
++Stop ALL older dispatchers that can access the board before starting any upgraded
++ones or setting ownership. Drain active workers at a safe idle window; do not kill
++sessions to activate this feature. Mixed-version operation is unsupported: older
++code ignores ownership and may lock an unresolved symlink path while new code
++locks the canonical target. Then upgrade every dispatcher and run:
+ 
+ ```sh
+ hermes kanban boards dispatch-owner example dedicated-worker --json
+@@ -54,21 +58,40 @@ owned boards. No plugin monkeypatch or lock bypass is necessary.
+   beginning with an alphanumeric. No trimming, case folding, or coercion.
+ * The actual SQLite main database path selects metadata and the dispatch lock;
+   an explicit board label or `HERMES_KANBAN_DB` alias cannot select a different
+-  owner's metadata. Symlinks resolve to their target. Default-board metadata
+-  lives under `kanban/boards/default/board.json`; other DB metadata is adjacent.
++  owner's metadata. Symlinks resolve to their target, independent of the caller's
++  home or which metadata files happen to exist. For canonical paths:
++  * `.../kanban/boards/<slug>/kanban.db` uses adjacent `board.json`, except
++    a DB placed inside the reserved `default` directory uses `kanban.db.board.json`
++    (that directory's `board.json` already belongs to the legacy root DB).
++  * Other `.../kanban.db` paths use `.../kanban/boards/default/board.json`.
++  * Other filenames use `<database filename>.board.json` alongside the DB, so
++    separate databases in one directory never share ownership.
++  Board display reads/edits follow this same mapping; operator readback reports
++  the canonical DB path. Moving a DB requires moving its metadata as well.
+ * Under the same lock, invalid/unreadable metadata or a mismatched identity returns
+   `skipped_owned=True` before reconciliation, reclaim, promotion, claim, spawn,
+   checkpoint, or dispatch observers. A valid owner appears in `dispatch_owner`;
+   read/validation failures appear in `ownership_error`.
+-* An unavailable lock refuses dispatch and owner changes. Owner changes and
+-  display metadata edits use atomic replacement while holding that lock.
++* An unavailable lock refuses dispatch and owner changes. This intentionally
++  removes the former unguarded fallback even on unowned boards: without the lock
++  an owner setter could race an apparently unowned tick. Fix lock permissions
++  rather than bypassing it. Skipped-lock ticks do not fire dispatch observers,
++  since ownership cannot safely be established without acquiring the lock.
++* Owner changes and display metadata edits use atomic replacement under that
++  lock. Busy edits fail immediately and should be retried; they do not stall the
++  gateway. Removal refuses busy boards before changing the current pointer or
++  moving a directory, avoiding partially archived boards on lock contention.
++* Gateway auto-decomposition also holds this lock through listing and decomposing
++  triage work. Owned/invalid boards neither spend auxiliary LLM calls nor count
++  toward the stock gateway's stuck-dispatch health check.
+ * In-memory/unidentifiable connections fail closed. Direct task APIs are not
+   changed: this coordinates dispatchers, not arbitrary same-UID database writers.
+ 
+ ## Tests
+ 
+ Run `scripts/run_tests.sh tests/hermes_cli/test_kanban_dispatch_owner.py
+- tests/hermes_cli/test_kanban_dispatch_owner_operator.py` (one shell command).
++ tests/hermes_cli/test_kanban_dispatch_owner_operator.py
++ tests/hermes_cli/test_kanban_dispatch_owner_regressions.py` (one shell command).
+ These exercise native dispatch, CLI and embedded-gateway denial, strict metadata,
+ actual-connection identity, alias/symlink handling, operator set/read/clear,
+ allowed scoped spawning, and owner/display edits attempted inside a live tick.
+-- 
+2.55.0
+

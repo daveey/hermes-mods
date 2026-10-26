@@ -1,0 +1,383 @@
+From 4f8540a2a489f3842c54a6e4d065bed9988eb246 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 12:10:29 +0000
+Subject: [PATCH] fix(kanban): reject relocated dispatch connections [daveey]
+
+---
+ gateway/kanban_watchers_dispatcher.py         |   8 +-
+ hermes_cli/kanban_db_connect.py               |  14 ++-
+ hermes_cli/kanban_dispatch_owner.py           |  39 ++++++-
+ .../test_kanban_dispatch_owner_connection.py  | 106 ++++++++++++++++++
+ .../test_kanban_dispatch_owner_lifecycle.py   |   8 +-
+ .../test_kanban_dispatch_owner_regressions.py |   9 +-
+ .../kanban-dispatch-ownership.md              |  20 +++-
+ 7 files changed, 184 insertions(+), 20 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_owner_connection.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index f508c37ef1..4fff112f41 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -225,10 +225,12 @@ class _KanbanDispatcher:
+             allowed = None
+             try:
+                 conn = stack.enter_context(_kbc().connect_closing(board=slug))
+-                path = connection_db_path(conn)
++                path = connection_db_path(conn, validate=False)
+                 held = stack.enter_context(_kbc()._dispatch_tick_lock(path))
+-                if held and get_dispatch_owner(path) is None:
+-                    allowed = conn
++                if held:
++                    connection_db_path(conn)
++                    if get_dispatch_owner(path) is None:
++                        allowed = conn
+             except (OSError, ValueError, UnicodeError, RecursionError, sqlite3.Error) as exc:
+                 logger.debug("kanban dispatcher: pre-dispatch work denied on %s (%s)", slug, exc)
+             yield allowed
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 4519dd373b..fd9eae91ec 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import hashlib
++import os
+ import random
+ import re
+ import secrets
+@@ -59,11 +60,12 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
+     byte-level probes of the file are refused because an ``open()``/``close()``
+     would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``)."""
+     from hermes_cli.sqlite_safe_read import connect_tracked
++    from hermes_cli.kanban_dispatch_owner import connect_with_identity
+ 
+     busy_timeout_ms = _resolve_busy_timeout_ms()
+     conn = connect_tracked(
+         path,
+-        connect_fn=sqlite3.connect,
++        connect_fn=connect_with_identity,
+         isolation_level=None,
+         timeout=busy_timeout_ms / 1000.0,
+     )
+@@ -192,7 +194,15 @@ def _dispatch_tick_lock(db_path: Path):
+         acquired = False
+         handle = None
+     try:
+-        yield acquired
++        # Archive/delete may have moved this lock after open but before flock.
++        # An acquired obsolete inode does not serialize work on its replacement.
++        current = False
++        if acquired:
++            try:
++                current = os.path.samestat(os.fstat(handle.fileno()), lock_path.stat())
++            except OSError:
++                current = False
++        yield acquired and current
+     finally:
+         if handle is not None:
+             try:
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index cb09b44082..16f2b450ee 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -8,11 +8,41 @@ import sqlite3
+ import tempfile
+ 
+ 
+-def connection_db_path(conn: sqlite3.Connection) -> Path:
+-    """Use the opened database, never an enumerated board alias or env pin."""
++def connect_with_identity(path, **kwargs):
++    """Capture the opened inode while native archive/delete cannot relocate it.
++
++    Ordinary clients may still connect during a tick. Such handles cannot later
++    dispatch: reopen after contention clears instead of trusting a pathname.
++    """
++    from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    canonical = Path(path).resolve()
++    with _dispatch_tick_lock(canonical) as held:
++        conn = sqlite3.connect(str(canonical), **kwargs)
++        try:
++            stat = canonical.stat() if held else None
++            conn._dispatch_identity = (stat.st_dev, stat.st_ino) if stat else None
++            return conn
++        except BaseException:
++            conn.close()
++            raise
++
++
++def connection_db_path(conn: sqlite3.Connection, *, validate: bool = True) -> Path:
++    """Validate the opened inode, not just PRAGMA's original filename.
++
++    Call again under the dispatch lock before reading ownership or doing work.
++    Raw SQLite handles cannot establish lifecycle provenance and fail closed.
++    """
++    expected = getattr(conn, "_dispatch_identity", None)
++    if validate and expected is None:
++        raise ValueError("dispatch requires a native connection opened without lock contention; reconnect")
+     for row in conn.execute("PRAGMA database_list"):
+         if row[1] == "main" and row[2]:
+-            return Path(row[2]).resolve(strict=True)
++            path = Path(row[2]).resolve(strict=True)
++            stat = path.stat()
++            if validate and (stat.st_dev, stat.st_ino) != expected:
++                raise ValueError("database was relocated or replaced after connection open; reconnect")
++            return path
+     raise ValueError("dispatcher requires an identifiable on-disk database")
+ 
+ 
+@@ -70,13 +100,14 @@ def run_owned_tick(conn, tick, dispatcher_id, board, dry_run):
+     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+     from hermes_cli.kanban_db_dispatch import DispatchResult
+     try:
+-        db_path = connection_db_path(conn)
++        db_path = connection_db_path(conn, validate=False)
+     except (OSError, ValueError, sqlite3.Error) as exc:
+         return DispatchResult(skipped_owned=True, ownership_error=str(exc))
+     with kbc._dispatch_tick_lock(db_path) as held:
+         if not held:
+             return DispatchResult(skipped_locked=True)
+         try:
++            connection_db_path(conn)
+             owner = get_dispatch_owner(db_path)
+         except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+             return DispatchResult(skipped_owned=True, ownership_error=str(exc))
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_connection.py b/tests/hermes_cli/test_kanban_dispatch_owner_connection.py
+new file mode 100644
+index 0000000000..fc5e48b1a3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_connection.py
+@@ -0,0 +1,106 @@
++"""Dispatch must reject handles invalidated by native board lifecycle operations."""
++from contextlib import closing
++from hermes_cli import kanban_db_connect as kbc
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_dispatch import DispatchResult
++from hermes_cli.kanban_dispatch_owner import run_owned_tick, set_dispatch_owner
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    kb.create_board("sample")
++    path = kb.board_dir("sample") / "kanban.db"
++    set_dispatch_owner(path, "dedicated")
++    return path
++
++
++@pytest.mark.parametrize("archive", [True, False])
++def test_stale_connection_cannot_dispatch_recreated_board(board, archive):
++    with closing(kbc.connect(board="sample")) as conn:
++        kb.remove_board("sample", archive=archive)
++        kb.create_board("sample")
++        callback = Mock(return_value=DispatchResult())
++        result = run_owned_tick(conn, callback, None, "sample", False)
++        assert result.skipped_owned
++        callback.assert_not_called()
++    with closing(kbc.connect(board="sample")) as fresh:
++        callback = Mock(return_value=DispatchResult())
++        assert not run_owned_tick(fresh, callback, None, "sample", False).skipped_owned
++        callback.assert_called_once()
++
++
++def test_gateway_checks_identity_after_lock_acquisition(board, monkeypatch):
++    from contextlib import contextmanager
++    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher
++    from hermes_cli import kanban_db_connect as kbc
++
++    original = kbc._dispatch_tick_lock
++    replaced = False
++
++    @contextmanager
++    def interleave(path):
++        nonlocal replaced
++        if not replaced:
++            replaced = True
++            kb.remove_board("sample")
++            kb.create_board("sample")
++        with original(path) as held:
++            yield held
++
++    dispatcher = _KanbanDispatcher.__new__(_KanbanDispatcher)
++    # Arrange the native lifecycle transition after opening, before gating.
++    with closing(kbc.connect(board="sample")) as conn:
++        @contextmanager
++        def existing(**kwargs):
++            yield conn
++        monkeypatch.setattr(kbc, "connect_closing", existing)
++        monkeypatch.setattr(kbc, "_dispatch_tick_lock", interleave)
++        with dispatcher._unowned_board_work("sample") as allowed:
++            assert allowed is None
++
++
++def test_contended_open_requires_reconnect_before_dispatch(board):
++    with kbc._dispatch_tick_lock(board) as held:
++        assert held
++        conn = kbc.connect(board)
++    with closing(conn):
++        callback = Mock(return_value=DispatchResult())
++        result = run_owned_tick(conn, callback, "dedicated", "sample", False)
++        assert result.skipped_owned and result.ownership_error
++        callback.assert_not_called()
++    with closing(kbc.connect(board)) as fresh:
++        callback = Mock(return_value=DispatchResult())
++        result = run_owned_tick(fresh, callback, "dedicated", "sample", False)
++        assert not result.skipped_owned
++        assert result.dispatch_owner == "dedicated"
++        callback.assert_called_once()
++
++
++def test_raw_connection_requires_native_reconnect(board):
++    import sqlite3
++    with closing(sqlite3.connect(board)) as conn:
++        callback = Mock(return_value=DispatchResult())
++        result = run_owned_tick(conn, callback, "dedicated", "sample", False)
++        assert result.skipped_owned and result.ownership_error
++        callback.assert_not_called()
++
++
++def test_moved_lock_inode_is_not_authority(board, monkeypatch):
++    original = kbc._try_lock_nb
++    moved = board.with_name("old-lock")
++    def relocate_before_acquire(handle):
++        lock = board.with_name(board.name + ".dispatch.lock")
++        lock.rename(moved)
++        lock.touch()
++        return original(handle)
++    monkeypatch.setattr(kbc, "_try_lock_nb", relocate_before_acquire)
++    with kbc._dispatch_tick_lock(board) as held:
++        assert not held
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py b/tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
+index ab80384dd4..85b05eea47 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_lifecycle.py
+@@ -1,4 +1,6 @@
+ """Ownership must not alter display identity, and must survive native moves."""
++from contextlib import closing
++from hermes_cli import kanban_db_connect as kbc
+ import json
+ import sqlite3
+ import tarfile
+@@ -61,7 +63,7 @@ def test_archive_preserves_owner_for_direct_dispatch(home, tmp_path, external):
+     result = kb.remove_board("sample")
+     archived = Path(result["new_path"]) / "kanban.db"
+     assert get_dispatch_owner(archived) == "dedicated"
+-    with sqlite3.connect(archived) as conn:
++    with closing(kbc.connect(archived)) as conn:
+         tick = Mock(return_value=DispatchResult())
+         assert run_owned_tick(conn, tick, None, "sample", False).skipped_owned
+         tick.assert_not_called()
+@@ -71,7 +73,7 @@ def test_archive_preserves_owner_for_direct_dispatch(home, tmp_path, external):
+ 
+ def test_dangling_owner_link_through_missing_ancestor_denies(home, tmp_path):
+     path = home / "kanban.db"
+-    with sqlite3.connect(path) as conn:
++    with closing(kbc.connect(path)) as conn:
+         target_dir = tmp_path / "owner-data"
+         target_dir.mkdir()
+         target = target_dir / "owner.json"
+@@ -127,7 +129,7 @@ def test_broken_display_ancestor_cannot_hide_owner(home, tmp_path):
+     backing = tmp_path / "display"
+     backing.mkdir()
+     display.symlink_to(backing, target_is_directory=True)
+-    with sqlite3.connect(path) as conn:
++    with closing(kbc.connect(path)) as conn:
+         set_dispatch_owner(path, "dedicated")
+         backing.rename(tmp_path / "moved-display")
+         tick = Mock(return_value=DispatchResult())
+diff --git a/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py b/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+index 5a25876e15..d5274d25ef 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
++++ b/tests/hermes_cli/test_kanban_dispatch_owner_regressions.py
+@@ -1,4 +1,5 @@
+ """Ownership authority must be invariant across homes and DB aliases."""
++from contextlib import closing
+ import json
+ import sqlite3
+ from pathlib import Path
+@@ -26,7 +27,7 @@ def test_foreign_default_owner_survives_home_switch_and_display_edit(home, tmp_p
+     foreign = tmp_path / "foreign"
+     foreign.mkdir()
+     path = foreign / "kanban.db"
+-    with sqlite3.connect(path) as conn:
++    with closing(kbc.connect(path)) as conn:
+         set_dispatch_owner(path, "dedicated")
+         monkeypatch.setenv("HERMES_KANBAN_HOME", str(foreign))
+         tick = Mock(return_value=DispatchResult())
+@@ -44,7 +45,7 @@ def test_default_symlink_to_named_board_cannot_hide_owner(home, tmp_path, monkey
+         pass
+     set_dispatch_owner(path, "dedicated")
+     (home / "kanban.db").symlink_to(path)
+-    with sqlite3.connect(home / "kanban.db") as conn:
++    with closing(kbc.connect(home / "kanban.db")) as conn:
+         tick = Mock(return_value=DispatchResult())
+         assert run_owned_tick(conn, tick, None, "default", False).skipped_owned
+         tick.assert_not_called()
+@@ -68,7 +69,7 @@ def test_deep_metadata_denies_without_traceback(home):
+     path = home / "kanban.db"
+     metadata = path.with_name(path.name + ".dispatch-owner.json")
+     metadata.write_text('[' * 2000 + ']' * 2000)
+-    with sqlite3.connect(path) as conn:
++    with closing(kbc.connect(path)) as conn:
+         tick = Mock()
+         result = run_owned_tick(conn, tick, None, "default", False)
+         assert result.skipped_owned and result.ownership_error
+@@ -78,7 +79,7 @@ def test_deep_metadata_denies_without_traceback(home):
+ @pytest.mark.parametrize("owned", [True, False])
+ def test_lock_failure_is_closed_even_for_unowned_board(home, monkeypatch, owned):
+     path = home / "kanban.db"
+-    with sqlite3.connect(path) as conn:
++    with closing(kbc.connect(path)) as conn:
+         if owned:
+             set_dispatch_owner(path, "dedicated")
+         original = Path.open
+diff --git a/website/docs/developer-guide/kanban-dispatch-ownership.md b/website/docs/developer-guide/kanban-dispatch-ownership.md
+index 77943b5316..252f777b3e 100644
+--- a/website/docs/developer-guide/kanban-dispatch-ownership.md
++++ b/website/docs/developer-guide/kanban-dispatch-ownership.md
+@@ -38,10 +38,10 @@ repaired explicitly rather than silently replaced by display defaults.
+ Call the native boundary with a constant ID and your scoped spawn function:
+ 
+ ```python
+-from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect_closing
+ from hermes_cli.kanban_db_dispatch import dispatch_once
+ 
+-with kb.connect_closing(board="example") as conn:
++with connect_closing(board="example") as conn:
+     result = dispatch_once(conn, board="example", dispatcher_id="dedicated-worker",
+                            spawn_fn=scoped_spawn)
+ ```
+@@ -92,8 +92,20 @@ an identity implicitly.
+ * Gateway auto-decomposition also holds this lock through listing and decomposing
+   triage work. Owned/invalid boards neither spend auxiliary LLM calls nor count
+   toward the stock gateway's stuck-dispatch health check.
+-* In-memory/unidentifiable connections fail closed. Direct task APIs are not
+-  changed: this coordinates dispatchers, not arbitrary same-UID database writers.
++* Dispatch requires a native `kanban_db_connect.connect`/`connect_closing`
++  connection. Native open captures device/inode under the lifecycle lock, and
++  both tick and gateway pre-work revalidate it under that lock. Archive/delete
++  followed by recreating a slug cannot redirect an already-open handle to the
++  replacement's owner. Raw SQLite and in-memory handles fail closed. A native
++  connection opened while that lock is busy remains usable for ordinary task
++  APIs, but must be closed and reopened before dispatch (even after contention
++  clears). This intentional API tightening applies to unowned boards too.
++* Direct task APIs are not changed: this coordinates dispatchers, not arbitrary
++  same-UID database writers. Replacing a DB manually without removing its sidecar
++  retains ownership, including corruption recovery; clear ownership explicitly
++  if the replacement should become unowned.
++* Auto-decomposition holds the lock across auxiliary calls; operator edits may
++  report busy for their entire duration and must be retried.
+ 
+ ## Tests
+ 
+-- 
+2.55.0
+

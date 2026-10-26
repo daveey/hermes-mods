@@ -1,0 +1,126 @@
+From ee532bdf523ef2ed40ddc701185188aac535dbd0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:22:49 +0000
+Subject: [PATCH] fix(desktop): bound reconnect termination and dispatch fences
+ [daveey]
+
+---
+ apps/desktop/electron/main.ts                 | 16 ++++-------
+ .../registry-reconnect-service.test.ts        |  8 ++++--
+ .../electron/registry-reconnect-service.ts    | 27 ++++++++++---------
+ 3 files changed, 26 insertions(+), 25 deletions(-)
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 4bd2dd5f03..e112708b7e 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -11082,12 +11082,12 @@ async function ensureRegistryBackend(
+     throw new Error(`No connection with id "${id}".`)
+   }
+ 
++  const profileKey = String(profile ?? '').trim() || 'default'
++
+   if (source.kind === 'ssh') {
+-    managedConnectionUpdateGate.assertCanDial(id, managedUpdateCorrelation)
++    registryReconnectService.assertCanDispatch(id, profileKey, managedUpdateCorrelation)
+   }
+ 
+-  const profileKey = String(profile ?? '').trim() || 'default'
+-
+   // Never pool a backend under a name no profile can have. A gateway-qualified
+   // session ref (`default@mac-mini/<id>`) once leaked its `profile@gateway` head
+   // here as a profile: the phantom `conn:mac-mini::default@mac-mini` entry then
+@@ -16161,14 +16161,8 @@ const registryReconnectService = createRegistryReconnectService({
+   terminate: async state => {
+     const expected = { ...state, profile: state.remoteProfile || '' }
+ 
+-    if (state.remotePlatform === 'Windows') {
+-      await terminateOwnedWindowsDashboardForUpdate(state.ssh,
+-        { hermesPath: state.hermesPath, hermesHome: state.hermesHome, python: state.pythonPath }, expected)
+-    } else if (state.remotePlatform === 'Linux' || state.remotePlatform === 'Darwin') {
+-      await remoteLifecycle.terminateOwnedDashboardForUpdate(state.ssh, expected)
+-    } else {
+-      throw new Error('Unsupported registry SSH platform')
+-    }
++    if (state.remotePlatform !== 'Linux') { throw new Error('Unsupported registry SSH platform') }
++    await remoteLifecycle.terminateOwnedDashboardForUpdate(state.ssh, expected)
+   },
+   close: async (key, state) => {
+     sshIsolatedKeepalives.stop(key)
+diff --git a/apps/desktop/electron/registry-reconnect-service.test.ts b/apps/desktop/electron/registry-reconnect-service.test.ts
+index 1dcdfa61be..40aed6d9e4 100644
+--- a/apps/desktop/electron/registry-reconnect-service.test.ts
++++ b/apps/desktop/electron/registry-reconnect-service.test.ts
+@@ -61,6 +61,10 @@ test('a second profile cannot borrow a pending reconnect claim', async () => {
+   await vi.waitFor(() => expect(f.terminate).toHaveBeenCalledOnce())
+   expect(await f.service.run(second)).toEqual({ ok: false })
+   expect(() => f.gate.assertCanDial('hub')).toThrow()
++  expect(() => f.service.assertCanDispatch('hub', 'other')).not.toThrow()
++  expect(() => f.service.assertCanDispatch('hub', 'default')).toThrow()
++  expect(() => f.service.assertCanStop('conn:hub::other')).not.toThrow()
++  expect(() => f.service.assertCanStop('conn:hub::default')).toThrow()
+   finish()
+   await running
+ })
+@@ -85,10 +89,10 @@ test('busy backend releases the connection gate without tearing down its transpo
+   expect(f.gate.owner('hub')).toBeNull()
+ })
+ 
+-test('unsupported termination platform is refused before retirement', async () => {
++test.each(['Darwin', 'Windows'])('unsupported termination platform %s is refused before retirement', async platform => {
+   const f = fixture()
+   const target = f.service.target('hub', 'default')!
+-  f.state.remotePlatform = 'Darwin'
++  f.state.remotePlatform = platform
+   expect(await f.service.run(target)).toEqual({ ok: false })
+   expect(f.request).not.toHaveBeenCalled()
+   expect(f.terminate).not.toHaveBeenCalled()
+diff --git a/apps/desktop/electron/registry-reconnect-service.ts b/apps/desktop/electron/registry-reconnect-service.ts
+index fc1abfd8e5..6eaa7bcd5f 100644
+--- a/apps/desktop/electron/registry-reconnect-service.ts
++++ b/apps/desktop/electron/registry-reconnect-service.ts
+@@ -40,9 +40,10 @@ export function createRegistryReconnectService<D, E extends PoolEntry<D>, S exte
+     const entry = deps.pool.get(key)
+     const state = deps.states.get(key)
+ 
+-    // POSIX owned termination deliberately refuses Darwin (no pidfd).
+-    // Refuse here, before committing an irreversible backend admission fence.
+-    if (!state || !['Linux', 'Windows'].includes(state.remotePlatform)) { return undefined }
++    // Only Linux has runtime-independent, identity-bound termination today.
++    // Windows uses the possibly deleted managed Python; Darwin lacks pidfd.
++    // Refuse before committing an irreversible backend admission fence.
++    if (!state || state.remotePlatform !== 'Linux') { return undefined }
+ 
+     if (!deps.isSsh(connectionId) || !entry || !state || state.primaryRegistryScope ||
+         state.registryConnectionId !== connectionId || !state.spawnNonce || deps.inFlight(key)) {
+@@ -102,16 +103,18 @@ export function createRegistryReconnectService<D, E extends PoolEntry<D>, S exte
+ 
+       return resident ? { connectionId, profile, generation: resident.generation } : null
+     },
++    assertCanDispatch: (connectionId: string, profile: string, correlation = '') => {
++      // Our connection-wide claim protects configuration and new publication,
++      // not dispatch to already resident, unrelated profiles (including primary).
++      const held = correlations.get(connectionId)
++
++      if (held && deps.gate.owner(connectionId) === held && claimedProfiles.get(connectionId) !== profile) { return }
++      deps.gate.assertCanDial(connectionId, correlation)
++    },
+     assertCanStop: (key: string) => {
+-      const entry = deps.pool.get(key)
+-      const resident = entry && residents.get(entry)
+-
+-      if (resident) {
+-        // The key is opaque; retain the exact route instead of parsing ids.
+-        for (const [connectionId] of correlations) {
+-          if (resident.state.registryConnectionId === connectionId) {
+-            throw new Error('Registry backend reconnect in progress')
+-          }
++      for (const [connectionId, profile] of claimedProfiles) {
++        if (deps.key(connectionId, profile) === key) {
++          throw new Error('Registry backend reconnect in progress')
+         }
+       }
+     },
+-- 
+2.55.0
+

@@ -1,0 +1,1812 @@
+From 54d68ef05f8b20aa1fe8490126ae0a8b4f348160 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 08:13:32 +0000
+Subject: [PATCH] fix(kanban): validate assignments and route worker capability
+ gaps [daveey]
+
+
+Public-series adaptation: preserve merged preceding changes.
+
+---
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index bde1a770c2..247d4ec622 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -413,9 +413,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             "SELECT 1 FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1",
+             (idem_key,)).fetchone() is not None
+         from hermes_cli.kanban_db_workspace import WorktreeWorkspaceConfigError
++        from hermes_cli.kanban_capabilities import CapabilityMismatchError
+         try:
+             task_id = kb.create_task(
+-                conn, title=args.title, body=body, assignee=args.assignee, session_id=session_id,
++                conn, title=args.title, body=body,
++                assignee=args.assignee or (_profile_author() if in_worker or _agent_invoked() else None),
++                session_id=session_id, requires=getattr(args, "requires", None),
+                 created_by=args.created_by or _profile_author(),
+                 workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                 project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+@@ -434,6 +437,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             )
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
++        except CapabilityMismatchError as exc:
++            return _err(f"kanban: {exc.code}: {exc}", 2)
+         if session_key and not idem_hit:
+             # Same completion subscription the kanban_create tool adds, so the chat
+             # that shelled out hears when the card lands (and its row stays busy).
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+new file mode 100644
+index 0000000000..6d88f565b3
+--- /dev/null
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -0,0 +1,139 @@
++"""Bounded, durable supervisor handoff for worker-local assignment failures.
++
++Called inside block_task's transaction, after its run-ownership CAS. A supervisor
++is a normal ready card, never a human blocker or an unobservable notification.
++"""
++from __future__ import annotations
++
++import re
++from pathlib import Path
++
++from hermes_cli.kanban_capabilities import CapabilityMismatchError, validate_assignment
++
++_SUPERVISOR_PREFIX = 'assignment-repair:'
++_HUMAN_ACCESS = re.compile(
++    r'\b(credential\w*|password\w*|secret\w*|token\w*|oauth|login|log[ -]?in|'
++    r'sign[ -]?in|authenticat\w*|authoriz\w*|api[ _-]?key|2fa|mfa|approval|consent|'
++    r'payment|billing|policy[ -]+decision)\b', re.IGNORECASE,
++)
++
++
++# Full-match a deliberately small vocabulary: policy drift alone must never
++# absorb an unrelated human decision or a mixed tool-and-human request.
++_WORKER_MISMATCH = re.compile(
++    r'(?:(?:worker|profile|assignee) (?:lacks|is missing|has no) '
++    r'(?:terminal|file|git|repo|repository|host_repo)(?: tools?| access)?|'
++    r'(?:missing|no) (?:terminal|file|git|repo|repository)(?: tools?| access)?|'
++    r'(?:wrong|incompatible) (?:worker|profile|assignee)|'
++    r'(?:worker|profile|assignee) (?:capability )?mismatch)[.!]?', re.IGNORECASE,
++)
++
++
++class AssignmentRoutingError(ValueError):
++    """No valid repair can be scheduled; callers must surface this failure."""
++
++    code = 'no_capable_supervisor'
++
++
++def classify(task, kind, reason):
++    """Require both a narrow worker-local reason and independent policy evidence."""
++    if kind == 'assignment' and _HUMAN_ACCESS.search(reason or ''):
++        return 'capability', 'human_access_request'
++    if (kind != 'capability' or _HUMAN_ACCESS.search(reason or '')
++            or not _WORKER_MISMATCH.fullmatch((reason or '').strip())):
++        return kind, None
++    try:
++        validate_assignment(task.assignee, requires=task.requires,
++                            workspace_kind=task.workspace_kind,
++                            workspace_path=task.workspace_path)
++    except CapabilityMismatchError as exc:
++        # Unreadable policy is not evidence that the worker lacks tools.
++        if exc.__cause__ is None:
++            return 'assignment', 'profile_capability_mismatch'
++    return kind, None
++
++
++def _supervisor(task):
++    from hermes_cli.config import load_config_readonly
++    from hermes_cli.profiles import resolve_profile_env
++
++    cfg = load_config_readonly()
++    candidates = [cfg.get('kanban', {}).get('orchestrator_profile'), task.created_by]
++    for name in dict.fromkeys(candidates):
++        if not isinstance(name, str) or not name or name == task.assignee:
++            continue
++        try:
++            # Unconstrained scratch validation intentionally skips profile IO;
++            # routing still needs an existing configured profile, never a label.
++            if not (Path(resolve_profile_env(name)) / 'config.yaml').is_file():
++                continue
++            required = validate_assignment(name, requires=[*(task.requires or []), 'kanban'],
++                                           workspace_kind=task.workspace_kind,
++                                           workspace_path=task.workspace_path)
++        except (ValueError, OSError):
++            continue
++        return name, required
++    return None, []
++
++
++def validate_repair_completion(conn, task_id):
++    """A completed repair must not release an invalid assignment after policy drift."""
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute('SELECT idempotency_key FROM tasks WHERE id=?', (task_id,)).fetchone()
++    key = row[0] if row else None
++    if not key or not key.startswith(_SUPERVISOR_PREFIX):
++        return
++    original = kb.get_task(conn, key.removeprefix(_SUPERVISOR_PREFIX))
++    if original is None or original.assignee is None:
++        raise AssignmentRoutingError('Assignment repair has no assigned original task')
++    validate_assignment(original.assignee, requires=original.requires,
++                        workspace_kind=original.workspace_kind,
++                        workspace_path=original.workspace_path)
++
++
++def route(conn, task, payload):
++    """Create at most one repair card per original, atomically with its wait edge."""
++    from hermes_cli import kanban_db as kb
++
++    key = _SUPERVISOR_PREFIX + task.id
++    own_key = conn.execute('SELECT idempotency_key FROM tasks WHERE id=?', (task.id,)).fetchone()[0]
++    previous = conn.execute('SELECT id FROM tasks WHERE idempotency_key=?', (key,)).fetchone()
++    if (own_key or '').startswith(_SUPERVISOR_PREFIX) or previous:
++        raise AssignmentRoutingError(
++            'supervisor_route_exhausted: assignment repair already attempted; '
++            'the existing supervisor must resolve the assignment or report the '
++            'specific external blocker. No new block or repair was recorded.'
++        )
++    name, required = _supervisor(task)
++    if name is None:
++        raise AssignmentRoutingError(
++            f'no_capable_supervisor: task {task.id} requires a different profile '
++            'with its original capabilities and kanban tools; configure '
++            'kanban.orchestrator_profile or a capable creator profile.'
++        )
++    # The enclosing block transaction owns the run CAS and validated this profile.
++    # assign_task's post-commit observer cannot run inside this transaction.
++    conn.execute(
++        'UPDATE tasks SET assignee=?, consecutive_failures=0, last_failure_error=NULL WHERE id=?',
++        (name, task.id),
++    )
++    kb._append_event(conn, task.id, 'assigned', {'assignee': name, 'from': task.assignee})
++    supervisor_id = kb.create_task(
++        conn, title=f'Repair assignment: {task.title}',
++        body=(f'Task {task.id} cannot run under profile {task.assignee!r}. '
++              f'Block reason: {payload.get("reason") or "assignment mismatch"}\n'
++              f'The original has been reassigned to verified profile {name!r}. '
++              'Inspect the original task and verify its assignment and requirements '
++              'before completing this repair. Record the verification evidence. '
++              'Do not execute, unblock or recreate the original task here; it waits '
++              'on this repair dependency and runs separately after verification. '
++              'Do not request credentials on behalf of a worker or create another supervisor.'),
++        assignee=name, created_by=task.assignee, workspace_kind='scratch',
++        requires=required, idempotency_key=key, creator_task_id=task.id,
++        session_id=task.session_id, tenant=task.tenant, priority=task.priority,
++    )
++    kb._link(conn, supervisor_id, task.id)
++    conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (task.id,))
++    payload['supervisor_task_id'] = supervisor_id
++    payload['supervisor_profile'] = name
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+index a5e8910417..a71f749831 100644
+--- a/hermes_cli/kanban_block_routing.py
++++ b/hermes_cli/kanban_block_routing.py
+@@ -1,23 +1,55 @@
+-"""Block transition policy, separate from the database facade."""
++"""Typed block routing and recurrence accounting for the Kanban domain."""
+ from __future__ import annotations
+ 
++import sqlite3
++from typing import Optional
+ 
+-def _normalized_reason(reason: str | None) -> str:
++
++def latest_run_blocker(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """Shared blocker of the latest non-neutral closed run."""
++    from hermes_cli.kanban_db import _json_dict
++    from hermes_cli.kanban_shared_blockers import NEUTRAL_OUTCOMES, normalize_blocker_id
++    for row in conn.execute(
++        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
++        "ORDER BY id DESC LIMIT 20", (task_id,),
++    ):
++        bid = normalize_blocker_id(_json_dict(row["metadata"]).get("blocker_id"))
++        if bid is not None:
++            return bid
++        if (row["outcome"] or "") not in NEUTRAL_OUTCOMES:
++            return None
++    return None
++
++
++def latest_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """Reason of the newest blocked or block-loop event."""
++    from hermes_cli.kanban_db import _json_dict
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? "
++        "AND kind IN ('blocked', 'block_loop_detected') ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if row is None:
++        return None
++    value = _json_dict(row["payload"]).get("reason")
++    return value if isinstance(value, str) else None
++
++
++def _normalized_reason(reason: Optional[str]) -> str:
+     return " ".join((reason or "").split()).casefold()
+ 
+ 
+ def route_block(
+-    kind: str | None, reason: str | None, source_status: str, *,
+-    prev_kind: str | None, prev_recurrences: int, prev_reason: str | None = None,
++    kind: Optional[str], reason: Optional[str], source_status: str, *,
++    prev_kind: Optional[str], prev_recurrences: int, prev_reason: Optional[str] = None,
+     compare_reason: bool = False,
+ ) -> tuple[str, str, str, tuple, dict]:
+-    """Return status, event, SQL fields/params and payload for a block.
++    """Return status, event, SQL fields/params and audit payload for block_task.
+ 
+-    Dependency waits never enter the human bucket. Repeated blocks retain the
+-    loop breaker; a changed human question resets it because an answer is progress.
++    Dependency waits stay in todo. Other kinds count repeated blocks; changed
++    human questions reset recurrence, but reworded impossible dependencies don't.
+     """
+-    from hermes_cli import kanban_db as kb
+-
++    from hermes_cli.kanban_db import BLOCK_RECURRENCE_LIMIT
+     payload = {"reason": reason, "kind": kind, "source_status": source_status}
+     if kind == "dependency":
+         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+@@ -28,7 +60,7 @@ def route_block(
+     recurrences = prev_recurrences + 1 if same_cause else 1
+     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+-    if recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
+-        payload["limit"] = kb.BLOCK_RECURRENCE_LIMIT
++    if recurrences >= BLOCK_RECURRENCE_LIMIT:
++        payload["limit"] = BLOCK_RECURRENCE_LIMIT
+         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+     return "blocked", "blocked", set_sql, (kind, recurrences), payload
+diff --git a/hermes_cli/kanban_capabilities.py b/hermes_cli/kanban_capabilities.py
+new file mode 100644
+index 0000000000..480764090c
+--- /dev/null
++++ b/hermes_cli/kanban_capabilities.py
+@@ -0,0 +1,126 @@
++"""Standalone, conservative assignment preflight against a profile's CLI policy.
++
++This checks configured capabilities, not executable installation or repository existence.
++In particular ``git`` means terminal access, not that a git binary was probed. Remote
++backends never prove access to a host repository, even when mounts might make it possible.
++"""
++from __future__ import annotations
++
++from contextlib import ExitStack
++from pathlib import Path
++from collections.abc import Iterable
++
++_CAPABILITIES = ("terminal", "file", "git", "host_repo", "kanban")
++_WORKSPACE_REQUIRES = {
++    "scratch": (),
++    "dir": ("terminal", "file", "host_repo"),
++    "worktree": ("terminal", "file", "git", "host_repo"),
++}
++
++
++class CapabilityMismatchError(ValueError):
++    """An assignee cannot prove the requested configured capabilities."""
++
++    code = "assignee_capability_mismatch"
++
++    def __init__(self, assignee: str, missing: Iterable[str], *, reason: str = ""):
++        self.assignee = assignee
++        self.missing = list(missing)
++        message = f"Assignee {assignee!r} lacks required capabilities: {', '.join(self.missing)}"
++        if reason:
++            message += f" ({reason})"
++        super().__init__(message)
++
++
++def _required_capabilities(requires, workspace_kind: str) -> list[str]:
++    if workspace_kind not in _WORKSPACE_REQUIRES:
++        raise ValueError(f"Unknown workspace kind: {workspace_kind!r}")
++    if requires is None:
++        requires = []
++    if not isinstance(requires, (list, tuple, set, frozenset)):
++        raise ValueError("requires must be a collection of capability names")
++    for name in requires:
++        if not isinstance(name, str) or name not in _CAPABILITIES:
++            raise ValueError(f"Unknown required capability: {name!r}")
++    required = set(requires) | set(_WORKSPACE_REQUIRES[workspace_kind])
++    return [name for name in _CAPABILITIES if name in required]
++
++
++def _check_policy_shape(config) -> None:
++    """Reject malformed policy rather than the interactive loader's permissive fallback."""
++    from hermes_cli.toolset_validation import parse_platform_toolsets_value
++
++    if not isinstance(config, dict):
++        raise ValueError("profile config must be a mapping")
++    for section in ("platform_toolsets", "terminal", "agent"):
++        if section in config and not isinstance(config[section], dict):
++            raise ValueError(f"{section} must be a mapping")
++    platform = config.get("platform_toolsets", {})
++    if "cli" in platform and parse_platform_toolsets_value(platform["cli"]) is None:
++        raise ValueError("platform_toolsets.cli must be a list")
++    terminal = config.get("terminal", {})
++    if "backend" in terminal and (not isinstance(terminal["backend"], str) or not terminal["backend"].strip()):
++        raise ValueError("terminal.backend must be a nonempty string")
++
++
++def _profile_capabilities(assignee: str) -> set[str]:
++    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
++    from hermes_cli.config_effective import load_user_config_effective
++    from hermes_cli.profiles import resolve_profile_env
++    from hermes_cli.tools_config import _get_platform_tools
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    from tools.terminal_scope import build_profile_terminal_scope, reset_terminal_scope, set_terminal_scope
++    from utils import load_yaml_file_readonly
++
++    home = Path(resolve_profile_env(assignee))
++    config_path = home / "config.yaml"
++    # Missing files and malformed roots are otherwise treated as default policy by the
++    # shared loader. That is fine for startup, but cannot establish assignment authority.
++    _check_policy_shape(load_yaml_file_readonly(config_path))
++    with ExitStack() as stack:
++        stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
++        stack.callback(reset_secret_scope, set_secret_scope(build_profile_secret_scope(home)))
++        config = load_user_config_effective(config_path, fail_closed=True)
++        _check_policy_shape(config)
++        terminal = build_profile_terminal_scope(home)
++        # Effective config includes managed overlays and expanded values; the terminal
++        # scope helper also preserves a legacy profile-local .env backend when YAML omits it.
++        if "backend" in config.get("terminal", {}):
++            terminal["TERMINAL_ENV"] = config["terminal"]["backend"]
++        stack.callback(reset_terminal_scope, set_terminal_scope(terminal))
++        toolsets = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
++        available = set(toolsets) & {"terminal", "file", "kanban"}
++        if "terminal" in available:
++            available.add("git")
++        if terminal.get("TERMINAL_ENV", "").strip().lower() == "local":
++            available.add("host_repo")
++        return available
++
++
++def validate_assignment(
++    assignee: str | None, *, requires=None, workspace_kind: str = "scratch",
++    workspace_path=None, skills=None,
++) -> list[str]:
++    """Return canonical, deduplicated requirements or raise CapabilityMismatchError.
++
++    Explicit requirements augment workspace inference; even ``requires=[]`` cannot
++    disable worktree/dir checks. Unconstrained scratch tasks retain legacy behavior
++    without reading a profile config. ``workspace_path`` is not probed: locality is
++    established solely by backend policy, not a path existing on the dispatch host.
++
++    Skill-derived requirements are not implemented: there is no established skill
++    capability metadata contract. ``skills`` is reserved, and names/prose are never
++    guessed into requirements. Callers must supply explicit ``requires`` instead.
++    """
++    required = _required_capabilities(requires, workspace_kind)
++    if not required or assignee is None:
++        # Unassigned drafts cannot dispatch; assign_task validates before binding.
++        return required
++    try:
++        available = _profile_capabilities(assignee)
++    except Exception as exc:
++        raise CapabilityMismatchError(assignee, required, reason=f"profile policy unavailable: {exc}") from exc
++    missing = [name for name in required if name not in available]
++    if missing:
++        raise CapabilityMismatchError(assignee, missing)
++    return required
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index ba5addded0..cf6611da80 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -107,8 +107,8 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
+ 
+ VALID_INITIAL_STATUSES = {"running", "blocked"}
+ 
+-# Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
+-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "time"}
++# Typed block reasons (routing in kanban_block_routing); None = legacy untyped.
++VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "assignment", "transient", "time"}
+ 
+ # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+ # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
+@@ -657,6 +657,7 @@ class Task:
+     workflow_template_id: Optional[str] = None
+     current_step_key: Optional[str] = None
+     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
++    requires: Optional[list] = None          # Configured assignment capabilities
+     model_override: Optional[str] = None
+     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
+     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
+@@ -687,6 +688,7 @@ class Task:
+             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
+             last_failure_error=g("last_failure_error", g("last_spawn_error")),
+             skills=skills_value,
++            requires=_json_or(g("requires")) or [],
+             goal_mode=bool(g("goal_mode")),
+             block_recurrences=int(g("block_recurrences") or 0),
+         )
+@@ -858,6 +860,7 @@ CREATE TABLE IF NOT EXISTS tasks (
+     -- Force-loaded skills for the worker on this task, stored as JSON.
+     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
+     skills               TEXT,
++    requires             TEXT,
+     -- Per-task model override. When set, the dispatcher passes -m <model>
+     -- to the worker, overriding the profile's default model. NULL = use
+     -- the profile default.
+@@ -1213,6 +1216,7 @@ def create_task(
+     completion_contract: Optional[str] = None,
+     validate_workspace: bool = False,
+     origin_intent: Optional[dict] = None,
++    requires: Optional[list[str]] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1313,6 +1317,10 @@ def create_task(
+         if board_default:
+             workspace_path = str(board_default)
+ 
++    from hermes_cli.kanban_capabilities import validate_assignment
++    required = validate_assignment(assignee, requires=requires, workspace_kind=workspace_kind,
++                                   workspace_path=workspace_path)
++
+     # Retry once on the extremely unlikely id collision.
+     for attempt in range(2):
+         task_id = _new_task_id()
+@@ -1338,8 +1346,8 @@ def create_task(
+                         max_runtime_seconds,
+                         skills, max_retries, model_override, provider_override,
+                         reasoning_effort,
+-                        goal_mode, goal_max_turns, session_id, completion_contract
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        goal_mode, goal_max_turns, session_id, completion_contract, requires
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         task_id, title.strip(), body, assignee, task_status, priority,
+@@ -1349,6 +1357,7 @@ def create_task(
+                         json.dumps(skills_list) if skills_list is not None else None,
+                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
++                        json.dumps(required),
+                     ),
+                 )
+                 for pid in parents:
+@@ -1368,6 +1377,7 @@ def create_task(
+                         "branch_name": branch_name,
+                         "project_id": project_id,
+                         "skills": list(skills_list) if skills_list else None,
++                        "requires": required,
+                         "goal_mode": bool(goal_mode) or None,
+                         "model_override": model_override,
+                         "provider_override": provider_override,
+@@ -1537,6 +1547,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str])
+                 f"cannot reassign {task_id}: currently running (claimed). "
+                 "Wait for completion or reclaim the stale lock first."
+             )
++        from hermes_cli.kanban_capabilities import validate_assignment
++        task = get_task(conn, task_id)
++        validate_assignment(profile, requires=task.requires, workspace_kind=task.workspace_kind,
++                            workspace_path=task.workspace_path)
+         if row["assignee"] != profile:
+             # The failure streak is per task/profile; a new profile starts fresh.
+             conn.execute(
+@@ -2746,6 +2760,8 @@ def complete_task(
+         # reopened while this task waited.
+         if not _parents_satisfied(conn, task_id):
+             return False
++        from hermes_cli.kanban_assignment_routing import validate_repair_completion
++        validate_repair_completion(conn, task_id)
+         from hermes_cli.kanban_goal_receipt import record as record_goal
+         goal_event_id = record_goal(conn, task_id, goal_verification, (summary or result or '').strip())
+         acceptance_event_id = record_acceptance(conn, task_id, acceptance) if acceptance is not None else None
+@@ -3207,7 +3223,7 @@ def block_task(
+     check_every: Optional[int] = None, clock_only: bool = False,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+-    :func:`_route_block`). A wait on time -- ``kind='time'``, a ``dependency``
++    :func:`kanban_block_routing.route_block`). A wait on time -- ``kind='time'``, a ``dependency``
+     with no open parent, or a ``SCHEDULED_UNTIL=`` reason -- parks ``scheduled``
+     with a wake time instead (``kanban_timed_park``). ``transient`` still counts
+     toward the loop breaker. True on any transition. ``blocker_id`` names a
+@@ -3220,6 +3236,9 @@ def block_task(
+     audit event is appended, while status, failure evidence and the terminal
+     runs stay exactly as the breaker left them. A typed block, a card with a
+     live run, or a kind-less call on a blocked card are still refused.
++    ``assignment`` is agent-owned: a capable configured supervisor receives a
++    durable repair card and the original waits in ``todo`` on that dependency
++    (including explicit classification of a breaker-parked card).
+     """
+     if kind is not None and kind not in VALID_BLOCK_KINDS:
+         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+@@ -3254,9 +3273,12 @@ def block_task(
+             ).rowcount
+             if classified != 1:
+                 return False
+-            _append_event(conn, task_id, "blocked", {
+-                "kind": kind, "reason": reason, "classified_in_place": True,
+-            })
++            payload = {"kind": kind, "reason": reason, "classified_in_place": True}
++            if kind == "assignment":
++                from hermes_cli import kanban_assignment_routing as assignment_routing
++                payload.update(requested_kind=kind, rekind_reason=None)
++                assignment_routing.route(conn, get_task(conn, task_id), payload)
++            _append_event(conn, task_id, "blocked", payload)
+             return True
+         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+         requested_kind, rekind_reason = kind, None
+@@ -3264,6 +3286,9 @@ def block_task(
+         exhausted_budget = is_exhausted_budget_block(conn, task_id, kind, reason)
+         if exhausted_budget:
+             kind, rekind_reason = "transient", "continuation_exhausted"
++        from hermes_cli import kanban_assignment_routing as assignment_routing
++        if kind in {"capability", "assignment"} and not blocker_id:
++            kind, rekind_reason = assignment_routing.classify(get_task(conn, task_id), kind, reason)
+         no_open_parent = _parents_satisfied(conn, task_id)
+         from hermes_cli import kanban_timed_park as ktp
+         if not blocker_id and ktp.is_timed_park(kind, reason, parents_satisfied=no_open_parent):
+@@ -3274,11 +3299,13 @@ def block_task(
+         if kind == "dependency" and no_open_parent:
+             kind = "needs_input"
+             rekind_reason = "no_open_parent"
+-        from hermes_cli.kanban_block_routing import route_block
++        from hermes_cli.kanban_block_routing import (
++            latest_block_reason, latest_run_blocker, route_block,
++        )
+         new_status, event_kind, set_sql, params, payload = route_block(
+             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+-            prev_reason=_latest_block_reason(conn, task_id),
++            prev_reason=latest_block_reason(conn, task_id),
+             # A dependency re-kinded to needs_input is an impossible wait, not a
+             # human question: its rewording is no progress.
+             compare_reason=requested_kind == "needs_input",
+@@ -3293,7 +3320,7 @@ def block_task(
+         if blocker_id:
+             payload["blocker_id"] = blocker_id
+             if (new_status == "triage" and _row_get(cur_row, "block_kind") == kind
+-                    and _latest_run_blocker(conn, task_id) == blocker_id):
++                    and latest_run_blocker(conn, task_id) == blocker_id):
+                 # A probe re-asserting the shared blocker it was parked behind is the
+                 # dispatcher's bounded probe cadence, not an unblock loop: keep the
+                 # recurrence count where it was and stay ``blocked``. [daveey]
+@@ -3324,6 +3351,10 @@ def block_task(
+             metadata={"blocker_id": blocker_id} if blocker_id else None,
+             synthesize=bool(reason or blocker_id),
+         )
++        if kind == "assignment":
++            payload["requested_kind"] = requested_kind
++            payload["rekind_reason"] = rekind_reason
++            assignment_routing.route(conn, get_task(conn, task_id), payload)
+         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+         blocked_task = get_task(conn, task_id)
+         if kind == "dependency":
+@@ -3334,34 +3365,6 @@ def block_task(
+     return True
+ 
+ 
+-def _latest_run_blocker(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+-    """``blocker_id`` of the task's latest non-neutral closed run, if any. [daveey]"""
+-    from hermes_cli.kanban_shared_blockers import NEUTRAL_OUTCOMES, normalize_blocker_id
+-    for row in conn.execute(
+-        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+-        "ORDER BY id DESC LIMIT 20", (task_id,),
+-    ):
+-        bid = normalize_blocker_id(_json_dict(row["metadata"]).get("blocker_id"))
+-        if bid is not None:
+-            return bid
+-        if (row["outcome"] or "") not in NEUTRAL_OUTCOMES:
+-            return None
+-    return None
+-
+-
+-def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+-    """``reason`` of the newest ``blocked``/``block_loop_detected`` event, if any. [daveey]"""
+-    row = conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id = ? "
+-        "AND kind IN ('blocked', 'block_loop_detected') ORDER BY id DESC LIMIT 1",
+-        (task_id,),
+-    ).fetchone()
+-    if row is None:
+-        return None
+-    value = _json_dict(_row_get(row, "payload")).get("reason")
+-    return value if isinstance(value, str) else None
+-
+-
+ def redact_review_value(value: Any) -> Any:
+     """Redact secrets at the domain boundary for durable review handoffs."""
+     if isinstance(value, str):
+@@ -3441,6 +3444,18 @@ def request_review(
+                         "malformed); pass reviewer= explicitly",
+                     )
+             reviewer = _canonical_assignee(reviewer)
++            if trow["status"] not in ("running", "ready") or (
++                expected_run_id is not None and trow["current_run_id"] != int(expected_run_id)
++            ):
++                return _ret(
++                    False, "task is not in running/ready (or expected_run_id did not match the current run)",
++                )
++            if reviewer is not None:
++                from hermes_cli.kanban_capabilities import validate_assignment
++
++                task = get_task(conn, task_id)
++                validate_assignment(reviewer, requires=task.requires,
++                                    workspace_kind=task.workspace_kind, workspace_path=task.workspace_path)
+             # The actor is the run that did the work. ``assignee`` is the actor
+             # only while a worker holds the card; on a never-claimed card it is
+             # whoever the operator assigned -- possibly the reviewer itself,
+@@ -3560,6 +3575,11 @@ def request_changes(
+         if implementer is None:
+             return False, "review handoff has no valid implementer provenance"
+         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
++        from hermes_cli.kanban_capabilities import validate_assignment
++
++        task = get_task(conn, task_id)
++        validate_assignment(implementer, requires=task.requires,
++                            workspace_kind=task.workspace_kind, workspace_path=task.workspace_path)
+ 
+         new_status = _landing_status_after_parents(conn, task_id)
+         # consecutive_failures deliberately PRESERVED: a review transition is
+@@ -3737,14 +3757,22 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+     not a block; only :func:`complete_task` clears them)."""
+     now = int(time.time())
+     with write_txn(conn):
++        task = get_task(conn, task_id)
++        if task is None or task.status != "review":
++            return False
++        review_event = _latest_event(conn, task_id, "review_requested")
++        handoff = _json_dict(_row_get(review_event, "payload"))
++        implementer = _nonblank_str(handoff.get("implementer"))
++        if implementer:
++            from hermes_cli.kanban_capabilities import validate_assignment
++
++            validate_assignment(implementer, requires=task.requires,
++                                workspace_kind=task.workspace_kind, workspace_path=task.workspace_path)
+         _reclaim_dangling_run(
+             conn, task_id, statuses=("review",), now=now,
+             note="invariant recovery on review reopen",
+         )
+         new_status = _landing_status_after_parents(conn, task_id)
+-        review_event = _latest_event(conn, task_id, "review_requested")
+-        handoff = _json_dict(_row_get(review_event, "payload"))
+-        implementer = _nonblank_str(handoff.get("implementer"))
+         params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
+         cur = conn.execute(
+             # consecutive_failures deliberately PRESERVED: review reopen is not
+@@ -3934,6 +3962,11 @@ def specify_triage_task(
+         ).fetchone()
+         if existing is None:
+             return False
++        from hermes_cli.kanban_capabilities import validate_assignment
++        task = get_task(conn, task_id)
++        validate_assignment(assignee or task.assignee, requires=task.requires,
++                            workspace_kind=task.workspace_kind,
++                            workspace_path=task.workspace_path)
+         sets: list[str] = ["status = 'todo'"]
+         params: list[Any] = []
+         changed_fields: list[str] = []
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 7d68b7da51..af2322cc58 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -871,6 +871,7 @@ _LATER_TASK_COLUMNS = (
+     ("current_step_key", "current_step_key TEXT"),
+     # JSON array of skill names the dispatcher force-loads via --skills.
+     ("skills", "skills TEXT"),
++    ("requires", "requires TEXT"),
+     # Per-task override for the consecutive-failure circuit breaker; NULL =
+     # ``kanban.failure_limit`` config, then ``DEFAULT_FAILURE_LIMIT``.
+     ("max_retries", "max_retries INTEGER"),
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index e3a1f306c4..aa3f5af236 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -115,7 +115,7 @@ def decompose_triage_task(
+     now = int(time.time())
+     with write_txn(conn):
+         root_row = conn.execute(
+-            "SELECT id, status, tenant, workspace_kind, workspace_path "
++            "SELECT id, status, tenant, workspace_kind, workspace_path, assignee, requires "
+             "FROM tasks WHERE id = ?", (task_id,),
+         ).fetchone()
+         if root_row is None or root_row["status"] != "triage":
+@@ -127,6 +127,13 @@ def decompose_triage_task(
+             (task_id,),
+         ).fetchone():
+             return None
++        import json
++        from hermes_cli.kanban_capabilities import validate_assignment
++        validate_assignment(
++            root_assignee if root_assignee is not None else root_row["assignee"],
++            requires=json.loads(root_row["requires"] or "[]"),
++            workspace_kind=root_row["workspace_kind"], workspace_path=root_row["workspace_path"],
++        )
+         child_ids = [
+             _insert_decomposed_child(conn, task_id, root_row, child, author, now)
+             for child in children
+@@ -195,20 +202,27 @@ def _insert_decomposed_child(
+     else:
+         child_ws_path = None
+     new_id = _new_task_id()
++    import json
++    from hermes_cli.kanban_capabilities import validate_assignment
++    assignee = _canonical_assignee(child.get("assignee"))
++    required = validate_assignment(assignee, requires=child.get("requires"),
++                                   workspace_kind=child_ws_kind, workspace_path=child_ws_path)
+     body = child.get("body")
+     conn.execute(
+         "INSERT INTO tasks "
+         "(id, title, body, assignee, status, workspace_kind, "
+-        " workspace_path, tenant, created_at, created_by) "
+-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
++        " workspace_path, tenant, created_at, created_by, requires) "
++        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
+         (
+             new_id, child["title"].strip(), body if isinstance(body, str) else None,
+-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
++            assignee, child_ws_kind, child_ws_path,
+             root_row["tenant"], now, (author or "decomposer"),
++            json.dumps(required),
+         ),
+     )
+     _append_event(
+-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
++        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id,
++                                  "requires": required},
+     )
+     inherit_creator_origin(conn, new_id, root_id, created_at=now)
+     return new_id
+diff --git a/hermes_cli/kanban_decompose.py b/hermes_cli/kanban_decompose.py
+index f4e74e9d52..e10652f988 100644
+--- a/hermes_cli/kanban_decompose.py
++++ b/hermes_cli/kanban_decompose.py
+@@ -55,6 +55,7 @@ Output a single JSON object with this exact shape:
+         "title": "<concrete task title, imperative voice, <= 80 chars>",
+         "body":  "<detailed spec for the worker on this child task>",
+         "assignee": "<profile name from the roster, or null for default>",
++        "requires": ["<terminal, file, git, or host_repo when needed>"],
+         "parents": [<int>, ...]
+       },
+       ...
+@@ -72,6 +73,10 @@ Rules:
+   - Pick assignees from the roster by matching the task to the profile's
+     DESCRIPTION (not just the name). When nothing matches well, use null
+     and the system will route to the default_assignee.
++  - Declare explicit "requires" for every child: terminal for shell work, file for
++    filesystem editing, git for git operations, host_repo for dispatcher-host repo
++    access. Use [] only when none apply. The system validates the profile's actual
++    configured tools/backend; descriptions do not prove capability.
+   - Each child task body is what a fresh worker will read with no other
+     context — be specific about goal, approach, and acceptance criteria.
+ 
+@@ -228,10 +233,13 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
+         )
+     if title_val is None and body_val is None:
+         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
+-    with kbc.connect_closing() as conn:
+-        ok = kb.specify_triage_task(
+-            conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
+-        )
++    try:
++        with kbc.connect_closing() as conn:
++            ok = kb.specify_triage_task(
++                conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
++            )
++    except ValueError as exc:
++        return DecomposeOutcome(task.id, False, f"DB rejected assignment: {exc}")
+     if not ok:
+         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
+     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
+@@ -265,6 +273,7 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
+             "title": title.strip()[:200],
+             "body": body.strip() if isinstance(body, str) else "",
+             "assignee": chosen,
++            "requires": entry.get("requires"),
+             # Drop non-int, out-of-range and self parent indices.
+             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
+         })
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 73c6e64ccd..27a834f9bf 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -186,6 +186,8 @@ _SPECS = [
+                   "newlines or flag-like lines survive shell quoting. "
+                   "Mutually exclusive with --body."),
+         _arg("--assignee", help="Profile name to assign"),
++        _arg("--requires", action="append", choices=["terminal", "file", "git", "host_repo"],
++             help="Required configured capability (repeatable); repo work also infers requirements"),
+         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
+         _arg("--workspace",
+              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
+@@ -343,7 +345,8 @@ _SPECS = [
+         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
+              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
+                   "parents finish, no human); 'needs_input'/'capability' go to "
+-                  "blocked for a human; 'transient' marks a maybe-flaky failure. "
++                  "blocked for a human; 'assignment' routes worker-local tool/backend "
++                  "mismatches to a capable supervisor; 'transient' marks a maybe-flaky failure. "
+                   "Repeated same-kind re-blocks after unblock route the task to "
+                   "triage to break unblock loops. Omit for a generic block."),
+         *_WAKE_CHECK_ARGS(),
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 6d4b11a7bd..ac64489c29 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -500,6 +500,7 @@ class CreateTaskBody(BaseModel):
+     idempotency_key: Optional[str] = None
+     max_runtime_seconds: Optional[int] = None
+     skills: Optional[list[str]] = None
++    requires: Optional[list[str]] = None
+     goal_mode: bool = False
+     goal_max_turns: Optional[int] = None
+     model_override: Optional[str] = None
+@@ -784,7 +785,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+         # current implementer before the task is routed to the reviewer.
+         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
+         if payload.assignee is not None and not review_assignee_deferred:
+-            with _map_errors(409, RuntimeError):
++            with _map_errors(409, RuntimeError), _value_error_400():
+                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
+         if payload.status is not None:
+             _patch_status(conn, task_id, payload, review_assignee_deferred)
+diff --git a/tests/hermes_cli/test_kanban_assignment_routing.py b/tests/hermes_cli/test_kanban_assignment_routing.py
+new file mode 100644
+index 0000000000..b8b905537d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_assignment_routing.py
+@@ -0,0 +1,266 @@
++"""Durable assignment repair stays agent-owned without swallowing human asks."""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_session_activity as activity
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / '.hermes'
++    home.mkdir()
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: supervisor\n')
++    for name in ('worker', 'supervisor', 'creator'):
++        profile = home / 'profiles' / name
++        profile.mkdir(parents=True)
++        (profile / 'config.yaml').write_text('platform_toolsets:\n  cli: [terminal, file, kanban]\nterminal:\n  backend: local\n')
++    kb.init_db()
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        yield conn, home
++
++
++def task_with_drift(board):
++    conn, home = board
++    tid = kb.create_task(conn, title='Fix repo', assignee='worker', created_by='creator',
++                         requires=['terminal'], session_id='chat')
++    (home / 'profiles/worker/config.yaml').write_text('platform_toolsets:\n  cli: [web]\n')
++    return tid
++
++
++def payload(conn, tid):
++    return json.loads(conn.execute('SELECT payload FROM task_events WHERE task_id=? AND kind IN ("blocked", "block_loop_detected") ORDER BY id DESC', (tid,)).fetchone()[0])
++
++
++@pytest.mark.parametrize('kind', ['assignment', 'capability'])
++def test_routes_real_mismatch_to_durable_supervisor(board, kind):
++    conn, _ = board
++    tid = task_with_drift(board)
++    assert kb.block_task(conn, tid, kind=kind, reason='Worker lacks terminal tools')
++    original = kb.get_task(conn, tid)
++    assert original.status == 'todo'
++    assert original.assignee == 'supervisor'
++    assert original.requires == ['terminal']
++    assert original.block_kind == 'assignment'
++    audit = payload(conn, tid)
++    assert audit['requested_kind'] == kind
++    assert audit['rekind_reason'] == ('profile_capability_mismatch' if kind == 'capability' else None)
++    supervisor = kb.get_task(conn, audit['supervisor_task_id'])
++    assert supervisor.assignee == 'supervisor'
++    assert supervisor.status == 'ready'
++    assert not kb._parents_satisfied(conn, tid)
++    assert kb._parents_satisfied(conn, supervisor.id)
++    path = Path(conn.execute('PRAGMA database_list').fetchone()[2])
++    assert activity._read_counts(path).get('chat') == 2
++    assert activity._read_counts(path, activity.BLOCKED_STATUSES).get('chat', 0) == 0
++    assert activity._replica_bucket({'status': 'blocked', 'block_kind': 'assignment'}) == 'active'
++    assert not kb.block_task(conn, tid, kind=kind, reason='retry')
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 2
++
++
++@pytest.mark.parametrize('kind', ['capability', 'assignment'])
++@pytest.mark.parametrize('reason', ['Need credentials', 'Please sign in to GitHub', 'Need API key',
++                                  'Need user approval', 'Payment method expired', 'Policy decision required'])
++def test_real_human_access_request_not_rekinded(board, reason, kind):
++    conn, _ = board
++    tid = task_with_drift(board)
++    assert kb.block_task(conn, tid, kind=kind, reason=reason)
++    assert kb.get_task(conn, tid).block_kind == 'capability'
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('reason', [
++    'Need David to choose a deployment region',
++    'Waiting for the owner to review the contract',
++    'Service unavailable',
++    'Worker lacks terminal tools; please choose the release scope',
++    '',
++])
++def test_unrelated_human_or_ambiguous_reason_not_rekinded(board, reason):
++    conn, _ = board
++    tid = task_with_drift(board)
++    assert kb.block_task(conn, tid, kind='capability', reason=reason)
++    assert kb.get_task(conn, tid).block_kind == 'capability'
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_supervisor_must_have_board_tools(board):
++    conn, home = board
++    tid = task_with_drift(board)
++    (home / 'profiles/supervisor/config.yaml').write_text(
++        'platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n')
++    assert kb.block_task(conn, tid, kind='assignment', reason='Wrong worker')
++    assert kb.get_task(conn, tid).assignee == 'creator'
++    repair = kb.get_task(conn, payload(conn, tid)['supervisor_task_id'])
++    assert repair.assignee == 'creator'
++    assert 'kanban' in repair.requires
++
++
++def test_no_requirements_means_no_proven_mismatch(board):
++    conn, _ = board
++    tid = kb.create_task(conn, title='Research', assignee='worker')
++    assert kb.block_task(conn, tid, kind='capability', reason='Cannot use terminal')
++    assert kb.get_task(conn, tid).block_kind == 'capability'
++
++
++def test_creator_fallback_and_no_self_supervision(board):
++    conn, home = board
++    tid = task_with_drift(board)
++    (home / 'profiles/supervisor/config.yaml').write_text('platform_toolsets:\n  cli: [web]\n')
++    assert kb.block_task(conn, tid, kind='assignment', reason='Wrong worker')
++    repair = kb.get_task(conn, payload(conn, tid)['supervisor_task_id'])
++    assert repair.assignee == 'creator'
++    with pytest.raises(ValueError, match='supervisor_route_exhausted'):
++        kb.block_task(conn, repair.id, kind='assignment', reason='Cannot repair')
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 2
++    assert kb.get_task(conn, repair.id).status == 'ready'
++
++
++def test_missing_or_self_targets_remain_visible_without_fake_routing(board):
++    conn, home = board
++    tid = task_with_drift(board)
++    (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: missing\n')
++    conn.execute('UPDATE tasks SET created_by="worker" WHERE id=?', (tid,))
++    conn.commit()
++    with pytest.raises(ValueError, match='no_capable_supervisor'):
++        kb.block_task(conn, tid, kind='assignment', reason='Wrong profile')
++    assert kb.get_task(conn, tid).status == 'ready'
++    assert kb.get_task(conn, tid).assignee == 'worker'
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_workspace_alone_proves_mismatch(board, tmp_path):
++    conn, home = board
++    tid = kb.create_task(conn, title='Repo', assignee='worker', workspace_kind='worktree',
++                         workspace_path=str(tmp_path))
++    (home / 'profiles/worker/config.yaml').write_text('platform_toolsets:\n  cli: [web]\n')
++    assert kb.block_task(conn, tid, kind='capability', reason='Missing repo tools')
++    assert kb.get_task(conn, tid).block_kind == 'assignment'
++
++
++def test_classify_breaker_parked_assignment_routes(board):
++    conn, _ = board
++    tid = task_with_drift(board)
++    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
++    conn.commit()
++    assert kb.block_task(conn, tid, kind='assignment', reason='Worker mismatch')
++    assert payload(conn, tid)['supervisor_task_id']
++    assert kb.get_task(conn, tid).status == 'todo'
++
++
++def test_supervisor_failure_rolls_back_original(board, monkeypatch):
++    conn, _ = board
++    tid = task_with_drift(board)
++    def fail(*args, **kwargs):
++        raise RuntimeError('write failed')
++    monkeypatch.setattr(kb, 'create_task', fail)
++    with pytest.raises(RuntimeError, match='write failed'):
++        kb.block_task(conn, tid, kind='assignment', reason='Worker mismatch')
++    assert kb.get_task(conn, tid).status == 'ready'
++    assert kb.get_task(conn, tid).assignee == 'worker'
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_running_original_handoff_waits_then_dispatches_new_profile(board):
++    conn, _ = board
++    tid = task_with_drift(board)
++    claimed = kb.claim_task(conn, tid, claimer='worker-run')
++    assert claimed is not None
++    assert kb.block_task(conn, tid, kind='assignment', reason='Wrong worker',
++                         expected_run_id=claimed.current_run_id)
++    original = kb.get_task(conn, tid)
++    assert original.assignee == 'supervisor'
++    assert original.claim_lock is None
++    assert kb.claim_task(conn, tid) is None
++    repair_id = payload(conn, tid)['supervisor_task_id']
++    assert kb.complete_task(conn, repair_id, result='Verified original assignment and requirements')
++    kb.recompute_ready(conn)
++    resumed = kb.claim_task(conn, tid, claimer='supervisor-run')
++    assert resumed is not None
++    assert resumed.assignee == 'supervisor'
++
++
++def test_repair_completion_rechecks_policy_drift(board):
++    from hermes_cli.kanban_capabilities import CapabilityMismatchError
++    conn, home = board
++    tid = task_with_drift(board)
++    assert kb.block_task(conn, tid, kind='assignment', reason='Wrong worker')
++    repair_id = payload(conn, tid)['supervisor_task_id']
++    (home / 'profiles/supervisor/config.yaml').write_text('platform_toolsets:\n  cli: [web]\n')
++    with pytest.raises(CapabilityMismatchError):
++        kb.complete_task(conn, repair_id, result='Verified')
++    assert kb.get_task(conn, tid).status == 'todo'
++    assert kb.get_task(conn, repair_id).status != 'done'
++
++
++def test_completed_repair_does_not_spawn_an_endless_supervisor_chain(board):
++    conn, _ = board
++    tid = task_with_drift(board)
++    assert kb.block_task(conn, tid, kind='assignment', reason='Wrong worker')
++    repair_id = payload(conn, tid)['supervisor_task_id']
++    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (repair_id,))
++    conn.commit()
++    kb.recompute_ready(conn)
++    assert kb.get_task(conn, tid).status == 'ready'
++    with pytest.raises(ValueError, match='supervisor_route_exhausted'):
++        kb.block_task(conn, tid, kind='assignment', reason='Still wrong worker')
++    assert kb.get_task(conn, tid).status == 'ready'
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 2
++
++
++@pytest.mark.parametrize('surface', ['tool', 'cli'])
++def test_assignment_block_entry_points_route(board, monkeypatch, surface):
++    import argparse
++    from hermes_cli import kanban as cli
++    from tools import kanban_tools as tools
++    from tools.registry import registry
++    conn, _ = board
++    tid = task_with_drift(board)
++    if surface == 'tool':
++        schema = registry.get_schema('kanban_block')
++        assert 'assignment' in schema['parameters']['properties']['kind']['enum']
++        monkeypatch.setattr(tools, '_worker_guard', lambda *args: tid)
++        monkeypatch.setattr(tools, '_worker_run_id', lambda *args: None)
++        conn.execute('UPDATE tasks SET goal_mode=1 WHERE id=?', (tid,))
++        conn.commit()
++        result = json.loads(registry.dispatch('kanban_block', {
++            'task_id': tid, 'kind': 'assignment', 'reason': 'Profile mismatch',
++        }))
++        assert result.get('ok'), result
++    else:
++        parser = argparse.ArgumentParser()
++        cli.build_parser(parser.add_subparsers())
++        args = parser.parse_args(['kanban', 'block', tid, 'Profile mismatch',
++                                 '--kind', 'assignment'])
++        assert cli._cmd_block(args) == 0
++    assert kb.get_task(conn, tid).status == 'todo'
++    assert payload(conn, tid)['supervisor_task_id']
++
++
++def test_repair_failure_has_typed_tool_error(board, monkeypatch):
++    from tools import kanban_tools as tools
++    from tools.registry import registry
++    conn, home = board
++    tid = task_with_drift(board)
++    (home / 'config.yaml').write_text('kanban:\n  orchestrator_profile: missing\n')
++    conn.execute('UPDATE tasks SET created_by="worker" WHERE id=?', (tid,))
++    conn.commit()
++    monkeypatch.setattr(tools, '_worker_guard', lambda *args: tid)
++    monkeypatch.setattr(tools, '_worker_run_id', lambda *args: None)
++    result = json.loads(registry.dispatch('kanban_block', {
++        'task_id': tid, 'kind': 'assignment', 'reason': 'Wrong profile',
++    }))
++    assert result['code'] == 'no_capable_supervisor'
++    assert kb.get_task(conn, tid).status == 'ready'
++
++
++def test_stale_run_does_not_create_supervisor(board):
++    conn, _ = board
++    tid = task_with_drift(board)
++    assert not kb.block_task(conn, tid, kind='capability', reason='No terminal', expected_run_id=9999)
++    assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_capabilities.py b/tests/hermes_cli/test_kanban_capabilities.py
+new file mode 100644
+index 0000000000..0dc1785ad0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capabilities.py
+@@ -0,0 +1,171 @@
++"""Assignment policy checks use real isolated profile configs, not a worker or database."""
++from pathlib import Path
++
++import pytest
++
++from hermes_cli.kanban_capabilities import CapabilityMismatchError, validate_assignment
++
++
++@pytest.fixture
++def profiles(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++
++    def create(name, text):
++        target = home if name == "default" else home / "profiles" / name
++        target.mkdir(parents=True, exist_ok=True)
++        (target / "config.yaml").write_text(text)
++        return target
++
++    return create
++
++
++LOCAL = "platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n"
++
++
++def test_capable_local_worktree_and_dir(profiles):
++    profiles("coder", LOCAL)
++    assert validate_assignment("coder", workspace_kind="worktree", workspace_path="/host/repo") == [
++        "terminal", "file", "git", "host_repo"
++    ]
++    assert validate_assignment("coder", workspace_kind="dir") == ["terminal", "file", "host_repo"]
++
++
++def test_mac_ops_without_terminal_is_rejected(profiles):
++    profiles("mac-ops", "platform_toolsets:\n  cli: [file, browser]\n")
++    with pytest.raises(CapabilityMismatchError) as caught:
++        validate_assignment("mac-ops", workspace_kind="worktree")
++    error = caught.value
++    assert isinstance(error, ValueError)
++    assert error.code == "assignee_capability_mismatch"
++    assert error.assignee == "mac-ops"
++    assert error.missing == ["terminal", "git"]
++    assert "mac-ops" in str(error) and "terminal" in str(error)
++
++
++@pytest.mark.parametrize("backend", ["docker", "ssh", "modal", "unknown"])
++def test_remote_backends_cannot_claim_host_repo(profiles, backend):
++    profiles("alpha", LOCAL.replace("local", backend))
++    with pytest.raises(CapabilityMismatchError) as caught:
++        validate_assignment("alpha", workspace_kind="worktree", workspace_path="/host/repo")
++    assert caught.value.missing == ["host_repo"]
++    assert validate_assignment("alpha", requires=["terminal", "git"]) == ["terminal", "git"]
++
++
++def test_explicit_empty_cli_is_not_defaulted(profiles):
++    profiles("empty", "platform_toolsets:\n  cli: []\n")
++    with pytest.raises(CapabilityMismatchError) as caught:
++        validate_assignment("empty", requires=["file", "terminal"])
++    assert caught.value.missing == ["terminal", "file"]
++
++
++def test_explicit_requirements_are_deduplicated_and_added_to_inference(profiles):
++    profiles("coder", LOCAL)
++    assert validate_assignment("coder", requires=["git", "file", "git"]) == ["file", "git"]
++    assert validate_assignment("coder", requires=["git"], workspace_kind="dir") == [
++        "terminal", "file", "git", "host_repo"
++    ]
++
++
++def test_empty_requirements_keep_legacy_profiles_without_config(profiles):
++    assert validate_assignment("legacy", requires=[]) == []
++    assert validate_assignment("legacy") == []
++
++
++@pytest.mark.parametrize("text", [None, "terminal: [", "[]", "platform_toolsets: {cli: nonsense}", "terminal: []"])
++def test_missing_or_invalid_policy_fails_closed(profiles, text):
++    if text is not None:
++        profiles("broken", text)
++    with pytest.raises(CapabilityMismatchError) as caught:
++        validate_assignment("broken", requires=["terminal"])
++    assert caught.value.missing == ["terminal"]
++
++
++def test_existing_identity_without_config_fails_closed(profiles):
++    target = profiles("legacy", LOCAL)
++    (target / "config.yaml").unlink()
++    (target / "SOUL.md").write_text("Legacy profile")
++    with pytest.raises(CapabilityMismatchError):
++        validate_assignment("legacy", requires=["terminal"])
++
++
++def test_unreadable_policy_fails_closed(profiles, monkeypatch):
++    from hermes_cli import config_effective
++
++    profiles("coder", LOCAL)
++    def denied(*args, **kwargs):
++        raise PermissionError("denied")
++    monkeypatch.setattr(config_effective, "load_user_config_effective", denied)
++    with pytest.raises(CapabilityMismatchError):
++        validate_assignment("coder", requires=["terminal"])
++
++
++def test_disabled_toolsets_and_composites_use_effective_cli_policy(profiles):
++    profiles("coder", "platform_toolsets:\n  cli: [hermes-cli]\nagent:\n  disabled_toolsets: [terminal]\n")
++    with pytest.raises(CapabilityMismatchError) as caught:
++        validate_assignment("coder", requires=["git"])
++    assert caught.value.missing == ["git"]
++
++
++def test_target_backend_ignores_ambient_profile(profiles, monkeypatch):
++    profiles("coder", LOCAL)
++    monkeypatch.setenv("TERMINAL_ENV", "docker")
++    assert validate_assignment("coder", requires=["host_repo"]) == ["host_repo"]
++    target = profiles("sandbox", "platform_toolsets:\n  cli: [terminal, file]\n")
++    (target / ".env").write_text("TERMINAL_ENV=ssh\n")
++    with pytest.raises(CapabilityMismatchError):
++        validate_assignment("sandbox", requires=["host_repo"])
++
++
++def test_default_profile_and_implicit_cli_defaults(profiles):
++    profiles("default", "terminal: {backend: local}\n")
++    assert validate_assignment("default", workspace_kind="worktree") == [
++        "terminal", "file", "git", "host_repo"
++    ]
++
++
++@pytest.mark.parametrize("requires", [["telepathy"], "terminal", [42]])
++def test_invalid_explicit_requirements_are_not_silently_dropped(profiles, requires):
++    with pytest.raises(ValueError):
++        validate_assignment("legacy", requires=requires)
++
++
++def test_unknown_workspace_kind_is_not_silently_unconstrained(profiles):
++    with pytest.raises(ValueError):
++        validate_assignment("legacy", workspace_kind="worktre")
++
++
++def test_empty_requirements_cannot_disable_workspace_inference(profiles):
++    profiles("empty", "platform_toolsets: {cli: []}\n")
++    with pytest.raises(CapabilityMismatchError) as caught:
++        validate_assignment("empty", requires=[], workspace_kind="dir")
++    assert caught.value.missing == ["terminal", "file"]
++
++
++def test_missing_file_capability_is_independent_of_terminal(profiles):
++    profiles("shell", "platform_toolsets: {cli: [terminal]}\n")
++    with pytest.raises(CapabilityMismatchError) as caught:
++        validate_assignment("shell", workspace_kind="worktree")
++    assert caught.value.missing == ["file"]
++
++
++def test_profile_scopes_are_restored_on_success_and_failure(profiles):
++    from hermes_constants import get_hermes_home
++    from tools.terminal_scope import get_terminal_scope
++
++    profiles("coder", LOCAL)
++    profiles("broken", "terminal: [")
++    original_home = get_hermes_home()
++    original_terminal = get_terminal_scope()
++    validate_assignment("coder", requires=["terminal"])
++    with pytest.raises(CapabilityMismatchError):
++        validate_assignment("broken", requires=["terminal"])
++    assert get_hermes_home() == original_home
++    assert get_terminal_scope() is original_terminal
++
++
++def test_skill_names_are_not_guessed_as_capabilities(profiles):
++    # Skill capability metadata has no established convention; do not infer from names/prose.
++    assert validate_assignment("legacy", skills=["git", "terminal"]) == []
+diff --git a/tests/hermes_cli/test_kanban_capability_create.py b/tests/hermes_cli/test_kanban_capability_create.py
+new file mode 100644
+index 0000000000..d62005694f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capability_create.py
+@@ -0,0 +1,97 @@
++"""Assignment preflight belongs at the shared mutation boundary."""
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_capabilities import CapabilityMismatchError
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / '.hermes'
++    home.mkdir()
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    profile = home / 'profiles' / 'restricted'
++    profile.mkdir(parents=True)
++    (profile / 'config.yaml').write_text('platform_toolsets:\n  cli: [web]\nterminal:\n  backend: local\n')
++    kb.init_db()
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        yield conn
++
++
++def test_shared_create_rejects_incompatible_worktree(board, tmp_path):
++    with pytest.raises(CapabilityMismatchError) as err:
++        kb.create_task(board, title='Repo work', assignee='restricted',
++                       workspace_kind='worktree', workspace_path=str(tmp_path))
++    assert err.value.code == 'assignee_capability_mismatch'
++    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
++
++
++def test_explicit_requirements_are_validated_and_persisted(board):
++    with pytest.raises(CapabilityMismatchError):
++        kb.create_task(board, title='Shell', assignee='restricted', requires=['terminal'])
++    tid = kb.create_task(board, title='Unconstrained', assignee='restricted', requires=[])
++    assert kb.get_task(board, tid).requires == []
++
++
++def test_decomposition_cannot_bypass_assignment_preflight(board):
++    from hermes_cli.kanban_db_graph import decompose_triage_task
++    root = kb.create_task(board, title='Parent', assignee='restricted', triage=True)
++    with pytest.raises(CapabilityMismatchError):
++        decompose_triage_task(board, root, root_assignee='restricted', children=[
++            {'title': 'Safe', 'assignee': 'restricted'},
++            {'title': 'Shell', 'assignee': 'restricted', 'requires': ['terminal']},
++        ])
++    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_unassigned_draft_can_be_created_but_assignment_must_validate(board, tmp_path):
++    tid = kb.create_task(board, title='Draft repo work', workspace_kind='dir',
++                         workspace_path=str(tmp_path))
++    assert kb.get_task(board, tid).requires == ['terminal', 'file', 'host_repo']
++    with pytest.raises(CapabilityMismatchError):
++        kb.assign_task(board, tid, 'restricted')
++    assert kb.get_task(board, tid).assignee is None
++
++
++def test_decomposer_keeps_requirements_for_shared_validation(board):
++    from hermes_cli.kanban_decompose import _Routing, _clean_children
++    from hermes_cli.kanban_db_graph import decompose_triage_task
++    routing = _Routing('restricted', 'restricted', True, [], {'restricted'})
++    children, error = _clean_children('root', [
++        {'title': 'Shell', 'assignee': 'restricted', 'requires': ['terminal']},
++    ], routing)
++    assert not error
++    root = kb.create_task(board, title='Parent', assignee='restricted', triage=True)
++    with pytest.raises(CapabilityMismatchError):
++        decompose_triage_task(board, root, root_assignee='restricted', children=children)
++    assert board.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('surface', ['tool', 'cli'])
++def test_agent_create_defaults_to_creator_and_checks_requires(board, monkeypatch, surface):
++    import argparse
++    import json
++    from hermes_cli import kanban as cli
++    from tools import kanban_tools as tools
++    monkeypatch.setattr(tools, '_persisted_identity', lambda: 'restricted')
++    monkeypatch.setattr(cli, '_profile_author', lambda: 'restricted')
++    monkeypatch.setattr(cli, '_agent_invoked', lambda: True)
++    monkeypatch.setattr(cli, '_check_dispatcher_presence', lambda: (True, ''))
++    if surface == 'tool':
++        out = json.loads(tools._handle_create({'title': 'Defaulted'}))
++        assert out.get('task_id'), out
++        tid = out['task_id']
++        error = json.loads(tools._handle_create({'title': 'Needs shell', 'requires': ['terminal']}))
++        assert error['code'] == 'assignee_capability_mismatch'
++    else:
++        parser = argparse.ArgumentParser()
++        cli.build_parser(parser.add_subparsers())
++        assert cli._cmd_create(parser.parse_args(['kanban', 'create', 'Defaulted'])) == 0
++        tid = board.execute("SELECT id FROM tasks WHERE title='Defaulted'").fetchone()[0]
++        assert cli._cmd_create(parser.parse_args(['kanban', 'create', 'Needs shell',
++                                                  '--requires', 'terminal'])) == 2
++    assert kb.get_task(board, tid).assignee == 'restricted'
+diff --git a/tests/hermes_cli/test_kanban_create_entry_parity.py b/tests/hermes_cli/test_kanban_create_entry_parity.py
+index 22bae969a4..539b69ed28 100644
+--- a/tests/hermes_cli/test_kanban_create_entry_parity.py
++++ b/tests/hermes_cli/test_kanban_create_entry_parity.py
+@@ -158,3 +158,92 @@ def test_suggested_notify_subscribe_links_the_orphan(chat, monkeypatch, capsys):
+     assert kc._cmd_notify_subscribe(args) == 0
+     ksa._reset_cache_for_tests()
+     assert task_id in {t["id"] for t in ksa.session_tasks([SID])}
++
++
++@pytest.fixture
++def restricted_creator(chat, monkeypatch):
++    profile = chat / "profiles" / "restricted"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("platform_toolsets:\n  cli: [web]\nterminal:\n  backend: local\n")
++    from tools import kanban_tools
++    monkeypatch.setattr(kanban_tools, "_persisted_identity", lambda: "restricted")
++    monkeypatch.setattr(kc, "_profile_author", lambda: "restricted")
++    monkeypatch.setattr(kc, "_agent_invoked", lambda: True)
++    monkeypatch.setattr(kc, "_check_dispatcher_presence", lambda **kw: (True, ""))
++
++
++@pytest.mark.parametrize("surface", ["registry", "cli"])
++def test_create_requires_and_default_creator_parity(restricted_creator, surface):
++    if surface == "registry":
++        from tools.registry import registry
++        schema = registry.get_schema("kanban_create")
++        assert "kanban" in schema["parameters"]["properties"]["requires"]["items"]["enum"]
++        good = json.loads(registry.dispatch("kanban_create", {"title": "Allowed", "requires": []}))
++        assert good.get("task_id"), good
++        bad = json.loads(registry.dispatch("kanban_create", {"title": "Denied", "requires": ["terminal"]}))
++        assert bad["code"] == "assignee_capability_mismatch", bad
++    else:
++        root = argparse.ArgumentParser()
++        kc.build_parser(root.add_subparsers())
++        assert kc._cmd_create(root.parse_args(["kanban", "create", "Allowed"])) == 0
++        assert kc._cmd_create(root.parse_args(["kanban", "create", "Denied", "--requires", "terminal"])) == 2
++    with kbc.connect_closing() as conn:
++        tasks = kb.list_tasks(conn)
++        assert len(tasks) == 1
++        assert tasks[0].assignee == "restricted"
++        assert tasks[0].requires == []
++
++
++def test_rest_create_preserves_and_enforces_requires(restricted_creator):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from plugins.kanban.dashboard.plugin_api import router
++    app = FastAPI()
++    app.include_router(router)
++    with TestClient(app) as client:
++        denied = client.post("/tasks", json={"title": "Denied", "assignee": "restricted", "requires": ["terminal"]})
++        assert denied.status_code == 400, denied.text
++        allowed = client.post("/tasks", json={"title": "Draft", "requires": ["terminal"]})
++        assert allowed.status_code == 200, allowed.text
++        assert allowed.json()["task"]["requires"] == ["terminal"]
++        tid = allowed.json()["task"]["id"]
++        rejected = client.patch(f"/tasks/{tid}", json={"assignee": "restricted"})
++        assert rejected.status_code == 400, rejected.text
++        with kbc.connect_closing() as conn:
++            assert kb.get_task(conn, tid).assignee is None
++
++
++def test_decomposition_root_assignment_is_validated_atomically(restricted_creator):
++    from hermes_cli.kanban_capabilities import CapabilityMismatchError
++    from hermes_cli.kanban_db_graph import decompose_triage_task
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Draft", triage=True, requires=["terminal"])
++        with pytest.raises(CapabilityMismatchError):
++            decompose_triage_task(conn, tid, root_assignee="restricted", children=[{"title": "Safe", "assignee": "restricted"}])
++        assert len(kb.list_tasks(conn)) == 1
++        assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_single_task_promotion_checks_assignment(restricted_creator):
++    from hermes_cli.kanban_capabilities import CapabilityMismatchError
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Draft", triage=True, requires=["terminal"])
++        with pytest.raises(CapabilityMismatchError):
++            kb.specify_triage_task(conn, tid, title="Specified", assignee="restricted")
++        task = kb.get_task(conn, tid)
++        assert (task.title, task.status, task.assignee) == ("Draft", "triage", None)
++
++
++def test_single_decomposer_returns_rejected_outcome(restricted_creator, monkeypatch):
++    from hermes_cli import kanban_decompose as decompose
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Draft", triage=True, requires=["terminal"])
++    routing = decompose._Routing("restricted", "restricted", True, [], {"restricted"})
++    monkeypatch.setattr(decompose, "_load_routing", lambda **kw: routing)
++    monkeypatch.setattr(decompose, "_call_aux", lambda *a, **kw: (
++        json.dumps({"fanout": False, "title": "Specified", "assignee": "restricted"}), ""))
++    outcome = decompose.decompose_task(tid)
++    assert not outcome.ok
++    assert "lacks required capabilities" in outcome.reason
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "triage"
+diff --git a/tests/hermes_cli/test_kanban_review_capabilities.py b/tests/hermes_cli/test_kanban_review_capabilities.py
+new file mode 100644
+index 0000000000..4866345b57
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_capabilities.py
+@@ -0,0 +1,95 @@
++"""Review handoffs enforce real profile policy before mutating task/run history."""
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_capabilities import CapabilityMismatchError
++
++
++LOCAL = "platform_toolsets: {cli: [terminal, file]}\nterminal: {backend: local}\n"
++
++
++@pytest.fixture
++def profiles(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++
++    def configure(name, policy=LOCAL):
++        target = home / "profiles" / name
++        target.mkdir(parents=True, exist_ok=True)
++        (target / "config.yaml").write_text(policy)
++
++    configure("implementer")
++    configure("reviewer")
++    kb.init_db()
++    return configure
++
++
++def _prepare(conn, operation, workspace_kind):
++    tid = kb.create_task(
++        conn, title="Capability-checked review", assignee="implementer",
++        workspace_kind=workspace_kind, workspace_path=None,
++        validate_workspace=False,
++        requires=["terminal"] if workspace_kind == "scratch" else [],
++    )
++    assert kb.claim_task(conn, tid) is not None
++    if operation != "request":
++        assert kb.request_review(
++            conn, tid, reviewer="reviewer",
++            expected_run_id=kb.get_task(conn, tid).current_run_id,
++        )
++        if operation != "reopen":
++            assert kb.claim_review_task(conn, tid) is not None
++        if operation == "rerequest":
++            assert kb.request_changes(conn, tid, reason="Revise")[0]
++            assert kb.claim_task(conn, tid) is not None
++    return tid
++
++
++def _handoff(conn, tid, operation):
++    run_id = kb.get_task(conn, tid).current_run_id
++    if operation in {"request", "rerequest"}:
++        return kb.request_review(
++            conn, tid, reviewer="reviewer" if operation == "request" else None,
++            expected_run_id=run_id,
++        )
++    if operation == "changes":
++        return kb.request_changes(conn, tid, reason="Revise", expected_run_id=run_id)[0]
++    return kb.reopen_review_task(conn, tid)
++
++
++@pytest.mark.parametrize("operation", ["request", "rerequest", "changes", "reopen"])
++@pytest.mark.parametrize("workspace_kind", ["scratch", "dir", "worktree"])
++def test_review_rejects_incapable_target_atomically(profiles, operation, workspace_kind):
++    with kbc.connect() as conn:
++        tid = _prepare(conn, operation, workspace_kind)
++        target = "reviewer" if operation in {"request", "rerequest"} else "implementer"
++        # Policy can change after creation or the previous handoff. Remote terminal
++        # access satisfies explicit terminal needs but not host workspace access.
++        policy = (
++            "platform_toolsets: {cli: [file]}\n"
++            if workspace_kind == "scratch" else LOCAL.replace("local", "ssh")
++        )
++        profiles(target, policy)
++        before = list(conn.iterdump())
++        with pytest.raises(CapabilityMismatchError) as caught:
++            _handoff(conn, tid, operation)
++        assert caught.value.assignee == target
++        assert caught.value.missing == (["terminal"] if workspace_kind == "scratch" else ["host_repo"])
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("operation", ["request", "rerequest", "changes", "reopen"])
++def test_review_accepts_capable_target(profiles, operation):
++    with kbc.connect() as conn:
++        tid = _prepare(conn, operation, "worktree")
++        assert _handoff(conn, tid, operation)
++        task = kb.get_task(conn, tid)
++        reviewing = operation in {"request", "rerequest"}
++        assert task.assignee == ("reviewer" if reviewing else "implementer")
++        assert task.status == ("review" if reviewing else "ready")
++        assert task.current_run_id is None
+diff --git a/tests/hermes_cli/test_kanban_transfer.py b/tests/hermes_cli/test_kanban_transfer.py
+index 9e437d8ed2..9421f21771 100644
+--- a/tests/hermes_cli/test_kanban_transfer.py
++++ b/tests/hermes_cli/test_kanban_transfer.py
+@@ -44,9 +44,17 @@ def kanban_root(tmp_path, monkeypatch):
+     fresh root, which is as close to "the other machine" as a unit test
+     gets.
+     """
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++
+     def _use(name: str) -> Path:
+         root = tmp_path / name
+         root.mkdir(exist_ok=True)
++        profile = root / "profiles" / "coder"
++        profile.mkdir(parents=True, exist_ok=True)
++        (profile / "config.yaml").write_text(
++            "platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n",
++            encoding="utf-8",
++        )
+         monkeypatch.setenv("HERMES_HOME", str(root))
+         monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+         for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT",
+diff --git a/tests/hermes_cli/test_kanban_worktree_create_validation.py b/tests/hermes_cli/test_kanban_worktree_create_validation.py
+index 3f5f918b97..d130f0bc52 100644
+--- a/tests/hermes_cli/test_kanban_worktree_create_validation.py
++++ b/tests/hermes_cli/test_kanban_worktree_create_validation.py
+@@ -34,6 +34,12 @@ def kanban_home(tmp_path, monkeypatch):
+     home.mkdir()
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    profile = home / "profiles" / "a"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text(
++        "platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n",
++        encoding="utf-8",
++    )
+     kb.init_db()
+     return home
+ 
+diff --git a/tests/hermes_cli/test_kanban_worktree_isolation.py b/tests/hermes_cli/test_kanban_worktree_isolation.py
+index 10a9ab1aff..eae1f8b35e 100644
+--- a/tests/hermes_cli/test_kanban_worktree_isolation.py
++++ b/tests/hermes_cli/test_kanban_worktree_isolation.py
+@@ -34,6 +34,13 @@ def kanban_home(tmp_path, monkeypatch):
+     home.mkdir()
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for name in ("alice", "bob", "orchestrator"):
++        profile = home / "profiles" / name
++        profile.mkdir(parents=True)
++        (profile / "config.yaml").write_text(
++            "platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n",
++            encoding="utf-8",
++        )
+     kb.init_db()
+     return home
+ 
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 3bc7f08114..82d6692d0c 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -774,6 +774,12 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
+     repo.mkdir()
+     with pdb.connect_closing() as pconn:
+         project_id = pdb.create_project(pconn, name="Ambient", primary_path=str(repo))
++    peer = tmp_path / ".hermes" / "profiles" / "peer"
++    peer.mkdir(parents=True)
++    (peer / "config.yaml").write_text(
++        "platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n",
++        encoding="utf-8",
++    )
+     kb.write_board_metadata("default", project_id=project_id)
+     kb.create_board("target", name="Target", project_id=project_id if target_scoped else "")
+ 
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 9f86081fe7..7fbc2d0a17 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -220,6 +220,12 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                     from hermes_cli.kanban_origin import OriginError
+                     if isinstance(e, OriginError):
+                         return tool_error(str(e), code=e.code, handoff_complete=False)
++                from hermes_cli.kanban_capabilities import CapabilityMismatchError
++                from hermes_cli.kanban_assignment_routing import AssignmentRoutingError
++                if isinstance(e, AssignmentRoutingError):
++                    return tool_error(str(e), code=e.code)
++                if isinstance(e, CapabilityMismatchError):
++                    return tool_error(str(e), code=e.code, assignee=e.assignee, missing=e.missing)
+                 if not isinstance(e, ValueError):
+                     logger.exception(f"{tool_name} failed")
+                 if classify_rejections:
+@@ -506,7 +512,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
+ 
+ # --- Goal-mode judge gate ---
+ 
+-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "time"})
++_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "time", "assignment"})
+ 
+ 
+ def _goal_judge_available() -> bool:
+@@ -1316,9 +1322,7 @@ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+     _reject_delegated_child_mutation("kanban_create")
+     title = _require_text(args, "title")
+-    assignee = args.get("assignee")
+-    _check(assignee, "assignee is required — name the profile that should execute this "
+-                     "task (the dispatcher will only spawn tasks with an assignee)")
++    assignee = args.get("assignee") or _persisted_identity()
+     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
+     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
+     # mutate review evidence or race its checkout). Project identity is the one safe thing
+@@ -1380,6 +1384,7 @@ def _handle_create(args: dict, **kw) -> str:
+             creator_task_id=self_tid,
+             idempotency_key=args.get("idempotency_key"),
+             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
++            requires=args.get("requires"),
+             model_override=model_override, provider_override=provider_override,
+             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+             completion_contract=args.get("completion_contract"),
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 2866159393..6cc9d25cc8 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -195,7 +195,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "goes to todo and auto-resumes when that task finishes, no human "
+         "needed), 'needs_input' (you need a human decision/answer), "
+         "'capability' (a hard wall: no access, missing credentials, an action "
+-        "no agent can do), 'transient' (a flaky failure that may clear), or "
++        "no agent can do), 'assignment' (this worker has the wrong tools/backend; "
++        "route to a capable supervisor, not a human), 'transient' (a flaky failure that may clear), or "
+         "'time' (waiting on a clock, a cron, a soak or a release, not a person: "
+         "parks the card 'scheduled' with a wake time, never as a human block). "
+         "``reason`` is shown to the human on the board and, in Desktop, in a "
+@@ -226,7 +227,7 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         )),
+         "kind": {
+             "type": "string",
+-            "enum": ["dependency", "needs_input", "capability", "transient", "time"],
++            "enum": ["dependency", "needs_input", "capability", "assignment", "transient", "time"],
+             "description": (
+                 "Why you're blocked. 'dependency' waits in todo and "
+                 "resumes automatically when an incomplete parent finishes; "
+@@ -505,9 +506,12 @@ KANBAN_CREATE_SCHEMA = _schema(
+         "assignee": _prop("string", (
+                 "Profile name that should execute this task "
+                 "(e.g. 'researcher-a', 'reviewer', 'writer'). "
+-                "Required — tasks without an assignee are never "
+-                "dispatched."
++                "Omit to use the creating agent's profile. Requirements are checked before creation."
+         )),
++        "requires": {"type": "array", "items": {"type": "string",
++                     "enum": ["terminal", "file", "git", "host_repo", "kanban"]},
++                     "description": "Required configured capabilities, including skill prerequisites. "
++                     "Worktree/dir workspaces infer host repo access; git means terminal access, not an executable probe."},
+         "body": _prop("string", (
+                 "Opening post: full spec, acceptance criteria, "
+                 "links. The assigned worker reads this as part of "
+@@ -636,7 +640,7 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "to a different one. Requires 'model'."
+         )),
+     },
+-    ["title", "assignee"],
++    ["title"],
+ )
+ 
+ KANBAN_UNBLOCK_SCHEMA = _schema(
+diff --git a/website/docs/user-guide/features/kanban-worker-lanes.md b/website/docs/user-guide/features/kanban-worker-lanes.md
+index 6507462f9e..9ef30e205e 100644
+--- a/website/docs/user-guide/features/kanban-worker-lanes.md
++++ b/website/docs/user-guide/features/kanban-worker-lanes.md
+@@ -28,6 +28,44 @@ To be a kanban worker lane, an integration must provide three things:
+ 
+ The dispatcher matches `task.assignee` against either a Hermes profile name (the default lane shape) or a registered non-spawnable identifier (the plugin lane shape — see [Adding an external CLI worker lane](#adding-an-external-cli-worker-lane) below). Tasks whose assignee doesn't resolve are left on `ready` with a `skipped_nonspawnable` event so a board operator can fix them; they are not silently dropped or executed by an arbitrary fallback.
+ 
++### Capability preflight and assignment repair
++
++Cards can declare `requires: [terminal, file, git, host_repo, kanban]` (any subset).
++The CLI accepts repeated `--requires` flags; the create tool and dashboard API accept
++an array. The stored requirements travel through decomposition and later assignment,
++including review handoffs. Agent create calls that omit the assignee use their own
++profile; a human CLI or dashboard may still create an unassigned draft.
++
++Preflight reads the assignee's actual CLI toolsets and profile-scoped terminal backend.
++A `dir` workspace implies `terminal`, `file`, and `host_repo`; a `worktree` additionally
++implies `git`. Explicit requirements augment these checks, never disable them.
++`git` means configured terminal access, not a successful binary or credential probe.
++`host_repo` means a local backend; remote/container mounts are not inferred from paths.
++Unknown or unreadable profiles fail closed for constrained tasks. Unconstrained scratch
++cards keep legacy behavior. Skills have no standard capability metadata contract:
++put their prerequisites in `requires`, rather than relying on skill-name heuristics.
++
++A mismatched create or reassignment fails before mutation; the create tool returns
++`code: assignee_capability_mismatch` with the missing capabilities. Fix the target
++profile or choose a compatible one; do not ask a human to supply credentials for
++what is actually a worker-tool mismatch.
++
++Use `kanban_block(kind="assignment", reason="Wrong worker")` when another agent can
++perform the work but this worker's tools/backend cannot. The kernel selects a compatible
++`kanban.orchestrator_profile`, then the creating profile as fallback; it must have both
++the original requirements and Kanban tools. It atomically reassigns the original,
++creates one ready assignment-verification card for that supervisor, and dependency-gates
++the original until verification completes. Completion rechecks policy drift. There is
++no recursive repair chain: unavailable/exhausted routing fails without ending the run
++or parking an invisible blocked card. The caller must resolve the existing assignment
++or identify the concrete external blocker, rather than claim the handoff succeeded.
++
++Legacy `kind="capability"` calls are reclassified only when a narrow worker-mismatch
++reason and the actual profile policy both prove the mismatch. Audit events preserve
++`requested_kind` and `rekind_reason`. Credentials, sign-in, payment, and human policy
++requests stay human-visible, even when mistakenly labeled assignment. Assignment waits
++are agent work, not human-blocked counts; time waits retain their scheduled behavior.
++
+ ### 2. A spawn mechanism
+ 
+ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <assignee> chat -q <prompt>` (or the equivalent module form when the `hermes` shim isn't on `$PATH`) inside the task's pinned workspace, with these env vars set:

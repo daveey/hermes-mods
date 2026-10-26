@@ -1,0 +1,845 @@
+From 2f9b23d03fb814d4bf786997878637f36de8a611 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:18:12 +0000
+Subject: [PATCH] feat(desktop): checkpoint scoped registry reconnect [daveey]
+
+---
+ apps/desktop/electron/main.ts                 |  42 +++++
+ apps/desktop/electron/preload.ts              |   2 +
+ .../registry-reconnect-service.test.ts        | 128 +++++++++++++
+ .../electron/registry-reconnect-service.ts    | 153 ++++++++++++++++
+ .../electron/registry-reconnect.test.ts       | 171 ++++++++++++++++++
+ apps/desktop/electron/registry-reconnect.ts   | 125 +++++++++++++
+ .../electron/registry-retirement-http.test.ts |  46 +++++
+ .../electron/registry-retirement-http.ts      |  53 ++++++
+ apps/desktop/src/global.d.ts                  |   2 +
+ 9 files changed, 722 insertions(+)
+ create mode 100644 apps/desktop/electron/registry-reconnect-service.test.ts
+ create mode 100644 apps/desktop/electron/registry-reconnect-service.ts
+ create mode 100644 apps/desktop/electron/registry-reconnect.test.ts
+ create mode 100644 apps/desktop/electron/registry-reconnect.ts
+ create mode 100644 apps/desktop/electron/registry-retirement-http.test.ts
+ create mode 100644 apps/desktop/electron/registry-retirement-http.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 074ca22535..4bd2dd5f03 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -528,6 +528,7 @@ import {
+   createQuitTeardownCoordinator,
+   type QuitTeardownTask
+ } from './quit-teardown'
++import { createRegistryReconnectService } from './registry-reconnect-service'
+ import * as remoteLifecycle from './remote-lifecycle'
+ import {
+   attachPowerResumeRemoteRevalidation,
+@@ -9867,6 +9868,7 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
+ 
+ async function teardownSshConnection(profile) {
+   const scope = sshScopeKey(profile)
++  registryReconnectService.assertCanStop(scope)
+   sshIsolatedKeepalives.stop(scope)
+   const state = sshConnections.get(scope)
+ 
+@@ -11306,6 +11308,10 @@ async function ensureRegistryBackend(
+     return ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation, opts)
+   }
+ 
++  if (source.kind === 'ssh') {
++    managedConnectionUpdateGate.assertCanDial(id, managedUpdateCorrelation)
++  }
++
+   const entry = {
+     process: null,
+     port: null,
+@@ -12430,6 +12436,7 @@ const poolStopper = createPoolStopper({
+ })
+ 
+ function stopPoolBackend(profile: string): Promise<void> {
++  registryReconnectService.assertCanStop(profile)
+   const entry = backendPool.get(profile)
+ 
+   const stopping = releaseLocalBackendSlotAfterExit(
+@@ -16143,6 +16150,41 @@ ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => appl
+ // Storage-level CRUD for named agent sources. Routing/pooling consumption of
+ // the registry lands separately; these handlers only manage the persisted
+ // list, so they are safe to ship ahead of the switchover.
++const registryReconnectService = createRegistryReconnectService({
++  pool: backendPool,
++  states: sshConnections,
++  gate: managedConnectionUpdateGate,
++  key: backendScopeKey,
++  isSsh: id => readDesktopConnectionsRegistry().connections.some(source => source.id === id && source.kind === 'ssh'),
++  inFlight: key => Boolean(backendDialClaims.inFlight(key) || poolStopper.inFlight(key) || sshBootstrapCoordinator.pending.has(key)),
++  request: (descriptor, requestPath, options) => fetchJsonForBackend(descriptor, requestPath, options),
++  terminate: async state => {
++    const expected = { ...state, profile: state.remoteProfile || '' }
++
++    if (state.remotePlatform === 'Windows') {
++      await terminateOwnedWindowsDashboardForUpdate(state.ssh,
++        { hermesPath: state.hermesPath, hermesHome: state.hermesHome, python: state.pythonPath }, expected)
++    } else if (state.remotePlatform === 'Linux' || state.remotePlatform === 'Darwin') {
++      await remoteLifecycle.terminateOwnedDashboardForUpdate(state.ssh, expected)
++    } else {
++      throw new Error('Unsupported registry SSH platform')
++    }
++  },
++  close: async (key, state) => {
++    sshIsolatedKeepalives.stop(key)
++    terminalIpc.disposeTerminalSessionsForSshScope(key)
++    // The owned serve is already confirmed stopped. Closing its transport
++    // must never fall back to generic remote disconnect/kill.
++    await state.ssh.close().catch(error => sshRememberLog(`[registry-reconnect] transport close: ${String(error)}`))
++  },
++  onCleanupError: error => sshRememberLog(`[registry-reconnect] cleanup: ${String(error)}`),
++  reopen: (id, profile, correlation) => ensureRegistryBackend(id, profile, correlation)
++})
++
++ipcMain.handle('hermes:connections:reconnect-target', (_event, id, profile) =>
++  registryReconnectService.target(id, profile))
++ipcMain.handle('hermes:connections:reconnect', (_event, target) => registryReconnectService.run(target))
++
+ ipcMain.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
+ ipcMain.handle('hermes:connections:save', async (_event, payload) => {
+   const saved = await saveRegistryConnection(payload)
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index 4e64400a0a..40077e84c0 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -289,6 +289,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+     setLaunchMode: mode => ipcRenderer.invoke('hermes:connections:set-launch-mode', mode),
+     setLastUsed: id => ipcRenderer.invoke('hermes:connections:set-last-used', id),
+     test: id => ipcRenderer.invoke('hermes:connections:test', id),
++    reconnectTarget: (id, profile) => ipcRenderer.invoke('hermes:connections:reconnect-target', id, profile),
++    reconnect: target => ipcRenderer.invoke('hermes:connections:reconnect', target),
+     updateManaged: id => ipcRenderer.invoke('hermes:connections:update-managed', id),
+     // Fan out `hermes update` to every eligible registered connection.
+     // Optional excludeIds skips rows the caller updates through another path.
+diff --git a/apps/desktop/electron/registry-reconnect-service.test.ts b/apps/desktop/electron/registry-reconnect-service.test.ts
+new file mode 100644
+index 0000000000..1dcdfa61be
+--- /dev/null
++++ b/apps/desktop/electron/registry-reconnect-service.test.ts
+@@ -0,0 +1,128 @@
++import { expect, test, vi } from 'vitest'
++
++import { ManagedConnectionUpdateGate } from './managed-ssh-update'
++import { createRegistryReconnectService } from './registry-reconnect-service'
++
++function fixture() {
++  const descriptor = { baseUrl: 'http://hub', token: 'synthetic' }
++  const primary = { connectionPromise: Promise.resolve({ baseUrl: 'http://local' }) }
++  const entry = { connectionPromise: Promise.resolve(descriptor) }
++  const state = { registryConnectionId: 'hub', primaryRegistryScope: false, spawnNonce: 'owned', remotePlatform: 'Linux' }
++  const pool = new Map([['default', primary], ['conn:hub::default', entry]])
++  const states = new Map([['conn:hub::default', state]])
++  const gate = new ManagedConnectionUpdateGate()
++
++  const request = vi.fn(async (_descriptor, path, options) => path === '/api/ssh/ownership'
++    ? { ok: true, protocolVersion: 1, sshOwnerNonce: 'owned', runtimeIntact: false }
++    : { ok: true, idle: true, token: 'permit', action: options.body?.action })
++
++  const terminate = vi.fn(async () => {})
++  const close = vi.fn(async () => {})
++
++  const reopen = vi.fn(async (id, profile, correlation) => {
++    gate.assertCanDial(id, correlation)
++    pool.set(`conn:${id}::${profile}`, { connectionPromise: Promise.resolve(descriptor) })
++    states.set(`conn:${id}::${profile}`, { ...state, spawnNonce: 'new-owned' })
++  })
++
++  const service = createRegistryReconnectService({
++    pool, states, gate, request, terminate, close, reopen,
++    onCleanupError: vi.fn(),
++    key: (id, profile) => `conn:${id}::${profile}`,
++    isSsh: id => id === 'hub',
++    inFlight: () => false
++  })
++
++  return { service, pool, states, entry, state, primary, gate, request, terminate, reopen, close }
++}
++
++test('composed reconnect repairs a deleted runtime without touching local default', async () => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  expect(target.generation).toBeTruthy()
++  const result = await f.service.run(target)
++  expect(result.ok).toBe(true)
++  expect(result.generation).not.toBe(target.generation)
++  expect(f.terminate).toHaveBeenCalledWith(f.state)
++  expect(f.pool.get('default')).toBe(f.primary)
++  expect(f.request.mock.calls.map(call => call[2].body?.action).filter(Boolean)).toEqual(['prepare', 'commit'])
++  expect(f.gate.owner('hub')).toBeNull()
++})
++
++test('a second profile cannot borrow a pending reconnect claim', async () => {
++  const f = fixture()
++  f.pool.set('conn:hub::other', { connectionPromise: f.entry.connectionPromise })
++  f.states.set('conn:hub::other', { ...f.state })
++  const first = f.service.target('hub', 'default')!
++  const second = f.service.target('hub', 'other')!
++  let finish!: () => void
++  f.terminate.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
++  const running = f.service.run(first)
++  await vi.waitFor(() => expect(f.terminate).toHaveBeenCalledOnce())
++  expect(await f.service.run(second)).toEqual({ ok: false })
++  expect(() => f.gate.assertCanDial('hub')).toThrow()
++  finish()
++  await running
++})
++
++test('a primary alias cannot acquire retirement authority', async () => {
++  const f = fixture()
++  f.state.primaryRegistryScope = true
++  expect(f.service.target('hub', 'default')).toBeNull()
++  expect(await f.service.run({ connectionId: 'hub', profile: 'default', generation: 'invented' })).toEqual({ ok: false })
++  expect(f.request).not.toHaveBeenCalled()
++  expect(f.terminate).not.toHaveBeenCalled()
++})
++
++test('busy backend releases the connection gate without tearing down its transport', async () => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  f.request.mockImplementation(async (_d, path) => path === '/api/ssh/ownership'
++    ? { ok: true, protocolVersion: 1, sshOwnerNonce: 'owned' } : { ok: false, idle: false })
++  expect(await f.service.run(target)).toEqual({ ok: false })
++  expect(f.terminate).not.toHaveBeenCalled()
++  expect(f.close).not.toHaveBeenCalled()
++  expect(f.gate.owner('hub')).toBeNull()
++})
++
++test('unsupported termination platform is refused before retirement', async () => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  f.state.remotePlatform = 'Darwin'
++  expect(await f.service.run(target)).toEqual({ ok: false })
++  expect(f.request).not.toHaveBeenCalled()
++  expect(f.terminate).not.toHaveBeenCalled()
++  expect(f.gate.owner('hub')).toBeNull()
++})
++
++test('descriptor replacement invalidates a previously discovered generation', async () => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  f.entry.connectionPromise = Promise.resolve({ baseUrl: 'http://replacement', token: 'replacement' })
++  expect(f.service.target('hub', 'default')!.generation).not.toBe(target.generation)
++  expect(await f.service.run(target)).toEqual({ ok: false })
++  expect(f.request).not.toHaveBeenCalled()
++  expect(f.terminate).not.toHaveBeenCalled()
++})
++
++test('transport cleanup failure after confirmed exit does not strand admission', async () => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  f.close.mockRejectedValueOnce(new Error('transport already closed'))
++  expect((await f.service.run(target)).ok).toBe(true)
++  expect(f.reopen).toHaveBeenCalledOnce()
++  expect(f.gate.owner('hub')).toBeNull()
++})
++
++test('ambiguous termination retains both gates and exact-generation retry can recover', async () => {
++  const f = fixture()
++  const target = f.service.target('hub', 'default')!
++  f.terminate.mockRejectedValueOnce(new Error('lost transport'))
++  await expect(f.service.run(target)).rejects.toThrow('lost transport')
++  expect(() => f.gate.assertCanDial('hub')).toThrow()
++  expect(() => f.service.assertCanStop('conn:hub::default')).toThrow()
++  expect(() => f.service.assertCanStop('default')).not.toThrow()
++  expect(f.close).not.toHaveBeenCalled()
++  expect((await f.service.run(target)).ok).toBe(true)
++  expect(f.gate.owner('hub')).toBeNull()
++})
+diff --git a/apps/desktop/electron/registry-reconnect-service.ts b/apps/desktop/electron/registry-reconnect-service.ts
+new file mode 100644
+index 0000000000..fc1abfd8e5
+--- /dev/null
++++ b/apps/desktop/electron/registry-reconnect-service.ts
+@@ -0,0 +1,153 @@
++import { randomUUID } from 'node:crypto'
++
++import type { ManagedConnectionUpdateGate } from './managed-ssh-update'
++import { createRegistryReconnector, type RegistryReconnectTarget } from './registry-reconnect'
++import { createRegistryRetirementClient } from './registry-retirement-http'
++
++interface PoolEntry<D> { connectionPromise: Promise<D> }
++interface OwnedState {
++  registryConnectionId: string
++  primaryRegistryScope?: boolean
++  spawnNonce: string
++  remotePlatform: string
++}
++interface ServiceDeps<D, E extends PoolEntry<D>, S extends OwnedState> {
++  pool: Map<string, E>
++  states: Map<string, S>
++  gate: ManagedConnectionUpdateGate
++  key: (connectionId: string, profile: string) => string
++  isSsh: (connectionId: string) => boolean
++  inFlight: (key: string) => boolean
++  request: Parameters<typeof createRegistryRetirementClient<D>>[0]
++  terminate: (state: S) => Promise<void>
++  close: (key: string, state: S) => Promise<void>
++  onCleanupError: (error: unknown) => void
++  reopen: (connectionId: string, profile: string, correlation: string) => Promise<unknown>
++}
++
++/** The connection gate fences registry edits and all bootstrap publications;
++ * the coordinator fences only this resident's teardown and uncertain retries.
++ */
++export function createRegistryReconnectService<D, E extends PoolEntry<D>, S extends OwnedState>(deps: ServiceDeps<D, E, S>) {
++  interface Resident { entry: E; state: S; descriptor: Promise<D>; generation: string; key: string }
++  const residents = new WeakMap<E, Resident>()
++  const correlations = new Map<string, string>()
++  const claimedProfiles = new Map<string, string>()
++  const client = createRegistryRetirementClient(deps.request)
++
++  function current(connectionId: string, profile: string): Resident | undefined {
++    const key = deps.key(connectionId, profile)
++    const entry = deps.pool.get(key)
++    const state = deps.states.get(key)
++
++    // POSIX owned termination deliberately refuses Darwin (no pidfd).
++    // Refuse here, before committing an irreversible backend admission fence.
++    if (!state || !['Linux', 'Windows'].includes(state.remotePlatform)) { return undefined }
++
++    if (!deps.isSsh(connectionId) || !entry || !state || state.primaryRegistryScope ||
++        state.registryConnectionId !== connectionId || !state.spawnNonce || deps.inFlight(key)) {
++      return undefined
++    }
++
++    let resident = residents.get(entry)
++
++    if (!resident || resident.state !== state || resident.descriptor !== entry.connectionPromise) {
++      resident = { entry, state, descriptor: entry.connectionPromise, key, generation: randomUUID() }
++      residents.set(entry, resident)
++    }
++
++    return resident
++  }
++
++  const coordinator = createRegistryReconnector<Resident>({
++    current,
++    generation: resident => resident.generation,
++    proveOwned: async resident => client.proveOwned(await resident.descriptor, resident.state.spawnNonce),
++    prepare: async resident => client.prepare(await resident.descriptor),
++    commit: async (resident, token) => client.commit(await resident.descriptor, token),
++    cancel: async (resident, token) => client.cancel(await resident.descriptor, token),
++    terminate: async resident => {
++      await deps.terminate(resident.state)
++
++      // Only remove the captured resident. Close is transport-only, never a
++      // generic teardown that could signal a replacement process.
++      if (deps.pool.get(resident.key) !== resident.entry || deps.states.get(resident.key) !== resident.state) {
++        throw new Error('Registry backend changed during termination')
++      }
++
++      deps.pool.delete(resident.key)
++      deps.states.delete(resident.key)
++
++      // Exit is already confirmed. A transport-only cleanup error cannot
++      // retain an uncertain-process fence after its resident was removed.
++      try {
++        await deps.close(resident.key, resident.state)
++      } catch (error) {
++        deps.onCleanupError(error)
++      }
++    },
++    reopen: async (connectionId, profile) => {
++      await deps.reopen(connectionId, profile, correlations.get(connectionId)!)
++      const replacement = current(connectionId, profile)
++
++      if (!replacement) { throw new Error('Registry backend reconnect did not publish an owned resident') }
++
++      return replacement.generation
++    }
++  })
++
++  return {
++    target: (connectionId: string, profile: string): RegistryReconnectTarget | null => {
++      const resident = current(connectionId, profile)
++
++      return resident ? { connectionId, profile, generation: resident.generation } : null
++    },
++    assertCanStop: (key: string) => {
++      const entry = deps.pool.get(key)
++      const resident = entry && residents.get(entry)
++
++      if (resident) {
++        // The key is opaque; retain the exact route instead of parsing ids.
++        for (const [connectionId] of correlations) {
++          if (resident.state.registryConnectionId === connectionId) {
++            throw new Error('Registry backend reconnect in progress')
++          }
++        }
++      }
++    },
++    run: async (target: RegistryReconnectTarget) => {
++      if (!target || typeof target.connectionId !== 'string' || typeof target.profile !== 'string' ||
++          typeof target.generation !== 'string') { return { ok: false } }
++
++      const resident = current(target.connectionId, target.profile)
++
++      if (!resident || resident.generation !== target.generation) { return { ok: false } }
++      const held = correlations.get(target.connectionId)
++
++      if (held && claimedProfiles.get(target.connectionId) !== target.profile) { return { ok: false } }
++      const correlation: string = held || randomUUID()
++
++      if (!held) {
++        if (!deps.gate.claim(target.connectionId, correlation)) { return { ok: false } }
++        correlations.set(target.connectionId, correlation)
++        claimedProfiles.set(target.connectionId, target.profile)
++      }
++
++      try {
++        return await coordinator.run(target)
++      } finally {
++        // A failed/unknown commit must not reopen normal admission. Only the
++        // exact-generation retry can reconcile it; never cancel on ambiguity.
++        let clear = false
++
++        try { coordinator.assertCanDial(target.connectionId, target.profile); clear = true } catch { /* fenced */ }
++
++        if (clear) {
++          correlations.delete(target.connectionId)
++          claimedProfiles.delete(target.connectionId)
++          deps.gate.release(target.connectionId, correlation)
++        }
++      }
++    }
++  }
++}
+diff --git a/apps/desktop/electron/registry-reconnect.test.ts b/apps/desktop/electron/registry-reconnect.test.ts
+new file mode 100644
+index 0000000000..d1f7304b15
+--- /dev/null
++++ b/apps/desktop/electron/registry-reconnect.test.ts
+@@ -0,0 +1,171 @@
++import { expect, test, vi } from 'vitest'
++
++import { createRegistryReconnector } from './registry-reconnect'
++
++function fixture() {
++  let entry = { generation: 'hub-1' }
++
++  const deps = {
++    current: vi.fn(() => entry),
++    generation: (value: typeof entry) => value.generation,
++    proveOwned: vi.fn(async () => true),
++    prepare: vi.fn(async (): Promise<string | null> => 'permit'),
++    commit: vi.fn(async () => true),
++    cancel: vi.fn(async () => {}),
++    terminate: vi.fn(async () => {}),
++    reopen: vi.fn(async () => 'hub-2')
++  }
++
++  return { deps, reconnect: createRegistryReconnector(deps), replace: () => { entry = { generation: 'hub-new' } } }
++}
++
++const target = { connectionId: 'hub', profile: 'default', generation: 'hub-1' }
++
++test.each([
++  { connectionId: '', profile: 'default', generation: 'hub-1' },
++  { connectionId: 'hub', profile: '', generation: 'hub-1' },
++  { connectionId: 'hub', profile: 'default', generation: '' },
++  { connectionId: ' hub', profile: 'default', generation: 'hub-1' }
++])('refuses incomplete or implicitly normalized target %j', async invalid => {
++  const { deps, reconnect } = fixture()
++  expect(await reconnect.run(invalid)).toEqual({ ok: false })
++  expect(deps.proveOwned).not.toHaveBeenCalled()
++  expect(deps.prepare).not.toHaveBeenCalled()
++})
++
++test.each(['busy', 'unowned', 'stale'] as const)('fails closed for %s without terminating', async refusal => {
++  const { deps, reconnect } = fixture()
++
++  if (refusal === 'busy') {deps.prepare.mockResolvedValue(null)}
++
++  if (refusal === 'unowned') {deps.proveOwned.mockResolvedValue(false)}
++  expect(await reconnect.run({ ...target, generation: refusal === 'stale' ? 'old' : target.generation })).toEqual({ ok: false })
++  expect(deps.terminate).not.toHaveBeenCalled()
++  expect(deps.reopen).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).not.toThrow()
++})
++
++test('a refused commit cancels preparation and releases the local dial gate', async () => {
++  const { deps, reconnect } = fixture()
++  deps.commit.mockResolvedValue(false)
++  expect(await reconnect.run(target)).toEqual({ ok: false })
++  expect(deps.cancel).toHaveBeenCalledWith(expect.anything(), 'permit')
++  expect(deps.terminate).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).not.toThrow()
++})
++
++test('termination failure retains the committed fence for an exact-generation retry', async () => {
++  const { deps, reconnect } = fixture()
++  deps.terminate.mockRejectedValueOnce(new Error('transport lost'))
++  await expect(reconnect.run(target)).rejects.toThrow('transport lost')
++  expect(deps.cancel).not.toHaveBeenCalled()
++  expect(deps.reopen).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).toThrow('reconnect')
++  // The signal may have succeeded before its response was lost. Recovery
++  // must use exact SSH process identity, not the now-dead HTTP server.
++  deps.proveOwned.mockRejectedValue(new Error('serve already stopped'))
++  deps.prepare.mockRejectedValue(new Error('serve already stopped'))
++  expect(await reconnect.run(target)).toEqual({ ok: true, generation: 'hub-2' })
++})
++
++test('a replacement during prepare cancels only the old permit without committing or terminating', async () => {
++  const { deps, reconnect, replace } = fixture()
++  deps.prepare.mockImplementation(async () => { replace();
++
++ return 'permit' })
++  expect(await reconnect.run(target)).toEqual({ ok: false })
++  expect(deps.cancel).toHaveBeenCalledOnce()
++  expect(deps.commit).not.toHaveBeenCalled()
++  expect(deps.terminate).not.toHaveBeenCalled()
++})
++
++test('freezes same-scope dials and duplicate reconnects before the first async ownership probe', async () => {
++  const { deps, reconnect } = fixture()
++  let resolve!: (value: boolean) => void
++  deps.proveOwned.mockImplementation(() => new Promise<boolean>(done => { resolve = done }))
++  const first = reconnect.run(target)
++  expect(() => reconnect.assertCanDial('hub', 'default')).toThrow('reconnect')
++  expect(() => reconnect.assertCanDial('hub', 'reviewer')).not.toThrow()
++  expect(() => reconnect.assertCanDial('other', 'default')).not.toThrow()
++  expect(await reconnect.run(target)).toEqual({ ok: false })
++  resolve(false)
++  expect(await first).toEqual({ ok: false })
++  expect(() => reconnect.assertCanDial('hub', 'default')).not.toThrow()
++  expect(deps.terminate).not.toHaveBeenCalled()
++})
++
++test('an ambiguous commit keeps the scope fenced for retry, never cancelling a possibly committed permit', async () => {
++  const { deps, reconnect } = fixture()
++  deps.commit.mockRejectedValueOnce(new Error('response lost'))
++  await expect(reconnect.run(target)).rejects.toThrow('response lost')
++  expect(deps.cancel).not.toHaveBeenCalled()
++  expect(deps.terminate).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).toThrow('reconnect')
++  expect(await reconnect.run(target)).toEqual({ ok: true, generation: 'hub-2' })
++  expect(() => reconnect.assertCanDial('hub', 'default')).not.toThrow()
++})
++
++test('an uncertain committed resident cannot grant retry authority over a replacement', async () => {
++  const { deps, reconnect, replace } = fixture()
++  deps.commit.mockRejectedValueOnce(new Error('response lost'))
++  await expect(reconnect.run(target)).rejects.toThrow('response lost')
++  replace()
++  expect(await reconnect.run({ ...target, generation: 'hub-new' })).toEqual({ ok: false })
++  expect(deps.prepare).toHaveBeenCalledOnce()
++  expect(deps.terminate).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).toThrow('reconnect')
++})
++
++test('replacement during commit cannot terminate or reopen a newer resident', async () => {
++  const { deps, reconnect, replace } = fixture()
++  deps.commit.mockImplementation(async () => { replace();
++
++ return true })
++  expect(await reconnect.run(target)).toEqual({ ok: false })
++  expect(deps.terminate).not.toHaveBeenCalled()
++  expect(deps.reopen).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).toThrow('reconnect')
++})
++
++test('replacement while termination is pending cannot be reopened by the old request', async () => {
++  const { deps, reconnect, replace } = fixture()
++  deps.terminate.mockImplementation(async () => { replace() })
++  expect(await reconnect.run(target)).toEqual({ ok: false })
++  expect(deps.reopen).not.toHaveBeenCalled()
++  expect(() => reconnect.assertCanDial('hub', 'default')).not.toThrow()
++})
++
++test('reconnects only the generation-qualified registry default, never the primary default', async () => {
++  const primary = { generation: 'primary' }
++  const target = { generation: 'hub-1' }
++  const other = { generation: 'other-1' }
++  const entries = new Map([['default', primary], ['conn:hub::default', target], ['conn:other::default', other]])
++  const prepare = vi.fn(async () => 'permit')
++  const cancel = vi.fn(async () => {})
++  const commit = vi.fn(async () => true)
++
++  const terminate = vi.fn(async (entry: typeof target) => {
++    expect(entry).toBe(target)
++  })
++
++  const reopen = vi.fn(async () => 'hub-2')
++
++  const reconnect = createRegistryReconnector({
++    current: (connectionId: string, profile: string) => entries.get(`conn:${connectionId}::${profile}`),
++    generation: (entry: typeof target) => entry.generation,
++    proveOwned: async () => true,
++    prepare, commit, cancel, terminate,
++    reopen
++  })
++
++  expect(await reconnect.run({ connectionId: 'hub', profile: 'default', generation: 'hub-1' })).toEqual({
++    ok: true, generation: 'hub-2'
++  })
++  expect(prepare).toHaveBeenCalledWith(target)
++  expect(commit).toHaveBeenCalledWith(target, 'permit')
++  expect(terminate).toHaveBeenCalledOnce()
++  expect(reopen).toHaveBeenCalledWith('hub', 'default', target)
++  expect(cancel).not.toHaveBeenCalled()
++  expect(entries.get('default')).toBe(primary)
++  expect(entries.get('conn:other::default')).toBe(other)
++})
+diff --git a/apps/desktop/electron/registry-reconnect.ts b/apps/desktop/electron/registry-reconnect.ts
+new file mode 100644
+index 0000000000..635552c096
+--- /dev/null
++++ b/apps/desktop/electron/registry-reconnect.ts
+@@ -0,0 +1,125 @@
++export interface RegistryReconnectTarget {
++  connectionId: string
++  profile: string
++  generation: string
++}
++
++export interface RegistryReconnectDeps<E> {
++  current: (connectionId: string, profile: string) => E | undefined
++  generation: (entry: E) => string
++  proveOwned: (entry: E) => Promise<boolean>
++  prepare: (entry: E) => Promise<string | null>
++  commit: (entry: E, token: string) => Promise<boolean>
++  cancel: (entry: E, token: string) => Promise<void>
++  terminate: (entry: E) => Promise<void>
++  reopen: (connectionId: string, profile: string, entry: E) => Promise<string>
++}
++
++export function createRegistryReconnector<E>(deps: RegistryReconnectDeps<E>) {
++  const active = new Set<string>()
++  const uncertain = new Map<string, E>()
++  const committed = new Map<string, E>()
++  const keyFor = (connectionId: string, profile: string) => JSON.stringify([connectionId, profile])
++
++  async function finish(target: RegistryReconnectTarget, key: string, entry: E) {
++    await deps.terminate(entry)
++    uncertain.delete(key)
++    committed.delete(key)
++
++    // Remote termination awaits I/O; never reopen over a newer resident.
++    const current = deps.current(target.connectionId, target.profile)
++
++    if (current && (current !== entry || deps.generation(current) !== target.generation)) {
++      return { ok: false }
++    }
++
++    return { ok: true, generation: await deps.reopen(target.connectionId, target.profile, entry) }
++  }
++
++  async function recycle(target: RegistryReconnectTarget) {
++    const key = keyFor(target.connectionId, target.profile)
++    const entry = deps.current(target.connectionId, target.profile)
++
++    if (uncertain.has(key) && uncertain.get(key) !== entry) {
++      return { ok: false }
++    }
++
++    if (!entry || deps.generation(entry) !== target.generation) {
++      return { ok: false }
++    }
++
++    // A confirmed commit survives serve exit. The terminator re-proves the
++    // exact SSH process identity or confirms that captured owner has exited.
++    if (committed.get(key) === entry) { return finish(target, key, entry) }
++
++    if (!(await deps.proveOwned(entry))) { return { ok: false } }
++
++    const token = await deps.prepare(entry)
++
++    if (!token) {
++      return { ok: false }
++    }
++
++    let mayBeCommitted = false
++
++    try {
++      if (deps.current(target.connectionId, target.profile) !== entry || deps.generation(entry) !== target.generation) {
++        return { ok: false }
++      }
++
++      mayBeCommitted = true
++      uncertain.set(key, entry)
++      const didCommit = await deps.commit(entry, token)
++
++      if (!didCommit) {
++        mayBeCommitted = false
++        uncertain.delete(key)
++
++        return { ok: false }
++      }
++
++      committed.set(key, entry)
++
++      if (deps.current(target.connectionId, target.profile) !== entry || deps.generation(entry) !== target.generation) {
++        return { ok: false }
++      }
++
++      return await finish(target, key, entry)
++    } finally {
++      if (!mayBeCommitted) {
++        await deps.cancel(entry, token)
++      }
++    }
++  }
++
++  return {
++    assertCanDial: (connectionId: string, profile: string) => {
++      const key = keyFor(connectionId, profile)
++
++      if (active.has(key) || uncertain.has(key)) {
++        throw new Error('Registry backend reconnect in progress')
++      }
++    },
++    run: async (target: RegistryReconnectTarget) => {
++      if (![target?.connectionId, target?.profile, target?.generation].every(value =>
++        typeof value === 'string' && value.length > 0 && value.trim() === value
++      )) {
++        return { ok: false }
++      }
++
++      const key = keyFor(target.connectionId, target.profile)
++
++      if (active.has(key)) {
++        return { ok: false }
++      }
++
++      active.add(key)
++
++      try {
++        return await recycle(target)
++      } finally {
++        active.delete(key)
++      }
++    }
++  }
++}
+diff --git a/apps/desktop/electron/registry-retirement-http.test.ts b/apps/desktop/electron/registry-retirement-http.test.ts
+new file mode 100644
+index 0000000000..d29667fb09
+--- /dev/null
++++ b/apps/desktop/electron/registry-retirement-http.test.ts
+@@ -0,0 +1,46 @@
++import { expect, test, vi } from 'vitest'
++
++import { createRegistryRetirementClient } from './registry-retirement-http'
++
++const descriptor = { baseUrl: 'http://127.0.0.1:31000', token: 'synthetic-token' }
++
++test('ownership remains provable for a deleted runtime without treating it as reusable', async () => {
++  const request = vi.fn(async () => ({ ok: true, protocolVersion: 1, sshOwnerNonce: 'nonce', runtimeIntact: false }))
++  const client = createRegistryRetirementClient(request)
++  expect(await client.proveOwned(descriptor, 'nonce')).toBe(true)
++  expect(await client.proveOwned(descriptor, 'other')).toBe(false)
++  expect(request).toHaveBeenCalledWith(descriptor, '/api/ssh/ownership', { timeoutMs: 3000 })
++})
++
++test.each([null, {}, { ok: true, idle: null }, { ok: true, idle: false, token: 'permit' }, { ok: true, idle: true }])(
++  'unknown or busy preparation grants no permit: %j', async reply => {
++    const client = createRegistryRetirementClient(vi.fn(async () => reply))
++    expect(await client.prepare(descriptor)).toBeNull()
++  }
++)
++
++test('uses the exact authenticated descriptor for prepare, commit and cancellation', async () => {
++  const request = vi.fn(async () => ({ ok: true, idle: true, token: 'permit' }))
++  const client = createRegistryRetirementClient(request)
++  expect(await client.prepare(descriptor)).toBe('permit')
++  expect(await client.commit(descriptor, 'permit')).toBe(true)
++  await client.cancel(descriptor, 'permit')
++  expect(request.mock.calls).toEqual(['prepare', 'commit', 'cancel'].map(action => [
++    descriptor, '/api/health/retirement', {
++      method: 'POST', timeoutMs: 3000,
++      body: { action, ...(action === 'prepare' ? {} : { token: 'permit' }) }
++    }
++  ]))
++})
++
++test.each([null, {}, { ok: 'true' }])('ambiguous commit response throws rather than releasing the fence: %j', async reply => {
++  const client = createRegistryRetirementClient(vi.fn(async () => reply))
++  await expect(client.commit(descriptor, 'permit')).rejects.toThrow('Unknown retirement commit outcome')
++})
++
++test('transport loss at commit propagates while a definite refusal returns false', async () => {
++  const request = vi.fn().mockRejectedValueOnce(new Error('lost response')).mockResolvedValueOnce({ ok: false })
++  const client = createRegistryRetirementClient(request)
++  await expect(client.commit(descriptor, 'permit')).rejects.toThrow('lost response')
++  expect(await client.commit(descriptor, 'permit')).toBe(false)
++})
+diff --git a/apps/desktop/electron/registry-retirement-http.ts b/apps/desktop/electron/registry-retirement-http.ts
+new file mode 100644
+index 0000000000..d2b1cd9d17
+--- /dev/null
++++ b/apps/desktop/electron/registry-retirement-http.ts
+@@ -0,0 +1,53 @@
++interface RetirementReply {
++  ok?: boolean
++  idle?: boolean | null
++  token?: string
++  sshOwnerNonce?: string
++  protocolVersion?: number
++}
++
++type RequestJson<D> = (
++  descriptor: D,
++  path: string,
++  options: { method?: string; body?: Record<string, string>; timeoutMs: number }
++) => Promise<unknown>
++
++/** Remote descriptors must use the bearer-aware authenticated transport.
++ * Unlike the local pool client, an unknown commit result must propagate: the
++ * coordinator must retain its gate until the exact resident is reconciled.
++ */
++export function createRegistryRetirementClient<D>(requestJson: RequestJson<D>) {
++  async function request(descriptor: D, action: string, token?: string) {
++    return await requestJson(descriptor, '/api/health/retirement', {
++      method: 'POST', body: { action, ...(token ? { token } : {}) }, timeoutMs: 3000
++    }) as RetirementReply | null
++  }
++
++  return {
++    proveOwned: async (descriptor: D, nonce: string): Promise<boolean> => {
++      const proof = await requestJson(descriptor, '/api/ssh/ownership', { timeoutMs: 3000 }) as RetirementReply | null
++
++      // runtimeIntact is deliberately NOT a prerequisite for retirement. A
++      // deleted managed Python runtime is precisely what reconnect repairs.
++      return Boolean(nonce) && proof?.ok === true && proof.protocolVersion === 1 && proof.sshOwnerNonce === nonce
++    },
++    prepare: async (descriptor: D): Promise<string | null> => {
++      const reply = await request(descriptor, 'prepare')
++
++      return reply?.ok === true && reply.idle === true && typeof reply.token === 'string' && reply.token
++        ? reply.token : null
++    },
++    commit: async (descriptor: D, token: string): Promise<boolean> => {
++      const reply = await request(descriptor, 'commit', token)
++
++      if (reply?.ok !== true && reply?.ok !== false) {
++        throw new Error('Unknown retirement commit outcome')
++      }
++
++      return reply.ok
++    },
++    cancel: async (descriptor: D, token: string): Promise<void> => {
++      await request(descriptor, 'cancel', token)
++    }
++  }
++}
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index 601ed7b0d4..3a1e438214 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -242,6 +242,8 @@ declare global {
+         test: (id: string) => Promise<DesktopConnectionTestResult>
+         // Drain/update/restore one Desktop-managed SSH install. External URL
+         // and cloud sources are refused without touching their processes.
++        reconnectTarget?: (id: string, profile: string) => Promise<{ connectionId: string; profile: string; generation: string } | null>
++        reconnect?: (target: { connectionId: string; profile: string; generation: string }) => Promise<{ ok: boolean; generation?: string }>
+         updateManaged?: (id: string) => Promise<DesktopManagedConnectionUpdateResult>
+         // Fan out `hermes update` to every eligible registered connection;
+         // cloud entries are skipped (platform-managed), each row independent.
+-- 
+2.55.0
+

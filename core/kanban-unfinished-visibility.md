@@ -1,6 +1,6 @@
 # Unfinished Kanban visibility and conditional holds
 
-Patch: `0290`. Complements [sidebar-status-stripe.md](sidebar-status-stripe.md).
+Patch: `0358`. Complements [sidebar-status-stripe.md](sidebar-status-stripe.md).
 
 ## Behavior
 
@@ -34,7 +34,7 @@ The implementation owner's handoff additionally reports 87 passing Desktop state
 
 ## Applying
 
-Apply the complete ordered `core/patches/` series with `git am -3` at its upstream/fork merge-base, not an independently advanced upstream tip. All 284 patches were successfully applied at `4957bbd0a0` for this export.
+Apply the complete ordered `core/patches/` series with `git am -3 --empty=keep` at its upstream/fork merge-base, not an independently advanced upstream tip. All 284 patches were successfully applied at `4957bbd0a0` for this export.
 
 ## Gotchas
 
