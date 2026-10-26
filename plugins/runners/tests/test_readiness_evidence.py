@@ -45,12 +45,12 @@ def test_held_never_hides_independent_failure(tmp_path, failure):
 
 
 def test_busy_draining_preserves_activity_and_checks(tmp_path):
-    _, svc, snap = build(tmp_path, kind='drained', source='systemd')
+    _, svc, snap = build(tmp_path, kind='drained', source='systemd', service='stopped')
     rid = snap['runners'][0]['id']
     snap['states'][rid]['activity'] = 'busy'
     row = projected(svc, snap)
     assert row['activity'] == 'busy'
-    assert row['readiness_evidence']['failed'] == ['operational:drained:systemd']
+    assert row['readiness_evidence']['failed'] == ['service', 'operational:drained:systemd']
     assert row['readiness_evidence']['hold_explained_failures'] == row['readiness_evidence']['failed']
 
 
