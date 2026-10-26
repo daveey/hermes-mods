@@ -2,6 +2,130 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
 const p = await loadPlugin()
+test('node projection includes empty hosts and keeps unassigned registrations separate', () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: 'host_0000000000000002', display_name: 'Empty node' }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  s.data.runners.push({ ...s.data.runners[0], id: 'runner_0000000000000002', provider_runner_id: '2', host_id: null })
+  const sources = [source(s)]
+  const v = p.projectNodes(sources, p.projectFleet(sources).rows)
+  assert.equal(v.nodes.length, 2)
+  assert.deepEqual(v.nodes.map(n => n.registrationCount), [1, 0])
+  assert.equal(v.unassigned.length, 1)
+  assert.equal(v.nodes[0].runners[0].source.route, route)
+  assert.equal(v.nodes[1].activity.busy, null)
+  assert.equal(v.nodes[1].freshness.observedAt, null)
+})
+test('host provenance supplies only actual probe age including empty nodes', () => {
+  const s = snapshot(), now = Date.now()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  const observed_at = new Date(now - 30000).toISOString()
+  const probe = { source_id: fixtures.Host.resource_id, observed_at, expires_at: new Date(now + 1000).toISOString(), state: 'fresh', observation_ids: ['probe'] }
+  s.meta.provenance.push(probe)
+  const node = () => p.projectNodes([source(s)], [], now).nodes[0]
+  assert.deepEqual(node().freshness, { state: 'fresh', observedAt: observed_at })
+  probe.expires_at = new Date(now - 1).toISOString()
+  assert.equal(node().freshness.state, 'stale')
+  probe.state = 'unavailable'
+  assert.equal(node().freshness.state, 'unavailable')
+  probe.observed_at = null
+  assert.equal(node().freshness.observedAt, null)
+  assert.notEqual(node().freshness.state, 'fresh')
+})
+test('node summary renders probe age and freshness rather than collector heartbeat', async () => {
+  const s = snapshot(), now = Date.now()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.meta.provenance.push({ source_id: fixtures.Host.resource_id, observed_at: new Date(now - 120000).toISOString(), expires_at: new Date(now - 1000).toISOString(), state: 'stale', observation_ids: ['probe'] })
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    const node = document.querySelector('[data-node-row]')
+    assert.match(node.textContent, /stale.*2m/i)
+    assert.doesNotMatch(node.textContent, /Not observed/)
+  } finally { await ui.close() }
+})
+test('node health never turns management reachability or busy activity into verified health', () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host)]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  s.data.runners[0].activity = 'busy'
+  const sources = [source(s)]
+  let n = p.projectNodes(sources, p.projectFleet(sources).rows).nodes[0]
+  assert.equal(n.health.state, 'unknown')
+  assert.match(n.health.reason, /Reachable.*health unverified/)
+  assert.equal(n.freshness.observedAt, null)
+  s.data.hosts[0].management = 'unreachable'
+  n = p.projectNodes(sources, p.projectFleet(sources).rows).nodes[0]
+  assert.match(n.health.reason, /not proof of.*outage/)
+  assert.equal(n.health.state, 'unknown')
+  assert.equal(n.monitoring, 'unreachable')
+})
+test('node duplicates select newest usable owner evidence independent of discovery order', () => {
+  const older = snapshot(), newer = snapshot()
+  older.data.hosts = [structuredClone(fixtures.Host)]
+  newer.data.hosts = [{ ...structuredClone(fixtures.Host), management: 'unreachable' }]
+  older.meta.observed_at = new Date(Date.now() - 60000).toISOString()
+  const a = source(older), b = source(newer, { route: { ...route, connectionId: 'second' } })
+  for (const sources of [[a, b], [b, a]]) {
+    const n = p.projectNodes(sources).nodes[0]
+    assert.equal(n.monitoring, 'unreachable')
+    assert.equal(n.source.route.connectionId, 'second')
+  }
+  b.error = 'Owner unreachable'
+  assert.equal(p.projectNodes([b, a]).nodes[0].monitoring, 'reachable')
+  const failed = p.projectNodes([b]).nodes[0]
+  assert.match(failed.health.reason, /Owner unreachable/)
+  assert.equal(failed.freshness.state, 'stale')
+  assert.equal(failed.monitoring, 'unknown')
+})
+test('node projection tolerates unavailable directory entries without routes', () => {
+  const result = p.projectNodes([{ error: 'Directory unavailable' }, { error: 'No routes' }])
+  assert.deepEqual(result, { nodes: [], unassigned: [] })
+})
+test('node projection treats owner state failures as stale even without transport errors', () => {
+  for (const state of ['owner_disconnected', 'plugin_unavailable', 'owner_conflict']) {
+    const s = snapshot()
+    s.data.state = state
+    s.data.hosts = [structuredClone(fixtures.Host)]
+    const node = p.projectNodes([source(s)]).nodes[0]
+    assert.equal(node.monitoring, 'unknown')
+    assert.equal(node.freshness.state, 'stale')
+    assert.match(node.health.reason, /Owner unavailable/)
+  }
+})
+test('node capacity uses enforced limits and maintenance expires without inventing draining', () => {
+  const s = snapshot(), now = Date.now()
+  s.data.hosts = [{ ...structuredClone(fixtures.Host), capacity: { enforced: false, declared_max_jobs: 8, observed_active_jobs: null }, maintenance: { state: 'active', reason: 'Inspection', expires_at: new Date(now - 1).toISOString() } }]
+  let projection = p.projectNodes([source(s)], [], now)
+  assert.deepEqual(projection.nodes[0].capacity, { enforced: false, limit: null, active: null })
+  assert.equal(projection.nodes[0].maintenance.active, false)
+  assert.equal(p.selectNodes(projection, '', 'Maintenance').groups.length, 0)
+  s.data.hosts[0].capacity.enforced = true
+  s.data.hosts[0].maintenance.expires_at = new Date(now + 1000).toISOString()
+  projection = p.projectNodes([source(s)], [], now)
+  assert.deepEqual(projection.nodes[0].capacity, { enforced: true, limit: 8, active: null })
+  assert.equal(projection.nodes[0].maintenance.active, true)
+  assert.equal(projection.nodes[0].maintenance.reason, 'Inspection')
+  assert.equal(p.selectNodes(projection, '', 'Maintenance').groups.length, 1)
+})
+test('node search keeps matching empty hosts and reports only enumerated filtered registrations', () => {
+  const s = snapshot()
+  s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: 'host_0000000000000002', display_name: 'Empty orchard' }]
+  s.data.runners[0].host_id = s.data.hosts[0].id
+  const sources = [source(s)]
+  const nodes = p.projectNodes(sources, p.projectFleet(sources).rows)
+  const empty = p.selectNodes(nodes, 'orchard', 'All')
+  assert.equal(empty.groups.length, 1)
+  assert.equal(empty.groups[0].name, 'Empty orchard')
+  assert.equal(empty.rows.length, 0)
+  assert.equal(p.selectNodes(nodes, 'absent-term', 'All').groups.length, 0)
+  assert.equal(p.selectNodes(nodes, 'orchard', 'Busy').groups.length, 0)
+  const all = p.selectNodes(nodes)
+  assert.equal(all.groups.length, 2)
+  assert.equal(all.rows.length, 1)
+  assert.deepEqual(all.rows, all.groups.flatMap(g => g.rows))
+})
 test('status chip cannot wrap or shrink below its reduced label', () => {
   assert.match(p.CSS, /\[data-slot=runners-chip\]\{flex-shrink:0;white-space:nowrap\}/)
 })
@@ -193,6 +317,7 @@ test('render 100 registrations with no per-row request amplification, native pop
   try {
     assert.ok(button('Show runners'))
     await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
     assert.equal(document.querySelectorAll('[data-runner-row]').length, 100)
     assert.match(document.body.textContent, /Collector heartbeat/)
     assert.equal(calls.filter(([x]) => x.includes('/inventory')).length, 1)
@@ -216,8 +341,11 @@ test('keyboard slash, arrows, Enter, Escape details then popover and focus resto
   const ui = await mount(React.createElement(p.Runners, { ctx }))
   try {
     await ui.click(button('Show runners'))
+    await ui.click(document.querySelector('[data-node-row]'))
     await ui.key(document.querySelector('[data-runners-panel]'), '/')
     assert.equal(document.activeElement.getAttribute('aria-label'), 'Search runners')
+    await ui.key(document.activeElement, 'ArrowDown')
+    assert.ok(document.activeElement.hasAttribute('data-node-row'))
     await ui.key(document.activeElement, 'ArrowDown')
     assert.ok(document.activeElement.hasAttribute('data-runner-row'))
     await ui.key(document.activeElement, 'Enter')
@@ -225,6 +353,8 @@ test('keyboard slash, arrows, Enter, Escape details then popover and focus resto
     await ui.key(document.activeElement, 'Escape')
     assert.doesNotMatch(document.body.textContent, /Source observations/)
     await ui.key(document.querySelector('[data-runners-panel]'), 'Escape')
+    assert.equal(document.querySelector('[data-node-row]').getAttribute('aria-expanded'), 'false')
+    await ui.key(document.activeElement, 'Escape')
     assert.equal(document.querySelector('[data-runners-panel]'), null)
     assert.equal(document.activeElement, button('Show runners'))
   } finally {
