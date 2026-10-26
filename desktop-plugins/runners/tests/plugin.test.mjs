@@ -54,6 +54,21 @@ test('node projection tolerates unavailable directory entries without routes', (
   const result = p.projectNodes([{ error: 'Directory unavailable' }, { error: 'No routes' }])
   assert.deepEqual(result, { nodes: [], unassigned: [] })
 })
+test('node capacity uses enforced limits and maintenance expires without inventing draining', () => {
+  const s = snapshot(), now = Date.now()
+  s.data.hosts = [{ ...structuredClone(fixtures.Host), capacity: { enforced: false, declared_max_jobs: 8, observed_active_jobs: null }, maintenance: { state: 'active', reason: 'Inspection', expires_at: new Date(now - 1).toISOString() } }]
+  let projection = p.projectNodes([source(s)], [], now)
+  assert.deepEqual(projection.nodes[0].capacity, { enforced: false, limit: null, active: null })
+  assert.equal(projection.nodes[0].maintenance.active, false)
+  assert.equal(p.selectNodes(projection, '', 'Maintenance').groups.length, 0)
+  s.data.hosts[0].capacity.enforced = true
+  s.data.hosts[0].maintenance.expires_at = new Date(now + 1000).toISOString()
+  projection = p.projectNodes([source(s)], [], now)
+  assert.deepEqual(projection.nodes[0].capacity, { enforced: true, limit: 8, active: null })
+  assert.equal(projection.nodes[0].maintenance.active, true)
+  assert.equal(projection.nodes[0].maintenance.reason, 'Inspection')
+  assert.equal(p.selectNodes(projection, '', 'Maintenance').groups.length, 1)
+})
 test('node search keeps matching empty hosts and reports only enumerated filtered registrations', () => {
   const s = snapshot()
   s.data.hosts = [structuredClone(fixtures.Host), { ...structuredClone(fixtures.Host), id: 'host_0000000000000002', display_name: 'Empty orchard' }]

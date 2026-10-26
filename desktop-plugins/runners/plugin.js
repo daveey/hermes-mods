@@ -437,6 +437,16 @@ export function projectNodes(sources = [], projectedRows = [], now = Date.now())
       nodes.set(key, {
         key, host, owner: snapshot.meta.owner, source, runners,
         registrationCount: runners.length,
+        capacity: {
+          enforced: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs >= 0,
+          limit: host.capacity?.enforced === true && Number.isInteger(host.capacity?.declared_max_jobs) && host.capacity.declared_max_jobs >= 0 ? host.capacity.declared_max_jobs : null,
+          active: Number.isInteger(host.capacity?.observed_active_jobs) && host.capacity.observed_active_jobs >= 0 ? host.capacity.observed_active_jobs : null
+        },
+        maintenance: {
+          active: host.maintenance?.state === 'active' && Date.parse(host.maintenance.expires_at) > now,
+          reason: host.maintenance?.reason || null,
+          expiresAt: host.maintenance?.expires_at || null
+        },
         monitoring: source.error ? 'unknown' : host.management || 'unknown',
         health: {
           state: 'unknown',
@@ -485,7 +495,7 @@ export function selectNodes(projection, search = '', filter = 'All') {
     const rows = selectRows(n.runners, hostMatches ? '' : search, filter)
     const nodeMatchesFilter = filter === 'All' ||
       (filter === 'Needs attention' && (n.source.error || n.monitoring !== 'reachable' || n.freshness.state !== 'fresh')) ||
-      (filter === 'Maintenance' && n.host.maintenance?.state === 'active')
+      (filter === 'Maintenance' && n.maintenance.active)
     return rows.length || (hostMatches && nodeMatchesFilter)
       ? [{ ...n, name: n.host.display_name, rows }] : []
   })
