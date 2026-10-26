@@ -221,8 +221,8 @@ function rowState(r, source, hostRow, now) {
   const maintenance =
     hostRow?.maintenance?.state === 'active' && Date.parse(hostRow.maintenance.expires_at) > now
   const issue =
-    (!maintenance && ['offline', 'missing'].includes(r.registration)) ||
-    (!maintenance && ['fail', 'warn'].includes(r.readiness))
+    stale || ['offline', 'missing', 'unknown'].includes(r.registration) ||
+    ['fail', 'warn'].includes(r.readiness)
   const health = stale
     ? 'Stale'
     : r.readiness === 'fail'
@@ -306,8 +306,12 @@ export function projectFleet(sources = [], now = Date.now()) {
         label,
         scope: s.data.scopes.find((x) => x.id === c.scope_id)?.name || c.scope_id
       })
-    for (const e of s.meta.source_errors || [])
-      messages.push(`${label}: ${text(e.source_id)} · ${text(e.code)}`)
+    for (const e of s.meta.source_errors || []) {
+      const remaining = typeof e.retry_after_seconds === 'number'
+        ? Math.ceil((Date.parse(e.observed_at) + e.retry_after_seconds * 1000 - now) / 1000)
+        : 0
+      messages.push(`${label}: ${text(e.source_id)} · ${text(e.code)}${Number.isFinite(remaining) && remaining > 0 ? ` · retry in ${remaining}s` : ''}`)
+    }
     for (const r of s.data.runners) {
       const scope = s.data.scopes.find((x) => x.id === r.scope_id),
         hostRow = s.data.hosts.find((x) => x.id === r.host_id)

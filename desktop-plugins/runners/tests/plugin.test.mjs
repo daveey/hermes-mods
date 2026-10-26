@@ -154,6 +154,14 @@ test('source error once, host management warning once, disconnected cached rows 
   assert.equal(v.rows[0].actionable, false)
   assert.equal(v.counts.ready, 0)
 })
+test('source cooldown ETA is aged from its observation, not reset on render', () => {
+  const s = snapshot()
+  const now = Date.now()
+  s.meta.source_errors = [{ source_id: fixtures.Scope.id, code: 'forbidden',
+    retry_after_seconds: 60, observed_at: new Date(now - 20000).toISOString() }]
+  assert.match(p.projectFleet([source(s)], now).messages.join(' '), /retry in 40s/)
+  assert.doesNotMatch(p.projectFleet([source(s)], now + 61000).messages.join(' '), /retry in/)
+})
 test('polling pauses hidden and uses 15/60 second cadence', () => {
   assert.equal(p.pollInterval(true, true), 15000)
   assert.equal(p.pollInterval(false, true), 60000)
