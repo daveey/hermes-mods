@@ -36,6 +36,7 @@ test('source diagnostics are collapsed while material owner failure remains visi
     const diagnostics = document.querySelector('details[data-runners-diagnostics]')
     assert.ok(diagnostics, 'source diagnostics disclosure exists')
     assert.equal(diagnostics.open, false)
+    assert.ok(document.querySelector('.hermes-runners-scroll').compareDocumentPosition(diagnostics) & Node.DOCUMENT_POSITION_FOLLOWING, 'diagnostics follow inventory')
     assert.match(diagnostics.textContent, /Collector heartbeat/)
     const status = document.querySelector('[role="status"]')
     assert.match(status.textContent, /Owner unavailable/)

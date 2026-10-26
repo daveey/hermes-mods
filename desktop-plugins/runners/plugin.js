@@ -1205,45 +1205,6 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
           search.trim() || filter !== 'All' ? h('div', { 'data-filtered-cohort': true }, `Showing ${groups.filter(g => g.host).length} nodes · ${rows.length} registrations`) : null
         ),
         h(
-          'details',
-          { 'data-runners-diagnostics': true },
-          h('summary', { className: 'hermes-runners-muted' }, 'Source diagnostics'),
-          h(
-          'div',
-          { className: 'hermes-runners-muted' },
-          `Collector heartbeat ${ago(
-            selected
-              .map((s) => s.snapshot?.meta.observed_at)
-              .filter(Boolean)
-              .sort()[0]
-          )} · Coverage ${view.coverage.filter((c) => c.state === 'complete').length}/${view.coverage.length} scopes complete · ${view.complete ? 'current' : 'incomplete / stale'}`
-        ),
-        h(
-          'details',
-          null,
-          h(
-            'summary',
-            { className: 'hermes-runners-muted' },
-            'Source coverage and observation ages'
-          ),
-          ...selected.map((s, i) =>
-            h(
-              'div',
-              { key: i, className: 'hermes-runners-note' },
-              `${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''} · checked ${ago(s.snapshot?.meta.observed_at)}`
-            )
-          ),
-          ...view.coverage.map((c, i) =>
-            h(
-              'div',
-              { key: `coverage-${i}`, className: 'hermes-runners-note' },
-              `${c.scope}: ${c.state} · ${c.enumerated_count ?? '?'} / ${c.provider_total_count ?? '?'} · ${text(c.reason_code)}`
-            )
-          )
-        ),
-        ...view.messages.map((m) => h('p', { key: m, className: 'hermes-runners-note' }, m))
-        ),
-        h(
           'div',
           {
             role: 'status',
@@ -1340,6 +1301,21 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
                 : null
             )
           )
+        ),
+        h(
+          'details',
+          { 'data-runners-diagnostics': true, style: { maxHeight: 100, overflow: 'auto', flexShrink: 0 } },
+          h('summary', { className: 'hermes-runners-muted' }, 'Source diagnostics'),
+          h('div', { className: 'hermes-runners-muted' },
+            `Collector heartbeat ${ago(selected.map(s => s.snapshot?.meta.observed_at).filter(Boolean).sort()[0])} · Coverage ${view.coverage.filter(c => c.state === 'complete').length}/${view.coverage.length} scopes complete · ${view.complete ? 'current' : 'incomplete / stale'}`),
+          h('details', null,
+            h('summary', { className: 'hermes-runners-muted' }, 'Source coverage and observation ages'),
+            ...selected.map((s, i) => h('div', { key: i, className: 'hermes-runners-note' },
+              `${s.route?.connectionId || 'Sources'} / ${s.route?.targetProfile || ''} · checked ${ago(s.snapshot?.meta.observed_at)}`)),
+            ...view.coverage.map((c, i) => h('div', { key: `coverage-${i}`, className: 'hermes-runners-note' },
+              `${c.scope}: ${c.state} · ${c.enumerated_count ?? '?'} / ${c.provider_total_count ?? '?'} · ${text(c.reason_code)}`))
+          ),
+          ...view.messages.map(m => h('p', { key: m, className: 'hermes-runners-note' }, m))
         ),
         h(
           'div',
