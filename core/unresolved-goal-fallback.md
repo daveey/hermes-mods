@@ -79,3 +79,22 @@ poll requirement, scope/rotation, wrong-thread rejection, refusal, expiration an
 The coach `test_goal_owner_gate_liveness.py` exercises native board polling with an unreadable
 board negative; `test_goal_ownership_liveness.py` covers isolated completion collection to an
 origin test sink. These do not claim real client transport acceptance.
+
+
+## Private-candidate transport delivery (draft)
+
+Buffered assistant candidates no longer bypass the gate as `reasoning.available`
+progress previews. Native provider reasoning and unbuffered legacy previews are
+unchanged. An unresolved gate outcome now sets a failed/error result with a
+non-retryable `pre_final_gate_unresolved` runtime descriptor, rather than presenting
+an incomplete goal as a successful gateway `message.complete`.
+
+Tests: `tests/agent/test_pre_final_delivery_channels.py` covers held progress text,
+accepted delivery, error outcome, runtime error classification and legacy previews.
+The companion `plugins/coach/tests/test_goal_disposition_transport.py` executes
+isolated Python CLI stream-json dispatch, stdio JSON-RPC and loopback WebSocket
+using the production Desktop gateway handler, a local SSE model and real SessionDB.
+All nine cases pass after reproducing progress leaks and incorrect terminal status
+on both gateway routes. Analysis-only and explicit action-denial controls pass.
+This does not claim Electron UI, authenticated serve startup, interactive PTY,
+interrupt-RPC, or production activation coverage. Enforcement remains disabled.
