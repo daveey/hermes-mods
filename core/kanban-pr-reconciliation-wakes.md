@@ -26,7 +26,7 @@ Source suites, **not run in this documentation pass**:
 - `tests/hermes_cli/test_kanban_pr_wake.py`: open/merged/closed states, invalid identifiers without normalization, transport timeout/error redaction, real test-board wake without completion.
 - `tests/hermes_cli/test_kanban_pr_supersession.py`: exact successful job/head, containing default branch, invalid argument pair before transport, malformed evidence/conclusions, abandoned-PR controls.
 
-Run with `bash scripts/run_tests.sh <files>` in the isolated applied checkout. Mocked API tests are not a live GitHub or broker exercise. Full-series apply/test verification is pending the mirror owner.
+Run with `bash scripts/run_tests.sh <files>` in the isolated applied checkout. Mocked API tests are not a live GitHub or broker exercise. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md).
 
 ## Applying
 

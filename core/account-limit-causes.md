@@ -31,7 +31,7 @@ Unreadable/corrupt stores produce a conservative diagnostic without exposing row
 
 Source `tests/hermes_cli/test_anthropic_unavailable_diagnostics.py` covers this diagnostic boundary;
 it was not run in this documentation pass. Run it with `bash scripts/run_tests.sh` in the isolated
-applied checkout. Full-series verification is pending the mirror owner, and no live authentication
+applied checkout. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md), and no live authentication
 was attempted. Apply 0340 in ordered-series context. This runtime-provider change is core, not the
 account-usage display plugin; a message is not proof that a credential will work on retry.
 

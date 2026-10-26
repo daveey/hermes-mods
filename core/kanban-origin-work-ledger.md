@@ -67,7 +67,7 @@ Desktop consumers apply freshness consistently to rows, tabs, navigation and arc
 
 ## Tests
 
-These are **source regression suites**, not tests executed by this documentation pass. Full ordered-series apply and applied-tree test verification are pending the mirror owner. No live gateway, courier, Desktop or notification deployment is claimed.
+These are **source regression suites**, not tests executed by this documentation pass. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md). No live gateway, courier, Desktop or notification deployment is claimed.
 
 Python suites under `tests/hermes_cli/`:
 

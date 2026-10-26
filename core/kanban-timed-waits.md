@@ -25,7 +25,7 @@ kind instead of remaining `blocked + time`. Genuine `needs_input`/`capability` c
 human-visible. The shared `hermes_cli/kanban_db.py` / `kanban_timed_park.py` implementation is covered
 by source `tests/hermes_cli/test_kanban_timed_park.py`; this documentation pass did not run that suite.
 0373 only condenses the explanatory comment in `kanban_db.py`; it makes no runtime change and adds no test.
-Apply both in series order. Full-series apply/test verification is pending the mirror owner; neither
+Apply both in series order. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); neither
 patch implies a live dispatcher deployment. This remains core routing, not a plugin notification fix.
 
 ## Behavior

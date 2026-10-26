@@ -57,7 +57,7 @@ Source regression suites, **not executed in this documentation pass**:
 - `tests/plugins/test_kanban_board_lifecycle_api.py`: dashboard lifecycle errors.
 - `tests/gateway/test_kanban_pre_dispatch_isolation.py`: one board's pre-work failure does not stop other boards.
 
-Run these with `bash scripts/run_tests.sh <files>` in the isolated applied checkout. Full-series verification remains pending the mirror owner; no live board ownership was set by this mirror.
+Run these with `bash scripts/run_tests.sh <files>` in the isolated applied checkout. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); no live board ownership was set by this mirror.
 
 ## Applying
 

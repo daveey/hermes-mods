@@ -141,13 +141,12 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 ## Applying
 
-The current export contains **368 patches**, including **73 newly mirrored source commits**
-beyond the prior 295-patch inventory, pinned to source
-`6385cf3622a002fc9ad7cd182b53f2e346358fa5`. The feature rows cover all new identities,
-including repeated reconnect commits (0309/0318, 0310/0319, 0315/0320, 0317/0321)
-and the repeated Nix guard change (0347/0353). Full ordered apply/adaptation and
-applied-tree test verification are **pending the mirror owner**; the historical
-results below do not certify this expanded series. No deployment is claimed.
+The current export contains **377 patches**, including **82 newly mirrored source commits**
+beyond the prior295-patch inventory, pinned to source
+`85ef8520b95d5ee775a25161b20c195b2d2349b9`. All377 apply in order with
+`git am -3 --empty=keep`;324 selected Python tests and136 Desktop tests pass,
+and renderer typechecking passes. See [verification](mirror-377-verification.md)
+for duplicate/adaptation details and exact scope. No runtime deployment is claimed.
 Chrome 0370–0372 remains experimental; see [managed-chrome-leases.md](managed-chrome-leases.md).
 Existing source identities are retained, with renumbered references; do not assume
 that repeated changes can be applied twice without an explicit adaptation.

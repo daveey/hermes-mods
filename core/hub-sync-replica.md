@@ -60,8 +60,7 @@ row/menu components and hub-sync poller.
 `app/session/hooks/use-session-list-actions.test.tsx` and
 `use-session-actions/archive-linked-confirm.test.tsx` (paths relative to `apps/desktop/src`).
 They cover owner collisions, stale menu snapshots, live reconnect precedence, linked archive confirmation,
-real poller/list refresh and both row rendering paths. Full-series apply/test verification remains pending
-the mirror owner; historical results below are not a 0364 or current-series run. No live deployment is claimed.
+real poller/list refresh and both row rendering paths. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); historical results below are not a 0364 or current-series run. No live deployment is claimed.
 
 Apply 0364 after 0329 in the ordered series; it needs the owner-routing and unknown-work archive changes.
 Do not fall back to the ambient selected gateway/profile when an offline action cannot prove its owner.

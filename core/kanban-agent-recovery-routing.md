@@ -35,7 +35,7 @@ Source tests, **not executed in this documentation pass**:
 - `tests/hermes_cli/test_kanban_block_classify.py`, `test_kanban_core_functionality.py`, `test_kanban_db.py`, `test_kanban_quota_guard.py`: automatic-stop integration.
 - `tests/hermes_cli/test_kanban_park_invariants.py`, `test_kanban_review_lifecycle_complete.py`, `test_kanban_worker_exit_trailer.py`, `test_kanban_worker_scope_failure.py`, `test_kanban_worktree_create_validation.py`: 0365 lifecycle expectations.
 
-Use `bash scripts/run_tests.sh <files>` in the applied isolated checkout. Full-series verification is pending the mirror owner; no live dispatcher exercise or UI verification is claimed here.
+Use `bash scripts/run_tests.sh <files>` in the applied isolated checkout. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); no live dispatcher exercise or UI verification is claimed here.
 
 ## Applying
 

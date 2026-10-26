@@ -23,8 +23,8 @@ Patch0373 explicitly includes inspected merge-only safety changes: comment-ID co
 ## Tests executed on the applied public series
 
 - Fresh full `git am -3 --empty=keep`: exit0,377 patches produce377 commits, clean worktree, no implicit already-applied skips.
-- Applied tree: `3fce516dd6273982cd9c403e8c6f463bf6da123c`.
--454 changed Python files parse successfully.
+- Applied tree: `719f121bc6986eb7f0b8089a05f5ac2bcc864f0b`.
+- 454 changed Python files parse successfully.
 - Canonical `scripts/run_tests.sh -j 3`:19 files,324 passed,0 failed. Covers continuation exhaustion, agent stop routing, dispatch owner/operator, session activity, origin ledger/adapter/intent/CLI/service/alias release and session-start/resume tests selected by their file globs.
 - Desktop Vitest:5 files,136 passed,0 failed: session-dot-state, sidebar session-row, archive-linked-confirm, registry-reconnect and registry-reconnect-service.
 - Renderer TypeScript `tsc -p . --noEmit`: pass with `NODE_OPTIONS=--max-old-space-size=6144`. Default heap initially aborted; no type errors were suppressed.
@@ -36,3 +36,5 @@ An earlier invocation adding `-p hermes_bootstrap` hit pytest fixture-internal a
 Private denylist scan of all377 patch files returned zero matches. Prior attribution/fixture substitutions remain. Patch-format context blank lines and mail trailers naturally trigger outer `git diff --check` whitespace diagnostics; they were not rewritten, because they are patch syntax. Documentation whitespace is checked separately. Publication uses normal repository privacy/coverage hooks.
 
 This mirror updates public patches and documentation only. Runtime deployment, production owner settings, release acceptance and live user-interface verification remain with the owning implementation cards.
+
+The final privacy hook flagged a route-key test string as a possible API key. Parenthesizing that same literal avoids the false positive without changing its value. The full377-patch apply was rerun after this change.

@@ -42,7 +42,7 @@ Source suites, **not executed by this documentation pass**:
 - `registry-reconnect-wiring.test.ts`: exact dial correlation and ownership/transport classification.
 - `tests/hermes_cli/test_backend_retirement.py`: authenticated endpoint and threaded atomic admission-versus-freeze race (0322).
 
-Run Electron tests using `npx vitest run electron/<suite>.test.ts` from `apps/desktop`, and Python tests using `bash scripts/run_tests.sh tests/hermes_cli/test_backend_retirement.py`. Full-series apply and test verification are pending the mirror owner. No live reconnect or bundle installation is claimed.
+Run Electron tests using `npx vitest run electron/<suite>.test.ts` from `apps/desktop`, and Python tests using `bash scripts/run_tests.sh tests/hermes_cli/test_backend_retirement.py`. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md). No live reconnect or bundle installation is claimed.
 
 ## Applying
 
