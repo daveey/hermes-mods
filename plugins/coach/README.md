@@ -576,9 +576,11 @@ these authored cases are not a blind holdout.
 
 `tests/test_goal_electron_acceptance.py` drives a built Electron renderer under
 Linux Xvfb through its composer and actual production serve/token-auth transport.
-It checks rejected-candidate DOM observation, unresolved persistence, and a second
-analysis-only turn, with four actual HTTP auxiliary calls to a deterministic local
-fixture. It is not a live-model evaluation. Prepare a core worktree with its locked
+Its four cases cover initial rejection, composer Stop, Ctrl+Enter queueing, and
+reconnection of the exact remote session socket. Each checks rejected-candidate
+DOM observation and persistence, one shared session, and a second analysis-only
+turn. Stop produces interrupted status; the other first turns produce unresolved
+error status. The deterministic loopback model is not a live-model evaluation. Prepare a core worktree with its locked
 Desktop dependencies, installed Electron binary and `npm run build --workspace
 apps/desktop`; provide Node, `xvfb-run`, a C compiler and the same Python transport
 dependencies used by `test_goal_serve_acceptance.py`. Run both files using that
@@ -586,11 +588,16 @@ core's `scripts/run_tests.sh`. Missing Electron prerequisites skip the optional
 renderer test; a skipped run does not meet Electron acceptance.
 
 The test seeds only sandbox-local connection settings, supplies the source Python
-interpreter for ancillary local roster backends, and waits for Backend ready before
-submitting. `electron_loopback_fence.c` is inherited by test subprocesses to reject
+interpreter for ancillary local roster backends, and waits for both Backend ready
+and restored remote route before submitting. `electron_loopback_fence.c` is inherited by test subprocesses to reject
 non-loopback connect/sendto and signals to processes with a different HERMES_HOME.
 `test_goal_electron_fence.py` verifies the foreign-process and network denials using
 an owned disposable process. This is a regression-fixture guard, not a security
 sandbox for hostile executables or direct syscalls. No production profile should be
-used for these tests. Electron queue/stop/reconnect controls, production activation,
-remote owner adapters and exact-original replay remain separate requirements.
+used for these tests. Full app reload, backend restart and all-gateway socket loss
+are not covered by the session-socket reconnect case. Production activation,
+remote/process owner adapters and exact-original replay remain separate requirements.
+
+`test_goal_process_ownership.py` verifies that cached process handles, notify flags
+and forged consumer assertions cannot certify ownership or release a prior hold.
+It is a conservative UNKNOWN regression, not a positive process owner adapter.

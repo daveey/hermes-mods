@@ -14,10 +14,12 @@ from http.server import ThreadingHTTPServer
 import yaml
 import pytest
 from test_goal_disposition_transport import isolated_env, TEXTS
-from test_goal_serve_acceptance import Model, _ready
+from test_goal_serve_acceptance import _ready
+from electron_control_model import Model
 
 
-def test_real_electron_guard(tmp_path):
+@pytest.mark.parametrize('control', ['initial', 'stop', 'queue', 'reconnect'])
+def test_real_electron_guard(tmp_path, control):
     import hermes_constants
     core = Path(hermes_constants.__file__).resolve().parent
     if sys.platform != 'linux' or not shutil.which('xvfb-run') or not (core / 'apps/desktop/dist/electron-main.mjs').exists():
@@ -33,7 +35,10 @@ def test_real_electron_guard(tmp_path):
     provider = ThreadingHTTPServer(('127.0.0.1', 0), Model)
     provider.calls = []
     provider.release = threading.Event()
-    provider.release.set()
+    provider.home = home
+    provider.control = control
+    if control == 'initial':
+        provider.release.set()
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     endpoint = f'http://127.0.0.1:{provider.server_port}/v1'
@@ -48,17 +53,28 @@ def test_real_electron_guard(tmp_path):
             port = _ready(home/'ready.json',process,errors)
             env.update(HERMES_DESKTOP_HERMES_ROOT=str(core),HERMES_DESKTOP_PYTHON=sys.executable,HERMES_DESKTOP_ISOLATED_BACKEND='1')
             driver=Path(__file__).with_name('electron_guard_driver.mjs')
-            result=subprocess.run(['xvfb-run','-a','node',str(driver),str(core),str(home),f'http://127.0.0.1:{port}',token],env=env,cwd=home,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=260)
+            result=subprocess.run(['xvfb-run','-a','node',str(driver),str(core),str(home),f'http://127.0.0.1:{port}',token,control],env=env,cwd=home,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=260)
             (home/'electron.log').write_text(result.stdout)
             assert result.returncode == 0, result.stdout + repr([(str(p),p.read_text()[-14000:]) for p in home.rglob('desktop.log')])
             receipt=json.loads((home/'electron-receipt.json').read_text())
             assert receipt['passed'] and receipt['electron']
             with sqlite3.connect(home/'state.db') as db:
                 persisted='\n'.join(row[0] or '' for row in db.execute("SELECT content FROM messages WHERE role='assistant'"))
+                # Queued sends retain an inactive accept-time row; stop adds a typed runtime marker.
+                user_rows = db.execute("SELECT session_id, content FROM messages WHERE role='user' AND active=1 AND COALESCE(display_kind, '') != 'turn_stopped' ORDER BY timestamp").fetchall()
+            assert len(user_rows) == 2, user_rows
+            assert len({r[0] for r in user_rows}) == 1, user_rows
+            assert user_rows[0][1].startswith('Repair example app'), user_rows
+            assert user_rows[1][1].startswith('Explain HTTP 503'), user_rows
             assert TEXTS['abandoned'] not in persisted
-            assert 'Unresolved goal' in persisted and TEXTS['analysis'] in persisted
-            assert sum(c.get('model')=='acceptance-judge' for c in provider.calls)==4
+            assert TEXTS['analysis'] in persisted
+            if control != 'stop':
+                assert 'Unresolved goal' in persisted
+            else:
+                assert 'Unresolved goal' not in persisted
+            assert sum(c.get('model')=='acceptance-judge' for c in provider.calls)==(1 if control == 'stop' else 4)
         finally:
+            provider.release.set()
             process.terminate()
             try: process.wait(timeout=20)
             except subprocess.TimeoutExpired: process.kill();process.wait(timeout=10)
