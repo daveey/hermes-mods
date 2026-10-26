@@ -61,6 +61,9 @@ def authorization(v, evidence):
             or v['boundary_kind'] != 'approval'
             or result.get('status') != 'pending_approval'
             or result.get('approval_pending') is not True or result.get('command') != action
+            or result.get('success') is True
+            or type(result.get('exit_code')) is int and result['exit_code'] == 0
+            or type(result.get('status_code')) is int and 200 <= result['status_code'] < 300
             or path != '/approve' or '/approve' not in candidate):
         raise ValueError('unproven_current_approval_boundary')
     # Execution options do not identify an operation. A newer result for the

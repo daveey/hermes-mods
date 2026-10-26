@@ -552,3 +552,33 @@ and interactive CLI PTY Ctrl-C. Together with `test_goal_disposition_transport.p
 keypresses respect the native 50ms paste debounce; no input-handler bypass is used.
 These do not cover Electron, production serve auth/startup, real-model semantics or
 actual-profile activation. The original private incident replay remains unresolved.
+
+
+### Electron and approval consistency acceptance
+
+`tests/test_goal_approval_consistency.py` rejects pending-approval evidence that
+simultaneously claims success, a zero exit, or a successful HTTP status. Its core
+recheck test proves this cannot clear a confirmed hold. Exact literal action
+binding is not semantic proof that the action is necessary for the requested goal;
+the explicitly named relevance characterization remains a limitation.
+
+`tests/test_goal_electron_acceptance.py` drives a built Electron renderer under
+Linux Xvfb through its composer and actual production serve/token-auth transport.
+It checks rejected-candidate DOM observation, unresolved persistence, and a second
+analysis-only turn, with four actual HTTP auxiliary calls to a deterministic local
+fixture. It is not a live-model evaluation. Prepare a core worktree with its locked
+Desktop dependencies, installed Electron binary and `npm run build --workspace
+apps/desktop`; provide Node, `xvfb-run`, a C compiler and the same Python transport
+dependencies used by `test_goal_serve_acceptance.py`. Run both files using that
+core's `scripts/run_tests.sh`. Missing Electron prerequisites skip the optional
+renderer test; a skipped run does not meet Electron acceptance.
+
+The test seeds only sandbox-local connection settings, supplies the source Python
+interpreter for ancillary local roster backends, and waits for Backend ready before
+submitting. `electron_loopback_fence.c` is inherited by test subprocesses to reject
+non-loopback connect/sendto and signals to processes with a different HERMES_HOME.
+`test_goal_electron_fence.py` verifies the foreign-process and network denials using
+an owned disposable process. This is a regression-fixture guard, not a security
+sandbox for hostile executables or direct syscalls. No production profile should be
+used for these tests. Electron queue/stop/reconnect controls, production activation,
+remote owner adapters and exact-original replay remain separate requirements.
