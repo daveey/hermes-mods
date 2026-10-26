@@ -257,6 +257,10 @@ class Collector:
                       if row['scope_id'] == scope['id'] and row['activity'] == 'busy']
             jobs = self.adapter.enrich_jobs(scope, inventory.rows,
                 allowed_repositories=self.job_repositories[scope['id']], recent_runner_ids=recent)
+            # A cooldown is no new observation. Preserve original timestamps;
+            # do not replace useful evidence with an empty advisory result.
+            if jobs.error == 'enrichment_cooldown':
+                continue
             self.job_results[scope['id']] = dict(rows=list(jobs.rows), complete=jobs.complete,
                 error=jobs.error, observed_at=jobs.observed_at)
         probed=self._hosts(now, forced_hosts)
@@ -346,7 +350,8 @@ class Collector:
                             collection=dict(id=cycle,state='complete' if complete else 'partial',target_ids=[]),
                             host_results=deepcopy(self.host_results),
                             next_scope_lane=self.next_scope_lane,
-                            job_results=deepcopy(self.job_results),
+                            job_results={sid:dict(deepcopy(result), rows=[deepcopy(row) for row in result['rows'] if row['repository'] in self.job_repositories[sid]]) for sid,result in self.job_results.items() if self.job_repositories.get(sid)},
+                            job_monitoring_scopes=sorted(sid for sid,repos in self.job_repositories.items() if repos),
                             coverage=coverage, provenance=provenance, source_errors=errors,
                             runners=rows, states={r['id']:asdict(self.store.load_health(r['id'])) for r in rows})
             for key, targets, created, status in claimed:

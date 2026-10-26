@@ -120,7 +120,9 @@ D['WorkspaceLogs'] = obj(job_id=ID, source_digest=DIGEST, next_cursor=nullable(I
 D['Collection'] = obj(id=ID, state=enum('pending', 'running', 'complete', 'partial', 'failed'), target_ids=array(ID, 100))
 D['Counts'] = obj(registrations=integer(), online=integer(), busy=integer(), verified_ready=integer(), readiness_unverified=integer(), issues=integer(), mapped_hosts=integer(), host_capacity=nullable(integer()))
 D['Inventory'] = obj(state=enum('ready', 'not_configured', 'loading', 'partial', 'provider_unavailable', 'owner_disconnected', 'plugin_unavailable', 'configuration_error', 'owner_conflict'), collection=nullable(ref('Collection')), counts=ref('Counts'), hosts=array(ref('Host')), runners=array(ref('Runner')), scopes=array(ref('Scope'), 1000), providers=array(ref('Provider')), targets=array(ref('ExecutionTarget')))
-D['RunnerDetail'] = obj(runner=ref('Runner'), observations=array(ref('Observation'), 100), incidents=array(ref('Incident'), 100), repairs=array(ref('Repair'), 100), jobs=array(ref('Job'), 100))
+D['JobMonitoring'] = obj(state=enum('configured', 'not_configured', 'forbidden', 'unavailable', 'unknown'), reason_code=text(80), observed_at=nullable(TIME), expires_at=nullable(TIME))
+D['ObservedJob'] = obj(repository={'type':'string','pattern':'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'}, run_id=text(20), job_id=text(20), runner_id=text(20), status=enum('queued','in_progress','completed','waiting','requested','pending'), conclusion=nullable(enum('success','failure','neutral','cancelled','skipped','timed_out','action_required','stale','startup_failure')), observed_at=TIME, expires_at=TIME, url={'type':'string','pattern':r'^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+/job/[0-9]+$'})
+D['RunnerDetail'] = obj(runner=ref('Runner'), observations=array(ref('Observation'), 100), incidents=array(ref('Incident'), 100), repairs=array(ref('Repair'), 100), jobs=array(ref('Job'), 100), job_monitoring=ref('JobMonitoring'), observed_jobs=array(ref('ObservedJob'),100))
 D['RepairResult'] = obj(repair=ref('Repair'), owner_route=nullable(ref('ClientRoute')), route_status=enum('resolved', 'unresolved', 'disconnected', 'unsupported'))
 D['Resolution'] = obj(id=ID, expires_at=TIME, request_digest=DIGEST, candidates=array(ref('ExecutionTarget'), 100), selected_target_id=nullable(ID), state=enum('resolved', 'no_match', 'unknown', 'denied', 'unsupported'), reason_code=text(80))
 D['ArtifactAccess'] = obj(artifact=ref('Artifact'), retrieval_ref=nullable(ID))
@@ -181,6 +183,7 @@ def sample(schema) -> Any:
 def generate():
     schema = {'$schema': 'https://json-schema.org/draft/2020-12/schema', '$id': 'https://example.com/contracts/runners/v1/schema', 'title': 'PROPOSED Runners v1; no runtime endpoints implied', '$ref': '#/$defs/Config', '$defs': D}
     fixtures = {name: sample(value) for name, value in D.items() if value.get('type') == 'object'}
+    fixtures['ObservedJob'].update(repository='example/project', run_id='1', job_id='2', runner_id='3', url='https://github.com/example/project/actions/runs/1/job/2')
     fixtures['Scope'].update(id=oid('scope'), name='example/project', credential_ref=oid('cred'))
     fixtures['Host'].update(resource_id=oid('host'), display_name='Fictional build host', service_refs=[oid('service')])
     fixtures['Runner'].update(id=oid('runner'), scope_id=oid('scope'), display_name='Fictional registration', host_id=None)

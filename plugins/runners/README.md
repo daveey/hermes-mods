@@ -50,6 +50,19 @@ collector attempt. The panel shows this row age separately from the collector
 heartbeat. Failed refreshes retain last-known registrations without asserting
 fresh readiness or available capacity.
 
+Host provenance uses `source_id=host.resource_id`, including hosts with no bound
+registration. Its timestamps come from the actual fixed probe; missing evidence is
+unknown, failed probes unavailable, and expired evidence stale. Inspect adds
+`job_monitoring` (state/reason_code/observed_at/expires_at) and `observed_jobs` with
+bounded provider IDs, status, conclusion, observation times and GitHub links.
+These read-only external observations are separate from `jobs`, the dispatched Job
+contract: no request/attempt/source identity is fabricated. Rows are filtered by
+scope and provider runner ID, capped by history_limit (100), and never fetched on
+GET. Empty rows do not imply monitoring is disabled. Older collector snapshots
+report unknown configuration; an explicit absent allowlist reports not_configured.
+Truncated bounded queries remain configured but identify their partial reason.
+Expired job evidence reports unknown/stale_evidence; cooldowns never renew its age.
+
 Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/enrollment`, GET
 `/inventory`, GET `/runners/{id}`, POST `/refresh`. Enrollment returns the explicit
 profile, enrollment flag and observe capabilities without opening the database or
