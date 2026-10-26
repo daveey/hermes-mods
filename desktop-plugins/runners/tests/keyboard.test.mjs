@@ -25,6 +25,57 @@ test('physical nodes start collapsed including empty hosts; expand reveals lazy 
     assert.equal(calls.filter(p => p.includes('/runners/')).length, 1)
   } finally { await ui.close() }
 })
+test('node keyboard traversal and layered Escape preserve focus', async () => {
+  const s = snapshot()
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    const input = document.querySelector('input'), node = document.querySelector('[data-node-row]')
+    await ui.key(input, 'ArrowDown')
+    assert.ok(document.activeElement === node, 'node receives keyboard focus')
+    await ui.key(node, 'ArrowRight')
+    assert.equal(node.getAttribute('aria-expanded'), 'true')
+    await ui.key(node, 'ArrowDown')
+    const row = document.querySelector('[data-runner-row]')
+    assert.ok(document.activeElement === row, 'runner receives focus')
+    await ui.key(row, 'Enter')
+    assert.ok(document.querySelector('.hermes-runners-detail'))
+    await ui.key(row, 'Escape')
+    assert.equal(document.querySelector('.hermes-runners-detail'), null)
+    assert.ok(document.activeElement === row, 'runner receives focus')
+    await ui.key(row, 'ArrowLeft')
+    assert.ok(document.activeElement === node, 'node receives keyboard focus')
+    assert.equal(node.getAttribute('aria-expanded'), 'false')
+    await ui.key(node, 'Enter')
+    assert.equal(node.getAttribute('aria-expanded'), 'true')
+    await ui.key(node, 'Escape')
+    assert.equal(node.getAttribute('aria-expanded'), 'false')
+    assert.ok(document.querySelector('[data-runners-panel]'))
+    await ui.key(node, 'Escape')
+    assert.equal(document.querySelector('[data-runners-panel]'), null)
+    assert.equal(document.activeElement, button('Show runners'))
+  } finally { await ui.close() }
+})
+test('type-ahead seeds search at end and Escape clears query before collapsing node', async () => {
+  const s = snapshot()
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : s } }))
+  try {
+    await ui.click(button('Show runners'))
+    const node = document.querySelector('[data-node-row]')
+    await ui.click(node)
+    await ui.key(node, 'f')
+    const input = document.querySelector('input')
+    assert.ok(document.activeElement === input, 'type-ahead focuses input')
+    assert.equal(input.value, 'f')
+    assert.equal(input.selectionStart, 1)
+    await ui.key(input, 'Escape')
+    assert.equal(input.value, '')
+    assert.equal(node.getAttribute('aria-expanded'), 'true')
+    assert.ok(document.querySelector('[data-runners-panel]'))
+  } finally { await ui.close() }
+})
 test('native menu right click, overflow, Shift+F10, Escape preserve details and owner refresh', async () => {
   const s = snapshot(),
     calls = [],
@@ -79,7 +130,7 @@ test('native menu right click, overflow, Shift+F10, Escape preserve details and 
       assert.equal(document.querySelector('[data-runners-menu]'), null)
       assert.ok(document.querySelector('[data-runners-panel]'))
       assert.match(document.body.textContent, /Source observations/)
-      assert.equal(document.activeElement, row)
+      assert.ok(document.activeElement === row, 'runner receives focus')
     }
     await ui.click(button('Actions for Fictional registration'))
     await ui.click(

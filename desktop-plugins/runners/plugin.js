@@ -916,14 +916,67 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
   function onExpand(key) {
     setExpanded((old) => (old === key ? null : key))
   }
+  function escape(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (expanded) {
+      const key = expanded
+      setExpanded(null)
+      panel.current?.querySelectorAll('[data-runner-row]').forEach(el => {
+        if (el.getAttribute('data-runner-row') === key) el.focus()
+      })
+    } else if (search) {
+      setSearch('')
+      searchRef.current?.focus()
+    } else {
+      const activeNode = document.activeElement?.closest('.hermes-runners-group')?.querySelector('[data-node-row]')
+      const node = activeNode?.getAttribute('aria-expanded') === 'true' ? activeNode :
+        panel.current?.querySelector('[data-node-row][aria-expanded="true"]')
+      if (node) {
+        setExpandedNodes(old => {
+          const next = new Set(old)
+          next.delete(node.getAttribute('data-node-row'))
+          return next
+        })
+        node.focus()
+      } else {
+        setOpen(false)
+        trigger.current?.focus()
+      }
+    }
+  }
   function keyboard(e) {
-    if (e.target.closest?.('[role=menu]')) return
+    if (e.defaultPrevented || e.target.closest?.('[role=menu]')) return
+    const node = e.target.closest('.hermes-runners-group')?.querySelector('[data-node-row]')
+    if (node && ['ArrowRight', 'ArrowLeft'].includes(e.key) && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+      e.preventDefault()
+      const key = node.getAttribute('data-node-row')
+      setExpandedNodes(old => {
+        const next = new Set(old)
+        e.key === 'ArrowRight' ? next.add(key) : next.delete(key)
+        return next
+      })
+      if (e.key === 'ArrowLeft') { setExpanded(null); node.focus() }
+    }
+    if (e.key === 'Enter' && e.target.hasAttribute('data-node-row')) {
+      e.preventDefault()
+      e.target.click()
+    }
+    if (e.key.length === 1 && e.key !== '/' && e.key !== ' ' && e.key !== '?' &&
+        !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing &&
+        !e.target.isContentEditable && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+      e.preventDefault()
+      const next = search + e.key
+      setSearch(next)
+      searchRef.current?.focus()
+      requestAnimationFrame(() => searchRef.current?.setSelectionRange(next.length, next.length))
+    }
     if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
       e.preventDefault()
       searchRef.current?.focus()
     }
     if (['ArrowDown', 'ArrowUp'].includes(e.key) && e.target.tagName !== 'SELECT') {
-      const buttons = [...panel.current.querySelectorAll('[data-runner-row]')]
+      const buttons = [...panel.current.querySelectorAll('[data-node-row], [data-runner-row]')]
       if (buttons.length) {
         e.preventDefault()
         const index = buttons.indexOf(document.activeElement),
@@ -932,20 +985,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         buttons[next].focus()
       }
     }
-    if (e.key === 'Escape') {
-      e.preventDefault()
-      e.stopPropagation()
-      if (expanded) {
-        const key = expanded
-        setExpanded(null)
-        panel.current?.querySelectorAll('[data-runner-row]').forEach((el) => {
-          if (el.getAttribute('data-runner-row') === key) el.focus()
-        })
-      } else {
-        setOpen(false)
-        trigger.current?.focus()
-      }
-    }
+    if (e.key === 'Escape') escape(e)
   }
   return h(
     Popover,
@@ -988,17 +1028,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
           e.preventDefault()
           searchRef.current?.focus()
         },
-        onEscapeKeyDown: (e) => {
-          if (expanded) {
-            e.preventDefault()
-            e.stopPropagation()
-            const key = expanded
-            setExpanded(null)
-            panel.current?.querySelectorAll('[data-runner-row]').forEach((el) => {
-              if (el.getAttribute('data-runner-row') === key) el.focus()
-            })
-          }
-        },
+        onEscapeKeyDown: escape,
         onCloseAutoFocus: (e) => {
           e.preventDefault()
           trigger.current?.focus()
