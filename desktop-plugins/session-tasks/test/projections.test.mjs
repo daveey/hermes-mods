@@ -398,6 +398,40 @@ test('failed authoritative task read stays unknown even when legacy board succee
   } finally { delete globalThis.window }
 })
 
+test('archive resolves omitted connection to registry primary, never active, and pins profile', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.connections = async () => [{ id: 'primary-owner', primary: true }, { id: 'other-active' }]
+  host.state = { connectionId: { get: () => 'other-active' } }
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    if (args.path.startsWith('/api/sessions/')) return { id: 'archive-primary', parent_session_id: null }
+    return { gateway_id: 'primary-gateway', machines: [] }
+  } } }
+  try {
+    assert.deepEqual(await m.archiveGuard({ sessionId: 'archive-primary', profile: 'work' }), [])
+    assert.equal(calls.length, 2)
+    assert.ok(calls.every(c => c.connectionId === 'primary-owner' && c.profile === 'work'))
+  } finally { delete globalThis.window; delete host.connections }
+})
+
+test('archive explicit remote owner bypasses primary discovery and retains machine warnings', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.connections = async () => assert.fail('explicit owners must not resolve primary')
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async args => {
+    calls.push(args)
+    if (args.path.startsWith('/api/sessions/')) return { id: 'archive-remote', parent_session_id: null }
+    return { gateway_id: 'remote-gateway', machines: [{ key: 'machine', display_name: 'Worker', status: 'running', ownership: [{ gateway_id: 'remote-gateway', profile: 'work', session_id: 'archive-remote' }] }] }
+  } } }
+  try {
+    const lines = await m.archiveGuard({ sessionId: 'archive-remote', connectionId: 'remote-owner', profile: 'work' })
+    assert.equal(lines[0].label, 'Rented machine')
+    assert.match(lines[0].value, /Worker.*running/)
+    assert.ok(calls.every(c => c.connectionId === 'remote-owner' && c.profile === 'work'))
+  } finally { delete globalThis.window; delete host.connections }
+})
+
 test('explicit unresolved task and archive routes never re-resolve the active connection', async () => {
   const { host } = await import('@hermes/plugin-sdk')
   host.state = { connectionId: { get: () => 'unrelated-active' } }
