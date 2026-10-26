@@ -63,10 +63,12 @@ def authorization(v, evidence):
             or result.get('approval_pending') is not True or result.get('command') != action
             or path != '/approve' or '/approve' not in candidate):
         raise ValueError('unproven_current_approval_boundary')
+    # Execution options do not identify an operation. A newer result for the
+    # same literal command supersedes this boundary, never grants permission.
     keys = list(evidence)
     later = keys[keys.index(p['source_ref'])+1:]
     if any(evidence[k]['role'] == 'user' or (
-            evidence[k]['role'] == 'tool' and call(evidence[k]) == (name, args)) for k in later):
+            evidence[k]['role'] == 'tool' and call(evidence[k])[1].get('command') == action) for k in later):
         raise ValueError('superseded_approval_evidence')
 
 
