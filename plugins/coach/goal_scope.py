@@ -45,7 +45,9 @@ def _user_row(row):
     text = steering_content(row)
     if text is not None:
         return {'role': 'user', 'content': text, 'content_source': 'native_content',
-                'message_uid': row['message_uid']}
+                'message_uid': row['message_uid'],
+                'steering_source': {k: copy.deepcopy(row[k]) for k in
+                    ('role', 'content', 'display_kind', 'message_uid', '_native_steer')}}
     metadata = row.get('display_metadata') or {}
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
@@ -62,7 +64,7 @@ def _user_row(row):
     return result
 
 
-def require_known_steering(session_id, live_rows, *, historical=False):
+def require_known_steering(session_id, live_rows, *, historical=False, captured_rows=None):
     """Missing live attestation is UNKNOWN, never absence of a restriction.
 
     The DB is used only as a loss detector, not to manufacture human authority.
@@ -72,6 +74,17 @@ def require_known_steering(session_id, live_rows, *, historical=False):
     from agent.steering_provenance import steering_content
 
     known = set()
+    # Only the trusted capture projection keeps this source. Raw history labels
+    # are discarded by _user_row; attestations are revalidated, never restored.
+    for row in captured_rows or []:
+        source = row.get('steering_source')
+        if source is None:
+            continue
+        text = steering_content(source)
+        if (text is None or text != row.get('content')
+                or source.get('message_uid') != row.get('message_uid')):
+            raise ValueError('scope_unknown_steering')
+        known.add((source['message_uid'], source['content']))
     for row in live_rows or []:
         if row.get('role') != 'user' or row.get('display_kind') != 'steer' or _queued_receipt(row):
             continue
