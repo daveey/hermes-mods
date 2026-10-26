@@ -132,8 +132,10 @@ def initialize(store):
 class Collector:
     def __init__(self, store, config, adapter, *, clock=time.time, host_probe=None,
                  max_scopes=16, tick_budget=20, monotonic=time.monotonic,
-                 job_repositories=None, max_job_scopes=2):
+                 job_repositories=None, max_job_scopes=2, repair_service=None):
         self.store, self.config, self.adapter, self.clock = store, config, adapter, clock
+        self.repair_service = repair_service
+        self._repair_checked_at = None
         if type(max_scopes) is not int or max_scopes < 1 or tick_budget <= 0:
             raise ValueError('invalid_collection_budget')
         self.max_scopes, self.tick_budget, self.monotonic = max_scopes, tick_budget, monotonic
@@ -194,7 +196,8 @@ class Collector:
         due = [h for h in self.config['hosts'] if h['id'] in force or now-self.host_results.get(h['id'], {}).get('at', -1e20)>=60]
         def collect(host):
             try:
-                facts=self.host_probe(host)
+                fresh_probe = getattr(self.host_probe, 'refresh', self.host_probe)
+                facts=(fresh_probe if host['id'] in force else self.host_probe)(host)
                 return host['id'], dict(at=self.clock(),management='reachable',facts=facts)
             except Exception:
                 return host['id'], dict(at=self.clock(),management='unreachable',facts={})
@@ -203,12 +206,21 @@ class Collector:
         return {h['id'] for h in due}
 
     def tick(self):
+        # Independent status-only lane: no provider I/O or runtime dispatch is
+        # required to reconcile a repair. Never infer completion from absence.
+        if (self.config['features']['observe'] and
+                self.config['features'].get('repair_sessions') and
+                self.repair_service is not None):
+            now = self.monotonic()
+            if self._repair_checked_at is None or now - self._repair_checked_at >= 30:
+                self.repair_service.reconcile_all()
+                self._repair_checked_at = now
         # A failed commit must not advance the in-memory scheduler or refresh
         # progress. Provider request budgets deliberately are NOT rolled back:
         # those requests happened even when persistence failed.
         previous = deepcopy((self.host_results, self.scope_results, self.refresh_progress, self.job_results, self.next_scope_lane))
         try:
-            return self._tick()
+            snapshot = self._tick()
         except BaseException:
             self.host_results, self.scope_results, self.refresh_progress, self.job_results, self.next_scope_lane = previous
             raise
@@ -217,6 +229,9 @@ class Collector:
             # failed. This does not persist credentials or ETag response caches.
             if hasattr(self.adapter, 'export_state') and not hasattr(self.adapter, 'state_sink'):
                 self._save_budget(self.adapter.export_state())
+        if self.repair_service is not None:
+            self.repair_service.reconcile_verifications()
+        return snapshot
 
     def _tick(self):
         if not self.config['features']['observe']:
@@ -229,6 +244,12 @@ class Collector:
             claimed = list(self.store.connection.execute("SELECT id,targets,created,state FROM collector_refresh WHERE state IN ('pending','running') ORDER BY created"))
             self.store.connection.executemany("UPDATE collector_refresh SET state='running' WHERE id=?", ((r[0],) for r in claimed))
         wanted, forced_hosts = set(), set()
+        if self.repair_service is not None:
+            targets = self.repair_service.verification_targets()
+            if targets:
+                ss, hh = self._targets(targets)
+                wanted.update(ss)
+                forced_hosts.update(hh)
         for key, targets, created, status in claimed:
             ss, hh = self._targets(json.loads(targets))
             progress=self.refresh_progress.get(key,{'scopes':[],'hosts':[]})
@@ -396,6 +417,17 @@ class Collector:
                 if saved['error']:
                     errors.append(dict(source_id=sid,code=saved['error'],retry_after_seconds=saved.get('retry_after_seconds'),observed_at=iso(saved['attempted_at'])))
             rows = self.store.list('Runner')
+            # An investigation context is not a failure assertion. Persist its
+            # identity once so repeated clicks/reloads share the same context,
+            # including online or readiness-unverified registrations.
+            contexts = {i['entity_id']: i for i in self.store.list('Incident')
+                        if i['dimension'] == 'investigation' and not i['resolved_at']}
+            for entity_id in [r['id'] for r in rows] + [h['resource_id'] for h in self.config['hosts']]:
+                context = contexts.get(entity_id) or dict(id=ident('incident'),
+                    entity_id=entity_id, dimension='investigation', opened_at=iso(now),
+                    last_seen=iso(now), resolved_at=None, transitions=[])
+                context['last_seen'] = iso(now)
+                self.store.put('Incident', context, at=now)
             snapshot = dict(at=now, owner=self.owner(), scope_results=deepcopy(self.scope_results),
                             collection=dict(id=cycle,state='complete' if complete else 'partial',target_ids=[]),
                             host_results=deepcopy(self.host_results),

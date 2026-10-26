@@ -1,13 +1,22 @@
-# Runners observe-only inventory
+# Runners inventory and diagnosis
 
 Validation, persistence, pure health rules, bounded GitHub/SSH collection and a
 cached authenticated dashboard API. Import and `register(ctx)` remain inert:
 collection starts only through the explicit supervised entry script. Mutation,
-dispatch, repair sessions and workspace execution must remain disabled.
+dispatch and workspace execution remain disabled. Repair sessions have a separate
+default-off gate: enable only after live owner-routed duplicate-click acceptance.
 
 ## Collector and API deployment
 
 Install PyYAML and `jsonschema[format]` into a dedicated production interpreter.
+Repair reconciliation additionally requires a compatible Hermes core with trusted
+`StartIntent.metadata`, plus its status-layer dependencies (`python-dotenv` and
+`ruamel.yaml` in the tested runtime). For an isolated interpreter, pass an absolute
+`--core-root /path/to/hermes-core` to `scripts/install_service.py`; the supervisor
+loads that checkout after the plugin namespace, checks the metadata interface,
+and fails closed on missing/conflicting core. It never installs dependencies or
+starts a gateway. Validate with the actual supervisor interpreter before enabling
+repairs; test-environment imports alone do not establish production readiness.
 Create a private mode-0600 runtime JSON with `credentials` mapping opaque refs to
 `{scope, env_var, key}` broker references (never token values), and `probes` mapping
 opaque SSH refs to `{target, spec}`. Credential aliases sharing a provider quota
@@ -113,6 +122,48 @@ Config parsing is stat-fenced/cached while response freshness and owner checks r
 on each request. Deployment acceptance must separately verify live discovery,
 authenticated routing, provider-count parity and measured GET p95; unit tests do
 not establish live installation. See `dashboard/README.md` for API details.
+
+## Diagnosis-only repair transactions
+
+Repair operations require a verified principal shared by REST and the core
+`session.start_request` transport. An inventory token without a principal is not
+enough. Enrollment advertises `features.repair_sessions` per owner and principal;
+the Desktop never takes the selected chat's gateway as action authority.
+
+POST `/repairs` reserves the physical host (or unmapped registration), persists an
+immutable quoted diagnosis brief, and registers its stable core request ID.
+Desktop invokes `session.start_request` in namespace `runners` on the captured
+owner route, then opens the returned stored/lineage session on that same route.
+GET `/repairs/{id}` reconciles via core; GET `/repairs` supplies a principal-scoped,
+active-first latest-100 list for badges without per-row polling. Inspect includes
+that principal's related host repairs. Collector-created Incident records with
+dimension `investigation` identify diagnostic contexts, not confirmed failures.
+
+The collector uses the owner's canonical SessionDB status service every 30 seconds;
+it never dispatches a turn. Paused/completed initial turns retain the reservation.
+Archival, cancellation or failure releases it only after an authoritative receipt.
+Missing runtime or unreachable owner is not completion. Unknown outcomes do not
+replay prompts. Only an authoritative absent/queued mapping permits an explicit
+retry of the same durable request ID, recovering a pre-create/pre-claim crash.
+
+POST `/repairs/{id}/verify` durably queues bounded independent rechecks. Two distinct
+fresh provider cycles, fresh host/service/tool checks and all required capability
+observations are necessary for `restored_unverified_build`; no build is claimed.
+Forced verification probing stops after five minutes; a new explicit verify key
+can reopen that window. Stale/unknown/failed evidence cannot satisfy it.
+
+GET `/maintenance` returns the overlay CAS revision. POST `/maintenance` uses it as
+`expected_config_revision` alongside the unchanged expected owner identity.
+This overlay has an expiry and reason, silences alerts and excludes ready capacity,
+but never drains jobs or alters provider evidence. Staleness stays visible.
+
+The tools `runners_list`, `runners_inspect`, `runners_refresh`, `runners_repair` and
+`runners_verify` use these domain services. Repair/verify require the actual owning
+gateway runtime session; unsupported CLI/isolated runtimes fail explicitly.
+There are no authorized restarts, cleanup, job cancellation or signing operations.
+The separate repair ledger is additive and bounded to 100 active reservations and
+10,000 audit/idempotency requests. It fails closed when full rather than forgetting
+an ambiguous request. Generic Store retention does not prune this ledger.
 
 ## Boundaries
 

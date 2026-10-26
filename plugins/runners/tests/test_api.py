@@ -74,7 +74,7 @@ def test_enrollment_discovery_reports_owner_without_store(disk_api):
     response = client.get(PREFIX + '/enrollment', headers=TOKEN)
     assert response.status_code == 200
     assert response.json() == {'contract_version': 1, 'profile': 'example', 'enrolled': True,
-                               'capabilities': ['inventory', 'inspect', 'refresh']}
+                               'capabilities': ['inventory', 'inspect', 'refresh'], 'features': {'repair_sessions': False}}
     assert not (path.parent / 'runners/state.sqlite').exists()
 
 

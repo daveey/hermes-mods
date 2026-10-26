@@ -95,6 +95,7 @@ def main(argv=None):
     action.add_argument('--install', action='store_true')
     action.add_argument('--uninstall', action='store_true')
     parser.add_argument('--python', default=sys.executable)
+    parser.add_argument('--core-root', help='Absolute compatible core checkout for repair status reconciliation')
     for name in ('config', 'runtime', 'state-dir', 'owner-gateway-id', 'owner-profile'):
         parser.add_argument('--' + name)
     parser.add_argument('--owner-epoch', type=int)
@@ -111,6 +112,10 @@ def main(argv=None):
     command = [args.python, str(Path(__file__).with_name('run_collector.py').resolve())]
     for name in ('config', 'runtime', 'state_dir', 'owner_gateway_id', 'owner_profile', 'owner_epoch'):
         command.extend(['--' + name.replace('_', '-'), str(getattr(args, name))])
+    if args.core_root is not None:
+        if not Path(args.core_root).is_absolute():
+            parser.error('core-root must be absolute')
+        command.extend(['--core-root', args.core_root])
     install(sys.platform, command)
     return 0
 
