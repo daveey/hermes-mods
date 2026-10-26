@@ -10,6 +10,7 @@ export async function resolve(spec, ctx, next) {
   return next(spec, ctx)
 }`))
 const m = await import('../plugin.js')
+const request = (action, interaction = 'approval') => ({ action, interaction, why_human: 'Only the owner can use this control.', scope: action, evidence: 'Checked the documented owner-only control; owner interaction is required.' })
 
 const ev = (id, kind, payload) => ({ id, kind, payload, created_at: 1000 + id })
 
@@ -20,17 +21,17 @@ test('latestBlock takes the newest block after the newest unblock', () => {
     ev(3, 'commented', {}),
     ev(4, 'blocked', JSON.stringify({ reason: 'Plug the phone in.', kind: 'capability' }))
   ]
-  assert.deepEqual(m.latestBlock(events), { reason: 'Plug the phone in.', kind: 'capability', at: 1004 })
+  assert.deepEqual(m.latestBlock(events), { reason: 'Plug the phone in.', kind: 'capability', human_request: undefined, at: 1004 })
   assert.equal(m.latestBlock([ev(1, 'blocked', { reason: 'x' }), ev(2, 'unblocked', {})]), null)
   assert.equal(m.latestBlock([ev(1, 'blocked', { reason: 'initial_status' })]).reason, '')
 })
 
-test('needsHuman: transient and "no human action needed" are not shown; needs_input/capability/unknown are', () => {
+test('needsHuman requires evidence, not a kind or missing history', () => {
   assert.equal(m.needsHuman({ kind: 'transient', reason: 'flaky' }), false)
   assert.equal(m.needsHuman({ kind: 'needs_input', reason: 'No human action needed. Waiting on time: two nightly runs.' }), false)
-  assert.equal(m.needsHuman({ kind: 'needs_input', reason: 'Approve the design doc.' }), true)
-  assert.equal(m.needsHuman({ kind: 'capability', reason: 'Restore the API login.' }), true)
-  assert.equal(m.needsHuman(null), true)
+  assert.equal(m.needsHuman({ kind: 'needs_input', human_request: request('Approve the design doc.') }), true)
+  assert.equal(m.needsHuman({ kind: 'capability', human_request: request('Restore the API login.', 'external') }), true)
+  assert.equal(m.needsHuman(null), false)
 })
 
 test('stepsOf splits inline "1) … 2) …" runs and keeps the intro', () => {
@@ -55,7 +56,7 @@ test('stepsOf splits line-leading markers and leaves plain prose alone', () => {
   assert.deepEqual(m.stepsOf(''), { intro: '', steps: [], start: 1 })
 })
 
-test('blockedItems keeps human-blocked cards, falls back to the card body, newest first', () => {
+test('blockedItems keeps evidenced requests only, newest first', () => {
   const tasks = [
     { id: 't_a', title: 'A', status: 'blocked', board: 'default' },
     { id: 't_b', title: 'B', status: 'running', board: 'default' },
@@ -65,19 +66,19 @@ test('blockedItems keeps human-blocked cards, falls back to the card body, newes
     { id: 't_a', title: 'A dup', status: 'blocked', board: 'default' }
   ]
   const details = new Map([
-    ['default:t_a', { task: {}, events: [ev(5, 'blocked', { reason: 'Turn on UI Automation.', kind: 'needs_input' })] }],
-    ['ops:t_c', { task: { body: 'Human op: rotate the key.' }, events: [ev(1, 'blocked', { reason: 'initial_status' })] }],
+    ['default:t_a', { task: {}, events: [ev(5, 'blocked', { reason: 'Turn on UI Automation.', kind: 'needs_input', human_request: request('Turn on UI Automation.', 'external') })] }],
+    ['ops:t_c', { task: { body: 'Unrelated coordination prose.' }, events: [ev(1, 'blocked', { reason: 'initial_status', human_request: request('Human op: rotate the key.', 'external') })] }],
     ['default:t_d', { task: {}, events: [ev(9, 'blocked', { reason: 'retrying', kind: 'transient' })] }]
     // t_e: detail not loaded yet
   ])
   const items = m.blockedItems(tasks, details)
-  assert.deepEqual(items.map(i => i.id), ['t_a', 't_c', 't_e'])
+  assert.deepEqual(items.map(i => i.id), ['t_a', 't_c'])
   assert.equal(items[0].kindLabel, 'Needs your input')
   assert.equal(items[0].text, 'Turn on UI Automation.')
-  assert.equal(items[1].fromBody, true)
+  assert.equal(items[1].fromBody, false)
   assert.equal(items[1].board, 'ops')
   assert.equal(items[1].text, 'Human op: rotate the key.')
-  assert.equal(items[2].loaded, false)
+  assert.ok(m.agentIssues(tasks, details).some(i => i.id === 't_e'))
 })
 
 test('parked (⌘B) matches any lineage id; junk storage is empty', () => {
@@ -253,7 +254,7 @@ test('blockedItems excludes failure-parked cards; agentIssues lists them with no
 })
 
 test('explicit human block stays a human item with its reason, even after an earlier failure', () => {
-  const events = [...failureEvents, ev(5, 'blocked', { reason: 'Approve the migration plan.', kind: 'needs_input' })]
+  const events = [...failureEvents, ev(5, 'blocked', { reason: 'Approve the migration plan.', kind: 'needs_input', human_request: request('Approve the migration plan.') })]
   const details = new Map([['default:t_h', { task: { body: 'unrelated body' }, events }]])
   const items = m.blockedItems([T('t_h')], details)
   assert.equal(items.length, 1)
@@ -266,34 +267,27 @@ test('explicit human block stays a human item with its reason, even after an ear
   assert.equal(m.blockState([...later, ev(7, 'unblocked', {})]).origin, 'unknown')
 })
 
-test('legacy and initial-blocked cards stay human; body is only quoted as the ask for initial_status', () => {
+test('legacy and initial-blocked cards without evidence stay operational', () => {
   const d = new Map([
     ['default:t_init', { task: { body: 'Rotate the key, then say done.' }, events: [ev(1, 'blocked', { reason: 'initial_status' })] }],
     ['default:t_noev', { task: { body: 'Remaining after the sweep: three things.' }, events: [] }],
     ['default:t_empty', { task: { body: 'Remaining after the sweep: three things.' }, events: [ev(1, 'blocked', { kind: 'needs_input' })] }]
   ])
   const items = m.blockedItems([T('t_init'), T('t_noev'), T('t_empty')], d)
-  assert.deepEqual(items.map(i => i.id).sort(), ['t_empty', 't_init', 't_noev'])
-  const by = Object.fromEntries(items.map(i => [i.id, i]))
-  assert.equal(by.t_init.reasonSource, 'initial')
-  assert.equal(m.askSummary(by.t_init), 'Rotate the key, then say done.')
-  for (const id of ['t_noev', 't_empty']) {
-    assert.match(m.askSummary(by[id]), /No block reason was recorded/)
-    assert.doesNotMatch(m.askSummary(by[id]), /Remaining after/)
-  }
+  assert.deepEqual(items, [])
+  const issues = m.agentIssues([T('t_init'), T('t_noev'), T('t_empty')], d)
+  assert.deepEqual(issues.map(i => i.id).sort(), ['t_empty', 't_init', 't_noev'])
+  for (const issue of issues) assert.equal(issue.owner, 'unassigned')
 })
 
-test('missing detail (loading) keeps a placeholder without claiming a reason', () => {
-  const [it] = m.blockedItems([T('t_load')], new Map())
-  assert.equal(it.loaded, false)
-  assert.equal(it.reasonSource, 'loading')
-  assert.match(m.askSummary(it), /Loading/)
-  assert.deepEqual(m.agentIssues([T('t_load')], new Map()), [])
+test('missing detail stays operational without claiming a human ask', () => {
+  assert.deepEqual(m.blockedItems([T('t_load')], new Map()), [])
+  assert.equal(m.agentIssues([T('t_load')], new Map())[0].failureKind, 'unclassified')
 })
 
 test('actionable multi-step human ask: askSummary is the first explicit step, not the body', () => {
   const reason = 'Do these: 1) Open Settings \u2192 Privacy. 2) Enable Automation for the app. 3) Click Done.'
-  const d = new Map([['default:t_m', { task: { body: 'Unrelated first sentence.' }, events: [ev(1, 'blocked', { reason, kind: 'capability' })] }]])
+  const d = new Map([['default:t_m', { task: { body: 'Unrelated first sentence.' }, events: [ev(1, 'blocked', { reason, kind: 'capability', human_request: request(reason, 'external') })] }]])
   const [it] = m.blockedItems([T('t_m')], d)
   assert.deepEqual(it.steps.slice(0, 2), ['Open Settings \u2192 Privacy.', 'Enable Automation for the app.'])
   assert.equal(m.askSummary(it), 'Open Settings \u2192 Privacy.')
@@ -322,7 +316,7 @@ test('pause with no recorded reason says so instead of inventing one; benign dep
   const [i] = m.agentIssues([T('t_e')], mapOf('t_e', [ev(1, 'blocked', { kind: 'transient' })]))
   assert.equal(i.reason, 'Paused automatically; no reason was recorded.')
   assert.equal(i.refusal, false)
-  for (const p of [{ kind: 'dependency', reason: 'Waiting for t_other.' }, { kind: 'needs_input', reason: 'No human action needed. Waiting on time: nightly run.' }]) {
+  for (const p of [{ kind: 'dependency', reason: 'Waiting for failed t_other.' }, { kind: 'time', reason: 'No human action needed. Waiting on time: nightly run failed.' }]) {
     const d = mapOf('t_w', [ev(1, 'blocked', p)])
     assert.deepEqual(m.blockedItems([T('t_w')], d), [])
     assert.deepEqual(m.agentIssues([T('t_w')], d), [])
@@ -330,7 +324,7 @@ test('pause with no recorded reason says so instead of inventing one; benign dep
 })
 
 test('an actual human block after the pause overrides it; a later failure overrides the human block', () => {
-  const human = [...pauseEvents, ev(6, 'blocked', { reason: 'Approve the retry.', kind: 'needs_input' })]
+  const human = [...pauseEvents, ev(6, 'blocked', { reason: 'Approve the retry.', kind: 'needs_input', human_request: request('Approve the retry.') })]
   const d = mapOf('t_o', human)
   const items = m.blockedItems([T('t_o')], d)
   assert.equal(items.length, 1)
@@ -340,7 +334,7 @@ test('an actual human block after the pause overrides it; a later failure overri
 })
 
 test('mixed board: counts split asks vs issues, issues carry no unblock fields', () => {
-  const d = new Map([...mapOf('t_a', failureEvents), ...mapOf('t_b', pauseEvents), ...mapOf('t_c', [ev(1, 'blocked', { reason: 'Plug in the phone.', kind: 'capability' })])])
+  const d = new Map([...mapOf('t_a', failureEvents), ...mapOf('t_b', pauseEvents), ...mapOf('t_c', [ev(1, 'blocked', { reason: 'Plug in the phone.', kind: 'capability', human_request: request('Plug in the phone.', 'physical') })])])
   const tasks = [T('t_a'), T('t_b'), T('t_c')]
   assert.deepEqual(m.blockedItems(tasks, d).map(i => i.id), ['t_c'])
   const issues = m.agentIssues(tasks, d)
@@ -364,7 +358,8 @@ test('structured kind=time (external-event wait, classified in place) is not a h
   assert.deepEqual(m.blockedItems([T('t_wait')], d), [])
   assert.deepEqual(m.agentIssues([T('t_wait')], d), [])
   // a real ask after it is shown again with its buttons' data
-  d.get('default:t_wait').events.push(ev(3, 'blocked', { kind: 'needs_input', reason: 'Approve the plan in the doc.' }))
+  d.get('default:t_wait').events.push(ev(3, 'blocked', { kind: 'needs_input', reason: 'Approve the plan in the doc.', human_request: request('Approve the plan in the doc.') }))
   assert.equal(m.blockedItems([T('t_wait')], d).length, 1)
-  assert.equal(m.needsHuman({ kind: 'capability', reason: 'External-event wait: restore the API login.' }), true)
+  assert.equal(m.needsHuman({ kind: 'capability', reason: 'External-event wait: restore the API login.' }), false)
+  assert.equal(m.needsHuman({ kind: 'capability', human_request: request('Restore the API login.', 'external') }), true)
 })
