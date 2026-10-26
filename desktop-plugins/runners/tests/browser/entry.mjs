@@ -9,6 +9,9 @@ s.data.hosts=[{...fixtures.Host,display_name:'Build node',os:'linux',arch:'x86_6
 s.data.runners[0].host_id=s.data.hosts[0].id
 s.data.runners[0].display_name='Quartz runner'
 s.data.runners.push({...s.data.runners[0],id:'run_0000000000000002',provider_runner_id:'1234567',host_id:null,display_name:'Unmapped runner'})
+if(new URLSearchParams(location.search).has('long')) {
+  for(let i=3;i<70;i++)s.data.hosts.push({...s.data.hosts[0],id:`host_${i.toString(16).padStart(16,'0')}`,display_name:`Extra node ${i}`})
+}
 window.entries=new Map();window.calls=[]
 const detail=structuredClone(fixtures.InspectResponse)
 detail.meta=structuredClone(s.meta);detail.data.runner=structuredClone(s.data.runners[0])

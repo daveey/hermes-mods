@@ -43,6 +43,15 @@ const alignment=await page.locator('[data-node-row]').evaluateAll(nodes=>nodes.m
 assert.ok(alignment.every(Boolean),'node health stays aligned at right, including narrow fallback')
 report.captures.push({theme,width,metrics})
 }
+await page.goto('file://'+process.cwd()+'/index.html?long=1')
+await page.locator('[data-slot=runners-chip]').click();await page.locator('[data-node-row]').first().waitFor()
+const long=await page.evaluate(()=>{
+ const sc=document.querySelector('.hermes-runners-scroll'),panel=document.querySelector('[data-runners-panel]'),head=document.querySelector('.hermes-runners-head');
+ const top=head.getBoundingClientRect().top;sc.scrollTop=1000;
+ return {scrolls:sc.scrollHeight>sc.clientHeight,headerStable:head.getBoundingClientRect().top===top,height:panel.getBoundingClientRect().height,max:innerHeight*.7}
+})
+assert.ok(long.scrolls && long.headerStable && long.height<=long.max,'long inventory scrolls inside bounded panel without moving header')
+report.longList=long
 assert.deepEqual(report.errors,[])
 }finally{await writeFile('report.json',JSON.stringify(report,null,2));await browser.close()}
 console.log(JSON.stringify(report,null,2))
