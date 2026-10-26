@@ -1,4 +1,6 @@
-# Unresolved goal fallback (draft, not deployed)
+# Unresolved goal fallback
+
+Patch **0392** (`2228cfe8da`, core PR #48; squash of the draft commits listed under Code).
 
 ## Behavior
 
@@ -10,7 +12,7 @@ An opt-in pre-final plugin can attach `unresolved_fallback: {goal, evidence_refs
 
 ## Code
 
-Draft core PR: https://github.com/daveey/hermes/pull/48
+Core PR (merged): https://github.com/daveey/hermes/pull/48
 
 - `agent/pre_final_gate.py`
 - `agent/turn_stop_gates.py`
@@ -35,7 +37,7 @@ Combined coach discovery and scripted agent-loop tests cover CLI/Desktop platfor
 
 ## Applying
 
-Do not enable enforcement yet. The changes are on draft branches, not the released numbered patch series. After review and merge, regenerate the public fork patch series and verify application before deployment. Source checkout changes are not evidence that an already-running backend reloaded.
+Part of the ordered series (0392). Apply the full series from the documented merge base with `git am -3 --empty=keep`; verified in [mirror-392-verification.md](mirror-392-verification.md). Merging core adds only the hook infrastructure: enforcement stays off until the opt-in coach `goal_disposition` plugin (hermes-mods PR #3) is enabled. A running backend needs a restart to load it.
 
 ## Gotchas
 
@@ -62,7 +64,7 @@ overflow and unsupported multimodal durable data remain UNKNOWN. Mid-turn sessio
 rotation is still unverified. The combined suite passed 515 tests, with one SQLite
 host-dependent skip. Independent review still requests changes: exact-action/approval
 proof, remote/scheduled ownership and return liveness, holdout/private replay, transport
-acceptance, CI, mirror/apply and activation remain required. Do not activate this draft.
+acceptance, CI, mirror/apply and activation remain required. (Historical review note, superseded by the merged PR #48 and shadow-mode coach activation.)
 
 
 ## Native local result-consumer evidence (draft)

@@ -11,14 +11,12 @@ These are the changes I carry on my fork of
 
 Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
-## Draft work (not in the released patch series)
-
-- [Unresolved goal fallback](unresolved-goal-fallback.md): optional structured pre-final fallback; companion coach guard remains default-off pending ownership/context and activation acceptance.
-
 ## Features
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [unresolved-goal-fallback.md](unresolved-goal-fallback.md) | 0392 | Optional structured `pre_final_gate` fallback retained at budget/cap/unavailable boundaries, ownership-bound rechecks, private held text, scoped Kanban/process/dispatcher health receipts; enforcement stays opt-in (coach plugin) |
+| [retention-observation.md](retention-observation.md) | 0391 | Fail-closed, observation-only non-CI retention slice (`retention_cli observe`); cannot delete or authorize deletion |
 | [kanban-origin-adoption.md](kanban-origin-adoption.md) | 0380–0382 | State-preserving existing-task origin adoption with immutable request replay/conflict checks |
 | [kanban-local-owner-projection.md](kanban-local-owner-projection.md) | 0384–0390 | Exact local owner evidence and alias-qualified dedup, foreign-profile preservation, nonblocking ledger refresh, one scoped annotation snapshot and per-projection alias-read reuse; live acceptance remains separate |
 | [kanban-origin-work-ledger.md](kanban-origin-work-ledger.md) | 0221 0223 0242–0247 0268 0270 0273–0279 0281–0282 0293 0295–0297 0299 0311 0313–0314 0316 0324–0328 0342 0361 | Owner-qualified remote work, durable binding/creation receipts, fresh lifecycle evidence, routed drawers/archive checks and deferred completion notices |
@@ -148,10 +146,10 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 ## Applying
 
-The current export contains **390 patches**, pinned to source
-`3d318c51379635168cdad6c8e36c345e6d5b6a86`. All 390 apply in order with
-`git am -3 --empty=keep`; 69 selected Python tests across eight files pass on the
-applied public series. See [current verification](mirror-390-verification.md)
+The current export contains **392 patches**, pinned to source
+`2228cfe8dada6912c5f8966f967d12870d029c2d`. All 392 apply in order with
+`git am -3 --empty=keep`; 69 selected Python tests (38 platform skips) across nine files pass on the
+applied public series. See [current verification](mirror-392-verification.md)
 for privacy, preservation and exact execution scope. The earlier 377-patch run's
 Desktop/typecheck results are historical, not rerun for this export. No runtime
 deployment or legacy migration is claimed.
