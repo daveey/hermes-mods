@@ -54,6 +54,15 @@ expiry and record timestamps; current holds suppress verified readiness. Old or
 unavailable configured checks cannot silently pass. Supervisor withdrawal logs
 are historical evidence only, not proof a label is still withdrawn.
 
+Optional `readiness_evidence` exposes existing required/passed/failed/warned
+check keys with their host observation timestamps and freshness. Its separate
+`hold_explained_failures` subset never masks independent disk/tool/service
+failures: a stopped service is explained only by exact-service, current,
+explicit intentional disabled/inactive drain evidence. Failed or missing services
+remain independent. Unknown required checks remain unknown even on a held runner.
+Provider fields cannot supply this projection; unbound runners omit it. See
+`contracts/README.md` for client semantics. No extra probes are performed.
+
 Journal checks are deliberately fail-closed, not complete state machines:
 `headroom` recognizes waits but has no authoritative clear event; admission
 requires a fresh explicit pressure-free record to clear. Opting into these checks

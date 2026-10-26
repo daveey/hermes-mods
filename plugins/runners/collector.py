@@ -121,6 +121,48 @@ def readiness(config, row, host_results, now, *, snapshot_current=True):
     return checks,state
 
 
+def readiness_evidence(config, row, host_results, now, checks, *, snapshot_current=True):
+    """Expose computed check causes without making another observation.
+
+    A drained/systemd held fact is emitted only by service_evidence after
+    proving configured intentional drain with loaded+disabled+inactive state.
+    Pair it with stopped (never failed/missing) for the exact bound service.
+    """
+    binding = next((b for b in config['bindings']
+                    if b['runner_id'] == row['id'] and b['host_id'] == row.get('host_id')), None)
+    if binding is None:
+        return None
+    host = host_results.get(binding['host_id'], {})
+    at = host.get('at')
+    ttl = config['thresholds']['host_stale_seconds']
+    if not valid_timestamp(at, ttl):
+        at = None
+    if not host or at is None:
+        freshness = 'unknown'
+    elif host.get('management') != 'reachable':
+        freshness = 'unavailable'
+    else:
+        freshness = 'fresh' if snapshot_current and 0 <= now-at < ttl else 'stale'
+    explained = []
+    if freshness == 'fresh':
+        for item in operational_evidence(config, row, host_results, now):
+            if item['state'] != 'held' or item['freshness'] != 'fresh':
+                continue
+            key = 'operational:' + item['kind'] + ':' + item['source']
+            if key not in checks.failed:
+                continue
+            explained.append(key)
+            if (item['kind'], item['source']) == ('drained', 'systemd'):
+                service = host.get('facts', {}).get('services', {}).get(binding['service_ref'])
+                if service == 'stopped' and 'service' in checks.failed:
+                    explained.append('service')
+    return dict(required=list(checks.required), passed=list(checks.passed),
+                failed=list(checks.failed), warned=list(checks.warned),
+                hold_explained_failures=[key for key in checks.failed if key in explained],
+                observed_at=iso(at) if at is not None else None,
+                expires_at=iso(at+ttl) if at is not None else None, freshness=freshness)
+
+
 def initialize(store):
     # Additive extension, independent of the foundation's schema version.
     with store.transaction():
@@ -375,6 +417,8 @@ class Collector:
                 # Incomplete page sets cannot replace last-known evidence.
                 for row in result.rows if result.complete else ():
                     row = deepcopy(row)
+                    row.pop('readiness_evidence', None)
+                    row.pop('operational_evidence', None)
                     previous = identities.get((sid, row['provider_runner_id']))
                     row['host_id'] = None
                     if previous:

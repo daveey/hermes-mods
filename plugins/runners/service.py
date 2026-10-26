@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .collector import ident, iso, readiness, operational_evidence
+from .collector import ident, iso, readiness, operational_evidence, readiness_evidence
 from .health import State, project, Policy
 from .models import validate
 
@@ -79,6 +79,10 @@ class Service:
             checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock(), snapshot_current=current)
             # This is host projection data, never provider-supplied runner data.
             row.pop('operational_evidence', None)
+            row.pop('readiness_evidence', None)
+            causes = readiness_evidence(c, row, snap.get('host_results', {}), self.clock(), checks, snapshot_current=current)
+            if causes is not None:
+                row['readiness_evidence'] = causes
             operational = operational_evidence(c, row, snap.get('host_results', {}), self.clock(), snapshot_current=current)
             if operational:
                 row['operational_evidence'] = operational
