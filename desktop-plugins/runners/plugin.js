@@ -890,6 +890,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
     [scope, setScope] = useState('all'),
     [expanded, setExpanded] = useState(null),
     [expandedNodes, setExpandedNodes] = useState(new Set()),
+    [help, setHelp] = useState(false),
     [actionError, setActionError] = useState('')
   const visible = useVisible(),
     client = useQueryClient(),
@@ -958,6 +959,7 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
   function escape(e) {
     e.preventDefault()
     e.stopPropagation()
+    if (help) { setHelp(false); return }
     if (expanded) {
       const key = expanded
       setExpanded(null)
@@ -1009,6 +1011,11 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
       setSearch(next)
       searchRef.current?.focus()
       requestAnimationFrame(() => searchRef.current?.setSelectionRange(next.length, next.length))
+    }
+    if (e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing &&
+        !e.target.isContentEditable && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+      e.preventDefault()
+      setHelp(old => !old)
     }
     if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
       e.preventDefault()
@@ -1251,7 +1258,9 @@ export function Runners({ ctx, features = { repair_sessions: false } }) {
         h(
           'div',
           { className: 'hermes-runners-muted' },
-          '↑↓ Move · Enter Details · Shift+F10 Actions · Esc Back'
+          '↑↓ Move · Enter Details · Shift+F10 Actions · Esc Back · ? Help',
+          help ? h('div', { 'data-runners-help': true, role: 'note' },
+            '↑↓ Move through visible nodes and runners. Enter toggles a node or runner detail. Right: expand node. Left: collapse node. / or type: search. Shift+F10: runner actions. Escape: help, detail, query, expanded node, then panel.') : null
         )
       )
     )

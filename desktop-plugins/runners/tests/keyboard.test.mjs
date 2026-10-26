@@ -58,6 +58,19 @@ test('runner name search retains parent and highlights nested matching text', as
     assert.match(document.body.textContent, /Showing 1 nodes · 1 registrations/)
   } finally { await ui.close() }
 })
+test('question mark opens shortcut help and Escape closes help before panel', async () => {
+  host.profileRoutes = async () => [route]
+  const ui = await mount(React.createElement(p.Runners, { ctx: { rest: async path => path.includes('/enrollment') ? enrollment() : snapshot() } }))
+  try {
+    await ui.click(button('Show runners'))
+    const node = document.querySelector('[data-node-row]')
+    await ui.key(node, '?')
+    assert.match(document.querySelector('[data-runners-help]')?.textContent || '', /Right.*expand/)
+    await ui.key(node, 'Escape')
+    assert.equal(document.querySelector('[data-runners-help]'), null)
+    assert.ok(document.querySelector('[data-runners-panel]'))
+  } finally { await ui.close() }
+})
 test('node keyboard traversal and layered Escape preserve focus', async () => {
   const s = snapshot()
   host.profileRoutes = async () => [route]
