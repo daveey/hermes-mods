@@ -15,7 +15,9 @@ const receipt={electron:await app.evaluate(()=>process.versions.electron), contr
 try {
  const page=await app.firstWindow();
  await page.exposeFunction('observeGuardDOM', text=>{if(text.includes('The example app remains HTTP 503 because the prerequisite was deferred.'))receipt.leaked=true;});
- await page.evaluate(()=>{new MutationObserver(()=>window.observeGuardDOM(document.body.innerText)).observe(document.body,{subtree:true,childList:true,characterData:true});});
+ const observeDOM=()=>{new MutationObserver(()=>window.observeGuardDOM(document.body?.innerText || '')).observe(document,{subtree:true,childList:true,characterData:true});};
+ await page.addInitScript(observeDOM);
+ await page.evaluate(observeDOM);
  page.on('websocket', ws=>{const item={url:ws.url(),closed:false};receipt.sockets.push(item);ws.on('close',()=>item.closed=true);for(const direction of ['framesent','framereceived'])ws.on(direction,frame=>{try{receipt.wire.push({direction,frame:JSON.parse(String(frame.payload))});}catch{}});});
  const composer=page.locator('[data-slot="composer-root"] [contenteditable="true"]').filter({visible:true}).first();
  await page.getByRole('button',{name:'Backend ready',exact:true}).waitFor({state:'visible',timeout:90000});
@@ -42,15 +44,47 @@ try {
    fs.writeFileSync(path.join(home,'release-primary'),'');
   } else {
    const before=receipt.sockets.length;
+   const activeSockets=receipt.sockets.filter(s=>!s.closed);
+   if(control === 'reload') {
+    receipt.beforeReload=await page.evaluate(()=>({timeOrigin:performance.timeOrigin,href:location.href}));
+    await page.reload();
+    receipt.afterReload=await page.evaluate(()=>({timeOrigin:performance.timeOrigin,href:location.href}));
+    expect(receipt.afterReload.timeOrigin).not.toBe(receipt.beforeReload.timeOrigin);
+   } else {
    const cdp=await page.context().newCDPSession(page);
    const proto=await cdp.send('Runtime.evaluate',{expression:'WebSocket.prototype'});
    const objects=await cdp.send('Runtime.queryObjects',{prototypeObjectId:proto.result.objectId});
-   const closed=await cdp.send('Runtime.callFunctionOn',{objectId:objects.objects.objectId,functionDeclaration:'function(){let n=0;for(const s of this){if(s.readyState===1 && new URL(s.url).origin===arguments[0] && new URL(s.url).searchParams.get("profile")==="default"){s.close(4000,"acceptance reconnect");n++;}}return n;}',arguments:[{value:url.replace('http:','ws:')}],returnByValue:true});
-   receipt.closedForReconnect=closed.result.value;
+   const closed=await cdp.send('Runtime.callFunctionOn',{
+    objectId:objects.objects.objectId,
+    functionDeclaration:`function(origin, all) {
+     const gatewaySockets=Array.from(this).filter(s=>new URL(s.url).pathname==='/api/ws');
+     const targets=gatewaySockets.filter(s=>s.readyState===1 &&
+      (all || (new URL(s.url).origin===origin && new URL(s.url).searchParams.get('profile')==='default')));
+     const urls=targets.map(s=>s.url);
+     for(const s of targets)s.close(4000,'acceptance reconnect');
+     return {urls, remainingOpen:gatewaySockets.filter(s=>s.readyState===1).map(s=>s.url)};
+    }`,
+    arguments:[{value:url.replace('http:','ws:')},{value:control==='all-sockets'}],returnByValue:true});
+   receipt.socketLoss=closed.result.value;
+   receipt.closedForReconnect=receipt.socketLoss.urls.length;
+   if(control==='all-sockets') {
+    expect(receipt.socketLoss.remainingOpen).toEqual([]);
+    expect(receipt.socketLoss.urls.some(u=>!new URL(u).searchParams.has('profile'))).toBe(true);
+    expect(receipt.socketLoss.urls.some(u=>new URL(u).searchParams.get('profile')==='default')).toBe(true);
+   }
    await cdp.detach();
-   expect(receipt.closedForReconnect).toBeGreaterThan(0);
+   expect(receipt.closedForReconnect).toBeGreaterThan(control==='all-sockets'?1:0);
+   }
    await expect.poll(()=>receipt.sockets.length,{timeout:30000}).toBeGreaterThan(before);
+   if(control==='reload' || control==='all-sockets') {
+    await expect.poll(()=>activeSockets.every(s=>s.closed),{timeout:30000}).toBe(true);
+    receipt.allPriorSocketsClosed=true;
+   }
    await page.getByRole('button',{name:'Backend ready',exact:true}).waitFor({state:'visible',timeout:90000});
+   if(control==='all-sockets') {
+    await expect.poll(()=>receipt.socketLoss.urls.every(u=>receipt.sockets.slice(before).some(s=>s.url===u && !s.closed)),{timeout:30000}).toBe(true);
+    receipt.allGatewaySocketsReplaced=true;
+   }
    receipt.reconnected=true;
    fs.writeFileSync(path.join(home,'release-primary'),'');
   }

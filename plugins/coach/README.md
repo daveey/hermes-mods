@@ -590,8 +590,11 @@ these authored cases are not a blind holdout.
 
 `tests/test_goal_electron_acceptance.py` drives a built Electron renderer under
 Linux Xvfb through its composer and actual production serve/token-auth transport.
-Its four cases cover initial rejection, composer Stop, Ctrl+Enter queueing, and
-reconnection of the exact remote session socket. Each checks rejected-candidate
+Its six cases cover initial rejection, composer Stop, Ctrl+Enter queueing,
+reconnection of the exact remote session socket, full renderer-document reload,
+and simultaneous loss/replacement of all gateway sockets in the single configured
+remote topology (ambient plus default-profile socket). Reload asserts a new document
+identity and keeps DOM leak observation active across navigation. Each checks rejected-candidate
 DOM observation and persistence, one shared session, and a second analysis-only
 turn. Stop produces interrupted status; the other first turns produce unresolved
 error status. The deterministic loopback model is not a live-model evaluation. Prepare a core worktree with its locked
@@ -608,9 +611,11 @@ non-loopback connect/sendto and signals to processes with a different HERMES_HOM
 `test_goal_electron_fence.py` verifies the foreign-process and network denials using
 an owned disposable process. This is a regression-fixture guard, not a security
 sandbox for hostile executables or direct syscalls. No production profile should be
-used for these tests. Full app reload, backend restart and all-gateway socket loss
-are not covered by the session-socket reconnect case. Production activation,
-remote owner adapters and exact-original replay remain separate requirements.
+used for these tests. Renderer reload is not Electron process relaunch or backend
+restart. Socket-loss fault injection permits immediate reconnect; sustained network
+outage, completion while offline and multiple remote gateways remain unverified.
+Production activation, remote owner adapters and exact-original replay remain
+separate requirements.
 
 `test_goal_process_ownership.py` verifies that cached process handles, notify flags
 and forged consumer assertions cannot certify ownership or release a prior hold.

@@ -18,7 +18,7 @@ from test_goal_serve_acceptance import _ready
 from electron_control_model import Model
 
 
-@pytest.mark.parametrize('control', ['initial', 'stop', 'queue', 'reconnect'])
+@pytest.mark.parametrize('control', ['initial', 'stop', 'queue', 'reconnect', 'reload', 'all-sockets'])
 def test_real_electron_guard(tmp_path, control):
     import hermes_constants
     core = Path(hermes_constants.__file__).resolve().parent
