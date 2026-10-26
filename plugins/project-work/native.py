@@ -34,6 +34,12 @@ class NativeBridge:
         self.bot_user_id = bot_user_id
         self.live = {}
 
+    def _bind_live(self, live_id, stored_id):
+        # A cold resume replaces the gateway-local ID, not durable ownership.
+        self.live = {key: value for key, value in self.live.items()
+                     if value != stored_id}
+        self.live[live_id] = stored_id
+
     def _exact(self, stored_id):
         rows = self.sessions({'id': stored_id, 'profile': self.policy.builder_profile})
         if len(rows) != 1 or rows[0].get('id') != stored_id:
@@ -50,7 +56,7 @@ class NativeBridge:
         result = self.rpc('session.create', {'profile': profile, 'source': 'desktop', 'cwd': cwd,
             'title': title, 'hidden': False, 'close_on_disconnect': False,
             'idempotency_key': 'project-work:' + workflow_id})
-        self.live[result['session_id']] = result['stored_session_id']
+        self._bind_live(result['session_id'], result['stored_session_id'])
         return result
 
     def recover_session(self, workflow_id):
@@ -65,7 +71,7 @@ class NativeBridge:
         result = self.rpc('session.resume', {'session_id': row['id'], 'profile': self.policy.builder_profile})
         if result.get('stored_session_id') != row['id']:
             raise ValueError('Resume changed durable identity')
-        self.live[result['session_id']] = row['id']
+        self._bind_live(result['session_id'], row['id'])
         return result
 
     def _resolve_live(self, live_id):
@@ -80,7 +86,7 @@ class NativeBridge:
         result = self.rpc('session.resume', {'session_id': row['id'], 'profile': self.policy.builder_profile})
         if result.get('stored_session_id') != row['id']:
             raise ValueError('Resume changed durable identity')
-        self.live[result['session_id']] = row['id']
+        self._bind_live(result['session_id'], row['id'])
         return result['session_id'], row['id']
 
     def prompt(self, session_id, text, idempotency_key):
@@ -167,7 +173,9 @@ class NativeBridge:
         stored = params.get('stored_session_id')
         if stored:
             # Card lookup/readback only needs durable ownership, not a live RPC ID.
-            live = next((key for key, value in self.live.items() if value == stored), None)
+            live = params.get('session_id')
+            if self.live.get(live) != stored:
+                live = None
         else:
             # Upgrade old intents by unique durable title, never an expired live ID.
             rows = self.sessions({'title': 'Project work ' + workflow_id,
@@ -176,7 +184,7 @@ class NativeBridge:
             if len(rows) != 1:
                 raise ValueError('Ambiguous durable card owner')
             stored = rows[0]['id']
-            live = next((key for key, value in self.live.items() if value == stored), None)
+            live = None
         session = self._exact(stored)
         if session.get('title') != 'Project work ' + workflow_id:
             raise PermissionError('Card owner session mismatch')

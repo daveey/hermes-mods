@@ -14,6 +14,7 @@ from typing import Protocol
 
 from .store import Store, followup_text
 from .native import InboundChanged
+from .errors import RejectedRequest, RejectedScope
 
 
 @dataclass(frozen=True)
@@ -91,11 +92,11 @@ class Service:
 
     def _authorize(self, ctx):
         if not isinstance(ctx, AuthContext):
-            raise PermissionError('Trusted AuthContext required')
+            raise RejectedScope('Trusted AuthContext required')
         if (ctx.platform != 'slack' or ctx.team_id != self.policy.team_id or
                 ctx.channel_id != self.policy.channel_id or ctx.profile != self.policy.ingress_profile or
                 not ctx.user_id or not ctx.message_id):
-            raise PermissionError('Request outside configured ingress scope')
+            raise RejectedScope('Request outside configured ingress scope')
         if str(Path(self.policy.cwd).resolve()) != self.policy.cwd or not Path(self.policy.cwd).is_dir():
             raise PermissionError('Configured path changed')
 
@@ -104,7 +105,7 @@ class Service:
             raise PermissionError('Configured path changed')
         row = self.store.get(workflow_id)
         if row['policy'] != self.policy.document():
-            raise PermissionError('Workflow policy mismatch')
+            raise RejectedScope('Workflow policy mismatch')
         return row
 
     def status(self, ctx, workflow_id):
@@ -144,7 +145,7 @@ class Service:
         if followup:
             text = followup_text(text)
         if not isinstance(text, str) or not text.strip():
-            raise ValueError('Nonempty request text required')
+            raise RejectedRequest('Nonempty request text required')
         with self.store.lock():
             row, fresh = self.store.receive(asdict(ctx), text, self.policy.document(),
                                             False, followup)
@@ -172,13 +173,13 @@ class Service:
     def approve(self, ctx, workflow_id, plan_hash):
         self._authorize(ctx)
         if ctx.user_id not in self.policy.owner_ids:
-            raise PermissionError('Owner approval required')
+            raise RejectedScope('Owner approval required')
         with self.store.lock():
             row = self._row(workflow_id)
             if not row['plan_hash'] or plan_hash != row['plan_hash']:
-                raise PermissionError('Approval must bind the current concrete plan hash')
+                raise RejectedScope('Approval must bind the current concrete plan hash')
             if self.ports.verify_approval(ctx, row, plan_hash) is not True:
-                raise PermissionError('Exact Slack approval readback required')
+                raise RejectedScope('Exact Slack approval readback required')
             if row['approved']:
                 return row
             row['approved'] = True

@@ -268,6 +268,26 @@ An unavailable runtime/reader is an error, not evidence of completion. Followups
 an archived owned session and require a new plan confirmation. The platform's own
 home-channel configuration is neither read nor changed by the plugin.
 
+Gateway-local IDs are replaced on successful resume, including when only the gateway
+restarts and the controller survives. Card recovery uses durable ownership; a new
+card write uses the current validated live owner, never the first cached alias.
+Only explicit `RejectedScope`, `RejectedRequest`, and missing-workflow approval
+errors are terminal ingress rejections. Environmental/native PermissionError,
+ValueError, KeyError and transport errors remain queued for retry. The deployment
+must monitor the journal's `rejected` table and notify the original requester;
+dead-letter persistence alone is not user notification.
+
+Operational limits: invalidated/errored active rows still reconcile each runtime tick.
+An edited source can remain invalidated even after a fresh followup; followups do
+not erase the edited history. Use operator recovery, not automatic approval or archive.
+The quarantine procedure above does not set a ledger quarantine flag: before resuming,
+the private adapter MUST durably deny all future native writes/dispatch for abandoned
+workflow IDs (not just publication). If that denial is unavailable, keep the runtime
+paused; a late recovered effect must not restart an abandoned graph. Verify Slack
+pagination against the real API before rollout, including repeated page-boundary IDs.
+For Unix socket tests use a short `--basetemp` inside your workspace when the inherited
+temporary directory is long; native AF_UNIX endpoint length limits still apply.
+
 ## Tests
 
 Run from the repository root:

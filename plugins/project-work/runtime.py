@@ -27,6 +27,7 @@ from .config import load_config
 from .native import NativeBridge
 from .service import AuthContext, Service
 from .store import Store
+from .errors import MissingWorkflow, RejectedRequest, RejectedScope
 
 
 def public_status(row):
@@ -55,13 +56,13 @@ class Controller:
             # No unknown thread can become a workflow merely by being observed.
             try:
                 return public_status(self.service.followup(**args))
-            except KeyError:
+            except MissingWorkflow:
                 return {'ignored': True}
-            except (ValueError, PermissionError) as exc:
+            except (RejectedRequest, RejectedScope) as exc:
                 return {'rejected': True, 'reason': type(exc).__name__}
         try:
             result = getattr(self.service, operation)(**args)
-        except (PermissionError, ValueError) as exc:
+        except (MissingWorkflow, RejectedScope, RejectedRequest) as exc:
             if operation in ('approve', 'request'):
                 # A rejected command is terminal, not an outage to retry forever.
                 # The Slack backfill records the exact attempt for watermarking.

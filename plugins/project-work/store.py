@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import uuid
 from decimal import Decimal, InvalidOperation
+from .errors import MissingWorkflow, RejectedRequest, RejectedScope
 
 
 def message_order(value):
@@ -18,7 +19,7 @@ def message_order(value):
 
 def followup_text(text):
     if not isinstance(text, str):
-        raise ValueError('Text must be a string')
+        raise RejectedRequest('Text must be a string')
     return text if text.strip() else '[Non-text human follow-up: inspect the original Slack message and attachments.]'
 
 _LOCKS = {}
@@ -71,7 +72,7 @@ class Store:
             record = db.execute('SELECT data FROM workflows WHERE workflow_id=?',
                                 (workflow_id,)).fetchone()
         if record is None:
-            raise KeyError(workflow_id)
+            raise MissingWorkflow(workflow_id)
         return json.loads(record[0])
 
     def save(self, row):
@@ -109,7 +110,7 @@ class Store:
             if found:
                 row = json.loads(found[0])
                 if row['policy'] != policy:
-                    raise PermissionError('Stored policy differs from configured policy')
+                    raise RejectedScope('Stored policy differs from configured policy')
                 snapshot = {k: v for k, v in row.items() if k not in ('history', 'text', 'source_ids', 'approval_attempts')}
                 row.setdefault('history', []).append(snapshot)
                 row.update(generation=row['generation'] + 1, cards={}, evidence={},
@@ -117,9 +118,9 @@ class Store:
                            prompt_state=None, approved=False, plan=None, plan_hash=None)
             else:
                 if followup:
-                    raise KeyError('No workflow for this thread')
+                    raise MissingWorkflow('No workflow for this thread')
                 if context['thread_id'] and context['thread_id'] != context['message_id']:
-                    raise ValueError('Start new project work in a root channel message')
+                    raise RejectedRequest('Start new project work in a root channel message')
                 row = dict(workflow_id=str(uuid.uuid4()), team_id=team, channel_id=channel,
                            thread_id=thread, policy=policy, generation=1, approved=approved,
                            session_id=None, stored_session_id=None, cards={}, evidence={},
