@@ -55,6 +55,11 @@ Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/enrollment`, GET
 profile, enrollment flag and observe capabilities without opening the database or
 starting a collector. A profile with no runners configuration is not enrolled;
 invalid configuration or an unavailable plugin is not silently treated as empty.
+During mixed-version deployment only an enrollment HTTP 404 permits a read-only
+legacy inventory probe through the same authenticated route and owner checks.
+Validated rows remain visible as stale/deployment-pending with actions and ready
+capacity disabled until enrollment works. Authorization errors never fall back;
+explicitly unenrolled profiles never query inventory.
 Other GETs read SQLite only. Refresh queues bounded,
 deduplicated asynchronous work. Core gateway authentication plus profile and
 same-origin/CSRF fences apply; no standalone unauthenticated fallback exists.

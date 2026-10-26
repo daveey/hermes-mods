@@ -135,8 +135,16 @@ export function createTransport(ctx, hostRef = host) {
             key = routeKey(route),
             prior = sources.get(key)
           try {
-            const enrollment = await request(route, '/enrollment')
-            if (!enrollment.enrolled) {
+            let enrollment, legacy = false
+            try {
+              enrollment = await request(route, '/enrollment')
+            } catch (e) {
+              // An older mounted router may still serve a valid owner inventory.
+              // Only 404 permits a read-only probe; auth/config failures never do.
+              if (e?.status !== 404) throw e
+              legacy = true
+            }
+            if (!legacy && !enrollment.enrolled) {
               sources.set(key, { route, enrolled: false })
               continue
             }
@@ -160,7 +168,7 @@ export function createTransport(ctx, hostRef = host) {
             )
               throw safeError('Invalid inventory response')
             queryClient?.setQueryData(ownerQueryKey(snapshot.meta.owner), snapshot)
-            sources.set(key, { route, snapshot })
+            sources.set(key, { route, snapshot, ...(legacy ? { error: 'Deployment pending: enrollment unavailable; last-known inventory' } : {}) })
           } catch (e) {
             sources.set(key, { ...prior, route, error: failure(e) })
           }
