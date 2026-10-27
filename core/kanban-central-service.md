@@ -86,6 +86,18 @@ rejected ops and clean diffs. Known: a claim can race the push of its card's cre
 (one deferred tick); the service stalled 15–18 s around a deploy (likely the Durable Object restarting onto new
 code); a lease granted outside a local claim is requeued by the orphan sweep and waits out one TTL.
 
+After the cutover the hourly diffs caught one real defect: every process's first connect dropped and recreated
+the capture triggers with no transaction around it, so a write from another process in that window (a claim's run
+row right after a gateway restart) was never captured. Fixed: the install runs in one write transaction, is a no-op
+when the triggers already match, and on an attached board queues any row it finds written without capture
+(`test_kanban_sync_client.py`, capture gaps). The rows missed before the fix were re-imported; all three diffs are
+clean in `primary`.
+
+Linked cards (the Desktop strip above the composer): the remote-links projection no longer makes readers wait on its
+rebuild (`/api/session-kanban-tasks` went from 11–19 s to under 40 ms on a busy gateway), and the session-tasks plugin
+paints a chat's last-known cards from a per-chat cache the moment it is opened, loads each source independently and
+shows each card as a row (status, title, assignee, latest activity, note, PR link).
+
 What is not built yet: Desktop reading linked cards and boards from the replica, the WebSocket feed (the client
 polls every 5 s), and placement beyond "a card runs where it was created" (`runs_on`, Worker nodes and transcripts).
 
