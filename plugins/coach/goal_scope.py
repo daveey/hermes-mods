@@ -3,6 +3,10 @@ import copy
 import json
 import math
 from pathlib import Path
+import importlib.util
+_spec = importlib.util.spec_from_file_location('_coach_scope_images', Path(__file__).with_name('goal_images.py'))
+_images = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_images)
 
 
 def is_evidence_row(row):
@@ -53,7 +57,7 @@ def _user_row(row):
         metadata = json.loads(metadata)
     if row.get('_user_content_sanitized') or metadata.get('user_content_sanitized'):
         raise ValueError('ambiguous_memory_provenance')
-    if isinstance(row.get('content'), list) and not row.get('api_content'):
+    if isinstance(row.get('content'), list):
         # Historical multimodal injection shares content, without a native split.
         raise ValueError('scope_unsupported_content')
     result = {'role': 'user', 'content': copy.deepcopy(row.get('content'))}
@@ -210,7 +214,7 @@ def recover_scope(session_id, user_message, history, *, canonical_user_content=N
                 clean += (" AND CASE WHEN json_valid(display_metadata) THEN "
                           "COALESCE(json_type(display_metadata, '$._queued_prompt'), '') != 'true' ELSE 1 END")
                 anchors = conn.execute('SELECT id FROM messages WHERE session_id=? AND ' + clean +
-                                       ' AND content=? LIMIT 2', (session_id, user_message)).fetchall()
+                                       ' AND content=? LIMIT 2', (session_id, json.dumps(user_message) if isinstance(user_message, list) else user_message)).fetchall()
                 if len(anchors) > 1:
                     raise ValueError('scope_ambiguous_anchor')
                 segments = []
@@ -262,7 +266,7 @@ def recover_scope(session_id, user_message, history, *, canonical_user_content=N
                         if not isinstance(content, str) or content.startswith(('[', '{')):
                             raise ValueError('scope_unsupported_content')
                         recovered.append(_user_row(dict(row)))
-                    if len(recovered) > 200 or len(json.dumps(recovered)) > 32000:
+                    if len(recovered) > 200 or _images.serialized_size(recovered) > 32000:
                         raise ValueError('context_limit')
     # Retain ordering/repeated restrictions; only remove an overlapping suffix/prefix.
     overlap = 0
@@ -272,7 +276,7 @@ def recover_scope(session_id, user_message, history, *, canonical_user_content=N
     rows = (recovered[:-overlap] if overlap else recovered) + rows
     if not rows or rows[-1].get('content') != user_message:
         rows.append({'role': 'user', 'content': user_message})
-    if len(rows) > 200 or len(json.dumps(rows)) > 32000:
+    if len(rows) > 200 or _images.serialized_size(rows) > 32000:
         raise ValueError('context_limit')
     return rows
 
@@ -324,7 +328,7 @@ def resolve_scope(session_id, contexts, turn_messages=None):
                     captured_users = [r.get('content') for r in rows if r.get('role') == 'user']
                     if supplied_users and (not captured_users or supplied_users[-1] != captured_users[-1]):
                         raise ValueError('scope_current_request_mismatch')
-                    if len(rows) > 200 or len(json.dumps(rows)) > 32000:
+                    if len(rows) > 200 or _images.serialized_size(rows) > 32000:
                         raise ValueError('context_limit')
                     return rows
                 if SessionMessagesMixin._is_explicit_fork_child_row(None, current, include_reset=True):

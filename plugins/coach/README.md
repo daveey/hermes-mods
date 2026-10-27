@@ -778,3 +778,39 @@ Primary/judge answers and hook
 wiring are fixture-controlled; HTTP/terminal results and repair are real. This is not
 live-model, production or activation acceptance, and does not close the original-incident
 or remote-ownership release gates.
+
+
+### Bounded native inline images (experimental)
+
+The goal gate preserves authenticated native user content unchanged in its capture
+and proof evidence. `goal_images.py` supplies a separate text-budget projection
+(shared by scope recovery, rotated capture, observation, and evidence budgeting):
+attachment indices and SHA-256 identities replace image bytes only in the JSON
+text projection. The auxiliary receives the original ordered `image_url` blocks,
+not base64 embedded in JSON text. Full user text and literal tags remain intact;
+screenshots never confer authority. Native text-only Stop alongside an image
+still vetoes abandonment.
+
+The deliberately narrow supported format is static 8-bit non-interlaced PNG
+(grayscale, RGB, grayscale-alpha, RGBA), including bounded screenshot metadata
+(iCCP, cICP, eXIf, pHYs, iTXt and iDOT) preserved byte-for-byte. CRC,
+header, exact bounded zlib output and scanline filter checks reject malformed
+payloads. Budgets: four images, 4 MiB decoded bytes per image / 8 MiB aggregate,
+4 million pixels per image / 8 million aggregate, 1024 PNG chunks, 200 content
+parts per native user row. Existing 200-row / 32k text limits remain; images do
+not spend that text budget. Metadata has a 1 MiB aggregate expanded/raw budget;
+compressed profiles/text are bounded before decoding. Other formats, unsupported
+ancillary chunks, animation, remote
+or file URLs, historical list content (even self-labelled with a sidecar), and
+unknown blocks remain UNKNOWN. No image fetching or historical reconstruction.
+
+A vision verdict is accepted only if the auxiliary's reported final provider/model
+has positively known vision capability. Main-model defaults and provider aliases
+are not borrowed for auxiliary capability checks. Unsupported/missing route metadata or
+provider errors remain UNKNOWN. This capability check occurs after the auxiliary
+call, to validate the final route including fallback; it does not certify an
+actual provider's image interpretation. Tests are offline, not live-model semantic
+validation: `tests/test_goal_native_multimodal.py` covers native full-loop delivery,
+exact bytes/order/text/provenance preservation, limits, unsupported inputs/routes,
+literal restrictions and explicit host Stop. Original historical incident
+prevention and live transport/model behavior remain separate acceptance gates.

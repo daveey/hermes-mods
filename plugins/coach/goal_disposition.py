@@ -50,6 +50,8 @@ def evidence_for(messages, candidate):
             ref = 'user:' + str(sum(e['role'] == 'user' for e in evidence.values()))
             evidence[ref] = {'role': 'user', 'content': _evidence.user_content(
                 row.get('content'), canonical=row.get('content_source') == 'native_content')}
+            if row.get('content_source') == 'native_content':
+                evidence[ref]['content_source'] = 'native_content'
         elif row.get('role') == 'assistant':
             for call in row.get('tool_calls') or []:
                 if isinstance(call, dict) and isinstance(call.get('id'), str):
@@ -75,9 +77,24 @@ def settings():
 
 def aux_judge(system, prompt):
     from agent.auxiliary_client import call_llm
+    content, has_images = _evidence._images.prompt_content(prompt)
+    route = {}
     response = call_llm(task='coach_goal_disposition', messages=[
-        {'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}],
-        max_tokens=800, temperature=0, timeout=15)
+        {'role': 'system', 'content': system}, {'role': 'user', 'content': content}],
+        max_tokens=800, temperature=0, timeout=15, route_info=route)
+    if has_images:
+        from agent.image_routing import _lookup_supports_vision
+        from hermes_cli.config import load_config_readonly
+        provider, model = route.get("provider"), route.get("model")
+        if not isinstance(provider, str) or not provider.strip() or not isinstance(model, str) or not model.strip():
+            raise ValueError("image_provider_unsupported")
+        # Main-model defaults are not evidence about the final auxiliary route.
+        # Also remove its provider alias: the resolver otherwise borrows that
+        # provider's per-model override for an unrelated auxiliary provider.
+        cfg = dict(load_config_readonly() or {})
+        cfg.pop("model", None)
+        if _lookup_supports_vision(provider, model, cfg) is not True:
+            raise ValueError('image_provider_unsupported')
     return response.choices[0].message.content
 
 
