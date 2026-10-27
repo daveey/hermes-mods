@@ -14,6 +14,8 @@ Prints a Markdown block the coach Bot turns into reports/weekly-<date>.md:
      across hosts, and spend that doubled.
   2c. Self-heal lane: defects filed, proposed, approved, fixed, reverted, closed as not-a-defect; recurrence; $ per
      fix (selfheal_* coach events + `selfheal:` Kanban cards, or the hub's reports/selfheal-lane.jsonl snapshot).
+  2d. Guards in shadow/off > 7 days: every mode-switched detector/guard (GUARDS) on this host stuck in shadow/off,
+     with its fire count; --file-guard-cards opens one Kanban card per guard (never an Inbox card).
   3. Each --check: before/after comparison for a config change at a timestamp (sessions fully before vs started
      after, equal-length windows), with a keep / raise / revert recommendation.
   4. Pending and rejected proposals (the Bot must not re-propose rejected ones).
@@ -583,6 +585,119 @@ def section_selfheal(data, now, days, homes=None, events=None, cards=None):
     return out
 
 
+# Detectors / guards that ship behind a mode switch. A guard left in shadow or off is a decision nobody made: after
+# GUARD_LIMBO_DAYS the digest lists it with its fire count and (with --file-guard-cards) opens ONE Kanban card per
+# guard to enforce or remove it. Never an Inbox card: the decision is agent work, not David's.
+# (name, config file under <home>, json key, env var, default mode, active modes, fire events)
+GUARDS = [
+    ("self-heal lane", "coach/selfheal-config.json", "mode", "COACH_SELFHEAL", "shadow", ("live",),
+     ("selfheal_would_file",)),
+    ("goal_disposition (abandonment guard)", "coach/goal-disposition.json", "mode", None, "off", ("enforce",),
+     ("goal_disposition", "goal_disposition_unknown")),
+    ("topic-shift Jev screen", None, None, "SYSTEM_ONE_MODE_TOPIC_SHIFT", "shadow", ("on",), ()),
+]
+GUARD_LIMBO_DAYS = 7
+
+
+def _env_file_value(home, var):
+    p = Path(home) / ".env"
+    if not var or not p.exists():
+        return None
+    for line in p.read_text(errors="replace").splitlines():
+        k, _, v = line.partition("=")
+        if k.strip().removeprefix("export ").strip() == var:
+            return v.strip().strip("'\"").lower() or None
+    return None
+
+
+def guard_modes(home, now, state_path=None):
+    """[{name, mode, since, days, fires}] for each GUARDS entry on this host. `since` is sticky in
+    <home>/coach/guard-modes.json (reset when the mode changes); first sight = the guard's earliest logged event or its
+    config file's mtime, whichever is older, else now."""
+    home = Path(home)
+    state_path = Path(state_path or home / "coach" / "guard-modes.json")
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception:
+        state = {}
+    seen = collections.defaultdict(list)  # guard name -> event timestamps
+    names = {e: g[0] for g in GUARDS for e in g[6]}
+    log = home / "coach" / "log.jsonl"
+    if log.exists():
+        for line in log.read_text(errors="replace").splitlines():
+            if '"event"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            n = names.get(r.get("event")) if isinstance(r, dict) else None
+            if n and isinstance(r.get("ts"), (int, float)):
+                seen[n].append(float(r["ts"]))
+    out = []
+    for name, cfg, key, env, default, active, _ev in GUARDS:
+        mode, mtime = None, None
+        if cfg and (home / cfg).exists():
+            mtime = (home / cfg).stat().st_mtime
+            try:
+                mode = str(json.loads((home / cfg).read_text()).get(key) or "").lower() or None
+            except Exception:
+                mode = None
+        mode = _env_file_value(home, env) or mode or default
+        prev = state.get(name) or {}
+        if prev.get("mode") == mode and prev.get("since"):
+            since = prev["since"]
+        elif prev.get("mode") and prev.get("mode") != mode:
+            since = now  # the mode changed since the last digest
+        else:
+            since = min(seen[name] + ([mtime] if mtime else []) or [now])
+        state[name] = {"mode": mode, "since": since}
+        fires = sum(1 for ts in seen[name] if ts >= since)
+        out.append({"name": name, "mode": mode, "active": mode in active, "since": since,
+                    "days": (now - since) / 86400, "fires": fires})
+    with contextlib.suppress(OSError):
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state, indent=1, sort_keys=True))
+    return out
+
+
+def guard_card(g, host):
+    """`hermes kanban create` argv for one guard in limbo (idempotent per host + guard + mode)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", g["name"].lower()).strip("-")
+    since = datetime.fromtimestamp(g["since"], coach_yield.PT)
+    body = (f"The {g['name']} on {host} has been `{g['mode']}` since {since:%Y-%m-%d %H:%M %Z} "
+            f"({g['days']:.0f} days) and fired {g['fires']} times in that mode.\n\n"
+            "Decide it: sample its fires (or replay labeled cases if it never fires), judge precision against its "
+            "activation criteria, then either switch it to enforce/live within its budget or remove it, and say why. "
+            "\"Still shadow\" is not an outcome. Comment the precision sample on this card.")
+    return ["hermes", "kanban", "create", f"Retire or enforce: {g['name']} ({g['mode']} {g['days']:.0f}d, "
+            f"{g['fires']} fires)", "--assignee", "default", "--created-by", "coach",
+            "--idempotency-key", f"guard-limbo:{host}:{slug}:{g['mode']}", "--body", body]
+
+
+def section_guards(home, now, host=None, file_cards=False, run=None, state_path=None):
+    import socket
+    import subprocess
+    host = host or socket.gethostname().split(".")[0]
+    rows = guard_modes(home, now, state_path)
+    limbo = [g for g in rows if not g["active"] and g["days"] > GUARD_LIMBO_DAYS]
+    out = [f"## Guards in shadow/off > {GUARD_LIMBO_DAYS} days ({host})", ""]
+    if not limbo:
+        out.append(f"Shadow-age: none. Every mode-switched detector/guard on {host} is enforcing or changed mode within "
+                   f"{GUARD_LIMBO_DAYS} days.")
+        return out
+    out.append("Shadow-age: " + "; ".join(f"{g['name']} {g['mode']} {g['days']:.0f}d, {g['fires']} fires"
+                                          for g in limbo)
+               + ". Each one gets a Kanban card to enforce or remove it (never an Inbox card).")
+    if file_cards:
+        for g in limbo:
+            r = (run or subprocess.run)(guard_card(g, host), capture_output=True, text=True)
+            got = (r.stdout or r.stderr or "").strip().splitlines()
+            out.append(f"- {g['name']}: " + (f"card {got[-1][:120]}" if r.returncode == 0 and got
+                                             else f"card create FAILED (rc {r.returncode}): {' '.join(got)[-200:]}"))
+    return out
+
+
 def canary_checks(data):
     """CHECKS entries registered by canary applies (status canary with a `check` spec)."""
     return [p["check"] for p in coach_proposals.state(data).values() if p.get("status") == "canary" and p.get("check")]
@@ -600,6 +715,11 @@ def main():
     ap.add_argument("--source-target-root", help="Local rollout checkout directory for source-list proposals")
     ap.add_argument("--home", action="append", default=[],
                     help="Hermes home(s) whose coach log + Kanban boards feed the self-heal section (default ~/.hermes)")
+    ap.add_argument("--guard-home", default=str(Path.home() / ".hermes"),
+                    help="Hermes home whose mode-switched guards the shadow-age line reads (default ~/.hermes, the "
+                         "default profile, even when run from the coach profile)")
+    ap.add_argument("--file-guard-cards", action="store_true",
+                    help="open one idempotent Kanban card per guard in shadow/off > 7 days (the hub's Sunday prerun)")
     ap.add_argument("--selfheal-export", metavar="PATH",
                     help="write the self-heal lane snapshot (events + cards) to PATH and exit; the hub writes "
                          "<data>/reports/selfheal-lane.jsonl so the cloud Bot sees the lane")
@@ -616,6 +736,7 @@ def main():
     out += section_findings(data, ds, now, a.days, a.top) + [""]
     out += section_spend(ds, now, a.days) + [""]
     out += section_selfheal(data, now, a.days, homes=a.home or None) + [""]
+    out += section_guards(a.guard_home, now, file_cards=a.file_guard_cards) + [""]
     checks = list(dict.fromkeys(a.check + canary_checks(data)))
     if checks:
         out += ["## Config-change checks", ""]

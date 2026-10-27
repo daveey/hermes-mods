@@ -356,3 +356,80 @@ class SelfHealLane(unittest.TestCase):
         self.assertEqual(coach_weekly.selfheal_fp("selfheal:abc"), "abc")
         self.assertEqual(coach_weekly.selfheal_fp("selfheal:abc:fix"), "abc")
         self.assertEqual(coach_weekly.selfheal_fp("selfheal-fix:abc"), "abc")
+
+
+class GuardShadowAge(unittest.TestCase):
+    """Shadow-age line: guards in shadow/off > 7 days, with fire counts; each opens a Kanban card, never an Inbox one."""
+    NOW = 1_800_000_000.0
+    DAY = 86400
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        (self.home / "coach").mkdir()
+
+    def cfg(self, name, mode, age_days):
+        import os
+        p = self.home / "coach" / name
+        p.write_text(json.dumps({"mode": mode}))
+        os.utime(p, (self.NOW - age_days * self.DAY,) * 2)
+
+    def log(self, rows):
+        with (self.home / "coach" / "log.jsonl").open("a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def section(self, **kw):
+        return "\n".join(coach_weekly.section_guards(self.home, self.NOW, host="hub", **kw))
+
+    def test_lists_each_guard_stuck_over_7_days_with_its_fire_count(self):
+        self.cfg("selfheal-config.json", "shadow", 1)  # rewritten yesterday, but firing in shadow for 9 days
+        self.log([{"ts": self.NOW - d * self.DAY, "event": "selfheal_would_file"} for d in (9, 5, 1)]
+                 + [{"ts": self.NOW - self.DAY, "event": "reply_checked"}])
+        self.cfg("goal-disposition.json", "shadow", 3)  # 3 days: not yet in limbo
+        self.log([{"ts": self.NOW - 2 * self.DAY, "event": "goal_disposition"}])
+        out = self.section()
+        self.assertIn("Shadow-age: ", out)
+        self.assertIn("self-heal lane shadow 9d, 3 fires", out)
+        self.assertNotIn("goal_disposition", out)
+        self.assertNotIn("topic-shift", out)  # default shadow, no config or events: first sight = now, age 0
+        self.assertIn("Kanban card", out)
+        self.assertNotIn("Inbox card)", out.replace("never an Inbox card", ""))
+
+    def test_active_guard_is_not_listed_and_a_mode_change_resets_the_age(self):
+        self.cfg("selfheal-config.json", "shadow", 20)
+        coach_weekly.section_guards(self.home, self.NOW, host="hub")
+        self.cfg("selfheal-config.json", "live", 0)
+        self.assertNotIn("self-heal lane", self.section())
+        self.cfg("selfheal-config.json", "shadow", 0)  # back to shadow: the clock restarts
+        later = coach_weekly.section_guards(self.home, self.NOW + 3 * self.DAY, host="hub")
+        self.assertNotIn("self-heal lane", "\n".join(later))
+
+    def test_none_in_limbo_says_so(self):
+        (self.home / ".env").write_text("SYSTEM_ONE_MODE_TOPIC_SHIFT=on\n")
+        self.cfg("selfheal-config.json", "live", 30)
+        self.cfg("goal-disposition.json", "enforce", 30)
+        self.assertIn("Shadow-age: none", self.section())
+
+    def test_file_cards_opens_one_idempotent_kanban_card_per_guard_never_inbox(self):
+        self.cfg("selfheal-config.json", "shadow", 10)
+        self.cfg("goal-disposition.json", "off", 12)
+        calls = []
+
+        class R:
+            returncode, stdout, stderr = 0, "Created t_abc123\n", ""
+
+        out = self.section(file_cards=True, run=lambda argv, **kw: calls.append(argv) or R())
+        self.assertEqual(len(calls), 2)
+        for argv in calls:
+            self.assertEqual(argv[:3], ["hermes", "kanban", "create"])
+            self.assertNotIn("inbox", " ".join(argv[:3]))
+            key = argv[argv.index("--idempotency-key") + 1]
+            self.assertTrue(key.startswith("guard-limbo:hub:"))
+            self.assertIn("Still shadow", argv[argv.index("--body") + 1])
+        self.assertIn("card Created t_abc123", out)
+        again = []
+        self.section(file_cards=True, run=lambda argv, **kw: again.append(argv) or R())
+        self.assertEqual([a[a.index("--idempotency-key") + 1] for a in again],
+                         [a[a.index("--idempotency-key") + 1] for a in calls])  # same keys -> same cards
