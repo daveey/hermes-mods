@@ -1,0 +1,2371 @@
+From aa305c54c12a5c1a5705ff1a7c6bd2ea06fb06c4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 05:45:03 +0000
+Subject: [PATCH 434/453] fix(routing): enforce managed subscriptions and
+ preserve exact intent
+
+(cherry picked from commit 40f638ec5b758ea41f7e8858f02728f1c98b3cc1)
+---
+ agent/agent_runtime_helpers.py                |  47 +++---
+ agent/agent_runtime_switch.py                 |  93 +++++++++++
+ agent/auxiliary_class_readiness.py            |  14 +-
+ agent/auxiliary_class_routing.py              |  23 ++-
+ agent/auxiliary_client.py                     |  37 ++---
+ agent/auxiliary_wire.py                       |  23 +++
+ agent/chat_completion_helpers.py              |   6 +-
+ agent/client_lifecycle.py                     |   5 +
+ agent/codex_runtime.py                        |   2 +
+ agent/model_routing.py                        |  14 +-
+ agent/model_routing_agent.py                  |  10 +-
+ agent/model_routing_auxiliary_guard.py        |  46 ++++++
+ agent/model_routing_managed.py                | 130 ++++++++++++++++
+ agent/model_routing_request.py                |   2 +
+ agent/model_routing_restore.py                |  30 ++++
+ agent/model_routing_runtime.py                |  25 ++-
+ agent/model_routing_state.py                  |  20 ++-
+ gateway/platforms/api_server_class_routing.py |  33 ++--
+ gateway/run_class_routing.py                  |  24 ++-
+ hermes_cli/cli_model_routing.py               |  17 +--
+ hermes_cli/config_defaults.py                 |   8 +-
+ hermes_cli/config_defaults_routing.py         |  11 ++
+ hermes_cli/runtime_provider.py                |  12 ++
+ tests/agent/test_managed_auxiliary.py         |  53 +++++++
+ tests/agent/test_managed_auxiliary_wire.py    |  68 +++++++++
+ tests/agent/test_managed_defaults.py          |  20 +++
+ tests/agent/test_managed_main_wire.py         |  76 +++++++++
+ tests/agent/test_managed_responses_wire.py    | 143 +++++++++++++++++
+ .../agent/test_managed_review_regressions.py  |  55 +++++++
+ tests/agent/test_managed_subscription.py      | 110 +++++++++++++
+ tests/agent/test_managed_switch.py            | 144 ++++++++++++++++++
+ tests/agent/test_model_routing_restore.py     | 118 ++++++++++++++
+ tests/cron/test_managed_entry.py              |  23 +++
+ tests/gateway/test_api_exact_pin_resume.py    |  46 ++++++
+ tests/gateway/test_managed_entry.py           |  64 ++++++++
+ tests/hermes_cli/test_managed_entry.py        |  44 ++++++
+ tests/tools/test_managed_entry.py             |  32 ++++
+ tests/tui_gateway/test_managed_entry.py       |  29 ++++
+ tui_gateway/class_routing.py                  |  13 +-
+ 39 files changed, 1537 insertions(+), 133 deletions(-)
+ create mode 100644 agent/agent_runtime_switch.py
+ create mode 100644 agent/model_routing_auxiliary_guard.py
+ create mode 100644 agent/model_routing_managed.py
+ create mode 100644 agent/model_routing_restore.py
+ create mode 100644 hermes_cli/config_defaults_routing.py
+ create mode 100644 tests/agent/test_managed_auxiliary.py
+ create mode 100644 tests/agent/test_managed_auxiliary_wire.py
+ create mode 100644 tests/agent/test_managed_defaults.py
+ create mode 100644 tests/agent/test_managed_main_wire.py
+ create mode 100644 tests/agent/test_managed_responses_wire.py
+ create mode 100644 tests/agent/test_managed_review_regressions.py
+ create mode 100644 tests/agent/test_managed_subscription.py
+ create mode 100644 tests/agent/test_managed_switch.py
+ create mode 100644 tests/agent/test_model_routing_restore.py
+ create mode 100644 tests/cron/test_managed_entry.py
+ create mode 100644 tests/gateway/test_api_exact_pin_resume.py
+ create mode 100644 tests/gateway/test_managed_entry.py
+ create mode 100644 tests/hermes_cli/test_managed_entry.py
+ create mode 100644 tests/tools/test_managed_entry.py
+ create mode 100644 tests/tui_gateway/test_managed_entry.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index c97acabc08..5e7f4512b7 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2282,7 +2282,7 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
+     agent.client = agent._create_openai_client(dict(agent._client_kwargs), reason="switch_model", shared=True)
+ 
+ 
+-def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm) -> None:
++def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm, managed=None) -> None:
+     """Swap identity/transport fields, reload the pool, rebuild the client (rolled back by the caller on error)."""
+     # Clear the per-config override so the new model's context window is re-resolved.
+     agent._config_context_length = None
+@@ -2311,7 +2311,10 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
+         agent.api_key = api_key
+     # Reload the credential pool on provider change: a pool with a mismatched provider makes
+     # recover_with_credential_pool short-circuit. Reload failure is non-fatal.
+-    if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
++    if managed is not None:
++        agent._credential_pool = managed['credential_pool']
++        agent.model_routing = managed['model_routing']
++    elif old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
+         # A pool bound to the old provider is worse than none: the recovery guard rejects it.
+         agent._credential_pool = None
+         agent._credential_pool_entry_id = None
+@@ -2440,7 +2443,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
+     return rt
+ 
+ 
+-def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
++def _finish_switch(agent, new_provider, old_norm, new_norm, managed=None) -> None:
+     """Post-switch bookkeeping: fallback reset/prune, request_overrides, billing route."""
+     agent._fallback_activated = False
+     agent._provider_fallback_active = False
+@@ -2448,7 +2451,8 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
+     agent._fallback_index = 0
+     agent._credential_pool_revert_id = None
+     from agent.model_routing_agent import clear_class_route
+-    clear_class_route(agent)
++    if managed is None:
++        clear_class_route(agent)
+     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
+     if old_norm and new_norm and old_norm != new_norm:
+         fallback_chain = [
+@@ -2464,29 +2468,21 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
+         logger.debug("switch_model: request_overrides re-derivation failed", exc_info=True)
+ 
+ 
+-def _persist_switch_billing_route(agent) -> None:
+-    """Persist the billing route so dashboard Model cards show the post-switch provider."""
+-    # _session_db / session_id may be unset (tests, bare agents).
+-    session_db = getattr(agent, "_session_db", None)
+-    session_id = getattr(agent, "session_id", None)
+-    if session_db is None or not session_id:
+-        return
+-    try:
+-        session_db.update_session_billing_route(
+-            session_id, provider=agent.provider, base_url=agent.base_url,
+-            billing_mode=getattr(agent, "api_mode", None),
+-        )
+-    except Exception:
+-        logger.warning("Failed to persist billing route after model switch", exc_info=True)
+-
+-
+ def switch_model(
+     agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
++):
++    from agent.agent_runtime_switch import switch_runtime
++    return switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, capabilities)
++
++
++def _switch_model_runtime(
++    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None, managed=None
+ ):
+     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
+     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
+     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
+     snapshot and re-raises (callers catch)."""
++
+     old_model = agent.model
+     old_provider = agent.provider
+     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
+@@ -2503,7 +2499,7 @@ def switch_model(
+     snapshot = _snapshot_switch_state(agent)
+     try:
+         _swap_switch_runtime(
+-            agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm
++            agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm, managed
+         )
+     except Exception:
+         _restore_switch_snapshot(agent, snapshot)
+@@ -2528,7 +2524,7 @@ def switch_model(
+             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
+         )
+     except Exception as _reasoning_err:
+-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
++        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err, exc_info=True)
+     # Invalidate the cached system prompt so it rebuilds next turn.
+     agent._cached_system_prompt = None
+     # Publish the destination capability map only after every runtime setup above has succeeded.
+@@ -2538,13 +2534,16 @@ def switch_model(
+     # short-circuiting the freshly selected healthy provider.
+     from agent.chat_completion_helpers import _reset_stale_streak
+     _reset_stale_streak(agent)
++    _finish_switch(agent, new_provider, old_norm, new_norm, managed)
++    from agent.model_routing_managed import finish_managed_switch
++    finish_managed_switch(agent, managed)
+     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
+-    _finish_switch(agent, new_provider, old_norm, new_norm)
+     logger.info(
+         "Model switched in-place: %s (%s) -> %s (%s)",
+         old_model, old_provider, new_model, new_provider,
+     )
+-    _persist_switch_billing_route(agent)
++    from agent.agent_runtime_switch import persist_switch_billing_route
++    persist_switch_billing_route(agent)
+ 
+ 
+ def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
+diff --git a/agent/agent_runtime_switch.py b/agent/agent_runtime_switch.py
+new file mode 100644
+index 0000000000..043f55fe52
+--- /dev/null
++++ b/agent/agent_runtime_switch.py
+@@ -0,0 +1,93 @@
++"""Session bookkeeping for explicit runtime switches."""
++import logging
++from copy import copy
++
++
++class _DeferredSessionWrites:
++    """Read the live compressor backend but publish mutations only after commit."""
++
++    def __init__(self, backend, writes):
++        self.backend, self.writes = backend, writes
++
++    def __getattr__(self, name):
++        method = getattr(self.backend, name)
++        if not name.startswith(("set_", "clear_", "update_", "patch_")):
++            return method
++
++        def defer(*args, **kwargs):
++            self.writes.append((method, args, kwargs))
++            return True
++        return defer
++
++
++def _stage_compressor(compressor):
++    """Delay the native compressor's durable resets until switch publication."""
++    if compressor is None:
++        return None, []
++    # SessionDB and SDK clients contain locks and must remain shared handles.
++    # Switch setters/resetters change scalar fields and mutable state containers,
++    # not the bound durable backend itself.
++    staged = copy(compressor)
++    for key, value in vars(compressor).items():
++        if isinstance(value, (dict, list, set)):
++            setattr(staged, key, copy(value))
++    writes = []
++    backend = getattr(staged, '_session_db', None)
++    if backend is not None:
++        staged._session_db = _DeferredSessionWrites(backend, writes)
++    return staged, writes
++
++
++def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities):
++    """Prepare managed switches privately, then publish after the allocation commits."""
++    from agent.agent_runtime_helpers import _switch_model_runtime
++    from agent.model_routing_managed import managed_config, resolve_managed_runtime
++    from agent.model_routing_agent import persist_class_metadata
++
++    config = managed_config()
++    if config is None:
++        return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
++    staged = copy(agent)
++    # Switch helpers mutate these containers in place. Never expose partial work
++    # or clear live provenance while constructing a replacement.
++    for key, value in vars(agent).items():
++        if isinstance(value, (dict, list, set)):
++            setattr(staged, key, copy(value))
++    staged.context_compressor, compressor_writes = _stage_compressor(getattr(agent, 'context_compressor', None))
++    staged._session_db = None
++
++    def prepare(runtime):
++        staged._credential_pool = runtime['credential_pool']
++        _switch_model_runtime(staged, runtime['model'], runtime['provider'], runtime['api_key'],
++                              runtime['base_url'], runtime['api_mode'], capabilities, managed=runtime)
++
++    from agent.model_routing import is_class_selector
++    from agent.model_routing_runtime import resolve_class_runtime
++    resolver = resolve_class_runtime if is_class_selector(model) else resolve_managed_runtime
++    resolver(model, provider, config=config, session_id=agent.session_id,
++             requirements=getattr(agent, '_model_routing_requirements', {}),
++             prepare_runtime=prepare, replace=True)
++    staged._session_db = getattr(agent, '_session_db', None)
++    backend = getattr(staged.context_compressor, '_session_db', None)
++    if isinstance(backend, _DeferredSessionWrites):
++        staged.context_compressor._session_db = backend.backend
++    vars(agent).update(vars(staged))
++    persist_class_metadata(agent)
++    for method, args, kwargs in compressor_writes:
++        method(*args, **kwargs)
++    persist_switch_billing_route(agent)
++
++
++def persist_switch_billing_route(agent) -> None:
++    """Persist the billing route so dashboard Model cards show the post-switch provider."""
++    session_db = getattr(agent, "_session_db", None)
++    session_id = getattr(agent, "session_id", None)
++    if session_db is None or not session_id:
++        return
++    try:
++        session_db.update_session_billing_route(
++            session_id, provider=agent.provider, base_url=agent.base_url,
++            billing_mode=getattr(agent, "api_mode", None),
++        )
++    except Exception:
++        logging.getLogger(__name__).warning("Failed to persist billing route after model switch", exc_info=True)
+diff --git a/agent/auxiliary_class_readiness.py b/agent/auxiliary_class_readiness.py
+index e988119197..b53eddf5ee 100644
+--- a/agent/auxiliary_class_readiness.py
++++ b/agent/auxiliary_class_readiness.py
+@@ -48,13 +48,13 @@ def class_readiness(callback):
+         request = _class_request(task or None, {'main_runtime': main_runtime})
+         if request is None:
+             return callback(task, main_runtime=main_runtime)
+-        model, _, requirements = request
++        model, _, requirements, config, declared_model = request
+         # Availability checks neither consume round-robin slots nor create sticky
+         # sessions. Re-check the actual request at create() time, including images,
+         # tools and context, rather than trusting this earlier readiness result.
+-        resolve_class_runtime(model, 'auto', session_id='aux-readiness',
++        resolve_class_runtime(model, 'auto', config=config, session_id='aux-readiness',
+                               requirements=requirements, state_path=':memory:')
+-        return DeferredClassClient(task or None, model, main_runtime), model
++        return DeferredClassClient(task or None, declared_model, main_runtime), declared_model
+     return wrapped
+ 
+ 
+@@ -75,11 +75,11 @@ def class_direct_resolver(callback):
+             return callback(*args, **kwargs)
+         if options.get('raw_codex'):
+             raise ModelRoutingError('Class clients require normalized completions, not raw provider access')
+-        model, _, requirements = request
+-        resolve_class_runtime(model, 'auto', session_id='aux-readiness',
++        model, _, requirements, config, declared_model = request
++        resolve_class_runtime(model, 'auto', config=config, session_id='aux-readiness',
+                               requirements=requirements, state_path=':memory:')
+-        client = DeferredClassClient(task, model, options.get('main_runtime'), options.get('async_mode', False))
++        client = DeferredClassClient(task, declared_model, options.get('main_runtime'), options.get('async_mode', False))
+         # Provider is deliberately unresolved until create knows the request's
+         # capabilities; the concrete route is recorded by the shared allocator.
+-        return ('auto', client, model) if vision_resolver else (client, model)
++        return ('auto', client, declared_model) if vision_resolver else (client, declared_model)
+     return wrapped
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index dfdacf42df..733faf479f 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -39,13 +39,18 @@ def _class_request(task, options):
+     task_config = aux._get_auxiliary_task_config(task) if task else {}
+     runtime = aux._normalize_main_runtime(options.get("main_runtime"))
+     requested = _requested_model(task_config, options, runtime)
+-    if not is_class_selector(requested):
++    from agent.model_routing_managed import managed_config, pin_policy
++    config = managed_config()
++    if not is_class_selector(requested) and config is None:
+         return None
+     provider, model, base, key, mode = aux._resolve_task_provider_model(
+         task, options.get("provider"), requested,
+         options.get("base_url"), options.get("api_key"))
+-    if not is_class_selector(model):
+-        return None
++    declared_model = model
++    pinned = not is_class_selector(model)
++    if pinned:
++        level, config = pin_policy(model, provider, config)
++        model, provider = "class:" + level, "auto"
+     overrides = (base, key, mode, options.get("api_mode"), options.get("api_key"),
+                  task_config.get("base_url"), task_config.get("api_key"),
+                  task_config.get("key_env"), task_config.get("api_key_env"))
+@@ -61,9 +66,9 @@ def _class_request(task, options):
+     owner = runtime.get("session_id") or str(uuid4())
+     # Separate side jobs from the main allocation; retries/restarts of a named
+     # session's same task reuse its durable route without pinning unrelated jobs.
+-    identity = f"aux:{owner}:{task or 'call'}:{model}"
++    identity = f"aux:{owner}:{task or 'call'}:{declared_model}"
+     requirements = _requirements(task, options, extra)
+-    return model, identity, requirements
++    return model, identity, requirements, config, declared_model
+ 
+ 
+ def _requirements(task, options, extra):
+@@ -109,10 +114,13 @@ def _client(runtime):
+ 
+ def _prepare(task, options, request, failed):
+     from agent import auxiliary_client as aux
+-    model, identity, requirements = request
+-    runtime = resolve_class_runtime(model, "auto", session_id=identity,
++    model, identity, requirements, config, _ = request
++    runtime = resolve_class_runtime(model, "auto", config=config, session_id=identity,
+                                     requirements=requirements, excluded=failed)
+     client = _client(runtime)
++    client._managed_subscription_runtime = runtime
++    if hasattr(client, "_real_client"):
++        client._real_client._managed_subscription_runtime = runtime
+     extra = aux._get_task_extra_body(task)
+     extra.update(options.get("extra_body") or {})
+     kwargs = aux._build_call_kwargs(
+@@ -223,6 +231,7 @@ def class_routed_async(callback):
+         while True:
+             runtime, sync_client, kwargs = _prepare(task, options, request, failed)
+             client, _ = aux._to_async_client(sync_client, runtime["model"])
++            client._managed_subscription_runtime = runtime
+             try:
+                 async def create(request_kwargs):
+                     return await aux._acreate_with_progress(
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 7f0d74ea21..275b3c5253 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1547,6 +1547,8 @@ class _CodexCompletionsAdapter:
+ 
+     def create(self, **kwargs) -> Any:
+         from hermes_cli.providers import is_actual_route
++        from agent.model_routing_auxiliary_guard import verify_adapter_request
++        verify_adapter_request(self._client, kwargs)
+ 
+         if is_actual_route(
+             getattr(self._client, "_hermes_aux_effective_provider", ""),
+@@ -1672,28 +1674,6 @@ class AsyncCodexAuxiliaryClient(_AsyncAuxiliaryClientBase):
+     pass
+ 
+ 
+-def _translate_anthropic_response_format(anthropic_kwargs: dict[str, Any], response_format: Any) -> None:
+-    """Merge an OpenAI response format into Anthropic ``output_config``."""
+-    if not isinstance(response_format, dict):
+-        return
+-    format_type = response_format.get("type")
+-    if format_type == "json_schema":
+-        json_schema = response_format.get("json_schema")
+-        if not isinstance(json_schema, dict) or "schema" not in json_schema:
+-            return
+-        schema = json_schema["schema"]
+-    elif format_type == "json_object":
+-        # Anthropic SDK has no schema-less JSON mode; only ``json_schema``.
+-        schema = {"type": "object"}
+-    else:
+-        return
+-    output_config = anthropic_kwargs.get("output_config")
+-    if not isinstance(output_config, dict):
+-        output_config = {}
+-        anthropic_kwargs["output_config"] = output_config
+-    output_config["format"] = {"type": "json_schema", "schema": schema}
+-
+-
+ class _AnthropicCompletionsAdapter:
+     """OpenAI-client-compatible adapter for Anthropic Messages API."""
+ 
+@@ -1715,6 +1695,9 @@ class _AnthropicCompletionsAdapter:
+     def create(self, **kwargs) -> Any:
+         from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
+         from agent.transports import get_transport
++        from agent.auxiliary_wire import translate_anthropic_response_format
++        from agent.model_routing_auxiliary_guard import verify_adapter_request
++        verify_adapter_request(self._client, kwargs)
+         model = kwargs.get("model", self._model)
+         # ZAI's Anthropic endpoint rejects max_tokens on vision models (code 1210);
+         # callers signal this via _skip_zai_max_tokens.
+@@ -1770,10 +1753,10 @@ class _AnthropicCompletionsAdapter:
+         # contract silently became prompt compliance (#85626 review, point 2).
+         top_level_response_format = kwargs.get("response_format")
+         if top_level_response_format is not None:
+-            _translate_anthropic_response_format(anthropic_kwargs, top_level_response_format)
++            translate_anthropic_response_format(anthropic_kwargs, top_level_response_format)
+         caller_extra_body = kwargs.get("extra_body")
+         if caller_extra_body and isinstance(caller_extra_body, dict):
+-            _translate_anthropic_response_format(anthropic_kwargs, caller_extra_body.get("response_format"))
++            translate_anthropic_response_format(anthropic_kwargs, caller_extra_body.get("response_format"))
+             passthrough = {
+                 k: v for k, v in caller_extra_body.items()
+                 if k not in {"reasoning", "response_format"} and not str(k).startswith("_")
+@@ -2626,6 +2609,8 @@ def _relay_sync_completion(
+ ) -> Any:
+     from agent.auxiliary_wire import prepare_chat_messages
+ 
++    from agent.model_routing_managed import verify_managed_auxiliary
++    verify_managed_auxiliary(client, kwargs, provider)
+     kwargs = prepare_chat_messages(client, kwargs)
+     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
+     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
+@@ -2665,6 +2650,8 @@ async def _relay_async_completion(
+ ) -> Any:
+     from agent.auxiliary_wire import prepare_chat_messages
+ 
++    from agent.model_routing_managed import verify_managed_auxiliary
++    verify_managed_auxiliary(client, kwargs, provider)
+     kwargs = prepare_chat_messages(client, kwargs)
+     # Async twin of the seam default above (#98466).
+     callback = create or (lambda request: _acreate_with_progress(client, request))
+@@ -2694,6 +2681,8 @@ def _relay_sync_stream(
+ ) -> Any:
+     from agent.auxiliary_wire import prepare_chat_messages
+ 
++    from agent.model_routing_managed import verify_managed_auxiliary
++    verify_managed_auxiliary(client, kwargs, provider)
+     kwargs = prepare_chat_messages(client, kwargs)
+     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
+     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
+diff --git a/agent/auxiliary_wire.py b/agent/auxiliary_wire.py
+index 565d1c05a1..29e9cd7cbe 100644
+--- a/agent/auxiliary_wire.py
++++ b/agent/auxiliary_wire.py
+@@ -1,6 +1,7 @@
+ """Message hygiene at the resolved auxiliary client boundary."""
+ 
+ from openai import AsyncOpenAI, OpenAI
++from typing import Any
+ 
+ from agent.transports.chat_completions import ChatCompletionsTransport
+ 
+@@ -22,3 +23,25 @@ def prepare_chat_messages(client, kwargs: dict) -> dict:
+         model=kwargs.get("model"), base_url=base_url,
+     )
+     return {**kwargs, "messages": messages}
++
++
++def translate_anthropic_response_format(anthropic_kwargs: dict[str, Any], response_format: Any) -> None:
++    """Merge an OpenAI response format into Anthropic ``output_config``."""
++    if not isinstance(response_format, dict):
++        return
++    format_type = response_format.get("type")
++    if format_type == "json_schema":
++        json_schema = response_format.get("json_schema")
++        if not isinstance(json_schema, dict) or "schema" not in json_schema:
++            return
++        schema = json_schema["schema"]
++    elif format_type == "json_object":
++        # Anthropic SDK has no schema-less JSON mode; only ``json_schema``.
++        schema = {"type": "object"}
++    else:
++        return
++    output_config = anthropic_kwargs.get("output_config")
++    if not isinstance(output_config, dict):
++        output_config = {}
++        anthropic_kwargs["output_config"] = output_config
++    output_config["format"] = {"type": "json_schema", "schema": schema}
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 8f8eb62336..bc74d771e7 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -3390,12 +3390,12 @@ class _StreamingCall(StreamingWaitMonitor):
+         runaway = None
+ 
+         from agent import relay_llm
+-        from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
++        from agent.anthropic_adapter import normalize_stream_usage
+         accumulator = relay_llm.AnthropicStreamAccumulator()
+ 
+         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
+-            final_kwargs = dict(next_api_kwargs)
+-            sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
++            from agent.model_routing_managed import prepare_anthropic_stream
++            final_kwargs = prepare_anthropic_stream(self.agent, request_client, next_api_kwargs)
+             manager = request_client.messages.stream(**final_kwargs)
+             _stream_context["manager"] = manager
+             return normalize_stream_usage(manager.__enter__())
+diff --git a/agent/client_lifecycle.py b/agent/client_lifecycle.py
+index 9e4cb29445..88f0cde5ec 100644
+--- a/agent/client_lifecycle.py
++++ b/agent/client_lifecycle.py
+@@ -572,6 +572,9 @@ class ClientLifecycleMixin:
+     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
+         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
+             return False
++        if getattr(self, "model_routing", None):
++            from agent.model_routing_runtime import refresh_class_responses_token
++            return refresh_class_responses_token(self)
+         # No silent account swap: a non-singleton credential (manual pool entry, explicit api_key=) must not be
+         # replaced by the device_code singleton's tokens — the pool's reactive recovery owns that case.
+         try:
+@@ -1038,6 +1041,8 @@ class ClientLifecycleMixin:
+             self._try_refresh_anthropic_client_credentials()
+         from agent.model_routing_runtime import verify_agent_class_credentials
+         verify_agent_class_credentials(self)
++        from agent.model_routing_managed import verify_main_sdk
++        verify_main_sdk(self, client or self._anthropic_client, api_kwargs)
+         # Strips Responses-only kwargs that leak in under an api_mode-flip race.
+         from agent.anthropic_adapter import create_anthropic_message
+         # on_response: rate-limit + credits state live in response headers, which the parsed Message drops.
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 8794219f8d..2b357f1c75 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -1236,6 +1236,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+             raise ValueError(
+                 "Actual requests require Chat Completions; refusing to call /responses."
+             )
++        from agent.model_routing_managed import verify_main_sdk
++        verify_main_sdk(agent, active_client, next_api_kwargs)
+         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
+         stream_kwargs["stream"] = True
+         return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+diff --git a/agent/model_routing.py b/agent/model_routing.py
+index 848d2fa8b2..67043ac438 100644
+--- a/agent/model_routing.py
++++ b/agent/model_routing.py
+@@ -55,6 +55,8 @@ def validate_policy(policy):
+         raise ModelRoutingError("model_routing must be a mapping")
+     if type(policy.get("enabled", False)) is not bool or type(policy.get("allow_metered", False)) is not bool:
+         raise ModelRoutingError("model_routing enabled/allow_metered must be boolean")
++    if type(policy.get("enforce_subscription_only", False)) is not bool:
++        raise ModelRoutingError("model_routing enforce_subscription_only must be boolean")
+     if type(policy.get("policy_version", 1)) is not int or policy.get("policy_version", 1) != 1:
+         raise ModelRoutingError("Unsupported model_routing policy_version")
+     routes = policy.get("routes", {})
+@@ -96,13 +98,14 @@ def eligible_routes(policy, level, requirements=None, excluded=(), eligible=None
+             if r.get("eligible") is True and r.get("funding_verified") is True
+             and (r["provider"], r["model"]) not in excluded
+             and _capable(r, requirements or {})
+-            and (r["billing"] == "subscription" or policy.get("allow_metered", False))
++            and (r["billing"] == "subscription" or
++                 (policy.get("allow_metered", False) and not policy.get("enforce_subscription_only", False)))
+             and (eligible is None or eligible(r))]
+ 
+ 
+ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+                         parent_session_id=None, requirements=None, excluded=(), state_path=None,
+-                        eligible=None, prepare=None):
++                        eligible=None, prepare=None, exact_pin=False, replace=False):
+     """Return concrete model/provider and durable metadata, or unchanged exact pin.
+ 
+     ``excluded`` is a sequence of failed (provider, model) pairs for a new attempt,
+@@ -110,6 +113,10 @@ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+     permissible after ModelRoutingError. Caller must validate actual credentials.
+     """
+     if not is_class_selector(model):
++        from agent.model_routing_managed import managed_config, pin_policy
++        managed = managed_config(config)
++        if managed is not None:
++            pin_policy(model, provider, managed)
+         return {"model": model, "provider": provider, "metadata": None}
+     level = model.removeprefix("class:")
+     if level not in CLASSES:
+@@ -133,5 +140,6 @@ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+         from hermes_constants import get_hermes_home
+         state_path = get_hermes_home() / "model-routing.sqlite3"
+     metadata = RoutingState(state_path).allocate(session_id, parent_session_id, level,
+-                                                routes, policy.get("policy_version", 1), excluded, prepare)
++                                                routes, policy.get("policy_version", 1), excluded, prepare,
++                                                exact_pin=exact_pin, replace=replace)
+     return {"model": metadata["selected_model"], "provider": metadata["selected_provider"], "metadata": metadata}
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index b1d1f51bfa..bc5ae7162c 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -11,14 +11,16 @@ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+     rotated IDs explicitly before exposing its child in SessionDB.
+     """
+     agent.model_routing = None
+-    if not is_class_selector(model):
++    from agent.model_routing_managed import managed_config
++    managed = managed_config()
++    if not is_class_selector(model) and managed is None:
+         return (model, provider, session_id, api_key, base_url, api_mode,
+                 credential_pool, fallback_model)
+     from hermes_state_ids import new_session_id
+     from hermes_cli.config_effective import load_user_config_effective
+     from hermes_cli.runtime_provider import resolve_runtime_provider
+ 
+-    config = load_user_config_effective()
++    config = managed or load_user_config_effective()
+     model_config = config.get("model", {})
+     requirements = {"tools": True, "streaming": True}
+     if isinstance(model_config, dict) and model_config.get("context_length"):
+@@ -26,7 +28,7 @@ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+     session_id = session_id or new_session_id()
+     runtime = resolve_runtime_provider(
+         requested=provider or "auto", target_model=model,
+-        explicit_api_key=api_key, explicit_base_url=base_url,
++        explicit_api_key=None if managed else api_key, explicit_base_url=None if managed else base_url,
+         routing_session_id=session_id, routing_config=config,
+         routing_requirements=requirements)
+     agent.model_routing = runtime["model_routing"]
+@@ -68,6 +70,8 @@ def try_class_fallback(agent):
+         _reresolve_fallback_reasoning_config, _rescope_fallback_extra_body,
+     )
+ 
++    if agent.model_routing.get("exact_pin"):
++        return False
+     failed = getattr(agent, "_model_routing_failed", set())
+     failed.add((agent.provider, agent.model))
+     agent._model_routing_failed = failed
+diff --git a/agent/model_routing_auxiliary_guard.py b/agent/model_routing_auxiliary_guard.py
+new file mode 100644
+index 0000000000..8abd9a837e
+--- /dev/null
++++ b/agent/model_routing_auxiliary_guard.py
+@@ -0,0 +1,46 @@
++"""Fail-closed managed checks on the native auxiliary SDK about to transmit."""
++from agent.model_routing import ModelRoutingError
++
++
++_AUTH_HEADERS = {"authorization", "x-api-key", "api-key", "host"}
++_BODY_IDENTITY = {"model", "messages", "tools", "stream", "max_tokens", "max_completion_tokens"}
++
++
++def verify_sdk_request(client, request, runtime):
++    """Compare live endpoint/auth/headers with the already OAuth-fenced runtime."""
++    from agent.model_routing_runtime import verify_class_runtime
++
++    if not isinstance(runtime, dict):
++        raise ModelRoutingError("Managed auxiliary SDK lacks subscription provenance")
++    verify_class_runtime(runtime, runtime["model_routing"])
++    if request.get("model") != runtime["model"]:
++        raise ModelRoutingError("Managed auxiliary SDK model differs from approved exact route")
++    if set(request.get("extra_body") or {}) & _BODY_IDENTITY:
++        raise ModelRoutingError("Managed auxiliary body cannot override request identity")
++    if {str(k).lower() for k in (request.get("extra_headers") or {})} & _AUTH_HEADERS:
++        raise ModelRoutingError("Managed auxiliary request cannot override authentication")
++    if str(client.base_url).rstrip("/") != str(runtime["base_url"]).rstrip("/"):
++        raise ModelRoutingError("Managed auxiliary SDK endpoint changed")
++    expected = runtime["api_key"]
++    if runtime["provider"] == "anthropic":
++        if client.auth_token != expected or client.api_key:
++            raise ModelRoutingError("Managed Anthropic SDK requires the selected OAuth token only")
++    elif client.api_key != expected:
++        raise ModelRoutingError("Managed auxiliary SDK credential changed")
++    headers = {str(k).lower(): v for k, v in client.default_headers.items()}
++    if headers.get("authorization") != "Bearer " + expected:
++        raise ModelRoutingError("Managed auxiliary SDK authorization header changed")
++    if any(headers.get(k) for k in ("x-api-key", "api-key", "host")):
++        raise ModelRoutingError("Managed auxiliary SDK has conflicting authentication headers")
++
++
++def verify_adapter_request(client, request):
++    """Run inside native adapters, including retained and async-to-thread clients."""
++    from agent.model_routing_managed import managed_config, verify_selected_route
++
++    config = managed_config()
++    if config is None:
++        return
++    runtime = getattr(client, "_managed_subscription_runtime", None)
++    verify_sdk_request(client, request, runtime)
++    verify_selected_route(request["model"], runtime["provider"], runtime["model_routing"], config)
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+new file mode 100644
+index 0000000000..2240f7b048
+--- /dev/null
++++ b/agent/model_routing_managed.py
+@@ -0,0 +1,130 @@
++"""Opt-in managed subscription policy, including concrete and persisted pins.
++
++A concrete name is not spending authorization. Unknown pins fail closed rather
++than acquiring a guessed class; approved native pins retain their exact tuple.
++"""
++from copy import deepcopy
++
++from agent.model_routing import ModelRoutingError, eligible_routes, is_class_selector, validate_policy
++
++
++def managed_config(config=None):
++    if config is None:
++        from hermes_cli.config_effective import load_user_config_effective
++        config = load_user_config_effective()
++    policy = config.get("model_routing", {})
++    if not policy.get("enabled") or not policy.get("enforce_subscription_only"):
++        return None
++    validate_policy(policy)
++    return config
++
++
++def pin_policy(model, provider, config):
++    """Only an unambiguous, eligible exact native tuple is an approved pin."""
++    policy = config["model_routing"]
++    matches = [(level, route) for level in policy.get("routes", {})
++               for route in eligible_routes(policy, level)
++               if route["billing"] == "subscription" and route["model"] == model
++               and provider in (None, "", "auto", route["provider"])]
++    if len(matches) != 1:
++        raise ModelRoutingError("Managed subscription policy rejects unregistered or ambiguous concrete pin")
++    level, route = matches[0]
++    restricted = deepcopy(config)
++    restricted["model_routing"]["routes"] = {level: [route]}
++    restricted["model_routing"]["allow_metered"] = False
++    return level, restricted
++
++
++def resolve_managed_runtime(model, provider, *, config, session_id=None, requirements=None,
++                            prepare_runtime=None, replace=False):
++    from agent.model_routing_runtime import resolve_class_runtime
++    from hermes_state_ids import new_session_id
++    level, restricted = pin_policy(model, provider, config)
++    runtime = resolve_class_runtime("class:" + level, "auto", config=restricted,
++                                    session_id=session_id or new_session_id(), requirements=requirements,
++                                    exact_pin=True, replace=replace, prepare_runtime=prepare_runtime)
++    return runtime
++
++
++def verify_selected_route(model, provider, metadata, config):
++    """Validate a resolved tuple in its recorded class, not every registry class."""
++    if not metadata or metadata.get("billing_group") != "subscription":
++        raise ModelRoutingError("Managed request lacks verified subscription provenance; recreate runtime")
++    if (metadata.get("selected_model"), metadata.get("selected_provider")) != (model, provider):
++        raise ModelRoutingError("Managed request changed selected route identity")
++    routes = eligible_routes(config["model_routing"], metadata.get("requested_class"))
++    if not any(route["model"] == model and route["provider"] == provider
++               and route["billing"] == "subscription" for route in routes):
++        raise ModelRoutingError("Managed request route is no longer eligible in its recorded class")
++
++
++def verify_managed_agent(agent, request):
++    """Fence cached agents and stale overrides at each outbound attempt."""
++    config = managed_config()
++    if config is None:
++        return
++    model = request.get("model", agent.model)
++    if is_class_selector(model) or model != agent.model:
++        raise ModelRoutingError("Managed request model differs from the approved runtime")
++    metadata = getattr(agent, "model_routing", None)
++    verify_selected_route(model, agent.provider, metadata, config)
++    from agent.model_routing_runtime import verify_class_runtime
++    verify_class_runtime(agent_runtime(agent), metadata)
++
++
++def agent_runtime(agent):
++    native = agent.provider == "anthropic"
++    return {
++        "model": agent.model, "provider": agent.provider, "api_mode": agent.api_mode,
++        "api_key": getattr(agent, "_anthropic_api_key", None) if native else agent.api_key,
++        "base_url": getattr(agent, "_anthropic_base_url", None) if native else agent.base_url,
++        "credential_pool": agent._credential_pool, "model_routing": agent.model_routing,
++    }
++
++
++def verify_main_sdk(agent, client, request):
++    """Final native callback fence, after Relay and request-client checkout."""
++    if managed_config() is None:
++        return
++    verify_managed_agent(agent, request)
++    from agent.model_routing_auxiliary_guard import verify_sdk_request
++    verify_sdk_request(client, request, agent_runtime(agent))
++
++
++def prepare_anthropic_stream(agent, client, request):
++    from agent.anthropic_adapter import sanitize_anthropic_kwargs
++    verify_main_sdk(agent, client, request)
++    result = dict(request)
++    sanitize_anthropic_kwargs(result, log_prefix=getattr(agent, "log_prefix", ""))
++    return result
++
++
++def verify_managed_auxiliary(client, request, provider):
++    config = managed_config()
++    if config is None:
++        return
++    runtime = getattr(client, "_managed_subscription_runtime", None)
++    if not isinstance(runtime, dict):
++        raise ModelRoutingError("Managed auxiliary request lacks verified subscription provenance")
++    model = request.get("model")
++    metadata = runtime["model_routing"]
++    verify_selected_route(model, provider, metadata, config)
++    if (model != runtime["model"] or provider != runtime["provider"] or
++            metadata["billing_group"] != "subscription"):
++        raise ModelRoutingError("Managed auxiliary request changed subscription identity")
++    from agent.model_routing_runtime import verify_class_runtime
++    verify_class_runtime(runtime, metadata)
++    from agent.model_routing_auxiliary_guard import verify_sdk_request
++    verify_sdk_request(getattr(client, "_real_client", client), request, runtime)
++
++
++def finish_managed_switch(agent, runtime):
++    if runtime is None:
++        return
++    from agent.model_routing_agent import persist_class_metadata
++    agent.model_routing = runtime["model_routing"]
++    agent._credential_pool = runtime["credential_pool"]
++    agent._model_routing_requirements = getattr(agent, "_model_routing_requirements", {})
++    agent._fallback_chain = []
++    agent._fallback_model = None
++    persist_class_metadata(agent)
+diff --git a/agent/model_routing_request.py b/agent/model_routing_request.py
+index c7941b3fd7..5198a02e0a 100644
+--- a/agent/model_routing_request.py
++++ b/agent/model_routing_request.py
+@@ -40,6 +40,8 @@ def validate_class_request(agent, request, *, streaming):
+     Capability failures are explicit rather than discarding images or changing the
+     model halfway through a tool round. Failure recovery retains these requirements.
+     """
++    from agent.model_routing_managed import verify_managed_agent
++    verify_managed_agent(agent, request)
+     metadata = getattr(agent, "model_routing", None)
+     if not metadata:
+         return
+diff --git a/agent/model_routing_restore.py b/agent/model_routing_restore.py
+new file mode 100644
+index 0000000000..2d61055e95
+--- /dev/null
++++ b/agent/model_routing_restore.py
+@@ -0,0 +1,30 @@
++"""Restore persisted routing intent without granting new routing permissions."""
++import json
++
++from agent.model_routing import CLASSES, ModelRoutingError
++
++
++def restore_route(model, config):
++    """Return (model selector, provider), leaving policy validation to runtime.
++
++    Class allocations may fail over; exact pins must retain both tuple members,
++    including when the allocation database has been lost. Session metadata is
++    intent, not authorization to bypass the current managed policy.
++    """
++    if isinstance(config, str):
++        try:
++            config = json.loads(config)
++        except (ValueError, TypeError):
++            return None
++    route = config.get("model_routing") if isinstance(config, dict) else None
++    if not isinstance(route, dict) or route.get("selected_model") != model:
++        return None
++    if route.get("exact_pin"):
++        provider = route.get("selected_provider")
++        if not isinstance(model, str) or not model or not isinstance(provider, str) or not provider or provider == "auto":
++            raise ModelRoutingError("Persisted exact pin lacks a concrete model/provider tuple")
++        return model, provider
++    level = route.get("requested_class")
++    if level in CLASSES:
++        return "class:" + level, "auto"
++    return None
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 3c45dbaebf..046a59d390 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -6,7 +6,7 @@ from agent.model_routing import ModelRoutingError, resolve_model_route
+ 
+ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+                           parent_session_id=None, requirements=None, excluded=(), state_path=None,
+-                          prepare_runtime=None):
++                          prepare_runtime=None, exact_pin=False, replace=False):
+     from agent.credential_pool import load_pool
+     from hermes_cli import runtime_provider as runtime
+ 
+@@ -55,7 +55,8 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         try:
+             resolve_model_route(model, provider, config=config, session_id=session_id,
+                                 parent_session_id=parent_session_id, requirements=requirements,
+-                                excluded=failed, eligible=eligible, state_path=state_path, prepare=prepare)
++                                excluded=failed, eligible=eligible, state_path=state_path, prepare=prepare,
++                                exact_pin=exact_pin, replace=replace)
+             return resolved
+         except UnavailableCredential:
+             continue
+@@ -85,6 +86,23 @@ def refresh_class_anthropic_token(agent):
+     return runtime["api_key"]
+ 
+ 
++def refresh_class_responses_token(agent):
++    """Refresh only the active OAuth pool entry; never consult a singleton fallback."""
++    from hermes_cli.runtime_provider import _resolve_runtime_from_pool_entry
++    pool = agent._credential_pool
++    entry = pool.try_refresh_current() if pool else None
++    if entry is None:
++        return False
++    runtime = _resolve_runtime_from_pool_entry(
++        provider=agent.provider, entry=entry, model_cfg={"default": agent.model, "provider": agent.provider},
++        pool=pool, requested_provider=agent.provider, target_model=agent.model)
++    verify_class_runtime(runtime, agent.model_routing)
++    if runtime['api_key'] == agent.api_key:
++        return False
++    return agent._adopt_openai_credentials(runtime['api_key'], runtime['base_url'],
++                                            reason='class_oauth_refresh')
++
++
+ def verify_agent_class_credentials(agent):
+     """Recheck the actual native credential immediately before client checkout."""
+     metadata = getattr(agent, "model_routing", None)
+@@ -110,6 +128,9 @@ def verify_class_runtime(runtime, metadata):
+     entry = pool.current() if pool else None
+     if entry is None or entry.auth_type != "oauth":
+         raise ModelRoutingError("Subscription routing requires an OAuth credential, never a paid API key")
++    from hermes_cli.runtime_provider import _pool_entry_api_key
++    if runtime["api_key"] != _pool_entry_api_key(entry):
++        raise ModelRoutingError("Subscription credential differs from the selected OAuth token in the pool entry")
+     expected = {
+         "anthropic": ("api.anthropic.com", "anthropic_messages"),
+         "openai-codex": (base_url_hostname(DEFAULT_CODEX_BASE_URL), "codex_responses"),
+diff --git a/agent/model_routing_state.py b/agent/model_routing_state.py
+index c3b67b90e0..6ecaf209d6 100644
+--- a/agent/model_routing_state.py
++++ b/agent/model_routing_state.py
+@@ -12,7 +12,8 @@ class RoutingState:
+         self.path = Path(path)
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+ 
+-    def allocate(self, session_id, parent_session_id, level, candidates, version, excluded, prepare=None):
++    def allocate(self, session_id, parent_session_id, level, candidates, version, excluded, prepare=None,
++                 exact_pin=False, replace=False):
+         """Allocate and persist atomically; aliases share one failover decision."""
+         with closing(sqlite3.connect(self.path, timeout=30, isolation_level=None)) as db:
+             db.execute("PRAGMA busy_timeout=30000")
+@@ -22,7 +23,8 @@ class RoutingState:
+             db.execute("CREATE TABLE IF NOT EXISTS counters (pool TEXT PRIMARY KEY, position INTEGER NOT NULL)")
+             db.execute("BEGIN IMMEDIATE")
+             try:
+-                result = self._allocate(db, session_id, parent_session_id, level, candidates, version, excluded)
++                result = self._allocate(db, session_id, parent_session_id, level, candidates, version, excluded,
++                                        exact_pin, replace)
+                 # Credentials/client must be usable before another process can
+                 # observe the replacement. Failure rolls back counters as well.
+                 if prepare is not None:
+@@ -67,12 +69,12 @@ class RoutingState:
+                 db.execute("ROLLBACK")
+                 raise
+ 
+-    def _allocate(self, db, session, parent, level, candidates, version, excluded):
++    def _allocate(self, db, session, parent, level, candidates, version, excluded, exact_pin=False, replace=False):
+         from agent.model_routing import ModelRoutingError
+ 
+         root = self._root(db, session, parent)
+         row = db.execute("SELECT metadata FROM routes WHERE root=? AND class=?", (root, level)).fetchone()
+-        if row:
++        if row and not replace:
+             previous = json.loads(row[0])
+             identity = previous["selected_provider"], previous["selected_model"]
+             allowed = any((r["provider"], r["model"]) == identity and
+@@ -80,13 +82,23 @@ class RoutingState:
+             if identity not in excluded:
+                 if not allowed:
+                     raise ModelRoutingError("Sticky route is no longer eligible; explicit failure selection required")
++                if exact_pin and not previous.get("exact_pin"):
++                    previous["exact_pin"] = True
++                    db.execute("UPDATE routes SET metadata=? WHERE root=? AND class=?",
++                               (json.dumps(previous), root, level))
+                 return previous
++            if previous.get("exact_pin"):
++                raise ModelRoutingError("Exact pinned route cannot fail over")
+         if not candidates:
+             raise ModelRoutingError(f"No eligible {level} routes under billing/capability policy")
+         route = self._choose(db, level, candidates, version)
+         metadata = {"requested_class": level, "policy_version": version,
+                     "selected_provider": route["provider"], "selected_model": route["model"],
+                     "billing_group": route["billing"], "reason": "same-class-failover" if row else "allocation"}
++        if exact_pin:
++            metadata["exact_pin"] = True
++        if replace:
++            metadata["reason"] = "explicit-switch"
+         db.execute("INSERT OR REPLACE INTO routes VALUES (?, ?, ?)", (root, level, json.dumps(metadata)))
+         return metadata
+ 
+diff --git a/gateway/platforms/api_server_class_routing.py b/gateway/platforms/api_server_class_routing.py
+index d4b427a1a3..00f145a0a8 100644
+--- a/gateway/platforms/api_server_class_routing.py
++++ b/gateway/platforms/api_server_class_routing.py
+@@ -8,21 +8,18 @@ def deferred_runtime(model, provider=None):
+     return {"provider": provider or "auto", "requested_provider": provider or "auto"}
+ 
+ 
+-def restore_session_class(adapter, session_id, session_model, confirmed_runtime_lock):
+-    """A concrete persisted selection is not an explicit pin when it carries class provenance."""
++def restore_session_route(adapter, session_id, session_model, confirmed_runtime_lock):
++    """Restore the persisted selector and provider without widening exact pins."""
++    from agent.model_routing_restore import restore_route
+     if not session_id or confirmed_runtime_lock:
+-        return session_model
++        return None
+     db = adapter._ensure_session_db()
+     row = db.get_session(session_id) if db is not None else None
+     if not isinstance(row, dict):
+-        return session_model
+-    config = adapter._parse_session_model_config(row.get("model_config"))
+-    metadata = config.get("model_routing") or {}
+-    if (metadata.get("selected_model") == row.get("model")
+-            and metadata.get("requested_class") in {"deep", "standard", "fast"}
+-            and (not session_model or session_model == row.get("model"))):
+-        return "class:" + metadata["requested_class"]
+-    return session_model
++        return None
++    if session_model and session_model != row.get("model"):
++        return None
++    return restore_route(row.get("model"), row.get("model_config"))
+ 
+ 
+ def initial_runtime(adapter, *, default_model, requested_model,
+@@ -49,13 +46,17 @@ def prepare_runtime(adapter, session_id, session_model, confirmed_runtime_lock,
+                     requested_model, route, gateway_session_key):
+     from gateway.run import _resolve_gateway_model
+     from gateway.platforms.api_server import _ProviderAuthResolutionError
+-    session_model = restore_session_class(adapter, session_id, session_model, confirmed_runtime_lock)
++    restored = restore_session_route(adapter, session_id, session_model, confirmed_runtime_lock)
++    session_model = restored[0] if restored else session_model
+     model = _resolve_gateway_model()
+     try:
+-        runtime = initial_runtime(
+-            adapter, default_model=model, requested_model=requested_model, route=route,
+-            session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
+-            session_key=gateway_session_key or session_id)
++        if restored and not adapter._session_model_override_for(gateway_session_key or session_id):
++            runtime = {"provider": restored[1], "requested_provider": restored[1]}
++        else:
++            runtime = initial_runtime(
++                adapter, default_model=model, requested_model=requested_model, route=route,
++                session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
++                session_key=gateway_session_key or session_id)
+     except RuntimeError as exc:
+         raise _ProviderAuthResolutionError(str(exc)) from exc
+     model = runtime.pop("model", None) or model
+diff --git a/gateway/run_class_routing.py b/gateway/run_class_routing.py
+index 73c8980d63..a97023a636 100644
+--- a/gateway/run_class_routing.py
++++ b/gateway/run_class_routing.py
+@@ -13,9 +13,10 @@ def class_session_runtime(runner, model, override, source, user_config, session_
+ 
+     channel = channel_override(runner, source)
+     if not override:
+-        restored = stored_class(runner, session_key)
++        restored = stored_route(runner, session_key)
+         if restored:
+-            return restored, {"provider": "auto", "requested_provider": "auto"}
++            selected_model, selected_provider = restored
++            return selected_model, {"provider": selected_provider, "requested_provider": selected_provider}
+     candidate = (override or {}).get("model") or (channel.model if channel else None) or model
+     if not (is_class_selector(candidate) or is_class_selector(model)):
+         return None
+@@ -36,8 +37,13 @@ def class_session_runtime(runner, model, override, source, user_config, session_
+ 
+ 
+ def stored_class(runner, session_key):
++    restored = stored_route(runner, session_key)
++    return restored[0] if restored else None
++
++
++def stored_route(runner, session_key):
+     """Resume class provenance, not a new global/channel default, after restart."""
+-    import json
++    from agent.model_routing_restore import restore_route
+     store = getattr(runner, "session_store", None)
+     entry = getattr(store, "_entries", {}).get(session_key) if session_key else None
+     db = getattr(runner, "_session_db", None)
+@@ -47,17 +53,7 @@ def stored_class(runner, session_key):
+     row = db.get_session(entry.session_id)
+     if not isinstance(row, dict):
+         return None
+-    config = row.get("model_config") or {}
+-    if isinstance(config, str):
+-        try:
+-            config = json.loads(config)
+-        except (ValueError, TypeError):
+-            return None
+-    metadata = config.get("model_routing") if isinstance(config, dict) else None
+-    if (isinstance(metadata, dict) and metadata.get("requested_class") in {"deep", "standard", "fast"}
+-            and metadata.get("selected_model") == row.get("model")):
+-        return "class:" + metadata["requested_class"]
+-    return None
++    return restore_route(row.get("model"), row.get("model_config"))
+ 
+ 
+ def class_context_length(model, *, config=None, runner=None, session_key=None, provider="auto"):
+diff --git a/hermes_cli/cli_model_routing.py b/hermes_cli/cli_model_routing.py
+index 05a15122f6..fbc6cccbc1 100644
+--- a/hermes_cli/cli_model_routing.py
++++ b/hermes_cli/cli_model_routing.py
+@@ -3,7 +3,6 @@
+ Keep the selector on the shell, concrete route on the agent. Reconstructing an
+ agent from a bare concrete model would lose the subscription-only failure fence.
+ """
+-import json
+ import logging
+ import sys
+ 
+@@ -72,18 +71,10 @@ def skip_or_restore_class(cli, session_meta):
+ def restore_class_route(cli, session_meta):
+     if getattr(cli, "_explicit_model_override", False):
+         return False
+-    config = session_meta.get("model_config") or {}
+-    if isinstance(config, str):
+-        try:
+-            config = json.loads(config)
+-        except (ValueError, TypeError):
+-            return False
+-    metadata = config.get("model_routing") if isinstance(config, dict) else None
+-    if not isinstance(metadata, dict) or metadata.get("selected_model") != session_meta.get("model"):
++    from agent.model_routing_restore import restore_route
++    restored = restore_route(session_meta.get("model"), session_meta.get("model_config"))
++    if restored is None:
+         return False
+-    selector = "class:" + str(metadata.get("requested_class", ""))
+-    if not is_class_selector(selector):
+-        return False
+-    cli.model, cli.requested_provider = selector, "auto"
++    cli.model, cli.requested_provider = restored
+     cli._explicit_api_key = cli._explicit_base_url = None
+     return True
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index d16fc3fa5f..556f4c2606 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -18,6 +18,7 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
+ 
+ 
+ from hermes_cli.config_defaults_aux import auxiliary_defaults as _aux
++from hermes_cli.config_defaults_routing import routing_defaults
+ 
+ 
+ DEFAULT_CONFIG = {
+@@ -26,12 +27,7 @@ DEFAULT_CONFIG = {
+     "fallback_providers": [],
+     # Opt-in class selectors; exact pins retain legacy behavior. Empty manifests
+     # fail closed. Eligibility/funding attestations are host-specific, not keys.
+-    "model_routing": {
+-        "enabled": False,
+-        "policy_version": 1,
+-        "allow_metered": False,
+-        "routes": {"deep": [], "standard": [], "fast": []},
+-    },
++    "model_routing": routing_defaults(),
+     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
+     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
+     # of switching the turn to a fallback model.
+diff --git a/hermes_cli/config_defaults_routing.py b/hermes_cli/config_defaults_routing.py
+new file mode 100644
+index 0000000000..c45203d5c3
+--- /dev/null
++++ b/hermes_cli/config_defaults_routing.py
+@@ -0,0 +1,11 @@
++"""Pure-data defaults for opt-in model-class policy."""
++
++
++def routing_defaults():
++    return {
++        "enabled": False,
++        "policy_version": 1,
++        "allow_metered": False,
++        "enforce_subscription_only": False,
++        "routes": {"deep": [], "standard": [], "fast": []},
++    }
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index d058e771b7..527a84e4d3 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -1013,6 +1013,18 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
+     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
+     OpenCode Zen/Go where different models route through different API surfaces)."""
+     from agent.model_routing import ModelRoutingError, is_class_selector
++    from agent.model_routing_managed import managed_config, resolve_managed_runtime
++    managed = managed_config(routing_config)
++    if managed is not None and not target_model:
++        model_config = managed.get("model", {})
++        target_model = model_config.get("default") if isinstance(model_config, dict) else model_config
++        if not requested and isinstance(model_config, dict):
++            requested = model_config.get("provider")
++    if managed is not None and not is_class_selector(target_model):
++        if explicit_api_key or explicit_base_url:
++            raise ModelRoutingError("Managed subscription pins cannot override credentials or endpoint")
++        return resolve_managed_runtime(target_model, requested, config=managed,
++                                       session_id=routing_session_id, requirements=routing_requirements)
+     if is_class_selector(target_model):
+         from agent.model_routing_runtime import resolve_class_runtime
+         if explicit_api_key or explicit_base_url:
+diff --git a/tests/agent/test_managed_auxiliary.py b/tests/agent/test_managed_auxiliary.py
+new file mode 100644
+index 0000000000..540cd325ca
+--- /dev/null
++++ b/tests/agent/test_managed_auxiliary.py
+@@ -0,0 +1,53 @@
++"""Managed native auxiliary pins remain exact through deferred SDK calls."""
++from unittest.mock import patch
++
++import pytest
++
++from agent import auxiliary_client as aux
++from agent.model_routing import ModelRoutingError
++from hermes_cli.config import atomic_config_write
++from tests.tui_gateway import test_class_routing as fixtures
++
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++native_transport = fixtures.native_transport
++
++
++@pytest.fixture(autouse=True)
++def managed(routing_home, streaming_route, tmp_path):
++    routing_home['model_routing']['enforce_subscription_only'] = True
++    atomic_config_write(tmp_path / 'config.yaml', routing_home)
++
++
++@pytest.mark.parametrize('async_mode', [False, True])
++@pytest.mark.parametrize('model', ['class:deep', 'anthropic-deep'])
++@pytest.mark.asyncio
++async def test_managed_deferred_native_send(async_mode, model, native_transport):
++    client, selected = aux.resolve_provider_client('auto', model, async_mode=async_mode)
++    assert selected == model
++    result = client.chat.completions.create(model=selected, messages=[{'role': 'user', 'content': 'ok'}])
++    if async_mode:
++        result = await result
++    assert result.choices[0].message.content == 'ok'
++    assert native_transport[0][2]['model'] == 'anthropic-deep'
++    assert native_transport[0][1]['authorization'].startswith('Bearer sk-ant-oat')
++    assert 'x-api-key' not in native_transport[0][1]
++
++
++@pytest.mark.parametrize('kind', ['sync', 'async', 'stream', 'direct', 'vision'])
++@pytest.mark.asyncio
++async def test_managed_paid_override_never_sends(kind, native_transport):
++    options = dict(provider='openrouter', model='paid', messages=[{'role': 'user', 'content': 'ok'}])
++    calls = {
++        'sync': lambda: aux.call_llm(**options),
++        'stream': lambda: list(aux.call_llm(**options, stream=True)),
++        'direct': lambda: aux.resolve_provider_client('openrouter', 'paid'),
++        'vision': lambda: aux.resolve_vision_provider_client(provider='openrouter', model='paid'),
++    }
++    with patch.object(aux, '_try_discovery_chain', side_effect=AssertionError('paid discovery')):
++        with pytest.raises(ModelRoutingError):
++            if kind == 'async':
++                await aux.async_call_llm(**options)
++            else:
++                calls[kind]()
++    assert native_transport == []
+diff --git a/tests/agent/test_managed_auxiliary_wire.py b/tests/agent/test_managed_auxiliary_wire.py
+new file mode 100644
+index 0000000000..9eb30146a6
+--- /dev/null
++++ b/tests/agent/test_managed_auxiliary_wire.py
+@@ -0,0 +1,68 @@
++"""The transmitting SDK, not its saved runtime snapshot, owns the auth proof."""
++from unittest.mock import patch
++
++import pytest
++
++from agent import auxiliary_class_routing as routing
++from agent import auxiliary_client as aux
++from agent.model_routing import ModelRoutingError
++from tests.agent import test_managed_auxiliary as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++native_transport = fixtures.native_transport
++
++
++def corrupt_credential(leaf):
++    leaf.api_key = "synthetic-paid"
++    leaf.auth_token = None
++
++
++def corrupt_endpoint(leaf):
++    leaf.base_url = "https://paid.invalid/v1"
++
++
++def corrupt_headers(leaf):
++    leaf._custom_headers["x-api-key"] = "synthetic-paid"
++
++
++@pytest.mark.parametrize("mutation", [corrupt_credential, corrupt_endpoint, corrupt_headers])
++@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
++@pytest.mark.asyncio
++async def test_mutated_sdk_never_sends(mutation, mode, native_transport):
++    original = routing._client
++
++    def build(runtime):
++        client = original(runtime)
++        mutation(client._real_client)
++        return client
++
++    options = dict(model="class:deep", messages=[{"role": "user", "content": "ok"}])
++    with patch.object(routing, "_client", side_effect=build):
++        with pytest.raises(ModelRoutingError):
++            if mode == "async":
++                await aux.async_call_llm(**options)
++            elif mode == "stream":
++                list(aux.call_llm(**options, stream=True))
++            else:
++                aux.call_llm(**options)
++    assert native_transport == []
++
++
++@pytest.mark.parametrize("mutation", [
++    {"model": "paid"}, {"extra_headers": {"x-api-key": "synthetic-paid"}},
++    {"extra_body": {"model": "paid"}},
++])
++def test_relay_rewrite_cannot_bypass_final_send(mutation, native_transport):
++    from agent import relay_llm
++
++    def rewrite(kwargs, callback, **options):
++        return callback({**kwargs, **mutation})
++
++    with patch.object(aux, "_relay_auxiliary_metadata", return_value=(
++            "anthropic", "anthropic-deep", {"auxiliary_task": "test"})), \
++            patch.object(relay_llm, "execute_current", side_effect=rewrite):
++        with pytest.raises(ModelRoutingError):
++            aux.call_llm(model="class:deep", messages=[{"role": "user", "content": "ok"}])
++    assert native_transport == []
+diff --git a/tests/agent/test_managed_defaults.py b/tests/agent/test_managed_defaults.py
+new file mode 100644
+index 0000000000..a1ab5d6e91
+--- /dev/null
++++ b/tests/agent/test_managed_defaults.py
+@@ -0,0 +1,20 @@
++"""Omitted runtime targets honor effective managed defaults, not guessed classes."""
++import pytest
++
++from hermes_cli.config import atomic_config_write
++from hermes_cli.runtime_provider import resolve_runtime_provider
++from tests.agent import test_managed_subscription as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.mark.parametrize("default", ["class:deep", "anthropic-deep"])
++def test_missing_target_uses_managed_default(managed, tmp_path, default):
++    managed.setdefault("model", {}).update(default=default, provider="auto")
++    atomic_config_write(tmp_path / "config.yaml", managed)
++    runtime = resolve_runtime_provider(routing_session_id="default-job")
++    assert runtime["model"] == "anthropic-deep"
++    assert runtime["provider"] == "anthropic"
++    assert runtime["model_routing"].get("exact_pin", False) == (default == "anthropic-deep")
+diff --git a/tests/agent/test_managed_main_wire.py b/tests/agent/test_managed_main_wire.py
+new file mode 100644
+index 0000000000..a43d26301d
+--- /dev/null
++++ b/tests/agent/test_managed_main_wire.py
+@@ -0,0 +1,76 @@
++"""Main native transmission validates the live SDK after Relay rewrites."""
++import json
++from unittest.mock import patch
++
++import anthropic
++import httpx
++import pytest
++
++from run_agent import AIAgent
++from tests.agent import test_managed_subscription as fixtures
++from tests.agent.test_class_failure_wire import completion
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.mark.parametrize('stream', [False, True])
++@pytest.mark.parametrize('mutation', ['none', 'credential', 'endpoint', 'headers', 'relay-model', 'relay-auth'])
++def test_main_native_wire_rechecks_live_client(managed, stream, mutation):
++    from agent import relay_llm
++    sent = []
++    original = anthropic.Anthropic
++
++    def respond(request):
++        sent.append(request)
++        body = json.loads(request.content)
++        if body.get('stream'):
++            return completion(body['model'])
++        return httpx.Response(200, json={'id': 'message', 'type': 'message', 'role': 'assistant',
++            'model': body['model'], 'content': [{'type': 'text', 'text': 'ok'}],
++            'stop_reason': 'end_turn', 'usage': {'input_tokens': 1, 'output_tokens': 1}})
++
++    def sdk(**kwargs):
++        kwargs.update(http_client=httpx.Client(transport=httpx.MockTransport(respond)), max_retries=0)
++        client = original(**kwargs)
++        mutations = {
++            'credential': lambda: setattr(client, 'auth_token', 'synthetic-paid'),
++            'endpoint': lambda: setattr(client, 'base_url', 'https://paid.invalid'),
++            'headers': lambda: client._custom_headers.update({'Authorization': 'Bearer synthetic-paid'}),
++        }
++        mutations.get(mutation, lambda: None)()
++        return client
++
++    original_stream, original_execute = relay_llm.stream, relay_llm.execute
++
++    def rewrite(kwargs):
++        changes = {'relay-model': {'model': 'unapproved'},
++                   'relay-auth': {'extra_headers': {'Authorization': 'Bearer synthetic-paid'}}}
++        return {**kwargs, **changes.get(mutation, {})}
++
++    def relay_stream(kwargs, callback, **options):
++        return original_stream(kwargs, lambda final: callback(rewrite(final)), **options)
++
++    def relay_execute(kwargs, callback, **options):
++        return original_execute(kwargs, lambda final: callback(rewrite(final)), **options)
++
++    with patch('anthropic.Anthropic', side_effect=sdk), \
++         patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.title_generator._auto_title_enabled', return_value=False), \
++         patch('agent.turn_recovery.interruptible_backoff_sleep', return_value=None), \
++         patch.object(relay_llm, 'stream', side_effect=relay_stream), \
++         patch.object(relay_llm, 'execute', side_effect=relay_execute):
++        agent = AIAgent(model='anthropic-deep', provider='anthropic', session_id='wire',
++                        quiet_mode=True, skip_memory=True, skip_context_files=True, max_iterations=2)
++        agent._disable_streaming = not stream
++        try:
++            result = agent.run_conversation('Say ok')
++            if mutation == 'none':
++                assert result['final_response'] == 'ok', result
++                assert sent
++            else:
++                assert result.get('failed') or result.get('error'), result
++                assert sent == []
++        finally:
++            agent.release_clients()
+diff --git a/tests/agent/test_managed_responses_wire.py b/tests/agent/test_managed_responses_wire.py
+new file mode 100644
+index 0000000000..92372f83d9
+--- /dev/null
++++ b/tests/agent/test_managed_responses_wire.py
+@@ -0,0 +1,143 @@
++"""Codex/xAI native credentials and final Relay request are fenced on wire."""
++import json
++from copy import deepcopy
++from unittest.mock import patch
++
++import httpx
++import openai
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from hermes_cli.config import atomic_config_write
++from run_agent import AIAgent
++from tests.agent import test_managed_subscription as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.fixture(params=['openai-codex', 'xai-oauth'])
++def native_policy(request, managed, tmp_path):
++    provider = request.param
++    route = deepcopy(managed['model_routing']['routes']['deep'][0])
++    route.update(provider=provider, model=provider + '-deep')
++    managed['model_routing']['routes']['deep'] = [route]
++    atomic_config_write(tmp_path / 'config.yaml', managed)
++    (tmp_path / 'auth.json').write_text(json.dumps({'version': 1, 'credential_pool': {provider: [
++        {'id': 'native', 'label': 'native', 'priority': 1, 'auth_type': 'oauth',
++         'source': 'manual', 'access_token': 'synthetic-oauth-token'}]}}))
++    return provider, route['model']
++
++
++def response(request):
++    model = json.loads(request.content)['model']
++    item = {'type': 'message', 'id': 'm1', 'role': 'assistant', 'status': 'completed',
++            'content': [{'type': 'output_text', 'text': 'ok', 'annotations': []}]}
++    final = {'id': 'r1', 'object': 'response', 'model': model, 'status': 'completed', 'output': [item],
++             'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}
++    events = [{'type': 'response.created', 'response': {**final, 'status': 'in_progress', 'output': []}},
++              {'type': 'response.output_item.done', 'output_index': 0, 'item': item},
++              {'type': 'response.completed', 'response': final}]
++    body = ''.join(f'event: {e["type"]}\ndata: {json.dumps(e)}\n\n' for e in events)
++    return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=body)
++
++
++@pytest.mark.parametrize('mutation', ['none', 'credential', 'headers', 'relay-auth'])
++def test_responses_main_wire(native_policy, mutation):
++    from agent import process_bootstrap, relay_llm
++    sent = []
++    original = openai.OpenAI
++
++    def respond(request):
++        sent.append(request)
++        return response(request)
++
++    def sdk(**kwargs):
++        kwargs.update(http_client=httpx.Client(transport=httpx.MockTransport(respond)), max_retries=0)
++        client = original(**kwargs)
++        mutations = {'credential': lambda: setattr(client, 'api_key', 'synthetic-paid'),
++                     'headers': lambda: client._custom_headers.update({'Authorization': 'Bearer synthetic-paid'})}
++        mutations.get(mutation, lambda: None)()
++        return client
++
++    original_stream = relay_llm.stream
++
++    def relay_stream(kwargs, callback, **options):
++        def final(request):
++            if mutation == 'relay-auth':
++                request = {**request, 'extra_headers': {'Authorization': 'Bearer synthetic-paid'}}
++            return callback(request)
++        return original_stream(kwargs, final, **options)
++
++    provider, model = native_policy
++    with patch.object(process_bootstrap, 'OpenAI', side_effect=sdk), \
++         patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.title_generator._auto_title_enabled', return_value=False), \
++         patch('agent.turn_recovery.interruptible_backoff_sleep', return_value=None), \
++         patch.object(relay_llm, 'stream', side_effect=relay_stream):
++        agent = AIAgent(model=model, provider=provider, session_id='responses',
++                        quiet_mode=True, skip_memory=True, skip_context_files=True, max_iterations=2)
++        try:
++            result = agent.run_conversation('Say ok')
++            if mutation == 'none':
++                assert result['final_response'] == 'ok', result
++                assert sent
++                assert all(r.headers['authorization'] == 'Bearer synthetic-oauth-token' for r in sent)
++            else:
++                assert result.get('failed') or result.get('error'), result
++                assert sent == []
++        finally:
++            agent.release_clients()
++
++
++@pytest.mark.parametrize('invalid', [False, True])
++def test_native_refresh_keeps_pool_provenance(native_policy, invalid):
++    provider, model = native_policy
++    with patch('model_tools.get_tool_definitions', return_value=[]):
++        agent = AIAgent(model=model, provider=provider, session_id='refresh',
++                        quiet_mode=True, skip_memory=True, skip_context_files=True)
++    entry = deepcopy(agent._credential_pool.current())
++    entry.access_token = 'synthetic-refreshed'
++    if invalid:
++        entry.auth_type = 'api_key'
++    try:
++        with patch.object(agent._credential_pool, 'try_refresh_current', return_value=entry), \
++             patch.object(agent._credential_pool, 'current', return_value=entry), \
++             patch.object(agent, '_adopt_openai_credentials', return_value=True) as adopt, \
++             patch('hermes_cli.auth.resolve_codex_runtime_credentials') as codex, \
++             patch('hermes_cli.auth.resolve_xai_oauth_runtime_credentials') as xai:
++            if invalid:
++                with pytest.raises(ModelRoutingError):
++                    agent._try_refresh_codex_client_credentials()
++                adopt.assert_not_called()
++            else:
++                assert agent._try_refresh_codex_client_credentials()
++                assert adopt.call_args.args[0] == 'synthetic-refreshed'
++            codex.assert_not_called()
++            xai.assert_not_called()
++    finally:
++        agent.release_clients()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('mode', ['sync', 'async', 'stream'])
++async def test_auxiliary_responses_rejects_mutated_leaf(native_policy, mode):
++    from agent import auxiliary_client as aux, auxiliary_class_routing as routing
++    original = routing._client
++
++    def corrupt(runtime):
++        client = original(runtime)
++        client._real_client._custom_headers['Authorization'] = 'Bearer synthetic-paid'
++        return client
++
++    options = {'model': 'class:deep', 'messages': [{'role': 'user', 'content': 'ok'}]}
++    with patch.object(routing, '_client', side_effect=corrupt), patch('httpx.Client.send') as send:
++        with pytest.raises(ModelRoutingError):
++            if mode == 'async':
++                await aux.async_call_llm(**options)
++            elif mode == 'stream':
++                list(aux.call_llm(**options, stream=True))
++            else:
++                aux.call_llm(**options)
++        send.assert_not_called()
+diff --git a/tests/agent/test_managed_review_regressions.py b/tests/agent/test_managed_review_regressions.py
+new file mode 100644
+index 0000000000..73936b4373
+--- /dev/null
++++ b/tests/agent/test_managed_review_regressions.py
+@@ -0,0 +1,55 @@
++"""Managed send/switch regressions found during independent review."""
++from copy import deepcopy
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent import auxiliary_client as aux
++from hermes_cli.config import atomic_config_write
++from hermes_state import SessionDB
++from tests.agent import test_managed_switch as switches
++from tests.agent import test_managed_auxiliary as auxiliary
++
++managed = switches.managed
++routing_home = switches.routing_home
++streaming_route = switches.streaming_route
++destinations = switches.destinations
++native_transport = auxiliary.native_transport
++
++
++def test_switch_with_real_session_database(destinations, tmp_path):
++    db = SessionDB(tmp_path / 'sessions.db')
++    db.create_session('pin', source='cli', model='anthropic-deep')
++    try:
++        with patch('model_tools.get_tool_definitions', return_value=[]), \
++             patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++            agent = switches.build('class:deep')
++            agent._session_db = db
++            agent._session_db_created = True
++            agent.context_compressor.bind_session_state(db, 'pin')
++            agent.switch_model('z-anthropic-deep', 'anthropic')
++            assert agent.model == 'z-anthropic-deep'
++            assert agent.context_compressor._session_db is db
++            assert db.get_session('pin')['model'] == 'z-anthropic-deep'
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize('surface', ['main', 'auxiliary'])
++def test_class_route_shared_between_classes_sends(managed, tmp_path, native_transport, surface):
++    managed['model_routing']['routes']['standard'] = deepcopy(managed['model_routing']['routes']['deep'])
++    atomic_config_write(tmp_path / 'config.yaml', managed)
++    if surface == 'auxiliary':
++        result = aux.call_llm(model='class:deep', provider='auto', messages=[{'role': 'user', 'content': 'ok'}])
++        assert result.choices[0].message.content == 'ok'
++    else:
++        with patch('model_tools.get_tool_definitions', return_value=[]), \
++             patch('agent.title_generator._auto_title_enabled', return_value=False):
++            agent = switches.build('class:deep')
++            try:
++                result = agent.run_conversation('ok')
++                assert result['final_response'] == 'ok', result
++            finally:
++                agent.release_clients()
++    assert native_transport
++    assert native_transport[0][2]['model'] == 'anthropic-deep'
+diff --git a/tests/agent/test_managed_subscription.py b/tests/agent/test_managed_subscription.py
+new file mode 100644
+index 0000000000..c35e192d0b
+--- /dev/null
++++ b/tests/agent/test_managed_subscription.py
+@@ -0,0 +1,110 @@
++"""Managed policy rejects stale paid overrides before any HTTP send."""
++import asyncio
++import json
++from unittest.mock import patch
++
++import anthropic
++import httpx
++import pytest
++
++from agent.model_routing import ModelRoutingError, resolve_model_route
++from hermes_cli.config import atomic_config_write
++from hermes_cli.runtime_provider import resolve_runtime_provider
++from run_agent import AIAgent
++from tests.agent import test_model_routing_agent as helpers
++from tests.agent.test_class_failure_wire import completion
++
++routing_home = helpers.routing_home
++streaming_route = helpers.streaming_route
++
++
++@pytest.fixture
++def managed(routing_home, streaming_route, tmp_path):
++    routing_home["model_routing"]["enforce_subscription_only"] = True
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    return routing_home
++
++
++@pytest.mark.parametrize("provider,model", [("openrouter", "vendor/paid"), ("auto", "unknown"),
++                                           ("openai", "anthropic-deep")])
++def test_concrete_pin_rejected_at_selector_and_runtime(managed, provider, model):
++    with pytest.raises(ModelRoutingError):
++        resolve_model_route(model, provider)
++    with pytest.raises(ModelRoutingError):
++        resolve_runtime_provider(requested=provider, target_model=model)
++
++
++@pytest.mark.parametrize("surface", ["cli", "desktop", "telegram", "api", "cron", "kanban", "delegated"])
++def test_stale_surface_override_cannot_construct_paid_agent(managed, surface):
++    sent = []
++    with patch("httpx.Client.send", side_effect=lambda request, **kw: sent.append(request)):
++        with pytest.raises(ModelRoutingError):
++            AIAgent(model="vendor/paid", provider="openrouter", api_key="synthetic-paid",
++                    base_url="https://openrouter.ai/api/v1", platform=surface,
++                    skip_context_files=True, skip_memory=True, quiet_mode=True)
++    assert sent == []
++
++
++@pytest.mark.parametrize("reject", [False, True])
++def test_approved_exact_native_pin_uses_oauth_and_never_paid_fallback(managed, reject):
++    sent = []
++    original = anthropic.Anthropic
++
++    def respond(request):
++        sent.append(request)
++        if reject:
++            return httpx.Response(401, json={"type": "error", "error": {
++                "type": "authentication_error", "message": "invalid credential"}})
++        return completion(json.loads(request.content)["model"])
++
++    def sdk(**kwargs):
++        kwargs.update(http_client=httpx.Client(transport=httpx.MockTransport(respond)), max_retries=0)
++        return original(**kwargs)
++
++    with patch("anthropic.Anthropic", side_effect=sdk), \
++         patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("agent.turn_recovery.interruptible_backoff_sleep", return_value=None):
++        agent = AIAgent(model="anthropic-deep", provider="anthropic", session_id="exact-pin",
++                        quiet_mode=True, skip_memory=True, skip_context_files=True, max_iterations=2,
++                        fallback_model=[{"provider": "openrouter", "model": "paid"}])
++        try:
++            result = agent.run_conversation("Say ok")
++            assert agent.model == "anthropic-deep"
++            assert agent.model_routing["exact_pin"]
++            assert agent._fallback_chain == []
++            if not reject:
++                assert result["final_response"] == "ok", result
++            else:
++                assert result.get("failed") or result.get("error"), result
++        finally:
++            agent.release_clients()
++    assert sent
++    assert all(r.headers.get("authorization", "").startswith("Bearer sk-ant-oat") for r in sent)
++    assert all("x-api-key" not in r.headers for r in sent)
++
++
++@pytest.mark.parametrize("kind", ["sync", "async", "stream"])
++def test_cached_paid_auxiliary_client_is_fenced_at_relay(managed, kind):
++    from agent import auxiliary_client as aux
++    sent = []
++    client = httpx.Client(transport=httpx.MockTransport(lambda request: sent.append(request)))
++    try:
++        with pytest.raises(ModelRoutingError):
++            if kind == "async":
++                asyncio.run(aux._relay_async_completion(client, {"model": "paid"}, provider="openrouter"))
++            elif kind == "stream":
++                aux._relay_sync_stream(client, {"model": "paid"}, provider="openrouter")
++            else:
++                aux._relay_sync_completion(client, {"model": "paid"}, provider="openrouter")
++    finally:
++        client.close()
++    assert sent == []
++
++
++def test_managed_switch_rejects_paid_pin_before_next_wire(managed):
++    from agent.model_routing_request import validate_class_request
++    from types import SimpleNamespace
++    stale = SimpleNamespace(model="vendor/paid", provider="openrouter", model_routing=None)
++    with pytest.raises(ModelRoutingError):
++        validate_class_request(stale, {"model": stale.model}, streaming=False)
+diff --git a/tests/agent/test_managed_switch.py b/tests/agent/test_managed_switch.py
+new file mode 100644
+index 0000000000..1eb83fda9d
+--- /dev/null
++++ b/tests/agent/test_managed_switch.py
+@@ -0,0 +1,144 @@
++"""Exact managed intent survives restart and failed explicit switches."""
++from copy import deepcopy
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent.model_routing_state import RoutingState
++from hermes_cli.config import atomic_config_write
++from run_agent import AIAgent
++from tests.agent import test_managed_subscription as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.fixture
++def destinations(managed, tmp_path):
++    second = deepcopy(managed['model_routing']['routes']['deep'][0])
++    second['model'] = 'z-anthropic-deep'
++    managed['model_routing']['routes']['deep'].append(second)
++    standard = deepcopy(second)
++    standard['model'] = 'anthropic-standard'
++    managed['model_routing']['routes']['standard'] = [standard]
++    atomic_config_write(tmp_path / 'config.yaml', managed)
++    return managed
++
++
++def build(model='anthropic-deep', session='pin'):
++    return AIAgent(model=model, provider='auto', session_id=session,
++                   quiet_mode=True, skip_memory=True, skip_context_files=True)
++
++
++def test_exact_intent_persisted_before_restart_and_compression(destinations, tmp_path):
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++        first = build()
++        state = RoutingState(tmp_path / 'model-routing.sqlite3')
++        assert state.peek('pin', 'deep')['exact_pin'] is True
++        state.link_continuation('compressed', 'pin')
++        resumed = build('class:deep', 'compressed')
++        assert resumed.model == first.model
++        assert resumed.model_routing['exact_pin'] is True
++        assert resumed._try_activate_fallback() is False
++
++
++@pytest.mark.parametrize('target,level', [('z-anthropic-deep', 'deep'), ('anthropic-standard', 'standard')])
++@pytest.mark.parametrize('failure', [None, 'client', 'compressor'])
++def test_managed_switch_commits_only_after_runtime_ready(destinations, tmp_path, target, level, failure):
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++        agent = build('class:deep')
++        state = RoutingState(tmp_path / 'model-routing.sqlite3')
++        before = state.peek('pin', level)
++        old_model = agent.model
++        old_metadata = deepcopy(agent.model_routing)
++        old_client = agent._anthropic_client
++        seam = {'client': 'agent.anthropic_adapter.build_anthropic_client',
++                'compressor': 'agent.agent_runtime_helpers._update_switch_compressor'}
++        if failure:
++            with patch(seam[failure], side_effect=RuntimeError('construction failed')):
++                with pytest.raises(RuntimeError, match='construction failed'):
++                    agent.switch_model(target, 'anthropic')
++            assert agent.model == old_model
++            assert agent.model_routing == old_metadata
++            assert agent._anthropic_client is old_client
++            assert state.peek('pin', level) == before
++        else:
++            agent.switch_model(target, 'anthropic')
++            assert agent.model == target
++            assert state.peek('pin', level)['exact_pin'] is True
++            assert state.peek('pin', level)['selected_model'] == target
++            resumed = build('class:' + level)
++            assert resumed.model == target
++            assert resumed._try_activate_fallback() is False
++
++
++@pytest.mark.parametrize('target', ['class:deep', 'class:standard'])
++def test_explicit_class_switch_releases_exact_pin(destinations, tmp_path, target):
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++        agent = build()
++        assert agent.model_routing['exact_pin'] is True
++        agent.switch_model(target, 'auto')
++        assert agent.model_routing['requested_class'] == target.split(':')[1]
++        assert not agent.model_routing.get('exact_pin')
++        assert RoutingState(tmp_path / 'model-routing.sqlite3').peek('pin', target.split(':')[1]) == agent.model_routing
++        assert agent._fallback_chain == []
++
++
++def test_managed_cross_provider_preparation_keeps_verified_pool(destinations):
++    from agent.agent_runtime_helpers import _swap_switch_runtime
++    from types import SimpleNamespace
++    pool = object()
++    agent = SimpleNamespace(_credential_pool=pool, model_routing={'exact_pin': True},
++                            _read_reasoning_echo_from_config=lambda: False)
++    with patch('agent.turn_recovery_codex.reset_codex_reasoning_replay'), \
++         patch('agent.credential_pool.load_pool') as load, \
++         patch('agent.agent_runtime_helpers._build_switched_client'), \
++         patch('agent.agent_runtime_helpers.sync_credential_pool_entry_id'):
++        _swap_switch_runtime(agent, 'native', 'openai-codex', 'oauth',
++                             'https://chatgpt.com/backend-api/codex', 'codex_responses',
++                             'anthropic', 'anthropic', 'openai-codex',
++                             managed={'credential_pool': pool, 'model_routing': {'exact_pin': True}})
++    load.assert_not_called()
++    assert agent._credential_pool is pool
++
++
++def test_switch_primary_snapshot_uses_destination_overrides(destinations):
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++        agent = build('class:deep')
++        agent.request_overrides = {'old': True}
++        def apply(destination, provider):
++            destination.request_overrides = {'new': True}
++        with patch('agent.agent_runtime_helpers._apply_switched_provider_request_overrides', side_effect=apply):
++            agent.switch_model('z-anthropic-deep', 'anthropic')
++        assert agent._primary_runtime['request_overrides'] == agent.request_overrides
++        assert 'old' not in agent._primary_runtime['request_overrides']
++
++
++def test_late_failed_switch_does_not_reset_durable_compressor(destinations, tmp_path):
++    from agent import agent_runtime_helpers as runtime
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++        agent = build('class:deep')
++        db = MagicMock()
++        compressor = agent.context_compressor
++        compressor._session_db, compressor._session_id = db, 'pin'
++        compressor._ineffective_compression_count = 3
++        before = RoutingState(tmp_path / 'model-routing.sqlite3').peek('pin', 'deep')
++        original = runtime._update_switch_compressor
++
++        def fail_after_update(*args):
++            original(*args)
++            raise RuntimeError('late failure')
++
++        with patch.object(runtime, '_update_switch_compressor', side_effect=fail_after_update):
++            with pytest.raises(RuntimeError, match='late failure'):
++                agent.switch_model('z-anthropic-deep', 'anthropic')
++        assert agent.context_compressor is compressor
++        assert compressor._ineffective_compression_count == 3
++        assert db.mock_calls == []
++        assert RoutingState(tmp_path / 'model-routing.sqlite3').peek('pin', 'deep') == before
+diff --git a/tests/agent/test_model_routing_restore.py b/tests/agent/test_model_routing_restore.py
+new file mode 100644
+index 0000000000..db16b2e39a
+--- /dev/null
++++ b/tests/agent/test_model_routing_restore.py
+@@ -0,0 +1,118 @@
++"""Resume adapters preserve pin permission even after allocation state is lost."""
++import json
++from copy import deepcopy
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_restore import restore_route
++from agent.model_routing_state import RoutingState
++from hermes_cli.config import atomic_config_write
++from hermes_cli.runtime_provider import resolve_runtime_provider
++from hermes_state import SessionDB
++from tests.agent import test_model_routing_agent as fixtures
++
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++def cli_restore(db, session_id):
++    from hermes_cli.cli_model_routing import restore_class_route
++    cli = SimpleNamespace(_explicit_model_override=False)
++    assert restore_class_route(cli, db.get_session(session_id))
++    assert cli._explicit_api_key is cli._explicit_base_url is None
++    return cli.model, cli.requested_provider
++
++
++def desktop_restore(db, session_id):
++    from tui_gateway.class_routing import restore_class_overrides
++    row = db.get_session(session_id)
++    overrides = restore_class_overrides(row["model"], json.loads(row["model_config"]), {})
++    assert overrides["model_override"]["provider"] == overrides["provider_override"]
++    return overrides["model_override"]["model"], overrides["provider_override"]
++
++
++def messaging_restore(db, session_id):
++    from gateway.run_class_routing import class_session_runtime
++    runner = SimpleNamespace(_session_db=db, session_store=SimpleNamespace(
++        _entries={"key": SimpleNamespace(session_id=session_id)}))
++    model, runtime = class_session_runtime(runner, "class:fast", None, None, {}, "key")
++    assert runtime["provider"] == runtime["requested_provider"]
++    return model, runtime["provider"]
++
++
++def api_restore(db, session_id):
++    from gateway.platforms.api_server_class_routing import prepare_runtime
++    adapter = SimpleNamespace(_ensure_session_db=lambda: db, _session_model_override_for=lambda key: None)
++    with patch("gateway.run._resolve_gateway_model", return_value="paid-default"), patch(
++        "gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("default authentication")):
++        _, runtime, model = prepare_runtime(adapter, session_id, db.get_session(session_id)["model"],
++                                            False, None, None, None)
++    assert runtime["provider"] == runtime["requested_provider"]
++    return model, runtime["provider"]
++
++
++@pytest.mark.parametrize("restore", [cli_restore, desktop_restore, messaging_restore, api_restore])
++@pytest.mark.parametrize("exact", [True, False], ids=["pin", "class"])
++@pytest.mark.parametrize("continuation", [False, True], ids=["root", "compression-child"])
++def test_missing_allocation_db_preserves_resume_intent(
++        routing_home, streaming_route, tmp_path, restore, exact, continuation):
++    routing_home["model_routing"]["enforce_subscription_only"] = True
++    second = deepcopy(routing_home["model_routing"]["routes"]["deep"][0])
++    second["model"] = "z-pinned-model"
++    routing_home["model_routing"]["routes"]["deep"].append(second)
++    if exact:
++        # Model name alone is ambiguous: dropping the provider must fail.
++        other_provider = dict(second, provider="openai-codex")
++        routing_home["model_routing"]["routes"]["deep"].append(other_provider)
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    original = resolve_runtime_provider(requested="anthropic" if exact else "auto",
++        target_model="z-pinned-model" if exact else "class:deep", routing_session_id="root")
++    path = tmp_path / "model-routing.sqlite3"
++    state = RoutingState(path)
++    assert state.peek("root", "deep") == original["model_routing"]
++    session_id = "child" if continuation else "root"
++    if continuation:
++        state.link_continuation("child", "root")
++        assert state.peek("child", "deep") == original["model_routing"]
++    db_path = tmp_path / "sessions.db"
++    db = SessionDB(db_path=db_path)
++    db.create_session(session_id, source="local", model=original["model"], model_config={
++        "model_routing": original["model_routing"], "provider": "stale-provider"})
++    db.close()
++    path.unlink()
++    db = SessionDB(db_path=db_path)
++    try:
++        model, provider = restore(db, session_id)
++        assert not path.exists(), "Resume adapter must not allocate"
++        assert (model, provider) == (("z-pinned-model", "anthropic") if exact else ("class:deep", "auto"))
++        resumed = resolve_runtime_provider(requested=provider, target_model=model, routing_session_id=session_id)
++        metadata = RoutingState(path).peek(session_id, "deep")
++        assert metadata == resumed["model_routing"]
++        assert bool(metadata.get("exact_pin")) is exact
++        assert (metadata["selected_model"], metadata["selected_provider"]) == (original["model"], original["provider"])
++        if exact:
++            with pytest.raises(ModelRoutingError, match="cannot fail over"):
++                RoutingState(path).allocate(session_id, None, "deep", [second], metadata["policy_version"],
++                                            {("anthropic", "z-pinned-model")})
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize("provider", [None, "", "auto"])
++def test_incomplete_exact_tuple_fails_closed(provider):
++    with pytest.raises(ModelRoutingError, match="concrete model/provider"):
++        restore_route("pinned", {"model_routing": {
++            "selected_model": "pinned", "selected_provider": provider, "requested_class": "deep", "exact_pin": True}})
++
++
++def test_restored_pin_is_not_managed_authorization(routing_home, tmp_path):
++    routing_home["model_routing"]["enforce_subscription_only"] = True
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    model, provider = restore_route("paid", {"model_routing": {
++        "selected_model": "paid", "selected_provider": "openrouter", "requested_class": "deep", "exact_pin": True}})
++    with pytest.raises(ModelRoutingError, match="rejects"):
++        resolve_runtime_provider(requested=provider, target_model=model, routing_session_id="stale")
++    assert not (tmp_path / "model-routing.sqlite3").exists()
+diff --git a/tests/cron/test_managed_entry.py b/tests/cron/test_managed_entry.py
+new file mode 100644
+index 0000000000..dc6744687d
+--- /dev/null
++++ b/tests/cron/test_managed_entry.py
+@@ -0,0 +1,23 @@
++"""Managed cron fires reject old paid model/provider settings."""
++from unittest.mock import patch
++
++from tests.agent import test_managed_subscription as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++def test_paid_cron_job_fails_without_send(managed):
++    from cron.scheduler import run_job
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('cron.scheduler_delivery._resolve_origin', return_value=None), \
++         patch('cron.scheduler._init_cron_mcp_tools'), \
++         patch('hermes_cli.env_loader.load_hermes_dotenv'), \
++         patch('hermes_cli.env_loader.reset_secret_source_cache'), \
++         patch('httpx.Client.send') as send:
++        success, _, _, error = run_job({'id': 'stale-paid-cron', 'name': 'paid cron',
++                                       'model': 'vendor/paid', 'provider': 'openrouter', 'prompt': 'Say ok'})
++        assert not success
++        assert 'Managed subscription policy' in error
++        send.assert_not_called()
+diff --git a/tests/gateway/test_api_exact_pin_resume.py b/tests/gateway/test_api_exact_pin_resume.py
+new file mode 100644
+index 0000000000..3f692a16ab
+--- /dev/null
++++ b/tests/gateway/test_api_exact_pin_resume.py
+@@ -0,0 +1,46 @@
++"""API resume retains the exact provider through runtime precedence and construction."""
++from copy import deepcopy
++from unittest.mock import patch
++
++from agent.model_routing_state import RoutingState
++from hermes_cli.config import atomic_config_write
++from hermes_cli.runtime_provider import resolve_runtime_provider
++from tests.gateway import test_api_class_routing as fixtures
++
++adapter = fixtures.adapter
++native_transport = fixtures.native_transport
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++def test_api_exact_pin_resume_without_allocation_db(
++        adapter, routing_home, streaming_route, native_transport, tmp_path):
++    routing_home["model_routing"]["enforce_subscription_only"] = True
++    second = deepcopy(routing_home["model_routing"]["routes"]["deep"][0])
++    second["model"] = "z-exact-model"
++    routing_home["model_routing"]["routes"]["deep"].append(second)
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    original = resolve_runtime_provider(requested="anthropic", target_model=second["model"],
++                                        routing_session_id="api-pin")
++    db = adapter._ensure_session_db()
++    db.create_session("api-pin", source="api_server", model=second["model"], model_config={
++        "model_routing": original["model_routing"], "provider": "openrouter"})
++    path = tmp_path / "model-routing.sqlite3"
++    path.unlink()
++    with patch("gateway.run._resolve_gateway_model", return_value="paid-default"), patch(
++        "gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("paid default")), patch(
++        "model_tools.get_tool_definitions", return_value=[]):
++        agent = adapter._create_agent(session_id="api-pin", session_model=second["model"],
++                                       requested_model="ignored", requested_provider="openrouter")
++        try:
++            assert (agent.model, agent.provider) == (second["model"], "anthropic")
++            assert agent.model_routing["exact_pin"] is True
++            assert RoutingState(path).peek("api-pin", "deep") == agent.model_routing
++            assert agent._fallback_chain == []
++            assert agent.run_conversation("Say ok")["final_response"] == "ok"
++            assert agent._try_activate_fallback() is False
++        finally:
++            agent.release_clients()
++    assert native_transport
++    assert all(body["model"] == second["model"] and headers.get("authorization", "").startswith("Bearer sk-ant-oat")
++               and "x-api-key" not in headers for _, headers, body in native_transport)
+diff --git a/tests/gateway/test_managed_entry.py b/tests/gateway/test_managed_entry.py
+new file mode 100644
+index 0000000000..db639c24e6
+--- /dev/null
++++ b/tests/gateway/test_managed_entry.py
+@@ -0,0 +1,64 @@
++"""Managed paid overrides at actual HTTP and messaging ingress."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestClient, TestServer
++
++
++from gateway.session import Platform, SessionSource
++from tests.agent import test_managed_subscription as fixtures
++from tests.gateway import test_api_class_routing as api_fixtures
++from tests.gateway.test_pre_agent_fallback_notice import _runner_with_real_runtime_resolution
++from tests.waiting import async_wait_until
++
++adapter = api_fixtures.adapter
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('stream', [False, True])
++async def test_paid_completions_never_send(managed, adapter, stream):
++    app = web.Application()
++    app.router.add_post('/v1/chat/completions', adapter._handle_chat_completions)
++    with patch('httpx.Client.send') as send, patch('model_tools.get_tool_definitions', return_value=[]):
++        async with TestClient(TestServer(app)) as client:
++            response = await client.post('/v1/chat/completions', json={
++                'model': 'vendor/paid', 'provider': 'openrouter', 'stream': stream,
++                'messages': [{'role': 'user', 'content': 'Say ok'}]})
++            text = await response.text()
++            # The existing OpenAI facade renders auth errors as assistant content,
++            # including SSE errors after headers have been sent.
++            assert 'Managed subscription policy rejects' in text
++        send.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_paid_run_never_sends(managed, adapter):
++    app = web.Application()
++    app.router.add_post('/v1/runs', adapter._handle_runs)
++    with patch('httpx.Client.send') as send, patch('model_tools.get_tool_definitions', return_value=[]):
++        async with TestClient(TestServer(app)) as client:
++            response = await client.post('/v1/runs', json={
++                'model': 'vendor/paid', 'provider': 'openrouter', 'input': 'Say ok'})
++            payload = await response.json()
++            assert response.status == 202, payload
++            await async_wait_until(lambda: not adapter.active_agent_work_count(), timeout=20)
++            status = adapter._run_statuses[payload['run_id']]
++            assert status['status'] == 'failed', status
++        send.assert_not_called()
++
++
++def test_saved_messaging_paid_override_rejected(managed):
++    runner = _runner_with_real_runtime_resolution()
++    runner._peek_session_state.return_value = SimpleNamespace(conversation=SimpleNamespace(model_override={
++        'model': 'vendor/paid', 'provider': 'openrouter'}))
++    with patch('gateway.run._resolve_gateway_model', return_value='class:deep'), \
++         patch('gateway.run._get_channel_override', return_value=None), patch('httpx.Client.send') as send:
++        with pytest.raises(RuntimeError, match='Managed subscription policy'):
++            runner._resolve_session_agent_runtime(
++                source=SessionSource(platform=Platform.LOCAL, chat_id='c'), user_config=managed)
++        send.assert_not_called()
+diff --git a/tests/hermes_cli/test_managed_entry.py b/tests/hermes_cli/test_managed_entry.py
+new file mode 100644
+index 0000000000..d99a368817
+--- /dev/null
++++ b/tests/hermes_cli/test_managed_entry.py
+@@ -0,0 +1,44 @@
++"""Concrete paid CLI settings and generated Kanban worker argv fail closed."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import cli
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from hermes_state import SessionDB
++from tests.agent import test_managed_subscription as fixtures
++from tests.hermes_cli.test_kanban_class_routing import worker_args
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.mark.parametrize('surface', ['cli', 'kanban'])
++def test_paid_entry_rejected_before_send(managed, tmp_path, monkeypatch, surface):
++    model, provider = 'vendor/paid', 'openrouter'
++    if surface == 'kanban':
++        task = SimpleNamespace(id='stale-card', skills=[], reasoning_effort=None,
++                               model_override=model, provider_override=provider)
++        argv = worker_args(task, monkeypatch)
++        model, provider = argv[argv.index('-m') + 1], argv[argv.index('--provider') + 1]
++    db = SessionDB(tmp_path / 'worker.db')
++    try:
++        with patch('cli._prepare_deferred_agent_startup'), \
++             patch('hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build'), \
++             patch('model_tools.get_tool_definitions', return_value=[]), \
++             patch('httpx.Client.send') as send:
++            try:
++                shell = cli.HermesCLI(model=model, provider=provider, compact=True)
++                shell.session_id = 'managed-' + surface
++                shell._session_db = db
++                shell._install_tool_callbacks = lambda: None
++                shell.streaming_enabled = False
++                shell.ignore_rules = True
++                assert not shell._init_agent()
++            except ModelRoutingError:
++                pass
++            send.assert_not_called()
++    finally:
++        db.close()
+diff --git a/tests/tools/test_managed_entry.py b/tests/tools/test_managed_entry.py
+new file mode 100644
+index 0000000000..7a1ae26478
+--- /dev/null
++++ b/tests/tools/test_managed_entry.py
+@@ -0,0 +1,32 @@
++"""Managed delegation cannot inherit or request a paid route."""
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from run_agent import AIAgent
++from tools.delegate_tool_config import _resolve_delegation_credentials
++from tests.agent import test_managed_subscription as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++def test_paid_delegation_rejected_without_send(managed):
++    from tools.delegate_tool import _build_child_agent, _credential_overrides
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()), \
++         patch('tools.delegate_tool._load_config', return_value={}), patch('httpx.Client.send') as send:
++        parent = AIAgent(model='class:deep', provider='auto', session_id='parent',
++                         quiet_mode=True, skip_memory=True, skip_context_files=True)
++        config = {'model': 'vendor/paid', 'provider': 'openrouter'}
++        try:
++            with pytest.raises((ModelRoutingError, ValueError), match='Managed subscription policy'):
++                creds = _resolve_delegation_credentials(config, parent)
++                _build_child_agent(task_index=0, goal='Say ok', context=None, toolsets=None,
++                                   model=creds['model'], max_iterations=2, task_count=1,
++                                   parent_agent=parent, **_credential_overrides(creds, config))
++            send.assert_not_called()
++        finally:
++            parent.release_clients()
+diff --git a/tests/tui_gateway/test_managed_entry.py b/tests/tui_gateway/test_managed_entry.py
+new file mode 100644
+index 0000000000..372c508d61
+--- /dev/null
++++ b/tests/tui_gateway/test_managed_entry.py
+@@ -0,0 +1,29 @@
++"""Desktop saved overrides are fenced by the real agent builder."""
++from unittest.mock import patch
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from tests.agent import test_managed_subscription as fixtures
++from tui_gateway import server
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++def test_desktop_saved_paid_override_never_sends(managed, monkeypatch, tmp_path):
++    monkeypatch.chdir(tmp_path)
++    from hermes_cli.config import load_config
++    monkeypatch.setattr(server, '_load_cfg', load_config)
++    monkeypatch.setattr(server, '_resolve_startup_runtime', lambda: ('class:deep', 'auto'))
++    monkeypatch.setattr(server, '_agent_cbs', lambda sid: {})
++    monkeypatch.setattr(server, '_load_enabled_toolsets', lambda platform: [])
++    monkeypatch.setattr(server, '_startup_system_prompt', lambda *a: '')
++    monkeypatch.setattr(server, '_get_db', lambda: None)
++    overrides = server._stored_session_runtime_overrides({
++        'model': 'vendor/paid', 'model_config': {'model': 'vendor/paid', 'provider': 'openrouter'}})
++    with patch('httpx.Client.send') as send, patch('model_tools.get_tool_definitions', return_value=[]):
++        with pytest.raises(ModelRoutingError):
++            server._make_agent('ui', 'stale-paid', **overrides)
++        send.assert_not_called()
+diff --git a/tui_gateway/class_routing.py b/tui_gateway/class_routing.py
+index 4d4c3fb7b8..ca7cbf39fb 100644
+--- a/tui_gateway/class_routing.py
++++ b/tui_gateway/class_routing.py
+@@ -35,14 +35,13 @@ def probe_class_runtime(model, provider, config):
+ 
+ 
+ def restore_class_overrides(model, config, overrides):
+-    route = config.get("model_routing")
+-    if not isinstance(route, dict) or route.get("selected_model") != model:
++    from agent.model_routing_restore import restore_route
++    restored = restore_route(model, config)
++    if restored is None:
+         return overrides
+-    level = route.get("requested_class")
+-    if level not in ("deep", "standard", "fast"):
+-        return overrides
+-    overrides["model_override"] = {"model": f"class:{level}", "provider": "auto"}
+-    overrides["provider_override"] = "auto"
++    model, provider = restored
++    overrides["model_override"] = {"model": model, "provider": provider}
++    overrides["provider_override"] = provider
+     return overrides
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

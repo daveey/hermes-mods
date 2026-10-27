@@ -105,3 +105,27 @@ Apply the complete ordered series, not this noncontiguous subset alone. It build
 ## Plugin relationship
 
 Hub/courier and Desktop plugins consume these seams, including profile-pinned REST, but transactional creation, durable release evidence, shared activity projection and Desktop owner routing require core changes. Updating a disk plugin alone does not activate them.
+
+## Remote inventory sharing (0403) and terminal release of attested remote cards (0450)
+
+Patch **0403** (`7f0a44e948`): `kanban_session_activity._remote_links` is cached per origin scope for `_CACHE_TTL_S`
+while no store it reads (boards, hub replica, origin ledger) changed, single-flight so concurrent readers wait for
+one projection; failures are not cached. `_legacy_remote_links` writes the origin-work snapshot only when the
+inventory changed, and a locked snapshot write is logged instead of failing the read (previously it marked every
+sidebar row `kanban_unknown`). Tests: `tests/hermes_cli/test_kanban_remote_inventory_cache.py`.
+
+Patch **0450** (`d52e183104`), requires 0403, 0397 (scope heartbeat) and 0398–0400:
+
+- **Behavior.** A remote shepherd card that its owner attests done or archived leaves the origin session's open
+  counts (explicit row, `unfinished=False`, `released=True`). Attestation needs a fresh hub sync, identity fields
+  matching the key, a terminal status inside the hash-bound `origin_observation`, and the owner's per-scope
+  heartbeat for that profile/board within 180 s. Ledger-bound cards (`origin_bindings`) also need the owner's
+  `verified=True` completion. Absence is never release: stale or offline owners stay unfinished.
+- **Legacy fold.** Board/id replica rows fold into their single profile-qualified twin when `created_at` and
+  `created_by` match, with shepherd links moving along; this ends double counting. Ambiguous rows stay unknown. The
+  durable snapshot treats a folded alias as present so the old row is not resurrected as stale.
+- **Code.** `hermes_cli/kanban_session_activity.py` (`_read_remote_links`).
+- **Tests.** `tests/hermes_cli/test_kanban_remote_terminal_release.py` (20 tests) and the updated
+  `tests/hermes_cli/test_kanban_origin_alias_release.py::test_unproven_intermediate_alias_needs_verified_owner_release`.
+- **Residual.** Five ledger-bound goal cards owned by hub task `t_b11f0591` still need owner verification; the
+  ledger `project()` is untouched.

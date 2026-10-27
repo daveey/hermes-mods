@@ -103,7 +103,10 @@ class Service:
                     observation_ids=row['observation_ids']))
         for provenance in meta['provenance']:
             if provenance['state']=='fresh' and (meta['freshness']!='fresh' or self.clock()>datetime.fromisoformat(provenance['expires_at'].replace('Z','+00:00')).timestamp()): provenance['state']='stale'
-        count=dict(registrations=len(rows),online=sum(r.registration=='online' for r in projections),busy=sum(r.activity=='busy' for r in projections),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(r.registration=='online' and not r.ready for r in projections),issues=sum('source_unavailable' in r.reasons or r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
+        # online/busy/unverified describe CURRENT evidence (plan §3/§5: stale inventory keeps
+        # last-known values per row but never counts as live); same rule as the Desktop chip.
+        current=[p for p,row in zip(projections,rows) if p.freshness=='fresh' and not snap['states'][row['id']].get('source_error') and p.registration=='online']
+        count=dict(registrations=len(rows),online=len(current),busy=sum(p.activity=='busy' for p in current),verified_ready=sum(r.ready for r in projections),readiness_unverified=sum(not p.ready for p in current),issues=sum('source_unavailable' in r.reasons or r.health in ('missing','offline','unavailable','degraded','stale','unknown','suspected_offline') for r in projections),mapped_hosts=len({r['host_id'] for r in rows if r['host_id']}),host_capacity=None)
         state='loading' if not snap else ('ready' if snap['collection']['state']=='complete' else 'partial')
         if snap and any(p['state']!='fresh' for p in meta['provenance']): state='partial'
         if not c['scopes']: state='not_configured'

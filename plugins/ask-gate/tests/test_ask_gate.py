@@ -152,13 +152,13 @@ def test_ok_verdict_delivers_and_records_for_open_asks(gate):
     assert gate.ledger().open_asks("s1") == ["Should I delete the 40 GB of backups?"]
 
 
-def test_nudge_budget_then_append_note(gate):
+def test_nudge_budget_then_withhold_rejected_draft(gate):
     gate.LLM = llm_returning([("unverified", "unchecked premise", "run the check")])
     text = "Can you confirm the token was revoked?"
     assert gate.pre_final_gate(session_id="s1", platform="tui", final_response=text, attempt=0)["hold"]
     assert gate.pre_final_gate(session_id="s1", platform="tui", final_response=text, attempt=1)["hold"]
     r = gate.pre_final_gate(session_id="s1", platform="tui", final_response=text, attempt=2)
-    assert "append" in r and "could not verify" in r["append"]
+    assert "replace" in r and text not in r["replace"]
     assert gate.last_verdict("s1") == "unverified"
 
 
@@ -203,7 +203,7 @@ def test_l1_block_lists_cards_and_ledger(board, gate):
     board("t_b0192d39", "done", title="Remove Superhuman", completed=1_792_620_000.0)
     board("t_aaaaaaaa", "blocked", title="Other", created=1100.0)
     board("t_zzzzzzzz", "done", session="other-chat")
-    gate.ledger().add("Superhuman", "already revoked", session="s0")
+    gate.ledger().add("Superhuman", "already revoked", session="s1")
     out = gate.pre_llm_call(session_id="s1", user_message="hi", conversation_history=[], platform="tui")
     ctx = out["context"]
     assert "t_b0192d39 [done" in ctx and "t_aaaaaaaa [blocked" in ctx and "t_zzzzzzzz" not in ctx
@@ -229,9 +229,9 @@ def test_l4_user_answer_is_recorded_and_shown_next_turn(gate):
                             conversation_history=[], platform="tui")
     assert "cancel Superhuman subscription" in out["context"]
     assert gate.ledger().open_asks("s1") == []
-    # cross-session: another chat sees it too
+    # Unrelated chats may concern a different account: no implicit global scope.
     out2 = gate.pre_llm_call(session_id="s9", user_message="hello", conversation_history=[], platform="tui")
-    assert "cancel Superhuman subscription" in out2["context"]
+    assert out2 is None
 
 
 def test_l4_strong_dismissal_recorded_even_if_model_down(gate):
@@ -449,7 +449,7 @@ def test_I1_I2_cards_pass_the_checked_gate_only_with_real_evidence(gate):
 
 
 def test_I4_repeat_is_caught_by_the_ledger_without_any_model_call(gate):
-    gate.ledger().add("cancel the Superhuman subscription", "already handled, i keep completing it", session="old")
+    gate.ledger().add("cancel the Superhuman subscription", "already handled, i keep completing it", session="s1")
     stub = llm_returning([("ok", "")])
     gate.LLM = stub
     r = gate.pre_final_gate(session_id="s1", platform="tui", final_response=FIX["I4"]["reply"], attempt=0)

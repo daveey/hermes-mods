@@ -1,0 +1,2086 @@
+From 5cd9bd01614bc56ce2576ba0ac93a28937b7e2d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:46:44 -0700
+Subject: [PATCH] feat(kanban): client-side sync seams behind
+ kanban.sync.enabled (off) [daveey]
+
+Phase 1 of the central Kanban sync service (hermes-mods
+core/kanban-central-service.md, "proposed patch 0193"). New sibling
+hermes_cli/kanban_db_sync.py holds the logic; each seam is one call.
+
+- Config gate: kanban.sync.enabled (default false) read at first connect.
+  Off: no sync table or trigger is created and stale capture triggers are
+  dropped, so every kanban path behaves as before.
+- On: kanban_sync_state/outbox/tombstones, uid columns, lease mirror, and
+  AFTER INSERT/UPDATE/DELETE triggers that capture synced columns into the
+  outbox inside the writer's transaction. Triggers are generated from
+  PRAGMA table_info minus the declared local-only set; undeclared_columns()
+  plus a test guard against trigger drift. BLOB cells travel as
+  {"$blob": hex} so a trigger never fails a write.
+- apply_remote_changes: one txn per page, echo suppression (applying flag
+  + client_op_id), run_uid -> local run id, local-only columns never
+  written, cursor atomic with rows, hooks fire once after commit with
+  remote=True/origin_gateway, dispatcher wake.
+- Leases (mode primary only): claim_task/claim_review_task ask an
+  injectable client before the CAS; no grant -> claim_deferred, card stays
+  ready. heartbeat_claim renews at most once per ttl/3 and bounds the claim
+  at lease_expires - 60s; release_stale_claims stops a worker that lost
+  its lease (run outcome lease_lost). reclaim_task releases the lease.
+- delete on a synced board writes one delete op + tombstone; synced
+  boards mint 16-hex time-ordered task ids.
+- Gateway dispatcher sleep ends early on a sync wake.
+
+Size ratchet offset: pure worker-context helpers moved to
+kanban_db_context.py.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/kanban_watchers.py                    |  20 +-
+ hermes_cli/config_defaults.py                 |   7 +-
+ hermes_cli/kanban_db.py                       | 109 +--
+ hermes_cli/kanban_db_connect.py               |   1 +
+ hermes_cli/kanban_db_context.py               |  76 ++
+ hermes_cli/kanban_db_graph.py                 |   7 +-
+ hermes_cli/kanban_db_sync.py                  | 807 ++++++++++++++++++
+ .../test_kanban_dispatcher_sync_wake.py       |  53 ++
+ tests/hermes_cli/kanban_sync_support.py       |  78 ++
+ tests/hermes_cli/test_kanban_sync_apply.py    | 176 ++++
+ tests/hermes_cli/test_kanban_sync_capture.py  | 238 ++++++
+ tests/hermes_cli/test_kanban_sync_leases.py   | 220 +++++
+ 12 files changed, 1708 insertions(+), 84 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_context.py
+ create mode 100644 hermes_cli/kanban_db_sync.py
+ create mode 100644 tests/gateway/test_kanban_dispatcher_sync_wake.py
+ create mode 100644 tests/hermes_cli/kanban_sync_support.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_apply.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_capture.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_leases.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 5e686a2ab5..004bcb84c4 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -60,6 +60,24 @@ class GatewayKanbanWatchersMixin:
+             await asyncio.sleep(min(1.0, interval - slept))
+             slept += 1.0
+ 
++    async def _sleep_until_tick_or_sync_wake(self, interval: float) -> None:
++        """``_sleep_between_ticks``, cut short (within ~1s) when an applied remote
++        sync change made work claimable (``kanban_db_sync.wake_dispatcher``)."""
++        from hermes_cli.kanban_db_sync import consume_dispatcher_wake
++        sleeper = asyncio.ensure_future(self._sleep_between_ticks(interval))
++        woke = False
++        try:
++            while not sleeper.done():
++                if consume_dispatcher_wake():
++                    woke = True
++                    break
++                await asyncio.wait({sleeper}, timeout=1.0)
++        finally:
++            if not sleeper.done():
++                sleeper.cancel()
++        if not woke:
++            await sleeper  # its result, or what it raised (stop/cancel semantics unchanged)
++
+     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+ 
+@@ -337,7 +355,7 @@ class GatewayKanbanWatchersMixin:
+                     health.invalidate()
+                     logger.exception("kanban dispatcher: unexpected watcher error")
+ 
+-                await self._sleep_between_ticks(interval)
++                await self._sleep_until_tick_or_sync_wake(interval)
+ 
+         finally:
+             self._release_kanban_dispatcher_lock()
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 13c8131e08..556f4c2606 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1890,6 +1890,8 @@ DEFAULT_CONFIG = {
+     },
+     # Kanban coordination: one dispatcher per board reclaims, promotes, and spawns workers.
+     "kanban": {
++        # Central sync (core patch 0193): true = boards opened afterwards get sync tables + outbox triggers. [daveey]
++        "sync": {"enabled": False},
+         # Opt-in per-profile broker argv before gh (empty = ordinary login); never include tokens.
+         "pr_acceptance": {"gh_command_prefix": []},
+         # Calendar retention for terminal worktrees; archive commits to recovery
+@@ -1937,10 +1939,7 @@ DEFAULT_CONFIG = {
+         "max_in_progress": None,
+         # Per-profile cap: positive int = no single profile runs more than N workers even if the
+         # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
+-        # when fan-out would saturate one profile's model/API quota/browser pool.
+-        # Unset (None) means "no per-profile cap" — backward-compatible with existing installs. Useful for
+-        # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
+-        # pool while leaving other profiles idle. See #21582.
++        # when fan-out would saturate one profile's model/API quota/browser pool. See #21582.
+         "max_in_progress_per_profile": None,
+         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
+         # this home's dispatcher may claim (list or comma-separated string). None = any existing
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 36fda86826..553e13a5c4 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -29,6 +29,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
++from hermes_cli import kanban_db_sync as _sync
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+ from toolsets import get_toolset_names
+@@ -330,34 +331,6 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
+     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+ 
+ 
+-# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
+-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+-_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
+-_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
+-_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
+-_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+-
+-
+-def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
+-    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
+-    reads a bare absolute timestamp as current fact — the relative age is what
+-    prompts a worker to re-verify stale sibling work."""
+-    try:
+-        ts = int(ts)
+-    except (TypeError, ValueError):
+-        return ""
+-    if now is None:
+-        now = int(time.time())
+-    delta = now - ts
+-    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
+-        return "just now"
+-    if delta < 3600:
+-        return f"{delta // 60}m ago"
+-    if delta < 86400:
+-        return f"{delta // 3600}h ago"
+-    return f"{delta // 86400}d ago"
+-
+-
+ # --- Paths ---
+ 
+ DEFAULT_BOARD = "default"
+@@ -1328,7 +1301,7 @@ def create_task(
+ 
+     # Retry once on the extremely unlikely id collision.
+     for attempt in range(2):
+-        task_id = _new_task_id()
++        task_id = _sync.new_task_id(conn)
+         try:
+             # allow_nested: graph builders compose create_task under one outer
+             # commit so the dispatcher never sees a half-built graph.
+@@ -2164,7 +2137,7 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
+ 
+ def _claim_and_open_run(
+     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
+-    *, event_extra: Optional[dict] = None,
++    *, event_extra: Optional[dict] = None, gate: Optional[_sync.ClaimGate] = None,
+ ) -> Optional[int]:
+     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
+     when the CAS lost. Caller holds the txn."""
+@@ -2184,6 +2157,7 @@ def _claim_and_open_run(
+     )
+     if cur.rowcount != 1:
+         return None
++    _sync.stage_claim(conn, task_id, gate)
+     trow = conn.execute(
+         "SELECT assignee, max_runtime_seconds, current_step_key "
+         "FROM tasks WHERE id = ?", (task_id,),
+@@ -2222,7 +2196,10 @@ def claim_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+-    with write_txn(conn):
++    gate = _sync.claim_gate(conn, task_id, expires)
++    if gate.deferred:
++        return None
++    with gate, write_txn(conn):
+         # Single enforcement point: never ready -> running with an undone
+         # parent, whichever writer set 'ready'. Demote to 'todo';
+         # recompute_ready re-promotes when the parents finish.
+@@ -2237,7 +2214,7 @@ def claim_task(
+         _reclaim_dangling_run(
+             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
+         )
+-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
++        run_id = _claim_and_open_run(conn, task_id, "ready", lock, gate.expires, now, gate=gate)
+         if run_id is None:
+             return None
+         claimed = get_task(conn, task_id)
+@@ -2255,7 +2232,10 @@ def claim_review_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+-    with write_txn(conn):
++    gate = _sync.claim_gate(conn, task_id, expires)
++    if gate.deferred:
++        return None
++    with gate, write_txn(conn):
+         if not _parents_satisfied(conn, task_id):
+             demoted = conn.execute(
+                 "UPDATE tasks SET status = 'todo' "
+@@ -2268,7 +2248,7 @@ def claim_review_task(
+                 )
+             return None
+         run_id = _claim_and_open_run(
+-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
++            conn, task_id, "review", lock, gate.expires, now, event_extra={"source_status": "review"}, gate=gate,
+         )
+         if run_id is None:
+             return None
+@@ -2339,6 +2319,7 @@ def heartbeat_claim(
+     """Extend a running claim; True if we still own it."""
+     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
+     lock = claimer or _claimer_id()
++    expires = _sync.heartbeat_expiry(conn, task_id, expires)  # bounded by the lease on synced boards
+     with write_txn(conn):
+         cur = conn.execute(
+             "UPDATE tasks SET claim_expires = ? "
+@@ -2403,9 +2384,10 @@ def release_stale_claims(
+         # Backstop: a heartbeat older than the max-stale threshold means no
+         # observable progress — reclaim even if the PID is alive (logic loop).
+         heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
++        lease_lost = _sync.lease_lost(conn, row["id"], now)  # a live worker never outlives its lease
+         started_at = _row_get(row, "worker_started_at")
+         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
+-                and not heartbeat_stale):
++                and not heartbeat_stale and not lease_lost):
+             _extend_live_stale_claim(conn, row, now)
+             continue
+ 
+@@ -2433,7 +2415,7 @@ def release_stale_claims(
+             if cur.rowcount != 1:
+                 continue
+             run_id = _record_reclaim(
+-                conn, row["id"], termination,
++                conn, row["id"], termination, outcome="lease_lost" if lease_lost else "reclaimed",
+                 error=f"stale_lock={row['claim_lock']}",
+                 payload={
+                     "stale_lock": row["claim_lock"],
+@@ -2468,11 +2450,12 @@ def release_stale_claims(
+ 
+ def _record_reclaim(
+     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
++    outcome: str = "reclaimed",
+ ) -> Optional[int]:
+     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
+     (payload merged with the termination report). Caller holds the txn."""
+     run_id = _end_run(
+-        conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
++        conn, task_id, outcome=outcome, status=outcome, error=error, metadata=termination,
+     )
+     payload.update(termination)
+     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+@@ -2535,11 +2518,12 @@ def reclaim_task(
+         )
+         if cur.rowcount != 1:
+             return False
+-        _record_reclaim(
++        run_id = _record_reclaim(
+             conn, task_id, termination,
+             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
+             payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
+         )
++    _sync.release_lease(conn, task_id, _sync.run_uid(conn, run_id))
+     # Operator intervention = fresh retry budget (own txn, runs after commit).
+     _clear_failure_counter(conn, task_id)
+     return True
+@@ -4096,43 +4080,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     return "\n".join(lines).rstrip() + "\n" + build_recovery_context(conn, task_id)
+ 
+ 
+-def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+-    """Truncate to ``limit`` chars with a visible ellipsis."""
+-    if not s:
+-        return ""
+-    s = s.strip()
+-    if len(s) <= limit:
+-        return s
+-    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+-
+-
+-def _ctx_stamp(ts: int, now: int) -> str:
+-    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
+-    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+-    age = _relative_age(ts, now)
+-    return f"{disp}, {age}" if age else disp
+-
+-
+-def _ctx_metadata_line(metadata: Any) -> Optional[str]:
+-    if not metadata:
+-        return None
+-    try:
+-        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
+-    except Exception:
+-        return None
+-
+-
+-def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
+-    """Keep the newest ``cap`` items; describe the omitted head, if any."""
+-    omitted = max(0, len(items) - cap)
+-    if not omitted:
+-        return items, None
+-    return items[-cap:], (
+-        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
+-        f"omitted; showing most recent {cap})_"
+-    )
+-
+-
+ def _ctx_header(lines: list[str], task: Task) -> None:
+     lines.append(f"# Kanban task {task.id}: {task.title}")
+     lines.append("")
+@@ -4563,6 +4510,18 @@ from hermes_cli.kanban_db_boards import (
+     remove_board,
+     write_board_metadata,
+ )
++from hermes_cli.kanban_db_context import (
++    _CTX_MAX_BODY_BYTES,
++    _CTX_MAX_COMMENT_BYTES,
++    _CTX_MAX_COMMENTS,
++    _CTX_MAX_FIELD_BYTES,
++    _CTX_MAX_PRIOR_ATTEMPTS,
++    _ctx_cap,
++    _ctx_metadata_line,
++    _ctx_stamp,
++    _ctx_tail,
++    _relative_age,
++)
+ from hermes_cli.kanban_db_connect import (
+     _INITIALIZED_PATHS,
+     init_db,
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 857ab4f1e9..7277453b1a 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -788,6 +788,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+             if resolved not in _INITIALIZED_PATHS:
+                 conn.executescript(_kb.SCHEMA_SQL)
+                 _migrate_add_optional_columns(conn)
++                _kb._sync.install_or_remove(conn, resolved)
+                 _INITIALIZED_PATHS.add(resolved)
+ 
+         conn, _ = _open_configured(path, _init_if_needed)
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+new file mode 100644
+index 0000000000..e1da9c977e
+--- /dev/null
++++ b/hermes_cli/kanban_db_context.py
+@@ -0,0 +1,76 @@
++"""Pure text helpers for :func:`kanban_db.build_worker_context`: the prompt caps,
++truncation, timestamps with relative ages and tail-capping of long lists.
++
++Split out of ``hermes_cli.kanban_db`` (no board or SQLite access here).
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from typing import Any, Optional
++
++
++# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
++_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
++_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
++_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
++_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
++_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
++
++
++def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
++    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
++    reads a bare absolute timestamp as current fact — the relative age is what
++    prompts a worker to re-verify stale sibling work."""
++    try:
++        ts = int(ts)
++    except (TypeError, ValueError):
++        return ""
++    if now is None:
++        now = int(time.time())
++    delta = now - ts
++    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
++        return "just now"
++    if delta < 3600:
++        return f"{delta // 60}m ago"
++    if delta < 86400:
++        return f"{delta // 3600}h ago"
++    return f"{delta // 86400}d ago"
++
++
++def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
++    """Truncate to ``limit`` chars with a visible ellipsis."""
++    if not s:
++        return ""
++    s = s.strip()
++    if len(s) <= limit:
++        return s
++    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
++
++
++def _ctx_stamp(ts: int, now: int) -> str:
++    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
++    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
++    age = _relative_age(ts, now)
++    return f"{disp}, {age}" if age else disp
++
++
++def _ctx_metadata_line(metadata: Any) -> Optional[str]:
++    if not metadata:
++        return None
++    try:
++        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
++    except Exception:
++        return None
++
++
++def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
++    """Keep the newest ``cap`` items; describe the omitted head, if any."""
++    omitted = max(0, len(items) - cap)
++    if not omitted:
++        return items, None
++    return items[-cap:], (
++        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
++        f"omitted; showing most recent {cap})_"
++    )
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index aa3f5af236..4bbf5cbdb2 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -187,9 +187,8 @@ def _insert_decomposed_child(
+     with no lock; leaving it unset makes dispatch materialize a fresh
+     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+     """
+-    from hermes_cli.kanban_db import (
+-        _new_task_id, _canonical_assignee, _append_event,
+-    )
++    from hermes_cli.kanban_db import _canonical_assignee, _append_event
++    from hermes_cli.kanban_db_sync import new_task_id
+ 
+     root_ws_kind = root_row["workspace_kind"] or "scratch"
+     child_ws_kind = child.get("workspace_kind") or root_ws_kind
+@@ -201,7 +200,7 @@ def _insert_decomposed_child(
+         child_ws_path = root_row["workspace_path"]
+     else:
+         child_ws_path = None
+-    new_id = _new_task_id()
++    new_id = new_task_id(conn)
+     import json
+     from hermes_cli.kanban_capabilities import validate_assignment
+     assignee = _canonical_assignee(child.get("assignee"))
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+new file mode 100644
+index 0000000000..3db6237fe4
+--- /dev/null
++++ b/hermes_cli/kanban_db_sync.py
+@@ -0,0 +1,807 @@
++"""Client-side seams for the central Kanban sync service (core patch 0193).
++
++Everything here is inert unless ``kanban.sync.enabled`` is true when a board
++file is first opened. With the flag off no sync table or trigger is created
++(and triggers left by an earlier enable are dropped), so every kanban code path
++behaves exactly as before.
++
++With the flag on, each board file gets:
++
++- ``kanban_sync_state`` (one row: mode ``off|shadow|primary``, feed cursor,
++  ``applying`` echo guard, the run uid a granted lease reserved),
++  ``kanban_sync_outbox`` and ``kanban_sync_tombstones``;
++- a ``uid`` on comments/events/runs/attachments and the lease mirror columns on
++  ``tasks``;
++- ``AFTER INSERT/UPDATE/DELETE`` triggers that copy synced columns into the
++  outbox inside the writer's own transaction. They are generated from
++  ``PRAGMA table_info`` minus the declared local-only columns, so a column an
++  upstream migration adds is captured by default; ``undeclared_columns`` names
++  it so a test forces the synced/local decision.
++
++The network side (outbox drain, change feed, enrollment) is not here: it lives
++in a plugin on top of :func:`apply_remote_changes` and :func:`set_lease_client`.
++Design: hermes-mods ``core/kanban-central-service.md``.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import secrets
++import sqlite3
++import threading
++import time
++from dataclasses import dataclass, field
++from typing import Any, Mapping, Optional, Protocol, Sequence
++
++from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
++
++_log = logging.getLogger(__name__)
++
++MODES = ("off", "shadow", "primary")
++# A worker whose lease cannot be renewed is stopped this long before the
++# server-side expiry, so it is gone before another gateway can be granted the card.
++LEASE_SAFETY_MARGIN_SECONDS = 60
++
++# Columns that travel to the service. Integer cross-references travel as uids
++# (``REF_COLUMNS``); identity columns (``KEY_COLUMNS``) are the row key, never a field.
++SYNCED_COLUMNS: dict[str, frozenset[str]] = {
++    "tasks": frozenset({
++        "title", "body", "assignee", "status", "priority", "created_by", "created_at", "started_at",
++        "completed_at", "workspace_kind", "branch_name", "tenant", "result", "idempotency_key",
++        "consecutive_failures", "last_failure_error", "max_runtime_seconds", "current_run_id",
++        "workflow_template_id", "current_step_key", "skills", "requires", "model_override",
++        "provider_override", "reasoning_effort", "max_retries", "goal_mode", "goal_max_turns",
++        "block_kind", "human_request", "block_recurrences", "completion_contract",
++    }),
++    "task_links": frozenset({"parent_id", "child_id"}),
++    "task_comments": frozenset({"task_id", "author", "body", "created_at"}),
++    "task_events": frozenset({"task_id", "run_id", "kind", "payload", "created_at"}),
++    "task_runs": frozenset({
++        "task_id", "profile", "step_key", "status", "max_runtime_seconds", "started_at", "ended_at",
++        "outcome", "summary", "metadata", "error",
++    }),
++    "task_attachments": frozenset({
++        "task_id", "filename", "content_type", "size", "uploaded_by", "created_at", "blob_key",
++    }),
++}
++# Machine-local: host:pid claimers, PIDs, local paths, local session ids and the
++# read-only lease mirror. Stored locally, never pushed, never overwritten by a pull.
++LOCAL_COLUMNS: dict[str, frozenset[str]] = {
++    "tasks": frozenset({
++        "claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at",
++        "workspace_path", "session_id", "project_id", "sync_version", "field_hlc", "lease_holder",
++        "lease_expires",
++    }),
++    "task_links": frozenset(),
++    "task_comments": frozenset(),
++    "task_events": frozenset(),
++    "task_runs": frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at"}),
++    "task_attachments": frozenset({"stored_path"}),
++}
++KEY_COLUMNS: dict[str, frozenset[str]] = {
++    "tasks": frozenset({"id"}),
++    "task_links": frozenset(),
++    **{t: frozenset({"id", "uid"}) for t in ("task_comments", "task_events", "task_runs", "task_attachments")},
++}
++REF_COLUMNS: dict[tuple[str, str], str] = {
++    ("tasks", "current_run_id"): "current_run_uid",
++    ("task_events", "run_id"): "run_uid",
++}
++SYNCED_TABLES = tuple(SYNCED_COLUMNS)
++_UID_TABLES = ("task_comments", "task_events", "task_runs", "task_attachments")
++# Append-only rows leave only with their task; a delete trigger there would echo
++# every cascade row of a task delete the service already cascades itself.
++_DELETE_CAPTURED = ("tasks", "task_links", "task_attachments")
++
++_NOW_MS_SQL = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
++# UUIDv7 inline (no subquery: SQLite may evaluate an uncorrelated subquery once per statement).
++_UUID7_SQL = (
++    f"printf('%08x-%04x-7%03x-%x%03x-%012x', ({_NOW_MS_SQL}) >> 16, ({_NOW_MS_SQL}) & 65535, "
++    "abs(random()) % 4096, 8 + abs(random()) % 4, abs(random()) % 4096, abs(random()) % 281474976710656)"
++)
++_NOT_APPLYING = "COALESCE((SELECT applying FROM kanban_sync_state LIMIT 1), 0) = 0"
++
++SYNC_SCHEMA_SQL = """
++CREATE TABLE IF NOT EXISTS kanban_sync_outbox (
++    op_id        TEXT PRIMARY KEY,
++    table_name   TEXT NOT NULL,
++    row_uid      TEXT NOT NULL,
++    op           TEXT NOT NULL,
++    fields       TEXT NOT NULL,
++    base_version INTEGER,
++    hlc          TEXT NOT NULL,
++    created_at   INTEGER NOT NULL,
++    attempts     INTEGER NOT NULL DEFAULT 0,
++    last_error   TEXT,
++    state        TEXT NOT NULL DEFAULT 'pending'
++);
++CREATE INDEX IF NOT EXISTS idx_outbox_pending ON kanban_sync_outbox(state, created_at);
++CREATE TABLE IF NOT EXISTS kanban_sync_tombstones (
++    table_name TEXT NOT NULL,
++    row_uid    TEXT NOT NULL,
++    deleted_at INTEGER NOT NULL,
++    PRIMARY KEY (table_name, row_uid)
++);
++CREATE TABLE IF NOT EXISTS kanban_sync_state (
++    board_id        TEXT PRIMARY KEY,
++    cursor          INTEGER NOT NULL DEFAULT 0,
++    gateway_id      TEXT NOT NULL,
++    hlc_last        TEXT NOT NULL,
++    mode            TEXT NOT NULL,
++    applying        INTEGER NOT NULL DEFAULT 0,
++    pending_run_uid TEXT
++);
++"""
++_SYNC_COLUMN_DDL = (
++    *((t, "uid", "uid TEXT") for t in _UID_TABLES),
++    ("task_attachments", "blob_key", "blob_key TEXT"),
++    ("tasks", "sync_version", "sync_version INTEGER"),
++    ("tasks", "field_hlc", "field_hlc TEXT"),
++    ("tasks", "lease_holder", "lease_holder TEXT"),
++    ("tasks", "lease_expires", "lease_expires INTEGER"),
++)
++
++# Resolved db paths whose triggers this process installed. Empty = no synced
++# board was opened here, and every seam returns without touching SQLite.
++_SYNCED_PATHS: set[str] = set()
++_DISPATCHER_WAKE = threading.Event()
++_RENEW_ATTEMPTS: dict[str, float] = {}
++
++
++def uuid7() -> str:
++    """Time-ordered UUIDv7 string (48-bit ms timestamp + 74 random bits)."""
++    ms = time.time_ns() // 1_000_000
++    rand = int.from_bytes(secrets.token_bytes(10), "big")
++    value = (ms & ((1 << 48) - 1)) << 80 | 0x7 << 76 | (rand >> 68 & 0xFFF) << 64 | 0b10 << 62 | rand & ((1 << 62) - 1)
++    h = f"{value:032x}"
++    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
++
++
++# --- Config + install -----------------------------------------------------------------------------
++
++def sync_enabled() -> bool:
++    """``kanban.sync.enabled`` (default False). An unreadable config reads as off,
++    which is today's behaviour."""
++    try:
++        from hermes_cli.config import load_config
++        kanban = (load_config() or {}).get("kanban") or {}
++    except Exception as exc:  # health: allow BLE001 -- an unreadable config reads as sync off; connect() must not break
++        _log.warning("kanban sync: cannot read config (%s: %s); sync stays off", type(exc).__name__, exc)
++        return False
++    sync = kanban.get("sync") if isinstance(kanban, Mapping) else None
++    return bool(isinstance(sync, Mapping) and sync.get("enabled"))
++
++
++def _db_key(conn: sqlite3.Connection) -> Optional[str]:
++    from hermes_cli.kanban_db_connect import _main_db_file
++    return _main_db_file(conn)
++
++
++def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
++    """Init-time seam: with the flag on, create the sync tables and (unless the
++    board was detached to ``off``) install the capture triggers; with it off,
++    drop any capture trigger an earlier enable left in the file."""
++    if not sync_enabled():
++        _SYNCED_PATHS.discard(db_path)
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
++                        "AND name LIKE 'kanban_sync_%' LIMIT 1").fetchone():
++            drop_triggers(conn)
++        return
++    conn.executescript(SYNC_SCHEMA_SQL)
++    for table, column, ddl in _SYNC_COLUMN_DDL:
++        _add_column_if_missing(conn, table, column, ddl)
++    for table in _UID_TABLES:
++        conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uid ON {table}(uid)")
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_sync_state (board_id, gateway_id, hlc_last, mode) "
++        "SELECT ?, ?, '', 'shadow' WHERE NOT EXISTS (SELECT 1 FROM kanban_sync_state)",
++        (f"local:{uuid7()}", f"gw_{uuid7()}"),
++    )
++    if conn.execute("SELECT mode FROM kanban_sync_state").fetchone()[0] == "off":
++        drop_triggers(conn)
++        _SYNCED_PATHS.discard(db_path)
++        return
++    # Rows written before the first enable get their global identity now.
++    for table in _UID_TABLES:
++        conn.execute(f"UPDATE {table} SET uid = {_UUID7_SQL} WHERE uid IS NULL")
++    install_triggers(conn)
++    _SYNCED_PATHS.add(db_path)
++
++
++def drop_triggers(conn: sqlite3.Connection) -> None:
++    names = [r[0] for r in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'kanban_sync_%'")]
++    for name in names:
++        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++
++
++def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
++    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
++
++
++def captured_columns(conn: sqlite3.Connection, table: str) -> list[str]:
++    """Columns the triggers capture: everything but local-only and key columns."""
++    skip = LOCAL_COLUMNS[table] | KEY_COLUMNS[table]
++    return [c for c in table_columns(conn, table) if c not in skip]
++
++
++def undeclared_columns(conn: sqlite3.Connection) -> dict[str, set[str]]:
++    """Per synced table, columns that are neither synced, local-only nor a key:
++    a migration added them and nobody decided whether they leave the gateway."""
++    out: dict[str, set[str]] = {}
++    for table in SYNCED_TABLES:
++        known = SYNCED_COLUMNS[table] | LOCAL_COLUMNS[table] | KEY_COLUMNS[table]
++        extra = set(table_columns(conn, table)) - known
++        if extra:
++            out[table] = extra
++    return out
++
++
++def _wire_name(table: str, column: str) -> str:
++    return REF_COLUMNS.get((table, column), column)
++
++
++def _wire_value(table: str, column: str, ref: str) -> str:
++    """SQL for one captured value as JSON text (``ref`` is ``NEW`` or a row alias).
++    JSON cannot hold a BLOB, and a capture trigger must never fail the writer's
++    statement, so a BLOB cell travels as ``{"$blob": "<hex>"}``."""
++    if (table, column) in REF_COLUMNS:
++        return f"json_quote((SELECT r.uid FROM task_runs AS r WHERE r.id = {ref}.{column}))"
++    value = f"{ref}.{column}"
++    return f"CASE WHEN typeof({value}) = 'blob' THEN json_object('$blob', hex({value})) ELSE json_quote({value}) END"
++
++
++def _from_wire(value: Any) -> Any:
++    if isinstance(value, Mapping) and set(value) == {"$blob"}:
++        return bytes.fromhex(value["$blob"])
++    return value
++
++
++def _row_uid_sql(table: str, ref: str) -> str:
++    if table == "tasks":
++        return f"{ref}.id"
++    if table == "task_links":
++        return f"{ref}.parent_id || '>' || {ref}.child_id"
++    return f"{ref}.uid"
++
++
++def _outbox_insert(table: str, op: str, row_uid: str, fields_sql: str, base_version: str = "NULL") -> str:
++    return (
++        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++        f"VALUES ({_UUID7_SQL}, '{table}', {row_uid}, '{op}', {fields_sql}, {base_version}, '', {_NOW_MS_SQL});"
++    )
++
++
++def _insert_trigger(table: str, columns: list[str]) -> str:
++    name = f"kanban_sync_{table}_ins"
++    if table in _UID_TABLES:
++        uid = _UUID7_SQL
++        prelude = ""
++        if table == "task_runs":
++            uid = f"COALESCE((SELECT pending_run_uid FROM kanban_sync_state LIMIT 1), {_UUID7_SQL})"
++            prelude = "UPDATE kanban_sync_state SET pending_run_uid = NULL WHERE pending_run_uid IS NOT NULL;"
++        fields = "json_object(" + ", ".join(f"'{_wire_name(table, c)}', json({_wire_value(table, c, 's')})" for c in columns) + ")"
++        body = (
++            f"UPDATE {table} SET uid = {uid} WHERE id = NEW.id AND uid IS NULL; {prelude}"
++            "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++            f"SELECT {_UUID7_SQL}, '{table}', s.uid, 'upsert', {fields}, NULL, '', {_NOW_MS_SQL} "
++            f"FROM {table} AS s WHERE s.id = NEW.id;"
++        )
++    else:
++        fields = "json_object(" + ", ".join(f"'{_wire_name(table, c)}', json({_wire_value(table, c, 'NEW')})" for c in columns) + ")"
++        body = _outbox_insert(table, "upsert", _row_uid_sql(table, "NEW"), fields)
++        if table == "task_links":  # add-wins: re-linking clears an earlier removal
++            body = (f"DELETE FROM kanban_sync_tombstones WHERE table_name = 'task_links' "
++                    f"AND row_uid = {_row_uid_sql(table, 'NEW')}; " + body)
++    return f"CREATE TRIGGER {name} AFTER INSERT ON {table} WHEN {_NOT_APPLYING} BEGIN {body} END"
++
++
++def _update_trigger(table: str, columns: list[str]) -> str:
++    changed = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in columns)
++    pairs = " UNION ALL ".join(
++        f"SELECT '{_wire_name(table, c)}' AS k, {_wire_value(table, c, 'NEW')} AS v WHERE OLD.{c} IS NOT NEW.{c}"
++        for c in columns
++    )
++    fields = f"(SELECT json_group_object(k, json(v)) FROM ({pairs}))"
++    base = "NEW.sync_version" if table == "tasks" else "NULL"
++    body = _outbox_insert(table, "upsert", _row_uid_sql(table, "NEW"), fields, base)
++    return (f"CREATE TRIGGER kanban_sync_{table}_upd AFTER UPDATE ON {table} "
++            f"WHEN {_NOT_APPLYING} AND ({changed}) BEGIN {body} END")
++
++
++def _delete_trigger(table: str) -> str:
++    when = _NOT_APPLYING
++    if table == "task_links":  # links removed by a task delete ride on the task's tombstone
++        when += (" AND EXISTS (SELECT 1 FROM tasks WHERE id = OLD.parent_id)"
++                 " AND EXISTS (SELECT 1 FROM tasks WHERE id = OLD.child_id)")
++    elif table == "task_attachments":
++        when += " AND EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)"
++    uid = _row_uid_sql(table, "OLD")
++    body = (
++        _outbox_insert(table, "delete", uid, "'{}'")
++        + " INSERT OR REPLACE INTO kanban_sync_tombstones (table_name, row_uid, deleted_at) "
++        f"VALUES ('{table}', {uid}, {_NOW_MS_SQL});"
++    )
++    return f"CREATE TRIGGER kanban_sync_{table}_del AFTER DELETE ON {table} WHEN {when} BEGIN {body} END"
++
++
++def install_triggers(conn: sqlite3.Connection) -> None:
++    """(Re)generate every capture trigger from the live column list."""
++    drop_triggers(conn)
++    for table in SYNCED_TABLES:
++        columns = captured_columns(conn, table)
++        conn.execute(_insert_trigger(table, columns))
++        if table != "task_links":
++            conn.execute(_update_trigger(table, columns))
++        if table in _DELETE_CAPTURED:
++            conn.execute(_delete_trigger(table))
++
++
++# --- Per-connection state -------------------------------------------------------------------------
++
++def board_mode(conn: sqlite3.Connection) -> str:
++    """``off`` unless this process installed sync on the connection's file."""
++    if not _SYNCED_PATHS or _db_key(conn) not in _SYNCED_PATHS:
++        return "off"
++    row = conn.execute("SELECT mode FROM kanban_sync_state LIMIT 1").fetchone()
++    return row[0] if row else "off"
++
++
++def _state(conn: sqlite3.Connection) -> sqlite3.Row:
++    return conn.execute("SELECT board_id, gateway_id, cursor FROM kanban_sync_state LIMIT 1").fetchone()
++
++
++def set_mode(conn: sqlite3.Connection, mode: str) -> None:
++    """Switch the board's sync mode; ``off`` drops the capture triggers."""
++    if mode not in MODES:
++        raise ValueError(f"unknown kanban sync mode {mode!r}")
++    from hermes_cli.kanban_db_connect import write_txn
++    key = _db_key(conn)
++    with write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET mode = ?", (mode,))
++        if mode == "off":
++            drop_triggers(conn)
++        else:
++            install_triggers(conn)
++    if key:
++        (_SYNCED_PATHS.discard if mode == "off" else _SYNCED_PATHS.add)(key)
++
++
++def new_task_id(conn: sqlite3.Connection) -> str:
++    """Synced boards: ``t_`` + 16 hex (48-bit ms timestamp + 16 random bits), safe
++    across gateways and offline creation; otherwise the classic 8-hex id."""
++    from hermes_cli import kanban_db as _kb
++    if board_mode(conn) == "off":
++        return _kb._new_task_id()
++    return f"t_{time.time_ns() // 1_000_000 & ((1 << 48) - 1):012x}{secrets.token_hex(2)}"
++
++
++# --- Leases ---------------------------------------------------------------------------------------
++
++class LeaseUnavailable(Exception):
++    """The lease service could not be reached (offline, timeout, not enrolled).
++    Clients raise this (or let a socket ``OSError`` through) for every transport failure."""
++
++
++_CLIENT_ERRORS = (LeaseUnavailable, OSError)
++
++
++@dataclass(frozen=True)
++class Lease:
++    granted: bool
++    run_uid: str
++    expires_ms: Optional[int] = None
++    holder: Optional[str] = None
++    reason: Optional[str] = None
++
++
++class LeaseClient(Protocol):
++    def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> Lease: ...
++
++    def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> Lease: ...
++
++    def release(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str) -> None: ...
++
++
++_LEASE_CLIENT: Optional[LeaseClient] = None
++
++
++def set_lease_client(client: Optional[LeaseClient]) -> Optional[LeaseClient]:
++    """Install the process's lease client (the sync plugin); returns the previous one."""
++    global _LEASE_CLIENT
++    previous, _LEASE_CLIENT = _LEASE_CLIENT, client
++    return previous
++
++
++def _client() -> LeaseClient:
++    if _LEASE_CLIENT is None:
++        raise LeaseUnavailable("no lease client registered")
++    return _LEASE_CLIENT
++
++
++class ClaimGate:
++    """Outcome of asking for a lease before a claim CAS.
++
++    Used as the OUTER context manager around the claim's ``write_txn`` so a
++    lease granted for a CAS that then lost is released after the commit, never
++    while the SQLite write lock is held."""
++
++    def __init__(self, expires: int, *, deferred: bool = False, lease: Optional[Lease] = None,
++                 ids: Optional[tuple[str, str, str]] = None) -> None:
++        self.expires, self.deferred, self.lease, self._ids = expires, deferred, lease, ids
++        self.consumed = False
++
++    def __enter__(self) -> ClaimGate:
++        return self
++
++    def __exit__(self, *exc: object) -> None:
++        if self.lease is None or self.consumed:
++            return
++        board_id, gateway_id, task_id = self._ids
++        try:
++            _client().release(board_id=board_id, task_uid=task_id, run_uid=self.lease.run_uid, gateway_id=gateway_id)
++        except _CLIENT_ERRORS as err:  # the lease then simply expires on the server
++            _log.info("kanban sync: release of unused lease for %s failed: %s", task_id, err)
++
++
++def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int) -> ClaimGate:
++    """Lease seam before a claim CAS. Only ``primary`` boards ask the service;
++    without a grant the card stays ``ready`` (no offline claims: every card is
++    at-most-once in v1). A grant bounds the local claim to the lease deadline."""
++    if board_mode(conn) != "primary":
++        return ClaimGate(expires)
++    state = _state(conn)
++    ids = (state["board_id"], state["gateway_id"], task_id)
++    run_uid = uuid7()
++    try:
++        lease = _client().acquire(board_id=ids[0], task_uid=task_id, run_uid=run_uid, gateway_id=ids[1],
++                                  ttl_s=max(expires - int(time.time()), 1))
++    except _CLIENT_ERRORS as exc:  # fail closed: an unreachable service defers the claim
++        _log.info("claim_deferred: offline task=%s (%s: %s)", task_id, type(exc).__name__, exc)
++        return ClaimGate(expires, deferred=True)
++    if not lease.granted:
++        _log.info("claim_deferred: %s task=%s holder=%s", lease.reason or "denied", task_id, lease.holder)
++        return ClaimGate(expires, deferred=True)
++    deadline = lease.expires_ms // 1000 - LEASE_SAFETY_MARGIN_SECONDS
++    return ClaimGate(min(expires, deadline), lease=lease, ids=ids)
++
++
++def stage_claim(conn: sqlite3.Connection, task_id: str, gate: Optional[ClaimGate]) -> None:
++    """Inside the claim txn, after the CAS won: mirror the lease onto the task
++    and reserve its run uid for the run row the caller inserts next."""
++    if gate is None or gate.lease is None:
++        return
++    lease = gate.lease
++    conn.execute("UPDATE kanban_sync_state SET pending_run_uid = ?", (lease.run_uid,))
++    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ? WHERE id = ?",
++                 (gate._ids[1], lease.expires_ms, task_id))
++    gate.consumed = True
++
++
++def _renewal_due(task_id: str, lease_expires_ms: int, ttl_s: int) -> bool:
++    """At most one renewal attempt per ``ttl/3``, and only once a third of the lease is used."""
++    remaining_s = lease_expires_ms / 1000 - time.time()
++    last = _RENEW_ATTEMPTS.get(task_id)
++    if remaining_s > ttl_s * 2 / 3 or (last is not None and time.monotonic() - last < ttl_s / 3):
++        return False
++    _RENEW_ATTEMPTS[task_id] = time.monotonic()
++    return True
++
++
++def heartbeat_expiry(conn: sqlite3.Connection, task_id: str, expires: int) -> int:
++    """Heartbeat seam: renew the lease when due and bound the claim extension to
++    the lease deadline. A worker that cannot renew therefore goes stale at
++    ``lease_expires - margin`` and the dispatcher's stale-claim path stops it."""
++    if board_mode(conn) != "primary":
++        return expires
++    row = conn.execute(
++        "SELECT t.lease_expires, r.uid AS run_uid FROM tasks t "
++        "LEFT JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?", (task_id,),
++    ).fetchone()
++    if row is None or row["lease_expires"] is None:
++        return expires
++    lease_expires = row["lease_expires"]
++    ttl_s = max(expires - int(time.time()), 1)
++    if _renewal_due(task_id, lease_expires, ttl_s):
++        lease_expires = _renew(conn, task_id, row["run_uid"], ttl_s) or lease_expires
++    return min(expires, lease_expires // 1000 - LEASE_SAFETY_MARGIN_SECONDS)
++
++
++def _renew(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str], ttl_s: int) -> Optional[int]:
++    from hermes_cli.kanban_db_connect import write_txn
++    state = _state(conn)
++    try:
++        lease = _client().renew(board_id=state["board_id"], task_uid=task_id, run_uid=run_uid or "",
++                                gateway_id=state["gateway_id"], ttl_s=ttl_s)
++    except _CLIENT_ERRORS as exc:
++        _log.warning("kanban sync: lease renewal for %s failed (%s: %s)", task_id, type(exc).__name__, exc)
++        return None
++    with write_txn(conn):
++        if lease.granted:
++            conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (lease.expires_ms, task_id))
++            return lease.expires_ms
++        _log.warning("kanban sync: lease for %s lost to %s (%s)", task_id, lease.holder, lease.reason)
++        conn.execute("UPDATE tasks SET lease_holder = ? WHERE id = ?", (lease.holder, task_id))
++    return None
++
++
++def lease_lost(conn: sqlite3.Connection, task_id: str, now: int) -> bool:
++    """True when this gateway no longer holds the card's lease, or the lease is
++    within the safety margin of expiring (renewal kept failing)."""
++    if board_mode(conn) != "primary":
++        return False
++    row = conn.execute("SELECT lease_holder, lease_expires FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or row["lease_expires"] is None:
++        return False
++    own = _state(conn)["gateway_id"]
++    return row["lease_holder"] != own or now >= row["lease_expires"] // 1000 - LEASE_SAFETY_MARGIN_SECONDS
++
++
++def release_lease(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str]) -> None:
++    """Best-effort release after an operator reclaim (post-commit)."""
++    if board_mode(conn) != "primary" or run_uid is None:
++        return
++    state = _state(conn)
++    try:
++        _client().release(board_id=state["board_id"], task_uid=task_id, run_uid=run_uid,
++                          gateway_id=state["gateway_id"])
++    except _CLIENT_ERRORS as exc:
++        _log.info("kanban sync: lease release for %s failed (%s); it expires on the server", task_id, exc)
++
++
++def run_uid(conn: sqlite3.Connection, run_id: Optional[int]) -> Optional[str]:
++    if run_id is None or board_mode(conn) == "off":
++        return None
++    row = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++    return row[0] if row else None
++
++
++# --- Dispatcher wake ------------------------------------------------------------------------------
++
++def wake_dispatcher() -> None:
++    _DISPATCHER_WAKE.set()
++
++
++def consume_dispatcher_wake() -> bool:
++    """True once after :func:`apply_remote_changes` made work claimable."""
++    if not _DISPATCHER_WAKE.is_set():
++        return False
++    _DISPATCHER_WAKE.clear()
++    return True
++
++
++# --- Apply path -----------------------------------------------------------------------------------
++
++@dataclass(frozen=True)
++class RemoteChange:
++    seq: int
++    table: str
++    uid: str
++    op: str  # 'upsert' | 'delete' | 'lease'
++    fields: Mapping[str, Any]
++    version: int
++    hlc: str
++    origin_gateway: str
++    client_op_id: Optional[str] = None
++
++
++@dataclass
++class ApplyResult:
++    cursor: int
++    applied: int = 0
++    skipped_echo: int = 0
++    skipped: int = 0
++    hooks: list[tuple[str, str, dict]] = field(default_factory=list)
++    changed_fields: dict[str, set[str]] = field(default_factory=dict)
++    wake_dispatcher: bool = False
++    blobs_to_fetch: list[str] = field(default_factory=list)
++
++
++_STATUS_HOOKS = {"running": "kanban_task_claimed", "done": "kanban_task_completed", "blocked": "kanban_task_blocked"}
++_CLAIMABLE = ("ready", "review")
++
++
++def apply_remote_changes(
++    conn: sqlite3.Connection, changes: Sequence[RemoteChange], *, new_cursor: int, board: Optional[str] = None,
++) -> ApplyResult:
++    """Apply one feed page in ONE transaction, then fire local observers.
++
++    The ``applying`` flag suppresses the capture triggers (no echo), our own op
++    coming back (``client_op_id`` still in the outbox) only clears that outbox
++    row, ``run_uid`` is translated to the local run id, local-only columns are
++    never written from the wire, and the cursor advances in the same commit as
++    the rows. Hooks fire once, after the commit, with ``remote=True`` and
++    ``origin_gateway``; a page that makes work claimable wakes the dispatcher."""
++    from hermes_cli.kanban_db_connect import write_txn
++    if board_mode(conn) == "off":
++        raise RuntimeError("apply_remote_changes: kanban sync is not enabled on this board")
++    result = ApplyResult(cursor=new_cursor)
++    with write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        own = _state(conn)["gateway_id"]
++        for change in changes:
++            _apply_one(conn, change, own, result)
++        conn.execute("UPDATE kanban_sync_state SET cursor = ?, applying = 0", (new_cursor,))
++    _after_commit(conn, result, board)
++    return result
++
++
++def _apply_one(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> None:
++    if ch.table not in SYNCED_COLUMNS:
++        raise ValueError(f"apply_remote_changes: unknown table {ch.table!r}")
++    if ch.client_op_id and conn.execute(
++            "DELETE FROM kanban_sync_outbox WHERE op_id = ?", (ch.client_op_id,)).rowcount:
++        if ch.table == "tasks":
++            conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
++                         (ch.version, ch.uid))
++        result.skipped_echo += 1
++        return
++    handler = _APPLY_HANDLERS[(ch.table == "tasks", ch.op)]
++    if handler(conn, ch, own, result):
++        result.applied += 1
++    else:
++        result.skipped += 1
++
++
++def _tombstoned(conn: sqlite3.Connection, table: str, uid: Any) -> bool:
++    return conn.execute("SELECT 1 FROM kanban_sync_tombstones WHERE table_name = ? AND row_uid = ?",
++                        (table, uid)).fetchone() is not None
++
++
++def _local_run_id(conn: sqlite3.Connection, uid: Optional[str], task_id: Any) -> Optional[int]:
++    """Local integer id for a run uid; a run not seen yet gets a placeholder row
++    that its own upsert fills in later."""
++    if uid is None:
++        return None
++    row = conn.execute("SELECT id FROM task_runs WHERE uid = ?", (uid,)).fetchone()
++    if row:
++        return row[0]
++    return conn.execute(
++        "INSERT INTO task_runs (uid, task_id, status, started_at) VALUES (?, ?, 'pending_sync', 0)", (uid, task_id),
++    ).lastrowid
++
++
++def _local_fields(conn: sqlite3.Connection, table: str, fields: Mapping[str, Any], task_id: Any) -> dict[str, Any]:
++    """Wire fields -> local columns: drop local-only/key/unknown columns, uids -> local ids."""
++    allowed = set(captured_columns(conn, table))
++    out: dict[str, Any] = {}
++    for column in allowed:
++        wire = _wire_name(table, column)
++        if wire not in fields:
++            continue
++        value = _from_wire(fields[wire])
++        out[column] = _local_run_id(conn, value, task_id) if (table, column) in REF_COLUMNS else value
++    return out
++
++
++def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> bool:
++    if _tombstoned(conn, "tasks", ch.uid):
++        return False
++    old = conn.execute("SELECT * FROM tasks WHERE id = ?", (ch.uid,)).fetchone()
++    if old is not None and old["sync_version"] is not None and ch.version <= old["sync_version"]:
++        return False
++    cols = _local_fields(conn, "tasks", ch.fields, ch.uid)
++    if old is None:
++        names = ["id", *cols, "sync_version"]
++        conn.execute(f"INSERT INTO tasks ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
++                     (ch.uid, *cols.values(), ch.version))
++        changed = set(cols)
++    else:
++        changed = {c for c, v in cols.items() if old[c] != v}
++        assignments = ", ".join(f"{c} = ?" for c in cols)
++        conn.execute(f"UPDATE tasks SET {assignments}{', ' if cols else ''}sync_version = ? WHERE id = ?",
++                     (*cols.values(), ch.version, ch.uid))
++    _collect_task_observers(ch, cols.get("status"), changed, result)
++    return True
++
++
++def _collect_task_observers(ch: RemoteChange, new_status: Optional[str], changed: set[str],
++                            result: ApplyResult) -> None:
++    kwargs = {"remote": True, "origin_gateway": ch.origin_gateway}
++    if "status" in changed and new_status in _STATUS_HOOKS:
++        result.hooks.append((_STATUS_HOOKS[new_status], ch.uid, kwargs))
++    if "status" in changed and new_status in _CLAIMABLE:
++        result.wake_dispatcher = True
++    other = changed - {"status"}
++    if other:
++        result.changed_fields.setdefault(ch.uid, set()).update(other)
++
++
++def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> bool:
++    table = ch.table
++    task_id = ch.fields.get("task_id") or ch.fields.get("parent_id")
++    if _tombstoned(conn, "tasks", task_id) or (table != "task_links" and _tombstoned(conn, table, ch.uid)):
++        return False
++    cols = _local_fields(conn, table, ch.fields, task_id)
++    if table == "task_links":
++        return conn.execute("INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
++                            (cols["parent_id"], cols["child_id"])).rowcount == 1
++    existing = conn.execute(f"SELECT id FROM {table} WHERE uid = ?", (ch.uid,)).fetchone()
++    if existing is not None:
++        assignments = ", ".join(f"{c} = ?" for c in cols)
++        if cols:
++            conn.execute(f"UPDATE {table} SET {assignments} WHERE id = ?", (*cols.values(), existing[0]))
++        return True
++    if table == "task_attachments":
++        cols["stored_path"] = ""
++        result.blobs_to_fetch.append(ch.uid)
++    names = ["uid", *cols]
++    conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
++                 (ch.uid, *cols.values()))
++    return True
++
++
++def _delete_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> bool:
++    from hermes_cli import kanban_db as _kb
++    _tombstone(conn, "tasks", ch.uid)
++    if conn.execute("DELETE FROM tasks WHERE id = ?", (ch.uid,)).rowcount != 1:
++        return False
++    _kb._delete_task_relations(conn, ch.uid)
++    result.wake_dispatcher = True  # a deleted parent satisfies its children
++    return True
++
++
++def _delete_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> bool:
++    _tombstone(conn, ch.table, ch.uid)
++    if ch.table == "task_links":
++        parent, _, child = ch.uid.partition(">")
++        return conn.execute("DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
++                            (parent, child)).rowcount == 1
++    return conn.execute(f"DELETE FROM {ch.table} WHERE uid = ?", (ch.uid,)).rowcount == 1
++
++
++def _tombstone(conn: sqlite3.Connection, table: str, uid: str) -> None:
++    conn.execute("INSERT OR REPLACE INTO kanban_sync_tombstones (table_name, row_uid, deleted_at) VALUES (?, ?, ?)",
++                 (table, uid, time.time_ns() // 1_000_000))
++
++
++def _lease_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> bool:
++    """Mirror a lease change. A lease that moved away from this gateway while a
++    local worker holds the claim makes the claim stale now, so the dispatcher's
++    stale-claim path stops the worker (run outcome ``lease_lost``)."""
++    row = conn.execute("SELECT status, claim_lock, sync_version FROM tasks WHERE id = ?", (ch.uid,)).fetchone()
++    if row is None or (row["sync_version"] is not None and ch.version <= row["sync_version"]):
++        return False
++    holder, expires = ch.fields.get("lease_holder"), ch.fields.get("lease_expires")
++    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ?, sync_version = ? WHERE id = ?",
++                 (holder, expires, ch.version, ch.uid))
++    if holder != own and row["claim_lock"] is not None:
++        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ? AND claim_lock IS NOT NULL",
++                     (int(time.time()) - 1, ch.uid))
++    if holder is None and row["status"] in _CLAIMABLE:
++        result.wake_dispatcher = True
++    return True
++
++
++_APPLY_HANDLERS = {
++    (True, "upsert"): _upsert_task,
++    (False, "upsert"): _upsert_row,
++    (True, "delete"): _delete_task,
++    (False, "delete"): _delete_row,
++    (True, "lease"): _lease_task,
++}
++
++
++def _after_commit(conn: sqlite3.Connection, result: ApplyResult, board: Optional[str]) -> None:
++    from hermes_cli import kanban_db as _kb
++    board = board or _kb.get_current_board()
++    for event, task_id, kwargs in result.hooks:
++        row = conn.execute("SELECT assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        _kb._fire_kanban_lifecycle_hook(
++            event, task_id, board=board, assignee=row["assignee"] if row else None,
++            run_id=row["current_run_id"] if row else None, **kwargs,
++        )
++    if result.changed_fields and _kb._kanban_observer_consumed("on_kanban_task_updated"):
++        for task_id, fields in result.changed_fields.items():
++            _kb._fire_kanban_lifecycle_hook(
++                "on_kanban_task_updated", task_id, board=board, changed_fields=sorted(fields), remote=True,
++            )
++    if result.wake_dispatcher:
++        wake_dispatcher()
++
++
++def outbox(conn: sqlite3.Connection) -> list[dict[str, Any]]:
++    """Pending outbox rows in FIFO order, ``fields`` decoded (drain + inspection)."""
++    rows = conn.execute("SELECT * FROM kanban_sync_outbox ORDER BY created_at, rowid").fetchall()
++    return [{**dict(r), "fields": json.loads(r["fields"])} for r in rows]
+diff --git a/tests/gateway/test_kanban_dispatcher_sync_wake.py b/tests/gateway/test_kanban_dispatcher_sync_wake.py
+new file mode 100644
+index 0000000000..caaa876eb6
+--- /dev/null
++++ b/tests/gateway/test_kanban_dispatcher_sync_wake.py
+@@ -0,0 +1,53 @@
++"""The embedded dispatcher's between-tick sleep ends early when an applied
++remote sync change made work claimable (core patch 0193), and otherwise keeps
++``_sleep_between_ticks`` semantics."""
++
++from __future__ import annotations
++
++import asyncio
++import time
++
++import pytest
++
++from gateway import kanban_watchers as watchers
++from hermes_cli import kanban_db_sync as sync
++
++
++@pytest.fixture
++def runner():
++    sync.consume_dispatcher_wake()
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    return runner
++
++
++def test_sync_wake_cuts_the_tick_sleep_short(runner):
++    async def scenario():
++        loop = asyncio.get_running_loop()
++        loop.call_later(0.2, sync.wake_dispatcher)
++        started = time.monotonic()
++        await runner._sleep_until_tick_or_sync_wake(60)
++        return time.monotonic() - started
++
++    assert asyncio.run(scenario()) < 5
++    assert sync.consume_dispatcher_wake() is False  # the wake was consumed by the sleep
++
++
++def test_without_a_wake_the_sleep_runs_to_its_end(runner, monkeypatch):
++    calls = []
++
++    async def between(interval):
++        calls.append(interval)
++
++    monkeypatch.setattr(runner, "_sleep_between_ticks", between)
++    asyncio.run(runner._sleep_until_tick_or_sync_wake(7))
++    assert calls == [7]
++
++
++def test_cancellation_inside_the_sleep_still_propagates(runner, monkeypatch):
++    async def between(interval):
++        raise asyncio.CancelledError
++
++    monkeypatch.setattr(runner, "_sleep_between_ticks", between)
++    with pytest.raises(asyncio.CancelledError):
++        asyncio.run(runner._sleep_until_tick_or_sync_wake(7))
+diff --git a/tests/hermes_cli/kanban_sync_support.py b/tests/hermes_cli/kanban_sync_support.py
+new file mode 100644
+index 0000000000..62365694ad
+--- /dev/null
++++ b/tests/hermes_cli/kanban_sync_support.py
+@@ -0,0 +1,78 @@
++"""Shared setup for the kanban sync seam tests (core patch 0193). Each test
++module wraps these generators in its own fixtures.
++
++Sync is switched on the way a user switches it on: ``kanban.sync.enabled: true``
++in the profile's ``config.yaml``, read by the loader at first connect.
++"""
++
++from __future__ import annotations
++
++import time
++from pathlib import Path
++from typing import Optional
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++
++
++def write_sync_config(home: Path, enabled: bool) -> None:
++    (home / "config.yaml").write_text(f"kanban:\n  sync:\n    enabled: {'true' if enabled else 'false'}\n")
++
++
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    sync.consume_dispatcher_wake()
++    return home
++
++
++def synced_conn(kanban_home):
++    write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def lease_client():
++    client = FakeLeaseClient()
++    previous = sync.set_lease_client(client)
++    try:
++        yield client
++    finally:
++        sync.set_lease_client(previous)
++
++
++class FakeLeaseClient:
++    """Stub Board service: ``mode`` is ``grant`` | ``deny`` | ``offline``."""
++
++    def __init__(self) -> None:
++        self.mode = "grant"
++        self.renew_mode = "grant"
++        self.lease_seconds: Optional[int] = None  # None = the requested ttl
++        self.calls: list[tuple[str, dict]] = []
++
++    def _answer(self, mode: str, kind: str, kw: dict) -> sync.Lease:
++        self.calls.append((kind, kw))
++        if mode == "offline":
++            raise sync.LeaseUnavailable("connection refused")
++        if mode == "deny":
++            return sync.Lease(granted=False, run_uid=kw["run_uid"], holder="gw_other", reason="held")
++        seconds = self.lease_seconds if self.lease_seconds is not None else kw["ttl_s"]
++        return sync.Lease(granted=True, run_uid=kw["run_uid"], expires_ms=int((time.time() + seconds) * 1000),
++                          holder=kw["gateway_id"])
++
++    def acquire(self, **kw) -> sync.Lease:
++        return self._answer(self.mode, "acquire", kw)
++
++    def renew(self, **kw) -> sync.Lease:
++        return self._answer(self.renew_mode, "renew", kw)
++
++    def release(self, **kw) -> None:
++        self.calls.append(("release", kw))
++
++    def count(self, kind: str) -> int:
++        return sum(1 for k, _ in self.calls if k == kind)
+diff --git a/tests/hermes_cli/test_kanban_sync_apply.py b/tests/hermes_cli/test_kanban_sync_apply.py
+new file mode 100644
+index 0000000000..c727f3eec8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_apply.py
+@@ -0,0 +1,176 @@
++"""``apply_remote_changes`` (core patch 0193): one transaction per feed page,
++echo suppression, run uid translation, hooks once after commit, cursor atomic
++with the rows, dispatcher wake. Design: hermes-mods ``core/kanban-central-service.md``."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.plugins import get_plugin_manager
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def synced_conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++OTHER = "gw_other"
++
++
++def _ch(seq, table, uid, fields, version=1, op="upsert", client_op_id=None):
++    return sync.RemoteChange(seq, table, uid, op, fields, version, f"{seq:013d}-0000-{OTHER}", OTHER, client_op_id)
++
++
++def _task_fields(**over):
++    return {"title": "remote card", "status": "ready", "created_at": 1_700_000_000, "workspace_kind": "scratch",
++            "assignee": "worker", **over}
++
++
++def _outbox_count(conn) -> int:
++    return conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0]
++
++
++@pytest.fixture
++def captured_hooks():
++    mgr = get_plugin_manager()
++    saved = {k: list(v) for k, v in mgr._hooks.items()}
++    events: list[tuple[str, dict]] = []
++    for hook in ("kanban_task_claimed", "kanban_task_completed", "kanban_task_blocked", "on_kanban_task_updated"):
++        mgr._hooks.setdefault(hook, []).append(lambda _h=hook, **kw: events.append((_h, kw)))
++    try:
++        yield events
++    finally:
++        mgr._hooks = saved
++
++
++def test_remote_changes_are_not_echoed_into_the_outbox(synced_conn):
++    conn = synced_conn
++    before = _outbox_count(conn)
++    sync.apply_remote_changes(conn, [_ch(1, "tasks", "t_remote000000001", _task_fields())], new_cursor=1)
++    assert kb.get_task(conn, "t_remote000000001").title == "remote card"
++    assert _outbox_count(conn) == before
++    assert conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0] == 0
++
++
++def test_own_op_coming_back_only_clears_its_outbox_row(synced_conn):
++    conn = synced_conn
++    tid = kb.create_task(conn, title="mine")
++    [op] = [o for o in sync.outbox(conn) if o["table_name"] == "tasks"]
++    echo = _ch(1, "tasks", tid, {**op["fields"], "title": "server copy"}, version=1, client_op_id=op["op_id"])
++    result = sync.apply_remote_changes(conn, [echo], new_cursor=1)
++    assert (result.skipped_echo, result.applied) == (1, 0)
++    assert op["op_id"] not in {o["op_id"] for o in sync.outbox(conn)}
++    assert kb.get_task(conn, tid).title == "mine"
++    assert conn.execute("SELECT sync_version FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == 1
++
++
++def test_run_uid_translates_to_local_run_ids_in_any_order(synced_conn):
++    conn = synced_conn
++    tid = "t_remote000000002"
++    page = [
++        _ch(1, "tasks", tid, _task_fields(status="running")),
++        # event first: its run uid is unknown yet and gets a placeholder run row
++        _ch(2, "task_events", "ev-1", {"task_id": tid, "run_uid": "run-A", "kind": "claimed", "payload": "{}",
++                                       "created_at": 5}),
++        _ch(3, "task_runs", "run-A", {"task_id": tid, "status": "running", "profile": "worker", "started_at": 5}),
++        _ch(4, "tasks", tid, {"current_run_uid": "run-A"}, version=2),
++    ]
++    sync.apply_remote_changes(conn, page, new_cursor=4)
++    run_id = conn.execute("SELECT id FROM task_runs WHERE uid = 'run-A'").fetchone()[0]
++    assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE uid = 'run-A'").fetchone()[0] == 1
++    assert conn.execute("SELECT run_id FROM task_events WHERE uid = 'ev-1'").fetchone()[0] == run_id
++    assert kb.get_task(conn, tid).current_run_id == run_id
++    assert conn.execute("SELECT status, profile FROM task_runs WHERE id = ?", (run_id,)).fetchone()[:] == (
++        "running", "worker")
++
++
++def test_local_only_columns_are_never_written_from_the_wire(synced_conn):
++    conn = synced_conn
++    tid = kb.create_task(conn, title="local", assignee="worker")
++    kb.claim_task(conn, tid)
++    lock, path = conn.execute("SELECT claim_lock, workspace_path FROM tasks WHERE id = ?", (tid,)).fetchone()
++    sync.apply_remote_changes(conn, [_ch(1, "tasks", tid, {
++        "title": "renamed", "claim_lock": "evil:1", "workspace_path": "/elsewhere", "worker_pid": 1,
++        "not_a_column": "ignored",
++    })], new_cursor=1)
++    row = conn.execute("SELECT title, claim_lock, workspace_path, worker_pid FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert tuple(row) == ("renamed", lock, path, None)
++
++
++def test_hooks_fire_once_after_commit_with_remote_kwargs(synced_conn, captured_hooks):
++    conn = synced_conn
++    tid = "t_remote000000003"
++    sync.apply_remote_changes(conn, [_ch(1, "tasks", tid, _task_fields())], new_cursor=1)
++    captured_hooks.clear()
++    seen_status = []
++    mgr = get_plugin_manager()
++
++    def _reads_committed_state(**_kw):
++        # A separate connection sees the completion: the hook runs after COMMIT.
++        with kbc.connect_closing(Path(conn.execute("PRAGMA database_list").fetchone()[2])) as other:
++            seen_status.append(other.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0])
++
++    mgr._hooks["kanban_task_completed"].append(_reads_committed_state)
++    page = [_ch(2, "tasks", tid, {"status": "done", "result": "shipped", "completed_at": 9}, version=2)]
++    sync.apply_remote_changes(conn, page, new_cursor=2)
++    sync.apply_remote_changes(conn, page, new_cursor=2)  # replayed page: idempotent, no second hook
++    completed = [kw for name, kw in captured_hooks if name == "kanban_task_completed"]
++    assert len(completed) == 1
++    assert completed[0]["task_id"] == tid and completed[0]["remote"] is True
++    assert completed[0]["origin_gateway"] == OTHER
++    assert seen_status == ["done"]
++    updated = [kw for name, kw in captured_hooks if name == "on_kanban_task_updated"]
++    assert len(updated) == 1 and set(updated[0]["changed_fields"]) == {"result", "completed_at"}
++
++
++def test_cursor_advances_atomically_with_the_rows(synced_conn):
++    conn = synced_conn
++    bad_page = [
++        _ch(1, "tasks", "t_remote000000004", _task_fields()),
++        _ch(2, "no_such_table", "x", {}),
++    ]
++    with pytest.raises(ValueError):
++        sync.apply_remote_changes(conn, bad_page, new_cursor=2)
++    assert kb.get_task(conn, "t_remote000000004") is None
++    assert tuple(conn.execute("SELECT cursor, applying FROM kanban_sync_state").fetchone()) == (0, 0)
++    sync.apply_remote_changes(conn, bad_page[:1], new_cursor=1)
++    assert conn.execute("SELECT cursor FROM kanban_sync_state").fetchone()[0] == 1
++    assert kb.get_task(conn, "t_remote000000004") is not None
++
++
++def test_remote_promotion_wakes_the_dispatcher_once(synced_conn):
++    conn = synced_conn
++    tid = "t_remote000000005"
++    sync.apply_remote_changes(conn, [_ch(1, "tasks", tid, _task_fields(status="todo"))], new_cursor=1)
++    assert sync.consume_dispatcher_wake() is False
++    sync.apply_remote_changes(conn, [_ch(2, "tasks", tid, {"status": "ready"}, version=2)], new_cursor=2)
++    assert sync.consume_dispatcher_wake() is True
++    assert sync.consume_dispatcher_wake() is False
++
++
++def test_remote_delete_tombstones_and_removes_relations(synced_conn):
++    conn = synced_conn
++    tid = kb.create_task(conn, title="will vanish")
++    kb.add_comment(conn, tid, "me", "x")
++    before = _outbox_count(conn)
++    sync.apply_remote_changes(conn, [_ch(1, "tasks", tid, {}, version=3, op="delete")], new_cursor=1)
++    assert kb.get_task(conn, tid) is None
++    assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] == 0
++    assert conn.execute("SELECT 1 FROM kanban_sync_tombstones WHERE row_uid = ?", (tid,)).fetchone()
++    assert _outbox_count(conn) == before
++
++
++def test_apply_refuses_an_unsynced_board(kanban_home):
++    with kbc.connect_closing(kanban_home / "plain.db") as conn:
++        with pytest.raises(RuntimeError):
++            sync.apply_remote_changes(conn, [], new_cursor=1)
+diff --git a/tests/hermes_cli/test_kanban_sync_capture.py b/tests/hermes_cli/test_kanban_sync_capture.py
+new file mode 100644
+index 0000000000..551c0fccd5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_capture.py
+@@ -0,0 +1,238 @@
++"""Outbox capture for synced boards (core patch 0193): config gate, trigger
++coverage of every synced column, the trigger-drift guard, tombstoned deletes
++and wide task ids. Design: hermes-mods ``core/kanban-central-service.md``."""
++
++from __future__ import annotations
++
++import re
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.config_defaults import DEFAULT_CONFIG
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def synced_conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++
++def _triggers(conn) -> set[str]:
++    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' "
++                                       "AND name LIKE 'kanban_sync_%'")}
++
++
++def _ops(conn) -> list[dict]:
++    return sync.outbox(conn)
++
++
++def _clear_outbox(conn) -> None:
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++
++
++def test_config_key_turns_capture_on_through_the_loader(kanban_home):
++    assert DEFAULT_CONFIG["kanban"]["sync"]["enabled"] is False
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "on.db")
++    try:
++        assert {"kanban_sync_tasks_ins", "kanban_sync_tasks_upd", "kanban_sync_tasks_del"} <= _triggers(conn)
++        assert conn.execute("SELECT mode FROM kanban_sync_state").fetchone()[0] == "shadow"
++        kb.create_task(conn, title="captured")
++        assert [op["table_name"] for op in _ops(conn)][:1] == ["tasks"]
++    finally:
++        conn.close()
++
++
++def test_flag_off_installs_nothing_and_drops_old_triggers(kanban_home):
++    conn = kbc.connect(kanban_home / "off.db")
++    try:
++        assert _triggers(conn) == set()
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'kanban_sync_outbox'").fetchone() is None
++        assert re.fullmatch(r"t_[0-9a-f]{8}", kb.create_task(conn, title="classic"))
++    finally:
++        conn.close()
++    support.write_sync_config(kanban_home, True)
++    kbc.init_db(kanban_home / "off.db")
++    with kbc.connect_closing(kanban_home / "off.db") as conn:
++        assert _triggers(conn)
++    support.write_sync_config(kanban_home, False)
++    kbc.init_db(kanban_home / "off.db")
++    with kbc.connect_closing(kanban_home / "off.db") as conn:
++        assert _triggers(conn) == set()
++        kb.create_task(conn, title="not captured")
++        assert conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++
++
++def _probe_value(conn, table: str, column: str, run_id: int):
++    if (table, column) in sync.REF_COLUMNS:
++        return run_id
++    decl = next(r[2] for r in conn.execute(f"PRAGMA table_info({table})") if r[1] == column).upper()
++    return 7_000_001 if "INT" in decl else f"probe-{column}"
++
++
++def _seed_rows(conn) -> dict[str, int | str]:
++    parent = kb.create_task(conn, title="parent")
++    tid = kb.create_task(conn, title="child", assignee="worker")
++    kb.claim_task(conn, tid)
++    kb.add_comment(conn, tid, "me", "hello")
++    with kbc.write_txn(conn):
++        conn.execute("INSERT INTO task_attachments (task_id, filename, stored_path, created_at) "
++                     "VALUES (?, 'f.txt', '/tmp/f.txt', 1)", (tid,))
++    run_id = kb._current_run_id(conn, tid)
++    return {
++        "parent": parent, "tasks": tid, "run_id": run_id,
++        "task_comments": conn.execute("SELECT MAX(id) FROM task_comments").fetchone()[0],
++        "task_events": conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0],
++        "task_runs": run_id,
++        "task_attachments": conn.execute("SELECT MAX(id) FROM task_attachments").fetchone()[0],
++    }
++
++
++def test_every_synced_column_is_captured_on_update(synced_conn):
++    conn = synced_conn
++    rows = _seed_rows(conn)
++    run_uid = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (rows["run_id"],)).fetchone()[0]
++    for table in ("tasks", "task_comments", "task_events", "task_runs", "task_attachments"):
++        columns = sync.captured_columns(conn, table)
++        assert sync.SYNCED_COLUMNS[table] <= set(columns)
++        for column in columns:
++            if (table, column) in sync.REF_COLUMNS:
++                with kbc.write_txn(conn):
++                    conn.execute(f"UPDATE {table} SET {column} = NULL WHERE id = ?", (rows[table],))
++            _clear_outbox(conn)
++            value = _probe_value(conn, table, column, rows["run_id"])
++            with kbc.write_txn(conn):
++                conn.execute(f"UPDATE {table} SET {column} = ? WHERE id = ?", (value, rows[table]))
++            ops = _ops(conn)
++            wire = sync.REF_COLUMNS.get((table, column), column)
++            expected = run_uid if (table, column) in sync.REF_COLUMNS else value
++            assert [(op["table_name"], op["op"], op["fields"]) for op in ops] == [(table, "upsert", {wire: expected})], (
++                table, column)
++
++
++def test_insert_captures_every_synced_column(synced_conn):
++    conn = synced_conn
++    _clear_outbox(conn)
++    tid = kb.create_task(conn, title="fresh")
++    kb.add_comment(conn, tid, "me", "body")
++    kb.link_tasks(conn, kb.create_task(conn, title="p"), tid)
++    by_table: dict[str, dict] = {}
++    for op in _ops(conn):
++        by_table.setdefault(op["table_name"], op)
++    for table, op in by_table.items():
++        wire = {sync.REF_COLUMNS.get((table, c), c) for c in sync.captured_columns(conn, table)}
++        assert set(op["fields"]) == wire, table
++    assert by_table["task_links"]["row_uid"].endswith(f">{tid}")
++    assert by_table["tasks"]["row_uid"] == tid
++
++
++def test_local_only_columns_are_never_captured(synced_conn):
++    conn = synced_conn
++    rows = _seed_rows(conn)
++    for table in ("tasks", "task_runs", "task_attachments"):
++        for column in sorted(sync.LOCAL_COLUMNS[table]):
++            _clear_outbox(conn)
++            with kbc.write_txn(conn):
++                conn.execute(f"UPDATE {table} SET {column} = ? WHERE id = ?",
++                             (_probe_value(conn, table, column, rows["run_id"]), rows[table]))
++            assert _ops(conn) == [], (table, column)
++
++
++def test_heartbeat_writes_no_outbox_rows(synced_conn):
++    conn = synced_conn
++    tid = kb.create_task(conn, title="beat", assignee="worker")
++    kb.claim_task(conn, tid)
++    _clear_outbox(conn)
++    assert kb.heartbeat_claim(conn, tid)
++    assert _ops(conn) == []
++
++
++def test_blob_cells_are_captured_without_failing_the_write(synced_conn):
++    """JSON cannot hold a BLOB; the trigger must encode it, never fail the writer's statement."""
++    conn = synced_conn
++    tid = kb.create_task(conn, title="blobby")
++    _clear_outbox(conn)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (b"\xff\xfe raw", tid))
++        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'me', ?, 1)",
++                     (tid, b"\x00\x01"))
++    fields = [op["fields"] for op in _ops(conn)]
++    assert fields[0] == {"body": {"$blob": "FFFE20726177"}}
++    assert fields[1]["body"] == {"$blob": "0001"}
++    other = kb.create_task(conn, title="target")
++    sync.apply_remote_changes(conn, [sync.RemoteChange(1, "tasks", other, "upsert", fields[0], 1, "", "gw_x")],
++                              new_cursor=1)
++    assert conn.execute("SELECT body FROM tasks WHERE id = ?", (other,)).fetchone()[0] == b"\xff\xfe raw"
++
++
++def test_every_task_column_is_declared_synced_or_local(synced_conn):
++    """Trigger drift guard: a column an upstream migration adds must be put in
++    SYNCED_COLUMNS or LOCAL_COLUMNS of ``kanban_db_sync`` deliberately."""
++    assert sync.undeclared_columns(synced_conn) == {}
++
++
++def test_drift_guard_names_a_new_column_and_capture_includes_it(synced_conn):
++    conn = synced_conn
++    with kbc.write_txn(conn):
++        conn.execute("ALTER TABLE tasks ADD COLUMN upstream_new_field TEXT")
++    assert sync.undeclared_columns(conn) == {"tasks": {"upstream_new_field"}}
++    sync.install_triggers(conn)
++    tid = kb.create_task(conn, title="drift")
++    _clear_outbox(conn)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET upstream_new_field = 'x' WHERE id = ?", (tid,))
++    assert [op["fields"] for op in _ops(conn)] == [{"upstream_new_field": "x"}]
++
++
++def test_delete_task_writes_one_tombstone_and_drops_later_pulls(synced_conn):
++    conn = synced_conn
++    parent = kb.create_task(conn, title="parent")
++    tid = kb.create_task(conn, title="doomed", parents=[parent])
++    kb.add_comment(conn, tid, "me", "bye")
++    _clear_outbox(conn)
++    assert kb.delete_task(conn, tid)
++    ops = [(op["table_name"], op["op"], op["row_uid"]) for op in _ops(conn) if op["op"] == "delete"]
++    assert ops == [("tasks", "delete", tid)]  # links/comments/events ride on the task's tombstone
++    assert conn.execute("SELECT 1 FROM kanban_sync_tombstones WHERE table_name = 'tasks' AND row_uid = ?",
++                        (tid,)).fetchone()
++    late = [
++        sync.RemoteChange(1, "tasks", tid, "upsert", {"title": "revived", "status": "ready", "created_at": 1},
++                          5, "", "gw_other"),
++        sync.RemoteChange(2, "task_comments", "c-late", "upsert",
++                          {"task_id": tid, "author": "x", "body": "late", "created_at": 1}, 1, "", "gw_other"),
++    ]
++    result = sync.apply_remote_changes(conn, late, new_cursor=2)
++    assert result.applied == 0 and result.skipped == 2
++    assert kb.get_task(conn, tid) is None
++    assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] == 0
++
++
++def test_synced_board_mints_wide_time_ordered_task_ids(synced_conn):
++    before_ms = time.time_ns() // 1_000_000
++    tid = kb.create_task(synced_conn, title="wide")
++    assert re.fullmatch(r"t_[0-9a-f]{16}", tid)
++    assert abs(int(tid[2:14], 16) - before_ms) < 60_000
++    assert kb._TASK_ID_PROSE_RE.search(f"see {tid} for details")
++
++
++def test_rows_written_before_enable_get_uids(kanban_home):
++    with kbc.connect_closing(kanban_home / "late.db") as conn:
++        tid = kb.create_task(conn, title="old", assignee="worker")
++        kb.claim_task(conn, tid)
++        kb.add_comment(conn, tid, "me", "before sync")
++    support.write_sync_config(kanban_home, True)
++    kbc.init_db(kanban_home / "late.db")
++    with kbc.connect_closing(kanban_home / "late.db") as conn:
++        for table in ("task_comments", "task_events", "task_runs"):
++            uids = [r[0] for r in conn.execute(f"SELECT uid FROM {table}")]
++            assert uids and None not in uids and len(set(uids)) == len(uids), table
+diff --git a/tests/hermes_cli/test_kanban_sync_leases.py b/tests/hermes_cli/test_kanban_sync_leases.py
+new file mode 100644
+index 0000000000..e57a8bc40f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_leases.py
+@@ -0,0 +1,220 @@
++"""Lease seams (core patch 0193): a ``primary`` synced board claims only with a
++server-granted lease, renews it at most once per ``ttl/3``, and a worker that
++cannot renew is stopped before the lease expires (run outcome ``lease_lost``).
++The Board service is a stub. Design: hermes-mods ``core/kanban-central-service.md``."""
++
++from __future__ import annotations
++
++import logging
++import subprocess
++import sys
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def lease_client():
++    yield from support.lease_client()
++
++
++@pytest.fixture
++def synced_conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++
++@pytest.fixture
++def primary(synced_conn):
++    sync.set_mode(synced_conn, "primary")
++    return synced_conn
++
++
++def _gateway_id(conn) -> str:
++    return conn.execute("SELECT gateway_id FROM kanban_sync_state").fetchone()[0]
++
++
++def _run_rows(conn, tid):
++    return conn.execute("SELECT uid, outcome, status FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)).fetchall()
++
++
++def test_granted_lease_claims_with_its_run_uid_and_deadline(primary, lease_client):
++    conn = primary
++    tid = kb.create_task(conn, title="leased", assignee="worker")
++    claimed = kb.claim_task(conn, tid, ttl_seconds=900)
++    assert claimed is not None and claimed.status == "running"
++    [(kind, req)] = lease_client.calls
++    assert kind == "acquire" and req["task_uid"] == tid and req["gateway_id"] == _gateway_id(conn)
++    assert 890 <= req["ttl_s"] <= 900
++    [(run_uid, _outcome, _status)] = _run_rows(conn, tid)
++    assert run_uid == req["run_uid"]
++    holder, lease_ms, claim_expires = conn.execute(
++        "SELECT lease_holder, lease_expires, claim_expires FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert holder == _gateway_id(conn)
++    assert claim_expires <= lease_ms // 1000 - sync.LEASE_SAFETY_MARGIN_SECONDS
++    assert conn.execute("SELECT pending_run_uid FROM kanban_sync_state").fetchone()[0] is None
++
++
++@pytest.mark.parametrize("mode", ["deny", "offline"])
++def test_no_lease_leaves_the_card_ready(primary, lease_client, caplog, mode):
++    conn = primary
++    lease_client.mode = mode
++    tid = kb.create_task(conn, title="waits", assignee="worker")
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db_sync"):
++        assert kb.claim_task(conn, tid) is None
++    assert kb.get_task(conn, tid).status == "ready"
++    assert _run_rows(conn, tid) == []
++    expected = "claim_deferred: offline" if mode == "offline" else "claim_deferred: held"
++    assert any(expected in r.getMessage() for r in caplog.records)
++
++
++def test_no_registered_client_counts_as_offline(primary, caplog):
++    sync.set_lease_client(None)
++    tid = kb.create_task(primary, title="no client", assignee="worker")
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db_sync"):
++        assert kb.claim_task(primary, tid) is None
++    assert kb.get_task(primary, tid).status == "ready"
++    assert any("claim_deferred: offline" in r.getMessage() for r in caplog.records)
++
++
++def test_review_claim_also_needs_a_lease(primary, lease_client):
++    conn = primary
++    tid = kb.create_task(conn, title="review me", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
++    lease_client.mode = "offline"
++    assert kb.claim_review_task(conn, tid) is None
++    lease_client.mode = "grant"
++    assert kb.claim_review_task(conn, tid) is not None
++    assert _run_rows(conn, tid)[0][0] == lease_client.calls[-1][1]["run_uid"]
++
++
++def test_shadow_board_claims_without_asking(synced_conn, lease_client):
++    tid = kb.create_task(synced_conn, title="shadow", assignee="worker")
++    assert kb.claim_task(synced_conn, tid) is not None
++    assert lease_client.calls == []
++
++
++def test_lease_granted_for_a_lost_cas_is_released(primary, lease_client):
++    conn = primary
++    tid = kb.create_task(conn, title="already taken", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET claim_lock = 'elsewhere:1' WHERE id = ?", (tid,))
++    assert kb.claim_task(conn, tid) is None
++    assert [k for k, _ in lease_client.calls] == ["acquire", "release"]
++    assert lease_client.calls[1][1]["run_uid"] == lease_client.calls[0][1]["run_uid"]
++
++
++def test_heartbeat_renews_at_most_once_per_third_of_the_ttl(primary, lease_client):
++    conn = primary
++    tid = kb.create_task(conn, title="beats", assignee="worker")
++    lock = "host:1"
++    lease_client.lease_seconds = 900
++    kb.claim_task(conn, tid, ttl_seconds=900, claimer=lock)
++    assert kb.heartbeat_claim(conn, tid, ttl_seconds=900, claimer=lock)
++    assert lease_client.count("renew") == 0  # lease still fresh
++    lease_client.lease_seconds = 400  # pretend 500s of the lease are used up
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int((time.time() + 400) * 1000), tid))
++    lease_client.lease_seconds = 900
++    assert kb.heartbeat_claim(conn, tid, ttl_seconds=900, claimer=lock)
++    assert kb.heartbeat_claim(conn, tid, ttl_seconds=900, claimer=lock)
++    assert lease_client.count("renew") == 1
++    lease_ms = conn.execute("SELECT lease_expires FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert lease_ms / 1000 > time.time() + 800
++
++
++def _spawn_worker():
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
++    reaper = threading.Thread(target=proc.wait, daemon=True)  # reap at once so the pid is really gone
++    reaper.start()
++    return proc, reaper
++
++
++def _attach_worker(conn, tid, proc):
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ?, last_heartbeat_at = ? WHERE id = ?",
++                     (proc.pid, kbd._process_fingerprint(proc.pid), int(time.time()), tid))
++
++
++def test_worker_that_cannot_renew_is_stopped_before_lease_expiry(primary, lease_client):
++    conn = primary
++    tid = kb.create_task(conn, title="network drops", assignee="worker")
++    lease_client.lease_seconds = 30  # lease already inside the 60s safety margin
++    kb.claim_task(conn, tid, ttl_seconds=900)
++    lease_ms = conn.execute("SELECT lease_expires FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    proc, reaper = _spawn_worker()
++    try:
++        _attach_worker(conn, tid, proc)
++        lease_client.renew_mode = "offline"
++        kb.heartbeat_claim(conn, tid, ttl_seconds=900)
++        assert lease_client.count("renew") == 1
++        claim_expires = conn.execute("SELECT claim_expires FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++        assert claim_expires <= lease_ms // 1000 - sync.LEASE_SAFETY_MARGIN_SECONDS
++        assert kb.release_stale_claims(conn) == 1
++        stopped_at_ms = time.time() * 1000
++        reaper.join(timeout=30)
++        assert proc.poll() is not None, "worker kept running after its lease was lost"
++        assert stopped_at_ms < lease_ms
++        assert kb.get_task(conn, tid).status == "ready"
++        assert _run_rows(conn, tid)[-1][1:] == ("lease_lost", "lease_lost")
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++
++
++def test_live_worker_with_a_valid_lease_keeps_its_claim(primary, lease_client):
++    """Control for the test above: same stale claim, lease still valid -> extended."""
++    conn = primary
++    tid = kb.create_task(conn, title="healthy", assignee="worker")
++    kb.claim_task(conn, tid, ttl_seconds=900)
++    proc, _reaper = _spawn_worker()
++    try:
++        _attach_worker(conn, tid, proc)
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 1, tid))
++        assert kb.release_stale_claims(conn) == 0
++        assert proc.poll() is None
++        assert kb.get_task(conn, tid).status == "running"
++    finally:
++        proc.kill()
++
++
++def test_lease_moved_to_another_gateway_stops_the_local_worker(primary, lease_client):
++    conn = primary
++    tid = kb.create_task(conn, title="reset by operator", assignee="worker")
++    kb.claim_task(conn, tid, ttl_seconds=900)
++    proc, reaper = _spawn_worker()
++    try:
++        _attach_worker(conn, tid, proc)
++        far = int((time.time() + 3600) * 1000)
++        sync.apply_remote_changes(conn, [sync.RemoteChange(
++            1, "tasks", tid, "lease", {"lease_holder": "gw_other", "lease_expires": far}, 9, "", "gw_other",
++        )], new_cursor=1)
++        assert kb.release_stale_claims(conn) == 1
++        reaper.join(timeout=30)
++        assert proc.poll() is not None
++        assert _run_rows(conn, tid)[-1][1] == "lease_lost"
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++
++
++def test_operator_reclaim_releases_the_lease(primary, lease_client):
++    conn = primary
++    tid = kb.create_task(conn, title="reclaimed", assignee="worker")
++    kb.claim_task(conn, tid)
++    run_uid = lease_client.calls[0][1]["run_uid"]
++    assert kb.reclaim_task(conn, tid, reason="operator")
++    assert lease_client.calls[-1][0] == "release" and lease_client.calls[-1][1]["run_uid"] == run_uid
+-- 
+2.55.0
+

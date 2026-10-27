@@ -54,13 +54,33 @@ Deterministic first: an ask naming a card that is `done`/`archived` in the datab
 The judge sees: the ask sentences, this turn's tool calls and results, the last 30 user messages, live status of every
 card id mentioned, the ledger, and a **capability sheet generated at runtime** (token-broker scope names and tiers —
 no values —, ssh hosts from `~/.ssh/config`, signed-in Chrome profile emails from Chrome's Local State, browser vault
-entry names). The sheet is built in memory, cached 10 minutes, and never written to disk or committed.
+entry names). The sheet is built in memory and never written to disk or committed. Ask validation refreshes
+it immediately rather than trusting the optional 10-minute cache. Broker discovery runs only `scopes`,
+tries the current `~/.local/bin/token-broker` before a distinct PATH client, and falls back on execution or
+invalid-response failures. A successful list (including an empty list) is authoritative; malformed rows
+are omitted, not interpreted as capabilities. Only validated scope names and known tiers reach the judge.
+Scope discovery is evidence of an available credential route, not proof of vendor permission or authorization
+to execute an action. Tests in `tests/test_f3_broker.py` exercise discovery through temporary executables and
+the final-response gate with a stub judge; they do not vend credentials or contact a vendor.
 
-## Needs core hook `pre_final_gate`
+## Requires compatible core before plugin rollout
 
-L2 uses a core hook `pre_final_gate(session_id, platform, model, final_response, turn_messages, attempt) -> None |
-{"hold": True, "nudge": str} | {"append": str}` (fork card t_45d5a361) so a held draft is neither shown nor saved. On
-a core without it the plugin still registers (L1/L3/L4 work); L2 is simply never called.
+Registration requires `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES` with integer
+`version: 1` and literal `True` for `replace`, `accepts_hold_budget`, `needs_buffer`,
+and `post_transform_release`. The check runs before installing adapters or hooks.
+Missing/malformed support refuses registration with a loader error instead of silently
+registering partial protection. Hook registration errors also propagate to the loader.
+
+Deploy compatible core **first**, then activate this plugin. On an incompatible core
+the whole plugin is unavailable (including previously working L1/L3/L4); ordinary turns
+still run. Refusal is not a runtime fail-closed policy, authorization, or proof that a
+particular transport is protected. Do not publish/activate this plugin ahead of core.
+
+Tests: `tests/test_runtime_contract.py` checks the explicit advertisement,
+`tests/test_runtime_registration.py` checks registration ordering and error propagation,
+and `tests/integration_f3/test_runtime_compatibility.py` uses real PluginManager discovery.
+The compatible buffered publication path is exercised separately by
+`tests/integration_f3/test_final_publication.py` against an explicit core checkout.
 
 ## open-asks interplay
 
@@ -126,6 +146,31 @@ the plugin entry point, the actual structured hook, failure rollback, foreign re
 full live PluginManager discovery and real private adapters still require deployment verification.
 
 This seam alone is not an installed approval integration: without a matching adapter the ordinary gate remains.
+## Positive rejection survives reporting failures
+
+Once the final hook has rejected a draft for stopped workflow, retired answer, authoritative
+reconciliation, or a negative judge verdict, failures in unrelated verdict reporting cannot
+release that draft. The response is replaced with a non-action notice. Before any positive
+rejection, the existing judge-unavailable policy is unchanged.
+`tests/test_f3_reporting_failure.py` reproduces corrupt reporting-cache shapes for all four
+rejection paths and checks the non-rejection control. This does not prove old-core replacement
+support or protection before a rejection has been established.
+
+## Exact user-step source reconciliation (bounded integration)
+
+`user_step_lifecycle.py` reads existing `::user-step` IDs through the adjacent user-steps
+revisioned source reader, using the runtime profile and compression root rather than draft
+ownership claims. Resolved state is durably latched for suppression, never authorization or
+trusted reopen. Missing/corrupt/unknown source state holds for agent-owned recovery.
+The final hook replaces already-framed requests before unrelated history/reporting can fail open.
+
+Tests: `tests/test_user_step_lifecycle.py` exercises real source ledgers, profile/root isolation,
+malformed directives, multiple IDs, rollback and final-hook suppression including exhausted budgets
+and unrelated storage failures. This is NOT complete generated-step protection: ordinary user-steps
+output transformation runs AFTER the final gate and creates new IDs/publishes cards. Source-owned
+action identity continuity and a pre-publication reconciliation boundary remain required; no
+plain-prose binding, trusted reopen or live deployment is claimed by these tests.
+
 Adapters own current-head lookup, authenticated proof validation and domain-specific selection. No adapter may
 mint a decision from a model claim or impersonate a user. The gate never calls decide, unblocks/completes a task,
 or retires user-step metadata. Legacy prose and final-text wiring are not covered by this structured-hook slice.

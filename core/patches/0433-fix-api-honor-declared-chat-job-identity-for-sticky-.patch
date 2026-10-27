@@ -1,0 +1,194 @@
+From 21f1b7b88f8a8d82ca7f112a4d19951e1b7cfa6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 03:44:43 +0000
+Subject: [PATCH 433/453] fix(api): honor declared chat job identity for sticky
+ routing
+
+(cherry picked from commit 1eed78de283bc59dcbc376001c3f2b097011088d)
+---
+ gateway/platforms/api_server_openai_routes.py |  22 +++-
+ .../test_api_class_declared_identity.py       | 122 ++++++++++++++++++
+ 2 files changed, 137 insertions(+), 7 deletions(-)
+ create mode 100644 tests/gateway/test_api_class_declared_identity.py
+
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+index 8e9ef81f70..ec5effb9cc 100644
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -634,11 +634,21 @@ class OpenAICompatRoutesMixin:
+         agent_task.add_done_callback(_done)
+         return agent_task, agent_ref
+ 
++    async def _chat_body_session_id(self, gateway_session_key, system_prompt, messages):
++        """Select a declared job or legacy fingerprint without loading server history."""
++        from gateway.platforms.api_server import _api_request_profile, _derive_chat_session_id
++        if gateway_session_key:
++            return (await asyncio.to_thread(
++                self._declared_conversation_session, gateway_session_key) or str(uuid.uuid4()))
++        first_user = next(
++            (cm.get("content", "") for cm in messages if cm.get("role") == "user"), "")
++        return _derive_chat_session_id(system_prompt, first_user, _api_request_profile.get())
++
+     async def _handle_chat_completions(self, request: web.Request) -> web.Response:
+         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+         from gateway.platforms.api_server import (
+-            ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _coerce_request_bool,
+-            _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
++            ThreadSafeAsyncQueue, _chat_usage_payload, _coerce_request_bool,
++            _content_has_visible_payload, _error_response, _invalid_request,
+             _multimodal_validation_error, _normalize_chat_content, _normalize_multimodal_content,
+             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+         # Bound total in-flight agent runs (configurable; #7483).
+@@ -715,11 +725,8 @@ class OpenAICompatRoutesMixin:
+                 logger.warning("Failed to load session history for %s: %s", session_id, e)
+                 history = []
+         else:
+-            # Stable id from the conversation fingerprint so Open WebUI-style clients map onto
+-            # one Hermes session; namespaced by the routed profile (#123989).
+-            first_user = next(
+-                (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
+-            session_id = _derive_chat_session_id(system_prompt, first_user, _api_request_profile.get())
++            session_id = await self._chat_body_session_id(
++                gateway_session_key, system_prompt, conversation_messages)
+         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+         model_name = body.get("model", self._model_name)
+         created = int(time.time())
+@@ -732,6 +739,7 @@ class OpenAICompatRoutesMixin:
+             user_message=user_message, conversation_history=history,
+             ephemeral_system_prompt=system_prompt, session_id=session_id,
+             gateway_session_key=gateway_session_key, **agent_overrides, route=route,
++            bind_declared_conversation=bool(gateway_session_key) and not provided_session_id,
+             relay_metadata=relay_metadata,
+             # #98619: only an explicitly provided X-Hermes-Session-Id is wake-capable (the
+             # header is 403-gated on API_SERVER_KEY, so the wake self-post can authenticate
+diff --git a/tests/gateway/test_api_class_declared_identity.py b/tests/gateway/test_api_class_declared_identity.py
+new file mode 100644
+index 0000000000..de99027ab5
+--- /dev/null
++++ b/tests/gateway/test_api_class_declared_identity.py
+@@ -0,0 +1,122 @@
++"""Declared chat jobs keep routing identity, not server-managed message history."""
++from unittest.mock import patch
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestClient, TestServer
++
++from tests.gateway import test_api_class_routing
++
++adapter = test_api_class_routing.adapter
++native_transport = test_api_class_routing.native_transport
++routing_home = test_api_class_routing.routing_home
++streaming_route = test_api_class_routing.streaming_route
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_declared_job_stays_sticky_without_appending_history(
++    adapter, routing_home, streaming_route, native_transport, stream,
++):
++    adapter._api_key = "test-key"
++    app = web.Application()
++    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
++    seen = []
++    real = adapter._run_agent
++
++    async def capture(**kwargs):
++        seen.append(kwargs)
++        return await real(**kwargs)
++
++    adapter._run_agent = capture
++    with patch("model_tools.get_tool_definitions", return_value=[]):
++        async with TestClient(TestServer(app)) as client:
++            for key, text in [("doc-a", "page one"), ("doc-a", "page two"), ("doc-b", "page two")]:
++                response = await client.post("/v1/chat/completions", headers={
++                    "Authorization": "Bearer test-key", "X-Hermes-Session-Key": key,
++                }, json={"model": "class:deep", "provider": "auto", "stream": stream,
++                         "messages": [{"role": "user", "content": text}]})
++                assert response.status == 200, await response.text()
++                assert "ok" in await response.text()
++    assert seen[0]["session_id"] == seen[1]["session_id"]
++    assert seen[1]["session_id"] != seen[2]["session_id"]
++    assert all(call["conversation_history"] == [] for call in seen)
++    assert all(not call["session_history_delivery"] for call in seen)
++    assert adapter._declared_conversation_session("doc-a") == seen[0]["session_id"]
++    assert adapter._declared_conversation_session("doc-b") == seen[2]["session_id"]
++    db = adapter._ensure_session_db()
++    first = db.get_session(seen[0]["session_id"])
++    assert first["model"] == "anthropic-deep"
++    assert all(body["model"] == first["model"] for _, _, body in native_transport)
++    assert len(native_transport) == 3
++
++
++@pytest.mark.asyncio
++async def test_declared_identity_is_profile_scoped_and_requires_auth(adapter, tmp_path):
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    from tests.gateway.test_api_server_declared_conversation import _spy_run_agent
++
++    @web.middleware
++    async def scope(request, handler):
++        token = set_hermes_home_override(tmp_path / request.headers.get("X-Test-Profile", "a"))
++        try:
++            return await handler(request)
++        finally:
++            reset_hermes_home_override(token)
++
++    adapter._api_key = "test-key"
++    seen = []
++    adapter._run_agent = _spy_run_agent(adapter, seen)
++    app = web.Application(middlewares=[scope])
++    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
++    async with TestClient(TestServer(app)) as client:
++        for profile in ["a", "b", "a"]:
++            response = await client.post("/v1/chat/completions", headers={
++                "Authorization": "Bearer test-key",
++                "X-Hermes-Session-Key": "same-key", "X-Test-Profile": profile,
++            }, json={"model": "class:deep", "messages": [{"role": "user", "content": "same"}]})
++            assert response.status == 200, await response.text()
++        adapter._api_key = ""
++        response = await client.post("/v1/chat/completions", headers={
++            "X-Hermes-Session-Key": "same-key",
++        }, json={"messages": [{"role": "user", "content": "same"}]})
++        assert response.status == 403
++    assert len(seen) == 3
++    assert seen[0]["session_id"] == seen[2]["session_id"]
++    assert seen[0]["session_id"] != seen[1]["session_id"]
++
++
++@pytest.mark.asyncio
++async def test_explicit_id_wins_and_follows_compression_without_rebinding(adapter):
++    from tests.gateway.test_api_server_declared_conversation import _spy_run_agent
++
++    adapter._api_key = "test-key"
++    db = adapter._ensure_session_db()
++    db.create_session("original", "api_server", session_key="original-key")
++    db.publish_compression_child(
++        parent_session_id="original", child_session_id="tip", source="api_server",
++        messages=[{"role": "user", "content": "compressed history"}],
++        require_compression_lease=False,
++    )
++    adapter._bind_declared_conversation("tip", "original-key")
++    seen = []
++    adapter._run_agent = _spy_run_agent(adapter, seen)
++    app = web.Application()
++    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
++    async with TestClient(TestServer(app)) as client:
++        for headers in [
++            {"X-Hermes-Session-Id": "original", "X-Hermes-Session-Key": "other-key"},
++            {"X-Hermes-Session-Key": "original-key"},
++        ]:
++            headers["Authorization"] = "Bearer test-key"
++            response = await client.post("/v1/chat/completions", headers=headers, json={
++                "model": "class:deep", "messages": [{"role": "user", "content": "new page"}],
++            })
++            assert response.status == 200, await response.text()
++    assert [call["session_id"] for call in seen] == ["tip", "tip"]
++    assert [(m["role"], m["content"]) for m in seen[0]["conversation_history"]] == [
++        ("user", "compressed history")]
++    assert seen[0]["bind_declared_conversation"] is False
++    assert seen[0]["session_history_delivery"] == "1"
++    assert seen[1]["conversation_history"] == []
++    assert adapter._declared_conversation_session("other-key") is None
+-- 
+2.54.0 (Apple Git-157)
+

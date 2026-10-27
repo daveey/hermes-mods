@@ -39,6 +39,21 @@ board selection, ambiguity and the actual installed decoder (AST-isolated to
 avoid client side effects), or its explicit equivalent contract when the optional
 client is absent. The original sender commit had no intervening sender fix.
 
+## `@` typeahead (Desktop half)
+
+`desktop-plugins/session-mentions/plugin.js` offers sessions and kanban tasks from every connected gateway in
+the composer's `@` popover. Rows come from a per-gateway cache that refreshes in the background (60 s stale).
+
+- **Redraw:** both completion sources pass `subscribe`; the plugin signals (coalesced over 30 ms) when a fetch
+  starts, lands or fails, and core patch 0458 (`core/at-completion-refresh.md`) makes an open popover ask
+  again. On a Desktop without 0458 the signal is ignored and the next keystroke picks the rows up, as before.
+- **Warm start:** fetched rows are saved to `localStorage` (`hermes.session-mentions.warm.v1`, typeahead fields
+  only, at most 3,000 rows per gateway and kind) and loaded on register as already stale, so the first `@` after
+  a reload answers from them while a refresh runs.
+- **Status rows:** a gateway with nothing cached and a fetch in flight shows `Loading sessions from <gateway>…`;
+  a failed fetch shows `Couldn't load sessions|tasks from <gateway>` with the error. Picking one inserts the
+  bare `@session:` / `@task:` prefix.
+
 ## Tests
 
 From the repo root with pytest installed:
@@ -55,6 +70,12 @@ and correction of rejected legacy identities. Both read and comment entrypoints
 run against the receiver decoder contract. Set `HERMES_HUB_CLIENT` to a client
 source file to explicitly select that validator. Dispatches are captured in
 memory: these tests send no real hub messages.
+
+The Desktop half runs under Node: `node --test plugins/session-mentions/tests/*.test.mjs`.
+`typeahead-refresh.test.mjs` drives `register()` and the completion sources' `provide`/`subscribe` with a fake
+bridge: cold cache shows Loading then signals and offers the session; a failed session fetch and a failed task
+fetch each show an error row; rows saved by one run answer the next run's first query, slimmed; corrupt or
+foreign warm data is ignored. Redraw inside a running Desktop with patch 0458 is untested.
 
 ## Deployment
 

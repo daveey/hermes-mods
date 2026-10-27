@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, core, handoff, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -32,8 +32,11 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return _sys.modules.setdefault(key, mod)
     core, judge_mod, handoff = _sib("core"), _sib("judge"), _sib("handoff")
+    lifecycle = _sib("lifecycle")
+    user_step_lifecycle = _sib("user_step_lifecycle")
     approval_reconciliation = _sib("approval_reconciliation")
     approval_adapter_loading = _sib("approval_adapter_loading")
+    runtime_contract = _sib("runtime_contract")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -41,7 +44,6 @@ _SUBAGENTS: set[str] = set()                  # sessions seen with a parent_sess
 MAX_NUDGES = 2
 LOG = core.TurnLog()
 _LEDGER: dict[str, Any] = {}
-_JUDGED: dict[tuple, list] = {}  # (session, text hash) -> verdicts, so a re-asked judge call is not repeated
 
 
 def _off() -> bool:
@@ -180,12 +182,22 @@ def _user_msgs(session_id: str) -> list[str]:
 def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "", *, structured: bool = False) -> list[dict]:
     ids = core.card_ids(" ".join(asks) + " " + reply)
     statuses = core.card_status(ids)
-    led = ledger().recent(14 * 86400, limit=20)
+    led = ledger().relevant(session_id, limit=20)
+    retired = core.retired_matches(asks, ledger().retired_for(session_id, asks))
+    remaining = [i for i in range(len(asks)) if i not in retired]
+    if not remaining:
+        return [retired[i] for i in range(len(asks))]
     ledger_text = "\n".join(f"- {a['topic']} -> {a['answer']} ({core.fmt_ts(a['ts'])})" for a in led)
-    return judge_mod.judge(asks, tools_text=core.render_tools(tools), user_msgs=_user_msgs(session_id),
-                           card_status=statuses, ledger_text=ledger_text, caps=core.capability_sheet(),
-                           reply=reply, llm=judge_mod.structured_llm(_llm()) if structured else _llm(), ledger=led,
-                           soft=[core.is_soft_ask(a) for a in asks])
+    pending = [asks[i] for i in remaining]
+    verdicts = judge_mod.judge(pending, tools_text=core.render_tools(tools), user_msgs=_user_msgs(session_id),
+                              card_status=statuses, ledger_text=ledger_text, caps=core.capability_sheet(force=True),
+                              reply=reply, llm=judge_mod.structured_llm(_llm()) if structured else _llm(),
+                              ledger=[a for a in led if not a.get('retired')],
+                              soft=[core.is_soft_ask(a) for a in pending])
+    for v in verdicts:
+        i = remaining[v['i']]
+        retired[i] = {**v, 'i': i}
+    return [retired[i] for i in range(len(asks))]
 
 
 # ---- L1 + L4 ------------------------------------------------------------------------------------------
@@ -216,7 +228,13 @@ def pre_llm_call(session_id: str = "", user_message: str = "", conversation_hist
                 and isinstance(m.get("content"), str)]
         users = [t for t in (_human_text(h) for h in hist + [user_message or ""]) if t]
         LOG.set_users(session_id, users)
-        _record_answers(session_id, _human_text(user_message or ""), conversation_history or [])
+        # Workflow state accepts the entire direct user message only. The legacy
+        # answer extractor unwraps embedded text and is not provenance for a stop
+        # or resume. Wrapped steering requires a trusted transport event adapter.
+        directive = ledger().record_workflow_directive(session_id, user_message or "")
+        if not directive:
+            _record_answers(session_id, _human_text(user_message or ""), conversation_history or [],
+                            raw_message=user_message or "")
         block = core.l1_block(session_id, ledger())
         return {"context": block} if block else None
     except Exception as e:  # never break a chat
@@ -231,14 +249,30 @@ def _last_assistant_text(history: list) -> str:
     return ""
 
 
-def _record_answers(session_id: str, msg: str | None, history: list) -> None:
+def _record_answers(session_id: str, msg: str | None, history: list,
+                    raw_message: str | None = None) -> None:
     if not msg:
         return
     led = ledger()
-    open_asks = led.open_asks(session_id)
+    snapshot = led.pending_snapshot(session_id)
+    open_asks = snapshot or []
     strong = core.is_strong_dismissal(msg)
-    if not open_asks:
+    if snapshot is None:
         open_asks = core.find_asks(_last_assistant_text(history))
+    direct_terminal = bool(re.fullmatch(
+        r"(?:the|that|this) (?:subscription|account|step|action) "
+        r"(?:is|was|has been) (?:cancelled|canceled|revoked|completed|impossible)"
+        r"(?: on this platform)?[.!]?", msg.strip(), re.I))
+    # Rendered steering wrappers are not a trusted transport provenance signal.
+    # Require the complete direct input for durable terminal state; the legacy
+    # extractor remains usable only for non-terminal conversational evidence.
+    direct_input = raw_message is None or raw_message.strip() == msg.strip()
+    if len(open_asks) == 1 and direct_terminal and direct_input:
+        # A single pending question has an unambiguous target. Persist the actual
+        # user's words, never a classifier-generated terminal assertion.
+        led.add(open_asks[0], msg, session=session_id)
+        led.set_open_asks(session_id, [])
+        return
     if not open_asks and not strong:
         return
     if not (strong or core.looks_like_answer(msg)):
@@ -252,9 +286,12 @@ def _record_answers(session_id: str, msg: str | None, history: list) -> None:
         topic = (open_asks[0] if open_asks else _last_assistant_text(history)[:160]) or "asks in general"
         answered = [{"i": -1, "topic": topic, "answer": msg[:160]}]
     for a in answered:
-        led.add(a["topic"], a["answer"], session=session_id)
+        led.add(a["topic"], msg, session=session_id, retire=False)
     if answered:
-        led.set_open_asks(session_id, [])
+        answered_indices = {a.get("i") for a in answered if type(a.get("i")) is int and a["i"] >= 0}
+        # A general dismissal (-1) is not proof that every distinct question was
+        # answered. Keep unmatched pending items available for a later answer.
+        led.set_open_asks(session_id, [ask for i, ask in enumerate(open_asks) if i not in answered_indices])
         core.log_event("l4_answered", session=session_id, n=len(answered))
 
 
@@ -266,40 +303,91 @@ def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, se
 
 # ---- L2 -----------------------------------------------------------------------------------------------
 def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", final_response: str = "",
-                   turn_messages: list | None = None, attempt: int = 0, **_: Any) -> dict | None:
+                   turn_messages: list | None = None, attempt: int = 0,
+                   hold_budget: int | None = None, **_: Any) -> dict | None:
     if not _gate_eligible(session_id, platform) or not isinstance(final_response, str):
         return None
+    # Exact source reconciliation must not fail open when unrelated history or
+    # audit storage is corrupt. Reporting is best-effort, suppression is not.
+    exact = user_step_lifecycle.preflight({"session_id": session_id, "draft": final_response})
+    if exact is not None:
+        try:
+            record_verdict(session_id, exact["reason"], final_response)
+            ledger().set_open_asks(session_id, [])
+        except Exception:
+            pass
+        return {"replace": "I withheld a user-step request after checking its lifecycle state. "
+                "No new permission or execution authorization is granted by this notice."}
+    rejected = False
     try:
         users = _user_msgs(session_id)
         howto = bool(users) and core.asked_how_to(users[-1])
-        held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
-        if held is not None:
-            return held
         asks = core.find_asks(final_response, howto=howto)
-        if not asks:
-            return None
-        tools = core.merge_tool_logs(core.tools_from_messages(turn_messages or []), LOG.get(session_id))
-        key = (session_id, core.text_hash(final_response))
-        verdicts = _JUDGED.get(key)
-        if verdicts is None:
+        retirement_candidates = asks + handoff.find_handoffs(final_response)
+        if not howto and retirement_candidates and ledger().workflow_stopped(session_id):
+            rejected = True
+            record_verdict(session_id, "workflow_stopped", final_response)
+            return {"replace": "The workflow remains stopped. I withheld a request to act on it."}
+        retired = core.retired_matches(retirement_candidates, ledger().retired_for(session_id, retirement_candidates))
+        if retired:
+            rejected = True
+            record_verdict(session_id, "retired", final_response)
+            return {"replace":
+                    "I suppressed a repeated request because this action has a recorded terminal answer. "
+                    "This record does not authorize performing or reopening it."}
+        reconciled = lifecycle.preflight({"session_id": session_id, "tool_name": "pre_final_gate",
+                                          "draft": final_response, "howto": howto})
+        if reconciled is None:
+            reconciled = _reconcile_prose(session_id, "pre_final_gate", asks if howto else retirement_candidates)
+        if reconciled is not None:
+            rejected = True
+            record_verdict(session_id, "approval_reconciled", final_response)
+            try:
+                ledger().set_open_asks(session_id, [])
+            except Exception as e:
+                core.log_event("pending_clear_error", session=session_id, error=repr(e))
+            return {"replace": "I withheld a request after checking authoritative approval or lifecycle state. "
+                    "No new permission or execution authorization is granted by this notice."}
+        budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
+        held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
+        if held is not None and attempt < budget:
+            return held
+        if held is not None:
+            # A hold cannot protect a draft after the core retry budget ends.
+            # Continue through the same rejection/ledger-clear path as the judge.
+            verdicts = [{"i": 0, "verdict": "unverified", "reason": "Handoff was not opened."}]
+        elif asks:
+            tools = core.merge_tool_logs(core.tools_from_messages(turn_messages or []), LOG.get(session_id))
+            # Re-read evidence even when the draft text has not changed.
             verdicts = run_judge(session_id, asks, tools, final_response)
-            _JUDGED[key] = verdicts
-            if len(_JUDGED) > 200:
-                _JUDGED.pop(next(iter(_JUDGED)))
+        else:
+            return None
         bad = judge_mod.bad(verdicts)
+        rejected = bool(bad)
         core.log_event("verdict", session=session_id, attempt=attempt, asks=asks,
                        verdicts=[(v["verdict"], v.get("reason", "")) for v in verdicts])
         if not bad:
             ledger().set_open_asks(session_id, asks)
             record_verdict(session_id, "ok", final_response)
             return None
-        if attempt < MAX_NUDGES:
+        if attempt < budget:
             record_verdict(session_id, "held", final_response)
             return {"hold": True, "nudge": judge_mod.nudge(asks, verdicts)}
         record_verdict(session_id, "unverified", final_response)
-        ledger().set_open_asks(session_id, [asks[v["i"]] for v in verdicts if v["verdict"] == "ok"])
-        return {"append": judge_mod.delivery_note(asks, verdicts)}
-    except Exception as e:  # judge down: deliver, log, never break a chat
+        # The entire draft is withheld, including its otherwise valid asks.
+        # Never save a pending question the user did not actually see.
+        try:
+            ledger().set_open_asks(session_id, [])
+        except Exception as e:
+            core.log_event("pending_clear_error", session=session_id, error=repr(e))
+        return {"replace": "I withheld a request that did not pass the current-state check. "
+                "No action or approval is requested by this notice."}
+    except Exception as e:
+        # Reporting/pending-ledger failures must not resurrect a rejected draft.
+        # Preserve the existing fail-open policy only before a rejection exists.
+        if rejected:
+            return {"replace": "I withheld a request that did not pass the current-state check. "
+                    "No action or approval is requested by this notice."}
         core.log_event("gate_error", session=session_id, error=repr(e))
         return None
 
@@ -324,6 +412,7 @@ def _handoff_gate(session_id: str, final_response: str, turn_messages: list | No
 
 # core may buffer streamed final text while this hook is registered, so a held draft never reaches the screen
 pre_final_gate.needs_buffer = True  # type: ignore[attr-defined]
+pre_final_gate.accepts_hold_budget = True  # type: ignore[attr-defined]
 # core skips gate hooks in cron/kanban/subagent runs unless they opt in; _gate_eligible then lets only bot crons through
 pre_final_gate.include_background = True  # type: ignore[attr-defined]
 
@@ -342,6 +431,40 @@ def _tools_now(session_id: str) -> list[dict]:
     return LOG.get(session_id)
 
 
+def _reconcile_prose(session_id: str, surface: str, asks: list[str]) -> dict | None:
+    # This is candidate text, not a validated request or authority. Resolvers
+    # classify the action and obtain exact scope/head from their own store.
+    for ask in asks:
+        context = {"session_id": session_id, "tool_name": surface,
+                   "human_request": {"action": ask}}
+        result = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
+        if result is not None:
+            return result
+    return None
+
+
+RETIRED_MSG = ("ask-gate: this ask was retired by a recorded terminal user answer (revoked, cancelled, completed "
+               "or impossible). Do not ask again; if the user explicitly reopened it, record the reopen first.")
+UNKNOWN_RETIREMENT_MSG = ("ask-gate: retirement state is unavailable, so this ask is held. Park the work without "
+                          "asking the user and retry once the ledger is readable.")
+
+
+def _retired_block(session_id: str, asks: list[str]) -> dict | None:
+    """Durable terminal answers precede judgment on structured ask surfaces; unknown state fails closed."""
+    asks = [a for a in asks if isinstance(a, str) and a.strip()]
+    if not asks or not session_id:
+        return None
+    try:
+        retired = core.retired_matches(asks, ledger().retired_for(session_id, asks))
+    except Exception as e:
+        core.log_event("retirement_unknown", session=session_id, error=repr(e))
+        return {"action": "block", "message": UNKNOWN_RETIREMENT_MSG}
+    if retired:
+        core.log_event("retired_structured_ask", session=session_id)
+        return {"action": "block", "message": RETIRED_MSG}
+    return None
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -351,12 +474,14 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             raise ValueError("human_request cannot accompany dependency/time/transient blocks")
         if tool_name == "kanban_create" and args.get("initial_status") != "blocked":
             raise ValueError("human_request requires initial_status=blocked on creation")
-        reconciled = approval_reconciliation.preflight({
-            "session_id": session_id, "tool_name": tool_name,
-            "human_request": request, "args": args,
-        })
+        context = {"session_id": session_id, "tool_name": tool_name,
+                   "human_request": request, "args": args}
+        reconciled = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
         if reconciled is not None:
             return reconciled
+        retired = _retired_block(session_id, [request["action"]])
+        if retired is not None:
+            return retired
         tools = _tools_now(session_id)
         evidence = request["evidence"]
         claim = core.checked_line(evidence) or evidence
@@ -382,14 +507,44 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
     if _off() or not isinstance(args, dict):
         return None
     try:
+        if tool_name in {"clarify", "kanban_create", "kanban_block"} and session_id:
+            is_ask = (tool_name == "clarify" or args.get("human_request") is not None
+                      or core.needs_checked(tool_name, args, _is_worker())[0])
+            if is_ask:
+                try:
+                    stopped = ledger().workflow_stopped(session_id)
+                except Exception as e:
+                    core.log_event("retirement_unknown", session=session_id, error=repr(e))
+                    return {"action": "block", "message": UNKNOWN_RETIREMENT_MSG}
+            else:
+                stopped = False
+            if stopped:
+                return {"action": "block", "message": "ask-gate: workflow is terminal by explicit user stop. "
+                        "Do not request action or execute/reopen it without an explicit workflow resume."}
+        if tool_name == "clarify":
+            questions = args.get("questions", [])
+            candidates = [q["question"] for q in questions
+                          if isinstance(q, dict) and isinstance(q.get("question"), str)] if isinstance(questions, list) else []
+            reconciled = _reconcile_prose(session_id, tool_name, candidates) or _retired_block(session_id, candidates)
+            if reconciled is not None:
+                return reconciled
         if tool_name == "kanban_complete" and _is_worker():
             return _worker_complete(session_id, args)
         if tool_name not in ("kanban_create", "kanban_block"):
             return None
         if args.get("human_request") is not None:
             return _human_request_gate(session_id, tool_name, args)
+        candidate = str(args.get("reason") or "") if tool_name == "kanban_block" else (
+            str(args.get("title") or "") + "\n" + str(args.get("body") or ""))
+        found = core.find_asks(candidate)
+        reconciled = _reconcile_prose(session_id, tool_name, found)
+        if reconciled is not None:
+            return reconciled
         if tool_name == "kanban_block" and str(args.get("kind") or "") in _WORKER_NO_ASK_KINDS:
             return None
+        reconciled = _retired_block(session_id, found)
+        if reconciled is not None:
+            return reconciled
         gated, text = core.needs_checked(tool_name, args, _is_worker())
         if not gated or "Filed automatically by the `open-asks` plugin" in text:
             return None
@@ -470,11 +625,9 @@ def _prewarm() -> None:
 
 
 def register(ctx) -> None:
+    runtime_contract.require_runtime_contract()
     approval_adapter_loading.install(ctx, approval_reconciliation)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
-    try:
-        ctx.register_hook("pre_final_gate", pre_final_gate)
-    except Exception:  # older core without the hook: L1/L3/L4 still work
-        core.log_event("no_pre_final_gate")
+    ctx.register_hook("pre_final_gate", pre_final_gate)

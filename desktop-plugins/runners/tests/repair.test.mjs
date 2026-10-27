@@ -103,6 +103,26 @@ test('disconnected, conflicting, missing incident and wrong-owner RPC fail close
     if (['disconnect', 'conflict', 'incident'].includes(kind)) assert.equal(f.rpc.length, 0)
   }
 })
+test('core-authority RPC result opens only after owner status binds the same session', async () => {
+  // Live core keys StartOwner by its install authority, never the runners UUID.
+  const f = setup()
+  f.result.gateway_id = 'install:core-authority'
+  await p.createTransport(f.ctx, f.ownerHost).repair(f.row)
+  assert.deepEqual(f.opens, [['compressed_tip', { route }]])
+  const g = setup()
+  g.result.gateway_id = 'install:core-authority'
+  const owned = g.result.stored_session_id
+  const rest = g.ctx.rest
+  g.ctx.rest = async (...args) => {
+    const value = await rest(...args)
+    if (args[0].includes('/repairs/') && args[1]?.method !== 'POST')
+      value.data.repair.session.stored_session_id = owned
+    return value
+  }
+  g.result.stored_session_id = 'unrelated_session'
+  await assert.rejects(p.createTransport(g.ctx, g.ownerHost).repair(g.row), /identity mismatch/)
+  assert.equal(g.opens.length, 0)
+})
 test('existing repair opens via status without scheduling another start', async () => {
   const f = setup(), rest = f.ctx.rest
   f.ctx.rest = async (...args) => {
@@ -209,7 +229,7 @@ test('authoritative reserved status recovers a pre-create crash using the same c
   const f = setup(), rest = f.ctx.rest
   f.ctx.rest = async (...args) => {
     if (args[0].includes('/runners/')) return { meta: f.s.meta, data: { ...fixtures.RunnerDetail, repairs: [f.repair] } }
-    if (args[0].includes('/repairs/')) return { ...f.response, data: { repair: { ...f.repair,
+    if (args[0].includes('/repairs/') && !f.rpc.length) return { ...f.response, data: { repair: { ...f.repair,
       session: { ...f.repair.session, stored_session_id: null, lineage_tip_id: null, state: 'reserved' } } } }
     return rest(...args)
   }

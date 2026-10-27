@@ -83,6 +83,27 @@ def env(tmp_path, monkeypatch):
     return thread
 
 
+def test_registered_screen_schema_routes_explicit_viewer(env):
+    registered = {}
+
+    class Context:
+        def register_tool(self, **kw):
+            registered[kw['name']] = kw
+
+    mo.register(Context())
+    tool = registered['mac_screen']
+    props = tool['schema']['parameters']['properties']
+    assert props['via']['type'] == 'string'
+    out = json.loads(tool['handler']({'host': 'mbp', 'op': 'shot', 'via': 'mini'}))
+    assert out['ok']
+    assert env['calls']()[-1]['to'] == 'you@mini.example.com'
+    assert env['calls']()[-1]['cmd'] == ['screen', 'mbp', 'shot']
+    before = len(env['calls']())
+    assert not json.loads(tool['handler']({'host': 'mbp', 'op': 'shot', 'via': 'missing'}))['ok']
+    assert not json.loads(tool['handler']({'host': 'mbp', 'op': 'shot', 'via': 'mbp'}))['ok']
+    assert len(env['calls']()) == before
+
+
 def test_diag_returns_shim_json(env):
     out = json.loads(mo.tool_diag({"host": "mbp"}))
     assert out["ok"] and out["result"]["displays"] == 2

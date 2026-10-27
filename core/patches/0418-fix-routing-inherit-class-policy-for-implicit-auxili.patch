@@ -1,0 +1,222 @@
+From e316c754d32afb2a8d60544391b71136525a1ff4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:07:20 +0000
+Subject: [PATCH 418/453] fix(routing): inherit class policy for implicit
+ auxiliary jobs [daveey]
+
+(cherry picked from commit 7b7672bb98117519e0bf99a64e92090f1d51b837)
+---
+ agent/auxiliary_class_routing.py              | 31 +++++++--
+ agent/auxiliary_client.py                     |  5 +-
+ agent/model_routing_agent.py                  |  7 ++
+ agent/turn_context.py                         |  1 +
+ run_agent.py                                  |  6 +-
+ .../agent/test_auxiliary_class_inheritance.py | 64 +++++++++++++++++++
+ 6 files changed, 103 insertions(+), 11 deletions(-)
+ create mode 100644 tests/agent/test_auxiliary_class_inheritance.py
+
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index 44868c86e6..dfdacf42df 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -11,16 +11,38 @@ from agent.model_routing import ModelRoutingError, is_class_selector
+ from agent.model_routing_runtime import resolve_class_runtime
+ 
+ 
+-def _class_request(task, options):
++def _requested_model(task_config, options, runtime):
+     from agent import auxiliary_client as aux
+-    task_config = aux._get_auxiliary_task_config(task) if task else {}
+     requested = options.get("model")
+-    if not requested or requested == "auto":
++    if requested in (None, "", "auto"):
+         requested = task_config.get("model")
++    if requested not in (None, "", "auto"):
++        return requested
++    # A specialized provider/transport pin is not permission to route its job to
++    # another provider, even when the main agent uses classes.
++    for source in (options, task_config):
++        if source.get("provider") not in (None, "", "auto"):
++            return None
++        if any(source.get(k) for k in ("base_url", "api_key", "api_mode", "key_env", "api_key_env")):
++            return None
++    if runtime.get("requested_class"):
++        return "class:" + runtime["requested_class"]
++    # A live concrete user switch beats configured class defaults. Never infer a
++    # model's class from its name or from another process-global session.
++    if runtime.get("model"):
++        return runtime["model"]
++    return aux._read_main_model()
++
++
++def _class_request(task, options):
++    from agent import auxiliary_client as aux
++    task_config = aux._get_auxiliary_task_config(task) if task else {}
++    runtime = aux._normalize_main_runtime(options.get("main_runtime"))
++    requested = _requested_model(task_config, options, runtime)
+     if not is_class_selector(requested):
+         return None
+     provider, model, base, key, mode = aux._resolve_task_provider_model(
+-        task, options.get("provider"), options.get("model"),
++        task, options.get("provider"), requested,
+         options.get("base_url"), options.get("api_key"))
+     if not is_class_selector(model):
+         return None
+@@ -36,7 +58,6 @@ def _class_request(task, options):
+     headers = options.get("extra_headers") or {}
+     if {k.lower() for k in headers} & {"authorization", "x-api-key", "api-key", "host"}:
+         raise ModelRoutingError("Auxiliary class headers cannot override authentication or destination")
+-    runtime = aux._normalize_main_runtime(options.get("main_runtime"))
+     owner = runtime.get("session_id") or str(uuid4())
+     # Separate side jobs from the main allocation; retries/restarts of a named
+     # session's same task reuse its durable route without pinning unrelated jobs.
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 9f0bb9683f..ed8aa252ad 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -2755,7 +2755,7 @@ def _runtime_main_value(field: str) -> Any:
+ def set_runtime_main(
+     provider: str, model: str, *, requested_provider: str = "", base_url: str = "",
+     api_key: Any = "", api_mode: str = "", auth_mode: str = "", session_id: str = "",
+-    cache_scope: str = "",
++    cache_scope: str = "", requested_class: str = "",
+ ) -> contextvars.Token:
+     """Record the current context's live main runtime for auxiliary routing.
+ 
+@@ -2777,6 +2777,7 @@ def set_runtime_main(
+         "auth_mode": (auth_mode or "").strip().lower(),
+         "session_id": (session_id or "").strip(),
+         "cache_scope": (cache_scope or "").strip(),
++        "requested_class": (requested_class or "").strip(),
+     }
+     # Publish authoritative context before updating the locked mirrors.
+     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
+@@ -3097,7 +3098,7 @@ def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
+ 
+ _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
+ _MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+-    "requested_provider", "session_id", "cache_scope",
++    "requested_provider", "session_id", "cache_scope", "requested_class",
+ )
+ 
+ 
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 335d1f9648..c988f6874b 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -113,6 +113,13 @@ def clear_class_route(agent):
+     persist_class_metadata(agent)
+ 
+ 
++def current_main_runtime(agent):
++    runtime = {key: getattr(agent, key, "") or "" for key in (
++        "model", "provider", "base_url", "api_key", "api_mode", "auth_mode", "session_id")}
++    runtime["requested_class"] = (getattr(agent, "model_routing", None) or {}).get("requested_class", "")
++    return runtime
++
++
+ def routing_model_config(agent):
+     metadata = getattr(agent, "model_routing", None)
+     return {"model_routing": metadata} if metadata else {}
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 51aff80384..67f4748489 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -544,6 +544,7 @@ def _publish_runtime_main(agent: Any) -> None:
+                 "requested_provider", "base_url", "api_key", "api_mode", "auth_mode", "session_id"
+             )},
+             cache_scope=_cache_scope,
++            requested_class=(getattr(agent, "model_routing", None) or {}).get("requested_class", ""),
+         )
+ 
+ 
+diff --git a/run_agent.py b/run_agent.py
+index 7b9b056ec1..3685865346 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -506,10 +506,8 @@ class AIAgent(
+ 
+     def _current_main_runtime(self) -> dict[str, str]:
+         """Return the live main runtime for session-scoped auxiliary routing."""
+-        return {
+-            key: getattr(self, key, "") or ""
+-            for key in ("model", "provider", "base_url", "api_key", "api_mode", "auth_mode", "session_id")
+-        }
++        from agent.model_routing_agent import current_main_runtime
++        return current_main_runtime(self)
+ 
+     _check_compression_model_feasibility = _forward("agent.conversation_compression", "check_compression_model_feasibility")
+     _replay_compression_warning = _forward("agent.conversation_compression", "replay_compression_warning")
+diff --git a/tests/agent/test_auxiliary_class_inheritance.py b/tests/agent/test_auxiliary_class_inheritance.py
+new file mode 100644
+index 0000000000..6aded28aa4
+--- /dev/null
++++ b/tests/agent/test_auxiliary_class_inheritance.py
+@@ -0,0 +1,64 @@
++"""Implicit auxiliary jobs inherit class policy, never a paid legacy ladder."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent import auxiliary_client as aux
++from agent import auxiliary_class_routing as routing
++from tests.tui_gateway import test_class_routing as fixtures
++
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++native_transport = fixtures.native_transport
++
++
++@pytest.mark.parametrize("source", ["explicit-runtime", "turn-context", "config"])
++def test_auto_auxiliary_inherits_class_on_wire(source, routing_home, streaming_route,
++                                               native_transport, monkeypatch, tmp_path):
++    from hermes_cli.config import atomic_config_write
++    from agent.turn_context import _publish_runtime_main
++    from run_agent import AIAgent
++
++    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {})
++    aux.clear_runtime_main()
++    options = {}
++    agent = SimpleNamespace(model="anthropic-deep", provider="anthropic", session_id="owner",
++                            model_routing={"requested_class": "deep"})
++    if source == "explicit-runtime":
++        options["main_runtime"] = AIAgent._current_main_runtime(agent)
++    elif source == "turn-context":
++        _publish_runtime_main(agent)
++    else:
++        routing_home["model"].update(default="class:deep", provider="auto")
++        atomic_config_write(tmp_path / "config.yaml", routing_home)
++    try:
++        with patch.object(aux, "_try_discovery_chain", side_effect=AssertionError("legacy discovery")), \
++                patch.object(aux, "_try_main_provider_route", side_effect=AssertionError("unfenced route")):
++            response = aux.call_llm("title", messages=[{"role": "user", "content": "ok"}], **options)
++        assert response.choices[0].message.content == "ok"
++        assert native_transport[0][2]["model"] == "anthropic-deep"
++        assert native_transport[0][1]["authorization"].startswith("Bearer sk-ant-oat")
++    finally:
++        aux.clear_runtime_main()
++
++
++@pytest.mark.parametrize("pin", [{"model": "exact-user-model"}, {"provider": "custom"},
++                                 {"base_url": "https://pinned.invalid"}, {"api_key": "explicit"}])
++def test_explicit_auxiliary_pin_does_not_inherit_class(pin, monkeypatch):
++    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {})
++    options = {"main_runtime": {"requested_class": "deep", "model": "selected", "provider": "anthropic"}, **pin}
++    assert routing._class_request("title", options) is None
++
++
++def test_concrete_main_runtime_wins_over_class_config(monkeypatch):
++    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {})
++    monkeypatch.setattr(aux, "_read_main_model", lambda: "class:deep")
++    assert routing._class_request("title", {"main_runtime": {"model": "exact-user-model"}}) is None
++
++
++def test_explicit_class_wins_over_inherited_class(monkeypatch):
++    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {})
++    request = routing._class_request("title", {"model": "class:fast", "main_runtime": {
++        "requested_class": "deep", "model": "selected", "session_id": "owner"}})
++    assert request[0] == "class:fast"
+-- 
+2.54.0 (Apple Git-157)
+

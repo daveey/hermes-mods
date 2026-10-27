@@ -1,0 +1,362 @@
+From eb215058a7540631b432a0148e97f3dd576501df Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 22:10:52 -0700
+Subject: [PATCH 452/453] =?UTF-8?q?kanban:=20provider=20quota=20walls=20?=
+ =?UTF-8?q?=E2=80=94=20record=20retry-after,=20re-tier=20walled=20cards=20?=
+ =?UTF-8?q?(incl.=20keep-pattern/OOM/pins)=20to=20default=5Fmodel,=20storm?=
+ =?UTF-8?q?=20alert=20(t=5Fae75445e)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 8ae2a621a9a0110d4ebea9b4122b31506bad341f)
+---
+ hermes_cli/kanban_db_dispatch.py              |  11 ++
+ hermes_cli/kanban_model_tier.py               |  15 ++
+ hermes_cli/kanban_provider_walls.py           | 165 ++++++++++++++++++
+ .../hermes_cli/test_kanban_provider_walls.py  | 106 +++++++++++
+ 4 files changed, 297 insertions(+)
+ create mode 100644 hermes_cli/kanban_provider_walls.py
+ create mode 100644 tests/hermes_cli/test_kanban_provider_walls.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index e905b10488..1dd0939d23 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1350,6 +1350,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                 )
+             if dead.rate_limited:
+                 sweep.rate_limited.append(row["id"])
++                try:
++                    from hermes_cli import kanban_provider_walls as _walls
++                    _walls.record_wall_for_run(conn, row["id"], row["current_run_id"],
++                                               _kb.worker_log_path(row["id"], board=board))
++                except Exception:
++                    _kb._log.warning("kanban: recording provider wall failed", exc_info=True)
+             else:
+                 sweep.crashed.append(row["id"])
+                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+@@ -2359,6 +2365,11 @@ def _run_reclaim_phase(
+         result.shared_blocker_released = release_cleared_blockers(conn)
+     except Exception:
+         _kb._log.warning("kanban: releasing cleared shared blockers failed", exc_info=True)
++    try:
++        from hermes_cli import kanban_provider_walls as _walls
++        _walls.alert_on_storm(conn, board=board)
++    except Exception:
++        _kb._log.warning("kanban: rate-limit storm alert failed", exc_info=True)
+     try:
+         result.quota_block_released = _kbq.release_recovered_quota_blocks(conn)
+     except Exception:
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 6d115db046..8efa6465a0 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -154,6 +154,21 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+     except Exception as exc:
+         logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc)
+         return "error"
++    if reason not in ("off", "profile_out_of_scope"):
++        try:
++            from hermes_cli import kanban_provider_walls as _walls
++            cfg_ = load_tier_config() if cfg is None else cfg
++            if model:
++                probe = type("T", (), {"model_override": model, "provider_override": provider,
++                                       "title": task.title, "body": task.body})()
++            else:
++                probe = task
++            moved = _walls.retier_for_walls(probe, cfg_)
++            if moved:
++                model, provider, walled = moved
++                reason = f"{reason}+wall:{walled}"
++        except Exception as exc:  # never break dispatch over wall bookkeeping
++            logger.debug("kanban model tier: wall re-tier failed for %s (%s)", getattr(task, "id", "?"), exc)
+     if model:
+         task.model_override = model
+         task.provider_override = provider
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+new file mode 100644
+index 0000000000..7cd8414e17
+--- /dev/null
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -0,0 +1,165 @@
++"""Provider quota walls: stop respawning kanban workers into a wall that lasts hours or days. [daveey]
++
++2026-10-26: the hub spawned workers on openai-codex that died ~60 s later with ``retry after 524389s``
++(~6 days), 285 times in 24h. A ``rate_limited`` exit is requeued as neutral, so nothing noticed.
++
++* :func:`record_wall` runs when a worker exits rate-limited. It reads the retry-after from the worker log
++  and stores ``provider -> until`` in ``<kanban home>/provider_walls.json`` (a wall under
++  ``MIN_WALL_SECONDS`` is left to the normal respawn cooldown).
++* :func:`retier_for_walls` runs at claim time, after the tier decision. If the provider the worker would
++  run on is walled, the card moves to the configured fallback (``kanban.default_model``/``default_provider``)
++  unless the fallback is walled too. This covers keep-pattern, review and retry tiers (which resolve to
++  ``model: null`` = profile default) as well as explicit pins. A card whose body contains ``require_model``
++  keeps its pin.
++* :func:`rate_limit_storm` counts ``rate_limited`` runs in the last hour for the alert card.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import re
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++MIN_WALL_SECONDS = 15 * 60
++DEFAULT_WALL_SECONDS = 30 * 60
++STORM_THRESHOLD = 10
++REQUIRE_MODEL_MARKER = "require_model"
++_RETRY_RE = re.compile(r"retry[\s_-]*after[:=\s]+(\d+)\s*s", re.IGNORECASE)
++
++
++def walls_path() -> Path:
++    from hermes_cli import kanban_db as _kb
++    return _kb.kanban_home() / "provider_walls.json"
++
++
++def _load(path: Optional[Path] = None) -> dict[str, float]:
++    try:
++        data = json.loads((path or walls_path()).read_text())
++        return {str(k): float(v) for k, v in data.items()}
++    except Exception:
++        return {}
++
++
++def active_walls(*, now: Optional[float] = None, path: Optional[Path] = None) -> dict[str, float]:
++    now = time.time() if now is None else now
++    return {p: u for p, u in _load(path).items() if u > now}
++
++
++def parse_retry_after(text: str) -> Optional[int]:
++    """Largest ``retry after Ns`` in ``text`` (the log tail), or None."""
++    vals = [int(m) for m in _RETRY_RE.findall(text or "")]
++    return max(vals) if vals else None
++
++
++def _norm(provider: Optional[str]) -> str:
++    return str(provider or "").strip().lower()
++
++
++def profile_provider() -> str:
++    try:
++        from hermes_cli.config import load_config
++        model = (load_config() or {}).get("model") or {}
++        return _norm(model.get("provider")) if isinstance(model, dict) else ""
++    except Exception:
++        return ""
++
++
++def record_wall(provider: str, retry_after: Optional[int], *, now: Optional[float] = None,
++                path: Optional[Path] = None) -> Optional[float]:
++    """Mark ``provider`` unavailable for ``retry_after`` s. Returns the expiry, or None if too short to track."""
++    provider = _norm(provider)
++    if not provider or provider == "auto":
++        return None
++    now = time.time() if now is None else now
++    seconds = DEFAULT_WALL_SECONDS if retry_after is None else int(retry_after)
++    if seconds < MIN_WALL_SECONDS:
++        return None
++    until = now + seconds
++    p = path or walls_path()
++    walls = active_walls(now=now, path=p)
++    walls[provider] = max(until, walls.get(provider, 0))
++    try:
++        p.parent.mkdir(parents=True, exist_ok=True)
++        tmp = p.with_suffix(".tmp")
++        tmp.write_text(json.dumps(walls))
++        tmp.replace(p)
++    except OSError as exc:
++        logger.warning("kanban walls: cannot write %s (%s)", p, exc)
++    return walls[provider]
++
++
++def record_wall_for_run(conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
++                        log_path: Optional[Path]) -> Optional[float]:
++    """Wall bookkeeping for a rate-limited exit: provider from the run's ``model_tier`` event."""
++    provider = ""
++    try:
++        for row in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_tier' "
++            "AND (run_id IS ? OR run_id IS NULL) ORDER BY id DESC LIMIT 1", (task_id, run_id)):
++            provider = _norm((json.loads(row[0] or "{}")).get("provider"))
++        if not provider:
++            row = conn.execute("SELECT provider_override FROM tasks WHERE id = ?", (task_id,)).fetchone()
++            provider = _norm(row[0]) if row else ""
++    except Exception as exc:
++        logger.debug("kanban walls: provider lookup failed for %s (%s)", task_id, exc)
++    provider = provider or profile_provider()
++    retry = None
++    try:
++        if log_path and log_path.exists():
++            data = log_path.read_bytes()[-20000:].decode("utf-8", "replace")
++            retry = parse_retry_after(data)
++    except OSError:
++        pass
++    return record_wall(provider, retry)
++
++
++def retier_for_walls(task: Any, cfg: dict[str, Any], *, now: Optional[float] = None,
++                     path: Optional[Path] = None) -> Optional[tuple[str, str, str]]:
++    """``(model, provider, walled_provider)`` to run on instead, or None to leave the task alone."""
++    walls = active_walls(now=now, path=path)
++    if not walls:
++        return None
++    if REQUIRE_MODEL_MARKER in f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}":
++        return None
++    provider = _norm(getattr(task, "provider_override", None)) or (
++        profile_provider() if not str(getattr(task, "model_override", "") or "").strip() else "")
++    if provider not in walls:
++        return None
++    model = str(cfg.get("default_model") or "").strip()
++    fb = _norm(cfg.get("default_provider"))
++    if not model or not fb or fb == "auto" or fb in walls:
++        return None
++    return model, fb, provider
++
++
++def rate_limit_storm(conn: sqlite3.Connection, *, now: Optional[float] = None) -> int:
++    now = int(time.time() if now is None else now)
++    return conn.execute(
++        "SELECT COUNT(*) FROM task_runs WHERE outcome = 'rate_limited' AND ended_at > ?", (now - 3600,)
++    ).fetchone()[0]
++
++
++def alert_on_storm(conn: sqlite3.Connection, *, board: Optional[str] = None, now: Optional[float] = None) -> Optional[str]:
++    """Open ONE card per host per day when more than STORM_THRESHOLD rate_limited runs landed in the last hour."""
++    n = rate_limit_storm(conn, now=now)
++    if n <= STORM_THRESHOLD:
++        return None
++    import socket
++    from hermes_cli import kanban_db as _kb
++    host = socket.gethostname().split(".")[0]
++    day = time.strftime("%Y%m%d", time.localtime(now or time.time()))
++    walls = ", ".join(f"{p} until {time.strftime('%H:%M', time.localtime(u))}" for p, u in active_walls(now=now).items())
++    return _kb.create_task(
++        conn, title=f"{host}: {n} rate_limited kanban runs in the last hour (provider quota wall)",
++        body=(f"More than {STORM_THRESHOLD} workers exited on a provider quota wall in an hour on {host}. "
++              f"Known walls: {walls or 'none recorded'}. Check `kanban.default_model`/`default_provider`, the "
++              "provider's usage limit, and cards pinned to the walled provider (`require_model`)."),
++        assignee="default", created_by="rate-limit-alert", priority=80, idempotency_key=f"rate_limit_storm:{host}:{day}",
++        board=board,
++    )
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+new file mode 100644
+index 0000000000..afdfc85491
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -0,0 +1,106 @@
++"""Provider quota walls: record on rate-limited exit, re-tier at claim, storm alert [daveey]."""
++from __future__ import annotations
++
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli.kanban_model_tier import apply_model_tier
++
++from tests.hermes_cli.test_kanban_model_tier import (
++    OPUS, SONNET, _dispatch, _tier_events, _write_cfg, board,
++)
++
++CODEX = "openai-codex"
++
++
++def _wall(board, provider=CODEX, seconds=524389):
++    walls.record_wall(provider, seconds, path=board / "kanban" / "provider_walls.json")
++
++
++def test_parse_retry_after_takes_largest():
++    assert walls.parse_retry_after("quota exhausted (429); retry after 524389s") == 524389
++    assert walls.parse_retry_after("nothing here") is None
++
++
++def test_short_wall_not_tracked(board):
++    assert walls.record_wall(CODEX, 60, path=board / "w.json") is None
++    assert walls.active_walls(path=board / "w.json") == {}
++
++
++def test_expired_wall_ignored(board):
++    p = board / "w.json"
++    walls.record_wall(CODEX, 3600, now=time.time() - 7200, path=p)
++    assert walls.active_walls(path=p) == {}
++
++
++def test_keep_pattern_card_retiered_off_walled_profile_provider(board, monkeypatch):
++    _write_cfg(board, default_model=SONNET, default_provider="anthropic", default_model_keep_patterns=["security"])
++    monkeypatch.setattr(walls, "profile_provider", lambda: CODEX)
++    monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
++    walls.record_wall(CODEX, 524389, path=board / "w.json")
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="security audit", assignee="default")
++    seen = _dispatch(conn)
++    assert seen[tid][:2] == (SONNET, "anthropic")
++    assert "wall:openai-codex" in _tier_events(conn, tid)[-1]["reason"]
++
++
++def test_pinned_card_on_walled_provider_moves_unless_require_model(board, monkeypatch):
++    _write_cfg(board, default_model=SONNET, default_provider="anthropic")
++    monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
++    walls.record_wall(CODEX, 524389, path=board / "w.json")
++    conn = kbc.connect()
++    a = kb.create_task(conn, title="a", assignee="default", model_override="gpt-6-astra", provider_override=CODEX)
++    b = kb.create_task(conn, title="b require_model", assignee="default", model_override="gpt-6-astra",
++                       provider_override=CODEX)
++    seen = _dispatch(conn)
++    assert seen[a][:2] == (SONNET, "anthropic")
++    assert seen[b][:2] == ("gpt-6-astra", CODEX)
++
++
++def test_no_wall_no_change(board, monkeypatch):
++    _write_cfg(board, default_model=SONNET, default_provider="anthropic", default_model_keep_patterns=["security"])
++    monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
++    monkeypatch.setattr(walls, "profile_provider", lambda: CODEX)
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="security audit", assignee="default")
++    assert _dispatch(conn)[tid][0] is None
++
++
++def test_fallback_also_walled_leaves_task(board, monkeypatch):
++    _write_cfg(board, default_model=SONNET, default_provider="anthropic")
++    monkeypatch.setattr(walls, "walls_path", lambda: board / "w.json")
++    _wall(board); walls.record_wall("anthropic", 7200, path=board / "w.json")
++    class T: model_override, provider_override, title, body = "x", CODEX, "t", ""
++    assert walls.retier_for_walls(T(), {"default_model": SONNET, "default_provider": "anthropic"},
++                                  path=board / "w.json") is None
++
++
++def test_record_wall_for_run_uses_tier_event_and_log(board, monkeypatch):
++    p = board / "w.json"
++    monkeypatch.setattr(walls, "walls_path", lambda: p)
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="x", assignee="default")
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "model_tier", {"provider": CODEX, "reason": "default"}, run_id=None)
++    log = board / "t.log"
++    log.write_text("Codex provider quota exhausted (429); retry after 524389s")
++    assert walls.record_wall_for_run(conn, tid, None, log)
++    assert CODEX in walls.active_walls(path=p)
++
++
++def test_storm_alert_opens_one_card(board):
++    conn = kbc.connect()
++    now = int(time.time())
++    for i in range(12):
++        conn.execute("INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
++                     "VALUES ('t_x', 'default', 'rate_limited', 'rate_limited', ?, ?)", (now - 60, now - 30))
++    conn.commit()
++    first = walls.alert_on_storm(conn)
++    assert first and walls.alert_on_storm(conn) == first
++
++
++def test_storm_alert_quiet_below_threshold(board):
++    assert walls.alert_on_storm(kbc.connect()) is None
+-- 
+2.54.0 (Apple Git-157)
+

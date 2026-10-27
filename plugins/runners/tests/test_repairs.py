@@ -27,6 +27,7 @@ class StartIntent:
     text: str
     source: str = 'desktop'
     metadata: dict = field(default_factory=dict)
+    toolsets: tuple | list | None = None
 
 F = json.loads((Path(__file__).parents[1] / 'contracts/fixtures.json').read_text())
 PRINCIPAL = 'principal_0000000000000001'
@@ -69,6 +70,29 @@ def core_types(monkeypatch):
     module.StartIntent = StartIntent
     module.get_service = lambda profile: pytest.fail('ambient core runtime used')
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    # Core keys start ledgers by its install authority, not the runners owner UUID.
+    rooms = ModuleType('gateway.hosted_rooms')
+    rooms.local_authority_gateway_id = lambda: CORE_AUTHORITY
+    if 'gateway' not in sys.modules:
+        monkeypatch.setitem(sys.modules, 'gateway', ModuleType('gateway'))
+    monkeypatch.setitem(sys.modules, rooms.__name__, rooms)
+
+
+CORE_AUTHORITY = 'install:fixture-authority'
+
+
+def test_start_owner_uses_core_authority_not_runners_owner(env):
+    # The live RPC builds StartOwner(local_authority_gateway_id(), ...). A
+    # resolver keyed by the runners owner UUID is unreachable (4030).
+    row = reserve(env)
+    owner = env.domain.register(PRINCIPAL)
+    assert owner.gateway_id == CORE_AUTHORITY != env.service.config['owner_gateway_id']
+    rpc_owner = StartOwner(CORE_AUTHORITY, env.service.config['owner_profile'], PRINCIPAL)
+    started = env.core.start(rpc_owner, 'runners', row['session']['start_request_id'])
+    assert started['gateway_id'] == CORE_AUTHORITY
+    repair = env.domain.reconcile(row['id'], principal=PRINCIPAL)
+    assert repair['session']['stored_session_id'] == 'chat_first'
+    assert repair['owner']['gateway_id'] == env.service.config['owner_gateway_id']
 
 
 @pytest.fixture
@@ -102,6 +126,33 @@ def test_registered_intent_carries_persisted_repair_metadata(env):
     owner = env.domain.register(PRINCIPAL)
     intent = env.core.resolvers[owner, 'runners'](owner, row['session']['start_request_id'])
     assert intent.metadata == {'runner_repair_id': row['id']}
+
+
+def test_repair_start_requests_closed_runners_only_toolset(env):
+    row = reserve(env)
+    owner = env.domain.register(PRINCIPAL)
+    intent = env.core.resolvers[owner, 'runners'](owner, row['session']['start_request_id'])
+    assert list(intent.toolsets) == ['runners', 'clarify', 'todo']
+    for forbidden in ('terminal', 'code_execution', 'file', 'delegation', 'kanban', 'browser', 'all', '*'):
+        assert forbidden not in intent.toolsets
+
+
+def test_core_without_toolset_support_fails_repair_start_explicitly(env, monkeypatch):
+    import sys
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class OldStartIntent:  # a core before the toolsets field: no such keyword
+        title: str
+        text: str
+        source: str = 'desktop'
+        metadata: dict | None = None
+    monkeypatch.setattr(sys.modules['tui_gateway.session_start_requests'], 'StartIntent', OldStartIntent)
+    row = reserve(env)
+    owner = env.domain.register(PRINCIPAL)
+    with pytest.raises(RuntimeError, match='repair_toolsets_unsupported'):
+        env.core.resolvers[owner, 'runners'](owner, row['session']['start_request_id'])
+    assert env.core.calls == 0
 
 
 def test_brief_preserves_target_provenance_beyond_fleet_limit(env):

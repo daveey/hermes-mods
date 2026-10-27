@@ -1,0 +1,1070 @@
+From c9421d3fc17870e1c545d1e10763502628401f17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:56:01 -0700
+Subject: [PATCH 404/453] fix(desktop): keep new Home sessions visible across
+ sidebar views [daveey]
+
+Use consistent provisional placement for unresolved cwd-only chats, honor authoritative Home ownership, and synthesize Home when absent. Cover previews, lanes, filtering, labels, and ownership transitions with helper and rendered regression tests. Previously cwd fallback selected a nonexistent project and tests asserted omission; regression coverage now requires a visible destination.
+
+(cherry picked from commit 2f45b7b6865a172f45e999986393cf127cee178f)
+---
+ .../sidebar/chat-sidebar.integration.test.tsx |  91 +++++++
+ apps/desktop/src/app/chat/sidebar/index.tsx   |  60 +++--
+ .../src/app/chat/sidebar/projects/index.ts    |   5 +-
+ .../sidebar/projects/overview-row.test.tsx    |  25 +-
+ .../chat/sidebar/projects/overview-row.tsx    |   4 +-
+ .../sidebar/projects/workspace-groups.test.ts | 216 ++++++++++++++++-
+ .../chat/sidebar/projects/workspace-groups.ts | 225 ++++++++++++++++--
+ .../src/app/chat/sidebar/session-row.test.tsx |  37 +++
+ .../src/app/chat/sidebar/session-row.tsx      |   5 +-
+ apps/desktop/src/lib/session-project-label.ts |  16 +-
+ 10 files changed, 634 insertions(+), 50 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+index 0a94d88820..f2e6fb2501 100644
+--- a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+@@ -275,6 +275,97 @@ describe('ChatSidebar project entry', () => {
+   })
+ })
+ 
++// A brand-new chat in a folder no project claims (a CLI started in ~) has no
++// backend owner yet, and the tree may carry no Home node at all (Home only
++// exists once a persisted row lands there). It must still show in the grouped
++// overview at once — under Home, not nowhere — and a fresh chat in a known
++// repo's subfolder must show under that repo only, never twice.
++describe('ChatSidebar fresh chat before the tree knows it', () => {
++  const repoRow = makeSessionInfo({
++    cwd: '/work/repo',
++    git_repo_root: '/work/repo',
++    id: 'repo-row',
++    last_active: 5,
++    message_count: 3,
++    profile: 'default',
++    started_at: 5,
++    title: 'Repo chat'
++  })
++
++  const repoProject = {
++    id: '/work/repo',
++    isAuto: true,
++    label: 'repo',
++    path: '/work/repo',
++    previewSessions: [repoRow],
++    repos: [{ groups: [], id: '/work/repo', label: 'repo', path: '/work/repo', sessionCount: 1 }],
++    sessionCount: 1,
++    sessionIds: ['repo-row']
++  }
++
++  const fresh = (cwd: string, id: string, title: string) =>
++    makeSessionInfo({ cwd, id, last_active: 10, message_count: 0, profile: 'default', started_at: 10, title })
++
++  beforeEach(() => {
++    setSidebarAgentsGrouped(true)
++    $projectTree.set([repoProject])
++  })
++
++  afterEach(() => {
++    cleanup()
++    $projectScope.set(ALL_PROJECTS)
++    $projectTree.set([])
++    setSidebarAgentsGrouped(false)
++    $sessions.set([])
++  })
++
++  // The overview project row a rendered chat sits under.
++  const rowOwner = (title: string) =>
++    screen.getByText(title).closest('[data-sessions-project]')?.getAttribute('data-sessions-project')
++
++  it('shows a fresh zero-message home-folder chat under a Home row the tree never sent', () => {
++    $sessions.set([repoRow, fresh('/Users/example', 'fresh-home', 'Fresh home chat')])
++
++    renderSidebar('/', 'chat')
++
++    expect(screen.getAllByText('Fresh home chat')).toHaveLength(1)
++    expect(rowOwner('Fresh home chat')).toBe('__no_project__')
++    expect(rowOwner('Repo chat')).toBe('/work/repo')
++  })
++
++  it('lists the fresh home-folder chat when Home is entered before the tree has a Home node', () => {
++    $sessions.set([repoRow, fresh('/Users/example', 'fresh-home', 'Fresh home chat')])
++    $projectScope.set('__no_project__')
++
++    renderSidebar('/', 'chat')
++
++    expect($projectScope.get()).toBe('__no_project__')
++    expect(screen.getAllByText('Fresh home chat')).toHaveLength(1)
++    expect(screen.queryByText('Repo chat')).toBeNull()
++  })
++
++  it('files a fresh chat in a known repo subfolder under that repo only, even with a Home node', () => {
++    const homeNode = {
++      id: '__no_project__',
++      isNoProject: true,
++      label: 'Home',
++      path: null,
++      previewSessions: [],
++      repos: [],
++      sessionCount: 0,
++      sessionIds: []
++    }
++
++    $projectTree.set([homeNode, repoProject])
++    $sessions.set([repoRow, fresh('/work/repo/apps', 'fresh-sub', 'Fresh subfolder chat')])
++
++    renderSidebar('/', 'chat')
++
++    expect(screen.getAllByText('Fresh subfolder chat')).toHaveLength(1)
++    expect(rowOwner('Fresh subfolder chat')).toBe('/work/repo')
++  })
++})
++
+ // Messaging platforms group rows by owner the same way recents does once every
+ // profile is on screen, so a Telegram thread is attributable to its profile
+ // (#87715). The platform's row cap and load-more stay the section's.
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index 5bde11a906..98019bce24 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -167,6 +167,7 @@ import { ProjectDialog } from './project-dialog'
+ import { filterToSessionBearingProjects, resolveLiveProjectFilter } from './project-filter'
+ import {
+   excludeProjectSessions,
++  knownProjectsOf,
+   orderProjectsByIds,
+   overlayLiveLanes,
+   overlayLivePreviews,
+@@ -182,7 +183,8 @@ import {
+   type SidebarWorkspaceTree,
+   sortProjectsForOverview,
+   StartWorkButton,
+-  useRepoWorktreeMap
++  useRepoWorktreeMap,
++  withProvisionalHome
+ } from './projects'
+ import { WorktreeDialog } from './projects/worktree-dialog'
+ import {
+@@ -533,15 +535,7 @@ export function ChatSidebar({
+   const projects = useStore($projects)
+   const projectTree = useStore($projectTree)
+   const projectOwners = useStore($projectOwnerBySessionId)
+-
+-  // The persisted project filter's storage is shared across profiles, so ids
+-  // picked in another profile don't resolve in the active one and the raw
+-  // membership whitelist empties every tier of the sidebar (#96246). Narrow
+-  // to ids the ACTIVE tree resolves; dead ids are inert, not fatal.
+-  const projectFilter = useMemo(
+-    () => resolveLiveProjectFilter(persistedProjectFilter, projectTree),
+-    [persistedProjectFilter, projectTree]
+-  )
++  const knownProjects = useMemo(() => knownProjectsOf(projectTree), [projectTree])
+ 
+   const projectTreeLoading = useStore($projectTreeLoading)
+   const removedSessionIds = useStore($removedSessionIds)
+@@ -637,6 +631,30 @@ export function ChatSidebar({
+     return filterSessionsByProfileScope(pool, profileScope)
+   }, [sessions, archivedSessions, showArchived, profileScope])
+ 
++  // The tree the sidebar renders and filters by: the backend's, plus a Home
++  // node when a fresh row only Home can show arrives before the tree has one.
++  // Built from the unfiltered rows, so filters narrow it like any other node.
++  const visibleProjectTree = useMemo(
++    () =>
++      showArchived
++        ? projectTree
++        : withProvisionalHome(projectTree, scopedSessions, projects, {
++            known: knownProjects,
++            owners: projectOwners,
++            removed: removedSessionIds
++          }),
++    [showArchived, projectTree, scopedSessions, projects, knownProjects, projectOwners, removedSessionIds]
++  )
++
++  // The persisted project filter's storage is shared across profiles, so ids
++  // picked in another profile don't resolve in the active one and the raw
++  // membership whitelist empties every tier of the sidebar (#96246). Narrow
++  // to ids the ACTIVE tree resolves; dead ids are inert, not fatal.
++  const projectFilter = useMemo(
++    () => resolveLiveProjectFilter(persistedProjectFilter, visibleProjectTree),
++    [persistedProjectFilter, visibleProjectTree]
++  )
++
+   // One predicate for the status/project filters, so the flat list and the
+   // project lanes narrow by the same rule. A project lane holds rows the loaded
+   // page may not, so it has to be answerable per session rather than by
+@@ -684,7 +702,7 @@ export function ChatSidebar({
+       // Same membership the sidebar groups and colors by (backend owner first,
+       // cwd walk otherwise), so a filtered row lands in the lane the user
+       // picked it from.
+-      return sessionMatchesProjectFilter(session, projectFilter, projects, projectOwners)
++      return sessionMatchesProjectFilter(session, projectFilter, projects, projectOwners, knownProjects)
+     },
+     [
+       hiddenGatewayIds,
+@@ -699,6 +717,7 @@ export function ChatSidebar({
+       pullRequests,
+       projects,
+       projectOwners,
++      knownProjects,
+       dotStates
+     ]
+   )
+@@ -1053,7 +1072,7 @@ export function ChatSidebar({
+   // overview sort. Membership is the backend tree's — never re-derived here.
+   const projectModel = useMemo<SidebarProjectTree[]>(() => {
+     const sorted = sortProjectsForOverview(
+-      filterToSessionBearingProjects(filterVisibleProjects(projectTree, dismissedAutoProjects))
++      filterToSessionBearingProjects(filterVisibleProjects(visibleProjectTree, dismissedAutoProjects))
+         // A filtered-out project drops its whole lane, header included — hiding
+         // only its rows would leave a row of empty folders behind.
+         .filter(project => !projectFilter.length || projectFilter.includes(project.id))
+@@ -1091,7 +1110,7 @@ export function ChatSidebar({
+ 
+     return orderProjectsByIds(deduped, projectOrderIds)
+   }, [
+-    projectTree,
++    visibleProjectTree,
+     dismissedAutoProjects,
+     orderRepos,
+     activeProjectId,
+@@ -1169,9 +1188,12 @@ export function ChatSidebar({
+   const enteredProjectContent = useMemo(
+     () =>
+       enteredProject
+-        ? overlayLiveLanes(enteredProject, enteredProjectOverlaySessions, removedSessionIds, projectOwners)
++        ? overlayLiveLanes(enteredProject, enteredProjectOverlaySessions, removedSessionIds, projectOwners, {
++            explicitProjects: projects,
++            known: knownProjects
++          })
+         : undefined,
+-    [enteredProject, enteredProjectOverlaySessions, removedSessionIds, projectOwners]
++    [enteredProject, enteredProjectOverlaySessions, removedSessionIds, projectOwners, projects, knownProjects]
+   )
+ 
+   const scopedRepoPaths = useMemo(
+@@ -1278,12 +1300,14 @@ export function ChatSidebar({
+         showAllSessions ? Infinity : PROJECT_PREVIEW_COUNT,
+         {
+           removed: removedSessionIds,
++          owners: projectOwners,
++          known: knownProjects,
+           // Rank before the trim, so "3 priciest in this project" isn't "3 most
+           // recent, priciest first".
+           rankIds: sortOrderIds
+         }
+       ),
+-    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, showAllSessions]
++    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, showAllSessions, projectOwners, knownProjects]
+   )
+ 
+   // A row's "Show all" hydrates raw backend lanes, which — like the drill-in —
+@@ -1297,7 +1321,7 @@ export function ChatSidebar({
+     const counts: Record<string, number> = {}
+ 
+     for (const session of sessions) {
+-      const projectId = isHidden(session) ? sessionBucketId(session, projects, projectOwners) : null
++      const projectId = isHidden(session) ? sessionBucketId(session, projects, projectOwners, knownProjects) : null
+ 
+       if (projectId) {
+         counts[projectId] = (counts[projectId] ?? 0) + 1
+@@ -1305,7 +1329,7 @@ export function ChatSidebar({
+     }
+ 
+     return { isHidden, counts }
+-  }, [sessions, projects, projectOwners, isHiddenFromProjects, removedSessionIds])
++  }, [sessions, projects, projectOwners, knownProjects, isHiddenFromProjects, removedSessionIds])
+ 
+   const onEnterProject = useCallback(
+     (id: string) => {
+diff --git a/apps/desktop/src/app/chat/sidebar/projects/index.ts b/apps/desktop/src/app/chat/sidebar/projects/index.ts
+index d4fb9dac7b..b93265a9bb 100644
+--- a/apps/desktop/src/app/chat/sidebar/projects/index.ts
++++ b/apps/desktop/src/app/chat/sidebar/projects/index.ts
+@@ -12,6 +12,8 @@ export { ProjectMenu } from './project-menu'
+ export { SidebarWorkspaceGroup } from './workspace-group'
+ export {
+   excludeProjectSessions,
++  type KnownProjects,
++  knownProjectsOf,
+   liveSessionProjectId,
+   overlayLiveLanes,
+   overlayLivePreviews,
+@@ -22,6 +24,7 @@ export {
+   sessionRecency,
+   type SidebarProjectTree,
+   type SidebarSessionGroup,
+-  type SidebarWorkspaceTree
++  type SidebarWorkspaceTree,
++  withProvisionalHome
+ } from './workspace-groups'
+ export { StartWorkButton } from './workspace-header'
+diff --git a/apps/desktop/src/app/chat/sidebar/projects/overview-row.test.tsx b/apps/desktop/src/app/chat/sidebar/projects/overview-row.test.tsx
+index 5b022000ff..54980f74d8 100644
+--- a/apps/desktop/src/app/chat/sidebar/projects/overview-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/projects/overview-row.test.tsx
+@@ -14,6 +14,9 @@ afterEach(cleanup)
+ 
+ const workspaceOpen = vi.hoisted(() => ({ value: false }))
+ 
++// The snapshot's lane rows the row falls back to when no preview override is given.
++const laneFallback = vi.hoisted(() => ({ rows: [] as SessionInfo[] }))
++
+ const projectsStore = vi.hoisted(() => ({
+   fetchProjectSessions:
+     vi.fn<(id: string, options?: { supersedable?: boolean }) => Promise<null | SidebarProjectTree>>(),
+@@ -47,7 +50,7 @@ vi.mock('@/store/projects', async importOriginal => ({
+ // persisted open/collapse hook and the in-memory fallback preview.
+ vi.mock('./model', async () => ({
+   ...(await vi.importActual<typeof Model>('./model')),
+-  latestProjectSessions: () => [],
++  latestProjectSessions: () => laneFallback.rows,
+   useWorkspaceNodeOpen: () => [workspaceOpen.value, vi.fn()]
+ }))
+ 
+@@ -72,6 +75,7 @@ beforeEach(() => {
+ describe('ProjectOverviewRow', () => {
+   afterEach(() => {
+     workspaceOpen.value = false
++    laneFallback.rows = []
+     projectsStore.fetchProjectSessions.mockReset()
+     projectsStore.projectProfile.mockReset().mockReturnValue('default')
+   })
+@@ -82,6 +86,25 @@ describe('ProjectOverviewRow', () => {
+     expect(screen.queryByRole('button', { name: 'Show Test D sessions' })).toBeNull()
+   })
+ 
++  // `previewSessions` is the live overlay's answer for this project. An empty
++  // list means "nothing here now" (e.g. the only row moved to another
++  // project), so the row must not fall back to its stale snapshot lanes; only
++  // an absent override (undefined) falls back.
++  it('treats an empty preview override as authoritative and an absent one as lane fallback', () => {
++    workspaceOpen.value = true
++    laneFallback.rows = [session('stale', 100)]
++    const one = { ...project, sessionCount: 1 } as SidebarProjectTree
++    const rows = (items: SessionInfo[]) => <div data-testid="rows">{items.map(item => item.id).join(',')}</div>
++
++    const { rerender } = render(<ProjectOverviewRow previewSessions={[]} project={one} renderRows={rows} />)
++
++    expect(screen.queryByTestId('rows')).toBeNull()
++
++    rerender(<ProjectOverviewRow project={one} renderRows={rows} />)
++
++    expect(screen.getByTestId('rows').textContent).toBe('stale')
++  })
++
+   // Group by → Projects previews only the 3 most-recent sessions per project;
+   // sessions 4+ need a visible, in-place way to be reached (#112406).
+   it('offers "Show all N sessions" past the preview cap and reveals the rest of the project inline', async () => {
+diff --git a/apps/desktop/src/app/chat/sidebar/projects/overview-row.tsx b/apps/desktop/src/app/chat/sidebar/projects/overview-row.tsx
+index e718ee6321..79e943aa5b 100644
+--- a/apps/desktop/src/app/chat/sidebar/projects/overview-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/projects/overview-row.tsx
+@@ -134,7 +134,9 @@ export function ProjectOverviewRow({
+   const [expanding, setExpanding] = useState(false)
+   const limit = showAllSessions || expanded ? Infinity : PROJECT_PREVIEW_COUNT
+   const fetched = (previewSessions ?? []).slice(0, limit)
+-  const recent = fetched.length ? fetched : latestProjectSessions(project, limit)
++  // A preview override (even an empty one: its rows moved away) is the live
++  // overlay's answer; only its absence falls back to the snapshot lanes.
++  const recent = previewSessions ? fetched : latestProjectSessions(project, limit)
+   // The hydrated lanes come straight from the backend, so — like the drill-in
+   // (index.tsx) — they haven't been through the tree's exclusion filter yet.
+   const visible = expanded && isSessionHidden ? excludeProjectSessions(expanded, isSessionHidden) : expanded
+diff --git a/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.test.ts b/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.test.ts
+index 6997c056a0..a6bf9d4083 100644
+--- a/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.test.ts
++++ b/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.test.ts
+@@ -8,6 +8,7 @@ import {
+   baseName,
+   excludeProjectSessions,
+   kanbanWorktreeDir,
++  knownProjectsOf,
+   laneSwitchTarget,
+   liveSessionProjectId,
+   mergeRepoWorktreeGroups,
+@@ -21,7 +22,8 @@ import {
+   sessionProjectColor,
+   type SidebarProjectTree,
+   type SidebarSessionGroup,
+-  sortWorktreeGroups
++  sortWorktreeGroups,
++  withProvisionalHome
+ } from './workspace-groups'
+ 
+ // The grouping itself now lives on the backend (tui_gateway/project_tree.py,
+@@ -647,6 +649,15 @@ describe('sessionProjectColor', () => {
+     expect(sessionProjectColor(makeCwdSession(null), [colored('p_app', ['/www/app'], '#4a9eff')])).toBeNull()
+   })
+ 
++  it('follows backend Home ownership: no project tint, even under a colored folder', () => {
++    // Color follows the membership the sidebar groups by; a Home-owned row
++    // sits in Home, so it must not wear the folder project's tint.
++    const session = makeCwdSession('/www/app/src', { id: 'home-owned' })
++    const owners = new Map([['home-owned', NO_PROJECT_ID]])
++
++    expect(sessionProjectColor(session, [colored('p_app', ['/www/app'], '#4a9eff')], owners)).toBeNull()
++  })
++
+   it('uses the longest-prefix project when nested projects both match', () => {
+     const session = makeCwdSession('/www/app/packages/api/src', { git_repo_root: '/www/app' })
+ 
+@@ -1148,13 +1159,141 @@ describe('overlayLiveLanes', () => {
+     expect(overlaid.sessionCount).toBe(1)
+   })
+ 
+-  it('leaves Home alone for a session that has a cwd', () => {
+-    // A cwd-carrying row the backend hasn't placed yet (junk root, deleted
+-    // workspace) needs its probes — guessing here would flicker it into Home
+-    // and back out on the next snapshot.
++  it.each([false, true])('honors backend Home ownership despite a named-project cwd (compressed=%s)', compressed => {
++    const session = makeCwdSession('/named', {
++      id: 'fresh',
++      message_count: 0,
++      git_repo_root: null,
++      ...(compressed ? { _lineage_root_id: 'root' } : {})
++    })
++
++    const owners = new Map([[compressed ? 'root' : session.id, NO_PROJECT_ID]])
++    const home = homeNode([])
++    const explicitProjects = [makeProject('p_named', ['/named'])]
++
++    expect(sessionMatchesProjectFilter(session, [NO_PROJECT_ID], explicitProjects, owners)).toBe(true)
++    expect(sessionMatchesProjectFilter(session, ['p_named'], explicitProjects, owners)).toBe(false)
++    expect(overlayLiveLanes(home, [session], new Set(), owners, { explicitProjects }).repos[0].groups[0].sessions).toEqual([session])
++    expect(overlayLivePreviews([home], [session], explicitProjects, 3, { owners })[NO_PROJECT_ID]).toEqual([session])
++  })
++
++  it.each(['preview', 'lane', 'filter'] as const)('keeps an unowned cwd-only fresh chat visible in Home (%s)', surface => {
+     const home = homeNode([])
++    const session = makeCwdSession('/Users/example', { id: 'fresh', message_count: 0, git_repo_root: null })
++    const known = knownProjectsOf([home])
++    const owners = projectOwnerBySessionId([home])
++
++    if (surface === 'preview') {
++      expect(overlayLivePreviews([home], [session], [], 3)[NO_PROJECT_ID]).toEqual([session])
++    } else if (surface === 'lane') {
++      expect(overlayLiveLanes(home, [session], new Set(), owners, { known }).repos[0].groups[0].sessions).toEqual([session])
++    } else {
++      expect(sessionMatchesProjectFilter(session, [NO_PROJECT_ID], [], owners, known)).toBe(true)
++    }
++  })
++
++  it.each([
++    ['known cwd project', '/work/app', null, '/work/app'],
++    ['named project', '/named/app', null, 'p_named'],
++    ['repo root', '/work/repo', '/work/repo', '/work/repo'],
++    ['in-tree worktree', '/work/repo/.worktrees/feature', '/work/repo', '/work/repo'],
++    ['unprobed worktree', '/work/repo/.worktrees/feature', null, '/work/repo/.worktrees/feature'],
++    ['sibling worktree', '/work/repo-feature', '/work/repo', null],
++    ['kanban worktree', '/work/repo/.worktrees/t_abcdef', '/work/repo', null]
++  ])('does not misfile a %s in provisional Home', (_label, cwd, gitRepoRoot, expected) => {
++    const session = makeCwdSession(cwd, { git_repo_root: gitRepoRoot })
++    const explicitProjects = [makeProject('p_named', ['/named'])]
++    const home = homeNode([])
++
++    const known = knownProjectsOf([
++      home,
++      projectNode({
++        id: '/work/app',
++        repos: [{ id: '/work/app', label: 'app', path: '/work/app', sessionCount: 0, groups: [] }]
++      })
++    ])
+ 
+-    expect(overlayLiveLanes(home, [makeCwdSession('/www/app', { id: 'fresh' })])).toBe(home)
++    const owners = new Map<string, string>()
++
++    expect(sessionBucketId(session, explicitProjects, owners, known)).toBe(expected)
++    expect(sessionMatchesProjectFilter(session, [NO_PROJECT_ID], explicitProjects, owners, known)).toBe(false)
++    expect(overlayLiveLanes(home, [session], new Set(), owners, { explicitProjects, known })).toBe(home)
++    expect(overlayLivePreviews([home], [session], explicitProjects, 3, { owners, known })[NO_PROJECT_ID]).toBeUndefined()
++  })
++
++  // One ownership policy across surfaces: a fresh row (no backend owner, no
++  // git evidence yet) whose cwd sits inside a folder the tree already knows
++  // files under THAT project everywhere — preview, filter, Home lane and the
++  // project's own lanes — never Home in one and the repo in another.
++  it.each([
++    ['subfolder of a known repo', '/work/repo/apps', '/work/repo'],
++    ['unprobed in-tree worktree of a known repo', '/work/repo/.worktrees/feature', '/work/repo'],
++    ['folder under a known sibling worktree lane', '/work/repo-ci/src', '/work/repo'],
++    ['folder no known project claims', '/Users/example', NO_PROJECT_ID]
++  ])('files a fresh %s under exactly one owner on every surface', (_label, cwd, expected) => {
++    const session = makeCwdSession(cwd, { id: 'fresh', message_count: 0, git_repo_root: null })
++    const home = homeNode([])
++
++    const repo = projectNode({
++      id: '/work/repo',
++      isAuto: true,
++      repos: [
++        {
++          id: '/work/repo',
++          label: 'repo',
++          path: '/work/repo',
++          sessionCount: 0,
++          groups: [lane({ id: '/work/repo-ci', label: 'ci', path: '/work/repo-ci', isMain: false })]
++        }
++      ]
++    })
++
++    const tree = [home, repo]
++    const owners = projectOwnerBySessionId(tree)
++    const known = knownProjectsOf(tree)
++    const other = expected === NO_PROJECT_ID ? repo.id : NO_PROJECT_ID
++
++    const rowsOf = (node: SidebarProjectTree) =>
++      overlayLiveLanes(node, [session], new Set(), owners, { known }).repos.flatMap(r =>
++        r.groups.flatMap(g => g.sessions.map(row => row.id))
++      )
++
++    expect(sessionBucketId(session, [], owners, known)).toBe(expected)
++    expect(sessionMatchesProjectFilter(session, [expected], [], owners, known)).toBe(true)
++    expect(sessionMatchesProjectFilter(session, [other], [], owners, known)).toBe(false)
++
++    const previews = overlayLivePreviews(tree, [session], [], 3, { owners, known })
++    expect(previews[expected]?.map(row => row.id)).toEqual(['fresh'])
++    expect(previews[other] ?? []).toEqual([])
++
++    expect(rowsOf(expected === NO_PROJECT_ID ? home : repo)).toEqual(['fresh'])
++    expect(rowsOf(expected === NO_PROJECT_ID ? repo : home)).toEqual([])
++  })
++
++  it.each([NO_PROJECT_ID, 'p_named'])('evicts stale placement when the authoritative owner becomes %s', owner => {
++    const session = makeCwdSession('/named', { id: 'fresh', git_repo_root: null })
++    const home = { ...homeNode([session]), previewSessions: [session] }
++
++    const named = projectNode({
++      id: 'p_named',
++      previewSessions: [session],
++      repos: [{ id: '/named', label: 'named', path: '/named', sessionCount: 1, groups: [lane({ id: '/named', label: 'named', path: '/named', isMain: true, sessions: [session] })] }]
++    })
++
++    const owners = new Map([[session.id, owner]])
++    const known = knownProjectsOf([home, named])
++    const explicitProjects = [makeProject(named.id, ['/named'])]
++    const previews = overlayLivePreviews([home, named], [session], explicitProjects, 3, { owners, known })
++    const other = owner === NO_PROJECT_ID ? named.id : NO_PROJECT_ID
++
++    expect(previews[owner]).toEqual([session])
++    // An explicit empty override prevents the overview from falling back to its stale preview.
++    expect(previews[other]).toEqual([])
++
++    for (const node of [home, named]) {
++      const overlaid = overlayLiveLanes(node, [session], new Set(), owners, { explicitProjects, known })
++      expect(overlaid.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions))).toEqual(node.id === owner ? [session] : [])
++    }
+   })
+ 
+   // #77591 C: compression rotates the live id (root -> tip) while the snapshot
+@@ -1478,3 +1617,68 @@ describe('project filter row rule (#97762)', () => {
+     expect(sessionProjectColor(sibling, explicit, owners)).toBe('#abc')
+   })
+ })
++
++describe('withProvisionalHome', () => {
++  const repo = projectNode({
++    id: '/work/repo',
++    isAuto: true,
++    repos: [{ id: '/work/repo', label: 'repo', path: '/work/repo', sessionCount: 0, groups: [] }]
++  })
++
++  const freshHome = () => makeCwdSession('/Users/example', { id: 'fresh', message_count: 0, git_repo_root: null })
++  const home = (tree: SidebarProjectTree[]) => tree.find(node => node.isNoProject)
++
++  it('adds a Home node carrying a fresh unclaimed row when the tree has none', () => {
++    const session = freshHome()
++    const tree = withProvisionalHome([repo], [session], [])
++    const node = home(tree)!
++
++    expect(tree.map(n => n.id)).toEqual([NO_PROJECT_ID, repo.id])
++    expect(node.previewSessions).toEqual([session])
++    expect(node.repos[0].groups[0].sessions).toEqual([session])
++    expect(node.sessionCount).toBe(1)
++  })
++
++  it('keeps Home filter, previews and entered lane on that same row', () => {
++    const session = freshHome()
++    const tree = withProvisionalHome([repo], [session], [])
++    const known = knownProjectsOf([repo])
++    const owners = projectOwnerBySessionId([repo])
++
++    expect(sessionMatchesProjectFilter(session, [NO_PROJECT_ID], [], owners, known)).toBe(true)
++    expect(overlayLivePreviews(tree, [session], [], 3, { owners, known })[NO_PROJECT_ID]).toEqual([session])
++    expect(overlayLiveLanes(home(tree)!, [session], new Set(), owners, { known }).repos[0].groups[0].sessions).toEqual([
++      session
++    ])
++  })
++
++  it('leaves a tree that already has Home, or has no nodes yet, untouched', () => {
++    const withHome = [homeNode([]), repo]
++    const session = freshHome()
++
++    expect(withProvisionalHome(withHome, [session], [])).toBe(withHome)
++    expect(withProvisionalHome([], [session], [])).toEqual([])
++  })
++
++  it.each([
++    ['a known repo subfolder', makeCwdSession('/work/repo/apps', { git_repo_root: null })],
++    ['a row the backend gave a project', makeCwdSession('/Users/example', { id: 'owned', git_repo_root: null })],
++    ['a removed row', makeCwdSession('/Users/example', { id: 'gone', git_repo_root: null })],
++    ['a git row', makeCwdSession('/elsewhere/repo', { git_repo_root: '/elsewhere/repo' })]
++  ])('adds no Home for %s', (_label, session) => {
++    const tree = [repo]
++
++    expect(
++      withProvisionalHome(tree, [session], [], {
++        owners: new Map([['owned', repo.id]]),
++        removed: new Set(['gone'])
++      })
++    ).toBe(tree)
++  })
++
++  it('adds Home for a detached (cwd-less) fresh row too', () => {
++    const session = makeCwdSession(null, { id: 'detached', git_repo_root: null })
++
++    expect(home(withProvisionalHome([repo], [session], []))?.previewSessions).toEqual([session])
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.ts b/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.ts
+index 716fda4301..5d3e6624c3 100644
+--- a/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.ts
++++ b/apps/desktop/src/app/chat/sidebar/projects/workspace-groups.ts
+@@ -434,9 +434,9 @@ export function liveSessionProjectId(
+   explicitProjects: ProjectInfo[],
+   owners: ReadonlyMap<string, string> = NO_OWNERS
+ ): null | string {
+-  const owner = owners.get(session.id)
++  const owner = ownerOf(owners, session)
+ 
+-  if (owner && owner !== NO_PROJECT_ID) {
++  if (owner) {
+     return owner
+   }
+ 
+@@ -487,13 +487,165 @@ export function liveSessionProjectId(
+   return repoRoot
+ }
+ 
+-/** The lane a row files under: its live project, or Home for detached (cwd-less) rows. */
++/**
++ * What the full (unfiltered) tree already knows, for placing rows the backend
++ * hasn't assigned yet: every node id, plus each folder a node's lanes would
++ * file a live row under (repo roots and non-root lane paths). Build it once
++ * per tree with {@link knownProjectsOf}.
++ */
++export interface KnownProjects {
++  ids: ReadonlySet<string>
++  roots: readonly { path: string; projectId: string }[]
++}
++
++export function knownProjectsOf(tree: readonly SidebarProjectTree[]): KnownProjects {
++  const roots: { path: string; projectId: string }[] = []
++
++  for (const project of tree) {
++    if (project.isNoProject) {
++      continue
++    }
++
++    for (const repo of project.repos) {
++      const repoPath = normalizePath(repo.path)
++
++      if (repoPath) {
++        roots.push({ path: repoPath, projectId: project.id })
++      }
++
++      // A linked worktree lane can sit outside its repo root; the live lane
++      // overlay joins rows to it by its own path, so placement must too.
++      for (const group of repo.groups) {
++        const lanePath = normalizePath(group.path)
++
++        if (lanePath && pathKey(lanePath) !== pathKey(repoPath)) {
++          roots.push({ path: lanePath, projectId: project.id })
++        }
++      }
++    }
++  }
++
++  return { ids: new Set(tree.map(project => project.id)), roots }
++}
++
++/** The known project whose deepest folder holds this row's cwd, if any. */
++function knownClaimant(known: KnownProjects, session: SessionInfo): null | string {
++  const cwd = (session.cwd || '').trim()
++  let claimant: null | string = null
++  let bestLen = -1
++
++  if (!cwd) {
++    return null
++  }
++
++  for (const root of known.roots) {
++    const len = segments(root.path).length
++
++    if (len > bestLen && isPathUnder(root.path, cwd)) {
++      bestLen = len
++      claimant = root.projectId
++    }
++  }
++
++  return claimant
++}
++
++/** Visible placement: authoritative owner, inferred project, then provisional Home. */
+ export function sessionBucketId(
+   session: SessionInfo,
+   explicitProjects: ProjectInfo[],
+-  owners: ReadonlyMap<string, string> = NO_OWNERS
++  owners: ReadonlyMap<string, string> = NO_OWNERS,
++  known?: KnownProjects
+ ): null | string {
+-  return liveSessionProjectId(session, explicitProjects, owners) ?? (isDetachedSession(session) ? NO_PROJECT_ID : null)
++  const projectId = liveSessionProjectId(session, explicitProjects, owners)
++
++  // Only a guess (no owner, no named project) that names no known node needs
++  // more: such a row has no lane to render in yet.
++  if (
++    !projectId ||
++    !known ||
++    known.ids.has(projectId) ||
++    ownerOf(owners, session) ||
++    explicitProjects.some(project => !project.archived && project.id === projectId)
++  ) {
++    return projectId ?? (isDetachedSession(session) ? NO_PROJECT_ID : null)
++  }
++
++  // Inside a folder the tree already knows (a repo subfolder, an unprobed
++  // in-tree worktree, a sibling worktree lane): that project's lanes take the
++  // row, so every other surface files it there too.
++  const claimant = knownClaimant(known, session)
++
++  if (claimant) {
++    return claimant
++  }
++
++  // A cwd alone is not proof of a project (notably a CLI started in the
++  // user's home). Keep that row visible in Home until the tree resolves it;
++  // git evidence or a worktree path still waits for the backend's probe.
++  if (session.git_repo_root?.trim() || /(?:^|[/\\])\.worktrees(?:[/\\]|$)/.test(session.cwd ?? '')) {
++    return projectId
++  }
++
++  return NO_PROJECT_ID
++}
++
++/**
++ * The tree with a Home node for rows only Home can show. The backend emits
++ * Home only once a persisted row lands there, so a brand-new chat in an
++ * unclaimed folder (or with no folder) has no node to render under until the
++ * next snapshot. Synthesize one — from the same placement the previews,
++ * filter and lanes use, before any filtering — so it shows at once. A tree
++ * that already has Home, or has nothing yet (still loading, or no projects:
++ * the flat list shows the rows), is returned as-is. Never authoritative: the
++ * owner map is built from the backend tree, not from this.
++ */
++export function withProvisionalHome(
++  tree: SidebarProjectTree[],
++  live: readonly SessionInfo[],
++  explicitProjects: ProjectInfo[],
++  {
++    owners = NO_OWNERS,
++    known = knownProjectsOf(tree),
++    removed = NO_REMOVED,
++    label = 'Home'
++  }: { owners?: ReadonlyMap<string, string>; known?: KnownProjects; removed?: ReadonlySet<string>; label?: string } = {}
++): SidebarProjectTree[] {
++  if (!tree.length || tree.some(project => project.isNoProject)) {
++    return tree
++  }
++
++  const rows = uniqueConversations(
++    live.filter(
++      session =>
++        !removed.has(session.id) && sessionBucketId(session, explicitProjects, owners, known) === NO_PROJECT_ID
++    )
++  ).sort((a, b) => sessionRecency(b) - sessionRecency(a))
++
++  if (!rows.length) {
++    return tree
++  }
++
++  const home: SidebarProjectTree = {
++    id: NO_PROJECT_ID,
++    isNoProject: true,
++    label,
++    lastActive: sessionRecency(rows[0]),
++    path: null,
++    previewSessions: rows,
++    repos: [
++      {
++        groups: [{ id: NO_PROJECT_ID, label, path: null, sessions: rows }],
++        id: NO_PROJECT_ID,
++        label,
++        path: null,
++        sessionCount: rows.length
++      }
++    ],
++    sessionCount: rows.length
++  }
++
++  return [home, ...tree]
+ }
+ 
+ /**
+@@ -506,13 +658,14 @@ export function sessionMatchesProjectFilter(
+   session: SessionInfo,
+   filter: readonly string[],
+   explicitProjects: ProjectInfo[],
+-  owners: ReadonlyMap<string, string> = NO_OWNERS
++  owners: ReadonlyMap<string, string> = NO_OWNERS,
++  known?: KnownProjects
+ ): boolean {
+   if (!filter.length) {
+     return true
+   }
+ 
+-  const id = sessionBucketId(session, explicitProjects, owners)
++  const id = sessionBucketId(session, explicitProjects, owners, known)
+ 
+   return id !== null && filter.includes(id)
+ }
+@@ -800,8 +953,8 @@ export function overlayRepoLanes(
+ }
+ 
+ /**
+- * Home's overlay: its rows have no cwd to place, so this is a plain upsert of
+- * detached live sessions into its single lane — a brand-new project-less chat
++ * Home's overlay uses the same visible placement as previews and filters.
++ * Upsert its live sessions into the single lane — a brand-new project-less chat
+  * shows the instant it's created, matching the flat Recents list. A chat the
+  * authoritative owner map gives to a named project stays out, even while its
+  * live copy is briefly detached (else it lists in both places).
+@@ -810,7 +963,8 @@ function overlayHomeLane(
+   project: SidebarProjectTree,
+   live: SessionInfo[],
+   removed: ReadonlySet<string>,
+-  owners: ReadonlyMap<string, string>
++  owners: ReadonlyMap<string, string>,
++  { explicitProjects = [], known }: LivePlacementContext
+ ): SidebarProjectTree {
+   const ownedElsewhere = (session: SessionInfo): boolean => {
+     const owner = ownerOf(owners, session)
+@@ -820,14 +974,18 @@ function overlayHomeLane(
+ 
+   const belongs = (session: SessionInfo): boolean => !removed.has(session.id) && !ownedElsewhere(session)
+   const lane = project.repos[0]?.groups[0]
+-  const detached = live.filter(session => isDetachedSession(session) && belongs(session))
++
++  const homeRows = live.filter(
++    session => sessionBucketId(session, explicitProjects, owners, known) === NO_PROJECT_ID && belongs(session)
++  )
++
+   const kept = (lane?.sessions ?? []).filter(belongs)
+ 
+-  if (!detached.length && kept.length === (lane?.sessions.length ?? 0)) {
++  if (!homeRows.length && kept.length === (lane?.sessions.length ?? 0)) {
+     return project
+   }
+ 
+-  const sessions = detached.reduce(upsertSession, kept)
++  const sessions = homeRows.reduce(upsertSession, kept)
+   const nextLane = { id: NO_PROJECT_ID, label: project.label, path: null, sessions }
+ 
+   return {
+@@ -896,15 +1054,29 @@ export function excludeProjectSessions(
+   }
+ }
+ 
++interface LivePlacementContext {
++  explicitProjects?: ProjectInfo[]
++  known?: KnownProjects
++}
++
+ /** Project-level overlay: {@link overlayRepoLanes} across every repo subtree. */
+ export function overlayLiveLanes(
+   project: SidebarProjectTree,
+   live: SessionInfo[],
+   removed: ReadonlySet<string> = NO_REMOVED,
+-  authoritativeOwners: ReadonlyMap<string, string> = NO_OWNERS
++  authoritativeOwners: ReadonlyMap<string, string> = NO_OWNERS,
++  placement: LivePlacementContext = {}
+ ): SidebarProjectTree {
++  // The overview owner can refresh before an entered project's full lanes.
++  // Remove stale rows there too, not just from the incoming live candidates.
++  project = excludeProjectSessions(project, session => {
++    const owner = ownerOf(authoritativeOwners, session)
++
++    return Boolean(owner) && owner !== project.id
++  })
++
+   if (project.isNoProject) {
+-    return overlayHomeLane(project, live, removed, authoritativeOwners)
++    return overlayHomeLane(project, live, removed, authoritativeOwners, placement)
+   }
+ 
+   let changed = false
+@@ -951,6 +1123,8 @@ export function reconcileEnteredProjectSessions(
+ }
+ 
+ interface PreviewOverlayOptions {
++  owners?: ReadonlyMap<string, string>
++  known?: KnownProjects
+   removed?: ReadonlySet<string>
+   /** The active sort key as an id order; recency when empty. */
+   rankIds?: string[]
+@@ -962,17 +1136,21 @@ export function overlayLivePreviews(
+   live: SessionInfo[],
+   explicitProjects: ProjectInfo[],
+   limit: number,
+-  { removed = NO_REMOVED, rankIds }: PreviewOverlayOptions = {}
++  {
++    removed = NO_REMOVED,
++    rankIds,
++    owners = projectOwnerBySessionId(projects),
++    known = knownProjectsOf(projects)
++  }: PreviewOverlayOptions = {}
+ ): Record<string, SessionInfo[]> {
+   const byProject = new Map<string, SessionInfo[]>()
+-  const authoritativeOwners = projectOwnerBySessionId(projects)
+ 
+   for (const session of live) {
+     if (removed.has(session.id)) {
+       continue
+     }
+ 
+-    const projectId = ownerOf(authoritativeOwners, session) ?? sessionBucketId(session, explicitProjects)
++    const projectId = sessionBucketId(session, explicitProjects, owners, known)
+ 
+     if (!projectId) {
+       continue
+@@ -987,9 +1165,16 @@ export function overlayLivePreviews(
+ 
+   for (const node of projects) {
+     const liveRows = byProject.get(node.id) ?? []
+-    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id))
+ 
+-    if (!liveRows.length && !base.length) {
++    const base = (node.previewSessions ?? []).filter(session => {
++      const owner = ownerOf(owners, session)
++
++      return !removed.has(session.id) && (!owner || owner === node.id)
++    })
++
++    // Emit [] when eviction empties a snapshot preview: undefined would make
++    // the overview fall back to those stale rows.
++    if (!liveRows.length && !node.previewSessions?.length) {
+       continue
+     }
+ 
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+index 6e2a4afbeb..b59bdea483 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+@@ -12,6 +12,7 @@ import type * as ChatRuntime from '@/lib/chat-runtime'
+ import { SESSION_ROW_AREAS, type SessionRowSlotProps } from '@/lib/session-row-slots'
+ import type * as Time from '@/lib/time'
+ import type * as ComposerStatusStore from '@/store/composer-status'
++import { $projectTree } from '@/store/project-tree'
+ import type * as SessionStore from '@/store/session'
+ import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
+ import type * as SessionStatesStore from '@/store/session-states'
+@@ -474,6 +475,42 @@ describe('SidebarSessionRow continuation badge', () => {
+   })
+ })
+ 
++// The card header names the row's project. A backend-Home-owned row files
++// under the Home bucket, so the card names Home in human copy, never the
++// bucket's internal id.
++describe('SidebarSessionRow card project label', () => {
++  afterEach(() => {
++    $projectTree.set([])
++  })
++
++  it('names Home for a Home-owned row with a cwd, not the internal sentinel', () => {
++    $projectTree.set([
++      {
++        id: '__no_project__',
++        isNoProject: true,
++        label: 'Home',
++        path: null,
++        repos: [],
++        sessionCount: 1,
++        sessionIds: ['home-row']
++      }
++    ])
++
++    const { container } = renderRow(makeSession({ cwd: '/Users/me', id: 'home-row', title: 'Fresh home chat' }), {
++      card: true
++    })
++
++    expect(container.textContent).not.toContain('__no_project__')
++    expect(screen.getByText('Home')).toBeTruthy()
++  })
++
++  it('keeps naming an unowned cwd row by its folder', () => {
++    renderRow(makeSession({ cwd: '/work/scratch', id: 'loose-row', title: 'Loose' }), { card: true })
++
++    expect(screen.getByText('scratch')).toBeTruthy()
++  })
++})
++
+ // [daveey] A session waiting on kanban work shows its open and blocked task
+ // counts after the age (and before the gateway glyph).
+ describe('SidebarSessionRow kanban counts', () => {
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index e3bb910b11..22597d7ff6 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -385,7 +385,10 @@ function SidebarSessionRowImpl({
+   // a row only repaints when its own label actually changes — and one-line
+   // rows always select null.
+   const context = useStoreSelector($projects, projects =>
+-    card ? (sessionProjectLabel(session, projects) ?? (pathLeaf(session.cwd) || t.sidebar.projects.home)) : null
++    card
++      ? (sessionProjectLabel(session, projects, t.sidebar.projects.home) ??
++        (pathLeaf(session.cwd) || t.sidebar.projects.home))
++      : null
+   )
+ 
+   // Card footer line: which model worked on it and how big it got. Rendered
+diff --git a/apps/desktop/src/lib/session-project-label.ts b/apps/desktop/src/lib/session-project-label.ts
+index c1bb4de0b0..087f3009ee 100644
+--- a/apps/desktop/src/lib/session-project-label.ts
++++ b/apps/desktop/src/lib/session-project-label.ts
+@@ -1,4 +1,4 @@
+-import { liveSessionProjectId } from '@/app/chat/sidebar/projects/workspace-groups'
++import { liveSessionProjectId, NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
+ import { pathLeaf } from '@/lib/display-path'
+ import { $projectOwnerBySessionId } from '@/store/projects'
+ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
+@@ -13,6 +13,10 @@ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
+  *   2. the recorded `git_repo_root` leaf.
+  *   3. null (a chat with no workspace at all).
+  *
++ * A row the backend files under Home resolves to the Home bucket's internal
++ * id; that id is never shown — the caller's translated `homeLabel` is (null
++ * when none is given, so the caller's own fallback names it).
++ *
+  * Why step 2 exists: `liveSessionProjectId` deliberately refuses to place a
+  * worktree that lives OUTSIDE its repo root (`bb/<slug>` beside the checkout
+  * rather than in-tree `.worktrees/`), because for LANE MEMBERSHIP a sibling
+@@ -26,9 +30,17 @@ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
+  * This never widens membership — it only names a row that placement leaves
+  * unplaced.
+  */
+-export function sessionProjectLabel(session: SessionInfo, projects: ProjectInfo[]): null | string {
++export function sessionProjectLabel(
++  session: SessionInfo,
++  projects: ProjectInfo[],
++  homeLabel: null | string = null
++): null | string {
+   const projectId = liveSessionProjectId(session, projects, $projectOwnerBySessionId.get())
+ 
++  if (projectId === NO_PROJECT_ID) {
++    return homeLabel
++  }
++
+   if (projectId) {
+     const explicit = projects.find(project => project.id === projectId)
+ 
+-- 
+2.54.0 (Apple Git-157)
+

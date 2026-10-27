@@ -42,7 +42,11 @@ import uuid
 from .models import validate
 
 NAMESPACE = 'runners'
+# Repair chats get only these toolsets (runners_* tools, clarify, todo); see core session-start toolsets.
+REPAIR_TOOLSETS = ('runners', 'clarify', 'todo')
 MAX_ACTIVE = 100
+# Two absent core reads this far apart retire an old-revision reservation.
+ABSENT_GRACE_SECONDS = 60
 MAX_AUDIT = 10000
 _DOMAINS = {}
 _DOMAINS_LOCK = threading.RLock()
@@ -109,18 +113,33 @@ CREATE TABLE IF NOT EXISTS repair_domain_verification (
 '''
 
 
+def core_gateway_id():
+    """Core's start-ledger authority. session.start_request builds its StartOwner
+    from local_authority_gateway_id(), not the runners owner UUID; resolvers and
+    status reads must use the same key or the RPC is refused (4030)."""
+    from gateway.hosted_rooms import local_authority_gateway_id
+    return local_authority_gateway_id()
+
+
 class RepairService:
-    def __init__(self, service, *, core_factory=None, config_loader=None):
+    def __init__(self, service, *, core_factory=None, config_loader=None, core_gateway=None):
         self.service = service
         self.config_loader = config_loader
         self.path = Path(service.path)
         self.core_factory = core_factory
+        self._core_gateway = core_gateway
         self._registrations = {}
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.executescript(_SCHEMA)
+            if 'absent_since' not in {r[1] for r in db.execute('PRAGMA table_info(repair_domain_records)')}:
+                try:
+                    db.execute('ALTER TABLE repair_domain_records ADD COLUMN absent_since REAL')
+                except sqlite3.OperationalError as error:  # concurrent collector/backend migration
+                    if 'duplicate column' not in str(error):
+                        raise
             db.execute('INSERT OR IGNORE INTO repair_domain_revision VALUES (1,?)',
                        (service.config['config_revision'],))
         self.path.chmod(0o600)
@@ -337,7 +356,7 @@ class RepairService:
             if key in self._registrations:
                 return self._registrations[key][0]
             o = self._owner()
-            owner = StartOwner(o['gateway_id'], o['profile'], principal)
+            owner = StartOwner(self._core_gateway or core_gateway_id(), o['profile'], principal)
             core = (self.core_factory or get_service)(o['profile'])
 
             def resolve(caller, request_id):
@@ -350,8 +369,14 @@ class RepairService:
                     if row is None:
                         raise KeyError('not_found')
                     brief = json.loads(self._row(db, row['id'], principal)['brief'])
-                return StartIntent(title=brief['title'], text=brief['text'], source='desktop',
-                                   metadata={'runner_repair_id': row['id']})
+                try:
+                    # Closed allowlist enforced by core for the whole session lineage: no terminal, sudo,
+                    # files, delegation or kanban, so the agent cannot go around the broker.
+                    return StartIntent(title=brief['title'], text=brief['text'], source='desktop',
+                                       metadata={'runner_repair_id': row['id']}, toolsets=list(REPAIR_TOOLSETS))
+                except TypeError as exc:
+                    # An older core would silently start a full-toolset chat: refuse instead.
+                    raise RuntimeError('repair_toolsets_unsupported: core cannot restrict repair chats') from exc
 
             unregister = core.register(owner, NAMESPACE, resolve)
             self._registrations[key] = (owner, core, unregister)
@@ -410,7 +435,7 @@ class RepairService:
         if historical:
             from tui_gateway.session_start_requests import StartOwner, get_service
             old = repair['owner']
-            owner = StartOwner(old['gateway_id'], old['profile'], principal)
+            owner = StartOwner(self._core_gateway or core_gateway_id(), old['profile'], principal)
         else:
             owner, core = self._core(principal)
         try:
@@ -428,6 +453,19 @@ class RepairService:
             with self._db(transaction=True) as db:
                 row = self._row(db, repair_id, principal, historical=True)
                 repair = json.loads(row['payload'])
+                if row['active'] and historical:
+                    # Old-revision reservation core never accepted. The fresh-
+                    # config resolver refuses old revisions, so after a second
+                    # absent read past the grace window no chat can appear:
+                    # release the host instead of stranding it forever.
+                    now = self.service.clock()
+                    if row['absent_since'] is None:
+                        db.execute('UPDATE repair_domain_records SET absent_since=? WHERE id=?', (now, repair_id))
+                    elif now - row['absent_since'] >= ABSENT_GRACE_SECONDS:
+                        repair['state'], repair['session']['state'] = 'closed', 'cancelled'
+                        db.execute('UPDATE repair_domain_records SET payload=?, active=0 WHERE id=?',
+                                   (_dump(repair), repair_id))
+                        return repair
                 # Successful owner-local lookup proves no accepted request yet.
                 # Only this fact permits an explicit same-ID RPC retry.
                 if row['active']:

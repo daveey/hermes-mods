@@ -1,0 +1,275 @@
+From 08f65aa7e653358fad441e3203f57f219d860f86 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:54:13 -0700
+Subject: [PATCH] fix(kanban): core-update drain hold suppresses spawns only;
+ wake probes, promotion and reclaim keep running [daveey]
+
+The embedded dispatcher skipped the whole tick while <root>/core-update/drain-hold was live, so
+due wake probes, todo->ready promotion and stale-claim reclaim stopped for the length of the hold
+(16-17 min observed 10-26, parked chains stalled). ESTOP keeps the full skip; the drain hold now
+runs tick_once with max_spawn=0 and keeps the 'ready but 0 spawned' health warning quiet.
+---
+ gateway/kanban_watchers.py            |  12 ++-
+ gateway/kanban_watchers_common.py     |  28 ++++--
+ gateway/kanban_watchers_dispatcher.py |  13 ++-
+ tests/agent/test_core_update_drain.py | 119 ++++++++++++++++++++++++++
+ 4 files changed, 158 insertions(+), 14 deletions(-)
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 7a9b005556..5a8843e8a2 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -10,6 +10,7 @@ in ``kanban_watchers_common``.
+ from __future__ import annotations
+ 
+ import asyncio
++import functools
+ import os
+ import time
+ from pathlib import Path
+@@ -18,6 +19,7 @@ from typing import Any, Optional
+ from gateway.kanban_watchers_common import (
+     _acquire_singleton_lock,
+     _kanban_dispatch_allowed,
++    _kanban_dispatch_gate,
+     _release_singleton_lock,
+     _resolve_auto_decompose_settings,
+     _gc_retention_days,
+@@ -322,8 +324,16 @@ class GatewayKanbanWatchersMixin:
+                 try:
+                     # Emergency stop (`hermes pause`): no auto-decompose or
+                     # dispatch while paused; running workers finish naturally.
+-                    if not _kanban_dispatch_allowed():
++                    # Core-update drain hold: spawns only are suppressed; wake probes,
++                    # promotion and reclaim keep running. [daveey]
++                    gate = _kanban_dispatch_gate()
++                    if gate == "estop":
+                         bad_ticks = 0
++                    elif gate == "drain":
++                        results = await _to_thread_process_service(
++                            functools.partial(dispatcher.tick_once, suppress_spawn=True))
++                        _log_spawn_results(results)
++                        bad_ticks = 0  # a held ready queue is expected, not "stuck"
+                     else:
+                         # Re-read the auto-decompose toggle live so disabling it
+                         # takes effect on the next tick, not on restart.
+diff --git a/gateway/kanban_watchers_common.py b/gateway/kanban_watchers_common.py
+index e78afcd74f..2df2f52e47 100644
+--- a/gateway/kanban_watchers_common.py
++++ b/gateway/kanban_watchers_common.py
+@@ -97,24 +97,34 @@ def _gc_retention_days() -> int:
+         return 30
+ 
+ 
+-def _kanban_dispatch_allowed() -> bool:
+-    """False while the global emergency stop (`hermes pause`) is engaged.
++def _kanban_dispatch_gate() -> Optional[str]:
++    """Why this tick may not spawn: ``"estop"``, ``"drain"`` or ``None`` (free to dispatch).
+ 
+-    Checked every tick before spawning, so a pause applies on the next tick;
+-    in-flight workers are never touched. Fails open if estop is unimportable.
++    ``"estop"`` (`hermes pause`) skips the whole tick. ``"drain"`` (hermes-sync core-update drain
++    hold) only suppresses NEW claims: wake probes, promotion, stale-claim reclaim and health keep
++    running, so parked chains don't stall for the length of the hold. [daveey]
++    Fails open when either module is unimportable.
+     """
+     try:
+         from agent.estop import check_paused
+     except ImportError:
+-        return True
++        return None
+     if check_paused("kanban", logger):
+-        return False
+-    # hermes-sync core-update drain: no new claims while running work drains (never touches it).
++        return "estop"
+     try:
+         from agent.core_update_drain import check_drain_hold
+     except ImportError:
+-        return True
+-    return not check_drain_hold("kanban", logger)
++        return None
++    return "drain" if check_drain_hold("kanban", logger) else None
++
++
++def _kanban_dispatch_allowed() -> bool:
++    """False while the emergency stop or a core-update drain hold forbids NEW claims.
++
++    Checked every tick before spawning, so a pause applies on the next tick;
++    in-flight workers are never touched.
++    """
++    return _kanban_dispatch_gate() is None
+ 
+ 
+ def _acquire_singleton_lock(lock_path) -> tuple[Optional[object], str]:
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 6bce371eee..061a670bba 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -174,17 +174,20 @@ class _KanbanDispatcher:
+         self.disabled_corrupt_boards.pop(slug, None)
+         return True
+ 
+-    def tick_once_for_board(self, slug: str) -> Optional[object]:
++    def tick_once_for_board(self, slug: str, *, suppress_spawn: bool = False) -> Optional[object]:
+         """Run one dispatch_once for a specific board.
+ 
+         The per-board DB is opened explicitly so boards never share a
+-        connection or claim across each other.
++        connection or claim across each other. ``suppress_spawn`` (core-update
++        drain hold) runs reclaim, wake probes and promotion but claims nothing.
+         """
+         conn = None
+         fingerprint = self.board_db_fingerprint(slug)
+         if not self._quarantine_lifted(slug, fingerprint):
+             return None
+         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
++        if suppress_spawn:
++            kwargs["max_spawn"] = 0  # budget gate refuses every claim; bookkeeping phases still run
+         try:
+             # No explicit init_db(): connect() runs the migration once per
+             # process (see the matching note in the notifier collector).
+@@ -223,10 +226,12 @@ class _KanbanDispatcher:
+                 with contextlib.suppress(Exception):
+                     conn.close()
+ 
+-    def tick_once(self) -> list[tuple[str, Optional[object]]]:
++    def tick_once(self, *, suppress_spawn: bool = False) -> list[tuple[str, Optional[object]]]:
+         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+         self.successful_scopes = []
+-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
++        if not suppress_spawn:
++            return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
++        return [(slug, self.tick_once_for_board(slug, suppress_spawn=True)) for slug in self._board_slugs()]
+ 
+     @staticmethod
+     def _receipt_scope() -> tuple[set, set]:
+diff --git a/tests/agent/test_core_update_drain.py b/tests/agent/test_core_update_drain.py
+index 2846694fba..28e117632d 100644
+--- a/tests/agent/test_core_update_drain.py
++++ b/tests/agent/test_core_update_drain.py
+@@ -65,3 +65,122 @@ def test_profile_home_honors_fleet_root_hold(tmp_path, monkeypatch):
+     monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
+     _write(tmp_path, {"pid": os.getpid()})
+     assert drain.active_hold()["path"] == str(tmp_path / drain.HOLD_RELPATH)
++
++
++def test_estop_and_drain_are_distinct_gates(home):
++    from gateway.kanban_watchers_common import _kanban_dispatch_gate
++    assert _kanban_dispatch_gate() is None
++    _write(home, {"pid": os.getpid()})
++    assert _kanban_dispatch_gate() == "drain"
++
++
++# ── embedded dispatcher under a live hold: bookkeeping runs, claims don't ─────
++
++
++def _dispatcher_board(tmp_path, monkeypatch):
++    """A board with a due wake probe, a todo card whose parent is done, and a spawnable ready card."""
++    from pathlib import Path
++    from types import SimpleNamespace
++
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_db_schedule as kbs
++
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda **kw: [SimpleNamespace(name="default")])
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "default")
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
++    spawned = []
++    monkeypatch.setattr(kbd, "_default_spawn", lambda task, ws, *, board=None: spawned.append(task.id) or None)
++    with kbc.connect_closing(board="default") as conn:
++        parent = kb.create_task(conn, title="parent", assignee="default")
++        child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++        ready = kb.create_task(conn, title="ready", assignee="default")
++        parked = kb.create_task(conn, title="parked", assignee="default")
++        assert kbs.schedule_task(conn, parked, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait",
++                                 wake_check="true", check_every=120)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++        assert kb.get_task(conn, child).status == "todo"
++        assert kb.get_task(conn, ready).status == "ready"
++    return dict(parent=parent, child=child, ready=ready, parked=parked), spawned
++
++
++def _run_one_tick(tmp_path, monkeypatch):
++    import asyncio
++
++    from gateway import kanban_watchers as watchers
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    probes = []
++    real_probe = kwc.run_due_wake_checks
++
++    def probe(conn, *, now=None, wait=False):
++        out = real_probe(conn, now=now, wait=True)
++        probes.append(out["submitted"])
++        return out
++
++    monkeypatch.setattr(kwc, "run_due_wake_checks", probe)
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    cfg = {"auto_decompose": False, "dispatch_interval_seconds": 1}
++    monkeypatch.setattr(runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": cfg}, kb, cfg))
++
++    async def no_sleep(delay):
++        return None
++
++    async def stop(interval):
++        runner._running = False
++
++    monkeypatch.setattr(watchers.asyncio, "sleep", no_sleep)
++    monkeypatch.setattr(runner, "_sleep_until_tick_or_sync_wake", stop)
++    try:
++        asyncio.run(runner._kanban_dispatcher_watcher())
++    finally:
++        kwc._shutdown_for_tests()
++    return probes
++
++
++def _statuses(ids):
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    with kbc.connect_closing(board="default") as conn:
++        return {k: kb.get_task(conn, v).status for k, v in ids.items()}
++
++
++def test_live_hold_runs_wake_probes_and_promotion_but_claims_nothing(tmp_path, monkeypatch):
++    monkeypatch.setattr(drain, "_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    ids, spawned = _dispatcher_board(tmp_path, monkeypatch)
++    _write(tmp_path, {"pid": os.getpid(), "started_at": time.time(), "reason": "core update"})
++    probes = _run_one_tick(tmp_path, monkeypatch)
++    assert [ids["parked"]] in probes  # the due wake probe ran under the hold
++    st = _statuses(ids)
++    assert st["parked"] == "ready"  # ... and its condition woke the card
++    assert st["child"] == "ready"  # todo with a done parent was promoted
++    assert st["ready"] == "ready" and spawned == []  # but nothing was claimed
++
++
++def test_without_hold_the_same_tick_claims(tmp_path, monkeypatch):
++    """Control: the board above is spawnable, so the held tick's zero claims are the hold's doing."""
++    monkeypatch.setattr(drain, "_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    ids, spawned = _dispatcher_board(tmp_path, monkeypatch)
++    _run_one_tick(tmp_path, monkeypatch)
++    assert ids["ready"] in spawned
++    assert _statuses(ids)["ready"] == "running"
++
++
++def test_estop_still_skips_the_whole_tick(tmp_path, monkeypatch):
++    monkeypatch.setattr(drain, "_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    ids, spawned = _dispatcher_board(tmp_path, monkeypatch)
++    (tmp_path / "ESTOP").touch()
++    probes = _run_one_tick(tmp_path, monkeypatch)
++    assert probes == [] and spawned == []
++    assert _statuses(ids)["child"] == "todo"
+-- 
+2.55.0
+

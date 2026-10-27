@@ -109,6 +109,31 @@ def test_revision_unknown_and_nonterminal_keep_lock_and_never_restart(env, state
     assert not e.core.resolvers
 
 
+def test_revision_releases_reservation_absent_from_core_after_grace(env):
+    # A reservation the old revision never got into core (start refused or
+    # never sent) strands the host forever unless released. Core's ledger is
+    # authoritative and the fresh-config resolver refuses old revisions, so a
+    # second absent read after a grace window proves no chat can appear.
+    e = env
+    now = [1900000000.0]
+    e.service.clock = lambda: now[0]
+    row = reserve(e)
+    e.domain.close()
+    e.service.config['config_revision'] += 1
+    e.inventory['meta']['owner']['config_revision'] += 1
+    e.core.store = SimpleNamespace(status=lambda owner, namespace, request_id: e.core.rows.get(request_id))
+    e.domain = RepairService(e.service, core_factory=lambda profile: e.core)
+    e.domain.reconcile_all()
+    with pytest.raises(ValueError, match='owner_conflict'):
+        reserve(e, expected_owner=e.inventory['meta']['owner'], idempotency_key='request_0000000000000002')
+    now[0] += 61
+    released = e.domain.reconcile_all()
+    assert released[0]['state'] == 'closed' and released[0]['session']['state'] == 'cancelled'
+    fresh = reserve(e, expected_owner=e.inventory['meta']['owner'], idempotency_key='request_0000000000000003')
+    assert fresh['id'] != row['id']
+    assert e.core.calls == 0 and not e.core.rows
+
+
 @pytest.mark.parametrize('field,value', [('owner_epoch', 2), ('owner_gateway_id', 'other'), ('owner_profile', 'other')])
 def test_history_never_crosses_owner_transfer(env, field, value):
     row, calls = historical(env)

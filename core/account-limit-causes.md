@@ -77,6 +77,49 @@ account-usage display plugin; a message is not proof that a credential will work
   old Codex `usage_limit_reached` on a duplicate login showed a Pro account as out of quota at 30% weekly use.
 - `tui_gateway/contracts/config_free_tier_control.py`: additive optional fields; contract files regenerated.
 
+## Fresh usage lifts a stale quota bench (0457)
+
+Patch: `patches/0457-feat-account-usage-fresh-usage-with-quota-left-lifts.patch` (agent + tui_gateway). Cut on
+fork main after two unmirrored kanban commits; it touches no kanban file and applies cleanly on the 0456 tip.
+
+What you see: you reset a Codex subscription early (or the plan changes). Within about two minutes with the
+Desktop chip polling, or ten minutes with nothing open, the account turns green and routing uses it again.
+Before 0457 a `usage_limit_reached` bench held the account out until the provider's old reset time, while the
+chip showed 0% weekly use next to a red dot.
+
+### Behavior
+
+- **Picker path (`model.options` → `_apply_usage` → per-account refresh, `_refresh_entries`):** after each
+  per-account fetch, `clear_recovered_quota_benches` clears the bench of the account's pool entries when all of
+  these hold: the entry is `exhausted` for a usage/quota reason code (`usage_limit_reached`, `insufficient_quota`,
+  ...); it is not a 401/402, billing or auth bench, and not a plain rate limit; the snapshot is for the same
+  account identity and was fetched after the bench was set; the snapshot has at least one account-scoped window
+  and every one is below 100%. Clearing uses `pool.reset_status(id)`, the same call as `hermes auth reset`.
+- **Background watch (TUI gateway only):** `tui_gateway/entry.py` starts `start_quota_recovery_watch()`, a
+  daemon that every 10 minutes queues usage refreshes for quota-benched entries whose bench is still live (one
+  per account; healthy entries and lapsed benches are not fetched). The refresh then runs the same clear rule.
+  The messaging gateway (`gateway/run.py`) does not start the watch (untested, not wired).
+- Telemetry still never sets a bench. A wrong clear costs one request: its quota error benches the credential
+  again.
+
+### Tests
+
+- `tests/agent/test_account_usage_recovery.py` (real auth stores, faked usage HTTP only):
+  `test_picker_refresh_lifts_quota_bench_when_usage_shows_quota` (picker path, end to end: `limited` →
+  bench cleared → `ready`); `test_bench_kept_without_quota_evidence` (window still at 100%, model-scoped window
+  only, 401 auth, 402 billing, plain rate limit); `test_snapshot_fetched_before_the_bench_proves_nothing`;
+  `test_only_the_matching_account_is_cleared`;
+  `test_background_watch_fetches_only_benched_accounts_and_clears_recovered` (watch path);
+  `test_watch_starts_once_and_ticks`.
+- `tests/tui_gateway/test_quota_recovery_starter.py`: the TUI gateway starter calls the watch.
+- Run with the existing `test_model_options_pool_usage.py`, `test_account_usage_cache_claims.py`,
+  `test_account_usage_pool_fetch.py` and `test_credential_pool.py`: 90 passed (`scripts/run_tests.sh`).
+
+### Gotchas
+
+- Needs a usage fetcher for the provider (Codex and Claude have one). Without one nothing is fetched or cleared.
+- Billing benches are left alone on purpose: usage windows with room say nothing about a payment problem.
+
 ## Tests
 
 - 0340: source `tests/hermes_cli/test_anthropic_unavailable_diagnostics.py`; not run in this

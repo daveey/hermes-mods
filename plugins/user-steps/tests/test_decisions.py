@@ -239,7 +239,9 @@ def test_identical_extracted_titles_do_not_merge_and_model_cannot_decide(tmp_pat
     first = core.process_reply(reply, 'session-a', ledger=lg, action_store=s, action_owner=OWNER,
                                llm=lambda *a: json.dumps(payload))
     payload['resolved'] = [first['steps'][0]['id']]
-    second = core.process_reply(reply, 'session-a', ledger=lg, action_store=s, action_owner=OWNER,
+    reply2 = 'Should I change the example now?'
+    payload['steps'][0]['verbatim_span'] = reply2
+    second = core.process_reply(reply2, 'session-a', ledger=lg, action_store=s, action_owner=OWNER,
                                 llm=lambda *a: json.dumps(payload))
     assert second['resolved'] == []
     assert len(s.requests(OWNER)) == 2

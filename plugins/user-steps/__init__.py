@@ -145,10 +145,14 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
     if not _eligible(session_id, platform):
         return None
     try:
+        try:
+            action_owner = core.server_owner(session_id)
+        except core.ActionError:
+            action_owner = None  # no authenticated owner: ledger-only, no canonical request is minted
         out = core.process_reply(
             response_text, session_id, user_msg=_USER_MSG.pop(session_id, ""), llm=aux_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
-            action_store=core.ActionStore(), action_owner=core.server_owner(session_id),
+            action_store=core.ActionStore() if action_owner else None, action_owner=action_owner,
             session_ref=f"@session:{_profile()}/{session_id}")
         if out.get("error"):
             log.warning("user-steps extractor fell back to regex: %s", out["error"])
@@ -163,6 +167,30 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
         _trace(hook="transform", session=session_id, platform=platform, exception=repr(exc)[:300])
         log.exception("user-steps transform failed")
         return None  # fail open: the reply is shown unchanged
+
+
+def publication_buffer(**_: Any):
+    """Keep final drafts private until process_reply reconciles the source ledger.
+
+    This gate does not judge or hold; its buffering declaration prevents a
+    standalone user-steps transform from trying to retract already-visible text.
+    """
+    return None
+
+
+publication_buffer.needs_buffer = True
+
+
+def _require_publication_contract() -> None:
+    try:
+        from agent.pre_final_gate import PRE_FINAL_GATE_CAPABILITIES
+    except ImportError as exc:
+        raise RuntimeError("user-steps requires post-transform buffered publication; update core first") from exc
+    contract = PRE_FINAL_GATE_CAPABILITIES
+    if not isinstance(contract, dict) or any(
+        contract.get(key) is not True for key in ("needs_buffer", "post_transform_release")
+    ):
+        raise RuntimeError("user-steps requires post-transform buffered publication; update core first")
 
 
 def publish_action_request(args: dict, session_id: str = '', **_) -> str:
@@ -219,6 +247,8 @@ PRODUCER_SCHEMA = {
 
 
 def register(ctx) -> None:
+    _require_publication_contract()
+    ctx.register_hook("pre_final_gate", publication_buffer)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)
     ctx.register_tool(name='action_request', toolset='user_steps', schema=PRODUCER_SCHEMA,

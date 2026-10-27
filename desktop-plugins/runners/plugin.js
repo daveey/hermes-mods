@@ -230,7 +230,7 @@ export function createTransport(ctx, hostRef = host) {
         throw safeError('Repair session owner identity mismatch')
       return { gateway_id: current.owner.gateway_id, profile: current.owner.profile,
         stored_session_id: current.session.stored_session_id, resolved_session_id: current.session.lineage_tip_id,
-        exists: !!current.session.stored_session_id, reconciliation: current.session.state }
+        exists: !!current.session.stored_session_id, reconciliation: current.session.state, reconciled: true }
     }
     const key = JSON.stringify([ownerKey(owner), owner.owner_epoch, params.start_request_id])
     await assertRoute(route)
@@ -261,6 +261,21 @@ export function createTransport(ctx, hostRef = host) {
       result = await hostRef.requestProfile(route, 'session.start_request', params, 10000, { spawnPriority: 'foreground' })
     }
     await assertRoute(route)
+    // Core keys its start ledger by its own install authority, not the runners
+    // owner UUID. Bind an RPC result to the verified runners owner through the
+    // owner's reconciled status for the same repair before opening anything.
+    if (result && !result.reconciled) {
+      let server
+      try {
+        server = await status()
+      } catch {
+        throw safeError('Repair session started; owner status unavailable. Open again to reconcile. No prompt resent.')
+      }
+      if (result.profile !== owner.profile || !server.exists ||
+          server.stored_session_id !== result.stored_session_id)
+        throw safeError('Repair session owner identity mismatch')
+      result = server
+    }
     if (result?.gateway_id !== owner.gateway_id || result.profile !== owner.profile)
       throw safeError('Repair session owner identity mismatch')
     const id = result.resolved_session_id || result.stored_session_id

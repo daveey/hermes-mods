@@ -1,0 +1,441 @@
+From 54178461e4cecb9ddaf6bf700387e42208ca5aba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 09:03:27 +0000
+Subject: [PATCH] feat(session-start): pin a closed toolset allowlist on a
+ durable start for the whole session lineage [daveey]
+
+StartIntent.toolsets (validated, known concrete names, never all/*) is stored in
+session_start_requests.toolsets_json and part of the idempotency digest. _make_agent
+resolves the pin through parent_session_id (compression, branch, reopen) and builds the
+agent with exactly that list; reload/refresh paths cannot widen it. A failed lookup
+refuses the build. Absent allowlist is unchanged.
+---
+ apps/shared/src/gateway-contract.generated.ts |   1 +
+ apps/shared/src/gateway-contract.openrpc.json |   7 +
+ tests/tui_gateway/test_start_toolsets.py      | 201 ++++++++++++++++++
+ tools/mcp_tool_agent.py                       |   5 +
+ tui_gateway/contracts/sessions.py             |   1 +
+ tui_gateway/server.py                         |  10 +-
+ tui_gateway/session_start_requests.py         |  56 ++++-
+ 7 files changed, 276 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tui_gateway/test_start_toolsets.py
+
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index aed511749a..2b3dcb53de 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -3060,6 +3060,7 @@ export interface SessionStartRequestResult {
+   active_turn: boolean
+   reconciliation: StartReconciliation
+   metadata?: Record<string, string>
++  toolsets?: string[]
+ }
+ export type FirstTurnState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+ export type StartReconciliation = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown_outcome'
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 97088b58ef..bd4a64bed4 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -32965,6 +32965,13 @@
+             },
+             "title": "Metadata",
+             "type": "object"
++          },
++          "toolsets": {
++            "items": {
++              "type": "string"
++            },
++            "title": "Toolsets",
++            "type": "array"
+           }
+         },
+         "required": [
+diff --git a/tests/tui_gateway/test_start_toolsets.py b/tests/tui_gateway/test_start_toolsets.py
+new file mode 100644
+index 0000000000..c670453559
+--- /dev/null
++++ b/tests/tui_gateway/test_start_toolsets.py
+@@ -0,0 +1,201 @@
++"""A durable start may pin a closed toolset allowlist that every later agent build keeps."""
++import hashlib
++import json
++import types
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway import server
++from tui_gateway.session_start_requests import StartIntent, StartOwner, StartStore
++
++OWNER = StartOwner("example-gateway", "default", "example:user")
++ALLOW = ["example_ops", "clarify", "todo"]
++
++
++@pytest.fixture(autouse=True)
++def _plugin_toolset(monkeypatch):
++    """Stands in for a plugin-registered toolset such as runners."""
++    import toolsets
++    monkeypatch.setitem(toolsets.TOOLSETS, "example_ops", toolsets._ts("Example plugin tools", [], []))
++
++
++@pytest.fixture
++def store(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    yield StartStore(db)
++    db.close()
++
++
++def accept(store, toolsets=None, request_id="request"):
++    return store.accept(owner=OWNER, namespace="example", request_id=request_id,
++                        intent=StartIntent("Title", "Inspect only", toolsets=toolsets))
++
++
++# ── validation ──────────────────────────────────────────────────────────────
++
++@pytest.mark.parametrize("bad", [[], "terminal", ["nope-not-a-toolset"], ["all"], ["*"], ["clarify", 3],
++                                 ["clarify", "clarify"], [""], ["x"] * 65, {"clarify": True}])
++def test_toolsets_validation_rejects_unknown_or_unclosed(bad):
++    with pytest.raises(ValueError, match="toolsets"):
++        StartIntent("Title", "Inspect", toolsets=bad)
++
++
++def test_toolsets_are_normalized_immutable_and_independent_of_caller():
++    supplied = ["todo", "clarify"]
++    intent = StartIntent("Title", "Inspect", toolsets=supplied)
++    supplied.append("terminal")
++    assert intent.toolsets == ("clarify", "todo")
++
++
++def test_absent_toolsets_keep_old_digest_and_behaviour(store):
++    row = accept(store)
++    old = hashlib.sha256(json.dumps(dict(title="Title", text="Inspect only", source="desktop"),
++                                    sort_keys=True, ensure_ascii=True).encode()).hexdigest()
++    assert row["intent_digest"] == old
++    assert StartIntent("t", "x").toolsets is None
++    assert store.session_toolsets(row["stored_session_id"]) is None
++    assert store.status(OWNER, "example", "request")["toolsets"] == []
++
++
++# ── persistence ─────────────────────────────────────────────────────────────
++
++def test_toolsets_durable_idempotent_and_conflict(store):
++    row = accept(store, ALLOW)
++    assert accept(store, list(reversed(ALLOW))) == row
++    with pytest.raises(ValueError, match="conflict"):
++        accept(store, ["clarify"])
++    with pytest.raises(ValueError, match="conflict"):
++        accept(store, None)
++    assert store.status(OWNER, "example", "request")["toolsets"] == sorted(ALLOW)
++
++
++def test_pin_follows_compression_branch_and_reopen(store):
++    sid = accept(store, ALLOW)["stored_session_id"]
++    assert store.session_toolsets(sid) == tuple(sorted(ALLOW))
++    store.db.end_session(sid, "compression")
++    store.db.create_session("child", source="desktop", parent_session_id=sid)
++    store.db.create_session("grandchild", source="desktop", parent_session_id="child")
++    with SessionDB(store.db.db_path) as reopened:
++        fresh = StartStore(reopened)
++        assert fresh.session_toolsets("grandchild") == tuple(sorted(ALLOW))
++        assert fresh.session_toolsets("child") == tuple(sorted(ALLOW))
++
++
++def test_unrelated_session_and_old_ledger_have_no_pin(store):
++    accept(store, ALLOW)
++    store.db.create_session("other", source="desktop")
++    assert store.session_toolsets("other") is None
++    assert store.session_toolsets("missing") is None
++
++
++def test_pin_lookup_without_ledger_table_is_unpinned(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session("plain", source="desktop")
++        assert StartStore.session_toolsets_for(db, "plain") is None
++    finally:
++        db.close()
++
++
++def test_upgrade_existing_ledger_adds_column(store):
++    row = accept(store)
++    store.db._execute_write(lambda conn: conn.execute(
++        "ALTER TABLE session_start_requests DROP COLUMN toolsets_json"))
++    upgraded = StartStore(store.db)
++    assert accept(upgraded)["stored_session_id"] == row["stored_session_id"]
++    assert upgraded.session_toolsets(row["stored_session_id"]) is None
++
++
++# ── enforcement at agent build ──────────────────────────────────────────────
++
++def _pinned_session(store):
++    sid = accept(store, ALLOW)["stored_session_id"]
++    store.db.end_session(sid, "compression")
++    store.db.create_session("compressed-tip", source="desktop", parent_session_id=sid)
++    return sid
++
++
++def test_pinned_tool_surface_has_no_terminal_execute_code_or_delegate(store):
++    import model_tools
++    from tools import tool_search
++    pin = list(store.session_toolsets(_pinned_session(store)))
++    listed = {t["function"]["name"] for t in model_tools.get_tool_definitions(enabled_toolsets=pin, quiet_mode=True)}
++    scoped = model_tools.get_tool_definitions(enabled_toolsets=pin, quiet_mode=True, skip_tool_search_assembly=True)
++    surface = {t["function"]["name"] for t in scoped}
++    assert "clarify" in listed and surface == {"clarify", "todo_list"}
++    for forbidden in ("terminal", "execute_code", "delegate_task", "read_file", "write_file", "patch",
++                      "kanban_create", "cronjob_manage", "cross_session", "browser_exec"):
++        assert forbidden not in listed | surface
++        assert forbidden not in tool_search.scoped_deferrable_names(scoped)
++        # The tool_search bridge is scoped to the same set: nothing outside it is re-dispatched.
++        _, redispatch = model_tools._dispatch_bridge_tool(
++            "tool_call", {"name": forbidden, "arguments": {}}, pin, None)
++        assert redispatch is None
++
++
++def test_agent_loop_rejects_names_outside_the_pinned_surface():
++    from agent.agent_runtime_helpers import repair_tool_call
++    agent = types.SimpleNamespace(valid_tool_names={"clarify", "tool_search", "tool_call", "tool_describe"})
++    for name in ("terminal", "execute_code", "delegate_task", "Terminal", "run_terminal"):
++        assert repair_tool_call(agent, name) is None
++
++
++class _FakeAgent:
++    def __init__(self, **kwargs):
++        self.kwargs = kwargs
++        self.enabled_toolsets = kwargs["enabled_toolsets"]
++        self.disabled_toolsets = kwargs["disabled_toolsets"]
++        self.platform = kwargs["platform"]
++
++
++def _build(monkeypatch, store, key, wide=("terminal", "file", "code_execution")):
++    import run_agent
++    monkeypatch.setattr(run_agent, "AIAgent", _FakeAgent)
++    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda platform=None: list(wide))
++    monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
++    monkeypatch.setattr(server, "_startup_system_prompt", lambda cfg, key: "")
++    monkeypatch.setattr(server, "_resolve_agent_model_runtime", lambda m, p: ("model", {}))
++    monkeypatch.setattr(server, "_load_cfg", lambda: {})
++    monkeypatch.setattr(server, "_resolve_agent_platform", lambda p=None: "desktop")
++    return server._make_agent("sid", key, session_id=key, session_db=store.db)
++
++
++def test_make_agent_uses_only_the_pin_for_original_and_compressed_sessions(monkeypatch, store):
++    sid = _pinned_session(store)
++    for key in (sid, "compressed-tip"):
++        agent = _build(monkeypatch, store, key)
++        assert list(agent.kwargs["enabled_toolsets"]) == sorted(ALLOW)
++        assert agent._toolset_pin == tuple(sorted(ALLOW))
++
++
++def test_make_agent_without_pin_is_unchanged(monkeypatch, store):
++    store.db.create_session("normal", source="desktop")
++    agent = _build(monkeypatch, store, "normal")
++    assert agent.kwargs["enabled_toolsets"] == ["terminal", "file", "code_execution"]
++    assert getattr(agent, "_toolset_pin", None) is None
++
++
++def test_pin_lookup_failure_refuses_the_build(monkeypatch, store):
++    sid = _pinned_session(store)
++    def boom(*a, **kw):
++        raise RuntimeError("db gone")
++    monkeypatch.setattr(StartStore, "session_toolsets_for", staticmethod(boom))
++    with pytest.raises(RuntimeError):
++        _build(monkeypatch, store, sid)
++
++
++def test_refresh_cannot_widen_a_pinned_agent():
++    from tools.mcp_tool_agent import _resolve_refresh_toolsets
++    agent = types.SimpleNamespace(enabled_toolsets=["clarify", "todo"], disabled_toolsets=None, platform="desktop",
++                                  _toolset_pin=("clarify", "todo"))
++    enabled, _ = _resolve_refresh_toolsets(agent, ["terminal", "file"], [])
++    assert enabled == ["clarify", "todo"]
++    assert agent.enabled_toolsets == ["clarify", "todo"]
++
++
++def test_refresh_without_pin_still_takes_override():
++    from tools.mcp_tool_agent import _resolve_refresh_toolsets
++    agent = types.SimpleNamespace(enabled_toolsets=["clarify"], disabled_toolsets=None, platform="desktop")
++    enabled, _ = _resolve_refresh_toolsets(agent, ["terminal"], [])
++    assert enabled == ["terminal"]
+diff --git a/tools/mcp_tool_agent.py b/tools/mcp_tool_agent.py
+index 4207c0f832..5aeceb4f1d 100644
+--- a/tools/mcp_tool_agent.py
++++ b/tools/mcp_tool_agent.py
+@@ -35,6 +35,11 @@ def _resolve_refresh_toolsets(agent, enabled_override, disabled_override):
+     and reuse the build-time selection."""
+     enabled = getattr(agent, "enabled_toolsets", None)
+     disabled = getattr(agent, "disabled_toolsets", None)
++    pin = getattr(agent, "_toolset_pin", None)
++    if pin:
++        # A session started with a closed allowlist can never be widened by a reload or config change.
++        enabled_override = list(pin)
++        agent.enabled_toolsets = enabled_override
+     if enabled_override is not None or disabled_override is not None:
+         enabled = enabled_override if enabled_override is not None else enabled
+         if disabled_override is not None:
+diff --git a/tui_gateway/contracts/sessions.py b/tui_gateway/contracts/sessions.py
+index 3f1425b8b4..4075659218 100644
+--- a/tui_gateway/contracts/sessions.py
++++ b/tui_gateway/contracts/sessions.py
+@@ -53,6 +53,7 @@ class SessionStartRequestResult(Result):
+     active_turn: bool
+     reconciliation: StartReconciliation
+     metadata: dict[str, str] = Field(default_factory=dict)
++    toolsets: list[str] = Field(default_factory=list)
+ 
+ 
+ method("session.start_request", params=SessionStartRequestParams, result=SessionStartRequestResult)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index facd76dcb1..37abfe4514 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2678,6 +2678,11 @@ def _make_agent(
+     ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
+     with _sessions_lock:
+         session = _sessions.get(sid)
++    # A start that pinned a closed toolset allowlist keeps it for the whole lineage (resume, compression,
++    # branch). A failed lookup raises: never build a wider agent than the start allowed.
++    _build_db = session_db if session_db is not None else _get_db()
++    from tui_gateway.session_start_requests import StartStore
++    toolset_pin = StartStore.session_toolsets_for(_build_db, session_id or key)
+     agent = AIAgent(
+         model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
+         requested_provider=runtime.get("requested_provider"),
+@@ -2688,7 +2693,7 @@ def _make_agent(
+         reasoning_config=(
+             reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
+         service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
+-        enabled_toolsets=_load_enabled_toolsets(platform),
++        enabled_toolsets=list(toolset_pin) if toolset_pin else _load_enabled_toolsets(platform),
+         disabled_toolsets=_load_disabled_toolsets(),
+         # OpenRouter provider_routing prefs (gateway + CLI parity).
+         providers_allowed=_pr.get("only"), providers_ignored=_pr.get("ignore"), providers_order=_pr.get("order"),
+@@ -2698,7 +2703,7 @@ def _make_agent(
+         # The dashboard login identity reaches memory providers as the runtime user, like a gateway user id.
+         # Builds that run before the record exists (branch, eager resume, compute host) pass it explicitly.
+         user_id=auth_user_id if auth_user_id is not None else _session_auth_user_id(session),
+-        session_db=session_db if session_db is not None else _get_db(), ephemeral_system_prompt=system_prompt or None,
++        session_db=_build_db, ephemeral_system_prompt=system_prompt or None,
+         checkpoints_enabled=_resolve_checkpoints_enabled(cfg),
+         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
+         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
+@@ -2708,6 +2713,7 @@ def _make_agent(
+     if context_cwd_is_launch_artifact is None:
+         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
+     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
++    agent._toolset_pin = toolset_pin
+     if fallback_notice:
+         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
+         agent._pending_fallback_notice = fallback_notice
+diff --git a/tui_gateway/session_start_requests.py b/tui_gateway/session_start_requests.py
+index 0996081701..e31ef56f54 100644
+--- a/tui_gateway/session_start_requests.py
++++ b/tui_gateway/session_start_requests.py
+@@ -185,6 +185,8 @@ class StartIntent:
+     text: str
+     source: str = "desktop"
+     metadata: dict[str, str] | None = None
++    # Closed tool allowlist for the whole session lineage (None = normal toolsets).
++    toolsets: tuple[str, ...] | list[str] | None = None
+ 
+     def __post_init__(self):
+         if not isinstance(self.title, str) or not 1 <= len(self.title) <= 500:
+@@ -199,6 +201,22 @@ class StartIntent:
+                        or not isinstance(v, str) or len(v) > 1024 for k, v in metadata.items())):
+             raise ValueError("start metadata must have at most 32 string pairs (keys 1–64, values 0–1024)")
+         object.__setattr__(self, "metadata", MappingProxyType(dict(metadata)))
++        object.__setattr__(self, "toolsets", _validate_toolsets(self.toolsets))
++
++
++def _validate_toolsets(value) -> tuple[str, ...] | None:
++    """A closed allowlist: 1–64 distinct, known, concrete toolset names (never all/*)."""
++    if value is None:
++        return None
++    if (not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 64
++            or any(not isinstance(v, str) or not 1 <= len(v) <= 128 for v in value)
++            or len(set(value)) != len(value) or any(v in ("all", "*") for v in value)):
++        raise ValueError("start toolsets must be 1–64 distinct concrete toolset names")
++    from toolsets import validate_toolset
++    unknown = [v for v in value if not validate_toolset(v)]
++    if unknown:
++        raise ValueError("start toolsets contain unknown toolsets: " + ", ".join(sorted(unknown)))
++    return tuple(sorted(value))
+ 
+ 
+ _SCHEMA = """
+@@ -244,6 +262,8 @@ class StartStore:
+             columns = {row[1] for row in conn.execute("PRAGMA table_info(session_start_requests)")}
+             if "metadata_json" not in columns:
+                 conn.execute("ALTER TABLE session_start_requests ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
++            if "toolsets_json" not in columns:
++                conn.execute("ALTER TABLE session_start_requests ADD COLUMN toolsets_json TEXT")
+         db._execute_write(initialize)
+ 
+     @staticmethod
+@@ -252,6 +272,32 @@ class StartStore:
+         result["metadata"] = json.loads(result.pop("metadata_json"))
+         return result
+ 
++    def session_toolsets(self, session_id: str) -> tuple[str, ...] | None:
++        return self.session_toolsets_for(self.db, session_id)
++
++    @staticmethod
++    def session_toolsets_for(db, session_id: str) -> tuple[str, ...] | None:
++        """The allowlist pinned by the start that created this session's lineage, else None.
++
++        Walks parent_session_id (compression, branches) to the root, so every descendant
++        keeps the pin. A missing ledger or column means no pin; any other failure propagates
++        so a caller refuses to build rather than silently widening.
++        """
++        if db._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_start_requests'") is None:
++            return None
++        if not any(r[1] == "toolsets_json" for r in db._read_all("PRAGMA table_info(session_start_requests)")):
++            return None
++        seen, current = set(), session_id
++        while current and current not in seen and len(seen) < 10_000:
++            seen.add(current)
++            row = db._read_one("SELECT toolsets_json FROM session_start_requests WHERE stored_session_id=?",
++                               (current,))
++            if row is not None:
++                return tuple(json.loads(row[0])) if row[0] else None
++            parent = db._read_one("SELECT parent_session_id FROM sessions WHERE id=?", (current,))
++            current = parent[0] if parent else None
++        return None
++
+     def lookup(self, owner: StartOwner, namespace: str, request_id: str) -> dict | None:
+         row = self.db._read_one("SELECT * FROM session_start_requests WHERE " + _WHERE,
+                                 _key(owner, namespace, request_id))
+@@ -264,6 +310,8 @@ class StartStore:
+         # Preserve the original digest for old callers and pre-migration starts.
+         if metadata:
+             payload["metadata"] = metadata
++        if intent.toolsets is not None:
++            payload["toolsets"] = list(intent.toolsets)
+         digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+         session_id, turn_id = uuid.uuid4().hex, uuid.uuid4().hex
+         now = time.time()
+@@ -289,9 +337,10 @@ class StartStore:
+             conn.execute(
+                 "INSERT INTO session_start_requests "
+                 "(gateway_id,profile,principal,namespace,request_id,intent_digest,stored_session_id,"
+-                "first_turn_id,user_row_id,state,runtime_token,created_at,updated_at,metadata_json) "
+-                "VALUES (?,?,?,?,?,?,?,?,?,'queued',NULL,?,?,?)",
+-                (*key, digest, session_id, turn_id, row_id, now, now, json.dumps(metadata, sort_keys=True)))
++                "first_turn_id,user_row_id,state,runtime_token,created_at,updated_at,metadata_json,toolsets_json) "
++                "VALUES (?,?,?,?,?,?,?,?,?,'queued',NULL,?,?,?,?)",
++                (*key, digest, session_id, turn_id, row_id, now, now, json.dumps(metadata, sort_keys=True),
++                 json.dumps(list(intent.toolsets)) if intent.toolsets is not None else None))
+             return self._decode(conn.execute("SELECT * FROM session_start_requests WHERE " + _WHERE, key).fetchone())
+         return self.db._execute_write(write, patience_s=self.db._TRANSCRIPT_WRITE_PATIENCE_S)
+ 
+@@ -319,6 +368,7 @@ class StartStore:
+             "exists": row is not None, "archived": bool(row and row.get("archived")),
+             "active_turn": active,
+             "metadata": start["metadata"],
++            "toolsets": json.loads(start["toolsets_json"]) if start.get("toolsets_json") else [],
+             "reconciliation": "unknown_outcome" if state == "running" and not active else state,
+         }
+ 
+-- 
+2.55.0
+

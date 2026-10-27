@@ -11,9 +11,11 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -98,6 +100,32 @@ def session_source(session_id: str, db: Optional[Path] = None) -> str:
 # ---- ledger --------------------------------------------------------------------------------------------
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]")
+MAX_LEDGER_BYTES = 1024 * 1024  # bounded lifecycle snapshots, including JSON parsing
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate ledger JSON key")
+        result[key] = value
+    return result
+
+
+def _invalid_constant(value):
+    raise ValueError("invalid ledger JSON constant")
+
+
+def _validate_ledger(d, root, *, legacy=False):
+    if not isinstance(d, dict) or d.get("root") != root:
+        raise ValueError("ledger root mismatch or invalid document")
+    if not isinstance(d.get("steps"), list) or any(not isinstance(s, dict) for s in d["steps"]):
+        raise ValueError("invalid ledger steps")
+    if legacy and "revision" not in d:
+        return
+    revision = d.get("revision")
+    if type(revision) is not int or revision < 1:
+        raise ValueError("invalid or missing ledger revision")
 
 
 class Ledger:
@@ -119,16 +147,86 @@ class Ledger:
         lock = open(self.dir / ".lock", "a+")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            d = self._read(root)
+            try:
+                d = self._read_strict(root, legacy=True, bounded=False)
+            except FileNotFoundError:
+                d = {"root": root, "steps": [], "card": None, "gen": 0}
+            revision = d.get("revision", 0)
             yield d
+            # The writer, not the edit caller/model, owns this counter.
+            d["revision"] = revision + 1
             d["updated"] = time.time()
+            _validate_ledger(d, root)
+            raw = json.dumps(d, ensure_ascii=False, indent=1, allow_nan=False).encode("utf-8")
+
             p = self.path(root)
-            tmp = p.with_suffix(f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1))
-            os.replace(tmp, p)
+            tmp = p.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                with tmp.open("xb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(tmp, p)
+                try:
+                    fd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    # Replacement already committed. Do not report an abort or
+                    # prevent card synchronization, but surface durability loss.
+                    logging.getLogger("user-steps").error(
+                        "Ledger committed; directory durability could not be confirmed", exc_info=True)
+            finally:
+                tmp.unlink(missing_ok=True)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
+
+    def _read_strict(self, root: str, *, legacy: bool = False, bounded: bool = True) -> dict:
+        if not isinstance(root, str) or not root:
+            raise ValueError("ledger root must be a nonempty string")
+        # No symlinks or blocking special files; size-check and read the same fd.
+        def opener(path, flags):
+            return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with open(self.path(root), "rb", opener=opener) as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("ledger source must be a regular file")
+            if bounded and info.st_size > MAX_LEDGER_BYTES:
+                raise ValueError("ledger size exceeds limit")
+            raw = stream.read(MAX_LEDGER_BYTES + 1) if bounded else stream.read()
+        if bounded and len(raw) > MAX_LEDGER_BYTES:
+            raise ValueError("ledger size exceeds limit")
+        try:
+            d = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object,
+                           parse_constant=_invalid_constant)
+        except RecursionError as exc:
+            raise ValueError("ledger JSON nesting exceeds limit") from exc
+        _validate_ledger(d, root, legacy=legacy)
+        return d
+
+    def read_exact(self, root: str, step_id: str) -> dict:
+        """Read only root's file; return {root, revision, step}, never scan/resolve lineage.
+
+        OSError means missing/unreadable source, ValueError invalid/oversized source
+        (including legacy files until their next edit), LookupError a missing step.
+        Duplicate target IDs are invalid. IDs are opaque exact source keys; a
+        directive consumer must separately validate its own ID grammar.
+        The detached snapshot carries raw source
+        evidence only: resolved status can suppress an ask, but neither it nor
+        resolved_by is trusted provenance or authority to reopen anything.
+        """
+        if not isinstance(step_id, str) or not step_id:
+            raise ValueError("step ID must be a nonempty string")
+        d = self._read_strict(root)
+        matches = [s for s in d["steps"] if s.get("id") == step_id]
+        if len(matches) > 1:
+            raise ValueError("duplicate ledger step ID")
+        if not matches:
+            raise LookupError("step not found in exact ledger")
+        return {"root": root, "revision": d["revision"], "step": matches[0]}
 
     def _read(self, root: str) -> dict:
         try:
@@ -403,12 +501,23 @@ def recommendation_without_request(span: str, block: str = "") -> bool:
     return bool(_RECOMMENDATION.search(context) and not grounded)
 
 
-def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None) -> list[dict]:
+def action_identity(step: dict) -> tuple:
+    """Exact validated source fields, not a topic/account key or reopen proof.
+
+    Include evidence and ordered choices: identical labels alone cannot bind two
+    actions. No further normalization, fuzzy matching, or model-supplied IDs.
+    Legacy steps with these fields participate without a separate key migration.
+    """
+    return (step.get("kind"), step.get("text"), step.get("verbatim_span"),
+            tuple(step.get("options") or []))
+
+
+def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None,
+             *, continuity: bool = False) -> list[dict]:
     out: list[dict] = []
-    # Extraction is not an identity oracle. Similar (or identical) titles across
-    # turns must never merge decisions. Within one reply only identical evidence
-    # spans are suppressed, not request text.
-    seen = set()
+    # The creation boundary needs repeats too, including those resolved while the
+    # model runs. Ordinary extractor callers retain their old deduplication.
+    seen: set[Any] = set() if continuity else {_norm(s.get("text", "")) for s in open_steps}
     for s in raw_steps if isinstance(raw_steps, list) else []:
         if not isinstance(s, dict):
             continue
@@ -431,21 +540,25 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             continue  # full evidence required; locate's framing prefix is not validation
         if recommendation_without_request(span, block["text"]):
             continue  # a recommendation is not permission to manufacture a choice
-        if span in seen:
+        candidate = {"text": text, "kind": kind, "verbatim_span": span, "options": opts}
+        key = action_identity(candidate) if continuity else _norm(text)
+        if key in seen:
             continue
         if is_terminal_handoff(text, span, reply):
             if dropped is not None:
                 dropped.append(text)
             continue  # terminal-doable: the agent runs it via run_in_user_terminal, no For-you card
-        seen.add(span)
-        out.append({"text": text, "kind": kind, "verbatim_span": span, "options": opts})
-    return out[:MAX_NEW_PER_REPLY]
+        seen.add(key)
+        out.append(candidate)
+    # Suppression/reuse must not be truncated by a *new* action budget.
+    return out if continuity else out[:MAX_NEW_PER_REPLY]
 
 
 LLM = Callable[[str, str], str]
 
 
-def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM]) -> dict:
+def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM],
+            *, continuity: bool = False) -> dict:
     """{steps, resolved, source: 'model'|'regex', error?}."""
     ids = {s["id"] for s in open_steps}
     dropped: list[str] = []
@@ -453,14 +566,14 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
         try:
             d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg)))
             resolved = [str(x) for x in (d.get("resolved") or []) if str(x) in ids]
-            return {"steps": validate(d.get("steps"), reply, open_steps, dropped), "resolved": resolved,
+            return {"steps": validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), "resolved": resolved,
                     "source": "model", "dropped": dropped}
         except Exception as exc:  # fall back to the regex detector; resolution then only comes from buttons
             err = f"{type(exc).__name__}: {exc}"[:200]
             dropped.clear()
-            return {"steps": validate(regex_steps(reply), reply, open_steps, dropped), "resolved": [], "source": "regex",
+            return {"steps": validate(regex_steps(reply), reply, open_steps, dropped, continuity=continuity), "resolved": [], "source": "regex",
                     "error": err, "dropped": dropped}
-    return {"steps": validate(regex_steps(reply), reply, open_steps, dropped), "resolved": [], "source": "regex",
+    return {"steps": validate(regex_steps(reply), reply, open_steps, dropped, continuity=continuity), "resolved": [], "source": "regex",
             "dropped": dropped}
 
 
@@ -633,38 +746,95 @@ def resolve(ledger: Ledger, root: str, ids: list[str], resolution: str, by: str)
     return done
 
 
+HELD_REPLY = "This reply has been held because it repeats a retired request. No new action is requested."
+
+
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
                   ledger: Ledger, cards: Optional[Cards] = None, framed: bool = True,
                   session_ref: str = "", now: Optional[float] = None,
                   action_store=None, action_owner=None) -> dict:
     """Run one final reply through the pipeline. Returns {text (None = unchanged), steps, resolved, source}."""
+    # A positive retirement finding must survive later persistence/card failures.
+    # Local state is not model-supplied and grants no reopen/execution authority.
+    retired = []
+    try:
+        return _process_reply(reply, session_id, user_msg=user_msg, llm=llm, ledger=ledger,
+                              cards=cards, framed=framed, session_ref=session_ref, now=now,
+                              retired=retired, action_store=action_store, action_owner=action_owner)
+    except Exception:
+        if not retired:
+            raise
+        logging.getLogger("user-steps").exception("publication failed after retirement; preserving hold")
+        return {"text": HELD_REPLY, "steps": [], "resolved": [], "source": "retirement-hold"}
+
+
+def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[LLM],
+                   ledger: Ledger, cards: Optional[Cards], framed: bool,
+                   session_ref: str, now: Optional[float], retired: list,
+                   action_store=None, action_owner=None) -> dict:
+    """Reconcile exact actions under the source lock before creation/publication.
+
+    Resolution is suppression-only. Neither model metadata nor a later repeated
+    extraction can reopen a source action. This is not semantic deduplication.
+    """
     now = now or time.time()
     root = ledger.root(session_id)
     opened = ledger.open_steps(session_id)
     if not opened and not _worth_asking(reply):
         return {"text": None, "steps": [], "resolved": [], "source": "skip"}
-    res = extract(reply, opened, user_msg, llm)
-    resolved = (resolve(ledger, root, res["resolved"], "answered in chat", "model")
-                if res["resolved"] and action_store is None else [])
-    recent = sum(1 for s in ledger._read(root).get("steps", []) if now - s.get("created", 0) < 3600)
-    new = res["steps"][: max(0, MAX_NEW_PER_HOUR - recent)]
-    for s in new:
-        s.update(id=new_step_id(), status="open", created=now, session=session_id)
-        b = locate(reply, s["verbatim_span"])
-        s["paragraph"] = b["text"] if b else s["verbatim_span"]
-        if action_store is not None:
-            canonical = action_store.migrate_step(action_owner, s)
-            s['requestId'] = canonical['requestId']
-            s['requestOwner'] = canonical['owner']
-            s['requestRevision'] = canonical['revision']
-    if new:
+    res = extract(reply, opened, user_msg, llm, continuity=True)
+    published, resolved = [], []
+    text = reply
+    changed = False
+    if res["steps"] or res["resolved"]:
+        # Re-read after extraction under Ledger.edit's flock. Resolve, match,
+        # budget, and append in one transaction; never decide from opened above.
         with ledger.edit(root) as d:
-            d["root"] = root
-            d["steps"].extend(new)
-    text = frame(reply, new, session_id) if (new and framed) else None
-    if new or resolved:
+            seen = {_norm(s.get("text", "")) for s in d["steps"] if s.get("status") == "open"}
+            for step in d["steps"]:
+                if step.get("id") in res["resolved"] and step.get("status") == "open" and not step.get("requestId"):
+                    step.update(status="resolved", resolution="answered in chat", resolved_by="model",
+                                resolved_at=now)
+                    resolved.append(step["id"])
+            matches = [(s, [old for old in d["steps"] if action_identity(old) == action_identity(s)])
+                       for s in res["steps"]]
+            suppressed = [s for s, old in matches if any(x.get("status") == "resolved" for x in old)]
+            held = False
+            if suppressed:
+                # Evidence does not delimit dependent instructions in other blocks.
+                # Hold the whole draft rather than leave an orphaned approval ask.
+                retired.extend(suppressed)
+                text, held = HELD_REPLY, True
+            recent = sum(1 for s in d["steps"] if now - s.get("created", 0) < 3600)
+            budget = min(MAX_NEW_PER_REPLY, max(0, MAX_NEW_PER_HOUR - recent))
+            # Retain old label dedup only for genuinely new actions, never use it
+            # as an authority binding or to bypass exact retirement/reuse.
+            for candidate, prior in matches:
+                block = locate(text, candidate["verbatim_span"])
+                if held or candidate in suppressed or block is None:
+                    continue
+                existing = next((s for s in prior if s.get("status") == "open"), None)
+                if existing is not None:
+                    published.append(dict(existing))
+                    continue
+                if budget <= 0 or (action_store is None and _norm(candidate["text"]) in seen):
+                    continue
+                step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
+                        "session": session_id, "paragraph": block["text"]}
+                if action_store is not None:
+                    canonical = action_store.migrate_step(action_owner, step)
+                    step.update(requestId=canonical["requestId"], requestOwner=canonical["owner"],
+                                requestRevision=canonical["revision"])
+                d["steps"].append(step)
+                published.append(dict(step))
+                seen.add(_norm(candidate["text"]))
+                budget -= 1
+                changed = True
+    if published and framed:
+        text = frame(text, published, session_id)
+    if changed or resolved:
         sync_card(ledger, root, session_id, session_ref or f"@session:default/{session_id}", cards)
-    return {"text": text if text != reply else None, "steps": new, "resolved": resolved, "source": res["source"],
+    return {"text": text if text != reply else None, "steps": published, "resolved": resolved, "source": res["source"],
             "dropped": res.get("dropped") or [], **({"error": res["error"]} if res.get("error") else {})}
 
 

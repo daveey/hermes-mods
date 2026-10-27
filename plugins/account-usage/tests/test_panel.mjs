@@ -218,3 +218,16 @@ test('status-only unchecked key (state unknown, no windows) reads "not checked y
  const [x]=plugin.summarize({providers:[{slug:'xai-oauth',usage:{accounts:[{id:'a',label:'a',state:'unknown',windows:[]}]}}]})
  assert.doesNotMatch(plugin.statusHint(x,x.accounts[0]),/blocked/)
 })
+test('clean table: only rows with something to say get a chevron; status-only cells use a short label', async () => {
+ const {plugin}=await setup()
+ const g={statusOnly:false}
+ assert.equal(plugin.hasDetails(g,{state:'ready',windows:[]}),false)
+ assert.equal(plugin.hasDetails(g,{state:'limited',limit_kind:'quota',reason:'usage_limit'}),true)
+ assert.equal(plugin.hasDetails(g,{state:'unavailable',reason:'auth'}),true)
+ assert.equal(plugin.hasDetails(g,{state:'ready',model_cooldowns:[{model:'m',until:'2099-01-01T00:00:00Z'}]}),true)
+ assert.equal(plugin.hasDetails({statusOnly:true},{state:'ready'}),true)
+ const [gem]=plugin.summarize({providers:[{slug:'gemini',usage:{accounts:[{id:'k',label:'k',state:'limited',limit_kind:'quota',windows:[]}]}}]})
+ assert.equal(plugin.statusLabel(gem,gem.accounts[0]),'key rejected')
+ const x={statusOnly:true}
+ assert.deepEqual(['ready','limited','unavailable','unknown'].map(state=>plugin.statusLabel(x,{state})),['ok','blocked','sign-in needed','not checked'])
+})

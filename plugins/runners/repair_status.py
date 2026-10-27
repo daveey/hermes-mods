@@ -41,7 +41,7 @@ def repair_reconciler(service):
     """Open exactly the configured owner's canonical SessionDB, never plugin DB."""
     from hermes_cli.profiles import get_profile_dir
     from hermes_state import SessionDB
-    from .repairs import RepairService
+    from .repairs import RepairService, core_gateway_id
 
     profile = service.config['owner_profile']
     path = Path(get_profile_dir(profile)) / 'state.db'
@@ -50,14 +50,15 @@ def repair_reconciler(service):
     db = SessionDB(db_path=path)
     repairs = None
     try:
-        core = StatusOnlyCore(db, service.config['owner_gateway_id'], profile)
+        authority = core_gateway_id()
+        core = StatusOnlyCore(db, authority, profile)
 
         def factory(requested):
             if requested != profile:
                 raise ValueError('owner_conflict')
             return core
 
-        repairs = RepairService(service, core_factory=factory)
+        repairs = RepairService(service, core_factory=factory, core_gateway=authority)
         yield repairs
     finally:
         try:
