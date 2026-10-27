@@ -535,7 +535,7 @@ class Ledger:
         """
         text = message.strip().replace("’", "'")
         stopped = bool(re.fullmatch(
-            r"(?:(?:cancel|stop|halt) this (?:project|workflow)|(?:we're |we are )?done here)[.!]?",
+            r"(?:(?:cancel|stop|halt) this (?:project|workflow)|we are done with this (?:project|workflow))[.!]?",
             text, re.I))
         resumed = bool(re.fullmatch(r"(?:resume|reopen) this (?:project|workflow)[.!]?", text, re.I))
         if not session or not (stopped or resumed):
@@ -859,6 +859,8 @@ def vault_entries() -> list[str]:
 
 
 def capability_sheet(force: bool = False, ttl_s: float = 600) -> str:
+    # Advisory evidence for the LLM judge only. It is NOT a deterministic pre-render
+    # capability check: a listed scope/host is never permission and is not enforced here.
     if not force and _CAP_CACHE["text"] and time.time() - _CAP_CACHE["t"] < ttl_s:
         return _CAP_CACHE["text"]
     scopes, hosts, chrome, vault = broker_scopes(), ssh_hosts(), chrome_accounts(), vault_entries()

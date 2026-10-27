@@ -3,6 +3,15 @@
 What each chat is waiting for **you** to do, shown where you look, with one-click answers. Replaces
 `open-asks` and blocked-panel's composer panel.
 
+## Legacy ledgers without `revision` (migration note)
+
+Ledger files written before revisions existed have no `revision` key. They stay
+editable: the first `Ledger.edit()` migrates them to `revision: 1`. Until that
+edit, `read_exact()` deliberately raises `ValueError`, so lifecycle consumers
+(ask-gate retirement) treat the step as unknown and fail closed instead of
+trusting an unversioned snapshot. Test:
+`tests/test_lifecycle_source.py::test_revision_new_migration_and_noop`.
+
 ## What you see (Hermes Desktop)
 
 - **In the reply:** the paragraph that asks you something becomes an amber **For you** box with the original text

@@ -6,7 +6,7 @@ import pytest
 ASK = "Could you approve the Example deployment?"
 
 
-@pytest.mark.parametrize("message", ["Cancel this project.", "Stop this workflow.", "We're done here."])
+@pytest.mark.parametrize("message", ["Cancel this project.", "Stop this workflow.", "We are done with this project."])
 def test_explicit_stop_survives_reload_and_never_asks(gate, message):
     gate.ledger().set_open_asks("origin", [ASK])
     gate.pre_llm_call(session_id="origin", user_message=message)
@@ -37,6 +37,12 @@ def test_ambiguous_or_quoted_stop_does_not_close_work(gate, monkeypatch, message
     monkeypatch.setattr(gate, "LLM", lambda *a: '{"asks":[{"i":0,"verdict":"ok"}]}')
     gate.pre_llm_call(session_id="origin", user_message=message)
     assert gate.pre_final_gate(session_id="origin", final_response=ASK) is None
+
+
+@pytest.mark.parametrize("message", ["We're done here.", "done here", "Cancel this project, we are done here."])
+def test_ambiguous_done_here_does_not_stop_workflow(gate, message):
+    gate.pre_llm_call(session_id="origin", user_message=message)
+    assert gate.ledger().workflow_stopped("origin") is False
 
 
 def test_only_explicit_resume_reopens_and_does_not_erase_retirement(gate, monkeypatch):
