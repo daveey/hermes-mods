@@ -26,7 +26,7 @@
  * renders the focused chat's panel only when that tile is the focused one.
  *
  * Retired as a composer panel when user-steps is loaded (window.__userSteps.ownsComposer): its "For you"
- * strip shows these cards via window.__blockedPanel.{snapshot,subscribe,unblockCard,openCard,checklist}.
+ * strip shows these cards via window.__blockedPanel.{snapshot,subscribe,openCard,checklist}.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import * as sdk from '@hermes/plugin-sdk'
@@ -297,6 +297,9 @@ export function blockedItems(tasks, details) {
       board: str(t.board) || 'default',
       title: unescapeText(t.title) || str(t.id),
       kind: block?.kind || null,
+      gatewayId: d?.task?.gatewayId || t.gatewayId || t.gateway,
+      profile: d?.task?.profile || t.profile,
+      action_request: d?.task?.action_request || t.action_request,
       human_request: { ...block.human_request },
       kindLabel: KIND_LABEL[block?.kind] || 'Waiting on you',
       text,
@@ -611,6 +614,8 @@ export async function refresh(force = false) {
   running = true
   try {
     const stored = host.state.focusedStoredSessionId.get()
+    const connection = activeConnection()
+    const profile = host.state.focusedSessionOwner?.get?.()?.profile || host.state.profile?.get?.() || 'default'
     if (!stored) {
       snapshot = { stored, items: [], issues: [], parked: false }
       return emit()
@@ -619,12 +624,14 @@ export async function refresh(force = false) {
     const ids = await lineageIds(stored)
     const tasks = await sessionTasks(ids)
     if (tasks) await loadDetails(tasks)
-    if (host.state.focusedStoredSessionId.get() !== stored) return
+    if (host.state.focusedStoredSessionId.get() !== stored || activeConnection() !== connection || (host.state.focusedSessionOwner?.get?.()?.profile || host.state.profile?.get?.() || 'default') !== profile) { rerun = true; return }
     const flat = new Map([...details].map(([k, v]) => [k, v.data]))
-    const same = snapshot.stored === stored
+    const same = snapshot.stored === stored && snapshot.connectionId === connection && snapshot.profile === profile
     const items = tasks ? blockedItems(tasks, flat) : same ? snapshot.items : []
     snapshot = {
       stored,
+      connectionId: connection,
+      profile,
       // fetch failed: keep this chat's last list, never another chat's
       items: withRewrites(items),
       issues: tasks ? agentIssues(tasks, flat) : same ? snapshot.issues || [] : [],
@@ -662,6 +669,8 @@ function subscribe(fn) {
 
 const AMBER = 'var(--warning, #d29922)'
 const btn = (primary = false) => ({
+  minHeight: 44,
+  minWidth: 44,
   padding: '2px 10px',
   borderRadius: 6,
   border: `1px solid ${primary ? AMBER : 'color-mix(in srgb, var(--border, #8884) 90%, transparent)'}`,
@@ -731,29 +740,12 @@ function Linked({ text }) {
   )
 }
 
-function Item({ item }) {
+export function Item({ item }) {
   const [open, setOpen] = useState(false)
-  const [replying, setReplying] = useState(false)
-  const [note, setNote] = useState('')
-  const [busy, setBusy] = useState(false)
   const [showNote, setShowNote] = useState(false)
-  const list = checklist(item, item.rewritten)
+  const list = { ...checklist(item, item.rewritten), steps: checklist(item, item.rewritten).steps.filter(s => s !== HANDBACK) }
   const long = list.steps.length > COLLAPSED_LINES + 1
 
-  const act = async withNote => {
-    setBusy(true)
-    try {
-      await unblockCard(item, withNote ? note : '')
-      notify('success', `Unblocked ${item.id}${withNote && note.trim() ? ' with your note' : ''}`)
-      setReplying(false)
-      setNote('')
-      void refresh(true)
-    } catch (e) {
-      notify('error', `Couldn't unblock ${item.id}: ${e?.message || e}`)
-    } finally {
-      setBusy(false)
-    }
-  }
 
   const steps = open || !long ? list.steps : list.steps.slice(0, COLLAPSED_LINES)
 
@@ -808,42 +800,10 @@ function Item({ item }) {
           item.text && list.source !== 'parsed' && jsx('button', { type: 'button', style: { ...btn(), border: 'none', padding: '2px 4px', opacity: 0.75 }, onClick: () => setShowNote(!showNote), children: showNote ? 'Hide agent\u2019s note' : 'Agent\u2019s note' }),
           jsx('span', { style: { flex: 1 } }),
           jsx('button', { type: 'button', style: btn(), onClick: () => openCard(item), children: 'Open card' }),
-          item.loaded && jsx('button', { type: 'button', style: btn(), disabled: busy, onClick: () => setReplying(!replying), children: 'Reply & unblock' }),
-          item.loaded && jsx('button', { type: 'button', style: btn(true), disabled: busy, onClick: () => act(false), title: 'I did it — move the card back to ready so the worker resumes', children: busy ? 'Unblocking…' : 'Done → unblock' })
+          jsx('span', { children: 'Legacy reference — not approval.' }),
+          jsx('button', { type: 'button', style: btn(), onClick: () => { const session = host.state.focusedStoredSessionId.get(); void host.composer?.setDraft?.(session, `Please provide a complete versioned action request inline for: ${item.text || item.title}`); host.composer?.focus?.(session) }, children: 'Request complete action' })
         ]
-      }),
-      replying &&
-        jsxs('div', {
-          style: { display: 'flex', gap: 6, alignItems: 'flex-end' },
-          children: [
-            jsx('textarea', {
-              value: note,
-              autoFocus: true,
-              rows: 2,
-              placeholder: 'Answer or note for the worker (posted as a card comment)…',
-              onChange: e => setNote(e.target.value),
-              onKeyDown: e => {
-                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && note.trim()) {
-                  e.preventDefault()
-                  void act(true)
-                } else if (e.key === 'Escape') setReplying(false)
-                e.stopPropagation()
-              },
-              style: {
-                flex: 1,
-                resize: 'vertical',
-                fontSize: 12.5,
-                fontFamily: 'inherit',
-                padding: '4px 6px',
-                borderRadius: 6,
-                border: '1px solid var(--border, #8884)',
-                background: 'var(--card, transparent)',
-                color: 'var(--foreground, inherit)'
-              }
-            }),
-            jsx('button', { type: 'button', style: btn(true), disabled: busy || !note.trim(), onClick: () => act(true), title: '⌘↩', children: 'Send & unblock' })
-          ]
-        })
+      })
     ]
   })
 }
@@ -958,8 +918,8 @@ export default {
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
     // version 6: explicit non-human pauses (transient) surface as agent issues; failure reasons are plain (no raw error)
-    // version 4: subscribe/unblockCard/openCard for user-steps' "For you" strip (it reuses this poller + actions)
-    window.__blockedPanel = { version: 6, askSummary, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
+    // Shared adapter is read-only: semantic decisions belong to user-steps.
+    window.__blockedPanel = { version: 6, askSummary, get snapshot() { return snapshot }, refresh, checklist, subscribe, openCard }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel

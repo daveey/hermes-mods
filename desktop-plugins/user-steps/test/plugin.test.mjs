@@ -33,7 +33,7 @@ register('data:text/javascript,' + encodeURIComponent(`
 export async function resolve(spec, ctx, next) {
   const map = {
     '@hermes/plugin-sdk': 'const s=globalThis.__us.sdk;export const COMPOSER_AREAS=s.COMPOSER_AREAS,TRANSCRIPT_DIRECTIVE_AREA=s.TRANSCRIPT_DIRECTIVE_AREA,host=s.host,useValue=s.useValue',
-    'react': 'const R=globalThis.__us.React;export const useEffect=R.useEffect,useState=R.useState',
+    'react': 'const R=globalThis.__us.React;export const useEffect=R.useEffect,useState=R.useState,useRef=R.useRef',
     'react/jsx-runtime': 'const J=globalThis.__us.jsxRt;export const jsx=J.jsx,jsxs=J.jsxs'
   }
   if (map[spec]) return { url: 'data:text/javascript,' + encodeURIComponent(map[spec]), shortCircuit: true }
@@ -120,17 +120,17 @@ test('actionsFor gives each kind its buttons', () => {
   assert.equal(m.actionsFor(step('us_aaaaaa03', 'choose', { options: ['SQLite', 'Postgres'] }))[0].text, 'Chose: SQLite \u2014 text of us_aaaaaa03')
 })
 
-test('click: submit a visible turn, THEN resolve; no composer = no resolve; Reply only drafts', async () => {
+test('legacy semantic submission is rejected; Reply only drafts without resolving', async () => {
   const steps = [step('us_aaaaaa02', 'do'), step('us_aaaaaa04', 'input')]
   const call = fakeRest(steps)
   composer.sent = []
   const done = m.actionsFor(steps[0])[0]
-  assert.equal(await m.performAction(steps[0], done, 'S1', { composer, call }), 'sent')
-  assert.deepEqual(composer.sent, [['S1', '\u2713 Done: text of us_aaaaaa02']])
-  assert.deepEqual(call.calls.at(-1), ['/api/plugins/user-steps/resolve', 'POST', { id: 'us_aaaaaa02', session: 'S1', resolution: 'Done', by: 'desktop' }])
+  await assert.rejects(m.performAction(steps[0], done, 'S1', { composer, call }), /Legacy actions cannot authorize/)
+  assert.deepEqual(composer.sent, [])
+  assert.deepEqual(call.calls, [])
   composer.ok = false
   const n = call.calls.length
-  assert.equal(await m.performAction(steps[0], done, 'S1', { composer, call }), 'no-composer')
+  await assert.rejects(m.performAction(steps[0], done, 'S1', { composer, call }), /Legacy actions cannot authorize/)
   assert.equal(call.calls.length, n)
   composer.ok = true
   assert.equal(await m.performAction(steps[1], m.actionsFor(steps[1])[0], 'S1', { composer, call }), 'drafted')
@@ -152,7 +152,7 @@ test('projectStrip: open steps oldest first, then blocked cards, minus the chat\
   assert.equal(m.cardSummary({ text: 'Plug it in. Then say done.' }, () => ({ steps: ['Plug it in.'] })), 'Plug it in.')
 })
 
-test('directive renders a framed box from the ledger, and the click resolves it in place', async () => {
+test('directive preserves original text as passive receipt without approval controls', async () => {
   m.clearStepCache()
   const steps = [step('us_cccccc01', 'approve', { text: 'Approve the deploy' })]
   const call = fakeRest(steps)
@@ -163,12 +163,10 @@ test('directive renders a framed box from the ledger, and the click resolves it 
   assert.equal(box.style.userSelect || box.style.webkitUserSelect, 'text')
   assert.equal(box.querySelector('[data-user-step-text]').textContent, 'Want me to deploy build "412"?')
   const buttons = [...box.querySelectorAll('[data-user-step-action]')].map(b => b.textContent)
-  assert.deepEqual(buttons, ['Do it', 'No'])
-  await React.act(async () => { box.querySelector('[data-user-step-action="Do it"]').click(); await flush() })
-  await React.act(async () => { await flush() })
-  assert.deepEqual(composer.sent, [['S1', 'Go: Approve the deploy']])
-  assert.equal(steps[0].status, 'resolved')
-  assert.match(el().querySelector('[data-user-step-resolved]').textContent, /Go/)
+  assert.deepEqual(buttons, [])
+  assert.deepEqual(composer.sent, [])
+  assert.equal(steps[0].status, 'open')
+  assert.match(box.textContent, /Reference only/)
   assert.equal(el().querySelector('[data-user-step-action]'), null)
 })
 
@@ -194,7 +192,7 @@ test('strip: lists open steps + other blocked cards for the focused chat, hides 
   assert.ok(strip, el().innerHTML)
   // the composer chrome is user-select:none; the strip must opt back in so its text can be copied
   assert.equal(strip.style.userSelect || strip.style.webkitUserSelect, 'text')
-  assert.match(strip.textContent, /For you \(2\)/)
+  assert.match(strip.textContent, /Legacy references \(2\)/)
   assert.ok(strip.querySelector('[data-user-steps-step="us_eeeeee01"]'))
   assert.ok(strip.querySelector('[data-user-steps-card="t_human001"]'))
   assert.equal(strip.querySelector('[data-user-steps-card="t_rolling9"]'), null)
@@ -202,9 +200,10 @@ test('strip: lists open steps + other blocked cards for the focused chat, hides 
   const unblocked = []
   window.__blockedPanel.unblockCard = async (item, note) => unblocked.push([item.id, note])
   composer.sent = []
-  const doneBtn = [...strip.querySelectorAll('[data-user-steps-card="t_human001"] button')].find(b => b.textContent.startsWith('Done'))
-  await React.act(async () => { doneBtn.click(); await flush() })
-  assert.deepEqual(unblocked, [['t_human001', '']])
+  const requestBtn = [...strip.querySelectorAll('[data-user-steps-card="t_human001"] button')].find(b => b.textContent === 'Request complete action')
+  await React.act(async () => { requestBtn.click(); await flush() })
+  assert.deepEqual(unblocked, [])
+  assert.match(composer.drafts.at(-1)[1], /complete versioned action request/)
   assert.deepEqual(composer.sent, [])
   // everything resolved, no other cards -> no strip at all
   steps[0].status = 'resolved'
@@ -214,7 +213,7 @@ test('strip: lists open steps + other blocked cards for the focused chat, hides 
   delete window.__blockedPanel
 })
 
-test('a click in the strip also flips the in-message box to resolved', async () => {
+test('legacy queue action drafts context without resolving transcript or ledger', async () => {
   m.clearStepCache()
   const steps = [step('us_ffffff01', 'do', { text: 'Charge the widget' })]
   const call = fakeRest(steps, { card: { id: 't_rolling8' } })
@@ -225,15 +224,15 @@ test('a click in the strip also flips the in-message box to resolved', async () 
     React.createElement(m.StepBox, { key: 'box', attrs: { id: 'us_ffffff01', s: 'S1', t: 'Charge the widget, then tell me.' }, streaming: false, deps: { call } }),
     React.createElement(m.Strip, { key: 'strip' })
   ]))
-  assert.ok(el().querySelector('[data-user-step="us_ffffff01"] [data-user-step-action="Done"]'))
+  assert.equal(el().querySelector('[data-user-step="us_ffffff01"] button'), null)
   // the strip's buttons use the real REST bridge; route it to the fake
   window.hermesDesktop = { api: ({ path, ...opts }) => call(path, opts) }
-  await React.act(async () => { el().querySelector('[data-slot="user-steps"] [data-user-step-action="Done"]').click(); await flush() })
+  await React.act(async () => { el().querySelector('[data-slot="user-steps"] button').click(); await flush() })
   await React.act(async () => { await flush(); await flush() })
-  assert.deepEqual(composer.sent, [['S1', '\u2713 Done: Charge the widget']])
-  assert.equal(steps[0].status, 'resolved')
-  assert.ok(el().querySelector('[data-user-step-resolved="us_ffffff01"]'), el().innerHTML.slice(0, 400))
-  assert.equal(el().querySelector('[data-slot="user-steps"]'), null)
+  assert.deepEqual(composer.sent, [])
+  assert.equal(steps[0].status, 'open')
+  assert.equal(el().querySelector('[data-user-step-resolved="us_ffffff01"]'), null)
+  assert.ok(el().querySelector('[data-slot="user-steps"]'))
   delete window.hermesDesktop
 })
 
@@ -347,7 +346,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await show(React.createElement(m.Strip, { key: 'issues' }))
   const strip = el().querySelector('[data-slot="user-steps"]')
   assert.ok(strip, el().innerHTML)
-  assert.match(strip.textContent, /For you/)
+  assert.match(strip.textContent, /Legacy references/)
   assert.equal(strip.querySelectorAll('[data-user-steps-card]').length, 1)
   const issue = strip.querySelector('[data-user-steps-issue="t_failed01"]')
   assert.ok(issue)
@@ -358,7 +357,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   assert.equal(strip.querySelector('[data-user-steps-card="t_failed01"]'), null)
   const human = strip.querySelector('[data-user-steps-card="t_human002"]')
   assert.match(human.textContent, /Approve the plan in the doc/)
-  assert.ok([...human.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
+  assert.ok([...human.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
   const loading = strip.querySelector('[data-user-steps-issue="t_loading03"]')
   assert.match(loading.textContent, /No actionable human request/)
   assert.deepEqual([...loading.querySelectorAll('button')].map(b => b.textContent), ['Open card', 'Dismiss'])
@@ -394,8 +393,8 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await m.refresh(fakeRest([], {}))
   await show(React.createElement(m.Strip, { key: 'issues5' }))
   const mixed = el().querySelector('[data-slot="user-steps"]')
-  assert.match(mixed.textContent, /For you/)
-  assert.equal(mixed.querySelector('[data-user-steps-dismiss-all]'), null)
+  assert.match(mixed.textContent, /Legacy references/)
+  assert.ok(mixed.querySelector('[data-user-steps-dismiss-all]'), 'agent issues stay separately dismissible')
   window.__blockedPanel.snapshot = { stored: 'S1', items: [], issues: onlyIssues }
   // A coordinator explicitly pauses recovery after the failure. It remains an issue, not an ask.
   details.get('default:t_failed01').events.push(ev(4, 'blocked', {
@@ -419,7 +418,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await show(React.createElement(m.Strip, { key: 'human-after-pause' }))
   assert.equal(el().querySelector('[data-user-steps-issue="t_failed01"]'), null)
   const actionable = el().querySelector('[data-user-steps-card="t_failed01"]')
-  assert.ok([...actionable.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
+  assert.ok([...actionable.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
   delete window.__blockedPanel
 })
 
@@ -476,7 +475,7 @@ test('strip: an external-event wait (kind=time, classified in place) shows no Fo
   await m.refresh(fakeRest([], {}))
   await show(React.createElement(m.Strip, { key: 'time-wait-ask' }))
   const card = el().querySelector('[data-user-steps-card="t_tracker1"]')
-  assert.ok(card && [...card.querySelectorAll('button')].some(b => b.textContent.startsWith('Done')))
+  assert.ok(card && [...card.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
   delete window.__blockedPanel
 })
 

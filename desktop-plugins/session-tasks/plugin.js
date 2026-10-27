@@ -117,6 +117,7 @@ function taskChip(t, status) {
     kind: 'kanban',
     id: str(t.id),
     gateway: str(t.gateway),
+    gatewayId: str(t.gatewayId || t.gateway),
     connectionId,
     profile: str(t.profile) || null,
     board: str(t.board) || 'default',
@@ -615,6 +616,7 @@ function Chip({ chip, now }) {
       alignItems: 'center',
       gap: 5,
       maxWidth: 280,
+      minHeight: clickable ? 44 : undefined,
       padding: '1px 8px',
       borderRadius: 999,
       ...chipFrame(chip.state),
@@ -641,9 +643,17 @@ function Chip({ chip, now }) {
   })
 }
 
+export function subscribeDecisionChanges(fn, target = window) {
+  // Subscribe to the stable window, not a replaceable plugin incarnation.
+  target.addEventListener('hermes:user-steps-changed', fn)
+  return () => target.removeEventListener('hermes:user-steps-changed', fn)
+}
+
 function Strip() {
   const [snap, setSnap] = useState(snapshot)
   const [now, setNow] = useState(Date.now())
+  const [, setQueueTick] = useState(0)
+  useEffect(() => subscribeDecisionChanges(() => setQueueTick(t => t + 1)), [])
   const focused = useValue(host.state.focusedSessionId)
   const stored = useValue(host.state.focusedStoredSessionId)
   // Subscribe to owner and ambient fallback changes, not just the runtime id.
@@ -655,12 +665,21 @@ function Strip() {
   const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
   useEffect(() => subscribe(next => (setSnap(next), setNow(Date.now()))), [])
   useEffect(() => void refresh(), [focused, scope])
-  const chips = snap.runtime === focused && snap.scope === scope ? snap.chips : []
+  const chips = snap.runtime === focused && snap.scope === scope ? progressChips(snap.chips) : []
   if (!chips.length) return null
-  return jsx('div', {
+  return jsxs('details', {
     'data-slot': 'session-tasks',
-    style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 4, width: '100%', marginBottom: 2 },
-    children: chips.map(chip => jsx(Chip, { chip, now }, chip.key))
+    style: { width: '100%', minWidth: 0, marginBottom: 2 },
+    children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Agent progress (${chips.length}) — no decision required` }), jsx('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4 }, children: chips.map(chip => jsx(Chip, { chip, now }, chip.key)) })]
+  })
+}
+
+export function progressChips(chips, lookup = source => window.__userSteps?.requestForSource?.(source)) {
+  return (chips || []).filter(chip => {
+    if (chip.kind !== 'kanban') return true
+    const request = lookup({ gatewayId: chip.gatewayId || chip.gateway, profile: chip.profile, type: 'kanban', board: chip.board, id: chip.id })
+    // Retain genuine execution after authorization, not a second blocked decision chip.
+    return !request || ['running','ready','scheduled','review'].includes(chip.state)
   })
 }
 

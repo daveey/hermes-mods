@@ -714,7 +714,8 @@ def sync_card(ledger: Ledger, root: str, session_id: str, session_ref: str, card
 
 # ---- REST payloads (here, not in plugin_api.py, so edits apply without a backend restart) ----------------
 
-_PUBLIC = ("id", "text", "kind", "options", "status", "created", "session", "paragraph", "resolution", "resolved_at")
+_PUBLIC = ("id", "text", "kind", "options", "status", "created", "session", "paragraph", "resolution", "resolved_at",
+           "requestId", "requestOwner", "requestRevision")
 
 
 def public_step(step: dict) -> dict:
@@ -738,7 +739,7 @@ def resolve(ledger: Ledger, root: str, ids: list[str], resolution: str, by: str)
     done: list[str] = []
     with ledger.edit(root) as d:
         for s in d.get("steps", []):
-            if s.get("id") in ids and s.get("status") == "open":
+            if s.get("id") in ids and s.get("status") == "open" and not s.get('requestId'):
                 s.update(status="resolved", resolution=(resolution or "")[:200], resolved_by=by,
                          resolved_at=time.time())
                 done.append(s["id"])
@@ -750,14 +751,16 @@ HELD_REPLY = "This reply has been held because it repeats a retired request. No 
 
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
                   ledger: Ledger, cards: Optional[Cards] = None, framed: bool = True,
-                  session_ref: str = "", now: Optional[float] = None) -> dict:
+                  session_ref: str = "", now: Optional[float] = None,
+                  action_store=None, action_owner=None) -> dict:
+    """Run one final reply through the pipeline. Returns {text (None = unchanged), steps, resolved, source}."""
     # A positive retirement finding must survive later persistence/card failures.
     # Local state is not model-supplied and grants no reopen/execution authority.
     retired = []
     try:
         return _process_reply(reply, session_id, user_msg=user_msg, llm=llm, ledger=ledger,
                               cards=cards, framed=framed, session_ref=session_ref, now=now,
-                              retired=retired)
+                              retired=retired, action_store=action_store, action_owner=action_owner)
     except Exception:
         if not retired:
             raise
@@ -767,7 +770,8 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
 
 def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[LLM],
                    ledger: Ledger, cards: Optional[Cards], framed: bool,
-                   session_ref: str, now: Optional[float], retired: list) -> dict:
+                   session_ref: str, now: Optional[float], retired: list,
+                   action_store=None, action_owner=None) -> dict:
     """Reconcile exact actions under the source lock before creation/publication.
 
     Resolution is suppression-only. Neither model metadata nor a later repeated
@@ -788,7 +792,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         with ledger.edit(root) as d:
             seen = {_norm(s.get("text", "")) for s in d["steps"] if s.get("status") == "open"}
             for step in d["steps"]:
-                if step.get("id") in res["resolved"] and step.get("status") == "open":
+                if step.get("id") in res["resolved"] and step.get("status") == "open" and not step.get("requestId"):
                     step.update(status="resolved", resolution="answered in chat", resolved_by="model",
                                 resolved_at=now)
                     resolved.append(step["id"])
@@ -813,10 +817,14 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 if existing is not None:
                     published.append(dict(existing))
                     continue
-                if budget <= 0 or _norm(candidate["text"]) in seen:
+                if budget <= 0 or (action_store is None and _norm(candidate["text"]) in seen):
                     continue
                 step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
                         "session": session_id, "paragraph": block["text"]}
+                if action_store is not None:
+                    canonical = action_store.migrate_step(action_owner, step)
+                    step.update(requestId=canonical["requestId"], requestOwner=canonical["owner"],
+                                requestRevision=canonical["revision"])
                 d["steps"].append(step)
                 published.append(dict(step))
                 seen.add(_norm(candidate["text"]))
@@ -854,3 +862,380 @@ def reminder(open_steps: list[dict]) -> str:
     lines.append("Act on any the user's message answers. Don't re-ask an open step verbatim; the strip already "
                  "shows it. Steps are marked resolved automatically from the user's reply.")
     return "\n".join(lines)
+
+
+# ---- ActionRequest v2: immutable scope versions + durable decision outbox -----
+
+class ActionError(ValueError):
+    def __init__(self, message: str, status: int = 422):
+        super().__init__(message)
+        self.status = status
+
+
+def _object(value, required, optional=()):
+    if not isinstance(value, dict) or set(value) - set(required) - set(optional) or set(required) - set(value):
+        raise ActionError('Invalid object fields')
+
+
+def _string(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ActionError('Expected nonempty string')
+
+
+def validate_owner(owner):
+    _object(owner, ('gatewayId', 'profile', 'storedSessionId'))
+    for value in owner.values(): _string(value)
+
+
+def validate_ref(ref):
+    _object(ref, ('gatewayId', 'profile', 'type', 'id'), ('board',))
+    for value in ref.values(): _string(value)
+    if ref['type'] not in ('message', 'user_step', 'kanban'):
+        raise ActionError('Invalid source type')
+    if (ref['type'] == 'kanban') != ('board' in ref):
+        raise ActionError('Kanban references require an explicit board')
+
+
+def _json(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def validate_action(value):
+    _object(value, ('schemaVersion', 'owner', 'requestId', 'revision', 'kind', 'title', 'scope',
+                    'limits', 'exclusions', 'outcomes', 'choices', 'aliases', 'state'), ('resolution',))
+    if type(value['schemaVersion']) is not int or value['schemaVersion'] != 2:
+        raise ActionError('schemaVersion must be 2')
+    validate_owner(value['owner'])
+    try:
+        if str(uuid.UUID(value['requestId'])) != value['requestId']: raise ValueError()
+    except (ValueError, TypeError, AttributeError): raise ActionError('requestId must be a canonical UUID')
+    if type(value['revision']) is not int or value['revision'] < 1:
+        raise ActionError('revision must be a positive integer')
+    if value['kind'] not in ('approval', 'choice', 'input', 'external_step'):
+        raise ActionError('Invalid kind')
+    _string(value['title'])
+    scope = value['scope']; _object(scope, ('markdown', 'complete', 'sourceRefs'))
+    if not isinstance(scope['markdown'], str) or type(scope['complete']) is not bool:
+        raise ActionError('Invalid scope')
+    if scope['complete']: _string(scope['markdown'])
+    for refs in (scope['sourceRefs'], value['aliases']):
+        if not isinstance(refs, list): raise ActionError('References must be arrays')
+        for ref in refs: validate_ref(ref)
+        if len({_json(ref) for ref in refs}) != len(refs): raise ActionError('Duplicate reference')
+    for field in ('limits', 'exclusions', 'choices'):
+        if not isinstance(value[field], list): raise ActionError('Expected array')
+    for limit in value['limits']:
+        _object(limit, ('key', 'value'), ('permissionRequired',))
+        for text in limit.values(): _string(text)
+    for text in value['exclusions']: _string(text)
+    _object(value['outcomes'], ('revise',), ('approve', 'decline'))
+    for text in value['outcomes'].values(): _string(text)
+    ids = set()
+    for choice in value['choices']:
+        _object(choice, ('id', 'label', 'effect'))
+        _string(choice['id']); _string(choice['label'])
+        if choice['id'] in ids or choice['effect'] not in ('approve', 'revise', 'decline', 'answer'):
+            raise ActionError('Invalid or duplicate choice')
+        ids.add(choice['id'])
+        if choice['effect'] in ('approve', 'decline') and choice['effect'] not in value['outcomes']:
+            raise ActionError('Choice requires a stated outcome')
+    if not ids: raise ActionError('At least one choice is required')
+    if value['state'] not in ('needs_context', 'open', 'resolved', 'superseded', 'cancelled'):
+        raise ActionError('Invalid state')
+    if value['state'] == 'open' and not scope['complete']:
+        raise ActionError('Incomplete requests must need context')
+    if 'resolution' in value:
+        r = value['resolution']; _object(r, ('choiceId', 'operationId', 'revision', 'recordedAt'))
+        for key in ('choiceId', 'operationId', 'recordedAt'): _string(r[key])
+        if type(r['revision']) is not int or r['revision'] < 1: raise ActionError('Invalid resolution revision')
+    return json.loads(_json(value))
+
+
+def server_owner(session: str) -> dict:
+    """Use the core install identity and task-scoped profile, not launcher/session env.
+
+    current_profile_name honors multiplex HERMES_HOME context overrides. The install
+    ID is shared with the core hosted-room authority; no plugin-specific provisioning.
+    Missing core identity fails closed rather than inventing a local namespace.
+    """
+    try:
+        from hermes_cli.install_identity import get_install_id
+        from hermes_cli.profiles import current_profile_name
+        install_id = get_install_id()
+        if not install_id: raise ValueError('Missing install identity')
+        owner = {'gatewayId': f'install:{install_id}', 'profile': current_profile_name(),
+                 'storedSessionId': session}
+        validate_owner(owner)
+        return owner
+    except Exception as exc:
+        raise ActionError('Server gateway identity or stored session missing', 503) from exc
+
+
+def validate_admission_text(value):
+    """Reject paste controls before freezing intent, never silently alter scope.
+
+    Core's sanitizer is authoritative when installed. The conservative standalone
+    guard also rejects escaped controls in JSON and keeps offline store validation
+    safe without importing the gateway (which would create another runtime).
+    """
+    text = _json(value)
+    if re.search(r'(?:\[20[01]~|\^\[\[20[01]~|(?:^|[\s>:\]\)])00~|01~(?=$|[\s<\[()\):;.,!?])|~\[\[e)', text):
+        raise ActionError('Remove terminal paste control markers before deciding')
+    try:
+        from hermes_cli.input_sanitize import sanitize_user_prompt_text
+    except ImportError:
+        return
+    if sanitize_user_prompt_text(text) != text:
+        raise ActionError('Decision text must be sanitized before recording')
+
+
+class ActionStore:
+    """SQLite FULL-sync transaction commits decision + frozen delivery intent before dispatch.
+
+    No fuzzy identity, cross-session search, or automatic compression/branch inheritance.
+    Immutable revision documents are separate from resolution and delivery projections.
+    """
+    def __init__(self, path=None):
+        self.path = Path(path) if path else home() / 'user-steps' / 'actions.sqlite3'
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as c:
+            c.executescript('''
+                CREATE TABLE IF NOT EXISTS requests (
+                  namespace TEXT, id TEXT, session TEXT, revision INTEGER, state TEXT, resolution TEXT,
+                  PRIMARY KEY(namespace,id));
+                CREATE TABLE IF NOT EXISTS revisions (
+                  namespace TEXT, id TEXT, revision INTEGER, body TEXT,
+                  PRIMARY KEY(namespace,id,revision));
+                CREATE TABLE IF NOT EXISTS aliases (
+                  ref TEXT PRIMARY KEY, namespace TEXT, id TEXT);
+                CREATE TABLE IF NOT EXISTS operations (
+                  id TEXT PRIMARY KEY, namespace TEXT, session TEXT, request TEXT, revision INTEGER,
+                  idem TEXT, fingerprint TEXT, body TEXT,
+                  UNIQUE(namespace,session,idem), UNIQUE(namespace,request,revision));
+            ''')
+
+    def _connect(self):
+        c = sqlite3.connect(self.path, timeout=30)
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA synchronous=FULL')
+        return c
+
+    @contextmanager
+    def _tx(self):
+        c = self._connect()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            yield c
+            c.commit()
+        except BaseException:
+            c.rollback(); raise
+        finally: c.close()
+
+    @staticmethod
+    def _ns(owner):
+        validate_owner(owner)
+        return _json([owner['gatewayId'], owner['profile']])
+
+    def _get(self, c, owner, rid):
+        row = c.execute('SELECT * FROM requests WHERE namespace=? AND id=? AND session=?',
+                        (self._ns(owner), rid, owner['storedSessionId'])).fetchone()
+        if not row: raise ActionError('Unknown request in this session', 404)
+        body = json.loads(c.execute('SELECT body FROM revisions WHERE namespace=? AND id=? AND revision=?',
+                                   (row['namespace'], rid, row['revision'])).fetchone()[0])
+        body['state'] = row['state']
+        if row['resolution']: body['resolution'] = json.loads(row['resolution'])
+        return body
+
+    def get(self, owner, rid):
+        with self._tx() as c: return self._get(c, owner, rid)
+
+    def requests(self, owner):
+        with self._tx() as c:
+            ids = c.execute('SELECT id FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
+                            (self._ns(owner), owner['storedSessionId'])).fetchall()
+            return [self._get(c, owner, row[0]) for row in ids]
+
+    def _aliases(self, c, owner, r):
+        ns = self._ns(owner)
+        for ref in r['aliases']:
+            # Remote aliases are provenance only; never resolve/mutate another gateway's card.
+            old = c.execute('SELECT namespace,id FROM aliases WHERE ref=?', (_json(ref),)).fetchone()
+            if old and tuple(old) != (ns, r['requestId']):
+                raise ActionError('Alias already belongs to another request', 409)
+            c.execute('INSERT OR IGNORE INTO aliases VALUES (?,?,?)', (_json(ref), ns, r['requestId']))
+
+    def create(self, owner, value, *, bind=None):
+        r = validate_action(value); ns = self._ns(owner)
+        if r['owner'] != owner: raise ActionError('Owner mismatch', 403)
+        if r['revision'] != 1 or 'resolution' in r or r['state'] not in ('open', 'needs_context'):
+            raise ActionError('New request must be unresolved revision 1')
+        try:
+            with self._tx() as c:
+                c.execute('INSERT INTO requests VALUES (?,?,?,?,?,NULL)',
+                          (ns, r['requestId'], owner['storedSessionId'], 1, r['state']))
+                self._aliases(c, owner, r)
+                c.execute('INSERT INTO revisions VALUES (?,?,?,?)', (ns, r['requestId'], 1, _json(r)))
+                if bind is not None: bind(r, 0)
+        except sqlite3.IntegrityError: raise ActionError('Request already exists', 409)
+        return r
+
+    def history(self, owner, rid):
+        with self._tx() as c:
+            self._get(c, owner, rid)
+            return [json.loads(row[0]) for row in c.execute(
+                'SELECT body FROM revisions WHERE namespace=? AND id=? ORDER BY revision', (self._ns(owner), rid))]
+
+    def revise(self, owner, rid, expected, replacement, *, bind=None):
+        with self._tx() as c:
+            old = self._get(c, owner, rid); ns = self._ns(owner)
+            if type(expected) is not int or old['revision'] != expected: raise ActionError('Stale revision', 409)
+            pending = c.execute('SELECT body FROM operations WHERE namespace=? AND request=? AND revision=?',
+                                (ns, rid, expected)).fetchone()
+            if pending and json.loads(pending[0])['dispatchState'] not in ('delivered', 'cancelled'):
+                raise ActionError('Decision delivery is pending', 409)
+            r = dict(replacement, revision=expected + 1)
+            if r.get('owner') != owner or r.get('requestId') != rid or 'resolution' in r:
+                raise ActionError('Replacement identity mismatch')
+            r = validate_action(r)
+            if r['state'] not in ('open', 'needs_context'): raise ActionError('Replacement must require a fresh decision')
+            # Provenance associations cannot be reassigned or silently removed.
+            if not {_json(x) for x in old['aliases']} <= {_json(x) for x in r['aliases']}:
+                raise ActionError('Replacement must preserve aliases')
+            self._aliases(c, owner, r)
+            c.execute('INSERT INTO revisions VALUES (?,?,?,?)', (ns, rid, r['revision'], _json(r)))
+            c.execute('UPDATE requests SET revision=?,state=?,resolution=NULL WHERE namespace=? AND id=?',
+                      (r['revision'], r['state'], ns, rid))
+            if bind is not None: bind(r, expected)
+            return r
+
+    def _operation(self, c, owner, oid=None, key=None):
+        column, value = ('id', oid) if oid else ('idem', key)
+        row = c.execute(f'SELECT body FROM operations WHERE namespace=? AND session=? AND {column}=?',
+                        (self._ns(owner), owner['storedSessionId'], value)).fetchone()
+        if not row: raise ActionError('Unknown operation in this session', 404)
+        op = json.loads(row[0])
+        return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
+
+    def operation(self, owner, oid=None, key=None):
+        with self._tx() as c: return self._operation(c, owner, oid, key)
+
+    def decide(self, owner, decision):
+        _object(decision, ('requestId', 'expectedRevision', 'choiceId', 'idempotencyKey'), ('revisionText',))
+        for key in ('requestId', 'choiceId', 'idempotencyKey'): _string(decision[key])
+        if len(decision['idempotencyKey']) > 255: raise ActionError('Idempotency key too long')
+        if type(decision['expectedRevision']) is not int: raise ActionError('Invalid expectedRevision')
+        text = decision.get('revisionText')
+        if text is not None and not isinstance(text, str): raise ActionError('Invalid revisionText')
+        fingerprint = _json(dict(decision, revisionText=text))
+        ns = self._ns(owner)
+        with self._tx() as c:
+            existing = c.execute('SELECT id,fingerprint FROM operations WHERE namespace=? AND session=? AND idem=?',
+                                 (ns, owner['storedSessionId'], decision['idempotencyKey'])).fetchone()
+            if existing:
+                if existing['fingerprint'] != fingerprint: raise ActionError('Idempotency key payload conflict', 409)
+                return self._operation(c, owner, existing['id'])
+            r = self._get(c, owner, decision['requestId'])
+            if r['revision'] != decision['expectedRevision'] or r['state'] not in ('open', 'needs_context'):
+                raise ActionError('Stale or closed request', 409)
+            choice = next((x for x in r['choices'] if x['id'] == decision['choiceId']), None)
+            if not choice: raise ActionError('Unknown choice')
+            effect = choice['effect']
+            if effect in ('approve', 'answer') and not r['scope']['complete']: raise ActionError('Scope is incomplete')
+            if effect == 'revise': _string(text)
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).isoformat()
+            oid = str(uuid.uuid4())
+            op = {'operationId': oid, 'owner': owner, 'requestId': r['requestId'], 'revision': r['revision'],
+                  'idempotencyKey': decision['idempotencyKey'], 'decision': decision,
+                  'recordedAt': stamp, 'dispatchState': 'pending', 'attempts': 0,
+                  'intent': {'request': r, 'effect': effect, 'revisionText': text,
+                             'executionAuthorized': effect == 'approve',
+                             'permissionGrants': []}}
+            validate_admission_text({'operationId': oid, **op['intent']})
+            try:
+                c.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)',
+                          (oid, ns, owner['storedSessionId'], r['requestId'], r['revision'],
+                           decision['idempotencyKey'], fingerprint, _json(op)))
+            except sqlite3.IntegrityError: raise ActionError('A decision is already recorded for this revision', 409)
+            resolution = {'choiceId': decision['choiceId'], 'operationId': oid,
+                          'revision': r['revision'], 'recordedAt': stamp}
+            c.execute('UPDATE requests SET resolution=? WHERE namespace=? AND id=?',
+                      (_json(resolution), ns, r['requestId']))
+            return self._operation(c, owner, oid)
+
+    def dispatch(self, owner, oid, receiver):
+        # Commit the attempt then release the DB lock BEFORE external I/O. Other
+        # requests stay usable; concurrent retries share the receiver's durable key.
+        with self._tx() as c:
+            result = self._operation(c, owner, oid); op = result['operation']
+            if op['dispatchState'] in ('delivered', 'cancelled'): return result
+            op['attempts'] += 1
+            from datetime import datetime, timezone
+            op['dispatchStartedAt'] = datetime.now(timezone.utc).isoformat()
+            op['dispatchState'] = 'pending'
+            c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
+        receipt = None
+        confirmed = False
+        try:
+            if receiver is None: raise RuntimeError('No durable delivery receiver configured')
+            receipt = receiver.deliver(op)
+            confirmed = bool(receiver.readback(op, receipt))
+        except Exception:
+            # Never expose credentials, receiver URLs or raw transport bodies.
+            pass
+        with self._tx() as c:
+            result = self._operation(c, owner, oid); op = result['operation']
+            # A slow failed retry cannot downgrade a concurrently confirmed delivery.
+            if op['dispatchState'] in ('delivered', 'cancelled'): return result
+            if confirmed:
+                cancelled = receipt.get('terminalCancelled') is True
+                op.update(dispatchState='cancelled' if cancelled else 'delivered', receipt=receipt)
+                op.pop('error', None)
+                effect = op['intent']['effect']
+                state = 'cancelled' if cancelled else {'revise': 'superseded', 'decline': 'cancelled'}.get(effect, 'resolved')
+                resolution = {'choiceId': op['decision']['choiceId'], 'operationId': oid,
+                              'revision': op['revision'], 'recordedAt': op['recordedAt']}
+                c.execute('UPDATE requests SET state=?,resolution=? WHERE namespace=? AND id=? AND revision=?',
+                          (state, _json(resolution), self._ns(owner), op['requestId'], op['revision']))
+            else:
+                op.update(dispatchState='failed', error='Delivery unconfirmed; retry the same idempotency key.')
+            c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
+            return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
+
+    def pending_owners(self):
+        with self._tx() as c:
+            owners = {_json(op['owner']): op['owner'] for row in c.execute('SELECT body FROM operations')
+                      if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')}
+            return list(owners.values())
+
+    def reconcile(self, owner, receiver):
+        with self._tx() as c:
+            ids = [row['id'] for row in c.execute(
+                'SELECT id,body FROM operations WHERE namespace=? AND session=? ORDER BY rowid',
+                (self._ns(owner), owner['storedSessionId']))
+                if json.loads(row['body'])['dispatchState'] not in ('delivered', 'cancelled')]
+        return [self.dispatch(owner, oid, receiver) for oid in ids]
+
+    def migrate_step(self, owner, step):
+        if step.get('session') != owner['storedSessionId']: raise ActionError('Legacy session association unproven', 403)
+        _string(step.get('id')); _string(step.get('text'))
+        ref = dict(gatewayId=owner['gatewayId'], profile=owner['profile'], type='user_step', id=step['id'])
+        with self._tx() as c:
+            old = c.execute('SELECT namespace,id FROM aliases WHERE ref=?', (_json(ref),)).fetchone()
+            if old:
+                if old['namespace'] != self._ns(owner): raise ActionError('Alias owner mismatch', 403)
+                return self._get(c, owner, old['id'])
+        r = {'schemaVersion': 2, 'owner': owner, 'requestId': str(uuid.uuid4()), 'revision': 1,
+             'kind': {'approve': 'approval', 'choose': 'choice', 'do': 'external_step'}.get(step.get('kind'), 'input'),
+             'title': step['text'], 'scope': {'markdown': step.get('paragraph') or step['text'],
+                                             'complete': False, 'sourceRefs': [ref]},
+             'limits': [], 'exclusions': [], 'outcomes': {'revise': 'Request complete action; keep work blocked.'},
+             'choices': [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}],
+             'aliases': [ref], 'state': 'needs_context'}
+        try: return self.create(owner, r)
+        except ActionError as exc:
+            if exc.status != 409: raise
+            with self._tx() as c:
+                old = c.execute('SELECT id FROM aliases WHERE ref=?', (_json(ref),)).fetchone()
+                if not old: raise
+                return self._get(c, owner, old['id'])

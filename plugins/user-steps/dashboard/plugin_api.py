@@ -1,29 +1,29 @@
-"""Mounted at /api/plugins/user-steps.
+"""Canonical ActionRequest v2 API, mounted at /api/plugins/user-steps.
 
-GET  /ping                         -> {ok, api}
-GET  /steps?session=<id>           -> {root, steps: [open steps, oldest first], card: {id, board}|null,
-                                       own_cards: [this chat's rolling card ids, current + archived]}
-GET  /step?id=<step id>&s=<sid>    -> {step|null, root}
-POST /resolve {id, session?, resolution?, by?} -> {ok, resolved: [ids], card: {id, board}|null}
-     Marks a step resolved (a Desktop button click) and archives the chat's rolling blocked card when it was the
-     last open step.
+Authentication is provided by the owning dashboard/profile mount. Namespace comes
+from server configuration, never a payload. The optional owner_resolver is a server
+integration seam for authenticated connection principals, not an HTTP parameter.
+Legacy reads remain passive; generic resolve is intentionally gone (410).
 """
 import importlib.util
 import sys
+import logging
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
 
-API_VERSION = 1
+API_VERSION = 2
 
 
 def _load(name: str):
-    """Sibling module, reloaded when the file changes (edits apply without a backend restart)."""
     key = f"_user_steps_{name}"
     path = Path(__file__).resolve().parents[1] / f"{name}.py"
-    mtime = path.stat().st_mtime
+    mtime = path.stat().st_mtime_ns
     mod = sys.modules.get(key)
     if mod is None or getattr(mod, "_mtime", None) != mtime:
         spec = importlib.util.spec_from_file_location(key, path)
@@ -34,46 +34,152 @@ def _load(name: str):
     return mod
 
 
-class ResolveBody(BaseModel):
-    id: str
-    session: str = ""
-    resolution: str = ""
-    by: str = "desktop"
+class DecisionBody(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    session: StrictStr
+    expectedRevision: StrictInt
+    choiceId: StrictStr
+    revisionText: Optional[StrictStr] = None
+    idempotencyKey: StrictStr
 
 
-def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None, cards=None):
-    router = APIRouter()
+def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
+                  cards=None, *, action_store=None, owner_resolver=None, receiver=None):
+    recovered = set()
+    recovery_lock = threading.Lock()
+
+    def recover_once():
+        # The core hot-mount path includes routes AFTER app startup; router
+        # lifespan is not entered there. Its outer profile dependency runs before
+        # this dependency, and the threadpool copies that request-local context.
+        # Key by home, not process launch identity: each served profile owns an outbox.
+        key = str(_load('core').home().resolve())
+        with recovery_lock:
+            if key in recovered:
+                return
+            recover()
+            recovered.add(key)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # Never resume a cold owner or start a competing writer on restart.
+        await run_in_threadpool(recover_once)
+        yield
+
+    router = APIRouter(lifespan=lifespan, dependencies=[Depends(recover_once)])
 
     def ledger():
-        return _load("core").Ledger(ledger_dir, state_db)
+        return _load('core').Ledger(ledger_dir, state_db)
 
-    def card_ops():
-        return cards if cards is not None else _load("cards").HermesCards(in_process=False)
+    def store():
+        return action_store if action_store is not None else _load('core').ActionStore(
+            Path(ledger_dir) / 'actions.sqlite3' if ledger_dir else None)
 
-    @router.get("/ping")
+    def delivery():
+        return receiver if receiver is not None else _load('cards').DecisionDelivery(
+            Path(ledger_dir) / 'decision-inbox.sqlite3' if ledger_dir else None)
+
+    def owner(session):
+        core = _load('core')
+        if not session.strip(): raise HTTPException(422, 'Stored session is required')
+        if owner_resolver is not None:
+            result = owner_resolver(session)
+            core.validate_owner(result)
+            if result['storedSessionId'] != session: raise HTTPException(403, 'Session mismatch')
+            return result
+        result = core.server_owner(session)
+        # Require a real stored session on THIS profile, not a guessed runtime ID or
+        # lineage-root fallback. No branches/siblings silently inherit authorization.
+        if not core._row(state_db or core._state_db(), session):
+            raise HTTPException(404, 'Unknown stored session on this profile')
+        return result
+
+    def run(fn):
+        try: return fn()
+        except ValueError as exc:
+            # The core module may be hot-reloaded, so class identity isn't stable.
+            if hasattr(exc, 'status'): raise HTTPException(exc.status, str(exc)) from exc
+            raise
+
+    def migrate(own):
+        # Only explicitly session-associated ledger entries. Rolling aggregate cards
+        # and title similarities are NOT decision aliases. Unknown rows stay passive.
+        lg = ledger(); st = store()
+        for step in lg.read(own['storedSessionId']).get('steps', []):
+            if step.get('session') == own['storedSessionId'] and step.get('status') == 'open':
+                st.migrate_step(own, step)
+        return st
+
+    def recover():
+        try:
+            st = store()
+            for recorded_owner in st.pending_owners():
+                try:
+                    own = owner(recorded_owner['storedSessionId'])
+                    if own == recorded_owner:
+                        st.reconcile(own, delivery())
+                except Exception:
+                    logging.getLogger('user-steps').warning('Startup reconciliation deferred for an unavailable owner')
+        except Exception:
+            logging.getLogger('user-steps').warning('Startup reconciliation unavailable; manual retry remains available')
+
+    @router.get('/ping')
     def ping():
-        return {"ok": True, "api": API_VERSION}
+        return {'ok': True, 'api': API_VERSION}
 
-    @router.get("/steps")
-    def steps(session: str = ""):
-        return _load("core").steps_payload(ledger(), session)
+    @router.get('/requests')
+    def requests(session: str):
+        def action():
+            own = owner(session)
+            return {'requests': migrate(own).requests(own)}
+        return run(action)
 
-    @router.get("/step")
-    def step(id: str, s: str = ""):
-        root, st = ledger().find(id, s)
-        return {"root": root, "step": _load("core").public_step(st) if st else None}
+    @router.get('/requests/{request_id}')
+    def request(request_id: str, session: str):
+        return run(lambda: {'request': store().get(owner(session), request_id)})
 
-    @router.post("/resolve")
-    def resolve(b: ResolveBody):  # sync: FastAPI runs it in the threadpool (CLI archive call)
-        core = _load("core")
-        lg = ledger()
-        root, st = lg.find(b.id, b.session)
-        if not st:
-            return {"ok": False, "error": "unknown step", "resolved": [], "card": None}
-        done = core.resolve(lg, root, [b.id], b.resolution, b.by)
-        sid = b.session or st.get("session") or root
-        card = core.sync_card(lg, root, sid, f"@session:default/{sid}", card_ops())
-        return {"ok": True, "resolved": done, "card": card}
+    @router.post('/requests/{request_id}/decisions')
+    def decide(request_id: str, body: DecisionBody):
+        def action():
+            own = owner(body.session); st = store()
+            payload = body.model_dump(exclude={'session'})
+            payload['requestId'] = request_id
+            recorded = st.decide(own, payload)  # durable commit BEFORE any receiver effects
+            return st.dispatch(own, recorded['operation']['operationId'], delivery())
+        return run(action)
+
+    @router.get('/operations')
+    def operation_by_key(session: str, idempotencyKey: str):
+        return run(lambda: store().operation(owner(session), key=idempotencyKey))
+
+    @router.get('/operations/{operation_id}')
+    def operation(operation_id: str, session: str):
+        return run(lambda: store().operation(owner(session), oid=operation_id))
+
+    @router.post('/operations/{operation_id}/retry')
+    def retry(operation_id: str, session: str):
+        return run(lambda: store().dispatch(owner(session), operation_id, delivery()))
+
+    @router.post('/reconcile')
+    def reconcile(session: str):
+        return run(lambda: {'results': store().reconcile(owner(session), delivery())})
+
+    @router.get('/steps')
+    def steps(session: str = ''):
+        # Compatibility read only; old callers cannot mutate through /resolve.
+        return _load('core').steps_payload(ledger(), session)
+
+    @router.get('/step')
+    def step(id: str, s: str = ''):
+        if not s: return {'root': None, 'step': None}
+        lg = ledger(); root = lg.root(s)
+        found = next((x for x in lg._read(root).get('steps', [])
+                      if x.get('id') == id and x.get('session') == s), None)
+        return {'root': root, 'step': _load('core').public_step(found) if found else None}
+
+    @router.post('/resolve')
+    def resolve():
+        raise HTTPException(410, 'Legacy resolution is read-only; request a complete canonical action.')
 
     return router
 

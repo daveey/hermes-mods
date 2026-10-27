@@ -27,6 +27,9 @@ sys.modules["user_steps_core"] = core
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import types
+    monkeypatch.setitem(sys.modules, 'hermes_cli.install_identity', types.SimpleNamespace(get_install_id=lambda: 'test-install'))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.profiles', types.SimpleNamespace(current_profile_name=lambda: 'default'))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     db = sqlite3.connect(tmp_path / "state.db")
     db.execute("create table sessions (id text primary key, parent_session_id text, end_reason text, source text)")
@@ -283,22 +286,22 @@ def test_rolling_card_create_update_archive_via_rest(home):
     assert c.get("/api/plugins/user-steps/ping").json()["api"] >= 1
     got = c.get("/api/plugins/user-steps/steps", params={"session": "S1"}).json()
     assert [s["id"] for s in got["steps"]] == ids and got["card"]["id"] == rows[0][0]  # oldest first
-    one = c.get("/api/plugins/user-steps/step", params={"id": ids[0]}).json()["step"]
+    one = c.get("/api/plugins/user-steps/step", params={"id": ids[0], "s": "S1"}).json()["step"]
     assert one["kind"] == "approve" and one["paragraph"].startswith("Want me to deploy")
+    assert c.get("/api/plugins/user-steps/step", params={"id": ids[0]}).json()["step"] is None
 
-    r = c.post("/api/plugins/user-steps/resolve", json={"id": ids[0], "session": "S1", "resolution": "Go"}).json()
-    assert r["resolved"] == [ids[0]] and r["card"]["id"] == rows[0][0]
-    assert board.rows()[0][3] == "blocked" and ids[0] not in board.rows()[0][2]  # body rewritten, still open
-    r = c.post("/api/plugins/user-steps/resolve", json={"id": ids[1], "session": "S1"}).json()
-    assert r["card"] is None and board.rows()[0][3] == "archived"
+    # Direction B retires generic Done/Go. Unknown legacy requests cannot grant
+    # approval or archive unrelated rolling tracking cards.
+    for sid in ids:
+        r = c.post("/api/plugins/user-steps/resolve", json={"id": sid, "session": "S1", "resolution": "Go"})
+        assert r.status_code == 410
+    assert board.rows() == rows
     after = c.get("/api/plugins/user-steps/steps", params={"session": "S1"}).json()
-    assert after["steps"] == [] and after["card"] is None and after["own_cards"] == [rows[0][0]]
-    # a resolved step stays resolved; resolving again is a no-op
-    assert c.post("/api/plugins/user-steps/resolve", json={"id": ids[1]}).json()["resolved"] == []
-    # a NEW step after archival opens a NEW card (fresh idempotency generation)
-    run(home, DO, llm=fake_llm({"steps": [{"text": "Plug in", "kind": "do", "verbatim_span": "Plug the watch"}]}),
-        cards=board)
-    assert [r[3] for r in board.rows()] == ["archived", "blocked"]
+    assert [s['id'] for s in after['steps']] == ids
+    canonical = c.get('/api/plugins/user-steps/requests', params={'session':'S1'}).json()['requests']
+    assert len(canonical) == 2
+    assert all(r['state'] == 'needs_context' and not r['scope']['complete'] for r in canonical)
+    assert all(not any(ref['type'] == 'kanban' for ref in r['aliases']) for r in canonical)
 
 
 def test_archive_failure_keeps_card_pointer(home):
@@ -359,7 +362,8 @@ def test_pre_llm_call_note_only_when_steps_are_open(home, monkeypatch):
     run(home, APPROVE, llm=fake_llm({"steps": [{"text": "Approve deploy", "kind": "approve",
                                                 "verbatim_span": "Want me to deploy"}]}))
     note = plugin.pre_llm_call(session_id="S1", user_message="what's left?", platform="tui")["context"]
-    assert "[user-steps]" in note and "Approve deploy" in note
+    assert "Canonical requests" in note and "Approve deploy" in note
+    assert '"complete": false' in note
     assert plugin._USER_MSG["S1"] == "what's left?"
     assert plugin.pre_llm_call(session_id="S1", platform="cron") is None
 
