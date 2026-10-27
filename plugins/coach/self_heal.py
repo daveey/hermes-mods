@@ -1004,7 +1004,8 @@ def _defer_investigation(d: dict, result: dict, store):
 
 
 PENDING_MAX_AGE_S = 7 * 86400  # detections waiting longer than this are dropped, not filed late
-_SOURCE_RANK = {"complaint": 0, "admission": 0, "backstop": 1}  # David's own words before machine signals
+_SOURCE_RANK = {"complaint": 0, "admission": 0, "signal": 1}  # in-chat judges, then machine signals (9/10 real in
+# the Oct 2026 shadow sample), then the digest backstop (3/6) and anything else
 
 
 def _detected_at(d: dict) -> Optional[float]:
@@ -1021,7 +1022,7 @@ def _detected_at(d: dict) -> Optional[float]:
 
 
 def _pending_priority(d: dict) -> tuple:
-    """Drain order: complaints/admissions, then the digest backstop, then machine signals; within a class the
+    """Drain order: complaints/admissions, then machine signals, then the digest backstop; within a class the
     likelier defect, then the newest. Input (~75 new fingerprints a day in the Oct 2026 shadow log) far exceeds the
     $25/day lane (~3 cards), so this order decides which defects get investigated at all."""
     try:

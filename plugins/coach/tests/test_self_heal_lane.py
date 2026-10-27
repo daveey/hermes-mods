@@ -292,7 +292,7 @@ def _queue(store, *ds):
         sh.file_defect(d, store=store, m="live", runner=Runner(), now=NOW, cfg=HUB, budget_fn=busy)
 
 
-def test_pending_drains_complaints_first_then_likelier_then_newer(store):
+def test_pending_drains_complaints_then_signals_then_backstop_likelier_first(store):
     sig = defect(symptom="traceback a", source="signal", p_defect=None, at=NOW - 30)
     weak = defect(symptom="weak complaint", source="backstop", p_defect=0.7, at=NOW - 20)
     strong = defect(symptom="strong complaint", source="backstop", p_defect=0.95, at=NOW - 500)
@@ -300,7 +300,7 @@ def test_pending_drains_complaints_first_then_likelier_then_newer(store):
     _queue(store, sig, weak, strong, direct)
     got = []
     sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["symptom"]) or {"action": "filed"})
-    assert got == ["direct complaint", "strong complaint", "weak complaint", "traceback a"]
+    assert got == ["direct complaint", "traceback a", "strong complaint", "weak complaint"]
 
 
 def test_pending_pass_stops_at_the_first_renewed_denial(store):
