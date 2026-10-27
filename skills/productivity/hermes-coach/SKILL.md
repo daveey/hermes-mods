@@ -149,6 +149,12 @@ Undone notices are always plain cards.
 - A new curriculum `adopted` test that needs a fact the digest lacks: add a counter to `call_features()` /
   `CMD_FEATURES` in `session_digest.py` (names only, never argument text), bump `DIGEST_V`, re-ship, rerun every feed.
   Sanity-check new adoption counts against real sessions before trusting them (agent-run commands count too).
+- Reply-check rules match one model's failure modes, so silence after a default-model change means nothing. Opus fails
+  by asking ("Want me to…?", caught by `confirm`). GPT-6 Astra fails by reporting accurately and stopping ("not fixed;
+  nothing needs you"), which no rule matched, so the check logged 0 nudges in 4 days. After any `model.default`
+  change, blind-judge a few hundred of the new model's endings (fixed / started / proposed / offered / report_only)
+  and compare them per trigger (human question vs action ask vs automated event) with the old model's, before trusting
+  the detectors. Questions about a problem are where models diverge most. Explicit "fix X" asks barely differ.
 - Verify a regex detector's hits (e.g. `coach_askgate.py`) against what the agent said just before, not the quote alone,
   because quotes like "why didnt the agent…" or "…yourself" fire on third-party bots and on handoffs nobody asked for.
   Local sessions: the previous assistant row in `state.db` `messages`. Other hosts: the digest
