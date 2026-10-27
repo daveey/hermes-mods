@@ -322,12 +322,38 @@ class Ledger:
         return dict(ok=True, audience=self.policy['audience'],
                     workflows=[dict(repository=r[0], workflow_path=r[1], last_claim_at=r[2]) for r in rows])
 
+    def revoke(self, body):
+        """Retire an UNCLAIMED intent so no late run can ever claim it (explicit retry path)."""
+        rid = body.get('request_id')
+        if type(rid) is not str or not REQUEST_ID.fullmatch(rid):
+            raise Refused('invalid_request', 400)
+        now = self.clock()
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                if db.execute('SELECT 1 FROM intents WHERE request_id=?', (rid,)).fetchone() is None:
+                    db.execute('ROLLBACK')
+                    return dict(ok=True, request_id=rid, revoked=True, intent=False)
+                if db.execute('SELECT 1 FROM claims WHERE request_id=?', (rid,)).fetchone() is not None:
+                    db.execute('ROLLBACK')
+                    raise Refused('claim_exists', 409)
+                db.execute('UPDATE intents SET expires_at=? WHERE request_id=? AND expires_at>?', (now - 1, rid, now - 1))
+                db.execute('COMMIT')
+            except Refused:
+                raise
+            except BaseException:
+                db.execute('ROLLBACK')
+                raise
+        return dict(ok=True, request_id=rid, revoked=True, intent=True)
+
     def handle_owner(self, body):
         op = body.get('op')
         if op == 'register':
             return self.register(body)
         if op == 'status':
             return self.status(body)
+        if op == 'revoke':
+            return self.revoke(body)
         if op == 'reachability':
             return self.reachability(body)
         if op == 'health':
@@ -508,7 +534,7 @@ class OwnerSocket:
                 os.unlink(self.path)
 
 
-def make_http_server(address, ledger, *, max_concurrent=32, io_timeout=10):
+def make_http_server(address, ledger, *, max_concurrent=32, io_timeout=10, total_deadline=20, max_per_source=4):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'hermes-runners-claims/1'
         sys_version = ''
@@ -561,22 +587,55 @@ def make_http_server(address, ledger, *, max_concurrent=32, io_timeout=10):
                     pass
 
     slots = threading.BoundedSemaphore(max_concurrent)
+    per_source, per_source_lock = {}, threading.Lock()
 
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         request_queue_size = 32
 
         def process_request(self, request, client_address):
-            if not slots.acquire(blocking=False):
+            source = client_address[0] if client_address else ''
+            with per_source_lock:
+                busy = per_source.get(source, 0) >= max_per_source
+                if not busy:
+                    per_source[source] = per_source.get(source, 0) + 1
+            if busy:
                 self.shutdown_request(request)
                 return
-            super().process_request(request, client_address)
+            if not slots.acquire(blocking=False):
+                self._release_source(source)
+                self.shutdown_request(request)
+                return
+            try:
+                super().process_request(request, client_address)
+            except Exception:
+                slots.release()
+                self._release_source(source)
+                self.shutdown_request(request)
+
+        @staticmethod
+        def _release_source(source):
+            with per_source_lock:
+                per_source[source] = per_source.get(source, 1) - 1
+                if per_source[source] <= 0:
+                    per_source.pop(source, None)
 
         def process_request_thread(self, request, client_address):
+            # Total wall-clock deadline per connection (the socket timeout is per read).
+            def expire():
+                try:
+                    request.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            watchdog = threading.Timer(total_deadline, expire)
+            watchdog.daemon = True
+            watchdog.start()
             try:
                 super().process_request_thread(request, client_address)
             finally:
+                watchdog.cancel()
                 slots.release()
+                self._release_source(client_address[0] if client_address else '')
 
     server = Server(address, Handler)
     server.timeout = 10

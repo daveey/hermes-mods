@@ -91,6 +91,15 @@ class ArtifactError(Exception):
     pass
 
 
+class ArtifactLocalError(ArtifactError):
+    """A local filesystem failure (disk full, race); retried, never a verdict on the artifact."""
+
+
+# Download failures that are a verdict on the artifact itself, not a transient condition.
+FINAL_DOWNLOAD_ERRORS = ('artifact_redirect_refused', 'response_too_large', 'artifact_not_found', 'artifact_too_large')
+MAX_TRANSIENT_ARTIFACT_ATTEMPTS = 10
+
+
 def _ident(prefix):
     return prefix + '_' + uuid.uuid4().hex
 
@@ -166,7 +175,7 @@ def safe_extract(blob, destination, *, limits=ARTIFACT_LIMITS):
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix='.extract-', dir=destination.parent))
     except OSError:
-        raise ArtifactError('artifact_extract_failed') from None
+        raise ArtifactLocalError('artifact_extract_failed') from None
     try:
         written = _extract_into(blob, staging, limits)
         if destination.exists():
@@ -174,7 +183,7 @@ def safe_extract(blob, destination, *, limits=ARTIFACT_LIMITS):
         os.rename(staging, destination)
         return written
     except OSError:
-        raise ArtifactError('artifact_extract_failed') from None
+        raise ArtifactLocalError('artifact_extract_failed') from None
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -315,6 +324,9 @@ class ClaimsClient:
 
     def status(self, request_id):
         return self._call(dict(op='status', request_id=request_id))
+
+    def revoke(self, request_id):
+        return self._call(dict(op='revoke', request_id=request_id))
 
     def reachability(self):
         return self._call(dict(op='reachability'))
@@ -665,6 +677,22 @@ class JobDomain:
         job['provider_run_id'] = str(chosen['id'])
 
     def reconcile(self, job_id):
+        """Bounded remote refresh of one job; one reconcile per job at a time (cross-process flock)."""
+        import fcntl
+        lock_dir = self.artifact_root / '.locks'
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(lock_dir / ('%s.lock' % validate('JobLookupRequest', dict(job_id=job_id))['job_id']),
+                     os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return self._response(self._load(job_id))  # another reconcile is in progress
+            return self._reconcile(job_id)
+        finally:
+            os.close(fd)
+
+    def _reconcile(self, job_id):
         record = self._load(job_id)
         loaded_at = record.pop('_updated_at', None)
         if record['state'] in ('rejected', 'rejected_pre_dispatch', 'intent'):
@@ -680,7 +708,8 @@ class JobDomain:
             if ('[%s]' % job['request_id']) not in str(run.get('display_title', '')):
                 raise JobError('owner_conflict', 'run_request_mismatch')
             latest = int(run['run_attempt'])
-            claim = (self.claims.status(job['request_id']) or {}).get('claim')
+            broker = self.claims.status(job['request_id']) or {}
+            claim, intent = broker.get('claim'), broker.get('intent')
             record['claim'] = claim
             if claim and str(claim['run_id']) != job['provider_run_id']:
                 record['claim_run_mismatch'] = str(claim['run_id'])
@@ -714,12 +743,19 @@ class JobDomain:
                                                                     self._workflow(job['workflow_id'])[0]['scope_id'],
                                                                     str(gh_job['runner_id']))
                 record['runner_name'] = str(gh_job.get('runner_name') or '')[:120]
+            if claim and record.get('artifacts_checked') and record.get('artifacts_attempt') != attempt:
+                # Results recorded for another attempt (or for "no claim yet") are not this attempt's.
+                record['artifacts_checked'], record['artifact_details'], job['artifacts'] = None, [], []
             if job['status'] == 'concluded' and claim and not record.get('artifacts_checked'):
                 self._collect_artifacts(record)
             elif job['status'] == 'concluded' and not claim and not record.get('artifacts_checked'):
-                # No attempt ever held the claim, so nothing was built: there is no artifact to trust.
+                # Nothing was built without a claim. Settle only once no later attempt can still claim
+                # (intent expired or revoked); until then a GitHub re-run could legitimately claim.
+                expired = intent is None or (isinstance(intent.get('expires_at'), (int, float))
+                                             and intent['expires_at'] <= self.clock())
                 record['artifact_details'] = [dict(state='none', reason='no_execution_claim')]
-                record['artifacts_checked'] = True
+                if expired:
+                    record['artifacts_checked'], record['artifacts_attempt'] = True, None
             if record['state'] in ('unknown_outcome', 'dispatched', 'dispatching'):
                 record['state'] = 'tracked'
                 record['history'].append(dict(at=self.clock(), state='tracked'))
@@ -756,7 +792,11 @@ class JobDomain:
                     artifacts.append(dict(base, digest=placeholder, state='expired'))
                     details.append(dict(id=artifact_id, state='expired', reason='artifact_expired_not_rebuilt'))
                     continue
-                transient = True  # download failures are retried by a later reconcile
+                if str(exc) in FINAL_DOWNLOAD_ERRORS:
+                    artifacts.append(dict(base, digest=placeholder, state='unknown'))
+                    details.append(dict(id=artifact_id, state='rejected', reason=str(exc)))
+                    continue
+                transient = True  # download failures are retried by a later reconcile (bounded)
                 details.append(dict(id=artifact_id, state='pending', reason=str(exc)))
                 continue
             try:
@@ -769,13 +809,20 @@ class JobDomain:
                 artifacts.append(dict(base, digest=digest, state='available', source_sha=job['source_sha'],
                                       size_bytes=len(blob)))
                 details.append(dict(id=artifact_id, state='verified', path=str(root), **provenance))
+            except ArtifactLocalError as exc:
+                transient = True
+                details.append(dict(id=artifact_id, state='pending', reason=str(exc)))
             except ArtifactError as exc:
                 artifacts.append(dict(base, digest=placeholder, state='unknown'))
                 details.append(dict(id=artifact_id, state='rejected', reason=str(exc)))
         record['artifact_details'] = details
-        if not transient:
-            job['artifacts'] = artifacts
-            record['artifacts_checked'] = True
+        if transient:
+            record['artifact_transient_attempts'] = record.get('artifact_transient_attempts', 0) + 1
+            if record['artifact_transient_attempts'] < MAX_TRANSIENT_ARTIFACT_ATTEMPTS:
+                return
+            details.append(dict(state='rejected', reason='artifact_retrieval_gave_up'))
+        job['artifacts'] = artifacts
+        record['artifacts_checked'], record['artifacts_attempt'] = True, job['attempt']
 
     def details(self, job_id):
         """Owner-side evidence view (not a contract response)."""
@@ -783,7 +830,9 @@ class JobDomain:
         return dict(state=record['state'], job=record['job'], claim=record.get('claim'),
                     runner_name=record.get('runner_name'), artifact_details=record.get('artifact_details'),
                     duplicate_run_ids=record.get('duplicate_run_ids'), history=record['history'],
-                    dispatch_error=record.get('dispatch_error'), queued_reason=record.get('queued_reason'))
+                    dispatch_error=record.get('dispatch_error'), queued_reason=record.get('queued_reason'),
+                    refused_attempts=record.get('refused_attempts', []),
+                    claim_run_mismatch=record.get('claim_run_mismatch'), retry_of=record.get('retry_of'))
 
     def retry(self, job_id, *, principal, idempotency_key, canary=False):
         """Explicit retry: a NEW authorized request; the old claim is never reused."""
@@ -800,6 +849,18 @@ class JobDomain:
             if (record['job']['provider_run_id'] is not None or claim is not None or row is None
                     or self.clock() - row[0] < UNKNOWN_RETRY_WINDOW_SECONDS):
                 raise JobError('unknown_outcome', 'outcome_still_unknown_reconcile_first', retryable=True)
+        # The old request must be unable to build before a new one exists: revoke its intent unless
+        # it is already claimed (a consumed claim can never be used again anyway).
+        old_claim = (self.claims.status(record['job']['request_id']) or {}).get('claim')
+        if old_claim is None:
+            try:
+                revoked = self.claims.revoke(record['job']['request_id'])
+            except (OSError, ValueError):
+                revoked = None
+            if not revoked or not revoked.get('ok'):
+                refusal = (revoked or {}).get('refusal')
+                if refusal != 'claim_exists':
+                    raise JobError('dependency_unavailable', 'old_intent_not_revoked', retryable=True)
         workflow, _private = self._workflow(record['job']['workflow_id'])
         inputs = [dict(input_id=k, value=v) for k, v in record.get('request_inputs', [])]
         response = self.submit(dict(workflow_id=workflow['id'], source_sha=record['job']['source_sha'], inputs=inputs,
@@ -942,6 +1003,8 @@ class GitHubDispatchPort:
             status, headers, _raw = self._request(ref, 'GET', '/repos/%s/actions/artifacts/%s/zip' % (repository, artifact_id))
             if status == 410:
                 raise ArtifactError('artifact_expired')
+            if status == 404:
+                raise ArtifactError('artifact_not_found')
             if status != 302 or 'location' not in headers:
                 raise ArtifactError('artifact_download_failed')
             target = urlsplit(headers['location'])

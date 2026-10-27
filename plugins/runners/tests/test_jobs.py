@@ -65,6 +65,8 @@ def runner(n=1, **overrides):
 class FakeClaims:
     def __init__(self):
         self.healthy, self.intents, self.claim, self.proof, self.fail_register = True, {}, {}, [], False
+        self.expiry, self.revoked, self.fail_revoke = {}, [], False
+        self.now = lambda: NOW
 
     def health(self):
         if self.healthy is None:
@@ -75,10 +77,23 @@ class FakeClaims:
         if self.fail_register:
             raise OSError('down')
         self.intents[intent['request_id']] = intent
+        self.expiry.setdefault(intent['request_id'], self.now() + 86400)
         return dict(ok=True)
 
     def status(self, request_id):
-        return dict(ok=True, claim=self.claim.get(request_id))
+        intent = None
+        if request_id in self.intents:
+            intent = dict(self.intents[request_id], expires_at=self.expiry[request_id])
+        return dict(ok=True, claim=self.claim.get(request_id), intent=intent)
+
+    def revoke(self, request_id):
+        if self.fail_revoke:
+            raise OSError('down')
+        if request_id in self.claim:
+            return dict(ok=False, refusal='claim_exists')
+        self.revoked.append(request_id)
+        self.expiry[request_id] = self.now() - 1
+        return dict(ok=True, revoked=True)
 
     def reachability(self):
         return dict(ok=True, workflows=self.proof)
@@ -141,6 +156,7 @@ class Env:
         self.clock = lambda: self.now
         self.now = NOW
         self.claims = FakeClaims()
+        self.claims.now = self.clock
         self.box = [None, self.claims]
         self.github = FakeGitHub(self.box)
         self.inventory_rows = [runner()] if runners is None else runners
@@ -405,11 +421,47 @@ def test_rerun_of_successful_attempt_keeps_winning_attempt_and_artifact(env):
     assert data['artifacts'][0]['state'] == 'available' and data['artifacts'][0]['attempt'] == 1
 
 
-def test_unclaimed_concluded_run_has_no_trusted_artifact(env):
+def test_unclaimed_concluded_run_settles_only_after_intent_expiry(env):
     job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    rid = env.domain.details(job_id)['job']['request_id']
     env.github.runs['9001'].update(status='completed', conclusion='failure')
     env.domain.reconcile(job_id)
     assert env.domain.details(job_id)['artifact_details'] == [dict(state='none', reason='no_execution_claim')]
+    assert not env.domain._load(job_id).get('artifacts_checked')  # a GitHub re-run could still claim
+    env.claims.expiry[rid] = env.now - 1
+    env.domain.reconcile(job_id)
+    assert env.domain._load(job_id).get('artifacts_checked') is True
+
+
+def test_rerun_that_claims_after_preclaim_failure_is_collected(env):
+    job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    job = env.domain.details(job_id)['job']
+    env.github.runs['9001'].update(status='completed', conclusion='failure')  # attempt 1 failed before claiming
+    env.domain.reconcile(job_id)
+    # GitHub re-run: attempt 2 claims, builds and uploads.
+    env.github.runs['9001'].update(run_attempt=2, conclusion='success')
+    env.claims.claim[job['request_id']] = dict(run_id='9001', run_attempt='2', claim_id='claim_b')
+    env.github.jobs[('9001', 2)] = [dict(id=2, runner_id=23, runner_name='example-mini')]
+    blob = provenance_zip(dict(job, provider_run_id='9001', attempt=2))
+    env.github.blobs[42] = blob
+    env.github.artifact_list['9001'] = [dict(id=42, name='canary-' + job['request_id'], size_in_bytes=len(blob),
+                                             expired=False, digest='sha256:' + hashlib.sha256(blob).hexdigest())]
+    data = env.domain.reconcile(job_id)['data']
+    assert (data['attempt'], data['conclusion'], data['artifacts'][0]['state']) == (2, 'success', 'available')
+
+
+def test_retry_revokes_the_old_unclaimed_intent_first(env):
+    job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    old = env.domain.details(job_id)['job']['request_id']
+    env.github.runs['9001'].update(status='completed', conclusion='failure')
+    env.domain.reconcile(job_id)
+    env.claims.fail_revoke = True
+    assert code_of(lambda: env.domain.retry(job_id, principal=PRINCIPAL, idempotency_key='idem_' + '7' * 32)) == (
+        'dependency_unavailable', 'old_intent_not_revoked')
+    assert len(env.github.dispatches) == 1
+    env.claims.fail_revoke = False
+    env.domain.retry(job_id, principal=PRINCIPAL, idempotency_key='idem_' + '7' * 32)
+    assert env.claims.revoked == [old] and len(env.github.dispatches) == 2
 
 
 def test_unknown_outcome_retry_waits_for_reconcile_window(env):
@@ -537,6 +589,30 @@ def test_unsafe_or_mismatched_artifacts_are_rejected(env, build, reason):
     job_id = concluded(env, blob=build)
     env.domain.reconcile(job_id)
     assert env.domain.details(job_id)['artifact_details'][0]['reason'] == reason
+
+
+def test_local_extraction_failure_is_retried_and_final_download_errors_are_not(env, monkeypatch):
+    job_id = concluded(env)
+    real = J.safe_extract
+
+    def disk_full(*a, **k):
+        raise J.ArtifactLocalError('artifact_extract_failed')
+    monkeypatch.setattr(J, 'safe_extract', disk_full)
+    env.domain.reconcile(job_id)
+    assert env.domain.details(job_id)['artifact_details'][0]['state'] == 'pending'
+    monkeypatch.setattr(J, 'safe_extract', real)
+    assert env.domain.reconcile(job_id)['data']['artifacts'][0]['state'] == 'available'
+
+    other = Env(env.domain.artifact_root.parent / 'final')
+    job2 = concluded(other)
+
+    def refused(*a):
+        raise J.ArtifactError('artifact_redirect_refused')
+    other.github.download_artifact = refused
+    other.domain.reconcile(job2)
+    assert other.domain.details(job2)['artifact_details'][0] == dict(
+        id=other.domain.details(job2)['artifact_details'][0]['id'], state='rejected', reason='artifact_redirect_refused')
+    assert other.domain._load(job2)['artifacts_checked'] is True
 
 
 def test_transient_artifact_download_is_retried_not_final(env):
