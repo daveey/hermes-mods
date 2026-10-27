@@ -71,6 +71,56 @@ def register(ctx):
         ctx.register_tool(name=name, toolset='runners', description=description,
             schema=dict(name=name, description=description, parameters=parameters), handler=handler)
     _register_operate(ctx)
+    _register_jobs(ctx, schema)
+
+
+RUN_DESCRIPTION = (
+    'Dispatch an allowlisted GitHub Actions workflow (workflow_id from GET /workflows) for an exact 40-hex source_sha '
+    'on the owner gateway. Requires feature dispatch, an authenticated in-process principal, a reachable claim '
+    'broker, an eligible online runner and a source SHA reachable from the trusted protected ref. Never builds '
+    'locally. A timeout returns status unknown_outcome: poll runners_job, never resubmit with a new key. Reusing '
+    'the same idempotency_key returns the same job.')
+JOB_DESCRIPTION = (
+    'Read a dispatched job by job_id: exact run id/attempt/job id, assigned runner, workflow-ref SHA vs checked-out '
+    'source SHA, verified artifacts (expired ones are reported, never rebuilt). Cached; each call schedules one '
+    'bounded background reconcile.')
+
+
+def _register_jobs(ctx, schema):
+    def handler_for(op):
+        def handler(args, **context):
+            from .dashboard import plugin_api as api
+            try:
+                backend = api.service()
+                if backend.config['owner_profile'] != api.active_profile():
+                    raise PermissionError('owner_profile_mismatch')
+                domain = api.jobs_domain(backend)
+                try:
+                    if op == 'run':
+                        principal = tool_principal(context.get('session_id'), backend.config['owner_profile'])
+                        result = domain.submit(args, principal=principal)
+                    else:
+                        from .models import validate
+                        result = domain.get(validate('JobLookupRequest', args)['job_id'], background=api._start_background)
+                except Exception as exc:
+                    if not api._job_error(exc):
+                        raise
+                    result = dict(meta=domain.meta(), error=exc.error())
+                return json.dumps(result)
+            except (PermissionError, NotImplementedError) as exc:
+                reason = str(exc)
+                return json.dumps(dict(error=reason if reason in ('owning_gateway_runtime_required', 'owner_profile_mismatch', 'authenticated_principal_required') else 'dispatch_access_denied'))
+            except (RuntimeError, ValueError, KeyError, OSError, ImportError):
+                return json.dumps(dict(error='runner_operation_unavailable_or_unauthorized'))
+        return handler
+
+    # runners_run lives in its own toolset so repair chats (pinned to the 'runners' toolset) cannot dispatch builds.
+    for name, request_type, op, description, toolset in (
+            ('runners_run', 'JobRequest', 'run', RUN_DESCRIPTION, 'runners_dispatch'),
+            ('runners_job', 'JobLookupRequest', 'job', JOB_DESCRIPTION, 'runners')):
+        parameters = dict(schema['$defs'][request_type], **{'$defs': schema['$defs']})
+        ctx.register_tool(name=name, toolset=toolset, description=description,
+            schema=dict(name=name, description=description, parameters=parameters), handler=handler_for(op))
 
 
 OPERATE_DESCRIPTION = (

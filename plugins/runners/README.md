@@ -226,12 +226,56 @@ Enforced on every request:
 `broker/authorization.py` generates the polkit rule that grants the broker user only `start`
 on listed canary units. With no canary listed, it grants nothing. It also provides the
 install boundary check and the forced-command probe key line. The workflow-facing
-execution-claim API (phase G) must be a separate listener; `server.ROUTES` serves only
-`management`.
+execution-claim API is a separate service (`broker/claims.py`, below); `server.ROUTES`
+serves only `management`.
 
 Limitation: on a host where the agent's Unix user has passwordless sudo, OS separation
 protects credentials and policy from the unprivileged agent but cannot stop a root-capable
 agent. Mutation safety is then only as strong as that session's tool boundary.
+
+## Workflow dispatch and execution claims
+
+`GET /v1/workflows`, `POST /v1/jobs`, `GET /v1/jobs/{id}` and the `runners_run` (toolset
+`runners_dispatch`, so pinned repair chats cannot dispatch) / `runners_job` tools share
+`jobs.JobDomain`. GitHub stays the scheduler; nothing is ever built on the gateway.
+
+- Allowlist: `runners.yaml` `allowed_workflows` (opaque IDs only). The private
+  `$HERMES_HOME/runners-dispatch.json` maps each ID to repository, workflow file, trusted ref,
+  runner labels, offline policy and named inputs. Clients never send names, refs or URLs.
+- Gates, in order: `features.dispatch` and the workflow's `dispatch_enabled`; typed inputs
+  (duplicate/unknown/unsafe values refused); per-principal rate limit; idempotency (same key +
+  payload returns the same job; another payload is `idempotency_conflict`); claim broker
+  reachable (owner socket + runner-facing health); a recorded successful claim from that
+  workflow within `reachability_max_age_seconds` (runners proved they can reach and
+  authenticate to the broker); an eligible online runner (else `no_eligible_runner_online`,
+  rejected or queued per workflow, never a local fallback); source SHA reachable from the
+  trusted ref, which must be protected.
+- The intent (fresh `request_id`) is persisted and registered with the claim broker before
+  GitHub is called. `request_id` and `source_sha` are workflow inputs and the run-name carries
+  `[request_id]`. A timeout/reset/5xx after sending is `unknown_outcome`: reconcile by request
+  ID, never resubmit. Several runs for one request bind to the broker's claim holder.
+- `GET /jobs/{id}` is cached and schedules one background reconcile: exact run id, attempt,
+  job id and assigned runner, workflow-ref SHA (`head_sha`) kept distinct from the checked-out
+  source SHA. Explicit retry (`JobDomain.retry`) is a new request; GitHub re-runs cannot claim.
+- Artifacts (`<prefix><request_id>`) are downloaded only after completion: provider digest
+  must match, the zip is extracted with traversal/symlink/size/count limits, and
+  `provenance.json` must bind request, source SHA, run, attempt and every file's sha256.
+  Expired artifacts are reported, never rebuilt.
+- Canary mode (`submit(..., canary=True)`) exists only for in-process owner scripts and only
+  for workflows marked `canary`; it is how the first runner-reachability proof is produced
+  while `features.dispatch` is still false. REST and tools cannot reach it.
+
+`broker/claims.py` runs as its own identity `hermes-runners-claims`
+(`templates/claims.service`), stdlib only, no management or GitHub credentials. Owner side:
+`/run/hermes-runners-claims/intent.sock` (`SO_PEERCRED` uid allowlist) for
+register/status/reachability. Workflow side: `POST /v1/claims` on the tailnet address with a
+GitHub Actions OIDC token. It verifies RS256 against the issuer JWKS (no other algorithms or
+header keys), issuer, audience, expiry/nbf/iat with 60 s skew and 1 h maximum lifetime,
+repository, `workflow_ref`/`job_workflow_ref` = policy workflow at the trusted ref, `ref`,
+`event_name=workflow_dispatch`, `runner_environment=self-hosted`, and that the body's request
+ID and source SHA equal the registered intent. The first run/attempt wins atomically; the
+same run and attempt get the same grant again (lost response); re-run attempts and other runs
+are refused forever (no lease expiry or takeover). Rate limits per source and globally.
 
 ## Boundaries
 
