@@ -531,8 +531,10 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> st
         lines.append(f"- {tid} [{state}] {c.get('title') or ''}\n  handoff: {handoff}")
     lines.append(
         "Write the closing answer for the user now: what each card delivered (from its handoff; check any claim you "
-        "can cheaply verify), what is still open, and for a card blocked on the user the exact one-line ask. Don't "
-        "start new work unless a handoff says something promised is still undone; then create a card for it.")
+        "can cheaply verify), and for a card blocked on the user the exact one-line ask. For each problem the "
+        "handoffs leave open that an agent can fix, fix it now if it's small and reversible; otherwise create a "
+        "linked card with acceptance criteria and name it. List as still open only items that are the user's own "
+        "call, or that a card you checked this turn is actively running.")
     return "\n".join(lines)
 
 

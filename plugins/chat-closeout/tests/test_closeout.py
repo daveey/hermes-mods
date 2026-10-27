@@ -352,3 +352,13 @@ def test_reload_stops_the_previous_waker_thread(monkeypatch):
         assert plugin._state['thread'].is_alive()
     finally:
         stop.set()
+
+
+def test_closeout_prompt_asks_to_act_on_fixable_leftovers():
+    cards = {'t_one': {'status': 'done', 'title': 'x', 'summary': 'shipped; flaky test left open'}}
+    prompt = core.closeout_prompt({'batch': ['t_one']}, cards)
+    assert "Don't start new work" not in prompt
+    assert "fix it now if it's small and reversible" in prompt
+    assert 'create a linked card with acceptance criteria and name it' in prompt
+    assert "List as still open only items that are the user's own call" in prompt
+    assert 'a card you checked this turn is actively running' in prompt
