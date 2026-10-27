@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [notification-held-handoff.md](notification-held-handoff.md) | 0530 | Owner-addressed notifications wait with their owner's poller instead of bouncing through every chat's poller on the shared queue (a busy chat no longer pins the Desktop backend); sidebar kanban counts recompute once for all queued readers. |
 | [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md) | 0528 | Every gateway's sessions show from the hub replica at once on a cold start (no SSH wait); owners that published within 180 s give ordinary, running-aware rows. |
 | [kanban-no-producer-no-park.md](kanban-no-producer-no-park.md) | 0529 | Every Kanban park records who produces its condition (`awaiting` = card / ci / deploy / external / clock); agent-action waits with no producing card (`agent_action_wait`) and hidden waits on the user (`human_wait`, ask-gate ledger aware) are refused; the third park on one premise becomes an owner card for a supervisor. |
 | [exhausted-provider-recovery.md](exhausted-provider-recovery.md) | 0521 | Exhausted providers (`failure_kind` exhausted/auth_missing, `provider`, nullable `reset_at` in UNIX seconds) open a recovery screen naming the provider and reset time instead of the first-run picker; nine locales. |
