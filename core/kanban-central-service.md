@@ -5,8 +5,9 @@ built yet.** What is built is described under Current state.
 
 Status: design / RFC, 2026-10-23, widened 2026-10-26. It proposes one cloud source of truth for Kanban boards, the
 sessions index and the Inbox, with every gateway keeping a full local cache that serves reads and accepts writes while
-offline. Ownership is a lease in the source of truth. This is now the single plan: the private hub plan (v2,
-2026-10-23) and the 2026-10-26 additions are folded in here. Shipped behavior is limited to what Current state,
+offline. Ownership is a lease in the source of truth. Work runs on worker nodes chosen by labels, and transcripts
+sync end-to-end encrypted so any session opens from a local copy (Worker nodes and transcripts). This is now the
+single plan: the private hub plan (v2, 2026-10-23) and the 2026-10-26 additions are folded in here. Shipped behavior is limited to what Current state,
 Liveness and the "Built so far" note under Operations describe; everything else claims nothing that tests prove.
 
 All line references are to upstream `hermes-agent` at `07ee800d` (2026-10-22) unless a path starts with `plugins/`
@@ -92,13 +93,15 @@ With several gateways (laptop, mac-mini, a cloud gateway), each one has its own,
   sidebar and Inbox, from its own cache.
 - When a gateway is gone, its work can be taken over, without ever running a card twice (Ownership).
 - "Is this chat's remote work done" is a local read of the card, not a proof collected from another gateway.
+- Work runs where it can (any cloud node, a Mac with Xcode, or one specific machine), and every session opens in
+  under a second on every key device, from its local copy, wherever it runs (Worker nodes and transcripts).
 
 ## Non-goals
 
-- Replicating transcripts, `state.db` messages, worker workspaces or chat ids. Session *metadata* (title, status,
-  links) is synced; the conversation never leaves the host. Workspaces stay on the gateway that runs the card.
-- Taking over a session from a machine that is gone. Its transcript is on that machine, so a takeover would lose the
-  history. Sessions move only when both machines are up.
+- Sending transcripts in the clear, replicating workspaces, or syncing chat ids. Transcripts sync end-to-end
+  encrypted to key devices (Worker nodes and transcripts): the service stores ciphertext only. Session *metadata* (title, status, links) syncs in
+  the clear. Workspaces stay on the node that runs the work and move only as explicit snapshots.
+- Server-side search of transcripts. Search stays local, over each device's decrypted copy.
 - Multi-tenant SaaS. This is one owner's boards, a handful of gateways and at most tens of thousands of cards.
 - Real-time collaborative text editing of card bodies. Field-level last-writer-wins is enough.
 - Replacing the dispatcher. Each gateway still runs its own embedded dispatcher
@@ -198,8 +201,9 @@ backend-agnostic so that switching later costs one server rewrite and no client 
 - **Scopes**: `board:read`, `board:write` and `board:claim` per board, plus a global `operator` scope (lease reset,
   enroll, revoke) held by the owner's devices only. A read-only gateway (for example a phone
   companion) never gets `claim`.
-- **Revocation**: deleting the gateway row in the D1 registry invalidates its refresh token. Its outstanding leases
-  expire normally (see Claims).
+- **Revocation**: deleting the gateway row in the D1 registry invalidates its refresh token, and every request also
+  checks the registry, so its unexpired access token stops working at once. Its outstanding leases expire normally
+  (see Claims); a revoked machine's sessions are reassigned (Worker nodes and transcripts).
 - **Attachments**: the service never proxies bytes. It returns presigned R2/S3 URLs scoped to
   `boards/<board_id>/attachments/<attachment_uid>` that expire in 5 minutes.
 
@@ -559,7 +563,8 @@ edits are per-field LWW by HLC; append-only rows are a union.**
 
 Columns: `title`, `body`, `assignee`, `priority`, `tenant`, `branch_name`, `workspace_kind`, `skills`,
 `model_override`, `provider_override`, `reasoning_effort`, `max_retries`, `max_runtime_seconds`, `goal_mode`,
-`goal_max_turns`, `workflow_template_id`, `current_step_key`, `idempotency_key`.
+`goal_max_turns`, `workflow_template_id`, `current_step_key`, `idempotency_key`, `runs_on` (Worker nodes and
+transcripts, Placement).
 
 - The HLC is `(physical_ms, counter, gateway_id)`. It is updated on every local stamp and on every received change
   (`max(local, remote)`), so a gateway with a skewed clock still orders after anything it has seen. The server
@@ -582,6 +587,8 @@ Columns: `title`, `body`, `assignee`, `priority`, `tenant`, `branch_name`, `work
   archives a card that another gateway completed meanwhile. `archive` from `done` is legal and applies. `complete`
   from `archived` is rejected, and the run's summary is still kept as a comment. A `complete`/`block` op must carry
   the run uid of the lease holder (below).
+- **`created_on`**: the creating gateway id, set once by the server when the card is created and never changed.
+  Placement's default uses it; `origin_gateway` cannot, because it records the last writer.
 - **`recompute_ready`** (todo → ready when parents are done) runs on the server after any status change, because
   only the server sees every parent. Gateways stop promoting locally for synced boards; they still run it for
   `mode='off'` boards.
@@ -674,10 +681,9 @@ An early reset gives up the at-most-once guarantee for that card: if the holder 
 keeps running until its own lease deadline and its side effects can happen twice. Fencing only protects the
 service's state. So an early reset is a deliberate operator decision, shown with that warning, and listed in Risks.
 
-**Sessions.** A session's owner is the machine it runs on: a pointer in the sessions index, not an expiring lease.
-It moves with a two-phase handoff (the service marks the move, the current owner acks on its next sync) and only
-while both machines are up. There is no takeover. A session whose machine is gone shows as unavailable. Inbox cards follow the same rule: each
-has an owning gateway, other gateways act on it by request, and there are no leases.
+**Sessions.** A session's owner is the node it runs on, with an owner epoch rather than an expiring lease. Moves,
+reassignment and fencing are in Worker nodes and transcripts ("Sessions on worker nodes"). Inbox cards have an owning
+gateway, other gateways act on them by request, and they never move.
 
 ## Liveness (built 2026-10-26)
 
@@ -698,6 +704,271 @@ In the target design this stays as "this gateway successfully read its boards th
 mark on each gateway's cards. It is different from the feed WebSocket's keepalive (Sync protocol), which only says
 the connection is up. Neither is lease renewal (see Ownership). The rule to keep: nothing that changes every cycle goes inside a record whose hash
 decides what syncs.
+
+## Worker nodes and transcripts
+
+Work should run where it can, and every session should open in under a second on every device. Today neither is
+true.
+
+Some work can run on any cloud machine, and we want several of those. Some needs a Mac (macOS or iOS builds,
+simulators). Some has to run on one specific machine, for example to debug a problem on that laptop. And viewing a
+session that runs on another machine is slow: Desktop opens SSH, starts a fresh dashboard process there and tunnels
+to it, on almost every connection. Measured 2026-10-26 from Desktop's lifecycle log (`[ssh-lifecycle]` lines) and
+by timing the sessions handler in-process on the host: 6 to 10 s to the cloud gateway and about 19 s to a Mac gateway
+before the first request is served, while the sessions request itself takes 0.1 to 1.8 s there. The cost is the
+per-connection process start on a busy host, not the session.
+
+So we separate where work runs from where you view it.
+
+### Terms
+
+- **machine**: one physical or virtual host. It has one registry entry (below).
+- **principal**: an enrolled credential on a machine. A machine can have several: its **gateway** (runs agent
+  sessions and card runs, and submits workspace jobs) and, if it builds, a separately enrolled **workspace worker**
+  (the contract's worker, whose credential job code cannot read).
+- **worker node**: a machine that runs work, through any of its principals. Not to be confused with Cloudflare
+  Workers (the service runtime), the sync worker (the client loop in Architecture) or a card's worker process (the
+  dispatcher's child).
+- **user device**: a machine the account owner works at (laptops, desktops). **Key device**: a machine holding
+  transcript keys. User devices are key devices; a worker node that runs sessions is one too (it has to read the
+  transcripts it extends).
+- **account**: the one owner of all boards, sessions and machines (this is not multi-tenant).
+- **session feed**: a session's append-only stream of transcript records, a collection on the service's existing
+  replication feed.
+
+### One machine registry for every kind of work
+
+The runners plugin's workspace-job contract (`plugins/runners/contracts/workspace-jobs.md`) already specifies an
+enrolled worker with least privilege, admission, holds, revocation, safe drain, receipts and mandatory sandboxing,
+for build jobs over unpublished source. We keep that contract as the rules for workspace jobs and put every kind of
+work on one **machine registry**, so a machine is described once.
+
+A machine entry holds its labels (`linux`/`macos`, tools such as `xcode`, `simulators`, `gpu`, and
+`machine:<name>`), a `pinned_only` flag, per-kind capacity, and its principals (gateway ids and workspace worker
+ids). Labels and `pinned_only` are set by an operator action, never by the machine, so a machine cannot claim
+another's `machine:` label. Leases are granted to a gateway id (Claims); the service finds that gateway's machine
+entry and checks its labels and capacity there.
+
+What is shared, and what is not:
+
+- **Shared:** the registry entry, owner holds (a hold stops new work of every kind on the machine), revocation (it
+  revokes every principal of the machine) and one append-only audit.
+- **Per kind:** capacity (`workspace_slots` per the contract's slot accounts, §10 and §17.6; `max_sessions` and
+  `max_card_runs` for agent work, checked by session assignment and the lease grant), heartbeats and loss timing.
+  Workspace jobs keep the contract's heartbeat and loss rules (§9, §17.5), card runs keep Claims step 3, sessions
+  keep the owner rules below. A machine's total load is visible in one place even though the counters differ.
+
+| Kind | Who places it | Execution rules |
+|---|---|---|
+| workspace job | a grant binding submitter, worker and recipe (contract §2, enforced at §10) | the contract: sandboxed recipe, at most one launch per attempt (§8, §17.4), receipts |
+| card run | the lease grant (Claims) plus the label check below | this doc's lease rules |
+| session | assignment plus the label check below | owner epoch and self-fencing (Sessions on worker nodes) |
+
+Least privilege holds: a session that delegates (below) acts through its gateway principal, which is a contract
+*submitter*. It never acts as a workspace worker. The workspace worker principal still calls only
+`workspace.worker.*`.
+
+Batch work on committed source (builds, tests) can keep running as GitHub Actions jobs on the existing runners, which
+the runners plugin already routes. We use the same vocabulary (`runs_on` labels, claim, lease renewal, drain) so the
+two read alike, but sessions never go through GitHub: they are long-lived and interactive, their transcripts are
+encrypted, and an Actions outage or billing hold must not stop them.
+
+Two contract questions remain (Open questions): the contract runs `workspace.*` over a different hub than this
+service, and it allows admin actions only from a local shell on that hub. This service has no shell. Its equivalent
+is an operator action that also needs a signature from a user device (Keys), which is stronger than an Access login
+alone.
+
+**Which operator actions need a user-device signature.** Anything that widens access or can cause a double run:
+setting labels or `pinned_only`, adding or revoking a machine, an early lease reset, an early session reassignment, a
+move onto a `pinned_only` machine, and reassignment policies. The `operator` scope alone (Auth) covers read-only
+views and actions that only narrow access, such as placing a hold.
+
+### Placement
+
+Sessions and cards carry `runs_on`, a list of labels that must **all** be present on the machine:
+
+- **default:** the creating machine's labels minus its `machine:` label ("a machine like this one"). The creating
+  gateway may claim at once; any other matching machine may claim when the work has been `ready` and unclaimed for
+  `home_grace` (default 10 min) or the creator's heartbeat is stale. That keeps today's behavior (work runs where it
+  was created) and still lets a dead gateway's work be taken over (Ownership).
+- `[]`: any machine. Explicit opt-in. Cloud machines scale horizontally; leases already prevent two running one card.
+- `[macos, xcode]`: any machine with both labels.
+- `[machine:<name>]`: that machine only.
+
+`runs_on` is a synced LWW column, and `created_on` (the creating gateway id) is set once by the server at create
+(Per-field LWW, Server-authoritative operations). The lease grant (Claims, step 1) and every session assignment check
+the machine's registry labels against `runs_on`. A `pinned_only` machine accepts only work whose `runs_on` names its
+`machine:` label, so an arbitrary card never runs on a personal laptop with its files and logged-in accounts. Queue
+depth of `[]` work is the signal to add a cloud machine.
+
+### Delegate or migrate
+
+Sometimes a session finds out mid-way that it needs something its machine lacks.
+
+**Delegate (the default).** The session stays put and sends only the step that needs the capability: a card with the
+right `runs_on`, plus a workspace snapshot (contract §6) when it needs unpublished edits. The snapshot follows the
+contract's secret rules: a snapshot containing a secret-looking file is refused, never silently trimmed (§6.3). The
+session waits for the card's result and carries on. Most "build and test this on a Mac" needs end here.
+
+**Migrate (when the rest of the work needs the other machine).** The agent calls `request_move(runs_on)`, and at the
+next turn boundary, never mid-tool-call:
+
+1. Quiesce: finish the turn, stop or record background processes, and write a **handoff note**: what was running,
+   how to restart it, and what will not move (processes, simulator state, files outside the workspace, `/tmp`).
+2. Snapshot: publish the workspace snapshot (same rules as delegate) and confirm the session feed is fully synced.
+3. Hand off: the service assigns the session to a matching machine and bumps the owner epoch (below). The new owner
+   materializes the workspace and resumes from the feed.
+4. Orient: the first turn there gets the handoff note as a new message. History and the system prompt are never
+   edited, so the cached prompt prefix stays valid (if the new machine uses the same provider account it may still
+   hit; otherwise the first turn pays a full cache miss).
+
+Credentials never move: the new machine uses its own token broker. A move onto a `pinned_only` machine needs the
+operator's approval each time; moves between pool machines can be automatic. Migration needs the session feed (W1)
+and the registry (W3), so it arrives with W3.
+
+### Sessions on worker nodes
+
+A session's owner is the gateway it runs on: a pointer in the sessions index plus an **owner epoch**. Two rules keep
+a session from running twice:
+
+- **Fencing at the service.** Every transcript record and op the owner writes carries the epoch, and the service
+  rejects anything with an older one.
+- **Self-fencing at the owner.** The gateway heartbeat lists every session it owns with that session's signed head,
+  and the service confirms ownership per session. The owner starts a turn only while its last *confirmed* heartbeat
+  was *sent* less than `owner_ttl` (default 2 min) ago, measured on a clock that keeps running through sleep
+  (`CLOCK_BOOTTIME` on Linux, `mach_continuous_time` on macOS). A turn is cut off at `max_turn_seconds`, and the
+  cut-off stops the turn's whole process group, background processes included, before the turn counts as ended. An
+  owner whose heartbeats go out but are not confirmed for `owner_ttl` stops heartbeating that session, so the service
+  sees silence rather than a live owner that has stopped (a one-way partition cannot stall the session).
+
+Because the owner measures from when it *sent* a heartbeat and the service from when it *received* it, the owner's
+deadline is always earlier. Reassigning a session whose owner has gone silent waits `owner_ttl + max_turn_seconds +
+60 s` after the last heartbeat received (the 60 s margin matches Claims step 3), then bumps the epoch. The new owner
+reads the feed up to the newest signed head the old owner published and resumes from there; if records named by that
+head are missing, it says so ("resumed from record N; head M unavailable"). Anything the old owner never synced is
+lost, and the reassignment says so.
+
+**Who may change the owner.** Every epoch change is a signed record in the session feed. A cooperative move is
+signed by the old owner. Any other reassignment is signed by a user device, either directly or through a reassignment
+policy a user device signed once ("pool sessions may be reassigned automatically after the timeout"). Readers check
+that each record's signer is the owner of its epoch, and that each epoch change carries a valid signature for its
+kind. Two chains for one epoch, or an epoch change without a valid signature, is a fork: readers show both and the
+operator chooses. An operator can also reassign before the timeout, accepting that a still-running turn may repeat
+its side effects (the same trade as an early lease reset); that also needs a user device's signature.
+
+Revoking a machine (Revocation, below) immediately bumps the epoch of every session it owns and stops confirming its
+heartbeats. Inbox cards keep their own rule: an owning gateway, other gateways act by request, no moves.
+
+### Transcripts sync, end-to-end encrypted
+
+Every message of a session (user turns, assistant turns, tool calls and results) becomes a record in the session
+feed. The owner is the only writer of a session's feed: a user's message is a signed op addressed to the session
+(not to an epoch, so it reaches whoever owns the session when it arrives), which the owner appends, user signature
+included, in order. The appended record is the acknowledgement. The sender watches the feed for its op's uid,
+marks the message "not delivered" if it does not appear within 30 s, and resends; ops are idempotent by uid. The
+service can delay or drop ops, interrupts included, but not silently: the sender sees them undelivered. Records reach the service as soon as they are written (an
+immediate push), not on the collector's 75 s cycle, and readers subscribe over the feed's WebSocket (the endpoint
+exists; clients poll today). That is what makes live updates and sub-second opens possible.
+
+User devices decrypt every feed into their own local `state.db`, so the transcript is effectively replicated, but
+only to key devices. A worker node fetches only the feeds of sessions assigned to it; the service enforces that,
+since until W4 one key opens every session. Sessions that existed before W1 are backfilled by their current owner
+as **imported** records: signed by that owner, marked imported, starting a fresh chain. Readers show them as
+imported rather than as records written live. Desktop renders any session
+from the local copy with no connection to the machine running it, even offline. Large tool outputs, attachments and
+workspace snapshots stored by the service go to the blob store, encrypted the same way. Search stays local.
+
+**The device log.** An append-only log of devices, each entry (add, revoke, mark as user device, signed policy)
+signed by an existing user device. Readers verify the whole chain from a pinned first entry, so the service can relay
+the log but cannot add a device, change a key or promote a worker node to user device without a valid signature.
+
+- **Genesis.** The first entry exists only after an explicit `init` run by the operator on a user device; that
+  device creates the first entry, the data key and the recovery key (Backup). A device is never "first" because the
+  service says no log exists: without `init`, a device that finds no log waits. The service refuses a second
+  genesis for the account.
+- **Pinning.** A device learns the genesis fingerprint during pairing, from the approving device, not from the
+  service (it is one of the inputs to the short code below). A device given a forked log therefore fails pairing.
+
+**Keys.** Device keys belong to the machine: one Ed25519 signing key and one X25519 encryption key per machine,
+created when the machine is first enrolled and recorded on its registry entry. Every principal enrolled on that
+machine later (its gateway through `sync enroll`, its workspace worker) attaches to the same entry, so one device-log
+revoke covers all of them.
+
+- The account **data key** encrypts records (XChaCha20-Poly1305). `init` creates it; the service only stores the
+  fact that key epoch 1 exists.
+- **Pairing.** A new machine gets the data key after pairing with a user device. Each side first sends a commitment
+  (a hash of its public keys) and only then the keys themselves, so neither side can choose keys after seeing the
+  other's. Both sides then show a short code of at least 30 bits (for example 10 digits), derived from both machines'
+  public keys, the genesis fingerprint and the current device-log head, and the operator confirms they match. The
+  approving device wraps the key to the new machine (box to its X25519 key, signed with its Ed25519 key) and appends
+  the device-log entry; the new machine checks both against the log it just verified.
+- **Headless machines** (cloud worker nodes) pair the same way, with the operator's provisioning shell as the new
+  machine's screen: the provisioning command shows the code on the worker side and the operator compares it with the
+  user device's.
+- A machine enrolled by one-time code alone sees metadata only until it is paired.
+- The crypto runs in core's runtime: the stdlib sync client already calls core this way for owner observations (its
+  task-observation collector runs `hermes --run-module …`). The child reads the key from the machine's secret store;
+  records pass through a pipe, never through argv or the environment. PyNaCl becomes a direct core dependency (today
+  it is reachable only through optional extras and a version override).
+- **Backup.** `init` also creates a **recovery key**: a keypair entered in the device log as a user device, whose
+  private half is kept offline, encrypted with a passphrase-derived key (Argon2id at libsodium's `MODERATE`
+  limits). Every new data key epoch is wrapped to it as well, so the backup never needs refreshing. Restoring it on
+  a new machine reads all history and can sign that machine into the log, so it recovers the account, not just the
+  history. The service stores only the wrapped keys, which it cannot open.
+
+**Integrity.** Each record and op is signed by its writer, and its associated data binds session, record uid, owner
+epoch, key epoch and the device-log position (seq) the writer had verified. Record uids are unique per session;
+readers reject a duplicate. Each record includes the hash of the previous one, so the service cannot drop or reorder
+records without detection. Each owner heartbeat carries a signed head (last record seq and hash), so the service
+cannot hold back *some* records without readers seeing the gap. It can withhold everything, records and heartbeats
+alike; readers then show the session as "cannot verify latest" after two missed heartbeats, not as current, and
+never mistake it for complete.
+
+**Approvals** are signed by a user device in the verified device log, and each one names the hash of the exact
+pending tool-call record it approves; the owner acts only on an approval whose hash matches, and an approval is used
+once. That stops the service or another machine from approving, or replaying an old approval. It does not stop a
+compromised *owner*: it holds the tools and could act without asking. Its actions are signed records, so they are
+detectable afterwards, not prevented.
+
+**Revocation.** A user device revokes a machine: it appends a signed revoke entry to the device log, creates a new
+data key epoch and wraps it to the remaining key devices (and the recovery key). The service revokes the machine's
+principals at once: access tokens are checked against the registry on every request, so the ≈15 min token lifetime
+gives no grace (Auth, Revocation). It also bumps the epoch of every session the machine owns (Sessions on worker
+nodes). Ordering uses the device-log seq in each record: readers accept a record sealed under an old key epoch only
+if its device-log seq is before the revoke entry, so records written offline before the revoke stay valid, and any
+record signed by the revoked machine at or after that seq is rejected. Owners refresh the device log with every
+heartbeat and seal with the newest epoch they hold. A revoked machine keeps whatever it had already decrypted; this
+is not retroactive.
+
+**Who sees plaintext.** The service stores ciphertext only. Worker nodes that run sessions hold the data key and see
+the plaintext of every session they can fetch (they run the turns). Per-session keys, so a cloud machine holds only
+the keys of sessions it runs, are a later hardening step (W4). Card `body`, `result` and comments are not covered by
+this and stay in the clear for now (Risks).
+
+**Visible to the service.** Session titles and status, owner pointers and epochs, which device wrote each record,
+record counts, sizes and timing, which machine ran what, labels, `runs_on`, key epochs, device public keys and the
+device log, and blob and snapshot sizes.
+
+**Sending to a remote session.** A user message to a session running elsewhere is a signed, encrypted op delivered
+to the owner, which appends it and runs the turn; the result streams back through the feed. With that (W2), no
+Desktop needs an SSH dashboard on a worker node to use a session there.
+
+**Quick win, before any of this.** Keep one dashboard per remote host warm and reuse it. Desktop already has reuse
+logic, but almost every connection starts a new one; W0 first records why each reuse misses, then fixes it. The SSH
+path stays as the fallback until W2.
+
+### Worker nodes rollout
+
+| Phase | What | Exit criteria |
+|---|---|---|
+| W0. Warm dashboards | log the reason for each reuse miss; keep one service-managed dashboard per remote host (started by the host's service manager, outliving Desktop); Desktop reuses it | a cold Desktop reaches a usable remote session in under 2 s on the cloud gateway, measured from Desktop's lifecycle log |
+| W1. Encrypted transcripts, read-only | device keys at enrollment, pairing with the short code, the signed device log; owner-written, signed, hash-chained records with signed heads; immediate push and WebSocket delivery; Desktop renders remote sessions from its local copy | any remote session opens in under 1 s from the local copy; a session renders with its machine offline; the privacy test passes; an unpaired device cannot read |
+| W2. Interactive over the feed | user messages, approvals and interrupts as signed ops to the owner; owner epochs and self-fencing (same machine, no moves) | a full turn on a cloud machine from a Desktop with no SSH to it; turn latency within 1 s of today's; a stale epoch's write is rejected |
+| W3. Machine registry, placement and moves | one registry for workspace jobs and agent work; operator-set labels and `pinned_only`; the label check in lease grants and assignment; delegate via cards; migrate and reassignment; a second cloud machine | an `xcode` card only runs on a Mac; `machine:` work never runs elsewhere; a machine cannot take work by claiming a label; a migrated session resumes on a Mac; two cloud machines drain one queue with no double run |
+| W4. Per-session keys | cloud machines hold only the keys of sessions they run | a cloud machine cannot decrypt a session it was never assigned |
+
+W0 to W2 use only the existing replication feed, not the Kanban phases. W3's card placement needs Kanban leases
+(phase 3); its session moves replace phase 6's "two-phase handoffs".
 
 ## Apply path (proposed core patch `0193`)
 
@@ -906,7 +1177,7 @@ above come first, then:
 | Phase | What | Exit criteria |
 |---|---|---|
 | 5. Ledger retirement | receipts to session links, shadow diff, readers switched, ledger paths deleted | a week of zero unexplained diffs; one association code path |
-| 6. Sessions and Inbox | the replicated collections become service-owned with the same feed and outbox; session moves as two-phase handoffs | the sidebar and Inbox match on every gateway with one gateway asleep |
+| 6. Sessions and Inbox | the replicated collections become service-owned with the same feed and outbox; session moves come from W3 (Worker nodes and transcripts) | the sidebar and Inbox match on every gateway with one gateway asleep |
 
 Phases 5 and 6 are not estimated yet, so the total above covers only phases 0 to 4. Deleting the ledger paths is the
 last step of phase 5, after its soak: until then the ledger stays read-only, so `sync detach` can still fall back
@@ -954,6 +1225,13 @@ to local-only.
 - Lease TTLs per kind of work, and whether a laptop that knows it is going to sleep should release its leases first.
 - Is the operator reset enough, or do we want an automatic reset after a much longer timeout for gateways that never
   come back?
+- How far back to backfill transcripts in W1: every session (one busy device's messages table is about 2.4 GB), or
+  recent and active ones with older ones on demand?
+- Should a phone or read-only companion (see Auth) be a key device and see transcripts, or metadata only?
+- The workspace-job contract: move its `workspace.*` operations onto this service, so each machine has one registry
+  entry, and replace its local-shell-only admin with an operator action signed by a user device. Both need the
+  contract owner's agreement; until then workspace jobs stay on their own hub and only agent work uses this
+  registry.
 - Should `body` and `result` (long text) use a text CRDT instead of LWW? This design says no: card bodies are
   rarely co-edited.
 - Timers on the server (DO alarms) mean the server must understand timed waits and soft deadlines. Alternatively,
@@ -970,6 +1248,13 @@ to local-only.
 
 - **Double run through a lease bug.** This is the worst failure. Mitigation: fencing by `run_uid` on every
   terminal op, server-side audit of overlapping leases from `changes`, and a phase 3 soak with alerts.
+- **Key loss.** Transcripts are only readable on key devices. Losing all of them loses the history. Mitigation: more
+  than one key device, and an offline backup of the data key encrypted with a passphrase-derived key (Argon2id),
+  never stored by the service.
+- **Plaintext on worker nodes.** Nodes that run sessions hold the data key until W4. A compromised cloud node can
+  read every session, though it cannot approve its own actions (signed approvals).
+- **Metadata in the clear.** See "Visible to the service". Encrypting titles is an open question (it costs any web
+  view of the sidebar).
 - **Operator reset of a live holder.** An early reset can run a card twice (Ownership). Mitigation: show the
   warning, reset only holders known to be gone, and audit resets from `changes`.
 - **Two association paths during the ledger retirement.** Until readers switch, the ledger and the session links
@@ -984,7 +1269,8 @@ to local-only.
   conformance suite runs the same transition cases against both.
 - **Privacy.** Card bodies, results and comments move off-host into a cloud store. Chat ids (`kanban_notify_subs`)
   and local paths never leave. Encrypt at rest (the platform default) and consider client-side encryption of
-  `body`/`result`/comments as a follow-up. Access tokens live in the gateway secret store only.
+  `body`/`result`/comments as a follow-up: transcripts are end-to-end encrypted (Worker nodes and transcripts), cards are
+not yet. Access tokens live in the gateway secret store only.
 - **Service outage.** Gateways degrade to local-only for reads and edits, running cards finish within their lease,
   and new claims pause. This is visible to the user as cards that stay `ready`. The dashboard should show a
   "sync offline" chip.
@@ -995,7 +1281,8 @@ For the Kanban source of truth, none yet. Proposed: `hermes_cli/kanban_db_sync.p
 `plugins/kanban-sync/` (sync worker, enroll/import/detach CLI), and the existing separate service repo (Worker +
 Durable Object), which already runs the replication described under Current state. Built for Liveness: scope
 heartbeats in the service client and core `kanban_origin_ledger.project` (tests:
-`test_kanban_origin_scope_heartbeat.py`).
+`test_kanban_origin_scope_heartbeat.py`). Worker nodes and transcripts: none yet; the worker node model reuses the
+runners plugin's workspace-job contract (`plugins/runners/contracts/`).
 
 ## Tests
 
@@ -1005,7 +1292,21 @@ atomically); lease tests (two gateways race, lease expiry mid-run, a stale holde
 replay (outbox survives restart, idempotent re-POST); and the import/remap tests. Added by Ownership: a holder that
 cannot renew stops before `lease_expires`; an operator reset followed by the old holder's `complete` is rejected; an
 `at_most_once` card is never claimed offline. Added by the ledger retirement: the shadow diff of remote work per
-session. Liveness has its tests already (see Liveness).
+session. Liveness has its tests already (see Liveness). Added by worker nodes and transcripts: the privacy test (a fixture transcript
+with a sentinel string never appears in any outbound request body or stored record, client HTTP captured); a
+fingerprint mismatch refuses the wrap; a device without approval cannot read; a revoked device gets no key for the
+new epoch; a dropped or reordered record is detected through the hash chain; a worker node's signature cannot approve
+an action; a stale owner epoch's write is rejected; placement (`runs_on` against registry labels, a node cannot take
+work by advertising a label, `pinned_only` machines refuse unpinned work); a device-log entry without a valid
+user-device signature is rejected; a stale owner stops starting turns after `owner_ttl`; a withheld record is
+reported when the signed head is ahead of the feed; a session renders from the local copy with its machine
+unreachable; W0 logs a reason for every reuse miss. Trust and fencing: a device without operator `init` never
+creates a genesis; a forked log fails pairing; pairing refuses keys that do not match their commitment; an approval
+naming another record's hash, or reused, is refused; an old-epoch record after the revoke seq is rejected while an
+offline pre-revoke one is accepted; a revoked machine's access token fails on the next request; an epoch change
+without a valid signature is reported as a fork; an owner stops starting turns `owner_ttl` after its last confirmed
+send, including across sleep; the turn cut-off kills its background processes; an unconfirmed owner stops
+heartbeating.
 
 ## Gotchas
 
