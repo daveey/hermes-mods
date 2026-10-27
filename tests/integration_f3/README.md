@@ -51,9 +51,15 @@ the interpreter. Core import provenance is asserted.
 - A held first draft must never reach extraction, cards, stream or persisted
   history. Events require `judge(first), judge(accepted), extract(accepted)`.
 
+- Standalone user-steps discovery (ask-gate disabled) repeats a resolved request
+  with plain/framed replies, with and without a verification continuation. Its
+  buffering declaration must prevent raw stale stream/interim emission; returned
+  and SQLite messages agree with the held reply and no new cards appear.
+- Compatibility tests simulate missing runtime capabilities and registration
+  failure through normal discovery; neither plugin may load a partial unsafe path.
+
 This does not prove fuzzy/semantic identity, account/project retirement, trusted
-reopen, external resolution/publication races, old-core compatibility or live
-Desktop rendering.
+reopen, external resolution/publication races, or live Desktop rendering.
 
 ## Baseline finding and corrective verification (not release acceptance)
 

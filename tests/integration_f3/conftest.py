@@ -62,8 +62,9 @@ def harness(tmp_path, monkeypatch, request):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_USER_STEPS_FRAME", "1")
+    enabled = getattr(request, "param", ["ask-gate", "user-steps"])
     home.joinpath("config.yaml").write_text(
-        "plugins:\n  enabled: [ask-gate, user-steps]\nagent:\n  pre_final_gate_max: 1\n"
+        f"plugins:\n  enabled: [{', '.join(enabled)}]\nagent:\n  pre_final_gate_max: 1\n"
         "model:\n  default: test/model\n  provider: openai-compat\n"
         "  base_url: https://example.invalid/v1\n  context_length: 128000\n"
         "auxiliary:\n  title_generation:\n    enabled: false\n",
@@ -80,10 +81,12 @@ def harness(tmp_path, monkeypatch, request):
         manager.discover_and_load()
         gate_callbacks = manager.iter_hook_callbacks("pre_final_gate")
         transforms = manager.iter_hook_callbacks("transform_llm_output")
-        assert len(gate_callbacks) == len(transforms) == 1, manager._plugins
-        ask = sys.modules[gate_callbacks[0].__module__]
+        assert len(transforms) == 1, manager._plugins
+        ask_callbacks = [cb for cb in gate_callbacks if cb.__name__ == 'pre_final_gate']
+        ask = sys.modules[ask_callbacks[0].__module__] if 'ask-gate' in enabled else None
         steps = sys.modules[transforms[0].__module__]
-        assert Path(ask.__file__).is_relative_to(home)
+        if ask is not None:
+            assert Path(ask.__file__).is_relative_to(home)
         assert Path(steps.__file__).is_relative_to(home)
         agent = AIAgent(session_id="f3-portable", api_key="test-only",
                         base_url="https://example.invalid/v1", provider="openai-compat",

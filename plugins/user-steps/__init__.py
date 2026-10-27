@@ -146,6 +146,32 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
         return None  # fail open: the reply is shown unchanged
 
 
+def publication_buffer(**_: Any):
+    """Keep final drafts private until process_reply reconciles the source ledger.
+
+    This gate does not judge or hold; its buffering declaration prevents a
+    standalone user-steps transform from trying to retract already-visible text.
+    """
+    return None
+
+
+publication_buffer.needs_buffer = True
+
+
+def _require_publication_contract() -> None:
+    try:
+        from agent.pre_final_gate import PRE_FINAL_GATE_CAPABILITIES
+    except ImportError as exc:
+        raise RuntimeError("user-steps requires post-transform buffered publication; update core first") from exc
+    contract = PRE_FINAL_GATE_CAPABILITIES
+    if not isinstance(contract, dict) or any(
+        contract.get(key) is not True for key in ("needs_buffer", "post_transform_release")
+    ):
+        raise RuntimeError("user-steps requires post-transform buffered publication; update core first")
+
+
 def register(ctx) -> None:
+    _require_publication_contract()
+    ctx.register_hook("pre_final_gate", publication_buffer)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)

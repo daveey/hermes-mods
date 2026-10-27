@@ -18,10 +18,14 @@ def test_old_runtime_does_not_load_partial_ask_gate(harness, monkeypatch, caplog
     assert len(loaded) == 1 and not loaded[0].enabled
     assert "registration refused" in loaded[0].error
     assert "Install a compatible Hermes core" in caplog.text
-    assert list(h.manager.iter_hook_callbacks("pre_final_gate")) == []
-    for hook in ("pre_llm_call", "pre_tool_call", "post_tool_call"):
+    for hook in ("pre_final_gate", "pre_llm_call", "pre_tool_call", "post_tool_call"):
         assert all("ask_gate" not in cb.__module__ for cb in h.manager.iter_hook_callbacks(hook))
-    assert list(h.manager.iter_hook_callbacks("transform_llm_output")), "Unrelated plugin must still load"
+    # user-steps needs buffering/publication, not replacement or hold budgets.
+    steps = next(p for p in h.manager._plugins.values() if p.manifest.name == "user-steps")
+    supported = missing in {"replace", "accepts_hold_budget"}
+    assert steps.enabled is supported
+    assert bool(list(h.manager.iter_hook_callbacks("transform_llm_output"))) is supported
+    assert bool(list(h.manager.iter_hook_callbacks("pre_final_gate"))) is supported
 
 
 def test_final_registration_failure_rolls_back_earlier_hooks(harness, monkeypatch, caplog):
@@ -43,4 +47,7 @@ def test_final_registration_failure_rolls_back_earlier_hooks(harness, monkeypatc
     assert "test final registry unavailable" in caplog.text
     for hook in ("pre_llm_call", "pre_tool_call", "post_tool_call", "pre_final_gate"):
         assert all("ask_gate" not in cb.__module__ for cb in h.manager.iter_hook_callbacks(hook))
-    assert list(h.manager.iter_hook_callbacks("transform_llm_output"))
+    assert list(h.manager.iter_hook_callbacks("transform_llm_output")) == []
+    steps = next(p for p in h.manager._plugins.values() if p.manifest.name == "user-steps")
+    assert not steps.enabled
+    assert "test final registry unavailable" in steps.error

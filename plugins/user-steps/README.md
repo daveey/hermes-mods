@@ -43,6 +43,27 @@ before the reply is shown, ~2 s). Env `USER_STEPS_PROVIDER` / `USER_STEPS_MODEL`
 Trace: one JSON line per extraction in `~/.hermes/cache/user-steps/trace.jsonl` (source model/regex/skip, new and
 resolved ids, framed, errors).
 
+## Buffered publication (core-first rollout)
+
+A no-op `pre_final_gate` callback declares `needs_buffer=True`, independently of
+ask-gate. It neither judges nor holds a reply: it keeps final drafts private until
+the existing output transform reconciles the ledger. Tool-call commentary retains
+core's existing release behavior. Buffered verification interims stay private.
+Registration requires core to advertise literal `True` for `needs_buffer` and
+`post_transform_release` in `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES`.
+Unsupported core refuses this plugin before hooks are installed; update core first.
+This refusal is not a claim of active protection on an older runtime.
+
+Buffering is static for foreground turns while the plugin is loaded, including
+when the extraction off switch is set; disable the plugin itself to remove its
+buffering contribution. Core still excludes its normal background contexts.
+
+`tests/integration_f3/test_user_steps_only.py` exercises real normal discovery,
+AIAgent streaming, verification continuation, source retirement, and SQLite
+publication with only user-steps enabled (plain and framed replies). See
+`tests/integration_f3/README.md` for the explicit checkout command. Compatibility
+integration also checks refusal and registration rollback for both plugins.
+
 ## Lifecycle source contract
 
 Every successful `Ledger.edit` advances a writer-owned integer `revision` under
