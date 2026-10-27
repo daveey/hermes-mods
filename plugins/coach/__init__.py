@@ -288,7 +288,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if not only:
                 return None
             th_unv = so.setting("diff_review_threshold")
-            thresholds = {"unverified": th_unv} if repos and th_unv is not None else None
+            thresholds = dict(cfg.get("thresholds") or {})
+            if repos and th_unv is not None:
+                thresholds["unverified"] = th_unv
             s1 = _load("system_one")
             m = s1.mode()
             screen = ((lambda cands: s1.reply_screen(cands, ask, log_lines, final_response, rc.profile_text()))
@@ -304,8 +306,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     return {"action": "continue", "message": msg}
                 if "unverified" not in cfg["rules"]:  # added only for the review: fall back to the next real rule
                     v = hit["verdict"]
-                    rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response) and v.get(r, 0) >= cfg["threshold"]
-                            and r != "unwatched"]
+                    rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response)
+                            and v.get(r, 0) >= (cfg.get("thresholds") or {}).get(r, cfg["threshold"])
+                            and r != "unwatched" and not (r == "report_only" and rc.scope_limited(ask))]
                     hit = None
                     if rest:
                         r = max(rest, key=lambda x: v[x])

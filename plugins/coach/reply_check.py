@@ -1,6 +1,6 @@
 """reply_check: look at the agent's final answer for a turn BEFORE the turn ends (pre_verify hook).
 
-Four anti-patterns, measured in the user's own history (coach gap report 2026-10-14):
+Five anti-patterns, measured in the user's own history (coach gap report 2026-10-14):
 - handoff:     the agent hands the user a step it could plausibly do itself (click/log in/run/paste...).
 - confirm:     the agent ends by asking permission for a reversible next step ("Want me to ...?").
 - unverified:  the agent claims done/fixed/working without checking on the user's real path.
@@ -8,6 +8,10 @@ Four anti-patterns, measured in the user's own history (coach gap report 2026-10
                runs finish") but nothing will wake the session: no background process, kanban card, goal or
                subagent. The turn ends, the sidebar paints the row done, and the promise is never kept.
                A deterministic wake-source check runs first, so the judge only sees promises with no waker.
+- report_only: the agent describes or diagnoses a problem it could fix and ends there: no fix, no started fix
+               (card, worker, PR), no concrete proposal ("Not fixed. No action is needed from you."). An explicit
+               scope limit in the user's ask ("analysis only", "just tell me", "don't change anything") skips it
+               before the judge runs.
 
 Layer 1 (here, zero latency) are cheap regex prefilters; Layer 2 is an LLM judge (aux task
 `coach_reply`) that sees the user's ask, the turn's tool log and the reply. Only a judge verdict
@@ -54,8 +58,48 @@ DONE_RE = re.compile(
     r"\b(done|fixed|works now|is working|now works|verified|deployed|shipped|is live|it'?s live|resolved|"
     r"all set|should (?:now )?(?:work|be fixed|be working)|ready to use|in place|complete[d]?)\b", re.I)
 
-RULES = ("handoff", "confirm", "unverified", "unwatched")
-DEFAULT_RULES = ("handoff", "confirm", "unwatched")
+# report_only: high recall over the reply's tail; the judge supplies the precision. Phrases from the 2026-10-27
+# labeled set (report-only endings on fixable problems) plus negated status verbs, which carry most of the misses.
+REPORT_RE = re.compile(
+    r"\bnot (?:been |yet )?fixed\b|\bdiagnos(?:ed|is)\b|\bnot yet\b"
+    r"|\b(?:have|has|had|did)(?:n't|n’t| not) (?:yet )?(?:\w+ ){0,2}?(?:fixed|established|verified|checked|confirmed|"
+    r"paused|installed|deployed|shipped|sent|done|started|changed|touched|followed|taken|found)\b"
+    r"|\b(?:is|are|was|were)(?:n't|n’t| not) (?:yet )?(?:fixed|deployed|installed|live|shipped|verified|complete|done|"
+    r"sent|processed|enforced|resolved|working)\b"
+    r"|\bremains? \w+|\bstill (?:broken|open|failing|unfinished|stale|not|a\b|lists?|uses?|shows?|returns?|needs?|"
+    r"blocked|missing|wrong|down|pending|running|queued|in shadow|off)"
+    r"|\bstill (?:\w+ )?(?:hidden|being|untested|unverified|unmeasured|alerting|refus\w+)\b"
+    r"|\b(?:unresolved|unfixed|untested|unmeasured|unverified)\b|\bthe existing (?:owner|task|card|worker)\b"
+    r"|\bexisting (?:owner|task|card|worker)\b|\b(?:already )?owns (?:it|this|that|the)\b|\bowner\b|\brelayed\b"
+    r"|\bno (?:further )?action (?:is )?needed\b|\bnothing (?:else )?needs you\b|\bneeds your attention\b"
+    r"|\b(?:doesn't|doesn’t|does not|don't|don’t) (?:mean anything )?needs? your\b"
+    r"|\byou can (?:safely )?ignore\b|(?:^|\n)\W*(?:open|remaining|still open|not fixed|gaps?|caveats?|known issues?)\b\W*:"
+    r"|\bstill open\b|\bremaining\b|\bgap\b|\bawaiting\b|\bno longer\b|\bhanded (?:that |it )?back\b"
+    r"|\bnot (?:processed|enforced|deployed|installed|sent|reproduced|verified)\b"
+    r"|\b(?:didn|haven|hasn|aren|isn|won|can)(?:'|’)?t\b"
+    r"|\bneeds? (?:conversion|extending|fixing|a fix|work|to be (?:fixed|updated|converted|extended))\b"
+    r"|\brefus(?:es|ing)\b|\bcontinues? to (?:alert|fail|error|break|show)\b|\bone limit\b|\blimitation\b",
+    re.I)
+# An explicit scope limit in the user's ask: a diagnosis is what they asked for, so report_only never applies.
+SCOPE_LIMIT_RE = re.compile(
+    r"\b(?:analysis|analy[sz]e|diagnos(?:is|e)|research|investigat(?:e|ion)|report|read)[- ]only\b"
+    r"|\bjust (?:tell me (?:why|what|how|if|whether)|explain|answer)\b|\bonly (?:tell|explain|want to know|report)\b"
+    r"|\bplan (?:it )?first\b|\bdon'?t (?:change|touch|fix|edit|modify|mutate|ship|deploy) (?:anything|it|this|that|a thing)\b"
+    r"|\bdo not (?:change|touch|fix|edit|modify|mutate) (?:anything|it|this|that)\b"
+    r"|\b(?:make |with )?no (?:edits|changes|fixes|code changes|mutations)\b|\bwithout (?:changing|fixing|editing) (?:anything|it)\b"
+    r"|\bdon'?t fix\b|\bnot (?:to )?fix (?:it|anything)\b",
+    re.I)
+
+RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only")
+DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only")
+# Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
+# report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
+DEFAULT_THRESHOLDS = {"report_only": 0.75}
+
+
+def scope_limited(user_ask: str) -> bool:
+    """The user explicitly limited the turn to analysis ("analysis only", "just tell me", "don't change anything")."""
+    return bool(SCOPE_LIMIT_RE.search(user_ask or ""))
 
 
 def prefilter(reply: str) -> list[str]:
@@ -71,6 +115,8 @@ def prefilter(reply: str) -> list[str]:
         out.append("unverified")
     if WAIT_RE.search(r[-1200:]):
         out.append("unwatched")
+    if REPORT_RE.search(r[-1500:]):
+        out.append("report_only")
     return out
 
 
@@ -171,7 +217,7 @@ def wake_sources(session_id: str, tool_log: Optional[list] = None) -> list[str]:
 
 
 JUDGE_SYS = """You review an AI agent's final message for a turn, right before the turn ends, for a power user who wants
-the agent to self-serve and to verify its own work. Judge ONLY from the evidence shown. Score three independent
+the agent to self-serve and to verify its own work. Judge ONLY from the evidence shown. Score five independent
 probabilities (0-1):
 
 - handoff: the message asks the USER to perform a step (click, sign in, run a command, paste, approve a dialog,
@@ -196,10 +242,33 @@ probabilities (0-1):
   subagent). Score high when the agent's own follow-up depends on that outside work. Score low when the next step is
   the USER's (they will test, decide, or reply), when the agent says plainly that it is stopping and the user should
   ping it, or when the outside work's result needs no further action from the agent.
+- report_only: the message describes or diagnoses a problem (broken, stale, failing, stalled, unfinished, unmerged,
+  undeployed, "not fixed", "remains open", "owned by the existing card", "relayed to the owner", "no action needed
+  from you") that the agent could fix or start fixing itself, and ends WITHOUT fixing it, starting a fix (a kanban
+  card, worker/subagent or PR created in this turn's tool log for that problem) or proposing a concrete fix (what
+  would change and how). A vague "want me to look into it?" or "the next thing I'd look at is X" is not a proposal.
+  This user wants every fixable problem acted on, so:
+  * A QUESTION about a problem ("what is this?", "what's going on?", "why is X stuck/blocked?", "what am I supposed
+    to do with this?", "is it doing what I asked?") is NOT a scope limit. It means "explain it AND fix it". A reply
+    that explains and stops scores HIGH, even though it answered the question.
+  * A status report that names an unresolved, agent-fixable problem as an open leftover (a stale or wrong UI, a
+    stalled card/CI/worker, work "not yet" merged/deployed/started, a gap or follow-up left for later) and stops
+    scores high. "No action needed from you" / "nothing needs you" does not excuse it.
+  * Pointing at an existing owner (card, worker, other session) that "has it" scores high UNLESS the tool log shows
+    the agent checked that owner this turn (e.g. kanban_show / process poll) and it is actually running.
+  * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
+    send to it (cross_session / kanban_comment / kanban_create / delegate_task) and the message says what fix or
+    reproduction it sent.
+  * Asking or offering is a different failure: a message that proposes a concrete fix and asks for a go ("Go with
+    this policy?", "say if you want it fixed", "want me to apply it?") scores LOW here (the confirm rule covers it).
+  Score it LOW when: the user explicitly limited scope ("analysis only", "just tell me", "plan first", "don't change
+  anything"); the problem genuinely needs the user's hands, password, money, a physical device or a decision only
+  they can make, and the message says so; the message is a plan the user asked for; or no unresolved problem is left.
 
-Calibrate: 0.8+ means you'd bet the user will push back ("do it yourself" / "just do it" / "you have access").
+Calibrate: 0.8+ means you'd bet the user will push back ("do it yourself" / "just do it" / "you have access"; for
+report_only: "fix it" / "why aren't you fixing this?").
 
-Return ONLY JSON: {"handoff": p, "confirm": p, "unverified": p, "unwatched": p, "evidence": "<=25 words citing the message/tool log"}"""
+Return ONLY JSON: {"handoff": p, "confirm": p, "unverified": p, "unwatched": p, "report_only": p, "evidence": "<=25 words citing the message/tool log"}"""
 
 
 def _hermes_home():
@@ -270,11 +339,17 @@ NUDGES = {
                   "completion signal (result files, job/CI status) with a sensible interval and a time cap, then "
                   "exits with a short summary. Use a kanban card instead for multi-hour work. If you are actually "
                   "handing the follow-up to the user, say so plainly instead of promising it."),
+    "report_only": ("[coach] Your message ends on a problem you could fix ({evidence}) without fixing it, starting a "
+                    "fix or proposing one. The user wants problems fixed, not reported, and standing approval covers "
+                    "fixes. Fix it now if it's small or reversible. Otherwise start it (kanban_create with acceptance "
+                    "criteria, linked to this chat) and name the card. If it really is the user's call, propose the "
+                    "exact fix. Don't end on the diagnosis."),
 }
 
 
 def settings() -> dict:
-    """COACH_REPLY_RULES (comma list; "none" = off) and COACH_REPLY_THRESHOLD.
+    """COACH_REPLY_RULES (comma list; "none" = off), COACH_REPLY_THRESHOLD and COACH_REPLY_THRESHOLDS
+    ("rule=th,..." per-rule overrides on top of DEFAULT_THRESHOLDS).
 
     Defaults come from the 2026-10-14 backtest (360 real replies, hindsight gold labels that saw the user's
     reaction): handoff at 0.7 fired 11, 10 right (precision 0.91, recall 0.33); confirm at 0.7 fired 4, all
@@ -285,7 +360,15 @@ def settings() -> dict:
         th = float(os.environ.get("COACH_REPLY_THRESHOLD", "0.7"))
     except ValueError:
         th = 0.7
-    return {"rules": rules, "threshold": th}
+    ths = dict(DEFAULT_THRESHOLDS)
+    for part in os.environ.get("COACH_REPLY_THRESHOLDS", "").split(","):
+        k, _, v = part.partition("=")
+        if k.strip() in RULES:
+            try:
+                ths[k.strip()] = float(v)
+            except ValueError:
+                pass
+    return {"rules": rules, "threshold": th, "thresholds": ths}
 
 
 def aux_judge(system: str, prompt: str) -> str:
@@ -312,6 +395,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     `screen(candidates) -> {rule: p} | None` (a System One model) drops screened candidates below `screen_below`
     before the LLM judge; when no candidate survives, the LLM is skipped. `shadow` = log only, drop nothing."""
     cands = [r for r in prefilter(reply) if not only or r in only]
+    if "report_only" in cands and scope_limited(user_ask):
+        cands.remove("report_only")
     if "unwatched" in cands:
         try:
             if wake is None or wake():

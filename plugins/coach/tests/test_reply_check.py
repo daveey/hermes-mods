@@ -78,7 +78,7 @@ def test_check_respects_rule_allowlist_and_bad_judge_output():
 def test_settings_env(monkeypatch):
     monkeypatch.setenv("COACH_REPLY_RULES", "handoff,bogus")
     monkeypatch.setenv("COACH_REPLY_THRESHOLD", "0.9")
-    assert rc.settings() == {"rules": ["handoff"], "threshold": 0.9}
+    assert rc.settings()["rules"] == ["handoff"] and rc.settings()["threshold"] == 0.9
     monkeypatch.setenv("COACH_REPLY_RULES", "none")
     assert rc.settings()["rules"] == []
 
@@ -109,7 +109,10 @@ def test_pre_verify_hook_nudges_once_per_turn(tmp_path, monkeypatch):
 def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
     monkeypatch.delenv("COACH_REPLY_THRESHOLD", raising=False)
-    assert rc.settings() == {"rules": ["handoff", "confirm", "unwatched"], "threshold": 0.7}
+    monkeypatch.delenv("COACH_REPLY_THRESHOLDS", raising=False)
+    cfg = rc.settings()
+    assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only"] and cfg["threshold"] == 0.7
+    assert set(cfg["thresholds"]) == {"report_only"}
 
 
 ORPHAN = ("Everything is running.\n\nOnce the last runs finish, around 03:30 UTC, I'll build the tables from the "
@@ -149,3 +152,124 @@ def test_wake_sources_tool_log_and_live_process(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "tools.process_registry", None)  # force the processes.json fallback
     assert rc.wake_sources("s1", []) == ["process:proc_live"]
     assert rc.wake_sources("s3", []) == []
+
+
+# --- report_only: the reply ends on a diagnosis of a problem the agent could fix, without fixing it -------------
+# Endings from the labeled eval set (report_only + agent_fixable), trimmed to the phrase that carries the signal.
+REPORT_ONLY_ENDINGS = [
+    "Root cause: the watcher drops the event when the panel is hidden. Diagnosed, not fixed.",
+    "You can ignore this prompt. I haven't fixed the panel itself.",
+    "Relayed the 98% disk warning to the existing owner.",
+    "The card ran, but the automation gap remains unfixed.",
+    "No further action is needed from you; the safeguard is still not deployed.",
+    "Open: the retry path still drops the last message.",
+    "Still open: the sidebar badge is stale after a restart.",
+    "**Remaining:** the hub copy is stale.",
+    "The fix is merged but not yet live on the MacBook.",
+    "The export job is still failing on the second batch.",
+    "I haven't established yet whether those cooldowns are justified or stale.",
+    "Both posts are still hidden: the blog index doesn't mention either of them.",
+    "The outcome baseline remains unmeasured; no new analytics automation was deployed.",
+    "Nothing needs you here; the existing card owns it.",
+]
+FINISHED_WORK = [
+    "Fixed: the sidebar now scrolls. I reloaded Desktop and checked it on your session.",
+    "Here are the three options I found, with their trade-offs.",
+    "Merged and deployed. The tests pass and the live page shows the new label.",
+]
+
+
+def test_prefilter_report_only_catches_real_endings():
+    for s in REPORT_ONLY_ENDINGS:
+        assert "report_only" in rc.prefilter(s), s
+
+
+def test_prefilter_report_only_skips_finished_work():
+    for s in FINISHED_WORK:
+        assert "report_only" not in rc.prefilter(s), s
+
+
+def test_prefilter_report_only_reads_only_the_tail():
+    old = "Earlier the build was not fixed. " + "Then I fixed it and verified the result. " * 60
+    assert len(old) > 1600 and "report_only" not in rc.prefilter(old)
+
+
+def test_parse_verdict_reads_report_only():
+    v = rc.parse_verdict('ok {"handoff": 0.1, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0.91, '
+                         '"evidence": "ends on not fixed"}')
+    assert v["report_only"] == 0.91 and v["evidence"] == "ends on not fixed"
+    assert rc.parse_verdict('{"handoff": 0.2, "evidence": ""}')["report_only"] == 0.0  # older judge output
+    assert '"report_only"' in rc.JUDGE_SYS and "report_only" in rc.RULES and "report_only" in rc.DEFAULT_RULES
+
+
+REPORT_ASK = "what am I supposed to do with this?"
+REPORT_REPLY = "You can ignore this prompt. The panel is stale because its cache never refreshes. I haven't fixed the panel itself."
+
+
+def test_check_fires_report_only_with_spec_nudge():
+    llm, calls = _judge({"handoff": 0, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0.9,
+                         "evidence": "ends on 'I haven't fixed the panel'"})
+    hit = rc.check(REPORT_REPLY, REPORT_ASK, ["-> terminal(ls)"], llm, threshold=0.7,
+                   thresholds=rc.settings()["thresholds"])
+    assert hit["rule"] == "report_only" and len(calls) == 1
+    assert hit["nudge"].startswith("[coach] Your message ends on a problem you could fix (ends on 'I haven't fixed")
+    assert "kanban_create with acceptance criteria" in hit["nudge"] and "Don't end on the diagnosis." in hit["nudge"]
+
+
+def test_check_report_only_respects_its_own_threshold():
+    th = rc.settings()["thresholds"]["report_only"]
+    llm, _ = _judge({"report_only": max(0.0, th - 0.05), "evidence": "e"})
+    assert rc.check(REPORT_REPLY, REPORT_ASK, [], llm, threshold=0.0, only=["report_only"],
+                    thresholds={"report_only": th}) is None
+
+
+def test_thresholds_env_override(monkeypatch):
+    monkeypatch.setenv("COACH_REPLY_THRESHOLDS", "report_only=0.95,bogus=0.1,handoff=x")
+    assert rc.settings()["thresholds"] == {"report_only": 0.95}
+
+
+SCOPE_LIMITED_ASKS = [  # explicit limits: a diagnosis is exactly what was asked for
+    "Analysis only: why is the sidebar badge stale?",
+    "just tell me why the export job fails, don't fix it",
+    "Plan first. What is wrong with the retry path?",
+    "Don't change anything, I only want to know why CI is red.",
+    "Diagnose the flaky test but make no edits; report evidence only.",
+    "Read-only: figure out why the hub disk is at 98%.",
+]
+
+
+def test_scope_limited_ask_never_fires_report_only_and_skips_the_judge():
+    llm, calls = _judge({"report_only": 1.0, "evidence": "e"})
+    for ask in SCOPE_LIMITED_ASKS:
+        assert rc.scope_limited(ask), ask
+        assert rc.check(REPORT_REPLY, ask, [], llm, only=["report_only"]) is None, ask
+    assert calls == []
+    for ask in [REPORT_ASK, "why is this red?", "fix the export job", "is it stuck?"]:
+        assert not rc.scope_limited(ask), ask
+
+
+def test_physical_step_reply_is_left_to_the_judge():
+    reply = "The sensor is not fixed: its battery is dead. Swap the battery in the hall sensor; nothing else is open."
+    llm, calls = _judge({"handoff": 0.1, "report_only": 0.2, "evidence": "needs a physical battery swap"})
+    assert "report_only" in rc.prefilter(reply)
+    assert rc.check(reply, "why is the hall sensor offline?", [], llm, thresholds=rc.settings()["thresholds"]) is None
+    assert len(calls) == 1
+
+
+def test_pre_verify_hook_holds_a_report_only_reply(tmp_path, monkeypatch):
+    monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
+    spec = importlib.util.spec_from_file_location("coach_init_ro", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcl = mod._load("reply_check")
+    monkeypatch.setattr(rcl, "aux_judge", lambda s, p: json.dumps(
+        {"handoff": 0.0, "confirm": 0.0, "unverified": 0.0, "unwatched": 0.0, "report_only": 0.93,
+         "evidence": "stops at 'haven't fixed the panel'"}))
+    store = core.Store(root=tmp_path / "coach")
+    coach, hooks = mod.build(store=store, checkout=None)
+    hooks["pre_llm_call"](session_id="s9", user_message=REPORT_ASK)
+    out = hooks["pre_verify"](session_id="s9", attempt=0, final_response=REPORT_REPLY)
+    assert out and out["action"] == "continue" and "Don't end on the diagnosis." in out["message"]
+    logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert any(r["event"] == "reply_nudge" and r["rule"] == "report_only" for r in logged)

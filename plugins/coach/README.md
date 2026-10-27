@@ -45,13 +45,24 @@ this user's agents can reach). A hit keeps the turn going with a nudge the user 
 | `handoff` | the reply hands the user a step the agent could do itself (log in, click, run, paste...) | try it first with shell/ssh/browser/vault/token-broker; hand off only what needs hands or judgment, and say why |
 | `confirm` | the reply ends with "Want me to…?" about a reversible, in-scope step | proceed, verify, report; ask only before irreversible or external actions |
 | `unwatched` | the reply promises to continue after outside work finishes ("I'll write the report once the runs finish", "waiting on CI") and `wake_sources()` finds nothing armed: no live background process for the session or its compression ancestors, no open kanban card, no active goal, and no delegate/kanban/cron call this turn. A row like this gets painted done and its follow-up never runs | arm one `terminal(background=true, notify=true)` watcher on the real completion signal with a time cap (a kanban card for multi-hour work), or say plainly that the user owns the follow-up |
+| `report_only` | the reply describes or diagnoses a problem the agent could fix and ends there: no fix, no started fix (card, worker or PR this turn) and no concrete proposal ("Not fixed. No action is needed from you.", "relayed to the existing owner", an "Open:" list). An explicit scope limit in the user's ask ("analysis only", "just tell me why", "plan first", "don't change anything", "no edits", "read-only") drops it before the judge runs. Own threshold: `report_only=0.75` | fix it now if small or reversible; otherwise start it (`kanban_create` with acceptance criteria, linked to the chat) and name the card; if it really is the user's call, propose the exact fix |
 | `unverified` (off by default) | "done/fixed" with no check on the user's real path | verify on the user's path or say what's unchecked. With `diff_review` on it is also judged on turns that changed a git repo, and a hit there runs an Opus review of the diff (see Second opinions) |
 
 Measured on 360 real replies against hindsight labels (the labeler also saw the user's next message). At
 threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
 samples are small (n=120), so treat these numbers as early. `unverified` showed no usable signal.
 `unwatched` checks wake sources deterministically before the judge runs, so a reply with a live watcher costs no LLM call. Of 3,260 recent Desktop replies, 299 matched the prefilter. On three real cases the judge scored the orphaned "once the runs finish, I'll…" reply 0.85 and scored the user-owned next step and the reply that armed a watcher below threshold. Watchers die when their backend restarts, so a promise made before a restart can become orphaned later; the rule only catches this at turn end.
-Settings: `COACH_REPLY_RULES` (comma list or `none`) and `COACH_REPLY_THRESHOLD`. Needs core
+`report_only` (2026-10-27, 762 labeled MacBook Desktop reply endings, split 70/30 by session; judge = the live
+`coach_reply` model claude-sonnet-5-5; harness `eval/report_only_eval.py`): the prefilter keeps 96% of the positive
+human-turn endings and passes 71% of human-turn replies to the judge. At 0.75, held-out human turns: precision
+0.67, recall 0.43 (10 of 15 fires right, 23 positives); held-out event turns: 2 fires, both right, recall 0.07;
+train human 0.68 / 0.35. The acceptance target (precision >= 0.85 and recall >= 0.6) is NOT met. claude-opus-5-5
+as judge scored 0.82 / 0.39 held out at the same threshold. Most disagreements are label calls: replies that relay a
+problem to a supervisor session (labeled "started") and small caveats left in finished work (labeled report_only).
+Six explicit scope-limit fixtures (`tests/fixtures/report_only_scope_limits.json`) never fire; the deterministic
+`scope_limited()` guard drops them and the judge alone scores them <= 0.1.
+Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` and `COACH_REPLY_THRESHOLDS`
+(`rule=th,...` per-rule overrides; default `report_only=0.75`). Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
 
