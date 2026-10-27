@@ -1,25 +1,16 @@
 /**
- * User Steps — what this chat is waiting for YOU to do, with one-click answers.
- *
- * Two surfaces, one ledger (the `user-steps` agent plugin, REST /api/plugins/user-steps):
- *   - `::user-step{id="us_…[,us_…]" s="<session>" t="<paragraph text>"}` directive: the agent plugin replaces the
- *     paragraph of a reply that asks you something with this leaf. It renders as an amber-framed box with the
- *     original text and the step's buttons, fetched from GET /step by id. Ledger unreachable → the `t` text as a
- *     plain paragraph (nothing is lost).
- *   - "For you" strip (COMPOSER_AREAS.top): the focused chat's open ledger steps, oldest first, plus its blocked
- *     human Kanban cards (blocked-panel's data via window.__blockedPanel; the chat's own rolling user-steps card
- *     is left out, its steps are already listed). Hidden when empty.
- * Buttons by kind: approve [Do it][No] · do [Done][Can't] · choose [one per option, recommended first]
- * · input [Reply…] (prefills the composer). A click sends a short VISIBLE user turn ("Go: …", "✓ Done: …",
- * "Chose: …") through host.composer.submit and, once sent, POSTs /resolve (which archives the chat's rolling
- * blocked card after the last step). Kanban cards keep blocked-panel's Done → unblock / Reply & unblock.
+ * Session decisions: one canonical v2 queue above the composer. Transcript directives
+ * are passive receipts; legacy steps/cards are read-only references with a draft-only
+ * request for complete context. Authorization uses durable owner-routed REST operations,
+ * never composer.submit plus resolve or generic card unblocking. Existing links,
+ * preview navigation and separately collapsed agent issues remain available.
  */
 import { COMPOSER_AREAS, TRANSCRIPT_DIRECTIVE_AREA, host, useValue } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 6
+const VERSION = 7
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -144,10 +135,7 @@ export async function performAction(step, action, sessionId, deps = {}) {
     composer?.focus?.(sessionId)
     return ok === false ? 'no-composer' : 'drafted'
   }
-  const ok = composer?.submit?.(sessionId, action.text)
-  if (!ok) return 'no-composer'
-  await call(`${BASE}/resolve`, { method: 'POST', body: { id: step.id, session: str(sessionId), resolution: action.resolution, by: 'desktop' } })
-  return 'sent'
+  throw new Error('Legacy actions cannot authorize or resolve work. Request a complete canonical action.')
 }
 
 /** Defense against old/malformed blocked-panel snapshots. Presentation, not authorization. */
@@ -231,7 +219,7 @@ const emit = () => subs.forEach(fn => fn(snapshot))
 const DISMISS_KEY = 'hermes.userSteps.dismissedIssues.v1'
 const DISMISS_CAP = 300
 let dismissed = null
-export const issueKey = i => `${i?.board || 'default'}:${i?.id}:${i?.at ?? ''}`
+export const issueKey = i => JSON.stringify([i?.gatewayId || i?.gateway || i?.connectionId || '', i?.profile || '', i?.board || 'default', i?.id, i?.at ?? ''])
 function dismissedSet() {
   if (dismissed) return dismissed
   try {
@@ -260,13 +248,15 @@ export function dismissIssues(list) {
 function blockedPanel() {
   return typeof window !== 'undefined' ? window.__blockedPanel : null
 }
+const matchingBlocked = (s, route) => s?.stored === route.session && (!s.connectionId || s.connectionId === route.connectionId) && (!s.profile || s.profile === route.profile)
 
 function attachKanban() {
   if (unsubKanban) return
   const bp = blockedPanel()
   if (typeof bp?.subscribe !== 'function') return
   unsubKanban = bp.subscribe(s => {
-    snapshot = { ...snapshot, kanban: s?.stored === snapshot.stored ? s.items || [] : [], issues: s?.stored === snapshot.stored ? s.issues || [] : [] }
+    const match = matchingBlocked(s, decisionRoute()) && snapshot.scope === routeKey(decisionRoute())
+    snapshot = { ...snapshot, kanban: match ? s.items || [] : [], issues: match ? s.issues || [] : [] }
     emit()
   })
 }
@@ -284,37 +274,38 @@ export async function refresh(call = api) {
       snapshot = { ...snapshot, stored, ledger: { steps: [], card: null } }
       return emit()
     }
-    const connectionId = activeConnection()
-    let ledger = snapshot.stored === stored && snapshot.ledger.connectionId === connectionId
+    const route = decisionRoute()
+    const connectionId = route.connectionId
+    let ledger = snapshot.scope === routeKey(route)
       ? snapshot.ledger : { connectionId, steps: [], card: null }
     let ok = snapshot.ok
     try {
-      const r = await call(`${BASE}/steps?session=${encodeURIComponent(stored)}`, { connectionId, timeoutMs: 6_000 })
+      if (host.state?.focusedSessionOwner && !connectionId) throw Error('Session owner unavailable')
+      const r = await call(`${BASE}/steps?session=${encodeURIComponent(stored)}`, { ...route, timeoutMs: 6_000 })
       // A connection switch may keep the same session ID. Drop the old owner's
       // response before it can populate either the strip or the step cache.
-      if (focusedId() !== stored || activeConnection() !== connectionId) {
+      if (!currentRoute(route)) {
         rerun = true
         return
       }
       ledger = { connectionId, steps: Array.isArray(r?.steps) ? r.steps : [], card: r?.card || null, own_cards: Array.isArray(r?.own_cards) ? r.own_cards : [] }
       ok = true
-      const open = new Set(ledger.steps.map(s => s.id))
-      for (const [sid, hit] of stepCache) if ((hit.step?.status || 'open') === 'open' && !open.has(sid) && hit.step?.session && snapshot.ledger.steps.some(x => x.id === sid)) stepCache.delete(sid)
-      for (const s of ledger.steps) stepCache.set(s.id, { at: Date.now(), step: s })
+      for (const s of ledger.steps) stepCache.set(JSON.stringify([connectionId, route.profile, stored, s.id]), { at: Date.now(), step: s })
     } catch (e) {
       ok = false
       log('steps fetch failed', e?.message || e)
     }
-    if (focusedId() !== stored || activeConnection() !== connectionId) {
+    if (!currentRoute(route)) {
       rerun = true
       return
     }
     const bp = blockedPanel()?.snapshot
     snapshot = {
       stored,
+      scope: routeKey(route),
       ledger,
-      kanban: bp?.stored === stored ? bp.items || [] : snapshot.stored === stored ? snapshot.kanban : [],
-      issues: bp?.stored === stored ? bp.issues || [] : snapshot.stored === stored ? snapshot.issues || [] : [],
+      kanban: matchingBlocked(bp, route) ? bp.items || [] : snapshot.scope === routeKey(route) ? snapshot.kanban : [],
+      issues: matchingBlocked(bp, route) ? bp.issues || [] : snapshot.scope === routeKey(route) ? snapshot.issues || [] : [],
       ok
     }
     emit()
@@ -332,7 +323,8 @@ export const getSnapshot = () => snapshot
 function subscribe(fn) {
   subs.add(fn)
   if (!timer) {
-    timer = setInterval(() => (typeof document !== 'undefined' && document.hidden) || void refresh(), POLL_MS)
+    const poll = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
+    timer = setInterval(poll, POLL_MS)
     void refresh()
   }
   return () => {
@@ -346,11 +338,15 @@ function subscribe(fn) {
 
 /** GET /step for a directive id (cached 5 s so a re-render doesn't refetch). `call` injectable for tests. */
 export async function fetchStep(id, session, call = api) {
-  const hit = stepCache.get(id)
+  const route = decisionRoute()
+  const key = JSON.stringify([route.connectionId, route.profile, session, id])
+  const hit = stepCache.get(key)
   if (hit && Date.now() - hit.at < 5_000) return hit.step
-  const r = await call(`${BASE}/step?id=${encodeURIComponent(id)}&s=${encodeURIComponent(str(session))}`, { timeoutMs: 6_000 })
+  if (host.state?.focusedSessionOwner && !route.connectionId) throw Error('Session owner unavailable')
+  const r = await call(`${BASE}/step?id=${encodeURIComponent(id)}&s=${encodeURIComponent(str(session))}`, { ...route, timeoutMs: 6_000 })
+  if (!currentRoute(route)) return null
   const step = r?.step || null
-  if (step) stepCache.set(id, { at: Date.now(), step })
+  if (step) stepCache.set(key, { at: Date.now(), step })
   return step
 }
 
@@ -360,6 +356,8 @@ export const clearStepCache = () => stepCache.clear()
 
 const AMBER = 'var(--warning, #d29922)'
 const btn = (primary = false) => ({
+  minHeight: 44,
+  minWidth: 44,
   padding: '2px 10px',
   borderRadius: 6,
   border: `1px solid ${primary ? AMBER : 'color-mix(in srgb, var(--border, #8884) 90%, transparent)'}`,
@@ -429,40 +427,22 @@ function notify(kind, message) {
   }
 }
 
-function StepButtons({ step, deps, onDone }) {
-  const [busy, setBusy] = useState(false)
-  const click = async action => {
-    if (busy) return
-    setBusy(true)
-    try {
-      const sid = deps?.sessionId || focusedId() || step.session
-      const r = await performAction(step, action, sid, deps)
-      if (r === 'no-composer') notify('error', 'Open this chat\u2019s composer to answer the step.')
-      else if (r === 'sent') {
-        stepCache.set(step.id, { at: Date.now(), step: { ...step, status: 'resolved', resolution: action.resolution } })
-        onDone?.(action)
-        void refresh(deps?.call)
-        void blockedPanel()?.refresh?.(true) // the rolling card may just have been archived
-      }
-    } catch (e) {
-      notify('error', `Couldn\u2019t resolve the step: ${e?.message || e}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-  return jsx('div', {
-    style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' },
-    children: actionsFor(step).map((a, i) =>
-      jsx('button', { type: 'button', 'data-user-step-action': a.label, style: btn(a.primary), disabled: busy, onClick: () => click(a), children: a.label }, i)
-    )
-  })
+function requestComplete(text) {
+  const session = focusedId()
+  void host.composer?.setDraft?.(session, `Please provide a complete versioned action request inline for: ${text}`)
+  host.composer?.focus?.(session)
+}
+function StepButtons({ step }) {
+  return jsx('button', { type: 'button', style: actionStyle, onClick: () => requestComplete(step.text), children: 'Request complete action' })
 }
 
 /** The in-message framed box for `::user-step{...}`. */
 export function StepBox({ attrs, streaming, deps }) {
+  useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
+  const route = decisionRoute(), scope = routeKey(route)
   const ids = directiveIds(attrs)
   const fallback = decodeAttr(attrs?.t)
-  const [state, setState] = useState({ loading: true, steps: [], failed: false })
+  const [state, setState] = useState({ loading: true, steps: [], failed: false, scope })
   const [tick, setTick] = useState(0)
   const key = ids.join(',')
   // Re-read when the shared snapshot changes: a click in the strip (or the model resolving the step) must flip
@@ -474,19 +454,20 @@ export function StepBox({ attrs, streaming, deps }) {
   }, [])
   useEffect(() => {
     let live = true
+    setState(st => st.scope === scope ? st : { loading: true, steps: [], failed: false, scope })
     Promise.all(ids.map(id => fetchStep(id, attrs?.s, deps?.call)))
       .then(steps => {
-        if (!live) return
+        if (!live || !currentRoute(route)) return
         const got = steps.filter(Boolean)
         // keep a known step when a refetch fails transiently; never re-open one we saw resolved
-        setState(st => (got.length || !st.steps.length ? { loading: false, steps: got, failed: steps.every(s => !s) && !st.steps.length } : { ...st, loading: false }))
+        setState(st => (got.length || !st.steps.length ? { loading: false, steps: got, failed: steps.every(s => !s) && !st.steps.length, scope } : { ...st, loading: false }))
       })
-      .catch(() => live && setState(st => (st.steps.length ? { ...st, loading: false } : { loading: false, steps: [], failed: true })))
+      .catch(() => live && currentRoute(route) && setState(st => (st.steps.length ? { ...st, loading: false } : { loading: false, steps: [], failed: true, scope })))
     return () => {
       live = false
     }
-  }, [key, tick])
-  if (!ids.length || state.failed) {
+  }, [key, tick, scope, attrs?.s])
+  if (!ids.length || state.failed || state.scope !== scope) {
     // ledger unreachable / unknown ids: the paragraph as plain text (empty t = the text is already above)
     return fallback ? jsx('div', { 'data-user-step-fallback': '', style: { whiteSpace: 'pre-wrap' }, children: jsx(Linked, { text: fallback }) }) : null
   }
@@ -498,8 +479,8 @@ export function StepBox({ attrs, streaming, deps }) {
       margin: '6px 0',
       padding: '8px 10px',
       borderRadius: 8,
-      border: `1px solid color-mix(in srgb, ${AMBER} 60%, transparent)`,
-      background: `color-mix(in srgb, ${AMBER} 8%, transparent)`,
+      border: '1px solid var(--border)',
+      background: 'transparent',
       display: 'flex',
       flexDirection: 'column',
       gap: 6
@@ -508,7 +489,7 @@ export function StepBox({ attrs, streaming, deps }) {
       jsxs('div', {
         key: 'h',
         style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: AMBER, fontWeight: 600 },
-        children: [jsx('i', { 'aria-hidden': true, className: 'codicon codicon-account' }), 'For you']
+        children: ['Decision reference']
       }),
       jsx('div', { key: 't', 'data-user-step-text': '', style: { whiteSpace: 'pre-wrap', lineHeight: 1.5 }, children: jsx(Linked, { text }) }),
       state.loading && jsx('div', { key: 'l', style: { fontSize: 11, opacity: 0.6 }, children: 'Loading\u2026' }),
@@ -518,7 +499,7 @@ export function StepBox({ attrs, streaming, deps }) {
               style: { display: 'flex', flexDirection: 'column', gap: 4 },
               children: [
                 state.steps.length > 1 && jsx('div', { style: { fontSize: 12, opacity: 0.85 }, children: jsx(Linked, { text: s.text }) }),
-                !streaming && jsx(StepButtons, { step: s, deps, onDone: a => setState(st => ({ ...st, steps: st.steps.map(x => (x.id === s.id ? { ...x, status: 'resolved', resolution: a.resolution } : x)) })) })
+                jsx('small', { children: receiptStatus({ ...attrs, gatewayId: attrs?.gatewayId || s.requestOwner?.gatewayId, profile: attrs?.profile || s.requestOwner?.profile, requestId: attrs?.requestId || s.requestId }, ids, scope) })
               ]
             }, s.id)
           : jsx('div', { 'data-user-step-resolved': s.id, style: { fontSize: 11.5, opacity: 0.65 }, children: `\u2713 ${s.resolution || 'Resolved'}${state.steps.length > 1 ? ` \u2014 ${s.text}` : ''}` }, s.id)
@@ -531,70 +512,12 @@ const rowStyle = { display: 'flex', flexDirection: 'column', gap: 4, padding: '6
 
 function CardRow({ item }) {
   const bp = blockedPanel()
-  const [replying, setReplying] = useState(false)
-  const [note, setNote] = useState('')
-  const [busy, setBusy] = useState(false)
-  const unblock = async withNote => {
-    if (!actionableCard(item)) return
-    if (typeof bp?.unblockCard !== 'function') return notify('error', 'blocked-panel is not loaded')
-    setBusy(true)
-    try {
-      await bp.unblockCard(item, withNote ? note : '')
-      notify('success', `Unblocked ${item.id}`)
-      setReplying(false)
-      setNote('')
-      void bp.refresh?.(true)
-    } catch (e) {
-      notify('error', `Couldn\u2019t unblock ${item.id}: ${e?.message || e}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-  return jsxs('div', {
-    'data-user-steps-card': item.id,
-    style: rowStyle,
-    children: [
-      jsxs('div', {
-        style: { display: 'flex', gap: 6, alignItems: 'baseline', minWidth: 0 },
-        children: [
-          jsx('i', { 'aria-hidden': true, className: 'codicon codicon-debug-pause', style: { color: AMBER, flex: 'none' } }),
-          jsx('span', { style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }, title: item.title, children: item.title }),
-          jsx('span', { style: { marginLeft: 'auto', flex: 'none', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', opacity: 0.6 }, children: item.id })
-        ]
-      }),
-      jsx('div', { style: { fontSize: 12.5, lineHeight: 1.45 }, children: jsx(Linked, { text: cardSummary(item, bp?.checklist, bp?.askSummary) }) }),
-      jsxs('div', {
-        style: { display: 'flex', flexWrap: 'wrap', gap: 6 },
-        children: [
-          item.loaded !== false && jsx('button', { type: 'button', style: btn(true), disabled: busy, onClick: () => unblock(false), children: busy ? 'Unblocking\u2026' : 'Done \u2192 unblock' }),
-          item.loaded !== false && jsx('button', { type: 'button', style: btn(), disabled: busy, onClick: () => setReplying(!replying), children: 'Reply & unblock' }),
-          typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: btn(), onClick: () => bp.openCard(item), children: 'Open card' })
-        ]
-      }),
-      replying &&
-        jsxs('div', {
-          style: { display: 'flex', gap: 6, alignItems: 'flex-end' },
-          children: [
-            jsx('textarea', {
-              value: note,
-              autoFocus: true,
-              rows: 2,
-              placeholder: 'Answer for the worker (posted as a card comment)\u2026',
-              onChange: e => setNote(e.target.value),
-              onKeyDown: e => {
-                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && note.trim()) {
-                  e.preventDefault()
-                  void unblock(true)
-                }
-                e.stopPropagation()
-              },
-              style: { flex: 1, fontSize: 12.5, fontFamily: 'inherit', padding: '4px 6px', borderRadius: 6, border: '1px solid var(--border, #8884)', background: 'var(--card, transparent)', color: 'var(--foreground, inherit)' }
-            }),
-            jsx('button', { type: 'button', style: btn(true), disabled: busy || !note.trim(), onClick: () => unblock(true), children: 'Send & unblock' })
-          ]
-        })
-    ]
-  })
+  return jsxs('div', { 'data-user-steps-card': item.id, style: rowStyle, children: [
+    jsx('strong', { children: item.title }),
+    jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: jsx(Linked, { text: item.text || item.human_request?.action }) }),
+    jsx('small', { children: 'Legacy reference — not an approval request.' }),
+    jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, onClick: () => requestComplete(item.text || item.title), children: 'Request complete action' }), typeof bp?.openCard === 'function' && jsx('button', { type: 'button', style: actionStyle, onClick: () => bp.openCard(item), children: 'Open card' })] })
+  ] })
 }
 
 /** A card parked by a worker/dispatcher failure: an agent issue, never a task for the user. */
@@ -645,59 +568,297 @@ function StepRow({ step, sessionId }) {
 
 export function Strip() {
   const [snap, setSnap] = useState(snapshot)
-  const [collapsed, setCollapsed] = useState(false)
   const focused = useValue(host.state.focusedStoredSessionId)
+  useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
+  useValue(host.state.profile || host.state.focusedStoredSessionId)
+  const route = decisionRoute(), scope = routeKey(route)
   useEffect(() => subscribe(setSnap), [])
-  useEffect(() => void refresh(), [focused])
-  if (!focused || snap.stored !== focused) return null
-  const rows = projectStrip(snap.ledger, snap.kanban)
-  const issues = (Array.isArray(snap.issues) ? snap.issues : []).filter(i => !isDismissed(i))
+  useEffect(() => { void refresh() }, [focused, scope])
+  if (!focused || snap.stored !== focused || (snap.scope && snap.scope !== scope)) return null
+  const requests = canonical.scope === scope ? canonical.requests : []
+  const rows = projectStrip(snap.ledger, snap.kanban).filter(row => !requestForSource(requests, row.type === 'card'
+    ? { gatewayId: row.item.gatewayId || row.item.gateway, profile: row.item.profile, type: 'kanban', board: row.item.board, id: row.item.id }
+    : { gatewayId: row.step.requestOwner?.gatewayId || row.step.gatewayId || row.step.owner?.gatewayId, profile: row.step.requestOwner?.profile || row.step.profile || row.step.owner?.profile, type: 'user_step', id: row.step.id }))
+  const issues = (snap.issues || []).filter(i => !isDismissed(i))
   if (!rows.length && !issues.length) return null
-  return jsxs('div', {
-    'data-slot': 'user-steps',
-    role: 'status',
-    style: {
-      ...SELECTABLE,
-      width: '100%',
-      boxSizing: 'border-box',
-      marginBottom: 6,
-      padding: '6px 10px',
-      borderRadius: 8,
-      border: `1px solid color-mix(in srgb, ${AMBER} 55%, transparent)`,
-      background: `color-mix(in srgb, ${AMBER} 9%, var(--card, transparent))`,
-      color: 'var(--foreground, inherit)',
-      maxHeight: '40vh',
-      overflowY: 'auto'
-    },
-    children: [
-      jsxs('div', {
-        key: 'h',
-        style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, paddingBottom: collapsed ? 0 : 4 },
-        children: [
-          jsx('i', { 'aria-hidden': true, className: `codicon ${rows.length ? 'codicon-account' : 'codicon-warning'}`, style: { color: AMBER } }),
-          jsx('span', { style: { fontWeight: 600 }, children: rows.length ? `For you${rows.length > 1 ? ` (${rows.length})` : ''}` : `Agent issue${issues.length > 1 ? `s (${issues.length})` : ''} \u2014 no action required from you` }),
-          !rows.length && jsx('button', {
-            type: 'button',
-            'data-user-steps-dismiss-all': true,
-            style: { ...btn(), marginLeft: 'auto', border: 'none', padding: '0 4px' },
-            onClick: () => dismissIssues(issues),
-            title: issues.length > 1 ? 'Dismiss all agent issues' : 'Dismiss',
-            'aria-label': 'Dismiss',
-            children: jsx('i', { className: 'codicon codicon-close' })
-          }),
-          jsx('button', {
-            type: 'button',
-            style: { ...btn(), ...(rows.length ? { marginLeft: 'auto' } : {}), border: 'none', padding: '0 4px' },
-            onClick: () => setCollapsed(!collapsed),
-            'aria-label': collapsed ? 'Expand' : 'Collapse',
-            children: jsx('i', { className: `codicon codicon-chevron-${collapsed ? 'down' : 'up'}` })
-          })
-        ]
-      }),
-      ...(collapsed ? [] : rows.map(r => (r.type === 'step' ? jsx(StepRow, { step: r.step, sessionId: focused }, r.key) : jsx(CardRow, { item: r.item }, r.key)))),
-      ...(collapsed ? [] : issues.map(i => jsx(IssueRow, { issue: i }, `i:${i.board}:${i.id}`)))
-    ]
+  return jsxs('div', { 'data-slot': 'user-steps', style: { ...SELECTABLE, minWidth: 0, color: 'var(--foreground)' }, children: [
+    rows.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Legacy references (${rows.length}) — not approvals` }), ...rows.map(r => r.type === 'step' ? jsx(StepRow, { step: r.step }, r.key) : jsx(CardRow, { item: r.item }, r.key))] }),
+    issues.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Agent issues (${issues.length}) — no action required from you` }), jsx('button', { type: 'button', 'data-user-steps-dismiss-all': true, style: actionStyle, onClick: () => dismissIssues(issues), children: 'Dismiss agent issues' }), ...issues.map(i => jsx(IssueRow, { issue: i }, `i:${i.board}:${i.id}`))] })
+  ] })
+}
+
+// Canonical v2 decisions. The server, not composer text or card status, records authorization.
+export const requestKey = r => r?.owner?.gatewayId && r?.owner?.profile && r?.requestId
+  ? JSON.stringify([r.owner.gatewayId, r.owner.profile, r.requestId]) : null
+export const sourceKey = r => r?.gatewayId && r?.profile && r?.id && ['message', 'user_step', 'kanban'].includes(r.type) && (r.type !== 'kanban' || r.board)
+  ? JSON.stringify([r.gatewayId, r.profile, r.type, r.type === 'kanban' ? r.board : '', r.id]) : null
+export function validRequest(r) {
+  const text = s => typeof s === 'string' && !!s.trim()
+  return !!requestKey(r) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r.requestId) &&
+    r.schemaVersion === 2 && Number.isInteger(r.revision) && r.revision >= 1 && text(r.owner.storedSessionId) &&
+    ['approval','choice','input','external_step'].includes(r.kind) && text(r.title) &&
+    ['needs_context','open','resolved','superseded','cancelled'].includes(r.state) &&
+    typeof r.scope?.markdown === 'string' && typeof r.scope.complete === 'boolean' &&
+    Array.isArray(r.scope.sourceRefs) && r.scope.sourceRefs.every(sourceKey) &&
+    Array.isArray(r.aliases) && r.aliases.every(sourceKey) &&
+    Array.isArray(r.limits) && r.limits.every(l => text(l?.key) && text(l.value) && (l.permissionRequired === undefined || text(l.permissionRequired))) &&
+    Array.isArray(r.exclusions) && r.exclusions.every(text) && text(r.outcomes?.revise) &&
+    Array.isArray(r.choices) && r.choices.length > 0 && new Set(r.choices.map(c => c?.id)).size === r.choices.length &&
+    r.choices.every(c => text(c?.id) && text(c.label) && ['approve','revise','decline','answer'].includes(c.effect))
+}
+export function projectRequests(requests) {
+  const byId = new Map()
+  for (const r of Array.isArray(requests) ? requests : []) {
+    const key = requestKey(r)
+    if (!key || !validRequest(r)) continue
+    if (!byId.has(key) || byId.get(key).revision < r.revision) byId.set(key, r)
+  }
+  return [...byId.values()]
+}
+export function requestForSource(requests, source) {
+  const key = sourceKey(source)
+  if (!key) return null
+  const matches = projectRequests(requests).filter(r => (r.aliases || []).some(a => sourceKey(a) === key))
+  return matches.length === 1 ? matches[0] : null // ambiguous provenance never suppresses another request
+}
+function decisionRoute() {
+  const owner = host.state?.focusedSessionOwner?.get?.()
+  return { connectionId: owner ? owner.connectionId : activeConnection(), profile: owner?.targetProfile || owner?.profile || host.state?.profile?.get?.() || 'default', session: focusedId() }
+}
+const routeKey = r => JSON.stringify([r.connectionId || '', r.profile, r.session])
+const currentRoute = route => routeKey(route) === routeKey(decisionRoute())
+const operations = new Map() // authoritative readbacks shared by mounted tiles
+const INTENT_PREFIX = 'hermes.actionIntent.v2:'
+// Persist only retry intent, NOT authorization or delivery success. Every recovery queries the owner.
+function recoverIntent(key, request) {
+  try {
+    const d = JSON.parse(window.localStorage.getItem(INTENT_PREFIX + key) || 'null')
+    return d?.session === request.owner.storedSessionId && d.expectedRevision === request.revision && typeof d.idempotencyKey === 'string' && request.choices.some(c => c.id === d.choiceId) ? d : null
+  } catch { return null }
+}
+function rememberIntent(key, decision) {
+  if (typeof window !== 'undefined') window.localStorage.setItem(INTENT_PREFIX + key, JSON.stringify(decision))
+}
+let canonical = { scope: null, requests: [], error: null }
+const canonicalSubs = new Set()
+const readbacks = new Set()
+let requestRead = 0
+function receiptStatus(attrs, ids, scope) {
+  if (canonical.scope !== scope) return 'Reference only — review and decide above the composer.'
+  const linked = canonical.requests.find(r => r.owner.storedSessionId === attrs?.s && r.owner.gatewayId === attrs?.gatewayId && r.owner.profile === attrs?.profile && (r.requestId === attrs?.requestId || (r.aliases || []).some(a => a.type === 'user_step' && ids.includes(a.id) && a.gatewayId === attrs.gatewayId && a.profile === attrs.profile)))
+  const state = linked && operations.get(`${scope}:${requestKey(linked)}`)
+  if (state?.phase === 'cancelled') return 'Decision not started — no permission was delivered. A replacement revision requires a fresh decision.'
+  return state?.phase === 'confirmed' ? 'Confirmed — decision delivered.' : linked?.resolution || state?.decision ? 'Decision recorded; delivery status is above the composer.' : 'Reference only — review and decide above the composer.'
+}
+function signalDecisionChanges() {
+  if (typeof window !== 'undefined' && window.dispatchEvent) window.dispatchEvent(new window.Event('hermes:user-steps-changed'))
+}
+const publishCanonical = () => { canonicalSubs.forEach(fn => fn(canonical)); signalDecisionChanges(); emit() }
+export async function refreshRequests(call = api) {
+  const generation = ++requestRead
+  const route = decisionRoute(), scope = routeKey(route)
+  if (!route.session) return
+  try {
+    if (host.state?.focusedSessionOwner && !route.connectionId) throw Error('Session owner unavailable')
+    const result = await call(`${BASE}/requests?session=${encodeURIComponent(route.session)}`, route)
+    if (!currentRoute(route) || generation !== requestRead) return
+    if (!Array.isArray(result?.requests)) throw Error('Invalid action queue response')
+    const requests = projectRequests(result.requests)
+    if (requests.length !== new Set(result.requests.map(requestKey)).size || requests.some(r => r.owner.storedSessionId !== route.session || r.owner.profile !== route.profile)) throw Error('Invalid action request owner or schema')
+    canonical = { scope, requests, error: null }
+    publishCanonical()
+    readbacks.forEach(check => check())
+  } catch (e) {
+    if (!currentRoute(route) || generation !== requestRead) return
+    canonical = { scope, requests: canonical.scope === scope ? canonical.requests : [], error: `Action queue unavailable: ${e.message}. Legacy references are not authorization.` }
+    publishCanonical()
+  }
+}
+const operationId = op => op?.operationId || op?.id
+const operationState = op => { const s = op?.dispatchState || op?.state || op?.status; return s === 'delivery_failed' ? 'failed' : s }
+const errorStatus = e => e?.status || e?.statusCode || e?.response?.status || Number(str(e?.message).match(/\b(400|403|404|409|422)\b/)?.[1])
+const actionStyle = { ...btn(), minHeight: 44, minWidth: 44, maxWidth: '100%', whiteSpace: 'normal', overflowWrap: 'anywhere' }
+const flowStyle = { display: 'flex', flexWrap: 'wrap', gap: 8 }
+const planStyle = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', minWidth: 0 }
+function saveReadback(route, request) {
+  if (!currentRoute(route)) return
+  if (canonical.scope === routeKey(route)) {
+    canonical = { ...canonical, requests: projectRequests(canonical.requests.some(r => requestKey(r) === requestKey(request)) ? canonical.requests.map(r => requestKey(r) === requestKey(request) ? request : r) : [...canonical.requests, request]) }
+    publishCanonical()
+  }
+}
+
+export function DecisionRow({ request, route, call = api, unavailable = false }) {
+  const key = `${routeKey(route)}:${requestKey(request)}`
+  const [state, setState] = useState(() => {
+    const decision = recoverIntent(key, request)
+    return operations.get(key) || { request, phase: decision ? 'unknown' : 'idle', decision, text: decision?.revisionText || '' }
   })
+  const [editing, setEditing] = useState(null)
+  const input = useRef(null), trigger = useRef(null), live = useRef(true)
+  const latest = useRef(request)
+  latest.current = request
+  useEffect(() => { live.current = true; const fn = () => { const s = operations.get(key); if (s) setState(s) }; canonicalSubs.add(fn); return () => { live.current = false; canonicalSubs.delete(fn) } }, [key])
+  const update = patch => {
+    if (!live.current || !currentRoute(route)) return
+    const next = { ...(operations.get(key) || state), ...patch }
+    operations.set(key, next); setState(next); canonicalSubs.forEach(fn => fn(canonical))
+  }
+  const r = state.request?.revision > request.revision ? state.request
+    : request.revision > (state.request?.revision || 0) || request.resolution || !['open','needs_context'].includes(request.state) ? request : state.request || request
+  useEffect(() => {
+    if (request.revision > state.request.revision && !request.resolution && ['open','needs_context'].includes(request.state)) {
+      update({ request, phase: 'idle', decision: null, operation: null, error: '' })
+    }
+  }, [request.revision])
+  const locked = !!state.decision || !!r.resolution || !['open','needs_context'].includes(r.state)
+  const close = () => { setEditing(null); queueMicrotask(() => trigger.current?.focus()) }
+  useEffect(() => { if (editing) input.current?.focus() }, [editing])
+  const query = `?session=${encodeURIComponent(route.session)}`
+  const readOperation = async id => call(`${BASE}/operations/${encodeURIComponent(id)}${query}`, route)
+  const findOperation = async decision => {
+    try { return await call(`${BASE}/operations${query}&idempotencyKey=${encodeURIComponent(decision.idempotencyKey)}`, route) }
+    catch (e) { if (errorStatus(e) === 404) return { operation: null }; throw e }
+  }
+  const apply = data => {
+    if (!live.current || !currentRoute(route)) return
+    if (!validRequest(data?.request) || requestKey(data.request) !== requestKey(request) || data.request.owner.storedSessionId !== route.session || data.request.revision < Math.max(latest.current.revision, operations.get(key)?.request?.revision || 0)) throw Error('Invalid or stale decision readback')
+    if (!data.operation || !operationId(data.operation) || !['pending','failed','delivered','cancelled'].includes(operationState(data.operation))) throw Error('Invalid operation readback')
+    if (data.operation.requestId && data.operation.requestId !== request.requestId) throw Error('Operation belongs to a different request')
+    if (data.operation.owner && (data.operation.owner.gatewayId !== request.owner.gatewayId || data.operation.owner.profile !== route.profile || data.operation.owner.storedSessionId !== route.session)) throw Error('Operation belongs to a different owner')
+    const status = operationState(data.operation)
+    if (['delivered','cancelled'].includes(status) && data.request.resolution?.operationId !== operationId(data.operation)) throw Error('Delivery not yet confirmed by request readback')
+    if (status === 'cancelled' && data.request.state !== 'cancelled') throw Error('Cancellation not yet confirmed by request readback')
+    update({ request: data.request, operation: data.operation, phase: status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? 'Decision recorded; delivery failed. Retry uses the same operation.' : '' })
+    if (['delivered','cancelled'].includes(status)) { try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {} }
+    saveReadback(route, data.request)
+  }
+  const check = async () => {
+    if (!currentRoute(route)) return
+    const op = state.operation || (r.resolution && { operationId: r.resolution.operationId })
+    update({ phase: 'checking', error: '' })
+    try {
+      if (operationId(op)) apply(await readOperation(operationId(op)))
+      else if (state.decision) {
+        const found = await findOperation(state.decision)
+        if (!found.operation) { update({ phase: 'unknown', error: 'No operation found yet. Retry safely with the same key.' }); return }
+        apply(await readOperation(operationId(found.operation)))
+      } else update({ phase: 'unknown', error: 'No operation receipt is available. Reload actions.' })
+    } catch (e) { update({ phase: 'unknown', error: e.message }) }
+  }
+  // Reconnect/remount: recorded resolution is not delivery confirmation. Read the durable operation.
+  useEffect(() => { if ((r.resolution?.operationId || (state.phase === 'unknown' && state.decision)) && !state.operation) void check() }, [r.resolution?.operationId, state.decision?.idempotencyKey])
+  useEffect(() => {
+    const poll = () => { if (['pending','failed','unknown'].includes(state.phase)) void check() }
+    readbacks.add(poll); return () => readbacks.delete(poll)
+  }, [state.phase, state.operation, state.decision])
+  useEffect(() => {
+    const onStorage = e => {
+      if (e.key !== INTENT_PREFIX + key || operations.get(key)?.decision) return
+      const decision = recoverIntent(key, request)
+      if (decision) update({ decision, phase: 'unknown', text: decision.revisionText || '' })
+    }
+    window.addEventListener('storage', onStorage); return () => window.removeEventListener('storage', onStorage)
+  }, [key, request.revision])
+  const send = async (choice, retry = false) => {
+    if (!currentRoute(route) || unavailable || ['submitting','checking'].includes(operations.get(key)?.phase)) return
+    if (!retry && (locked || operations.get(key)?.decision || !choice || (['approve','answer'].includes(choice.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')))) return
+    const text = state.text || ''
+    if (!retry && ['revise','answer'].includes(choice.effect) && !text.trim()) return
+    let decision = retry ? state.decision : { session: route.session, expectedRevision: r.revision, choiceId: choice.id, revisionText: ['revise','answer'].includes(choice.effect) ? text.trim() : undefined, idempotencyKey: globalThis.crypto.randomUUID() }
+    const knownId = operationId(state.operation) || r.resolution?.operationId
+    if (retry && knownId) {
+      update({ phase: 'submitting', error: '' })
+      try {
+        const current = await readOperation(knownId)
+        if (!currentRoute(route)) return
+        if (!['delivered','cancelled'].includes(operationState(current.operation))) {
+          await call(`${BASE}/operations/${encodeURIComponent(knownId)}/retry${query}`, { ...route, method: 'POST' })
+        }
+        apply(await readOperation(knownId))
+      } catch (e) { update({ phase: 'unknown', error: `Delivery not confirmed: ${e.message}. Retry retains the recorded operation.` }) }
+      return
+    }
+    if (!decision) return check()
+    try { rememberIntent(key, decision) } catch { update({ error: 'Cannot retain a safe retry key. Check browser storage before submitting.' }); return }
+    update({ phase: 'submitting', decision, error: '' }) // synchronous shared lock prevents a double click/two tiles
+    try {
+      if (retry) {
+        const found = await findOperation(decision)
+        if (!currentRoute(route)) return
+        if (found?.operation && operationState(found.operation) !== 'failed') { apply(await readOperation(operationId(found.operation))); return }
+      }
+      const result = await call(`${BASE}/requests/${encodeURIComponent(r.requestId)}/decisions`, { ...route, method: 'POST', body: decision })
+      if (!currentRoute(route)) return
+      if (!operationId(result?.operation)) throw Error('Missing operation receipt; outcome unknown')
+      update({ operation: result.operation, phase: 'checking' })
+      apply(await readOperation(operationId(result.operation))) // POST success alone is never confirmation
+      if (live.current && currentRoute(route)) setEditing(null)
+    } catch (e) {
+      if (!currentRoute(route)) return
+      const status = errorStatus(e)
+      if ([409,422,400,403].includes(status)) {
+        try {
+          const fresh = await call(`${BASE}/requests/${encodeURIComponent(r.requestId)}${query}`, route)
+          if (validRequest(fresh?.request) && requestKey(fresh.request) === requestKey(r) && fresh.request.owner.storedSessionId === route.session && fresh.request.revision >= r.revision) {
+            if (fresh.operation) { apply(fresh); return }
+            try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {}
+            update({ request: fresh.request, decision: null, operation: null, phase: 'stale', error: 'Request changed or was rejected. Review the current scope before choosing again.' }); saveReadback(route, fresh.request); return
+          }
+        } catch { /* retain locked unknown outcome if readback fails */ }
+      }
+      // A lost POST must be queried before any resend, including after reconnect.
+      try {
+        const found = await findOperation(decision)
+        if (found?.operation) { apply(await readOperation(operationId(found.operation))); return }
+      } catch { /* explicit unknown below */ }
+      update({ phase: 'unknown', error: `Outcome unknown: ${e.message}. Check status or retry safely.` })
+    }
+  }
+  const choices = Array.isArray(r.choices) ? r.choices : []
+  const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
+  const phaseText = { idle: r.state === 'needs_context' ? 'Full plan required before approval.' : '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: 'Decision recorded; delivery failed.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
+  return jsxs('article', { 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
+    jsx('h3', { style: { margin: '4px 0', fontSize: 14, overflowWrap: 'anywhere' }, children: `${r.title} · revision ${r.revision}` }),
+    jsx('div', { 'data-action-scope': '', style: { ...planStyle, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': 'Complete plan', children: jsx(Linked, { text: r.scope?.markdown || 'The full plan has not been provided.' }) }),
+    jsx('ul', { style: { paddingLeft: 20, ...planStyle }, children: (r.limits || []).map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) }),
+    jsx('div', { style: planStyle, children: (r.exclusions || []).join('\n') }),
+    jsx('div', { style: planStyle, children: Object.entries(r.outcomes || {}).map(([k,v]) => `${k}: ${v}`).join('\n') }),
+    jsx('div', { role: 'status', 'aria-live': 'polite', children: phaseText }),
+    selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : r.outcomes?.[selected.effect] || ''}` }),
+    state.error && jsx('div', { role: 'alert', children: state.error }),
+    !locked && jsxs('div', { style: flowStyle, children: [
+      ...choices.map(c => jsx('button', { type: 'button', style: actionStyle, disabled: unavailable || (c.effect === 'approve' && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (['revise','answer'].includes(c.effect)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: c.label }, c.id)),
+      !r.scope?.complete && choices.some(c => c.effect === 'revise') && jsx('button', { type: 'button', style: actionStyle, disabled: unavailable, onClick: e => { trigger.current = e.currentTarget; update({ text: 'Please provide the full exact plan inline, including files, tests, acceptance criteria and deliverables.' }); setEditing(choices.find(c => c.effect === 'revise')) }, children: 'Request full plan inline' })
+    ] }),
+    editing && jsxs('div', { onKeyDown: e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close() } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void send(editing) } }, children: [
+      jsx('label', { children: jsxs('span', { children: ['Revision or answer', jsx('textarea', { ref: input, 'aria-label': 'Revision or answer', value: state.text || '', disabled: locked, onChange: e => update({ text: e.target.value }), rows: 3, style: { width: '100%', boxSizing: 'border-box', font: 'inherit', color: 'var(--foreground)', background: 'var(--card)', ...planStyle } })] }) }),
+      jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, disabled: locked || !state.text?.trim(), onClick: () => send(editing), children: 'Send revision' }), jsx('button', { type: 'button', style: actionStyle, onClick: close, children: 'Cancel' })] })
+    ] }),
+    ['pending','failed','unknown'].includes(state.phase) && jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, onClick: check, children: 'Check status' }), jsx('button', { type: 'button', style: actionStyle, onClick: () => send(null, true), children: 'Retry' })] })
+  ] })
+}
+
+export function ActionQueue() {
+  const [snap, setSnap] = useState(canonical), [filter, setFilter] = useState('')
+  useValue(host.state.focusedStoredSessionId)
+  useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
+  useValue(host.state.profile || host.state.focusedStoredSessionId)
+  useValue(host.state.connectionId || host.state.focusedStoredSessionId)
+  const route = decisionRoute(), scope = routeKey(route)
+  useEffect(() => { canonicalSubs.add(setSnap); return () => canonicalSubs.delete(setSnap) }, [])
+  useEffect(() => { void refreshRequests() }, [scope])
+  if (!route.session || snap.scope !== scope) return null
+  const requests = snap.requests
+  if (!requests.length && !snap.error) return null
+  const visible = requests.filter(r => operations.get(`${scope}:${requestKey(r)}`)?.decision || r.resolution || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
+  return jsxs('section', { 'data-action-queue': '', 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)' }, children: [
+    jsx('style', { children: '[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
+    jsx('h2', { style: { margin: 0, fontSize: 14 }, children: `For you (${requests.filter(r => ['open','needs_context'].includes(r.state)).length})` }),
+    snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
+    requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
+    jsx('div', { onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
+  ] })
 }
 
 export default {
@@ -706,14 +867,16 @@ export default {
   register(ctx) {
     osApi = ctx?.os || null
     previewApi = typeof ctx?.openPreview === 'function' ? (t => ctx.openPreview(t)) : null
-    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => jsx(Strip, {}) })
+    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => jsxs('div', { style: { minWidth: 0, width: '100%' }, children: [jsx(ActionQueue, {}), jsx(Strip, {})] }) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
-    const onVis = () => (typeof document !== 'undefined' && document.hidden) || void refresh()
+    const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null }
+    signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)
       if (typeof window !== 'undefined' && window.__userSteps?.version === VERSION) delete window.__userSteps
+      signalDecisionChanges()
       unsubKanban?.()
       unsubKanban = null
       if (timer) clearInterval(timer)

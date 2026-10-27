@@ -22,7 +22,20 @@ globalThis.stripHost = {
 }
 globalThis.document = { hidden: false, getElementById: () => true, addEventListener() {}, removeEventListener() {} }
 globalThis.window = {}
-const { default: plugin, refresh, sessionTaskChips } = await import('../plugin.js')
+const { default: plugin, refresh, sessionTaskChips, subscribeDecisionChanges } = await import('../plugin.js')
+
+test('decision ownership changes survive producer load order and hot reload', () => {
+  const target = new EventTarget()
+  let paints = 0
+  // Consumer mounts before producer, so there is no __userSteps to subscribe to.
+  const stop = subscribeDecisionChanges(() => { paints++ }, target)
+  target.dispatchEvent(new Event('hermes:user-steps-changed'))
+  target.dispatchEvent(new Event('hermes:user-steps-changed'))
+  assert.equal(paints, 2)
+  stop()
+  target.dispatchEvent(new Event('hermes:user-steps-changed'))
+  assert.equal(paints, 2, 'unmount disposes the subscription')
+})
 let contribution
 plugin.register({ register: c => { contribution = c } })
 const render = () => contribution.render().type()
@@ -49,7 +62,9 @@ test('real Strip hides prior owner snapshot immediately on same-runtime owner sw
 test('rendered chips disable unresolved owners and click only their captured route', async () => {
   stripHost.state.focusedStoredSessionId.value = null
   await refresh()
-  const Chip = render().props.children[0].type
+  assert.equal(render().type, 'details', 'agent progress starts collapsed')
+  assert.equal(render().props.open, undefined)
+  const Chip = render().props.children[1].props.children[0].type
   const row = { id: 't_same', status: 'running', board: 'bb' }
   const [known] = sessionTaskChips([row], { connectionId: 'A', profile: 'work' })
   const [unknown] = sessionTaskChips([{ ...row, profile: null }])
