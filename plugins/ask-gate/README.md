@@ -63,11 +63,24 @@ Scope discovery is evidence of an available credential route, not proof of vendo
 to execute an action. Tests in `tests/test_f3_broker.py` exercise discovery through temporary executables and
 the final-response gate with a stub judge; they do not vend credentials or contact a vendor.
 
-## Needs core hook `pre_final_gate`
+## Requires compatible core before plugin rollout
 
-L2 uses a core hook `pre_final_gate(session_id, platform, model, final_response, turn_messages, attempt) -> None |
-{"hold": True, "nudge": str} | {"append": str}` (fork card t_45d5a361) so a held draft is neither shown nor saved. On
-a core without it the plugin still registers (L1/L3/L4 work); L2 is simply never called.
+Registration requires `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES` with integer
+`version: 1` and literal `True` for `replace`, `accepts_hold_budget`, `needs_buffer`,
+and `post_transform_release`. The check runs before installing adapters or hooks.
+Missing/malformed support refuses registration with a loader error instead of silently
+registering partial protection. Hook registration errors also propagate to the loader.
+
+Deploy compatible core **first**, then activate this plugin. On an incompatible core
+the whole plugin is unavailable (including previously working L1/L3/L4); ordinary turns
+still run. Refusal is not a runtime fail-closed policy, authorization, or proof that a
+particular transport is protected. Do not publish/activate this plugin ahead of core.
+
+Tests: `tests/test_runtime_contract.py` checks the explicit advertisement,
+`tests/test_runtime_registration.py` checks registration ordering and error propagation,
+and `tests/integration_f3/test_runtime_compatibility.py` uses real PluginManager discovery.
+The compatible buffered publication path is exercised separately by
+`tests/integration_f3/test_final_publication.py` against an explicit core checkout.
 
 ## open-asks interplay
 

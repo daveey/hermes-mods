@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, core, handoff, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -36,6 +36,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     user_step_lifecycle = _sib("user_step_lifecycle")
     approval_reconciliation = _sib("approval_reconciliation")
     approval_adapter_loading = _sib("approval_adapter_loading")
+    runtime_contract = _sib("runtime_contract")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -587,11 +588,9 @@ def _prewarm() -> None:
 
 
 def register(ctx) -> None:
+    runtime_contract.require_runtime_contract()
     approval_adapter_loading.install(ctx, approval_reconciliation)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
-    try:
-        ctx.register_hook("pre_final_gate", pre_final_gate)
-    except Exception:  # older core without the hook: L1/L3/L4 still work
-        core.log_event("no_pre_final_gate")
+    ctx.register_hook("pre_final_gate", pre_final_gate)
