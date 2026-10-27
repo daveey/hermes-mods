@@ -1253,6 +1253,22 @@ to it.
 
 ### Phase 6 plan: sessions index and Inbox (approved 2026-10-27)
 
+#### Built so far (2026-10-27)
+
+- **Shipped:** daveey/hermes-hub #19, #21, #23 and #25 (Worker) and client 1.6.0 on all three gateways. Shared fields are in `shadow` on all three since about 21:20Z. The hourly `diff-shared` soak logs to `~/.hermes/logs/hub-shared-fields-soak.jsonl` (launchd `in.dbloom.hub-shared-soak` on the Macs, cron :17 on the hub). Its first full check was clean on all three (219 sets, 0 mismatched).
+- **Live sleeping-owner test (primary, about 20 minutes, then back to shadow), mini asleep, done from the MacBook:**
+  - A rename, pin and Inbox archive, plus a pending act, all showed on the MacBook and the hub.
+  - On wake, the mini applied all of them, and the act ran exactly once.
+  - A refused act cleared its pending marker.
+  - The 10 s bar first failed (35–44 s, bounded by the 60 s poll). `hermes-hub watch` (#25) fixed it: across 5 trials a MacBook set reached the hub in 0.2–0.5 s and the mini in 0.3–0.7 s.
+  - A killed watcher was back in under 1 s on both Macs (launchd) and in 10.5 s on the hub (systemd `RestartSec=10`).
+- **Deviations from the plan below:**
+  - Clients check `/v2/sync/features`, answered by the Hub DO itself, before sending a `set`. An old Worker or DO would store a set op as a record, and would never say "unknown kind".
+  - The Inbox `archived` field accepts only `true`, because the store cannot unarchive.
+  - First enable and resync use `/v2/sync/overrides`. The full snapshot (about 30 MB) does not fit through a DO call; it returned 500 and stalled every gateway's sync for about 10 minutes. Its paging is a separate task.
+  - Desktop needed no patch: it reads and writes through the hub-sync plugin, and its existing tests cover the mapped fields. Nothing in the Desktop sets `hidden` yet.
+- **Not done:** the 7-day shadow soak, primary mode on all gateways, and deleting the request path for these fields.
+
 Approved by David 2026-10-27. Owner: the Claude Code session "Hermes cloud sync status"; the Kanban primary soak and phase 5 stay with "Hermes gateway restart". Nothing below is built yet. Building starts when the `default` board's primary soak is clean.
 
 #### What changes, in one paragraph
