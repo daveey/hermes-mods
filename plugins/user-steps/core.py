@@ -11,9 +11,11 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -98,6 +100,32 @@ def session_source(session_id: str, db: Optional[Path] = None) -> str:
 # ---- ledger --------------------------------------------------------------------------------------------
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]")
+MAX_LEDGER_BYTES = 1024 * 1024  # bounded lifecycle snapshots, including JSON parsing
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate ledger JSON key")
+        result[key] = value
+    return result
+
+
+def _invalid_constant(value):
+    raise ValueError("invalid ledger JSON constant")
+
+
+def _validate_ledger(d, root, *, legacy=False):
+    if not isinstance(d, dict) or d.get("root") != root:
+        raise ValueError("ledger root mismatch or invalid document")
+    if not isinstance(d.get("steps"), list) or any(not isinstance(s, dict) for s in d["steps"]):
+        raise ValueError("invalid ledger steps")
+    if legacy and "revision" not in d:
+        return
+    revision = d.get("revision")
+    if type(revision) is not int or revision < 1:
+        raise ValueError("invalid or missing ledger revision")
 
 
 class Ledger:
@@ -119,16 +147,86 @@ class Ledger:
         lock = open(self.dir / ".lock", "a+")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            d = self._read(root)
+            try:
+                d = self._read_strict(root, legacy=True, bounded=False)
+            except FileNotFoundError:
+                d = {"root": root, "steps": [], "card": None, "gen": 0}
+            revision = d.get("revision", 0)
             yield d
+            # The writer, not the edit caller/model, owns this counter.
+            d["revision"] = revision + 1
             d["updated"] = time.time()
+            _validate_ledger(d, root)
+            raw = json.dumps(d, ensure_ascii=False, indent=1, allow_nan=False).encode("utf-8")
+
             p = self.path(root)
-            tmp = p.with_suffix(f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1))
-            os.replace(tmp, p)
+            tmp = p.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                with tmp.open("xb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(tmp, p)
+                try:
+                    fd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    # Replacement already committed. Do not report an abort or
+                    # prevent card synchronization, but surface durability loss.
+                    logging.getLogger("user-steps").error(
+                        "Ledger committed; directory durability could not be confirmed", exc_info=True)
+            finally:
+                tmp.unlink(missing_ok=True)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
+
+    def _read_strict(self, root: str, *, legacy: bool = False, bounded: bool = True) -> dict:
+        if not isinstance(root, str) or not root:
+            raise ValueError("ledger root must be a nonempty string")
+        # No symlinks or blocking special files; size-check and read the same fd.
+        def opener(path, flags):
+            return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with open(self.path(root), "rb", opener=opener) as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("ledger source must be a regular file")
+            if bounded and info.st_size > MAX_LEDGER_BYTES:
+                raise ValueError("ledger size exceeds limit")
+            raw = stream.read(MAX_LEDGER_BYTES + 1) if bounded else stream.read()
+        if bounded and len(raw) > MAX_LEDGER_BYTES:
+            raise ValueError("ledger size exceeds limit")
+        try:
+            d = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object,
+                           parse_constant=_invalid_constant)
+        except RecursionError as exc:
+            raise ValueError("ledger JSON nesting exceeds limit") from exc
+        _validate_ledger(d, root, legacy=legacy)
+        return d
+
+    def read_exact(self, root: str, step_id: str) -> dict:
+        """Read only root's file; return {root, revision, step}, never scan/resolve lineage.
+
+        OSError means missing/unreadable source, ValueError invalid/oversized source
+        (including legacy files until their next edit), LookupError a missing step.
+        Duplicate target IDs are invalid. IDs are opaque exact source keys; a
+        directive consumer must separately validate its own ID grammar.
+        The detached snapshot carries raw source
+        evidence only: resolved status can suppress an ask, but neither it nor
+        resolved_by is trusted provenance or authority to reopen anything.
+        """
+        if not isinstance(step_id, str) or not step_id:
+            raise ValueError("step ID must be a nonempty string")
+        d = self._read_strict(root)
+        matches = [s for s in d["steps"] if s.get("id") == step_id]
+        if len(matches) > 1:
+            raise ValueError("duplicate ledger step ID")
+        if not matches:
+            raise LookupError("step not found in exact ledger")
+        return {"root": root, "revision": d["revision"], "step": matches[0]}
 
     def _read(self, root: str) -> dict:
         try:

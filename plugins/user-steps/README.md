@@ -43,6 +43,29 @@ before the reply is shown, ~2 s). Env `USER_STEPS_PROVIDER` / `USER_STEPS_MODEL`
 Trace: one JSON line per extraction in `~/.hermes/cache/user-steps/trace.jsonl` (source model/regex/skip, new and
 resolved ids, framed, errors).
 
+## Lifecycle source contract
+
+Every successful `Ledger.edit` advances a writer-owned integer `revision` under
+its existing cross-process lock. Legacy records without a revision migrate on
+the next edit. Corrupt evidence, invalid revisions, and root mismatches fail
+rather than being silently reset. Atomic replacement follows a file fsync;
+directory-sync failures after replacement are logged as durability errors, not
+reported as aborted edits (the new state is already visible).
+
+`Ledger.read_exact(root, step_id)` reads only that root's regular file, limited
+to 1 MiB, and returns `{root, revision, step}`. It rejects missing, corrupt,
+oversized, unrevisioned, symlinked, mismatched-root, or duplicate-target evidence;
+it never searches other sessions. IDs are opaque exact source keys; directive
+consumers must validate their own syntax and establish the compression root
+from the current session, not treat the directive's session attribute as a root.
+The snapshot limit does not restrict legacy writes or prevent resolving steps.
+
+This is a source API, not a deployed lifecycle adapter. A resolved snapshot is
+only conservative suppression evidence. Neither `resolved_by` nor a model/REST
+resolution string proves a trusted human transition, grants execution permission,
+or authorizes reopening. Authoritative ask-to-step binding and trusted reopen
+integration remain separate work.
+
 ## Limits
 
 - The strip only knows the FOCUSED chat (composer plugins get no surface id); tiles show the focused chat's strip.
