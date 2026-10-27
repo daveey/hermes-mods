@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, core, handoff, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, core, handoff, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -32,6 +32,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return _sys.modules.setdefault(key, mod)
     core, judge_mod, handoff = _sib("core"), _sib("judge"), _sib("handoff")
+    lifecycle = _sib("lifecycle")
     approval_reconciliation = _sib("approval_reconciliation")
     approval_adapter_loading = _sib("approval_adapter_loading")
 
@@ -318,14 +319,17 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             return {"replace":
                     "I suppressed a repeated request because this action has a recorded terminal answer. "
                     "This record does not authorize performing or reopening it."}
-        reconciled = _reconcile_prose(session_id, "pre_final_gate", asks if howto else retirement_candidates)
+        reconciled = lifecycle.preflight({"session_id": session_id, "tool_name": "pre_final_gate",
+                                          "draft": final_response, "howto": howto})
+        if reconciled is None:
+            reconciled = _reconcile_prose(session_id, "pre_final_gate", asks if howto else retirement_candidates)
         if reconciled is not None:
             record_verdict(session_id, "approval_reconciled", final_response)
             try:
                 ledger().set_open_asks(session_id, [])
             except Exception as e:
                 core.log_event("pending_clear_error", session=session_id, error=repr(e))
-            return {"replace": "I withheld an approval request after checking the authoritative store. "
+            return {"replace": "I withheld a request after checking authoritative approval or lifecycle state. "
                     "No new permission or execution authorization is granted by this notice."}
         budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
         held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
@@ -408,10 +412,9 @@ def _reconcile_prose(session_id: str, surface: str, asks: list[str]) -> dict | N
     # This is candidate text, not a validated request or authority. Resolvers
     # classify the action and obtain exact scope/head from their own store.
     for ask in asks:
-        result = approval_reconciliation.preflight({
-            "session_id": session_id, "tool_name": surface,
-            "human_request": {"action": ask},
-        })
+        context = {"session_id": session_id, "tool_name": surface,
+                   "human_request": {"action": ask}}
+        result = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
         if result is not None:
             return result
     return None
@@ -426,10 +429,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             raise ValueError("human_request cannot accompany dependency/time/transient blocks")
         if tool_name == "kanban_create" and args.get("initial_status") != "blocked":
             raise ValueError("human_request requires initial_status=blocked on creation")
-        reconciled = approval_reconciliation.preflight({
-            "session_id": session_id, "tool_name": tool_name,
-            "human_request": request, "args": args,
-        })
+        context = {"session_id": session_id, "tool_name": tool_name,
+                   "human_request": request, "args": args}
+        reconciled = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
         if reconciled is not None:
             return reconciled
         tools = _tools_now(session_id)
@@ -463,19 +465,26 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             if is_ask and ledger().workflow_stopped(session_id):
                 return {"action": "block", "message": "ask-gate: workflow is terminal by explicit user stop. "
                         "Do not request action or execute/reopen it without an explicit workflow resume."}
+        if tool_name == "clarify":
+            questions = args.get("questions", [])
+            candidates = [q["question"] for q in questions
+                          if isinstance(q, dict) and isinstance(q.get("question"), str)] if isinstance(questions, list) else []
+            reconciled = _reconcile_prose(session_id, tool_name, candidates)
+            if reconciled is not None:
+                return reconciled
         if tool_name == "kanban_complete" and _is_worker():
             return _worker_complete(session_id, args)
         if tool_name not in ("kanban_create", "kanban_block"):
             return None
         if args.get("human_request") is not None:
             return _human_request_gate(session_id, tool_name, args)
-        if tool_name == "kanban_block" and str(args.get("kind") or "") in _WORKER_NO_ASK_KINDS:
-            return None
         candidate = str(args.get("reason") or "") if tool_name == "kanban_block" else (
             str(args.get("title") or "") + "\n" + str(args.get("body") or ""))
         reconciled = _reconcile_prose(session_id, tool_name, core.find_asks(candidate))
         if reconciled is not None:
             return reconciled
+        if tool_name == "kanban_block" and str(args.get("kind") or "") in _WORKER_NO_ASK_KINDS:
+            return None
         gated, text = core.needs_checked(tool_name, args, _is_worker())
         if not gated or "Filed automatically by the `open-asks` plugin" in text:
             return None
