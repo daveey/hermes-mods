@@ -1,0 +1,12 @@
+# Runner verification evidence
+
+Use this procedure for diagnosis-only runner/host investigations with the runner tools. It establishes what the evidence supports, not a recovery recipe.
+
+1. Use `runners_inspect` with the exact runner identifier and a bounded history. Preserve the returned owner, per-dimension observations, collection IDs, timestamps, expiry, readiness requirements/results, job-query coverage, and source errors. Filter large saved responses locally to the target runner, host and provider scope; unrelated scope errors are not evidence of this runner's failure.
+2. Compare required readiness checks with passed checks. A fresh wrapper and passing disk/service/tool probes do not satisfy a required operational check whose state or timestamps are unknown. Keep the failed, missing and unknown categories distinct.
+3. Request an independent recheck through `runners_verify`, using the exact repair identifier and currently observed owner. Treat `pending` as an acknowledgement only. Read the target back through `runners_inspect` after a bounded wait; never turn submission success into verification success.
+4. Compare observation times and collection identities, not tool-call count. Re-reading the same cached collection is not a second cycle. A refreshed host probe may coexist with an older provider observation. Record each dimension separately and do not attribute a refresh to a verification request unless the returned provenance establishes that linkage.
+5. Inspect existing build/job evidence without dispatching work under diagnosis-only authority. Require a successful build attributable to the target runner, not a chat completion claim or an unrelated sibling's success. An empty bounded query means no matching jobs were returned within its coverage, not that the host is idle.
+6. Report the verdict first, then a compact dimension-by-cycle table, the supported why-chain, and the unmet acceptance gates. Give freshness as of the readback time, not as a permanent health claim. If verification remains pending or readiness/build proof is missing, explicitly leave success unproven.
+
+Two completed collections can demonstrate persistence of an evidence gap without establishing its root cause. To distinguish absent production from ingestion or mapping failures, obtain authorized evidence from those specific stages rather than inferring a cause from null timestamps alone.
