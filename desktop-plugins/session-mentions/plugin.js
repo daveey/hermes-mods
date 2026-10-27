@@ -259,6 +259,116 @@ const rowCache = new Map() // connectionId -> {at, rows}
 const rowInflight = new Map()
 const rowErrors = new Map() // connectionId -> last fetch error message
 
+// ── change notification (core re-asks an open @ popover) ─────────────────────
+
+const listeners = new Set()
+let notifyTimer = null
+
+/** Core's `subscribe` hook: called when cached rows or fetch errors change, so a popover
+ *  already open on `@the` re-asks instead of keeping what it had on the last keystroke. */
+export function subscribeRows(onChange) {
+  listeners.add(onChange)
+  return () => listeners.delete(onChange)
+}
+
+function notifyChanged() {
+  if (notifyTimer) return
+  notifyTimer = setTimeout(() => {
+    notifyTimer = null
+    for (const fn of [...listeners]) {
+      try {
+        fn()
+      } catch {
+        /* a broken listener must not stop the others */
+      }
+    }
+  }, 30)
+}
+
+// ── warm start (rows survive a reload; the first popover isn't empty) ────────
+
+const WARM_KEY = 'hermes.session-mentions.warm.v1'
+const WARM_MAX_ROWS = 3_000 // per connection and kind; slim rows are ~200 B
+const WARM_SAVE_MS = 1_000
+let warmTimer = null
+
+const safeStorage = () => {
+  try {
+    return globalThis.localStorage || null
+  } catch {
+    return null
+  }
+}
+
+/** Only what typeahead needs: score() reads title/preview/_gwLabel/id, sessionItems the rest. */
+export function slimSessionRow(r) {
+  return {
+    id: r.id,
+    title: r.title || '',
+    preview: String(r.preview || '').slice(0, 120),
+    profile: r.profile || '',
+    last_active: r.last_active || 0,
+    started_at: r.started_at || 0,
+    message_count: r.message_count || 0,
+    _conn: r._conn,
+    _gwLabel: r._gwLabel,
+    _gwKey: r._gwKey
+  }
+}
+
+/** Serialize both caches. Exported for tests. */
+export function saveWarm(storage = safeStorage()) {
+  if (!storage) return false
+  const pack = (cache, slim) => {
+    const out = {}
+    for (const [id, { rows }] of cache) if (rows?.length) out[id] = rows.slice(0, WARM_MAX_ROWS).map(slim)
+    return out
+  }
+  try {
+    storage.setItem(WARM_KEY, JSON.stringify({ v: 1, at: Date.now(), sessions: pack(rowCache, slimSessionRow), tasks: pack(taskCache, r => r) }))
+    return true
+  } catch {
+    return false // quota or private mode: warm start is a convenience
+  }
+}
+
+/** Seed both caches from storage as already-stale, so the next provide() refreshes them. */
+export function loadWarm(storage = safeStorage()) {
+  if (!storage) return 0
+  let data
+  try {
+    data = JSON.parse(storage.getItem(WARM_KEY) || 'null')
+  } catch {
+    return 0
+  }
+  if (!data || data.v !== 1) return 0
+  let n = 0
+  for (const [cache, rows] of [[rowCache, data.sessions], [taskCache, data.tasks]]) {
+    for (const [id, list] of Object.entries(rows || {})) {
+      if (!Array.isArray(list) || cache.has(id)) continue
+      cache.set(id, { at: 0, rows: list, warm: true })
+      n += list.length
+    }
+  }
+  return n
+}
+
+function scheduleWarmSave() {
+  if (warmTimer) return
+  warmTimer = setTimeout(() => {
+    warmTimer = null
+    saveWarm()
+  }, WARM_SAVE_MS)
+}
+
+/** Gateways a popover should mention: still loading with nothing cached, or failing. */
+export function fetchStatus(cache, inflight, errors, conns) {
+  const label = id => conns.find(c => c.id === id)?.label || id
+  const loading = conns.filter(c => inflight.has(c.id) && !cache.get(c.id)?.rows?.length).map(c => c.label)
+  const failed = [...errors].map(([id, error]) => ({ label: label(id), error }))
+  return { loading, failed }
+}
+
 /** Stamp each row with the gateway that OWNS it. Desktop's `hermes:api` answers a
  *  connection-pinned `/api/profiles/sessions?profile=all` with the ALL-gateways
  *  aggregate once that gateway is pooled: every row from a registry gateway carries
@@ -326,6 +436,8 @@ function fetchRows(conn, force = false) {
       const rows = tagRows(sessions, conn, connCache.rows)
       rowCache.set(conn.id, { at: Date.now(), rows })
       rowErrors.delete(conn.id)
+      notifyChanged()
+      scheduleWarmSave()
       return rows
     })
     .catch(error => {
@@ -333,10 +445,12 @@ function fetchRows(conn, force = false) {
       rowErrors.set(conn.id, String(error?.message || error).slice(0, 300))
       const old = rowCache.get(conn.id)
       rowCache.set(conn.id, { at: Date.now() - STALE_MS + 10_000, rows: old?.rows || [] })
+      notifyChanged()
       return old?.rows || []
     })
     .finally(() => rowInflight.delete(conn.id))
   rowInflight.set(conn.id, p)
+  notifyChanged() // a cold gateway's "Loading…" row appears
   return p
 }
 
@@ -558,16 +672,20 @@ function fetchTasks(conn, force = false) {
     .then(rows => {
       taskCache.set(conn.id, { at: Date.now(), rows })
       taskErrors.delete(conn.id)
+      notifyChanged()
+      scheduleWarmSave()
       return rows
     })
     .catch(error => {
       taskErrors.set(conn.id, String(error?.message || error).slice(0, 300))
       const old = taskCache.get(conn.id)
       taskCache.set(conn.id, { at: Date.now() - TASK_STALE_MS + 15_000, rows: old?.rows || [] })
+      notifyChanged()
       return old?.rows || []
     })
     .finally(() => taskInflight.delete(conn.id))
   taskInflight.set(conn.id, p)
+  notifyChanged()
   return p
 }
 
@@ -593,7 +711,7 @@ export function taskScore(row, query, { loose = false } = {}) {
   return score({ title: row.title, preview: loose ? `${row.assignee} ${row.board} ${row.status}` : '', _gwLabel: loose ? row._gwLabel : '', id: row.id }, q)
 }
 
-export function taskItems(rows, rawQuery, { active = 'local', conns = [], now = Date.now() } = {}) {
+export function taskItems(rows, rawQuery, { active = 'local', conns = [], now = Date.now(), status = null } = {}) {
   const query = String(rawQuery || '')
   const lower = query.toLowerCase()
   const items = []
@@ -630,6 +748,7 @@ export function taskItems(rows, rawQuery, { active = 'local', conns = [], now = 
       icon: 'simple'
     })
   }
+  items.push(...statusItems(status, 'tasks', '@task:'))
   return items
 }
 
@@ -781,7 +900,20 @@ function focusedIds() {
   return ids
 }
 
-export function sessionItems(rows, rawQuery, { active = 'local', conns = [], exclude = new Set(), now = Date.now() } = {}) {
+/** Popover rows saying a gateway is still loading (nothing cached yet) or failed. Picking one
+ *  inserts the bare scoped prefix, like the `@session:` helper row. */
+export function statusItems(status, kind, prefix) {
+  const items = []
+  if (status?.loading?.length) {
+    items.push({ insert: prefix, display: `Loading ${kind} from ${status.loading.join(', ')}…`, meta: 'This list updates when they arrive', icon: kind === 'tasks' ? 'simple' : 'session' })
+  }
+  for (const { label, error } of status?.failed || []) {
+    items.push({ insert: prefix, display: `Couldn't load ${kind} from ${label}`, meta: String(error || 'unknown error').slice(0, 160), icon: kind === 'tasks' ? 'simple' : 'session' })
+  }
+  return items
+}
+
+export function sessionItems(rows, rawQuery, { active = 'local', conns = [], exclude = new Set(), now = Date.now(), status = null } = {}) {
   const query = String(rawQuery || '')
   const lower = query.toLowerCase()
   const items = []
@@ -819,6 +951,7 @@ export function sessionItems(rows, rawQuery, { active = 'local', conns = [], exc
       icon: 'session'
     })
   }
+  items.push(...statusItems(status, 'sessions', '@session:'))
   return items
 }
 
@@ -1136,6 +1269,7 @@ export default {
     lastHomeBeat = 0
     connCache = { at: 0, rows: [] }
     deviceCache = { at: 0, info: null }
+    loadWarm()
     refreshStale()
     refreshStaleTasks()
 
@@ -1209,8 +1343,10 @@ export default {
         provide: query => {
           refreshStale()
           const conns = connCache.rows
-          return sessionItems(cachedRows(), query, { active: activeConnectionId(conns), conns, exclude: focusedIds() })
-        }
+          const status = fetchStatus(rowCache, rowInflight, rowErrors, conns)
+          return sessionItems(cachedRows(), query, { active: activeConnectionId(conns), conns, exclude: focusedIds(), status })
+        },
+        subscribe: subscribeRows
       }
     })
 
@@ -1221,8 +1357,10 @@ export default {
         provide: query => {
           refreshStaleTasks()
           const conns = connCache.rows
-          return taskItems(cachedTasks(), query, { active: activeConnectionId(conns), conns })
-        }
+          const status = fetchStatus(taskCache, taskInflight, taskErrors, conns)
+          return taskItems(cachedTasks(), query, { active: activeConnectionId(conns), conns, status })
+        },
+        subscribe: subscribeRows
       }
     })
   }
