@@ -443,6 +443,28 @@ def _reconcile_prose(session_id: str, surface: str, asks: list[str]) -> dict | N
     return None
 
 
+RETIRED_MSG = ("ask-gate: this ask was retired by a recorded terminal user answer (revoked, cancelled, completed "
+               "or impossible). Do not ask again; if the user explicitly reopened it, record the reopen first.")
+UNKNOWN_RETIREMENT_MSG = ("ask-gate: retirement state is unavailable, so this ask is held. Park the work without "
+                          "asking the user and retry once the ledger is readable.")
+
+
+def _retired_block(session_id: str, asks: list[str]) -> dict | None:
+    """Durable terminal answers precede judgment on structured ask surfaces; unknown state fails closed."""
+    asks = [a for a in asks if isinstance(a, str) and a.strip()]
+    if not asks or not session_id:
+        return None
+    try:
+        retired = core.retired_matches(asks, ledger().retired_for(session_id, asks))
+    except Exception as e:
+        core.log_event("retirement_unknown", session=session_id, error=repr(e))
+        return {"action": "block", "message": UNKNOWN_RETIREMENT_MSG}
+    if retired:
+        core.log_event("retired_structured_ask", session=session_id)
+        return {"action": "block", "message": RETIRED_MSG}
+    return None
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -457,6 +479,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         reconciled = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
         if reconciled is not None:
             return reconciled
+        retired = _retired_block(session_id, [request["action"]])
+        if retired is not None:
+            return retired
         tools = _tools_now(session_id)
         evidence = request["evidence"]
         claim = core.checked_line(evidence) or evidence
@@ -485,14 +510,22 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
         if tool_name in {"clarify", "kanban_create", "kanban_block"} and session_id:
             is_ask = (tool_name == "clarify" or args.get("human_request") is not None
                       or core.needs_checked(tool_name, args, _is_worker())[0])
-            if is_ask and ledger().workflow_stopped(session_id):
+            if is_ask:
+                try:
+                    stopped = ledger().workflow_stopped(session_id)
+                except Exception as e:
+                    core.log_event("retirement_unknown", session=session_id, error=repr(e))
+                    return {"action": "block", "message": UNKNOWN_RETIREMENT_MSG}
+            else:
+                stopped = False
+            if stopped:
                 return {"action": "block", "message": "ask-gate: workflow is terminal by explicit user stop. "
                         "Do not request action or execute/reopen it without an explicit workflow resume."}
         if tool_name == "clarify":
             questions = args.get("questions", [])
             candidates = [q["question"] for q in questions
                           if isinstance(q, dict) and isinstance(q.get("question"), str)] if isinstance(questions, list) else []
-            reconciled = _reconcile_prose(session_id, tool_name, candidates)
+            reconciled = _reconcile_prose(session_id, tool_name, candidates) or _retired_block(session_id, candidates)
             if reconciled is not None:
                 return reconciled
         if tool_name == "kanban_complete" and _is_worker():
@@ -503,11 +536,15 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             return _human_request_gate(session_id, tool_name, args)
         candidate = str(args.get("reason") or "") if tool_name == "kanban_block" else (
             str(args.get("title") or "") + "\n" + str(args.get("body") or ""))
-        reconciled = _reconcile_prose(session_id, tool_name, core.find_asks(candidate))
+        found = core.find_asks(candidate)
+        reconciled = _reconcile_prose(session_id, tool_name, found)
         if reconciled is not None:
             return reconciled
         if tool_name == "kanban_block" and str(args.get("kind") or "") in _WORKER_NO_ASK_KINDS:
             return None
+        reconciled = _retired_block(session_id, found)
+        if reconciled is not None:
+            return reconciled
         gated, text = core.needs_checked(tool_name, args, _is_worker())
         if not gated or "Filed automatically by the `open-asks` plugin" in text:
             return None
