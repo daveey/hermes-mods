@@ -1,6 +1,6 @@
 # Worker-launched Desktop test instances stay off the owner's screen
 
-Patch **0459** (source `2c2ec07ae5`).
+Patch **0459** (source `8e8da03e77`).
 
 ## Behavior
 
