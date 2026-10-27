@@ -265,3 +265,61 @@ def maintenance_version(request: Request):
     # Separate overlay CAS revision; do not mutate owner/config identity and
     # invalidate existing repair associations whenever maintenance changes.
     return repair_invoke(request, 'maintenance_revision', None)
+
+
+# ---------------------------------------------------------------- dispatch (phase G)
+
+def jobs_domain(backend):
+    _backend()
+    from hermes_constants import get_hermes_home
+    from hermes_runners_backend.jobs import domain_for
+    return domain_for(backend, Path(get_hermes_home()).resolve())
+
+
+def _start_background(fn):
+    threading.Thread(target=fn, name='runners-job-reconcile', daemon=True).start()
+
+
+def _job_error(exc):
+    # Matched by contract shape: the module may be loaded under the disk or package name.
+    return type(exc).__name__ == 'JobError' and callable(getattr(exc, 'error', None))
+
+
+def jobs_invoke(operation, *args, request=None, **kwargs):
+    try:
+        backend = service()
+        if backend.config['owner_profile'] != active_profile():
+            raise HTTPException(403, 'owner_profile_mismatch')
+        domain = jobs_domain(backend)
+        if operation == 'submit':
+            # Dispatch needs an authenticated login principal; canary mode is never reachable here.
+            return domain.submit(*args, principal=repair_principal(request))
+        if operation == 'get':
+            return domain.get(*args, background=_start_background)
+        return domain.workflows()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _job_error(exc):
+            headers = {'Retry-After': str(exc.retry_after)} if exc.retry_after else None
+            raise HTTPException(exc.status, exc.error(), headers=headers) from None
+        if isinstance(exc, (ValueError, KeyError)):
+            raise HTTPException(422, dict(code='invalid_request', retryable=False, reason_code='invalid_request')) from None
+        if isinstance(exc, (RuntimeError, OSError, sqlite3.Error, ImportError)):
+            raise HTTPException(503, 'unavailable') from None
+        raise
+
+
+@router.get('/workflows')
+def workflows():
+    return jobs_invoke('workflows')
+
+
+@router.post('/jobs', status_code=202)
+def job_submit(request: Request, payload: dict):
+    return jobs_invoke('submit', payload, request=request)
+
+
+@router.get('/jobs/{job_id}')
+def job_lookup(job_id: str):
+    return jobs_invoke('get', job_id)
