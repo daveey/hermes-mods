@@ -33,6 +33,8 @@ Patches:
 - `patches/0252-test-remove-shared-runner-timing-assumptions-daveey.patch`: the bundle-smoke JS test gets a 60 s budget (ten real Node CLIs share the runner) and the goal-parked-resume idle-hook test pins `time.time` so a slow `cli` import cannot outlast its one-second barrier.
 - `patches/0462-fix-ci-main-red-pin-utf-8-on-wait-check-ssh-subproce.patch`: the `wait-check` ssh subprocess in `hermes_cli/kanban_wait_check.py` pins `encoding="utf-8"` (a bare `text=True` trips `test_subprocess_text_encoding`); `test_kanban_block_reason_scrubbed_jwt` now blocks with `kind=needs_input` + `human_request` (ownerless agent blocks are refused) and asserts the call succeeded. Source `d2d18a116d`.
 - `patches/0463-fix-ci-migration-http-auth-test-creates-legacy-block.patch`: `tests/hermes_cli/test_kanban_migration_http_auth.py` creates its legacy blocked card with `lint_blocked=False`, since blocked-creation lint would otherwise refuse the fixture. Test-only. Source `e99a18feca`.
+- `patches/0465-test-sessions-page-owner-custom-home-case-follows-f6.patch` (`19a2a3de28`): `tests/hermes_cli/test_session_message_page_owner.py` expects the nested-custom-home `profile=default` case to resolve to that home (120-row newest page), per `f6a16700fd`'s nested-root rule; the named-profile case keeps the cross-profile 1-row assertion.
+- `patches/0466-chore-i18n-regenerate-_keys.desktop.json-for-shell.s.patch` (`3454645daa`): adds `shell.statusbar.modelLoading` to `locales/_keys.desktop.json` so `i18n-keys.test.mjs` (`check:test:desktop:platforms`) is green again.
 
 What you see: the private fork's CI runs (and passes) without GitHub-hosted minutes. None of this changes runtime
 behavior; it is workflow wiring and test isolation.
@@ -55,7 +57,7 @@ behavior; it is workflow wiring and test isolation.
 - `tests/fixtures/resolution_allowlist.json` lists `_prebuilt_desktop_app_mismatch`, `_prebuilt_signature_error`
   (macOS `codesign`) and `review_session_activity._gh` (`gh` with homebrew fallbacks) as reviewed bare-`which` sites.
 - `.github/workflows/actionlint.yml` lints every workflow on PRs and main (0218). Pushes to main in `ci.yaml`, `nix.yml` and `actionlint.yml` share one concurrency group each: the run in flight is never cancelled, only the newest pending push waits (0230).
-- Lint-only fixes (0224, 0226) and test-isolation fixes (0249, 0252, 0462, 0463) keep blocking `ruff check .` and the windows-footgun scan green on main; no runtime change.
+- Lint-only fixes (0224, 0226) and test-isolation fixes (0249, 0252, 0462, 0463, 0465, 0466) keep blocking `ruff check .` and the windows-footgun scan green on main; no runtime change.
 
 ## How it works
 
