@@ -1,15 +1,58 @@
-# Centralized Kanban board service (design)
+# Centralized sync service: Kanban, sessions and Inbox (design)
 
-Patch: proposed `0193` (core apply path) plus a client plugin and a cloud service. **Nothing here is built yet.**
+Patch: proposed `0193` (core apply path) plus a client plugin and a cloud service. **The Kanban source of truth is not
+built yet.** What is built is described under Current state.
 
-Status: design / RFC, 2026-10-23. This doc describes no shipped behavior and claims nothing that tests prove. It
-proposes making a cloud service the source of truth for Kanban boards, with every gateway's `kanban.db` kept as a
-local SQLite cache that serves reads and accepts writes while offline.
+Status: design / RFC, 2026-10-23, widened 2026-10-26. It proposes one cloud source of truth for Kanban boards, the
+sessions index and the Inbox, with every gateway keeping a full local cache that serves reads and accepts writes while
+offline. Ownership is a lease in the source of truth. This is now the single plan: the private hub plan (v2,
+2026-10-23) and the 2026-10-26 additions are folded in here. Shipped behavior is limited to what Current state,
+Liveness and the "Built so far" note under Operations describe; everything else claims nothing that tests prove.
 
 All line references are to upstream `hermes-agent` at `07ee800d` (2026-10-22) unless a path starts with `plugins/`
 or `core/` in this repo.
 
+## Current state (2026-10-26)
+
+What runs today is a step toward this design, not this design. A sync service replicates each gateway's records
+(sessions index, Inbox, Kanban tasks) into every other gateway's local replica. The gateway that owns a record is
+still its authority. Other gateways read the replica and change a record by sending its owner a request. Core patch
+0193 is not built, so cards still live in their home gateway's `kanban.db` and only run there.
+
+Terms used below for the current system:
+
+- **collector**: the client that reads a gateway's own sessions, Inbox and boards each sync cycle and publishes them.
+- **`gateway/info`**: the one record each gateway publishes about itself. Its `task_scopes[]` lists every
+  `profile/board` the collector tried to read this cycle, with `state` `ok` or `unknown`.
+- **qualified key**: a task record keyed `profile/board/task`. Older records were keyed `board/task` (a two-part
+  alias) and carry no profile.
+- **home gateway**: the gateway whose `kanban.db` holds a card today. In the target design it is only the default
+  first lease holder.
+- **sessions index**: the synced sidebar metadata (title, status, links), not the transcript.
+
+Because the owner is the authority, a chat on one gateway that hands work to another cannot just read whether that
+work is done. It has to collect proof. That is what the origin ledger does
+([kanban-origin-work-ledger.md](kanban-origin-work-ledger.md)): durable bindings, owner observations and release
+receipts. It works, but it costs. Measured on 2026-10-26 on one personal gateway, from its sync log, its published
+records and its error log (counts grow through the day as more boards publish):
+
+1. Every sync republished every task, because a per-task "still alive" timestamp sat inside each hashed record.
+   1,952 of 1,954 changed records per 75 s cycle were only that stamp. Fixed, see Liveness.
+2. Every reader reconciled two association paths and wrote the result back to a snapshot on the read path. That
+   write failed with `database is locked` 149 times in a day, and each time the sidebar showed every row as
+   unknown. Fixed in core (one shared projection per store state, best-effort snapshot;
+   `test_kanban_remote_inventory_cache.py`).
+3. Remote work does not shrink. 3,944 remote links resolve to 2,095 distinct session/card pairs, because 1,849
+   links come from old two-part `board/task` alias records (see Legacy two-part aliases). And 821 qualified links
+   whose owner reported done stay unfinished, because no release receipt exists for them.
+
+1 and 2 were fixes inside the current design. 3 is structural: with per-gateway authority a remote "done" is a claim
+to verify. With one source of truth it is the card's status.
+
 ## Problem
+
+As of 2026-10-23, before the replication described above. The board model below is still true; the "nothing is
+replicated" view model is not, but replication alone did not give one source of truth.
 
 A board is a SQLite file on one machine. `hermes_cli/kanban_db.py` L1–12 states the model: boards live under
 `kanban_home()` (L400; `HERMES_KANBAN_HOME` or the Hermes root, shared by every profile on the host), each board is
@@ -45,11 +88,17 @@ With several gateways (laptop, mac-mini, a cloud gateway), each one has its own,
 - Cross-gateway dependencies (parent on laptop, child on the cloud gateway) work natively.
 - Attachments are reachable from every gateway.
 - The rollout is incremental and reversible (feature flag, shadow mode, one-command rollback to local-only).
+- The sessions index (sidebar metadata) and the Inbox live in the same service, so every machine shows the same
+  sidebar and Inbox, from its own cache.
+- When a gateway is gone, its work can be taken over, without ever running a card twice (Ownership).
+- "Is this chat's remote work done" is a local read of the card, not a proof collected from another gateway.
 
 ## Non-goals
 
-- Replicating sessions, `state.db`, transcripts or worker workspaces. Workspaces stay on the gateway that runs the
-  card.
+- Replicating transcripts, `state.db` messages, worker workspaces or chat ids. Session *metadata* (title, status,
+  links) is synced; the conversation never leaves the host. Workspaces stay on the gateway that runs the card.
+- Taking over a session from a machine that is gone. Its transcript is on that machine, so a takeover would lose the
+  history. Sessions move only when both machines are up.
 - Multi-tenant SaaS. This is one owner's boards, a handful of gateways and at most tens of thousands of cards.
 - Real-time collaborative text editing of card bodies. Field-level last-writer-wins is enough.
 - Replacing the dispatcher. Each gateway still runs its own embedded dispatcher
@@ -130,7 +179,7 @@ flowchart LR
 | Cross-board queries | weak (fan-out to DOs; D1 index) | strong | weak |
 | Vendor lock-in | DO API | low (Postgres) | high |
 
-**Recommendation: Cloudflare.** The problem is "many small, independent, strictly ordered logs with exclusive
+**Decided: Cloudflare** (the existing service runs there). Original reasoning: The problem is "many small, independent, strictly ordered logs with exclusive
 leases", and one Durable Object per board is exactly that primitive. The DO's SQLite keeps the server schema a near
 copy of the client's, and hibernating WebSockets make live push essentially free. AWS + Aurora is the fallback if
 cross-board SQL analytics or Postgres portability ever matter more. Keep the wire protocol (below)
@@ -146,7 +195,8 @@ backend-agnostic so that switching later costs one server rewrite and no client 
 - **Profile identity**: profiles share one board root per host (`kanban_home()` L400), so the gateway is the
   security principal and the profile is an attribution field (`created_by`, `author`, `task_runs.profile`). The
   service records which gateway wrote what (`origin_gateway`) but does not try to authenticate individual profiles.
-- **Scopes**: `board:read`, `board:write` and `board:claim` per board. A read-only gateway (for example a phone
+- **Scopes**: `board:read`, `board:write` and `board:claim` per board, plus a global `operator` scope (lease reset,
+  enroll, revoke) held by the owner's devices only. A read-only gateway (for example a phone
   companion) never gets `claim`.
 - **Revocation**: deleting the gateway row in the D1 registry invalidates its refresh token. Its outstanding leases
   expire normally (see Claims).
@@ -585,12 +635,69 @@ logs `claim_deferred: offline` and leaves the card `ready`. Cards already runnin
 until their lease runs out (step 3). This trades availability for safety, deliberately: running a card twice can
 double-push a branch or double-send a message, while waiting only delays work. A per-board setting
 `offline_claims: "local-only"` could later allow claiming cards whose `assignee` profile exists only on this
-gateway, but that is an open question, not part of v1.
+gateway, but that is an open question, not part of v1. See Ownership: that question is now a per-card
+`available` setting, out of v1.
 
 **Cross-gateway dependencies become possible.** Because `task_links` and every task's status replicate, a parent
 on the laptop board can depend on a child that the cloud gateway runs. The server's `recompute_ready` promotes the
 parent when the child completes, the promotion arrives as a change, and the laptop's dispatcher, woken by the
 apply path, claims it. No relay is needed.
+
+### Ownership: availability, reset and sessions
+
+The claim rules above are the model for all ownership. Three additions.
+
+**Availability is a declared property, not a TTL.** "Keeps working when the service is down" and "can be taken over
+when a gateway is down" conflict for any one card. If an offline holder keeps running and someone else takes over,
+the card runs twice. So each card says which it wants:
+
+- `at_most_once` (default): the rules above. No offline claims, a holder that cannot renew stops at
+  `lease_expires` minus the safety margin, and only then can the card be claimed again. Anything that pushes a
+  branch, sends a message or spends money stays here.
+- `available`: the home gateway may claim offline. This needs a second lease mode that the claim rules above do not
+  have: a lease the service accepts after the fact when no other lease was granted meanwhile, and rejects
+  (`lease_lost`, reported) when one was. Only for work that is safe to repeat (no external side effects).
+
+We start with every card `at_most_once`. That is the behavior this doc already specifies, so `available` (and its
+lease mode) is a later opt-in, designed when a real card needs it, not a v1 requirement.
+
+**Renewal is per run.** A lease is renewed by its worker's heartbeat (`heartbeat_claim`), never by a gateway-wide
+heartbeat. A gateway whose sync process is alive but whose worker is hung must lose the lease.
+
+**Reset is expiry, plus an operator override.** The service already returns an expired lease's card to `ready` (DO
+alarm), so a dead gateway never strands work. On top of that, the operator (a principal with an `operator` scope,
+added to Auth) can reset a lease before it expires, when the holder is known to be gone. Either way the card's next
+claim gets a new `run_uid`, and the `run_uid` fencing in step 4 rejects the old holder's late writes. Gateways never
+reset each other's leases. A gateway that cannot reach the service looks exactly like a dead one from outside.
+
+An early reset gives up the at-most-once guarantee for that card: if the holder was alive after all, its worker
+keeps running until its own lease deadline and its side effects can happen twice. Fencing only protects the
+service's state. So an early reset is a deliberate operator decision, shown with that warning, and listed in Risks.
+
+**Sessions.** A session's owner is the machine it runs on: a pointer in the sessions index, not an expiring lease.
+It moves with a two-phase handoff (the service marks the move, the current owner acks on its next sync) and only
+while both machines are up. There is no takeover. A session whose machine is gone shows as unavailable. Inbox cards follow the same rule: each
+has an owning gateway, other gateways act on it by request, and there are no leases.
+
+## Liveness (built 2026-10-26)
+
+Liveness belongs to a source, not to a record.
+
+Before, the owner stamped `observed_at` on every task record it published, and readers required that stamp to be
+under 180 s old. Proving "I'm still here" meant rewriting every task every cycle: one gateway queued 3,927 records
+per cycle, and the replica's WAL grew to 176 MB.
+
+Now the collector writes one `observed_at` on each `gateway/info` `task_scopes[]` entry it read this cycle (state
+`ok` only), and a task is live when its owner's scope heartbeat is under 180 s old and the record is current. An
+unchanged task publishes an identical record. Readers still accept the old per-task stamp, for records published
+before the switch. Measured after, from each gateway's sync log: 1 to 10 records per quiet cycle on the two
+personal gateways, 22 to 36 on the always-on gateway that runs agents (real activity). Tests:
+`test_kanban_origin_scope_heartbeat.py` (core) and `client/tests/test_scope_heartbeat.py` (service client).
+
+In the target design this stays as "this gateway successfully read its boards this cycle", for the "last synced"
+mark on each gateway's cards. It is different from the feed WebSocket's keepalive (Sync protocol), which only says
+the connection is up. Neither is lease renewal (see Ownership). The rule to keep: nothing that changes every cycle goes inside a record whose hash
+decides what syncs.
 
 ## Apply path (proposed core patch `0193`)
 
@@ -749,6 +856,36 @@ These need review:
   and the single "probe" card is exactly a lease, so it becomes more correct.
 - **all-gateways**: retired as described above.
 
+### Retiring the origin ledger
+
+With one current version of each card in the service, a session's remote work is a join of its links against
+cards in the local cache. That retires the origin ledger's bindings and owner observations, the origin-work
+snapshot, the legacy/receipt reconciliation in the activity readers, and Desktop's owner probing.
+
+Steps: migrate every receipt to a synced session link (receipts are exact, so this is mechanical), shadow-read both
+answers for a week and diff "remote work per session", then switch readers and delete the ledger paths.
+
+The creation-intent receipts (idempotent remote card creation) are a different job. They probably fold into the
+outbox's `client_op_id`, but that needs its own look before they go.
+
+### Legacy two-part aliases
+
+Before profile-qualified keys existed, task records were published as `board/task`. Those records are frozen: the
+collector neither updates nor deletes them. In one gateway's replica, every one of 1,849 such links has a qualified
+record with the same gateway, board and task id, and no task id appears under two gateways. That is one replica, not
+a guarantee: ids are 32-bit (see Identity), which is why import plans for collisions.
+
+That is still not proof they are the same card. The old collector honored `HERMES_KANBAN_HOME` without recording
+provenance, so a `board/task` record can come from a different board root, for example a cloned board with copied
+ids. The rule from [kanban-local-owner-projection.md](kanban-local-owner-projection.md) stands: an ownerless record is
+not retired because a qualified row has the same id.
+
+So the import establishes provenance instead of inferring it. Each gateway imports the boards in its own files,
+with explicit profile and board. (A board copied to two machines is still the merge case under Backfill.) Frozen two-part records are not imported. A session link that only
+points at one moves to the imported card through owner-attested alias reconciliation (the owner confirms the alias),
+or stays as an "unresolved" link: not counted as active, archive allowed with one confirm, listed in one Inbox card.
+Separately, the 821 qualified owner-done links resolve on import, because the imported card's status is the answer.
+
 ### Phased rollout
 
 | Phase | What | Exit criteria | Effort |
@@ -760,6 +897,20 @@ These need review:
 | 4. Cleanup | retire the 0090 fan-out for synced boards, move follow-through/user-steps to helpers (optional), update the affected `core/kanban-*.md` docs | docs claim only what tests prove | 0.5–1 wk |
 
 Total: about 6–7 weeks of focused work plus two soak periods.
+
+**Kanban first.** The earlier hub plan started with sessions. But the sessions index and the Inbox are already
+replicated, single-writer collections, with no conflicts by construction, and they work today. The pain is
+cross-gateway Kanban status, and Kanban in the source of truth is what retires the origin ledger. So the phases
+above come first, then:
+
+| Phase | What | Exit criteria |
+|---|---|---|
+| 5. Ledger retirement | receipts to session links, shadow diff, readers switched, ledger paths deleted | a week of zero unexplained diffs; one association code path |
+| 6. Sessions and Inbox | the replicated collections become service-owned with the same feed and outbox; session moves as two-phase handoffs | the sidebar and Inbox match on every gateway with one gateway asleep |
+
+Phases 5 and 6 are not estimated yet, so the total above covers only phases 0 to 4. Deleting the ledger paths is the
+last step of phase 5, after its soak: until then the ledger stays read-only, so `sync detach` can still fall back
+to it.
 
 **Backfill / import with ID remapping.** `sync import` reads the local board like `export_board` (L114) but keeps
 history (no scrub of synced columns; it scrubs only the local-only columns listed above). It assigns `uid`s to
@@ -776,12 +927,33 @@ import becomes a set of creates for the ids that do not exist yet, and conflicti
 **Rollback.** `hermes kanban sync detach <board>` sets `mode='off'`, drops the triggers for that board, releases
 the leases it holds, and leaves `kanban.db` as a normal, complete local board, because the cache was always a full
 board. Any un-drained outbox rows are kept in the file and reported. Re-attaching later reconciles them through the
-normal push.
+normal push. Rollback is per board, for Kanban. After phase 5 deletes the ledger, a detached board's cross-gateway
+work answer comes from the replica again, without the ledger's proofs (see Phased rollout). Sessions and Inbox
+(phase 6) get their own detach.
+
+## Operations
+
+**Watch the sync, not just the data.** The republish-everything bug ran for days because nothing watched churn. A
+nightly digest compare is not enough. Alert on: records queued per quiet cycle, lease resets and expiries, rejected
+writes (`lease_lost`), and readers failing to annotate. The phase 2 nightly diff stays; it catches wrong data, not
+wasted work. Built so far: one gateway's watchdog (in the private config repo) alerts on sync churn (median queued
+over 5 cycles above 300) and on repeated sidebar annotation failures. The other gateways are not covered yet, and
+leases do not exist yet.
+
+**Rebuild the service from caches.** Once the service is the source of truth, every gateway's cache holds every
+synced row (not leases, notify subscriptions or local paths, which are local by design), so the caches are the
+backup. A rebuild imports the freshest gateway's synced rows into an empty service with a new feed generation; every
+client's cursor then gets `410 resync` and takes a snapshot, and open leases are re-granted on the next claim. The
+rebuild should be tested, not assumed. `sync detach` (Rollback) stays the way back
+to local-only.
 
 ## Open questions
 
-- Offline claims for profiles that exist on only one gateway (`offline_claims: "local-only"`): is the availability
-  gain worth a second claim mode?
+- Which cards, if any, should be `available` (see Ownership)? The default is none. This replaces the earlier
+  `offline_claims: "local-only"` question.
+- Lease TTLs per kind of work, and whether a laptop that knows it is going to sleep should release its leases first.
+- Is the operator reset enough, or do we want an automatic reset after a much longer timeout for gateways that never
+  come back?
 - Should `body` and `result` (long text) use a text CRDT instead of LWW? This design says no: card bodies are
   rarely co-edited.
 - Timers on the server (DO alarms) mean the server must understand timed waits and soft deadlines. Alternatively,
@@ -798,6 +970,10 @@ normal push.
 
 - **Double run through a lease bug.** This is the worst failure. Mitigation: fencing by `run_uid` on every
   terminal op, server-side audit of overlapping leases from `changes`, and a phase 3 soak with alerts.
+- **Operator reset of a live holder.** An early reset can run a card twice (Ownership). Mitigation: show the
+  warning, reset only holders known to be gone, and audit resets from `changes`.
+- **Two association paths during the ledger retirement.** Until readers switch, the ledger and the session links
+  must agree. The shadow diff is the guard; a disagreement blocks the switch.
 - **Trigger drift.** A new column added by an upstream migration is not captured until the trigger list is
   updated. Mitigation: generate triggers from `PRAGMA table_info` minus the local-only set at `init_db` time, and
   add a test that fails when a `tasks` column is neither synced nor declared local.
@@ -815,15 +991,21 @@ normal push.
 
 ## Code
 
-None yet. Proposed: `hermes_cli/kanban_db_sync.py` + seams (core patch 0193), `plugins/kanban-sync/` (sync
-worker, enroll/import/detach CLI), and a separate service repo (Worker + Durable Object).
+For the Kanban source of truth, none yet. Proposed: `hermes_cli/kanban_db_sync.py` + seams (core patch 0193),
+`plugins/kanban-sync/` (sync worker, enroll/import/detach CLI), and the existing separate service repo (Worker +
+Durable Object), which already runs the replication described under Current state. Built for Liveness: scope
+heartbeats in the service client and core `kanban_origin_ledger.project` (tests:
+`test_kanban_origin_scope_heartbeat.py`).
 
 ## Tests
 
 None yet. Required before any feature doc claims behavior: the upstream kanban suite with sync on and off; the
 apply-path tests (echo suppression, run uid translation, hooks fire once after commit, cursor advances
 atomically); lease tests (two gateways race, lease expiry mid-run, a stale holder's `complete` rejected); offline
-replay (outbox survives restart, idempotent re-POST); and the import/remap tests.
+replay (outbox survives restart, idempotent re-POST); and the import/remap tests. Added by Ownership: a holder that
+cannot renew stops before `lease_expires`; an operator reset followed by the old holder's `complete` is rejected; an
+`at_most_once` card is never claimed offline. Added by the ledger retirement: the shadow diff of remote work per
+session. Liveness has its tests already (see Liveness).
 
 ## Gotchas
 
