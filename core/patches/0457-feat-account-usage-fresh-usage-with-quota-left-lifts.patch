@@ -1,0 +1,443 @@
+From 2afd97840908f07853b3525853d0d7ba59631950 Mon Sep 17 00:00:00 2001
+From: x <x@example.com>
+Date: Tue, 27 Oct 2026 00:00:05 -0700
+Subject: [PATCH] feat(account-usage): fresh usage with quota left lifts a
+ stale quota bench [daveey]
+
+A Codex usage_limit_reached benched the credential until the provider's
+reset time, even after the subscription was reset early: routing skipped
+the account and the usage chip stayed red with 0% weekly use.
+
+- agent/account_usage_recovery.py: clear a bench only when it is a
+  usage/quota reason code (not billing, auth or a plain 429), the snapshot
+  is for the same account and was fetched after the bench, and every
+  account-scoped window is below 100%. Telemetry never sets a bench.
+- account_usage_cache._refresh_entries runs the check after each
+  per-account fetch (the picker path).
+- tui_gateway starts a 10-minute watch that re-fetches usage for
+  quota-benched accounts only, so recovery is seen with no picker open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/account_usage_cache.py                  |   5 +-
+ agent/account_usage_recovery.py               | 164 ++++++++++++++++++
+ tests/agent/test_account_usage_recovery.py    | 163 +++++++++++++++++
+ .../test_quota_recovery_starter.py            |  11 ++
+ tui_gateway/entry.py                          |   9 +-
+ 5 files changed, 350 insertions(+), 2 deletions(-)
+ create mode 100644 agent/account_usage_recovery.py
+ create mode 100644 tests/agent/test_account_usage_recovery.py
+ create mode 100644 tests/tui_gateway/test_quota_recovery_starter.py
+
+diff --git a/agent/account_usage_cache.py b/agent/account_usage_cache.py
+index 5951318bcd..bac8afa70d 100644
+--- a/agent/account_usage_cache.py
++++ b/agent/account_usage_cache.py
+@@ -281,6 +281,7 @@ def refresh_account_usage_entries_async(requests: Iterable[dict]) -> list[thread
+ 
+ def _refresh_entries(requests: list[dict]) -> None:
+     from agent.account_usage import fetch_account_usage
++    from agent.account_usage_recovery import clear_recovered_quota_benches
+ 
+     claims = [(request.get("_claim_key") or _key(request["provider"], request["identity_id"]),
+                request.get("_claim_token")) for request in requests]
+@@ -288,10 +289,12 @@ def _refresh_entries(requests: list[dict]) -> None:
+         for request, (key, token) in zip(requests, claims):
+             try:
+                 _touch_refresh(key, token)
+-                fetch_account_usage(
++                snapshot = fetch_account_usage(
+                     request["provider"], base_url=request.get("base_url"), api_key=request.get("api_key"),
+                     read_only=True, identity_id=request["identity_id"],
+                 )
++                # Fresh windows with quota left lift a stale quota bench (early reset, plan change).
++                clear_recovered_quota_benches(request["provider"], request["identity_id"], snapshot)
+             except Exception as exc:  # one bad slot must not starve its siblings
+                 logger.debug("account usage: refresh for %s/%s failed: %s",
+                              request.get("provider"), request.get("identity_id"), exc)
+diff --git a/agent/account_usage_recovery.py b/agent/account_usage_recovery.py
+new file mode 100644
+index 0000000000..9d6deca1cd
+--- /dev/null
++++ b/agent/account_usage_recovery.py
+@@ -0,0 +1,164 @@
++"""Clear a quota bench once fresh usage telemetry shows the account has quota again.
++
++A provider quota error (Codex ``usage_limit_reached``) benches a pool credential until the reset
++time the provider sent with it. When the subscription is reset early (a plan change, a new billing
++cycle, a manual reset on the provider's site) nothing would notice: the bench held the account out
++of rotation, and the usage chip red, until that old reset time.
++
++This module is the one place usage telemetry may change routing, and only in the safe direction:
++it clears a bench, never sets one. A wrong clear costs one request, whose quota error benches the
++credential again. The rule is narrow on purpose:
++
++- the entry is ``exhausted`` for a usage/quota reason code (not billing, not auth, not a plain 429);
++- the snapshot was fetched AFTER the bench was set, for the same account identity;
++- the snapshot has at least one account-scoped window, and every one of them is below 100%.
++
++``start_quota_recovery_watch`` re-fetches usage for benched accounts on a timer, so recovery is
++seen even when no picker is open (a picker read already refreshes every entry it lists).
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++# Provider reason codes that mean "this account's usage window is spent". Billing (402 / credits)
++# is left out on purpose: usage windows with room say nothing about a payment problem.
++QUOTA_BENCH_REASONS = frozenset({
++    "usage_limit_reached", "usage_limit", "insufficient_quota", "quota_exceeded", "quota_exhausted",
++    "rate_limit_exceeded_quota",
++})
++
++QUOTA_RECOVERY_INTERVAL_S = 10 * 60.0
++_EXHAUSTED_WINDOW_PERCENT = 100.0
++
++_watch_lock = threading.Lock()
++_watch_started = False
++
++
++def is_quota_bench(entry: Any) -> bool:
++    """Whether *entry* is benched because its provider said the usage quota is spent."""
++    from agent.credential_pool import STATUS_EXHAUSTED
++
++    if getattr(entry, "last_status", None) != STATUS_EXHAUSTED:
++        return False
++    if getattr(entry, "last_error_code", None) in (401, 402):
++        return False
++    if str(getattr(entry, "failure_reason", "") or "").strip().lower() in {"billing", "auth", "auth_permanent"}:
++        return False
++    return str(getattr(entry, "last_error_reason", "") or "").strip().lower() in QUOTA_BENCH_REASONS
++
++
++def snapshot_shows_quota(snapshot: Any) -> bool:
++    """At least one account-scoped window, and none of them spent."""
++    if snapshot is None or getattr(snapshot, "unavailable_reason", None):
++        return False
++    windows = [w for w in (getattr(snapshot, "windows", ()) or ())
++               if getattr(w, "scope", "account") == "account" and getattr(w, "used_percent", None) is not None]
++    return bool(windows) and all(float(w.used_percent) < _EXHAUSTED_WINDOW_PERCENT for w in windows)
++
++
++def _fetched_epoch(snapshot: Any) -> Optional[float]:
++    fetched = getattr(snapshot, "fetched_at", None)
++    try:
++        return fetched.timestamp() if fetched is not None else None
++    except Exception:
++        return None
++
++
++def clear_recovered_quota_benches(provider: str, identity_id: Optional[str], snapshot: Any) -> list[str]:
++    """Clear the quota bench of every pool entry of *identity_id*'s account that *snapshot* shows
++    has quota again. Returns the cleared entry ids. Never raises; never sets a bench."""
++    if not provider or snapshot is None:
++        return []
++    identity = getattr(snapshot, "identity", None) or identity_id
++    fetched = _fetched_epoch(snapshot)
++    if not identity or fetched is None or not snapshot_shows_quota(snapshot):
++        return []
++    try:
++        from agent.account_usage_cache import _identity_id_for
++        from agent.credential_pool import load_pool
++
++        pool = load_pool(provider)
++        cleared: list[str] = []
++        for entry in list(pool.entries()):
++            if not is_quota_bench(entry):
++                continue
++            if _identity_id_for(provider, entry) != identity:
++                continue
++            benched_at = getattr(entry, "last_status_at", None)
++            if not benched_at or fetched <= float(benched_at):
++                continue  # telemetry from before the bench proves nothing about recovery
++            if pool.reset_status(entry.id) is not None:
++                cleared.append(entry.id)
++                logger.info("account usage: cleared quota bench on %s credential %s; fresh usage shows quota left",
++                            provider, getattr(entry, "label", "") or entry.id)
++        return cleared
++    except Exception:
++        logger.debug("account usage: quota recovery check failed for %s", provider, exc_info=True)
++        return []
++
++
++def benched_usage_requests(providers: Optional[Iterable[str]] = None) -> list[dict]:
++    """Per-account usage refresh requests for quota-benched entries whose bench is still live."""
++    from agent.account_usage_cache import _identity_id_for, has_account_usage
++    from agent.credential_pool import _exhausted_until, load_pool
++    from hermes_cli.auth import read_credential_pool
++    from hermes_cli.inventory import _pool_entry_route_base_url
++
++    now = time.time()
++    slugs = list(providers) if providers is not None else [s for s, rows in read_credential_pool().items() if rows]
++    requests: list[dict] = []
++    for slug in slugs:
++        try:
++            if not has_account_usage(slug):
++                continue
++            seen: set[str] = set()
++            for entry in load_pool(slug).entries():
++                if not is_quota_bench(entry):
++                    continue
++                until = _exhausted_until(entry)
++                if until is not None and until <= now:
++                    continue  # the bench has already lapsed; routing will retry it
++                identity = _identity_id_for(slug, entry)
++                if identity in seen:
++                    continue
++                seen.add(identity)
++                requests.append({"provider": slug, "identity_id": identity,
++                                 "base_url": _pool_entry_route_base_url(slug, entry),
++                                 "api_key": entry.runtime_api_key})
++        except Exception:
++            logger.debug("account usage: benched-entry scan failed for %s", slug, exc_info=True)
++    return requests
++
++
++def check_quota_recovery_once() -> list[threading.Thread]:
++    """Queue usage refreshes for every quota-benched account; the refresh clears what recovered."""
++    from agent.account_usage_cache import refresh_account_usage_entries_async
++
++    requests = benched_usage_requests()
++    return refresh_account_usage_entries_async(requests) if requests else []
++
++
++def start_quota_recovery_watch(interval_s: float = QUOTA_RECOVERY_INTERVAL_S) -> bool:
++    """Start the process-wide daemon that checks benched accounts every *interval_s*. Idempotent."""
++    global _watch_started
++    with _watch_lock:
++        if _watch_started:
++            return False
++        _watch_started = True
++
++    def _loop() -> None:
++        while True:
++            time.sleep(interval_s)
++            try:
++                check_quota_recovery_once()
++            except Exception:
++                logger.debug("account usage: quota recovery watch tick failed", exc_info=True)
++
++    threading.Thread(target=_loop, name="account-usage-quota-recovery", daemon=True).start()
++    return True
+diff --git a/tests/agent/test_account_usage_recovery.py b/tests/agent/test_account_usage_recovery.py
+new file mode 100644
+index 0000000000..c678af719b
+--- /dev/null
++++ b/tests/agent/test_account_usage_recovery.py
+@@ -0,0 +1,163 @@
++"""Fresh usage telemetry lifts a stale quota bench (early subscription reset), and nothing else.
++
++Real auth stores on disk and the real pool; only the provider usage HTTP call is faked. Covers the
++picker path (``_apply_usage`` -> per-account refresh), the background watch path
++(``check_quota_recovery_once``). The gateway starter is in tests/tui_gateway.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++import time
++from datetime import UTC, datetime, timedelta
++
++import pytest
++
++from agent import account_usage
++from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
++from agent.account_usage_cache import _inflight, _last_try, _snapshots, _started
++from agent.account_usage_recovery import (
++    check_quota_recovery_once, clear_recovered_quota_benches, start_quota_recovery_watch,
++)
++from agent.credential_pool import load_pool
++from hermes_cli.inventory import _apply_usage
++
++FAR = time.time() + 6 * 86400  # the provider's (now stale) reset time
++
++
++def _join() -> None:
++    for worker in [t for t in threading.enumerate() if "hermes-account-usage-refresh" in t.name]:
++        worker.join(10)
++
++
++@pytest.fixture(autouse=True)
++def _isolate(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
++    for store in (_snapshots, _started, _last_try, _inflight):
++        store.clear()
++    yield
++    _join()
++
++
++def _fp(token: str) -> str:
++    import hashlib
++
++    return f"fp:{hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]}"
++
++
++def _write_pool(tmp_path, entries: list[dict]) -> None:
++    home = tmp_path / "h"
++    home.mkdir(parents=True, exist_ok=True)
++    (home / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"openrouter": entries}}), encoding="utf-8")
++
++
++def _entry(cred_id: str, token: str, **over) -> dict:
++    entry = {"id": cred_id, "label": cred_id, "auth_type": "api_key", "priority": 0, "source": "manual", "access_token": token}
++    entry.update(over)
++    return entry
++
++
++def _quota_bench(**over) -> dict:
++    bench = {"last_status": "exhausted", "last_status_at": time.time() - 60, "last_error_code": 429,
++             "last_error_reason": "usage_limit_reached", "last_error_reset_at": FAR}
++    bench.update(over)
++    return bench
++
++
++def _snapshot(used: float, *, scope: str = "account", fetched_at: datetime | None = None) -> AccountUsageSnapshot:
++    return AccountUsageSnapshot(
++        provider="openrouter", source="test", fetched_at=fetched_at or datetime.now(UTC),
++        windows=(AccountUsageWindow(label="Weekly", used_percent=used, reset_at=datetime.now(UTC) + timedelta(days=7), scope=scope),))
++
++
++def _fetcher(monkeypatch, answers: dict) -> list:
++    calls: list = []
++
++    def fake(base_url, api_key):
++        calls.append(api_key)
++        return answers.get(api_key)
++
++    monkeypatch.setitem(account_usage._USAGE_FETCHERS, "openrouter", fake)
++    return calls
++
++
++def _status(cred_id: str):
++    return next(e for e in load_pool("openrouter").entries() if e.id == cred_id).last_status
++
++
++def _rows() -> dict:
++    row = {"slug": "openrouter", "name": "OpenRouter", "models": ["m"], "authenticated": True}
++    _apply_usage([row])
++    return {a["id"]: a for a in row["usage"]["accounts"]}
++
++
++def test_picker_refresh_lifts_quota_bench_when_usage_shows_quota(monkeypatch, tmp_path):
++    """Picker path: a Codex-style usage_limit_reached bench with a far reset is cleared once the
++    per-account refresh sees every account window below 100%, and the next read shows it ready."""
++    _write_pool(tmp_path, [_entry("c1", "tok-1", **_quota_bench()), _entry("c2", "tok-2")])
++    _fetcher(monkeypatch, {"tok-1": _snapshot(0.0), "tok-2": _snapshot(20.0)})
++
++    first = _rows()
++    assert first[_fp("tok-1")]["state"] == "limited"  # cached view before the refresh lands
++    _join()
++
++    assert _status("c1") is None, "fresh usage with quota left must clear the stale quota bench"
++    assert _rows()[_fp("tok-1")]["state"] == "ready"
++
++
++@pytest.mark.parametrize("bench,used,scope,why", [
++    (_quota_bench(), 100.0, "account", "window still spent"),
++    (_quota_bench(), 0.0, "model", "only a model-scoped window: no account evidence"),
++    (_quota_bench(last_error_code=401, last_error_reason="token_expired"), 0.0, "account", "auth bench"),
++    (_quota_bench(last_error_code=402, last_error_reason="billing_hard_limit_reached"), 0.0, "account", "billing bench"),
++    (_quota_bench(last_error_reason="rate_limit_exceeded"), 0.0, "account", "plain rate limit, not quota"),
++])
++def test_bench_kept_without_quota_evidence(monkeypatch, tmp_path, bench, used, scope, why):
++    _write_pool(tmp_path, [_entry("c1", "tok-1", **bench), _entry("c2", "tok-2")])
++    assert clear_recovered_quota_benches("openrouter", _fp("tok-1"), _snapshot(used, scope=scope)) == [], why
++    assert _status("c1") == "exhausted", why
++
++
++def test_snapshot_fetched_before_the_bench_proves_nothing(monkeypatch, tmp_path):
++    _write_pool(tmp_path, [_entry("c1", "tok-1", **_quota_bench()), _entry("c2", "tok-2")])
++    old = datetime.now(UTC) - timedelta(minutes=5)
++    assert clear_recovered_quota_benches("openrouter", _fp("tok-1"), _snapshot(0.0, fetched_at=old)) == []
++    assert _status("c1") == "exhausted"
++
++
++def test_only_the_matching_account_is_cleared(monkeypatch, tmp_path):
++    _write_pool(tmp_path, [_entry("c1", "tok-1", **_quota_bench()), _entry("c2", "tok-2", **_quota_bench())])
++    assert clear_recovered_quota_benches("openrouter", _fp("tok-1"), _snapshot(5.0)) == ["c1"]
++    assert _status("c1") is None and _status("c2") == "exhausted"
++
++
++def test_background_watch_fetches_only_benched_accounts_and_clears_recovered(monkeypatch, tmp_path):
++    """Watch path: no picker open. One tick fetches usage for quota-benched entries only (not the
++    healthy one, not a lapsed bench) and lifts the bench whose account has quota again."""
++    _write_pool(tmp_path, [
++        _entry("c1", "tok-1", **_quota_bench()),
++        _entry("c2", "tok-2"),
++        _entry("c3", "tok-3", **_quota_bench(last_error_reset_at=time.time() - 10)),
++        _entry("c4", "tok-4", **_quota_bench()),
++    ])
++    calls = _fetcher(monkeypatch, {"tok-1": _snapshot(0.0), "tok-4": _snapshot(100.0)})
++
++    for worker in check_quota_recovery_once():
++        worker.join(10)
++
++    assert sorted(calls) == ["tok-1", "tok-4"]
++    assert _status("c1") is None
++    assert _status("c4") == "exhausted"
++
++
++def test_watch_starts_once_and_ticks(monkeypatch):
++    import agent.account_usage_recovery as recovery
++
++    ticked = threading.Event()
++    monkeypatch.setattr(recovery, "_watch_started", False)
++    monkeypatch.setattr(recovery, "check_quota_recovery_once", lambda: ticked.set() or [])
++    assert start_quota_recovery_watch(interval_s=0.01) is True
++    assert start_quota_recovery_watch(interval_s=0.01) is False
++    assert ticked.wait(2), "the watch thread must run a recovery check each interval"
++
+diff --git a/tests/tui_gateway/test_quota_recovery_starter.py b/tests/tui_gateway/test_quota_recovery_starter.py
+new file mode 100644
+index 0000000000..de12103911
+--- /dev/null
++++ b/tests/tui_gateway/test_quota_recovery_starter.py
+@@ -0,0 +1,11 @@
++"""The TUI gateway starts the account quota recovery watch at startup."""
++
++
++def test_tui_gateway_starter_starts_the_watch(monkeypatch):
++    import agent.account_usage_recovery as recovery
++    from tui_gateway import entry
++
++    started = []
++    monkeypatch.setattr(recovery, "start_quota_recovery_watch", lambda: started.append(True))
++    entry._start_quota_recovery_watch()
++    assert started == [True]
+diff --git a/tui_gateway/entry.py b/tui_gateway/entry.py
+index 12029a68ed..f4bfa23ba9 100644
+--- a/tui_gateway/entry.py
++++ b/tui_gateway/entry.py
+@@ -270,6 +270,12 @@ def _write_or_exit(payload: dict, reason: str) -> None:
+         sys.exit(0)
+ 
+ 
++def _start_quota_recovery_watch() -> None:
++    from agent.account_usage_recovery import start_quota_recovery_watch
++
++    start_quota_recovery_watch()
++
++
+ def main():
+     # stdout is this process's JSON-RPC client channel: peer-less global broadcasts belong on it.
+     server._stdio_is_rpc_channel = True
+@@ -299,7 +305,8 @@ def main():
+     for start, what in (
+             (server._start_backend_heartbeat_refresher, "backend heartbeat refresher start"),
+             (server._schedule_startup_orphan_sweep, "startup orphan sweep scheduling"),
+-            (server._start_kanban_unloaded_sweeper, "kanban unloaded-session sweeper start")):
++            (server._start_kanban_unloaded_sweeper, "kanban unloaded-session sweeper start"),
++            (_start_quota_recovery_watch, "account quota recovery watch start")):
+         try:
+             start()
+         except Exception:
+-- 
+2.55.0
+

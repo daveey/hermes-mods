@@ -2,6 +2,8 @@
  * Account Usage — status-bar chips showing every pooled Claude / ChatGPT (Codex)
  * subscription account: ready count, a dot per account, and a click-open
  * popover with per-account 5-hour session + weekly bars and reset times.
+ * The popover is a plain table of visual cues; why an account is limited, status
+ * hints and Reconnect open from the row's chevron.
  *
  * Data: gateway JSON-RPC `model.options` (same payload the model picker uses).
  * Pooled providers carry `usage.accounts[]` = {label, state, windows[], resets_at} plus the
@@ -35,6 +37,16 @@ const CSS = `
 .hermes-au-fix button { color: var(--ui-accent, var(--accent)); border: 1px solid currentColor; border-radius: 3px; padding: 1px 7px; background: transparent; cursor: pointer; font-size: 10.5px }
 .hermes-au-fix button:disabled { cursor: wait; opacity: .6 }
 .hermes-au-fix code { overflow-wrap: anywhere; opacity: .8 }
+.hermes-au-line { display: flex; align-items: center; gap: 2px }
+.hermes-au-line > .hermes-au-row { flex: 1; min-width: 0 }
+.hermes-au-more { flex: none; width: 18px; height: 18px; border: 0; border-radius: 3px; padding: 0; background: transparent; color: var(--au-c, currentColor); cursor: pointer; font-size: 10px; line-height: 18px; opacity: .8; transition: transform .12s }
+.hermes-au-more:hover { background: var(--chrome-action-hover); opacity: 1 }
+.hermes-au-more[aria-expanded='true'] { transform: rotate(90deg) }
+.hermes-au-more:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px }
+.hermes-au-gap { flex: none; width: 18px }
+.hermes-au-details { margin: 0 20px 4px 21px; padding: 4px 6px; border-left: 2px solid var(--au-c, var(--border)); font-size: 10.5px; display: flex; flex-direction: column; gap: 3px }
+.hermes-au-details .hermes-au-fix { padding: 0 }
+.hermes-au-pill { justify-self: start; font-size: 10px; padding: 0 5px; border-radius: 3px; border: 1px solid currentColor; color: var(--au-c); white-space: nowrap }
 .hermes-au-next { display: inline-block; white-space: nowrap; color: var(--ui-accent); border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 5px }
 @media (prefers-reduced-motion: reduce) { .hermes-au-dot[data-mark='active'] { animation: none } }
 `
@@ -114,6 +126,19 @@ export function countColor(g) {
   if (g.limited) return COLORS.limited
   if (g.cooling) return COLORS.cooldown
   return COLORS.unknown
+}
+
+// The one- or two-word status a status-only row shows in its table cell; statusHint is the detail.
+export function statusLabel(g, a) {
+  if (a.state === 'ready') return 'ok'
+  if (a.state === 'limited') return g.statusBad || 'blocked'
+  if (a.state === 'unavailable') return 'sign-in needed'
+  return 'not checked'
+}
+
+// Whether a row has anything behind its disclosure chevron. Ready rows with nothing to say have none.
+export function hasDetails(g, a) {
+  return !!g.statusOnly || !!describe(a) || needsReconnect(a)
 }
 
 export function statusHint(g, a) {
@@ -334,7 +359,7 @@ function since(ts) {
 function MarkBadge({ g }) {
   const active = g.mark === 'active'
   return jsx('span', { style: { display: 'inline-block', whiteSpace: 'nowrap', fontSize: 9.5, padding: '0 4px', marginLeft: 5, borderRadius: 3, border: '1px solid var(--border)',
-    color: active ? COLORS.ready : undefined, opacity: active ? 1 : 0.7 }, children: active ? 'in use' : `last used ${since(g.markAt)}` })
+    color: active ? COLORS.ready : undefined, opacity: active ? 1 : 0.7 }, title: `${active ? 'in use' : 'last used'} ${since(g.markAt)}`, children: active ? 'in use' : 'last' })
 }
 
 function Meter({ win }) {
@@ -371,30 +396,61 @@ function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   return jsxs('div', { className: 'hermes-au-fix', children })
 }
 
+// The table shows only visual cues (dot colour, bars, dimmed rows, a tinted chevron). Why an
+// account is limited, status hints and the Reconnect action sit behind the row's chevron.
+function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reconnectStore, reconnectState }) {
+  const t = tone(a)
+  const name = a.label || a.id
+  const why = describe(a)
+  const fix = reconnectState[reconnectStore.key(g.slug, a.id)] || {}
+  const details = hasDetails(g, a)
+  // A Reconnect outcome stays visible after the click even if the row is collapsed again.
+  const shown = details && (open || !!fix.message)
+  const cue = t === 'ready' || t === 'unknown' ? undefined : COLORS[t]
+  return jsxs('div', { children: [
+    jsxs('div', { className: 'hermes-au-line', children: [
+      jsxs('button', { type: 'button', className: 'hermes-au-row',
+        'aria-label': `Try ${name} next`, disabled: selectionState.busy || selectionState.loading,
+        onClick: () => selectionStore.select(g.slug, a),
+        style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.6 }, title: `${name} · ${why || a.state} · Next request in the focused chat only`, children: [
+        jsx(Dot, { t, mark: a.id === g.markId ? g.mark : null }),
+        jsxs('span', { style: { display: 'flex', alignItems: 'center', minWidth: 0, fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
+          jsx('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: name }), a.id === g.markId ? jsx(MarkBadge, { g }) : null,
+          selectionState.selection?.state === 'pending' && selectionState.selection.provider === g.slug && selectionState.selection.account_id === a.id
+            ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null] }),
+        ...(g.statusOnly
+          ? [jsx('span', { className: 'hermes-au-pill', style: { gridColumn: 'span 2', '--au-c': COLORS[t] }, children: statusLabel(g, a) })]
+          : [jsx(Meter, { win: pickWindow(a.windows, 'session') }), jsx(Meter, { win: pickWindow(a.windows, 'week') })])
+      ] }),
+      details
+        ? jsx('button', { type: 'button', className: 'hermes-au-more', 'aria-label': `Details for ${name}`, 'aria-expanded': shown,
+          style: { '--au-c': cue }, onClick: onToggle, children: '▶' })
+        : jsx('span', { className: 'hermes-au-gap' })
+    ] }),
+    shown ? jsxs('div', { className: 'hermes-au-details', 'data-account': name, style: { '--au-c': cue }, children: [
+      why ? jsx('span', { className: 'hermes-au-why', 'data-tone': t, style: { color: cue }, children: why }) : null,
+      g.statusOnly ? jsx('span', { style: { opacity: 0.8 }, children: statusHint(g, a) }) : null,
+      jsx(ReconnectLine, { g, a, reconnectStore, reconnectState })
+    ] }) : null
+  ] })
+}
+
 function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconnectState }) {
+  const [open, setOpen] = useState(() => new Set())
+  const toggle = id => setOpen(prev => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next })
   const limited = g.limited, cooling = g.cooling
   const unknown = g.total - g.ready - limited - cooling
   const parts = [`${g.ready} ready`, limited && `${limited} ${g.statusBad || 'out of quota'}`, cooling && `${cooling} cooling down`, unknown && `${unknown} unknown`].filter(Boolean)
-  return jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 7 }, children: [
+  return jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 }, children: [
     jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }, children: [
-      jsx('b', { style: { fontSize: 12 }, children: `${g.title} · ${g.total} account${g.total === 1 ? '' : 's'}` }),
+      jsx('b', { style: { fontSize: 12 }, children: g.title }),
       jsx('span', { style: { fontSize: 10.5, opacity: 0.65 }, children: parts.join(' · ') })
     ] }),
-    jsxs('div', { style: { ...GRID, fontSize: 10, opacity: 0.55 }, children: [jsx('span', {}), jsx('span', { children: 'Account' }), jsx('span', { children: '5-hour session' }), jsx('span', { children: 'Weekly' })] }),
-    ...g.accounts.map(a => jsxs('div', { key: a.id, children: [jsxs('button', { type: 'button', className: 'hermes-au-row',
-      'aria-label': `Try ${a.label || a.id} next`, disabled: selectionState.busy || selectionState.loading,
-      onClick: () => selectionStore.select(g.slug, a),
-      style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.72 }, title: `${describe(a) || a.state} · Next request in the focused chat only`, children: [
-      jsx(Dot, { t: tone(a), mark: a.id === g.markId ? g.mark : null }),
-      jsxs('span', { style: { minWidth: 0, overflowWrap: 'anywhere', fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
-        a.label || a.id, a.id === g.markId ? jsx(MarkBadge, { g }) : null,
-        selectionState.selection?.state === 'pending' && selectionState.selection.provider === g.slug && selectionState.selection.account_id === a.id
-          ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null,
-        describe(a) ? jsx('span', { className: 'hermes-au-why', 'data-tone': tone(a), style: { display: 'block', fontSize: 10, color: COLORS[tone(a)] || undefined, opacity: 0.9 }, children: describe(a) }) : null] }),
-      ...(g.statusOnly
-        ? [jsx('span', { style: { gridColumn: 'span 2', fontSize: 10.5, opacity: 0.8 }, children: statusHint(g, a) })]
-        : [jsx(Meter, { win: pickWindow(a.windows, 'session') }), jsx(Meter, { win: pickWindow(a.windows, 'week') })])
-    ] }), jsx(ReconnectLine, { g, a, reconnectStore, reconnectState })] }))
+    g.statusOnly ? null : jsxs('div', { className: 'hermes-au-line', style: { fontSize: 10, opacity: 0.5 }, children: [
+      jsxs('div', { style: { ...GRID, flex: 1, padding: '0 3px' }, children: [jsx('span', {}), jsx('span', { children: 'Account' }), jsx('span', { children: '5-hour' }), jsx('span', { children: 'Weekly' })] }),
+      jsx('span', { className: 'hermes-au-gap' })
+    ] }),
+    ...g.accounts.map(a => jsx(AccountRow, { key: a.id, g, a, open: open.has(a.id), onToggle: () => toggle(a.id), selectionStore, selectionState, reconnectStore, reconnectState }))
   ] })
 }
 
@@ -432,9 +488,8 @@ function UsageBar({ store, selectionStore, reconnectStore }) {
     }) }),
     jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[460px]', style: PANEL_STYLE, children:
       jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: 4, fontSize: 12 }, children: [
-        jsx('div', { style: { fontSize: 11, lineHeight: 1.5 }, children: 'Click an account for this chat’s next request only. Provider and model stay unchanged; other chats and global priority are unaffected.' }),
-        jsx('div', { style: { fontSize: 10.5, opacity: 0.75 }, children: 'In use / last used is a provider-global observation, not this chat’s queued account.' }),
-        jsxs('div', { role: 'status', 'aria-live': 'polite', children: [
+        jsxs('div', { role: 'status', 'aria-live': 'polite', style: { fontSize: 10.5, opacity: 0.75 },
+          title: 'Click an account for this chat’s next request only. Provider and model stay unchanged; other chats and global priority are unaffected. In use / last used is a provider-global observation, not this chat’s queued account.', children: [
           selectionState.busy ? 'Saving selection…' : selectionState.loading ? 'Loading selection…' : selectionState.selection ? `${selectionState.selection.provider} · ${selectionState.selection.model}` : 'Selection not loaded.',
           selectionState.selection?.state === 'pending' ? jsx('button', { type: 'button', 'aria-label': 'Cancel next account', disabled: selectionState.busy || selectionState.loading, onClick: () => selectionStore.cancel(), style: { marginLeft: 8, textDecoration: 'underline' }, children: 'Cancel next account' }) : null,
           jsx('button', { type: 'button', disabled: selectionState.busy || selectionState.loading, onClick: () => selectionStore.refresh(), style: { marginLeft: 8, textDecoration: 'underline' }, children: 'Refresh selection' })
