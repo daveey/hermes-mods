@@ -1,5 +1,13 @@
 # Actual-plugin fixture acceptance report
 
+## Packaged acceptance safety (required)
+
+Live acceptance in the user's real Desktop window is read-only: screenshots and DOM/API reads only. Never synthesize input, click, focus, resize, change themes or open/close panels in that window. Do not restore or inject intercepted user text: its original target is unknown and cannot be recovered reliably.
+
+Automated typing and keyboard checks belong only in an isolated test window/profile created and focused by the test. Verify that exact test window is frontmost immediately before every keystroke; abort on any mismatch. Never use the active window implicitly. Keep browser-harness input confined to its dedicated test browser, never a user's existing browser/profile. Record the window/profile identity with input evidence. VoiceOver remains unverified unless a separate isolated walkthrough is actually executed.
+
+For chip acceptance, compare the same snapshot and clock through panel buckets and chip projection, not raw API count parity. Verify stale/unknown/failed and all held registrations are excluded from online/busy; the panel may still show running/draining separately. Screenshot readback cannot substitute for these semantic tests.
+
 ## Contract-faithful fixtures
 
 An earlier review found the held fixture paired `not_checked` readiness with a fresh hold, which the backend cannot emit. Fixtures now mirror the merged `readiness_evidence` contract: every fresh hold is aggregate `fail` with its operational key failed and hold-explained (plus `service` for systemd drains), disk warnings stay independent, and the `?cases=1` set adds an independent tool failure under a drain, an unexplained service failure under a maintenance hold, and an unobserved operational key. The 1/3/8/45 partition is now reachable from real contract shapes. Harness results are still fixture evidence, not packaged or live-data acceptance.
