@@ -113,6 +113,20 @@ def _meta(conn, k, d=None):
     return d if not r or r[0] in (None, "None") else r[0]
 
 
+# Phase 6 shared fields (hermes-hub client >= 1.5.0, config "shared_fields"): fields any gateway sets directly on the
+# hub, merged per field by HLC. Mirrors hermes_hub.SHARED / overlay(); read here so an older client keeps working.
+SHARED = {"sessions": ("title", "pinned", "archived", "hidden"), "inbox": ("archived",)}
+
+
+def shared_mode(conn, coll) -> str:
+    try:
+        raw = json.loads(_meta(conn, "shared_fields") or '"off"')
+    except ValueError:
+        return "off"
+    v = raw.get(coll, "off") if isinstance(raw, dict) else raw
+    return v if v in ("off", "shadow", "primary") else "off"
+
+
 def _float(v):
     try:
         return None if v in (None, "", "None") else float(v)
@@ -131,6 +145,7 @@ class View:
         self.offline_since = _float(_meta(conn, "offline_since"))
         self._seen = None
         self._pending = None
+        self._overrides = {}
 
     # when did each owner last publish anything we pulled (seconds)
     def owner_seen(self) -> Dict[str, float]:
@@ -167,8 +182,37 @@ class View:
             self._pending = out
         return self._pending
 
+    def overrides(self, coll: str) -> Dict[tuple, Dict[str, dict]]:
+        """(gw, key) -> field -> {value, by, hlc} for this collection, when its shared fields are in primary mode."""
+        if coll not in self._overrides:
+            out: Dict[tuple, Dict[str, dict]] = {}
+            if coll in SHARED and shared_mode(self.conn, coll) == "primary" and _has(self.conn, "overrides"):
+                for r in self.conn.execute("SELECT gw, key, field, value, hlc, by_gw FROM overrides WHERE coll = ? AND value IS NOT NULL",
+                                           (coll,)):
+                    if r["field"] in SHARED[coll] or r["field"] == "pending_action":
+                        out.setdefault((r["gw"], r["key"]), {})[r["field"]] = {"value": _json(r["value"]), "by": r["by_gw"], "hlc": r["hlc"]}
+            self._overrides[coll] = out
+        return self._overrides[coll]
+
+    def _overlay(self, coll: str, d: dict) -> dict:
+        ovr = self.overrides(coll).get((d["gateway"], d["key"]))
+        if not ovr:
+            return d
+        for field, o in ovr.items():
+            if field == "pending_action":
+                d["pending_action"] = o["value"]
+                continue
+            if d.get(field) != o["value"]:
+                # set on the hub, not yet applied by the owner (asleep or behind): shown, and marked as such
+                d.setdefault("shared", {})[field] = {"by": o["by"], "owner_value": d.get(field)}
+            d[field] = o["value"]
+        if coll == "inbox" and d.get("archived") is True and d.get("state") in ("open", "queuing"):
+            d["state"] = "archived"
+        return d
+
     def rows(self, coll: str) -> List[dict]:
-        """Own records from `published`, other gateways' from `replica` (never own rows twice)."""
+        """Own records from `published`, other gateways' from `replica` (never own rows twice), with shared-field
+        overrides on top when the collection is in primary mode."""
         out = []
         pend = self.pending()
         if _has(self.conn, "published"):
@@ -190,7 +234,7 @@ class View:
                          synced_at=self.synced_at(r["gw"]), updated_at_hub=(r["updated_at"] or 0) / 1000.0,
                          pending=pend.get((r["gw"], coll, r["key"]), []))
                 out.append(d)
-        return out
+        return [self._overlay(coll, d) for d in out]
 
     def gateways(self) -> List[dict]:
         names = set(self.owner_seen())
@@ -205,6 +249,13 @@ class View:
                         "seen_at": self.now if g == self.gateway else self.owner_seen().get(g),
                         "synced_at": self.now if g == self.gateway else self.synced_at(g)})
         return out
+
+
+def _json(text):
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def _loads(text):
@@ -440,6 +491,8 @@ def _send_now(client, path: Path, wait_s: float) -> Optional[bool]:
             api = client.Api(cfg["hub_url"], client.read_key())
             db = client.open_db(path)
             client.send_queued(db, api)
+            if hasattr(client, "push_shared") and client.shared_any_on(db) and client.shared_supported(db, api, time.time()):
+                client.push_shared(db, api)
             result["ok"] = True
         except BaseException as e:  # noqa: BLE001 - Offline, SystemExit (no key), anything: stays queued
             result["ok"] = False
@@ -476,9 +529,15 @@ def request(body: Dict[str, Any], wait_s: float = SEND_WAIT_S) -> dict:
     try:
         rid = client.queue_request(db, req["gateway"], req["coll"], req["key"], req["action"], req["args"],
                                    req["base_version"])
+        row = db.execute("SELECT state, result FROM sent WHERE id = ?", (rid,)).fetchone()
+        shared = bool(row) and row["state"] == "done" and "shared_field" in (row["result"] or "")
     finally:
         db.close()
     sent = _send_now(client, path, wait_s)
+    if shared:
+        # Primary shared field: already applied on this gateway's view; the owner applies it when it is next awake.
+        return {"id": rid, "queued_locally": not sent, "state": "applied", "via": "shared_field", "gateway": req["gateway"],
+                "coll": req["coll"], "key": req["key"], "action": req["action"]}
     state = "queued" if sent else "local"
     return {"id": rid, "queued_locally": not sent, "state": state, "gateway": req["gateway"], "coll": req["coll"],
             "key": req["key"], "action": req["action"]}
