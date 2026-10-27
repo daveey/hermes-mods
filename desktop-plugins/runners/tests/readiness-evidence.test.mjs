@@ -160,7 +160,7 @@ test('expanded detail lists independent, hold-explained, warning and not-observe
     assert.match(detail, /Not observed: Tool xcode/)
   } finally { await ui.close() }
 })
-test('API count parity: active host maintenance withholds ready and busy counts last-known activity', () => {
+test('active host maintenance withholds ready and stale busy is excluded from chip', () => {
   const s = setup({ readiness: 'pass' }); delete s.data.runners[0].readiness_evidence
   s.data.hosts[0].maintenance = { state: 'active', reason: 'Planned', expires_at: iso(60000) }
   const v = p.projectFleet([{ route, snapshot: s }], now)
@@ -170,7 +170,7 @@ test('API count parity: active host maintenance withholds ready and busy counts 
   const stale = setup({ activity: 'busy', readiness: 'pass', freshness: 'stale' }); delete stale.data.runners[0].readiness_evidence
   const sv = p.projectFleet([{ route, snapshot: stale }], now)
   assert.equal(sv.rows[0].bucket, 'unknown')
-  assert.equal(sv.counts.busy, 1)
+  assert.equal(sv.counts.busy, 0)
 })
 test('chip issue count keeps owner API parity even when display classifies a row as hold-only', () => {
   const change = drained(); change.readiness_evidence.warned = []; change.readiness_evidence.passed.push('disk')

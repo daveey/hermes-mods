@@ -616,13 +616,16 @@ export function projectFleet(sources = [], now = Date.now()) {
   }
   const list = selectRows([...rows.values()], '', 'All'),
     groups = groupRows(list)
+  // Use the panel's current-evidence buckets, never raw last-known provider
+  // flags. Running/draining remains visible in the panel but held registrations
+  // are excluded from the chip's online/busy claims.
+  const currentOnline = list.filter(r => ['running', 'idle'].includes(r.bucket) && !r.holds.length)
   const counts = {
     registrations: list.length,
-    online: list.filter((r) => r.registration === 'online').length,
-    // Canonical API parity: last-known provider activity, not the display bucket.
-    busy: list.filter((r) => r.activity === 'busy').length,
+    online: currentOnline.length,
+    busy: currentOnline.filter(r => r.bucket === 'running').length,
     ready: list.filter((r) => r.ready).length,
-    unverified: list.filter((r) => r.registration === 'online' && !r.ready).length,
+    unverified: currentOnline.filter(r => !r.ready).length,
     issues: list.filter((r) => r.apiIssue).length + groups.filter((g) => g.issue).length
   }
   const complete =
@@ -839,7 +842,7 @@ export function chipLabel(v) {
   return `Runners · ${v.counts.online} online · ${v.counts.busy} busy${v.counts.issues ? ` · ${v.counts.issues} issues` : ''}${!v.complete ? ' · ?' : ''}`
 }
 export function chipTooltip(v) {
-  return `${chipLabel(v)}. Counts are registrations, not available build slots. ${v.counts.ready} verified-ready; ${v.counts.unverified} readiness-unverified. ${v.complete ? 'Complete source coverage.' : 'Incomplete or stale source coverage.'}`
+  return `${chipLabel(v)}. Counts are registrations, not available build slots. Online = current running or idle; busy = current running. Held (including running/draining), failed, unknown and stale registrations are excluded from online/busy. ${v.counts.ready} verified-ready; ${v.counts.unverified} readiness-unverified. ${v.complete ? 'Complete source coverage.' : 'Incomplete or stale source coverage.'}`
 }
 export function settingsURL(row) {
   const s = row.scope
