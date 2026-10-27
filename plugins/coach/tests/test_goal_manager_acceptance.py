@@ -172,12 +172,24 @@ def test_reversed_registration_executes_interacting_real_holds(environment, monk
     monkeypatch.setattr(gd, 'aux_judge', judge)
     out = run_turn(monkeypatch)
     assert_private(out)
-    expected_other = next(n for n in order if n != 'coach')
-    assert [(n,a) for n,a,_ in events[:2]] == [('coach',0), (expected_other,0)]
-    assert events[1][2]['hold'] is True
-    assert events[2][0:2] == ('coach',1) and events[2][2]['hold']
+    # Replacement consensus requires every gate to inspect each candidate;
+    # priority chooses the winning nudge, not a short-circuit dispatch point.
+    dispatch_order = ['coach', *(n for n in order if n != 'coach')]
+    assert [(n, a) for n, a, _ in events] == [
+        (name, attempt) for attempt in range(3) for name in dispatch_order]
+    rounds = [events[offset:offset + 3] for offset in range(0, len(events), 3)]
+    assert rounds[0][0][2] is None  # Unknown disposition leaves ordinary holds eligible.
+    assert rounds[0][1][2]['hold'] is True
+    assert rounds[1][0][2]['hold'] is True
+    assert rounds[1][0][2]['unresolved_fallback']['goal'] == 'Repair example app'
     assert len(out[1]) == 3
+    # Only the first eligible hold supplies the next model request's nudge.
+    for call, winner in zip(out[1][1:], [rounds[0][1], rounds[1][0]]):
+        nudges = [row for row in call['messages'] if row.get('role') == 'user']
+        assert nudges[-1]['content'] == winner[2]['nudge']
+    assert out[5]._pre_final_gate_attempts == 2
     assert 'Unresolved goal' in out[0]['final_response']
+    assert 'pre-final hold limit reached' in out[0]['final_response']
     print('EXECUTED', [(n,a) for n,a,_ in events])
 
 
@@ -214,8 +226,15 @@ def test_last_iteration_assesses_coach_before_other_holds(environment, monkeypat
     out = run_turn(monkeypatch, budget=1)
     assert_private(out)
     assert len(out[1]) == 1
-    assert [(n,a) for n,a,_ in events] == [('coach',0)]
-    assert 'Unresolved goal' in out[0]['final_response']
+    # Later validators still run, but cannot erase the coach's unresolved goal
+    # when there is no model-call budget left to act on its winning nudge.
+    assert [(n, a) for n, a, _ in events] == [
+        (name, 0) for name in ['coach', *(n for n in order if n != 'coach')]]
+    assert events[0][2]['hold'] is True
+    assert events[0][2]['unresolved_fallback']['goal'] == 'Repair example app'
+    assert out[5]._pre_final_gate_attempts == 1
+    assert 'Unresolved goal: Repair example app' in out[0]['final_response']
+    assert 'turn budget exhausted' in out[0]['final_response']
 
 
 @pytest.mark.parametrize('order', ORDERS)
