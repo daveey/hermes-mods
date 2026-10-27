@@ -31,6 +31,8 @@ Patches:
 - `patches/0230-ci-main-pushes-share-one-concurrency-group-per-CI-Ni.patch`: pushes to `main` share one concurrency group per workflow (`ci-main`, `nix-main`, `actionlint-main`): the run in flight finishes and only the newest pending push waits (a per-run group queued a full suite per push and saturated the hub runners). Refines 0205.
 - `patches/0249-test-publish-LSP-descendant-readiness-atomically-dav.patch`: the mock LSP server publishes its child PID by write-then-rename, so file existence implies a complete PID.
 - `patches/0252-test-remove-shared-runner-timing-assumptions-daveey.patch`: the bundle-smoke JS test gets a 60 s budget (ten real Node CLIs share the runner) and the goal-parked-resume idle-hook test pins `time.time` so a slow `cli` import cannot outlast its one-second barrier.
+- `patches/0462-fix-ci-main-red-pin-utf-8-on-wait-check-ssh-subproce.patch`: the `wait-check` ssh subprocess in `hermes_cli/kanban_wait_check.py` pins `encoding="utf-8"` (a bare `text=True` trips `test_subprocess_text_encoding`); `test_kanban_block_reason_scrubbed_jwt` now blocks with `kind=needs_input` + `human_request` (ownerless agent blocks are refused) and asserts the call succeeded. Source `d2d18a116d`.
+- `patches/0463-fix-ci-migration-http-auth-test-creates-legacy-block.patch`: `tests/hermes_cli/test_kanban_migration_http_auth.py` creates its legacy blocked card with `lint_blocked=False`, since blocked-creation lint would otherwise refuse the fixture. Test-only. Source `e99a18feca`.
 
 What you see: the private fork's CI runs (and passes) without GitHub-hosted minutes. None of this changes runtime
 behavior; it is workflow wiring and test isolation.
@@ -53,7 +55,7 @@ behavior; it is workflow wiring and test isolation.
 - `tests/fixtures/resolution_allowlist.json` lists `_prebuilt_desktop_app_mismatch`, `_prebuilt_signature_error`
   (macOS `codesign`) and `review_session_activity._gh` (`gh` with homebrew fallbacks) as reviewed bare-`which` sites.
 - `.github/workflows/actionlint.yml` lints every workflow on PRs and main (0218). Pushes to main in `ci.yaml`, `nix.yml` and `actionlint.yml` share one concurrency group each: the run in flight is never cancelled, only the newest pending push waits (0230).
-- Lint-only fixes (0224, 0226) and test-isolation fixes (0249, 0252) keep blocking `ruff check .` and the windows-footgun scan green on main; no runtime change.
+- Lint-only fixes (0224, 0226) and test-isolation fixes (0249, 0252, 0462, 0463) keep blocking `ruff check .` and the windows-footgun scan green on main; no runtime change.
 
 ## How it works
 
@@ -68,7 +70,7 @@ Pure workflow/test edits; no production code path changes.
 
 ## Tests
 
-These patches are the tests (0224 is covered by the windows-footgun scan, 0226/0249/0252 edit `tests/agent/test_delegate_marker_owner_binding.py`, `tests/agent/lsp/_mock_lsp_server.py`, `tests-js/bundle-smoke-metadata.test.mjs`, `tests/hermes_cli/test_cli_goal_parked_resume.py`; 0218/0230 are workflow files proven only by CI). Verified by the fork's CI going green on the runners; each edited file was run with
+These patches are the tests (0224 is covered by the windows-footgun scan, 0462/0463 edit `tests/tools/test_kanban_redaction.py` and `tests/hermes_cli/test_kanban_migration_http_auth.py` (the ssh encoding pin is guarded by `tests/hermes_cli/test_subprocess_text_encoding.py`), 0226/0249/0252 edit `tests/agent/test_delegate_marker_owner_binding.py`, `tests/agent/lsp/_mock_lsp_server.py`, `tests-js/bundle-smoke-metadata.test.mjs`, `tests/hermes_cli/test_cli_goal_parked_resume.py`; 0218/0230 are workflow files proven only by CI). Verified by the fork's CI going green on the runners; each edited file was run with
 `scripts/run_tests.sh <file>` when written. Not re-run when this doc was written (untested here).
 
 ## Applying
