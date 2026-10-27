@@ -86,3 +86,9 @@ ran cannot have opened a duplicate PR, so a review card is not held on the PR it
 opened a PR then crashed is still held. Tests: `tests/hermes_cli/test_kanban_pr_continuation.py` (never-run and
 crash cases) plus the `worker_ran` fixture in `tests/hermes_cli/kanban_guard_helpers.py`. Patch **0453** is a
 mirror fix-up that syncs `test_kanban_pr_continuation.py` with the source after a merge-adaptation conflict.
+
+Patch **0456** (`fb67f2fac2`) fixes 0448: the never-run release returned before the merge-queue rejection check, so a
+never-run repair card whose handoff names a queue-rejected PR lost its "repair and resubmit" note. The never-run
+path now posts `comment_rejection` for every `REJECTED` PR in the handoff before releasing. Tests:
+`tests/hermes_cli/test_kanban_pr_rejection.py` (worker-opened cases now mark `worker_ran`; the never-run case
+still gets the note).

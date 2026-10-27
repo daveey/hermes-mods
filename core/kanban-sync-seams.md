@@ -74,6 +74,12 @@ ratchet, the pure worker-context helpers moved to `kanban_db_context.py`.
 - The upstream kanban suite (`-k kanban`) gives the same failing test ids as clean main, both with the flag off and
   with it on (shadow mode, no server).
 
+## Config docs (0454)
+
+Patch **0454** (source `a7d87690e0`) documents `kanban.sync.enabled` in `website/docs/user-guide/configuration.md`
+(off by default; boards opened afterwards gain the sync tables and outbox triggers). Docs only; it fixes the
+upstream docs-drift ratchet test, which fails when a config default has no documentation.
+
 ## Not built (later phases)
 
 - The sync worker: outbox drain, change feed, enroll, import and detach.
