@@ -59,7 +59,7 @@ def install(ctx, registry):
             modules.append(name)
             spec.loader.exec_module(module)
             module.register(scope)
-    except Exception:
+    except (Exception, SystemExit):
         dispose()
 
         def unavailable(context):

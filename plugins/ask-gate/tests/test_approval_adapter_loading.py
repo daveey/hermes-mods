@@ -62,11 +62,12 @@ def test_config_failure_keeps_operational_hold_not_silent_unmanaged(gate, paths)
         ctx.unload()
 
 
-def test_partial_registration_failure_rolls_back_and_holds(gate, tmp_path):
+@pytest.mark.parametrize('error', ['RuntimeError', 'SystemExit'])
+def test_partial_registration_failure_rolls_back_and_holds(gate, tmp_path, error):
     path = adapter(tmp_path, '''def register(registry):
     registry.register('partial', lambda c: None, lambda t: None)
-    raise RuntimeError('private-sensitive-location')
-''')
+    raise ERROR('private-sensitive-location')
+'''.replace('ERROR', error))
     ctx = Context([path])
     gate.register(ctx)
     try:
