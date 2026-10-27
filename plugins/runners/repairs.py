@@ -43,6 +43,8 @@ from .models import validate
 
 NAMESPACE = 'runners'
 MAX_ACTIVE = 100
+# Two absent core reads this far apart retire an old-revision reservation.
+ABSENT_GRACE_SECONDS = 60
 MAX_AUDIT = 10000
 _DOMAINS = {}
 _DOMAINS_LOCK = threading.RLock()
@@ -130,6 +132,12 @@ class RepairService:
         with self._db() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.executescript(_SCHEMA)
+            if 'absent_since' not in {r[1] for r in db.execute('PRAGMA table_info(repair_domain_records)')}:
+                try:
+                    db.execute('ALTER TABLE repair_domain_records ADD COLUMN absent_since REAL')
+                except sqlite3.OperationalError as error:  # concurrent collector/backend migration
+                    if 'duplicate column' not in str(error):
+                        raise
             db.execute('INSERT OR IGNORE INTO repair_domain_revision VALUES (1,?)',
                        (service.config['config_revision'],))
         self.path.chmod(0o600)
@@ -437,6 +445,19 @@ class RepairService:
             with self._db(transaction=True) as db:
                 row = self._row(db, repair_id, principal, historical=True)
                 repair = json.loads(row['payload'])
+                if row['active'] and historical:
+                    # Old-revision reservation core never accepted. The fresh-
+                    # config resolver refuses old revisions, so after a second
+                    # absent read past the grace window no chat can appear:
+                    # release the host instead of stranding it forever.
+                    now = self.service.clock()
+                    if row['absent_since'] is None:
+                        db.execute('UPDATE repair_domain_records SET absent_since=? WHERE id=?', (now, repair_id))
+                    elif now - row['absent_since'] >= ABSENT_GRACE_SECONDS:
+                        repair['state'], repair['session']['state'] = 'closed', 'cancelled'
+                        db.execute('UPDATE repair_domain_records SET payload=?, active=0 WHERE id=?',
+                                   (_dump(repair), repair_id))
+                        return repair
                 # Successful owner-local lookup proves no accepted request yet.
                 # Only this fact permits an explicit same-ID RPC retry.
                 if row['active']:
