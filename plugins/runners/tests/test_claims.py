@@ -401,6 +401,26 @@ def test_stalled_http_clients_are_dropped(tmp_path, key):
         http.shutdown()
 
 
+def test_revoked_intent_can_never_be_claimed(tmp_path, key):
+    clock = Clock()
+    led = cb.Ledger(tmp_path / 'l.sqlite', policy(), jwks=cb.JWKS(lambda: dict(keys=[key.jwk()]), clock=clock), clock=clock)
+    led.register(dict(op='register', request_id=REQ, repository=REPO, workflow_path=WORKFLOW, ref=REF, source_sha=SHA))
+    assert led.handle_owner(dict(op='revoke', request_id=REQ))['revoked']
+    with pytest.raises(cb.Refused) as exc:
+        led.claim(token(key), dict(request_id=REQ, source_sha=SHA), source='192.0.2.5')
+    assert exc.value.args[0] == 'intent_expired'
+
+
+def test_revoke_refuses_once_claimed(tmp_path, key):
+    clock = Clock()
+    led = cb.Ledger(tmp_path / 'l.sqlite', policy(), jwks=cb.JWKS(lambda: dict(keys=[key.jwk()]), clock=clock), clock=clock)
+    led.register(dict(op='register', request_id=REQ, repository=REPO, workflow_path=WORKFLOW, ref=REF, source_sha=SHA))
+    assert led.claim(token(key), dict(request_id=REQ, source_sha=SHA), source='192.0.2.5')['ok']
+    with pytest.raises(cb.Refused) as exc:
+        led.handle_owner(dict(op='revoke', request_id=REQ))
+    assert exc.value.args[0] == 'claim_exists'
+
+
 def test_junk_tokens_do_not_consume_the_global_budget(tmp_path, key):
     clock = Clock()
     led = cb.Ledger(tmp_path / 'l.sqlite', policy(rate=dict(per_source_per_minute=1000, global_per_minute=2)),
