@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [instant-session-loads-cache.md](instant-session-loads-cache.md) | 0532, 0533 | A click paints the chat from a local SQLite transcript cache that a background prefetcher keeps current for every gateway's 200 most recent sessions; the REST read starts at the click; an asleep gateway's chat opens read-only; multi-segment lineage reads page in SQL; per-open timing log. |
 | [notification-held-handoff.md](notification-held-handoff.md) | 0530 | Owner-addressed notifications wait with their owner's poller instead of bouncing through every chat's poller on the shared queue (a busy chat no longer pins the Desktop backend); sidebar kanban counts recompute once for all queued readers. |
 | [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md) | 0528 | Every gateway's sessions show from the hub replica at once on a cold start (no SSH wait); owners that published within 180 s give ordinary, running-aware rows. |
 | [kanban-no-producer-no-park.md](kanban-no-producer-no-park.md) | 0529 | Every Kanban park records who produces its condition (`awaiting` = card / ci / deploy / external / clock); agent-action waits with no producing card (`agent_action_wait`) and hidden waits on the user (`human_wait`, ask-gate ledger aware) are refused; the third park on one premise becomes an owner card for a supervisor. |
