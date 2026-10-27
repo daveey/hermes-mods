@@ -35,7 +35,6 @@ def gate(tmp_path, monkeypatch):
     def boom(system, user):
         raise AssertionError("the model must not be called here")
     mod.LLM = boom
-    mod._JUDGED.clear()
     mod.LOG.reset("s1")
     return mod
 

@@ -54,7 +54,14 @@ Deterministic first: an ask naming a card that is `done`/`archived` in the datab
 The judge sees: the ask sentences, this turn's tool calls and results, the last 30 user messages, live status of every
 card id mentioned, the ledger, and a **capability sheet generated at runtime** (token-broker scope names and tiers —
 no values —, ssh hosts from `~/.ssh/config`, signed-in Chrome profile emails from Chrome's Local State, browser vault
-entry names). The sheet is built in memory, cached 10 minutes, and never written to disk or committed.
+entry names). The sheet is built in memory and never written to disk or committed. Ask validation refreshes
+it immediately rather than trusting the optional 10-minute cache. Broker discovery runs only `scopes`,
+tries the current `~/.local/bin/token-broker` before a distinct PATH client, and falls back on execution or
+invalid-response failures. A successful list (including an empty list) is authoritative; malformed rows
+are omitted, not interpreted as capabilities. Only validated scope names and known tiers reach the judge.
+Scope discovery is evidence of an available credential route, not proof of vendor permission or authorization
+to execute an action. Tests in `tests/test_f3_broker.py` exercise discovery through temporary executables and
+the final-response gate with a stub judge; they do not vend credentials or contact a vendor.
 
 ## Needs core hook `pre_final_gate`
 
