@@ -1,0 +1,305 @@
+From 70077f7149c723d172f6cbac972c2ec666a0670e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:56:29 -0700
+Subject: [PATCH 403/453] fix(kanban): share one remote inventory per store
+ state; best-effort snapshot [daveey]
+
+_remote_links rebuilt the full replica + receipt projection on every call:
+twice per /api/profiles/sessions request (kanban counts, then the
+chat-closeout plugin), plus once per concurrent poll, at ~0.2-0.7 s each.
+
+- _remote_links: cached per origin scope for _CACHE_TTL_S while no store it
+  reads changed (boards, hub replica, origin ledger; state.db alias tips
+  are bounded by the TTL), single-flight so concurrent readers wait for the
+  running projection. Failures are never cached.
+- _legacy_remote_links: the origin-work.db snapshot is written only when
+  the inventory changed, and a failed write (database is locked) is logged
+  instead of failing the read. It raised out of annotate_kanban_activity
+  and marked every sidebar row kanban_unknown (errors.log, twice on
+  2026-10-26). _remote_snapshot itself still propagates write failures.
+
+Tests: new test_kanban_remote_inventory_cache.py (shared projection,
+store-change and TTL invalidation, single-flight via an Event-gated
+projection, failures not cached, locked snapshot write, write-once); the
+four behaviour cases are red on base. test_kanban_local_receipt_authority
+re-stubs ledger.project without changing any store, so it resets the cache
+before those reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 7f0a44e9485bc4953c117ba2069b09d925c45652)
+---
+ hermes_cli/kanban_session_activity.py         |  54 ++++++-
+ .../test_kanban_local_receipt_authority.py    |   2 +
+ .../test_kanban_remote_inventory_cache.py     | 146 ++++++++++++++++++
+ 3 files changed, 198 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_remote_inventory_cache.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 94d0f23c03..ef97432063 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -252,6 +252,7 @@ HUB_STALE_AFTER_S = 180.0  # same as the hub-sync plugin: no successful hub sync
+ _REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority")
+ _remote_last: list[dict[str, Any]] | None = None  # last good read (process lifetime)
+ _remote_scope: tuple[str, ...] | None = None
++_snapshot_saved: tuple[tuple[str, ...], list[dict[str, Any]]] | None = None  # last (scope, cards) written to disk
+ 
+ 
+ def _meta_float(conn: sqlite3.Connection, key: str) -> float | None:
+@@ -451,8 +452,43 @@ def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
+             if (row['key'], row['session'], row['origin_session']) not in represented]
+ 
+ 
++_links_lock = threading.Lock()
++_links_cache: tuple[float, tuple, tuple, list[dict[str, Any]]] | None = None  # (expires, scope, fingerprint, cards)
++
++
++def _links_fingerprint() -> tuple:
++    """Every store the remote inventory reads except state.db (alias tips), which the TTL bounds instead."""
++    from hermes_constants import get_hermes_home
++
++    ledger = get_hermes_home() / 'kanban' / 'origin-ledger.db'
++    signature = list(_activity_fingerprint())
++    for path in (ledger, Path(str(ledger) + '-wal')):
++        try:
++            st = path.stat()
++            signature.append((str(path), st.st_ino, st.st_size, st.st_mtime_ns))
++        except FileNotFoundError:
++            signature.append((str(path), None))
++    return tuple(signature)
++
++
+ def _remote_links() -> list[dict[str, Any]]:
+-    """Shared origin-ledger projection, with preserved legacy associations."""
++    """Shared origin-ledger projection, with preserved legacy associations.
++
++    One projection per scope serves every reader (counts, session task lists, plugins) for ``_CACHE_TTL_S``
++    while no store it reads has changed. Single-flight: concurrent readers wait for the running projection
++    and share it instead of each rebuilding the whole replica inventory. Failures are never cached."""
++    global _links_cache
++    scope, fingerprint = _origin_scope(), _links_fingerprint()
++    with _links_lock:
++        hit = _links_cache
++        if hit is not None and hit[1] == scope and hit[2] == fingerprint and time.monotonic() < hit[0]:
++            return list(hit[3])
++        cards = _project_remote_links()
++        _links_cache = (time.monotonic() + _CACHE_TTL_S, scope, fingerprint, cards)
++        return list(cards)
++
++
++def _project_remote_links() -> list[dict[str, Any]]:
+     from hermes_constants import get_hermes_home
+     from hermes_cli.kanban_origin_adapter import _gateway
+     from hermes_cli.kanban_origin_ledger import project
+@@ -511,7 +547,7 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+     """``_read_remote_links`` of this gateway's replica. A failed read (corrupt/locked/vanished hub.db) is not
+     "no remote work": it returns the last good answer with every row marked stale, so a session never paints
+     done because the replica could not be read. No replica ever seen = not installed = []."""
+-    global _remote_last, _remote_scope
++    global _remote_last, _remote_scope, _snapshot_saved
+     scope = _origin_scope()
+     with _cache_lock:
+         previous = _remote_last if _remote_scope == scope else None
+@@ -535,7 +571,14 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+     present = {(c["session"], c["key"]) for c in cards}
+     cards.extend({**c, "stale": True} for c in (previous or [])
+                  if (c["session"], c["key"]) not in present)
+-    _remote_snapshot(cards)
++    if _snapshot_saved != (scope, cards):
++        # The durable snapshot only speeds a cold start. Losing a write race (database is locked) must not
++        # fail this read: the sidebar would mark every row kanban_unknown. The next changed read retries.
++        try:
++            _remote_snapshot(cards)
++            _snapshot_saved = (scope, [dict(c) for c in cards])
++        except sqlite3.Error as exc:
++            _log.warning("origin-work snapshot not saved; retrying on the next change: %s", exc)
+     with _cache_lock:
+         _remote_scope = scope
+         _remote_last = cards
+@@ -885,10 +928,13 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+ 
+ 
+ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+-    global _cache, _attention_cache, _remote_last
++    global _cache, _attention_cache, _remote_last, _links_cache, _snapshot_saved
++    with _links_lock:
++        _links_cache = None
+     with _cache_lock:
+         _cache = None
+         _attention_cache = None
+         if not keep_remote:
+             _remote_last = None
++            _snapshot_saved = None
+         _waiting_cache[0] = {}
+diff --git a/tests/hermes_cli/test_kanban_local_receipt_authority.py b/tests/hermes_cli/test_kanban_local_receipt_authority.py
+index 4584621a66..9467638a71 100644
+--- a/tests/hermes_cli/test_kanban_local_receipt_authority.py
++++ b/tests/hermes_cli/test_kanban_local_receipt_authority.py
+@@ -36,10 +36,12 @@ def test_local_open_association_dominates_stale_receipt(tmp_path, monkeypatch, s
+     for changed in ({'profile': 'other'}, {'board': 'other'}, {'profile': None},
+                     {'session': 's_other', 'origin_session': 's_other'}):
+         row.update(changed)
++        activity._reset_cache_for_tests()  # the stubbed projection changed without any store changing
+         assert activity._remote_links() == [row]
+         row.update(profile='default', board='default', session='s_one', origin_session='s_one')
+     other = {**row, 'session': 's_other', 'origin_session': 's_other'}
+     monkeypatch.setattr(ledger, 'project', lambda *args, **kwargs: [row, other])
++    activity._reset_cache_for_tests()
+     assert activity._remote_links() == [other]
+     # An arbitrary terminal status is not a verified durable release.
+     import sqlite3
+diff --git a/tests/hermes_cli/test_kanban_remote_inventory_cache.py b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+new file mode 100644
+index 0000000000..c2a03a29bd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+@@ -0,0 +1,146 @@
++"""The remote inventory is projected once per scope and store state, and its durable snapshot never fails a read."""
++import sqlite3
++import threading
++
++import pytest
++
++import hermes_constants
++from hermes_cli import kanban_origin_adapter as adapter
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import profiles
++from tests.waiting import wait_until
++
++
++@pytest.fixture
++def projection(tmp_path, monkeypatch):
++    """A receipt ledger whose (stubbed) projection counts how often it runs."""
++    (tmp_path / 'kanban').mkdir()
++    (tmp_path / 'kanban/origin-ledger.db').touch()
++    board = tmp_path / 'kanban.db'
++    with sqlite3.connect(board) as db:
++        db.execute('CREATE TABLE tasks (id TEXT, status TEXT)')
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
++    monkeypatch.setattr(adapter, '_gateway', lambda _: 'origin')
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(activity, '_board_db_paths', lambda: [board])
++    monkeypatch.setattr(activity, '_legacy_remote_links', list)
++    row = dict(gateway='owner', profile='work', board='build', id='t_one', key='owner/work/build/t_one',
++               session='s_one', origin_session='s_one', origin_gateway='origin', origin_profile='default',
++               status='running', unfinished=True, stale=False)
++    calls = {'n': 0, 'gate': None, 'fail': False}
++
++    def project(*args, **kwargs):
++        calls['n'] += 1
++        if calls['gate'] is not None:
++            calls['gate'].wait(timeout=10)  # held open until the test has every reader waiting
++        if calls['fail']:
++            calls['fail'] = False
++            raise sqlite3.OperationalError('database is locked')
++        return [dict(row)]
++
++    monkeypatch.setattr(ledger, 'project', project)
++    activity._reset_cache_for_tests()
++    yield calls, board
++    activity._reset_cache_for_tests()
++
++
++def test_unchanged_stores_share_one_projection(projection):
++    calls, _ = projection
++    first = activity._remote_links()
++    assert activity._remote_links() == first
++    assert activity.session_tasks(['s_one'])  # another reader of the same inventory
++    assert calls['n'] == 1
++
++
++def test_a_store_change_reprojects(projection):
++    calls, board = projection
++    activity._remote_links()
++    with sqlite3.connect(board) as db:
++        db.execute("INSERT INTO tasks VALUES ('t_two', 'ready')")
++    activity._remote_links()
++    assert calls['n'] == 2
++
++
++def test_ttl_expiry_reprojects(projection, monkeypatch):
++    calls, _ = projection
++    monkeypatch.setattr(activity, '_CACHE_TTL_S', 0.0)
++    activity._remote_links()
++    activity._remote_links()
++    assert calls['n'] == 2
++
++
++def test_concurrent_readers_wait_for_one_projection(projection):
++    calls, _ = projection
++    gate, arrived, results = threading.Event(), [], []
++    calls['gate'] = gate
++
++    def reader():
++        arrived.append(1)
++        results.append(activity._remote_links())
++
++    threads = [threading.Thread(target=reader) for _ in range(8)]
++    for t in threads:
++        t.start()
++    wait_until(lambda: len(arrived) == 8 and calls['n'] >= 1, what='readers started, one projecting')
++    try:  # without single-flight every reader starts its own projection while the first is held open
++        wait_until(lambda: calls['n'] == 8, timeout=1.0)
++    except AssertionError:
++        pass
++    gate.set()
++    for t in threads:
++        t.join()
++    assert len(results) == 8 and all(r == results[0] for r in results)
++    assert calls['n'] == 1
++
++
++def test_a_failed_projection_is_not_cached(projection):
++    calls, _ = projection
++    calls['fail'] = True
++    with pytest.raises(sqlite3.OperationalError):
++        activity._remote_links()
++    assert activity._remote_links()
++    assert calls['n'] == 2
++
++
++@pytest.fixture
++def replica(tmp_path, monkeypatch):
++    """A readable replica (stubbed read) plus a durable snapshot store that records writes."""
++    hub = tmp_path / 'hub.db'
++    hub.touch()
++    card = dict(id='t_one', key='owner/work/build/t_one', session='s_one', status='running', unfinished=True)
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: hub)
++    monkeypatch.setattr(activity, '_read_remote_links', lambda path: [dict(card)])
++    writes = []
++
++    def snapshot(cards=None):
++        if cards is None:
++            return None
++        writes.append(cards)
++        if snapshot.locked:
++            raise sqlite3.OperationalError('database is locked')
++        return cards
++
++    snapshot.locked = False
++    monkeypatch.setattr(activity, '_remote_snapshot', snapshot)
++    activity._reset_cache_for_tests()
++    yield snapshot, writes, card
++    activity._reset_cache_for_tests()
++
++
++def test_locked_snapshot_write_does_not_fail_the_read(replica):
++    snapshot, writes, card = replica
++    snapshot.locked = True
++    assert activity._legacy_remote_links() == [card]
++    assert len(writes) == 1
++    snapshot.locked = False
++    activity._legacy_remote_links()  # the unsaved inventory is retried, not forgotten
++    assert len(writes) == 2
++
++
++def test_unchanged_inventory_is_written_once(replica):
++    _, writes, _ = replica
++    activity._legacy_remote_links()
++    activity._legacy_remote_links()
++    assert len(writes) == 1
+-- 
+2.54.0 (Apple Git-157)
+

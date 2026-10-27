@@ -1,0 +1,256 @@
+From eb56b69f7144471d3b27b52606b4592591679f22 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:12:48 +0000
+Subject: [PATCH 441/453] fix(agent): retain caller overrides through runtime
+ switches [daveey]
+
+(cherry picked from commit 7d0a99f49bdaa6c17fb961ddc9071e7b1a219790)
+---
+ agent/agent_init.py                           |  2 +
+ agent/agent_runtime_helpers.py                |  6 +-
+ agent/model_routing_agent.py                  |  4 +-
+ agent/runtime_request_overrides.py            | 17 ++++
+ tests/agent/test_runtime_request_overrides.py | 73 +++++++++++++++++
+ .../docs/user-guide/model-class-routing.md    | 79 +++++++++++++++++++
+ 6 files changed, 178 insertions(+), 3 deletions(-)
+ create mode 100644 agent/runtime_request_overrides.py
+ create mode 100644 tests/agent/test_runtime_request_overrides.py
+ create mode 100644 website/docs/user-guide/model-class-routing.md
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index d8b89e4efc..d156517fe2 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -303,6 +303,8 @@ def _custom_provider_extra_body_for_agent(
+ 
+ 
+ def _merge_custom_provider_extra_body(agent, custom_providers: list[dict[str, Any]]) -> None:
++    from agent.runtime_request_overrides import capture_caller_body
++    capture_caller_body(agent)
+     extra_body = _custom_provider_extra_body_for_agent(
+         provider=agent.provider, model=agent.model, base_url=agent.base_url,
+         custom_providers=custom_providers,
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 5e7f4512b7..024b2d5488 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2133,10 +2133,12 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
+         provider=new_provider, model=getattr(agent, "model", "") or "",
+         base_url=getattr(agent, "base_url", "") or "", custom_providers=custom_providers or [],
+     )
++    from agent.runtime_request_overrides import switched_extra_body
++    new_extra_body = switched_extra_body(agent, new_extra_body)
+     overrides = dict(getattr(agent, "request_overrides", {}) or {})
+-    overrides.pop("extra_body", None)  # always drop the previous provider's extra_body
++    overrides.pop("extra_body", None)  # drop old defaults, not caller-owned settings
+     if new_extra_body:
+-        overrides["extra_body"] = dict(new_extra_body)
++        overrides["extra_body"] = new_extra_body
+     agent.request_overrides = overrides
+ 
+ 
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 8a234a15bc..f5a165c145 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -171,7 +171,9 @@ def clear_class_route(agent):
+ def current_main_runtime(agent):
+     runtime = {key: getattr(agent, key, "") or "" for key in (
+         "model", "provider", "base_url", "api_key", "api_mode", "auth_mode", "session_id")}
+-    runtime["requested_class"] = (getattr(agent, "model_routing", None) or {}).get("requested_class", "")
++    requested_class = (getattr(agent, "model_routing", None) or {}).get("requested_class")
++    if requested_class:
++        runtime["requested_class"] = requested_class
+     return runtime
+ 
+ 
+diff --git a/agent/runtime_request_overrides.py b/agent/runtime_request_overrides.py
+new file mode 100644
+index 0000000000..86cb3a5aa7
+--- /dev/null
++++ b/agent/runtime_request_overrides.py
+@@ -0,0 +1,17 @@
++"""Caller-owned request body settings, distinct from model-scoped provider defaults."""
++from copy import deepcopy
++
++
++def capture_caller_body(agent):
++    """Capture before custom-provider defaults merge; never infer ownership afterward."""
++    agent._caller_extra_body = deepcopy((agent.request_overrides or {}).get("extra_body") or {})
++    agent._caller_extra_body_route = (agent.provider, agent.base_url.rstrip("/"))
++
++
++def switched_extra_body(agent, provider_defaults):
++    """Caller settings survive model switches only within their original provider/endpoint."""
++    body = deepcopy(provider_defaults or {})
++    route = (agent.provider, agent.base_url.rstrip("/"))
++    if route == getattr(agent, "_caller_extra_body_route", None):
++        body.update(deepcopy(getattr(agent, "_caller_extra_body", {})))
++    return body
+diff --git a/tests/agent/test_runtime_request_overrides.py b/tests/agent/test_runtime_request_overrides.py
+new file mode 100644
+index 0000000000..54e237cab8
+--- /dev/null
++++ b/tests/agent/test_runtime_request_overrides.py
+@@ -0,0 +1,73 @@
++"""Caller bodies survive same-route switches without leaking provider defaults."""
++from copy import deepcopy
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.agent_init import _merge_custom_provider_extra_body
++from agent.agent_runtime_helpers import _apply_switched_provider_request_overrides
++from agent.agent_runtime_once import restore_runtime, snapshot_runtime
++from agent.model_routing_agent import current_main_runtime
++from tests.agent.test_primary_runtime_restore import (
++    _make_agent, TestSwitchModelRequestOverridesSnapshot as _SwitchHarness,
++)
++
++
++def test_provider_defaults_are_replaced_but_caller_settings_survive():
++    caller = {"reasoning": {"effort": "high"}}
++    agent = SimpleNamespace(provider="custom", base_url="https://example.test/v1",
++                            model="old", request_overrides={"extra_body": deepcopy(caller)})
++    providers = [{"name": "local", "base_url": agent.base_url, "model": "old",
++                  "extra_body": {"old_model_only": True, "reasoning": {"effort": "low"}}},
++                 {"name": "local", "base_url": agent.base_url, "model": "new",
++                  "extra_body": {"new_model_only": True, "reasoning": {"effort": "low"}}}]
++    _merge_custom_provider_extra_body(agent, providers)
++    agent._custom_providers = providers
++    agent.model = "new"
++    _apply_switched_provider_request_overrides(agent, "custom")
++    assert agent.request_overrides == {"extra_body": {"new_model_only": True, **caller}}
++    # The live request body cannot corrupt the caller's retained template.
++    agent.request_overrides["extra_body"]["reasoning"]["effort"] = "low"
++    _apply_switched_provider_request_overrides(agent, "custom")
++    assert agent.request_overrides["extra_body"]["reasoning"]["effort"] == "high"
++
++
++@pytest.mark.parametrize("provider,url", [("custom", "https://other.test/v1"),
++                                          ("openai", "https://my-llm.example.com/v1")])
++def test_caller_body_does_not_cross_provider_or_endpoint(provider, url):
++    agent = _make_agent(request_overrides={"extra_body": {"reasoning": {"effort": "high"}}})
++    _SwitchHarness()._switch(agent, new_provider=provider, base_url=url)
++    assert "extra_body" not in agent.request_overrides
++    assert "extra_body" not in agent._primary_runtime["request_overrides"]
++
++
++def test_temporary_switch_and_failed_switch_preserve_caller_body():
++    overrides = {"extra_body": {"reasoning": {"effort": "high"}}}
++    agent = _make_agent(request_overrides=overrides)
++    original = snapshot_runtime(agent)
++    agent._one_turn_runtime = original
++    _SwitchHarness()._switch(agent)
++    assert "extra_body" not in agent.request_overrides
++    restore_runtime(agent, original)
++    assert agent.request_overrides == overrides
++    with patch("agent.process_bootstrap.OpenAI", side_effect=RuntimeError("client build failed")), \
++         pytest.raises(RuntimeError, match="client build failed"):
++        agent.switch_model("other", "custom", api_key="synthetic", base_url=agent.base_url)
++    assert agent.request_overrides == overrides
++    _SwitchHarness()._switch(
++        agent, new_provider="custom", base_url=agent.base_url)
++    assert agent.request_overrides == overrides
++    assert agent._primary_runtime["request_overrides"] == overrides
++
++
++@pytest.mark.parametrize("metadata,expected", [(None, None), ({}, None),
++                                              ({"requested_class": "deep"}, "deep")])
++def test_main_runtime_class_metadata_is_optional(metadata, expected):
++    agent = SimpleNamespace(model="exact-native", provider="anthropic", model_routing=metadata)
++    runtime = current_main_runtime(agent)
++    if expected is None:
++        assert "requested_class" not in runtime
++    else:
++        assert runtime["requested_class"] == expected
++    assert runtime["model"] == "exact-native"
+diff --git a/website/docs/user-guide/model-class-routing.md b/website/docs/user-guide/model-class-routing.md
+new file mode 100644
+index 0000000000..8875a08185
+--- /dev/null
++++ b/website/docs/user-guide/model-class-routing.md
+@@ -0,0 +1,79 @@
++---
++title: Model class routing
++---
++
++# Model class routing
++
++Class routing is an opt-in, profile-local allocator. Set a workload's model to
++`class:deep`, `class:standard`, or `class:fast`, with provider `auto`. Hermes
++resolves the marker before constructing a provider request. Classes are operator
++assignments, not model-name guesses; failure never downgrades to another class.
++
++## Configuration
++
++| Setting | Default | Meaning |
++| --- | --- | --- |
++| `model_routing.enabled` | `false` | Enable class selectors. Disabled routing preserves legacy concrete-model behavior; class requests fail clearly. |
++| `model_routing.policy_version` | `1` | Registry/state policy schema version. Only version 1 is supported. |
++| `model_routing.allow_metered` | `false` | Permit verified credit-funded/metered registry routes when subscriptions are unavailable. This is spending authorization, not a budget or credit-exhaustion monitor. |
++| `model_routing.enforce_subscription_only` | `false` | When enabled with routing, also fence concrete pins, saved overrides, auxiliary calls and fallback paths to registered eligible native subscription routes. Overrides `allow_metered`. |
++| `model_routing.routes.deep` | `[]` | Exact routes eligible for deep reasoning workloads. |
++| `model_routing.routes.standard` | `[]` | Exact routes eligible for standard workloads. |
++| `model_routing.routes.fast` | `[]` | Exact routes eligible for fast workloads. |
++
++Each route requires `provider`, `model`, `billing`, `weight`, and `capabilities`.
++Identifiers are exact. `weight` is an integer from 1 to 100 and must be identical
++for all routes belonging to one provider within a class. Equal weights give
++providers equal allocation shares, regardless of account count.
++
++`billing` is `subscription`, `credit-funded`, or `metered`. Supported native
++subscription providers are `anthropic`, `openai-codex`, and `xai-oauth`.
++An API key or a consumer subscription alone does not prove subscription funding.
++In particular, Gemini API credits must be classified as credit-funded, not OAuth
++or unlimited. Both `eligible: true` and `funding_verified: true` are required
++before a route can receive work. These are host-specific operator attestations;
++the runtime separately verifies usable credentials before sending requests.
++
++Capabilities include boolean `tools`, `vision`, `json`, `streaming`, positive
++integer `context_tokens`, and optionally positive integer `max_latency_ms`.
++Use capabilities verified for the exact native transport, not a different API's
++advertised limits. Missing required capabilities exclude the route.
++
++A safe inactive starting configuration is:
++
++```yaml
++model_routing:
++  enabled: false
++  policy_version: 1
++  allow_metered: false
++  enforce_subscription_only: false
++  routes:
++    deep: []
++    standard: []
++    fast: []
++```
++
++Populate and verify host-specific routes before enabling selectors. Use the
++supported `hermes config set` interface for live configuration; never store
++credentials in this registry or copy rotating refresh tokens between hosts.
++An empty eligible class fails closed rather than using a paid fallback.
++
++## Sessions, pins, and recovery
++
++Allocation is transactionally stored in `model-routing.sqlite3` under the active
++profile home. A healthy session/job remains sticky across turns, tools, restarts,
++resume and compression lineage. Auth, quota or transport recovery may select an
++eligible route in the same class; it cannot bypass billing or capability checks.
++Subscription capacity precedes metered capacity for new allocations.
++
++Without managed subscription enforcement, explicit concrete pins retain legacy
++behavior. With `enforce_subscription_only`, a concrete pin must match one
++unambiguous eligible native subscription tuple in the registry. A stale paid
++model in a saved session is not authorization to spend. Unknown or ambiguous pins
++are rejected, not silently assigned a class. Temporary `/model --once` switches
++do not replace the standing session allocation.
++
++Routing covers CLI, Desktop/TUI, messaging, API completions and runs, delegation,
++cron, Kanban and auxiliary streaming/nonstreaming calls. Deployment and live
++provider eligibility are separate gates: a valid registry does not prove that
++all providers are entitled, funded, or available on every host.
+-- 
+2.54.0 (Apple Git-157)
+

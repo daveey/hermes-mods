@@ -1,0 +1,197 @@
+From 6c57e0e7fac9322080a64d18c39facc3b4736757 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 06:45:47 +0000
+Subject: [PATCH 409/453] feat(routing): fence Desktop readiness and side jobs
+ [daveey]
+
+(cherry picked from commit 76f39127ef8a9c1386829e3720c27dc3d776ee8c)
+---
+ agent/model_routing_runtime.py          |  4 ++--
+ docs/model-routing.md                   |  8 +++++--
+ tests/tui_gateway/test_class_routing.py | 32 ++++++++++++++++++++++++-
+ tui_gateway/agent_callbacks.py          |  3 ++-
+ tui_gateway/class_routing.py            | 22 +++++++++++++++++
+ tui_gateway/methods_config.py           |  6 ++++-
+ 6 files changed, 68 insertions(+), 7 deletions(-)
+
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 9e769db242..3117ceb1b4 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -5,7 +5,7 @@ from agent.model_routing import ModelRoutingError, resolve_model_route
+ 
+ 
+ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+-                          parent_session_id=None, requirements=None, excluded=()):
++                          parent_session_id=None, requirements=None, excluded=(), state_path=None):
+     from agent.credential_pool import load_pool
+     from hermes_cli import runtime_provider as runtime
+ 
+@@ -29,7 +29,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+     while True:
+         chosen = resolve_model_route(model, provider, config=config, session_id=session_id,
+                                      parent_session_id=parent_session_id, requirements=requirements,
+-                                     excluded=failed, eligible=eligible)
++                                     excluded=failed, eligible=eligible, state_path=state_path)
+         metadata = chosen["metadata"]
+         selected = chosen["provider"]
+         runtime._raise_if_provider_disabled(selected)
+diff --git a/docs/model-routing.md b/docs/model-routing.md
+index e50923922b..1cf58cae57 100644
+--- a/docs/model-routing.md
++++ b/docs/model-routing.md
+@@ -96,6 +96,10 @@ rebalance existing conversations when a class default changes. Desktop tests cov
+ construction, restoration, explicit pinning, empty-pool zero sends, and the native
+ Anthropic streaming SDK request via mock HTTP transport (not live entitlement).
+ 
++Readiness validates native credentials using an in-memory allocator, so polls consume
++no durable allocation slots. Background and preview jobs inherit the parent's class
++with independent durable job IDs, never its concrete credential pin; their SDK requests
++are covered by the same mock-transport test.
++
+ Messaging, API, delegation, cron, Kanban and auxiliary adapters and their per-entry
+-request/recovery tests remain required before activation. Desktop background/preview
+-agents and startup readiness also require audit. This document is not rollout proof.
++request/recovery tests remain required before activation. This document is not rollout proof.
+diff --git a/tests/tui_gateway/test_class_routing.py b/tests/tui_gateway/test_class_routing.py
+index c3b16cd040..47b65c53c5 100644
+--- a/tests/tui_gateway/test_class_routing.py
++++ b/tests/tui_gateway/test_class_routing.py
+@@ -3,6 +3,7 @@ from unittest.mock import patch
+ 
+ import pytest
+ import run_agent  # bootstrap before real-home guard
++import hermes_cli.main  # readiness lazily imports CLI bootstrap
+ from tui_gateway import server
+ from tests.agent import test_model_routing_agent
+ 
+@@ -41,7 +42,8 @@ def native_transport(monkeypatch):
+     return sent
+ 
+ 
+-def test_desktop_construct_resume_and_pin(routing_home, streaming_route, native_transport, monkeypatch):
++def test_desktop_construct_resume_and_pin(routing_home, streaming_route, native_transport, monkeypatch, tmp_path):
++    monkeypatch.chdir(tmp_path)
+     from hermes_cli.config import load_config
+     monkeypatch.setattr(server, "_load_cfg", load_config)
+     monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("class:deep", "auto"))
+@@ -61,6 +63,16 @@ def test_desktop_construct_resume_and_pin(routing_home, streaming_route, native_
+         assert all(headers.get("authorization", "").startswith("Bearer sk-ant-oat")
+                    and "x-api-key" not in headers for _, headers, _ in native_transport)
+         config = server._runtime_model_config(agent)
++        for builder in (server._background_agent_kwargs, server._ephemeral_preview_agent_kwargs):
++            kwargs = builder(agent, "side-" + builder.__name__)
++            assert kwargs["model"] == "class:deep"
++            assert kwargs["provider"] == "auto" and kwargs["api_key"] is None
++            child = run_agent.AIAgent(**kwargs)
++            assert child.model_routing["requested_class"] == "deep"
++            assert child.run_conversation("Say ok")["final_response"] == "ok"
++            child.release_clients()
++        assert all(body["model"] == "anthropic-deep" and headers.get("authorization", "").startswith("Bearer sk-ant-oat")
++                   and "x-api-key" not in headers for _, headers, body in native_transport)
+         overrides = server._stored_session_runtime_overrides({"model": agent.model, "model_config": config})
+         assert overrides["model_override"]["model"] == "class:deep"
+         assert overrides["provider_override"] == "auto"
+@@ -80,6 +92,24 @@ def test_desktop_construct_resume_and_pin(routing_home, streaming_route, native_
+         resumed.release_clients()
+ 
+ 
++def test_desktop_readiness_uses_native_fence_without_allocation(routing_home, streaming_route, monkeypatch):
++    from hermes_constants import get_hermes_home
++    from agent.model_routing import ModelRoutingError
++    monkeypatch.setattr(server, "_load_cfg", lambda: routing_home)
++    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("class:deep", "auto"))
++    monkeypatch.setattr(hermes_cli.main, "_has_any_provider_configured", lambda **kw: True)
++    monkeypatch.setattr(server, "_readiness_check", lambda rid, params, probe, **kw: probe(None, {}))
++    result = server._methods["setup.runtime_check"]("probe", {})
++    assert result["ok"] is True
++    assert result["provider"] == "anthropic"
++    assert result["model"] == "anthropic-deep"
++    assert not (get_hermes_home() / "model-routing.sqlite3").exists()
++    monkeypatch.setattr("agent.credential_pool.CredentialPool.has_available", lambda *a, **kw: False)
++    from tui_gateway.class_routing import probe_class_runtime
++    with pytest.raises(ModelRoutingError):
++        probe_class_runtime("class:deep", "auto", routing_home)
++
++
+ def test_desktop_exhaustion_cannot_enter_paid_fallback(routing_home, streaming_route, monkeypatch):
+     from agent.model_routing import ModelRoutingError
+     monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("class:deep", "auto"))
+diff --git a/tui_gateway/agent_callbacks.py b/tui_gateway/agent_callbacks.py
+index eb2ca5e3de..5a4d0f6344 100644
+--- a/tui_gateway/agent_callbacks.py
++++ b/tui_gateway/agent_callbacks.py
+@@ -392,6 +392,7 @@ def _sync_agent_fallback_with_config(sid: str, session: dict) -> None:
+ 
+ 
+ def _background_agent_kwargs(agent, task_id: str) -> dict:
++    from tui_gateway.class_routing import child_class_kwargs
+     cfg = _load_cfg()
+ 
+     def g(name, default=None):
+@@ -421,7 +422,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
+         # The side agent persists into the PARENT's store: a named-profile chat's ``bg_*`` rows
+         # belong to that profile's state.db, not the launch handle.
+         "platform": "tui", "session_db": getattr(agent, "_session_db", None) or _get_db(), "fallback_model": fallback,
+-        "side_agent": True}
++        "side_agent": True, **child_class_kwargs(agent)}
+ 
+ 
+ def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
+diff --git a/tui_gateway/class_routing.py b/tui_gateway/class_routing.py
+index 2463326332..4d4c3fb7b8 100644
+--- a/tui_gateway/class_routing.py
++++ b/tui_gateway/class_routing.py
+@@ -12,6 +12,28 @@ def deferred_runtime(model, provider, config):
+     return {"provider": requested, "requested_provider": requested}
+ 
+ 
++def child_class_kwargs(agent):
++    """Independent side jobs inherit the workload class, not a paid-capable concrete pin."""
++    route = getattr(agent, "model_routing", None)
++    if not isinstance(route, dict):
++        return {}
++    return {"model": f"class:{route['requested_class']}", "provider": "auto", "requested_provider": "auto",
++            "base_url": None, "api_key": None, "api_mode": None, "credential_pool": None,
++            "request_overrides": None, "fallback_model": [], "acp_command": None, "acp_args": None}
++
++
++def probe_class_runtime(model, provider, config):
++    """Check real native credentials without consuming a durable allocation slot."""
++    from agent.model_routing_runtime import resolve_class_runtime
++    requirements: dict[str, bool | int] = {"tools": True, "streaming": True}
++    model_config = config.get("model") or {}
++    if isinstance(model_config, dict) and model_config.get("context_length"):
++        requirements["min_context_tokens"] = int(model_config["context_length"])
++    runtime = resolve_class_runtime(model, provider, config=config, session_id="readiness",
++                                    requirements=requirements, state_path=":memory:")
++    return runtime["model"], runtime
++
++
+ def restore_class_overrides(model, config, overrides):
+     route = config.get("model_routing")
+     if not isinstance(route, dict) or route.get("selected_model") != model:
+diff --git a/tui_gateway/methods_config.py b/tui_gateway/methods_config.py
+index 758f1e0563..a151fe9e9b 100644
+--- a/tui_gateway/methods_config.py
++++ b/tui_gateway/methods_config.py
+@@ -441,11 +441,15 @@ def _(rid, params: dict) -> dict:
+ 
+         def probe(profile, scoped):
+             startup_model, startup_provider = _resolve_startup_runtime()
++            from agent.model_routing import is_class_selector
+             if requested:
+                 model, runtime = startup_model, resolve_runtime_provider(
+-                    requested=requested, target_model=startup_model or None)
++                    requested=requested, target_model=None if is_class_selector(startup_model) else startup_model or None)
+             else:
+                 model, runtime = _resolve_agent_model_runtime(None, None)
++                from tui_gateway.class_routing import probe_class_runtime
++                if is_class_selector(model):
++                    model, runtime = probe_class_runtime(model, runtime.get("provider"), _load_cfg())
+             provider_configured = bool(_has_any_provider_configured(strict_profile_scope=bool(profile)))
+             provider = runtime.get("provider") or "provider"
+             source = str(runtime.get("source") or "")
+-- 
+2.54.0 (Apple Git-157)
+

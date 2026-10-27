@@ -1,0 +1,588 @@
+From d28a9b343b970cdcb16078e041c487debee0eb7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 06:27:50 +0000
+Subject: [PATCH 437/453] fix(desktop): isolate one-turn routing from standing
+ session state
+
+(cherry picked from commit a25debd92da90e12cd7e9ddabf77fd425ad1a733)
+---
+ agent/agent_runtime_once.py                  |  43 ++++
+ agent/agent_runtime_switch.py                |  24 +-
+ agent/conversation_compression.py            |   3 +-
+ agent/model_routing_agent.py                 |  14 +-
+ agent/model_routing_runtime.py               |  16 ++
+ docs/model-routing.md                        |   9 +
+ tests/tui_gateway/test_managed_model_once.py | 221 +++++++++++++++++++
+ tui_gateway/class_routing.py                 |   2 +
+ tui_gateway/model_switch.py                  |  59 ++++-
+ 9 files changed, 369 insertions(+), 22 deletions(-)
+ create mode 100644 agent/agent_runtime_once.py
+ create mode 100644 tests/tui_gateway/test_managed_model_once.py
+
+diff --git a/agent/agent_runtime_once.py b/agent/agent_runtime_once.py
+new file mode 100644
+index 0000000000..06e6ea10c1
+--- /dev/null
++++ b/agent/agent_runtime_once.py
+@@ -0,0 +1,43 @@
++"""One-turn runtime ownership, separate from the standing session allocation."""
++from copy import copy, deepcopy
++
++
++def snapshot_runtime(agent):
++    from agent.agent_runtime_helpers import _SWITCH_SNAPSHOT_FIELDS
++    fields = (*_SWITCH_SNAPSHOT_FIELDS, '_client_kwargs', 'model_routing',
++              '_model_routing_requirements', '_model_routing_failed', '_primary_runtime',
++              'reasoning_config', 'request_overrides', 'context_compressor',
++              '_use_prompt_caching', '_use_native_cache_layout', '_custom_providers',
++              '_fallback_chain', '_fallback_model', '_fallback_activated', '_fallback_index',
++              '_provider_fallback_active', '_provider_fallback_route', '_credential_pool_revert_id',
++              '_cached_system_prompt', '_transport_cache', '_rate_limited_until')
++    # SDK clients, pools and compressor are owned handles, not deepcopy-able data.
++    values = {key: getattr(agent, key) for key in fields if hasattr(agent, key)}
++    return {key: copy(value) if key == '_transport_cache' else
++            deepcopy(value) if isinstance(value, (dict, list, set)) else value
++            for key, value in values.items()}
++
++
++def standing_runtime(agent):
++    """Persistence uses the standing identity even while a temporary turn is running."""
++    snapshot = getattr(agent, '_one_turn_runtime', None)
++    if not isinstance(snapshot, dict):
++        return agent
++    view = copy(agent)
++    for key, value in snapshot.items():
++        setattr(view, key, value)
++    return view
++
++
++def restore_runtime(agent, snapshot):
++    for key, value in snapshot.items():
++        setattr(agent, key, value)
++    agent.__dict__.pop('_one_turn_runtime', None)
++    # A compression rotation may have changed identity while the temporary route ran.
++    compressor = getattr(agent, 'context_compressor', None)
++    if (compressor is not None and hasattr(compressor, 'bind_session_state')
++            and getattr(compressor, '_session_id', None) != agent.session_id):
++        compressor.bind_session_state(getattr(agent, '_session_db', None), agent.session_id)
++        # Compression is the sanctioned prompt rebuild. Do not resurrect the
++        # pre-compression prompt snapshot when returning to the standing model.
++        agent._cached_system_prompt = None
+diff --git a/agent/agent_runtime_switch.py b/agent/agent_runtime_switch.py
+index 043f55fe52..2cd0282180 100644
+--- a/agent/agent_runtime_switch.py
++++ b/agent/agent_runtime_switch.py
+@@ -1,6 +1,7 @@
+ """Session bookkeeping for explicit runtime switches."""
+ import logging
+ from copy import copy
++from contextlib import nullcontext
+ 
+ 
+ class _DeferredSessionWrites:
+@@ -45,7 +46,12 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     from agent.model_routing_agent import persist_class_metadata
+ 
+     config = managed_config()
+-    if config is None:
++    from agent.model_routing import is_class_selector
++    if config is None and is_class_selector(model):
++        from hermes_cli.config_effective import load_user_config_effective
++        config = load_user_config_effective()
++    temporary = isinstance(getattr(agent, '_one_turn_runtime', None), dict)
++    if config is None and not temporary:
+         return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
+     staged = copy(agent)
+     # Switch helpers mutate these containers in place. Never expose partial work
+@@ -61,25 +67,31 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+         _switch_model_runtime(staged, runtime['model'], runtime['provider'], runtime['api_key'],
+                               runtime['base_url'], runtime['api_mode'], capabilities, managed=runtime)
+ 
+-    from agent.model_routing import is_class_selector
+     from agent.model_routing_runtime import resolve_class_runtime
+     resolver = resolve_class_runtime if is_class_selector(model) else resolve_managed_runtime
+-    resolver(model, provider, config=config, session_id=agent.session_id,
+-             requirements=getattr(agent, '_model_routing_requirements', {}),
+-             prepare_runtime=prepare, replace=True)
++    from agent.model_routing_runtime import temporary_resolution
++    with temporary_resolution() if temporary else nullcontext():
++        if config is None:
++            _switch_model_runtime(staged, model, provider, api_key, base_url, api_mode, capabilities)
++        else:
++            resolver(model, provider, config=config, session_id=agent.session_id,
++                     requirements=getattr(agent, '_model_routing_requirements', {}),
++                     prepare_runtime=prepare, replace=True)
+     staged._session_db = getattr(agent, '_session_db', None)
+     backend = getattr(staged.context_compressor, '_session_db', None)
+     if isinstance(backend, _DeferredSessionWrites):
+         staged.context_compressor._session_db = backend.backend
+     vars(agent).update(vars(staged))
+     persist_class_metadata(agent)
+-    for method, args, kwargs in compressor_writes:
++    for method, args, kwargs in ([] if temporary else compressor_writes):
+         method(*args, **kwargs)
+     persist_switch_billing_route(agent)
+ 
+ 
+ def persist_switch_billing_route(agent) -> None:
+     """Persist the billing route so dashboard Model cards show the post-switch provider."""
++    if isinstance(getattr(agent, '_one_turn_runtime', None), dict):
++        return
+     session_db = getattr(agent, "_session_db", None)
+     session_id = getattr(agent, "session_id", None)
+     if session_db is None or not session_id:
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 2565b95fea..c8bb7b3c0b 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -3340,9 +3340,10 @@ def _publish_rotated_compaction(
+     from agent.context_compressor import _DB_PERSISTED_MARKER
+     from tools.approval_yolo import with_session_yolo
+     from agent.conversation_compression_lineage import compression_child_source
++    from agent.agent_runtime_once import standing_runtime
+     agent._session_db.publish_compression_child(
+         parent_session_id=old_session_id, child_session_id=new_session_id,
+-        source=compression_child_source(agent, old_session_id), model=agent.model,
++        source=compression_child_source(agent, old_session_id), model=standing_runtime(agent).model,
+         model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
+         system_prompt=new_system_prompt, messages=compressed,
+         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index bc5ae7162c..899e001835 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -95,10 +95,14 @@ def try_class_fallback(agent):
+         _build_client(agent, runtime["api_key"], runtime["base_url"], [])
+ 
+     try:
+-        runtime = resolve_class_runtime(
+-            "class:" + agent.model_routing["requested_class"], "auto",
+-            session_id=agent.session_id, requirements=requirements, excluded=failed,
+-            prepare_runtime=prepare)
++        from contextlib import nullcontext
++        from agent.model_routing_runtime import temporary_resolution
++        scope = temporary_resolution() if isinstance(getattr(agent, '_one_turn_runtime', None), dict) else nullcontext()
++        with scope:
++            runtime = resolve_class_runtime(
++                "class:" + agent.model_routing["requested_class"], "auto",
++                session_id=agent.session_id, requirements=requirements, excluded=failed,
++                prepare_runtime=prepare)
+     except Exception as exc:
+         vars(agent).clear()
+         vars(agent).update(previous)
+@@ -144,6 +148,8 @@ def link_compression_route(agent, parent_session_id, child_session_id):
+ 
+ def persist_class_metadata(agent):
+     """Keep the ordinary session row in sync with the durable allocation store."""
++    if isinstance(getattr(agent, '_one_turn_runtime', None), dict):
++        return
+     metadata = getattr(agent, "model_routing", None)
+     config = getattr(agent, "_session_init_model_config", None)
+     if isinstance(config, dict):
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 046a59d390..1811701490 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -2,6 +2,20 @@
+ from __future__ import annotations
+ 
+ from agent.model_routing import ModelRoutingError, resolve_model_route
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++_temporary_resolution = ContextVar("temporary_model_resolution", default=False)
++
++
++@contextmanager
++def temporary_resolution():
++    """Validate/select normally, but never allocate a standing session or counter."""
++    token = _temporary_resolution.set(True)
++    try:
++        yield
++    finally:
++        _temporary_resolution.reset(token)
+ 
+ 
+ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+@@ -14,6 +28,8 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         from hermes_cli.config_effective import load_user_config_effective
+         config = load_user_config_effective()
+     pools = {}
++    if _temporary_resolution.get():
++        state_path = ":memory:"
+ 
+     def eligible(route):
+         from hermes_cli.config import is_provider_enabled
+diff --git a/docs/model-routing.md b/docs/model-routing.md
+index 8b93c0d15f..89dc112ebf 100644
+--- a/docs/model-routing.md
++++ b/docs/model-routing.md
+@@ -56,6 +56,15 @@ that tuple even within the same class. Replacement clients and compressor state
+ are prepared before allocation commit. Preparation failure preserves the previous
+ live runtime and durable selection. Native pool account refresh remains supported.
+ 
++Desktop `/model --once` uses an isolated in-memory allocation for preflight,
++switching, and any temporary same-class recovery. It does not replace the standing
++SQLite allocation or its counters. Persistence and restart retain the standing
++class/exact pin; turn cleanup restores matching runtime, provenance, pool, native
++client and compressor. Compression children also inherit the standing allocation.
++Manual gateway compression and background tasks accept deferred class/managed-pin
++runtimes, then authenticate through the same guarded AIAgent constructor; an empty
++preflight credential is not permission to skip the billing fence.
++
+ Managed send fences validate current policy, selected OAuth credential, actual SDK
+ endpoint/token/headers, and request identity after Relay processing. Cached clients
+ without subscription provenance must be recreated; enabling policy does not bless
+diff --git a/tests/tui_gateway/test_managed_model_once.py b/tests/tui_gateway/test_managed_model_once.py
+new file mode 100644
+index 0000000000..46e8a05c05
+--- /dev/null
++++ b/tests/tui_gateway/test_managed_model_once.py
+@@ -0,0 +1,221 @@
++"""Desktop's real switch boundary must not publish a one-turn allocation."""
++import json
++import sqlite3
++from copy import deepcopy
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from tests.agent import test_managed_switch as fixtures
++
++destinations = fixtures.destinations
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++build = fixtures.build
++from agent.model_routing_managed import verify_managed_agent
++from tui_gateway import server
++
++
++def allocation_dump(path):
++    with sqlite3.connect(path) as db:
++        return {table: db.execute(f'SELECT * FROM {table} ORDER BY 1, 2').fetchall()
++                for table in ('aliases', 'routes', 'counters')}
++
++
++@pytest.fixture
++def desktop(destinations, monkeypatch):
++    # Only UI delivery/worker spawning and external SDK construction are replaced.
++    monkeypatch.setattr(server, '_restart_slash_worker', lambda *args: None)
++    monkeypatch.setattr(server, '_emit_session_info', lambda *args: None)
++    monkeypatch.setattr(server, '_persist_live_session_system_prompt', lambda *args: None)
++    with patch('model_tools.get_tool_definitions', return_value=[]), patch(
++            'agent.anthropic_adapter.build_anthropic_client', side_effect=lambda *a, **k: MagicMock()):
++        yield
++
++
++def session_for(agent):
++    from hermes_state import SessionDB
++    agent._session_db = SessionDB()
++    agent._ensure_db_session()
++    return {'agent': agent, 'session_key': agent.session_id, 'history': [], 'source': 'desktop'}
++
++
++@pytest.mark.parametrize('standing', ['class:deep', 'anthropic-deep'])
++@pytest.mark.parametrize('temporary', ['z-anthropic-deep --provider anthropic', 'class:standard'])
++def test_once_preserves_allocation_resume_and_runtime(desktop, tmp_path, standing, temporary):
++    agent = build(standing)
++    session = session_for(agent)
++    server._persist_live_session_runtime(session)
++    before_row = agent._session_db.get_session('pin')
++    original = deepcopy(agent.model_routing)
++    client, compressor = agent._anthropic_client, agent.context_compressor
++    before = allocation_dump(tmp_path / 'model-routing.sqlite3')
++    result = server._apply_model_switch('ui', session, temporary + ' --once', confirm_expensive_model=True)
++    assert result['scope'] == 'once'
++    verify_managed_agent(agent, {'model': agent.model})
++    assert agent.model != original['selected_model']
++    assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
++    server._persist_live_session_runtime(session)
++    row = agent._session_db.get_session('pin')
++    assert row['model'] == before_row['model']
++    assert json.loads(row['model_config'])['model_routing'] == original
++    overrides = server._stored_session_runtime_overrides(row)
++    resumed = build(overrides['model_override']['model'])
++    assert resumed.model_routing == original
++    server._restore_agent_model_runtime(agent, session.pop('one_turn_model_restore'))
++    assert agent.model_routing == original
++    assert agent.model == original['selected_model']
++    assert agent._anthropic_client is client
++    assert agent.context_compressor is compressor
++    assert compressor.model == agent.model
++    assert agent._primary_runtime['model'] == agent.model
++    verify_managed_agent(agent, {'model': agent.model})
++    assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
++
++
++@pytest.mark.parametrize('failure', ['client', 'compressor'])
++def test_once_failure_is_noop(desktop, tmp_path, failure):
++    agent = build('class:deep')
++    session = session_for(agent)
++    server._persist_live_session_runtime(session)
++    before = allocation_dump(tmp_path / 'model-routing.sqlite3')
++    original = deepcopy(agent.model_routing)
++    client, compressor = agent._anthropic_client, agent.context_compressor
++    seam = {'client': 'agent.anthropic_adapter.build_anthropic_client',
++            'compressor': 'agent.agent_runtime_helpers._update_switch_compressor'}[failure]
++    with patch(seam, side_effect=RuntimeError('construction failed')):
++        with pytest.raises(ValueError, match='construction failed'):
++            server._apply_model_switch('ui', session, 'class:standard --once', confirm_expensive_model=True)
++    assert agent.model_routing == original
++    assert agent._anthropic_client is client
++    assert agent.context_compressor is compressor
++    assert 'one_turn_model_restore' not in session
++    assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
++    verify_managed_agent(agent, {'model': agent.model})
++
++
++@pytest.mark.parametrize('standing', ['class:deep', 'anthropic-deep'])
++def test_temporary_class_failover_and_compression_keep_standing_choice(desktop, tmp_path, standing):
++    from tests.agent.test_class_compression_lineage import rotate
++    agent = build(standing)
++    session = session_for(agent)
++    original = deepcopy(agent.model_routing)
++    client = agent._anthropic_client
++    agent._cached_system_prompt = 'pre-compression standing prompt'
++    before = allocation_dump(tmp_path / 'model-routing.sqlite3')
++    server._apply_model_switch('ui', session, 'class:deep --once', confirm_expensive_model=True)
++    assert agent._try_activate_fallback()
++    assert agent.model == 'z-anthropic-deep'
++    verify_managed_agent(agent, {'model': agent.model})
++    assert not agent._try_activate_fallback()
++    assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
++    child = rotate(agent)
++    session['session_key'] = child
++    server._persist_live_session_runtime(session)
++    row = agent._session_db.get_session(child)
++    assert row['model'] == original['selected_model']
++    assert json.loads(row['model_config'])['model_routing'] == original
++    restarted = build('class:deep', child)
++    assert restarted.model_routing == original
++    after = allocation_dump(tmp_path / 'model-routing.sqlite3')
++    assert after['routes'] == before['routes']
++    assert after['counters'] == before['counters']
++    server._restore_agent_model_runtime(agent, session.pop('one_turn_model_restore'))
++    assert agent.session_id == child
++    assert agent.context_compressor._session_id == child
++    assert agent._cached_system_prompt is None
++    assert agent.model_routing == original
++    assert agent._anthropic_client is client
++    client.close.assert_not_called()
++    verify_managed_agent(agent, {'model': agent.model})
++
++
++@pytest.mark.parametrize('blocked', ['paid --provider openrouter --once', 'class:deep --provider openrouter --once'])
++def test_once_never_bypasses_subscription_policy(desktop, tmp_path, blocked):
++    agent = build()
++    session = session_for(agent)
++    before = allocation_dump(tmp_path / 'model-routing.sqlite3')
++    with pytest.raises(ValueError):
++        server._apply_model_switch('ui', session, blocked, confirm_expensive_model=True)
++    assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
++    assert 'one_turn_model_restore' not in session
++    verify_managed_agent(agent, {'model': agent.model})
++
++
++def test_repeated_once_restores_original_and_exact_temporary_cannot_failover(desktop, tmp_path):
++    agent = build('class:deep')
++    session = session_for(agent)
++    before = allocation_dump(tmp_path / 'model-routing.sqlite3')
++    original = deepcopy(agent.model_routing)
++    reasoning = deepcopy(agent.reasoning_config)
++    for model in ('anthropic-standard', 'z-anthropic-deep'):
++        server._apply_model_switch('ui', session, model + ' --provider anthropic --once --reasoning high',
++                                   confirm_expensive_model=True)
++        assert not agent._try_activate_fallback()
++    server._restore_agent_model_runtime(agent, session.pop('one_turn_model_restore'))
++    assert agent.model_routing == original
++    assert agent.reasoning_config == reasoning
++    assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
++
++
++def test_class_confirmation_sees_concrete_route_without_allocation(desktop, tmp_path, monkeypatch):
++    agent = build()
++    session = session_for(agent)
++    before = allocation_dump(tmp_path / 'model-routing.sqlite3')
++    def confirm(result, *args):
++        assert result.new_model == 'anthropic-standard'
++        assert result.target_provider == 'anthropic'
++        return {'value': result.new_model, 'confirm_required': True}
++    monkeypatch.setattr(server, '_expensive_model_confirm', confirm)
++    result = server._apply_model_switch('ui', session, 'class:standard --once')
++    assert result['confirm_required']
++    assert result['value'] == 'class:standard'
++    assert agent.model == 'anthropic-deep'
++    assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
++
++
++@pytest.mark.parametrize('standing', ['class:deep', 'codex-deep'])
++def test_cross_provider_once_restores_native_clients(desktop, destinations, tmp_path, standing):
++    from hermes_cli.config import atomic_config_write
++    route = deepcopy(destinations['model_routing']['routes']['deep'][0])
++    route.update(provider='openai-codex', model='codex-deep')
++    destinations['model_routing']['routes']['deep'].append(route)
++    atomic_config_write(tmp_path / 'config.yaml', destinations)
++    auth_path = tmp_path / 'auth.json'
++    auth = json.loads(auth_path.read_text())
++    auth['credential_pool']['openai-codex'] = [{
++        'id': 'codex-test', 'label': 'test', 'priority': 0, 'auth_type': 'oauth',
++        'source': 'manual', 'access_token': 'synthetic-codex-oauth'}]
++    auth_path.write_text(json.dumps(auth))
++    from run_agent import AIAgent
++    with patch.object(AIAgent, '_create_openai_client',
++                      side_effect=lambda kwargs, **kw: MagicMock(base_url=kwargs['base_url'])):
++        agent = build(standing, 'cross')
++        from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
++        if agent.provider == 'openai-codex':
++            assert agent.base_url == DEFAULT_CODEX_BASE_URL, (agent.base_url, agent._client_kwargs)
++        verify_managed_agent(agent, {'model': agent.model})
++        session = session_for(agent)
++        original = deepcopy(agent.model_routing)
++        client, native = agent.client, agent._anthropic_client
++        target = ('codex-deep --provider openai-codex' if agent.provider == 'anthropic'
++                  else 'anthropic-standard --provider anthropic')
++        before = allocation_dump(tmp_path / 'model-routing.sqlite3')
++        server._apply_model_switch('ui', session, target + ' --once', confirm_expensive_model=True)
++        verify_managed_agent(agent, {'model': agent.model})
++        assert agent.provider != original['selected_provider']
++        server._persist_live_session_runtime(session)
++        row = agent._session_db.get_session('cross')
++        config = json.loads(row['model_config'])
++        snapshot = session['one_turn_model_restore']['runtime']
++        assert (row['model'], config['provider'], config['base_url'], config['api_mode']) == (
++            snapshot['model'], snapshot['provider'], snapshot['base_url'], snapshot['api_mode'])
++        server._restore_agent_model_runtime(agent, session.pop('one_turn_model_restore'))
++        assert agent.client is client
++        assert agent._anthropic_client is native
++        assert agent.context_compressor.model == agent.model
++        assert agent.context_compressor.provider == agent.provider
++        assert agent.model_routing == original
++        verify_managed_agent(agent, {'model': agent.model})
++        assert allocation_dump(tmp_path / 'model-routing.sqlite3') == before
+diff --git a/tui_gateway/class_routing.py b/tui_gateway/class_routing.py
+index ca7cbf39fb..3bb2e4b978 100644
+--- a/tui_gateway/class_routing.py
++++ b/tui_gateway/class_routing.py
+@@ -48,6 +48,8 @@ def restore_class_overrides(model, config, overrides):
+ def runtime_model_config(agent, existing, runtime_view, logger):
+     """Persist concrete display identity and class policy, clearing stale explicit-switch metadata."""
+     config = dict(existing or {})
++    from agent.agent_runtime_once import standing_runtime
++    agent = standing_runtime(agent)
+     route = getattr(agent, "model_routing", None)
+     agent = runtime_view(agent)
+     attr = lambda k: str(getattr(agent, k, "") or "").strip()
+diff --git a/tui_gateway/model_switch.py b/tui_gateway/model_switch.py
+index e1124e9a88..fb2822cee4 100644
+--- a/tui_gateway/model_switch.py
++++ b/tui_gateway/model_switch.py
+@@ -17,7 +17,9 @@ _RUNTIME_KEYS = ("model", "provider", "api_key", "base_url", "api_mode")
+ 
+ def _snapshot_agent_model_runtime(agent) -> dict:
+     """Capture the current agent model runtime for a one-turn restore."""
++    from agent.agent_runtime_once import snapshot_runtime
+     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
++            "runtime": snapshot_runtime(agent),
+             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+             "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
+ 
+@@ -26,6 +28,10 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
+     """Restore an agent model runtime captured before a one-turn override."""
+     if not snapshot or agent is None:
+         return
++    if "runtime" in snapshot:
++        from agent.agent_runtime_once import restore_runtime
++        restore_runtime(agent, snapshot["runtime"])
++        return
+     # `/model X --reasoning high --once`: the effort leaves with the model. Set before the
+     # runtime restore paths below (primary_runtime may predate a session /reasoning change).
+     if "reasoning_config" in snapshot:
+@@ -279,14 +285,24 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
+ 
+ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
+     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
++    previous_once = getattr(agent, '_one_turn_runtime', None)
++    if snapshot is not None:
++        if hasattr(agent, '_ensure_db_session'):
++            agent._ensure_db_session()
++        agent._one_turn_runtime = snapshot['runtime']
++    else:
++        agent.__dict__.pop('_one_turn_runtime', None)
+     try:
+         agent.switch_model(
+             new_model=result.new_model, new_provider=result.target_provider, api_key=result.api_key,
+             base_url=result.base_url, api_mode=result.api_mode,
+             capabilities=getattr(result, "runtime_capabilities", None))
+     except Exception as exc:
+-        # The in-place swap rolled the agent back and re-raised. Abort the whole commit (worker
+-        # restart, persist, marker, override, config write) or the session pins a broken model.
++        if previous_once is None:
++            agent.__dict__.pop('_one_turn_runtime', None)
++        else:
++            agent._one_turn_runtime = previous_once
++        # The in-place swap rolled back; restore its temporary ownership too.
+         # Abort the commit: do NOT restart the slash worker, persist runtime, append the switch marker, set
+         # a session model_override, or persist to config — all of which would otherwise leave the session
+         # pinned to a broken model and kill the conversation on the next turn (#50163). A failed switch is a
+@@ -296,7 +312,8 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model:
+                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
+     _restart_slash_worker(sid, session)
+     _persist_live_session_runtime(session)
+-    _persist_live_session_system_prompt(session)
++    if snapshot is None:
++        _persist_live_session_system_prompt(session)
+     _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
+     _emit_session_info(sid, session)
+     if snapshot is not None:
+@@ -327,19 +344,39 @@ def _apply_model_switch(
+         cfg = load_config()
+         user_provs = cfg.get("providers")
+         custom_provs = get_compatible_custom_providers(cfg)
+-    result = switch_model(
+-        raw_input=model_input, current_provider=current_provider, current_model=current_model,
+-        current_base_url=current_base_url, current_api_key=current_api_key, is_global=persist_global,
+-        explicit_provider=explicit_provider, user_providers=user_provs,
+-        custom_providers=custom_provs)
++    from agent.model_routing_runtime import temporary_resolution
++    from agent.model_routing import is_class_selector
++    # Preflight validates credentials but must not allocate before confirmation.
++    with temporary_resolution():
++        if is_class_selector(model_input):
++            from hermes_cli.model_switch import ModelSwitchResult
++            from agent.model_routing_runtime import resolve_class_runtime
++            preview = resolve_class_runtime(model_input, explicit_provider or 'auto', session_id='switch-preflight',
++                                            requirements=getattr(agent, '_model_routing_requirements', {}))
++            result = ModelSwitchResult(success=True, new_model=model_input, target_provider='auto',
++                                       is_global=persist_global)
++            from dataclasses import replace
++            guard_result = replace(result, new_model=preview['model'], target_provider=preview['provider'],
++                                   base_url=preview['base_url'], api_key=preview['api_key'], api_mode=preview['api_mode'])
++        else:
++            result = switch_model(
++                raw_input=model_input, current_provider=current_provider, current_model=current_model,
++                current_base_url=current_base_url, current_api_key=current_api_key, is_global=persist_global,
++                explicit_provider=explicit_provider, user_providers=user_provs,
++                custom_providers=custom_provs)
++            guard_result = result
+     if not result.success:
+         raise ValueError(result.error_message or "model switch failed")
+-    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
++    restore_snapshot = None
++    if one_turn and agent:
++        restore_snapshot = session.get('one_turn_model_restore') or _snapshot_agent_model_runtime(agent)
+     if agent:
+-        _merge_preflight_warning(result, agent, session, cfg, custom_provs)
++        _merge_preflight_warning(guard_result, agent, session, cfg, custom_provs)
++        result.warning_message = guard_result.warning_message
+     if not confirm_expensive_model:
+-        confirm = _expensive_model_confirm(result, current_base_url, current_api_key, agent)
++        confirm = _expensive_model_confirm(guard_result, current_base_url, current_api_key, agent)
+         if confirm is not None:
++            confirm['value'] = result.new_model
+             return confirm
+     records_composer_override = (
+         pin_session_override and isinstance(session, dict) and not one_turn
+-- 
+2.54.0 (Apple Git-157)
+

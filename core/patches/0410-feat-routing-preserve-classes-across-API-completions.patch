@@ -1,0 +1,260 @@
+From 64a44f5798a5120ac78f80b5a0753e38340c347f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 07:03:49 +0000
+Subject: [PATCH 410/453] feat(routing): preserve classes across API
+ completions and runs [daveey]
+
+(cherry picked from commit 15d50e9c9741cafc39c902c55f46b6177f126ff6)
+---
+ docs/model-routing.md                         | 11 ++-
+ gateway/platforms/api_server.py               | 23 ++---
+ gateway/platforms/api_server_class_routing.py | 63 ++++++++++++
+ tests/gateway/test_api_class_routing.py       | 98 +++++++++++++++++++
+ 4 files changed, 179 insertions(+), 16 deletions(-)
+ create mode 100644 gateway/platforms/api_server_class_routing.py
+ create mode 100644 tests/gateway/test_api_class_routing.py
+
+diff --git a/docs/model-routing.md b/docs/model-routing.md
+index 1cf58cae57..51c8815e34 100644
+--- a/docs/model-routing.md
++++ b/docs/model-routing.md
+@@ -101,5 +101,12 @@ no durable allocation slots. Background and preview jobs inherit the parent's cl
+ with independent durable job IDs, never its concrete credential pin; their SDK requests
+ are covered by the same mock-transport test.
+ 
+-Messaging, API, delegation, cron, Kanban and auxiliary adapters and their per-entry
+-request/recovery tests remain required before activation. This document is not rollout proof.
++API construction defers class credentials until the durable agent identity exists,
++without authenticating a legacy default first. Persisted class metadata restores the
++selector, while explicit session locks retain their existing precedence. Tests drive
++both streaming/nonstreaming `/v1/chat/completions` and `/v1/runs` through HTTP ingress
++to native SDK mock HTTP requests and verify concrete runtime reports.
++
++Messaging, delegation, cron, Kanban and auxiliary adapters and their per-entry
++request/recovery tests remain required before activation. Cross-provider failure and
++workload capability propagation still require audit. This document is not rollout proof.
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index a0e03f0aba..aaa97d989a 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -2198,6 +2198,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+     ) -> Optional[dict[str, Any]]:
+         """Runtime kwargs for ``provider``, falling back to the gateway's resolver; ``required``
+         raises ``_ProviderAuthResolutionError`` (controlled response, not a raw 500), not None."""
++        from gateway.platforms.api_server_class_routing import deferred_runtime
++        deferred = deferred_runtime(target_model, provider)
++        if deferred is not None:
++            return deferred
+         provider_name = _clean_request_string(provider)
+         if not provider_name:
+             return None
+@@ -2338,20 +2342,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
+         session ``/model`` override, disables the fallback chain and fails closed."""
+         from run_agent import AIAgent
+-        from gateway.run import (
+-            _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
+-            _resolve_gateway_model, _load_gateway_config, GatewayRunner)
++        from gateway.run import _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config, GatewayRunner
++        from gateway.platforms.api_server_class_routing import prepare_runtime
+         from hermes_cli.tools_config import _get_platform_tools
+-        # RuntimeError is caught ONLY here (sole provider-auth raiser); the typed subclass keeps
+-        # run_conversation() errors distinct.
+-        try:
+-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+-        except RuntimeError as exc:
+-            raise _ProviderAuthResolutionError(str(exc)) from exc
+-        # A fallback-provider runtime carries its own ``model``: pop it (overrides config, and
+-        # must not collide with the ``**runtime_kwargs`` spread).
+-        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
+-        runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
++        model, runtime_kwargs, session_model = prepare_runtime(
++            self, session_id, session_model, confirmed_runtime_lock, requested_model, route, gateway_session_key)
+         request_reasoning_config = _request_reasoning_config(model_options)
+         request_service_tier = _request_service_tier(model_options)
+         model, session_override, request_model, request_provider = self._select_agent_runtime(
+@@ -2404,7 +2399,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+             else "session_model_override" if session_override
+             else "raw_request" if route or request_model or request_provider else "global")
+         agent._hermes_api_runtime = {
+-            "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
++            "provider": getattr(agent, "provider", "") or runtime_kwargs.get("provider") or "",
+             "model": getattr(agent, "model", None) or model,
+             "route_source": route_source}
+         return agent
+diff --git a/gateway/platforms/api_server_class_routing.py b/gateway/platforms/api_server_class_routing.py
+new file mode 100644
+index 0000000000..d4b427a1a3
+--- /dev/null
++++ b/gateway/platforms/api_server_class_routing.py
+@@ -0,0 +1,63 @@
++"""Defer class credentials until the API agent has its durable session identity."""
++from agent.model_routing import is_class_selector
++
++
++def deferred_runtime(model, provider=None):
++    if not is_class_selector(model):
++        return None
++    return {"provider": provider or "auto", "requested_provider": provider or "auto"}
++
++
++def restore_session_class(adapter, session_id, session_model, confirmed_runtime_lock):
++    """A concrete persisted selection is not an explicit pin when it carries class provenance."""
++    if not session_id or confirmed_runtime_lock:
++        return session_model
++    db = adapter._ensure_session_db()
++    row = db.get_session(session_id) if db is not None else None
++    if not isinstance(row, dict):
++        return session_model
++    config = adapter._parse_session_model_config(row.get("model_config"))
++    metadata = config.get("model_routing") or {}
++    if (metadata.get("selected_model") == row.get("model")
++            and metadata.get("requested_class") in {"deep", "standard", "fast"}
++            and (not session_model or session_model == row.get("model"))):
++        return "class:" + metadata["requested_class"]
++    return session_model
++
++
++def initial_runtime(adapter, *, default_model, requested_model,
++                    route, session_model, confirmed_runtime_lock, session_key):
++    """Avoid touching default credentials before a class request overrides them.
++
++    The ordinary API precedence resolver remains the owner of route selection. This
++    preflight only skips unnecessary default authentication, never allocates a route.
++    """
++    from gateway.run import _resolve_runtime_agent_kwargs
++    override = None if confirmed_runtime_lock else adapter._session_model_override_for(session_key)
++    candidate = (override or {}).get("model") or (session_model if not confirmed_runtime_lock else None)
++    candidate = candidate or ((route.get("model") or default_model) if route is not None
++                              else requested_model or default_model)
++    if is_class_selector(candidate) or is_class_selector(default_model):
++        from hermes_cli.runtime_provider import _get_model_config
++        provider = (_get_model_config().get("provider") or "auto") if not (
++            override or session_model or requested_model or route) else "auto"
++        return {"provider": provider, "requested_provider": provider}
++    return _resolve_runtime_agent_kwargs()
++
++
++def prepare_runtime(adapter, session_id, session_model, confirmed_runtime_lock,
++                    requested_model, route, gateway_session_key):
++    from gateway.run import _resolve_gateway_model
++    from gateway.platforms.api_server import _ProviderAuthResolutionError
++    session_model = restore_session_class(adapter, session_id, session_model, confirmed_runtime_lock)
++    model = _resolve_gateway_model()
++    try:
++        runtime = initial_runtime(
++            adapter, default_model=model, requested_model=requested_model, route=route,
++            session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
++            session_key=gateway_session_key or session_id)
++    except RuntimeError as exc:
++        raise _ProviderAuthResolutionError(str(exc)) from exc
++    model = runtime.pop("model", None) or model
++    runtime.pop("_fallback_notice", None)
++    return model, runtime, session_model
+diff --git a/tests/gateway/test_api_class_routing.py b/tests/gateway/test_api_class_routing.py
+new file mode 100644
+index 0000000000..f0c0510a21
+--- /dev/null
++++ b/tests/gateway/test_api_class_routing.py
+@@ -0,0 +1,98 @@
++"""API class requests must not authenticate the legacy default first."""
++from unittest.mock import patch
++
++import pytest
++import run_agent
++from gateway.config import PlatformConfig
++from gateway.platforms.api_server import APIServerAdapter
++from tests.agent import test_model_routing_agent
++from tests.tui_gateway import test_class_routing
++
++native_transport = test_class_routing.native_transport
++routing_home = test_model_routing_agent.routing_home
++streaming_route = test_model_routing_agent.streaming_route
++
++
++@pytest.fixture
++def adapter(monkeypatch, tmp_path):
++    monkeypatch.chdir(tmp_path)
++    api = APIServerAdapter(PlatformConfig(enabled=True))
++    monkeypatch.setattr(api, "_session_model_override_for", lambda key: None)
++    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *a: [])
++    return api
++
++
++def test_api_constructor_class_wire_and_resume(adapter, routing_home, streaming_route, native_transport):
++    with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("paid default")), \
++            patch("model_tools.get_tool_definitions", return_value=[]):
++        agent = adapter._create_agent(session_id="api-class", requested_model="class:deep", requested_provider="auto")
++        assert isinstance(agent, run_agent.AIAgent)
++        assert agent.run_conversation("Say ok")["final_response"] == "ok"
++        assert agent.model_routing["requested_class"] == "deep"
++        assert agent._hermes_api_runtime["provider"] == "anthropic"
++        assert agent._hermes_api_runtime["model"] == "anthropic-deep"
++        resumed = adapter._create_agent(session_id="api-class", session_model=agent.model)
++        assert resumed.model_routing == agent.model_routing
++        assert resumed.model == agent.model
++        agent.release_clients()
++        resumed.release_clients()
++    assert native_transport
++    assert all(body["model"] == "anthropic-deep" and url.startswith("https://api.anthropic.com/")
++               and headers.get("authorization", "").startswith("Bearer sk-ant-oat")
++               and "x-api-key" not in headers for url, headers, body in native_transport)
++
++
++def test_api_empty_pool_never_uses_legacy(adapter, routing_home, streaming_route, monkeypatch):
++    from agent.model_routing import ModelRoutingError
++    monkeypatch.setattr("agent.credential_pool.CredentialPool.has_available", lambda *a, **kw: False)
++    with patch("gateway.run._resolve_runtime_agent_kwargs") as legacy, patch("anthropic.Anthropic") as sdk:
++        with pytest.raises(ModelRoutingError):
++            adapter._create_agent(session_id="empty", requested_model="class:deep", requested_provider="auto")
++    legacy.assert_not_called()
++    sdk.assert_not_called()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_completions_http_class(adapter, routing_home, streaming_route, native_transport, stream):
++    from aiohttp import web
++    from aiohttp.test_utils import TestClient, TestServer
++    app = web.Application()
++    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
++    with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("paid default")), \
++            patch("model_tools.get_tool_definitions", return_value=[]):
++        async with TestClient(TestServer(app)) as client:
++            response = await client.post("/v1/chat/completions", json={
++                "model": "class:deep", "provider": "auto", "stream": stream,
++                "messages": [{"role": "user", "content": "Say ok"}]})
++            text = await response.text()
++            assert response.status == 200, text
++            assert "ok" in text
++    assert native_transport
++    assert all(body["model"] == "anthropic-deep" and headers.get("authorization", "").startswith("Bearer sk-ant-oat")
++               for _, headers, body in native_transport)
++
++
++@pytest.mark.asyncio
++async def test_runs_http_class(adapter, routing_home, streaming_route, native_transport):
++    from aiohttp import web
++    from aiohttp.test_utils import TestClient, TestServer
++    from tests.waiting import async_wait_until
++    app = web.Application()
++    app.router.add_post("/v1/runs", adapter._handle_runs)
++    with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("paid default")), \
++            patch("model_tools.get_tool_definitions", return_value=[]):
++        async with TestClient(TestServer(app)) as client:
++            response = await client.post("/v1/runs", json={
++                "model": "class:deep", "provider": "auto", "input": "Say ok"})
++            payload = await response.json()
++            assert response.status == 202, payload
++            await async_wait_until(lambda: not adapter.active_agent_work_count(), timeout=20)
++            status = adapter._run_statuses[payload["run_id"]]
++            assert status["status"] == "completed", status
++            assert status["output"] == "ok"
++            assert status["runtime"]["provider"] == "anthropic"
++            assert status["runtime"]["model"] == "anthropic-deep"
++    assert native_transport
++    assert all(body["model"] == "anthropic-deep" and headers.get("authorization", "").startswith("Bearer sk-ant-oat")
++               for _, headers, body in native_transport)
+-- 
+2.54.0 (Apple Git-157)
+
