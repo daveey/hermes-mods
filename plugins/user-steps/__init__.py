@@ -1,11 +1,11 @@
-"""user-steps: what each chat is waiting for the user to do, framed in the reply and listed above the composer.
+"""Canonical user decisions, with passive transcript receipts.
 
-transform_llm_output  aux model (task `user_steps`) reads the final reply + open steps + the user's last message
-                      → new steps go into ~/.hermes/user-steps/<lineage root>.json, their paragraph in the reply
-                      becomes `::user-step{...}` (Desktop chats only), resolved steps close, and one rolling
-                      blocked Kanban card per chat lists the open steps (archived when the last one resolves).
-pre_llm_call          when steps are open, one note listing them (and the user message is kept for the extractor).
-Skipped: Kanban workers, subagents, cron/webhook. Off switch: HERMES_USER_STEPS_OFF=1. See README.
+The action_request tool publishes explicit versioned scope. transform_llm_output
+only proposes incomplete requests; it cannot authorize work or resolve decisions.
+pre_llm_call projects confirmed decision receipts into a normal turn. It never
+acknowledges pending delivery or starts a concurrent agent turn.
+Legacy rolling cards are not automatically created, unblocked or archived.
+Skipped: Kanban workers, subagents, cron/webhook. Off switch: HERMES_USER_STEPS_OFF=1.
 """
 from __future__ import annotations
 
@@ -114,8 +114,26 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
         return None
     try:
         _USER_MSG[session_id] = user_message if isinstance(user_message, str) else ""
-        opened = _ledger().open_steps(session_id)
-        return {"context": core.reminder(opened)} if opened else None
+        own = core.server_owner(session_id)
+        st = core.ActionStore()
+        for step in _ledger().read(session_id).get('steps', []):
+            if step.get('session') == session_id and step.get('status') == 'open':
+                st.migrate_step(own, step)
+        # A passive inbox is NOT a delivery receiver. Never acknowledge pending
+        # card/run work from this hook, nor wake a second writer inside a live turn.
+        # The owner API retries the persisted operation using the same key.
+        requests = st.requests(own)
+        receipts = cards_mod.DecisionInbox().context(own, requests)
+        pending = [{k: v for k, v in r.items() if k != 'resolution'}
+                   for r in requests if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
+        import json
+        note = ('[Canonical requests awaiting a user decision: this list grants NO execution '
+                'permission for the requests listed here. Recorded decisions are omitted: '
+                'their authority comes from the admitted user decision or confirmed receipt, '
+                'not from this list. Legacy steps and extracted text cannot grant permission.]\n'
+                + json.dumps(pending)) if pending else ''
+        context = '\n'.join(x for x in (note, receipts) if x)
+        return {'context': context} if context else None
     except Exception:
         log.exception("user-steps pre_llm_call failed")
         return None
@@ -129,7 +147,8 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
     try:
         out = core.process_reply(
             response_text, session_id, user_msg=_USER_MSG.pop(session_id, ""), llm=aux_llm, ledger=_ledger(),
-            cards=cards_mod.HermesCards(), framed=_framed(session_id),
+            cards=None, framed=_framed(session_id),
+            action_store=core.ActionStore(), action_owner=core.server_owner(session_id),
             session_ref=f"@session:{_profile()}/{session_id}")
         if out.get("error"):
             log.warning("user-steps extractor fell back to regex: %s", out["error"])
@@ -146,6 +165,61 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
         return None  # fail open: the reply is shown unchanged
 
 
+def publish_action_request(args: dict, session_id: str = '', **_) -> str:
+    """Agent producer: explicit scope only. Extraction NEVER calls this complete-plan path.
+
+    session_id is injected by tool dispatch; no owner/session payload is accepted.
+    Existing IDs require expectedRevision and publish a new immutable scope revision.
+    """
+    import json
+    import uuid
+    try:
+        core._object(args, ('request',), ('requestId', 'expectedRevision', 'decisionCard'))
+        owner = core.server_owner(session_id)
+        payload = dict(args['request'])
+        if any(key in payload for key in ('owner', 'requestId', 'revision', 'resolution')):
+            raise core.ActionError('Producer identity is server-owned')
+        rid = args.get('requestId') or str(uuid.uuid4())
+        st = core.ActionStore()
+        payload.update(owner=owner, requestId=rid, revision=1)
+        adapter = cards_mod.QualifiedCardDelivery()
+        # Aliases alone never authorize adopting a card. Only producer-created
+        # cards survive this path; replacement plans preserve the original binding.
+        refs = [ref for ref in payload.get('aliases', []) if ref.get('type') == 'kanban']
+        if args.get('requestId'):
+            if 'expectedRevision' not in args: raise core.ActionError('expectedRevision required')
+            if 'decisionCard' in args: raise core.ActionError('Cannot add a card to a replacement')
+            old_refs = [ref for ref in st.get(owner, rid)['aliases'] if ref['type'] == 'kanban']
+            if refs != old_refs: raise core.ActionError('Replacement must retain exact producer card aliases')
+            out = st.revise(owner, rid, args['expectedRevision'], payload, bind=adapter.bind_request)
+        else:
+            if 'expectedRevision' in args: raise core.ActionError('New requests have no expectedRevision')
+            if refs: raise core.ActionError('Card aliases must be created by decisionCard, not supplied')
+            payload = core.validate_action(payload)
+            if 'decisionCard' in args:
+                core._object(args['decisionCard'], ('board',))
+                ref = adapter.prepare(payload, args['decisionCard']['board'])
+                payload['aliases'].append(ref)
+            out = st.create(owner, payload, bind=adapter.bind_request)
+        return json.dumps({'request': out})
+    except (ValueError, TypeError, RuntimeError) as exc:
+        return json.dumps({'error': str(exc), 'status': getattr(exc, 'status', 422)})
+
+
+PRODUCER_SCHEMA = {
+    'name': 'action_request',
+    'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan.',
+    'parameters': {'type': 'object', 'additionalProperties': False,
+                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, choices [{id,label,effect}], qualified aliases, state (open or needs_context).'},
+                                  'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
+                                  'decisionCard': {'type': 'object', 'additionalProperties': False,
+                                                   'properties': {'board': {'type': 'string'}}, 'required': ['board'],
+                                                   'description': 'Optional new dedicated blocked decision metadata card. Never an existing card ID.'}},
+                   'required': ['request']}}
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)
+    ctx.register_tool(name='action_request', toolset='user_steps', schema=PRODUCER_SCHEMA,
+                      handler=publish_action_request, description=PRODUCER_SCHEMA['description'])
