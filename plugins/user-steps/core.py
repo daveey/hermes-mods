@@ -501,9 +501,23 @@ def recommendation_without_request(span: str, block: str = "") -> bool:
     return bool(_RECOMMENDATION.search(context) and not grounded)
 
 
-def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None) -> list[dict]:
+def action_identity(step: dict) -> tuple:
+    """Exact validated source fields, not a topic/account key or reopen proof.
+
+    Include evidence and ordered choices: identical labels alone cannot bind two
+    actions. No further normalization, fuzzy matching, or model-supplied IDs.
+    Legacy steps with these fields participate without a separate key migration.
+    """
+    return (step.get("kind"), step.get("text"), step.get("verbatim_span"),
+            tuple(step.get("options") or []))
+
+
+def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None,
+             *, continuity: bool = False) -> list[dict]:
     out: list[dict] = []
-    seen = {_norm(s.get("text", "")) for s in open_steps}
+    # The creation boundary needs repeats too, including those resolved while the
+    # model runs. Ordinary extractor callers retain their old deduplication.
+    seen: set[Any] = set() if continuity else {_norm(s.get("text", "")) for s in open_steps}
     for s in raw_steps if isinstance(raw_steps, list) else []:
         if not isinstance(s, dict):
             continue
@@ -526,21 +540,25 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             continue  # full evidence required; locate's framing prefix is not validation
         if recommendation_without_request(span, block["text"]):
             continue  # a recommendation is not permission to manufacture a choice
-        if _norm(text) in seen:
+        candidate = {"text": text, "kind": kind, "verbatim_span": span, "options": opts}
+        key = action_identity(candidate) if continuity else _norm(text)
+        if key in seen:
             continue
         if is_terminal_handoff(text, span, reply):
             if dropped is not None:
                 dropped.append(text)
             continue  # terminal-doable: the agent runs it via run_in_user_terminal, no For-you card
-        seen.add(_norm(text))
-        out.append({"text": text, "kind": kind, "verbatim_span": span, "options": opts})
-    return out[:MAX_NEW_PER_REPLY]
+        seen.add(key)
+        out.append(candidate)
+    # Suppression/reuse must not be truncated by a *new* action budget.
+    return out if continuity else out[:MAX_NEW_PER_REPLY]
 
 
 LLM = Callable[[str, str], str]
 
 
-def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM]) -> dict:
+def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM],
+            *, continuity: bool = False) -> dict:
     """{steps, resolved, source: 'model'|'regex', error?}."""
     ids = {s["id"] for s in open_steps}
     dropped: list[str] = []
@@ -548,14 +566,14 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
         try:
             d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg)))
             resolved = [str(x) for x in (d.get("resolved") or []) if str(x) in ids]
-            return {"steps": validate(d.get("steps"), reply, open_steps, dropped), "resolved": resolved,
+            return {"steps": validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), "resolved": resolved,
                     "source": "model", "dropped": dropped}
         except Exception as exc:  # fall back to the regex detector; resolution then only comes from buttons
             err = f"{type(exc).__name__}: {exc}"[:200]
             dropped.clear()
-            return {"steps": validate(regex_steps(reply), reply, open_steps, dropped), "resolved": [], "source": "regex",
+            return {"steps": validate(regex_steps(reply), reply, open_steps, dropped, continuity=continuity), "resolved": [], "source": "regex",
                     "error": err, "dropped": dropped}
-    return {"steps": validate(regex_steps(reply), reply, open_steps, dropped), "resolved": [], "source": "regex",
+    return {"steps": validate(regex_steps(reply), reply, open_steps, dropped, continuity=continuity), "resolved": [], "source": "regex",
             "dropped": dropped}
 
 
@@ -727,31 +745,88 @@ def resolve(ledger: Ledger, root: str, ids: list[str], resolution: str, by: str)
     return done
 
 
+HELD_REPLY = "This reply has been held because it repeats a retired request. No new action is requested."
+
+
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
                   ledger: Ledger, cards: Optional[Cards] = None, framed: bool = True,
                   session_ref: str = "", now: Optional[float] = None) -> dict:
-    """Run one final reply through the pipeline. Returns {text (None = unchanged), steps, resolved, source}."""
+    # A positive retirement finding must survive later persistence/card failures.
+    # Local state is not model-supplied and grants no reopen/execution authority.
+    retired = []
+    try:
+        return _process_reply(reply, session_id, user_msg=user_msg, llm=llm, ledger=ledger,
+                              cards=cards, framed=framed, session_ref=session_ref, now=now,
+                              retired=retired)
+    except Exception:
+        if not retired:
+            raise
+        logging.getLogger("user-steps").exception("publication failed after retirement; preserving hold")
+        return {"text": HELD_REPLY, "steps": [], "resolved": [], "source": "retirement-hold"}
+
+
+def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[LLM],
+                   ledger: Ledger, cards: Optional[Cards], framed: bool,
+                   session_ref: str, now: Optional[float], retired: list) -> dict:
+    """Reconcile exact actions under the source lock before creation/publication.
+
+    Resolution is suppression-only. Neither model metadata nor a later repeated
+    extraction can reopen a source action. This is not semantic deduplication.
+    """
     now = now or time.time()
     root = ledger.root(session_id)
     opened = ledger.open_steps(session_id)
     if not opened and not _worth_asking(reply):
         return {"text": None, "steps": [], "resolved": [], "source": "skip"}
-    res = extract(reply, opened, user_msg, llm)
-    resolved = resolve(ledger, root, res["resolved"], "answered in chat", "model") if res["resolved"] else []
-    recent = sum(1 for s in ledger._read(root).get("steps", []) if now - s.get("created", 0) < 3600)
-    new = res["steps"][: max(0, MAX_NEW_PER_HOUR - recent)]
-    for s in new:
-        s.update(id=new_step_id(), status="open", created=now, session=session_id)
-        b = locate(reply, s["verbatim_span"])
-        s["paragraph"] = b["text"] if b else s["verbatim_span"]
-    if new:
+    res = extract(reply, opened, user_msg, llm, continuity=True)
+    published, resolved = [], []
+    text = reply
+    changed = False
+    if res["steps"] or res["resolved"]:
+        # Re-read after extraction under Ledger.edit's flock. Resolve, match,
+        # budget, and append in one transaction; never decide from opened above.
         with ledger.edit(root) as d:
-            d["root"] = root
-            d["steps"].extend(new)
-    text = frame(reply, new, session_id) if (new and framed) else None
-    if new or resolved:
+            seen = {_norm(s.get("text", "")) for s in d["steps"] if s.get("status") == "open"}
+            for step in d["steps"]:
+                if step.get("id") in res["resolved"] and step.get("status") == "open":
+                    step.update(status="resolved", resolution="answered in chat", resolved_by="model",
+                                resolved_at=now)
+                    resolved.append(step["id"])
+            matches = [(s, [old for old in d["steps"] if action_identity(old) == action_identity(s)])
+                       for s in res["steps"]]
+            suppressed = [s for s, old in matches if any(x.get("status") == "resolved" for x in old)]
+            held = False
+            if suppressed:
+                # Evidence does not delimit dependent instructions in other blocks.
+                # Hold the whole draft rather than leave an orphaned approval ask.
+                retired.extend(suppressed)
+                text, held = HELD_REPLY, True
+            recent = sum(1 for s in d["steps"] if now - s.get("created", 0) < 3600)
+            budget = min(MAX_NEW_PER_REPLY, max(0, MAX_NEW_PER_HOUR - recent))
+            # Retain old label dedup only for genuinely new actions, never use it
+            # as an authority binding or to bypass exact retirement/reuse.
+            for candidate, prior in matches:
+                block = locate(text, candidate["verbatim_span"])
+                if held or candidate in suppressed or block is None:
+                    continue
+                existing = next((s for s in prior if s.get("status") == "open"), None)
+                if existing is not None:
+                    published.append(dict(existing))
+                    continue
+                if budget <= 0 or _norm(candidate["text"]) in seen:
+                    continue
+                step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
+                        "session": session_id, "paragraph": block["text"]}
+                d["steps"].append(step)
+                published.append(dict(step))
+                seen.add(_norm(candidate["text"]))
+                budget -= 1
+                changed = True
+    if published and framed:
+        text = frame(text, published, session_id)
+    if changed or resolved:
         sync_card(ledger, root, session_id, session_ref or f"@session:default/{session_id}", cards)
-    return {"text": text if text != reply else None, "steps": new, "resolved": resolved, "source": res["source"],
+    return {"text": text if text != reply else None, "steps": published, "resolved": resolved, "source": res["source"],
             "dropped": res.get("dropped") or [], **({"error": res["error"]} if res.get("error") else {})}
 
 

@@ -63,8 +63,23 @@ The snapshot limit does not restrict legacy writes or prevent resolving steps.
 This is a source API, not a deployed lifecycle adapter. A resolved snapshot is
 only conservative suppression evidence. Neither `resolved_by` nor a model/REST
 resolution string proves a trusted human transition, grants execution permission,
-or authorizes reopening. Authoritative ask-to-step binding and trusted reopen
-integration remain separate work.
+or authorizes reopening. Trusted reopen integration remains separate work.
+
+`process_reply` now reconciles extracted actions inside the source edit lock,
+using exact `(kind, text, verbatim_span, ordered options)` identity in that root.
+Open repeats reuse their ID; a resolved exact match holds the entire draft before
+new steps, framing or card creation. Whole-draft holding deliberately sacrifices
+unrelated narrative/actions because the evidence span cannot delimit dependent
+approval instructions in other paragraphs. A positive retirement finding survives
+later write/card-sync exceptions; failures before a finding retain the existing
+fail-open behavior. Model fields cannot reopen a step. This is not paraphrase or
+account matching: changed extraction fields and omitted extractions remain gaps.
+Publication after lock release is not atomic with a later source resolution.
+
+`tests/test_action_continuity.py` covers exact reuse/retirement, source lock races,
+compression/profile isolation, budgets, regex fallback, forged reopen fields,
+whole-draft holds and actual transform-wrapper write/card failures. These are
+isolated tests, not live deployment or full final-gate ordering proof.
 
 ## Limits
 
