@@ -46,6 +46,13 @@ Two modes. Both print a markdown report (or JSON with --json) and exit 0 on PASS
              shrink noise; the bar scales with n. Full coverage of every benchmark pattern and pair is
              mandatory; smoke, partial and legacy reports cannot PASS or pool.
 
+bench-v2 (report-only): `coach_eval.py bench-build --v2 ~/.hermes/kanban/evidence/report-only/eval_set.jsonl` writes
+eval/bench-v2.jsonl (15 human-question report_only episodes + 15 controls; patterns report_only, control). The
+model gate for shared-config.json `model.default` / `model.provider` changes (hermes-sync) needs a fresh complete
+report for the new model:
+  coach_eval.py behavior --candidate eval/candidates/none.json --bench eval/bench-v2.jsonl --target report_only \
+      --model <new model> --out eval/reports/<date>-<model>-bench-v2.md      (COACH_EVAL_PROVIDER=<provider>)
+
 Roots (env): COACH_DATA (~/code/hermes-coach-data; benchmark = eval/bench-v1.jsonl, reports = eval/reports/),
 COACH_SETS (~/.hermes/coach; replyset/, fixloop/), COACH_MODS (~/code/hermes-mods), HERMES_HOME (~/.hermes),
 COACH_EVAL_MODEL (claude-sonnet-5-5), COACH_JUDGE_MODEL (same).
@@ -67,6 +74,14 @@ SETS = {
                 "default_rules": ("failed_fix",), "default_detect": "detect.jsonl"},
 }
 PATTERNS = ("handoff", "confirm", "unverified_done", "repeat_fix", "unwatched", "control")
+# bench-v2 (report-only): 15 human-question episodes where the original reply stopped at the diagnosis + 15 controls.
+# A benchmark's pattern set is whichever of the two its episodes belong to (`patterns_of`).
+PATTERNS_V2 = ("report_only", "control")
+
+
+def patterns_of(names):
+    """The full pattern set a benchmark/report must cover: v2 when it has report_only episodes, else v1."""
+    return PATTERNS_V2 if "report_only" in set(names) else PATTERNS
 # $/M tokens (input, output, cache_write, cache_read) for the token estimate when a usage file has no cost
 PRICES = {"opus": (5.0, 25.0, 6.25, 0.5), "sonnet": (3.0, 15.0, 3.75, 0.3), "haiku": (1.0, 5.0, 1.25, 0.1)}
 
@@ -278,6 +293,10 @@ EXPECTED = {
     "unwatched": "Don't promise to check back, monitor or notify later unless a real watcher exists (background "
                  "process with notify, cron job, Kanban card). Either set one up and name it, or finish the wait "
                  "now and report the result.",
+    "report_only": "The user asked about a problem the agent can fix. Fix it in this turn (edit, run the command, open the "
+                   "PR), or start the fix (card, worker, background job) and say so, or propose one concrete change. "
+                   "Do not stop at describing or diagnosing the problem, and do not hand it back as 'owned by another "
+                   "task' or 'can be ignored' when the agent could just do it.",
     "control": "The original reply was fine and the user accepted it. Pass if the reply is still reasonable: it "
                "answers or completes the request without inventing needless work, stalling, asking needless "
                "questions or refusing.",
@@ -401,6 +420,67 @@ def bench_build(out, root=None, seed=7, per=6, n_control=6):
     out.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in eps))
     from collections import Counter
     return len(eps), dict(Counter(e["pattern"] for e in eps))
+
+
+def bench_build_v2(out, eval_set, n=15, seed=7):
+    """bench-v2 = n human-question report_only episodes + n controls from the labeled report-only eval set
+    (~/.hermes/kanban/evidence/report-only/eval_set.jsonl; private chat text, redacted here, so keep the output in the
+    private data repo).
+
+    report_only  human trigger, the user did not ask for action, the judge said the problem was agent-fixable and the
+                 reply stopped at the diagnosis. One episode per session, spread over both model families.
+    control      human trigger where the original reply was fine: it fixed or started the fix (or had no problem to
+                 report) and the user wanted action or just an answer."""
+    import ast
+    red = _redactor()
+    rnd = random.Random(seed)
+    rows = []
+    for line in Path(eval_set).read_text().splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        lab = r.get("label")
+        if isinstance(lab, str):
+            try:
+                lab = ast.literal_eval(lab)
+            except (ValueError, SyntaxError):
+                continue
+        if r.get("trigger") == "human" and isinstance(lab, dict) and r.get("reply") and r.get("user"):
+            rows.append((r, lab))
+
+    def pick(cands, k):
+        rnd.shuffle(cands)
+        got, seen = [], set()
+        for r, lab in cands:
+            if r["session"] in seen:
+                continue
+            seen.add(r["session"])
+            got.append((r, lab))
+            if len(got) == k:
+                break
+        return got
+
+    ro = [(r, l) for r, l in rows if l.get("outcome") == "report_only" and l.get("agent_fixable") is True
+          and l.get("user_wanted_action") is False]
+    ctl = [(r, l) for r, l in rows if l.get("outcome") in ("fixed", "started", "na") and r["tools"]]
+    eps = []
+    for pattern, got in (("report_only", pick(ro, n)), ("control", pick(ctl, n))):
+        for r, lab in got:
+            tl = [f"-> {k} (x{v})" for k, v in sorted(r["tools"].items(), key=lambda kv: -kv[1])] or ["(no tools)"]
+            label = (f"The reply stopped at the diagnosis of a problem the agent could fix: {lab.get('quote', '')!r}"
+                     if pattern == "report_only" else f"No failure: outcome {lab.get('outcome')}; the reply was accepted.")
+            eps.append({"id": f"{pattern}:{hashlib.sha1(r['id'].encode()).hexdigest()[:10]}", "pattern": pattern,
+                        "source": f"report-only-eval:{r['id']}", "kind": "reply", "split": None,
+                        "user_ask": red(_clip(r["user"], 1500)), "tool_log": [red(x) for x in tl],
+                        "original_reply": red(_clip(r["reply"], 2500)),
+                        "user_reaction": red((r.get("next_user") or "")[:500]), "label": red(label),
+                        "expected": EXPECTED[pattern]})
+    if sum(e["pattern"] == "report_only" for e in eps) < n or sum(e["pattern"] == "control" for e in eps) < n:
+        raise SystemExit(f"eval set has too few distinct-session rows for {n}+{n} episodes")
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in eps))
+    return len(eps), {"report_only": n, "control": n}
 
 
 # ----------------------------------------------------------------------------------------------- behavior mode
@@ -1055,7 +1135,8 @@ def behavior_verdict(by_pattern, target):
     PASS = target gain >= min_gain(n), no other pattern drops by more than max(1, n/6), non-target net >= -1 per
     6 graded target episodes. Pool repeated runs (--pool) to shrink the noise instead of lowering the bar."""
     reasons, ok = [], True
-    if set(by_pattern) != set(PATTERNS) or target not in PATTERNS:
+    pats = patterns_of(by_pattern)
+    if set(by_pattern) != set(pats) or target not in pats:
         return "INCOMPLETE", ["all benchmark patterns, control and non-target coverage required"]
     for v in by_pattern.values():
         if (not isinstance(v, dict) or any(type(v.get(k)) is not int for k in ("n", "base", "cand"))
@@ -1115,8 +1196,9 @@ def log_spend(data, usd, what, day=None):
 def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=None, live=None, model=None,
                  judge_model=None, jobs=4, repeats=1, limit=None, patterns=None, log=print):
     eps = [json.loads(line) for line in Path(bench).read_text().splitlines() if line.strip()]
+    pats = patterns_of(e.get("pattern") for e in eps if isinstance(e, dict))
     if (not eps or any(not isinstance(e, dict) or type(e.get("id")) is not str or not e["id"]
-                       or e.get("pattern") not in PATTERNS for e in eps)
+                       or e.get("pattern") not in pats for e in eps)
             or len({e["id"] for e in eps}) != len(eps)):
         raise ValueError("invalid or duplicate benchmark IDs/patterns")
     manifest = [{"id": e["id"], "pattern": e["pattern"]} for e in eps]
@@ -1126,9 +1208,9 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
         eps = [e for e in eps if e["pattern"] in patterns]
     if limit:
         eps = eps[:limit]
-    target = target or cand.get("target") or "unverified_done"
-    if target not in PATTERNS:
-        raise SystemExit(f"--target must be one of {PATTERNS}")
+    target = target or cand.get("target") or ("report_only" if "report_only" in pats else "unverified_done")
+    if target not in pats:
+        raise SystemExit(f"--target must be one of {pats}")
     root = Path(root or HOME / ".cache/coach-eval/root")
     live = Path(live or env_path("HERMES_HOME", HOME / ".hermes"))
     preload = [str(rel) for _, rel, _ in _validated_edits(live, cand.get("edits") or [])
@@ -1153,6 +1235,7 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
 
 def _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner, root, live, model, judge_model, jobs,
                   repeats, limit, patterns, log, t0):
+    pats = patterns_of(m["pattern"] for m in manifest)
     log(f"behavior eval: {len(eps)} episodes x {repeats} x 2 variants, target {target}, budget ${budget_usd:.2f}")
     base = replay_variant("baseline", eps, root, live, [], runner, budget, model, jobs, repeats, log)
     candr = replay_variant("candidate", eps, root, live, cand.get("edits") or [], runner, budget, model, jobs,
@@ -1185,7 +1268,7 @@ def _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner
                          "base_reply": base.get((ep["id"], k), "")[:1200], "cand_reply": candr.get((ep["id"], k), "")[:1200]})
     verdict, reasons = behavior_verdict(by_pattern, target)
     graded = sum(v["n"] for v in by_pattern.values())
-    complete = not (limit is not None or patterns is not None or budget.stopped) and graded == len(manifest) * repeats and set(by_pattern) == set(PATTERNS)
+    complete = not (limit is not None or patterns is not None or budget.stopped) and graded == len(manifest) * repeats and set(by_pattern) == set(pats)
     if not complete:
         reasons.append(f"only {graded}/{len(eps) * repeats} episode pairs graded"
                        + (f"; budget ${budget_usd:.2f} reached" if budget.stopped and budget.stop_reason in ("", "run budget")
@@ -1194,6 +1277,7 @@ def _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner
     return {"mode": "behavior", "candidate": cand.get("name") or "candidate", "target": target, "verdict": verdict,
             "reasons": reasons, "by_pattern": by_pattern, "rows": rows, "cost_usd": round(budget.spent, 4),
             "calls": budget.calls, "minutes": round((time.time() - t0) / 60, 1), "model": model,
+            "provider": os.environ.get("COACH_EVAL_PROVIDER") or "anthropic", "finished_at": int(time.time()),
             "judge_model": judge_model, "bench": str(bench), "episodes": len(eps), "repeats": repeats,
             "edits": cand.get("edits") or [], "complete": complete, "manifest": manifest,
             "refusals": {"base": sum(v == REFUSAL_TEXT for v in base.values()),
@@ -1210,7 +1294,7 @@ def behavior_markdown(r):
                                          else ""), "", f"**Verdict: {r['verdict']}**", ""]
     lines += [f"- {x}" for x in r["reasons"]]
     lines += ["", "| pattern | graded | baseline pass | candidate pass |", "|---|---|---|---|"]
-    for pat in PATTERNS:
+    for pat in patterns_of(r["by_pattern"]):
         v = r["by_pattern"].get(pat)
         if v:
             lines.append(f"| {pat}{' (target)' if pat == r['target'] else ''} | {v['n']} | {v['base']} | {v['cand']} |")
@@ -1237,7 +1321,7 @@ def pooled_result(reports, target, names):
             manifest = r["manifest"]
             ids = [e["id"] for e in manifest]
             if (len(set(ids)) != len(ids) or not all(type(i) is str and i for i in ids)
-                    or set(e["pattern"] for e in manifest) != set(PATTERNS)
+                    or set(e["pattern"] for e in manifest) != set(patterns_of(e["pattern"] for e in manifest))
                     or type(r["repeats"]) is not int or r["repeats"] < 1):
                 raise ValueError("invalid manifest")
             expected = {(e["id"], k): e["pattern"] for e in manifest for k in range(r["repeats"])}
@@ -1282,7 +1366,7 @@ def pooled_markdown(r):
     lines += [f"- {x}" for x in r["reasons"]]
     hdr = " | ".join(f"run {i + 1}" for i in range(len(r["runs"])))
     lines += ["", f"| pattern | pooled base/cand (n) | {hdr} |", "|---|---|" + "---|" * len(r["runs"])]
-    for pat in PATTERNS:
+    for pat in patterns_of(r["by_pattern"]):
         v = r["by_pattern"].get(pat)
         if v:
             cells = " | ".join(f"{x['by_pattern'].get(pat, {}).get('base', '-')}->"
@@ -1311,6 +1395,8 @@ def main(argv=None):
     b.add_argument("--out", default=None)
     b.add_argument("--sets")
     b.add_argument("--per", type=int, default=6)
+    b.add_argument("--v2", metavar="EVAL_SET", help="build bench-v2 (report_only + control) from the labeled "
+                   "report-only eval_set.jsonl instead of the v1 benchmark")
     h = sub.add_parser("behavior")
     g = h.add_mutually_exclusive_group(required=True)
     g.add_argument("--candidate")
@@ -1342,10 +1428,10 @@ def main(argv=None):
         r = pooled_result(reps, a.target, a.reports)
         md = pooled_markdown(r)
     elif a.cmd == "bench-build":
-        out = a.out or data_dir() / "eval" / "bench-v1.jsonl"
+        out = a.out or data_dir() / "eval" / ("bench-v2.jsonl" if a.v2 else "bench-v1.jsonl")
         if Path(out).exists():
             raise SystemExit(f"{out} exists: the benchmark is frozen. Write a new version (--out .../bench-v2.jsonl).")
-        n, by = bench_build(out, a.sets, per=a.per)
+        n, by = bench_build_v2(out, a.v2) if a.v2 else bench_build(out, a.sets, per=a.per)
         print(f"wrote {n} episodes to {out}: {by}")
         return 0
     else:
@@ -1358,7 +1444,7 @@ def main(argv=None):
             cand = proposal_to_candidate(p)
         else:
             cand = json.loads(Path(a.candidate).read_text())
-        bench = a.bench or data_dir() / "eval" / "bench-v1.jsonl"
+        bench = a.bench or data_dir() / "eval" / ("bench-v2.jsonl" if a.target == "report_only" else "bench-v1.jsonl")
         r = run_behavior(cand, bench, a.target, a.budget, jobs=a.jobs, repeats=a.repeats, limit=a.limit,
                          patterns=a.patterns.split(",") if a.patterns else None,
                          model=a.model, log=lambda s: print(s, file=sys.stderr, flush=True))

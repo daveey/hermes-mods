@@ -16,6 +16,9 @@ Prints a Markdown block the coach Bot turns into reports/weekly-<date>.md:
      fix (selfheal_* coach events + `selfheal:` Kanban cards, or the hub's reports/selfheal-lane.jsonl snapshot).
   2d. Guards in shadow/off > 7 days: every mode-switched detector/guard (GUARDS) on this host stuck in shadow/off,
      with its fire count; --file-guard-cards opens one Kanban card per guard (never an Inbox card).
+  2d. report_only_rate by model family (astra / opus / sonnet / other) and trigger (human-question / human-action /
+     event): the share of judged Desktop turns that end at a diagnosis of a fixable problem (coach_report_only.py,
+     judge rubric from the Oct 2026 eval, bounded by the engine budget). Targets: human-question <= 10%, event <= 20%.
   3. Each --check: before/after comparison for a config change at a timestamp (sessions fully before vs started
      after, equal-length windows), with a keep / raise / revert recommendation.
   4. Pending and rejected proposals (the Bot must not re-propose rejected ones).
@@ -720,6 +723,10 @@ def main():
                          "default profile, even when run from the coach profile)")
     ap.add_argument("--file-guard-cards", action="store_true",
                     help="open one idempotent Kanban card per guard in shadow/off > 7 days (the hub's Sunday prerun)")
+    ap.add_argument("--no-report-only", action="store_true",
+                    help="skip the report_only_rate section (it judges a sample of the week's Desktop turns)")
+    ap.add_argument("--state-db", default="~/.hermes/state.db", help="Desktop turns for the report_only_rate section")
+    ap.add_argument("--report-only-max", type=int, default=150, help="turns judged per weekly run")
     ap.add_argument("--selfheal-export", metavar="PATH",
                     help="write the self-heal lane snapshot (events + cards) to PATH and exit; the hub writes "
                          "<data>/reports/selfheal-lane.jsonl so the cloud Bot sees the lane")
@@ -736,6 +743,9 @@ def main():
     out += section_findings(data, ds, now, a.days, a.top) + [""]
     out += section_spend(ds, now, a.days) + [""]
     out += section_selfheal(data, now, a.days, homes=a.home or None) + [""]
+    if not a.no_report_only:
+        import coach_report_only
+        out += coach_report_only.section(a.state_db, a.days, data=data, max_turns=a.report_only_max) + [""]
     out += section_guards(a.guard_home, now, file_cards=a.file_guard_cards) + [""]
     checks = list(dict.fromkeys(a.check + canary_checks(data)))
     if checks:
