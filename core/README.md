@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-sync-seams.md](kanban-sync-seams.md) | 0401 | Phase 1 of the central Kanban sync service, off by default (`kanban.sync.enabled`): outbox capture triggers with a drift guard, `apply_remote_changes`, lease seams in claim/heartbeat/stale-claim, tombstoned deletes, wide ids, dispatcher wake; no network code yet |
 | [kanban-actionability-durable-evidence.md](kanban-actionability-durable-evidence.md) | 0393–0400 | Merge-adapted actionable escalation, scope heartbeat freshness, exact legacy attestation with a distinct wire action, contention timestamp retention, and test followups; locally verified candidate |
 | [unresolved-goal-fallback.md](unresolved-goal-fallback.md) | 0392 | Optional structured `pre_final_gate` fallback retained at budget/cap/unavailable boundaries, ownership-bound rechecks, private held text, scoped Kanban/process/dispatcher health receipts; enforcement stays opt-in (coach plugin) |
 | [retention-observation.md](retention-observation.md) | 0391 | Fail-closed, observation-only non-CI retention slice (`retention_cli observe`); cannot delete or authorize deletion |
