@@ -98,8 +98,25 @@ rebuild (`/api/session-kanban-tasks` went from 11–19 s to under 40 ms on a bus
 paints a chat's last-known cards from a per-chat cache the moment it is opened, loads each source independently and
 shows each card as a row (status, title, assignee, latest activity, note, PR link).
 
-What is not built yet: Desktop reading linked cards and boards from the replica, the WebSocket feed (the client
-polls every 5 s), and placement beyond "a card runs where it was created" (`runs_on`, Worker nodes and transcripts).
+Phase 5, chat links on the Board (2026-10-27): which chats a card belongs to now syncs like any other row, in a
+`task_chat_links` table (uid `task:gateway:profile:session:kind`, kind `created` or `shepherd`, a `released` flag).
+Each gateway's sync loop reconciles its own links every 60 s from its local data (`tasks.session_id`, tui
+subscriptions) and from the origin ledger, and pushes the difference. A board that only another gateway has gets a
+link-only file in `<root>/kanban/sync-links/`, so links to cards created elsewhere still have somewhere to live.
+`hermes kanban sync links-diff` compares, per chat, the open remote cards the ledger lists with the ones the
+replicas list. It was clean on all three gateways (1076, 8 and 202 links) before the readers switched:
+`kanban.sync.links_reader: replica` is set everywhere, and the Desktop's linked cards for another gateway's work now
+come from the local replica, with no call to that gateway. The ledger stays as the fallback (unset the key to go
+back). The endpoint opens every board and replica once and keeps the read-only connections, so one chat's cards take
+1–2 ms on the laptop and the mini and 1–5 ms on the hub (it was about 40 ms with a 120–340 ms tail when it opened
+16 files per call). Tests: `test_kanban_chat_links.py`, `test_kanban_ro_cache.py`.
+
+Boards: every board on every host is attached and `primary` (7 on the laptop, 4 on the mini, 5 on the hub). Boards a
+host only knows through links (the laptop's `bb`, `runners` and `unconventional-collab`) keep just a replica. The sync loop now wakes on the service's WebSocket
+feed, on a local outbox write or on its period, instead of polling every 5 s.
+
+What is not built yet: Desktop reading whole boards from the replica (only linked cards do), and placement beyond
+"a card runs where it was created" (`runs_on`, Worker nodes and transcripts).
 
 ## Problem
 
