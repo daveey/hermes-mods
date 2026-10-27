@@ -155,7 +155,7 @@ def handle_post(args: dict, **context) -> str:
         poster, cwd = _poster_for(context.get("session_id"))
         result = store_module().Inbox().post(
             args.get("title", ""), args.get("body", ""), args.get("accept_prompt", ""),
-            key=args.get("key"), poster=poster, cwd=args.get("cwd") or cwd, prompt_label=args.get("prompt_label"),
+            key=args.get("key"), poster=poster, cwd=args.get("cwd"), inherited_cwd=cwd, prompt_label=args.get("prompt_label"),
             type=args.get("type"), fields=args.get("fields"),
         )
         result["posted"] = True
@@ -191,13 +191,26 @@ def handle_types(args: dict, **_) -> str:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
 
-def _pre_llm_call(session_id=None, **_):
+def _pre_llm_call(session_id=None, **context):
+    routed = None
+    try:
+        path = Path(__file__).resolve().parent / "chat_routing.py"
+        key = f"_hermes_inbox_chat_routing_{path.stat().st_mtime_ns}"
+        mod = sys.modules.get(key)
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(key, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod = sys.modules.setdefault(key, mod)
+        routed = mod.route_first_turn(store_module().routing_module(), session_id=session_id, **context)
+    except Exception:
+        log.warning("inbox: first-turn project routing failed", exc_info=True)
     try:
         if session_id and store_module().Inbox().on_user_turn(session_id):
             log.info("inbox: %s accepted by a user turn", session_id)
     except Exception:
         log.debug("inbox: accept hook failed", exc_info=True)
-    return None
+    return routed
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -214,6 +227,9 @@ def _setup_cli(parser) -> None:
     p.add_argument("--type", help="card type (see `hermes inbox types`)")
     p.add_argument("--field", action="append", default=[], metavar="K=V", help="a type field (repeatable)")
     sub.add_parser("list", help="list open messages")
+    b = sub.add_parser("backfill-social", help="move social cards in the fallback cwd into this host's pr project")
+    b.add_argument("--apply", action="store_true", help="write the change (default: dry run)")
+    b.add_argument("--include-archived", action="store_true")
     u = sub.add_parser("unmute", help="let a poster muted as noise post again (after fixing it)")
     u.add_argument("poster")
     a = sub.add_parser("archive", help="archive a message")
@@ -247,6 +263,10 @@ def _run_cli(args) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        return 0
+    if cmd == "backfill-social":
+        rows = inbox.backfill_social(apply=args.apply, include_archived=args.include_archived)
+        print(json.dumps(rows, indent=2))
         return 0
     if cmd == "types":
         try:

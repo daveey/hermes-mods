@@ -171,6 +171,27 @@ workers to stop chasing tests.
    daily hosted spend and non-Linux SKUs, posting to the Hermes Inbox itself because Desktop cron has no home
    channel (`deliver=all` fails with "no delivery target"). Run it with `--force` for live state.
 
+## Landing a reviewed PR with a head-pinned watcher
+
+Order: exact-head review verdict AND exact-head required aggregate ("All required checks pass") green, then
+`gh pr merge N --rebase --match-head-commit <full sha>`. The watcher aborts on head move, aggregate failure or REJECT.
+- Read a Kanban reviewer's verdict from the run, not the card: `select summary,metadata from task_runs where
+  task_id=? order by id desc limit 1`. `tasks.result` is often empty, so a watcher grepping it never sees APPROVE and
+  waits until timeout. Verify the verdict yourself before arming the merge.
+- Every new head (your own rebase included) needs a fresh exact-head verdict, even when `git range-diff` shows
+  every patch identical: main moved underneath it. Ask the SAME reviewer lineage for a delta review of the new
+  sha (a done card can't be reopened unless it sits in review; create a continuation card, pinned to the same
+  model, and link it as parent of the ship card).
+- Exact-head failure: re-run only the failing test files on a detached worktree at the PR's merge-base. Failing
+  there too means it is inherited; route it to the owner of the breaking commit (search cards and comments for
+  the test name first), wait for that fix to merge, rebase onto it, re-verify range-diff, push with
+  `--force-with-lease=<ref>:<old sha>`, then request the delta review. Never merge over a red aggregate.
+- Hosted Actions refused for billing on a repo WITHOUT branch protection or required checks: run the workflow's
+  exact commands locally at the exact head for every matrix entry (`uv run --no-project --python 3.X --with
+  pytest python -m pytest ...`), run any tests a worker's mutation fence blocked as the supervisor in a clean
+  env (`env -i HOME=<tmp> PATH=/usr/bin:/bin ...`), post the evidence on the PR, then merge with
+  `--match-head-commit`. Never do this on a repo whose protection requires the checks.
+
 ## Rescuing a stalled merge watch
 
 For an open PR, inspect blockers before restarting a watcher:

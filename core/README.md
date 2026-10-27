@@ -15,6 +15,11 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-actionability-durable-evidence.md](kanban-actionability-durable-evidence.md) | 0393–0400 | Merge-adapted actionable escalation, scope heartbeat freshness, exact legacy attestation with a distinct wire action, contention timestamp retention, and test followups; locally verified candidate |
+| [unresolved-goal-fallback.md](unresolved-goal-fallback.md) | 0392 | Optional structured `pre_final_gate` fallback retained at budget/cap/unavailable boundaries, ownership-bound rechecks, private held text, scoped Kanban/process/dispatcher health receipts; enforcement stays opt-in (coach plugin) |
+| [retention-observation.md](retention-observation.md) | 0391 | Fail-closed, observation-only non-CI retention slice (`retention_cli observe`); cannot delete or authorize deletion |
+| [kanban-origin-adoption.md](kanban-origin-adoption.md) | 0380–0382 | State-preserving existing-task origin adoption with immutable request replay/conflict checks |
+| [kanban-local-owner-projection.md](kanban-local-owner-projection.md) | 0384–0390 | Exact local owner evidence and alias-qualified dedup, foreign-profile preservation, nonblocking ledger refresh, one scoped annotation snapshot and per-projection alias-read reuse; live acceptance remains separate |
 | [kanban-origin-work-ledger.md](kanban-origin-work-ledger.md) | 0221 0223 0242–0247 0268 0270 0273–0279 0281–0282 0293 0295–0297 0299 0311 0313–0314 0316 0324–0328 0342 0361 | Owner-qualified remote work, durable binding/creation receipts, fresh lifecycle evidence, routed drawers/archive checks and deferred completion notices |
 | [kanban-agent-recovery-routing.md](kanban-agent-recovery-routing.md) | 0269 0301 0307–0308 0334 0365 | Current-run continuation exhaustion and automatic stops route to agent recovery while genuine human asks remain visible |
 | [kanban-assignment-capabilities.md](kanban-assignment-capabilities.md) | 0300 0336 | Shared configured-capability/model preflight and bounded durable assignment repair |
@@ -42,7 +47,8 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [kanban-default-provider.md](kanban-default-provider.md) | 0265 | Default tier provider inference |
 | [test-live-git-config-guard.md](test-live-git-config-guard.md) | 0266 0271 | Protect live git identity during tests |
 | [kanban-worker-scope-failures.md](kanban-worker-scope-failures.md) | 0267 | Diagnose worker OOM and signal deaths |
-| [archive-linked-confirm.md](archive-linked-confirm.md) | 0110 | Archiving a chat with open Kanban tasks or rented machines asks first, listing them; plugins add checks via `ctx.registerArchiveGuard` |
+| [kanban-dependency-review-continuation.md](kanban-dependency-review-continuation.md) | 0378–0379 | Authenticated dependency parks permit one same-PR repair after structured independent review; claim release remains transactional |
+| [archive-linked-confirm.md](archive-linked-confirm.md) | 0110 0383 | Archiving a chat with open Kanban tasks or rented machines asks first, listing them; plugins add checks via `ctx.registerArchiveGuard` |
 | [screen-share.md](screen-share.md) | 0109 | Inline Screen Share plugin opens strictly validated VNC addresses on the client Desktop OS, never the remote gateway |
 | [session-navigation-shortcuts.md](session-navigation-shortcuts.md) | 0019 0021 0022 0026 0033 0035 0043 0048 0049 0050 0065 | ⌘]/⌘[ next/prev session with a green/red status stripe (stepping from the focused tab), ⌘B mark blocked (grey, skipped), ⌘⇧]/⌘⇧[ any session, ⌘⇧A archive-and-advance, ⌘R resume (⌥⌘R in 0064–0070), ⌥⇧⌘R window reload |
 | [ai-session-rename.md](ai-session-rename.md) | 0020 0032 0042 | ⌘⇧E rename (was ⌘⇧N until 0042), pre-filled with an AI short name (`session.title.suggest` RPC) |
@@ -141,12 +147,16 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 ## Applying
 
-The current export contains **377 patches**, including **82 newly mirrored source commits**
-beyond the prior295-patch inventory, pinned to source
-`85ef8520b95d5ee775a25161b20c195b2d2349b9`. All377 apply in order with
-`git am -3 --empty=keep`;324 selected Python tests and136 Desktop tests pass,
-and renderer typechecking passes. See [verification](mirror-377-verification.md)
-for duplicate/adaptation details and exact scope. No runtime deployment is claimed.
+The current local candidate contains **400 patches**, pinned to source
+`0146a882edf55e22fc9197e2a2e190a0fbacf068` (source independently reviewed and published).
+All 400 apply in order with `git am -3 --empty=keep`; 290 selected Python tests across
+15 files pass on the applied public series, with no failures or skips.
+Patches 0001–0392 are byte-identical and unrenumbered. Patch 0393 explicitly integrates
+merge `2b6644387f`; overlapping branch commits must not also be replayed.
+See [current verification](mirror-400-verification.md)
+for privacy, preservation and exact execution scope. The earlier 377-patch run's
+Desktop/typecheck results are historical, not rerun for this export. No runtime
+deployment or legacy migration is claimed.
 Chrome 0370–0372 remains experimental; see [managed-chrome-leases.md](managed-chrome-leases.md).
 Existing source identities are retained, with renumbered references; do not assume
 that repeated changes can be applied twice without an explicit adaptation.
@@ -268,4 +278,4 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Process and CI followups](process-ci-test-followups.md) | 0327 0332 0333 0337 0354 0374–0375 | Readiness, duplicate deadline identities, curl detection fallback and bounded fast-check lane. |
 | [Session start requests](session-start-requests.md) | 0376–0377 | Trusted metadata, authenticated SSH principal and persisted-owner preservation. |
 
-Current full-series apply instructions, adaptations, duplicate treatment and executed tests: [377-patch verification](mirror-377-verification.md).
+Current full-series apply instructions and executed tests: [390-patch verification](mirror-390-verification.md). Historical adaptations, duplicate treatment and broader prior tests: [377-patch verification](mirror-377-verification.md).

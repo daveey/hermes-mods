@@ -39,6 +39,23 @@ Unqualified legacy requests remain discovery-only. Replica rows are not authorit
   unreachable gateway, and offline-marked cached rows in the normal sidebar (`/sessions` + `/request`).
 - `desktop-plugins/inbox`: other gateways' open cards via `/inbox`; resolve/archive via `/request`.
 - `desktop-plugins/session-tasks`: linked cards on other gateways via `/session-links`.
+- `desktop-plugins/blocked-panel`: replica session links discover remote/offline cards;
+  live owner details classify actionable requests and all mutations stay on that owner.
+
+`/session-links` preserves `block_kind` and `human_request` when present in the
+replica, without inferring evidence from prose. **This plugin is not the replica
+producer.** The external hermes-hub client's `collect_tasks` and `stage` own the
+serialization into `published` and `outbox`. Client 1.4.1 includes and JSON-decodes canonical `human_request` task evidence,
+including explicit null on retirement; malformed/non-object JSON becomes null and
+legacy schemas omit the field. No event-based reconstruction restores old evidence.
+Deploy that client alongside this projection; the projection alone cannot repair an
+older producer's omission.
+
+`test_human_request_path.py` calls the actual source producer in a sibling isolated
+`hub/` checkout (override with `HERMES_HUB_CLIENT_REAL`) against a throwaway Kanban
+database, then verifies its staged JSON from `published` and `outbox`. These are
+required passing assertions, not expected failures. No installed/live source,
+sync or network request is used.
 
 ## Config
 

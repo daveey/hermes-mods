@@ -743,15 +743,33 @@ def checked_matches(claim: str, tools: list[dict]) -> bool:
     return False
 
 
+def validate_human_request(value: Any) -> dict[str, str]:
+    """Mirror the core wire contract without requiring a particular core version."""
+    fields = ("action", "why_human", "scope", "evidence", "interaction")
+    if not isinstance(value, dict) or any(
+        not isinstance(value.get(k), str) or not value[k].strip() for k in fields
+    ):
+        raise ValueError("human_request requires nonblank action, why_human, scope, evidence and interaction strings")
+    request = {k: value[k].strip() for k in fields}
+    if request["interaction"] not in {"approval", "reply", "user_terminal", "physical", "external"}:
+        raise ValueError("human_request interaction must be approval/reply/user_terminal/physical/external")
+    return request
+
+
 def needs_checked(tool_name: str, args: dict, is_worker: bool) -> tuple[bool, str]:
     """(does this tool call wait on David / need the Checked gate, the text to scan)."""
     if not isinstance(args, dict):
         return False, ""
+    if tool_name in {"kanban_block", "kanban_create"} and args.get("human_request") is not None:
+        request = validate_human_request(args["human_request"])
+        return True, json.dumps(request, ensure_ascii=False)
     if tool_name == "kanban_block":
-        return True, str(args.get("reason") or "")
+        reason = str(args.get("reason") or "")
+        if says_david_must_act(reason):
+            return True, reason
     if tool_name == "kanban_create":
         body = f"{args.get('title') or ''}\n{args.get('body') or ''}"
-        if str(args.get("initial_status")) == "blocked" or says_david_must_act(body):
+        if says_david_must_act(body):
             return True, body
     return False, ""
 

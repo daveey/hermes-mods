@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .collector import ident, iso, readiness
+from .collector import ident, iso, readiness, operational_evidence, readiness_evidence
 from .health import State, project, Policy
 from .models import validate
 
@@ -59,12 +59,35 @@ class Service:
 
     def _inventory(self, snap):
         meta=self._meta(snap); c=self.config; rows=[]; projections=[]
+        hosts=deepcopy(c['hosts'])
+        db=connect(self.path)
+        try:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_maintenance'").fetchone():
+                overlay={r[0]:json.loads(r[1]) for r in db.execute('SELECT entity_id,payload FROM repair_domain_maintenance')}
+                for host in hosts:
+                    host['maintenance']=overlay.get(host['resource_id'],host['maintenance'])
+        finally:
+            db.close()
+        for host in hosts:
+            m=host['maintenance']
+            if m['state']=='active' and datetime.fromisoformat(m['expires_at'].replace('Z','+00:00')).timestamp()<=self.clock():
+                host['maintenance']=dict(state='inactive',reason=None,expires_at=None)
         policy=Policy(inventory_ttl=c['thresholds']['inventory_stale_seconds'],host_ttl=c['thresholds']['host_stale_seconds'])
         for row in snap['runners'] if snap else ():
             row=deepcopy(row)
-            checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock())
+            current = meta['freshness'] == 'fresh'
+            checks, ready=readiness(c,row,snap.get('host_results',{}),self.clock(), snapshot_current=current)
+            # This is host projection data, never provider-supplied runner data.
+            row.pop('operational_evidence', None)
+            row.pop('readiness_evidence', None)
+            causes = readiness_evidence(c, row, snap.get('host_results', {}), self.clock(), checks, snapshot_current=current)
+            if causes is not None:
+                row['readiness_evidence'] = causes
+            operational = operational_evidence(c, row, snap.get('host_results', {}), self.clock(), snapshot_current=current)
+            if operational:
+                row['operational_evidence'] = operational
             host=snap.get('host_results',{}).get(row.get('host_id'),{})
-            maintenance=next((h['maintenance'] for h in c['hosts'] if h['id']==row.get('host_id')), {})
+            maintenance=next((h['maintenance'] for h in hosts if h['id']==row.get('host_id')), {})
             until=(datetime.fromisoformat(maintenance['expires_at'].replace('Z','+00:00')).timestamp()
                    if maintenance.get('state')=='active' else None)
             p=project(State(**snap['states'][row['id']]),now=self.clock(),policy=policy,checks=checks,management=host.get('management','unknown'),host_at=host.get('at'),maintenance_until=until)
@@ -85,7 +108,6 @@ class Service:
         if snap and any(p['state']!='fresh' for p in meta['provenance']): state='partial'
         if not c['scopes']: state='not_configured'
         if snap and meta['freshness']=='stale': state='owner_disconnected'
-        hosts=deepcopy(c['hosts'])
         for host in hosts:
             evidence=(snap or {}).get('host_results',{}).get(host['id'])
             at = evidence['at'] if evidence else None
@@ -104,7 +126,7 @@ class Service:
         data=dict(state=state,collection=snap['collection'] if snap else None,counts=count,hosts=hosts,runners=rows,scopes=c['scopes'],providers=c['providers'],targets=c['execution_targets'])
         return dict(meta=meta,data=data)
 
-    def inspect(self,runner_id,history_limit=100):
+    def inspect(self,runner_id,history_limit=100,*,principal=None):
         validate('InspectRequest',dict(runner_id=runner_id,history_limit=history_limit))
         if not self.config['features']['observe']:
             raise RuntimeError('feature_disabled')
@@ -116,9 +138,15 @@ class Service:
         try:
             # JSON filtering occurs before LIMIT; do not silently lose older matching rows.
             observations=[json.loads(r[0]) for r in db.execute("SELECT payload FROM runner_records WHERE kind='Observation' AND json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT ?",(runner_id,history_limit))]
+            incidents=[json.loads(r[0]) for r in db.execute("SELECT payload FROM runner_records WHERE kind='Incident' AND json_extract(payload,'$.entity_id')=? ORDER BY updated_at DESC LIMIT 100",(runner_id,))]
+            repairs=[]
+            if principal and self.config['features']['repair_sessions'] and db.execute("SELECT 1 FROM sqlite_master WHERE name='repair_domain_records'").fetchone():
+                scope='host:'+runner['host_id'] if runner.get('host_id') else 'runner:'+runner_id
+                owner=json.dumps(inventory['meta']['owner'],sort_keys=True,separators=(',',':'),ensure_ascii=True)
+                repairs=[json.loads(r[0]) for r in db.execute('SELECT payload FROM repair_domain_records WHERE scope=? AND principal=? AND owner=? ORDER BY rowid DESC LIMIT 100',(scope,principal,owner))]
         finally: db.close()
         monitoring, jobs = self._job_evidence(snap, runner, history_limit)
-        return dict(meta=inventory['meta'],data=dict(runner=runner,observations=observations,incidents=[],repairs=[],jobs=[],job_monitoring=monitoring,observed_jobs=jobs))
+        return dict(meta=inventory['meta'],data=dict(runner=runner,observations=observations,incidents=incidents,repairs=repairs,jobs=[],job_monitoring=monitoring,observed_jobs=jobs))
 
     def _job_evidence(self, snap, runner, limit):
         """External observations are not dispatched Job records or health proof."""

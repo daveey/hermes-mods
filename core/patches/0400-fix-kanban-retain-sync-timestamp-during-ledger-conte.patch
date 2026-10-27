@@ -1,0 +1,93 @@
+From 0146a882edf55e22fc9197e2a2e190a0fbacf068 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 23:45:13 +0000
+Subject: [PATCH] fix(kanban): retain sync timestamp during ledger contention
+ [daveey]
+
+---
+ hermes_cli/kanban_origin_ledger.py            |  9 +++--
+ ...est_kanban_origin_projection_contention.py | 40 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 15ed298045..989f95633d 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -269,13 +269,14 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+     last_ok = None
+     try:
+         if replica is not None and replica.is_file():
+-            # Inventory readers must not queue behind a receipt/sync writer.
+-            # Contention is an unavailable observation, handled conservatively
+-            # below; the next poll retries without dropping the durable receipt.
+-            refresh_observations(path, replica, timeout=0)
++            # Sync metadata is independent of the ledger write: retain its last
++            # successful pull timestamp even when observation refresh is busy.
+             source = _ro(replica)
+             meta = dict(source.execute("SELECT k,v FROM meta"))
+             last_ok = float(meta.get('last_ok') or 0)
++            # Inventory readers must not queue behind a receipt/sync writer.
++            # Only a successful refresh can make these observations current.
++            refresh_observations(path, replica, timeout=0)
+             fresh = (0 <= now - last_ok <= 180 and not meta.get('offline_since'))
+     except (OSError, sqlite3.Error, ValueError, TypeError):
+         # A failed refresh never erases a receipt. Reading the ledger below
+diff --git a/tests/hermes_cli/test_kanban_origin_projection_contention.py b/tests/hermes_cli/test_kanban_origin_projection_contention.py
+index 19bd66fb0f..90c38eeb2b 100644
+--- a/tests/hermes_cli/test_kanban_origin_projection_contention.py
++++ b/tests/hermes_cli/test_kanban_origin_projection_contention.py
+@@ -1,7 +1,10 @@
+ """Task inventory must not queue behind a concurrent origin-ledger writer."""
++import json
+ import sqlite3
+ import time
+ 
++import pytest
++
+ from hermes_cli import kanban_origin_ledger as ledger
+ from tests.hermes_cli.test_kanban_origin_ledger import world as world, publish, accept  # noqa: PLC0414
+ 
+@@ -22,3 +25,40 @@ def test_projection_preserves_unknown_without_waiting_for_writer(world):
+     # The competing writer has gone; normal refresh remains usable.
+     ledger.refresh_observations(path, replica)
+     assert ledger.project(path, replica=replica, gateway='origin', profile='default')[0]['unfinished']
++
++
++@pytest.mark.parametrize('advance', [False, True])
++def test_projection_keeps_sync_timestamp_but_not_freshness_during_write_contention(world, advance):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    if advance:
++        publish(replica, binding, status='blocked')
++    with sqlite3.connect(replica) as db:
++        if advance:
++            db.execute('UPDATE replica SET version=4')
++        db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++        db.execute("INSERT INTO meta VALUES ('last_ok','1000')")
++        db.execute("INSERT INTO replica VALUES ('owner','gateway','info',5,?)",
++                   (json.dumps({'gateway': 'owner', 'task_scopes': [
++                       {'profile': 'work', 'board': 'build', 'state': 'ok', 'observed_at': 1000}]}),))
++
++    with sqlite3.connect(path) as writer:
++        writer.execute('BEGIN IMMEDIATE')
++        start = time.monotonic()
++        row, = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++        elapsed = time.monotonic() - start
++        assert elapsed < 2, f'projection queued behind a writer for {elapsed:.3f}s'
++        assert row['synced_at'] == 1000
++        assert row['stale'] and row['unfinished']
++        assert row['status'] == 'unknown'
++        assert row['reported_status'] == 'running'
++        assert row['observation_version'] == 3
++
++    # Retry refreshes the durable observation, not the replica's sync timestamp.
++    row, = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++    assert row['synced_at'] == 1000
++    assert not row['stale']
++    assert row['unfinished']
++    assert row['status'] == row['reported_status'] == ('blocked' if advance else 'running')
++    assert row['observation_version'] == (4 if advance else 3)
+-- 
+2.55.0
+

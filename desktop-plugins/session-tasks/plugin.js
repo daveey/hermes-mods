@@ -458,11 +458,18 @@ async function loadMachines(ids) {
 // archived on ITS gateway (connectionId from the row), across its lineage.
 export async function archiveGuard({ sessionId, ids, profile, connectionId } = {}) {
   if (!sessionId) return []
+  // ArchiveGuardContext uses an omitted connection for the registry primary.
+  // Resolve that contract here, not in api(): other callers' missing owners
+  // remain unknown, and the active gateway is never a substitute for primary.
+  if (connectionId === undefined) {
+    const connections = await safe(() => host.connections(), [])
+    connectionId = connections?.find(c => c.primary)?.id
+  }
   const lineage = new Set(ids || [])
   const resolved = await lineageIds(sessionId, connectionId, profile || 'default')
   if (resolved.incomplete) return [{ label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }]
   for (const id of resolved) lineage.add(id)
-  const inv = await api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id=', connectionId, 2_000)
+  const inv = await api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id=', connectionId, 2_000, profile || 'default')
   if (!inv || !Array.isArray(inv.machines)) return []
   const chips = machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile: profile || 'default', ids: lineage })
   return machineArchiveLines(chips)

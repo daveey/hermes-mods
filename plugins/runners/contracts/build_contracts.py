@@ -59,6 +59,12 @@ D['PermissionResult'] = obj(action=enum('read_inventory', 'read_jobs', 'dispatch
 D['Scope'] = obj(id=ID, provider={'const': 'github_actions'}, endpoint={'const': 'https://api.github.com'}, kind=enum('repository', 'organization', 'enterprise'), name={'type': 'string', 'pattern': '^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$', 'maxLength': 201}, credential_ref=ID, permissions=array(ref('PermissionResult'), 4))
 D['Scope']['allOf'] = [{'if': {'properties': {'kind': {'const': 'repository'}}}, 'then': {'properties': {'name': {'pattern': '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'}}}, 'else': {'properties': {'name': {'pattern': '^[A-Za-z0-9_.-]+$'}}}}]
 D['Runner'] = obj(id=ID, provider={'const': 'github_actions'}, endpoint={'const': 'https://api.github.com'}, scope_id=ID, provider_runner_id={'type': 'string', 'pattern': '^[1-9][0-9]{0,19}$'}, host_id=nullable(UUID), display_name=text(), labels=array(text(64), 100), observed_os=OS, lifecycle=enum('persistent', 'ephemeral', 'jit', 'retired', 'unknown'), replacement_of=nullable(ID), expected_expiry=nullable(TIME), registration=enum('online', 'offline', 'missing', 'unknown'), activity=enum('idle', 'busy', 'unknown'), readiness=enum('pass', 'warn', 'fail', 'not_checked'), freshness=enum('fresh', 'stale', 'unknown'), repair=enum('none', 'creating', 'active', 'verifying', 'failed', 'closed'), observation_ids=array(ID))
+D['OperationalEvidence'] = obj(kind=enum('drained', 'maintenance', 'disk_pressure', 'root_headroom', 'label_withdrawn'), source=enum('systemd', 'maintenance_marker', 'admission_journal', 'runner_journal', 'supervisor_log'), state=enum('held', 'clear', 'unknown'), freshness=enum('fresh', 'stale', 'unknown', 'unavailable'), observed_at=nullable(TIME), expires_at=nullable(TIME), recorded_at=nullable(TIME))
+# Add only to properties: obj() otherwise makes all fields required, breaking
+# persisted Runner records and older collectors which lack operational facts.
+D['Runner']['properties']['operational_evidence'] = array(ref('OperationalEvidence'), 5)
+D['ReadinessEvidence'] = obj(required=array(text(256)), passed=array(text(256)), failed=array(text(256)), warned=array(text(256)), hold_explained_failures=array(text(256)), observed_at=nullable(TIME), expires_at=nullable(TIME), freshness=enum('fresh', 'stale', 'unknown', 'unavailable'))
+D['Runner']['properties']['readiness_evidence'] = ref('ReadinessEvidence')
 D['RunnerBinding'] = obj(runner_id=ID, host_id=UUID, service_ref=ID, verification_observation_id=ID)
 D['Capability'] = obj(id=ID, requirement=text(128), declared_version=nullable(text(64)), observed_version=nullable(text(64)), state=enum('available', 'unavailable', 'unknown', 'not_checked'), observed_at=nullable(TIME), expires_at=nullable(TIME), verifier=nullable(ID), observation_ids=array(ID))
 D['Observation'] = obj(id=ID, entity_id=ID, dimension=enum('registration', 'activity', 'management', 'readiness', 'capacity', 'capability', 'permission', 'binding', 'job'), value=text(512), reason_code=text(80), source_id=ID, collected_at=TIME, expires_at=TIME, evidence_summary=text(2048), error_class=nullable(enum('auth', 'forbidden', 'rate_limited', 'network', 'timeout', 'partial', 'unsupported', 'unknown')))
@@ -188,6 +194,7 @@ def generate():
     fixtures['Host'].update(resource_id=oid('host'), display_name='Fictional build host', service_refs=[oid('service')])
     fixtures['Runner'].update(id=oid('runner'), scope_id=oid('scope'), display_name='Fictional registration', host_id=None)
     fixtures['RunnerBinding'].update(runner_id=oid('runner'), service_ref=oid('service'))
+    fixtures['ReadinessEvidence'].update(required=['disk', 'service', 'operational:drained:systemd'], passed=['disk'], failed=['service', 'operational:drained:systemd'], warned=[], hold_explained_failures=['service', 'operational:drained:systemd'], observed_at='2030-01-01T00:00:00Z', expires_at='2030-01-01T00:03:00Z', freshness='fresh')
     fixtures['Workflow'].update(id=oid('workflow'), scope_id=oid('scope'))
     fixtures['Provider'].update(id=oid('provider'))
     fixtures['BBBinding'].update(id=oid('binding'), provider_id=oid('bbprovider'))

@@ -1,0 +1,134 @@
+From 76b9c78f24f2d89d22ec45e20b71a2e738d06c70 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 23:25:19 +0000
+Subject: [PATCH] fix(kanban): gate legacy reconciliation on a distinct wire
+ action
+
+---
+ hermes_cli/kanban_origin_adapter.py           |  7 +++-
+ .../origin_adapter_pre_attestation.py         | 33 +++++++++++++++++
+ .../hermes_cli/test_kanban_origin_adapter.py  | 36 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_origin_legacy.py |  2 +-
+ 4 files changed, 76 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/origin_adapter_pre_attestation.py
+
+diff --git a/hermes_cli/kanban_origin_adapter.py b/hermes_cli/kanban_origin_adapter.py
+index e706f904c7..24dd96fc57 100644
+--- a/hermes_cli/kanban_origin_adapter.py
++++ b/hermes_cli/kanban_origin_adapter.py
+@@ -70,10 +70,15 @@ def receive(request: dict) -> dict:
+         raise ValueError('origin_request_invalid')
+     binding = request['args'].get('binding')
+     validate_binding(binding)
+-    if (request.get('coll') != 'sessions' or request.get('action') != 'origin-bind'
++    if (request.get('coll') != 'sessions'
++            or request.get('action') not in ('origin-bind', 'origin-reconcile-legacy')
+             or request.get('to_gw') != gateway
+             or request.get('key') != f"{profile}/{binding['origin']['session']}"):
+         raise ValueError('origin_route_mismatch')
++    # A distinct wire action makes pre-attestation adapters reject before they
++    # consume the immutable receipt ID. Ordinary origin-bind stays compatible.
++    if request['action'] == 'origin-reconcile-legacy' and not isinstance(request['args'].get('legacy_alias'), dict):
++        raise ValueError('origin_legacy_invalid')
+     return accept_binding(path=home / 'kanban/origin-ledger.db', replica=replica,
+                           binding=binding, request_id=request.get('id'),
+                           sender=request.get('from'), gateway=gateway, profile=profile,
+diff --git a/tests/hermes_cli/origin_adapter_pre_attestation.py b/tests/hermes_cli/origin_adapter_pre_attestation.py
+new file mode 100644
+index 0000000000..3367b153a8
+--- /dev/null
++++ b/tests/hermes_cli/origin_adapter_pre_attestation.py
+@@ -0,0 +1,33 @@
++"""Frozen receive() from 1330267ab4 for wire-compatibility tests.
++
++The unchanged identity/lineage helpers are shared; the old dispatch and omitted
++legacy_alias argument must remain frozen, even when the production adapter changes.
++"""
++import os
++from pathlib import Path
++
++from hermes_cli.kanban_origin_adapter import _gateway, _resolve_session
++from hermes_cli.kanban_origin_ledger import accept_binding, validate_binding
++
++
++def receive(request: dict) -> dict:
++    from hermes_constants import get_hermes_home
++    from hermes_cli.profiles import get_active_profile_name
++    home = get_hermes_home()
++    profile = get_active_profile_name()
++    if profile == 'custom':
++        raise ValueError('origin_profile_unknown')
++    replica = Path(os.environ.get('HERMES_HUB_STATE') or Path.home() / '.local/state/hermes-hub') / 'hub.db'
++    gateway = _gateway(replica)
++    if not isinstance(request, dict) or not isinstance(request.get('args'), dict):
++        raise ValueError('origin_request_invalid')
++    binding = request['args'].get('binding')
++    validate_binding(binding)
++    if (request.get('coll') != 'sessions' or request.get('action') != 'origin-bind'
++            or request.get('to_gw') != gateway
++            or request.get('key') != f"{profile}/{binding['origin']['session']}"):
++        raise ValueError('origin_route_mismatch')
++    return accept_binding(path=home / 'kanban/origin-ledger.db', replica=replica,
++                          binding=binding, request_id=request.get('id'),
++                          sender=request.get('from'), gateway=gateway, profile=profile,
++                          resolve_session=lambda sid: _resolve_session(home / 'state.db', sid))
+diff --git a/tests/hermes_cli/test_kanban_origin_adapter.py b/tests/hermes_cli/test_kanban_origin_adapter.py
+index 8e5564547a..e7d70ca7b5 100644
+--- a/tests/hermes_cli/test_kanban_origin_adapter.py
++++ b/tests/hermes_cli/test_kanban_origin_adapter.py
+@@ -155,3 +155,39 @@ def test_canonical_lineage_does_not_bind_to_unrelated_child(world, monkeypatch,
+         db.end_session('s_unrelated', 'reset')
+     db.close()
+     assert invoke(world, monkeypatch, capsys)['resolved_session'] == 's_new'
++
++
++def test_old_receiver_rejects_without_consuming_id_then_upgrade_accepts(world, monkeypatch, capsys):
++    from tests.hermes_cli.origin_adapter_pre_attestation import receive as old_receive
++    from hermes_cli.kanban_origin_legacy import record_digest
++    home, hub, _, request = world
++    old = {'id': 't_one', 'board': 'build', 'sessions': [
++        {'gw': 'origin', 'profile': 'default', 'session': 's_old', 'rel': 'shepherd'}]}
++    with sqlite3.connect(hub / 'hub.db') as db:
++        db.execute("INSERT INTO replica VALUES ('owner','tasks','build/t_one',2,?)", (json.dumps(old),))
++    request['action'] = 'origin-reconcile-legacy'
++    alias = {'key': 'build/t_one', 'version': 2, 'digest': record_digest(old),
++             'evidence': 'Owner verified the archived source configuration.'}
++    request['args']['legacy_alias'] = alias
++    with pytest.raises(ValueError, match='origin_route_mismatch'):
++        old_receive(request)
++    path = home / 'kanban/origin-ledger.db'
++    assert not path.exists()
++    assert ledger.receipt(path, request['id']) is None
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] == 'accepted'
++    assert result['legacy_alias'] == alias
++    assert result['request_id'] == request['id']
++    assert ledger.receipt(path, request['id']) == result
++    assert invoke(world, monkeypatch, capsys) == result
++
++
++@pytest.mark.parametrize('alias', [None, {}, [], 'invalid'])
++def test_reconciliation_requires_alias_before_receipt(world, monkeypatch, capsys, alias):
++    world[3]['action'] = 'origin-reconcile-legacy'
++    if alias is not None:
++        world[3]['args']['legacy_alias'] = alias
++    result = invoke(world, monkeypatch, capsys)
++    assert result['status'] == 'rejected'
++    assert result['code'] == 'origin_legacy_invalid'
++    assert not (world[0] / 'kanban/origin-ledger.db').exists()
+diff --git a/tests/hermes_cli/test_kanban_origin_legacy.py b/tests/hermes_cli/test_kanban_origin_legacy.py
+index f5354f7e0e..7774464b0f 100644
+--- a/tests/hermes_cli/test_kanban_origin_legacy.py
++++ b/tests/hermes_cli/test_kanban_origin_legacy.py
+@@ -134,7 +134,7 @@ def test_receiver_and_session_projection_replace_only_attested_alias(world, tmp_
+     monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
+     monkeypatch.setattr(adapter, '_resolve_session', lambda path, sid: 's_tip')
+     request = {'id': 'request-one', 'from': 'gw:owner', 'to_gw': 'origin',
+-               'coll': 'sessions', 'key': 'default/s_old', 'action': 'origin-bind',
++               'coll': 'sessions', 'key': 'default/s_old', 'action': 'origin-reconcile-legacy',
+                'args': {'binding': world['binding'], 'legacy_alias': world['legacy_alias']}}
+     assert adapter.receive(request)['legacy_alias'] == world['legacy_alias']
+     monkeypatch.setattr(activity, '_hub_db_path', lambda: world['replica'])
+-- 
+2.55.0
+

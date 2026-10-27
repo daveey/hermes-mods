@@ -33,6 +33,7 @@ SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 TICK_S = float(os.environ.get("CHAT_CLOSEOUT_TICK_S", "30"))
 _state: dict[str, Any] = {}
 _thread_lock = threading.Lock()
+_waiting_lock = threading.Lock()
 
 
 # ---- environment -----------------------------------------------------------------------------------------------
@@ -90,10 +91,10 @@ def remote_cards() -> list[dict]:
     return [card for card in ksa._remote_links() if card.get('via') != 'origin'] + rows
 
 
-def read_cards(ids: list[str]) -> dict:
+def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict]]] = None) -> dict:
     cards = core.read_cards(board_paths(), ids)
     try:
-        remote = remote_cards()
+        remote = (remote_inventory or remote_cards)()
     except Exception:
         # Qualified local cards remain usable. Old bare IDs have lost ownership:
         # without the remote inventory they cannot safely resolve to local done.
@@ -111,6 +112,25 @@ def read_cards(ids: list[str]) -> dict:
     return cards
 
 
+def _pass_reader() -> Callable[[list[str]], dict]:
+    """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) is read
+    once and reused for every row, not once per pending row. A failed read fails every row the same way."""
+    memo: list[tuple[Optional[list[dict]], Optional[BaseException]]] = []
+
+    def inventory() -> list[dict]:
+        if not memo:
+            try:
+                memo.append((remote_cards(), None))
+            except Exception as exc:
+                memo.append((None, exc))
+        rows, exc = memo[0]
+        if exc is not None:
+            raise exc
+        return rows
+
+    return lambda ids: read_cards(ids, remote_inventory=inventory)
+
+
 def state_dbs() -> list[Path]:
     root = _kanban_root()
     out = [root / "state.db"]
@@ -122,6 +142,18 @@ def open_card_ids(session_id: str) -> list[str]:
     """Cards the chat created or shepherds that are not done/archived (queued, running, blocked, review)."""
     from hermes_cli import kanban_session_activity as ksa
     return sorted({core.card_key(t) for t in ksa.session_tasks([session_id], ksa.LISTED_STATUSES)})
+
+
+def session_proof(sid: str, tid: str, card: dict) -> bool:
+    """Transcript evidence that a finished card's final notice was delivered to the chat and answered."""
+    try:
+        at = card.get("completed_at")
+        if at is None:
+            return False
+        return core.ack_proven(state_dbs(), _lineage(sid), tid, float(at))
+    except Exception:
+        logger.debug("chat-closeout: ack proof unavailable", exc_info=True)
+        return False
 
 
 def _eligible(session_id: str, platform: str = "") -> bool:
@@ -157,8 +189,14 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not row or not row.get("batch"):
             return None
         cards = read_cards(row["batch"])
-        key = core.closeout_key(row, cards)
-        if not key or key == row.get("done_sig") or row.get("closing") is not None:
+        fix = core.reconcile_done(row, cards, lambda t, c: session_proof(session_id, t, c))
+        if fix:
+            ledger().write(session_id, **fix)
+            row = {**row, **fix}
+            if not row["batch"]:
+                return None
+        key = core.pending_key(row, cards)
+        if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
         ledger().write(session_id, closing=sorted(row["batch"]))
@@ -215,20 +253,21 @@ pre_final_gate.needs_buffer = True
 # ---- sidebar: a settled batch stays "waiting" until its close-out ----------------------------------------------
 def waiting_source() -> dict[str, list[str]]:
     """kanban_session_activity waiting source: chats whose cards all settled but whose close-out has not run yet.
-    Cached for 3 s (the session list polls)."""
+    Cached for 3 s (the session list polls). Single-flight: polls that arrive while a pass runs wait for it and
+    share its answer instead of each starting their own."""
     if _off():
         return {}
-    hit = _state.get("waiting_cache")
-    mono = time.monotonic()
-    if hit and mono - hit[0] < 3.0:
-        return hit[1]
-    try:
-        out = core.pending_closeouts(ledger(), read_cards)
-    except Exception:
-        logger.debug("chat-closeout waiting source failed", exc_info=True)
-        out = {}
-    _state["waiting_cache"] = (mono, out)
-    return out
+    with _waiting_lock:
+        hit = _state.get("waiting_cache")
+        if hit and time.monotonic() - hit[0] < 3.0:
+            return hit[1]
+        try:
+            out = core.pending_closeouts(ledger(), _pass_reader(), proof=session_proof)
+        except Exception:
+            logger.debug("chat-closeout waiting source failed", exc_info=True)
+            out = {}
+        _state["waiting_cache"] = (time.monotonic(), out)
+        return out
 
 
 def _register_waiting_source() -> None:
@@ -273,9 +312,12 @@ def _unseen_counts() -> Optional[dict[str, int]]:
 
 def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]] = None,
               unseen: Optional[dict[str, int]] = None, last_user: Optional[Callable[[list[str]], float]] = None,
-              read: Callable[[list[str]], dict] = read_cards) -> list[dict]:
-    """One close-out pass over the ledger. Returns what it did (for logs/tests)."""
+              read: Optional[Callable[[list[str]], dict]] = None,
+              proof: Optional[Callable[[str, str, dict], bool]] = None) -> list[dict]:
+    """One close-out pass over the ledger. Returns what it did (for logs/tests). One remote-inventory read per
+    tick, shared by every pending row."""
     now = time.time() if now is None else now
+    read = read or _pass_reader()
     if wake is None:
         srv = _server()
         if srv is None:
@@ -291,16 +333,18 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
         sid = row["session_id"]
         cards = read(row["batch"])
         fix = core.reconcile(row, cards)
+        fix.update(core.reconcile_done({**row, **fix}, cards,
+                                       lambda t, c, sid=sid: (proof or session_proof)(sid, t, c)))
         if fix:
             led.write(sid, **fix)
             row = {**row, **fix}
             if not row["batch"]:
                 continue
-        key = core.closeout_key(row, cards)
+        key = core.pending_key(row, cards)
         if key and key != row.get("settled_sig"):
             led.write(sid, settled_sig=key, settled_at=now)
         ids = _lineage(sid)
-        if key and key != row.get("done_sig") and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
+        if key and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
             if _state.setdefault("capped", {}).get(sid) != key:
                 _state["capped"][sid] = key
                 logger.warning("chat-closeout: %s hit the %d wakes/hour cap; close-out deferred", sid,
@@ -347,16 +391,17 @@ def post_inbox(title: str, body: str, key: str) -> None:
 
 def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                   unseen: Optional[dict[str, int]] = None, post: Callable[[str, str, str], None] = post_inbox,
-                  force: bool = False, read: Callable[[list[str]], dict] = read_cards) -> list[str]:
+                  force: bool = False, read: Optional[Callable[[list[str]], dict]] = None) -> list[str]:
     """Flag stuck pipelines (once per chat+state): unseen kanban results > 30 min, or a settled batch with no
     close-out > 30 min. Conditions are observed every tick; flagging runs in one process per 15 min.
 
     Ages: the persisted wall-clock stamp must be > 30 min AND this process must have seen the condition for
     > 30 min of monotonic time, so a lid sleep (monotonic clock stops) or a restart never fakes a stale pipeline.
     The flag is recorded only after the Inbox post succeeded, so a failed post retries next run.
-    Returns the flag keys raised."""
+    Returns the flag keys raised. One remote-inventory read per tick, shared by every pending row."""
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
+    read = read or _pass_reader()
     led = ledger()
     unseen = _unseen_counts() if unseen is None else unseen
     if unseen is None:
@@ -459,6 +504,7 @@ def start_thread() -> Optional[threading.Event]:
 
 
 def register(ctx) -> None:
+    logger.info("chat-closeout: loaded owner-final-proof-v2 module=%s core=%s", __file__, core.__file__)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)

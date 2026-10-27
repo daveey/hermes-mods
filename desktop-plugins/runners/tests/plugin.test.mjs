@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment } from './sdk-mock.mjs'
+import { React, host, route, snapshot, fixtures, loadPlugin, mount, button, enrollment, observe } from './sdk-mock.mjs'
 const p = await loadPlugin()
 test('node projection includes empty hosts and keeps unassigned registrations separate', () => {
   const s = snapshot()
@@ -159,6 +159,8 @@ test('host warnings affect severity and attention without repeating per registra
     id: 'runner_0000000000000002',
     provider_runner_id: '2'
   })
+  observe(s)
+  s.meta.coverage[0].enumerated_count = s.meta.coverage[0].provider_total_count = 2
   const v = p.projectFleet([source(s)])
   assert.equal(v.tone, 'warn')
   assert.equal(v.counts.issues, 1)
@@ -215,7 +217,7 @@ test('duplicate provider identity deduplicates across scope handles and conflict
 })
 test('host grouping capacity and maintenance do not conflate registrations with machines', () => {
   const s = snapshot()
-  s.data.hosts = [fixtures.Host]
+  s.data.hosts = [structuredClone(fixtures.Host)]
   s.data.hosts[0].maintenance = {
     state: 'active',
     expires_at: '2099-01-01T00:00:00Z',
@@ -227,11 +229,14 @@ test('host grouping capacity and maintenance do not conflate registrations with 
     id: 'runner_0000000000000002',
     provider_runner_id: '2'
   })
+  observe(s)
+  s.meta.coverage[0].enumerated_count = s.meta.coverage[0].provider_total_count = 2
   const v = p.projectFleet([source(s)])
   assert.equal(v.groups.length, 1)
   assert.equal(v.counts.issues, 0)
   assert.match(v.groups[0].capacity, /unknown/i)
-  assert.equal(p.selectRows(v.rows, '', 'Maintenance').length, 2)
+  assert.equal(p.selectRows(v.rows, '', 'Maintenance').length, 0)
+  assert.equal(p.selectNodes(p.projectNodes([source(s)], v.rows), '', 'Maintenance').groups.length, 1)
 })
 test('unmapped host, search all metadata, stable sort and long untrusted names', () => {
   const s = snapshot()
@@ -296,9 +301,11 @@ test('render 100 registrations with no per-row request amplification, native pop
   s.data.runners = Array.from({ length: 100 }, (_, i) => ({
     ...s.data.runners[0],
     id: `runner_${i.toString(16).padStart(16, '0')}`,
-    provider_runner_id: String(i),
+    provider_runner_id: String(i + 1),
     display_name: `Worker ${i}`
   }))
+  observe(s)
+  s.meta.coverage[0].enumerated_count = s.meta.coverage[0].provider_total_count = 100
   const calls = []
   host.profileRoutes = async () => [route]
   const ctx = {

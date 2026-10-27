@@ -136,8 +136,7 @@ test('search narrows physical nodes, highlights a matching empty host and labels
     await ui.key(document.querySelector('[data-node-row]'), 'Q')
     assert.equal(document.querySelectorAll('[data-node-row]').length, 1)
     assert.equal(document.querySelector('[data-node-row] mark').textContent, 'Q')
-    assert.match(document.body.textContent, /Scope: 1 registrations/)
-    assert.match(document.body.textContent, /Showing 1 nodes · 0 registrations/)
+    assert.equal(document.querySelector('[data-filtered-cohort]').textContent, '1 registrations · 0 shown')
     await ui.key(document.querySelector('input'), 'Escape')
     assert.equal(document.querySelectorAll('[data-node-row]').length, 2)
   } finally { await ui.close() }
@@ -155,7 +154,7 @@ test('runner name search retains parent and highlights nested matching text', as
     await ui.click(document.querySelector('[data-node-row]'))
     assert.equal(document.querySelectorAll('[data-runner-row]').length, 1)
     assert.equal(document.querySelector('[data-runner-row] mark')?.textContent, 'Q')
-    assert.match(document.body.textContent, /Showing 1 nodes · 1 registrations/)
+    assert.equal(document.querySelector('[data-filtered-cohort]').textContent, '1 registrations · 1 shown')
   } finally { await ui.close() }
 })
 test('metadata searches highlight OS and matching runner labels beyond the preview', async () => {
@@ -369,7 +368,8 @@ test('native menu right click, overflow, Shift+F10, Escape preserve details and 
       const menu = document.querySelector('[data-runners-menu]')
       assert.ok(menu, kind)
       assert.match(menu.textContent, /Refresh this runner/)
-      assert.match(menu.textContent, /Investigate in new session — not available yet/)
+      assert.match(menu.textContent, /Investigate in new session/)
+      assert.match(menu.textContent, /Mark maintenance…/)
       await ui.key(menu, 'Escape')
       assert.equal(document.querySelector('[data-runners-menu]'), null)
       assert.ok(document.querySelector('[data-runners-panel]'))
