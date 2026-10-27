@@ -1,11 +1,12 @@
-// Isolated real Chromium layout/keyboard test; no live backend or runtime dependency.
-// HERMES_DESKTOP_DIR=<test deps with react/react-dom/esbuild/playwright> node --test this-file
+// Isolated real Chromium layout/keyboard test; fake REST, real Desktop Markdown renderer.
+// HERMES_DESKTOP_DIR=<core apps/desktop checkout with dependencies> node --test this-file
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
+import { mkdir } from 'node:fs/promises'
 const desktopDir = process.env.HERMES_DESKTOP_DIR || `${homedir()}/.hermes/hermes-agent/apps/desktop`
 const require = createRequire(resolve(desktopDir, 'package.json'))
 const { build } = require('esbuild')
@@ -17,14 +18,14 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
  import React from 'react';import {createRoot} from 'react-dom/client';import {ActionQueue,refreshRequests} from './plugin.js';
  const owner={gatewayId:'fixture',profile:'default',storedSessionId:'S1'};
  const long='Exact files, tests, acceptance criteria and deliverables. '+('long-unbroken-identifier'.repeat(60));
- const requests=Array.from({length:8},(_,i)=>({schemaVersion:2,owner,requestId:'00000000-0000-4000-8000-'+String(i+1).padStart(12,'0'),revision:1,kind:'approval',title:'Request '+i,scope:{complete:true,markdown:long+'\\n'+('Complete plan paragraph.\\n'.repeat(60)),sourceRefs:[]},limits:[{key:'CPU',value:'≤4 CPU core-hours'},{key:'RAM',value:'≤4 GiB RAM'},{key:'GPU',value:'≤2 existing GPU-hours',permissionRequired:'owner permission'}],exclusions:['No rentals or new spend','Full training requires separate budget approval'],outcomes:{approve:'Stage A only',revise:'Work remains blocked',decline:'No execution'},choices:[{id:'yes',label:'Approve Stage A',effect:'approve'},{id:'revise',label:'Revise',effect:'revise'},{id:'no',label:'Decline',effect:'decline'}],aliases:[],state:'open'}));
- window.posts=[];window.hermesDesktop={api:async({path,...opts})=>{if(opts.method==='POST'){window.posts.push(opts.body);return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]}}if(path.includes('/operations/'))return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]};return {requests}}};
+ let requests=Array.from({length:8},(_,i)=>({schemaVersion:2,owner,requestId:'00000000-0000-4000-8000-'+String(i+1).padStart(12,'0'),revision:1,kind:'approval',title:'Request '+i,scope:{complete:true,markdown:long+'\\n'+('Complete plan paragraph.\\n'.repeat(60)),sourceRefs:[]},limits:[{key:'CPU',value:'≤4 CPU core-hours'},{key:'RAM',value:'≤4 GiB RAM'},{key:'GPU',value:'≤2 existing GPU-hours',permissionRequired:'owner permission'}],exclusions:['No rentals or new spend','Full training requires separate budget approval'],outcomes:{approve:'Stage A only',revise:'Work remains blocked',decline:'No execution'},choices:[{id:'yes',label:'Approve Stage A',effect:'approve'},{id:'revise',label:'Request changes',effect:'revise'},{id:'no',label:'Decline',effect:'decline'}],aliases:[],state:'open'}));
+ window.setRequests=async value=>{requests=value;await refreshRequests()};window.fixtureOwner=owner;window.posts=[];window.hermesDesktop={api:async({path,...opts})=>{if(opts.method==='POST'){window.posts.push(opts.body);return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]}}if(path.includes('/operations/'))return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]};return {requests}}};
  await refreshRequests();createRoot(document.getElementById('root')).render(React.createElement(ActionQueue));
- `,resolveDir:here,sourcefile:'fixture.mjs'},bundle:true,format:'esm',write:false,nodePaths:[resolve(desktopDir,'node_modules')],plugins:[{name:'sdk-test-only',setup(b){b.onResolve({filter:/^@hermes\/plugin-sdk$/},()=>({path:'sdk',namespace:'test'}));b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:`const atom=v=>({get:()=>v});export const COMPOSER_AREAS={top:'composer.top'},TRANSCRIPT_DIRECTIVE_AREA='directives',host={state:{focusedStoredSessionId:atom('S1'),connectionId:atom('C1'),profile:atom('default'),focusedSessionOwner:atom({connectionId:'C1',profile:'default'})}},useValue=a=>a?.get();`,loader:'js'}))}}]})
- const browser=await chromium.launch({headless:true,args:['--no-sandbox']})
+ `,resolveDir:here,sourcefile:'fixture.mjs'},bundle:true,format:'esm',write:false,outdir:'fixture-output',nodePaths:[resolve(desktopDir,'node_modules'),resolve(desktopDir,'../../node_modules')],define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"PROD":true}'},plugins:[{name:'sdk-test-only',setup(b){b.onResolve({filter:/^@hermes\/plugin-sdk$/},()=>({path:'sdk',namespace:'test'}));b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:`const atom=v=>({get:()=>v});export const COMPOSER_AREAS={top:'composer.top'},TRANSCRIPT_DIRECTIVE_AREA='directives',host={state:{focusedStoredSessionId:atom('S1'),connectionId:atom('C1'),profile:atom('default'),focusedSessionOwner:atom({connectionId:'C1',profile:'default'})}},useValue=a=>a?.get();export {MessageTextContent} from ${JSON.stringify(resolve(desktopDir,'src/components/assistant-ui/markdown-text.tsx'))};`,loader:'js',resolveDir:desktopDir}))}}]})
+ const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH ? {executablePath:process.env.CHROME_PATH} : {}),args:['--no-sandbox']})
  try {
   const page=await browser.newPage({viewport:{width:640,height:960}})
-  const errors=[];page.on('pageerror',e=>errors.push(e.message))
+  const errors=[];page.on('pageerror',e=>{errors.push(e.message);console.error(e.stack)})
   await page.route('http://localhost/**',route=>route.fulfill({body:'<!doctype html><html></html>',contentType:'text/html'}))
   await page.goto('http://localhost/isolated-test')
   await page.setContent('<style>:root{--foreground:#ddd;--card:#202024;--border:#666;--primary:#82bfff;--ring:#82bfff}body{margin:8px;background:#161618;color:#ddd;font:14px system-ui}button,input,textarea{font:inherit}button{color:inherit}#root{width:100%;min-width:0}</style><main id="root"></main>')
@@ -35,14 +36,14 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
    await page.evaluate(z=>document.body.style.zoom=z,zoom)
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,`overflow at zoom ${zoom}`)
    const metrics=await page.locator('[data-action-request]').first().evaluate(el=>({scope:el.querySelector('[data-action-scope]').textContent,scroll:el.querySelector('[data-action-scope]').scrollHeight>el.querySelector('[data-action-scope]').clientHeight,buttons:[...el.querySelectorAll('button')].map(b=>b.getBoundingClientRect().height)}))
-   assert.match(metrics.scope,/deliverables/);assert.ok(metrics.scope.endsWith('Complete plan paragraph.\n'));assert.equal(metrics.scroll,true);assert.ok(metrics.buttons.every(h=>h>=44))
+   assert.match(metrics.scope,/deliverables/);assert.ok(metrics.scope.trimEnd().endsWith('Complete plan paragraph.'));assert.equal(metrics.scope.match(/Complete plan paragraph\./g).length,60);assert.equal(metrics.scroll,true);assert.ok(metrics.buttons.every(h=>h>=44))
   }
   await page.evaluate(()=>document.body.style.zoom=1)
   const first=page.locator('[data-action-request]').first()
-  await first.getByRole('button',{name:'Revise',exact:true}).click()
+  await first.getByRole('button',{name:'Request changes',exact:true}).click()
   await page.getByRole('textbox',{name:'Revision or answer'}).fill('Keep the plan blocked; change the acceptance criteria')
   await page.keyboard.press('Escape')
-  assert.equal(await page.evaluate(()=>document.activeElement.textContent),'Revise')
+  assert.equal(await page.evaluate(()=>document.activeElement.textContent),'Request changes')
   await page.keyboard.press('Enter')
   assert.equal(await page.getByRole('textbox',{name:'Revision or answer'}).inputValue(),'Keep the plan blocked; change the acceptance criteria')
   await page.keyboard.press('Control+Enter')
@@ -56,6 +57,47 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   await page.keyboard.press('ArrowDown');await page.keyboard.press('Enter')
   assert.equal(await page.evaluate(()=>document.activeElement.tagName),'BUTTON')
   assert.equal(await page.evaluate(()=>window.posts.length),1,'keyboard navigation must not approve')
+  // Real SDK Markdown renderer, sanitized representative single-request fixtures.
+  await page.getByRole('textbox',{name:'Filter decisions'}).fill('')
+  const fixture={schemaVersion:2,owner:{gatewayId:'fixture',profile:'default',storedSessionId:'S1'},requestId:'00000000-0000-4000-8000-000000000090',revision:1,kind:'approval',title:'Open a pull request for the settings update',scope:{complete:true,markdown:'**Review the settings update** before opening a pull request.\n\n- Update `settings.js` and its unit tests.\n- Run the settings test suite.\n- Deliver a draft pull request with test results.',sourceRefs:[]},limits:[],exclusions:['Do not merge or deploy.'],outcomes:{approve:'Open the draft pull request only.',revise:'Keep work blocked and revise the plan.',decline:'Do not open the pull request.'},choices:[{id:'yes',label:'Open draft pull request',effect:'approve'},{id:'edit',label:'Revise plan',effect:'revise'},{id:'no',label:'Decline',effect:'decline'}],aliases:[],state:'open'}
+  await page.evaluate(value=>window.setRequests([value]),fixture)
+  const card=page.getByRole('article',{name:fixture.title})
+  await card.waitFor()
+  await card.locator('[data-action-scope] [data-streamdown="strong"]').waitFor()
+  assert.equal(await card.locator('[data-action-scope] [data-streamdown="strong"]').innerText(),'Review the settings update')
+  assert.equal(await card.locator('[data-action-scope] li').count(),3)
+  assert.equal(await card.locator('[data-action-scope] code').innerText(),'settings.js')
+  assert.equal(await card.getByRole('heading',{name:'Read this'}).count(),1)
+  assert.equal(await card.getByRole('heading',{name:'Your decision'}).count(),1)
+  const screenshots=process.env.APPROVAL_SCREENSHOTS
+  if(screenshots)await mkdir(screenshots,{recursive:true})
+  for(const width of [640,360]){
+   await page.setViewportSize({width,height:1000})
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
+   if(screenshots)await page.locator('[data-action-queue]').screenshot({path:resolve(screenshots,`complete-${width}.png`)})
+  }
+  await card.getByRole('button',{name:'Approve',exact:true}).focus()
+  await page.keyboard.press('Enter')
+  await page.waitForFunction(()=>window.posts.length===2)
+  assert.equal(await page.evaluate(()=>window.posts[1].choiceId),'yes')
+  assert.equal(await page.evaluate(()=>window.posts[1].expectedRevision),1)
+  const incomplete={...fixture,requestId:'00000000-0000-4000-8000-000000000091',title:'Confirm the proposed settings update',state:'needs_context',scope:{complete:false,markdown:'Do you mean **open a pull request**, or something else?',sourceRefs:[]},outcomes:{revise:'Request complete action; keep work blocked.'},exclusions:[],choices:[{id:'request-context',label:'Request complete action',effect:'revise'}]}
+  await page.evaluate(value=>window.setRequests([value]),incomplete)
+  const blocked=page.getByRole('article',{name:incomplete.title})
+  await blocked.locator('[data-action-scope] [data-streamdown="strong"]').waitFor()
+  assert.equal(await blocked.getByRole('button',{name:'Approve',exact:true}).isDisabled(),true)
+  assert.match(await blocked.locator('[data-approval-blocked]').innerText(),/full exact plan/)
+  for(const width of [640,360]){
+   await page.setViewportSize({width,height:1000})
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
+   if(screenshots)await page.locator('[data-action-queue]').screenshot({path:resolve(screenshots,`incomplete-${width}.png`)})
+  }
+  await blocked.getByRole('button',{name:'Request full plan inline'}).click()
+  assert.match(await page.getByRole('textbox',{name:'Revision or answer'}).inputValue(),/full exact plan inline/)
+  assert.equal(await page.evaluate(()=>window.posts.length),2,'request-plan opens editor without submitting')
+  await page.getByRole('button',{name:'Send revision'}).click()
+  await page.waitForFunction(()=>window.posts.length===3)
+  assert.equal(await page.evaluate(()=>window.posts[2].choiceId),'request-context')
   assert.deepEqual(errors,[])
  } finally {await browser.close()}
 })

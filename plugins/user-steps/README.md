@@ -18,6 +18,38 @@ trusting an unversioned snapshot. Test:
 
 ## What you see (Hermes Desktop)
 
+The decision sheet separates **Read this** (the inline plan rendered through the
+Desktop Markdown component, limits and exclusions) from **Your decision** (the
+existing choices and their exact outcomes). A single approval choice is labeled
+**Approve** in green; revision is **Request changes**, and Decline is red. Custom
+choice labels remain in the outcome description and button title; multiple
+approval choices retain distinct labels. No choice IDs or authorization routes
+change.
+
+Incomplete approval requests show a disabled Approve even when the producer
+only supplied a revise choice, with an amber explanation. **Request full plan
+inline** opens the existing revision editor, prefilled but not submitted. Approval
+is never manufactured from incomplete prose. Buttons retain 44px targets, wrapping,
+visible keyboard focus and the existing pending/error/revision safety states.
+
+UI verification: `desktop-plugins/user-steps/decision-queue.test.mjs` covers
+single dispatch across double clicks/two tiles, owner switches, stale revisions,
+retries and delivery readbacks. `decision-queue.browser.test.mjs` bundles the real
+Desktop Markdown renderer and tests formatting, real keyboard interaction,
+incomplete-plan revision, 360px/640px widths and 200% zoom with sanitized fixtures.
+Run from `desktop-plugins/user-steps` with Node 22+:
+
+```sh
+CHROME_PATH='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
+  /opt/homebrew/opt/nodejs/bin/node --test --test-reporter=tap \
+  test/plugin.test.mjs decision-queue.test.mjs decision-queue.browser.test.mjs
+```
+
+`HERMES_DESKTOP_DIR` selects the core Desktop checkout and dependencies;
+`CHROME_PATH` is optional if Playwright Chromium is installed.
+`APPROVAL_SCREENSHOTS=<directory>` saves complete/incomplete 640px and 360px captures.
+The browser test uses isolated fake REST, not live approval or execution.
+
 This branch awaits independent review, exact-head CI, deployment and packaged
 Desktop acceptance. Real-core isolated integration now exercises the REST-to-owner
 admission path and card delivery without skipped tests. Cold, busy or rotated owners

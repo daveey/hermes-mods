@@ -14,7 +14,7 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true
 const atom = value => ({ value, get() { return this.value } })
 const host = { state: { focusedStoredSessionId: atom('S1'), connectionId: atom('C1'), profile: atom('default'), focusedSessionOwner: atom({ connectionId: 'C1', profile: 'default' }) }, composer: { submit() { assert.fail('no composer delivery for decisions') }, setDraft() {}, focus() {} } }
 globalThis.queueHarness = { React, J, host }
-register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.queueHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.queueHarness.J;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':'export const host=globalThis.queueHarness.host,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get()'};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
+register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.queueHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.queueHarness.J;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':'export const host=globalThis.queueHarness.host,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get(),MessageTextContent=({text})=>text'};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const m = await import('./plugin.js')
 const { createRoot } = require('react-dom/client')
 const root = createRoot(document.getElementById('root'))
@@ -41,7 +41,7 @@ test('canonical projection uses exact identity and qualified aliases only', () =
 test('missing scope disables approve; exact limits and long scope stay inline; receipt is passive', async () => {
  const r = request({ scope: { complete: false, markdown: 'Missing exact plan', sourceRefs: [] } })
  await show(React.createElement(m.DecisionRow, { request: r, route, call: async () => ({}) }))
- assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Approve Stage A').disabled, true)
+ assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Approve').disabled, true)
  for (const s of ['≤4 CPU core-hours','≤4 GiB RAM','owner permission','Full training needs separate budget approval']) assert.ok(el().textContent.includes(s))
  for (const b of el().querySelectorAll('button')) assert.equal(b.style.minHeight, '44px')
  await show(React.createElement(m.StepBox, { attrs: { id: 'us_abcdef01', s: 'S1', t: 'Original receipt ~/plan.md' }, deps: { call: async () => ({ step: { id: 'us_abcdef01', text: 'Original', status: 'open' } }) } }))
@@ -54,12 +54,12 @@ test('revise focuses inline, validates, Escape restores focus; keyboard submits 
  const calls = []; let op = null; const r = freshRequest()
  const call = async (path, opts = {}) => { calls.push([path,opts]); if (opts.method === 'POST') { op = { operationId: 'op-revise', state: 'pending' }; return { operation: op, request: r } } return { operation: op, request: r } }
  await show(React.createElement(m.DecisionRow, { key: 'revise', request: r, route, call }))
- await click('Revise')
+ await click('Request changes')
  let input = el().querySelector('textarea'); assert.equal(document.activeElement, input)
  assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Send revision').disabled, true)
  await React.act(async () => { input.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await flush() })
- assert.equal(el().querySelector('textarea'), null); assert.equal(document.activeElement.textContent, 'Revise')
- await click('Revise'); input = el().querySelector('textarea')
+ assert.equal(el().querySelector('textarea'), null); assert.equal(document.activeElement.textContent, 'Request changes')
+ await click('Request changes'); input = el().querySelector('textarea')
  await React.act(async () => { Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype,'value').set.call(input,'Change the CPU limit'); input.dispatchEvent(new dom.window.Event('input',{bubbles:true})); await flush() })
  await React.act(async () => { input.dispatchEvent(new dom.window.KeyboardEvent('keydown',{key:'Enter',ctrlKey:true,bubbles:true})); await flush() })
  const posts = calls.filter(([,o]) => o.method === 'POST'); assert.equal(posts.length,1)
@@ -71,7 +71,7 @@ test('lost response is reconciled before retry; same key; only readback confirms
  const calls = []; const r = freshRequest(); let attempts = 0
  const call = async (path, opts={}) => { calls.push([path,opts]); if(opts.method==='POST'){ attempts++; if(attempts===1) throw Error('lost response'); return { operation:{operationId:'op1',state:'delivered'},request:r } } if(path.includes('/operations?')) return {operation:null,request:r}; return {operation:{operationId:'op1',state:'delivered'},request:{...r,state:'resolved',resolution:{choiceId:'yes',operationId:'op1',revision:1}}} }
  await show(React.createElement(m.DecisionRow,{key:'retry',request:r,route,call}))
- await click('Approve Stage A'); assert.match(el().textContent,/unknown|lost response/i)
+ await click('Approve'); assert.match(el().textContent,/unknown|lost response/i)
  await click('Retry')
  const posts=calls.filter(([,o])=>o.method==='POST'); assert.equal(posts.length,2)
  assert.equal(posts[0][1].body.idempotencyKey,posts[1][1].body.idempotencyKey)
@@ -92,19 +92,23 @@ test('double clicks and two mounted tiles submit once; failed delivery remains l
  const r=freshRequest(); let finish; const calls=[]
  const call=async(path,opts={})=>{calls.push([path,opts]); if(opts.method==='POST') return new Promise(resolve=>{finish=resolve}); return {operation:{operationId:'partial',dispatchState:'delivery_failed'},request:r}}
  await show(React.createElement('div',{},[React.createElement(m.DecisionRow,{key:'tile-a',request:r,route,call}),React.createElement(m.DecisionRow,{key:'tile-b',request:r,route,call})]))
- await React.act(async()=>{const buttons=[...el().querySelectorAll('button')].filter(b=>b.textContent==='Approve Stage A'); buttons[0].click();buttons[0].click();buttons[1].click();await flush()})
+ await React.act(async()=>{const buttons=[...el().querySelectorAll('button')].filter(b=>b.textContent==='Approve'); buttons[0].click();buttons[0].click();buttons[1].click();await flush()})
  assert.equal(calls.filter(([,o])=>o.method==='POST').length,1)
+ const [path,opts]=calls.find(([,o])=>o.method==='POST')
+ assert.equal(path,`/api/plugins/user-steps/requests/${r.requestId}/decisions`)
+ assert.equal(opts.connectionId,'C1');assert.equal(opts.profile,'default')
+ assert.equal(opts.body.choiceId,'yes');assert.equal(opts.body.expectedRevision,1);assert.equal(opts.body.session,'S1')
  await React.act(async()=>{finish({operation:{operationId:'partial',dispatchState:'delivery_failed'},request:r});await flush()})
  assert.equal(el().querySelectorAll('[role="alert"]').length,2)
  assert.doesNotMatch(el().textContent,/Confirmed/)
- assert.equal([...el().querySelectorAll('button')].filter(b=>b.textContent==='Approve Stage A').length,0)
+ assert.equal([...el().querySelectorAll('button')].filter(b=>b.textContent==='Approve').length,0)
 })
 
 test('409 reads changed scope, preserves revision text, requires fresh decision', async () => {
  const r=freshRequest(); const next={...r,revision:2,scope:{...r.scope,markdown:'New exact scope'}}
  const calls=[]; const call=async(path,opts={})=>{calls.push([path,opts]);if(opts.method==='POST')throw Object.assign(Error('conflict'),{status:409});return {request:next}}
  await show(React.createElement(m.DecisionRow,{key:'conflict',request:r,route,call}))
- await click('Approve Stage A')
+ await click('Approve')
  assert.match(el().textContent,/New exact scope/);assert.match(el().textContent,/review required/i)
  assert.doesNotMatch(el().textContent,/Confirmed/)
  await click('Decline')
@@ -156,7 +160,7 @@ test('cold reload recovers retry key but confirms only server readback; malforme
  assert.match(el().textContent,/recorded.*pending/i)
  assert.ok(calls[0][0].includes('idempotencyKey=retained-client-key'))
  assert.equal(calls.filter(([,o])=>o.method==='POST').length,0)
- assert.equal([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve Stage A'),false)
+ assert.equal([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve'),false)
  for(const change of [{limits:null},{choices:[{id:'x',label:'Go',effect:'execute'}]},{scope:null},{requestId:'malformed'}])assert.equal(cold.projectRequests([{...r,...change}]).length,0)
  await show(null)
 })
@@ -169,7 +173,7 @@ test('operation lookup 404 permits same-key resend; failed or mismatched readbac
   return {operation:{operationId:'mismatch',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'wrong',choiceId:'yes',revision:1}}}
  }
  await show(React.createElement(m.DecisionRow,{key:'404',request:r,route,call}))
- await click('Approve Stage A');await click('Retry')
+ await click('Approve');await click('Retry')
  assert.equal(posts,2);assert.equal(bodies[0].idempotencyKey,bodies[1].idempotencyKey)
  assert.doesNotMatch(el().textContent,/Confirmed/);assert.match(el().textContent,/unknown/i)
 })
@@ -180,7 +184,7 @@ test('confirmed readback fans out to passive qualified transcript receipt withou
  const step={id:'us_87654321',status:'open',text:'Original request',requestId:r.requestId,requestOwner:owner}
  const call=async(path,opts={})=>path.includes('/step?')?{step}:opts.method==='POST'?{operation:{operationId:'receipt',dispatchState:'delivered'},request:r}:{operation:{operationId:'receipt',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'receipt',choiceId:'yes',revision:1}}}
  await show(React.createElement('div',{},[React.createElement(m.DecisionRow,{key:'row',request:r,route,call}),React.createElement(m.StepBox,{key:'receipt',attrs:{id:step.id,s:'S1',t:'Exact original transcript text'},deps:{call}})]))
- await click('Approve Stage A')
+ await click('Approve')
  const receipt=el().querySelector('[data-user-step]')
  assert.match(receipt.textContent,/Confirmed/)
  assert.equal(receipt.querySelector('[data-user-step-text]').textContent,'Exact original transcript text')
@@ -210,8 +214,20 @@ test('cancelled dispatch is not success or retry; replacement revision requires 
  assert.match(el().textContent,/replacement revision/i)
  const next={...r,revision:2,state:'open',resolution:undefined}
  await show(React.createElement(m.DecisionRow,{key:'cancel-recovery',request:next,route,call}))
- assert.ok([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve Stage A'))
+ assert.ok([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve'))
  assert.equal(calls.filter(([,o])=>o.method==='POST').length,0)
+})
+
+test('multiple approval alternatives retain distinct labels and exact choice IDs',async()=>{
+ const r=freshRequest({kind:'choice',choices:[{id:'draft',label:'Open draft PR',effect:'approve'},{id:'ready',label:'Open ready PR',effect:'approve'},{id:'revise',label:'Revise',effect:'revise'}]})
+ const calls=[]
+ const call=async(path,opts={})=>{calls.push([path,opts]);return {request:r,operation:{operationId:'multi',dispatchState:'pending'}}}
+ await show(React.createElement(m.DecisionRow,{key:'multiple',request:r,route,call}))
+ assert.equal([...el().querySelectorAll('button')].some(b=>b.textContent==='Approve'),false)
+ assert.ok([...el().querySelectorAll('button')].some(b=>b.textContent==='Open draft PR'))
+ await click('Open ready PR')
+ assert.equal(calls.filter(([,o])=>o.method==='POST').length,1)
+ assert.equal(calls.find(([,o])=>o.method==='POST')[1].body.choiceId,'ready')
 })
 
 test('backend failure and malformed owner render inline errors and disable cached authorization',async()=>{
@@ -221,7 +237,7 @@ test('backend failure and malformed owner render inline errors and disable cache
  window.hermesDesktop.api=async()=>{throw Error('backend unavailable')}
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.match(el().textContent,/Action queue unavailable/)
- assert.equal([...el().querySelectorAll('button')].find(b=>b.textContent==='Approve Stage A').disabled,true)
+ assert.equal([...el().querySelectorAll('button')].find(b=>b.textContent==='Approve').disabled,true)
  window.hermesDesktop.api=async()=>({requests:[{...r,owner:{...owner,storedSessionId:'sibling-session'}}]})
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.match(el().textContent,/Invalid action request owner/)

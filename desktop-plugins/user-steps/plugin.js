@@ -5,12 +5,12 @@
  * never composer.submit plus resolve or generic card unblocking. Existing links,
  * preview navigation and separately collapsed agent issues remain available.
  */
-import { COMPOSER_AREAS, TRANSCRIPT_DIRECTIVE_AREA, host, useValue } from '@hermes/plugin-sdk'
+import { COMPOSER_AREAS, TRANSCRIPT_DIRECTIVE_AREA, host, useValue, MessageTextContent } from '@hermes/plugin-sdk'
 import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 7
+const VERSION = 8
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -680,6 +680,15 @@ const errorStatus = e => e?.status || e?.statusCode || e?.response?.status || Nu
 const actionStyle = { ...btn(), minHeight: 44, minWidth: 44, maxWidth: '100%', whiteSpace: 'normal', overflowWrap: 'anywhere' }
 const flowStyle = { display: 'flex', flexWrap: 'wrap', gap: 8 }
 const planStyle = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', minWidth: 0 }
+const SUCCESS = 'var(--success, #3fb950)'
+const DANGER = 'var(--destructive, #f85149)'
+const sectionLabel = { margin: '10px 0 6px', fontSize: 12, fontWeight: 700 }
+const choiceStyle = effect => ({ ...actionStyle, fontSize: 12.5, fontWeight: effect === 'approve' ? 700 : 500,
+  borderColor: effect === 'approve' ? SUCCESS : effect === 'decline' ? DANGER : 'var(--border)',
+  background: effect === 'approve' ? `color-mix(in srgb, ${SUCCESS} 22%, var(--card))` : 'transparent',
+  color: effect === 'decline' ? DANGER : 'var(--foreground)' })
+const choiceLabel = (c, choices) => c.effect === 'approve' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
+
 function saveReadback(route, request) {
   if (!currentRoute(route)) return
   if (canonical.scope === routeKey(route)) {
@@ -817,18 +826,26 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   }
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
-  const phaseText = { idle: r.state === 'needs_context' ? 'Full plan required before approval.' : '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
+  const approvalReason = (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')
+    ? 'Approval unavailable — the full exact plan is required. Request it below; work stays blocked.'
+    : r.kind === 'approval' && !choices.some(c => c.effect === 'approve') ? 'Approval unavailable — no approvable action was provided. Request changes to get a complete action.' : ''
+  const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
   return jsxs('article', { 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
-    jsx('h3', { style: { margin: '4px 0', fontSize: 14, overflowWrap: 'anywhere' }, children: `${r.title} · revision ${r.revision}` }),
-    jsx('div', { 'data-action-scope': '', style: { ...planStyle, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': 'Complete plan', children: jsx(Linked, { text: r.scope?.markdown || 'The full plan has not been provided.' }) }),
-    jsx('ul', { style: { paddingLeft: 20, ...planStyle }, children: (r.limits || []).map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) }),
-    jsx('div', { style: planStyle, children: (r.exclusions || []).join('\n') }),
-    jsx('div', { style: planStyle, children: Object.entries(r.outcomes || {}).map(([k,v]) => `${k}: ${v}`).join('\n') }),
+    jsx('h3', { style: { margin: '4px 0 0', fontSize: 14, overflowWrap: 'anywhere' }, children: r.title }),
+    jsx('small', { style: { color: 'var(--muted-foreground)', fontSize: 11 }, children: `Revision ${r.revision}` }),
+    jsx('h4', { style: sectionLabel, children: 'Read this' }),
+    jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': 'Complete plan', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || 'The full plan has not been provided.' }) }),
+    !!r.limits?.length && jsxs('div', { children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] }),
+    !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] }),
+    jsx('h4', { style: { ...sectionLabel, paddingTop: 10, borderTop: '1px solid var(--border)' }, children: 'Your decision' }),
+    jsx('div', { style: { ...planStyle, lineHeight: 1.5 }, children: choices.map(c => r.outcomes?.[c.effect] && jsxs('div', { 'data-decision-outcome': '', children: [jsx('strong', { children: `${choiceLabel(c, choices)}: ` }), jsx(MessageTextContent, { media: false, text: `${c.label}. ${r.outcomes[c.effect]}` })] }, c.id)) }),
+    !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
     jsx('div', { role: 'status', 'aria-live': 'polite', children: phaseText }),
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : r.outcomes?.[selected.effect] || ''}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [
-      ...choices.map(c => jsx('button', { type: 'button', style: actionStyle, disabled: unavailable || (c.effect === 'approve' && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (['revise','answer'].includes(c.effect)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: c.label }, c.id)),
+      r.kind === 'approval' && !choices.some(c => c.effect === 'approve') && jsx('button', { type: 'button', style: choiceStyle('approve'), disabled: true, title: 'No approvable action was provided. Request the complete plan.', children: 'Approve' }),
+      ...choices.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.effect), disabled: unavailable || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (['revise','answer'].includes(c.effect)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices) }, c.id)),
       !r.scope?.complete && choices.some(c => c.effect === 'revise') && jsx('button', { type: 'button', style: actionStyle, disabled: unavailable, onClick: e => { trigger.current = e.currentTarget; update({ text: 'Please provide the full exact plan inline, including files, tests, acceptance criteria and deliverables.' }); setEditing(choices.find(c => c.effect === 'revise')) }, children: 'Request full plan inline' })
     ] }),
     editing && jsxs('div', { onKeyDown: e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close() } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void send(editing) } }, children: [
@@ -853,7 +870,7 @@ export function ActionQueue() {
   if (!requests.length && !snap.error) return null
   const visible = requests.filter(r => operations.get(`${scope}:${requestKey(r)}`)?.decision || r.resolution || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
   return jsxs('section', { 'data-action-queue': '', 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)' }, children: [
-    jsx('style', { children: '[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
+    jsx('style', { children: '[data-action-queue] [data-streamdown="strong"]{font-weight:600}[data-decision-outcome]{margin:4px 0}[data-decision-outcome] .aui-md,[data-decision-outcome] .aui-md>div,[data-decision-outcome] p{display:inline;margin:0}[data-action-queue] button:disabled{opacity:.5;cursor:not-allowed}[data-action-queue] button:not(:disabled):hover{filter:brightness(1.15)}[data-action-scope] :is(pre,table){max-width:100%;overflow:auto}[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
     jsx('h2', { style: { margin: 0, fontSize: 14 }, children: `For you (${requests.filter(r => ['open','needs_context'].includes(r.state)).length})` }),
     snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
     requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),

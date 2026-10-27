@@ -32,7 +32,7 @@ globalThis.__us = {
 register('data:text/javascript,' + encodeURIComponent(`
 export async function resolve(spec, ctx, next) {
   const map = {
-    '@hermes/plugin-sdk': 'const s=globalThis.__us.sdk;export const COMPOSER_AREAS=s.COMPOSER_AREAS,TRANSCRIPT_DIRECTIVE_AREA=s.TRANSCRIPT_DIRECTIVE_AREA,host=s.host,useValue=s.useValue',
+    '@hermes/plugin-sdk': 'const s=globalThis.__us.sdk;export const COMPOSER_AREAS=s.COMPOSER_AREAS,TRANSCRIPT_DIRECTIVE_AREA=s.TRANSCRIPT_DIRECTIVE_AREA,host=s.host,useValue=s.useValue,MessageTextContent=({text})=>text',
     'react': 'const R=globalThis.__us.React;export const useEffect=R.useEffect,useState=R.useState,useRef=R.useRef',
     'react/jsx-runtime': 'const J=globalThis.__us.jsxRt;export const jsx=J.jsx,jsxs=J.jsxs'
   }
