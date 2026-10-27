@@ -94,6 +94,36 @@ prose/evidence, operational failures, open-asks marker smuggling, judge outages,
 preservation. Security prompt delivery and refusal handling are tested with a stub judge; real-model semantic
 accuracy and live UI/REST/CLI paths are not established by these plugin unit tests.
 
+## Approval-store reconciliation adapters
+
+Before judging an explicit `human_request` on create/block, `approval_reconciliation.preflight` consults
+registered trusted adapters. A verified approval for the exact authority/subject/revision suppresses the repeat
+ask; a veto stops the prompt without authorizing execution. Missing, stale, mismatched, malformed or unavailable
+store evidence is agent-owned operational recovery, never inferred permission or a reason to demand approval.
+An authoritative pending or new-scope result proceeds to the existing evidence/judge gate. Every attempt reads
+again; transcript claims and model verdicts cannot replace store evidence.
+
+Installed Python integrations call `approval_reconciliation.register(name, resolve, read)` and retain its disposer
+for unload. `resolve(context)` returns `None` for unrelated actions or a mapping with exactly `authority`,
+`subject_kind`, `subject`, `revision`. It must resolve the current full revision from its authority rather than trust
+caller-supplied scope/head, and classify the actual action rather than the caller's `interaction` label. Real OS
+password/physical authentication is distinct from approval. `read(target)` returns `{target, state, verified,
+observed_at}`; `verified` must be literal `True` after source/provenance checks, and `observed_at` is the fresh read's
+epoch timestamp (not the age of the approval). Maximum accepted read age is 30 seconds. `state` is `approved`,
+`vetoed`, `pending`, or `new_scope`; the last requires an authoritative absence for the exact current scope, not
+an older/mismatched approval. Readers must be bounded, read-only and return no secrets or raw principal evidence.
+Adapter exceptions fail closed without exposing exception contents. Duplicate names are refused.
+
+This seam alone is not an installed approval integration: without a matching adapter the ordinary gate remains.
+Adapters own current-head lookup, authenticated proof validation and domain-specific selection. No adapter may
+mint a decision from a model claim or impersonate a user. The gate never calls decide, unblocks/completes a task,
+or retires user-step metadata. Legacy prose and final-text wiring are not covered by this structured-hook slice.
+
+`tests/test_approval_reconciliation.py` tests both create/block hooks with synthetic trusted adapters: exact approval,
+veto, fresh repeated reads, scope/head/authority mismatch, stale/bad proof, unavailable store, agent-message claims,
+interaction-label evasion, actual OS authentication exclusion and unload. These tests prove neither a live store
+adapter nor Desktop rendering, natural-language authorization ingestion or execution completion.
+
 ## Model and config
 
 Default judge: `claude-haiku-5-5` on the `anthropic` provider through Hermes' auxiliary client (task `ask_gate`), so

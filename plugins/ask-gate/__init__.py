@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import core, handoff, judge as judge_mod
+    from . import approval_reconciliation, core, handoff, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -32,6 +32,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return _sys.modules.setdefault(key, mod)
     core, judge_mod, handoff = _sib("core"), _sib("judge"), _sib("handoff")
+    approval_reconciliation = _sib("approval_reconciliation")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -349,6 +350,12 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             raise ValueError("human_request cannot accompany dependency/time/transient blocks")
         if tool_name == "kanban_create" and args.get("initial_status") != "blocked":
             raise ValueError("human_request requires initial_status=blocked on creation")
+        reconciled = approval_reconciliation.preflight({
+            "session_id": session_id, "tool_name": tool_name,
+            "human_request": request, "args": args,
+        })
+        if reconciled is not None:
+            return reconciled
         tools = _tools_now(session_id)
         evidence = request["evidence"]
         claim = core.checked_line(evidence) or evidence
