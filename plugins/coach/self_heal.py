@@ -1414,14 +1414,20 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
         if dg.get("source") not in INTERACTIVE or dg.get("parent_session_id"):
             continue
         turns = [t for t in dg.get("user_turns") or [] if isinstance(t, dict) and t.get("t")]
-        since = cursor.get(rel, now - lookback)
-        new = [t for t in turns if t["t"] > since]
+        # Cursor: a bare timestamp (legacy) or [timestamp, k] meaning k turns AT that timestamp were already scanned.
+        cur = cursor.get(rel, now - lookback)
+        since, skip = (cur[0], int(cur[1])) if isinstance(cur, list) and len(cur) == 2 else (cur, None)
+        turns.sort(key=lambda t: t["t"])
+        at_since = [t for t in turns if t["t"] == since]
+        skip = len(at_since) if skip is None else skip  # legacy bare timestamp: everything at it was scanned
+        new = at_since[skip:] + [t for t in turns if t["t"] > since]
         if not new:
             continue
-        cursor[rel] = max(t["t"] for t in turns)
+        done = []  # turns actually scanned; the cursor only advances over these, so a spent limit loses nothing
         for t in new:
             if n >= limit:
                 break
+            done.append(t)
             text = t.get("text") or ""
             if not prefilter(text):
                 continue
@@ -1440,6 +1446,10 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
                        "fingerprint": hit["fingerprint"], "new": new_fp, "evidence": d["quote"][:300]})
             if new_fp:
                 out.append((filer or file_defect)(d, store=store, m=m))
+        if done:
+            last = done[-1]["t"]
+            scanned = sum(1 for t in done if t["t"] == last) + (skip if last == since else 0)
+            cursor[rel] = [last, scanned]
     cur_p.parent.mkdir(parents=True, exist_ok=True)
     cur_p.write_text(json.dumps(cursor))
     return out

@@ -461,6 +461,35 @@ def test_digest_backstop_scans_only_new_turns_of_interactive_sessions(store, tmp
     assert len(got) == 2 and "draft" in got[1]["quote"]
 
 
+def test_backstop_limit_does_not_advance_cursor_past_unscanned_turns(store, tmp_path):
+    """A spent limit must leave later sessions' turns for the next pass (they used to be skipped)."""
+    data = tmp_path / "data"
+    now = time.time()
+    write_digest(data, "macbook", "a", [(now - 500, "still broken, the sort fails")])
+    write_digest(data, "macbook", "b", [(now - 400, "still broken, the draft is lost")])
+    write_digest(data, "macbook", "c", [(now - 300, "still broken, the tab froze")])
+    seen = []
+    filer = lambda d, store=None, m=None: seen.append(d["session_id"]) or {"action": "would_file"}
+    for i in range(3):
+        sh.backstop(data, store=store, judge=judge(0.9, symptom=["sort fails on reload","draft vanishes after restart","tab freezes on scroll"][i]), now=now, filer=filer,
+                    m="shadow", limit=1)
+    assert sorted(seen) == ["a", "b", "c"]
+    assert sh.backstop(data, store=store, judge=judge(0.9), now=now, filer=filer, m="shadow", limit=1) == []
+
+
+def test_backstop_limit_inside_equal_timestamps_rescans_the_unscanned_turn(store, tmp_path):
+    data = tmp_path / "data"
+    now = time.time()
+    t = now - 200
+    write_digest(data, "macbook", "a", [(t, "still broken, the sort fails"), (t, "still broken, the draft is lost")])
+    quotes = []
+    filer = lambda d, store=None, m=None: quotes.append(d["quote"]) or {"action": "would_file"}
+    for i in range(2):
+        sh.backstop(data, store=store, judge=judge(0.9, symptom=["sort fails on reload","draft vanishes after restart","tab freezes on scroll"][i]), now=now, filer=filer,
+                    m="shadow", limit=1)
+    assert len(set(quotes)) == 2
+
+
 def test_backstop_gives_the_judge_the_prev_reply_and_session_context(store, tmp_path):
     """Digest v6 `prev` (the agent reply before the turn) and the title + earlier user turns reach the judge; without
     them the strict stage read 'why didnt this work [screenshot]' as a new issue (week of 2026-10-12 replay)."""
