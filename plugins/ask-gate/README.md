@@ -133,6 +133,21 @@ the plugin entry point, the actual structured hook, failure rollback, foreign re
 full live PluginManager discovery and real private adapters still require deployment verification.
 
 This seam alone is not an installed approval integration: without a matching adapter the ordinary gate remains.
+## Exact user-step source reconciliation (bounded integration)
+
+`user_step_lifecycle.py` reads existing `::user-step` IDs through the adjacent user-steps
+revisioned source reader, using the runtime profile and compression root rather than draft
+ownership claims. Resolved state is durably latched for suppression, never authorization or
+trusted reopen. Missing/corrupt/unknown source state holds for agent-owned recovery.
+The final hook replaces already-framed requests before unrelated history/reporting can fail open.
+
+Tests: `tests/test_user_step_lifecycle.py` exercises real source ledgers, profile/root isolation,
+malformed directives, multiple IDs, rollback and final-hook suppression including exhausted budgets
+and unrelated storage failures. This is NOT complete generated-step protection: ordinary user-steps
+output transformation runs AFTER the final gate and creates new IDs/publishes cards. Source-owned
+action identity continuity and a pre-publication reconciliation boundary remain required; no
+plain-prose binding, trusted reopen or live deployment is claimed by these tests.
+
 Adapters own current-head lookup, authenticated proof validation and domain-specific selection. No adapter may
 mint a decision from a model claim or impersonate a user. The gate never calls decide, unblocks/completes a task,
 or retires user-step metadata. Legacy prose and final-text wiring are not covered by this structured-hook slice.

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, core, handoff, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, core, handoff, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -33,6 +33,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
         return _sys.modules.setdefault(key, mod)
     core, judge_mod, handoff = _sib("core"), _sib("judge"), _sib("handoff")
     lifecycle = _sib("lifecycle")
+    user_step_lifecycle = _sib("user_step_lifecycle")
     approval_reconciliation = _sib("approval_reconciliation")
     approval_adapter_loading = _sib("approval_adapter_loading")
 
@@ -305,6 +306,17 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
                    hold_budget: int | None = None, **_: Any) -> dict | None:
     if not _gate_eligible(session_id, platform) or not isinstance(final_response, str):
         return None
+    # Exact source reconciliation must not fail open when unrelated history or
+    # audit storage is corrupt. Reporting is best-effort, suppression is not.
+    exact = user_step_lifecycle.preflight({"session_id": session_id, "draft": final_response})
+    if exact is not None:
+        try:
+            record_verdict(session_id, exact["reason"], final_response)
+            ledger().set_open_asks(session_id, [])
+        except Exception:
+            pass
+        return {"replace": "I withheld a user-step request after checking its lifecycle state. "
+                "No new permission or execution authorization is granted by this notice."}
     try:
         users = _user_msgs(session_id)
         howto = bool(users) and core.asked_how_to(users[-1])
