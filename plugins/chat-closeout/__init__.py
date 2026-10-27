@@ -4,6 +4,8 @@ they finish. Logic lives in core.py; this file wires Hermes hooks and the backen
   post_llm_call     waiting ledger: stamp the chat's open cards at every turn end (and close a settled batch)
   pre_llm_call      a turn that runs after the whole batch settled gets the close-out brief (handoffs + what to say)
   pre_final_gate    a reply promising to report later with nothing tracked behind it is held (then annotated)
+  thread (serve)    owner wake (owner_wake.py): a card parked for an agent-owned reason starts one supervise turn in
+                    its owning chat (archived/reaped/gone chat -> board-supervisor card), once per card per premise
   thread (serve)    close-out waker: wake an idle chat whose cards all settled, once per batch state (in-process
                     resume via server._wake_session_turn), at most MAX_WAKES_PER_HOUR per chat; watchdog every 15 min: Inbox item + WARNING for a chat
                     with unseen kanban results > 30 min or a settled batch with no close-out > 30 min
@@ -22,11 +24,16 @@ from typing import Any, Callable, Optional
 
 if __package__:
     from . import core
+    from . import owner_wake
 else:  # pytest imports the hyphenated plugin dir without a parent package
     _spec = importlib.util.spec_from_file_location("chat_closeout_core", Path(__file__).with_name("core.py"))
     core = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(core)
     core = sys.modules.setdefault("chat_closeout_core", core)
+    _spec = importlib.util.spec_from_file_location("chat_closeout_owner_wake", Path(__file__).with_name("owner_wake.py"))
+    owner_wake = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(owner_wake)
+    owner_wake = sys.modules.setdefault("chat_closeout_owner_wake", owner_wake)
 
 logger = logging.getLogger("chat_closeout")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -381,6 +388,49 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
     return done
 
 
+def wake_log() -> "owner_wake.WakeLog":
+    path = os.environ.get("CHAT_CLOSEOUT_OWNER_WAKE_DB") or str(_kanban_root() / "cache" / "chat-closeout" / "owner-wake.db")
+    if _state.get("wake_log_path") != path:
+        _state.update(wake_log_path=path, wake_log=owner_wake.WakeLog(Path(path)))
+    return _state["wake_log"]
+
+
+def _compression_tip(sid: str) -> Optional[str]:
+    from hermes_state import SessionDB
+    return SessionDB().get_compression_tip(sid)
+
+
+def owner_wake_tick(*, now: Optional[float] = None, cards: Optional[list[dict]] = None,
+                    wake: Optional[Callable[..., str]] = None,
+                    chat_info: Optional[Callable[[str], Optional[dict]]] = None,
+                    supervise: Optional[Callable[[list[dict], str, str], str]] = None,
+                    last_user: Optional[Callable[[str], float]] = None) -> list[dict]:
+    """Owner wake (owner_wake.py): a card parked for an agent-owned reason starts ONE supervise turn in the chat that
+    owns it (archived/reaped/gone chat -> a board-supervisor card). Needs core ``parked_waits``; older cores: no-op."""
+    if cards is None:
+        from hermes_cli import kanban_session_activity as ksa
+        if not hasattr(ksa, "parked_waits"):
+            return []
+        cards = ksa.parked_waits(now=now)
+    if wake is None:
+        srv = _server()
+        wake = srv._wake_session_turn if srv is not None else None
+    return owner_wake.tick(
+        cards=cards, wake=wake, log=wake_log(),
+        chat_info=chat_info or owner_wake.chat_info_from(state_dbs, _compression_tip),
+        supervise=supervise or owner_wake.supervise_on_board,
+        last_user=last_user or (lambda sid: core.last_user_at(state_dbs(), _lineage(sid))), now=now,
+        canonical=_canonical_session)
+
+
+def _canonical_session(sid: str) -> str:
+    """The chat a session id belongs to now: its compression tip, else itself."""
+    try:
+        return _compression_tip(sid) or sid
+    except Exception:
+        return sid
+
+
 def post_inbox(title: str, body: str, key: str) -> None:
     store_py = _kanban_root() / "plugins" / "inbox" / "store.py"
     spec = importlib.util.spec_from_file_location("chat_closeout_inbox_store", store_py)
@@ -466,7 +516,7 @@ def _loop(stop: threading.Event) -> None:
     stop.wait(float(os.environ.get("CHAT_CLOSEOUT_FIRST_S", "20")))
     while not stop.is_set():
         if _server() is not None and not _off():
-            for fn in (wake_tick, watchdog_tick):
+            for fn in (wake_tick, owner_wake_tick, watchdog_tick):
                 try:
                     fn()
                 except Exception:

@@ -16,6 +16,11 @@
  *          by the compute-rentals plugin's local registry
  *          (`/api/plugins/compute-rentals/inventory`, polled every 30 s; absent → no chips)
  *
+ * Parked kanban cards say what they wait on and since when ("waiting on card t_x on hub since 20:43"), from the
+ * backend's per-card `wait` (core kanban_wait_info: the park's producer or its wake check). A wait that only an
+ * agent can end and that has lasted over 2 h is amber "stalled"; other parked waits are grey "waiting"; a human
+ * ask stays red. [daveey]
+ *
  * Hidden when nothing is running. Polls every 5 s while the window is visible.
  * Known-owner kanban chips open the qualified Kanban drawer (never ambient
  * task mentions); unresolved owners are non-clickable. A machine chip opens the
@@ -44,11 +49,15 @@ const STATE_COLOR = {
   scheduled: '#e3b341', // waiting on a timer
   blocked: '#f85149',
   review: '#db61a2',
-  triage: '#f85149' // unfinished agent triage, not an implied human ask
+  triage: '#f85149', // unfinished agent triage, not an implied human ask
+  // [daveey] Wait looks (backend `wait.wait_state`), which override the status colour of a parked card:
+  waiting: '#8b949e', // parked on a named producer, or not yet stalled: grey
+  stalled: '#d29922', // agent-owned wait over 2 h, nothing producing it: amber
+  'needs-you': '#f85149' // a visible human ask: red
 }
 
 // States whose whole pill (border + fill) takes the state colour, not just the dot/label.
-const TINTED_STATES = new Set(['scheduled'])
+const TINTED_STATES = new Set(['scheduled', 'stalled'])
 
 /** Pill border/background for a chip state (exported for tests). */
 export function chipFrame(state) {
@@ -74,6 +83,33 @@ export function elapsed(sinceSec, nowMs = Date.now()) {
   if (s < 3600) return `${Math.floor(s / 60)}m`
   if (s < 86400) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}`
   return `${Math.floor(s / 86400)}d`
+}
+
+/** Wall-clock "since" for a wait start (seconds): HH:MM today, else "Mon 26 20:43" (exported for tests). */
+export function sinceClock(sec, nowMs = Date.now()) {
+  const t = Number(sec)
+  if (!t) return ''
+  const d = new Date(t * 1000)
+  const now = new Date(nowMs)
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  if (d.toDateString() === now.toDateString()) return hm
+  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]
+  return `${day} ${d.getDate()} ${hm}`
+}
+
+/** The card's wait look from the backend `wait` object: 'stalled' | 'waiting' | 'needs-you' | null. */
+export function waitLook(wait) {
+  const state = wait && typeof wait === 'object' ? str(wait.wait_state) : ''
+  return state === 'stalled' ? 'stalled' : state === 'human' ? 'needs-you' : state === 'waiting' ? 'waiting' : null
+}
+
+/** "waiting on <producer> since <time> (<age> ago)", or '' when the backend sent no wait (exported for tests). */
+export function waitLine(chip, nowMs = Date.now()) {
+  if (!chip?.waitingOn) return ''
+  const at = sinceClock(chip.waitingSince, nowMs)
+  const ago = elapsed(chip.waitingSince, nowMs)
+  const head = chip.look === 'stalled' ? 'stalled: ' : ''
+  return `${head}waiting on ${chip.waitingOn}${at ? ` since ${at}` : ''}${ago ? ` (${ago} ago)` : ''}`
 }
 
 // ── pure projections (exported for tests) ───────────────────────────────────
@@ -107,12 +143,20 @@ export function subagentChips(subagents) {
     })
 }
 
-const KANBAN_RANK = { running: 0, blocked: 1, review: 2, triage: 2, ready: 3, scheduled: 4, todo: 5 }
+const KANBAN_RANK = { running: 0, stalled: 1, blocked: 1, 'needs-you': 1, review: 2, triage: 2, ready: 3, scheduled: 4, waiting: 4, todo: 5 }
 
 function taskChip(t, status) {
   const watching = t.via === 'subscribed'
   const connectionId = t.connectionId || (t.gateway ? connectionForHubGateway(t.gateway) : null)
+  const wait = t.wait && typeof t.wait === 'object' ? t.wait : null
+  const look = t.stale ? null : waitLook(wait)
+  const waitingOn = look ? str(wait.waiting_on) : ''
+  const waitingSince = look ? Number(wait.waiting_since) || 0 : 0
+  const waitTitle = waitingOn ? `\n${look === 'stalled' ? 'STALLED (agent-owned wait over 2 h): ' : ''}waiting on ${waitingOn}${waitingSince ? ` since ${sinceClock(waitingSince)}` : ''}` : ''
   return {
+    look,
+    waitingOn,
+    waitingSince,
     key: `kb:${taskKey(t.gateway || connectionId, t.board, t.id, t.profile)}`,
     kind: 'kanban',
     id: str(t.id),
@@ -129,12 +173,14 @@ function taskChip(t, status) {
     prUrl: /^https:\/\/github\.com\//.test(str(t.pr_url)) ? str(t.pr_url) : null,
     activity: str(t.activity_kind) || null,
     activityAt: Number(t.activity_at) || 0,
-    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}`,
+    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}${waitTitle}`,
     since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
   }
 }
 
-const byRank = chips => chips.sort((a, b) => (KANBAN_RANK[a.state] ?? 9) - (KANBAN_RANK[b.state] ?? 9))
+// A parked card ranks by its wait look (stalled/needs-you first, grey waiting with the other parked work).
+const rankOf = c => KANBAN_RANK[c.look || c.state] ?? 9
+const byRank = chips => chips.sort((a, b) => rankOf(a) - rankOf(b))
 
 /** `/api/session-kanban-tasks` rows (already filtered to the lineage by the backend). */
 function withLocalRoute(t, route) {
@@ -739,7 +785,7 @@ export function openTaskChip(chip) {
 }
 
 function Chip({ chip, now }) {
-  const color = chipColor(chip.state)
+  const color = chipColor(chip.look || chip.state)
   const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
   const taskClickable = chip.kind === 'kanban' && !!chip.connectionId && !!chip.profile
   const clickable = taskClickable || showMachine
@@ -763,7 +809,7 @@ function Chip({ chip, now }) {
       minHeight: clickable ? 44 : undefined,
       padding: '1px 8px',
       borderRadius: 999,
-      ...chipFrame(chip.state),
+      ...chipFrame(chip.look || chip.state),
       color: 'var(--muted-foreground, inherit)',
       fontSize: 11,
       lineHeight: '18px',
@@ -781,7 +827,7 @@ function Chip({ chip, now }) {
       chip.kind === 'kanban' && jsx('span', { style: { opacity: 0.7, fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 10.5 }, children: chip.id }),
       jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 11 }, children: truncate(chip.label) }),
       chip.extra && jsx('span', { style: { opacity: 0.7, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: chip.extra }),
-      chip.state !== 'running' && jsx('span', { style: { color, fontSize: 10.5 }, children: chip.state }),
+      chip.state !== 'running' && jsx('span', { style: { color, fontSize: 10.5 }, children: chip.look === 'stalled' ? 'stalled' : chip.state }),
       age && jsx('span', { style: { opacity: 0.6, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: age })
     ]
   })
@@ -805,7 +851,9 @@ export function cardRowModel(chip, now = Date.now()) {
   const age = elapsed(chip.activityAt || chip.since, now)
   const pr = chip.prUrl ? chip.prUrl.match(/\/pull\/(\d+)$/) : null
   return {
-    status: chip.state,
+    status: chip.look === 'stalled' ? 'stalled' : chip.state,
+    look: chip.look || null,
+    wait: waitLine(chip, now),
     title: chip.label,
     meta: [chip.assignee, chip.gateway ? `on ${chip.gateway}` : '', activity && age ? `${activity} ${age} ago` : activity || (age ? `${age}` : '')]
       .filter(Boolean).join(' · '),
@@ -817,13 +865,14 @@ export function cardRowModel(chip, now = Date.now()) {
 
 function CardRow({ chip, now }) {
   const m = cardRowModel(chip, now)
-  const color = chipColor(chip.state)
+  const color = chipColor(chip.look || chip.state)
   const clickable = !!chip.connectionId && !!chip.profile
   return jsxs(clickable ? 'button' : 'div', {
     type: clickable ? 'button' : undefined,
     onClick: clickable ? () => openTaskChip(chip) : undefined,
     title: chip.title,
     'data-session-task': 'kanban-row',
+    'data-wait-look': chip.look || undefined,
     style: {
       display: 'grid', gridTemplateColumns: 'auto 1fr auto', columnGap: 8, alignItems: 'start', width: '100%',
       textAlign: 'left', padding: '5px 8px', borderRadius: 8, border: '1px solid color-mix(in srgb, var(--border, #8884) 70%, transparent)',
@@ -845,6 +894,11 @@ function CardRow({ chip, now }) {
           jsx('span', {
             style: { fontSize: 12, lineHeight: '16px', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
             children: m.title
+          }),
+          m.wait && jsx('span', {
+            'data-session-task-wait': chip.look || 'waiting',
+            style: { fontSize: 11, lineHeight: '15px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: chip.look === 'stalled' ? color : undefined, opacity: chip.look === 'stalled' ? 1 : 0.7 },
+            children: m.wait
           }),
           (m.meta || m.note) && jsx('span', {
             style: { fontSize: 11, lineHeight: '15px', opacity: 0.7, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
@@ -903,7 +957,9 @@ function Strip() {
 export function progressSummary(chips) {
   const base = `Agent progress (${chips.length}) — no decision required`
   const top = (chips || []).find(c => c.kind === 'kanban')
-  return top ? `${base} · ${top.state}: ${top.label}` : base
+  const stalled = (chips || []).filter(c => c.kind === 'kanban' && c.look === 'stalled').length
+  const head = stalled ? `${base} · ${stalled} stalled` : base
+  return top ? `${head} · ${top.look === 'stalled' ? 'stalled' : top.state}: ${top.label}` : head
 }
 
 export function progressChips(chips, lookup = source => window.__userSteps?.requestForSource?.(source)) {
@@ -935,7 +991,7 @@ export default {
     ctx.registerArchiveGuard?.(archiveGuard)
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'triage-visible-v1', get snapshot() { return snapshot }, refresh }
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       document.getElementById(`${ID}-style`)?.remove()

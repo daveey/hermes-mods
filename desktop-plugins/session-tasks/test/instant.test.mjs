@@ -123,7 +123,7 @@ test('a card row reads as status, title, who, what happened last, note and PR', 
     note: 'Opened the PR; CI green', pr_url: 'https://github.com/o/r/pull/42'
   })], { connectionId: 'conn', profile: 'default' })
   assert.deepEqual(m.cardRowModel(chip, now), {
-    status: 'review', title: 'Fix the flaky wake test', meta: 'worker · review requested 5m ago',
+    status: 'review', look: null, wait: '', title: 'Fix the flaky wake test', meta: 'worker · review requested 5m ago',
     note: 'Opened the PR; CI green', prLabel: 'PR #42', prUrl: 'https://github.com/o/r/pull/42'
   })
   const [unsafe] = m.sessionTaskChips([card('t_x', 'running', { pr_url: 'javascript:alert(1)' })], { connectionId: 'conn', profile: 'default' })
@@ -134,4 +134,60 @@ test('the collapsed strip names the most urgent card', () => {
   const chips = m.sessionTaskChips([card('t_a', 'ready'), card('t_b', 'running', { title: 'Ship the sync client' })], { connectionId: 'conn', profile: 'default' })
   assert.equal(m.progressSummary(chips), 'Agent progress (2) — no decision required · running: Ship the sync client')
   assert.equal(m.progressSummary([{ kind: 'bg', label: 'npm test' }]), 'Agent progress (1) — no decision required')
+})
+
+// [daveey] Each parked card says what it waits on and since when; an agent-owned wait over 2 h is amber "stalled",
+// distinct from grey waiting and red needs-you (backend `wait` from core kanban_wait_info).
+test('a parked card shows waiting on <producer> since <time>, amber when stalled', () => {
+  const now = Date.UTC(2026, 9, 27, 9, 0, 0)
+  const since = now / 1000 - 5 * 3600 - 600
+  const [stalled, waiting, human] = m.sessionTaskChips([
+    card('t_159f0063', 'blocked', { title: 'Self-hosted release route', wait: {
+      wait_state: 'stalled', waiting_on: 'an agent to split the work (continuation budget exhausted)',
+      waiting_since: since, agent_owned: true } }),
+    card('t_ci', 'scheduled', { wait: { wait_state: 'waiting', waiting_on: 'ci run 40577358595', waiting_since: now / 1000 - 600 } }),
+    card('t_ask', 'blocked', { wait: { wait_state: 'human', waiting_on: 'you', waiting_since: since } })
+  ], { connectionId: 'conn', profile: 'default' })
+  assert.equal(stalled.id, 't_159f0063', 'stalled ranks first')
+  assert.equal(stalled.look, 'stalled')
+  const row = m.cardRowModel(stalled, now)
+  assert.equal(row.status, 'stalled')
+  assert.equal(row.wait, `stalled: waiting on an agent to split the work (continuation budget exhausted) since ${m.sinceClock(since, now)} (5h10 ago)`)
+  assert.equal(m.chipColor(stalled.look), '#d29922', 'amber')
+  assert.match(stalled.title, /STALLED .* waiting on an agent to split the work/)
+  const w = [waiting, human].find(c => c.id === 't_ci')
+  assert.equal(w.look, 'waiting')
+  assert.equal(m.cardRowModel(w, now).wait, `waiting on ci run 40577358595 since ${m.sinceClock(now / 1000 - 600, now)} (10m ago)`)
+  assert.equal(m.chipColor(w.look), '#8b949e', 'grey')
+  const h = [waiting, human].find(c => c.id === 't_ask')
+  assert.equal(h.look, 'needs-you')
+  assert.equal(m.chipColor(h.look), '#f85149', 'red')
+  assert.notEqual(m.chipColor('stalled'), m.chipColor('waiting'))
+  assert.notEqual(m.chipColor('stalled'), m.chipColor('needs-you'))
+  assert.deepEqual(m.chipFrame('stalled').border.includes('#d29922'), true, 'the stalled pill is tinted')
+  assert.equal(m.progressSummary([stalled, w]), 'Agent progress (2) — no decision required · 1 stalled · stalled: Self-hosted release route')
+})
+
+test('older backends (no wait) and stale rows render as before', () => {
+  const [plain] = m.sessionTaskChips([card('t_old', 'scheduled')], { connectionId: 'conn', profile: 'default' })
+  assert.equal(plain.look, null)
+  assert.equal(m.cardRowModel(plain).wait, '')
+  const [stale] = m.sessionTaskChips([card('t_stale', 'blocked', { stale: true, wait: { wait_state: 'stalled', waiting_on: 'x', waiting_since: 1 } })], { connectionId: 'conn', profile: 'default' })
+  assert.equal(stale.look, null, 'a last-known row proves nothing about a stall')
+})
+
+test('sinceClock: HH:MM today, weekday + date otherwise', () => {
+  const now = new Date(2026, 9, 27, 9, 0, 0).getTime()
+  assert.equal(m.sinceClock(new Date(2026, 9, 27, 7, 5).getTime() / 1000, now), '07:05')
+  assert.equal(m.sinceClock(new Date(2026, 9, 26, 20, 43).getTime() / 1000, now), 'Mon 26 20:43')
+  assert.equal(m.sinceClock(0, now), '')
+})
+
+test('grey waiting cards rank with parked work, below live and review cards', () => {
+  const chips = m.sessionTaskChips([
+    card('t_wait', 'blocked', { wait: { wait_state: 'waiting', waiting_on: 'a parent card', waiting_since: 1 } }),
+    card('t_review', 'review'),
+    card('t_run', 'running')
+  ], { connectionId: 'conn', profile: 'default' })
+  assert.deepEqual(chips.map(c => c.id), ['t_run', 't_review', 't_wait'])
 })
