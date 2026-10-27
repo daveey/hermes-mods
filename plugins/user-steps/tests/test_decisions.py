@@ -259,7 +259,7 @@ def test_registered_producer_revise_and_consumer_hook(tmp_path, monkeypatch):
         def register_tool(self, **kw): self.tool = kw
     registry = Registry(); plugin.register(registry)
     assert registry.tool['name'] == 'action_request'
-    payload = request(False)
+    payload = request(True)
     for key in ('owner','requestId','revision'): payload.pop(key)
     r = json.loads(registry.tool['handler']({'request':payload}, session_id='session-a'))['request']
     s = plugin.core.ActionStore()

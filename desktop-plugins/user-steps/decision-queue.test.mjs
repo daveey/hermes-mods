@@ -230,6 +230,67 @@ test('multiple approval alternatives retain distinct labels and exact choice IDs
  assert.equal(calls.find(([,o])=>o.method==='POST')[1].body.choiceId,'ready')
 })
 
+test('clarifications preserve labels and concrete answers submit without free text',async()=>{
+ for (const kind of ['choice','input']) {
+  const r=freshRequest({kind,scope:{complete:true,markdown:'Which format?',sourceRefs:[]},outcomes:{answer:'Answer only, no execution.'},choices:[{id:'json',label:'JSON document',effect:'answer'},{id:'answer-text',label:'Something else',effect:'answer'}]})
+  assert.equal(m.validRequest(r),true)
+  const calls=[];const call=async(path,opts={})=>{calls.push([path,opts]);return {request:r,operation:{operationId:'answer-'+kind,dispatchState:'pending'}}}
+  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call}))
+  assert.equal(el().querySelector('[data-approval-blocked]'),null)
+  assert.equal(el().querySelector('[data-action-scope]').getAttribute('aria-label'),'Question')
+  assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['JSON document','Something else'])
+  await click('JSON document')
+  assert.equal(el().querySelector('textarea'),null)
+  const posts=calls.filter(([,o])=>o.method==='POST');assert.equal(posts.length,1)
+  assert.equal(posts[0][1].body.choiceId,'json');assert.equal(posts[0][1].body.revisionText,'JSON document')
+  assert.equal(posts[0][1].body.expectedRevision,1)
+ }
+})
+
+test('answer-text focuses and validates free text, then sends an answer rather than revision',async()=>{
+ const r=freshRequest({kind:'input',outcomes:{answer:'Answer only.'},choices:[{id:'answer-text',label:'Type an answer',effect:'answer'}]})
+ const posts=[];const call=async(path,opts={})=>{if(opts.method==='POST')posts.push(opts.body);return {request:r,operation:{operationId:'typed-answer',dispatchState:'pending'}}}
+ await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call}))
+ await click('Type an answer')
+ const input=el().querySelector('textarea');assert.equal(document.activeElement,input)
+ await click('Send answer');assert.equal(posts.length,0)
+ await React.act(async()=>{Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype,'value').set.call(input,'Plain text please');input.dispatchEvent(new dom.window.Event('input',{bubbles:true}));await flush()})
+ await click('Send answer');assert.equal(posts.length,1)
+ assert.equal(posts[0].revisionText,'Plain text please');assert.equal(posts[0].choiceId,'answer-text')
+})
+
+test('incomplete approvals await agent completion while legacy clarification labels stay literal',async()=>{
+ for(const kind of ['approval','choice','input']) {
+  const r=freshRequest({kind,state:'needs_context',scope:{complete:false,markdown:'Which change?',sourceRefs:[]},choices:[{id:'context',label:'Explain the target',effect:'revise'}]})
+  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>assert.fail('no submission')}))
+  const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
+  assert.equal(labels.includes('Request full plan inline'),false)
+  if(kind==='approval'){
+   assert.match(el().querySelector('[data-agent-completion-pending]').textContent,/Agent completion pending/)
+   assert.deepEqual(labels,['Approve']);assert.equal(el().querySelector('button').disabled,true)
+  }else{
+   assert.equal(el().querySelector('[data-approval-blocked]'),null)
+   assert.deepEqual(labels,['Explain the target'])
+  }
+ }
+})
+
+test('For you hides closed and superseded requests but retains operation readback until terminal confirmation',async()=>{
+ const closed=freshRequest({state:'resolved',title:'Old resolved'}),superseded=freshRequest({state:'superseded',title:'Old superseded'}),cancelled=freshRequest({state:'cancelled',title:'Old cancelled'})
+ const pending=freshRequest({state:'resolved',title:'Pending receipt',resolution:{operationId:'queue-readback',choiceId:'yes',revision:1}})
+ let delivered=false;const reads=[]
+ window.hermesDesktop={api:async({path})=>{if(path.includes('/operations/')){reads.push(path);return {request:pending,operation:{operationId:'queue-readback',dispatchState:delivered?'delivered':'pending'}}}return {requests:[closed,superseded,cancelled,pending]}}}
+ await show(React.createElement(m.ActionQueue,{key:'closed-filter'}))
+ assert.equal(el().querySelectorAll('[data-action-request]').length,1)
+ assert.match(el().textContent,/Pending receipt/);assert.doesNotMatch(el().textContent,/Old resolved|Old superseded|Old cancelled/)
+ assert.ok(reads.length>0)
+ delivered=true;await click('Check status')
+ assert.equal(el().querySelector('[data-action-queue]'),null)
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.equal(el().querySelector('[data-action-queue]'),null,'confirmed receipt stays out on refresh')
+ await show(null);delete window.hermesDesktop
+})
+
 test('backend failure and malformed owner render inline errors and disable cached authorization',async()=>{
  const r=freshRequest()
  window.hermesDesktop={api:async()=>({requests:[r]})}

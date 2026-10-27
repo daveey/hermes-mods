@@ -26,17 +26,38 @@ choice labels remain in the outcome description and button title; multiple
 approval choices retain distinct labels. No choice IDs or authorization routes
 change.
 
-Incomplete approval requests show a disabled Approve even when the producer
-only supplied a revise choice, with an amber explanation. **Request full plan
-inline** opens the existing revision editor, prefilled but not submitted. Approval
-is never manufactured from incomplete prose. Buttons retain 44px targets, wrapping,
-visible keyboard focus and the existing pending/error/revision safety states.
+Clarifications preserve literal source choice labels and provide a free-text
+answer, without approval/plan controls. Answers never grant execution permission.
+Existing revision-1 legacy clarifications receive a mechanical question-only
+revision, retaining their exact source and a server-owned migration receipt.
+
+Incomplete approvals are agent work: the producer rejects them with a completion
+instruction, and the buffered final gate nudges the agent to publish the exact
+inline plan with approve/change/decline choices. At budget exhaustion it withholds
+the approval ask. Existing incomplete cards say **Agent completion pending**; the
+user does not need to request a plan. Buttons retain 44px targets and owner/revision
+safety. A complete published request is not duplicated by prose extraction.
+
+Chat reconciliation retires source-bound clarification questions only, using the
+active same-session framed question and its first authentic user reply. Explicit
+same-task redirection also needs a subsequent assistant completion. A constrained
+auxiliary judge checks scope; quotes, source IDs, hashes and current revision are
+rechecked before a suppression-only transaction. Ambiguous assent, foreign
+sessions, arbitrary revisions, missing evidence and pending button decisions stay
+unresolved. Approvals are NEVER approved or retired from chat by this path.
+The receipt is separate from button operations: no synthetic approval, wake,
+permission grant or card mutation occurs. Exact repeated retired questions are
+held rather than re-published. Unframed or ambiguous evidence stays pending.
+
+`tests/test_chat_clarifications.py` covers transcript redirection, migration,
+answer outcomes, evidence races, owner/revision isolation, missing-plan behavior,
+pending decisions, repeat suppression, and repair API payload rejection.
 
 UI verification: `desktop-plugins/user-steps/decision-queue.test.mjs` covers
 single dispatch across double clicks/two tiles, owner switches, stale revisions,
 retries and delivery readbacks. `decision-queue.browser.test.mjs` bundles the real
 Desktop Markdown renderer and tests formatting, real keyboard interaction,
-incomplete-plan revision, 360px/640px widths and 200% zoom with sanitized fixtures.
+agent-owned incomplete plans, clarification choices, 360px/640px widths and 200% zoom with sanitized fixtures.
 Run from `desktop-plugins/user-steps` with Node 22+:
 
 ```sh
@@ -160,6 +181,10 @@ Routes under `/api/plugins/user-steps`:
 - `GET /requests/{requestId}?session=...`
 - `POST /requests/{requestId}/decisions` with `session`, `expectedRevision`,
   `choiceId`, optional `revisionText`, and `idempotencyKey`
+- `POST /requests/{requestId}/reconcile-chat` with only `session` and
+  `expectedRevision`: verifies stored evidence; accepts no caller-supplied answer
+  or desired result. New router mounts expose this route; existing mounts can use
+  the same `chat.reconcile` lifecycle API without restarting active sessions.
 - `GET /operations/{operationId}?session=...`
 - `GET /operations?session=...&idempotencyKey=...`
 - `POST /operations/{operationId}/retry?session=...` retries the frozen operation,

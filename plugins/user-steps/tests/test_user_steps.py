@@ -300,7 +300,11 @@ def test_rolling_card_create_update_archive_via_rest(home):
     assert [s['id'] for s in after['steps']] == ids
     canonical = c.get('/api/plugins/user-steps/requests', params={'session':'S1'}).json()['requests']
     assert len(canonical) == 2
-    assert all(r['state'] == 'needs_context' and not r['scope']['complete'] for r in canonical)
+    approval = next(r for r in canonical if r['kind'] == 'approval')
+    question = next(r for r in canonical if r['kind'] == 'input')
+    assert approval['state'] == 'needs_context' and not approval['scope']['complete']
+    assert question['state'] == 'open' and question['scope']['complete']
+    assert all(c['effect'] == 'answer' for c in question['choices'])
     assert all(not any(ref['type'] == 'kanban' for ref in r['aliases']) for r in canonical)
 
 

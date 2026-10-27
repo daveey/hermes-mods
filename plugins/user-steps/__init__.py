@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import cards as cards_mod, core
+    from . import cards as cards_mod, core, chat
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -29,7 +29,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return _sys.modules.setdefault(key, mod)
 
-    core, cards_mod = _sib("core"), _sib("cards")
+    core, cards_mod, chat = _sib("core"), _sib("cards"), _sib("chat")
 
 log = logging.getLogger("user-steps")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -116,6 +116,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
         _USER_MSG[session_id] = user_message if isinstance(user_message, str) else ""
         own = core.server_owner(session_id)
         st = core.ActionStore()
+        chat.reconcile(core, st, own, aux_llm)
         for step in _ledger().read(session_id).get('steps', []):
             if step.get('session') == session_id and step.get('status') == 'open':
                 st.migrate_step(own, step)
@@ -149,6 +150,8 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
             action_owner = core.server_owner(session_id)
         except core.ActionError:
             action_owner = None  # no authenticated owner: ledger-only, no canonical request is minted
+        if action_owner:
+            chat.reconcile(core, core.ActionStore(), action_owner, aux_llm)
         out = core.process_reply(
             response_text, session_id, user_msg=_USER_MSG.pop(session_id, ""), llm=aux_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
@@ -169,16 +172,29 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
         return None  # fail open: the reply is shown unchanged
 
 
-def publication_buffer(**_: Any):
-    """Keep final drafts private until process_reply reconciles the source ledger.
-
-    This gate does not judge or hold; its buffering declaration prevents a
-    standalone user-steps transform from trying to retract already-visible text.
-    """
-    return None
+def publication_buffer(session_id='', platform='', final_response='', attempt=0,
+                       hold_budget=2, **_: Any):
+    """Return missing plan work to the agent, never to a user-facing button."""
+    if not _eligible(session_id, platform) or not core._worth_asking(final_response):
+        return None
+    asks = core.extract(final_response, [], '', aux_llm).get('steps', [])
+    approvals = [s for s in asks if s['kind'] == 'approve']
+    if not approvals:
+        return None
+    owner = core.server_owner(session_id)
+    requests = core.ActionStore().requests(owner)
+    complete = [r for r in requests if r['kind'] == 'approval' and r['state'] == 'open'
+                and r['scope']['complete'] and not r.get('resolution')
+                and {'approve', 'revise', 'decline'} <= {c['effect'] for c in r['choices']}]
+    if all(any(core._norm(s['text']) == core._norm(r['title']) for r in complete) for s in approvals):
+        return None
+    if attempt >= hold_budget:
+        return {'replace': 'The approval request is not ready: the agent has not provided a complete exact plan. No approval is requested and no permission has been granted.'}
+    return {'hold': True, 'nudge': 'Complete the missing agent work now: publish action_request with the FULL EXACT inline plan, scope, consequences, limits, exclusions and approve/change/decline choices. Use the same question as its title. Do not ask the user to request a plan, and do not invent approval. If this is only a clarification, publish kind choice/input with concrete answer labels instead. Then present the decision.'}
 
 
 publication_buffer.needs_buffer = True
+publication_buffer.accepts_hold_budget = True
 
 
 def _require_publication_contract() -> None:
@@ -205,6 +221,11 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         core._object(args, ('request',), ('requestId', 'expectedRevision', 'decisionCard'))
         owner = core.server_owner(session_id)
         payload = dict(args['request'])
+        if payload.get('kind') == 'approval' and not (payload.get('scope') or {}).get('complete'):
+            raise core.ActionError('Complete the full exact inline plan, scope and consequences before publishing approval. This is agent work; do not ask the user to request a plan.')
+        if payload.get('kind') == 'approval' and not {'approve', 'revise', 'decline'} <= {
+                c.get('effect') for c in payload.get('choices', [])}:
+            raise core.ActionError('Provide approve, revise and decline choices with their exact outcomes.')
         if any(key in payload for key in ('owner', 'requestId', 'revision', 'resolution')):
             raise core.ActionError('Producer identity is server-owned')
         rid = args.get('requestId') or str(uuid.uuid4())

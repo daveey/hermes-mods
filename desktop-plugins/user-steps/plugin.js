@@ -10,7 +10,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 8
+const VERSION = 9
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -602,7 +602,8 @@ export function validRequest(r) {
     Array.isArray(r.scope.sourceRefs) && r.scope.sourceRefs.every(sourceKey) &&
     Array.isArray(r.aliases) && r.aliases.every(sourceKey) &&
     Array.isArray(r.limits) && r.limits.every(l => text(l?.key) && text(l.value) && (l.permissionRequired === undefined || text(l.permissionRequired))) &&
-    Array.isArray(r.exclusions) && r.exclusions.every(text) && text(r.outcomes?.revise) &&
+    Array.isArray(r.exclusions) && r.exclusions.every(text) &&
+    (text(r.outcomes?.revise) || (['choice','input'].includes(r.kind) && text(r.outcomes?.answer))) &&
     Array.isArray(r.choices) && r.choices.length > 0 && new Set(r.choices.map(c => c?.id)).size === r.choices.length &&
     r.choices.every(c => text(c?.id) && text(c.label) && ['approve','revise','decline','answer'].includes(c.effect))
 }
@@ -687,7 +688,8 @@ const choiceStyle = effect => ({ ...actionStyle, fontSize: 12.5, fontWeight: eff
   borderColor: effect === 'approve' ? SUCCESS : effect === 'decline' ? DANGER : 'var(--border)',
   background: effect === 'approve' ? `color-mix(in srgb, ${SUCCESS} 22%, var(--card))` : 'transparent',
   color: effect === 'decline' ? DANGER : 'var(--foreground)' })
-const choiceLabel = (c, choices) => c.effect === 'approve' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
+const needsText = c => c.effect === 'revise' || (c.effect === 'answer' && c.id === 'answer-text')
+const choiceLabel = (c, choices, kind) => kind !== 'approval' ? c.label : c.effect === 'approve' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
 
 function saveReadback(route, request) {
   if (!currentRoute(route)) return
@@ -772,8 +774,8 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   const send = async (choice, retry = false) => {
     if (!currentRoute(route) || unavailable || ['submitting','checking'].includes(operations.get(key)?.phase)) return
     if (!retry && (locked || operations.get(key)?.decision || !choice || (['approve','answer'].includes(choice.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')))) return
-    const text = state.text || ''
-    if (!retry && ['revise','answer'].includes(choice.effect) && !text.trim()) return
+    const text = choice?.effect === 'answer' && !needsText(choice) ? choice.label : state.text || ''
+    if (!retry && needsText(choice) && !text.trim()) return
     let decision = retry ? state.decision : { session: route.session, expectedRevision: r.revision, choiceId: choice.id, revisionText: ['revise','answer'].includes(choice.effect) ? text.trim() : undefined, idempotencyKey: globalThis.crypto.randomUUID() }
     const knownId = operationId(state.operation) || r.resolution?.operationId
     if (retry && knownId) {
@@ -826,31 +828,29 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   }
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
-  const approvalReason = (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')
-    ? 'Approval unavailable — the full exact plan is required. Request it below; work stays blocked.'
-    : r.kind === 'approval' && !choices.some(c => c.effect === 'approve') ? 'Approval unavailable — no approvable action was provided. Request changes to get a complete action.' : ''
+  const approvalPending = r.kind === 'approval' && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || !choices.some(c => c.effect === 'approve'))
+  const approvalReason = approvalPending ? 'Agent completion pending — the agent must provide the full exact plan and approvable action. Work stays blocked; no action is needed from you.' : ''
   const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
   return jsxs('article', { 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
     jsx('h3', { style: { margin: '4px 0 0', fontSize: 14, overflowWrap: 'anywhere' }, children: r.title }),
     jsx('small', { style: { color: 'var(--muted-foreground)', fontSize: 11 }, children: `Revision ${r.revision}` }),
     jsx('h4', { style: sectionLabel, children: 'Read this' }),
-    jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': 'Complete plan', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || 'The full plan has not been provided.' }) }),
+    jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) }),
     !!r.limits?.length && jsxs('div', { children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] }),
     !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] }),
     jsx('h4', { style: { ...sectionLabel, paddingTop: 10, borderTop: '1px solid var(--border)' }, children: 'Your decision' }),
-    jsx('div', { style: { ...planStyle, lineHeight: 1.5 }, children: choices.map(c => r.outcomes?.[c.effect] && jsxs('div', { 'data-decision-outcome': '', children: [jsx('strong', { children: `${choiceLabel(c, choices)}: ` }), jsx(MessageTextContent, { media: false, text: `${c.label}. ${r.outcomes[c.effect]}` })] }, c.id)) }),
-    !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
+    jsx('div', { style: { ...planStyle, lineHeight: 1.5 }, children: choices.map(c => r.outcomes?.[c.effect] && jsxs('div', { 'data-decision-outcome': '', children: [jsx('strong', { children: `${choiceLabel(c, choices, r.kind)}: ` }), jsx(MessageTextContent, { media: false, text: `${c.label}. ${r.outcomes[c.effect]}` })] }, c.id)) }),
+    !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', 'data-agent-completion-pending': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
     jsx('div', { role: 'status', 'aria-live': 'polite', children: phaseText }),
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : r.outcomes?.[selected.effect] || ''}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [
-      r.kind === 'approval' && !choices.some(c => c.effect === 'approve') && jsx('button', { type: 'button', style: choiceStyle('approve'), disabled: true, title: 'No approvable action was provided. Request the complete plan.', children: 'Approve' }),
-      ...choices.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.effect), disabled: unavailable || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (['revise','answer'].includes(c.effect)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices) }, c.id)),
-      !r.scope?.complete && choices.some(c => c.effect === 'revise') && jsx('button', { type: 'button', style: actionStyle, disabled: unavailable, onClick: e => { trigger.current = e.currentTarget; update({ text: 'Please provide the full exact plan inline, including files, tests, acceptance criteria and deliverables.' }); setEditing(choices.find(c => c.effect === 'revise')) }, children: 'Request full plan inline' })
+      r.kind === 'approval' && !choices.some(c => c.effect === 'approve') && jsx('button', { type: 'button', style: choiceStyle('approve'), disabled: true, title: 'Agent completion pending.', children: 'Approve' }),
+      ...choices.filter(c => !approvalPending || c.effect !== 'revise').map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.effect), disabled: unavailable || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id))
     ] }),
     editing && jsxs('div', { onKeyDown: e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close() } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void send(editing) } }, children: [
       jsx('label', { children: jsxs('span', { children: ['Revision or answer', jsx('textarea', { ref: input, 'aria-label': 'Revision or answer', value: state.text || '', disabled: locked, onChange: e => update({ text: e.target.value }), rows: 3, style: { width: '100%', boxSizing: 'border-box', font: 'inherit', color: 'var(--foreground)', background: 'var(--card)', ...planStyle } })] }) }),
-      jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, disabled: locked || !state.text?.trim(), onClick: () => send(editing), children: 'Send revision' }), jsx('button', { type: 'button', style: actionStyle, onClick: close, children: 'Cancel' })] })
+      jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, disabled: locked || !state.text?.trim(), onClick: () => send(editing), children: editing.effect === 'answer' ? 'Send answer' : 'Send revision' }), jsx('button', { type: 'button', style: actionStyle, onClick: close, children: 'Cancel' })] })
     ] }),
     ['pending','failed','unknown'].includes(state.phase) && jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, onClick: check, children: 'Check status' }), jsx('button', { type: 'button', style: actionStyle, onClick: () => send(null, true), children: 'Retry' })] })
   ] })
@@ -866,9 +866,14 @@ export function ActionQueue() {
   useEffect(() => { canonicalSubs.add(setSnap); return () => canonicalSubs.delete(setSnap) }, [])
   useEffect(() => { void refreshRequests() }, [scope])
   if (!route.session || snap.scope !== scope) return null
-  const requests = snap.requests
+  const needsReadback = r => {
+    const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
+    if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
+    return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
+  }
+  const requests = snap.requests.filter(r => (!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r))
   if (!requests.length && !snap.error) return null
-  const visible = requests.filter(r => operations.get(`${scope}:${requestKey(r)}`)?.decision || r.resolution || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
+  const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
   return jsxs('section', { 'data-action-queue': '', 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)' }, children: [
     jsx('style', { children: '[data-action-queue] [data-streamdown="strong"]{font-weight:600}[data-decision-outcome]{margin:4px 0}[data-decision-outcome] .aui-md,[data-decision-outcome] .aui-md>div,[data-decision-outcome] p{display:inline;margin:0}[data-action-queue] button:disabled{opacity:.5;cursor:not-allowed}[data-action-queue] button:not(:disabled):hover{filter:brightness(1.15)}[data-action-scope] :is(pre,table){max-width:100%;overflow:auto}[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
     jsx('h2', { style: { margin: 0, fontSize: 14 }, children: `For you (${requests.filter(r => ['open','needs_context'].includes(r.state)).length})` }),

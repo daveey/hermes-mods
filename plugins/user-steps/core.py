@@ -792,6 +792,11 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         with ledger.edit(root) as d:
             seen = {_norm(s.get("text", "")) for s in d["steps"] if s.get("status") == "open"}
             for step in d["steps"]:
+                if action_store is not None and step.get('requestId') and step.get('session') == session_id:
+                    current = action_store.get(action_owner, step['requestId'])
+                    if current['state'] in ('superseded', 'resolved', 'cancelled'):
+                        step.update(status='resolved', resolution='canonical request retired',
+                                    resolved_by='canonical', resolved_at=now)
                 if step.get("id") in res["resolved"] and step.get("status") == "open" and not step.get("requestId"):
                     step.update(status="resolved", resolution="answered in chat", resolved_by="model",
                                 resolved_at=now)
@@ -813,6 +818,13 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 block = locate(text, candidate["verbatim_span"])
                 if held or candidate in suppressed or block is None:
                     continue
+                if action_store is not None:
+                    kind = {'approve': 'approval', 'choose': 'choice', 'input': 'input', 'do': 'external_step'}[candidate['kind']]
+                    if any(r['kind'] == kind and r['title'] == candidate['text']
+                           and r['scope']['complete'] and r['state'] == 'open'
+                           and not any(ref['type'] == 'user_step' for ref in r['aliases'])
+                           for r in action_store.requests(action_owner)):
+                        continue  # explicit producer already owns this exact ask
                 existing = next((s for s in prior if s.get("status") == "open"), None)
                 if existing is not None:
                     published.append(dict(existing))
@@ -928,7 +940,8 @@ def validate_action(value):
         _object(limit, ('key', 'value'), ('permissionRequired',))
         for text in limit.values(): _string(text)
     for text in value['exclusions']: _string(text)
-    _object(value['outcomes'], ('revise',), ('approve', 'decline'))
+    _object(value['outcomes'], ('revise',) if value['kind'] == 'approval' else (),
+            ('approve', 'decline', 'answer') if value['kind'] == 'approval' else ('revise', 'approve', 'decline', 'answer'))
     for text in value['outcomes'].values(): _string(text)
     ids = set()
     for choice in value['choices']:
@@ -1012,6 +1025,12 @@ class ActionStore:
                   id TEXT PRIMARY KEY, namespace TEXT, session TEXT, request TEXT, revision INTEGER,
                   idem TEXT, fingerprint TEXT, body TEXT,
                   UNIQUE(namespace,session,idem), UNIQUE(namespace,request,revision));
+                CREATE TABLE IF NOT EXISTS chat_retirements (
+                  namespace TEXT, request TEXT, revision INTEGER, evidence TEXT,
+                  PRIMARY KEY(namespace,request,revision));
+                CREATE TABLE IF NOT EXISTS clarification_upgrades (
+                  namespace TEXT, request TEXT, revision INTEGER, body TEXT,
+                  PRIMARY KEY(namespace,request,revision));
             ''')
 
     def _connect(self):
@@ -1142,6 +1161,10 @@ class ActionStore:
             effect = choice['effect']
             if effect in ('approve', 'answer') and not r['scope']['complete']: raise ActionError('Scope is incomplete')
             if effect == 'revise': _string(text)
+            if effect == 'answer':
+                if r['kind'] not in ('choice', 'input'): raise ActionError('Answers require a clarification')
+                if choice['id'] == 'answer-text': _string(text)
+                elif text != choice['label']: raise ActionError('Answer must match the exact choice label')
             from datetime import datetime, timezone
             stamp = datetime.now(timezone.utc).isoformat()
             oid = str(uuid.uuid4())
@@ -1220,11 +1243,17 @@ class ActionStore:
         if step.get('session') != owner['storedSessionId']: raise ActionError('Legacy session association unproven', 403)
         _string(step.get('id')); _string(step.get('text'))
         ref = dict(gatewayId=owner['gatewayId'], profile=owner['profile'], type='user_step', id=step['id'])
+        previous = None
         with self._tx() as c:
             old = c.execute('SELECT namespace,id FROM aliases WHERE ref=?', (_json(ref),)).fetchone()
             if old:
                 if old['namespace'] != self._ns(owner): raise ActionError('Alias owner mismatch', 403)
-                return self._get(c, owner, old['id'])
+                previous = self._get(c, owner, old['id'])
+                legacy = [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}]
+                if not (previous['kind'] in ('choice', 'input') and previous['revision'] == 1
+                        and previous['state'] == 'needs_context' and not previous.get('resolution')
+                        and previous['choices'] == legacy):
+                    return previous
         r = {'schemaVersion': 2, 'owner': owner, 'requestId': str(uuid.uuid4()), 'revision': 1,
              'kind': {'approve': 'approval', 'choose': 'choice', 'do': 'external_step'}.get(step.get('kind'), 'input'),
              'title': step['text'], 'scope': {'markdown': step.get('paragraph') or step['text'],
@@ -1232,6 +1261,33 @@ class ActionStore:
              'limits': [], 'exclusions': [], 'outcomes': {'revise': 'Request complete action; keep work blocked.'},
              'choices': [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}],
              'aliases': [ref], 'state': 'needs_context'}
+        if r['kind'] in ('choice', 'input'):
+            # Completeness here describes the QUESTION, never executable scope.
+            # Only literal source options become buttons; no invented Yes/No or
+            # inferred permission. Free text is always available.
+            source = step.get('paragraph') or step['text']
+            options = list(dict.fromkeys(x for x in step.get('options', [])
+                                        if isinstance(x, str) and x.strip() and x in source))
+            r.update(state='open', choices=[
+                {'id': f'answer-{i}', 'label': label, 'effect': 'answer'}
+                for i, label in enumerate(options)
+            ] + [{'id': 'answer-text', 'label': 'Answer in your own words', 'effect': 'answer'}])
+            r['scope']['complete'] = True
+            r['outcomes'] = {'answer': 'Send this answer to the agent. This does not grant execution permission.',
+                             'revise': 'Clarify the question; no execution permission is granted.'}
+        if previous:
+            if (r['kind'] != previous['kind'] or r['scope']['markdown'] != previous['scope']['markdown']
+                    or r['title'] != previous['title']):
+                return previous
+            r['requestId'] = previous['requestId']
+            upgraded = self.revise(owner, previous['requestId'], 1, r)
+            # This marker proves a mechanical question-only migration, not an
+            # agent scope revision. Missing/racing markers fail closed in chat.
+            with self._tx() as c:
+                if self._get(c, owner, upgraded['requestId']) == upgraded:
+                    c.execute('INSERT INTO clarification_upgrades VALUES (?,?,?,?)',
+                              (self._ns(owner), upgraded['requestId'], upgraded['revision'], _json(upgraded)))
+            return upgraded
         try: return self.create(owner, r)
         except ActionError as exc:
             if exc.status != 409: raise

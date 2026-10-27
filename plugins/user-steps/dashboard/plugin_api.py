@@ -43,6 +43,12 @@ class DecisionBody(BaseModel):
     idempotencyKey: StrictStr
 
 
+class ChatReconcileBody(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    session: StrictStr
+    expectedRevision: StrictInt
+
+
 def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
                   cards=None, *, action_store=None, owner_resolver=None, receiver=None):
     recovered = set()
@@ -105,6 +111,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         # Only explicitly session-associated ledger entries. Rolling aggregate cards
         # and title similarities are NOT decision aliases. Unknown rows stay passive.
         lg = ledger(); st = store()
+        _load('chat').reconcile(_load('core'), st, own, db=state_db)
         for step in lg.read(own['storedSessionId']).get('steps', []):
             if step.get('session') == own['storedSessionId'] and step.get('status') == 'open':
                 st.migrate_step(own, step)
@@ -131,7 +138,9 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
     def requests(session: str):
         def action():
             own = owner(session)
-            return {'requests': migrate(own).requests(own)}
+            st = migrate(own)
+            _load('chat').reconcile(_load('core'), st, own, db=state_db)
+            return {'requests': st.requests(own)}
         return run(action)
 
     @router.get('/requests/{request_id}')
@@ -146,6 +155,15 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             payload['requestId'] = request_id
             recorded = st.decide(own, payload)  # durable commit BEFORE any receiver effects
             return st.dispatch(own, recorded['operation']['operationId'], delivery())
+        return run(action)
+
+    @router.post('/requests/{request_id}/reconcile-chat')
+    def reconcile_chat(request_id: str, body: ChatReconcileBody):
+        def action():
+            own = owner(body.session); st = store()
+            results = _load('chat').reconcile(_load('core'), st, own,
+                db=state_db, request_id=request_id, expected_revision=body.expectedRevision)
+            return {'request': st.get(own, request_id), 'results': results}
         return run(action)
 
     @router.get('/operations')
