@@ -285,6 +285,45 @@ def test_deferred_investigation_retries_without_losing_payload(store, action):
     assert sh.retry_deferred(store, now=NOW + 7202, filer=lambda *a, **k: pytest.fail("duplicate")) == []
 
 
+def _queue(store, *ds):
+    busy = lambda *a: {**OPEN(), "ok_running": False}
+    for d in ds:
+        sh.file_defect(d, store=store, m="live", runner=Runner(), now=NOW, cfg=HUB, budget_fn=busy)
+
+
+def test_pending_drains_complaints_first_then_likelier_then_newer(store):
+    sig = defect(symptom="traceback a", source="signal", p_defect=None, at=NOW - 30)
+    weak = defect(symptom="weak complaint", source="backstop", p_defect=0.7, at=NOW - 20)
+    strong = defect(symptom="strong complaint", source="backstop", p_defect=0.95, at=NOW - 500)
+    direct = defect(symptom="direct complaint", source="complaint", p_defect=0.8, at=NOW - 900)
+    _queue(store, sig, weak, strong, direct)
+    got = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["symptom"]) or {"action": "filed"})
+    assert got == ["direct complaint", "strong complaint", "weak complaint", "traceback a"]
+
+
+def test_pending_pass_stops_at_the_first_renewed_denial(store):
+    _queue(store, defect(symptom="one"), defect(symptom="two"), defect(symptom="three"))
+    calls = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: calls.append(1) or {"action": "deferred"})
+    assert len(calls) == 1
+    left = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: left.append(d) or {"action": "filed"})
+    assert len(left) == 3  # nothing lost by stopping early
+
+
+def test_stale_pending_is_dropped_with_a_skip_event_not_filed_late(store):
+    old = defect(symptom="old", at=NOW - 8 * 86400)
+    fresh = defect(symptom="fresh", at=NOW - 60)
+    _queue(store, old, fresh)
+    got = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["symptom"]) or {"action": "filed"})
+    assert got == ["fresh"]
+    assert any("stale pending" in e["why"] and e["fingerprint"] == old["fingerprint"]
+               for e in ev(store, "selfheal_skip"))
+    assert sh.retry_deferred(store, now=NOW + 7200, filer=lambda *a, **k: pytest.fail("resurrected")) == []
+
+
 @pytest.mark.parametrize("usd,cap", [(float("nan"), 25), (0, float("inf")), (-1, 25), (0, 0)])
 def test_invalid_accounting_values_fail_closed(monkeypatch, usd, cap):
     eb = SimpleNamespace(snapshot=lambda **kw: {"lanes": {"selfheal": usd}, "caps": {"selfheal": cap}},

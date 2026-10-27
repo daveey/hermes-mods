@@ -1002,8 +1002,40 @@ def _defer_investigation(d: dict, result: dict, store):
     return result
 
 
+PENDING_MAX_AGE_S = 7 * 86400  # detections waiting longer than this are dropped, not filed late
+_SOURCE_RANK = {"complaint": 0, "admission": 0, "backstop": 1}  # David's own words before machine signals
+
+
+def _detected_at(d: dict) -> Optional[float]:
+    at = d.get("at")
+    if isinstance(at, (int, float)):
+        return float(at)
+    if isinstance(at, str) and at:
+        import datetime
+        try:
+            return datetime.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _pending_priority(d: dict) -> tuple:
+    """Drain order: complaints/admissions, then the digest backstop, then machine signals; within a class the
+    likelier defect, then the newest. Input (~75 new fingerprints a day in the Oct 2026 shadow log) far exceeds the
+    $25/day lane (~3 cards), so this order decides which defects get investigated at all."""
+    try:
+        p = float(d.get("p_defect") or 0)
+    except (TypeError, ValueError):
+        p = 0.0
+    return (_SOURCE_RANK.get(d.get("source") or "", 2), -p, -(_detected_at(d) or 0))
+
+
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
-    """Recheck due investigations through normal admission, never automatically release a card."""
+    """Recheck due investigations through normal admission, never automatically release a card.
+
+    Highest priority first (`_pending_priority`); the pass stops at the first renewed denial, since every later row
+    would hit the same cap. Rows whose detection is older than PENDING_MAX_AGE_S are dropped (`selfheal_skip`,
+    why `stale pending`), which bounds the queue when input outruns the budget."""
     store = _store(store)
     now = now or time.time()
     if not (Path(store.root) / "selfheal_pending.sqlite").exists():
@@ -1012,9 +1044,22 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     out = []
     try:
         rows = db.execute("SELECT fp, payload, version FROM pending WHERE retry <= ?", (now,)).fetchall()
+        due = []
         for fp, payload, version in rows:
+            d = json.loads(payload)
+            at = _detected_at(d)
+            if at is not None and now - at > PENDING_MAX_AGE_S:
+                with db:
+                    db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
+                store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp,
+                           "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
+                out.append({"action": "skip", "why": "stale pending"})
+                continue
+            due.append((_pending_priority(d), fp, d, version))
+        due.sort(key=lambda r: r[0])
+        for _, fp, d, version in due:
             try:
-                result = (filer or file_defect)(json.loads(payload), store=store, m="live", now=now)
+                result = (filer or file_defect)(d, store=store, m="live", now=now)
             except Exception as exc:
                 result = {"action": "error", "why": str(exc)[:300]}
             out.append(result)
@@ -1022,10 +1067,11 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                 with db:
                     # Do not erase a newer detection written while this retry was executing.
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
+            elif result.get("action") == "deferred":
+                break  # the cap that denied this row denies the rest; they keep their retry time
     finally:
         db.close()
     return out
-
 
 def generation(st: dict) -> int:
     """Generations used so far for a fingerprint (0 = never filed). Lane files written before `gen` existed derive it
