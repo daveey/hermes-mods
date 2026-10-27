@@ -15,6 +15,8 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [onboarding-defer-default.md](onboarding-defer-default.md) | 0470 | The provider overlay no longer overwrites a configured default model: on a configured install every write waits for Begin on the confirm card (which says it changes the default for new chats); dismiss writes nothing. |
+| [kanban-sync-client-fixes.md](kanban-sync-client-fixes.md) | 0468–0469 | Sync client retries rejected rows under a fresh op id, skips non-board folders, keeps every chat of a shared card and syncs link-only boards. |
 | [kanban-parked-vs-live-sidebar.md](kanban-parked-vs-live-sidebar.md) | 0467 | Sidebar stripe tells live kanban work (no stripe) from parked cards (grey) and queues held behind a human ask (red); new `kanban_parked`/`kanban_held` row stamps. |
 | [model-class-routing.md](model-class-routing.md) | 0405–0430 0432–0438 0441 | Opt-in sticky class allocator (`class:deep|standard|fast`) with managed-subscription fences across CLI, Desktop, API, messaging, delegation, cron, Kanban and auxiliary calls. |
 | [desktop-agent-test-instance-hidden.md](desktop-agent-test-instance-hidden.md) | 0459 | A Desktop test instance a kanban worker launches gets no Dock icon and never shows a window; the owner's own Desktop stays visible. |
