@@ -1,0 +1,71 @@
+# Desktop: keep remote gateways warm (always-on dashboard, prewarm, probe skip)
+
+Patch **0526** (`4dbfb50490`). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
+
+## Behavior
+
+Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a backend spawn:
+
+- **Always-on remote dashboard.** `hermes always-on-dashboard install` writes a launchd agent (macOS,
+  `com.hermes.always-on-dashboard`, `KeepAlive`) or a systemd user unit (Linux, `hermes-always-on-dashboard.service`,
+  `Restart=always`) running `hermes always-on-dashboard run`. `run` waits for the update marker to clear, stages the
+  persisted token from `~/.hermes/desktop-ssh/always-on/` (0700 dir, 0600 `token`/`nonce`, minted once, never
+  rotated by a restart), writes `record.json` (pid, port, nonce, home) and execs the SAME
+  `HERMES_DESKTOP=1 serve --isolated --ssh-session-token-file … --ssh-owner-nonce …` Desktop spawns, on fixed
+  loopback port 9147 (a second copy exits `PORT_IN_USE`). `HERMES_ALWAYS_ON_DASHBOARD=1` disables the idle-exit
+  watchdog for that process only (read once, dropped from the env). Auth, cron gate, turn handling and the
+  code-skew watchdog are unchanged: after a core update it retires between turns and the supervisor restarts it
+  on the new code.
+- **Desktop reuses it.** `remote-lifecycle.connect()` (default profile only) reads record + token in one SSH exec,
+  forwards the port and runs the existing `/api/ssh/ownership` proof. Stale or down while installed: it polls up to
+  20 s for the supervisor restart rather than spawning beside it, then falls back to the owned-backend lockfile
+  path. It never kills it, writes a lockfile for it or rotates its token. Named profiles keep owned backends.
+- **Prewarm + hold.** `remote-prewarm.ts` dials every SSH connection in `connections.json` at app ready, then every
+  15 s forces a health probe through `ensureRegistryBackend(…, { forceProbe })`; a failure retires the dead tunnel
+  and reconnects, with 2/5/15/30/60 s backoff. `ControlPersist` 300 → 3600 s. `HERMES_DESKTOP_REMOTE_PREWARM=0`
+  turns it off.
+- **Dispatch probe skip.** The per-dispatch `/api/health` probe is skipped when that backend (by forwarded baseUrl)
+  answered within 30 s (`RemoteAnswerLedger`, fed by every successful `fetchJsonForBackend` and probe).
+- **Timing logs.** `desktop.log` gets `[remote-timing] <scope> connect-start`, `ssh dial +N ms`,
+  `reuse always-on|reuse owned|spawn pid=… ssh=dialed|master reused +N ms`, `first-request <path> served +N ms`
+  and `<pool key> dispatch probe skipped|ran (N ms)`; prewarm logs `[remote-prewarm] <id> warm|reconnected in N ms`.
+
+## Code
+
+`hermes_cli/always_on_dashboard.py` (new), `hermes_cli/web_server.py` (`_arm_ssh_isolated_idle_exit`),
+`hermes_cli/main.py` (parser); `apps/desktop/electron/remote-lifecycle.ts` (`readAlwaysOnState`,
+`connectAlwaysOn`), `remote-prewarm.ts` (new), `remote-liveness.ts` (`RemoteAnswerLedger`, skip),
+`ssh-connection.ts`, `main.ts` (wiring, timing).
+
+## Tests
+
+- `tests/hermes_cli/test_always_on_dashboard.py`: launchd plist and systemd unit (supervisor restarts, fixed
+  port), credentials persist with private modes, staged token passes the real `serve` token validator, update-marker
+  wait, `run` execs the isolated backend and publishes its record, CLI registration, idle-exit disabled for the
+  always-on backend only (ordinary SSH-isolated backend still arms it).
+- `apps/desktop/electron/remote-lifecycle-always-on.test.ts`: lifecycle reuse (no spawn, no lockfile, no kill);
+  after a core update it waits for the restart and reuses the restarted pid; fallback to spawn after the wait;
+  not installed / named profile skip it; malformed record rejected.
+- `apps/desktop/electron/remote-warm-dispatch.test.ts`: probe skipped within 30 s and run after 30 s; forced probe
+  on a dropped tunnel retires + reconnects; prewarmer backoff reconnect; startup prewarm dials all connections in
+  parallel and schedules the keepalive; removed connections drop; `main.ts` call sites (start on ready, stop on
+  quit, forced keepalive through `ensureRegistryBackend`, ledger wiring) pinned by source.
+
+The `main.ts` wiring is checked by source assertions, not by booting Electron; the live behavior is proved from
+`desktop.log` timing lines.
+
+## Applying
+
+Apply after 0448–0450. Then on each remote host: `hermes always-on-dashboard install` (once).
+
+## Gotchas
+
+- The always-on backend serves the default profile; a Desktop connection pinned to a named remote profile still
+  spawns its own backend.
+- A host's HERMES_HOME seen by the SSH shell must match the record's (`$HOME/.hermes` in the unit), or Desktop logs
+  `always-on dashboard serves X, not Y` and spawns as before.
+- Rotate the token by uninstalling, deleting `~/.hermes/desktop-ssh/always-on`, and installing again.
+
+## Plugin?
+
+No: it changes the serve lifecycle and Desktop's Electron main process.

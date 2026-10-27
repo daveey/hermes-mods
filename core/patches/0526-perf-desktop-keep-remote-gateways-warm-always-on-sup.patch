@@ -1,0 +1,1569 @@
+From 4dbfb504906e340344f013303513529dd722cc09 Mon Sep 17 00:00:00 2001
+From: x <x@example.com>
+Date: Tue, 27 Oct 2026 16:15:55 -0700
+Subject: [PATCH] perf(desktop): keep remote gateways warm - always-on
+ supervised dashboard, startup prewarm, 30 s dispatch probe skip [daveey]
+
+- hermes always-on-dashboard install|run|status|uninstall: one launchd/systemd-supervised
+  serve --isolated per host with a persisted token/nonce, fixed port 9147 and no idle exit;
+  code-skew retirement + KeepAlive/Restart=always restarts it on new code after an update.
+- remote-lifecycle connect(): default profile reuses the always-on dashboard before the
+  lockfile path; waits up to 20 s for a supervisor restart; never kills or locks it.
+- remote-prewarm.ts: dial every SSH connection at startup, 15 s forced keepalive, backoff
+  reconnect on drop. ControlPersist 300 -> 3600.
+- Dispatch skips /api/health when the backend answered within 30 s.
+- [remote-timing] logs: connect-start, ssh dial, reuse/spawn, first request, dispatch probe.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/main.ts                 |  62 +++-
+ .../remote-lifecycle-always-on.test.ts        | 183 ++++++++++
+ apps/desktop/electron/remote-lifecycle.ts     | 170 ++++++++++
+ apps/desktop/electron/remote-liveness.ts      |  57 +++-
+ apps/desktop/electron/remote-prewarm.ts       | 131 +++++++
+ .../electron/remote-warm-dispatch.test.ts     | 192 +++++++++++
+ apps/desktop/electron/ssh-connection.ts       |   3 +-
+ hermes_cli/always_on_dashboard.py             | 321 ++++++++++++++++++
+ hermes_cli/main.py                            |   2 +
+ hermes_cli/web_server.py                      |  31 +-
+ tests/hermes_cli/test_always_on_dashboard.py  | 132 +++++++
+ 11 files changed, 1271 insertions(+), 13 deletions(-)
+ create mode 100644 apps/desktop/electron/remote-lifecycle-always-on.test.ts
+ create mode 100644 apps/desktop/electron/remote-prewarm.ts
+ create mode 100644 apps/desktop/electron/remote-warm-dispatch.test.ts
+ create mode 100644 hermes_cli/always_on_dashboard.py
+ create mode 100644 tests/hermes_cli/test_always_on_dashboard.py
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index c98d0dfbfd..3927215135 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -533,8 +533,10 @@ import { createSshReuseProbe, wireRegistryReconnect } from './registry-reconnect
+ import * as remoteLifecycle from './remote-lifecycle'
+ import {
+   attachPowerResumeRemoteRevalidation,
++  DISPATCH_PROBE_SKIP_WINDOW_MS,
+   ensureHealthyPooledRemoteBackendForDispatch,
+   REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS,
++  remoteAnswerLedger,
+   RemoteLivenessTracker,
+   RemoteRevalidationCoordinator,
+   revalidatePooledRemoteBackends,
+@@ -543,6 +545,7 @@ import {
+ } from './remote-liveness'
+ import { resolveRemoteOauthTicket, rosterSourceEnumerationTimeoutMs } from './remote-oauth-ticket'
+ import { createRemoteOwnerCache } from './remote-owner-cache'
++import { RemotePrewarmer } from './remote-prewarm'
+ import { remoteSessionCookies } from './remote-session-cookies'
+ import {
+   attachRemoteRequestHeaderListener,
+@@ -10172,6 +10175,8 @@ async function rollbackSshBootstrapResult(ssh, result, profile, sshConfig, bound
+ 
+ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, source, metadata, fingerprint, lease) {
+   const scope = sshScopeKey(profile)
++  const timingStartedAt = Date.now()
++  rememberLog(`[remote-timing] ${scope} connect-start`)
+   const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
+   const existing = sshConnections.get(scope)
+ 
+@@ -10210,6 +10215,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
+     )
+     removeForceCleanup = lease.onForceCleanup(() => ssh.close())
+     await ssh.open({ signal: lease.signal })
++    rememberLog(`[remote-timing] ${scope} ssh dial +${Date.now() - timingStartedAt} ms`)
+   }
+ 
+   let result: any
+@@ -10319,6 +10325,11 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
+     rollback: error => rollbackSshBootstrapResult(ssh, result, profile, sshConfig, error)
+   })
+ 
++  rememberLog(
++    `[remote-timing] ${scope} ${result.alwaysOn ? 'reuse always-on' : result.reused ? 'reuse owned' : 'spawn'} ` +
++      `pid=${result.pid} ssh=${created ? 'dialed' : 'master reused'} +${Date.now() - timingStartedAt} ms`
++  )
++  remoteFirstRequestPending.set(result.baseUrl, { scope, startedAt: timingStartedAt })
+   sshRememberLog(
+     `[ssh] connection ${result.reused ? 'REUSED' : 'spawned'} dashboard: ` +
+       `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
+@@ -11053,11 +11064,24 @@ async function ensureBackend(
+ // a genuinely-local child when the v1 mode says remote; non-local connections
+ // pool under the composite key from backendScopeKey() and reuse the same pool
+ // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
++// Part B (instant session loads): dial every SSH gateway at startup and keep it warm (remote-prewarm.ts).
++const remotePrewarmer = new RemotePrewarmer({
++  listConnectionIds: () =>
++    process.env.HERMES_DESKTOP_REMOTE_PREWARM === '0'
++      ? []
++      : readDesktopConnectionsRegistry()
++          .connections.filter(connection => connection.kind === 'ssh')
++          .map(connection => connection.id),
++  ensure: (connectionId, { forceProbe }) =>
++    ensureRegistryBackend(connectionId, 'default', '', { forceProbe, spawnPriority: 'background' }),
++  log: line => rememberLog(line)
++})
++
+ async function ensureRegistryBackend(
+   connectionId,
+   profile,
+   managedUpdateCorrelation = '',
+-  opts: { passive?: boolean; spawnPriority?: LocalBackendSpawnPriority } = {}
++  opts: { forceProbe?: boolean; passive?: boolean; spawnPriority?: LocalBackendSpawnPriority } = {}
+ ) {
+   const spawnPriority = spawnPriorityFrom(opts.spawnPriority)
+   const passive = Boolean(opts.passive)
+@@ -11266,6 +11290,13 @@ async function ensureRegistryBackend(
+         connectionPromise,
+         currentConnectionPromise: () => backendPool.get(key)?.connectionPromise || null,
+         probe: (connection, requestPath, options) => fetchJsonForBackend(connection, requestPath, options),
++        answers: remoteAnswerLedger,
++        skipWindowMs: opts.forceProbe ? 0 : DISPATCH_PROBE_SKIP_WINDOW_MS,
++        onProbe: (outcome, elapsedMs) => {
++          if (!opts.forceProbe) {
++            rememberLog(`[remote-timing] ${key} dispatch probe ${outcome} (${elapsedMs} ms)`)
++          }
++        },
+         reconnect: () => ensureRegistryBackend(id, profile, '', { passive }),
+         retire: async (error: any) => {
+           // A late failure from an old descriptor must never tear down a newer
+@@ -16781,20 +16812,42 @@ async function fetchJsonForBackend(
+       headers: descriptor.headers
+     }
+ 
+-    return requestWithOauthFallback(descriptor.baseUrl, {
++    const answer = await requestWithOauthFallback(descriptor.baseUrl, {
+       ensureNativeAccessToken,
+       requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
+       requestWithCookie: () => fetchJsonViaOauthSession(url, options)
+     })
++
++    noteRemoteAnswer(descriptor.baseUrl, path)
++
++    return answer
+   }
+ 
+-  return fetchJson(url, descriptor.token, {
++  const answer = await fetchJson(url, descriptor.token, {
+     method: opts.method,
+     body: opts.body,
+     upload: opts.upload,
+     timeoutMs: opts.timeoutMs,
+     headers: descriptor.headers
+   })
++
++  noteRemoteAnswer(descriptor.baseUrl, path)
++
++  return answer
++}
++
++// Remote connection timing (part B, instant session loads): connect-start, reuse/spawn and the first request a
++// new descriptor serves, per scope, as `[remote-timing]` lines in desktop.log.
++const remoteFirstRequestPending = new Map<string, { scope: string; startedAt: number }>()
++
++function noteRemoteAnswer(baseUrl: string, path: string) {
++  remoteAnswerLedger.recordAnswer(baseUrl)
++  const pending = remoteFirstRequestPending.get(baseUrl)
++
++  if (pending) {
++    remoteFirstRequestPending.delete(baseUrl)
++    rememberLog(`[remote-timing] ${pending.scope} first-request ${path} served +${Date.now() - pending.startedAt} ms`)
++  }
+ }
+ 
+ ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
+@@ -19491,6 +19544,8 @@ app.whenReady().then(() => {
+     handleDeepLink(_coldStartLink)
+   }
+ 
++  void remotePrewarmer.start().catch(error => rememberLog(`[remote-prewarm] start failed: ${String(error)}`))
++
+   app.on('activate', () => {
+     // Recreate the primary window if it's gone. Guard on mainWindow directly
+     // (not just total window count) so a dock click still restores the main
+@@ -19691,6 +19746,7 @@ app.on('before-quit', event => {
+ 
+   minimizeToTray.beginQuit()
+   mainProcessLagWatchdog.stop()
++  remotePrewarmer.stop()
+ 
+   // A detached remote updater can outlive this Electron process. Do not tear
+   // down its SSH observer/restore transaction at the generic SSH shutdown
+diff --git a/apps/desktop/electron/remote-lifecycle-always-on.test.ts b/apps/desktop/electron/remote-lifecycle-always-on.test.ts
+new file mode 100644
+index 0000000000..1185d96615
+--- /dev/null
++++ b/apps/desktop/electron/remote-lifecycle-always-on.test.ts
+@@ -0,0 +1,183 @@
++import assert from 'node:assert/strict'
++
++import { test } from 'vitest'
++
++import { connect, readAlwaysOnState } from './remote-lifecycle'
++
++// Part B (instant session loads): a launchd/systemd-supervised always-on `serve` per remote host
++// (hermes_cli/always_on_dashboard.py). connect() reuses it for the default profile before the owned-backend
++// lockfile path, waits out a supervisor restart (core update, crash) instead of spawning beside it, and never
++// kills it or writes a lockfile for it.
++
++const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
++const TOKEN = 'a'.repeat(64)
++const NONCE = 'fedcba9876543210'
++
++function record(over: any = {}) {
++  return { schemaVersion: 1, pid: 4242, port: 9147, spawnNonce: NONCE, hermesHome: '~/.hermes', ...over }
++}
++
++// `states` is what successive always-on reads return: 'NONE' (not installed) or [ALIVE|DEAD, record].
++function fakeHost(states: any[], extra: any[] = []) {
++  const calls: string[] = []
++  let read = 0
++
++  return {
++    calls,
++    async exec(cmd: string) {
++      calls.push(cmd)
++
++      if (cmd.includes('desktop-ssh/always-on')) {
++        const state = states[Math.min(read++, states.length - 1)]
++
++        return state === 'NONE' ? 'NONE\n' : `${state[0]}\n${JSON.stringify(state[1])}\n${TOKEN}\n`
++      }
++
++      if (cmd.includes('.hermes-update-in-progress') && !/setsid|nohup/.test(cmd)) {
++        return 'CLEAR'
++      }
++
++      for (const [matcher, resp] of [
++        [/uname/, 'Darwin\narm64'],
++        [/\[ -x/, 'OK'],
++        [/kill -0/, 'ALIVE'],
++        ...extra
++      ] as any[]) {
++        if (matcher.test(cmd)) {
++          return typeof resp === 'function' ? resp(cmd) : resp
++        }
++      }
++
++      return ''
++    }
++  }
++}
++
++function deps(ssh, over: any = {}) {
++  const forwards: number[] = []
++  const cancelled: number[] = []
++
++  return {
++    forwards,
++    cancelled,
++    ssh,
++    ownershipId: OWNERSHIP_ID,
++    profile: '',
++    forward: async (_local, remote) => void forwards.push(remote),
++    cancelForward: async (_local, remote) => void cancelled.push(remote),
++    pickLocalPort: async () => 50001,
++    waitForHermes: async () => {},
++    probeReuseProof: async (_url, token, nonce) =>
++      token === TOKEN && nonce === NONCE ? 'authenticated-ok' : 'authenticated-stale',
++    adoptServedToken: async (_baseUrl, token) => token,
++    rememberLog: () => {},
++    readyTimeoutMs: 2000,
++    sleep: async () => {},
++    ...over
++  }
++}
++
++const SPAWNS = /setsid|nohup/
++const WRITES_LOCK = /backend\.lock\.json/
++const KILLS = /\bkill (-9 |-TERM )?4242\b|os\.kill\(/
++
++test('connect() reuses the always-on dashboard: no spawn, no lockfile, nothing killed', async () => {
++  const ssh = fakeHost([['ALIVE', record()]])
++  const d = deps(ssh)
++  const result = await connect(d)
++
++  assert.equal(result.alwaysOn, true)
++  assert.equal(result.reused, true)
++  assert.equal(result.pid, 4242)
++  assert.equal(result.remotePort, 9147)
++  assert.equal(result.token, TOKEN)
++  assert.deepEqual(d.forwards, [9147])
++  assert.ok(!ssh.calls.some(c => SPAWNS.test(c)), 'must not spawn an owned backend')
++  assert.ok(!ssh.calls.some(c => WRITES_LOCK.test(c)), 'must not read or write the owned lockfile')
++  assert.ok(!ssh.calls.some(c => KILLS.test(c)))
++})
++
++test('after a core update, connect() waits for the supervisor restart and reuses the restarted dashboard', async () => {
++  const logs: string[] = []
++  // 1: the old pid still runs the replaced runtime; 2: the code-skew watchdog retired it; 3: launchd/systemd restarted it.
++  const ssh = fakeHost([['ALIVE', record()], ['DEAD', record()], ['ALIVE', record({ pid: 5151 })]])
++  let probes = 0
++
++  const d = deps(ssh, {
++    rememberLog: line => logs.push(line),
++    probeReuseProof: async () => (++probes === 1 ? 'authenticated-stale' : 'authenticated-ok')
++  })
++
++  const result = await connect(d)
++
++  assert.equal(result.alwaysOn, true)
++  assert.equal(result.pid, 5151)
++  assert.ok(!ssh.calls.some(c => SPAWNS.test(c)), 'a restart window must not become a spawn')
++  assert.deepEqual(d.cancelled, [9147], 'the stale probe forward is closed')
++  assert.ok(logs.some(l => /stale after an update\); waiting for its supervisor restart/.test(l)), logs.join('\n'))
++  assert.ok(logs.some(l => /reusing always-on remote dashboard pid=5151/.test(l)), logs.join('\n'))
++})
++
++test('a dashboard that is still down after the restart wait falls back to the owned-backend path', async () => {
++  const logs: string[] = []
++  let clock = 0
++
++  const ssh = fakeHost(
++    [['DEAD', record()]],
++    [
++      [/grep -q ssh-session-token-file/, 'YES\n'],
++      [/setsid/, '777\n'],
++      [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=51999\n']
++    ]
++  )
++
++  const d = deps(ssh, {
++    rememberLog: line => logs.push(line),
++    now: () => clock,
++    sleep: async ms => void (clock += ms),
++    alwaysOnRestartWaitMs: 3000
++  })
++
++  try {
++    await connect(d)
++  } catch {
++    // The owned spawn may fail in this double; only that it was attempted matters.
++  }
++
++  assert.ok(logs.some(l => /always-on dashboard unavailable \(pid 4242 not running\)/.test(l)), logs.join('\n'))
++  assert.ok(ssh.calls.some(c => SPAWNS.test(c)), 'falls back to spawning an owned backend')
++})
++
++test('no always-on dashboard installed: connect() goes straight to the lockfile path', async () => {
++  const ssh = fakeHost(['NONE'])
++  const d = deps(ssh)
++
++  try {
++    await connect(d)
++  } catch {
++    void 0
++  }
++
++  assert.equal(ssh.calls.filter(c => c.includes('desktop-ssh/always-on')).length, 1, 'read once, no waiting')
++  assert.ok(ssh.calls.some(c => WRITES_LOCK.test(c)))
++})
++
++test('a named profile keeps its own owned backend and never reads the always-on record', async () => {
++  const ssh = fakeHost([['ALIVE', record()]])
++
++  try {
++    await connect(deps(ssh, { profile: 'work' }))
++  } catch {
++    void 0
++  }
++
++  assert.ok(!ssh.calls.some(c => c.includes('desktop-ssh/always-on')))
++})
++
++test('readAlwaysOnState rejects a malformed record or token', async () => {
++  const bad = { exec: async () => `ALIVE\n${JSON.stringify(record({ spawnNonce: 'nope' }))}\n${TOKEN}\n` }
++  assert.deepEqual(await readAlwaysOnState(bad), { installed: true, alive: false, record: null, token: '' })
++
++  const ok = { exec: async () => `ALIVE\n${JSON.stringify(record())}\n${TOKEN}\n` }
++  assert.equal((await readAlwaysOnState(ok))?.alive, true)
++})
+diff --git a/apps/desktop/electron/remote-lifecycle.ts b/apps/desktop/electron/remote-lifecycle.ts
+index c96e27f466..4f657b54dd 100644
+--- a/apps/desktop/electron/remote-lifecycle.ts
++++ b/apps/desktop/electron/remote-lifecycle.ts
+@@ -1549,6 +1549,163 @@ async function openForward(deps, remotePort, attempts = 3) {
+   throw lastError
+ }
+ 
++// Always-on remote dashboard (hermes_cli/always_on_dashboard.py): one launchd/systemd-supervised `serve` per host
++// with a persisted token, a fixed port and no idle exit. Desktop never owns it: it is reused when it proves itself
++// with the token it publishes, and never reaped, terminated or given a lockfile here.
++const ALWAYS_ON_DIR = '~/.hermes/desktop-ssh/always-on'
++const ALWAYS_ON_RECORD_SCHEMA = 1
++// A supervisor restart (code-skew retirement after an update, a crash) takes a few seconds; wait that out instead
++// of spawning a second backend next to it.
++const ALWAYS_ON_RESTART_WAIT_MS = 20_000
++const ALWAYS_ON_POLL_MS = 1_000
++
++// One remote command: is it installed, is the recorded pid alive, the record, the token. NONE = not installed.
++async function readAlwaysOnState(ssh) {
++  const dir = expandRemotePath(ALWAYS_ON_DIR)
++
++  const raw = await ssh.exec(
++    `d=${dir}; [ -f "$d/token" ] && [ -f "$d/record.json" ] || { echo NONE; exit 0; }; ` +
++      `rec=$(cat "$d/record.json"); pid=$(printf '%s' "$rec" | sed -n 's/.*"pid": *\\([0-9][0-9]*\\).*/\\1/p'); ` +
++      `if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo ALIVE; else echo DEAD; fi; ` +
++      `printf '%s\\n' "$rec"; cat "$d/token"`
++  )
++
++  const [state = '', recordLine = '', tokenLine = ''] = String(raw || '').trim().split('\n')
++
++  if (state.trim() === 'NONE' || !state.trim()) {
++    return null
++  }
++
++  let record
++
++  try {
++    record = JSON.parse(recordLine)
++  } catch {
++    return { installed: true, alive: false, record: null, token: '' }
++  }
++
++  const token = tokenLine.trim()
++
++  const valid =
++    record?.schemaVersion === ALWAYS_ON_RECORD_SCHEMA &&
++    Number.isInteger(record.pid) &&
++    Number.isInteger(record.port) &&
++    record.port > 0 &&
++    /^[0-9a-f]{16}$/.test(String(record.spawnNonce || '')) &&
++    /^[0-9a-f]{64}$/.test(token)
++
++  return valid
++    ? { installed: true, alive: state.trim() === 'ALIVE', record, token }
++    : { installed: true, alive: false, record: null, token: '' }
++}
++
++async function connectAlwaysOn(deps, { ssh, platform, hermesPath, hermesVersion, hermesHome, log, signal }) {
++  const { probeReuseProof, adoptServedToken, ownershipId } = deps
++  const waitMs = deps.alwaysOnRestartWaitMs ?? ALWAYS_ON_RESTART_WAIT_MS
++  const pollMs = deps.alwaysOnPollMs ?? ALWAYS_ON_POLL_MS
++  const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
++  const now = deps.now ?? Date.now
++  const deadline = now() + waitMs
++  let lastReason = ''
++
++  for (;;) {
++    assertBootstrapNotSuperseded(signal)
++    const state = await readAlwaysOnState(ssh)
++
++    if (!state) {
++      return null
++    }
++
++    if (!state.record) {
++      // The supervisor writes the record atomically; an unusable one will not fix itself while we wait.
++      log('always-on dashboard record or token is malformed; not reusing it')
++
++      return null
++    }
++
++    let reason = ''
++
++    if (state.record.hermesHome && state.record.hermesHome !== hermesHome) {
++      log(`always-on dashboard serves ${state.record.hermesHome}, not ${hermesHome}; not reusing it`)
++
++      return null
++    }
++
++    if (!state.alive) {
++      reason = `pid ${state.record.pid} not running`
++    } else {
++      const { pid, port, spawnNonce } = state.record
++      const localPort = await openForward(deps, port)
++      const baseUrl = `http://127.0.0.1:${localPort}`
++      let classification = ''
++
++      try {
++        classification = await probeReuseProof(baseUrl, state.token, spawnNonce)
++      } catch {
++        classification = 'unreachable'
++      }
++
++      if (classification === 'authenticated-ok') {
++        try {
++          const token = await adoptOwnedServedToken(
++            adoptServedToken,
++            baseUrl,
++            state.token,
++            ssh,
++            pid,
++            'always-on remote dashboard'
++          )
++
++          assertBootstrapNotSuperseded(signal)
++          log(`reusing always-on remote dashboard pid=${pid} port=${port}`)
++
++          return {
++            baseUrl,
++            token,
++            tokenFingerprint: fingerprintToken(token),
++            remotePort: port,
++            localPort,
++            pid,
++            reused: true,
++            alwaysOn: true,
++            platform,
++            hermesPath,
++            hermesVersion,
++            ownershipId,
++            spawnNonce,
++            logPath: '',
++            hermesHome,
++            startedAt: state.record.startedAt || '',
++            creationTime: ''
++          }
++        } catch (error) {
++          await cancelForwardSafe(deps, localPort, port)
++          throw error
++        }
++      }
++
++      await cancelForwardSafe(deps, localPort, port)
++      reason =
++        classification === 'authenticated-stale'
++          ? `pid ${pid} runs a replaced runtime (stale after an update)`
++          : `pid ${pid} not answering on port ${port}`
++    }
++
++    if (now() >= deadline) {
++      log(`always-on dashboard unavailable (${reason}) after ${waitMs} ms; falling back to an owned backend`)
++
++      return null
++    }
++
++    if (reason !== lastReason) {
++      log(`always-on dashboard ${reason}; waiting for its supervisor restart`)
++      lastReason = reason
++    }
++
++    await sleep(pollMs)
++  }
++}
++
+ /**
+  * Establish (or reuse) a remote dashboard and a tunnel to it. `deps` injects the
+  * opened SshConnection, forward/pickLocalPort/waitForHermes, a token-gated
+@@ -1631,6 +1788,15 @@ async function connect(deps) {
+     log(`remote hermes version: ${hermesVersion}`)
+   }
+ 
++  // The always-on dashboard serves the default profile; named profiles keep their own owned backends.
++  if (!profile && deps.alwaysOn !== false) {
++    const alwaysOn = await connectAlwaysOn(deps, { ssh, platform, hermesPath, hermesVersion, hermesHome, log, signal })
++
++    if (alwaysOn) {
++      return alwaysOn
++    }
++  }
++
+   const reuseToken = deps.reuseToken || ''
+   const lock = await readLockfile(ssh, ownershipId)
+ 
+@@ -1895,11 +2061,14 @@ async function connect(deps) {
+ 
+ export {
+   adoptOwnedServedToken,
++  ALWAYS_ON_DIR,
++  ALWAYS_ON_RESTART_WAIT_MS,
+   assertRemoteInstallUpdateClear,
+   buildSpawnCommand,
+   classifySshReuseProof,
+   cleanupStale,
+   connect,
++  connectAlwaysOn,
+   connectReservationPath,
+   DEFAULT_READY_TIMEOUT_MS,
+   disconnect,
+@@ -1921,6 +2090,7 @@ export {
+   probeRemoteHermesHome,
+   probeRemotePlatform,
+   PROTOCOL_VERSION,
++  readAlwaysOnState,
+   readLockfile,
+   readRemoteInstallId,
+   READY_RE,
+diff --git a/apps/desktop/electron/remote-liveness.ts b/apps/desktop/electron/remote-liveness.ts
+index ba1fe1e1da..9f3976c92c 100644
+--- a/apps/desktop/electron/remote-liveness.ts
++++ b/apps/desktop/electron/remote-liveness.ts
+@@ -22,6 +22,40 @@ export const REMOTE_LIVENESS_FAILURE_WINDOW_MS = 60_000
+ // streak via recordSuccess(), so a wide window cannot produce false drops.
+ export const REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS = 15 * 60_000
+ 
++// A dispatch skips its /api/health probe when this backend answered a request within this window: the probe
++// would only re-prove what the last answer already proved, and it costs a tunnel round trip on every send.
++export const DISPATCH_PROBE_SKIP_WINDOW_MS = 30_000
++
++/** When each remote backend (by its forwarded baseUrl) last answered a request successfully. */
++export class RemoteAnswerLedger {
++  readonly #lastAnswerAt = new Map<string, number>()
++  readonly #now: () => number
++
++  constructor(now: () => number = Date.now) {
++    this.#now = now
++  }
++
++  recordAnswer(baseUrl: null | string | undefined): void {
++    if (baseUrl) {
++      this.#lastAnswerAt.set(baseUrl, this.#now())
++    }
++  }
++
++  forget(baseUrl: null | string | undefined): void {
++    if (baseUrl) {
++      this.#lastAnswerAt.delete(baseUrl)
++    }
++  }
++
++  answeredWithin(baseUrl: null | string | undefined, windowMs: number): boolean {
++    const at = baseUrl ? this.#lastAnswerAt.get(baseUrl) : undefined
++
++    return at !== undefined && windowMs > 0 && this.#now() - at < windowMs
++  }
++}
++
++export const remoteAnswerLedger = new RemoteAnswerLedger()
++
+ export interface RemoteLivenessFailure {
+   failures: number
+   shouldReset: boolean
+@@ -86,6 +120,10 @@ interface EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection extends
+   probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
+   reconnect: () => Promise<TConnection>
+   retire: (error: unknown) => Promise<void> | void
++  // Skip the probe when the backend answered within skipWindowMs (0 forces it, e.g. the prewarm keepalive).
++  answers?: RemoteAnswerLedger
++  skipWindowMs?: number
++  onProbe?: (outcome: 'ran' | 'skipped', elapsedMs: number) => void
+ }
+ 
+ /**
+@@ -101,9 +139,13 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+   currentConnectionPromise,
+   probe,
+   reconnect,
+-  retire
++  retire,
++  answers,
++  skipWindowMs = DISPATCH_PROBE_SKIP_WINDOW_MS,
++  onProbe
+ }: EnsureHealthyPooledRemoteBackendForDispatchOptions<TConnection>): Promise<TConnection> {
+-  let connection: TConnection
++  let connection: TConnection | undefined
++  const startedAt = Date.now()
+ 
+   try {
+     connection = await connectionPromise
+@@ -112,6 +154,12 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+       return reconnect()
+     }
+ 
++    if (answers?.answeredWithin(connection.baseUrl, skipWindowMs)) {
++      onProbe?.('skipped', Date.now() - startedAt)
++
++      return connection
++    }
++
+     try {
+       await probe(connection, '/api/health', {
+         timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
+@@ -129,6 +177,8 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+       })
+     }
+   } catch (error) {
++    answers?.forget(connection?.baseUrl)
++
+     if (currentConnectionPromise() === connectionPromise) {
+       await retire(error)
+     }
+@@ -136,6 +186,9 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
+     return reconnect()
+   }
+ 
++  answers?.recordAnswer(connection.baseUrl)
++  onProbe?.('ran', Date.now() - startedAt)
++
+   if (currentConnectionPromise() !== connectionPromise) {
+     return reconnect()
+   }
+diff --git a/apps/desktop/electron/remote-prewarm.ts b/apps/desktop/electron/remote-prewarm.ts
+new file mode 100644
+index 0000000000..537bf30685
+--- /dev/null
++++ b/apps/desktop/electron/remote-prewarm.ts
+@@ -0,0 +1,131 @@
++// Hold every remote gateway warm: at startup, dial each SSH connection in connections.json (SSH ControlMaster +
++// tunnel + backend reuse), then keep it up with a forced health probe every tickMs and a backoff reconnect when it
++// drops. A dispatch then finds a pooled, recently-answered descriptor and never waits on an SSH dial or a spawn.
++//
++// Electron-free: main.ts injects the registry read, the ensure call and the clock.
++
++export const PREWARM_TICK_MS = 15_000
++export const PREWARM_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000]
++
++export interface RemotePrewarmDeps {
++  // SSH connection ids from connections.json, re-read every tick so added/removed connections converge.
++  listConnectionIds: () => string[]
++  // Dial or revalidate one connection; `forceProbe` bypasses the dispatch probe skip so a dropped tunnel is noticed.
++  ensure: (connectionId: string, opts: { forceProbe: boolean }) => Promise<unknown>
++  log: (line: string) => void
++  now?: () => number
++  setTimer?: (fn: () => void, ms: number) => { unref?: () => void }
++  clearTimer?: (timer: unknown) => void
++  tickMs?: number
++}
++
++interface ConnectionState {
++  failures: number
++  nextAttemptAt: number
++  warm: boolean
++}
++
++export class RemotePrewarmer {
++  readonly #deps: RemotePrewarmDeps
++  readonly #states = new Map<string, ConnectionState>()
++  readonly #inflight = new Set<string>()
++  #timer: unknown = null
++  #stopped = true
++
++  constructor(deps: RemotePrewarmDeps) {
++    this.#deps = deps
++  }
++
++  get running(): boolean {
++    return !this.#stopped
++  }
++
++  isWarm(connectionId: string): boolean {
++    return this.#states.get(connectionId)?.warm === true
++  }
++
++  // Dial every connection now (in parallel) and start the keepalive loop. Resolves when the first round settles.
++  async start(): Promise<void> {
++    if (!this.#stopped) {
++      return
++    }
++
++    this.#stopped = false
++    await this.tick(true)
++    this.#schedule()
++  }
++
++  stop(): void {
++    this.#stopped = true
++
++    if (this.#timer) {
++      ;(this.#deps.clearTimer ?? clearTimeout)(this.#timer as any)
++      this.#timer = null
++    }
++  }
++
++  // One round. The first round dials (no probe to force); later rounds force the probe on warm connections.
++  async tick(initial = false): Promise<void> {
++    const now = (this.#deps.now ?? Date.now)()
++    const ids = this.#deps.listConnectionIds()
++
++    for (const known of [...this.#states.keys()]) {
++      if (!ids.includes(known)) {
++        this.#states.delete(known)
++      }
++    }
++
++    await Promise.all(
++      ids.map(async id => {
++        const state = this.#states.get(id) ?? { failures: 0, nextAttemptAt: 0, warm: false }
++        this.#states.set(id, state)
++
++        if (this.#inflight.has(id) || now < state.nextAttemptAt || this.#stopped) {
++          return
++        }
++
++        this.#inflight.add(id)
++        const startedAt = (this.#deps.now ?? Date.now)()
++
++        try {
++          await this.#deps.ensure(id, { forceProbe: !initial && state.warm })
++
++          if (!state.warm || state.failures) {
++            this.#deps.log(
++              `[remote-prewarm] ${id} ${state.failures ? 'reconnected' : 'warm'} in ${(this.#deps.now ?? Date.now)() - startedAt} ms`
++            )
++          }
++
++          state.warm = true
++          state.failures = 0
++          state.nextAttemptAt = 0
++        } catch (error: any) {
++          const delay = PREWARM_BACKOFF_MS[Math.min(state.failures, PREWARM_BACKOFF_MS.length - 1)]
++          state.warm = false
++          state.failures += 1
++          state.nextAttemptAt = (this.#deps.now ?? Date.now)() + delay
++          this.#deps.log(
++            `[remote-prewarm] ${id} unavailable (${error?.message || error}); retry ${state.failures} in ${delay} ms`
++          )
++        } finally {
++          this.#inflight.delete(id)
++        }
++      })
++    )
++  }
++
++  #schedule(): void {
++    if (this.#stopped) {
++      return
++    }
++
++    const setTimer = this.#deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
++
++    const timer = setTimer(() => {
++      void this.tick().finally(() => this.#schedule())
++    }, this.#deps.tickMs ?? PREWARM_TICK_MS)
++
++    ;(timer as { unref?: () => void } | undefined)?.unref?.()
++    this.#timer = timer
++  }
++}
+diff --git a/apps/desktop/electron/remote-warm-dispatch.test.ts b/apps/desktop/electron/remote-warm-dispatch.test.ts
+new file mode 100644
+index 0000000000..1909f78bfd
+--- /dev/null
++++ b/apps/desktop/electron/remote-warm-dispatch.test.ts
+@@ -0,0 +1,192 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it, vi } from 'vitest'
++
++import {
++  DISPATCH_PROBE_SKIP_WINDOW_MS,
++  ensureHealthyPooledRemoteBackendForDispatch,
++  RemoteAnswerLedger
++} from './remote-liveness'
++import { PREWARM_BACKOFF_MS, RemotePrewarmer } from './remote-prewarm'
++
++// Part B (instant session loads): Desktop prewarms every SSH gateway at startup, holds it with a forced keepalive
++// probe, reconnects when the tunnel drops, and skips the per-dispatch /api/health probe while the backend answered
++// within the last 30 s.
++
++const BASE_URL = 'http://127.0.0.1:50001'
++
++function dispatchDeps(answers: RemoteAnswerLedger, over: any = {}) {
++  const connection = { baseUrl: BASE_URL, mode: 'ssh' }
++  const connectionPromise = Promise.resolve(connection)
++
++  return {
++    connection,
++    probe: vi.fn(async () => ({ ok: true })),
++    reconnect: vi.fn(async () => ({ baseUrl: 'http://127.0.0.1:50002', mode: 'ssh' })),
++    retire: vi.fn(async () => {}),
++    opts: { connectionPromise, currentConnectionPromise: () => connectionPromise, answers, ...over }
++  }
++}
++
++describe('dispatch probe skip', () => {
++  it('skips the probe when the backend answered within 30 s', async () => {
++    let now = 1_000_000
++    const answers = new RemoteAnswerLedger(() => now)
++    answers.recordAnswer(BASE_URL)
++    now += DISPATCH_PROBE_SKIP_WINDOW_MS - 1
++    const d = dispatchDeps(answers)
++    const onProbe = vi.fn()
++
++    const result = await ensureHealthyPooledRemoteBackendForDispatch({ ...d.opts, ...d, onProbe })
++
++    expect(result).toBe(d.connection)
++    expect(d.probe).not.toHaveBeenCalled()
++    expect(onProbe).toHaveBeenCalledWith('skipped', expect.any(Number))
++  })
++
++  it('runs the probe once 30 s have passed, and a success re-arms the skip', async () => {
++    let now = 1_000_000
++    const answers = new RemoteAnswerLedger(() => now)
++    answers.recordAnswer(BASE_URL)
++    now += DISPATCH_PROBE_SKIP_WINDOW_MS
++    const d = dispatchDeps(answers)
++
++    await ensureHealthyPooledRemoteBackendForDispatch({ ...d.opts, ...d })
++
++    expect(d.probe).toHaveBeenCalledWith(d.connection, '/api/health', expect.anything())
++    expect(answers.answeredWithin(BASE_URL, DISPATCH_PROBE_SKIP_WINDOW_MS)).toBe(true)
++  })
++
++  it('never skips for a backend that has not answered', async () => {
++    const d = dispatchDeps(new RemoteAnswerLedger())
++
++    await ensureHealthyPooledRemoteBackendForDispatch({ ...d.opts, ...d })
++
++    expect(d.probe).toHaveBeenCalledTimes(1)
++  })
++})
++
++describe('reconnect after a dropped tunnel', () => {
++  it('a forced keepalive probe ignores a recent answer, retires the dead tunnel and reconnects', async () => {
++    const answers = new RemoteAnswerLedger()
++    answers.recordAnswer(BASE_URL)
++    const d = dispatchDeps(answers, { skipWindowMs: 0 })
++    d.probe.mockRejectedValue(new Error('socket hang up'))
++
++    const result = await ensureHealthyPooledRemoteBackendForDispatch({ ...d.opts, ...d })
++
++    expect(d.probe).toHaveBeenCalled()
++    expect(d.retire).toHaveBeenCalledTimes(1)
++    expect(d.reconnect).toHaveBeenCalledTimes(1)
++    expect(result.baseUrl).toBe('http://127.0.0.1:50002')
++    expect(answers.answeredWithin(BASE_URL, DISPATCH_PROBE_SKIP_WINDOW_MS)).toBe(false)
++  })
++
++  it('the prewarmer retries a connection that dropped, with backoff, until it is warm again', async () => {
++    let now = 0
++    const logs: string[] = []
++    let up = true
++
++    const ensure = vi.fn(async () => {
++      if (!up) {
++        throw new Error('ssh: connect to host mini: Connection refused')
++      }
++    })
++
++    const prewarmer = new RemotePrewarmer({
++      listConnectionIds: () => ['mac-mini'],
++      ensure,
++      log: line => logs.push(line),
++      now: () => now,
++      setTimer: () => ({})
++    })
++
++    await prewarmer.start()
++    expect(prewarmer.isWarm('mac-mini')).toBe(true)
++
++    up = false
++    now += 15_000
++    await prewarmer.tick()
++    expect(ensure).toHaveBeenLastCalledWith('mac-mini', { forceProbe: true })
++    expect(prewarmer.isWarm('mac-mini')).toBe(false)
++
++    now += PREWARM_BACKOFF_MS[0] - 1
++    await prewarmer.tick()
++    expect(ensure).toHaveBeenCalledTimes(2) // still backing off
++
++    up = true
++    now += 1
++    await prewarmer.tick()
++    expect(ensure).toHaveBeenCalledTimes(3)
++    expect(prewarmer.isWarm('mac-mini')).toBe(true)
++    expect(logs.some(line => /mac-mini reconnected/.test(line))).toBe(true)
++    prewarmer.stop()
++  })
++})
++
++describe('prewarm at startup', () => {
++  it('dials every SSH connection in parallel at start, then keeps them on a timer', async () => {
++    const order: string[] = []
++    const timers: number[] = []
++    let release!: () => void
++    const gate = new Promise<void>(resolve => (release = resolve))
++
++    const prewarmer = new RemotePrewarmer({
++      listConnectionIds: () => ['mac-mini', 'hermes-hub'],
++      ensure: async (id, opts) => {
++        order.push(`${id}:${opts.forceProbe}`)
++        await gate
++      },
++      log: () => {},
++      setTimer: (_fn, ms) => (timers.push(ms), {}),
++      tickMs: 15_000
++    })
++
++    const started = prewarmer.start()
++    await Promise.resolve()
++    expect(order).toEqual(['mac-mini:false', 'hermes-hub:false']) // both dials in flight together
++    release()
++    await started
++
++    expect(prewarmer.isWarm('mac-mini') && prewarmer.isWarm('hermes-hub')).toBe(true)
++    expect(timers).toEqual([15_000])
++    prewarmer.stop()
++    expect(prewarmer.running).toBe(false)
++  })
++
++  it('drops a connection removed from connections.json', async () => {
++    let ids = ['mac-mini', 'hermes-hub']
++    const ensure = vi.fn(async () => {})
++    const prewarmer = new RemotePrewarmer({ listConnectionIds: () => ids, ensure, log: () => {}, setTimer: () => ({}) })
++
++    await prewarmer.start()
++    ids = ['mac-mini']
++    await prewarmer.tick()
++
++    expect(prewarmer.isWarm('hermes-hub')).toBe(false)
++    expect(ensure).toHaveBeenCalledTimes(3)
++    prewarmer.stop()
++  })
++})
++
++describe('main.ts wiring', () => {
++  // The Electron main process cannot boot under vitest; pin the call sites the behaviour above depends on.
++  const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
++
++  it('starts the prewarmer when the app is ready and stops it on quit', () => {
++    const ready = main.slice(main.indexOf('app.whenReady().then(() => {'))
++    expect(ready.indexOf('void remotePrewarmer.start()')).toBeGreaterThan(0)
++    expect(main).toMatch(/minimizeToTray\.beginQuit\(\)\n\s+mainProcessLagWatchdog\.stop\(\)\n\s+remotePrewarmer\.stop\(\)/)
++  })
++
++  it('prewarms registry SSH connections through ensureRegistryBackend with a forced keepalive probe', () => {
++    expect(main).toMatch(/connection\.kind === 'ssh'/)
++    expect(main).toMatch(/ensureRegistryBackend\(connectionId, 'default', '', \{ forceProbe, spawnPriority: 'background' \}\)/)
++  })
++
++  it('pooled dispatch skips the probe from the shared answer ledger unless forced', () => {
++    expect(main).toMatch(/answers: remoteAnswerLedger,\n\s+skipWindowMs: opts\.forceProbe \? 0 : DISPATCH_PROBE_SKIP_WINDOW_MS/)
++    expect(main).toMatch(/function noteRemoteAnswer\(baseUrl: string, path: string\) \{\n\s+remoteAnswerLedger\.recordAnswer\(baseUrl\)/)
++  })
++})
+diff --git a/apps/desktop/electron/ssh-connection.ts b/apps/desktop/electron/ssh-connection.ts
+index f758908f57..2b60caced6 100644
+--- a/apps/desktop/electron/ssh-connection.ts
++++ b/apps/desktop/electron/ssh-connection.ts
+@@ -57,7 +57,8 @@ const REMOTE_PROBE_TIMEOUT_SECS = 15
+ // is the connection reported dead.
+ const DEFAULT_TUNNEL_RESTART_LIMIT = 5
+ const DEFAULT_TUNNEL_RESTART_DELAY_MS = 1_000
+-const CONTROL_PERSIST_SECONDS = 300
++// Long: Desktop prewarms and holds every remote gateway (remote-prewarm.ts), so a quiet hour must not cost a re-auth.
++const CONTROL_PERSIST_SECONDS = 3600
+ const CONTROL_FORWARD_KEEPALIVE_MS = Math.min(60_000, Math.floor((CONTROL_PERSIST_SECONDS * 1_000) / 2))
+ 
+ // eslint-disable-next-line no-control-regex -- deliberately reject control chars in ssh targets
+diff --git a/hermes_cli/always_on_dashboard.py b/hermes_cli/always_on_dashboard.py
+new file mode 100644
+index 0000000000..a18719177c
+--- /dev/null
++++ b/hermes_cli/always_on_dashboard.py
+@@ -0,0 +1,321 @@
++"""Always-on remote dashboard: one supervised ``hermes serve`` per host for Hermes Desktop over SSH.
++
++Desktop reaches a remote gateway by SSH and, today, spawns a detached ``serve --isolated`` there on
++first use (about 8 s: platform probes, Python boot, READY scrape). That backend exits 900 s after its
++last client and retires itself after a core update, so most opens after a pause pay the spawn again.
++
++This module keeps one backend warm instead. ``hermes always-on-dashboard install`` writes a launchd
++agent (macOS) or a systemd user unit (Linux) that runs ``hermes always-on-dashboard run``. ``run``
++execs the SAME isolated SSH backend Desktop would spawn (``HERMES_DESKTOP=1 serve --isolated
++--ssh-session-token-file ... --ssh-owner-nonce ...``: same auth gate, ownership proof, cron gate and
++code-skew retirement), with three differences:
++
++* the token and owner nonce persist in ``~/.hermes/desktop-ssh/always-on/`` (0700 dir, 0600 files),
++  so every restart serves the same credential and Desktop reads it over SSH instead of minting one;
++* the port is fixed, so a second copy exits ``PORT_IN_USE`` and one host never runs two;
++* ``HERMES_ALWAYS_ON_DASHBOARD=1`` turns OFF the idle-exit watchdog (``web_server_idle_exit``) for
++  this process only. Everything else about turns is unchanged.
++
++After a core update the existing code-skew watchdog exits it between turns and the supervisor starts
++it again on the new code (``run`` first waits for the update marker to clear). ``record.json`` names
++the pid/port/nonce; Desktop's ``remote-lifecycle.connect()`` checks it before the lockfile path.
++"""
++
++from __future__ import annotations
++
++import argparse
++import contextlib
++import hashlib
++import json
++import os
++import plistlib
++import re
++import secrets
++import shlex
++import subprocess
++import sys
++import time
++from datetime import datetime, timezone, UTC
++from pathlib import Path
++from typing import Callable, Optional
++
++ENV_FLAG = "HERMES_ALWAYS_ON_DASHBOARD"
++DEFAULT_PORT = 9147
++RECORD_SCHEMA = 1
++LAUNCHD_LABEL = "com.hermes.always-on-dashboard"
++SYSTEMD_UNIT = "hermes-always-on-dashboard.service"
++# The token file `serve --ssh-session-token-file` accepts must sit at desktop-ssh/<32 hex>/<16 hex>.token.
++# A fixed slot id keeps it apart from every Desktop ownership slot (those are per-install random ids).
++OWNERSHIP_ID = hashlib.sha256(b"hermes-always-on-dashboard").hexdigest()[:32]
++UPDATE_WAIT_S = 600.0
++
++_TOKEN_RE = re.compile(r"[0-9a-f]{64}")
++_NONCE_RE = re.compile(r"[0-9a-f]{16}")
++
++
++def desktop_ssh_root(home: Optional[Path] = None) -> Path:
++    """``$HOME/.hermes/desktop-ssh``: where Desktop's SSH runtime lives, independent of HERMES_HOME."""
++    return (home or Path.home()) / ".hermes" / "desktop-ssh"
++
++
++def state_dir(home: Optional[Path] = None) -> Path:
++    return desktop_ssh_root(home) / "always-on"
++
++
++def always_on_enabled() -> bool:
++    """True in the always-on backend process (read once by the web server; not inherited further)."""
++    return os.environ.get(ENV_FLAG) == "1"
++
++
++def _private_dir(path: Path) -> None:
++    path.mkdir(mode=0o700, parents=True, exist_ok=True)
++    os.chmod(path, 0o700)
++
++
++def _write_private(path: Path, text: str) -> None:
++    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++    with os.fdopen(fd, "w", encoding="utf-8") as stream:
++        stream.write(text)
++    os.replace(tmp, path)
++
++
++def _read_matching(path: Path, pattern: re.Pattern) -> str:
++    with contextlib.suppress(OSError):
++        value = path.read_text(encoding="utf-8").strip()
++        if pattern.fullmatch(value):
++            return value
++    return ""
++
++
++def ensure_credentials(home: Optional[Path] = None) -> tuple[str, str]:
++    """The persisted (token, nonce), minted on first use. Never rotated by a restart."""
++    _private_dir(desktop_ssh_root(home))
++    directory = state_dir(home)
++    _private_dir(directory)
++    token = _read_matching(directory / "token", _TOKEN_RE)
++    if not token:
++        token = secrets.token_hex(32)
++        _write_private(directory / "token", token)
++    nonce = _read_matching(directory / "nonce", _NONCE_RE)
++    if not nonce:
++        nonce = secrets.token_hex(8)
++        _write_private(directory / "nonce", nonce)
++    return token, nonce
++
++
++def stage_token_file(token: str, nonce: str, home: Optional[Path] = None) -> Path:
++    """Write the one-shot token file ``serve`` reads and unlinks, in the shape it validates."""
++    slot = desktop_ssh_root(home) / OWNERSHIP_ID
++    _private_dir(slot)
++    path = slot / f"{nonce}.token"
++    with contextlib.suppress(FileNotFoundError):
++        path.unlink()
++    _write_private(path, token)
++    return path
++
++
++def write_record(*, pid: int, port: int, nonce: str, hermes_home: str, hermes_path: str,
++                 home: Optional[Path] = None) -> Path:
++    record = {
++        "schemaVersion": RECORD_SCHEMA,
++        "pid": int(pid),
++        "port": int(port),
++        "spawnNonce": nonce,
++        "hermesHome": hermes_home,
++        "hermesPath": hermes_path,
++        "startedAt": datetime.now(UTC).isoformat(),
++    }
++    path = state_dir(home) / "record.json"
++    _write_private(path, json.dumps(record))
++    return path
++
++
++def wait_for_update_clear(marker: Path, *, timeout_s: float = UPDATE_WAIT_S,
++                          sleep: Callable[[float], None] = time.sleep,
++                          now: Callable[[], float] = time.monotonic) -> bool:
++    """Block while ``hermes update`` holds its marker so a restart never boots half-written code.
++    True when clear; False after ``timeout_s`` (the caller starts anyway: a stale marker must not
++    keep the backend down forever)."""
++    deadline = now() + timeout_s
++    while marker.exists():
++        if now() >= deadline:
++            return False
++        sleep(2.0)
++    return True
++
++
++def build_serve_argv(hermes: str, port: int, token_path: Path, nonce: str) -> list[str]:
++    return [hermes, "serve", "--isolated", "--host", "127.0.0.1", "--port", str(int(port)),
++            "--ssh-session-token-file", str(token_path), "--ssh-owner-nonce", nonce]
++
++
++def _root_hermes_home() -> Path:
++    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
++
++
++def cmd_run(args: argparse.Namespace) -> int:
++    """Supervisor entry point: wait out an update, stage the token, publish the record, exec serve."""
++    from hermes_cli.update_lock import MARKER_NAME
++
++    hermes = os.path.abspath(args.hermes or sys.argv[0])
++    hermes_home = _root_hermes_home()
++    if not wait_for_update_clear(hermes_home / MARKER_NAME):
++        print(f"always-on dashboard: update marker still present after {UPDATE_WAIT_S:.0f}s; starting anyway",
++              file=sys.stderr, flush=True)
++    token, nonce = ensure_credentials()
++    token_path = stage_token_file(token, nonce)
++    # exec keeps this pid, so the record names the serve process itself.
++    write_record(pid=os.getpid(), port=args.port, nonce=nonce, hermes_home=str(hermes_home), hermes_path=hermes)
++    env = dict(os.environ)
++    env["HERMES_DESKTOP"] = "1"
++    env[ENV_FLAG] = "1"
++    env.pop("HERMES_DASHBOARD_SESSION_TOKEN", None)
++    argv = build_serve_argv(hermes, args.port, token_path, nonce)
++    print(f"always-on dashboard: exec {shlex.join(argv[:7])} ...", file=sys.stderr, flush=True)
++    os.execve(hermes, argv, env)
++    return 0  # unreachable
++
++
++def _service_path(hermes: str) -> str:
++    parts = [os.path.dirname(hermes), str(Path.home() / ".local" / "bin"), "/opt/homebrew/bin",
++             "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
++    return ":".join(dict.fromkeys(parts))
++
++
++def render_launchd_plist(*, hermes: str, port: int, home: Path, log_path: Path) -> bytes:
++    """KeepAlive: launchd restarts it after any exit (crash, code-skew retirement after an update)."""
++    return plistlib.dumps({
++        "Label": LAUNCHD_LABEL,
++        "ProgramArguments": [hermes, "always-on-dashboard", "run", "--port", str(int(port)), "--hermes", hermes],
++        "EnvironmentVariables": {"HOME": str(home), "PATH": _service_path(hermes), "LANG": "C.UTF-8"},
++        "RunAtLoad": True,
++        "KeepAlive": True,
++        "ThrottleInterval": 10,
++        "ProcessType": "Interactive",
++        "WorkingDirectory": str(home),
++        "StandardOutPath": str(log_path),
++        "StandardErrorPath": str(log_path),
++    })
++
++
++def render_systemd_unit(*, hermes: str, port: int, log_path: Path) -> str:
++    """Restart=always: systemd restarts it after any exit, including a clean code-skew retirement."""
++    return "\n".join([
++        "[Unit]",
++        "Description=Hermes always-on remote dashboard (warm backend for Hermes Desktop over SSH)",
++        "After=network-online.target",
++        "",
++        "[Service]",
++        "Type=simple",
++        f"ExecStart={shlex.quote(hermes)} always-on-dashboard run --port {int(port)} --hermes {shlex.quote(hermes)}",
++        f"Environment=PATH={_service_path(hermes)}",
++        "Restart=always",
++        "RestartSec=5",
++        # SIGTERM runs the server's flush-on-kill handlers; give a turn's checkpoint time to land.
++        "TimeoutStopSec=60",
++        f"StandardOutput=append:{log_path}",
++        f"StandardError=append:{log_path}",
++        "",
++        "[Install]",
++        "WantedBy=default.target",
++        "",
++    ])
++
++
++def _launchd_plist_path(home: Path) -> Path:
++    return home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
++
++
++def _systemd_unit_path(home: Path) -> Path:
++    return home / ".config" / "systemd" / "user" / SYSTEMD_UNIT
++
++
++def _log_path() -> Path:
++    path = _root_hermes_home() / "logs" / "always-on-dashboard.log"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
++    return subprocess.run(cmd, check=check, capture_output=True, text=True)
++
++
++def cmd_install(args: argparse.Namespace) -> int:
++    hermes = os.path.abspath(args.hermes or sys.argv[0])
++    home = Path.home()
++    ensure_credentials()
++    if sys.platform == "darwin":
++        plist = _launchd_plist_path(home)
++        plist.parent.mkdir(parents=True, exist_ok=True)
++        plist.write_bytes(render_launchd_plist(hermes=hermes, port=args.port, home=home, log_path=_log_path()))
++        domain = f"gui/{os.getuid()}"
++        _run(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"], check=False)
++        _run(["launchctl", "bootstrap", domain, str(plist)])
++        print(f"installed {plist} (launchd {domain}/{LAUNCHD_LABEL}, port {args.port})")
++    elif sys.platform.startswith("linux"):
++        unit = _systemd_unit_path(home)
++        unit.parent.mkdir(parents=True, exist_ok=True)
++        unit.write_text(render_systemd_unit(hermes=hermes, port=args.port, log_path=_log_path()), encoding="utf-8")
++        _run(["systemctl", "--user", "daemon-reload"])
++        _run(["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT])
++        print(f"installed {unit} (systemd --user {SYSTEMD_UNIT}, port {args.port})")
++    else:
++        print("always-on dashboard supervision is macOS (launchd) and Linux (systemd) only", file=sys.stderr)
++        return 2
++    return 0
++
++
++def cmd_uninstall(args: argparse.Namespace) -> int:
++    home = Path.home()
++    if sys.platform == "darwin":
++        _run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], check=False)
++        _launchd_plist_path(home).unlink(missing_ok=True)
++    elif sys.platform.startswith("linux"):
++        _run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT], check=False)
++        _systemd_unit_path(home).unlink(missing_ok=True)
++        _run(["systemctl", "--user", "daemon-reload"], check=False)
++    (state_dir() / "record.json").unlink(missing_ok=True)
++    print("always-on dashboard uninstalled (token kept; delete ~/.hermes/desktop-ssh/always-on to rotate it)")
++    return 0
++
++
++def read_record(home: Optional[Path] = None) -> Optional[dict]:
++    with contextlib.suppress(OSError, ValueError):
++        record = json.loads((state_dir(home) / "record.json").read_text(encoding="utf-8"))
++        if isinstance(record, dict) and record.get("schemaVersion") == RECORD_SCHEMA:
++            return record
++    return None
++
++
++def cmd_status(args: argparse.Namespace) -> int:
++    record = read_record()
++    if not record:
++        print("always-on dashboard: no record (not installed or not started yet)")
++        return 1
++    alive = False
++    with contextlib.suppress(OSError):
++        os.kill(int(record["pid"]), 0)
++        alive = True
++    print(json.dumps({**record, "alive": alive}))
++    return 0 if alive else 1
++
++
++def build_always_on_dashboard_parser(subparsers) -> None:
++    parser = subparsers.add_parser(
++        "always-on-dashboard",
++        help="Keep one supervised backend warm for Hermes Desktop SSH connections",
++        description="Install, run or inspect the always-on remote dashboard: a launchd/systemd-supervised "
++            "`hermes serve` that Hermes Desktop reuses over SSH instead of spawning a backend per connect.")
++    sub = parser.add_subparsers(dest="always_on_action", required=True)
++    for name, func, help_text in (
++        ("install", cmd_install, "Write and load the launchd agent / systemd user unit"),
++        ("uninstall", cmd_uninstall, "Stop and remove the supervisor unit"),
++        ("status", cmd_status, "Print the running backend's record"),
++        ("run", cmd_run, "Supervisor entry point (execs `hermes serve`)"),
++    ):
++        action = sub.add_parser(name, help=help_text)
++        if name in ("install", "run"):
++            action.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Loopback port (default {DEFAULT_PORT})")
++            action.add_argument("--hermes", default="", help="Absolute path of the hermes entry point to exec")
++        action.set_defaults(func=func)
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 0fba5f9cb2..5e32accabd 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -3437,6 +3437,8 @@ def _build_cli_parser():
+     build_auth_parser(subparsers, cmd_auth=cmd_auth)
+     build_status_parser(subparsers, cmd_status=cmd_status)
+     build_pause_parser(subparsers)
++    from hermes_cli.always_on_dashboard import build_always_on_dashboard_parser
++    build_always_on_dashboard_parser(subparsers)
+     build_cron_parser(subparsers, cmd_cron=cmd_cron)
+     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+ 
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index a83bb8a271..505c9cf583 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1428,6 +1428,29 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
+     hr.cleanup_on_exit(role)
+ 
+ 
++def _arm_ssh_isolated_idle_exit(server) -> bool:
++    """Start the idle-exit watchdog on an SSH-isolated backend; True when armed.
++
++    The supervised always-on backend (``hermes_cli/always_on_dashboard.py``) is the one SSH-isolated
++    backend that must NOT idle-exit: its point is being warm when Desktop next connects. Its env flag
++    is read once and dropped so agent children never inherit it."""
++    from hermes_cli.always_on_dashboard import ENV_FLAG as always_on_flag
++
++    always_on = os.environ.pop(always_on_flag, "") == "1"
++    if getattr(app.state, "ssh_isolated_clients", None) is None:
++        return False
++    if always_on:
++        _log.info("always-on dashboard: idle-exit watchdog disabled (supervised backend)")
++        return False
++    from hermes_cli.web_server_idle_exit import DEFAULT_IDLE_GRACE_S, start_idle_watchdog
++    try:
++        grace = float((load_config().get("dashboard") or {}).get("ssh_isolated_idle_grace_s", DEFAULT_IDLE_GRACE_S))
++    except (TypeError, ValueError):
++        grace = DEFAULT_IDLE_GRACE_S
++    start_idle_watchdog(server, app.state.ssh_isolated_clients, grace_s=grace)
++    return True
++
++
+ def _on_server_started(
+     server,
+     *,
+@@ -1470,13 +1493,7 @@ def _on_server_started(
+     _start_parent_death_watchdog()
+     # SSH-isolated backends are detached from any parent on purpose (#91668); their liveness signal
+     # is "does a client still hold a WebSocket" (#101626).
+-    if getattr(app.state, "ssh_isolated_clients", None) is not None:
+-        from hermes_cli.web_server_idle_exit import DEFAULT_IDLE_GRACE_S, start_idle_watchdog
+-        try:
+-            grace = float((load_config().get("dashboard") or {}).get("ssh_isolated_idle_grace_s", DEFAULT_IDLE_GRACE_S))
+-        except (TypeError, ValueError):
+-            grace = DEFAULT_IDLE_GRACE_S
+-        start_idle_watchdog(server, app.state.ssh_isolated_clients, grace_s=grace)
++    _arm_ssh_isolated_idle_exit(server)
+     if getattr(app.state, "ssh_isolated_clients", None) is not None or is_desktop_owned_backend():
+         # The host's updater never restarts this backend (SSH-isolated: only the remote Desktop
+         # client holds its token and owner nonce, #91668/#101626; Desktop-owned local serve:
+diff --git a/tests/hermes_cli/test_always_on_dashboard.py b/tests/hermes_cli/test_always_on_dashboard.py
+new file mode 100644
+index 0000000000..93d32882c0
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_dashboard.py
+@@ -0,0 +1,132 @@
++"""Always-on remote dashboard: supervisor units, persisted credentials, the run wrapper, idle-exit opt-out."""
++
++import argparse
++import os
++import plistlib
++import stat
++from pathlib import Path
++
++import pytest
++
++import hermes_cli.always_on_dashboard as ao
++import hermes_cli.web_server as ws_mod
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_HOME", raising=False)
++    monkeypatch.delenv(ao.ENV_FLAG, raising=False)
++    return tmp_path
++
++
++def _mode(path: Path) -> int:
++    return stat.S_IMODE(path.stat().st_mode)
++
++
++def test_launchd_plist_keeps_the_backend_alive_on_a_fixed_port(tmp_path):
++    raw = ao.render_launchd_plist(hermes="/opt/h/bin/hermes", port=9147, home=tmp_path, log_path=tmp_path / "l.log")
++    plist = plistlib.loads(raw)
++    assert plist["Label"] == ao.LAUNCHD_LABEL
++    assert plist["KeepAlive"] is True and plist["RunAtLoad"] is True
++    assert plist["ProgramArguments"] == [
++        "/opt/h/bin/hermes", "always-on-dashboard", "run", "--port", "9147", "--hermes", "/opt/h/bin/hermes"]
++    assert plist["EnvironmentVariables"]["PATH"].startswith("/opt/h/bin:")
++    assert plist["ThrottleInterval"] >= 5
++
++
++def test_systemd_unit_restarts_after_any_exit():
++    unit = ao.render_systemd_unit(hermes="/home/u/.local/bin/hermes", port=9147, log_path=Path("/tmp/l.log"))
++    lines = unit.splitlines()
++    assert "Restart=always" in lines
++    assert "ExecStart=/home/u/.local/bin/hermes always-on-dashboard run --port 9147 --hermes /home/u/.local/bin/hermes" in lines
++    assert "WantedBy=default.target" in lines
++    assert any(line.startswith("RestartSec=") for line in lines)
++
++
++def test_credentials_persist_across_restarts_with_private_modes(home):
++    token, nonce = ao.ensure_credentials()
++    assert len(token) == 64 and len(nonce) == 16
++    assert ao.ensure_credentials() == (token, nonce)
++    assert _mode(ao.state_dir()) == 0o700
++    assert _mode(ao.state_dir() / "token") == 0o600
++
++
++def test_staged_token_passes_the_real_serve_validator(home):
++    from hermes_cli.main_dashboard import _read_ssh_session_token_file
++
++    token, nonce = ao.ensure_credentials()
++    path = ao.stage_token_file(token, nonce)
++    assert _read_ssh_session_token_file(str(path)) == token
++    assert not path.exists()  # serve consumes the one-shot copy; the persisted token stays
++    assert (ao.state_dir() / "token").read_text() == token
++
++
++def test_wait_for_update_clear_blocks_until_the_marker_goes(tmp_path):
++    marker = tmp_path / ".hermes-update-in-progress"
++    marker.write_text("x")
++    sleeps = []
++
++    def sleep(seconds):
++        sleeps.append(seconds)
++        if len(sleeps) == 3:
++            marker.unlink()
++
++    assert ao.wait_for_update_clear(marker, sleep=sleep) is True
++    assert len(sleeps) == 3
++    marker.write_text("x")
++    clock = iter([0.0, 0.0, 1000.0])
++    assert ao.wait_for_update_clear(marker, timeout_s=10, sleep=lambda s: None, now=lambda: next(clock)) is False
++
++
++def test_run_execs_the_isolated_ssh_backend_and_publishes_its_record(home, monkeypatch):
++    captured = {}
++
++    def fake_execve(path, argv, env):
++        captured.update(path=path, argv=argv, env=env)
++
++    monkeypatch.setattr(ao.os, "execve", fake_execve)
++    ao.cmd_run(argparse.Namespace(port=9147, hermes="/opt/h/bin/hermes"))
++    token, nonce = ao.ensure_credentials()
++    argv = captured["argv"]
++    assert captured["path"] == "/opt/h/bin/hermes"
++    assert argv[:7] == ["/opt/h/bin/hermes", "serve", "--isolated", "--host", "127.0.0.1", "--port", "9147"]
++    assert argv[argv.index("--ssh-owner-nonce") + 1] == nonce
++    token_path = Path(argv[argv.index("--ssh-session-token-file") + 1])
++    assert token_path.parent.name == ao.OWNERSHIP_ID and token_path.read_text() == token
++    assert captured["env"]["HERMES_DESKTOP"] == "1" and captured["env"][ao.ENV_FLAG] == "1"
++    record = ao.read_record()
++    assert record["pid"] == os.getpid() and record["port"] == 9147 and record["spawnNonce"] == nonce
++    assert record["hermesHome"] == str(home / ".hermes")
++
++
++def test_run_parser_is_registered_on_the_hermes_cli():
++    parser = argparse.ArgumentParser()
++    ao.build_always_on_dashboard_parser(parser.add_subparsers())
++    args = parser.parse_args(["always-on-dashboard", "run", "--port", "9150"])
++    assert args.func is ao.cmd_run and args.port == 9150
++
++
++class _Server:
++    should_exit = False
++
++
++def test_idle_exit_is_disabled_only_for_the_always_on_backend(monkeypatch):
++    import hermes_cli.web_server_idle_exit as idle
++
++    armed = []
++    monkeypatch.setattr(idle, "start_idle_watchdog", lambda server, tracker, grace_s: armed.append(grace_s))
++    monkeypatch.setattr(ws_mod, "load_config", dict)
++    monkeypatch.setattr(ws_mod.app.state, "ssh_isolated_clients", idle.IdleClientTracker(), raising=False)
++
++    monkeypatch.delenv(ao.ENV_FLAG, raising=False)
++    assert ws_mod._arm_ssh_isolated_idle_exit(_Server()) is True  # an ordinary Desktop-spawned SSH backend
++    assert armed == [idle.DEFAULT_IDLE_GRACE_S]
++
++    monkeypatch.setenv(ao.ENV_FLAG, "1")
++    assert ws_mod._arm_ssh_isolated_idle_exit(_Server()) is False  # the supervised always-on backend
++    assert armed == [idle.DEFAULT_IDLE_GRACE_S]
++    assert ao.ENV_FLAG not in os.environ  # dropped, so agent children never inherit it
++
++    monkeypatch.setattr(ws_mod.app.state, "ssh_isolated_clients", None, raising=False)
++    assert ws_mod._arm_ssh_isolated_idle_exit(_Server()) is False  # not SSH-isolated at all
+-- 
+2.55.0
+
