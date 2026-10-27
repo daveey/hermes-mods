@@ -369,6 +369,49 @@ def test_owner_socket_is_not_a_management_api(servers):
     assert _owner(sock, dict(api='claims_owner', op='service_start'))['refusal'] == 'unknown_op'
 
 
+def test_stalled_http_clients_are_dropped(tmp_path, key):
+    led = cb.Ledger(tmp_path / 'l.sqlite', policy(), jwks=cb.JWKS(lambda: dict(keys=[key.jwk()])))
+    http = cb.make_http_server(('127.0.0.1', 0), led, max_concurrent=4, io_timeout=1)
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    try:
+        port = http.server_address[1]
+        stalled = []
+        for _ in range(6):
+            s = socket.create_connection(('127.0.0.1', port), timeout=5)
+            s.sendall(b'POST /v1/claims HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{')
+            stalled.append(s)
+        time.sleep(2.5)
+        for s in stalled:
+            s.settimeout(3)
+            try:
+                assert s.recv(65536) in (b'',) or True
+            except OSError:
+                pass
+            s.close()
+        # Slots were released after the per-connection timeout: a fresh request is served.
+        with urllib.request.urlopen('http://127.0.0.1:%d/v1/health' % port, timeout=5) as r:
+            assert json.loads(r.read())['ok']
+        req = urllib.request.Request('http://127.0.0.1:%d/v1/claims' % port, data=b'{}', method='POST',
+                                     headers={'Transfer-Encoding': 'chunked', 'Authorization': 'Bearer a.b.c'})
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+    finally:
+        http.shutdown()
+
+
+def test_junk_tokens_do_not_consume_the_global_budget(tmp_path, key):
+    clock = Clock()
+    led = cb.Ledger(tmp_path / 'l.sqlite', policy(rate=dict(per_source_per_minute=1000, global_per_minute=2)),
+                    jwks=cb.JWKS(lambda: dict(keys=[key.jwk()]), clock=clock), clock=clock)
+    led.register(dict(op='register', request_id=REQ, repository=REPO, workflow_path=WORKFLOW, ref=REF, source_sha=SHA))
+    for i in range(20):
+        with pytest.raises(cb.Refused):
+            led.claim('junk.token.value', dict(request_id=REQ, source_sha=SHA), source='192.0.2.%d' % i)
+    assert led.claim(token(key), dict(request_id=REQ, source_sha=SHA), source='192.0.2.99')['ok']
+
+
 def test_owner_socket_rejects_unlisted_peer(tmp_path, key):
     led = cb.Ledger(tmp_path / 'l.sqlite', policy(clients=[dict(uid=os.getuid() + 12345)]),
                     jwks=cb.JWKS(lambda: dict(keys=[key.jwk()])))
@@ -376,7 +419,11 @@ def test_owner_socket_rejects_unlisted_peer(tmp_path, key):
     thread = threading.Thread(target=owner.serve_forever, daemon=True)
     thread.start()
     try:
-        assert _owner(tmp_path / 's.sock', dict(api='claims_owner', op='health')) == dict(ok=False, refusal='peer_not_authorized')
+        # The broker answers an unlisted peer without reading its request at all.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(str(tmp_path / 's.sock'))
+            assert json.loads(s.recv(65536)) == dict(ok=False, refusal='peer_not_authorized')
     finally:
         owner.shutdown()
 

@@ -51,6 +51,11 @@ INPUT_NAME = re.compile(r'[a-z][a-z0-9_]{0,63}')
 ARTIFACT_LIMITS = dict(zip_bytes=64 * 1024 * 1024, files=64, file_bytes=48 * 1024 * 1024,
                        total_bytes=96 * 1024 * 1024)
 RESERVED_INPUTS = ('request_id', 'source_sha')
+# reconcile leaves a 'dispatching' record to its submitter for this long (crash recovery after).
+DISPATCH_GRACE_SECONDS = 300
+# An unknown_outcome request may be explicitly retried only after this long with no run carrying
+# its request ID and no claim recorded, so an accepted-but-slow dispatch cannot run twice.
+UNKNOWN_RETRY_WINDOW_SECONDS = 3600
 
 
 class JobError(Exception):
@@ -142,16 +147,40 @@ def load_dispatch_runtime(raw):
 # ------------------------------------------------------------------ artifact safety
 
 def safe_extract(blob, destination, *, limits=ARTIFACT_LIMITS):
-    """Extract a zip into an empty private directory, refusing unsafe members.
+    """Extract a zip into a private directory, refusing unsafe members.
 
     Rejects absolute paths, ``..``, backslashes, drive letters, symlinks/special
-    files, duplicate names, too many files, oversized members, inflated totals and
-    entries whose declared size differs from the inflated byte count.
+    files, duplicate names, file/directory conflicts, too many files, oversized
+    members, inflated totals and entries whose declared size differs from the
+    inflated byte count. Extraction happens in a fresh temporary sibling that is
+    atomically renamed into place, so a crash or refusal never leaves a partial
+    destination; a previous (job-owned) destination is replaced after a full pass.
+    Every filesystem error is reported as ArtifactError.
     """
+    import shutil
+    import tempfile
     if len(blob) > limits['zip_bytes']:
         raise ArtifactError('artifact_too_large')
     destination = Path(destination)
-    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+    try:
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix='.extract-', dir=destination.parent))
+    except OSError:
+        raise ArtifactError('artifact_extract_failed') from None
+    try:
+        written = _extract_into(blob, staging, limits)
+        if destination.exists():
+            shutil.rmtree(destination)
+        os.rename(staging, destination)
+        return written
+    except OSError:
+        raise ArtifactError('artifact_extract_failed') from None
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _extract_into(blob, destination, limits):
     try:
         archive = zipfile.ZipFile(io.BytesIO(blob))
     except zipfile.BadZipFile:
@@ -168,7 +197,7 @@ def safe_extract(blob, destination, *, limits=ARTIFACT_LIMITS):
         mode = (info.external_attr >> 16) & 0o170000
         if mode and mode not in (stat.S_IFREG, stat.S_IFDIR):
             raise ArtifactError('artifact_unsafe_type')
-        if name in names:
+        if name in names or name.rstrip('/') in {n.rstrip('/') for n in names}:
             raise ArtifactError('artifact_duplicate_name')
         names.add(name)
         if info.is_dir():
@@ -178,6 +207,11 @@ def safe_extract(blob, destination, *, limits=ARTIFACT_LIMITS):
         total += info.file_size
         if total > limits['total_bytes']:
             raise ArtifactError('artifact_too_large')
+    files = {n for n in names if not n.endswith('/')}
+    for n in names:
+        parts = n.rstrip('/').split('/')
+        if any('/'.join(parts[:i]) in files for i in range(1, len(parts))):
+            raise ArtifactError('artifact_path_conflict')
     root = destination.resolve()
     for info in infos:
         target = (destination / info.filename).resolve()
@@ -233,6 +267,8 @@ def verify_provenance(files, root, job):
     listed = manifest.get('files')
     if not isinstance(listed, dict) or not listed:
         raise ArtifactError('provenance_invalid')
+    if set(listed) != set(files) - {'provenance.json'}:
+        raise ArtifactError('artifact_unlisted_or_missing_file')
     for name, digest in listed.items():
         if name not in files or files[name]['sha256'] != digest:
             raise ArtifactError('artifact_checksum_mismatch')
@@ -346,14 +382,16 @@ class JobDomain:
 
     def _load(self, job_id):
         with self._db() as db:
-            row = db.execute('SELECT payload, state FROM jobs_domain_requests WHERE id=?', (job_id,)).fetchone()
+            row = db.execute('SELECT payload, state, updated_at FROM jobs_domain_requests WHERE id=?', (job_id,)).fetchone()
         if row is None:
             raise JobError('not_found', 'job_not_found')
         record = json.loads(row[0])
         record['state'] = row[1]
+        record['_updated_at'] = row[2]
         return record
 
     def _save(self, record, *, expect_state=None):
+        record.pop('_updated_at', None)
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
             try:
@@ -628,31 +666,46 @@ class JobDomain:
 
     def reconcile(self, job_id):
         record = self._load(job_id)
+        loaded_at = record.pop('_updated_at', None)
         if record['state'] in ('rejected', 'rejected_pre_dispatch', 'intent'):
             return self._response(record) if record['state'] != 'rejected' else None
+        if record['state'] == 'dispatching' and self.clock() - (loaded_at or 0) < DISPATCH_GRACE_SECONDS:
+            return self._response(record)  # the submitter still owns this transition
         job, private = record['job'], self.runtime['workflows'][record['job']['workflow_id']]
         before = json.dumps(record, sort_keys=True)
         self._bind_run(record)
         if job['provider_run_id'] is not None:
-            run = self.github.run(private['credential_ref'], record['repository'], job['provider_run_id'])
-            title = str(run.get('display_title', ''))
-            if ('[%s]' % job['request_id']) not in title:
+            cred, repo = private['credential_ref'], record['repository']
+            run = self.github.run(cred, repo, job['provider_run_id'])
+            if ('[%s]' % job['request_id']) not in str(run.get('display_title', '')):
                 raise JobError('owner_conflict', 'run_request_mismatch')
-            job['attempt'] = int(run['run_attempt'])
-            job['workflow_ref_sha'] = run['head_sha'] if SHA.fullmatch(str(run.get('head_sha', ''))) else None
+            latest = int(run['run_attempt'])
             claim = (self.claims.status(job['request_id']) or {}).get('claim')
             record['claim'] = claim
+            if claim and str(claim['run_id']) != job['provider_run_id']:
+                record['claim_run_mismatch'] = str(claim['run_id'])
+                claim = None
+            # Track the attempt that holds the claim, never "latest". Later attempts are refused
+            # by the broker and are reported separately.
+            if claim:
+                attempt = int(claim['run_attempt'])
+                record['refused_attempts'] = list(range(attempt + 1, latest + 1))
+                if attempt != latest:
+                    run = self.github.run_attempt(cred, repo, job['provider_run_id'], attempt)
+            else:
+                attempt = latest
+            job['attempt'] = attempt
+            job['workflow_ref_sha'] = run['head_sha'] if SHA.fullmatch(str(run.get('head_sha', ''))) else None
             status = run.get('status')
             if status == 'completed':
                 job['status'] = 'concluded'
                 conclusion = run.get('conclusion')
                 job['conclusion'] = conclusion if conclusion in ('success', 'failure', 'cancelled', 'timed_out') else 'unknown'
             elif status in ('in_progress',):
-                job['status'] = 'running'
+                job['status'], job['conclusion'] = 'running', None
             else:
-                job['status'] = 'queued'
-            jobs = self.github.run_jobs(private['credential_ref'], record['repository'], job['provider_run_id'],
-                                        job['attempt'])
+                job['status'], job['conclusion'] = 'queued', None
+            jobs = self.github.run_jobs(cred, repo, job['provider_run_id'], attempt)
             if jobs:
                 gh_job = jobs[0]
                 job['provider_job_id'] = str(gh_job['id'])
@@ -661,22 +714,27 @@ class JobDomain:
                                                                     self._workflow(job['workflow_id'])[0]['scope_id'],
                                                                     str(gh_job['runner_id']))
                 record['runner_name'] = str(gh_job.get('runner_name') or '')[:120]
-            if job['status'] == 'concluded' and not record.get('artifacts_checked'):
+            if job['status'] == 'concluded' and claim and not record.get('artifacts_checked'):
                 self._collect_artifacts(record)
+            elif job['status'] == 'concluded' and not claim and not record.get('artifacts_checked'):
+                # No attempt ever held the claim, so nothing was built: there is no artifact to trust.
+                record['artifact_details'] = [dict(state='none', reason='no_execution_claim')]
+                record['artifacts_checked'] = True
             if record['state'] in ('unknown_outcome', 'dispatched', 'dispatching'):
                 record['state'] = 'tracked'
                 record['history'].append(dict(at=self.clock(), state='tracked'))
         if json.dumps(record, sort_keys=True) != before:
             with self._db() as db:
-                db.execute('UPDATE jobs_domain_requests SET payload=?, state=?, updated_at=? WHERE id=?',
-                           (json.dumps(record), record['state'], self.clock(), job['id']))
+                # Optimistic: discard this pass if anyone else wrote the record meanwhile.
+                db.execute('UPDATE jobs_domain_requests SET payload=?, state=?, updated_at=? WHERE id=? AND updated_at=?',
+                           (json.dumps(record), record['state'], self.clock(), job['id'], loaded_at))
         return self._response(record)
 
     def _collect_artifacts(self, record):
         job, private = record['job'], self.runtime['workflows'][record['job']['workflow_id']]
         expected = '%s%s' % (private['artifact_name_prefix'], job['request_id'])
         listed = self.github.artifacts(private['credential_ref'], record['repository'], job['provider_run_id'])
-        details = []
+        details, artifacts, transient = [], [], False
         for item in listed:
             if item.get('name') != expected:
                 continue
@@ -685,29 +743,39 @@ class JobDomain:
                         source_sha=None, source_digest=None, provider_run_id=job['provider_run_id'],
                         attempt=job['attempt'], toolchain_observation_ids=[])
             provider_digest = item.get('digest')
+            placeholder = provider_digest if _is_digest(provider_digest) else 'sha256:' + '0' * 64
             if item.get('expired'):
-                job['artifacts'].append(dict(base, digest=provider_digest if _is_digest(provider_digest) else 'sha256:' + '0' * 64,
-                                             state='expired'))
+                artifacts.append(dict(base, digest=placeholder, state='expired'))
                 details.append(dict(id=artifact_id, state='expired', reason='artifact_expired_not_rebuilt'))
                 continue
             try:
                 blob = self.github.download_artifact(private['credential_ref'], record['repository'], item['id'],
                                                      ARTIFACT_LIMITS['zip_bytes'])
+            except ArtifactError as exc:
+                if str(exc) == 'artifact_expired':
+                    artifacts.append(dict(base, digest=placeholder, state='expired'))
+                    details.append(dict(id=artifact_id, state='expired', reason='artifact_expired_not_rebuilt'))
+                    continue
+                transient = True  # download failures are retried by a later reconcile
+                details.append(dict(id=artifact_id, state='pending', reason=str(exc)))
+                continue
+            try:
                 digest = 'sha256:' + hashlib.sha256(blob).hexdigest()
                 if not _is_digest(provider_digest) or provider_digest != digest:
                     raise ArtifactError('artifact_digest_mismatch')
                 root = self.artifact_root / job['id'] / artifact_id
                 files = safe_extract(blob, root)
                 provenance = verify_provenance(files, root, job)
-                job['artifacts'].append(dict(base, digest=digest, state='available', source_sha=job['source_sha'],
-                                             size_bytes=len(blob)))
+                artifacts.append(dict(base, digest=digest, state='available', source_sha=job['source_sha'],
+                                      size_bytes=len(blob)))
                 details.append(dict(id=artifact_id, state='verified', path=str(root), **provenance))
             except ArtifactError as exc:
-                job['artifacts'].append(dict(base, digest=provider_digest if _is_digest(provider_digest) else 'sha256:' + '0' * 64,
-                                             state='unknown'))
+                artifacts.append(dict(base, digest=placeholder, state='unknown'))
                 details.append(dict(id=artifact_id, state='rejected', reason=str(exc)))
         record['artifact_details'] = details
-        record['artifacts_checked'] = True
+        if not transient:
+            job['artifacts'] = artifacts
+            record['artifacts_checked'] = True
 
     def details(self, job_id):
         """Owner-side evidence view (not a contract response)."""
@@ -722,6 +790,16 @@ class JobDomain:
         record = self._load(job_id)
         if record['job']['status'] not in ('concluded', 'unknown_outcome', 'cancelled'):
             raise JobError('owner_conflict', 'job_still_active')
+        if record['job']['status'] == 'unknown_outcome':
+            self.reconcile(job_id)
+            record = self._load(job_id)
+            with self._db() as db:
+                row = db.execute('SELECT at FROM jobs_domain_dispatch_calls WHERE request_id=?',
+                                 (record['job']['request_id'],)).fetchone()
+            claim = (self.claims.status(record['job']['request_id']) or {}).get('claim')
+            if (record['job']['provider_run_id'] is not None or claim is not None or row is None
+                    or self.clock() - row[0] < UNKNOWN_RETRY_WINDOW_SECONDS):
+                raise JobError('unknown_outcome', 'outcome_still_unknown_reconcile_first', retryable=True)
         workflow, _private = self._workflow(record['job']['workflow_id'])
         inputs = [dict(input_id=k, value=v) for k, v in record.get('request_inputs', [])]
         response = self.submit(dict(workflow_id=workflow['id'], source_sha=record['job']['source_sha'], inputs=inputs,
@@ -788,32 +866,39 @@ class GitHubDispatchPort:
     def _json(self, ref, path):
         try:
             status, _headers, raw = self._request(ref, 'GET', path)
-        except (OSError, TimeoutError):
+            if status != 200:
+                raise DispatchUnknown()
+            return json.loads(raw)
+        except (OSError, TimeoutError, ValueError, ArtifactError):
             raise DispatchUnknown() from None
-        if status != 200:
-            raise DispatchUnknown()
-        return json.loads(raw)
 
     def source_reachable(self, ref, repository, trusted_ref, sha):
         branch = trusted_ref[len('refs/heads/'):]
         info = self._json(ref, '/repos/%s/branches/%s' % (repository, branch))
         if info.get('protected') is not True:
             return 'ref_not_protected'
-        try:
-            status, _h, raw = self._request(ref, 'GET', '/repos/%s/compare/%s...%s' % (repository, sha, info['commit']['sha']))
-        except (OSError, TimeoutError):
-            raise DispatchUnknown() from None
-        if status == 404:
-            return 'source_not_reachable_from_trusted_ref'
-        if status != 200:
+        head = (info.get('commit') or {}).get('sha')
+        if not isinstance(head, str) or not SHA.fullmatch(head) or not SHA.fullmatch(sha):
             raise DispatchUnknown()
-        compare = json.loads(raw)
-        if compare.get('status') in ('ahead', 'identical') and compare.get('merge_base_commit', {}).get('sha') == sha:
+        try:
+            status, _h, raw = self._request(ref, 'GET', '/repos/%s/compare/%s...%s' % (repository, sha, head))
+            if status == 404:
+                return 'source_not_reachable_from_trusted_ref'
+            if status != 200:
+                raise DispatchUnknown()
+            compare = json.loads(raw)
+        except (OSError, TimeoutError, ValueError, ArtifactError):
+            raise DispatchUnknown() from None
+        if compare.get('status') in ('ahead', 'identical') and (compare.get('merge_base_commit') or {}).get('sha') == sha:
             return 'reachable'
         return 'source_not_reachable_from_trusted_ref'
 
     def dispatch(self, ref, repository, workflow_path, git_ref, inputs):
         name = workflow_path.rsplit('/', 1)[-1]
+        try:
+            self.resolve(ref)  # nothing has been sent yet: a credential failure is a definite rejection
+        except Exception:
+            raise DispatchRejected('credential_unavailable') from None
         try:
             status, headers, raw = self._request(ref, 'POST', '/repos/%s/actions/workflows/%s/dispatches' % (repository, name),
                                                  dict(ref=git_ref, inputs=inputs, return_run_details=True))
@@ -839,6 +924,9 @@ class GitHubDispatchPort:
 
     def run(self, ref, repository, run_id):
         return self._json(ref, '/repos/%s/actions/runs/%s' % (repository, run_id))
+
+    def run_attempt(self, ref, repository, run_id, attempt):
+        return self._json(ref, '/repos/%s/actions/runs/%s/attempts/%d' % (repository, run_id, int(attempt)))
 
     def run_jobs(self, ref, repository, run_id, attempt):
         body = self._json(ref, '/repos/%s/actions/runs/%s/attempts/%s/jobs' % (repository, run_id, attempt))

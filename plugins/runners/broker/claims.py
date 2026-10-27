@@ -347,10 +347,13 @@ class Ledger:
 
     def claim(self, token, body, *, source='unknown'):
         rate = self.policy['rate']
-        if not self.rates.allow('global', rate['global_per_minute']) or not self.rates.allow(
-                'source:' + source, rate['per_source_per_minute']):
+        # Per-source before verification; the global bucket is charged only for verified tokens,
+        # so junk from a few sources cannot starve real claims.
+        if not self.rates.allow('source:' + source, rate['per_source_per_minute']):
             raise Refused('rate_limited', 429)
         claims = verify_token(token, jwks=self.jwks, audience=self.policy['audience'], now=self.clock())
+        if not self.rates.allow('global', rate['global_per_minute']):
+            raise Refused('rate_limited', 429)
         if not isinstance(body, dict) or set(body) - {'request_id', 'source_sha'}:
             raise Refused('invalid_request', 400)
         rid, sha = body.get('request_id'), body.get('source_sha')
@@ -432,8 +435,9 @@ def peer_uid(conn):
 class OwnerSocket:
     """Intent/status API for the owner gateway only; never routes management."""
 
-    def __init__(self, path, ledger, *, socket_mode=0o666):
+    def __init__(self, path, ledger, *, socket_mode=0o666, max_concurrent=8):
         self.path, self.ledger = path, ledger
+        self._slots = threading.BoundedSemaphore(max_concurrent)
         if os.path.exists(path):
             os.unlink(path)
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -451,15 +455,17 @@ class OwnerSocket:
         try:
             conn.settimeout(10)
             uid = peer_uid(conn)
+            if not any(c['uid'] == uid for c in self.ledger.policy['clients']):
+                # Refuse before reading anything from an unlisted peer.
+                conn.sendall(json.dumps(dict(ok=False, refusal='peer_not_authorized')).encode())
+                return
             data = b''
             while len(data) <= MAX_SOCKET_REQUEST:
                 chunk = conn.recv(65536)
                 if not chunk:
                     break
                 data += chunk
-            if not any(c['uid'] == uid for c in self.ledger.policy['clients']):
-                result = dict(ok=False, refusal='peer_not_authorized')
-            elif len(data) > MAX_SOCKET_REQUEST:
+            if len(data) > MAX_SOCKET_REQUEST:
                 result = dict(ok=False, refusal='request_too_large')
             else:
                 try:
@@ -476,6 +482,7 @@ class OwnerSocket:
             pass
         finally:
             conn.close()
+            self._slots.release()
 
     def serve_forever(self):
         while not self._stop.is_set():
@@ -487,6 +494,9 @@ class OwnerSocket:
                 if self._stop.is_set():
                     break
                 raise
+            if not self._slots.acquire(blocking=False):
+                conn.close()
+                continue
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def shutdown(self):
@@ -498,10 +508,11 @@ class OwnerSocket:
                 os.unlink(self.path)
 
 
-def make_http_server(address, ledger):
+def make_http_server(address, ledger, *, max_concurrent=32, io_timeout=10):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'hermes-runners-claims/1'
         sys_version = ''
+        timeout = io_timeout  # per-connection socket timeout: slow/stalled clients are dropped
 
         def log_message(self, *args):  # no request logging of headers/tokens
             pass
@@ -524,7 +535,12 @@ def make_http_server(address, ledger):
             if self.path != '/v1/claims':
                 return self._send(404, dict(ok=False, refusal='not_found'))
             try:
-                length = int(self.headers.get('Content-Length', '-1'))
+                if self.headers.get('Transfer-Encoding') is not None:
+                    raise Refused('invalid_request', 400)
+                try:
+                    length = int(self.headers.get('Content-Length', '-1'))
+                except ValueError:
+                    raise Refused('invalid_request', 400) from None
                 auth = self.headers.get('Authorization', '')
                 if not 0 < length <= MAX_BODY:
                     raise Refused('invalid_request', 400)
@@ -539,11 +555,28 @@ def make_http_server(address, ledger):
             except Refused as exc:
                 self._send(exc.status, dict(ok=False, refusal=exc.code))
             except (sqlite3.Error, OSError):
-                self._send(503, dict(ok=False, refusal='ledger_unavailable'))
+                try:
+                    self._send(503, dict(ok=False, refusal='ledger_unavailable'))
+                except OSError:
+                    pass
+
+    slots = threading.BoundedSemaphore(max_concurrent)
 
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         request_queue_size = 32
+
+        def process_request(self, request, client_address):
+            if not slots.acquire(blocking=False):
+                self.shutdown_request(request)
+                return
+            super().process_request(request, client_address)
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                slots.release()
 
     server = Server(address, Handler)
     server.timeout = 10

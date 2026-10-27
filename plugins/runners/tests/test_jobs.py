@@ -88,6 +88,7 @@ class FakeGitHub:
     def __init__(self, domain_box):
         self.box = domain_box
         self.dispatches, self.runs, self.jobs, self.artifact_list, self.blobs = [], {}, {}, {}, {}
+        self.attempts = {}
         self.mode, self.reachable, self.return_run_id = 'ok', 'reachable', True
         self.seen_state = []
 
@@ -120,6 +121,9 @@ class FakeGitHub:
 
     def run(self, cred, repo, run_id):
         return dict(self.runs[str(run_id)])
+
+    def run_attempt(self, cred, repo, run_id, attempt):
+        return dict(self.attempts[(str(run_id), int(attempt))])
 
     def run_jobs(self, cred, repo, run_id, attempt):
         return self.jobs.get((str(run_id), int(attempt)), [])
@@ -377,16 +381,63 @@ def test_retry_attempts_and_crashed_winner_need_a_new_request(env):
     job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
     old_rid = env.domain.details(job_id)['job']['request_id']
     env.claims.claim[old_rid] = dict(run_id='9001', run_attempt='1', claim_id='claim_a')
-    # The winning attempt crashed; someone re-ran it in GitHub (attempt 2 cannot claim, so it fails).
+    # The winning attempt crashed (failure); someone re-ran it in GitHub (attempt 2 cannot claim).
     env.github.runs['9001'].update(status='completed', conclusion='failure', run_attempt=2)
-    env.github.jobs[('9001', 2)] = [dict(id=1, runner_id=23, runner_name='example-mini')]
+    env.github.attempts[('9001', 1)] = dict(env.github.runs['9001'], run_attempt=1, conclusion='failure')
+    env.github.jobs[('9001', 1)] = [dict(id=1, runner_id=23, runner_name='example-mini')]
     data = env.domain.reconcile(job_id)['data']
-    assert (data['attempt'], data['status'], data['conclusion']) == (2, 'concluded', 'failure')
+    # Exact attempt: the one holding the claim, not the latest re-run.
+    assert (data['attempt'], data['status'], data['conclusion']) == (1, 'concluded', 'failure')
+    assert env.domain._load(job_id)['refused_attempts'] == [2]
     assert env.domain.details(job_id)['claim']['run_attempt'] == '1'
     retried = env.domain.retry(job_id, principal=PRINCIPAL, idempotency_key='idem_' + '7' * 32)
     new = env.domain.details(retried['data']['id'])
     assert new['job']['request_id'] != old_rid and len(env.github.dispatches) == 2
     assert env.github.dispatches[1]['inputs']['request_id'] == new['job']['request_id']
+
+
+def test_rerun_of_successful_attempt_keeps_winning_attempt_and_artifact(env):
+    job_id = concluded(env)
+    env.github.runs['9001'].update(run_attempt=2, conclusion='failure')  # attempt 2 refused at claim
+    env.github.attempts[('9001', 1)] = dict(env.github.runs['9001'], run_attempt=1, conclusion='success')
+    data = env.domain.reconcile(job_id)['data']
+    assert (data['attempt'], data['conclusion']) == (1, 'success')
+    assert data['artifacts'][0]['state'] == 'available' and data['artifacts'][0]['attempt'] == 1
+
+
+def test_unclaimed_concluded_run_has_no_trusted_artifact(env):
+    job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    env.github.runs['9001'].update(status='completed', conclusion='failure')
+    env.domain.reconcile(job_id)
+    assert env.domain.details(job_id)['artifact_details'] == [dict(state='none', reason='no_execution_claim')]
+
+
+def test_unknown_outcome_retry_waits_for_reconcile_window(env):
+    env.github.mode = 'timeout'
+    job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    env.github.mode = 'ok'
+    assert code_of(lambda: env.domain.retry(job_id, principal=PRINCIPAL, idempotency_key='idem_' + '7' * 32)) == (
+        'unknown_outcome', 'outcome_still_unknown_reconcile_first')
+    env.now += J.UNKNOWN_RETRY_WINDOW_SECONDS + 1
+    retried = env.domain.retry(job_id, principal=PRINCIPAL, idempotency_key='idem_' + '7' * 32)
+    assert retried['data']['id'] != job_id and len(env.github.dispatches) == 2
+
+
+def test_reconcile_leaves_fresh_dispatching_record_to_submitter(env):
+    calls = []
+    original = env.github.dispatch
+
+    def racing_dispatch(*args):
+        # A concurrent GET reconciles while the submitter is mid-dispatch.
+        rid = args[-1]['request_id']
+        with env.domain._db() as db:
+            jid = db.execute('SELECT id FROM jobs_domain_requests WHERE payload LIKE ?', ('%' + rid + '%',)).fetchone()[0]
+        calls.append(env.domain.reconcile(jid)['data']['status'])
+        return original(*args)
+    env.github.dispatch = racing_dispatch
+    result = env.domain.submit(env.request(), principal=PRINCIPAL)
+    assert calls == ['queued'] and result['data']['provider_run_id'] == '9001'
+    assert env.domain.details(result['data']['id'])['state'] == 'dispatched'
 
 
 def test_retry_refused_while_active(env):
@@ -419,13 +470,13 @@ def make_zip(entries, *, symlink=None):
     return buf.getvalue()
 
 
-def provenance_zip(job, **overrides):
+def provenance_zip(job, extra=None, **overrides):
     binary = b'\xcf\xfa\xed\xfe example binary'
     manifest = dict(request_id=job['request_id'], source_sha=job['source_sha'], run_id=job['provider_run_id'],
                     run_attempt=str(job['attempt']), workflow_sha=WSHA, exit_status=0, runner_name='example-mini',
                     toolchain='Swift version 6.0 (example)', files={'bin/canary': hashlib.sha256(binary).hexdigest()})
     manifest.update(overrides)
-    return make_zip({'bin/canary': binary, 'provenance.json': json.dumps(manifest)})
+    return make_zip(dict({'bin/canary': binary, 'provenance.json': json.dumps(manifest)}, **(extra or {})))
 
 
 def concluded(env, blob=None, expired=False, digest=None):
@@ -433,6 +484,7 @@ def concluded(env, blob=None, expired=False, digest=None):
     env.github.runs['9001'].update(status='completed', conclusion='success')
     env.github.jobs[('9001', 1)] = [dict(id=1, runner_id=23, runner_name='example-mini')]
     job = dict(env.domain.details(job_id)['job'], provider_run_id='9001', attempt=1)
+    env.claims.claim[job['request_id']] = dict(run_id='9001', run_attempt='1', claim_id='claim_a')
     blob = provenance_zip(job) if blob is None else (blob(job) if callable(blob) else blob)
     env.github.blobs[42] = blob
     env.github.artifact_list['9001'] = [dict(id=42, name='canary-' + job['request_id'], size_in_bytes=len(blob),
@@ -477,11 +529,41 @@ def test_expired_artifact_is_reported_never_rebuilt(env):
     (lambda job: provenance_zip(job, run_attempt='2'), 'provenance_mismatch'),
     (lambda job: provenance_zip(job, files={'bin/canary': '0' * 64}), 'artifact_checksum_mismatch'),
     (lambda job: make_zip({'bin/canary': 'x'}), 'provenance_missing'),
+    (lambda job: make_zip({'a': 'x', 'a/b': 'y'}), 'artifact_path_conflict'),
+    (lambda job: make_zip({'a/': '', 'a': 'y'}), 'artifact_duplicate_name'),
+    (lambda job: provenance_zip(job, extra={'extra.sh': 'x'}), 'artifact_unlisted_or_missing_file'),
 ])
 def test_unsafe_or_mismatched_artifacts_are_rejected(env, build, reason):
     job_id = concluded(env, blob=build)
     env.domain.reconcile(job_id)
     assert env.domain.details(job_id)['artifact_details'][0]['reason'] == reason
+
+
+def test_transient_artifact_download_is_retried_not_final(env):
+    job_id = concluded(env)
+    blobs, env.github.blobs = env.github.blobs, {}
+    original = env.github.download_artifact
+
+    def failing(*a):
+        raise J.ArtifactError('artifact_download_failed')
+    env.github.download_artifact = failing
+    env.domain.reconcile(job_id)
+    assert env.domain.details(job_id)['artifact_details'][0]['state'] == 'pending'
+    assert env.domain._load(job_id).get('artifacts_checked') is None
+    env.github.blobs, env.github.download_artifact = blobs, original
+    data = env.domain.reconcile(job_id)['data']
+    assert data['artifacts'][0]['state'] == 'available'
+
+
+def test_safe_extract_is_atomic_and_replaces_previous_destination(tmp_path):
+    dest = tmp_path / 'job' / 'artifact'
+    J.safe_extract(make_zip({'a.txt': 'one'}), dest)
+    with pytest.raises(J.ArtifactError):
+        J.safe_extract(make_zip({'../x': 'bad'}), dest)
+    assert (dest / 'a.txt').read_text() == 'one'  # refusal leaves the previous verified copy intact
+    J.safe_extract(make_zip({'b.txt': 'two'}), dest)
+    assert sorted(p.name for p in dest.iterdir()) == ['b.txt']
+    assert [p.name for p in (tmp_path / 'job').iterdir()] == ['artifact']  # no staging leftovers
 
 
 def test_safe_extract_detects_size_lies(tmp_path):
