@@ -288,5 +288,6 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 |---|---|---|
 | [Process and CI followups](process-ci-test-followups.md) | 0327 0332 0333 0337 0354 0374–0375 | Readiness, duplicate deadline identities, curl detection fallback and bounded fast-check lane. |
 | [Session start requests](session-start-requests.md) | 0376–0377 | Trusted metadata, authenticated SSH principal and persisted-owner preservation. |
+| [Session-start toolset allowlist](session-start-toolsets.md) | 0461 | A durable start can pin a closed toolset allowlist (validated, persisted, kept across resume, compression and branches; reloads cannot widen it). Runners repair chats use it to get only the runners tools. |
 
 Latest appended range (0454–0456): [456-patch verification](mirror-456-verification.md); before that (0402–0453): [453-patch verification](mirror-453-verification.md). Current full-series apply instructions and executed tests: [390-patch verification](mirror-390-verification.md). Historical adaptations, duplicate treatment and broader prior tests: [377-patch verification](mirror-377-verification.md).

@@ -42,6 +42,8 @@ import uuid
 from .models import validate
 
 NAMESPACE = 'runners'
+# Repair chats get only these toolsets (runners_* tools, clarify, todo); see core session-start toolsets.
+REPAIR_TOOLSETS = ('runners', 'clarify', 'todo')
 MAX_ACTIVE = 100
 # Two absent core reads this far apart retire an old-revision reservation.
 ABSENT_GRACE_SECONDS = 60
@@ -367,8 +369,14 @@ class RepairService:
                     if row is None:
                         raise KeyError('not_found')
                     brief = json.loads(self._row(db, row['id'], principal)['brief'])
-                return StartIntent(title=brief['title'], text=brief['text'], source='desktop',
-                                   metadata={'runner_repair_id': row['id']})
+                try:
+                    # Closed allowlist enforced by core for the whole session lineage: no terminal, sudo,
+                    # files, delegation or kanban, so the agent cannot go around the broker.
+                    return StartIntent(title=brief['title'], text=brief['text'], source='desktop',
+                                       metadata={'runner_repair_id': row['id']}, toolsets=list(REPAIR_TOOLSETS))
+                except TypeError as exc:
+                    # An older core would silently start a full-toolset chat: refuse instead.
+                    raise RuntimeError('repair_toolsets_unsupported: core cannot restrict repair chats') from exc
 
             unregister = core.register(owner, NAMESPACE, resolve)
             self._registrations[key] = (owner, core, unregister)
