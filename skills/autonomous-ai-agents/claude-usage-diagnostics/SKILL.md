@@ -68,6 +68,40 @@ Probe **all models on all credentials** and report the matrix. Partial availabil
 - Require combined recovery and unload/reload tests before recommending activation: verify selected-account wire identity, cooldown preservation, long-reset rotation/fallback, and both installers active. Never bypass compatibility by indiscriminately unwrapping `__wrapped__` or accepting new hashes; explicitly audit supported wrapper composition and reject foreign wrappers.
 - Distinguish on-disk implementation, fresh-process discovery, and activation in the owning live gateway/compute child. A mocked browser harness proves UI interactions, not native-app deployment or real provider dispatch.
 
+### 3c. "Codex provider quota exhausted" even though a fallback is configured
+
+- **The surfaced error is the primary's, not the real failure.** When every fallback entry fails, session init and cron resolve re-raise the primary AuthError and log the fallback's exception at debug level at most. Don't explain the toast as "Codex is out". Find out why the fallback failed.
+- **Read `fallback_providers` on every host and profile** (`sed -n '/^fallback_providers:/,/^[a-z]/p' config.yaml`). An entry that repeats the primary provider, or `fallback_providers: []`, means there is no real fallback. Prepend a working route (back up the file first), then prove it with `hermes chat --oneshot --ignore-rules -t '' --max-turns 1 -Q -q 'Reply with exactly: fb-ok'`. Expect "switching to fallback: <provider>" followed by `fb-ok`. Leave profiles with an explicit `[]` alone; that is a deliberate pin.
+- **Re-run the resolver in-process to tell transient from config.** Use the gateway's venv python with `sys.path.insert(0, <hermes-agent>); import hermes_bootstrap` before importing `tui_gateway.server` or `cron.scheduler`, because bare imports miss the bootstrap's site setup. Then call `_resolve_agent_model_runtime(model_override, provider_override)` or `_resolve_job_runtime(job, id, _load_cron_job_config(...))`. If it resolves to the fallback now, the earlier failure was transient and its cause was lost.
+- **Release cron quota holds after fixing the chain.** The re-raised primary 429 makes cron park jobs for the full Codex window (`quota_hold_until` in `cron/jobs.json`). Re-setting the same schedule clears the hold: `hermes cron edit <id> --schedule "<current schedule>"`. Then check `Next run` in `hermes cron list`.
+
+### 3d. The default model changed by itself while a provider was exhausted
+
+- **Symptom:** `model.default` and `provider` flip to another provider's model, for example to
+  `claude-sonnet-5` with `base_url` and `api_mode` written as well. No session asked for that model.
+- **Mechanism:** when every credential of the main provider is exhausted and no fallback works, Desktop opens its
+  provider picker. It looks like a first run ("getting started").
+  - Choosing an already signed-in provider there finishes at once. Anthropic is an `external` flow, so
+    "I've signed in" succeeds immediately.
+  - Desktop then saves that provider's recommended default (`GET /api/model/recommended-default?provider=<slug>`)
+    through `POST /api/model/set` before the confirm card appears. See `completeWithModelConfirm` in
+    `apps/desktop/src/store/onboarding.ts`; this applies unless your core defers that write until the user
+    confirms.
+- **Rule out agents first:** search `state.db` `messages.tool_calls` in the window for the model id,
+  `api/model/set` and `model.default`.
+- **The backend doesn't log model saves,** so time a flip from config history instead. Per-host config snapshots
+  from a sync tool (`git log -p -- <host>/config.yaml`) bracket each write. A shared-config re-apply that reverts
+  the flip within one sync interval is that tool working as designed, not a second bug.
+- **Prevention:** a working `fallback_providers` entry keeps `setup.runtime_check` ready, because it runs the
+  session resolver including the fallback chain. The picker then doesn't open.
+- **Log scans must stay bounded.** Desktop logs rotate at about 10 MB each (`gui.log*`, `desktop.log*`; `agent.log*`
+  is about 5 MB).
+  - Scanning several time windows across every rotation with awk in one call hit the 420 s tool timeout, which
+    silently ended the turn.
+  - First check `ls -la` sizes and each file's first and last timestamp. Then `rg` only the covering file with an
+    anchored timestamp regex such as `'^2026-10-26 (15:0[3-9]|15:1[0-7])'`.
+  - `desktop.log` records backend events, not renderer requests, so there is no request log for `/api/model/set`.
+
 ### 4. Find what burned the quota
 
 Grep transcripts for 429 `task-notification` storms — each names a dead subagent and its model. A parallel subagent fleet pinned to one model can drain that model's weekly bucket in a day. `ps aux` shows which desktop sessions are open and their `--model` flags; an idle session spends nothing, so only sessions actively retrying or spawning count.
@@ -99,5 +133,5 @@ Grep transcripts for 429 `task-notification` storms — each names a dead subage
 ## User-specific rules
 
 - No account-swap CLIs (claude-swap/cswap were deliberately removed). The Hermes credential pool (`hermes auth add anthropic`) is the sanctioned multi-account path; do not suggest or reinstall swapping tools.
-- The user's Max plans in the Hermes pool are the primary Claude path. Fix or explain the pool first; don't pivot to paid API keys (OpenRouter, broker Anthropic key) or file approval requests for them unless the user asks for extra capacity.
-- Prefer Nous providers or token-broker keys for extra capacity over accumulating more OAuth accounts.
+- For burn-rate reduction, balance new work across eligible Astra, Claude, Gemini and Grok routes within the existing model classes, across all gateways and Babybear; Claude-first fallback still concentrates consumption on Claude.
+- Prefer subscription capacity over metered API routes; Claude uses the Max pool and Astra uses Codex. Verify each route's actual funding rather than treating an API key or OAuth login alone as subscription entitlement.
