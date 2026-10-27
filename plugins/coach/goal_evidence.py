@@ -7,6 +7,12 @@ import copy
 import hashlib
 import json
 
+import importlib.util
+from pathlib import Path
+_spec = importlib.util.spec_from_file_location('_coach_goal_images', Path(__file__).with_name('goal_images.py'))
+_images = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_images)
+
 LIMIT = 32000
 
 
@@ -53,11 +59,11 @@ def bound(value):
     if len(rows) > 200:
         raise ValueError('context_limit')
     for limit in (2048, 1024, 512, 128, 0):
-        if len(json.dumps(result)) <= LIMIT:
+        if _images.serialized_size(result) <= LIMIT:
             return result
         for row in rows:
             if row.get('role') in ('tool', 'memory'):
                 _shorten(row, limit)
-    if len(json.dumps(result)) > LIMIT:
+    if _images.serialized_size(result) > LIMIT:
         raise ValueError('context_limit')
     return result

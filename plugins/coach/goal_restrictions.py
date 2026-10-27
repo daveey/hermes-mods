@@ -14,6 +14,8 @@ def whole_turn(evidence):
         return None
     ref, row = users[-1]
     text = row.get('content')
+    if isinstance(text, list) and row.get('content_source') == 'native_content':
+        text = ' '.join(part['text'] for part in text if part.get('type') == 'text')
     if not isinstance(text, str):
         return None
     text = ' '.join(text.strip().lower().rstrip('.!').split())
