@@ -185,9 +185,21 @@ test('sinceClock: HH:MM today, weekday + date otherwise', () => {
 
 test('grey waiting cards rank with parked work, below live and review cards', () => {
   const chips = m.sessionTaskChips([
-    card('t_wait', 'blocked', { wait: { wait_state: 'waiting', waiting_on: 'a parent card', waiting_since: 1 } }),
+    card('t_wait', 'scheduled', { wait: { wait_state: 'waiting', waiting_on: 'card t_x', waiting_since: 1 } }),
     card('t_review', 'review'),
     card('t_run', 'running')
   ], { connectionId: 'conn', profile: 'default' })
   assert.deepEqual(chips.map(c => c.id), ['t_run', 't_review', 't_wait'])
+})
+
+test('a blocked or triage card keeps its status colour under a grey wait, but still says what it waits on', () => {
+  const chips = m.sessionTaskChips([
+    card('t_dep', 'blocked', { wait: { wait_state: 'waiting', waiting_on: 'a parent card', waiting_since: 1 } }),
+    card('t_ask', 'blocked', { wait: { wait_state: 'waiting', waiting_on: 'an unvalidated ask (needs_input)', waiting_since: 1 } })
+  ], { connectionId: 'conn', profile: 'default' })
+  for (const c of chips) {
+    assert.equal(c.look, null)
+    assert.equal(m.chipColor(c.look || c.state), m.chipColor('blocked'))
+    assert.match(m.waitLine(c), /^waiting on /)
+  }
 })

@@ -210,7 +210,7 @@ def test_gateway_wide_caps_bound_a_backlog(tmp_path):
     assert len(h.wakes) == ow.MAX_CHAT_WAKES_HOUR
 
 
-def test_waits_older_than_a_week_are_recorded_not_woken(tmp_path):
+def test_waits_older_than_max_age_are_recorded_not_woken(tmp_path):
     h = Harness(tmp_path)
     old = card('default/t_old')
     old['wait']['waiting_since'] = NOW - ow.MAX_AGE_S - 1
@@ -231,3 +231,43 @@ def test_one_chat_across_its_compression_lineage_is_one_group(tmp_path):
                   wake=h.wake, log=h.log, chat_info=h.chats.get, supervise=h.supervise, last_user=lambda _s: 0.0,
                   now=NOW, canonical=lambda sid: 'tip')
     assert len(h.wakes) == 1 and h.wakes[0][0] == 'tip' and len(out[0]['cards']) == 2
+
+
+# ---- second review ------------------------------------------------------------------------------------------------
+def test_an_unreadable_state_store_is_unknown_not_gone(tmp_path):
+    good = tmp_path / 'state.db'
+    with sqlite3.connect(good) as c:
+        c.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY, archived INTEGER, end_reason TEXT, source TEXT)')
+    bad = tmp_path / 'locked.db'
+    bad.write_text('not a database')
+    info = ow.chat_info_from(lambda: [good, bad], lambda sid: None)
+    assert info('chat') == ow.UNKNOWN
+    assert ow.chat_info_from(lambda: [good], lambda sid: None)('chat') is None  # every store read cleanly: gone
+    h = Harness(tmp_path)
+    out = ow.tick(cards=[card('default/t_a')], wake=h.wake, log=h.log, chat_info=info, supervise=h.supervise,
+                  last_user=lambda _s: 0.0, now=NOW)
+    assert out == [] and h.wakes == [] and h.routes == [] and h.log.rows() == []
+
+
+def test_refused_wake_backs_off_for_the_claim_ttl_and_counts_toward_the_tick_cap(tmp_path):
+    chats = {f'c{i}': {'archived': False, 'end_reason': None, 'source': 'desktop'} for i in range(6)}
+    h = Harness(tmp_path, chats=chats, results=('refused',))
+    h.tick([card(f'default/t_{i}', session=f'c{i}', premise=f'p{i}') for i in range(6)])
+    assert len(h.wakes) == ow.MAX_CHAT_WAKES_PER_TICK  # failed attempts use up the tick
+    h.tick([card('default/t_0', session='c0', premise='p0')], now=NOW + 30)
+    assert len(h.wakes) == ow.MAX_CHAT_WAKES_PER_TICK  # backing off, not retried every tick
+    h.results = ['started']
+    h.tick([card('default/t_0', session='c0', premise='p0')], now=NOW + ow.CLAIM_TTL_S + 1)
+    assert len(h.wakes) == ow.MAX_CHAT_WAKES_PER_TICK + 1
+
+
+def test_bookkeeping_failure_after_a_started_wake_does_not_raise(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    monkeypatch.setattr(ow.time, 'sleep', lambda _s: None)
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(h.log, 'note_wake', boom)
+    out = h.tick([card('default/t_a')])
+    assert out[0]['result'] == 'started' and len(h.wakes) == 1
+    assert h.tick([card('default/t_a')], now=NOW + 60) == []  # finish() still recorded the premise

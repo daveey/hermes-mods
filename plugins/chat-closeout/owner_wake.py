@@ -40,13 +40,16 @@ MAX_SUPERVISOR_ROUTES_HOUR = 6
 # Gateway-wide caps on chat wakes, so a backlog (first deploy, a board-wide outage) can't wake every chat at once.
 MAX_CHAT_WAKES_PER_TICK = 3
 MAX_CHAT_WAKES_HOUR = 10
-# A wait older than this when first seen is history, not news: it is recorded (never wakes) instead of waking.
-MAX_AGE_S = 7 * 86400
+# A wait older than this when first seen is history, not news: it is recorded (never wakes) instead of waking. Short,
+# so the first pass after deploy does not turn days of backlog into hours of wakes (the board still shows them amber).
+MAX_AGE_S = 48 * 3600
 # A claim whose wake never finished (the backend died mid-wake) expires, so the premise is not lost forever.
 CLAIM_TTL_S = 600.0
 USER_QUIET_S = 120.0  # never wake over a user who typed in the last 2 minutes; the next tick retries
 SKIP_SOURCES = {"cron", "kanban", "webhook", "subagent"}
 REAPED_END_REASONS = {"startup_orphan_reap", "orphan_reap", "reaped"}
+# chat_info result when a state store could not be read and no store had the chat: unknown, never "gone".
+UNKNOWN = {"unknown": True}
 TAG = "[owner-wake]"
 
 _SCHEMA = """
@@ -205,9 +208,15 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             sid = str(card["session"])
         by_chat.setdefault(sid, []).append(card)
     done: list[dict[str, Any]] = []
-    woke_this_tick = 0
+    tried_this_tick = 0
     for sid, pending in sorted(by_chat.items()):
-        info = chat_info(sid)
+        try:
+            info = chat_info(sid)
+        except Exception:
+            logger.debug("owner-wake: chat_info(%s) failed", sid, exc_info=True)
+            info = UNKNOWN
+        if info is not None and info.get("unknown"):
+            continue  # a store was unreadable: unknown is not gone; the next tick reads again
         if info is not None and str(info.get("source") or "").lower() in SKIP_SOURCES:
             continue  # a worker/cron/subagent session: its dispatcher or parent owns the card
         orphaned = None
@@ -222,7 +231,7 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
         if orphaned is None:
             if now - float(last_user(sid) or 0) < USER_QUIET_S:
                 continue
-            if woke_this_tick >= MAX_CHAT_WAKES_PER_TICK or log.chat_wakes_last_hour(now) >= MAX_CHAT_WAKES_HOUR:
+            if tried_this_tick >= MAX_CHAT_WAKES_PER_TICK or log.chat_wakes_last_hour(now) >= MAX_CHAT_WAKES_HOUR:
                 continue  # gateway-wide cap: the rest wake on later ticks
             if log.wakes_last_hour(sid, now) >= MAX_WAKES_PER_CHAT_HOUR:
                 logger.warning("owner-wake: %s hit %d wakes/hour; %d card(s) wait for the next window", sid,
@@ -232,6 +241,7 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             if not claimed:
                 continue
             assert wake is not None
+            tried_this_tick += 1  # failed attempts count too: a refusing chat can't burn the tick
             try:
                 result = wake(sid, wake_prompt(claimed), display_kind="kanban_notice",
                               display_metadata={"display_text": notice_text(claimed), "owner_wake": True,
@@ -241,17 +251,17 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
                 logger.warning("owner-wake: wake of %s failed", sid, exc_info=True)
                 result = "error"
             if result == "started":
-                woke_this_tick += 1
-                log.note_wake(sid, now)
-                log.note_wake("__chats__", now)
+                _bookkeep(lambda: (log.note_wake(sid, now), log.note_wake("__chats__", now)), sid)
                 for c in claimed:
-                    log.finish(str(c["key"]), c["wait"]["premise"], "started", "chat")
+                    _bookkeep(lambda c=c: log.finish(str(c["key"]), c["wait"]["premise"], "started", "chat"), sid)
                 logger.info("owner-wake: woke %s for %s", sid, [c["key"] for c in claimed])
                 done.append({"session_id": sid, "route": "chat", "result": result, "cards": [c["key"] for c in claimed]})
                 continue
             if result != "missing":
-                for c in claimed:
-                    log.release(str(c["key"]), c["wait"]["premise"])
+                if result == "busy":  # the chat is mid-turn: retry next tick
+                    for c in claimed:
+                        log.release(str(c["key"]), c["wait"]["premise"])
+                # refused/error: keep the unfinished claim; it expires after CLAIM_TTL_S, which is the retry backoff
                 logger.info("owner-wake: wake of %s deferred (%s)", sid, result)
                 done.append({"session_id": sid, "route": "chat", "result": result, "cards": [c["key"] for c in claimed]})
                 continue
@@ -273,14 +283,29 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             for c in claimed:
                 log.release(str(c["key"]), c["wait"]["premise"])
             continue
-        log.note_route(now)
+        _bookkeep(lambda: log.note_route(now), sid)
         for c in claimed:
-            log.finish(str(c["key"]), c["wait"]["premise"], "routed", "supervisor", task_id)
+            _bookkeep(lambda c=c: log.finish(str(c["key"]), c["wait"]["premise"], "routed", "supervisor", task_id),
+                      sid)
         logger.info("owner-wake: chat %s is %s; routed %s to supervisor card %s", sid, orphaned,
                     [c["key"] for c in claimed], task_id)
         done.append({"session_id": sid, "route": "supervisor", "result": "routed",
                      "cards": [c["key"] for c in claimed], "supervisor_task": task_id, "why": orphaned})
     return done
+
+
+def _bookkeep(fn: Callable[[], Any], sid: str) -> None:
+    """Record a wake that already happened. Retried (SQLite busy), then logged: never raised into the tick, where an
+    unfinished claim would expire and wake the chat a second time."""
+    for attempt in range(3):
+        try:
+            fn()
+            return
+        except Exception:
+            if attempt == 2:
+                logger.warning("owner-wake: bookkeeping for %s failed", sid, exc_info=True)
+            else:
+                time.sleep(0.2)
 
 
 # ---- real collaborators ----------------------------------------------------------------------------------------
@@ -289,22 +314,25 @@ def chat_info_from(state_dbs: Callable[[], list[Path]], tip: Callable[[str], Opt
     """``chat_info`` over the state DBs. A compressed chat is judged by its compression tip (the live continuation)."""
 
     def read(sid: str) -> Optional[dict[str, Any]]:
+        """The chat's row; None only when every store read cleanly without it; UNKNOWN when a store failed."""
+        failed = False
         for path in state_dbs():
             try:
                 c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
             except sqlite3.Error:
+                failed = True
                 continue
             try:
                 cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
                 pick = ", ".join(x if x in cols else f"NULL AS {x}" for x in ("archived", "end_reason", "source"))
                 row = c.execute(f"SELECT {pick} FROM sessions WHERE id = ?", (sid,)).fetchone()
             except sqlite3.Error:
-                row = None
+                failed, row = True, None
             finally:
                 c.close()
             if row is not None:
                 return {"archived": bool(row[0]), "end_reason": row[1], "source": row[2]}
-        return None
+        return UNKNOWN if failed else None
 
     def info(sid: str) -> Optional[dict[str, Any]]:
         here = read(sid)
@@ -314,8 +342,10 @@ def chat_info_from(state_dbs: Callable[[], list[Path]], tip: Callable[[str], Opt
             t = None
         if t and t != sid:
             later = read(t)
-            if later is not None:
+            if later is not None and not later.get("unknown"):
                 return later
+            if later is not None:
+                return UNKNOWN
         return here
 
     return info

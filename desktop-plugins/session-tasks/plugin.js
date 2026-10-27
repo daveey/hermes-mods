@@ -149,9 +149,12 @@ function taskChip(t, status) {
   const watching = t.via === 'subscribed'
   const connectionId = t.connectionId || (t.gateway ? connectionForHubGateway(t.gateway) : null)
   const wait = t.wait && typeof t.wait === 'object' ? t.wait : null
-  const look = t.stale ? null : waitLook(wait)
-  const waitingOn = look ? str(wait.waiting_on) : ''
-  const waitingSince = look ? Number(wait.waiting_since) || 0 : 0
+  const rawLook = t.stale ? null : waitLook(wait)
+  // Grey 'waiting' only recolours a scheduled card: a blocked/triage card keeps its own (red/amber) status colour,
+  // so a dependency block or an unvalidated ask never turns grey. The wait line still names what it waits on.
+  const look = rawLook === 'waiting' && status !== 'scheduled' ? null : rawLook
+  const waitingOn = rawLook ? str(wait.waiting_on) : ''
+  const waitingSince = rawLook ? Number(wait.waiting_since) || 0 : 0
   const waitTitle = waitingOn ? `\n${look === 'stalled' ? 'STALLED (agent-owned wait over 2 h): ' : ''}waiting on ${waitingOn}${waitingSince ? ` since ${sinceClock(waitingSince)}` : ''}` : ''
   return {
     look,
