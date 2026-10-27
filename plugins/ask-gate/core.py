@@ -772,7 +772,15 @@ def needs_checked(tool_name: str, args: dict, is_worker: bool) -> tuple[bool, st
         if says_david_must_act(reason):
             return True, reason
     if tool_name == "kanban_create":
-        body = f"{args.get('title') or ''}\n{args.get('body') or ''}"
+        title = str(args.get("title") or "")
+        full = str(args.get("body") or "")
+        if args.get("initial_status") == "blocked":
+            body = f"{title}\n{full}"
+        else:
+            # Ready/todo cards only state a goal up front; later paragraphs are
+            # spec, quotes or code that may merely mention a blocked card.
+            first = re.split(r"\n\s*\n", full.strip(), maxsplit=1)[0] if full.strip() else ""
+            body = f"{title}\n{first}"
         if says_david_must_act(body):
             return True, body
     return False, ""
