@@ -1,0 +1,170 @@
+From ca4285335f52d478e15435c0b842e95a11256ea7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 11:17:23 -0700
+Subject: [PATCH] fix(kanban): stale remote-links reads only for the
+ linked-card strip [daveey]
+
+Problem: 32 kanban tests (origin alias release, local receipt authority,
+origin legacy) failed on main since 78130169; they pass on its parent 12758cf.
+Why 1: they write a release/association, then expect session_tasks() to
+  reflect it on the next read; it returned the previous projection
+  (test_kanban_origin_alias_release.py, local_receipt_authority.py).
+Why 2: 78130169 made _remote_links() serve the previous projection to EVERY
+  reader whenever a store changed, rebuilding in the background.
+Why 3: staleness was applied globally although only the Desktop strip and
+  its endpoint can tolerate it; other readers rely on read-your-writes.
+Root (happened): one projection contract changed for all callers instead of
+  an opt-in for the one tolerant reader.
+Root (not caught): the regression was compared against a base that already
+  contained 78130169, so "fails on base too" was wrong; nothing bisects a new
+  failure against the commit that introduced it.
+Countermeasures:
+- symptom+root: _remote_links(stale_ok=False) keeps the fresh single-flight
+  contract; only /api/session-kanban-tasks passes stale_ok=True.
+  proof: the 32 tests pass; full kanban suite (-n 8, twice) has no failure
+  that was absent before the regression.
+- detection: test_stale_ok_readers_never_wait_for_a_rebuild pins the opt-in
+  path; the original reproject tests are restored for the default path.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_session_activity.py         | 32 ++++++++++++-------
+ hermes_cli/web_routers/sessions.py            |  3 +-
+ .../test_kanban_remote_inventory_cache.py     | 22 ++++++-------
+ 3 files changed, 33 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index e20c7c5264..53445a10fc 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -565,24 +565,31 @@ def _links_fingerprint() -> tuple:
+     return tuple(signature)
+ 
+ 
+-def _remote_links() -> list[dict[str, Any]]:
++def _remote_links(stale_ok: bool = False) -> list[dict[str, Any]]:
+     """Shared origin-ledger projection, with preserved legacy associations.
+ 
+-    One projection per scope serves every reader (counts, session task lists, plugins). Readers never wait for a
+-    rebuild once a projection exists: when a store it reads changed (or ``_CACHE_TTL_S`` passed) the reader gets the
+-    previous projection at once and one background rebuild replaces it, so a busy board (workers writing every few
+-    seconds) cannot put the sidebar and the linked-card strip behind the projection lock. Only the first projection
+-    for a scope is built inline (single-flight: concurrent readers share it). Failures are never cached; a failed
+-    background rebuild keeps the previous projection."""
++    One projection per scope serves every reader (counts, session task lists, plugins) for ``_CACHE_TTL_S`` while
++    no store it reads has changed. Single-flight: concurrent readers wait for the running projection and share it
++    instead of each rebuilding. Failures are never cached.
++
++    ``stale_ok`` (the Desktop linked-card strip only): never wait for a rebuild once a projection exists. A reader
++    gets the previous projection at once and one background rebuild replaces it, so a busy board (workers writing
++    every few seconds) cannot hold the strip behind the projection lock. Every other reader keeps read-your-writes:
++    a release or association it just wrote is in the answer."""
+     scope, fingerprint = _origin_scope(), _links_fingerprint()
+     hit = _links_cache
+     if hit is not None and hit[1] == scope:
+-        if hit[2] != fingerprint or time.monotonic() >= hit[0]:
++        fresh = hit[2] == fingerprint and time.monotonic() < hit[0]
++        if fresh:
++            return list(hit[3])
++        if stale_ok:
+             _refresh_links_in_background(scope)
+-        return list(hit[3])
++            return list(hit[3])
+     with _links_lock:
+         hit = _links_cache
+-        if hit is not None and hit[1] == scope:
++        if hit is not None and hit[1] == scope and hit[2] == fingerprint and time.monotonic() < hit[0]:
++            return list(hit[3])
++        if stale_ok and hit is not None and hit[1] == scope:
+             return list(hit[3])
+         return _store_links(scope, fingerprint)
+ 
+@@ -936,7 +943,8 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+         found[task_id]["pr_url"] = url
+ 
+ 
+-def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES) -> list[dict[str, Any]]:
++def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES, *,
++                  stale_ok: bool = False) -> list[dict[str, Any]]:
+     """Every open/blocked/review task across all boards that the given session
+     ids (one compression lineage) created or shepherd — exactly the cards the
+     sidebar row's ``kanban_active``/``kanban_blocked`` counts cover. Failed
+@@ -952,7 +960,7 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+     # [daveey] Cards on other gateways this lineage owns: the same rows the counts use, owner-qualified
+     # (gateway/board/id), with ``stale``/``synced_at`` from the replica. One row per card.
+     wanted, seen = set(ids), set()
+-    for card in _remote_links():
++    for card in _remote_links(stale_ok=stale_ok):
+         belongs = card['session'] in wanted or card.get('origin_session') in wanted
+         listed = card.get('status') in statuses or (card.get('status') == 'unknown' and card.get('unfinished'))
+         if belongs and listed and card['key'] not in seen:
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index b1d8a916a1..ac6c813817 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -184,7 +184,8 @@ def get_session_kanban_tasks(ids: str = Query(..., max_length=4000)):
+     board — the cards behind the sidebar row's kanban counts. Lets the desktop
+     list them for the open chat without loading the whole board. [daveey]"""
+     wanted = [s.strip() for s in ids.split(",") if s.strip()][:50]
+-    return {"tasks": session_kanban_tasks(wanted)}
++    # The Desktop linked-card strip: serve the last remote-links projection rather than wait on a rebuild.
++    return {"tasks": session_kanban_tasks(wanted, stale_ok=True)}
+ 
+ 
+ # ``le=100`` on limit: an unbounded limit lets one request drag every session
+diff --git a/tests/hermes_cli/test_kanban_remote_inventory_cache.py b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+index 3d53cf844c..4db7dbac28 100644
+--- a/tests/hermes_cli/test_kanban_remote_inventory_cache.py
++++ b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+@@ -54,29 +54,29 @@ def test_unchanged_stores_share_one_projection(projection):
+     assert calls['n'] == 1
+ 
+ 
+-def test_a_store_change_reprojects_in_the_background(projection):
++def test_a_store_change_reprojects(projection):
+     calls, board = projection
+-    first = activity._remote_links()
++    activity._remote_links()
+     with sqlite3.connect(board) as db:
+         db.execute("INSERT INTO tasks VALUES ('t_two', 'ready')")
+-    assert activity._remote_links() == first  # served at once from the previous projection
+-    wait_until(lambda: calls['n'] == 2, what='one background rebuild after the store change')
++    activity._remote_links()
++    assert calls['n'] == 2
+ 
+ 
+-def test_ttl_expiry_reprojects_in_the_background(projection, monkeypatch):
++def test_ttl_expiry_reprojects(projection, monkeypatch):
+     calls, _ = projection
+     monkeypatch.setattr(activity, '_CACHE_TTL_S', 0.0)
+     activity._remote_links()
+     activity._remote_links()
+-    wait_until(lambda: calls['n'] == 2, what='one background rebuild after the TTL')
++    assert calls['n'] == 2
+ 
+ 
+-def test_readers_never_wait_for_a_rebuild(projection):
+-    """A busy board changes its stores every few seconds; a reader must get the previous projection immediately
+-    while one rebuild runs, never queue behind it (the linked-card strip waited 11-19 s on a live gateway)."""
++def test_stale_ok_readers_never_wait_for_a_rebuild(projection):
++    """The linked-card strip (stale_ok) gets the previous projection immediately while one rebuild runs, never
++    queues behind it (it waited 11-19 s on a live gateway); default readers keep read-your-writes."""
+     import time as _time
+     calls, board = projection
+-    first = activity._remote_links()
++    first = activity._remote_links(stale_ok=True)
+     gate = threading.Event()
+     calls['gate'] = gate  # the next projection is held open
+     with sqlite3.connect(board) as db:
+@@ -84,7 +84,7 @@ def test_readers_never_wait_for_a_rebuild(projection):
+     try:
+         for _ in range(5):  # one rebuild running and held; every read still returns at once
+             started = _time.monotonic()
+-            assert activity._remote_links() == first
++            assert activity._remote_links(stale_ok=True) == first
+             assert _time.monotonic() - started < 0.5
+         wait_until(lambda: calls['n'] == 2, what='exactly one rebuild in flight')
+         assert calls['n'] == 2
+-- 
+2.55.0
+

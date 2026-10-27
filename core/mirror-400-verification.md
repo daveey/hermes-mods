@@ -38,17 +38,17 @@ cache declaration placement and test ordering. They take the recorded merge vers
 old public patch bodies nor unrelated scrubbed source files are replaced. The patch envelope
 is synthetic and names its source merge rather than impersonating a raw source commit.
 
-0394–0400 are then the source first-parent followups in order:
+0394–0401 are then the source first-parent followups in order:
 
 | Patch | Source | Purpose |
 | --- | --- | --- |
 | 0394 | d69ad5291ce94014ab67a99a136ad43a2577a850 | Deterministic auto-continue marker timestamp test |
 | 0395 | 1330267ab4d0273b04045618ba97a289f1c27d9a | LSP cleanup/reaping test robustness |
-| 0396 | a286616b5a0e2eadfdaa97a9030a2247045d42f6 | Atomic activity snapshot projects fixture |
-| 0397 | dc50ba33a29bd0237f33bd2bf22a3e4070f5053a | Scope-heartbeat owner liveness |
-| 0398 | a253016acf39404f7e0b7aefd4151d09584a176e | Exact owner-attested legacy alias reconciliation |
-| 0399 | 76b9c78f24f2d89d22ec45e20b71a2e738d06c70 | Distinct legacy-reconciliation wire action |
-| 0400 | 0146a882edf55e22fc9197e2a2e190a0fbacf068 | Preserve sync timestamp during ledger contention |
+| 0397 | a286616b5a0e2eadfdaa97a9030a2247045d42f6 | Atomic activity snapshot projects fixture |
+| 0398 | dc50ba33a29bd0237f33bd2bf22a3e4070f5053a | Scope-heartbeat owner liveness |
+| 0399 | a253016acf39404f7e0b7aefd4151d09584a176e | Exact owner-attested legacy alias reconciliation |
+| 0400 | 76b9c78f24f2d89d22ec45e20b71a2e738d06c70 | Distinct legacy-reconciliation wire action |
+| 0401 | 0146a882edf55e22fc9197e2a2e190a0fbacf068 | Preserve sync timestamp during ledger contention |
 
 ## Full apply and preservation
 

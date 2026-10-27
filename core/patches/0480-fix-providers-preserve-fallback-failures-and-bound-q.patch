@@ -1,0 +1,801 @@
+From 1164b8813f97219030dfa218c930fbcaea2cdd58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 02:19:35 -0700
+Subject: [PATCH] fix(providers): preserve fallback failures and bound quota
+ holds [daveey]
+
+---
+ agent/agent_init.py                           |  29 +++--
+ cron/quota_hold.py                            |  24 +++-
+ cron/scheduler.py                             |   8 +-
+ gateway/run_turn_runner.py                    |  11 ++
+ hermes_cli/cli_agent_setup_mixin.py           |  19 ++-
+ hermes_cli/fallback_errors.py                 |  39 ++++++
+ hermes_cli/runtime_provider.py                |  24 ++--
+ .../test_init_fallback_refusal_warning.py     |  15 ++-
+ tests/cron/test_fallback_failure_details.py   |  39 ++++++
+ .../gateway/test_fallback_failure_details.py  |  32 +++++
+ .../test_fallback_error_classification.py     | 108 ++++++++++++++++
+ .../test_resolution_failure_details.py        | 120 ++++++++++++++++++
+ .../test_fallback_failure_details.py          |  24 ++++
+ tui_gateway/server.py                         |  23 +++-
+ 14 files changed, 480 insertions(+), 35 deletions(-)
+ create mode 100644 hermes_cli/fallback_errors.py
+ create mode 100644 tests/cron/test_fallback_failure_details.py
+ create mode 100644 tests/gateway/test_fallback_failure_details.py
+ create mode 100644 tests/hermes_cli/test_fallback_error_classification.py
+ create mode 100644 tests/hermes_cli/test_resolution_failure_details.py
+ create mode 100644 tests/tui_gateway/test_fallback_failure_details.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index d156517fe2..c6418857ec 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -870,6 +870,7 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
+     # #17929.
+     _explicit = (agent.provider or "").strip().lower()
+     _refused_entries = []
++    _failures = []
+     for _fb in _fallback_entries(fallback_model):
+         _fb_provider = str(_fb["provider"])
+         try:
+@@ -880,16 +881,20 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
+                 explicit_base_url=_fb.get("base_url"), explicit_api_key=_fb_explicit_key,
+             )
+         except Exception as _fb_exc:
+-            logger.debug("Init-time fallback entry %s failed: %s", _fb_provider, _fb_exc)
++            _failures.append((_fb_provider, str(_fb["model"]), _fb_exc))
++            logger.warning("Init-time fallback entry %s/%s failed: %s: %s",
++                           _fb_provider, _fb["model"], type(_fb_exc).__name__, _fb_exc)
+             # A bare exception (``KeyError()``) stringifies empty; name its type instead.
+             _refused_entries.append((_fb_provider, str(_fb_exc) or type(_fb_exc).__name__))
+             continue
+         if _fb_client is None:
+             # The router returns None when no credentials are usable for the entry — a skip
+             # that leaves no trace otherwise, hiding key-less fallback entries from the log.
+-            logger.debug(
+-                "Init-time fallback entry %s resolved no usable credentials", _fb_provider
+-            )
++            from agent.auxiliary_unavailable import ProviderNotConfiguredError
++            _fb_exc = ProviderNotConfiguredError("no usable credentials")
++            _failures.append((_fb_provider, str(_fb["model"]), _fb_exc))
++            logger.warning("Init-time fallback entry %s/%s failed: %s: %s",
++                           _fb_provider, _fb["model"], type(_fb_exc).__name__, _fb_exc)
+             _refused_entries.append((_fb_provider, "no usable credentials"))
+             continue
+         agent._fallback_activated = True
+@@ -922,6 +927,14 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
+             "credential pool exhausted" if _pool_exhausted else "no usable credentials",
+             "; ".join(f"{_p} ({_r})" for _p, _r in _refused_entries) or "none configured",
+         )
++    def _raise_resolution_error(primary_exc):
++        if _failures:
++            from hermes_cli.fallback_errors import ProviderFallbackError
++            raise ProviderFallbackError(
++                [(agent.provider or "auto", agent.model or "", primary_exc), *_failures]
++            ) from primary_exc
++        raise primary_exc
++
+     # A fully-exhausted pool is a billing/quota failure, NOT a config problem: name it for EVERY
+     # explicit provider. ``openrouter`` / ``custom`` have no provider-specific missing-credentials
+     # branch, so a burned override pool there fell through to the generic "No LLM provider
+@@ -940,19 +953,19 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
+             or pool_cooldown_message(_explicit)
+         )
+         if _exhausted_message:
+-            raise ProviderCredentialsExhaustedError(_exhausted_message, provider=_explicit)
++            _raise_resolution_error(ProviderCredentialsExhaustedError(_exhausted_message, provider=_explicit))
+     if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+         # Explicit non-OpenRouter provider with no creds and no usable fallback: fail fast.
+         from agent.auxiliary_unavailable import ProviderNotConfiguredError, missing_provider_credentials_message
+-        raise ProviderNotConfiguredError(missing_provider_credentials_message(_explicit))
++        _raise_resolution_error(ProviderNotConfiguredError(missing_provider_credentials_message(_explicit)))
+     from hermes_constants import profile_cli_selector
+     from agent.auxiliary_unavailable import ProviderNotConfiguredError
+     _sel = profile_cli_selector()
+-    raise ProviderNotConfiguredError(
++    _raise_resolution_error(ProviderNotConfiguredError(
+         "No LLM provider configured. Run `hermes model` to "
+         "select a provider, or run `hermes setup` for first-time "
+         "configuration."
+-    )
++    ))
+ 
+ 
+ def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
+diff --git a/cron/quota_hold.py b/cron/quota_hold.py
+index 5edefc4cdf..85eff99d1c 100644
+--- a/cron/quota_hold.py
++++ b/cron/quota_hold.py
+@@ -42,16 +42,28 @@ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
+     output cannot park a job."""
+     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+ 
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    def route_hold(error: BaseException) -> Optional[float]:
++        if isinstance(error, ProviderFallbackError):
++            waits = [route_hold(failure) for _, _, failure in error.failures]
++            return min(waits) if waits and all(wait is not None for wait in waits) else None
++        if isinstance(error, AuthError) and is_rate_limited_auth_error(error):
++            hint = getattr(error, "retry_after", None)
++            if hint is None:
++                m = _RETRY_AFTER_RE.search(str(error))
++                hint = float(m.group(1)) if m else None
++            return float(hint) if hint is not None and float(hint) > 0 else None
++        # A fallback's implicit context may be the primary quota exception.
++        # Never mistake that for a quota refusal by this route.
++        return None
++
+     seen: set[int] = set()
+     cur: Optional[BaseException] = exc
+     while cur is not None and id(cur) not in seen:
+         seen.add(id(cur))
+-        if isinstance(cur, AuthError) and is_rate_limited_auth_error(cur):
+-            hint = getattr(cur, "retry_after", None)
+-            if hint is None:
+-                m = _RETRY_AFTER_RE.search(str(cur))
+-                hint = float(m.group(1)) if m else None
+-            return float(hint) if hint is not None and float(hint) > 0 else None
++        if isinstance(cur, (ProviderFallbackError, AuthError)):
++            return route_hold(cur)
+         cur = cur.__cause__ or cur.__context__
+     return None
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 184c7fc52b..4bc0adf1f7 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1782,6 +1782,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
+         if not (is_auth or is_transient_net):
+             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
+ 
++        from hermes_cli.fallback_errors import ProviderFallbackError
++        failures = [(requested or getattr(resolve_exc, "provider", ""), model, resolve_exc)]
+         chain = _job_fallback_chain(job, jc.cfg) or []
+         logger.warning(
+             "Job '%s': primary provider resolve failed (%s: %s), %s",
+@@ -1819,7 +1821,11 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
+                     model, runtime.get("provider"), fb_model)
+                 return runtime, fb_model
+             except Exception as fb_exc:
+-                logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
++                logger.warning("Job '%s': fallback %s model %s failed: %s: %s",
++                               job_id, fb_provider, fb_model, type(fb_exc).__name__, fb_exc)
++                failures.append((fb_provider, fb_model, fb_exc))
++        if len(failures) > 1:
++            raise ProviderFallbackError(failures) from resolve_exc
+         raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
+ 
+ 
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 7e29a4cdf8..fcaeb89a12 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1922,6 +1922,17 @@ class TurnRunner:
+             # codes) belongs in the log, and the chat gets the commands that fix it.
+             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
+             from hermes_cli.auth import is_rate_limited_auth_error
++            from hermes_cli.fallback_errors import ProviderFallbackError
++            chain = exc if isinstance(exc, ProviderFallbackError) else exc.__cause__
++            if isinstance(chain, ProviderFallbackError):
++                from gateway.run import _gateway_provider_error_reply
++                # Keep raw diagnostics in the log; describe each route using the
++                # existing user-safe provider error mapping in messaging chats.
++                reply = '\n'.join(
++                    f"{provider}/{model}: {_gateway_provider_error_reply(str(error))}"
++                    for provider, model, error in chain.failures
++                )
++                return {"final_response": reply, "messages": [], "api_calls": 0, "tools": []}
+             if is_rate_limited_auth_error(exc.__cause__):
+                 # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
+                 from gateway.run import _gateway_provider_error_reply
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index ad0fb8ece9..c3ecea8a3a 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -268,7 +268,11 @@ class CLIAgentSetupMixin:
+         except Exception as exc:
+             _primary_exc = exc
+         if _primary_exc is not None:
+-            runtime = self._resolve_fallback_runtime(_primary_exc)
++            from hermes_cli.fallback_errors import ProviderFallbackError
++            try:
++                runtime = self._resolve_fallback_runtime(_primary_exc)
++            except ProviderFallbackError as exc:
++                _primary_exc = exc
+             if runtime is not None:
+                 _primary_exc = None
+         if runtime is None:
+@@ -390,13 +394,17 @@ class CLIAgentSetupMixin:
+     def _resolve_fallback_runtime(self, primary_exc):
+         """Primary provider resolution failed: on an AuthError try each fallback entry in
+         order and switch the CLI's requested_provider/model to the first that resolves.
+-        None when the error is not auth-related or no fallback resolves."""
++        None when the error is not auth-related or no fallback is attempted.
++        Failed attempts raise ProviderFallbackError with every cause."""
+         from cli import _cprint, logger
+         from hermes_cli.auth import AuthError, primary_failure_wording
+         from hermes_cli.runtime_provider import resolve_runtime_provider
+         if not isinstance(primary_exc, AuthError):
+             return None
+         _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
++        from hermes_cli.fallback_errors import ProviderFallbackError
++        failures = [(getattr(self, "requested_provider", None) or "",
++                     getattr(self, "model", None) or "", primary_exc)]
+         for _fb in _fb_chain:
+             _fb_provider = (_fb.get("provider") or "").strip().lower()
+             _fb_model = (_fb.get("model") or "").strip()
+@@ -425,8 +433,13 @@ class CLIAgentSetupMixin:
+                 self.model = _fb_model
+                 # reasoning_config follows the swap in _ensure_runtime_credentials (the only caller).
+                 return runtime
+-            except Exception:
++            except Exception as fb_exc:
++                failures.append((_fb_provider, _fb_model, fb_exc))
++                logger.warning("Fallback entry %s/%s failed: %s: %s",
++                               _fb_provider, _fb_model, type(fb_exc).__name__, fb_exc)
+                 continue
++        if len(failures) > 1:
++            raise ProviderFallbackError(failures) from primary_exc
+         return None
+ 
+     def _runtime_credentials_ready(self) -> bool:
+diff --git a/hermes_cli/fallback_errors.py b/hermes_cli/fallback_errors.py
+new file mode 100644
+index 0000000000..f80e1bf169
+--- /dev/null
++++ b/hermes_cli/fallback_errors.py
+@@ -0,0 +1,39 @@
++"""Preserve every failed runtime route, rather than rethrowing only the primary."""
++import math
++
++from hermes_cli.auth_constants import AuthError, CODEX_RATE_LIMITED_CODE
++
++
++class ProviderFallbackError(AuthError):
++    """An exhausted chain; individual exceptions remain available for retry policy."""
++
++    def __init__(self, failures: list[tuple[str, str, BaseException]]) -> None:
++        self.failures = tuple(failures)
++        details = '; '.join(
++            f"{'Primary' if i == 0 else 'Fallback'} {provider or 'configured provider'}"
++            f"/{model or 'configured model'}: {type(exc).__name__}: {exc}"
++            for i, (provider, model, exc) in enumerate(failures)
++        )
++        # Only classifications shared by every route describe the exhausted chain.
++        # In particular, one transient fallback must prevent a sticky auth block
++        # or quota classification inherited from the primary.
++        errors = [exc for _, _, exc in self.failures]
++        all_quota = bool(errors) and all(
++            isinstance(exc, AuthError) and not exc.relogin_required
++            and exc.code == CODEX_RATE_LIMITED_CODE for exc in errors
++        )
++        all_relogin = bool(errors) and all(
++            isinstance(exc, AuthError) and exc.relogin_required for exc in errors
++        )
++        retry_after = None
++        if all_quota:
++            waits = [exc.retry_after for exc in errors]
++            # Unknown/invalid windows must not hide a route that may recover sooner.
++            if all(isinstance(wait, (int, float)) and not isinstance(wait, bool)
++                   and math.isfinite(wait) and wait > 0 for wait in waits):
++                retry_after = min(waits)
++        super().__init__(
++            f'All provider routes failed. {details}',
++            code=CODEX_RATE_LIMITED_CODE if all_quota else 'fallback_exhausted',
++            relogin_required=all_relogin, retry_after=retry_after,
++        )
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 527a84e4d3..cce435ca45 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -1145,8 +1145,8 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
+     walks ``get_fallback_chain(config)`` in order and returns the first entry that resolves — the single
+     resolution-time walker shared by the gateway and oneshot. ``ValueError``/other errors are genuine
+     misconfiguration (unknown ``--provider`` ...) and propagate unchanged, so a typo is never silently
+-    rerouted onto a provider the operator did not ask for. When every entry fails, the *primary* error is
+-    re-raised: a fallback entry's failure is not what the operator configured first (#81209). The entry's
++    rerouted onto a provider the operator did not ask for. When attempted fallbacks all fail,
++    ProviderFallbackError retains every cause; with no attempts the primary is re-raised. The entry's
+     ``model`` is the model the caller must send.
+     """
+     from hermes_cli.auth import AuthError, primary_failure_wording
+@@ -1162,6 +1162,12 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
+                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
+     except AuthError as primary_exc:
+         from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
++        from hermes_cli.fallback_errors import ProviderFallbackError
++        model_config = (config or {}).get("model") or {}
++        if not isinstance(model_config, dict):
++            model_config = {}
++        failures = [(requested or model_config.get("provider") or "",
++                     target_model or model_config.get("default") or "", primary_exc)]
+         for entry in get_fallback_chain(config):
+             provider = (entry.get("provider") or "").strip().lower()
+             model = (entry.get("model") or "").strip()
+@@ -1170,16 +1176,14 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
+             kwargs: dict[str, Any] = {"requested": provider, "target_model": model}
+             if entry.get("base_url"):
+                 kwargs["explicit_base_url"] = entry["base_url"]
+-            if entry_key := resolve_entry_api_key(entry):
+-                kwargs["explicit_api_key"] = entry_key
+             try:
++                if entry_key := resolve_entry_api_key(entry):
++                    kwargs["explicit_api_key"] = entry_key
+                 runtime = resolve_runtime_provider(**kwargs)
+-            except AuthError as fb_exc:
+-                logger.debug("Fallback entry %s/%s failed: %s", provider, model, fb_exc)
+-                continue
+             except Exception as fb_exc:
+-                # Not a credential problem: a mistyped provider/base_url must be visible, not silently skipped.
+-                logger.warning("Fallback entry %s/%s is misconfigured and was skipped: %s", provider, model, fb_exc)
++                failures.append((provider, model, fb_exc))
++                logger.warning("Fallback entry %s/%s failed: %s: %s",
++                               provider, model, type(fb_exc).__name__, fb_exc)
+                 continue
+             # Named custom entries resolve to the bare "custom" class; persist the configured identity (#98739).
+             runtime["provider"] = effective_runtime_provider(entry, runtime)
+@@ -1188,4 +1192,6 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
+             logger.warning("Primary provider %s (%s). Falling back to %s/%s",
+                            primary_failure_wording(primary_exc)[0], primary_exc, provider, model)
+             return runtime, entry
++        if len(failures) > 1:
++            raise ProviderFallbackError(failures) from primary_exc
+         raise primary_exc
+diff --git a/tests/agent/test_init_fallback_refusal_warning.py b/tests/agent/test_init_fallback_refusal_warning.py
+index 689fa061e5..2bd45ddf3e 100644
+--- a/tests/agent/test_init_fallback_refusal_warning.py
++++ b/tests/agent/test_init_fallback_refusal_warning.py
+@@ -11,6 +11,8 @@ from types import SimpleNamespace
+ 
+ import pytest
+ 
++from hermes_cli.fallback_errors import ProviderFallbackError
++
+ 
+ def _agent(provider="openrouter"):
+     return SimpleNamespace(
+@@ -77,18 +79,18 @@ def test_fully_refusing_ladder_warns_with_each_reason(
+     )
+ 
+     with caplog.at_level(logging.WARNING, logger="run_agent"):
+-        with pytest.raises(RuntimeError, match=raise_match):
++        with pytest.raises(ProviderFallbackError if ladder else RuntimeError, match=raise_match):
+             agent_init._routed_client_kwargs(_agent(primary), ladder, 60)
+ 
+     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+-    assert len(warnings) == 1
+-    text = warnings[0].getMessage()
++    assert len(warnings) == (len(ladder) + 1)
++    text = warnings[-1].getMessage()
+     assert primary in text
+     for fragment in expected:
+         assert fragment in text
+ 
+ 
+-def test_recovered_ladder_does_not_warn(monkeypatch, caplog):
++def test_recovered_ladder_warns_for_failed_entry(monkeypatch, caplog):
+     """An entry refusing while a later one serves the init is degraded config, not a failure."""
+     from agent import agent_init
+ 
+@@ -117,4 +119,7 @@ def test_recovered_ladder_does_not_warn(monkeypatch, caplog):
+     assert kwargs == {"api_key": "k"}
+     assert agent.provider == "kimi"
+     assert agent._fallback_activated
+-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
++    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
++    assert len(warnings) == 1
++    assert "deepseek/deepseek-v4-pro" in warnings[0]
++    assert "ProviderNotConfiguredError: no usable credentials" in warnings[0]
+diff --git a/tests/cron/test_fallback_failure_details.py b/tests/cron/test_fallback_failure_details.py
+new file mode 100644
+index 0000000000..1784a45567
+--- /dev/null
++++ b/tests/cron/test_fallback_failure_details.py
+@@ -0,0 +1,39 @@
++import logging
++from unittest.mock import patch
++
++import pytest
++from hermes_cli.auth import AuthError
++from cron.scheduler import _CronJobConfig, _resolve_job_runtime
++
++
++@pytest.mark.parametrize('fallback, expected', [
++    (TimeoutError('fallback connection timed out'), None),
++    (AuthError('fallback quota (429); retry after 120s', code='codex_rate_limited', retry_after=120), 120),
++    (AuthError('fallback quota without wait', code='codex_rate_limited'), None),
++    (AuthError('bad credentials', relogin_required=True), None),
++])
++def test_quota_hold_requires_entire_chain(fallback, expected):
++    from cron.quota_hold import hold_seconds_from_failure
++    primary = AuthError('Codex quota exhausted (429); retry after 500000s',
++                        provider='openai-codex', code='codex_rate_limited', retry_after=500000)
++    cfg = {'fallback_providers': [{'provider': 'anthropic', 'model': 'claude-opus-5-5'}]}
++    jc = _CronJobConfig(cfg, 'gpt-test', {}, '')
++    with patch('hermes_cli.runtime_provider.resolve_runtime_provider',
++               side_effect=[primary, fallback]), pytest.raises(RuntimeError) as caught:
++        _resolve_job_runtime({}, 'test-job', jc)
++    assert hold_seconds_from_failure(caught.value) == expected
++
++
++def test_cron_failed_fallback_is_logged_and_surfaced(caplog):
++    primary = AuthError('Codex quota exhausted (429); retry after 500000s',
++                        provider='openai-codex', code='codex_rate_limited', retry_after=500000)
++    cfg = {'fallback_providers': [{'provider': 'anthropic', 'model': 'claude-opus-5-5'}]}
++    jc = _CronJobConfig(cfg, 'gpt-test', {'provider': 'openai-codex'}, '')
++    with patch('hermes_cli.runtime_provider.resolve_runtime_provider',
++               side_effect=[primary, TimeoutError('fallback connection timed out')]), \
++         caplog.at_level(logging.WARNING), pytest.raises(RuntimeError) as caught:
++        _resolve_job_runtime({}, 'test-job', jc)
++    assert 'fallback connection timed out' in str(caught.value)
++    assert str(primary) in str(caught.value)
++    assert any('anthropic' in r.message and 'claude-opus-5-5' in r.message
++               and 'fallback connection timed out' in r.message for r in caplog.records)
+diff --git a/tests/gateway/test_fallback_failure_details.py b/tests/gateway/test_fallback_failure_details.py
+new file mode 100644
+index 0000000000..89a86e1565
+--- /dev/null
++++ b/tests/gateway/test_fallback_failure_details.py
+@@ -0,0 +1,32 @@
++"""Resolution failures retain route diagnostics in the gateway reply."""
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++
++def test_gateway_reply_includes_failed_fallback(monkeypatch):
++    from hermes_cli import _early_recovery
++    monkeypatch.setattr(_early_recovery, 'restore_interrupted_pull', lambda root: False)
++    from gateway import run
++    from gateway.config import Platform
++    from gateway.run_turn_runner import TurnRunner
++    from hermes_cli.auth import AuthError
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    chain = ProviderFallbackError([
++        ('openai-codex', 'gpt-test', AuthError('primary quota exhausted', code='codex_rate_limited')),
++        ('anthropic', 'claude-test', TimeoutError('fallback connection timed out')),
++    ])
++    wrapped = RuntimeError(str(chain))
++    wrapped.__cause__ = chain
++    runner = SimpleNamespace(_resolve_session_agent_runtime=Mock(side_effect=wrapped))
++    turn = object.__new__(TurnRunner)
++    turn._runner = runner
++    turn._ctx = SimpleNamespace(source=SimpleNamespace(platform=Platform.LOCAL),
++                                session_key='test-session', user_config={})
++    monkeypatch.setattr(turn, '_combined_ephemeral_prompt', lambda: '')
++    monkeypatch.setattr(run, '_current_max_iterations', lambda: 10)
++    result = turn.run_sync()
++    assert 'openai-codex/gpt-test' in result['final_response']
++    assert 'anthropic/claude-test' in result['final_response']
++    assert run._gateway_provider_error_reply('fallback connection timed out') in result['final_response']
++    assert result['api_calls'] == 0
+diff --git a/tests/hermes_cli/test_fallback_error_classification.py b/tests/hermes_cli/test_fallback_error_classification.py
+new file mode 100644
+index 0000000000..f5090653a1
+--- /dev/null
++++ b/tests/hermes_cli/test_fallback_error_classification.py
+@@ -0,0 +1,108 @@
++"""An exhausted route chain only inherits classifications shared by every route."""
++import threading
++
++import pytest
++
++from hermes_cli.auth import is_rate_limited_auth_error
++from hermes_cli.auth_constants import AuthError, CODEX_RATE_LIMITED_CODE
++from hermes_cli.fallback_errors import ProviderFallbackError
++
++
++def aggregate(*errors):
++    return ProviderFallbackError([(f"provider-{i}", f"model-{i}", error)
++                                  for i, error in enumerate(errors)])
++
++
++def quota(wait=60):
++    return AuthError("quota exhausted", code=CODEX_RATE_LIMITED_CODE, retry_after=wait)
++
++
++def test_all_quota_retains_classification_and_earliest_window():
++    error = aggregate(quota(120), quota(30), quota(90))
++    assert is_rate_limited_auth_error(error)
++    assert error.retry_after == 30
++    assert not error.relogin_required
++
++
++@pytest.mark.parametrize("hint", [None, 0, -1, float("nan"), float("inf"),
++                                 float("-inf"), "invalid", True])
++def test_all_quota_invalid_hint_does_not_publish_a_window(hint):
++    error = aggregate(quota(120), quota(hint))
++    assert is_rate_limited_auth_error(error)
++    assert error.retry_after is None
++
++
++def test_all_relogin_retains_terminal_auth_classification():
++    error = aggregate(AuthError("expired", relogin_required=True),
++                      AuthError("revoked", relogin_required=True))
++    assert isinstance(error, AuthError) and error.relogin_required
++    assert not is_rate_limited_auth_error(error)
++    assert error.retry_after is None
++
++
++@pytest.mark.parametrize("other", [RuntimeError("network failed"),
++    AuthError("expired", relogin_required=True), AuthError("unknown")])
++@pytest.mark.parametrize("reverse", [False, True])
++def test_mixed_chain_does_not_inherit_quota_or_relogin(other, reverse):
++    errors = [quota(), other]
++    error = aggregate(*(errors[::-1] if reverse else errors))
++    assert not is_rate_limited_auth_error(error)
++    assert not error.relogin_required
++    assert error.retry_after is None
++    assert error.code == "fallback_exhausted"
++
++
++def test_relogin_and_transient_is_not_terminal():
++    error = aggregate(AuthError("expired", relogin_required=True), RuntimeError("network"))
++    assert not error.relogin_required
++
++
++def test_empty_chain_has_no_classification():
++    error = aggregate()
++    assert not is_rate_limited_auth_error(error)
++    assert not error.relogin_required
++    assert error.retry_after is None
++
++
++def test_nested_quota_chain_and_original_failures_are_preserved():
++    inner = aggregate(quota(120), quota(60))
++    last = quota(90)
++    error = aggregate(inner, last)
++    assert is_rate_limited_auth_error(error)
++    assert error.retry_after == 60
++    assert error.failures == (("provider-0", "model-0", inner), ("provider-1", "model-1", last))
++    assert "Primary provider-0/model-0" in str(error)
++    assert "Fallback provider-1/model-1" in str(error)
++
++
++@pytest.mark.parametrize("mixed", [False, True])
++def test_tui_not_configured_envelope_only_for_homogeneous_chain(monkeypatch, mixed):
++    from agent.auxiliary_unavailable import ProviderNotConfiguredError
++    # Bootstrap recovery probes the live repository's git dir in a linked worktree.
++    # This envelope test must never inspect or recover a real installation.
++    monkeypatch.setattr("hermes_cli._early_recovery.restore_interrupted_pull", lambda *a: False)
++    from tui_gateway import server
++
++    errors = [ProviderNotConfiguredError("primary missing"),
++              RuntimeError("network") if mixed else ProviderNotConfiguredError("fallback missing")]
++    error = aggregate(*errors)
++    events = []
++
++    def fail(*args, **kwargs):
++        raise error
++
++    monkeypatch.setattr(server, "_make_agent", fail)
++    monkeypatch.setattr(server, "_emit", lambda kind, sid, payload: events.append((kind, payload)))
++    monkeypatch.setattr(server, "_deferred_build_agent_kwargs", lambda *a, **kw: {})
++    monkeypatch.setattr(server, "_await_resume_history", lambda *a, **kw: True)
++    for name in ("_set_session_context", "_clear_session_context", "_session_cwd",
++                 "_bind_build_profile_scopes", "_finish_agent_build"):
++        monkeypatch.setattr(server, name, lambda *a, **kw: None)
++    session = {"session_key": "classification-key", "agent_ready": threading.Event()}
++    monkeypatch.setitem(server._sessions, "classification-sid", session)
++    server._start_agent_build("classification-sid", session)
++    session["_agent_build_thread"].join(timeout=30)
++    assert not session["_agent_build_thread"].is_alive()
++    payload = next(payload for kind, payload in events if kind == "error")
++    assert payload.get("code") == (None if mixed else "provider_not_configured")
++    assert "primary missing" in payload["message"]
+diff --git a/tests/hermes_cli/test_resolution_failure_details.py b/tests/hermes_cli/test_resolution_failure_details.py
+new file mode 100644
+index 0000000000..6880155f4c
+--- /dev/null
++++ b/tests/hermes_cli/test_resolution_failure_details.py
+@@ -0,0 +1,120 @@
++"""Resolution failures retain secondary causes across non-TUI surfaces."""
++import logging
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++import cli  # Bootstrap before the per-test home I/O guard.
++import run_agent
++from agent import agent_init
++from hermes_cli.auth import AuthError
++from hermes_cli.fallback_errors import ProviderFallbackError
++
++CHAIN = [{"provider": "anthropic", "model": "claude-test"},
++         {"provider": "deepseek", "model": "deepseek-test"}]
++
++
++@pytest.mark.parametrize("surface", ["shared", "cli", "init"])
++@pytest.mark.parametrize("outcome", ["exhausted", "success", "no_fallback"])
++def test_resolution_chain(surface, outcome, monkeypatch, caplog):
++    primary = AuthError("primary quota exhausted")
++    timeout = TimeoutError("secondary connect timed out")
++    final = ValueError("last route invalid")
++    chain = [] if outcome == "no_fallback" else CHAIN
++    caplog.set_level(logging.WARNING)
++    from hermes_cli.runtime_provider import resolve_runtime_with_fallback
++    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
++    from agent import agent_init
++
++    agent = SimpleNamespace(provider="openai-codex", requested_provider="openai-codex",
++                            model="gpt-test", _fallback_model=chain, _fallback_activated=False)
++    success = {"provider": "deepseek", "api_key": "test"}
++    def resolve(**kwargs):
++        provider = kwargs.get("requested")
++        if provider == "openai-codex":
++            raise primary
++        if provider == "anthropic":
++            raise timeout
++        if outcome == "success":
++            return success
++        raise final
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
++    monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", lambda _: None)
++    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _: Mock(has_credentials=lambda: False))
++    def resolve_client(provider, **kwargs):
++        if provider == "openai-codex":
++            return None, None
++        result = resolve(requested=provider)
++        return result, kwargs.get("model")
++    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve_client)
++    monkeypatch.setattr(agent_init, "_client_kwargs_from_routed", lambda *args: success)
++    monkeypatch.setattr(agent_init, "recompute_init_fallback_api_mode", lambda *args: None)
++    def run():
++        if surface == "shared":
++            return resolve_runtime_with_fallback({"fallback_providers": chain},
++                        requested=agent.provider, target_model=agent.model)[0]
++        if surface == "cli":
++            return CLIAgentSetupMixin._resolve_fallback_runtime(agent, primary)
++        return agent_init._routed_client_kwargs(agent, chain, 60)
++    if outcome == "success":
++        assert run() == success
++    elif outcome == "no_fallback":
++        if surface == "cli":
++            assert run() is None
++        else:
++            with pytest.raises(Exception) as caught:
++                run()
++            assert not isinstance(caught.value, ProviderFallbackError)
++            if surface == "shared":
++                assert caught.value is primary
++        return
++    else:
++        with pytest.raises(ProviderFallbackError) as caught:
++            run()
++        failures = caught.value.failures
++        assert [(p, m) for p, m, _ in failures] == [
++            ("openai-codex", "gpt-test"), ("anthropic", "claude-test"), ("deepseek", "deepseek-test")]
++        assert failures[1][2] is timeout
++        assert failures[2][2] is final
++        if surface != "init":
++            assert failures[0][2] is primary
++    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
++    assert any(all(s in text for s in ["anthropic", "claude-test", "TimeoutError", str(timeout)]) for text in warnings)
++    if outcome == "exhausted":
++        assert any(all(s in text for s in ["deepseek", "deepseek-test", "ValueError", str(final)]) for text in warnings)
++
++
++def test_cli_startup_reports_secondary_failure(monkeypatch, capsys):
++    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
++    shell = CLIAgentSetupMixin()
++    shell.model = "gpt-test"
++    shell.requested_provider = "openai-codex"
++    shell._explicit_api_key = shell._explicit_base_url = None
++    shell._fallback_model = CHAIN[:1]
++    shell.tool_progress_mode = "off"
++    def resolve(**kwargs):
++        if kwargs["requested"] == "openai-codex":
++            raise AuthError("primary quota exhausted", code="rate_limited")
++        raise TimeoutError("secondary connect timed out")
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
++    assert shell._ensure_runtime_credentials() is False
++    assert "TimeoutError: secondary connect timed out" in capsys.readouterr().err
++    assert shell._credentials_terminal is False
++
++
++def test_gateway_retains_aggregate_cause(monkeypatch):
++    from gateway import run
++    cfg = {"model": {"provider": "openai-codex", "default": "gpt-test"},
++           "fallback_providers": CHAIN[:1]}
++    monkeypatch.setattr(run, "_load_gateway_config", lambda: cfg)
++    monkeypatch.setattr("hermes_cli.runtime_provider._get_model_config", lambda: cfg["model"])
++    def resolve(**kwargs):
++        if not kwargs.get("requested"):
++            raise AuthError("primary quota exhausted")
++        raise TimeoutError("secondary connect timed out")
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
++    with pytest.raises(RuntimeError, match="secondary connect timed out") as caught:
++        run._resolve_runtime_agent_kwargs()
++    assert isinstance(caught.value.__cause__, ProviderFallbackError)
++    assert caught.value.__cause__.failures[0][:2] == ("openai-codex", "gpt-test")
+diff --git a/tests/tui_gateway/test_fallback_failure_details.py b/tests/tui_gateway/test_fallback_failure_details.py
+new file mode 100644
+index 0000000000..1ef0e14578
+--- /dev/null
++++ b/tests/tui_gateway/test_fallback_failure_details.py
+@@ -0,0 +1,24 @@
++import logging
++from unittest.mock import patch
++
++import pytest
++
++from hermes_cli.auth import AuthError
++from tui_gateway import server
++from tui_gateway.user_messages import agent_init_failed_message
++
++
++def test_failed_fallback_is_logged_and_surfaced(caplog):
++    primary = AuthError('Codex quota exhausted (429); retry after 500000s',
++                        provider='openai-codex', code='codex_rate_limited', retry_after=500000)
++    chain = [{'provider': 'anthropic', 'model': 'claude-opus-5-5'}]
++    with patch.object(server, '_load_fallback_model', return_value=chain), patch(
++        'hermes_cli.runtime_provider.resolve_runtime_provider',
++        side_effect=[primary, TimeoutError('fallback connection timed out')],
++    ), caplog.at_level(logging.WARNING), pytest.raises(AuthError) as caught:
++        server._resolve_runtime_with_fallback()
++    assert 'fallback connection timed out' in str(caught.value)
++    assert str(primary) in agent_init_failed_message(caught.value)
++    assert 'fallback connection timed out' in agent_init_failed_message(caught.value)
++    assert any('anthropic' in r.message and 'claude-opus-5-5' in r.message
++               and 'fallback connection timed out' in r.message for r in caplog.records)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 37abfe4514..0a0dbdc25a 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1219,6 +1219,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             _announce_built_agent(sid, key, current, agent)
+         except Exception as e:
+             from agent.auxiliary_unavailable import ProviderNotConfiguredError
++            from hermes_cli.fallback_errors import ProviderFallbackError
++
++            def not_configured(error):
++                if isinstance(error, ProviderFallbackError):
++                    return bool(error.failures) and all(
++                        not_configured(failure) for _, _, failure in error.failures)
++                return isinstance(error, ProviderNotConfiguredError)
++
+             current["agent_error"] = str(e)
+             # Logged: a failed build otherwise leaves no trace, so a prompt waiting on it reads in agent.log as
+             # a message that "never ran" (the client only got an event, which a disconnect can lose). [daveey]
+@@ -1229,7 +1237,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             # for the client; older clients keep matching the text.
+             _emit("error", sid, {
+                 "message": agent_init_failed_message(e),
+-                **({"code": "provider_not_configured"} if isinstance(e, ProviderNotConfiguredError) else {})})
++                **({"code": "provider_not_configured"} if not_configured(e) else {})})
+         finally:
+             _finish_agent_build(
+                 sid, key, current, notify_registered=notify_registered, scopes=scopes, session_db=session_db)
+@@ -2516,6 +2524,10 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
+     try:
+         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
+     except AuthError as primary_exc:
++        from hermes_cli.fallback_errors import ProviderFallbackError
++        kwargs = resolve_kwargs or {}
++        failures = [(kwargs.get("requested") or primary_exc.provider,
++                     kwargs.get("target_model") or "", primary_exc)]
+         for entry in _load_fallback_model() or []:
+             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
+             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
+@@ -2536,8 +2548,13 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
+                     "Primary %s (%s), falling back to %s model %s",
+                     primary_failure_wording(primary_exc)[0], primary_exc, fb_provider, fb_model)
+                 return _RuntimeFallbackResolution(runtime, fb_model, True)
+-            except Exception:
+-                continue
++            except Exception as fb_exc:
++                logging.getLogger(__name__).warning(
++                    "Fallback %s model %s failed: %s: %s",
++                    fb_provider, fb_model, type(fb_exc).__name__, fb_exc)
++                failures.append((fb_provider, fb_model, fb_exc))
++        if len(failures) > 1:
++            raise ProviderFallbackError(failures) from primary_exc
+         raise
+ 
+ 
+-- 
+2.55.0
+

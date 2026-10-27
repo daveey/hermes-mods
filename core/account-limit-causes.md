@@ -77,14 +77,14 @@ account-usage display plugin; a message is not proof that a credential will work
   old Codex `usage_limit_reached` on a duplicate login showed a Pro account as out of quota at 30% weekly use.
 - `tui_gateway/contracts/config_free_tier_control.py`: additive optional fields; contract files regenerated.
 
-## Fresh usage lifts a stale quota bench (0457)
+## Fresh usage lifts a stale quota bench (0463)
 
-Patch: `patches/0457-feat-account-usage-fresh-usage-with-quota-left-lifts.patch` (agent + tui_gateway). Cut on
-fork main after two unmirrored kanban commits; it touches no kanban file and applies cleanly on the 0456 tip.
+Patch: `patches/0463-feat-account-usage-fresh-usage-with-quota-left-lifts.patch` (agent + tui_gateway). Cut on
+fork main after two unmirrored kanban commits; it touches no kanban file and applies cleanly on the 0460 tip.
 
 What you see: you reset a Codex subscription early (or the plan changes). Within about two minutes with the
 Desktop chip polling, or ten minutes with nothing open, the account turns green and routing uses it again.
-Before 0457 a `usage_limit_reached` bench held the account out until the provider's old reset time, while the
+Before 0463 a `usage_limit_reached` bench held the account out until the provider's old reset time, while the
 chip showed 0% weekly use next to a red dot.
 
 ### Behavior

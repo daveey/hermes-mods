@@ -1,6 +1,6 @@
 # Goal continuations: a status-only turn is not progress
 
-Patch **0475** (source `5dbfc07e82`).
+Patch **0522** (source `5dbfc07e82`).
 
 ## Behavior
 
@@ -30,7 +30,7 @@ concrete step", so every continuation path that formats them carries it. Judge p
 
 ## Applying
 
-`git am -3 core/patches/0475-*.patch` on top of the series. Prompt-text only; no config.
+`git am -3 core/patches/0522-*.patch` on top of the series. Prompt-text only; no config.
 
 ## Gotchas
 

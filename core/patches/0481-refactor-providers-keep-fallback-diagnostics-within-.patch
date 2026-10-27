@@ -1,0 +1,225 @@
+From 582fab6bfb04037e344fb3f9e6f778c60ddd95a1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 02:55:17 -0700
+Subject: [PATCH] refactor(providers): keep fallback diagnostics within health
+ caps [daveey]
+
+---
+ agent/agent_init.py                           | 31 +--------------
+ agent/agent_init_routes.py                    | 39 +++++++++++++++++++
+ gateway/run_turn_resolution_errors.py         | 32 +++++++++++++++
+ gateway/run_turn_runner.py                    | 26 +------------
+ hermes_cli/cli_agent_setup_mixin.py           |  6 ++-
+ .../test_resolution_failure_details.py        |  1 -
+ tui_gateway/server.py                         |  2 +-
+ 7 files changed, 80 insertions(+), 57 deletions(-)
+ create mode 100644 agent/agent_init_routes.py
+ create mode 100644 gateway/run_turn_resolution_errors.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index c6418857ec..a5c7321383 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -86,35 +86,8 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "", say=None) ->
+ 
+ def _provider_default_routes(provider: str) -> set[str]:
+     """Return known exact default routes for a canonical provider id."""
+-    routes: set[str] = set()
+-
+-    def add(value):
+-        route = normalize_route_base_url(value)
+-        if route:
+-            routes.add(route)
+-
+-    with suppress(Exception):
+-        from hermes_cli.providers import HERMES_OVERLAYS, get_provider
+-        overlay = HERMES_OVERLAYS.get(provider)
+-        provider_def = get_provider(provider, allow_network=False)
+-        add(getattr(overlay, "base_url_override", ""))
+-        add(getattr(provider_def, "base_url", ""))
+-
+-    with suppress(Exception):
+-        from providers import get_provider_profile
+-        add(getattr(get_provider_profile(provider), "base_url", ""))
+-
+-    with suppress(Exception):
+-        from hermes_cli.auth import PROVIDER_REGISTRY
+-        from hermes_cli.models import normalize_provider as normalize_model_provider
+-        from hermes_cli.providers import normalize_provider as normalize_registry_provider
+-        for provider_id, config in PROVIDER_REGISTRY.items():
+-            if normalize_registry_provider(normalize_model_provider(provider_id)) == provider:
+-                add(getattr(config, "inference_base_url", ""))
+-
+-    if provider == "gemini":
+-        routes.update(f"{route.rstrip('/')}/openai" for route in list(routes))
+-    return routes
++    from agent.agent_init_routes import provider_default_routes
++    return provider_default_routes(provider)
+ 
+ 
+ def _context_route_mismatch(
+diff --git a/agent/agent_init_routes.py b/agent/agent_init_routes.py
+new file mode 100644
+index 0000000000..33df2ad4e8
+--- /dev/null
++++ b/agent/agent_init_routes.py
+@@ -0,0 +1,39 @@
++"""Provider catalog routes used to validate initialization context pins."""
++
++from contextlib import suppress
++
++
++def provider_default_routes(provider: str) -> set[str]:
++    """Return known exact default routes for a canonical provider id."""
++    # Keep the initialization module's normalization seam patchable at call time.
++    from agent.agent_init import normalize_route_base_url
++
++    routes: set[str] = set()
++
++    def add(value):
++        route = normalize_route_base_url(value)
++        if route:
++            routes.add(route)
++
++    with suppress(Exception):
++        from hermes_cli.providers import HERMES_OVERLAYS, get_provider
++        overlay = HERMES_OVERLAYS.get(provider)
++        provider_def = get_provider(provider, allow_network=False)
++        add(getattr(overlay, "base_url_override", ""))
++        add(getattr(provider_def, "base_url", ""))
++
++    with suppress(Exception):
++        from providers import get_provider_profile
++        add(getattr(get_provider_profile(provider), "base_url", ""))
++
++    with suppress(Exception):
++        from hermes_cli.auth import PROVIDER_REGISTRY
++        from hermes_cli.models import normalize_provider as normalize_model_provider
++        from hermes_cli.providers import normalize_provider as normalize_registry_provider
++        for provider_id, config in PROVIDER_REGISTRY.items():
++            if normalize_registry_provider(normalize_model_provider(provider_id)) == provider:
++                add(getattr(config, "inference_base_url", ""))
++
++    if provider == "gemini":
++        routes.update(f"{route.rstrip('/')}/openai" for route in list(routes))
++    return routes
+diff --git a/gateway/run_turn_resolution_errors.py b/gateway/run_turn_resolution_errors.py
+new file mode 100644
+index 0000000000..1ceaa3b250
+--- /dev/null
++++ b/gateway/run_turn_resolution_errors.py
+@@ -0,0 +1,32 @@
++"""User-safe replies for model resolution failures before a gateway turn starts."""
++
++
++def resolution_error_result(exc: Exception, session_key: str | None) -> dict:
++    """Log raw diagnostics while returning actionable, sanitized chat text."""
++    # Read the existing runner bindings at call time to preserve patch seams.
++    from gateway.run_turn_runner import logger, t
++
++    # Model/credential resolution failed before the turn began; the raw text (URLs, status
++    # codes) belongs in the log, and the chat gets the commands that fix it.
++    logger.warning("Model resolution failed for session %s: %s", session_key or "", exc)
++    from hermes_cli.auth import is_rate_limited_auth_error
++    from hermes_cli.fallback_errors import ProviderFallbackError
++    chain = exc if isinstance(exc, ProviderFallbackError) else exc.__cause__
++    if isinstance(chain, ProviderFallbackError):
++        from gateway.run import _gateway_provider_error_reply
++        # Keep raw diagnostics in the log; describe each route using the
++        # existing user-safe provider error mapping in messaging chats.
++        reply = '\n'.join(
++            f"{provider}/{model}: {_gateway_provider_error_reply(str(error))}"
++            for provider, model, error in chain.failures
++        )
++        return {"final_response": reply, "messages": [], "api_calls": 0, "tools": []}
++    if is_rate_limited_auth_error(exc.__cause__):
++        # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
++        from gateway.run import _gateway_provider_error_reply
++        return {"final_response": _gateway_provider_error_reply(str(exc)),
++                "messages": [], "api_calls": 0, "tools": []}
++    return {
++        "final_response": t("gateway.errors.no_credentials"),
++        "messages": [], "api_calls": 0, "tools": [],
++    }
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index fcaeb89a12..b29fa2ac99 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1918,30 +1918,8 @@ class TurnRunner:
+                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
+             )
+         except Exception as exc:
+-            # Model/credential resolution failed before the turn began; the raw text (URLs, status
+-            # codes) belongs in the log, and the chat gets the commands that fix it.
+-            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
+-            from hermes_cli.auth import is_rate_limited_auth_error
+-            from hermes_cli.fallback_errors import ProviderFallbackError
+-            chain = exc if isinstance(exc, ProviderFallbackError) else exc.__cause__
+-            if isinstance(chain, ProviderFallbackError):
+-                from gateway.run import _gateway_provider_error_reply
+-                # Keep raw diagnostics in the log; describe each route using the
+-                # existing user-safe provider error mapping in messaging chats.
+-                reply = '\n'.join(
+-                    f"{provider}/{model}: {_gateway_provider_error_reply(str(error))}"
+-                    for provider, model, error in chain.failures
+-                )
+-                return {"final_response": reply, "messages": [], "api_calls": 0, "tools": []}
+-            if is_rate_limited_auth_error(exc.__cause__):
+-                # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
+-                from gateway.run import _gateway_provider_error_reply
+-                return {"final_response": _gateway_provider_error_reply(str(exc)),
+-                        "messages": [], "api_calls": 0, "tools": []}
+-            return {
+-                "final_response": t("gateway.errors.no_credentials"),
+-                "messages": [], "api_calls": 0, "tools": [],
+-            }
++            from gateway.run_turn_resolution_errors import resolution_error_result
++            return resolution_error_result(exc, ctx.session_key)
+         pr = runner._provider_routing
+         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
+         runner._reasoning_config = reasoning_config
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index c3ecea8a3a..536f204406 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -435,8 +435,10 @@ class CLIAgentSetupMixin:
+                 return runtime
+             except Exception as fb_exc:
+                 failures.append((_fb_provider, _fb_model, fb_exc))
+-                logger.warning("Fallback entry %s/%s failed: %s: %s",
+-                               _fb_provider, _fb_model, type(fb_exc).__name__, fb_exc)
++                import logging
++                logging.getLogger(__name__).warning(
++                    "Fallback entry %s/%s failed: %s: %s",
++                    _fb_provider, _fb_model, type(fb_exc).__name__, fb_exc, exc_info=True)
+                 continue
+         if len(failures) > 1:
+             raise ProviderFallbackError(failures) from primary_exc
+diff --git a/tests/hermes_cli/test_resolution_failure_details.py b/tests/hermes_cli/test_resolution_failure_details.py
+index 6880155f4c..4f80e83bb2 100644
+--- a/tests/hermes_cli/test_resolution_failure_details.py
++++ b/tests/hermes_cli/test_resolution_failure_details.py
+@@ -25,7 +25,6 @@ def test_resolution_chain(surface, outcome, monkeypatch, caplog):
+     caplog.set_level(logging.WARNING)
+     from hermes_cli.runtime_provider import resolve_runtime_with_fallback
+     from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+-    from agent import agent_init
+ 
+     agent = SimpleNamespace(provider="openai-codex", requested_provider="openai-codex",
+                             model="gpt-test", _fallback_model=chain, _fallback_activated=False)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 0a0dbdc25a..e53180905d 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2551,7 +2551,7 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
+             except Exception as fb_exc:
+                 logging.getLogger(__name__).warning(
+                     "Fallback %s model %s failed: %s: %s",
+-                    fb_provider, fb_model, type(fb_exc).__name__, fb_exc)
++                    fb_provider, fb_model, type(fb_exc).__name__, fb_exc, exc_info=True)
+                 failures.append((fb_provider, fb_model, fb_exc))
+         if len(failures) > 1:
+             raise ProviderFallbackError(failures) from primary_exc
+-- 
+2.55.0
+

@@ -1,0 +1,226 @@
+From f6a16700fd586590b39d4d933eb65ac9413fb444 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 02:31:03 -0700
+Subject: [PATCH] fix(profiles): isolate scratch homes nested under the native
+ root [daveey]
+
+---
+ apps/desktop/scripts/isolated-probe.md | 98 ++++++++++++++++++++++++++
+ hermes_constants.py                    |  9 ++-
+ tests/test_scratch_home_isolation.py   | 79 +++++++++++++++++++++
+ 3 files changed, 183 insertions(+), 3 deletions(-)
+ create mode 100644 apps/desktop/scripts/isolated-probe.md
+ create mode 100644 tests/test_scratch_home_isolation.py
+
+diff --git a/apps/desktop/scripts/isolated-probe.md b/apps/desktop/scripts/isolated-probe.md
+new file mode 100644
+index 0000000000..9d942e4e8c
+--- /dev/null
++++ b/apps/desktop/scripts/isolated-probe.md
+@@ -0,0 +1,98 @@
++# Isolated Desktop probes
++
++A separate Electron `--user-data-dir` is necessary, but not sufficient. Never send
++synthetic input to the owner's window or use a real session as a test fixture.
++
++## What leaked
++
++`hermes_constants.get_default_hermes_root()` previously collapsed every descendant
++of the native Hermes home back to that home. Thus `HERMES_HOME=~/.hermes/cache/scratch/probe/home`
++made `hermes_cli.profiles` enumerate the real default and named profile directories.
++The sidebar's `profile=all` route uses `_profile_targets()` → `profiles_to_serve()`;
++it consequently read the real databases. Startup multi-profile detection uses the
++same root. The root resolver now recognizes only the native home and its immediate
++`profiles/<name>` homes (including native symlink aliases), not arbitrary descendants.
++
++Host discovery is a separate boundary. `gateway.host_rendezvous.host_state_dir()`
++uses `gateway.status._get_lock_dir()`: `HERMES_GATEWAY_LOCK_DIR`, otherwise
++`$XDG_STATE_HOME/hermes/gateway-locks` or `~/.local/state/hermes/gateway-locks`.
++Changing HERMES_HOME does NOT change this OS-user-wide namespace. Desktop's
++`HERMES_DESKTOP_ISOLATED_BACKEND=1` skips its attach-first ladder; it does not alone
++isolate Python profile enumeration or the backend's `desktop-serve` record.
++An observe-only warning is not proof of isolation.
++
++## Launch contract
++
++Use a worktree, never rebuild the live checkout. Build the worktree Electron main
++process first using the repository's normal build commands. Allocate one fresh,
++absolute probe directory and reserve unused renderer/CDP ports. Keep the following
++environment for both Electron and its backend; sanitize inherited worker, profile,
++gateway, token and connection settings rather than copying the owner's full env:
++
++    HOME=<probe>/oshome
++    HERMES_HOME=<probe>/oshome/.hermes
++    HERMES_GATEWAY_LOCK_DIR=<probe>/gateway-locks
++    XDG_STATE_HOME=<probe>/xdg-state
++    HERMES_DESKTOP_ISOLATED_BACKEND=1
++    HERMES_DESKTOP_HERMES_ROOT=<absolute-worktree>
++    HERMES_DESKTOP_DEV_SERVER=http://127.0.0.1:5175
++    HERMES_DESKTOP_CDP_PORT=9333
++
++Create HOME and HERMES_HOME first. Using a separate HOME is defense in depth and
++works around older cores' root-resolution bug; use the explicit lock override even
++then (an inherited XDG_STATE_HOME can otherwise point back to the real records).
++Start Electron from the worktree's `apps/desktop` with explicit
++`--remote-debugging-port=9333 --user-data-dir=<probe>/userdata`.
++Use a fresh userdata directory, not a copy of real connection settings.
++Do not copy real configs, plugins or credentials wholesale.
++
++Worker-launched unpackaged probes are hidden by `agent-test-instance.ts`. Preserve
++the worker-launch identity needed by that guard when sanitizing (HERMES_KANBAN_TASK),
++and require the `worker-launched test instance` log before proceeding. Never set
++HERMES_DESKTOP_AGENT_VISIBLE=1 without an explicit request. Do not use OS-level
++keyboard injection; own the CDP target and verify its identity before each action.
++
++## Vite must have its own cache
++
++Worktree `node_modules` may be a symlink into the live checkout. Vite's default
++cacheDir therefore writes a shared cache. Override it with an absolute path such as
++`<probe>/node_modules/.vite`; the literal `node_modules` path segment is essential:
++without it the React/Babel plugin can transform prebundled dependencies and Vite
++can stall for minutes. Do not use `<probe>/.vite`.
++
++For example, from `apps/desktop`, use Vite's API with the existing config:
++
++    PROBE_CACHE_DIR=<probe>/node_modules/.vite node --input-type=module -e '
++      import { createServer } from "vite";
++      const server = await createServer({
++        configFile: "./vite.config.ts",
++        cacheDir: process.env.PROBE_CACHE_DIR,
++        server: { host: "127.0.0.1", port: 5175, strictPort: true }
++      });
++      await server.listen();
++      server.printUrls();
++    '
++
++Use the repository's bundled Node. Do not run `dev:renderer` if it deletes dist.
++
++## Fail-closed checks and cleanup
++
++Before any send/openSession, verify the backend process has the exact probe home
++and lock directory, profile enumeration contains only homes inside the probe,
++and `GET /api/profiles/sessions?profile=all` contains only synthetic probe sessions
++(or is empty). Verify no real gateway connections exist in the fresh userdata.
++Abort on any foreign profile/session/host-owner record; do not test by sending to it.
++These environment settings are application data isolation, not an OS security sandbox.
++
++Afterward stop only the exact Electron, Vite and backend processes this probe
++started. Never `hermes serve --stop`, never kill the owner's app to free a port.
++Keep logs/screenshots in the probe directory and remove synthetic state when done.
++
++## Regression coverage
++
++`tests/test_scratch_home_isolation.py` covers nested root resolution, native and
++profile symlink compatibility, served profiles, sidebar all-profile targets, and
++separate rendezvous reads for serve, desktop-serve and gateway roles. It creates
++synthetic native/scratch trees and a valid shared record, proves that record is
++readable before switching namespaces, then proves the probe cannot see it.
++This is backend/helper coverage, not a live Electron UI acceptance test.
+diff --git a/hermes_constants.py b/hermes_constants.py
+index e491c1e8e2..0d556559d5 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -225,9 +225,12 @@ def get_default_hermes_root(*, home: str | Path | None = None) -> Path:
+         return memo[2]
+     result = native_home
+     if env_path is not None:
+-        try:
+-            env_path.resolve().relative_to(native_home.resolve())  # under ~/.hermes (normal or profile mode)
+-        except ValueError:  # Docker/custom root: <root>/profiles/<name> -> <root>, else HERMES_HOME itself
++        # Only the native home and its immediate profiles (including symlink aliases)
++        # belong to the native root. A scratch home below ~/.hermes/cache is an
++        # independent installation: collapsing every descendant exposes real sessions.
++        resolved = env_path.resolve()
++        native_resolved = native_home.resolve()
++        if resolved != native_resolved and resolved.parent != native_resolved / "profiles":
+             result = env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+     _default_hermes_root_memo = (*memo_key, result)
+     return result
+diff --git a/tests/test_scratch_home_isolation.py b/tests/test_scratch_home_isolation.py
+new file mode 100644
+index 0000000000..7a1bd8ecb2
+--- /dev/null
++++ b/tests/test_scratch_home_isolation.py
+@@ -0,0 +1,79 @@
++"""A nested scratch home must not enumerate the native install's profiles."""
++import json
++
++import pytest
++
++import hermes_constants as constants
++
++
++@pytest.fixture
++def homes(tmp_path, monkeypatch):
++    native = tmp_path / ".hermes"
++    scratch = native / "cache" / "scratch" / "probe" / "home"
++    for home in (native, native / "profiles" / "real", scratch):
++        home.mkdir(parents=True, exist_ok=True)
++        (home / "config.yaml").write_text("{}\n")
++    monkeypatch.setattr(constants, "_get_platform_default_hermes_home", lambda: native)
++    monkeypatch.setenv("HERMES_HOME", str(scratch))
++    monkeypatch.delenv("HERMES_PROFILE", raising=False)
++    return native, scratch
++
++
++def test_nested_scratch_is_its_own_root(homes):
++    native, scratch = homes
++    assert constants.get_default_hermes_root() == scratch
++    assert constants.get_default_hermes_root(home=scratch) == scratch
++    assert constants.get_default_hermes_root(home=native) == native
++    assert constants.get_default_hermes_root(home=native / "profiles" / "real") == native
++    assert constants.get_default_hermes_root(home=scratch / "profiles" / "test") == scratch
++
++
++def test_scratch_profile_enumeration_never_reads_native(homes):
++    from hermes_cli.profiles import get_profile_dir, profiles_to_serve
++
++    _, scratch = homes
++    assert get_profile_dir("default") == scratch
++    assert profiles_to_serve(multiplex=True, include_standalone=True, include_parked=True) == [
++        ("default", scratch)
++    ]
++
++
++def test_sidebar_profile_all_targets_only_scratch(homes):
++    from hermes_cli.web_routers.profiles import _profile_targets
++
++    _, scratch = homes
++    assert _profile_targets("isolation regression") == [("default", scratch)]
++
++
++@pytest.mark.parametrize("role", ["serve", "desktop-serve", "gateway"])
++def test_probe_lock_override_ignores_real_host_record(homes, monkeypatch, role):
++    from gateway import host_rendezvous as hr
++
++    native, scratch = homes
++    shared = native / "shared-locks"
++    shared.mkdir()
++    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(shared))
++    shared_record = hr.record_path(role)
++    record = hr.HostRecord(
++        role=role, pid=12345, create_time=None, host="127.0.0.1", port=9119,
++        protocol_version=hr.HOST_PROTOCOL_VERSION, token_fingerprint="test",
++        profiles=("default", "real"), updated_at="", home=str(native),
++    )
++    payload = json.dumps(record.to_json())
++    shared_record.write_text(payload)
++    assert hr.read_record(role, include_stale=True) == record
++    locks = scratch / "gateway-locks"
++    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(locks))
++    assert hr.host_state_dir() == locks
++    assert hr.read_record(role, include_stale=True) is None
++    assert shared_record.read_text() == payload
++
++
++def test_native_root_symlink_remains_native(homes, tmp_path):
++    native, _ = homes
++    alias = tmp_path / "native-alias"
++    alias.symlink_to(native, target_is_directory=True)
++    assert constants.get_default_hermes_root(home=alias) == native
++    profile_alias = tmp_path / "profile-alias"
++    profile_alias.symlink_to(native / "profiles" / "real", target_is_directory=True)
++    assert constants.get_default_hermes_root(home=profile_alias) == native
+-- 
+2.55.0
+

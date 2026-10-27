@@ -1,0 +1,79 @@
+From 41a47a3c3217eb4901864429a390c7893478c645 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 01:24:47 -0700
+Subject: [PATCH] fix(kanban-sync): diff counts acknowledged-but-unpulled rows
+ as in flight; refresh the replica first [daveey]
+
+The hub's 08:07 soak sample reported two status/run mismatches that a diff a
+minute later did not: the rows had been pushed and acknowledged (outbox
+empty) but the replica pulls one round later. A card whose acknowledged
+version is newer than the replica's is now in flight like an unpushed row,
+and `sync diff` pulls the replica before comparing.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_cli.py               |  4 ++++
+ hermes_cli/kanban_sync_client.py            |  5 +++++
+ tests/hermes_cli/test_kanban_sync_client.py | 18 ++++++++++++++++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 0aa2f0e5a4..10d3e03502 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -87,6 +87,10 @@ def _diff(args: argparse.Namespace) -> int:
+     live = kbc.connect(_path(slug))
+     shadow = ksc.open_shadow(slug, ident.gateway)
+     try:
++        try:  # compare against the service's current state, not the replica's last round
++            ksc.pull(shadow, ksc.Hub(ident), slug, observers=False)
++        except (ksc.HubError, ksc.Resync, OSError) as exc:
++            print(f"kanban sync: could not refresh the replica first ({exc}); comparing with its last round")
+         report = ksc.diff(live, shadow, ident.gateway)
+     finally:
+         live.close()
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 4a6dee45cd..e22820bf83 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -580,6 +580,11 @@ def diff(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) ->
+     pending_tasks = {r[0] for r in live.execute(
+         "SELECT DISTINCT CASE WHEN table_name = 'tasks' THEN row_uid ELSE json_extract(fields, '$.task_id') END "
+         "FROM kanban_sync_outbox WHERE state = 'pending'")}
++    # Acknowledged by the service but not pulled back into the replica yet (the replica lags one round):
++    # in flight, like an unpushed row, not a difference.
++    acked = {r[0]: r[1] for r in live.execute("SELECT id, sync_version FROM tasks WHERE sync_version IS NOT NULL")}
++    seen = {r[0]: r[1] or 0 for r in shadow.execute("SELECT id, sync_version FROM tasks")}
++    pending_tasks |= {t for t, v in acked.items() if v > seen.get(t, 0)}
+     live_tasks = _task_rows(live)
+     mine = {r[0] for r in shadow.execute("SELECT id FROM tasks WHERE created_on = ? OR created_on IS NULL", (gateway,))}
+     shadow_tasks = _task_rows(shadow, mine | set(live_tasks))
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 203e2ce610..8768167686 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -540,3 +540,21 @@ def test_a_worker_process_builds_its_own_lease_client_from_the_hub_enrollment(ka
+         assert isinstance(client, ksc.HubLeaseClient) and client.hub.ident.gateway == ME
+     finally:
+         sync.set_lease_client(previous)
++
++
++def test_diff_counts_an_acknowledged_row_the_replica_has_not_pulled_yet_as_in_flight(live, svc, kanban_home):
++    tid = kb.create_task(live, title="moving", assignee="worker")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)  # acknowledged; the replica has not pulled it yet
++    shadow = _shadow()
++    try:
++        report = ksc.diff(live, shadow, ME)
++        assert report["clean"] and report["pending"] == 1, report
++        ksc.pull(shadow, svc.hub(ME), BOARD, observers=False)
++        report = ksc.diff(live, shadow, ME)
++    finally:
++        shadow.close()
++    assert report["clean"] and report["pending"] == 0 and report["checked"] == 1
+-- 
+2.55.0
+

@@ -1,0 +1,155 @@
+From ffeb8f66fc22f8e66776763e0158c330ee4777d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 03:50:01 -0700
+Subject: [PATCH] fix(desktop): preserve task evidence across legacy reads and
+ activation races [daveey]
+
+---
+ .../hooks/refresh-retained-kanban.test.ts     |  8 +++
+ .../session/hooks/refresh-retained-kanban.ts  | 11 ++++
+ .../hooks/use-session-list-actions.test.tsx   | 13 ++++-
+ .../session/hooks/use-session-list-actions.ts | 51 ++++++++++---------
+ 4 files changed, 56 insertions(+), 27 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
+index 04c3237397..7be54fadc8 100644
+--- a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
++++ b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
+@@ -24,6 +24,14 @@ describe('retained older sidebar task evidence', () => {
+     expect(result).toMatchObject({ kanban_active: 16, kanban_unknown: true })
+   })
+ 
++  it.each([{}, { kanban_observed_at: null }, { kanban_observed_at: '123' },
++    { kanban_observed_at: NaN }, { kanban_observed_at: Infinity }, { kanban_observed_at: -1 },
++    { kanban_observed_at: 124, kanban_active: -1 }, { kanban_observed_at: 124, kanban_active: '16' },
++    { kanban_observed_at: 124, kanban_unknown: true }])('preserves counts for absent or invalid evidence %j', async evidence => {
++    const [result] = await refreshRetainedKanban([row({ kanban_active: 16, kanban_observed_at: 123 })], async () => row(evidence))
++    expect(result).toMatchObject({ kanban_active: 16, kanban_observed_at: 123, kanban_unknown: true })
++  })
++
+   it('rejects another profile with the same session id', async () => {
+     const [result] = await refreshRetainedKanban([row()], async () => row({ profile: 'other', kanban_active: 99 }))
+     expect(result.kanban_unknown).toBe(true)
+diff --git a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
+index 637e82b760..65f3661a3f 100644
+--- a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
++++ b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
+@@ -41,6 +41,17 @@ export async function refreshRetainedKanban(
+           throw new Error('Task evidence owner mismatch')
+         }
+ 
++        // Older gateways return session details without task annotations. A
++        // successful HTTP read is not proof of zero linked work.
++        const stamp = fresh.kanban_observed_at
++        const counts = [fresh.kanban_active, fresh.kanban_blocked, fresh.kanban_attention, fresh.kanban_remote_stale]
++
++        if (typeof stamp !== 'number' || !Number.isFinite(stamp) || stamp <= 0 ||
++          fresh.kanban_unknown || counts.some(value => value !== undefined &&
++            (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0))) {
++          throw new Error('Task evidence unavailable')
++        }
++
+         output[index] = withKanbanEvidence(row, fresh)
+       } catch {
+         output[index] = { ...row, kanban_unknown: true }
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index 998d179c10..40c3d4566f 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -212,7 +212,12 @@ it.each(['rename', 'remove', 'switch'])('guards retained task refresh against a
+ 
+   if (change === 'rename') { setSessions([row('old', { connection_id: 'remote', title: 'New title' })]) }
+ 
+-  if (change === 'switch') { gatewayScope.epoch++ }
++  if (change === 'switch') {
++    gatewayScope.epoch++
++    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('fresh-page')] }))
++    getSession.mockResolvedValue(row('old', { kanban_active: 7, kanban_observed_at: 125 }))
++  }
++
+   await act(async () => {
+     pending.resolve(row('old', { kanban_active: 16, kanban_observed_at: 123 }))
+     await refreshing
+@@ -222,7 +227,11 @@ it.each(['rename', 'remove', 'switch'])('guards retained task refresh against a
+ 
+   if (change === 'rename') { expect($sessions.get()[0]).toMatchObject({ title: 'New title', kanban_active: 16 }) }
+ 
+-  if (change === 'switch') { expect($sessions.get()[0].kanban_active).toBeUndefined() }
++  if (change === 'switch') {
++    expect(listSidebarSessions).toHaveBeenCalledTimes(2)
++    expect($sessions.get().find(s => s.id === 'fresh-page')).toBeDefined()
++    expect($sessions.get().find(s => s.id === 'old')).toMatchObject({ kanban_active: 7 })
++  }
+ })
+ 
+ // #67600: a cold-start read that fails must not render as "No sessions yet".
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+index d0ee050320..0ef523c2a7 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+@@ -389,36 +389,37 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+             messagingExclude: MESSAGING_EXCLUDED_SOURCES
+           })
+ 
+-        let activationEpoch = gatewayActivationEpoch()
+-        let result = await fetchPage()
+-
+-        // A gateway activation that landed mid-request voids this page: it may
+-        // describe the source the window just left. But every activation bumps
+-        // the epoch, including a re-activation of the route already in front
+-        // (a resume or profile click through ensureGatewayAgent), and those
+-        // move no route atom, so no effect asks for the list again. Dropping
+-        // the page there left the sidebar on "No sessions" while the backend
+-        // held the rows (#67600). Still the newest refresh for this scope, so
+-        // re-read under the current epoch instead.
+-        while (owns() && gatewayActivationEpoch() !== activationEpoch) {
++        let activationEpoch: number
++        let result: Awaited<ReturnType<typeof fetchPage>>
++        let primaryConnection: ReturnType<typeof primaryGatewayConnectionId>
++        let refreshed: SessionInfo[] = []
++
++        // Re-activating the same route moves no route atom, so no effect starts
++        // another refresh. Retry the entire observation (page AND details) when
++        // activation changes, unless a newer request/scope already owns it.
++        do {
+           activationEpoch = gatewayActivationEpoch()
++          primaryConnection = primaryGatewayConnectionId()
+           result = await fetchPage()
+-        }
+ 
+-        // Open/restored older rows survive paging, but otherwise their task
+-        // counts never refresh. Capture the primary owner before any await.
+-        const primaryConnection = primaryGatewayConnectionId()
+-        const page = result.recents.sessions ?? []
++          if (!owns()) { return }
++
++          if (gatewayActivationEpoch() !== activationEpoch) { continue }
++
++          // Open/restored older rows survive paging, but otherwise their task
++          // counts never refresh. Pin reads to the owner captured before await.
++          const page = result.recents.sessions ?? []
+ 
+-        const retained = mergeSessionPage($sessions.get(), page, sessionsToKeep())
+-          .filter(row => !page.some(item => item.id === row.id &&
+-            (item.profile ?? 'default') === (row.profile ?? 'default') &&
+-            (item.connection_id ?? primaryConnection) === (row.connection_id ?? primaryConnection)))
++          const retained = mergeSessionPage($sessions.get(), page, sessionsToKeep())
++            .filter(row => !page.some(item => item.id === row.id &&
++              (item.profile ?? 'default') === (row.profile ?? 'default') &&
++              (item.connection_id ?? primaryConnection) === (row.connection_id ?? primaryConnection)))
+ 
+-        const refreshed = await refreshRetainedKanban(retained, row => getSession(row.id, {
+-          connectionId: row.connection_id ?? primaryConnection,
+-          profile: row.profile ?? 'default'
+-        }))
++          refreshed = await refreshRetainedKanban(retained, row => getSession(row.id, {
++            connectionId: row.connection_id ?? primaryConnection,
++            profile: row.profile ?? 'default'
++          }))
++        } while (owns() && gatewayActivationEpoch() !== activationEpoch)
+ 
+         if (owns() && gatewayActivationEpoch() === activationEpoch) {
+           const recents = result.recents
+-- 
+2.55.0
+

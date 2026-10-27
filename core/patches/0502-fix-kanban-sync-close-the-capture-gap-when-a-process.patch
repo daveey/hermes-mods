@@ -1,0 +1,181 @@
+From 0fabd3eb47c0f6fe14405a82172a27e1dd5b986f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 10:20:13 -0700
+Subject: [PATCH] fix(kanban-sync): close the capture gap when a process
+ (re)installs triggers [daveey]
+
+Seen live after the cutover: diffs on two gateways reported run/comment rows
+the service never had and the outbox never held. A process's first connect
+ran install_or_remove, which dropped and recreated every capture trigger with
+no transaction around it; a write from another process in that window (here
+the dispatcher's claim inserting its run row right after a gateway restart)
+was never captured, and the uid backfill then gave it a fresh identity.
+
+- install_or_remove's trigger work and uid backfill run in one write
+  transaction, so no other writer can land between drop and create.
+- install_triggers is a no-op when the installed set already matches what it
+  would generate: ordinary process starts never touch the triggers.
+- On a board already attached to the service, rows the backfill has to give a
+  uid were written in a capture gap: they are queued for upload (logged), not
+  left to diverge. Before the first attach, import still uploads them.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_db_sync.py                | 66 ++++++++++++++++-----
+ tests/hermes_cli/test_kanban_sync_client.py | 52 ++++++++++++++++
+ 2 files changed, 104 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 50417423ab..5ad9478065 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -239,17 +239,39 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+         "SELECT ?, ?, '', 'shadow' WHERE NOT EXISTS (SELECT 1 FROM kanban_sync_state)",
+         (f"local:{uuid7()}", f"gw_{uuid7()}"),
+     )
+-    if conn.execute("SELECT mode FROM kanban_sync_state").fetchone()[0] == "off":
+-        drop_triggers(conn)
+-        _SYNCED_PATHS.discard(db_path)
+-        return
+-    # Rows written before the first enable get their global identity now.
+-    for table in _UID_TABLES:
+-        conn.execute(f"UPDATE {table} SET uid = {_UUID7_SQL} WHERE uid IS NULL")
+-    install_triggers(conn)
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):  # one transaction: no other writer can land between dropping and recreating a trigger
++        state = conn.execute("SELECT mode, board_id FROM kanban_sync_state").fetchone()
++        if state[0] == "off":
++            drop_triggers(conn)
++            _SYNCED_PATHS.discard(db_path)
++            return
++        # Rows without a uid were written while no trigger captured them: before the first enable (import uploads
++        # those), or, on a board already attached to the service, in a capture gap. Give them their identity, and
++        # queue the gap's rows for upload so they cannot silently diverge.
++        attached = not str(state[1]).startswith("local:")
++        for table in _UID_TABLES:
++            missed = [r[0] for r in conn.execute(f"SELECT id FROM {table} WHERE uid IS NULL")] if attached else []
++            conn.execute(f"UPDATE {table} SET uid = {_UUID7_SQL} WHERE uid IS NULL")
++            if missed:
++                _queue_rows(conn, table, missed)
++                _log.warning("kanban sync: %d %s row(s) were written without capture; queued for upload", len(missed), table)
++        install_triggers(conn)
+     _SYNCED_PATHS.add(db_path)
+ 
+ 
++def _queue_rows(conn: sqlite3.Connection, table: str, ids: list[int]) -> None:
++    """Queue full-row upserts for ``ids`` (rows a capture trigger never saw)."""
++    fields = "json_object(" + ", ".join(
++        f"'{_wire_name(table, c)}', json({_wire_value(table, c, 's')})" for c in captured_columns(conn, table)) + ")"
++    for chunk in range(0, len(ids), 500):
++        part = ids[chunk:chunk + 500]
++        conn.execute(
++            "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++            f"SELECT {_UUID7_SQL}, '{table}', s.uid, 'upsert', {fields}, NULL, '', {_NOW_MS_SQL} "
++            f"FROM {table} AS s WHERE s.id IN ({','.join('?' * len(part))})", part)
++
++
+ def drop_triggers(conn: sqlite3.Connection) -> None:
+     names = [r[0] for r in conn.execute(
+         "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'kanban_sync_%'")]
+@@ -367,16 +389,32 @@ def _delete_trigger(table: str) -> str:
+     return f"CREATE TRIGGER kanban_sync_{table}_del AFTER DELETE ON {table} WHEN {when} BEGIN {body} END"
+ 
+ 
+-def install_triggers(conn: sqlite3.Connection) -> None:
+-    """(Re)generate every capture trigger from the live column list."""
+-    drop_triggers(conn)
++def wanted_triggers(conn: sqlite3.Connection) -> dict[str, str]:
++    """Trigger name -> CREATE statement, generated from the live column list."""
++    out: dict[str, str] = {}
+     for table in SYNCED_TABLES:
+         columns = captured_columns(conn, table)
+-        conn.execute(_insert_trigger(table, columns))
++        sqls = [_insert_trigger(table, columns)]
+         if table != "task_links":
+-            conn.execute(_update_trigger(table, columns))
++            sqls.append(_update_trigger(table, columns))
+         if table in _DELETE_CAPTURED:
+-            conn.execute(_delete_trigger(table))
++            sqls.append(_delete_trigger(table))
++        for sql in sqls:
++            out[sql.split()[2]] = sql
++    return out
++
++
++def install_triggers(conn: sqlite3.Connection) -> None:
++    """(Re)generate every capture trigger from the live column list. A no-op when the installed set already
++    matches, so ordinary process starts never touch them; callers hold a write transaction so a rebuild has no
++    window in which another process's write goes uncaptured."""
++    wanted = wanted_triggers(conn)
++    have = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'kanban_sync_%'"))
++    if have == wanted:
++        return
++    drop_triggers(conn)
++    for sql in wanted.values():
++        conn.execute(sql)
+ 
+ 
+ # --- Per-connection state -------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 8768167686..a2b9353ef9 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -558,3 +558,55 @@ def test_diff_counts_an_acknowledged_row_the_replica_has_not_pulled_yet_as_in_fl
+     finally:
+         shadow.close()
+     assert report["clean"] and report["pending"] == 0 and report["checked"] == 1
++
++
++# --- capture gaps: trigger installs are atomic, skip when current, and heal missed rows --------------------------
++
++def _reinstall(kanban_home):
++    """A new process opening the board (its first connect runs install_or_remove)."""
++    kbc._INITIALIZED_PATHS.discard(str((kanban_home / "kanban.db").resolve()))
++    return kbc.connect(kanban_home / "kanban.db")
++
++
++def test_a_new_process_leaves_matching_triggers_untouched(live, kanban_home, monkeypatch):
++    drops = []
++    monkeypatch.setattr(sync, "drop_triggers", lambda conn: drops.append(1))
++    other = _reinstall(kanban_home)
++    other.close()
++    assert drops == []  # no drop/recreate window on an ordinary start
++
++
++def test_rows_written_in_a_capture_gap_are_queued_on_the_next_install(live, kanban_home):
++    tid = kb.create_task(live, title="gap", assignee="worker")
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++        sync.drop_triggers(live)  # the gap: another process's write lands with no trigger
++        live.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', 1)", (tid,))
++        live.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'me', 'missed', 1)", (tid,))
++    other = _reinstall(kanban_home)
++    try:
++        queued = {(r["table_name"], json.loads(r["fields"]).get("status") or json.loads(r["fields"]).get("body"))
++                  for r in other.execute("SELECT table_name, fields FROM kanban_sync_outbox")}
++        assert ("task_runs", "running") in queued and ("task_comments", "missed") in queued
++        assert other.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'kanban_sync_%'").fetchone()[0]
++    finally:
++        other.close()
++
++
++def test_rows_from_before_the_first_attach_are_left_to_import(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")  # never attached: board_id is local:…
++    try:
++        tid = kb.create_task(conn, title="pre", assignee="worker")
++        with kbc.write_txn(conn):
++            conn.execute("DELETE FROM kanban_sync_outbox")
++            sync.drop_triggers(conn)
++            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'me', 'old', 1)", (tid,))
++    finally:
++        conn.close()
++    other = _reinstall(kanban_home)
++    try:
++        assert other.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++        assert other.execute("SELECT uid FROM task_comments WHERE body = 'old'").fetchone()[0]
++    finally:
++        other.close()
+-- 
+2.55.0
+

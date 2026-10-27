@@ -1,0 +1,149 @@
+From d56b6210701826fcb9793b1ff38a172606897cc6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 13:44:55 -0700
+Subject: [PATCH] fix(model-routing): aux class requirements use token units;
+ title JSON best-effort (#123)
+
+Auxiliary class routing compared UTF-8 bytes of messages+tools against
+token-denominated route caps (same defect PR #122 fixed for the main turn),
+so large aux jobs such as compression refused spuriously. Use the same rough
+token estimator as compression/preflight.
+
+Title generation sends response_format as a hint and already parses prose,
+but under class routing it required attested JSON and failed closed on every
+native route. Serve title_generation without response_format instead; other
+tasks still require attested JSON.
+
+Co-authored-by: daveey <daveey@users.noreply.github.com>
+---
+ agent/auxiliary_class_routing.py              | 32 +++++++----
+ .../test_auxiliary_class_requirements.py      | 54 +++++++++++++++++++
+ 2 files changed, 77 insertions(+), 9 deletions(-)
+ create mode 100644 tests/agent/test_auxiliary_class_requirements.py
+
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index 733faf479f..48d5d01fc0 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -56,8 +56,7 @@ def _class_request(task, options):
+                  task_config.get("key_env"), task_config.get("api_key_env"))
+     if provider not in (None, "", "auto") or any(overrides):
+         raise ModelRoutingError("Auxiliary class requests require provider auto and no transport overrides")
+-    extra = aux._get_task_extra_body(task)
+-    extra.update(options.get("extra_body") or {})
++    extra = _task_extra_body(task, options)
+     if set(extra) & {"model", "messages", "tools", "stream", "max_tokens", "max_completion_tokens"}:
+         raise ModelRoutingError("Auxiliary class extra_body cannot override request identity or capabilities")
+     headers = options.get("extra_headers") or {}
+@@ -71,17 +70,33 @@ def _class_request(task, options):
+     return model, identity, requirements, config, declared_model
+ 
+ 
++# Tasks whose structured output is only a hint: the caller also parses prose
++# (title_generator._extract_title_text), so under class routing they are served
++# without response_format instead of failing closed on routes without attested JSON.
++_BEST_EFFORT_JSON_TASKS = frozenset({"title_generation"})
++
++
++def _task_extra_body(task, options):
++    from agent import auxiliary_client as aux
++    extra = aux._get_task_extra_body(task)
++    extra.update(options.get("extra_body") or {})
++    if task in _BEST_EFFORT_JSON_TASKS:
++        extra.pop("response_format", None)
++    return extra
++
++
+ def _requirements(task, options, extra):
+     from agent import auxiliary_client as aux
+     messages = options.get("messages") or []
+     vision = task == "vision" or any(
+         isinstance(block, dict) and block.get("type") in {"image", "image_url", "input_image"}
+         for msg in messages for block in (msg.get("content") if isinstance(msg.get("content"), list) else []))
+-    # Conservative byte bound avoids selecting a route too small before a
+-    # provider-specific tokenizer is known. Include output reservation and tools.
+-    import json
+-    context = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+-    context += len(json.dumps(options.get("tools") or []).encode("utf-8"))
++    # Same rough token estimator as compression/preflight: route caps are in
++    # tokens and UTF-8 bytes overstate them ~3-4x. Includes tools and the
++    # output reservation.
++    from agent.model_metadata import estimate_request_tokens_rough
++    context = estimate_request_tokens_rough(
++        [m for m in messages if isinstance(m, dict)], tools=options.get("tools") or None)
+     context += options.get("max_tokens") or 4096
+     return {"tools": bool(options.get("tools")), "vision": vision,
+             "streaming": True, "json": bool(extra.get("response_format")),
+@@ -121,8 +136,7 @@ def _prepare(task, options, request, failed):
+     client._managed_subscription_runtime = runtime
+     if hasattr(client, "_real_client"):
+         client._real_client._managed_subscription_runtime = runtime
+-    extra = aux._get_task_extra_body(task)
+-    extra.update(options.get("extra_body") or {})
++    extra = _task_extra_body(task, options)
+     kwargs = aux._build_call_kwargs(
+         runtime["provider"], runtime["model"], options["messages"],
+         temperature=options.get("temperature"), max_tokens=options.get("max_tokens"),
+diff --git a/tests/agent/test_auxiliary_class_requirements.py b/tests/agent/test_auxiliary_class_requirements.py
+new file mode 100644
+index 0000000000..673edb0257
+--- /dev/null
++++ b/tests/agent/test_auxiliary_class_requirements.py
+@@ -0,0 +1,54 @@
++"""Auxiliary class requirements: token units for context, best-effort JSON for titles."""
++import pytest
++from agent import auxiliary_client as aux
++from agent.model_routing import ModelRoutingError
++from tests.tui_gateway import test_class_routing as fixtures
++
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++native_transport = fixtures.native_transport
++
++
++def _write(routing_home, tmp_path, **caps):
++    from hermes_cli.config import atomic_config_write
++    routing_home["model_routing"]["routes"]["deep"][0]["capabilities"].update(caps)
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++
++
++def test_context_bound_is_tokens_not_bytes(routing_home, streaming_route, native_transport, tmp_path):
++    # ~300 KB of text is ~75k tokens: fits a 200k-token route, but its UTF-8 byte
++    # count alone exceeds the cap, which refused every large aux job before.
++    _write(routing_home, tmp_path, context_tokens=200_000)
++    text = "word " * 60_000
++    response = aux.call_llm("title", model="class:deep", max_tokens=32,
++                            messages=[{"role": "user", "content": text}])
++    assert response.choices[0].message.content == "ok"
++    assert len(native_transport) == 1
++
++
++def test_context_bound_still_refuses_oversized_requests(routing_home, streaming_route, native_transport,
++                                                       tmp_path):
++    _write(routing_home, tmp_path, context_tokens=20_000)
++    with pytest.raises(ModelRoutingError):
++        aux.call_llm("title", model="class:deep", max_tokens=32,
++                     messages=[{"role": "user", "content": "word " * 60_000}])
++    assert native_transport == []
++
++
++def test_title_generation_json_is_best_effort(routing_home, streaming_route, native_transport, tmp_path):
++    _write(routing_home, tmp_path, json=False)
++    fmt = {"type": "json_schema", "json_schema": {"name": "t", "schema": {"type": "object"}}}
++    response = aux.call_llm("title_generation", model="class:deep", max_tokens=32,
++                            messages=[{"role": "user", "content": "hi"}], extra_body={"response_format": fmt})
++    assert response.choices[0].message.content == "ok"
++    assert len(native_transport) == 1
++    _, _, body = native_transport[0]
++    assert "response_format" not in body and "output_format" not in body
++
++
++def test_other_tasks_still_require_attested_json(routing_home, streaming_route, native_transport, tmp_path):
++    _write(routing_home, tmp_path, json=False)
++    with pytest.raises(ModelRoutingError):
++        aux.call_llm("title", model="class:deep", messages=[{"role": "user", "content": "hi"}],
++                     extra_body={"response_format": {"type": "json_object"}})
++    assert native_transport == []
+-- 
+2.55.0
+

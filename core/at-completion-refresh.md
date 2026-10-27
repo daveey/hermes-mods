@@ -1,6 +1,6 @@
 # `@` completion sources can redraw an open popover
 
-Patch **0458** (source `fb72ad495b`).
+Patch **0464** (source `fb72ad495b`).
 
 ## Behavior
 

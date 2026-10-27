@@ -1,0 +1,1795 @@
+From a0c15d5af9e638dd0c851a3e479a8782330e30f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 01:36:23 +0000
+Subject: [PATCH] [daveey] Add durable exact-owner prompt admission with safe
+ cancellation
+
+---
+ apps/shared/src/gateway-contract.generated.ts |  30 +++
+ apps/shared/src/gateway-contract.openrpc.json | 183 +++++++++++++
+ hermes_state_prompt_admission.py              | 117 +++++++++
+ hermes_state_sessions.py                      |  40 +--
+ tests/hermes_state/test_prompt_admission.py   |  76 ++++++
+ .../test_prompt_admission_cancellation.py     |  33 +++
+ .../test_prompt_admission_races.py            |  44 ++++
+ .../test_prompt_admission_review.py           |  90 +++++++
+ tests/tui_gateway/test_prompt_admission.py    | 167 ++++++++++++
+ .../test_prompt_admission_cancellation.py     | 109 ++++++++
+ .../test_prompt_admission_review.py           | 147 +++++++++++
+ tui_gateway/PROMPT_ADMISSION.md               | 118 +++++++++
+ tui_gateway/contracts/prompt_voice.py         |  31 +++
+ tui_gateway/methods_prompt.py                 |  66 +++--
+ tui_gateway/methods_prompt_admission.py       | 241 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |   4 +-
+ tui_gateway/server.py                         |   6 +-
+ tui_gateway/session_lifecycle.py              |   9 +-
+ 18 files changed, 1458 insertions(+), 53 deletions(-)
+ create mode 100644 hermes_state_prompt_admission.py
+ create mode 100644 tests/hermes_state/test_prompt_admission.py
+ create mode 100644 tests/hermes_state/test_prompt_admission_cancellation.py
+ create mode 100644 tests/hermes_state/test_prompt_admission_races.py
+ create mode 100644 tests/hermes_state/test_prompt_admission_review.py
+ create mode 100644 tests/tui_gateway/test_prompt_admission.py
+ create mode 100644 tests/tui_gateway/test_prompt_admission_cancellation.py
+ create mode 100644 tests/tui_gateway/test_prompt_admission_review.py
+ create mode 100644 tui_gateway/PROMPT_ADMISSION.md
+ create mode 100644 tui_gateway/methods_prompt_admission.py
+
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index aed511749a..945eb4c20a 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -2746,6 +2746,30 @@ export interface PromptSubmitResult {
+   turn_isolation?: boolean | null
+ }
+ export type PromptSubmitStatus = 'streaming' | 'queued' | 'steered' | 'redirected'
++export interface PromptAdmitParams {
++  profile: string
++  stored_session_id: string
++  operation_id: string
++  payload_digest: string
++  text: string
++}
++export interface PromptAdmissionResult {
++  status: string
++  stored_session_id: string
++  operation_id: string
++  payload_digest: string
++  profile: string
++  user_row_id?: number | null
++  message_uid?: string | null
++  execution_status?: string
++  dispatch?: string
++}
++export interface PromptAdmissionGetParams {
++  profile: string
++  stored_session_id: string
++  operation_id: string
++  payload_digest: string
++}
+ export interface ClipboardPasteParams {
+   session_id: string
+   profile?: string | null
+@@ -5438,6 +5462,10 @@ export interface RpcMethods {
+   'projects.tree': { params: ProjectsTreeParams; result: ProjectsTreeResult }
+   /** Patch a project's display fields; answers the refreshed project. */
+   'projects.update': { params: ProjectsUpdateParams; result: ProjectResult }
++  /** Verify the exact accepted user row; acceptance does not assert execution. */
++  'prompt.admission.get': { params: PromptAdmissionGetParams; result: PromptAdmissionResult }
++  /** Durably accept once into an idle exact live owner. Never cold-resume or replay execution. */
++  'prompt.admit': { params: PromptAdmitParams; result: PromptAdmissionResult }
+   /** Run a task on a fresh agent in the background; the answer arrives as background.complete. */
+   'prompt.background': { params: SideAgentParams; result: TaskIdResult }
+   /** Side question over a snapshot of the live conversation; the answer arrives as btw.complete. */
+@@ -5801,6 +5829,8 @@ export const RPC_METHODS = [
+   'projects.set_primary',
+   'projects.tree',
+   'projects.update',
++  'prompt.admission.get',
++  'prompt.admit',
+   'prompt.background',
+   'prompt.btw',
+   'prompt.submit',
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 97088b58ef..827a4289eb 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -2976,6 +2976,42 @@
+         }
+       }
+     },
++    {
++      "name": "prompt.admission.get",
++      "summary": "Verify the exact accepted user row; acceptance does not assert execution.",
++      "params": [
++        {
++          "name": "params",
++          "schema": {
++            "$ref": "#/components/schemas/PromptAdmissionGetParams"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/PromptAdmissionResult"
++        }
++      }
++    },
++    {
++      "name": "prompt.admit",
++      "summary": "Durably accept once into an idle exact live owner. Never cold-resume or replay execution.",
++      "params": [
++        {
++          "name": "params",
++          "schema": {
++            "$ref": "#/components/schemas/PromptAdmitParams"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/PromptAdmissionResult"
++        }
++      }
++    },
+     {
+       "name": "prompt.background",
+       "summary": "Run a task on a fresh agent in the background; the answer arrives as background.complete.",
+@@ -27027,6 +27063,153 @@
+         "title": "ProjectsUpdateParams",
+         "type": "object"
+       },
++      "PromptAdmissionGetParams": {
++        "additionalProperties": false,
++        "properties": {
++          "profile": {
++            "maxLength": 128,
++            "minLength": 1,
++            "title": "Profile",
++            "type": "string"
++          },
++          "stored_session_id": {
++            "maxLength": 256,
++            "minLength": 1,
++            "title": "Stored Session Id",
++            "type": "string"
++          },
++          "operation_id": {
++            "maxLength": 256,
++            "minLength": 1,
++            "title": "Operation Id",
++            "type": "string"
++          },
++          "payload_digest": {
++            "pattern": "^[0-9a-f]{64}$",
++            "title": "Payload Digest",
++            "type": "string"
++          }
++        },
++        "required": [
++          "profile",
++          "stored_session_id",
++          "operation_id",
++          "payload_digest"
++        ],
++        "title": "PromptAdmissionGetParams",
++        "type": "object"
++      },
++      "PromptAdmissionResult": {
++        "additionalProperties": false,
++        "properties": {
++          "status": {
++            "title": "Status",
++            "type": "string"
++          },
++          "stored_session_id": {
++            "title": "Stored Session Id",
++            "type": "string"
++          },
++          "operation_id": {
++            "title": "Operation Id",
++            "type": "string"
++          },
++          "payload_digest": {
++            "title": "Payload Digest",
++            "type": "string"
++          },
++          "profile": {
++            "title": "Profile",
++            "type": "string"
++          },
++          "user_row_id": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "User Row Id"
++          },
++          "message_uid": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Message Uid"
++          },
++          "execution_status": {
++            "default": "unknown",
++            "title": "Execution Status",
++            "type": "string"
++          },
++          "dispatch": {
++            "default": "unknown",
++            "title": "Dispatch",
++            "type": "string"
++          }
++        },
++        "required": [
++          "status",
++          "stored_session_id",
++          "operation_id",
++          "payload_digest",
++          "profile"
++        ],
++        "title": "PromptAdmissionResult",
++        "type": "object"
++      },
++      "PromptAdmitParams": {
++        "additionalProperties": false,
++        "properties": {
++          "profile": {
++            "maxLength": 128,
++            "minLength": 1,
++            "title": "Profile",
++            "type": "string"
++          },
++          "stored_session_id": {
++            "maxLength": 256,
++            "minLength": 1,
++            "title": "Stored Session Id",
++            "type": "string"
++          },
++          "operation_id": {
++            "maxLength": 256,
++            "minLength": 1,
++            "title": "Operation Id",
++            "type": "string"
++          },
++          "payload_digest": {
++            "pattern": "^[0-9a-f]{64}$",
++            "title": "Payload Digest",
++            "type": "string"
++          },
++          "text": {
++            "maxLength": 1000000,
++            "minLength": 1,
++            "title": "Text",
++            "type": "string"
++          }
++        },
++        "required": [
++          "profile",
++          "stored_session_id",
++          "operation_id",
++          "payload_digest",
++          "text"
++        ],
++        "title": "PromptAdmitParams",
++        "type": "object"
++      },
+       "PromptSubmitParams": {
+         "additionalProperties": false,
+         "description": "``text`` is normally a string; the relay / hosted paths may hand a structured (parts list)\npayload, and the busy path renders it. Truncation (rewind / edit / regenerate) needs explicit\nconsent: ``confirm_truncate`` plus one durable target (``truncate_before_row_id`` preferred,\n``truncate_before_message_id``, or the legacy ``truncate_before_user_ordinal``).",
+diff --git a/hermes_state_prompt_admission.py b/hermes_state_prompt_admission.py
+new file mode 100644
+index 0000000000..9af1a8af4d
+--- /dev/null
++++ b/hermes_state_prompt_admission.py
+@@ -0,0 +1,117 @@
++"""Durable exact-session prompt receipts for the owning TUI runtime.
++
++Acceptance and its user row commit together. Only the transaction winner may
++start a turn; replay NEVER schedules execution, including after a process crash.
++This is at-most-once dispatch, not an exactly-once execution promise.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++
++_TABLE = """CREATE TABLE IF NOT EXISTS prompt_admissions (
++    operation_id TEXT PRIMARY KEY,
++    session_id TEXT NOT NULL,
++    payload_digest TEXT NOT NULL,
++    user_row_id INTEGER NOT NULL,
++    message_uid TEXT NOT NULL,
++    dispatch TEXT NOT NULL DEFAULT 'unknown'
++)"""
++
++
++def prompt_digest(session_id: str, text: str) -> str:
++    payload = json.dumps({"stored_session_id": session_id, "text": text},
++                         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
++
++
++def _receipt(conn, session_id, operation_id, payload_digest):
++    row = conn.execute("SELECT * FROM prompt_admissions WHERE operation_id = ?", (operation_id,)).fetchone()
++    if row is None:
++        return None
++    if row["session_id"] != session_id or row["payload_digest"] != payload_digest:
++        raise ValueError("prompt admission identity conflict")
++    # Row content can legitimately expand @files after admission. Identity, not
++    # current content or active state, proves the original committed occurrence.
++    message = conn.execute("SELECT role, message_uid FROM messages WHERE message_uid = ? AND session_id = ?",
++                           (row["message_uid"], session_id)).fetchone()
++    if message is None or message["role"] != "user" or message["message_uid"] != row["message_uid"]:
++        raise ValueError("accepted prompt row is no longer verifiable; never replay this operation")
++    dispatch = row["dispatch"] if "dispatch" in row.keys() else "unknown"
++    if dispatch == 'cancelled' and conn.execute(
++            "SELECT 1 FROM messages WHERE session_id = ? AND message_uid = ? AND active = 1",
++            (session_id, row['message_uid'])).fetchone():
++        raise ValueError("cancelled prompt row is active; cancellation is not verifiable")
++    return {"status": "accepted", "stored_session_id": session_id, "operation_id": operation_id,
++            "payload_digest": payload_digest, "user_row_id": row["user_row_id"],
++            "message_uid": row["message_uid"], "execution_status": "unknown",
++            "dispatch": row["dispatch"] if "dispatch" in row.keys() else "unknown"}
++
++
++def read_admission(db, session_id: str, operation_id: str, payload_digest: str):
++    with db._read_ctx() as conn:
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='prompt_admissions'").fetchone():
++            return None
++        return _receipt(conn, session_id, operation_id, payload_digest)
++
++
++def admit_prompt(db, session_id: str, operation_id: str, text: str, payload_digest: str):
++    """Caller must own the runtime's writer lease and already claim the running turn.
++
++    Returns (receipt, staged user dict, created). The dict is adopted by the normal
++    turn's submit-row path. No cold resume, title lookup, or compression-tip lookup.
++    """
++    from agent.context_compressor import _DB_PERSISTED_MARKER
++    from agent.message_metadata import stamp_message_timestamp, stamp_message_uid
++
++    if not operation_id or not session_id or not isinstance(text, str) or not text.strip():
++        raise ValueError("nonempty exact session, operation and text required")
++    if prompt_digest(session_id, text) != payload_digest:
++        raise ValueError("payload digest mismatch")
++    staged = stamp_message_timestamp({"role": "user", "content": text})
++    uid = stamp_message_uid(staged)
++
++    def write(conn):
++        conn.execute(_TABLE)
++        if "dispatch" not in {r["name"] for r in conn.execute("PRAGMA table_info(prompt_admissions)")}:
++            conn.execute("ALTER TABLE prompt_admissions ADD COLUMN dispatch TEXT NOT NULL DEFAULT 'unknown'")
++        prior = _receipt(conn, session_id, operation_id, payload_digest)
++        if prior is not None:
++            return prior, None, False
++        row = conn.execute("SELECT ended_at, end_reason FROM sessions WHERE id = ?", (session_id,)).fetchone()
++        if row is None or row["end_reason"] == "compression":
++            raise ValueError("exact session missing or rotated")
++        db._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
++        if row["ended_at"] is not None:
++            db._reopen_session_conn(conn, session_id)
++        db._insert_message_rows(conn, session_id, [staged])
++        db._bump_session_counters(conn, session_id, 1, 0, unit=True)
++        conn.execute("INSERT INTO prompt_admissions (operation_id, session_id, payload_digest, user_row_id, message_uid) "
++                     "VALUES (?, ?, ?, ?, ?)",
++                     (operation_id, session_id, payload_digest, staged["_row_id"], uid))
++        return _receipt(conn, session_id, operation_id, payload_digest), staged, True
++
++    receipt, message, created = db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
++    if message is not None:
++        message[_DB_PERSISTED_MARKER] = True
++        message["_submit_row_session_id"] = session_id
++    return receipt, message, created
++
++
++def mark_dispatch_failed(db, session_id, operation_id, payload_digest):
++    """Atomically retire a positively unstarted prompt, preserving its audit row.
++
++    Caller must fence the scheduler and retain the writer claim until commit.
++    Unknown execution outcomes MUST NOT call this function.
++    """
++    def write(conn):
++        receipt = _receipt(conn, session_id, operation_id, payload_digest)
++        if receipt is None:
++            raise ValueError("cannot cancel an absent admission")
++        db._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
++        conn.execute("UPDATE messages SET active = 0, compacted = 0 "
++                     "WHERE session_id = ? AND message_uid = ? AND role = 'user'",
++                     (session_id, receipt["message_uid"]))
++        conn.execute("UPDATE prompt_admissions SET dispatch = 'cancelled' WHERE operation_id = ?", (operation_id,))
++        return _receipt(conn, session_id, operation_id, payload_digest)
++    return db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index a3435dd5f3..5cb553ad51 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -564,25 +564,27 @@ class SessionSessionsMixin:
+         children, skipping explicit fork/delegate provenance and children that predate the parent itself.
+         The guard compares against the parent's started_at, not its current ended_at: a parent that was
+         reopened and re-ended later still owns reset children from its earlier boundaries."""
+-        def _do(conn):
+-            self._retire_undrained_queue_rows_conn(conn, session_id)
+-            conn.execute(
+-                "UPDATE sessions AS child SET model_config = json_set("
+-                "COALESCE(child.model_config, '{}'), '$._reset_from', child.parent_session_id) "
+-                f"WHERE child.parent_session_id = ? AND {_sql_json_extract('child.model_config', '$._reset_from')} IS NULL "
+-                f"AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
+-                f"AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL "
+-                "AND COALESCE(child.source, '') != 'tool' "
+-                "AND child.started_at >= (SELECT p.started_at FROM sessions p WHERE p.id = child.parent_session_id) "
+-                f"AND {_legacy_reset_child_sql('child', _session_ids_placeholders(_RESET_END_REASONS))}",
+-                (session_id, *_RESET_END_REASONS),
+-            )
+-            conn.execute(
+-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?", (session_id,),
+-            )
+-            # Resuming re-activates the chat: drop the idle sweep's archive (never a manual one).
+-            self._unarchive_auto_archived_lineage(conn, session_id)
+-        self._execute_write(_do)
++        self._execute_write(lambda conn: self._reopen_session_conn(conn, session_id))
++
++    def _reopen_session_conn(self, conn, session_id: str) -> None:
++        """Reopen on the caller's transaction, preserving queue and lineage invariants."""
++        self._retire_undrained_queue_rows_conn(conn, session_id)
++        conn.execute(
++            "UPDATE sessions AS child SET model_config = json_set("
++            "COALESCE(child.model_config, '{}'), '$._reset_from', child.parent_session_id) "
++            f"WHERE child.parent_session_id = ? AND {_sql_json_extract('child.model_config', '$._reset_from')} IS NULL "
++            f"AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
++            f"AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL "
++            "AND COALESCE(child.source, '') != 'tool' "
++            "AND child.started_at >= (SELECT p.started_at FROM sessions p WHERE p.id = child.parent_session_id) "
++            f"AND {_legacy_reset_child_sql('child', _session_ids_placeholders(_RESET_END_REASONS))}",
++            (session_id, *_RESET_END_REASONS),
++        )
++        conn.execute(
++            "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?", (session_id,),
++        )
++        # Resuming re-activates the chat: drop the idle sweep's archive (never a manual one).
++        self._unarchive_auto_archived_lineage(conn, session_id)
+ 
+     def promote_to_session_reset(self, session_id: str, reason: str = "session_reset") -> bool:
+         """Durably mark an intentional reset boundary on live rows or rows with a *recoverable* accidental
+diff --git a/tests/hermes_state/test_prompt_admission.py b/tests/hermes_state/test_prompt_admission.py
+new file mode 100644
+index 0000000000..b5da5d7976
+--- /dev/null
++++ b/tests/hermes_state/test_prompt_admission.py
+@@ -0,0 +1,76 @@
++"""Atomic exact-session acceptance survives lost replies without another user row."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_prompt_admission import admit_prompt, read_admission
++
++
++@pytest.fixture(autouse=True)
++def no_update_recovery(monkeypatch):
++    # A lazy transcript import boots the CLI; recovery belongs to startup, not
++    # this scratch-store test, and this worktree's gitdir is in the live home.
++    from hermes_cli import _early_recovery
++    monkeypatch.setattr(_early_recovery, "restore_interrupted_pull", lambda root: False)
++    from pm import environments
++    monkeypatch.setattr(environments, "activate_dependencies", lambda root: None)
++
++
++def digest(sid, text):
++    return hashlib.sha256(json.dumps({"stored_session_id": sid, "text": text},
++                                    sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
++
++
++def test_atomic_accept_and_reopen_readback(tmp_path):
++    path = tmp_path / "state.db"
++    db = SessionDB(db_path=path)
++    db.create_session(session_id="exact", source="desktop")
++    d = digest("exact", "approved scope")
++    receipt, staged, created = admit_prompt(db, "exact", "op", "approved scope", d)
++    assert created and staged["_row_id"] == receipt["user_row_id"]
++    db.close()
++    db = SessionDB(db_path=path)
++    try:
++        assert read_admission(db, "exact", "op", d) == receipt
++        again, _, created = admit_prompt(db, "exact", "op", "approved scope", d)
++        assert again == receipt and not created
++        assert len(db.get_messages("exact")) == 1
++        assert db.get_session("exact")["message_count"] == 1
++        with pytest.raises(ValueError, match="conflict"):
++            admit_prompt(db, "exact", "op", "different", digest("exact", "different"))
++        with pytest.raises(ValueError, match="conflict"):
++            read_admission(db, "other", "op", d)
++    finally:
++        db.close()
++
++
++def test_missing_target_and_bad_digest_write_nothing(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        with pytest.raises(ValueError):
++            admit_prompt(db, "missing", "op", "hello", digest("missing", "hello"))
++        db.create_session(session_id="exact", source="desktop")
++        with pytest.raises(ValueError, match="digest"):
++            admit_prompt(db, "exact", "op", "hello", "0" * 64)
++        assert db.get_messages("exact") == []
++        assert read_admission(db, "exact", "op", digest("exact", "hello")) is None
++    finally:
++        db.close()
++
++
++def test_transcript_failure_rolls_back_receipt(tmp_path, monkeypatch):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session(session_id="exact", source="desktop")
++    d = digest("exact", "hello")
++    def fail(*args, **kwargs):
++        raise RuntimeError("injected write failure")
++    monkeypatch.setattr(db, "_insert_message_rows", fail)
++    try:
++        with pytest.raises(RuntimeError, match="injected"):
++            admit_prompt(db, "exact", "op", "hello", d)
++        assert read_admission(db, "exact", "op", d) is None
++        assert db.get_messages("exact") == []
++    finally:
++        db.close()
+diff --git a/tests/hermes_state/test_prompt_admission_cancellation.py b/tests/hermes_state/test_prompt_admission_cancellation.py
+new file mode 100644
+index 0000000000..eb32d0fc7c
+--- /dev/null
++++ b/tests/hermes_state/test_prompt_admission_cancellation.py
+@@ -0,0 +1,33 @@
++"""Cancellation retains audit identity and atomically retires authority."""
++import sqlite3
++import pytest
++
++from hermes_state import SessionDB
++from tests.hermes_state.test_prompt_admission import no_update_recovery
++from hermes_state_prompt_admission import admit_prompt, read_admission, prompt_digest, mark_dispatch_failed
++
++
++def test_cancellation_is_atomic_and_replay_proof(tmp_path):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        db.create_session('exact', 'desktop')
++        digest = prompt_digest('exact', 'approve')
++        receipt, _, _ = admit_prompt(db, 'exact', 'op', 'approve', digest)
++        db._write_sql("CREATE TRIGGER reject_cancel BEFORE UPDATE ON prompt_admissions BEGIN SELECT RAISE(ABORT, 'blocked'); END", ())
++        with pytest.raises(sqlite3.IntegrityError, match='blocked'):
++            mark_dispatch_failed(db, 'exact', 'op', digest)
++        assert read_admission(db, 'exact', 'op', digest) == receipt
++        assert len(db.get_messages('exact')) == 1
++        db._write_sql('DROP TRIGGER reject_cancel', ())
++        cancelled = mark_dispatch_failed(db, 'exact', 'op', digest)
++        assert cancelled['dispatch'] == 'cancelled'
++        assert not db.get_messages('exact')
++        assert admit_prompt(db, 'exact', 'op', 'approve', digest) == (cancelled, None, False)
++        assert mark_dispatch_failed(db, 'exact', 'op', digest) == cancelled
++        with pytest.raises(ValueError, match='conflict'):
++            mark_dispatch_failed(db, 'exact', 'op', 'wrong')
++        db._write_sql('UPDATE messages SET active=1 WHERE message_uid=?', (cancelled['message_uid'],))
++        with pytest.raises(ValueError, match='not verifiable'):
++            read_admission(db, 'exact', 'op', digest)
++    finally:
++        db.close()
+diff --git a/tests/hermes_state/test_prompt_admission_races.py b/tests/hermes_state/test_prompt_admission_races.py
+new file mode 100644
+index 0000000000..e57a7b438e
+--- /dev/null
++++ b/tests/hermes_state/test_prompt_admission_races.py
+@@ -0,0 +1,44 @@
++"""Two independent SQLite writers cannot admit the same operation twice."""
++from concurrent.futures import ThreadPoolExecutor
++from threading import Barrier
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_prompt_admission import admit_prompt, prompt_digest, read_admission
++from tests.hermes_state.test_prompt_admission import no_update_recovery
++
++
++def test_competing_handles_have_one_winner(tmp_path):
++    path = tmp_path / "state.db"
++    db = SessionDB(db_path=path)
++    db.create_session(session_id="exact", source="desktop")
++    # Warm the lazy transcript machinery before entering independent threads.
++    db.append_message("exact", "assistant", "ready")
++    db.close()
++    barrier = Barrier(2)
++    digest = prompt_digest("exact", "hello")
++    def accept():
++        handle = SessionDB(db_path=path)
++        try:
++            barrier.wait(timeout=10)
++            return admit_prompt(handle, "exact", "op", "hello", digest)
++        finally:
++            handle.close()
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        results = list(pool.map(lambda _: accept(), range(2)))
++    assert sorted(result[2] for result in results) == [False, True]
++    assert results[0][0] == results[1][0]
++    db = SessionDB(db_path=path)
++    try:
++        assert [row["role"] for row in db.get_messages("exact")] == ["assistant", "user"]
++        receipt = results[0][0]
++        # A destructive external rewrite invalidates readback, but the operation
++        # tombstone survives: even then a replay cannot insert another user turn.
++        db._execute_write(lambda conn: conn.execute("DELETE FROM messages WHERE id = ?", (receipt["user_row_id"],)))
++        with pytest.raises(ValueError, match="no longer verifiable"):
++            read_admission(db, "exact", "op", digest)
++        with pytest.raises(ValueError, match="no longer verifiable"):
++            admit_prompt(db, "exact", "op", "hello", digest)
++    finally:
++        db.close()
+diff --git a/tests/hermes_state/test_prompt_admission_review.py b/tests/hermes_state/test_prompt_admission_review.py
+new file mode 100644
+index 0000000000..644bad0255
+--- /dev/null
++++ b/tests/hermes_state/test_prompt_admission_review.py
+@@ -0,0 +1,90 @@
++"""Admission preserves reopen and durable-message identity contracts."""
++import json
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_prompt_admission import admit_prompt, read_admission, prompt_digest
++from tests.hermes_state.test_prompt_admission import no_update_recovery
++
++
++def test_reopen_retires_queue_unarchives_and_freezes_reset_child(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("exact", "desktop", session_key="lane")
++        db.append_message("exact", "user", "never ran", display_metadata={"_queued_prompt": True})
++        db.end_session("exact", "session_reset")
++        db.create_session("child", "desktop", session_key="lane", parent_session_id="exact")
++        db._write_sql("UPDATE sessions SET archived=1, auto_archived=1 WHERE id=?", ("exact",))
++        admit_prompt(db, "exact", "op", "hello", prompt_digest("exact", "hello"))
++        assert [m["content"] for m in db.get_messages("exact")] == ["hello"]
++        row = db.get_session("exact")
++        assert row["ended_at"] is None
++        assert row["archived"] == row["auto_archived"] == 0
++        assert json.loads(db.get_session("child")["model_config"])["_reset_from"] == "exact"
++    finally:
++        db.close()
++
++
++def test_readback_survives_reinserted_inactive_uid(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("exact", "desktop")
++        d = prompt_digest("exact", "hello")
++        receipt, _, _ = admit_prompt(db, "exact", "op", "hello", d)
++        messages = db.get_messages_as_conversation("exact")
++        messages[0]["content"] = "expanded hello"
++        db.replace_messages("exact", messages)
++        rewritten = db.get_messages_as_conversation("exact", include_row_ids=True)
++        assert rewritten[0]["_row_id"] != receipt["user_row_id"]
++        assert read_admission(db, "exact", "op", d) == receipt
++        db._write_sql("UPDATE messages SET active=0 WHERE session_id=?", ("exact",))
++        assert read_admission(db, "exact", "op", d) == receipt
++    finally:
++        db.close()
++
++
++def test_failed_insert_rolls_back_reopen_invariants(tmp_path, monkeypatch):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("exact", "desktop")
++        db.append_message("exact", "user", "queued", display_metadata={"_queued_prompt": True})
++        db.end_session("exact", "cli_close")
++        db._write_sql("UPDATE sessions SET archived=1, auto_archived=1 WHERE id=?", ("exact",))
++        def fail(*args):
++            raise RuntimeError("insert failed")
++        monkeypatch.setattr(db, "_insert_message_rows", fail)
++        with pytest.raises(RuntimeError, match="insert failed"):
++            admit_prompt(db, "exact", "op", "hello", prompt_digest("exact", "hello"))
++        assert db.get_session("exact")["ended_at"] is not None
++        assert db.get_session("exact")["auto_archived"] == 1
++        assert [m["content"] for m in db.get_messages("exact")] == ["queued"]
++        assert read_admission(db, "exact", "op", prompt_digest("exact", "hello")) is None
++    finally:
++        db.close()
++
++
++def test_live_session_does_not_retire_current_queue(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("exact", "desktop")
++        db.append_message("exact", "user", "queued", display_metadata={"_queued_prompt": True})
++        admit_prompt(db, "exact", "op", "hello", prompt_digest("exact", "hello"))
++        assert [m["content"] for m in db.get_messages("exact")] == ["queued", "hello"]
++    finally:
++        db.close()
++
++
++def test_legacy_receipt_schema_read_and_migration(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("exact", "desktop")
++        d = prompt_digest("exact", "hello")
++        receipt, _, _ = admit_prompt(db, "exact", "op", "hello", d)
++        db._write_sql("ALTER TABLE prompt_admissions DROP COLUMN dispatch", ())
++        assert read_admission(db, "exact", "op", d) == receipt
++        assert admit_prompt(db, "exact", "op", "hello", d) == (receipt, None, False)
++        db._write_sql("UPDATE messages SET message_uid='replacement' WHERE session_id=?", ("exact",))
++        with pytest.raises(ValueError, match="no longer verifiable"):
++            read_admission(db, "exact", "op", d)
++    finally:
++        db.close()
+diff --git a/tests/tui_gateway/test_prompt_admission.py b/tests/tui_gateway/test_prompt_admission.py
+new file mode 100644
+index 0000000000..1a6a7d1f4b
+--- /dev/null
++++ b/tests/tui_gateway/test_prompt_admission.py
+@@ -0,0 +1,167 @@
++"""Real RPC + SQLite acceptance, with only model execution suppressed."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_prompt_admission import prompt_digest
++from tests.tui_gateway.test_submit_time_user_row import _desktop_session
++from tui_gateway import server
++
++
++@pytest.fixture
++def owner(monkeypatch, tmp_path):
++    from hermes_constants import get_hermes_home
++    monkeypatch.setattr(server, "_hermes_home", get_hermes_home())
++    db = SessionDB(db_path=tmp_path / "state.db")
++    sid, key = _desktop_session(monkeypatch, db)
++    session = server._sessions[sid]
++    server._ensure_session_db_row(session)
++    started = []
++    monkeypatch.setattr(server, "_start_agent_build", lambda *args: None)
++    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *args: False)
++    monkeypatch.setattr(server, "_start_session_work", lambda target, **kw: started.append(target) or True)
++    params = {"profile": server._current_profile_name(), "stored_session_id": key,
++              "operation_id": "decision-1", "text": "approved exact scope",
++              "payload_digest": prompt_digest(key, "approved exact scope")}
++    yield db, session, params, started
++    server._release_active_session_slot(session)
++    server._sessions.pop(sid, None)
++    db.close()
++
++
++def call(method, params):
++    return server.handle_request({"id": "test", "method": method, "params": params})
++
++
++def test_external_transport_cannot_admit_or_probe(owner, monkeypatch):
++    db, _session, params, started = owner
++    monkeypatch.setattr(server, 'current_transport', lambda: object())
++    for method in ('prompt.admit', 'prompt.admission.get'):
++        payload = params if method == 'prompt.admit' else {k:v for k,v in params.items() if k != 'text'}
++        response = call(method, payload)
++        assert response['error']['code'] == 4031
++    assert not started
++    assert db.get_messages(params['stored_session_id']) == []
++
++
++def test_rpc_accept_retry_and_readback_after_owner_disappears(owner):
++    db, session, params, started = owner
++    first = call("prompt.admit", params)
++    assert "result" in first, (first, session.get("profile_home"), server._hermes_home,
++                               server._profile_home(params["profile"]), session.get("session_key"))
++    receipt = first["result"]
++    assert receipt["status"] == "accepted"
++    assert len(started) == 1
++    assert call("prompt.admit", params)["result"] == receipt
++    assert len(started) == 1
++    assert len(db.get_messages(params["stored_session_id"])) == 1
++    saved = dict(server._sessions)
++    server._sessions.clear()
++    try:
++        assert call("prompt.admission.get", {k: v for k, v in params.items() if k != "text"})["result"] == receipt
++        assert call("prompt.admit", params)["result"] == receipt
++        assert len(started) == 1
++    finally:
++        server._sessions.update(saved)
++
++
++@pytest.mark.parametrize("state", ["busy", "rotated", "lazy", "missing", "wrong_profile", "queued", "closing", "images", "branch"])
++def test_refused_owner_has_no_message(owner, state):
++    db, session, params, started = owner
++    mutations = {
++        'busy': {'running': True},
++        'rotated': {'agent': SimpleNamespace(session_id='different')},
++        'lazy': {'lazy': True},
++        'queued': {'queued_prompt': {'text': 'already waiting'}},
++        'closing': {'_closing': True},
++        'images': {'attached_images': ['pending.png']},
++        'branch': {'seeded': True},
++    }
++    session.update(mutations.get(state, {}))
++    if state == 'missing':
++        params['stored_session_id'] = 'absent'
++        params['payload_digest'] = prompt_digest('absent', params['text'])
++    if state == 'wrong_profile':
++        params['profile'] = 'does-not-exist'
++    response = call("prompt.admit", params)
++    assert response["error"]["code"] in (4092, 4064), response
++    assert not started
++    assert db.get_messages(session["session_key"]) == []
++
++
++def test_crash_after_commit_does_not_reexecute(owner, monkeypatch):
++    db, _session, params, _started = owner
++    def crash(*args, **kwargs):
++        raise RuntimeError("simulated scheduler failure after commit")
++    monkeypatch.setattr(server, "_start_session_work", crash)
++    # The first call can lose its reply. Acceptance remains queryable and no
++    # retry is permitted to interpret a missing dispatch as permission to run.
++    call("prompt.admit", params)
++    again = call("prompt.admit", params)
++    assert again["result"]["status"] == "accepted", again
++    assert again["result"]["dispatch"] == "cancelled"
++    assert db.get_messages(params["stored_session_id"]) == []
++
++
++def test_turn_adopts_admission_row_without_duplicate_and_disables_recovery(owner, monkeypatch):
++    from tests.tui_gateway.test_submit_time_user_row import _flush_agent
++    from agent.turn_context import _stage_turn_user_message
++    db, session, params, started = owner
++    first = call("prompt.admit", params)
++    assert "result" in first, first
++    recorded = []
++    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **kw: recorded.append(kw))
++    started[0]()
++    assert recorded == [{"auto_continue": False}]
++    agent = _flush_agent(db, params["stored_session_id"])
++    server._adopt_submit_user_row(session, agent, params["text"], params["text"])
++    msg, _ = _stage_turn_user_message(agent, params["text"], params["text"], None, None, None, None)
++    agent._persist_user_message_idx = 0
++    agent._flush_messages_to_session_db([msg, {"role": "assistant", "content": "done"}], [])
++    assert [m["role"] for m in db.get_messages(params["stored_session_id"])] == ["user", "assistant"]
++
++
++def test_normal_submit_claim_cannot_overwrite_admitted_turn(owner):
++    _, session, params, _ = owner
++    assert "result" in call("prompt.admit", params)
++    sid = next(sid for sid, s in server._sessions.items() if s is session)
++    error, _fields = server._lock_in_submit_turn("other", sid, session, "race", {}, False, None, None, None)
++    assert error["error"]["code"] == 4009
++    assert session["_submit_user_row"]["content"] == params["text"]
++
++
++def test_foreign_writer_lease_refuses_before_acceptance(owner):
++    from hermes_cli.active_sessions import try_acquire_active_session
++    db, _session, params, started = owner
++    lease, refusal = try_acquire_active_session(
++        session_id=params["stored_session_id"], surface="desktop", config={},
++        metadata={"live_session_id": "another-runtime"})
++    assert refusal is None
++    try:
++        response = call("prompt.admit", params)
++        assert response["error"]["code"] == 4090, response
++        assert not started
++        assert db.get_messages(params["stored_session_id"]) == []
++    finally:
++        lease.release()
++
++
++def test_secondary_profile_cannot_read_or_admit_launch_owner(owner, monkeypatch, tmp_path):
++    from hermes_cli import profiles
++    _db, _session, params, started = owner
++    profiles_root = tmp_path / "profiles"
++    secondary = profiles_root / "secondary"
++    secondary.mkdir(parents=True)
++    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
++    secondary_db = SessionDB(db_path=secondary / "state.db")
++    secondary_db.create_session(session_id=params["stored_session_id"], source="desktop")
++    secondary_db.close()
++    assert "result" in call("prompt.admit", params)
++    foreign = {**params, "profile": "secondary"}
++    response = call("prompt.admit", foreign)
++    assert response["error"]["code"] == 4092, response
++    read = call("prompt.admission.get", {k: v for k, v in foreign.items() if k != "text"})
++    assert read["result"]["status"] == "absent", read
++    assert len(started) == 1
++
+diff --git a/tests/tui_gateway/test_prompt_admission_cancellation.py b/tests/tui_gateway/test_prompt_admission_cancellation.py
+new file mode 100644
+index 0000000000..056283371a
+--- /dev/null
++++ b/tests/tui_gateway/test_prompt_admission_cancellation.py
+@@ -0,0 +1,109 @@
++"""Known non-starts retire authority; uncertain scheduling never replays."""
++import pytest
++from concurrent.futures import ThreadPoolExecutor
++import threading
++
++from tests.tui_gateway.test_prompt_admission import call
++from tui_gateway import server, methods_prompt_admission as admission
++
++pytest_plugins = ['tests.tui_gateway.test_prompt_admission']
++
++
++def test_failed_dispatch_retires_row_before_releasing_writer(owner, monkeypatch):
++    db, session, params, started = owner
++    released = []
++    release = server._release_active_session_slot
++
++    def check_release(s):
++        released.append(True)
++        assert not db.get_messages(params['stored_session_id'])
++        return release(s)
++
++    monkeypatch.setattr(server, '_release_active_session_slot', check_release)
++    monkeypatch.setattr(server, '_start_session_work', lambda *a, **kw: None)
++    receipt = call('prompt.admit', params)['result']
++    assert receipt['dispatch'] == 'cancelled'
++    assert released and not session['running']
++    for _ in range(3):
++        assert call('prompt.admit', params)['result'] == receipt
++    assert not started
++    assert not db.get_messages_as_conversation(params['stored_session_id'])
++    # The audit row and operation identity survive; only authority is retired.
++    with db._read_ctx() as conn:
++        row = conn.execute('SELECT content, active FROM messages WHERE message_uid=?',
++                           (receipt['message_uid'],)).fetchone()
++        assert tuple(row) == (params['text'], 0)
++    monkeypatch.setattr(server, '_release_active_session_slot', release)
++    monkeypatch.setattr(server, '_start_session_work', lambda target, **kw: started.append(target) or True)
++    sid = next(sid for sid, s in server._sessions.items() if s is session)
++    assert 'result' in call('prompt.submit', {'session_id': sid, 'text': 'ordinary follow-up'})
++    assert [r['content'] for r in db.get_messages(params['stored_session_id'])] == ['ordinary follow-up']
++
++
++def test_cancellation_storage_failure_quarantines_until_readback(owner, monkeypatch):
++    db, session, params, _ = owner
++    real = admission.mark_dispatch_failed
++    monkeypatch.setattr(server, '_start_session_work', lambda *a, **kw: None)
++    def fail(*args):
++        raise RuntimeError('storage unavailable')
++    monkeypatch.setattr(admission, 'mark_dispatch_failed', fail)
++    assert 'error' in call('prompt.admit', params)
++    assert session['running'], 'do not admit ordinary history before authority retirement'
++    monkeypatch.setattr(admission, 'mark_dispatch_failed', real)
++    query = {k: v for k, v in params.items() if k != 'text'}
++    assert call('prompt.admission.get', query)['result']['dispatch'] == 'cancelled'
++    assert not session['running']
++    assert not db.get_messages(params['stored_session_id'])
++
++
++def test_scheduler_late_worker_cannot_execute_cancelled_admission(owner, monkeypatch):
++    _, _, params, _ = owner
++    workers = []
++    executed = []
++    def broken(target, **kw):
++        workers.append(target)
++        raise RuntimeError('scheduler failed before start')
++    monkeypatch.setattr(server, '_start_session_work', broken)
++    monkeypatch.setattr(server, '_run_after_agent_ready', lambda *a, **kw: executed.append(True))
++    assert call('prompt.admit', params)['result']['dispatch'] == 'cancelled'
++    workers[0]()
++    assert not executed
++
++
++def test_receipt_read_waits_for_scheduler_failure(owner, monkeypatch):
++    _, _, params, _ = owner
++    entered, finish, reading = threading.Event(), threading.Event(), threading.Event()
++    def scheduler(*args, **kwargs):
++        entered.set()
++        assert finish.wait(5)
++    monkeypatch.setattr(server, '_start_session_work', scheduler)
++    query = {k: v for k, v in params.items() if k != 'text'}
++    def read():
++        reading.set()
++        return call('prompt.admission.get', query)
++    with ThreadPoolExecutor(2) as pool:
++        submitted = pool.submit(call, 'prompt.admit', params)
++        assert entered.wait(5)
++        fetched = pool.submit(read)
++        assert reading.wait(5)
++        try:
++            assert not fetched.done(), 'readback exposed unsettled acceptance'
++        finally:
++            finish.set()
++        assert submitted.result(5)['result']['dispatch'] == 'cancelled'
++        assert fetched.result(5)['result']['dispatch'] == 'cancelled'
++
++
++def test_scheduler_throw_after_worker_started_is_not_cancellation(owner, monkeypatch):
++    db, _, params, _ = owner
++    executed = []
++    def uncertain(target, **kw):
++        target()
++        raise RuntimeError('reply failed after start')
++    monkeypatch.setattr(server, '_start_session_work', uncertain)
++    monkeypatch.setattr(server, '_run_after_agent_ready', lambda *a, **kw: executed.append(True))
++    result = call('prompt.admit', params)['result']
++    assert result['dispatch'] == 'unknown'
++    assert call('prompt.admit', params)['result'] == result
++    assert executed == [True]
++    assert len(db.get_messages(params['stored_session_id'])) == 1
+diff --git a/tests/tui_gateway/test_prompt_admission_review.py b/tests/tui_gateway/test_prompt_admission_review.py
+new file mode 100644
+index 0000000000..612bb1afac
+--- /dev/null
++++ b/tests/tui_gateway/test_prompt_admission_review.py
+@@ -0,0 +1,147 @@
++"""Review regressions: lock scope, same-operation races and failed dispatch."""
++from concurrent.futures import ThreadPoolExecutor
++import threading
++
++import pytest
++
++from tests.tui_gateway.test_prompt_admission import call
++pytest_plugins = ['tests.tui_gateway.test_prompt_admission']
++from tui_gateway import server, methods_prompt_admission as admission
++
++
++def test_db_and_slot_work_never_hold_global_or_history_locks(owner, monkeypatch):
++    _, session, params, _ = owner
++    original = admission.admit_prompt
++    ensure = server._ensure_active_session_slot
++
++    def check():
++        with ThreadPoolExecutor(1) as pool:
++            def probe():
++                for lock in (server._session_resume_lock, session["history_lock"]):
++                    assert lock.acquire(timeout=2), "database work holds admission lock"
++                    lock.release()
++            pool.submit(probe).result(timeout=5)
++        assert session["running"]
++
++    def write(*args, **kwargs):
++        check()
++        return original(*args, **kwargs)
++
++    def slot(*args, **kwargs):
++        check()
++        return ensure(*args, **kwargs)
++
++    monkeypatch.setattr(admission, "admit_prompt", write)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", slot)
++    assert "result" in call("prompt.admit", params)
++
++
++def test_same_operation_race_returns_one_receipt(owner, monkeypatch):
++    db, _, params, started = owner
++    original = admission._owner_home
++    barrier = threading.Barrier(2)
++    seen = threading.local()
++
++    def read(*args):
++        result = original(*args)
++        if not getattr(seen, "first", False):
++            seen.first = True
++            barrier.wait(timeout=5)
++        return result
++
++    monkeypatch.setattr(admission, "_owner_home", read)
++    with ThreadPoolExecutor(2) as pool:
++        futures = [pool.submit(call, "prompt.admit", params) for _ in range(2)]
++        replies = [future.result(timeout=10) for future in futures]
++    assert all("result" in r for r in replies), replies
++    assert replies[0]["result"] == replies[1]["result"]
++    assert len(started) == len(db.get_messages(params["stored_session_id"])) == 1
++
++
++def test_failed_dispatch_releases_lease_retains_terminal_error(owner, monkeypatch):
++    _, session, params, _ = owner
++    released = []
++    release = server._release_active_session_slot
++    monkeypatch.setattr(server, "_release_active_session_slot", lambda s: (released.append(s), release(s)))
++    monkeypatch.setattr(server, "_start_session_work", lambda *a, **kw: None)
++    reply = call("prompt.admit", params)
++    assert reply["result"].get("dispatch") == "cancelled"
++    assert released and not session["running"]
++    assert session["inflight_turn"]["error"]
++    assert call("prompt.admission.get", {k: v for k, v in params.items() if k != "text"})["result"]["dispatch"] == "cancelled"
++
++
++@pytest.mark.parametrize("state", ["settling", "detached"])
++def test_admission_refuses_disconnecting_owner(owner, state):
++    db, session, params, started = owner
++    if state == "settling":
++        session["_client_gone_interrupt_requested"] = True
++    else:
++        session["transport"] = server._detached_ws_transport
++    assert "error" in call("prompt.admit", params)
++    assert not started and not db.get_messages(params["stored_session_id"])
++
++
++def test_admission_refreshes_activity(owner):
++    _, session, params, _ = owner
++    session["last_active"] = 1
++    assert "result" in call("prompt.admit", params)
++    assert session["last_active"] > 1
++
++
++def test_normal_submit_lockin_race_queues(owner, monkeypatch):
++    _, session, params, _ = owner
++    sid = next(sid for sid, s in server._sessions.items() if s is session)
++    original = server._lock_in_submit_turn
++    first = True
++
++    def lockin(*args, **kwargs):
++        nonlocal first
++        if first:
++            first = False
++            assert "result" in call("prompt.admit", params)
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(server, "_lock_in_submit_turn", lockin)
++    reply = call("prompt.submit", {"session_id": sid, "text": "follow up", "queued": True})
++    assert reply.get("result", {}).get("status") == "queued", reply
++    assert session["_submit_user_row"]["content"] == params["text"]
++
++
++def test_storage_failure_undoes_claim_and_releases_slot(owner, monkeypatch):
++    _, session, params, _ = owner
++    released = []
++    release = server._release_active_session_slot
++    monkeypatch.setattr(server, "_release_active_session_slot", lambda s: (released.append(s), release(s)))
++    def fail(*args, **kwargs):
++        raise RuntimeError("storage unavailable")
++    monkeypatch.setattr(admission, "admit_prompt", fail)
++    assert "error" in call("prompt.admit", params)
++    assert not session["running"] and released
++    assert not session.get("inflight_turn")
++
++
++def test_cancel_during_acceptance_never_dispatches(owner, monkeypatch):
++    db, session, params, started = owner
++    original = admission.admit_prompt
++    def cancel(*args, **kwargs):
++        result = original(*args, **kwargs)
++        session["_turn_cancel_requested"] = True
++        return result
++    monkeypatch.setattr(admission, "admit_prompt", cancel)
++    reply = call("prompt.admit", params)
++    assert reply["result"]["dispatch"] == "cancelled"
++    assert not started and not session["running"]
++    assert db.get_messages(params["stored_session_id"]) == []
++
++
++def test_failed_dispatch_status_write_failure_keeps_acceptance(owner, monkeypatch):
++    _, session, params, started = owner
++    monkeypatch.setattr(server, "_start_session_work", lambda *a, **kw: None)
++    def fail(*args):
++        raise RuntimeError("status write failed")
++    monkeypatch.setattr(admission, "mark_dispatch_failed", fail)
++    assert 'error' in call("prompt.admit", params)
++    assert 'error' in call("prompt.admit", params)
++    assert not started and session["running"]
++    assert session["inflight_turn"]["error"]
+diff --git a/tui_gateway/PROMPT_ADMISSION.md b/tui_gateway/PROMPT_ADMISSION.md
+new file mode 100644
+index 0000000000..34d74936db
+--- /dev/null
++++ b/tui_gateway/PROMPT_ADMISSION.md
+@@ -0,0 +1,118 @@
++# Exact-session prompt admission (live-owner subset)
++
++Consumer: user-steps decision delivery. This is an extension of the existing
++TUI/Desktop JSON-RPC server, **not** `/v1/runs`, and does not advertise
++`runs_exact_session_admission`. Connect to the authenticated RPC transport of the
++runtime which already owns the Desktop session. Do not spawn a new backend, call
++`session.resume`, or import `SessionDB` in the plugin to perform admission.
++The existing transport authenticates callers; this adds no credential or listener.
++
++## Request
++
++`prompt.admit`:
++
++```json
++{
++  "profile": "default",
++  "stored_session_id": "EXACT_STORED_ID",
++  "operation_id": "PERSISTED_OPERATION_ID",
++  "text": "Frozen decision input",
++  "payload_digest": "64 lowercase hex characters"
++}
++```
++
++The digest is SHA-256 over UTF-8 of Python-equivalent:
++
++```python
++json.dumps({"stored_session_id": stored_id, "text": text},
++           sort_keys=True, separators=(',', ':'), ensure_ascii=False)
++```
++
++Profile must be the canonical name, not an alias. IDs and text are not trimmed,
++normalized or resolved through titles/compression tips. Input requiring the normal
++user-input sanitizer to change it is rejected; sanitize before freezing the payload.
++Operation IDs are unique within a profile's state.db and must never be recycled.
++Changing the target or digest under the same operation ID is a conflict. There is no
++TTL and no pruning of these operation tombstones in this implementation.
++
++`prompt.admission.get` takes the same fields **except text**. It can read receipts
++after the live session disappeared or after a runtime restart. Readback requires
++both the receipt and its user message UID to remain in the exact target session.
++Reinserted or inactive rows are valid; `user_row_id` is the original acceptance
++row ID, informational only. A deleted/rewritten-away UID produces an error,
++never permission to replay.
++
++Both methods return:
++
++```json
++{
++  "status": "accepted",
++  "profile": "default",
++  "stored_session_id": "EXACT_STORED_ID",
++  "operation_id": "PERSISTED_OPERATION_ID",
++  "payload_digest": "64 lowercase hex characters",
++  "user_row_id": 123,
++  "message_uid": "durable-message-uid",
++  "execution_status": "unknown",
++  "dispatch": "unknown"
++}
++```
++
++`get` returns `status: absent` without row/UID when no operation exists.
++Consumers must compare every identity field and require accepted + integer row ID
+++ nonempty UID. Acceptance proves a committed user message, **not** model execution,
++completion, or authorization beyond the submitted text. Unknown methods mean this
++core version is not installed; do not fall back to ordinary submit or `/v1/runs`.
++
++`dispatch: cancelled` is a terminal, positively unstarted admission: its user row
++is retained for audit but atomically made inactive with the cancellation receipt,
++BEFORE releasing the writer. It grants no authority to subsequent ordinary turns.
++The scheduler callback is fenced against a late start; an exception after a worker
++has started remains `unknown` and is never treated as cancellation. Receipt reads
++serialize with scheduling, so they cannot expose an intermediate acceptance that
++later gets cancelled. Legacy `failed` receipts do not prove row retirement.
++
++If cancellation persistence fails, the live writer remains quarantined and RPC
++returns an error, not successful delivery. Same-operation readback retries ONLY
++the retirement write and releases the quarantine after commit, never schedules.
++A process crash before this write commits still has the existing uncertain-crash
++semantics below; no automatic replay or permission to assume cancellation.
++Consumers may close a positively cancelled operation as **not delivered**, leaving
++cards blocked and omitting passive approval context. A replacement request revision
++requires fresh permission and a new operation; the cancelled key always remains
++terminal.
++
++## Ownership and crash semantics
++
++- New admission requires one exact already-loaded, idle, inline owner in this
++  process/profile. It refuses lazy/watch sessions, closing sessions, compression
++  rotations, pending queued input/images, unpersisted branch seeds, hosted-group
++  fences, compute-host sessions and foreign writer leases. It never takes over a
++  detached owner, rebinds transport, creates a missing session, or cold-resumes.
++- Resume/history locks protect only the in-memory running/in-flight claim; writer
++  lease acquisition and SQLite work happen after releasing both. Same-operation
++  retries serialize separately and re-read the receipt before claiming a turn.
++  The SQLite transaction additionally checks transcript guards and reopens ended
++  sessions using normal queue retirement, reset lineage and auto-unarchive rules.
++- The operation receipt and staged canonical user row commit atomically in state.db.
++  Only the transaction winner dispatches the existing build/turn runner. The normal
++  submit-row adoption path prevents a second user row during agent persistence.
++- A retry returns the original verified receipt and **never dispatches again**.
++  A crash after commit but before thread start therefore leaves accepted input with
++  uncertain execution. There is deliberately no automatic recovery worker. Crash
++  auto-continuation is disabled for this admitted turn's marker. Manual reconciliation
++  is required for uncertain execution; never invent a new operation ID to retry it.
++- Error 4092 is a target/state/digest conflict or unsupported owner; 4090 is writer
++  admission refusal; 5035 is retiring; normal validation/profile/storage errors also
++  apply. After any lost response or exception, query the same operation first.
++
++## Remaining integration limits
++
++This does not locate or proxy to an owning Desktop backend from the separate
++messaging/API gateway. The plugin must route to the existing authenticated owner RPC
++transport. Cold/unloaded and busy-owner queue admission are deliberately unsupported;
++busy requests can retry the same operation once the owner becomes idle. No completion
++receipt, automatic execution reconciliation, deployment, or real user decision was
++performed as part of this implementation.
++The Desktop still needs transcript rehydration to render the admitted user bubble;
++no new client event or renderer handling is included here.
+diff --git a/tui_gateway/contracts/prompt_voice.py b/tui_gateway/contracts/prompt_voice.py
+index 022fc6ca1d..5448254afc 100644
+--- a/tui_gateway/contracts/prompt_voice.py
++++ b/tui_gateway/contracts/prompt_voice.py
+@@ -79,6 +79,37 @@ method("prompt.submit", params=PromptSubmitParams, result=PromptSubmitResult,
+        doc="Send a user turn to a live session; busy sessions queue / steer / redirect instead of refusing.")
+ 
+ 
++# ── exact-session durable admission ───────────────────────────────────────────────────────────
++
++class PromptAdmissionGetParams(Params):
++    profile: str = Field(min_length=1, max_length=128)
++    stored_session_id: str = Field(min_length=1, max_length=256)
++    operation_id: str = Field(min_length=1, max_length=256)
++    payload_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
++
++
++class PromptAdmitParams(PromptAdmissionGetParams):
++    text: str = Field(min_length=1, max_length=1000000)
++
++
++class PromptAdmissionResult(Result):
++    status: str
++    stored_session_id: str
++    operation_id: str
++    payload_digest: str
++    profile: str
++    user_row_id: int | None = None
++    message_uid: str | None = None
++    execution_status: str = "unknown"
++    dispatch: str = "unknown"  # cancelled = positively unstarted; audit user row is inactive
++
++
++method("prompt.admit", params=PromptAdmitParams, result=PromptAdmissionResult,
++       doc="Durably accept once into an idle exact live owner. Never cold-resume or replay execution.")
++method("prompt.admission.get", params=PromptAdmissionGetParams, result=PromptAdmissionResult,
++       doc="Verify the exact accepted user row; acceptance does not assert execution.")
++
++
+ # ── attachments ───────────────────────────────────────────────────────────────────────────────
+ 
+ 
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index f4b0b80c94..1bbc566698 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -658,7 +658,8 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
+ 
+ 
+ def _run_after_agent_ready(
+-    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None
++    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
++    *, auto_continue=True
+ ):
+     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
+     accepted in-flight message), then run."""
+@@ -689,7 +690,7 @@ def _run_after_agent_ready(
+             return
+     _run_prompt_submit(
+         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
+-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
++        terminal_callback=hosted_terminal_callback, turn_author=turn_author, auto_continue=auto_continue)
+ 
+ 
+ _TRUNCATION_PARAMS = (
+@@ -704,6 +705,8 @@ def _lock_in_submit_turn(
+     with _session_turn_admission(session) as admitted:
+         if not admitted:
+             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
++        if session.get("running"):
++            return _err(rid, 4009, "session busy", {"reason": "turn_claim_busy"}), fields
+         # A watch session's run lives in the PARENT turn (own running flag False); typing
+         # mid-run would build a second agent racing the child on the same stored session.
+         if session.get("lazy") and _child_run_active(
+@@ -732,6 +735,23 @@ def _lock_in_submit_turn(
+ _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
+ 
+ 
++def _reopen_before_isolated_submit(sid, session):
++    try:
++        with _session_db(session) as db:
++            if db is not None:
++                _reopen_if_finalized(db, str(session.get('session_key') or ''))
++    except Exception:
++        logger.debug('finalized-session reopen before isolated dispatch failed for %s',
++                     sid, exc_info=True)
++
++
++def _submit_display_metadata(params):
++    title_preview = params.get('title_preview')
++    if isinstance(title_preview, str) and title_preview.strip():
++        return {'title_preview': title_preview[:1000]}
++    return None
++
++
+ @method("prompt.submit")
+ def _(rid, params: dict) -> dict:
+     from hermes_cli.input_sanitize import sanitize_user_prompt_text
+@@ -741,12 +761,7 @@ def _(rid, params: dict) -> dict:
+     # Off-screen sends (widget intents) type the row so no client renders a bubble;
+     # whitelisted to "hidden" — this RPC must not mint kinds.
+     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+-    title_preview = params.get("title_preview")
+-    display_metadata = (
+-        {"title_preview": title_preview[:1000]}
+-        if isinstance(title_preview, str) and title_preview.strip()
+-        else None
+-    )
++    display_metadata = _submit_display_metadata(params)
+     if (stopped := _typed_stop_phrase_response(rid, text)) is not None:
+         return stopped
+     if params.get("interrupted"):
+@@ -805,13 +820,24 @@ def _(rid, params: dict) -> dict:
+     # history_lock is released (a non-interruptible tool may hold it); if the old turn
+     # finished between the two acquisitions, retry the claim rather than strand this
+     # prompt in a queue whose drain already ran.
++    raw_rebind_ids = params.get("rebind_survivor_row_ids")
++    requested_rebind_ids = (
++        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
++        if isinstance(raw_rebind_ids, list) else None)
+     while True:
+         with session["history_lock"]:
+-            if not session.get("running"):
+-                break
+-            if internal_hosted_submit:
+-                return _err(rid, 4091, "hosted room member session is busy")
++            busy = bool(session.get("running"))
+             busy_transport = t or session.get("transport")
++        if not busy:
++            err, survivor_fields = _lock_in_submit_turn(
++                rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
++            if err is None:
++                break
++            if (err.get("error", {}).get("data") or {}).get("reason") == "turn_claim_busy":
++                continue
++            return err
++        if internal_hosted_submit:
++            return _err(rid, 4091, "hosted room member session is busy")
+         if has_truncation:
+             # A rewind/edit/restore/regenerate must land as a truncation, never as a
+             # steered correction or a plain follow-up queued to run after the live
+@@ -825,14 +851,6 @@ def _(rid, params: dict) -> dict:
+             display_kind=display_kind)
+         if busy_response is not None:
+             return busy_response
+-    raw_rebind_ids = params.get("rebind_survivor_row_ids")
+-    requested_rebind_ids = (
+-        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
+-        if isinstance(raw_rebind_ids, list) else None)
+-    err, survivor_fields = _lock_in_submit_turn(
+-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+-    if err is not None:
+-        return err
+     if turn_isolation:
+         if turn_author:
+             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
+@@ -843,13 +861,7 @@ def _(rid, params: dict) -> dict:
+         # applied inline), and the child's transcript writes must land in a live row
+         # (#85303 review: the early return made _reopen_if_finalized unreachable on
+         # this path). Best-effort like the helper: a failed read never blocks the send.
+-        try:
+-            with _session_db(session) as db:
+-                if db is not None:
+-                    _reopen_if_finalized(db, str(session.get("session_key") or ""))
+-        except Exception:
+-            logger.debug("finalized-session reopen before isolated dispatch failed for %s",
+-                         sid, exc_info=True)
++        _reopen_before_isolated_submit(sid, session)
+         isolated_response = _submit_prompt_to_compute_host(
+             rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
+         if not isolated_response.get("error"):
+diff --git a/tui_gateway/methods_prompt_admission.py b/tui_gateway/methods_prompt_admission.py
+new file mode 100644
+index 0000000000..90703665f9
+--- /dev/null
++++ b/tui_gateway/methods_prompt_admission.py
+@@ -0,0 +1,241 @@
++"""Idempotent admission on the existing owning runtime, never a second worker.
++
++Only idle, already-loaded inline sessions are supported. Lost-response retries
++and readback work without a live owner. An accepted operation is never dispatched
++again, even if the process died between the SQLite commit and thread start.
++"""
++from pathlib import Path
++from contextlib import contextmanager
++import threading
++import time
++import logging
++
++from hermes_state_prompt_admission import admit_prompt, mark_dispatch_failed, prompt_digest, read_admission
++
++
++_operations_lock = threading.Lock()
++_operations = {}
++
++
++@contextmanager
++def _operation_lock(home, operation_id):
++    # Serialize only retries of this operation, never unrelated sessions or DB work.
++    key = (home, operation_id)
++    with _operations_lock:
++        entry = _operations.setdefault(key, [threading.Lock(), 0])
++        entry[1] += 1
++    try:
++        with entry[0]:
++            yield
++    finally:
++        with _operations_lock:
++            entry[1] -= 1
++            if not entry[1]:
++                del _operations[key]
++
++
++def _owner_home(server, profile):
++    # Unlike legacy resume, this API does not accept aliases for a profile.
++    if server._response_profile_name(profile) != profile:
++        raise ValueError("exact canonical profile required")
++    return Path(server._profile_home(profile) or server._hermes_home).resolve()
++
++
++def _read(server, params, home):
++    # A failed cancellation write keeps the live writer quarantined. Readback
++    # retries retirement, NEVER scheduling, before it reports a terminal result.
++    with server._sessions_lock:
++        sessions = list(server._sessions.values())
++    for session in sessions:
++        pending = session.get('_admission_cancel_pending')
++        if (pending and pending['operation_id'] == params['operation_id']
++                and session.get('session_key') == params['stored_session_id']
++                and Path(session.get('profile_home') or server._hermes_home).resolve() == home):
++            with pending['lock']:
++                if session.get('_admission_cancel_pending') is pending:
++                    _finish_cancellation(server, session, pending)
++    with server._session_db({"profile_home": str(home) if home != Path(server._hermes_home).resolve() else None}) as db:
++        if db is None:
++            raise RuntimeError("session storage unavailable")
++        return read_admission(db, params["stored_session_id"], params["operation_id"], params["payload_digest"])
++
++
++def _reply(server, rid, params, receipt):
++    return server._ok(rid, {**(receipt or {
++        "status": "absent", "stored_session_id": params["stored_session_id"],
++        "operation_id": params["operation_id"], "payload_digest": params["payload_digest"],
++        "execution_status": "unknown"}), "profile": params["profile"]})
++
++
++def get_admission(rid, params):
++    from tui_gateway import server
++    if server.current_transport() is not None:
++        return server._err(rid, 4031, 'Prompt admission is restricted to in-process owner services')
++    try:
++        home = _owner_home(server, params["profile"])
++        with _operation_lock(home, params['operation_id']):
++            return _reply(server, rid, params, _read(server, params, home))
++    except ValueError as exc:
++        return server._err(rid, 4092, str(exc))
++
++
++def _live_owner(server, params, home):
++    with server._sessions_lock:
++        matches = [(sid, s) for sid, s in server._sessions.items()
++                   if s.get("session_key") == params["stored_session_id"]
++                   and Path(s.get("profile_home") or server._hermes_home).resolve() == home]
++    if len(matches) != 1:
++        raise ValueError("exact session has no unique live owner on this runtime")
++    sid, session = matches[0]
++    if session.get("lazy") or server._submit_row_target_key(session) != params["stored_session_id"]:
++        raise ValueError("exact session is lazy or rotated")
++    if (session.get("running") or session.get("_closing") or session.get("queued_prompt")
++            or session.get("queued_prompts") or session.get("attached_images")):
++        raise ValueError("exact session is busy or has pending input; retry later with the same operation")
++    if server._session_uses_compute_host(session, server._load_dashboard_process_isolation_config()):
++        raise ValueError("exact admission does not support isolated compute sessions")
++    if session.get("seeded") and not session.get("_branch_seed_persisted"):
++        raise ValueError("exact admission does not support unpersisted branches")
++    return sid, session
++
++
++def _dispatch(server, rid, sid, session, text):
++    # Existing build/turn implementation adopts _submit_user_row and retains the
++    # owner's transport. A plugin RPC must not steal the Desktop's connection.
++    if not server._restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
++        server._start_agent_build(sid, session)
++    gate = session['_admission_dispatch_gate']
++
++    def run():
++        with gate['lock']:
++            if gate['cancelled']:
++                return
++            gate['started'] = True
++        server._run_after_agent_ready(rid, sid, session, text, None, None, None, auto_continue=False)
++
++    worker = server._start_session_work(run, name="prompt-admission", session=session)
++    if worker is None:
++        raise RuntimeError("backend retired after durable acceptance")
++
++
++def submit_admission(rid, params):
++    from tui_gateway import server
++    from hermes_cli.input_sanitize import sanitize_user_prompt_text
++
++    if server.current_transport() is not None:
++        return server._err(rid, 4031, 'Prompt admission is restricted to in-process owner services')
++    try:
++        home = _owner_home(server, params["profile"])
++        text = params["text"]
++        if not text.strip() or sanitize_user_prompt_text(text) != text:
++            raise ValueError("text must be nonempty sanitized user input")
++        if prompt_digest(params["stored_session_id"], text) != params["payload_digest"]:
++            raise ValueError("payload digest mismatch")
++        with _operation_lock(home, params["operation_id"]):
++            # Serialize readback with scheduling and cancellation: durable
++            # acceptance alone is not yet a settled delivery result.
++            # Read outside the process/history locks: SQLite can wait on a writer.
++            prior = _read(server, params, home)
++            if prior is not None:
++                return _reply(server, rid, params, prior)
++            with server._session_resume_lock:
++                sid, session = _live_owner(server, params, home)
++                with server._session_turn_admission(session) as admitted:
++                    if not admitted:
++                        return server._err(rid, 5035, "backend is retiring")
++                    _live_owner(server, params, home)
++                    refusal = server._reattach_refusal(rid, sid, session)
++                    if refusal is not None:
++                        return refusal
++                    if server._ws_session_is_detached(session):
++                        raise ValueError("exact session is detached; reattach its owner first")
++                    refusal = server._legacy_group_fence_error(rid, session, params)
++                    if refusal is not None:
++                        return refusal
++                    session["running"] = True
++                    session["_turn_cancel_requested"] = False
++                    session["last_active"] = time.time()
++                    server._start_inflight_turn(session, text)
++            return _accept_claimed(server, rid, sid, session, params, text)
++    except ValueError as exc:
++        return server._err(rid, 4092, str(exc))
++    except Exception as exc:
++        logging.getLogger(__name__).exception("Prompt admission failed: %s", params["operation_id"])
++        return server._err(rid, 5071, f"Prompt admission storage failed; query this operation before retrying: {exc}")
++
++
++def _undo_claim(server, session, *, retain_error=False):
++    # Keep running visible until release completes so another admission cannot
++    # inherit a lease which this failed turn is about to release.
++    try:
++        server._release_active_session_slot(session)
++    finally:
++        with session["history_lock"]:
++            session["running"] = False
++            session["last_active"] = time.time()
++            session.pop("_submit_user_row", None)
++            if not retain_error:
++                server._clear_inflight_turn(session)
++
++
++def _finish_cancellation(server, session, params):
++    with server._session_db(session) as db:
++        receipt = mark_dispatch_failed(db, params['stored_session_id'],
++                                       params['operation_id'], params['payload_digest'])
++    # Persist retirement BEFORE releasing the writer: the next ordinary prompt
++    # must never load this cancelled approval from active history.
++    _undo_claim(server, session, retain_error=True)
++    session.pop('_admission_cancel_pending', None)
++    return receipt
++
++
++def _accept_claimed(server, rid, sid, session, params, text):
++    try:
++        if (limit := server._ensure_active_session_slot(sid, session, allow_takeover=False)) is not None:
++            _undo_claim(server, session)
++            return server._err(rid, 4090, str(limit))
++        with server._session_db(session) as db:
++            if db is None:
++                raise RuntimeError("session storage unavailable")
++            receipt, staged, created = admit_prompt(
++                db, params["stored_session_id"], params["operation_id"], text, params["payload_digest"])
++    except Exception:
++        _undo_claim(server, session)
++        raise
++    if not created:
++        _undo_claim(server, session)
++        return _reply(server, rid, params, receipt)
++    gate = {'lock': threading.Lock(), 'started': False, 'cancelled': False}
++    with session["history_lock"]:
++        session["_submit_user_row"] = staged
++        session['_admission_dispatch_gate'] = gate
++    try:
++        if session.get("_turn_cancel_requested") or session.get("_closing") or not session.get("running"):
++            raise RuntimeError("turn cancelled after durable acceptance")
++        _dispatch(server, rid, sid, session, text)
++    except Exception as exc:
++        server.logger.exception("Prompt accepted but dispatch failed: %s", params["operation_id"])
++        with gate['lock']:
++            if gate['started']:
++                # The worker owns cleanup now. Never claim cancellation or release
++                # its writer after an ambiguous scheduler return.
++                return _reply(server, rid, params, receipt)
++            gate['cancelled'] = True
++        pending = {**params, 'lock': threading.Lock()}
++        session['_admission_cancel_pending'] = pending
++        try:
++            server._emit_terminal_turn_error(sid, session, exc, error_surface={
++                "layer": "runtime", "code": "admission_dispatch_failed", "retryable": False})
++        finally:
++            try:
++                with pending['lock']:
++                    receipt = _finish_cancellation(server, session, pending)
++            except Exception:
++                server.logger.exception("Could not retire failed dispatch; writer remains quarantined")
++                raise
++    return _reply(server, rid, params, receipt)
++
++
++def register(server):
++    server.register_method("prompt.admit", server._profile_scoped(submit_admission))
++    server.register_method("prompt.admission.get", server._profile_scoped(get_admission))
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 91b089e25c..dbd3c25468 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1180,7 +1180,7 @@ def _run_prompt_submit(
+     display_metadata: dict | None = None, image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None,
+     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+-    turn_author: dict | None = None) -> bool:
++    turn_author: dict | None = None, auto_continue: bool = True) -> bool:
+     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
+     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
+     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
+@@ -1226,7 +1226,7 @@ def _run_prompt_submit(
+         st = _TurnRun(
+             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
+             receipt_committed=terminal_callback is None)
+-        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
++        st.marker_key = _record_turn_marker(session, text, auto_continue=auto_continue and terminal_callback is None,
+             notification_category=(display_metadata or {}).get("notification_category"))
+         goal_followup = None
+         try:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 8caf0158b6..2ab74de5f8 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3703,7 +3703,8 @@ from . import (
+     methods_display as _methods_display, methods_display_watch as _methods_display_watch,
+     methods_onboarding as _methods_onboarding, methods_i18n as _methods_i18n,
+     methods_shared_metrics as _methods_shared_metrics, methods_start_chat as _methods_start_chat,
+-    methods_plugin_catalog as _methods_plugin_catalog, kanban_unloaded as _kanban_unloaded)
++    methods_plugin_catalog as _methods_plugin_catalog, kanban_unloaded as _kanban_unloaded,
++    methods_prompt_admission as _methods_prompt_admission)
+ 
+ for _m in (
+     _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
+@@ -3715,6 +3716,7 @@ for _m in (
+     _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
+     _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors,
+     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding,
+-    _methods_i18n, _methods_shared_metrics, _methods_start_chat, _methods_plugin_catalog, _kanban_unloaded):
++    _methods_i18n, _methods_shared_metrics, _methods_start_chat, _methods_plugin_catalog, _kanban_unloaded,
++    _methods_prompt_admission):
+     _m.register(sys.modules[__name__])
+ del _m
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index fda95a234b..ebf18f11d5 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -146,11 +146,13 @@ def _durable_owner_refusal(session: dict):
+         f"Writer: {holder}", SESSION_NOT_OWNED)
+ 
+ 
+-def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
++def _ensure_active_session_slot(sid: str, session: dict, *, allow_takeover: bool = True) -> str | None:
+     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
+     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
+     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
+-    inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream."""
++    inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream.
++    Exact admission passes allow_takeover=False: it must not move a detached owner's lease,
++    and already holds the non-reentrant resume lock used by takeover."""
+     # A registry slot is not the SQLite writer lease. Check even on a warm Desktop session.
+     # Its own running agent is excluded by exact holder, preserving ordinary steer/stop.
+     if (refusal := _durable_owner_refusal(session)) is not None:
+@@ -164,7 +166,8 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
+         _attach_lease(session, lease)
+         return None
+     from hermes_cli.active_sessions import SESSION_NOT_OWNED
+-    if getattr(limit_message, "reason", None) == SESSION_NOT_OWNED and _take_over_detached_runtime_lease(sid, session, key):
++    if (allow_takeover and getattr(limit_message, "reason", None) == SESSION_NOT_OWNED
++            and _take_over_detached_runtime_lease(sid, session, key)):
+         return None
+     return limit_message
+ 
+-- 
+2.55.0
+

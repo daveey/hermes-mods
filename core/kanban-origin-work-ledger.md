@@ -106,15 +106,15 @@ Apply the complete ordered series, not this noncontiguous subset alone. It build
 
 Hub/courier and Desktop plugins consume these seams, including profile-pinned REST, but transactional creation, durable release evidence, shared activity projection and Desktop owner routing require core changes. Updating a disk plugin alone does not activate them.
 
-## Remote inventory sharing (0403) and terminal release of attested remote cards (0450)
+## Remote inventory sharing (0402) and terminal release of attested remote cards (0455)
 
-Patch **0403** (`7f0a44e948`): `kanban_session_activity._remote_links` is cached per origin scope for `_CACHE_TTL_S`
+Patch **0402** (`7f0a44e948`): `kanban_session_activity._remote_links` is cached per origin scope for `_CACHE_TTL_S`
 while no store it reads (boards, hub replica, origin ledger) changed, single-flight so concurrent readers wait for
 one projection; failures are not cached. `_legacy_remote_links` writes the origin-work snapshot only when the
 inventory changed, and a locked snapshot write is logged instead of failing the read (previously it marked every
 sidebar row `kanban_unknown`). Tests: `tests/hermes_cli/test_kanban_remote_inventory_cache.py`.
 
-Patch **0450** (`d52e183104`), requires 0403, 0397 (scope heartbeat) and 0398–0400:
+Patch **0455** (`d52e183104`), requires 0402, 0398 (scope heartbeat) and 0399–0401:
 
 - **Behavior.** A remote shepherd card that its owner attests done or archived leaves the origin session's open
   counts (explicit row, `unfinished=False`, `released=True`). Attestation needs a fresh hub sync, identity fields

@@ -1,0 +1,111 @@
+From 726d5b552531488b6ff56e2f9b3e1ba6215f3779 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:46:21 -0700
+Subject: [PATCH] fix(kanban-sync): send the full row for an edit of a card the
+ service never saw; import clears superseded rejects [daveey]
+
+A card created before sync was switched on captures only its changed columns
+on its first edit; the service cannot insert a partial task row and refused it
+(invalid_value: title), cascading depends_on_rejected through the batch. Seen
+live on the first shadow round. The client now sends the card's full current
+row while sync_version is NULL (the service has not acknowledged it), and
+import clears rejected rows its full rows supersede.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_cli.py               |  4 +++-
+ hermes_cli/kanban_sync_client.py            | 16 +++++++++++++-
+ tests/hermes_cli/test_kanban_sync_client.py | 24 +++++++++++++++++++++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 7274fa6064..0aa2f0e5a4 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -75,7 +75,9 @@ def _import(args: argparse.Namespace) -> int:
+         counts = ksc.import_board(conn)
+     finally:
+         conn.close()
+-    print(f"kanban sync: queued {sum(counts.values())} rows from {slug} ({', '.join(f'{k}={v}' for k, v in counts.items())})")
++    cleared = counts.pop("cleared_rejected", 0)
++    print(f"kanban sync: queued {sum(counts.values())} rows from {slug} ({', '.join(f'{k}={v}' for k, v in counts.items())})"
++          + (f"; cleared {cleared} refused rows they supersede" if cleared else ""))
+     return 0
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index b501896444..4a6dee45cd 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -196,6 +196,18 @@ def translate(row: dict, hlc: str) -> dict:
+     return out
+ 
+ 
++def _full_row_if_unseen(conn: sqlite3.Connection, row: dict) -> dict:
++    """A task edit captured before the service has acknowledged the card (``sync_version`` NULL: it was created
++    before sync was switched on and not imported yet) carries only the changed columns, which the service cannot
++    insert. Send the card's full current row instead; a later edit is then a plain merge."""
++    if row["table_name"] != "tasks" or row["op"] != "upsert":
++        return row
++    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["row_uid"],)).fetchone()
++    if task is None or task["sync_version"] is not None:
++        return row
++    return {**row, "fields": _row_fields(conn, "tasks", task)}
++
++
+ @dataclass
+ class PushResult:
+     sent: int = 0
+@@ -215,7 +227,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+         if not rows:
+             break
+         with write_txn(conn):
+-            wire = [translate(r, _next_hlc(conn, gateway)) for r in rows]
++            wire = [translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway)) for r in rows]
+         try:
+             resp = hub.ops(board, wire)
+         except (HubError, OSError) as exc:
+@@ -507,6 +519,8 @@ def import_board(conn: sqlite3.Connection, *, tables: Iterable[str] = IMPORT_ORD
+     counts: dict[str, int] = {}
+     now = time.time_ns() // 1_000_000
+     with write_txn(conn):
++        # Rows the service refused before the import (edits of cards it had not seen) are superseded by the full rows.
++        counts["cleared_rejected"] = conn.execute("DELETE FROM kanban_sync_outbox WHERE state = 'rejected'").rowcount
+         for table in tables:
+             order = "created_at, id" if table == "tasks" else ("parent_id, child_id" if table == "task_links" else "id")
+             n = 0
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index edd60c8d33..e238387c31 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -484,3 +484,27 @@ def test_own_partition_keeps_child_rows_of_own_cards_only(live):
+         sync.RemoteChange(6, "task_links", f"{tid}>t_foreign", "upsert", {}, 1, "", OTHER),
+     ]
+     assert [c.seq for c in ksc.own_partition(live, ch, ME)] == [1, 2, 5]
++
++
++def test_an_edit_of_a_card_the_service_never_saw_is_sent_as_the_full_row(live, svc):
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)
++    tid = kb.create_task(live, title="made before sync", assignee="worker")  # never captured, never imported
++    sync.install_triggers(live)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET priority = 7 WHERE id = ?", (tid,))  # captures only {"priority": 7}
++    res = ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    assert res.rejected == 0
++    row = svc.board(BOARD)["rows"]["tasks"][tid]
++    assert (row["title"], row["priority"], row["created_on"]) == ("made before sync", 7, ME)
++
++
++def test_import_clears_rows_the_service_refused_before_it(live, svc):
++    tid = kb.create_task(live, title="x", assignee="worker")
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_outbox SET state = 'rejected'")
++    counts = ksc.import_board(live, tables=("tasks",))
++    assert counts["cleared_rejected"] >= 1 and counts["tasks"] == 1
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()
++    assert ksc.push(live, svc.hub(ME), BOARD, ME, primary=False).rejected == 0
++    assert tid in svc.board(BOARD)["rows"]["tasks"]
+-- 
+2.55.0
+

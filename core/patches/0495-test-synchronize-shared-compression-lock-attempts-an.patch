@@ -1,0 +1,115 @@
+From 4f7a8404c5869a688f109c1e0cae4de449dbd2e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:08:02 -0700
+Subject: [PATCH] test: synchronize shared compression lock attempts and await
+ workers (#100)
+
+Co-authored-by: daveey <daveey@users.noreply.github.com>
+---
+ .../test_compression_concurrent_sessions.py   | 48 ++++++++-----------
+ 1 file changed, 20 insertions(+), 28 deletions(-)
+
+diff --git a/tests/gateway/test_compression_concurrent_sessions.py b/tests/gateway/test_compression_concurrent_sessions.py
+index 42d7e9c2e2..07450642ce 100644
+--- a/tests/gateway/test_compression_concurrent_sessions.py
++++ b/tests/gateway/test_compression_concurrent_sessions.py
+@@ -10,21 +10,17 @@ isolation guarantees:
+    the other returns its input unchanged (the no-op / lock-loser contract).
+ 
+ The stub-compressor pattern mirrors ``test_compression_concurrent_fork.py``:
+-the compressor returns deterministic output and sleeps briefly so threads
+-actually overlap at the OS level, making the absence of aliasing a genuine
+-stress test rather than a timing accident.
++the compressor returns deterministic output. A rendezvous after the real lock
++attempts keeps the winner holding its lock until the contender has tried it.
+ """
+ 
+ from __future__ import annotations
+ 
+ import os
+ import threading
+-import time
+ from pathlib import Path
+ from unittest.mock import MagicMock, patch
+ 
+-import pytest
+-
+ from hermes_state import SessionDB
+ 
+ 
+@@ -52,17 +48,16 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
+             skip_memory=True,
+         )
+ 
+-    # Stub the compressor: deterministic output, brief sleep to force thread overlap.
++    # Stub only summarization; locking and session rotation remain real.
+     compressor = MagicMock()
+ 
+-    def _compress_with_overlap(*_a, **_kw):
+-        time.sleep(0.2)  # match fork test sleep so threads reliably overlap
++    def _compress(*_a, **_kw):
+         return [
+             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+             {"role": "user", "content": "tail"},
+         ]
+ 
+-    compressor.compress.side_effect = _compress_with_overlap
++    compressor.compress.side_effect = _compress
+     compressor.compression_count = 1
+     compressor.last_prompt_tokens = 0
+     compressor.last_completion_tokens = 0
+@@ -106,27 +101,21 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
+     agent_a = _build_agent_with_db(db, shared_sid)
+     agent_b = _build_agent_with_db(db, shared_sid)
+ 
+-    # Force genuine simultaneous lock contention instead of relying on a
+-    # ``time.sleep`` inside the compressor stub to make the threads overlap.
+-    # Under CI CPU starvation that sleep is not enough: one thread could
+-    # acquire → compress → rotate → RELEASE the lock before the other even
+-    # reaches ``try_acquire``, so both would acquire on the shared id and
+-    # both would compress (the historical "got 2" flake). A two-party
+-    # barrier in front of the real acquire guarantees both threads are
+-    # contending for the lock at the same instant, which is exactly the
+-    # condition this test means to assert — with zero timing dependency.
+-    barrier = threading.Barrier(2, timeout=15)
++    # Rendezvous AFTER the real acquire: a barrier before it still lets a
++    # descheduled contender arrive after the winner has compressed and released.
++    # Hold the winner here until both atomic attempts finish.
++    barrier = threading.Barrier(2, timeout=60)
+     _real_acquire = db.try_acquire_compression_lock
++    sync_errors: list[Exception] = []
+ 
+     def _barriered_acquire(*args, **kwargs):
+-        # Rendezvous both callers, then let the real (atomic) acquire decide
+-        # the single winner. Tolerate a broken barrier so a test-side timeout
+-        # never masquerades as a lock-logic failure.
++        acquired = _real_acquire(*args, **kwargs)
+         try:
+             barrier.wait()
+-        except threading.BrokenBarrierError:
+-            pass
+-        return _real_acquire(*args, **kwargs)
++        except threading.BrokenBarrierError as exc:
++            sync_errors.append(exc)
++            raise
++        return acquired
+ 
+     db.try_acquire_compression_lock = _barriered_acquire
+ 
+@@ -144,8 +133,11 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
+     t_b = threading.Thread(target=run, args=("b", agent_b), name="review_fork")
+     t_a.start()
+     t_b.start()
+-    t_a.join(timeout=15)
+-    t_b.join(timeout=15)
++    t_a.join(timeout=90)
++    t_b.join(timeout=90)
++
++    assert not t_a.is_alive() and not t_b.is_alive(), "Compression workers did not finish"
++    assert not sync_errors, f"Lock-attempt rendezvous failed: {sync_errors}"
+ 
+     # Restore the real method so the post-join lock-leak assertion below
+     # (and any future call) hits the unwrapped implementation.
+-- 
+2.55.0
+

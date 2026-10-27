@@ -1,0 +1,278 @@
+From 236b07480e23321b2a607f6066dc7b23e0cd6f27 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:56:33 +0000
+Subject: [PATCH] fix(kanban): attest inherited legacy task aliases with exact
+ graph proofs [daveey]
+
+---
+ hermes_cli/kanban_origin_adapter.py           |   8 +-
+ hermes_cli/kanban_origin_legacy.py            |  71 ++++++---
+ .../test_kanban_origin_legacy_path.py         | 137 ++++++++++++++++++
+ 3 files changed, 197 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_legacy_path.py
+
+diff --git a/hermes_cli/kanban_origin_adapter.py b/hermes_cli/kanban_origin_adapter.py
+index 24dd96fc57..d056b8f550 100644
+--- a/hermes_cli/kanban_origin_adapter.py
++++ b/hermes_cli/kanban_origin_adapter.py
+@@ -71,13 +71,17 @@ def receive(request: dict) -> dict:
+     binding = request['args'].get('binding')
+     validate_binding(binding)
+     if (request.get('coll') != 'sessions'
+-            or request.get('action') not in ('origin-bind', 'origin-reconcile-legacy')
++            or request.get('action') not in ('origin-bind', 'origin-reconcile-legacy', 'origin-reconcile-legacy-path')
+             or request.get('to_gw') != gateway
+             or request.get('key') != f"{profile}/{binding['origin']['session']}"):
+         raise ValueError('origin_route_mismatch')
+     # A distinct wire action makes pre-attestation adapters reject before they
+     # consume the immutable receipt ID. Ordinary origin-bind stays compatible.
+-    if request['action'] == 'origin-reconcile-legacy' and not isinstance(request['args'].get('legacy_alias'), dict):
++    alias = request['args'].get('legacy_alias')
++    if request['action'] != 'origin-bind' and not isinstance(alias, dict):
++        raise ValueError('origin_legacy_invalid')
++    has_path = isinstance(alias, dict) and 'path' in alias
++    if has_path != (request['action'] == 'origin-reconcile-legacy-path'):
+         raise ValueError('origin_legacy_invalid')
+     return accept_binding(path=home / 'kanban/origin-ledger.db', replica=replica,
+                           binding=binding, request_id=request.get('id'),
+diff --git a/hermes_cli/kanban_origin_legacy.py b/hermes_cli/kanban_origin_legacy.py
+index e796bd30f6..f1d5509adc 100644
+--- a/hermes_cli/kanban_origin_legacy.py
++++ b/hermes_cli/kanban_origin_legacy.py
+@@ -13,36 +13,73 @@ def record_digest(task: dict) -> str:
+ 
+ def validate_alias(alias: dict, binding: dict) -> None:
+     owner = binding['owner']
+-    if (not isinstance(alias, dict) or set(alias) != {'key', 'version', 'digest', 'evidence'}
++    if (not isinstance(alias, dict) or set(alias) not in ({'key', 'version', 'digest', 'evidence'},
++                                                         {'key', 'version', 'digest', 'evidence', 'path'})
+             or alias.get('key') != f"{owner['board']}/{owner['task_id']}"
+             or type(alias.get('version')) is not int or alias['version'] < 1
+             or not isinstance(alias.get('digest'), str)
+             or not re.fullmatch('[0-9a-f]{64}', alias['digest'])
+             or not isinstance(alias.get('evidence'), str) or not alias['evidence'].strip()):
+         raise ValueError('origin_legacy_invalid')
++    if 'path' in alias:
++        _validate_path(alias, owner['board'])
+ 
+ 
+-def verify_publication(conn, alias: dict, binding: dict) -> bool:
+-    """Return pending only for missing/behind publication; reject changed evidence."""
+-    owner, origin = binding['owner'], binding['origin']
++def _validate_path(alias: dict, board: str) -> None:
++    path = alias['path']
++    if not isinstance(path, list) or not 2 <= len(path) <= 32:
++        raise ValueError('origin_legacy_invalid')
++    seen = set()
++    for node in path:
++        if (not isinstance(node, dict) or set(node) != {'key', 'version', 'digest'}
++                or not isinstance(node.get('key'), str)
++                or not node['key'].startswith(board + '/') or node['key'].count('/') != 1
++                or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}', node['key'].split('/')[1])
++                or node['key'] in seen
++                or type(node.get('version')) is not int or node['version'] < 1
++                or not isinstance(node.get('digest'), str)
++                or not re.fullmatch('[0-9a-f]{64}', node['digest'])):
++            raise ValueError('origin_legacy_invalid')
++        seen.add(node['key'])
++    if path[-1] != {k: alias[k] for k in ('key', 'version', 'digest')}:
++        raise ValueError('origin_legacy_invalid')
++
++
++def _publication(conn, node: dict, owner: dict):
+     row = conn.execute("SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+-                       (owner['gateway'], alias['key'])).fetchone()
+-    if not row or row[0] < alias['version']:
+-        return False
++                       (owner['gateway'], node['key'])).fetchone()
++    if not row or row[0] < node['version']:
++        return None
+     task = json.loads(row[1])
+-    if (row[0] != alias['version'] or not isinstance(task, dict)
+-            or record_digest(task) != alias['digest']
+-            or task.get('id') != owner['task_id'] or task.get('board') != owner['board']
++    if (row[0] != node['version'] or not isinstance(task, dict)
++            or record_digest(task) != node['digest']
++            or task.get('id') != node['key'].split('/')[1] or task.get('board') != owner['board']
+             or task.get('gateway') not in (None, owner['gateway'])
+             or task.get('profile') is not None):
+         raise ValueError('origin_legacy_publication_mismatch')
+-    links = task.get('sessions')
+-    if not isinstance(links, list) or not any(
+-            isinstance(link, dict) and link.get('rel') == 'shepherd'
+-            and link.get('gw') == origin['gateway'] and link.get('profile') == origin['profile']
+-            and link.get('session') == origin['session'] for link in links):
+-        raise ValueError('origin_legacy_association_mismatch')
+-    return True
++    return task
++
++
++def verify_publication(conn, alias: dict, binding: dict) -> bool:
++    """Exact task-graph evidence proves association, never qualified ownership."""
++    owner, origin = binding['owner'], binding['origin']
++    nodes = alias.get('path', [alias])
++    tasks = [_publication(conn, node, owner) for node in nodes]
++    for parent, child in zip(tasks, nodes[1:]):
++        if parent is None:
++            continue
++        children = parent.get('children')
++        if not isinstance(children, list) or child['key'].split('/')[1] not in children:
++            raise ValueError('origin_legacy_association_mismatch')
++    root = tasks[0]
++    if root is not None:
++        links = root.get('sessions')
++        if not isinstance(links, list) or not any(
++                isinstance(link, dict) and link.get('rel') == 'shepherd'
++                and link.get('gw') == origin['gateway'] and link.get('profile') == origin['profile']
++                and link.get('session') == origin['session'] for link in links):
++            raise ValueError('origin_legacy_association_mismatch')
++    return all(task is not None for task in tasks)
+ 
+ 
+ def check_conflicts(conn, alias: dict, binding: dict) -> None:
+diff --git a/tests/hermes_cli/test_kanban_origin_legacy_path.py b/tests/hermes_cli/test_kanban_origin_legacy_path.py
+new file mode 100644
+index 0000000000..94cf75c08c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_legacy_path.py
+@@ -0,0 +1,137 @@
++"""Task-graph aliases require exact publication evidence, not inferred owners."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_origin_ledger as ledger, kanban_origin_legacy as legacy
++from tests.hermes_cli.test_kanban_origin_legacy import world as _world_fixture
++
++world = _world_fixture
++
++
++def graph(world, depth=3):
++    nodes = []
++    with sqlite3.connect(world['replica']) as db:
++        leaf = json.loads(db.execute("SELECT data FROM replica WHERE key='build/t_one'").fetchone()[0])
++        links = leaf.pop('sessions')
++        for index in range(depth):
++            task_id = 't_one' if index == depth - 1 else f't_root{index}'
++            child = 't_one' if index == depth - 2 else f't_root{index + 1}'
++            task = leaf if index == depth - 1 else {'id': task_id, 'board': 'build', 'children': [child]}
++            if index == 0:
++                task['sessions'] = links
++            key = f'build/{task_id}'
++            db.execute('DELETE FROM replica WHERE key=?', (key,))
++            db.execute("INSERT INTO replica VALUES ('owner','tasks',?,2,?,100000)", (key, json.dumps(task)))
++            nodes.append({'key': key, 'version': 2, 'digest': legacy.record_digest(task)})
++    world['legacy_alias'].update(nodes[-1])
++    world['legacy_alias']['path'] = nodes
++    return nodes
++
++
++@pytest.mark.parametrize('contradiction', ['origin', 'edge'])
++def test_known_contradiction_is_not_masked_by_missing_descendant(world, contradiction):
++    nodes = graph(world)
++    with sqlite3.connect(world['replica']) as db:
++        root = json.loads(db.execute('SELECT data FROM replica WHERE key=?', (nodes[0]['key'],)).fetchone()[0])
++        root['sessions' if contradiction == 'origin' else 'children'] = []
++        nodes[0]['digest'] = legacy.record_digest(root)
++        db.execute('UPDATE replica SET data=? WHERE key=?', (json.dumps(root), nodes[0]['key']))
++        db.execute('DELETE FROM replica WHERE key=?', (nodes[1]['key'],))
++    with pytest.raises(ValueError, match='origin_legacy_association_mismatch'):
++        ledger.accept_binding(**world)
++    assert ledger.receipt(world['path'], world['request_id']) is None
++
++
++@pytest.mark.parametrize('depth', [2, 3, 32])
++def test_inherited_alias_receipt_and_projection_preserve_obligation(world, depth):
++    nodes = graph(world, depth)
++    from hermes_cli.kanban_session_activity import _read_remote_links
++    before = _read_remote_links(world['replica'], now=100)
++    leaf = next(c for c in before if c.get('legacy_record', {}).get('key') == 'build/t_one')
++    ack = ledger.accept_binding(**world)
++    assert ack['legacy_alias']['path'] == nodes
++    rows = ledger.project(world['path'], replica=world['replica'], gateway='origin', profile='default', now=100)
++    assert rows[0]['unfinished'] and legacy.supersedes(leaf, rows[0])
++    root = next(c for c in before if c.get('legacy_record', {}).get('key') == nodes[0]['key'])
++    assert not legacy.supersedes(root, rows[0])
++    world['replica'].unlink()
++    assert ledger.accept_binding(**world) == ack
++    world['legacy_alias']['path'][0]['version'] += 1
++    with pytest.raises(ValueError, match='origin_binding_conflict'):
++        ledger.accept_binding(**world)
++
++
++@pytest.mark.parametrize('change', ['missing', 'behind', 'digest', 'edge', 'origin', 'profile', 'gateway', 'board'])
++def test_path_publication_is_checked_at_every_hop(world, change):
++    nodes = graph(world)
++    key = nodes[0]['key']
++    with sqlite3.connect(world['replica']) as db:
++        task = json.loads(db.execute('SELECT data FROM replica WHERE key=?', (key,)).fetchone()[0])
++        if change == 'missing':
++            db.execute('DELETE FROM replica WHERE key=?', (key,))
++        elif change == 'behind':
++            db.execute('UPDATE replica SET version=1 WHERE key=?', (key,))
++        else:
++            updates = {'digest': {'title': 'changed'}, 'edge': {'children': []},
++                       'origin': {'sessions': []}, 'profile': {'profile': 'work'},
++                       'gateway': {'gateway': 'foreign'}, 'board': {'board': 'foreign'}}
++            task.update(updates[change])
++            db.execute('UPDATE replica SET data=? WHERE key=?', (json.dumps(task), key))
++            if change != 'digest':
++                nodes[0]['digest'] = legacy.record_digest(task)
++    if change in ('missing', 'behind'):
++        assert ledger.accept_binding(**world)['status'] == 'pending'
++    else:
++        with pytest.raises(ValueError, match='origin_legacy_'):
++            ledger.accept_binding(**world)
++    assert ledger.receipt(world['path'], world['request_id']) is None
++
++
++@pytest.mark.parametrize('change', ['cycle', 'short', 'long', 'namespace', 'boolean', 'extra', 'leaf', 'null', 'bad_key'])
++def test_malformed_path_never_creates_ledger(world, change):
++    nodes = graph(world)
++    mutations = {
++        'bad_key': [{**nodes[0], 'key': 'build/..'}, *nodes[1:]],
++        'cycle': [nodes[0], nodes[0], nodes[-1]], 'short': [nodes[-1]],
++        'long': nodes * 11, 'namespace': [{**nodes[0], 'key': 'other/t_root0'}, *nodes[1:]],
++        'boolean': [{**nodes[0], 'version': True}, *nodes[1:]],
++        'extra': [{**nodes[0], 'extra': 1}, *nodes[1:]], 'leaf': nodes[:-1], 'null': None,
++    }
++    world['legacy_alias']['path'] = mutations[change]
++    with pytest.raises(ValueError, match='origin_legacy_invalid'):
++        ledger.accept_binding(**world)
++    assert not world['path'].exists()
++
++
++@pytest.mark.parametrize('action,has_path,accepted', [
++    ('origin-reconcile-legacy-path', True, True),
++    ('origin-reconcile-legacy-path', False, False),
++    ('origin-reconcile-legacy', True, False),
++    ('origin-bind', True, False),
++])
++def test_path_requires_distinct_wire_action(world, tmp_path, monkeypatch, action, has_path, accepted):
++    from hermes_cli import kanban_origin_adapter as adapter, profiles
++    import hermes_constants
++    home = tmp_path / 'home'
++    home.mkdir()
++    world['path'] = home / 'kanban/origin-ledger.db'
++    cfg = tmp_path / 'mail.json'
++    cfg.write_text(json.dumps({'gateway': 'origin'}))
++    monkeypatch.setenv('HERMES_MAIL_CONFIG', str(cfg))
++    monkeypatch.setenv('HERMES_HUB_STATE', str(tmp_path))
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: home)
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(adapter, '_resolve_session', lambda path, sid: 's_tip')
++    if has_path:
++        graph(world)
++    request = {'id': 'request-one', 'from': 'gw:owner', 'to_gw': 'origin',
++               'coll': 'sessions', 'key': 'default/s_old', 'action': action,
++               'args': {'binding': world['binding'], 'legacy_alias': world['legacy_alias']}}
++    if accepted:
++        assert adapter.receive(request)['legacy_alias'] == world['legacy_alias']
++    else:
++        with pytest.raises(ValueError, match='origin_legacy_invalid'):
++            adapter.receive(request)
++        assert not world['path'].exists()
+-- 
+2.55.0
+

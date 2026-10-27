@@ -1,0 +1,433 @@
+From d121f4c697bac114c1c855a65265c82ccdd36928 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:32:24 +0000
+Subject: [PATCH] fix(kanban): scope remote observations to linked cards
+
+---
+ hermes_cli/kanban_session_activity.py         |  88 +++++------
+ .../test_kanban_actionability_counts.py       |   6 +-
+ .../hermes_cli/test_kanban_activity_scope.py  |   4 +-
+ .../test_kanban_observation_scope.py          | 144 ++++++++++++++++++
+ .../test_kanban_remote_inventory_cache.py     |   2 +-
+ .../test_kanban_remote_terminal_release.py    |   5 +-
+ .../test_kanban_session_activity.py           |  11 +-
+ 7 files changed, 199 insertions(+), 61 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_observation_scope.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 9474fe18a6..9a6a6b0203 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -189,11 +189,10 @@ def _read_unseen(path: Path) -> dict[str, int]:
+     return {str(sid): int(n) for sid, n in rows}
+ 
+ 
+-# [daveey] Cards on ANOTHER gateway. A session here can own work that runs elsewhere (``hermes-hub create-task``,
+-# a ``shepherd`` request, ``cross_task`` read/comment): the owner publishes it as a ``sessions`` link
+-# ``{session, gw: <this gateway>, rel: "shepherd"}`` on the card, and hermes-hub keeps a local replica of every
+-# gateway's cards in ``hub.db``. Those cards (and their children, transitively) count for the session too, so it
+-# doesn't paint green while its remote work runs. Read-only; no replica = no-op.
++# Remote ownership comes from create/adopt receipts in the origin ledger. Replica
++# session links observe the linked card only, never its dependency graph. Created
++# children inherit their own origin subscription/receipt; dependency children may
++# be unrelated downstream work and MUST NOT be walked. Ledger release stays strict.
+ def _hub_db_path() -> Path | None:
+     base = os.environ.get("HERMES_HUB_STATE") or str(Path.home() / ".local" / "state" / "hermes-hub")
+     path = Path(base) / "hub.db"
+@@ -242,12 +241,10 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+ # [daveey] The ONE origin-work association for cards on other gateways. The sidebar counts
+ # (``kanban_active``/``kanban_blocked``, which also drive the archive guard) and the session task list
+ # (``session_tasks``) both come from ``_remote_links``, so they can never disagree about which remote
+-# cards a session owns. A link is a ``rel: shepherd`` entry naming THIS gateway on a replica card (the
+-# owner stores it as a ``platform='hub'`` notify subscription: ``hermes-hub create-task`` origin, a
+-# ``shepherd`` request, or ``kanban_create`` run with an origin session); every descendant of that card
+-# (``children``, transitively, on the owner's same board) is the session's work too. Rows are qualified
+-# by gateway/profile/board/id: equal task IDs in different owner profiles are separate cards.
+-# Historical board/id records retain unknown ownership rather than default-profile inference.
++# cards a session observes or owns. Each link selects only its exact card. Created
++# children count via their own inherited links. Gateway/profile/board/id identifies
++# a card; distinct qualified profiles stay separate. Historical unqualified aliases
++# do not add another count when a qualified record for the same card is available.
+ HUB_STALE_AFTER_S = 180.0  # same as the hub-sync plugin: no successful hub sync for this long = stale
+ # The owner collector publishes each scope heartbeat about every 180s (sawtooth 0..~200s as replicated), so a
+ # 180s window flapped: a closed card was released half the time. Allow ~2.5 collector periods. [daveey]
+@@ -350,7 +347,8 @@ def _fold_legacy_aliases(tasks: dict[tuple, dict[str, Any]], raw: dict[tuple, di
+         del tasks[key]
+ 
+ 
+-def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, Any]]:
++def _read_remote_links(path: Path, now: float | None = None, *,
++                       qualified_out: set | None = None) -> list[dict[str, Any]]:
+     """Replica cards linked to a session on this gateway, one row per (session, card).
+ 
+     Open and unproven cards come back ``unfinished``; cards their owner attests closed
+@@ -408,7 +406,12 @@ def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, A
+                 # terminal evidence or the qualified ledger projection supersedes it.
+                 t = {**t, 'reported_status': t.get('status'), 'status': 'unknown', 'unfinished': True}
+             tasks[key] = t
++    blank_before = {key for key in tasks if key[1] is None}
+     _fold_legacy_aliases(tasks, raw)
++    # Only a proven-identity alias is the same card as its qualified twin (folded above, links carried
++    # over). An unproven or ambiguous alias stays a separate ``unknown`` obligation: absence is never release.
++    if qualified_out is not None:
++        qualified_out.update((gw, board, tid) for gw, _, board, tid in blank_before - set(tasks))
+     from hermes_cli.profiles import get_active_profile_name
+ 
+     origin_profile = get_active_profile_name()
+@@ -421,44 +424,31 @@ def _read_remote_links(path: Path, now: float | None = None) -> list[dict[str, A
+         links = t.get("sessions") if isinstance(t.get("sessions"), list) else []
+         sids = {str(link['session']) for link in links
+                 if isinstance(link, dict) and link.get('session') and link.get('gw') == me
+-                and link.get('profile') == origin_profile and link.get('rel') == 'shepherd'}
++                and link.get('profile') == origin_profile
++                and link.get('rel') in ('shepherd', 'cross_task', 'create-task', 'adopt-task')}
+         if not sids:
+             continue
+         owner_seen = seen_at.get(gw) or None
+         synced = min(owner_seen, last_ok) if (owner_seen and last_ok) else (owner_seen or last_ok)
+-        done: set[str] = set()
+-        todo = [tid]
+-        while todo:
+-            cur = todo.pop()
+-            if cur in done:
+-                continue
+-            done.add(cur)
+-            card = tasks.get((gw, owner_profile, board, cur))
+-            if card is None:
+-                continue
+-            closed = (gw, owner_profile, board, cur) in released
+-            if closed or card.get("status") in LISTED_STATUSES or card.get('unfinished'):
+-                prefix = f'{gw}/{owner_profile}/{board}' if owner_profile is not None else f'{gw}/{board}'
+-                ref = f'{prefix}/{cur}'
+-                via = "shepherd" if cur == tid else "descendant"
+-                for sid in sids:
+-                    prev = found.get((sid, ref))
+-                    if prev is None or (via == "shepherd" and prev["via"] != "shepherd"):
+-                        found[(sid, ref)] = {
+-                            **{f: card.get(f) for f in _REMOTE_FIELDS},
+-                            "id": cur, "board": board, "gateway": gw, "key": ref, "session": sid,
+-                            "via": via, "root": f"{prefix}/{tid}", "remote": True,
+-                            "profile": owner_profile, "owner_profile": owner_profile,
+-                            "origin_gateway": me, "origin_profile": origin_profile,
+-                            "ownership_state": 'unknown' if owner_profile is None else 'qualified',
+-                            "unfinished": not closed, "released": closed,
+-                            "reported_status": card.get('reported_status', card.get('status')),
+-                            "synced_at": synced, "stale": stale,
+-                            "legacy_record": legacy_records.get((gw, owner_profile, board, cur)),
+-                            "legacy_key": card.get('_legacy_key'),
+-                        }
+-            kids = card.get("children") if isinstance(card.get("children"), list) else []
+-            todo.extend(str(k) for k in kids if k)
++        # Observation scope: the linked card only, never its dependency descendants.
++        closed = (gw, owner_profile, board, tid) in released
++        prefix = f'{gw}/{owner_profile}/{board}' if owner_profile is not None else f'{gw}/{board}'
++        ref = f'{prefix}/{tid}'
++        for sid in sids:
++            found[(sid, ref)] = {
++                **{f: t.get(f) for f in _REMOTE_FIELDS},
++                "id": tid, "board": board, "gateway": gw, "key": ref, "session": sid,
++                "via": "shepherd", "root": ref, "remote": True,
++                "profile": owner_profile, "owner_profile": owner_profile,
++                "origin_gateway": me, "origin_profile": origin_profile,
++                "ownership_state": 'unknown' if owner_profile is None else 'qualified',
++                "unfinished": not closed and (t.get("status") in LISTED_STATUSES or bool(t.get("unfinished"))),
++                "released": closed,
++                "reported_status": t.get('reported_status', t.get('status')),
++                "synced_at": synced, "stale": stale,
++                "legacy_record": legacy_records.get((gw, owner_profile, board, tid)),
++                "legacy_key": t.get('_legacy_key'),
++            }
+     return list(found.values())
+ 
+ 
+@@ -660,7 +650,8 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+     try:
+         if path is None:
+             raise FileNotFoundError("no hub.db")
+-        cards = _read_remote_links(path)
++        qualified: set[tuple[str, str, str]] = set()
++        cards = _read_remote_links(path, qualified_out=qualified)
+     except Exception as exc:  # a broken replica must never break the sidebar
+         if previous is None:
+             if path is not None:
+@@ -681,6 +672,9 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+                      for c in cards if c.get("ownership_state") == "qualified"}
+     cards.extend({**c, "stale": True} for c in (previous or [])
+                  if (c["session"], c["key"]) not in present
++                 # Successful reads migrate graph-inferred cache entries only.
++                 # Receipt-backed obligations remain in the separate ledger.
++                 and c.get("via") != "descendant"
+                  and not (c.get("ownership_state") == "unknown"
+                           and (c["session"], c.get("gateway"), c.get("board"), c.get("id")) in qualified_now))
+     if _snapshot_saved != (scope, cards):
+diff --git a/tests/hermes_cli/test_kanban_actionability_counts.py b/tests/hermes_cli/test_kanban_actionability_counts.py
+index b12178e664..8a5e65de70 100644
+--- a/tests/hermes_cli/test_kanban_actionability_counts.py
++++ b/tests/hermes_cli/test_kanban_actionability_counts.py
+@@ -80,7 +80,7 @@ def test_stale_operational_block_remains_visible_and_owned():
+ 
+ 
+ @pytest.mark.parametrize("interaction", ["approval", "reply", "user_terminal", "physical", "external"])
+-def test_hub_replica_counts_explicit_requests_and_operational_children(tmp_path, interaction):
++def test_hub_replica_counts_explicit_requests_not_observed_descendants(tmp_path, interaction):
+     path = tmp_path / "hub.db"
+     root = dict(id="parent", status="blocked", block_kind="capability",
+                 human_request={**REQUEST, "interaction": interaction}, children=["child"],
+@@ -94,8 +94,8 @@ def test_hub_replica_counts_explicit_requests_and_operational_children(tmp_path,
+                          [(f"default/main/{card['id']}", json.dumps(card)) for card in [root, child]])
+     rows = activity._read_remote_links(path, now=1)
+     assert {row["id"]: (row["session"], activity._replica_bucket(row)) for row in rows} == {
+-        "parent": ("owner", "blocked"), "child": ("owner", "active"),
+-    }
++        "parent": ("owner", "blocked"),
++    }  # shepherd links observe only the linked card, never its descendants
+ 
+ 
+ @pytest.mark.parametrize("missing", list(REQUEST))
+diff --git a/tests/hermes_cli/test_kanban_activity_scope.py b/tests/hermes_cli/test_kanban_activity_scope.py
+index 700accaabb..0eefc3078d 100644
+--- a/tests/hermes_cli/test_kanban_activity_scope.py
++++ b/tests/hermes_cli/test_kanban_activity_scope.py
+@@ -32,10 +32,10 @@ def test_count_cache_does_not_leak_between_profiles(scoped, monkeypatch):
+ 
+ def test_remote_memory_fallback_does_not_leak_between_profiles(scoped, monkeypatch, tmp_path):
+     monkeypatch.setattr(activity, '_hub_db_path', lambda: tmp_path / 'replica')
+-    monkeypatch.setattr(activity, '_read_remote_links', lambda _: [card()])
++    monkeypatch.setattr(activity, '_read_remote_links', lambda _, **kw: [card()])
+     assert activity._legacy_remote_links() == [card()]
+     scoped[0] = 'work'
+-    def unavailable(_):
++    def unavailable(_, **kw):
+         raise OSError('offline')
+     monkeypatch.setattr(activity, '_read_remote_links', unavailable)
+     with pytest.raises(OSError, match='offline'):
+diff --git a/tests/hermes_cli/test_kanban_observation_scope.py b/tests/hermes_cli/test_kanban_observation_scope.py
+new file mode 100644
+index 0000000000..8d4314e754
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_observation_scope.py
+@@ -0,0 +1,144 @@
++"""Regression contract: observing a program is not owning its dependency graph."""
++import json
++import sqlite3
++
++from hermes_cli import kanban_session_activity as activity
++
++
++def replica(tmp_path, monkeypatch, records):
++    from hermes_cli import profiles
++
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    path = tmp_path / "hub.db"
++    with sqlite3.connect(path) as conn:
++        conn.executescript(
++            "CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);"
++            "INSERT INTO meta VALUES ('gateway', 'macbook');"
++            "INSERT INTO meta VALUES ('last_ok', '100');"
++            "CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER, version INTEGER);"
++        )
++        for key, card in records:
++            conn.execute("INSERT INTO replica VALUES ('hub', 'tasks', ?, ?, 100000, 1)",
++                         (key, json.dumps(card)))
++    return path
++
++
++def observation(task_id, status="running", **extra):
++    return {"id": task_id, "status": status, "created_at": 1, "created_by": "u", "sessions": [
++        {"gw": "macbook", "profile": "default", "session": "panel", "rel": "shepherd"}
++    ], **extra}
++
++
++def test_shepherd_does_not_claim_dependency_descendants(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [
++        ("default/runners/root", observation("root", children=["child"])),
++        ("default/runners/child", {"id": "child", "status": "todo", "children": ["grandchild"]}),
++        ("default/runners/grandchild", {"id": "grandchild", "status": "running"}),
++    ])
++    rows = activity._read_remote_links(path, now=100)
++    assert [r["id"] for r in rows] == ["root"]
++
++
++def test_blank_profile_duplicate_counts_only_qualified_card(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [
++        ("runners/root", observation("root")),
++        ("default/runners/root", observation("root")),
++    ])
++    rows = activity._read_remote_links(path, now=100)
++    assert [r["key"] for r in rows] == ["hub/default/runners/root"]
++
++
++def test_qualified_terminal_observation_supersedes_unknown_duplicate(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [
++        ("runners/root", observation("root", status="unknown")),
++        ("default/runners/root", observation("root", status="done")),
++    ])
++    rows = activity._read_remote_links(path, now=100)
++    # One canonical card; the unqualified duplicate is never counted. Without owner
++    # attestation the qualified terminal stays unverified (upstream release rule).
++    assert len(rows) == 1 and rows[0]["owner_profile"] == "default"
++
++
++def test_qualified_profiles_are_distinct_cards(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [
++        ("default/runners/root", observation("root")),
++        ("build/runners/root", observation("root")),
++    ])
++    rows = activity._read_remote_links(path, now=100)
++    assert {r["key"] for r in rows} == {"hub/default/runners/root", "hub/build/runners/root"}
++
++
++def test_created_child_counts_through_inherited_link(tmp_path, monkeypatch):
++    root = observation("root", children=["child"])
++    root["sessions"][0]["rel"] = "create-task"
++    child = observation("child", children=["unrelated"])
++    path = replica(tmp_path, monkeypatch, [
++        ("default/runners/root", root),
++        ("default/runners/child", child),
++        ("default/runners/unrelated", {"id": "unrelated", "status": "todo"}),
++    ])
++    assert {r["id"] for r in activity._read_remote_links(path, now=100)} == {"root", "child"}
++
++
++def test_successful_read_migrates_inferred_cache_only(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [("default/runners/root", observation("root"))])
++    root = activity._read_remote_links(path, now=100)[0]
++    descendant = {**root, "id": "child", "key": "hub/default/runners/child", "via": "descendant"}
++    missing_direct = {**root, "id": "missing", "key": "hub/default/runners/missing"}
++    monkeypatch.setattr(activity, "_origin_scope", lambda: ("test",))
++    monkeypatch.setattr(activity, "_remote_scope", ("test",))
++    monkeypatch.setattr(activity, "_remote_last", [root, descendant, missing_direct])
++    monkeypatch.setattr(activity, "_snapshot_saved", None)
++    monkeypatch.setattr(activity, "_hub_db_path", lambda: path)
++    monkeypatch.setattr(activity, "_remote_snapshot", lambda cards=None: cards)
++    rows = activity._legacy_remote_links()
++    assert {r["key"] for r in rows} == {root["key"], missing_direct["key"]}
++
++
++def test_terminal_observation_replaces_active_snapshot(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [("default/runners/root", observation("root"))])
++    old = activity._read_remote_links(path, now=100)[0]
++    monkeypatch.setattr(activity, "_origin_scope", lambda: ("test",))
++    monkeypatch.setattr(activity, "_remote_scope", ("test",))
++    monkeypatch.setattr(activity, "_remote_last", [old])
++    monkeypatch.setattr(activity, "_snapshot_saved", None)
++    monkeypatch.setattr(activity, "_hub_db_path", lambda: path)
++    monkeypatch.setattr(activity, "_remote_snapshot", lambda cards=None: cards)
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE replica SET data=?", (json.dumps(observation("root", "done")),))
++    rows = activity._legacy_remote_links()
++    assert len(rows) == 1 and rows[0]["reported_status"] == "done"
++    assert activity._legacy_remote_links() == rows
++
++
++def test_cached_proven_alias_is_dropped_once_folded(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [("runners/root", observation("root"))])
++    old = activity._read_remote_links(path, now=100)[0]
++    monkeypatch.setattr(activity, "_origin_scope", lambda: ("test",))
++    monkeypatch.setattr(activity, "_remote_scope", ("test",))
++    monkeypatch.setattr(activity, "_remote_last", [old])
++    monkeypatch.setattr(activity, "_snapshot_saved", None)
++    monkeypatch.setattr(activity, "_hub_db_path", lambda: path)
++    monkeypatch.setattr(activity, "_remote_snapshot", lambda cards=None: cards)
++    with sqlite3.connect(path) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub', 'tasks', 'default/runners/root', ?, 100000, 1)",
++                     (json.dumps(observation("root", "running")),))
++    assert [r["key"] for r in activity._legacy_remote_links()] == ["hub/default/runners/root"]
++
++
++def test_unproven_alias_stays_unknown_not_released(tmp_path, monkeypatch):
++    path = replica(tmp_path, monkeypatch, [
++        ("runners/root", observation("root", created_at=2)),
++        ("default/runners/root", observation("root")),
++    ])
++    rows = activity._read_remote_links(path, now=100)
++    assert {r["key"] for r in rows} == {"hub/runners/root", "hub/default/runners/root"}
++
++
++def test_failed_read_does_not_migrate_cache(tmp_path, monkeypatch):
++    old = {"session": "panel", "id": "child", "key": "hub/default/runners/child", "via": "descendant"}
++    monkeypatch.setattr(activity, "_origin_scope", lambda: ("test",))
++    monkeypatch.setattr(activity, "_remote_scope", ("test",))
++    monkeypatch.setattr(activity, "_remote_last", [old])
++    monkeypatch.setattr(activity, "_hub_db_path", lambda: None)
++    assert activity._legacy_remote_links() == [{**old, "stale": True}]
+diff --git a/tests/hermes_cli/test_kanban_remote_inventory_cache.py b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+index c2a03a29bd..a875adbf44 100644
+--- a/tests/hermes_cli/test_kanban_remote_inventory_cache.py
++++ b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+@@ -111,7 +111,7 @@ def replica(tmp_path, monkeypatch):
+     hub.touch()
+     card = dict(id='t_one', key='owner/work/build/t_one', session='s_one', status='running', unfinished=True)
+     monkeypatch.setattr(activity, '_hub_db_path', lambda: hub)
+-    monkeypatch.setattr(activity, '_read_remote_links', lambda path: [dict(card)])
++    monkeypatch.setattr(activity, '_read_remote_links', lambda path, **kw: [dict(card)])
+     writes = []
+ 
+     def snapshot(cards=None):
+diff --git a/tests/hermes_cli/test_kanban_remote_terminal_release.py b/tests/hermes_cli/test_kanban_remote_terminal_release.py
+index fbdec67256..581eba2c25 100644
+--- a/tests/hermes_cli/test_kanban_remote_terminal_release.py
++++ b/tests/hermes_cli/test_kanban_remote_terminal_release.py
+@@ -131,8 +131,9 @@ def test_descendants_of_a_folded_root_follow_the_qualified_graph(tmp_path):
+         ('default/default/t_2', observed(card('running', tid='t_2', sessions=[]))),
+     ])
+     rows = activity._read_remote_links(path, now=NOW)
++    # Observation scope: the linked card only, never its dependency descendants.
+     assert {(r['key'], r['via'], r['unfinished']) for r in rows} == {
+-        ('owner/default/default/t_1', 'shepherd', False), ('owner/default/default/t_2', 'descendant', True)}
++        ('owner/default/default/t_1', 'shepherd', False)}
+ 
+ 
+ def test_snapshot_does_not_resurrect_a_folded_or_released_alias(tmp_path, monkeypatch):
+@@ -144,7 +145,7 @@ def test_snapshot_does_not_resurrect_a_folded_or_released_alias(tmp_path, monkey
+     monkeypatch.setattr(activity, '_remote_last', None)
+     monkeypatch.setattr(activity, '_snapshot_saved', None)
+     real = activity._read_remote_links
+-    monkeypatch.setattr(activity, '_read_remote_links', lambda p: real(p, now=NOW))
++    monkeypatch.setattr(activity, '_read_remote_links', lambda p, **kw: real(p, now=NOW, **kw))
+     rows = activity._legacy_remote_links()
+     assert counted(rows) == []
+     assert {r['key'] for r in rows} == {'owner/default/default/t_1'}
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index a3ce657edb..500a32845c 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -324,8 +324,8 @@ def test_replica_card_shepherded_by_a_local_session_keeps_it_busy(kanban_root):
+     ])
+     rows = [{"id": "s_mac"}, {"id": "hub_oneshot"}]
+     ksa.annotate_kanban_activity(rows)
+-    assert rows[0]["kanban_active"] == 3  # includes unverified terminal shepherd
+-    assert rows[0]["kanban_blocked"] == 1
++    assert rows[0]["kanban_active"] == 2  # running card + unverified terminal shepherd; no descendants
++    assert "kanban_blocked" not in rows[0]  # dependencies are not owned
+     assert "kanban_active" not in rows[1]  # a session on the owning gateway is not ours
+ 
+ 
+@@ -470,13 +470,12 @@ def _make_subs_board(path: Path, tasks: list[tuple], subs: list[tuple[str, str,
+ 
+ 
+ def _dispatch_graph(root_status="running"):
+-    """A local chat on 'macbook' dispatched a 13-card graph that runs on 'hub': only the root carries the
+-    shepherd link (later cards are its descendants). Root running, 12 waiting on it."""
++    """Created children inherit their own origin subscription, not graph ownership."""
+     kids = [f"t_c{i:02d}" for i in range(12)]
+     cards = [{"_gw": "hub", "id": "t_root", "title": "P0", "status": root_status, "children": kids,
+               "sessions": [{"session": "hub_orch", "profile": None, "rel": "created"}, _shep("s_origin")]}]
+     cards += [{"_gw": "hub", "id": k, "title": k, "status": "todo", "parents": ["t_root"],
+-               "sessions": [{"session": "hub_orch", "profile": None, "rel": "created"}]} for k in kids]
++               "sessions": [{"session": "hub_orch", "profile": None, "rel": "created"}, _shep("s_origin")]} for k in kids]
+     return cards
+ 
+ 
+@@ -490,7 +489,7 @@ def test_remote_dispatch_graph_lists_every_owner_qualified_row_and_counts_the_sa
+         {("hub", "default", "t_root")} | {("hub", "default", f"t_c{i:02d}") for i in range(12)})
+     root = next(r for r in rows if r["id"] == "t_root")
+     assert root["remote"] is True and root["via"] == "shepherd" and root["status"] == "running"
+-    assert next(r for r in rows if r["id"] == "t_c00")["via"] == "descendant"
++    assert next(r for r in rows if r["id"] == "t_c00")["via"] == "shepherd"
+     assert all(r["key"] == f"hub/default/default/{r['id']}" for r in rows)
+     ann = [{"id": "s_origin"}]
+     ksa.annotate_kanban_activity(ann)
+-- 
+2.55.0
+

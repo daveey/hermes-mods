@@ -1,0 +1,187 @@
+From 1fe662a3a40bd2ad76b628727b668af461664929 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 13:35:19 -0700
+Subject: [PATCH] fix(shared-metrics): never offer; an unanswered profile reads
+ as "No thanks"
+
+consent_state() now always reports decided=True/reask=False, with enabled/send
+taken from the profile's own config. The Desktop composer strip, the dashboard
+offer, the pre-chat terminal offer and the end-of-setup offer all gate on
+`decided`, so none of them shows again. Opting in stays explicit via
+`hermes setup telemetry` or shared_metrics.set; collection still reads only the
+profile's own keys (shipped default off).
+
+Tests: the three tests that asserted the offer now assert it never appears,
+one per entry path (Desktop RPC status, dashboard consent read, pre-chat offer,
+end-of-setup offer), plus pre-fix answers kept without a re-ask.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .../observability/shared_metrics_consent.py   | 12 ++--
+ tests/hermes_cli/test_setup_telemetry.py      | 66 +++++++++++--------
+ .../test_shared_metrics_consent_rpc.py        | 18 ++---
+ 3 files changed, 54 insertions(+), 42 deletions(-)
+
+diff --git a/hermes_cli/observability/shared_metrics_consent.py b/hermes_cli/observability/shared_metrics_consent.py
+index b1313c962a..6c1bd71f05 100644
+--- a/hermes_cli/observability/shared_metrics_consent.py
++++ b/hermes_cli/observability/shared_metrics_consent.py
+@@ -56,18 +56,16 @@ OFFER_VERSION = 2
+ 
+ 
+ def consent_state(raw_cfg: Any) -> dict:
+-    """``{enabled, send, decided, reask}`` from a RAW config mapping (no defaults merged). ``reask``:
+-    an "off" answer from before ``OFFER_VERSION`` that may never have been seen; it reads undecided
+-    so every surface offers it once more. An opt-in was always a deliberate pick and stays."""
++    """``{enabled, send, decided, reask}`` from a RAW config mapping (no defaults merged). Fork
++    default: a profile that never answered (or answered "off" before ``OFFER_VERSION``) reads as
++    "No thanks", so no surface ever offers; ``hermes setup telemetry`` still opts in explicitly."""
+     section = _section(raw_cfg)
+     enabled = section.get("enabled") is True
+-    answered = "enabled" in section or "send" in section
+-    reask = answered and not enabled and section.get("offer_version") != OFFER_VERSION
+     return {
+         "enabled": enabled,
+         "send": enabled and section.get("send") is True,
+-        "decided": answered and not reask,
+-        "reask": reask,
++        "decided": True,
++        "reask": False,
+     }
+ 
+ 
+diff --git a/tests/hermes_cli/test_setup_telemetry.py b/tests/hermes_cli/test_setup_telemetry.py
+index 93abca3742..e9764813e7 100644
+--- a/tests/hermes_cli/test_setup_telemetry.py
++++ b/tests/hermes_cli/test_setup_telemetry.py
+@@ -95,24 +95,38 @@ def test_no_answer_survives_the_callers_later_config_save(monkeypatch):
+     assert read_raw_config()["telemetry"]["shared_metrics"] == {"enabled": False, "send": False, "offer_version": 2}
+ 
+ 
+-def test_chat_offer_asks_an_undecided_profile_once(monkeypatch):
+-    from hermes_cli.config import read_raw_config
+-    from hermes_cli.observability import shared_metrics_consent as consent
+-
+-    asked = []
+-    monkeypatch.setattr("hermes_cli.curses_ui.curses_radiolist", lambda *a, **k: asked.append(a) or 1)
++def _ask_recorder(monkeypatch) -> list:
++    asked: list = []
++    monkeypatch.setattr("hermes_cli.curses_ui.curses_radiolist", lambda *a, **k: asked.append(a) or 0)
+     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+     monkeypatch.delenv("HERMES_NONINTERACTIVE", raising=False)
++    return asked
+ 
+-    consent.offer_consent_before_chat(argparse.Namespace(query="hi"))  # no person to ask
+-    assert asked == []
+-    consent.offer_consent_before_chat(argparse.Namespace())
++
++OFF = {"enabled": False, "send": False, "decided": True, "reask": False}
++
++
++def test_chat_never_offers_an_unanswered_profile(monkeypatch):
++    """Fork default: an unanswered profile reads as "No thanks", so chat start never asks."""
++    from hermes_cli.config import read_raw_config
++    from hermes_cli.observability import shared_metrics_consent as consent
++
++    asked = _ask_recorder(monkeypatch)
+     consent.offer_consent_before_chat(argparse.Namespace())
+ 
+-    assert len(asked) == 1
+-    assert consent.consent_state(read_raw_config()) == {"enabled": True, "send": False, "decided": True, "reask": False}
++    assert asked == []
++    assert consent.consent_state(read_raw_config()) == OFF
++
++
++def test_setup_end_never_offers_an_unanswered_profile(monkeypatch):
++    from hermes_cli.observability import shared_metrics_consent as consent
++
++    asked = _ask_recorder(monkeypatch)
++    consent.offer_consent_if_undecided({})
++
++    assert asked == []
+ 
+ 
+ def test_offer_drops_keys_typed_before_it_appeared(monkeypatch):
+@@ -128,29 +142,27 @@ def test_offer_drops_keys_typed_before_it_appeared(monkeypatch):
+     assert events == ["flush", "ask"]
+ 
+ 
+-def test_unseen_no_thanks_is_asked_once_more_and_then_settled(monkeypatch):
+-    """A pre-fix "No thanks" is re-offered with the reason; Esc on the re-ask keeps it for good,
+-    while a pre-fix opt-in was a deliberate pick and is never re-asked."""
++def test_pre_fix_answers_are_kept_and_never_re_asked(monkeypatch):
++    """A "No thanks" without offer_version stays "No thanks"; an explicit opt-in stays on."""
+     from hermes_cli.config import read_raw_config, save_config
+     from hermes_cli.observability import shared_metrics_consent as consent
+ 
+-    shown = []
+-    monkeypatch.setattr("hermes_cli.curses_ui.curses_radiolist", lambda *a, **k: shown.append(k["description"]) or -1)
+-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+-    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+-    monkeypatch.delenv("HERMES_NONINTERACTIVE", raising=False)
+-
+-    save_config({"telemetry": {"shared_metrics": {"enabled": True, "send": False}}}, strip_defaults=False)
+-    consent.offer_consent_before_chat(argparse.Namespace())
+-    assert shown == []
+-
++    asked = _ask_recorder(monkeypatch)
+     save_config({"telemetry": {"shared_metrics": {"enabled": False, "send": False}}}, strip_defaults=False)
+     consent.offer_consent_before_chat(argparse.Namespace())
++    assert asked == []
++    assert consent.consent_state(read_raw_config()) == OFF
++
++    save_config({"telemetry": {"shared_metrics": {"enabled": True, "send": True}}}, strip_defaults=False)
+     consent.offer_consent_before_chat(argparse.Namespace())
++    assert asked == []
++    assert consent.consent_state(read_raw_config()) == {**OFF, "enabled": True, "send": True}
++
++
++def test_dashboard_consent_reads_an_unanswered_profile_as_off():
++    from hermes_cli.web_routers.shared_metrics import _read_consent
+ 
+-    assert len(shown) == 1 and shown[0].startswith(consent._REASK_NOTE)
+-    assert consent.consent_state(read_raw_config()) == {"enabled": False, "send": False, "decided": True, "reask": False}
++    assert {k: v for k, v in _read_consent().items() if k != "managed"} == OFF
+ 
+ 
+ def test_every_cli_promise_that_pre_opt_in_data_stays_local_names_the_install_note():
+diff --git a/tests/tui_gateway/test_shared_metrics_consent_rpc.py b/tests/tui_gateway/test_shared_metrics_consent_rpc.py
+index 4296f10ecf..1e5f8c57ce 100644
+--- a/tests/tui_gateway/test_shared_metrics_consent_rpc.py
++++ b/tests/tui_gateway/test_shared_metrics_consent_rpc.py
+@@ -58,19 +58,21 @@ def test_send_without_collection_is_normalized_off_and_closes_the_consent_window
+     assert not (launch / "telemetry").exists()
+ 
+ 
+-def test_status_is_undecided_until_a_key_is_written(tmp_path, monkeypatch):
++def test_status_reads_an_unanswered_profile_as_no_thanks(tmp_path, monkeypatch):
++    """Fork default: the Desktop strip shows only for ``decided: False``, which no profile reports."""
+     _launch, worker = _bind_homes(monkeypatch, tmp_path)
+ 
+-    unasked = {"enabled": False, "send": False, "decided": False, "reask": False}
+-    assert _call("shared_metrics.status", {"profile": "code"}) == unasked
++    off = {"enabled": False, "send": False, "decided": True, "reask": False}
++    assert _call("shared_metrics.status", {"profile": "code"}) == off
+ 
+-    # A "No thanks" from before the type-ahead fix (no offer_version) may never have been seen:
+-    # it is offered once more, and the answer to that settles it.
++    # A pre-fix "No thanks" (no offer_version) is kept, not re-offered.
+     (worker / "config.yaml").write_text(
+         yaml.safe_dump({"telemetry": {"shared_metrics": {"enabled": False}}}), encoding="utf-8")
+-    assert _call("shared_metrics.status", {"profile": "code"}) == {**unasked, "reask": True}
+-    _call("shared_metrics.set", {"profile": "code", "enabled": False, "send": False})
+-    assert _call("shared_metrics.status", {"profile": "code"}) == {**unasked, "decided": True}
++    assert _call("shared_metrics.status", {"profile": "code"}) == off
++
++    # An explicit opt-in still reads as on.
++    _call("shared_metrics.set", {"profile": "code", "enabled": True, "send": False})
++    assert _call("shared_metrics.status", {"profile": "code"}) == {**off, "enabled": True}
+ 
+ 
+ def test_only_the_first_run_answer_records_desktop_setup_completed(tmp_path, monkeypatch):
+-- 
+2.55.0
+

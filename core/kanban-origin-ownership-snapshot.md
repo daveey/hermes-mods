@@ -23,7 +23,7 @@ It returns the qualified binding generation (version, hash, publication/observat
 
 ## Applying
 
-Patch 0473 (real-home guard accepts linked worktrees) is a prerequisite for running these tests in a linked worktree; 0474 is the feature. Apply in order.
+Patch 0516 (real-home guard accepts linked worktrees) is a prerequisite for running these tests in a linked worktree; 0517 is the feature. Apply in order.
 
 ## Gotchas
 

@@ -1,0 +1,342 @@
+From 5803147af67f2242a03908c6a81d8d09abd3d759 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 03:35:58 -0700
+Subject: [PATCH] fix(desktop): refresh kanban evidence for retained older
+ sessions [daveey]
+
+---
+ .../hooks/refresh-retained-kanban.test.ts     | 32 +++++++++++
+ .../session/hooks/refresh-retained-kanban.ts  | 54 +++++++++++++++++++
+ .../hooks/use-session-list-actions.test.tsx   | 44 +++++++++++++++
+ .../session/hooks/use-session-list-actions.ts | 33 ++++++++++--
+ hermes_cli/web_routers/sessions.py            |  4 ++
+ .../hermes_cli/test_session_detail_kanban.py  | 40 ++++++++++++++
+ .../test_web_server_sessiondb_eventloop.py    |  3 ++
+ 7 files changed, 206 insertions(+), 4 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
+ create mode 100644 tests/hermes_cli/test_session_detail_kanban.py
+
+diff --git a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
+new file mode 100644
+index 0000000000..04c3237397
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from 'vitest'
++
++import type { SessionInfo } from '@/types/hermes'
++
++import { refreshRetainedKanban } from './refresh-retained-kanban'
++
++const row = (extra = {}) => ({ id: 'old', profile: 'default', title: 'Keep me', ...extra }) as SessionInfo
++
++describe('retained older sidebar task evidence', () => {
++  it('fills an unannotated detail row without replacing its metadata', async () => {
++    const [result] = await refreshRetainedKanban([row()], async () => row({ title: 'stale', kanban_active: 16, kanban_observed_at: 123 }))
++    expect(result).toMatchObject({ title: 'Keep me', kanban_active: 16, kanban_observed_at: 123 })
++  })
++
++  it('clears old counts when authoritative zero omits them', async () => {
++    const [result] = await refreshRetainedKanban([row({ kanban_active: 16, kanban_unknown: true })], async () => row({ kanban_observed_at: 124 }))
++    expect(result.kanban_active).toBeUndefined()
++    expect(result.kanban_unknown).toBeUndefined()
++    expect(result.kanban_observed_at).toBe(124)
++  })
++
++  it('preserves last known counts but marks a failed read unknown', async () => {
++    const [result] = await refreshRetainedKanban([row({ kanban_active: 16 })], async () => { throw new Error('offline') })
++    expect(result).toMatchObject({ kanban_active: 16, kanban_unknown: true })
++  })
++
++  it('rejects another profile with the same session id', async () => {
++    const [result] = await refreshRetainedKanban([row()], async () => row({ profile: 'other', kanban_active: 99 }))
++    expect(result.kanban_unknown).toBe(true)
++    expect(result.kanban_active).toBeUndefined()
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
+new file mode 100644
+index 0000000000..637e82b760
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
+@@ -0,0 +1,54 @@
++import type { SessionInfo } from '@/types/hermes'
++
++export function withKanbanEvidence(row: SessionInfo, fresh: SessionInfo): SessionInfo {
++  const next = { ...row }
++
++  for (const key of Object.keys(next)) {
++    if (key.startsWith('kanban_')) { delete (next as unknown as Record<string, unknown>)[key] }
++  }
++
++  for (const [key, value] of Object.entries(fresh)) {
++    if (key.startsWith('kanban_')) { (next as unknown as Record<string, unknown>)[key] = value }
++  }
++
++  return next
++}
++
++/** Refresh task evidence for retained rows outside the recency window. Never
++ * replace their transcript/optimistic metadata or borrow another owner's row. */
++export async function refreshRetainedKanban(
++  rows: SessionInfo[],
++  read: (row: SessionInfo) => Promise<SessionInfo>
++): Promise<SessionInfo[]> {
++  const output = [...rows]
++  let cursor = 0
++
++  await Promise.all(Array.from({ length: Math.min(4, rows.length) }, async () => {
++    while (cursor < rows.length) {
++      const index = cursor++
++      const row = rows[index]
++      let timer: ReturnType<typeof setTimeout> | undefined
++
++      try {
++        const fresh = await Promise.race([
++          read(row),
++          new Promise<never>((_, reject) => {
++            timer = setTimeout(() => reject(new Error('Task evidence timeout')), 5000)
++          })
++        ])
++
++        if (fresh.id !== row.id || (fresh.profile ?? 'default') !== (row.profile ?? 'default')) {
++          throw new Error('Task evidence owner mismatch')
++        }
++
++        output[index] = withKanbanEvidence(row, fresh)
++      } catch {
++        output[index] = { ...row, kanban_unknown: true }
++      } finally {
++        clearTimeout(timer)
++      }
++    }
++  }))
++
++  return output
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index 8c56a25a5a..998d179c10 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -75,6 +75,7 @@ const sidebar = (
+ const listSidebarSessions = vi.fn()
+ const listAllProfileSessions = vi.fn()
+ const getCronJobs = vi.fn()
++const getSession = vi.fn()
+ const gatewayScope = vi.hoisted(() => ({ epoch: 0 }))
+ 
+ interface Deferred<T> {
+@@ -87,6 +88,7 @@ interface Deferred<T> {
+ vi.mock('@/hermes', async importOriginal => ({
+   ...(await importOriginal<Record<string, unknown>>()),
+   getCronJobs: (...args: unknown[]) => getCronJobs(...args),
++  getSession: (...args: unknown[]) => getSession(...args),
+   listAllProfileSessions: (...args: unknown[]) => listAllProfileSessions(...args),
+   listSidebarSessions: (...args: unknown[]) => listSidebarSessions(...args)
+ }))
+@@ -116,6 +118,7 @@ vi.mock('@/store/session-states', async importActual => ({
+ }))
+ 
+ beforeEach(() => {
++  getSession.mockReset()
+   gatewayScope.epoch = 0
+   settled.ids = []
+   getCronJobs.mockReset()
+@@ -181,6 +184,47 @@ describe('workspace-only sidebar refresh', () => {
+   )
+ })
+ 
++it('refreshes a retained remote row outside the recency page on its own owner', async () => {
++  setSessions([row('old', { connection_id: 'remote', kanban_active: 2 })])
++  settled.ids = ['old']
++  listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('new')] }))
++  getSession.mockResolvedValue(row('old', { kanban_active: 16, kanban_observed_at: 123 }))
++  const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++  await act(async () => { await result.current.refreshSessions() })
++  expect(getSession).toHaveBeenCalledWith('old', { connectionId: 'remote', profile: 'default' })
++  expect($sessions.get().find(s => s.id === 'old')).toMatchObject({ kanban_active: 16, connection_id: 'remote' })
++})
++
++it.each(['rename', 'remove', 'switch'])('guards retained task refresh against a concurrent %s', async change => {
++  setSessions([row('old', { connection_id: 'remote' })])
++  settled.ids = ['old']
++  listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
++  const pending = deferred<SessionInfo>()
++  getSession.mockReturnValue(pending.promise)
++  const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++  let refreshing: Promise<void>
++  await act(async () => {
++    refreshing = result.current.refreshSessions()
++    await Promise.resolve()
++  })
++
++  if (change === 'remove') { setSessions([]) }
++
++  if (change === 'rename') { setSessions([row('old', { connection_id: 'remote', title: 'New title' })]) }
++
++  if (change === 'switch') { gatewayScope.epoch++ }
++  await act(async () => {
++    pending.resolve(row('old', { kanban_active: 16, kanban_observed_at: 123 }))
++    await refreshing
++  })
++
++  if (change === 'remove') { expect($sessions.get()).toEqual([]) }
++
++  if (change === 'rename') { expect($sessions.get()[0]).toMatchObject({ title: 'New title', kanban_active: 16 }) }
++
++  if (change === 'switch') { expect($sessions.get()[0].kanban_active).toBeUndefined() }
++})
++
+ // #67600: a cold-start read that fails must not render as "No sessions yet".
+ describe('refreshSessions cold-start load error', () => {
+   const failedScan = (storage?: Record<string, 'corrupt'>): SidebarSessionsResponse => ({
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+index c1598f3117..d0ee050320 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+@@ -1,6 +1,6 @@
+ import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
+ 
+-import { getApiRequestConnection, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
++import { getApiRequestConnection, getSession, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+ import { sameCronSignature } from '@/lib/session-signatures'
+ import {
+   isMessagingSource,
+@@ -8,7 +8,7 @@ import {
+   normalizeSessionSource,
+   SIDEBAR_EXCLUDED_SOURCES
+ } from '@/lib/session-source'
+-import { gatewayActivationEpoch } from '@/store/gateway'
++import { gatewayActivationEpoch, primaryGatewayConnectionId } from '@/store/gateway'
+ import {
+   $pinnedSessionIds,
+   $sessionsLimit,
+@@ -54,6 +54,8 @@ import { $sessionTiles, $workingSessionIds, getRecentlySettledSessionIds } from
+ 
+ import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
+ 
++import { refreshRetainedKanban, withKanbanEvidence } from './refresh-retained-kanban'
++
+ function sidebarRequestConnection(): string | undefined {
+   return getApiRequestConnection() ?? undefined
+ }
+@@ -403,7 +405,22 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+           result = await fetchPage()
+         }
+ 
+-        if (owns()) {
++        // Open/restored older rows survive paging, but otherwise their task
++        // counts never refresh. Capture the primary owner before any await.
++        const primaryConnection = primaryGatewayConnectionId()
++        const page = result.recents.sessions ?? []
++
++        const retained = mergeSessionPage($sessions.get(), page, sessionsToKeep())
++          .filter(row => !page.some(item => item.id === row.id &&
++            (item.profile ?? 'default') === (row.profile ?? 'default') &&
++            (item.connection_id ?? primaryConnection) === (row.connection_id ?? primaryConnection)))
++
++        const refreshed = await refreshRetainedKanban(retained, row => getSession(row.id, {
++          connectionId: row.connection_id ?? primaryConnection,
++          profile: row.profile ?? 'default'
++        }))
++
++        if (owns() && gatewayActivationEpoch() === activationEpoch) {
+           const recents = result.recents
+           const recentsErrors = recents.errors ?? result.errors
+           recordSidebarFreshness(result, requestConnection, sessionProfile)
+@@ -436,7 +453,15 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+             // Filter AFTER the merge: the guard must also catch survivors
+             // (a stale previous slice can still hold the doomed row through
+             // the keep set once the tombstone prune has cleared membership).
+-            const next = dropRemovalRaced(mergeSessionPage(prev, incoming, sessionsToKeep()), removalSnapshot)
++            const observed = prev.map(row => {
++              const fresh = refreshed.find(item => item.id === row.id &&
++                (item.profile ?? 'default') === (row.profile ?? 'default') &&
++                (item.connection_id ?? primaryConnection) === (row.connection_id ?? primaryConnection))
++
++              return fresh ? withKanbanEvidence(row, fresh) : row
++            })
++
++            const next = dropRemovalRaced(mergeSessionPage(observed, incoming, sessionsToKeep()), removalSnapshot)
+ 
+             return sameCronSignature(prev, next) ? prev : next
+           })
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 5d8c95061e..b1d8a916a1 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -591,6 +591,10 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
+         # clients resolve them to whichever gateway happened to be active.
+         session["profile"] = _serving_profile(profile)
+         session["is_default_profile"] = session["profile"] == "default"
++        # Older/open sidebar rows can be restored from detail rather than a
++        # recency page. They need fresh task evidence over the same lineage.
++        session["_lineage_ids"] = db.get_compression_chain(sid)
++        annotate_kanban_activity([session])
+         # A cron run's liveness is scheduler ownership, not the 300s activity
+         # window (#88443): a run inside a long tool call is still owned.
+         from hermes_cli.web_routers.cron import cron_run_scheduler_owned
+diff --git a/tests/hermes_cli/test_session_detail_kanban.py b/tests/hermes_cli/test_session_detail_kanban.py
+new file mode 100644
+index 0000000000..a816dcc9e4
+--- /dev/null
++++ b/tests/hermes_cli/test_session_detail_kanban.py
+@@ -0,0 +1,40 @@
++"""Older sidebar rows restored through detail need the same task evidence as list rows."""
++import asyncio
++
++import pytest
++
++from hermes_cli.web_routers import sessions
++
++
++@pytest.mark.parametrize("count", [0, 16])
++def test_detail_annotates_compression_lineage(monkeypatch, count):
++    class DB:
++        def resolve_session_id(self, sid):
++            return sid
++
++        def get_session(self, sid):
++            return {"id": sid}
++
++        def get_compression_chain(self, sid):
++            return ["root", "tip"]
++
++        def close(self):
++            pass
++
++    monkeypatch.setattr(sessions, "_open_session_db_for_profile", lambda *a, **kw: DB())
++    monkeypatch.setattr(sessions, "_serving_profile", lambda p: p)
++    from hermes_cli.web_routers import cron
++    monkeypatch.setattr(cron, "cron_run_scheduler_owned", lambda *a: None)
++
++    def annotate(rows):
++        assert rows[0]["_lineage_ids"] == ["root", "tip"]
++        rows[0]["kanban_observed_at"] = 1234
++        if count:
++            rows[0]["kanban_active"] = count
++        return rows
++
++    monkeypatch.setattr(sessions, "annotate_kanban_activity", annotate)
++    row = asyncio.run(sessions.get_session_detail("tip", "default"))
++    assert row["kanban_observed_at"] == 1234
++    assert row.get("kanban_active", 0) == count
++    assert row["profile"] == "default"
+diff --git a/tests/hermes_cli/test_web_server_sessiondb_eventloop.py b/tests/hermes_cli/test_web_server_sessiondb_eventloop.py
+index 2ae9fb7d7e..6368bb6e3b 100644
+--- a/tests/hermes_cli/test_web_server_sessiondb_eventloop.py
++++ b/tests/hermes_cli/test_web_server_sessiondb_eventloop.py
+@@ -74,6 +74,9 @@ class _ReadDB:
+     def get_session_rich_row(self, sid):
+         return self._hit(None)
+ 
++    def get_compression_chain(self, sid):
++        return self._hit([sid])
++
+     def get_compression_tip(self, root_id):
+         return self._hit(None)
+ 
+-- 
+2.55.0
+

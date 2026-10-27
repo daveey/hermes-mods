@@ -1,6 +1,6 @@
 # Kanban: refuse ownerless agent blocks
 
-Patch **0451** (`15f2bfb9bd`).
+Patch **0456** (`15f2bfb9bd`).
 
 ## Behavior
 
@@ -24,7 +24,7 @@ existing ownerless blocks older than 2 h through triage once, with evidence (`ag
 
 ## Applying
 
-After 0446 and 0447.
+After 0451 and 0452.
 
 ## Gotchas
 

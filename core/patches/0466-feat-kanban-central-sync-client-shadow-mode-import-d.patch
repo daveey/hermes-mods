@@ -1,0 +1,1825 @@
+From 6053646f27c995cc50c7a01f250086dd2989e669 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:39:30 -0700
+Subject: [PATCH] =?UTF-8?q?feat(kanban):=20central=20sync=20client=20?=
+ =?UTF-8?q?=E2=80=94=20shadow=20mode,=20import,=20diff=20(phase=202)=20[da?=
+ =?UTF-8?q?veey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 2 of the central Kanban plan (hermes-mods core/kanban-central-service.md):
+connects the phase 1 seams to the hermes-hub Board service.
+
+- hermes_cli/kanban_sync_client.py: pull first (GET /v2/boards/<id>/changes,
+  applied with the cursor in the same transaction; 410 rebuilds from paged
+  /snapshot), then push the capture-trigger outbox as row ops (POST /ops,
+  HLC-stamped here, FIFO batches of 200). applied/merged clear the row;
+  rejected marks it and, on a primary board, restores the service's row.
+  Fields with an unanswered local edit are not overwritten by a pull.
+  Identity is the gateway's hub enrollment (~/.config/hermes-mail), or
+  kanban.sync.{url,key_file,gateway}. HubLeaseClient implements the phase 1
+  LeaseClient over POST /leases (claim_gate now passes the review lane).
+- shadow mode: the live board's outbox is pushed, but the feed is applied
+  only into <root>/kanban/sync-shadow/<board>.db with observers off (no hooks,
+  no notifications), so the live board stays local while `sync diff` compares.
+- every synced board keeps a replica of the whole board in that file; primary
+  mode also applies this gateway's OWN cards from the feed into the live board
+  (created_on = it, plus their child rows) and never another gateway's, so the
+  dispatcher's sweeps (stale claims, orphans, concurrency) never see foreign
+  work; cross-gateway reads come from the replica.
+- hermes kanban sync {status,attach,import,diff,run}. import queues every
+  existing row once (tasks as import: an id another gateway created is
+  refused id_taken; events older than the service's 30-day retention are
+  skipped). diff reports missing/extra/field/child mismatches and rejected
+  ops; unpushed rows count as pending, not as differences.
+- gateway: _kanban_sync_watcher runs the loop in a thread, one gateway per
+  host (advisory lock), while kanban.sync.enabled is on.
+- kanban_db_sync: kanban.sync is read from the kanban root's config.yaml (the
+  storage is host-wide: a worker under another profile must not see sync off
+  and drop the board's triggers); kanban.sync.boards selects boards (absent =
+  all); server-set created_on is applied from the feed, never captured; the
+  service's lease mirror is taken from the task row; set_identity binds a
+  board to its service board and this gateway's hub name; an equal-version
+  row is re-applied (a re-send or a revert), only older ones are skipped.
+- kanban_provider_walls: read/write with an explicit encoding (scripts/check
+  footguns; the file came in with 8ae2a62).
+
+Tests: tests/hermes_cli/test_kanban_sync_client.py (25) against an in-memory
+fake of the Board contract (kanban_sync_fake_board.py); the phase 1 sync
+suites pass except three lease tests that fail identically on the base
+(live-system guard blocks a real os.kill on this host).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ gateway/kanban_watchers.py                  |  18 +
+ gateway/run_startup.py                      |   2 +-
+ hermes_cli/kanban.py                        |   5 +-
+ hermes_cli/kanban_db.py                     |   2 +-
+ hermes_cli/kanban_db_sync.py                | 118 +++-
+ hermes_cli/kanban_parser.py                 |  10 +
+ hermes_cli/kanban_sync_cli.py               | 126 ++++
+ hermes_cli/kanban_sync_client.py            | 624 ++++++++++++++++++++
+ tests/hermes_cli/kanban_sync_fake_board.py  | 147 +++++
+ tests/hermes_cli/test_kanban_sync_client.py | 486 +++++++++++++++
+ 10 files changed, 1515 insertions(+), 23 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_cli.py
+ create mode 100644 hermes_cli/kanban_sync_client.py
+ create mode 100644 tests/hermes_cli/kanban_sync_fake_board.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_client.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 004bcb84c4..7a9b005556 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -359,3 +359,21 @@ class GatewayKanbanWatchersMixin:
+ 
+         finally:
+             self._release_kanban_dispatcher_lock()
++
++    async def _kanban_sync_watcher(self) -> None:
++        """Central Kanban sync (``kanban.sync.enabled``): pull the Board service's feed and push the outbox every
++        ``kanban.sync.interval_seconds`` in a worker thread. One gateway per host (advisory lock), like the
++        dispatcher. [daveey]"""
++        from hermes_cli import kanban_db_sync as _sync
++        if not _sync.sync_enabled():
++            return
++        from hermes_cli import kanban_db as _kb
++        from hermes_cli import kanban_sync_client as _ksc
++        lock_handle, lock_state = _acquire_singleton_lock(_kb.kanban_home() / "kanban" / ".sync.lock")
++        if lock_state == "contended":
++            logger.info("kanban sync: another gateway on this host already syncs; not starting")
++            return
++        try:
++            await asyncio.to_thread(_ksc.run_forever, lambda: self._running)
++        finally:
++            _release_singleton_lock(lock_handle)
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index fe538ef1a3..a3ae8f58a8 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -1562,7 +1562,7 @@ class GatewayStartupMixin:
+     # name minus the leading underscore.
+     _PRE_RECONNECT_WATCHERS = (
+         "_session_housekeeping_watcher", "_model_catalog_refresh_watcher", "_session_stall_watcher",
+-        "_kanban_notifier_watcher", "_kanban_dispatcher_watcher",
++        "_kanban_notifier_watcher", "_kanban_dispatcher_watcher", "_kanban_sync_watcher",
+     )
+     _POST_RECONNECT_WATCHERS = (
+         "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 162d2b6f75..f04b0d98e7 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -33,6 +33,7 @@ from hermes_cli.kanban_ops import (
+     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
+ )
+ from hermes_cli.kanban_parser import build_parser
++from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
+ 
+ 
+ # --- Flag parsing helpers ---
+@@ -244,7 +245,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review",
+-    "gc", "origin-bind", "origin-create", "origin-adopt",
++    "gc", "origin-bind", "origin-create", "origin-adopt", "sync",
+ })
+ 
+ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+@@ -1522,7 +1523,7 @@ _HANDLERS = {
+     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
+     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
+     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+-    "gc": _cmd_gc,
++    "gc": _cmd_gc, "sync": _cmd_sync,
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index f5dfb19586..4c37e21ee6 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2250,7 +2250,7 @@ def claim_review_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+-    gate = _sync.claim_gate(conn, task_id, expires)
++    gate = _sync.claim_gate(conn, task_id, expires, lane="review")
+     if gate.deferred:
+         return None
+     with gate, write_txn(conn):
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 3db6237fe4..5ac35f6aaf 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -79,6 +79,8 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+     "task_runs": frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at"}),
+     "task_attachments": frozenset({"stored_path"}),
+ }
++# Set by the service, never by a gateway: applied from the feed, never captured.
++SERVER_COLUMNS: dict[str, frozenset[str]] = {"tasks": frozenset({"created_on"})}
+ KEY_COLUMNS: dict[str, frozenset[str]] = {
+     "tasks": frozenset({"id"}),
+     "task_links": frozenset(),
+@@ -140,6 +142,7 @@ _SYNC_COLUMN_DDL = (
+     ("tasks", "field_hlc", "field_hlc TEXT"),
+     ("tasks", "lease_holder", "lease_holder TEXT"),
+     ("tasks", "lease_expires", "lease_expires INTEGER"),
++    ("tasks", "created_on", "created_on TEXT"),
+ )
+ 
+ # Resolved db paths whose triggers this process installed. Empty = no synced
+@@ -160,17 +163,54 @@ def uuid7() -> str:
+ 
+ # --- Config + install -----------------------------------------------------------------------------
+ 
+-def sync_enabled() -> bool:
+-    """``kanban.sync.enabled`` (default False). An unreadable config reads as off,
+-    which is today's behaviour."""
++def sync_config() -> Mapping[str, Any]:
++    """``kanban.sync`` from the kanban root's ``config.yaml`` (empty when unset or unreadable).
++
++    Kanban storage is shared by every profile on the host (``kanban_db.kanban_home``), so the switch is read
++    there, never from the active profile: a worker running under a profile without the setting must not see
++    sync as off and drop the board's capture triggers under the gateway."""
+     try:
+-        from hermes_cli.config import load_config
+-        kanban = (load_config() or {}).get("kanban") or {}
++        import yaml
++        from hermes_cli import kanban_db
++        path = kanban_db.kanban_home() / "config.yaml"
++        kanban = ((yaml.safe_load(path.read_text(encoding="utf-8-sig")) if path.exists() else None) or {}).get("kanban") or {}
+     except Exception as exc:  # health: allow BLE001 -- an unreadable config reads as sync off; connect() must not break
+         _log.warning("kanban sync: cannot read config (%s: %s); sync stays off", type(exc).__name__, exc)
+-        return False
++        return {}
+     sync = kanban.get("sync") if isinstance(kanban, Mapping) else None
+-    return bool(isinstance(sync, Mapping) and sync.get("enabled"))
++    return sync if isinstance(sync, Mapping) else {}
++
++
++def sync_enabled() -> bool:
++    """``kanban.sync.enabled`` (default False). An unreadable config reads as off,
++    which is today's behaviour."""
++    return bool(sync_config().get("enabled"))
++
++
++SHADOW_DIR = "sync-shadow"
++
++
++def board_slug_for_path(db_path: str) -> str:
++    """``<root>/kanban.db`` -> ``default``; ``<root>/kanban/boards/<slug>/kanban.db`` -> ``<slug>``;
++    a shadow copy ``.../sync-shadow/<slug>.db`` -> ``<slug>``."""
++    from pathlib import Path
++    p = Path(db_path)
++    if p.parent.name == SHADOW_DIR:
++        return p.stem
++    if p.name == "kanban.db" and p.parent.parent.name == "boards":
++        return p.parent.name
++    return "default"
++
++
++def board_selected(db_path: str) -> bool:
++    """``kanban.sync.boards`` lists the boards that sync (absent = every board). A shadow copy always does."""
++    from pathlib import Path
++    if Path(db_path).parent.name == SHADOW_DIR:
++        return True
++    boards = sync_config().get("boards")
++    if not isinstance(boards, (list, tuple)):
++        return True
++    return board_slug_for_path(db_path) in {str(b) for b in boards}
+ 
+ 
+ def _db_key(conn: sqlite3.Connection) -> Optional[str]:
+@@ -181,8 +221,9 @@ def _db_key(conn: sqlite3.Connection) -> Optional[str]:
+ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+     """Init-time seam: with the flag on, create the sync tables and (unless the
+     board was detached to ``off``) install the capture triggers; with it off,
+-    drop any capture trigger an earlier enable left in the file."""
+-    if not sync_enabled():
++    drop any capture trigger an earlier enable left in the file. A board not listed
++    in ``kanban.sync.boards`` is treated as off."""
++    if not sync_enabled() or not board_selected(db_path):
+         _SYNCED_PATHS.discard(db_path)
+         if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                         "AND name LIKE 'kanban_sync_%' LIMIT 1").fetchone():
+@@ -221,8 +262,8 @@ def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+ 
+ 
+ def captured_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+-    """Columns the triggers capture: everything but local-only and key columns."""
+-    skip = LOCAL_COLUMNS[table] | KEY_COLUMNS[table]
++    """Columns the triggers capture: everything but local-only, server-set and key columns."""
++    skip = LOCAL_COLUMNS[table] | KEY_COLUMNS[table] | SERVER_COLUMNS.get(table, frozenset())
+     return [c for c in table_columns(conn, table) if c not in skip]
+ 
+ 
+@@ -231,7 +272,7 @@ def undeclared_columns(conn: sqlite3.Connection) -> dict[str, set[str]]:
+     a migration added them and nobody decided whether they leave the gateway."""
+     out: dict[str, set[str]] = {}
+     for table in SYNCED_TABLES:
+-        known = SYNCED_COLUMNS[table] | LOCAL_COLUMNS[table] | KEY_COLUMNS[table]
++        known = SYNCED_COLUMNS[table] | LOCAL_COLUMNS[table] | KEY_COLUMNS[table] | SERVER_COLUMNS.get(table, frozenset())
+         extra = set(table_columns(conn, table)) - known
+         if extra:
+             out[table] = extra
+@@ -368,6 +409,23 @@ def set_mode(conn: sqlite3.Connection, mode: str) -> None:
+         (_SYNCED_PATHS.discard if mode == "off" else _SYNCED_PATHS.add)(key)
+ 
+ 
++def set_identity(conn: sqlite3.Connection, board_id: str, gateway_id: str) -> None:
++    """Bind the board file to its service board and this gateway's service name (the name the service records in
++    ``origin_gateway``, ``created_on`` and lease holders, so echo and lease checks compare like with like)."""
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET board_id = ?, gateway_id = ?", (board_id, gateway_id))
++
++
++def sync_state(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
++    """The board's sync row (None when sync never ran on this file)."""
++    try:
++        row = conn.execute("SELECT * FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.OperationalError:
++        return None
++    return dict(row) if row else None
++
++
+ def new_task_id(conn: sqlite3.Connection) -> str:
+     """Synced boards: ``t_`` + 16 hex (48-bit ms timestamp + 16 random bits), safe
+     across gateways and offline creation; otherwise the classic 8-hex id."""
+@@ -397,7 +455,8 @@ class Lease:
+ 
+ 
+ class LeaseClient(Protocol):
+-    def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> Lease: ...
++    def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int,
++                lane: str = "ready") -> Lease: ...
+ 
+     def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> Lease: ...
+ 
+@@ -445,7 +504,7 @@ class ClaimGate:
+             _log.info("kanban sync: release of unused lease for %s failed: %s", task_id, err)
+ 
+ 
+-def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int) -> ClaimGate:
++def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str = "ready") -> ClaimGate:
+     """Lease seam before a claim CAS. Only ``primary`` boards ask the service;
+     without a grant the card stays ``ready`` (no offline claims: every card is
+     at-most-once in v1). A grant bounds the local claim to the lease deadline."""
+@@ -456,7 +515,7 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int) -> ClaimGat
+     run_uid = uuid7()
+     try:
+         lease = _client().acquire(board_id=ids[0], task_uid=task_id, run_uid=run_uid, gateway_id=ids[1],
+-                                  ttl_s=max(expires - int(time.time()), 1))
++                                  ttl_s=max(expires - int(time.time()), 1), lane=lane)
+     except _CLIENT_ERRORS as exc:  # fail closed: an unreachable service defers the claim
+         _log.info("claim_deferred: offline task=%s (%s: %s)", task_id, type(exc).__name__, exc)
+         return ClaimGate(expires, deferred=True)
+@@ -604,6 +663,7 @@ _CLAIMABLE = ("ready", "review")
+ 
+ def apply_remote_changes(
+     conn: sqlite3.Connection, changes: Sequence[RemoteChange], *, new_cursor: int, board: Optional[str] = None,
++    observers: bool = True,
+ ) -> ApplyResult:
+     """Apply one feed page in ONE transaction, then fire local observers.
+ 
+@@ -612,7 +672,8 @@ def apply_remote_changes(
+     row, ``run_uid`` is translated to the local run id, local-only columns are
+     never written from the wire, and the cursor advances in the same commit as
+     the rows. Hooks fire once, after the commit, with ``remote=True`` and
+-    ``origin_gateway``; a page that makes work claimable wakes the dispatcher."""
++    ``origin_gateway``; a page that makes work claimable wakes the dispatcher.
++    ``observers=False`` (a shadow copy) applies the rows and fires nothing."""
+     from hermes_cli.kanban_db_connect import write_txn
+     if board_mode(conn) == "off":
+         raise RuntimeError("apply_remote_changes: kanban sync is not enabled on this board")
+@@ -623,7 +684,8 @@ def apply_remote_changes(
+         for change in changes:
+             _apply_one(conn, change, own, result)
+         conn.execute("UPDATE kanban_sync_state SET cursor = ?, applying = 0", (new_cursor,))
+-    _after_commit(conn, result, board)
++    if observers:
++        _after_commit(conn, result, board)
+     return result
+ 
+ 
+@@ -664,7 +726,8 @@ def _local_run_id(conn: sqlite3.Connection, uid: Optional[str], task_id: Any) ->
+ 
+ def _local_fields(conn: sqlite3.Connection, table: str, fields: Mapping[str, Any], task_id: Any) -> dict[str, Any]:
+     """Wire fields -> local columns: drop local-only/key/unknown columns, uids -> local ids."""
+-    allowed = set(captured_columns(conn, table))
++    present = set(table_columns(conn, table))
++    allowed = set(captured_columns(conn, table)) | (SERVER_COLUMNS.get(table, frozenset()) & present)
+     out: dict[str, Any] = {}
+     for column in allowed:
+         wire = _wire_name(table, column)
+@@ -679,7 +742,7 @@ def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: A
+     if _tombstoned(conn, "tasks", ch.uid):
+         return False
+     old = conn.execute("SELECT * FROM tasks WHERE id = ?", (ch.uid,)).fetchone()
+-    if old is not None and old["sync_version"] is not None and ch.version <= old["sync_version"]:
++    if old is not None and old["sync_version"] is not None and ch.version < old["sync_version"]:  # equal = the same row (a re-send or a revert)
+         return False
+     cols = _local_fields(conn, "tasks", ch.fields, ch.uid)
+     if old is None:
+@@ -692,10 +755,27 @@ def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: A
+         assignments = ", ".join(f"{c} = ?" for c in cols)
+         conn.execute(f"UPDATE tasks SET {assignments}{', ' if cols else ''}sync_version = ? WHERE id = ?",
+                      (*cols.values(), ch.version, ch.uid))
++    if "lease_holder" in ch.fields:  # the service's full row carries its lease mirror
++        _mirror_lease(conn, ch.uid, ch.fields.get("lease_holder"), ch.fields.get("lease_expires"), own, result)
+     _collect_task_observers(ch, cols.get("status"), changed, result)
+     return True
+ 
+ 
++def _mirror_lease(conn: sqlite3.Connection, task_id: str, holder: Optional[str], expires: Optional[int],
++                  own: str, result: ApplyResult) -> None:
++    """Mirror the service's lease onto the task. A lease that moved away from this gateway while a local
++    worker holds the claim makes the claim stale now, so the dispatcher's stale-claim path stops the worker."""
++    row = conn.execute("SELECT status, claim_lock, lease_holder FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return
++    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ? WHERE id = ?", (holder, expires, task_id))
++    if holder != own and row["claim_lock"] is not None and row["lease_holder"] == own:
++        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ? AND claim_lock IS NOT NULL",
++                     (int(time.time()) - 1, task_id))
++    if holder is None and row["status"] in _CLAIMABLE:
++        result.wake_dispatcher = True
++
++
+ def _collect_task_observers(ch: RemoteChange, new_status: Optional[str], changed: set[str],
+                             result: ApplyResult) -> None:
+     kwargs = {"remote": True, "origin_gateway": ch.origin_gateway}
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 144ed2e73c..102f34744d 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -497,6 +497,16 @@ _SPECS = [
+         _arg("--log-retention-days", type=_nonnegative_int, default=30,
+              help="Delete worker log files older than N days (default: 30; 0 disables)"),
+     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
++    _cmd("sync", children=("sync_action", [
++        _cmd("status", [_json_flag()], help="Mode, service board, cursor, outbox depth and last error"),
++        _cmd("attach", [_arg("--mode", choices=("shadow", "primary", "off"), default="shadow",
++                             help="shadow (default): push, apply the feed to a shadow copy; primary: the service is "
++                                  "the source of truth; off: stop capturing")],
++             help="Bind the board to the central Board service under this gateway's hub name"),
++        _cmd("import", help="Queue every existing row of the board for upload (idempotent)"),
++        _cmd("diff", [_json_flag()], help="Compare this gateway's live cards with the shadow copy (exit 1 if not clean)"),
++        _cmd("run", [_json_flag()], help="Run one sync round for every synced board now"),
++    ]), help="Central Kanban sync (kanban.sync.*): attach, import, status, diff"),
+     _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
+          help="Check kanban.db integrity and auto-repair index-only corruption",
+          description=(
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+new file mode 100644
+index 0000000000..7274fa6064
+--- /dev/null
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -0,0 +1,126 @@
++"""``hermes kanban sync``: attach a board to the central Board service, import it, and inspect it. [daveey]
++
++- ``status``  mode, service board, gateway, cursor, outbox depth and the last error.
++- ``attach``  bind the board to the service under this gateway's hub name and set its mode (``shadow``/``primary``/``off``).
++- ``import``  queue every existing row for upload (idempotent; run once after the first attach).
++- ``diff``    this gateway's live cards against the shadow copy of the service (exit 1 when not clean).
++- ``run``     one sync round now (the gateway runs it continuously while ``kanban.sync.enabled`` is on).
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++
++
++def _board(args: argparse.Namespace) -> str:
++    return getattr(args, "board", None) or "default"
++
++
++def _path(slug: str):
++    from hermes_cli import kanban_db
++    return kanban_db.kanban_db_path(board=slug)
++
++
++def _print(obj, as_json: bool) -> None:
++    if as_json:
++        print(json.dumps(obj, indent=2, default=str))
++        return
++    for k, v in obj.items():
++        print(f"{k:>18}: {v}")
++
++
++def _status(args: argparse.Namespace) -> int:
++    slug = _board(args)
++    conn = kbc.connect(_path(slug))
++    try:
++        out = {"board": slug, **ksc.status(conn)}
++    finally:
++        conn.close()
++    shadow = ksc.shadow_path(slug)
++    if shadow.exists():
++        sconn = kbc.connect(shadow)
++        try:
++            out["shadow_cursor"] = (sync.sync_state(sconn) or {}).get("cursor")
++        finally:
++            sconn.close()
++    _print(out, args.json)
++    return 0
++
++
++def _attach(args: argparse.Namespace) -> int:
++    slug = _board(args)
++    if not sync.sync_enabled() or not sync.board_selected(str(_path(slug))):
++        print(f"kanban sync: enable it first (kanban.sync.enabled: true; kanban.sync.boards includes {slug})")
++        return 2
++    ident = ksc.load_identity()
++    conn = kbc.connect(_path(slug))
++    try:
++        ksc.ensure_identity(conn, slug, ident.gateway)
++        sync.set_mode(conn, args.mode)
++        print(f"kanban sync: {slug} attached to {ident.url} as {ident.gateway}, mode {args.mode}")
++    finally:
++        conn.close()
++    return 0
++
++
++def _import(args: argparse.Namespace) -> int:
++    slug = _board(args)
++    conn = kbc.connect(_path(slug))
++    try:
++        counts = ksc.import_board(conn)
++    finally:
++        conn.close()
++    print(f"kanban sync: queued {sum(counts.values())} rows from {slug} ({', '.join(f'{k}={v}' for k, v in counts.items())})")
++    return 0
++
++
++def _diff(args: argparse.Namespace) -> int:
++    slug = _board(args)
++    ident = ksc.load_identity()
++    live = kbc.connect(_path(slug))
++    shadow = ksc.open_shadow(slug, ident.gateway)
++    try:
++        report = ksc.diff(live, shadow, ident.gateway)
++    finally:
++        live.close()
++        shadow.close()
++    report = {"board": slug, **report}
++    if not args.json:
++        for key in ("missing_in_shadow", "extra_in_shadow"):
++            report[key] = f"{len(report[key])} {report[key][:10]}" if report[key] else 0
++        mismatch = report["field_mismatch"]
++        report["field_mismatch"] = f"{len(mismatch)} {dict(list(mismatch.items())[:10])}" if mismatch else 0
++    _print(report, args.json)
++    return 0 if report["clean"] else 1
++
++
++def _run(args: argparse.Namespace) -> int:
++    results = ksc.sync_all_once()
++    rows = [{"board": r.board, "mode": r.mode, "pulled": r.pulled, "pushed": r.push.sent if r.push else 0,
++             "rejected": r.push.rejected if r.push else 0, "error": r.error} for r in results]
++    if args.json:
++        print(json.dumps(rows, indent=2))
++    else:
++        for r in rows:
++            print(" ".join(f"{k}={v}" for k, v in r.items()))
++    return 1 if any(r["error"] for r in rows) else 0
++
++
++_ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run}
++
++
++def cmd_sync(args: argparse.Namespace) -> int:
++    action = getattr(args, "sync_action", None)
++    if action not in _ACTIONS:
++        print("usage: hermes kanban sync {status,attach,import,diff,run} [--board B]")
++        return 2
++    try:
++        return _ACTIONS[action](args)
++    except ksc.SyncUnavailable as exc:
++        print(str(exc))
++        return 2
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+new file mode 100644
+index 0000000000..b501896444
+--- /dev/null
++++ b/hermes_cli/kanban_sync_client.py
+@@ -0,0 +1,624 @@
++"""Central Kanban sync client (phase 2 of hermes-mods ``core/kanban-central-service.md``). [daveey]
++
++Connects the phase 1 seams in :mod:`hermes_cli.kanban_db_sync` to the Board service (the hermes-hub Worker's
++per-board Durable Object):
++
++- **pull first**: ``GET /v2/boards/<id>/changes?since=<cursor>`` pages are applied through
++  :func:`~hermes_cli.kanban_db_sync.apply_remote_changes` with the cursor advancing in the same transaction;
++  ``410`` (cursor below the retention floor) rebuilds from ``/snapshot``.
++- **then push**: pending capture-trigger outbox rows go to ``POST /v2/boards/<id>/ops`` as row ops in FIFO order,
++  HLC-stamped here (triggers cannot). ``applied``/``merged`` remove the row; ``rejected`` marks it and, on a
++  primary board, restores the service's row.
++- **modes** (per board, ``kanban_sync_state.mode``): ``shadow`` pushes the live board's outbox but applies the feed
++  only into a separate copy (``<root>/kanban/sync-shadow/<board>.db``) that nothing else reads, so ``sync diff`` can
++  compare the two while the live board stays local. ``primary`` applies the feed into the live board and claims
++  through service leases (:class:`HubLeaseClient`).
++- **import** enqueues every existing row once (tasks as ``import`` so an id another gateway created is refused).
++
++The gateway runs :func:`run_forever` as a supervised watcher while ``kanban.sync.enabled`` is on. Identity is the
++gateway's hub enrollment (``~/.config/hermes-mail/{config.json,gateway.key}``), overridable with
++``kanban.sync.{url,key_file,gateway}``.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++import urllib.error
++import urllib.request
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Callable, Iterable, Optional
++
++from hermes_cli import kanban_db_sync as sync
++
++_log = logging.getLogger(__name__)
++
++DEFAULT_INTERVAL_S = 5.0
++PUSH_BATCH = 200
++MAX_BATCHES_PER_ROUND = 25
++FEED_PAGE = 500
++SNAPSHOT_PAGE = 1000
++HTTP_TIMEOUT_S = 30.0
++EVENT_IMPORT_WINDOW_S = 30 * 24 * 3600  # the service's event retention (worker board.ts EVENT_RETENTION_MS)
++# Row order for an import: links need both tasks, everything else names its task.
++IMPORT_ORDER = ("tasks", "task_links", "task_runs", "task_comments", "task_events", "task_attachments")
++
++
++class SyncUnavailable(RuntimeError):
++    """Sync cannot run here (no hub enrollment, bad config)."""
++
++
++class HubError(RuntimeError):
++    def __init__(self, status: int, detail: str) -> None:
++        super().__init__(f"hub {status}: {detail}")
++        self.status = status
++
++
++class Resync(Exception):
++    """The cursor is below the service's retention floor: rebuild from a snapshot."""
++
++
++@dataclass(frozen=True)
++class Identity:
++    url: str
++    key: str
++    gateway: str
++
++
++def load_identity(cfg: Optional[dict] = None) -> Identity:
++    """The gateway's hub enrollment: ``kanban.sync.{url,key_file,gateway}`` or the hermes-mail files."""
++    cfg = dict(cfg if cfg is not None else sync.sync_config())
++    mail_dir = Path.home() / ".config" / "hermes-mail"
++    mail: dict[str, Any] = {}
++    try:
++        mail = json.loads((mail_dir / "config.json").read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        pass
++    url = str(cfg.get("url") or mail.get("hub_url") or mail.get("url") or "").rstrip("/")
++    gateway = str(cfg.get("gateway") or mail.get("gateway") or "")
++    key_file = Path(str(cfg.get("key_file") or mail_dir / "gateway.key")).expanduser()
++    try:
++        key = key_file.read_text(encoding="utf-8-sig").strip()
++    except OSError as exc:
++        raise SyncUnavailable(f"kanban sync: no hub key at {key_file} ({exc})") from exc
++    if not url or not gateway or not key:
++        raise SyncUnavailable("kanban sync: hub url, gateway name and key are all required")
++    return Identity(url=url, key=key, gateway=gateway)
++
++
++class Hub:
++    """The Board service's HTTP API for one gateway."""
++
++    def __init__(self, ident: Identity, timeout: float = HTTP_TIMEOUT_S) -> None:
++        self.ident, self.timeout = ident, timeout
++
++    def _call(self, method: str, path: str, body: Optional[dict] = None) -> dict:
++        data = None if body is None else json.dumps(body).encode()
++        req = urllib.request.Request(
++            self.ident.url + path, data=data, method=method,
++            headers={"authorization": f"Bearer {self.ident.key}", "content-type": "application/json",
++                     "user-agent": "hermes-kanban-sync/1"},
++        )
++        try:
++            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
++                return json.loads(resp.read() or b"{}")
++        except urllib.error.HTTPError as exc:
++            text = exc.read().decode("utf-8", "replace")[:500]
++            if exc.code == 410:
++                raise Resync(text) from exc
++            raise HubError(exc.code, text) from exc
++
++    def ops(self, board: str, ops: list[dict]) -> dict:
++        return self._call("POST", f"/v2/boards/{board}/ops", {"ops": ops})
++
++    def changes(self, board: str, since: int, limit: int = FEED_PAGE) -> dict:
++        return self._call("GET", f"/v2/boards/{board}/changes?since={int(since)}&limit={int(limit)}")
++
++    def snapshot_page(self, board: str, table: str, after: str = "", limit: int = SNAPSHOT_PAGE) -> dict:
++        from urllib.parse import quote
++        return self._call("GET", f"/v2/boards/{board}/snapshot?table={table}&after={quote(after)}&limit={limit}")
++
++    def leases(self, board: str, body: dict) -> dict:
++        return self._call("POST", f"/v2/boards/{board}/leases", body)
++
++
++# --- boards ---------------------------------------------------------------------------------------
++
++def board_paths() -> list[tuple[str, Path]]:
++    """``(slug, kanban.db)`` for every board on this host that ``kanban.sync.boards`` selects."""
++    from hermes_cli import kanban_db
++    root = kanban_db.kanban_home()
++    found = [("default", root / "kanban.db")] if (root / "kanban.db").exists() else []
++    boards = kanban_db.boards_root()
++    if boards.is_dir():
++        found += [(p.parent.name, p) for p in sorted(boards.glob("*/kanban.db")) if p.is_file()]
++    return [(slug, path) for slug, path in found if sync.board_selected(str(path))]
++
++
++def shadow_path(slug: str) -> Path:
++    from hermes_cli import kanban_db
++    return kanban_db.kanban_home() / "kanban" / sync.SHADOW_DIR / f"{slug}.db"
++
++
++def _connect(path: Path) -> sqlite3.Connection:
++    from hermes_cli import kanban_db_connect
++    return kanban_db_connect.connect(path)
++
++
++def ensure_identity(conn: sqlite3.Connection, board: str, gateway: str) -> dict:
++    st = sync.sync_state(conn)
++    if st is None:
++        raise SyncUnavailable("kanban sync is not installed on this board (kanban.sync.enabled / kanban.sync.boards)")
++    if st["board_id"] != board or st["gateway_id"] != gateway:
++        sync.set_identity(conn, board, gateway)
++        st = sync.sync_state(conn)
++    return st
++
++
++# --- HLC ------------------------------------------------------------------------------------------
++
++def _next_hlc(conn: sqlite3.Connection, gateway: str) -> str:
++    """Monotonic per-gateway HLC ``<ms:13>-<counter:4>-<gateway>``; the last stamp survives restarts."""
++    last = (sync.sync_state(conn) or {}).get("hlc_last") or ""
++    try:
++        last_ms, last_ctr = int(last[:13]), int(last[14:18])
++    except ValueError:
++        last_ms, last_ctr = 0, 0
++    now = time.time_ns() // 1_000_000
++    ms, ctr = (now, 0) if now > last_ms else (last_ms, last_ctr + 1)
++    if ctr > 9999:
++        ms, ctr = ms + 1, 0
++    stamp = f"{ms:013d}-{ctr:04d}-{gateway}"
++    conn.execute("UPDATE kanban_sync_state SET hlc_last = ?", (stamp,))
++    return stamp
++
++
++# --- push -----------------------------------------------------------------------------------------
++
++def _wire_fields(table: str, fields: dict) -> dict:
++    """Only the synced wire columns (a column a later migration added is not sent until it is declared)."""
++    allowed = {sync._wire_name(table, c) for c in sync.SYNCED_COLUMNS[table]}
++    return {k: v for k, v in fields.items() if k in allowed}
++
++
++def translate(row: dict, hlc: str) -> dict:
++    """One outbox row -> one row op."""
++    op = {"client_op_id": row["op_id"], "table": row["table_name"], "uid": row["row_uid"], "hlc": hlc}
++    if row["op"] == "delete":
++        return {**op, "op": "delete"}
++    fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"])
++    out = {**op, "op": "upsert", "fields": _wire_fields(row["table_name"], fields)}
++    if row["op"] == "import" and row["table_name"] == "tasks":
++        out["import"] = True
++    return out
++
++
++@dataclass
++class PushResult:
++    sent: int = 0
++    applied: int = 0
++    merged: int = 0
++    rejected: int = 0
++
++
++def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
++         max_batches: int = MAX_BATCHES_PER_ROUND) -> PushResult:
++    """Drain pending outbox rows in FIFO batches. A transport failure leaves them pending (retried next round)."""
++    from hermes_cli.kanban_db_connect import write_txn
++    out = PushResult()
++    for _ in range(max_batches):
++        rows = [dict(r) for r in conn.execute(
++            "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' ORDER BY created_at, rowid LIMIT ?", (PUSH_BATCH,))]
++        if not rows:
++            break
++        with write_txn(conn):
++            wire = [translate(r, _next_hlc(conn, gateway)) for r in rows]
++        try:
++            resp = hub.ops(board, wire)
++        except (HubError, OSError) as exc:
++            with write_txn(conn):
++                conn.executemany("UPDATE kanban_sync_outbox SET attempts = attempts + 1, last_error = ? WHERE op_id = ?",
++                                 [(str(exc)[:300], r["op_id"]) for r in rows])
++            raise
++        out.sent += len(rows)
++        authoritative: list[sync.RemoteChange] = []
++        with write_txn(conn):
++            for res in resp.get("results", []):
++                status, op_id = res.get("status"), res.get("client_op_id")
++                row = next((r for r in rows if r["op_id"] == op_id), None)
++                if row is None:
++                    continue
++                if status in ("applied", "merged"):
++                    conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id = ?", (op_id,))
++                    if row["table_name"] == "tasks" and res.get("version"):
++                        conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
++                                     (res["version"], row["row_uid"]))
++                    setattr(out, status, getattr(out, status) + 1)
++                    if status == "merged" and primary and res.get("row"):
++                        authoritative.append(_row_change(row["table_name"], res["row"]))
++                else:
++                    reason = f"{res.get('reason')}: {res.get('detail') or ''}".strip(": ")
++                    conn.execute("UPDATE kanban_sync_outbox SET state = 'rejected', last_error = ?, attempts = attempts + 1 "
++                                 "WHERE op_id = ?", (reason[:500], op_id))
++                    out.rejected += 1
++                    _log.warning("kanban sync: %s %s %s rejected (%s)", board, row["table_name"], row["row_uid"], reason)
++                    if primary and res.get("row"):
++                        authoritative.append(_row_change(row["table_name"], res["row"]))
++        if authoritative:
++            cursor = (sync.sync_state(conn) or {}).get("cursor", 0)
++            sync.apply_remote_changes(conn, authoritative, new_cursor=cursor, board=board)
++        if len(rows) < PUSH_BATCH:
++            break
++    return out
++
++
++# --- pull -----------------------------------------------------------------------------------------
++
++def _row_change(table: str, row: dict, *, seq: int = 0, client_op_id: Optional[str] = None) -> sync.RemoteChange:
++    return sync.RemoteChange(seq=seq, table=table, uid=str(row["uid"]), op="upsert", fields=row,
++                             version=int(row.get("version") or 0), hlc=str(row.get("hlc") or ""),
++                             origin_gateway=str(row.get("origin_gateway") or ""), client_op_id=client_op_id)
++
++
++def adapt(change: dict) -> Optional[sync.RemoteChange]:
++    """A feed change -> RemoteChange. Lease rows are dropped: the task's full row carries its lease mirror."""
++    table = change.get("table")
++    if table not in sync.SYNCED_COLUMNS:
++        return None
++    fields = change.get("fields") or {}
++    return sync.RemoteChange(
++        seq=int(change.get("seq") or 0), table=table, uid=str(change["uid"]), op=str(change["op"]), fields=fields,
++        version=int(fields.get("version") or 0), hlc=str(change.get("hlc") or ""),
++        origin_gateway=str(change.get("origin_gateway") or ""), client_op_id=change.get("client_op_id"),
++    )
++
++
++def pending_task_fields(conn: sqlite3.Connection) -> dict[str, set[str]]:
++    """Wire fields per task with a local edit still in the outbox (not rejected)."""
++    out: dict[str, set[str]] = {}
++    for uid, fields in conn.execute("SELECT row_uid, fields FROM kanban_sync_outbox "
++                                    "WHERE table_name = 'tasks' AND state != 'rejected'"):
++        out.setdefault(uid, set()).update(json.loads(fields))
++    return out
++
++
++def without_pending(changes: list[sync.RemoteChange], pending: dict[str, set[str]]) -> list[sync.RemoteChange]:
++    """A field with an unanswered local edit keeps the local value until that edit's answer arrives
++    (RFC "Offline queue and reconnect": pull first, local-pending fields win locally)."""
++    out = []
++    for ch in changes:
++        keep = pending.get(ch.uid) if ch.table == "tasks" and ch.op == "upsert" else None
++        if keep:
++            ch = sync.RemoteChange(ch.seq, ch.table, ch.uid, ch.op, {k: v for k, v in ch.fields.items() if k not in keep},
++                                   ch.version, ch.hlc, ch.origin_gateway, ch.client_op_id)
++        out.append(ch)
++    return out
++
++
++def own_partition(conn: sqlite3.Connection, changes: list[sync.RemoteChange], gateway: str) -> list[sync.RemoteChange]:
++    """The changes for cards this gateway created (``created_on`` = it, or unset) and their child rows.
++
++    A primary board's live file holds only its own cards, so the dispatcher's sweeps (stale claims, orphans,
++    concurrency counts) never see another gateway's work; the replica copy holds the whole board."""
++    kept: list[sync.RemoteChange] = []
++    mine: set[str] = set()
++
++    def is_mine(task_id: Optional[str]) -> bool:
++        if not task_id:
++            return False
++        if task_id in mine:
++            return True
++        return conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is not None
++
++    for ch in changes:
++        if ch.table == "tasks":
++            if ch.op == "upsert" and ch.fields.get("created_on") in (None, gateway):
++                mine.add(ch.uid)
++            if not is_mine(ch.uid):
++                continue
++        elif ch.table == "task_links":
++            parent, _, child = ch.uid.partition(">")
++            if not (is_mine(parent) and is_mine(child)):
++                continue
++        elif not is_mine(ch.fields.get("task_id") if ch.op == "upsert" else
++                         _child_task(conn, ch.table, ch.uid)):
++            continue
++        kept.append(ch)
++    return kept
++
++
++def _child_task(conn: sqlite3.Connection, table: str, uid: str) -> Optional[str]:
++    row = conn.execute(f"SELECT task_id FROM {table} WHERE uid = ?", (uid,)).fetchone()
++    return row[0] if row else None
++
++
++def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
++         partition: Optional[str] = None) -> int:
++    """Apply every feed page after this file's cursor. Returns the number of changes read. On a board with an
++    outbox (primary), fields with an unanswered local edit are not overwritten; ``partition`` (a gateway name)
++    keeps only that gateway's cards."""
++    total = 0
++    cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++    while True:
++        page = hub.changes(board, cursor)
++        changes = [c for c in (adapt(ch) for ch in page.get("changes", [])) if c is not None]
++        if partition is not None:
++            changes = own_partition(conn, changes, partition)
++        changes = without_pending(changes, pending_task_fields(conn))
++        nxt = int(page.get("next", cursor))
++        sync.apply_remote_changes(conn, changes, new_cursor=nxt, board=board, observers=observers)
++        total += len(page.get("changes", []))
++        cursor = nxt
++        if not page.get("more"):
++            return total
++
++
++def resync(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool, partition: Optional[str] = None) -> int:
++    """Rebuild from the service snapshot (every live row, paged per table), then resume the feed at its head.
++    ``partition`` keeps only that gateway's cards (a primary board's live file)."""
++    head: Optional[int] = None
++    count = 0
++    for table in IMPORT_ORDER:
++        after = ""
++        while True:
++            page = hub.snapshot_page(board, table, after)
++            head = page["head"] if head is None else head
++            rows = page.get("rows", [])
++            changes = [_row_change(table, r) for r in rows]
++            if partition is not None:
++                changes = own_partition(conn, changes, partition)
++            cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++            sync.apply_remote_changes(conn, changes, new_cursor=cursor, board=board, observers=observers)
++            count += len(rows)
++            if not page.get("more"):
++                break
++            after = str(page["next"])
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET cursor = ?", (int(head or 0),))
++    return count
++
++
++# --- one board ------------------------------------------------------------------------------------
++
++@dataclass
++class RoundResult:
++    board: str
++    mode: str
++    pulled: int = 0
++    push: Optional[PushResult] = None
++    error: Optional[str] = None
++
++
++def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
++    path = shadow_path(slug)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = _connect(path)
++    ensure_identity(conn, slug, gateway)
++    return conn
++
++
++def _pull_replica(slug: str, hub: Hub, gateway: str) -> int:
++    """The whole board into the replica copy (no hooks); a cursor below the retention floor rebuilds it."""
++    replica = open_shadow(slug, gateway)
++    try:
++        try:
++            return pull(replica, hub, slug, observers=False)
++        except Resync:
++            _log.warning("kanban sync: %s replica cursor below the retention floor; rebuilding from a snapshot", slug)
++            replica.close()
++            shadow_path(slug).unlink(missing_ok=True)
++            replica = open_shadow(slug, gateway)
++            return resync(replica, hub, slug, observers=False)
++    finally:
++        replica.close()
++
++
++def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
++    """One round for one board. Both modes keep the replica copy (the whole board) current and push the live
++    outbox; ``primary`` also applies this gateway's own cards from the feed into the live board."""
++    live = _connect(path)
++    try:
++        mode = sync.board_mode(live)
++        result = RoundResult(board=slug, mode=mode)
++        if mode == "off":
++            return result
++        ensure_identity(live, slug, gateway)
++        result.pulled = _pull_replica(slug, hub, gateway)
++        if mode == "primary":
++            try:
++                pull(live, hub, slug, observers=True, partition=gateway)
++            except Resync:
++                _log.warning("kanban sync: %s live cursor below the retention floor; rebuilding from a snapshot", slug)
++                resync(live, hub, slug, observers=True, partition=gateway)
++        result.push = push(live, hub, slug, gateway, primary=mode == "primary")
++        return result
++    finally:
++        live.close()
++
++
++def sync_all_once(hub: Optional[Hub] = None) -> list[RoundResult]:
++    ident = load_identity() if hub is None else hub.ident
++    hub = hub or Hub(ident)
++    results = []
++    for slug, path in board_paths():
++        try:
++            results.append(sync_board(slug, path, hub, ident.gateway))
++        except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable) as exc:
++            _log.warning("kanban sync: round for %s failed (%s: %s)", slug, type(exc).__name__, exc)
++            results.append(RoundResult(board=slug, mode="?", error=f"{type(exc).__name__}: {exc}"))
++    return results
++
++
++def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = None,
++                sleep: Callable[[float], None] = time.sleep) -> None:
++    """The gateway's sync loop (call from a worker thread). Installs the lease client for primary boards."""
++    try:
++        ident = load_identity()
++    except SyncUnavailable as exc:
++        _log.warning("%s; kanban sync not started", exc)
++        return
++    hub = Hub(ident)
++    sync.set_lease_client(HubLeaseClient(hub))
++    period = float(interval or sync.sync_config().get("interval_seconds") or DEFAULT_INTERVAL_S)
++    _log.info("kanban sync: running as gateway %s against %s every %.1fs", ident.gateway, ident.url, period)
++    while keep_running():
++        started = time.monotonic()
++        for r in sync_all_once(hub):
++            if r.push and (r.push.sent or r.push.rejected):
++                _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
++                          r.push.sent, r.push.rejected)
++        sleep(max(0.5, period - (time.monotonic() - started)))
++
++
++# --- import ---------------------------------------------------------------------------------------
++
++def _row_fields(conn: sqlite3.Connection, table: str, row: sqlite3.Row) -> dict:
++    out: dict[str, Any] = {}
++    for column in sync.captured_columns(conn, table):
++        if column not in sync.SYNCED_COLUMNS[table]:
++            continue
++        value = row[column]
++        if (table, column) in sync.REF_COLUMNS:
++            ref = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (value,)).fetchone() if value is not None else None
++            value = ref[0] if ref else None
++        elif isinstance(value, bytes):
++            value = {"$blob": value.hex()}
++        out[sync._wire_name(table, column)] = value
++    return out
++
++
++def _row_uid(table: str, row: sqlite3.Row) -> str:
++    if table == "tasks":
++        return row["id"]
++    if table == "task_links":
++        return f"{row['parent_id']}>{row['child_id']}"
++    return row["uid"]
++
++
++def import_board(conn: sqlite3.Connection, *, tables: Iterable[str] = IMPORT_ORDER) -> dict[str, int]:
++    """Queue every existing row of a synced board for upload (idempotent: the service keys rows by uid)."""
++    from hermes_cli.kanban_db_connect import write_txn
++    if sync.board_mode(conn) == "off":
++        raise SyncUnavailable("this board does not sync (kanban.sync.enabled / kanban.sync.boards / mode off)")
++    counts: dict[str, int] = {}
++    now = time.time_ns() // 1_000_000
++    with write_txn(conn):
++        for table in tables:
++            order = "created_at, id" if table == "tasks" else ("parent_id, child_id" if table == "task_links" else "id")
++            n = 0
++            # The service drops events older than its retention window; importing them would only churn the feed.
++            where = f" WHERE created_at >= {int(time.time()) - EVENT_IMPORT_WINDOW_S}" if table == "task_events" else ""
++            for row in conn.execute(f"SELECT * FROM {table}{where} ORDER BY {order}").fetchall():
++                op = "import" if table == "tasks" else "upsert"
++                conn.execute(
++                    "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++                    "VALUES (?, ?, ?, ?, ?, NULL, '', ?)",
++                    (sync.uuid7(), table, _row_uid(table, row), op, json.dumps(_row_fields(conn, table, row)), now),
++                )
++                n += 1
++            counts[table] = n
++    return counts
++
++
++# --- status and diff ------------------------------------------------------------------------------
++
++def status(conn: sqlite3.Connection) -> dict[str, Any]:
++    st = sync.sync_state(conn) or {}
++    counts = {s: n for s, n in conn.execute("SELECT state, COUNT(*) FROM kanban_sync_outbox GROUP BY state")} if st else {}
++    last_error = None
++    if st:
++        r = conn.execute("SELECT last_error FROM kanban_sync_outbox WHERE last_error IS NOT NULL "
++                         "ORDER BY created_at DESC LIMIT 1").fetchone()
++        last_error = r[0] if r else None
++    return {"mode": sync.board_mode(conn), "board_id": st.get("board_id"), "gateway": st.get("gateway_id"),
++            "cursor": st.get("cursor"), "pending": counts.get("pending", 0), "rejected": counts.get("rejected", 0),
++            "last_error": last_error}
++
++
++_DIFF_SKIP = {"current_run_id"}  # compared as run uids instead
++
++
++def _task_rows(conn: sqlite3.Connection, ids: Optional[set[str]] = None) -> dict[str, dict]:
++    columns = [c for c in sync.SYNCED_COLUMNS["tasks"] if c not in _DIFF_SKIP]
++    present = set(sync.table_columns(conn, "tasks"))
++    cols = [c for c in columns if c in present]
++    out = {}
++    for row in conn.execute(f"SELECT t.id, {', '.join('t.' + c for c in cols)}, r.uid AS run_uid "
++                            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id"):
++        if ids is None or row["id"] in ids:
++            out[row["id"]] = dict(row)
++    return out
++
++
++def _child_uids(conn: sqlite3.Connection, table: str, task_ids: set[str]) -> set[tuple[str, str]]:
++    if table == "task_links":
++        return {(p, f"{p}>{c}") for p, c in conn.execute("SELECT parent_id, child_id FROM task_links") if c in task_ids}
++    return {(t, u) for t, u in conn.execute(f"SELECT task_id, uid FROM {table} WHERE uid IS NOT NULL") if t in task_ids}
++
++
++def diff(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, Any]:
++    """This gateway's live cards against the shadow copy of the service. Rows with an unanswered local edit are
++    reported as pending, not as differences; rejected outbox rows are differences until fixed."""
++    pending_tasks = {r[0] for r in live.execute(
++        "SELECT DISTINCT CASE WHEN table_name = 'tasks' THEN row_uid ELSE json_extract(fields, '$.task_id') END "
++        "FROM kanban_sync_outbox WHERE state = 'pending'")}
++    live_tasks = _task_rows(live)
++    mine = {r[0] for r in shadow.execute("SELECT id FROM tasks WHERE created_on = ? OR created_on IS NULL", (gateway,))}
++    shadow_tasks = _task_rows(shadow, mine | set(live_tasks))
++    foreign = shadow.execute("SELECT COUNT(*) FROM tasks WHERE created_on IS NOT NULL AND created_on != ?",
++                             (gateway,)).fetchone()[0]
++    checked = set(live_tasks) - pending_tasks
++    missing = sorted(t for t in checked if t not in shadow_tasks)
++    extra = sorted(t for t in mine - set(live_tasks) - pending_tasks)
++    fields: dict[str, list[str]] = {}
++    for tid in sorted(checked & set(shadow_tasks)):
++        a, b = live_tasks[tid], shadow_tasks[tid]
++        bad = [k for k in a if k != "id" and a[k] != b.get(k)]
++        if bad:
++            fields[tid] = bad
++    children: dict[str, int] = {}
++    for table in ("task_links", "task_comments", "task_runs"):
++        lv = _child_uids(live, table, checked)
++        sh = _child_uids(shadow, table, checked)
++        n = len(lv ^ sh)
++        if n:
++            children[table] = n
++    rejected = live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()[0]
++    clean = not (missing or extra or fields or children or rejected)
++    return {"clean": clean, "checked": len(checked), "pending": len(pending_tasks & set(live_tasks)),
++            "missing_in_shadow": missing, "extra_in_shadow": extra, "field_mismatch": fields,
++            "child_mismatch": children, "rejected_ops": rejected, "foreign_cards": foreign}
++
++
++# --- leases (primary boards) ----------------------------------------------------------------------
++
++class HubLeaseClient:
++    """:class:`kanban_db_sync.LeaseClient` over ``POST /v2/boards/<id>/leases``."""
++
++    def __init__(self, hub: Hub) -> None:
++        self.hub = hub
++
++    def _lease(self, board_id: str, body: dict, run_uid: str) -> sync.Lease:
++        try:
++            res = self.hub.leases(board_id, {**body, "client_op_id": sync.uuid7()})
++        except (HubError, OSError) as exc:
++            raise sync.LeaseUnavailable(str(exc)) from exc
++        lease = res.get("lease") or {}
++        granted = res.get("status") == "applied" and lease.get("run_uid") == run_uid
++        return sync.Lease(granted=granted, run_uid=run_uid, expires_ms=lease.get("expires"),
++                          holder=lease.get("holder"), reason=None if granted else res.get("reason"))
++
++    def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int,
++                lane: str = "ready") -> sync.Lease:
++        return self._lease(board_id, {"action": "grant", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s,
++                                      "lane": lane}, run_uid)
++
++    def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> sync.Lease:
++        return self._lease(board_id, {"action": "renew", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s}, run_uid)
++
++    def release(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str) -> None:
++        self._lease(board_id, {"action": "release", "task": task_uid, "run_uid": run_uid}, run_uid)
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+new file mode 100644
+index 0000000000..0719cc9308
+--- /dev/null
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -0,0 +1,147 @@
++"""In-memory stand-in for the hermes-hub Board service (worker/src/rows.ts + board.ts), for the sync client tests.
++
++Implements the contract the client relies on: row ops (per-field LWW by HLC on tasks, ``created_on`` set once,
++``import`` refusing another gateway's id, a live lease fencing status moves), ``client_op_id`` idempotency, a dense
++``seq`` feed of full rows, a retention floor (``410``), paged snapshots and leases. Several gateways share one board.
++"""
++
++from __future__ import annotations
++
++import copy
++from typing import Any, Optional
++
++from hermes_cli import kanban_sync_client as ksc
++
++FENCED = {"status", "current_run_uid", "result", "started_at", "completed_at"}
++
++
++class FakeService:
++    def __init__(self) -> None:
++        self.boards: dict[str, dict[str, Any]] = {}
++        self.calls: list[tuple[str, str, Any]] = []
++        self.offline = False
++
++    def board(self, bid: str) -> dict[str, Any]:
++        return self.boards.setdefault(bid, {"seq": 0, "floor": 0, "changes": [], "rows": {}, "applied": {}, "leases": {}})
++
++    def hub(self, gateway: str) -> FakeHub:
++        return FakeHub(self, gateway)
++
++    # ---- server-side helpers ----
++    def _emit(self, b: dict, table: str, uid: str, op: str, row: Optional[dict], gw: str, op_id: Optional[str]) -> int:
++        b["seq"] += 1
++        b["changes"].append({"seq": b["seq"], "table": table, "uid": uid, "op": op,
++                             "fields": copy.deepcopy(row), "hlc": (row or {}).get("hlc", ""),
++                             "origin_gateway": gw, "client_op_id": op_id})
++        return b["seq"]
++
++    def _put(self, b: dict, table: str, uid: str, patch: dict, gw: str, op_id: Optional[str], hlc: str) -> dict:
++        rows = b["rows"].setdefault(table, {})
++        cur = rows.get(uid)
++        if cur is None:
++            cur = {"uid": uid, "version": 0}
++            rows[uid] = cur
++        cur.update(patch)
++        cur.update(version=cur["version"] + 1, hlc=hlc, origin_gateway=gw, deleted_at=None)
++        cur["seq"] = self._emit(b, table, uid, "upsert", None, gw, op_id)
++        b["changes"][-1]["fields"] = copy.deepcopy(cur)
++        return cur
++
++    def row_op(self, b: dict, op: dict, gw: str) -> dict:
++        table, uid, kind = op["table"], op["uid"], op["op"]
++        rows = b["rows"].setdefault(table, {})
++        if kind == "delete":
++            if uid not in rows or rows[uid].get("deleted_at"):
++                return {"status": "merged"}
++            rows[uid]["deleted_at"] = 1
++            self._emit(b, table, uid, "delete", None, gw, op["client_op_id"])
++            return {"status": "applied"}
++        f = dict(op["fields"])
++        if table == "tasks":
++            cur = rows.get(uid)
++            if cur is None:
++                clocks = {k: op["hlc"] for k in f}
++                return {"status": "applied", "row": self._put(b, table, uid, {"id": uid, **f, "created_on": gw,
++                                                                                "field_hlc": clocks}, gw, op["client_op_id"], op["hlc"])}
++            if op.get("import") and cur.get("created_on") not in (None, gw):
++                return {"status": "rejected", "reason": "id_taken", "row": cur}
++            lease = b["leases"].get(uid)
++            if lease and lease["holder"] != gw and FENCED & set(f):
++                return {"status": "rejected", "reason": "live_claim", "row": cur}
++            clocks = cur.setdefault("field_hlc", {})
++            won = {k: v for k, v in f.items() if k not in clocks or op["hlc"] > clocks[k]}
++            if not won:
++                return {"status": "merged", "row": cur}
++            for k in won:
++                clocks[k] = op["hlc"]
++            row = self._put(b, table, uid, won, gw, op["client_op_id"], op["hlc"])
++            return {"status": "applied" if len(won) == len(f) else "merged", "row": row}
++        return {"status": "applied", "row": self._put(b, table, uid, f, gw, op["client_op_id"], op["hlc"])}
++
++    def compact(self, bid: str) -> None:
++        """Advance the retention floor to the head (every older cursor now gets 410)."""
++        b = self.board(bid)
++        b["floor"] = b["seq"]
++
++
++class FakeHub:
++    """Duck-typed :class:`ksc.Hub` for one gateway."""
++
++    def __init__(self, svc: FakeService, gateway: str) -> None:
++        self.svc, self.gateway = svc, gateway
++        self.ident = ksc.Identity(url="https://hub.test", key="k", gateway=gateway)
++
++    def _check(self) -> None:
++        if self.svc.offline:
++            raise OSError("hub unreachable")
++
++    def ops(self, board: str, ops: list[dict]) -> dict:
++        self._check()
++        self.svc.calls.append(("ops", board, ops))
++        b = self.svc.board(board)
++        results = []
++        for op in ops:
++            prior = b["applied"].get(op["client_op_id"])
++            if prior is not None:
++                results.append({**prior, "dup": True})
++                continue
++            res = {"client_op_id": op["client_op_id"], **self.svc.row_op(b, op, self.gateway)}
++            row = res.get("row")
++            res["version"] = row.get("version") if row else None
++            b["applied"][op["client_op_id"]] = res
++            results.append(res)
++        return {"results": results, "head": b["seq"]}
++
++    def changes(self, board: str, since: int, limit: int = 500) -> dict:
++        self._check()
++        b = self.svc.board(board)
++        if since < b["floor"]:
++            raise ksc.Resync("cursor below the retention floor")
++        page = [c for c in b["changes"] if c["seq"] > since][:limit]
++        more = len([c for c in b["changes"] if c["seq"] > since]) > len(page)
++        return {"changes": copy.deepcopy(page), "next": page[-1]["seq"] if page else since, "head": b["seq"], "more": more}
++
++    def snapshot_page(self, board: str, table: str, after: str = "", limit: int = 1000) -> dict:
++        self._check()
++        b = self.svc.board(board)
++        live = sorted((u, r) for u, r in b["rows"].get(table, {}).items() if not r.get("deleted_at") and u > after)
++        page = live[:limit]
++        return {"head": b["seq"], "table": table, "rows": [copy.deepcopy(r) for _, r in page],
++                "next": page[-1][0] if page else after, "more": len(live) > limit}
++
++    def leases(self, board: str, body: dict) -> dict:
++        self._check()
++        b = self.svc.board(board)
++        task, run = body["task"], body["run_uid"]
++        cur = b["leases"].get(task)
++        if body["action"] == "grant":
++            if cur and cur["holder"] != self.gateway:
++                return {"status": "rejected", "reason": "lease_held", "lease": cur}
++            b["leases"][task] = {"task_id": task, "holder": self.gateway, "run_uid": run, "expires": 9_999_999_999_999}
++        elif body["action"] == "renew":
++            if not cur or cur["holder"] != self.gateway or cur["run_uid"] != run:
++                return {"status": "rejected", "reason": "lease_lost", "lease": cur}
++        else:
++            b["leases"].pop(task, None)
++            return {"status": "applied", "lease": None}
++        return {"status": "applied", "lease": b["leases"][task]}
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+new file mode 100644
+index 0000000000..edd60c8d33
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -0,0 +1,486 @@
++"""Central Kanban sync client (phase 2): push the outbox as row ops, pull the feed (into a shadow copy or the live
++board), snapshot resync, import, diff and the hub lease client. The service is an in-memory fake of the hermes-hub
++Board contract (``kanban_sync_fake_board``). Design: hermes-mods ``core/kanban-central-service.md``."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "macbook", "mini", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _pending(conn) -> list[dict]:
++    return [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox WHERE state = 'pending'")]
++
++
++def _round(kanban_home, svc, gateway=ME):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(gateway), gateway)
++
++
++def _shadow():
++    return kbc.connect(ksc.shadow_path(BOARD))
++
++
++def _other_creates(svc, task_id, **fields):
++    """Another gateway pushes a card straight to the service."""
++    hub = svc.hub(OTHER)
++    return hub.ops(BOARD, [{"client_op_id": f"other-{task_id}-op", "op": "upsert", "table": "tasks", "uid": task_id,
++                            "hlc": f"{1:013d}-0000-{OTHER}",
++                            "fields": {"title": task_id, "status": "ready", "created_at": 1, **fields}}])
++
++
++def _tables_digest(conn) -> str:
++    h = hashlib.sha256()
++    for table in ("tasks", "task_links", "task_comments", "task_runs", "task_events"):
++        cols = [c for c in sync.table_columns(conn, table) if c not in ("sync_version", "lease_holder", "lease_expires")]
++        for row in conn.execute(f"SELECT {', '.join(cols)} FROM {table} ORDER BY 1"):
++            h.update(repr(tuple(row)).encode())
++    return h.hexdigest()
++
++
++# --- translate --------------------------------------------------------------------------------------------------
++
++def test_translate_upsert_import_and_delete_rows():
++    up = ksc.translate({"op_id": "0192-a", "table_name": "tasks", "row_uid": "t_1", "op": "upsert",
++                        "fields": json.dumps({"title": "x", "status": "ready", "lease_holder": "me", "brand_new": 1})},
++                       "0000000000001-0000-me")
++    assert up == {"client_op_id": "0192-a", "table": "tasks", "uid": "t_1", "hlc": "0000000000001-0000-me",
++                  "op": "upsert", "fields": {"title": "x", "status": "ready"}}  # local/undeclared columns stay home
++    imp = ksc.translate({"op_id": "0192-b", "table_name": "tasks", "row_uid": "t_1", "op": "import",
++                         "fields": {"title": "x"}}, "h")
++    assert imp["op"] == "upsert" and imp["import"] is True
++    child = ksc.translate({"op_id": "0192-c", "table_name": "task_runs", "row_uid": "r-1", "op": "import",
++                           "fields": {"task_id": "t_1", "status": "done"}}, "h")
++    assert child["op"] == "upsert" and "import" not in child
++    gone = ksc.translate({"op_id": "0192-d", "table_name": "task_links", "row_uid": "a>b", "op": "delete",
++                          "fields": "{}"}, "h")
++    assert gone == {"client_op_id": "0192-d", "table": "task_links", "uid": "a>b", "hlc": "h", "op": "delete"}
++
++
++def test_hlc_is_monotonic_and_survives_a_reopen(live, kanban_home):
++    with kbc.write_txn(live):
++        a = ksc._next_hlc(live, ME)
++        b = ksc._next_hlc(live, ME)
++    assert b > a and a.endswith(f"-{ME}")
++    live.close()
++    conn = kbc.connect(kanban_home / "kanban.db")
++    with kbc.write_txn(conn):
++        assert ksc._next_hlc(conn, ME) > b
++    conn.close()
++
++
++# --- push -------------------------------------------------------------------------------------------------------
++
++def test_push_drains_the_outbox_and_the_service_records_this_gateway_as_creator(live, svc):
++    tid = kb.create_task(live, title="pushed", assignee="worker")
++    kb.add_comment(live, tid, "me", "a note")
++    assert _pending(live)
++    res = ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    assert res.rejected == 0 and res.sent >= 2 and not _pending(live)
++    row = svc.board(BOARD)["rows"]["tasks"][tid]
++    assert row["title"] == "pushed" and row["created_on"] == ME
++    assert any(r["body"] == "a note" for r in svc.board(BOARD)["rows"]["task_comments"].values())
++    assert kb.get_task(live, tid) is not None
++    assert live.execute("SELECT sync_version FROM tasks WHERE id = ?", (tid,)).fetchone()[0] >= 1
++
++
++def test_transport_failure_keeps_rows_pending_and_counts_the_attempt(live, svc):
++    kb.create_task(live, title="offline", assignee="worker")
++    n = len(_pending(live))
++    svc.offline = True
++    with pytest.raises(OSError):
++        ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    rows = _pending(live)
++    assert len(rows) == n and all(r["attempts"] == 1 and "unreachable" in r["last_error"] for r in rows)
++
++
++def test_outbox_survives_a_restart_and_a_lost_ack_replays_idempotently(live, svc, kanban_home):
++    tid = kb.create_task(live, title="replay", assignee="worker")
++    wire = [ksc.translate(r, f"{i + 1:013d}-0000-{ME}") for i, r in enumerate(_pending(live))]
++    svc.hub(ME).ops(BOARD, wire)  # the service applied them, but the answer never arrived
++    live.close()
++    conn = kbc.connect(kanban_home / "kanban.db")  # restart: the rows are still queued
++    assert len(_pending(conn)) == len(wire)
++    res = ksc.push(conn, svc.hub(ME), BOARD, ME, primary=False)
++    assert res.rejected == 0 and not _pending(conn)
++    assert len([c for c in svc.board(BOARD)["changes"] if c["table"] == "tasks" and c["uid"] == tid]) == 1
++    conn.close()
++
++
++def test_rejected_op_is_marked_and_a_primary_board_restores_the_service_row(live, svc):
++    tid = kb.create_task(live, title="contested", assignee="worker")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    svc.board(BOARD)["leases"][tid] = {"task_id": tid, "holder": OTHER, "run_uid": "run-other-1", "expires": 9e15}
++    sync.set_mode(live, "primary")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    res = ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    assert res.rejected == 1
++    rej = live.execute("SELECT state, last_error FROM kanban_sync_outbox").fetchone()
++    assert rej["state"] == "rejected" and rej["last_error"].startswith("live_claim")
++    assert kb.get_task(live, tid).status == "ready"  # the service's row, not the refused local edit
++
++
++# --- pull -------------------------------------------------------------------------------------------------------
++
++def test_shadow_pull_fills_the_shadow_copy_and_never_touches_the_live_board(live, svc, kanban_home):
++    mine = kb.create_task(live, title="mine", assignee="worker")
++    _other_creates(svc, "t_theirs")
++    live_before = _tables_digest(live)
++    result = _round(kanban_home, svc)
++    assert result.mode == "shadow" and result.error is None
++    shadow = _shadow()
++    try:
++        rows = {r["id"]: r["created_on"] for r in shadow.execute("SELECT id, created_on FROM tasks")}
++    finally:
++        shadow.close()
++    assert rows.get("t_theirs") == OTHER  # the other gateway's card reached our shadow copy
++    _round(kanban_home, svc)  # our own push comes back on the next pull
++    shadow = _shadow()
++    try:
++        assert shadow.execute("SELECT created_on FROM tasks WHERE id = ?", (mine,)).fetchone()[0] == ME
++    finally:
++        shadow.close()
++    assert kb.get_task(live, "t_theirs") is None
++    assert _tables_digest(live) == live_before  # pushes only clear outbox rows; no remote row lands live
++
++
++def test_pull_advances_the_cursor_with_the_page_and_keeps_it_when_apply_fails(live, svc, monkeypatch):
++    sync.set_mode(live, "primary")
++    _other_creates(svc, "t_a")
++    _other_creates(svc, "t_b")
++    hub = svc.hub(ME)
++    assert ksc.pull(live, hub, BOARD, observers=False) == 2
++    assert sync.sync_state(live)["cursor"] == svc.board(BOARD)["seq"]
++    _other_creates(svc, "t_c")
++    real = sync.apply_remote_changes
++
++    def broken(conn, changes, **kw):
++        real(conn, changes, **kw)
++        raise RuntimeError("crash after apply, before the caller saw it")
++    monkeypatch.setattr(sync, "apply_remote_changes", broken)
++    with pytest.raises(RuntimeError):
++        ksc.pull(live, hub, BOARD, observers=False)
++    monkeypatch.setattr(sync, "apply_remote_changes", real)
++    # The page committed with its cursor: a replay reads nothing new and the row is there once.
++    assert ksc.pull(live, hub, BOARD, observers=False) == 0
++    assert kb.get_task(live, "t_c") is not None
++
++
++def test_cursor_below_the_retention_floor_rebuilds_the_shadow_from_a_snapshot(live, svc, kanban_home):
++    _other_creates(svc, "t_old")
++    _round(kanban_home, svc)
++    _other_creates(svc, "t_new")
++    svc.compact(BOARD)
++    svc.board(BOARD)["floor"] += 1  # our cursor is now below the floor
++    result = _round(kanban_home, svc)
++    assert result.error is None
++    shadow = _shadow()
++    try:
++        ids = {r[0] for r in shadow.execute("SELECT id FROM tasks")}
++        assert {"t_old", "t_new"} <= ids
++        assert sync.sync_state(shadow)["cursor"] == svc.board(BOARD)["seq"]
++    finally:
++        shadow.close()
++
++
++def test_primary_pull_keeps_fields_with_an_unanswered_local_edit(live, svc):
++    tid = kb.create_task(live, title="local", assignee="worker")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    sync.set_mode(live, "primary")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET title = 'local edit' WHERE id = ?", (tid,))
++    svc.hub(OTHER).ops(BOARD, [{"client_op_id": "other-title-op1", "op": "upsert", "table": "tasks", "uid": tid,
++                                "hlc": f"{time.time_ns() // 1_000_000 + 1000:013d}-0000-{OTHER}",
++                                "fields": {"title": "remote edit", "priority": 5}}])
++    ksc.pull(live, svc.hub(ME), BOARD, observers=False)
++    t = kb.get_task(live, tid)
++    assert t.title == "local edit" and t.priority == 5
++
++
++def test_primary_pull_mirrors_the_lease_from_the_task_row(live, svc):
++    sync.set_mode(live, "primary")
++    _other_creates(svc, "t_leased")
++    b = svc.board(BOARD)
++    row = b["rows"]["tasks"]["t_leased"]
++    svc._put(b, "tasks", "t_leased", {"lease_holder": OTHER, "lease_expires": 123}, OTHER, None, row["hlc"])
++    ksc.pull(live, svc.hub(ME), BOARD, observers=False)
++    r = live.execute("SELECT lease_holder, lease_expires, created_on FROM tasks WHERE id = 't_leased'").fetchone()
++    assert (r["lease_holder"], r["lease_expires"], r["created_on"]) == (OTHER, 123, OTHER)
++
++
++# --- import -----------------------------------------------------------------------------------------------------
++
++def test_import_queues_every_row_once_and_is_safe_to_rerun(live, svc, kanban_home):
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)  # rows written before sync was switched on
++    a = kb.create_task(live, title="old a", assignee="worker")
++    b = kb.create_task(live, title="old b", assignee="worker", parents=[a])
++    kb.add_comment(live, a, "me", "history")
++    sync.install_triggers(live)
++    with kbc.write_txn(live):
++        for table in sync._UID_TABLES:
++            live.execute(f"UPDATE {table} SET uid = lower(hex(randomblob(8))) WHERE uid IS NULL")
++    counts = ksc.import_board(live)
++    assert counts["tasks"] == 2 and counts["task_links"] == 1 and counts["task_comments"] == 1
++    assert ksc.push(live, svc.hub(ME), BOARD, ME, primary=False).rejected == 0
++    ksc.import_board(live)
++    assert ksc.push(live, svc.hub(ME), BOARD, ME, primary=False).rejected == 0  # a re-import is accepted
++    rows = svc.board(BOARD)["rows"]
++    assert set(rows["tasks"]) == {a, b} and f"{a}>{b}" in rows["task_links"]
++
++
++def test_import_of_an_id_another_gateway_created_is_rejected_and_shows_in_the_diff(live, svc, kanban_home):
++    tid = kb.create_task(live, title="clash", assignee="worker")
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++    _other_creates(svc, tid)
++    ksc.import_board(live, tables=("tasks",))
++    assert ksc.push(live, svc.hub(ME), BOARD, ME, primary=False).rejected == 1
++    _round(kanban_home, svc)
++    shadow = _shadow()
++    try:
++        report = ksc.diff(live, shadow, ME)
++    finally:
++        shadow.close()
++    assert not report["clean"] and report["rejected_ops"] == 1
++
++
++# --- diff -------------------------------------------------------------------------------------------------------
++
++def test_diff_is_clean_after_sync_and_reports_an_injected_mismatch(live, svc, kanban_home):
++    tid = kb.create_task(live, title="same", assignee="worker")
++    kb.add_comment(live, tid, "me", "c")
++    _other_creates(svc, "t_foreign")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    shadow = _shadow()
++    try:
++        report = ksc.diff(live, shadow, ME)
++        assert report["clean"], report
++        assert report["checked"] == 1 and report["foreign_cards"] == 1
++        with kbc.write_txn(shadow):
++            shadow.execute("UPDATE kanban_sync_state SET applying = 1")
++            shadow.execute("UPDATE tasks SET title = 'drifted' WHERE id = ?", (tid,))
++            shadow.execute("UPDATE kanban_sync_state SET applying = 0")
++        report = ksc.diff(live, shadow, ME)
++    finally:
++        shadow.close()
++    assert not report["clean"] and report["field_mismatch"] == {tid: ["title"]}
++
++
++def test_diff_reports_unpushed_rows_as_pending_not_as_differences(live, svc, kanban_home):
++    _round(kanban_home, svc)
++    kb.create_task(live, title="not yet pushed", assignee="worker")
++    shadow = _shadow()
++    try:
++        report = ksc.diff(live, shadow, ME)
++    finally:
++        shadow.close()
++    assert report["clean"] and report["pending"] == 1
++
++
++# --- leases -----------------------------------------------------------------------------------------------------
++
++def test_hub_lease_client_acquire_renew_release(svc):
++    svc.board(BOARD)
++    client = ksc.HubLeaseClient(svc.hub(ME))
++    got = client.acquire(board_id=BOARD, task_uid="t_l", run_uid="run-me-0001", gateway_id=ME, ttl_s=60, lane="review")
++    assert got.granted and got.holder == ME and got.expires_ms
++    assert client.renew(board_id=BOARD, task_uid="t_l", run_uid="run-me-0001", gateway_id=ME, ttl_s=60).granted
++    other = ksc.HubLeaseClient(svc.hub(OTHER)).acquire(board_id=BOARD, task_uid="t_l", run_uid="run-ot-0001",
++                                                        gateway_id=OTHER, ttl_s=60)
++    assert not other.granted and other.holder == ME and other.reason == "lease_held"
++    client.release(board_id=BOARD, task_uid="t_l", run_uid="run-me-0001", gateway_id=ME)
++    assert "t_l" not in svc.board(BOARD)["leases"]
++    svc.offline = True
++    with pytest.raises(sync.LeaseUnavailable):
++        client.renew(board_id=BOARD, task_uid="t_l", run_uid="run-me-0001", gateway_id=ME, ttl_s=60)
++
++
++# --- config -----------------------------------------------------------------------------------------------------
++
++def test_only_listed_boards_capture(kanban_home):
++    (kanban_home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n    boards: [other]\n")
++    conn = kbc.connect(kanban_home / "kanban.db")
++    try:
++        kb.create_task(conn, title="not synced", assignee="worker")
++        assert sync.board_mode(conn) == "off"
++        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'kanban_sync_%'").fetchone()
++    finally:
++        conn.close()
++
++
++def test_identity_comes_from_the_hub_enrollment_files(tmp_path, monkeypatch):
++    monkeypatch.setattr(ksc.Path, "home", lambda: tmp_path)
++    mail = tmp_path / ".config" / "hermes-mail"
++    mail.mkdir(parents=True)
++    (mail / "config.json").write_text(json.dumps({"url": "https://hub.example", "gateway": "mini"}))
++    (mail / "gateway.key").write_text("secret\n")
++    ident = ksc.load_identity({})
++    assert (ident.url, ident.gateway, ident.key) == ("https://hub.example", "mini", "secret")
++    assert ksc.load_identity({"url": "https://other/", "gateway": "x"}).url == "https://other"
++    (mail / "gateway.key").unlink()
++    with pytest.raises(ksc.SyncUnavailable):
++        ksc.load_identity({})
++
++
++# --- entry paths: CLI and gateway watcher -------------------------------------------------------------------------
++
++def _cli(*argv: str) -> int:
++    import argparse
++    from hermes_cli import kanban as kc
++    parser = argparse.ArgumentParser()
++    kc.build_parser(parser.add_subparsers(dest="cmd"))
++    return kc.kanban_command(parser.parse_args(["kanban", *argv]))
++
++
++def test_cli_attach_import_run_diff_status(kanban_home, svc, monkeypatch, capsys):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    tid = kb.create_task(conn, title="cli card", assignee="worker")
++    conn.close()
++    hub = svc.hub(ME)
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: hub.ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident, **kw: hub)
++    assert _cli("sync", "attach", "--mode", "shadow") == 0
++    assert _cli("sync", "import") == 0
++    assert _cli("sync", "run") == 0
++    assert _cli("sync", "run") == 0  # second round pulls our own rows back into the shadow
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["created_on"] == ME
++    assert _cli("sync", "diff") == 0
++    capsys.readouterr()
++    assert _cli("sync", "status", "--json") == 0
++    out = json.loads(capsys.readouterr().out)
++    assert out["mode"] == "shadow" and out["board_id"] == BOARD and out["gateway"] == ME and out["pending"] == 0
++
++
++def test_cli_attach_refuses_when_sync_is_off(kanban_home, capsys):
++    support.write_sync_config(kanban_home, False)
++    assert _cli("sync", "attach") == 2
++    assert "enable it first" in capsys.readouterr().out
++
++
++def test_gateway_watcher_runs_the_loop_once_per_host_and_not_when_disabled(kanban_home, monkeypatch):
++    import asyncio
++    from gateway import kanban_watchers as watchers
++    calls = []
++
++    def fake_run_forever(keep_running, interval=None, sleep=None):
++        calls.append(keep_running())
++    monkeypatch.setattr(ksc, "run_forever", fake_run_forever)
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    support.write_sync_config(kanban_home, False)
++    asyncio.run(runner._kanban_sync_watcher())
++    assert calls == []
++    support.write_sync_config(kanban_home, True)
++    asyncio.run(runner._kanban_sync_watcher())
++    assert calls == [True]
++    from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
++    held, state = _acquire_singleton_lock(kb.kanban_home() / "kanban" / ".sync.lock")
++    try:
++        assert state == "held"
++        asyncio.run(runner._kanban_sync_watcher())  # another gateway on this host holds it
++        assert calls == [True]
++    finally:
++        _release_singleton_lock(held)
++
++
++def test_import_skips_events_older_than_the_service_retention(live):
++    tid = kb.create_task(live, title="evented", assignee="worker")
++    old = int(time.time()) - ksc.EVENT_IMPORT_WINDOW_S - 60
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_events (task_id, kind, payload, created_at, uid) VALUES (?, 'ancient', '{}', ?, 'ev-old')",
++                     (tid, old))
++        live.execute("DELETE FROM kanban_sync_outbox")
++    ksc.import_board(live, tables=("task_events",))
++    uids = {r[0] for r in live.execute("SELECT row_uid FROM kanban_sync_outbox WHERE table_name = 'task_events'")}
++    assert "ev-old" not in uids and uids  # the recent "created" event is still imported
++
++
++def test_a_worker_under_another_profile_keeps_the_hosts_sync_on(kanban_home, monkeypatch):
++    """The switch lives in the kanban root's config: a profile process (HERMES_HOME=<root>/profiles/x, its own
++    config without the setting) must not see sync as off and drop the board's capture triggers."""
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    conn.close()
++    profile = kanban_home / "profiles" / "worker"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("model: {}\n")
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    monkeypatch.setattr(kbc, "_INITIALIZED_PATHS", set())
++    assert sync.sync_enabled()
++    conn = kbc.connect(kanban_home / "kanban.db")
++    try:
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'kanban_sync_%'").fetchone()
++    finally:
++        conn.close()
++
++
++# --- primary: the live board holds this gateway's cards; the replica holds the whole board ------------------------
++
++def test_primary_keeps_other_gateways_cards_out_of_the_live_board_but_in_the_replica(live, svc, kanban_home):
++    mine = kb.create_task(live, title="mine", assignee="worker")
++    sync.set_mode(live, "primary")
++    _other_creates(svc, "t_theirs")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert kb.get_task(live, "t_theirs") is None  # the dispatcher never sees another gateway's card
++    replica = _shadow()
++    try:
++        assert {r[0] for r in replica.execute("SELECT id FROM tasks")} >= {mine, "t_theirs"}
++    finally:
++        replica.close()
++    # Another device edits OUR card on the service: the edit lands on the live board.
++    svc.hub(OTHER).ops(BOARD, [{"client_op_id": "other-edit-mine-1", "op": "upsert", "table": "tasks", "uid": mine,
++                                "hlc": f"{time.time_ns() // 1_000_000 + 1000:013d}-0000-{OTHER}",
++                                "fields": {"title": "renamed elsewhere"}}])
++    _round(kanban_home, svc)
++    assert kb.get_task(live, mine).title == "renamed elsewhere"
++    assert live.execute("SELECT created_on FROM tasks WHERE id = ?", (mine,)).fetchone()[0] == ME
++
++
++def test_own_partition_keeps_child_rows_of_own_cards_only(live):
++    tid = kb.create_task(live, title="own", assignee="worker")
++    ch = [
++        sync.RemoteChange(1, "tasks", "t_new_mine", "upsert", {"created_on": ME, "title": "n"}, 1, "", ME),
++        sync.RemoteChange(2, "task_comments", "c1", "upsert", {"task_id": "t_new_mine"}, 1, "", ME),
++        sync.RemoteChange(3, "task_comments", "c2", "upsert", {"task_id": "t_foreign"}, 1, "", OTHER),
++        sync.RemoteChange(4, "tasks", "t_foreign", "upsert", {"created_on": OTHER, "title": "f"}, 1, "", OTHER),
++        sync.RemoteChange(5, "task_links", f"{tid}>t_new_mine", "upsert", {}, 1, "", ME),
++        sync.RemoteChange(6, "task_links", f"{tid}>t_foreign", "upsert", {}, 1, "", OTHER),
++    ]
++    assert [c.seq for c in ksc.own_partition(live, ch, ME)] == [1, 2, 5]
+-- 
+2.55.0
+

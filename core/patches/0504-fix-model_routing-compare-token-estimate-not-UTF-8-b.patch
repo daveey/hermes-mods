@@ -1,0 +1,188 @@
+From d83286a1bd31fd39f201c6ac19e8a23e9deb4f6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 17:52:17 +0000
+Subject: [PATCH] fix(model_routing): compare token estimate, not UTF-8 bytes,
+ to route context caps; no ratchet; name failing capability
+
+---
+ agent/model_routing_request.py                | 54 +++++++++--
+ .../test_model_routing_request_context.py     | 90 +++++++++++++++++++
+ 2 files changed, 139 insertions(+), 5 deletions(-)
+ create mode 100644 tests/agent/test_model_routing_request_context.py
+
+diff --git a/agent/model_routing_request.py b/agent/model_routing_request.py
+index 5198a02e0a..514ae4e4f5 100644
+--- a/agent/model_routing_request.py
++++ b/agent/model_routing_request.py
+@@ -17,17 +17,54 @@ def _has_image(value):
+     return isinstance(value, list) and any(_has_image(item) for item in value)
+ 
+ 
++def _estimate_context_tokens(request, payload):
++    """Token estimate of the current request, in the same units compression uses."""
++    from agent.model_metadata import (
++        estimate_messages_tokens_rough, estimate_request_tokens_rough, estimate_tokens_rough)
++    total = estimate_request_tokens_rough(
++        [m for m in request.get("messages") or [] if isinstance(m, dict)],
++        tools=request.get("tools") or None)
++    for key in ("input", "system", "instructions"):
++        value = payload.get(key)
++        if isinstance(value, list) and all(isinstance(m, dict) for m in value):
++            total += estimate_messages_tokens_rough(value)
++        elif value:
++            total += estimate_tokens_rough(
++                value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str))
++    return total
++
++
++def _failing_requirements(route, requirements):
++    """Requirement names (and token counts, never content) that one route fails."""
++    failing = []
++    for key, value in requirements.items():
++        if not _capable(route, {key: value}):
++            if key == "min_context_tokens":
++                failing.append(f"min_context_tokens(required={value}, "
++                               f"attested={route['capabilities'].get('context_tokens', 0)})")
++            else:
++                failing.append(key)
++    return failing
++
++
+ def _requirements(agent, request, streaming):
+     requirements = dict(agent._model_routing_requirements)
++    # The construction-time minimum (e.g. compression's context floor) is remembered once;
++    # the per-request bound is recomputed from the CURRENT request so it shrinks again
++    # after compression instead of ratcheting forever.
++    floor = getattr(agent, "_model_routing_context_floor", None)
++    if floor is None:
++        floor = agent._model_routing_context_floor = requirements.get("min_context_tokens", 0)
+     payload = {key: request[key] for key in ("messages", "input", "system", "instructions", "tools")
+                if key in request}
+-    # Conservative byte bound before the selected provider's tokenizer is known.
+-    # Includes tool schemas, system prompt and the output reservation, not just user text.
+-    context = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
++    # Same rough token estimator as compression/preflight (UTF-8 bytes overstate tokens ~3-4x
++    # against token-denominated route caps). Includes tool schemas, system prompt and the
++    # output reservation, not just user text.
++    context = _estimate_context_tokens(request, payload)
+     reservation = next((request[key] for key in (
+         "max_tokens", "max_completion_tokens", "max_output_tokens") if request.get(key)), None)
+     context += reservation or getattr(agent, "max_tokens", None) or 4096
+-    requirements["min_context_tokens"] = max(requirements.get("min_context_tokens", 0), context)
++    requirements["min_context_tokens"] = max(floor, context)
+     requirements.update(tools=bool(request.get("tools")), vision=_has_image(payload),
+                         streaming=streaming, json=bool(request.get("response_format") or
+                         (request.get("text") or {}).get("format")))
+@@ -67,5 +104,12 @@ def validate_class_request(agent, request, *, streaming):
+                and (route["billing"] == "subscription" or policy.get("allow_metered", False))
+                and _capable(route, requirements)]
+     if not policy.get("enabled") or not allowed:
+-        raise ModelRoutingError("Selected class route is ineligible for this request; no bypass permitted")
++        detail = ""
++        same = [route for route in routes
++                if route["provider"] == agent.provider and route["model"] == agent.model]
++        failing = _failing_requirements(same[0], requirements) if same else []
++        if failing:
++            detail = "; failing capability: " + ", ".join(failing)
++        raise ModelRoutingError(
++            "Selected class route is ineligible for this request; no bypass permitted" + detail)
+     agent._model_routing_requirements = requirements
+diff --git a/tests/agent/test_model_routing_request_context.py b/tests/agent/test_model_routing_request_context.py
+new file mode 100644
+index 0000000000..5735c0921a
+--- /dev/null
++++ b/tests/agent/test_model_routing_request_context.py
+@@ -0,0 +1,90 @@
++"""validate_class_request compares TOKEN estimates (not bytes) to token caps, per request."""
++from types import SimpleNamespace
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_request import validate_class_request
++
++
++def _route(**caps):
++    return {"provider": "anthropic", "model": "claude-haiku-5-5", "billing": "subscription",
++            "eligible": True, "funding_verified": True, "weight": 1,
++            "capabilities": {"tools": True, "streaming": True, "context_tokens": 200000, **caps}}
++
++
++@pytest.fixture
++def setup(monkeypatch):
++    policy = {"enabled": True, "policy_version": 1, "allow_metered": False,
++              "routes": {"fast": [_route()]}}
++    monkeypatch.setattr("agent.model_routing_managed.verify_managed_agent", lambda *a, **k: None)
++    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective",
++                        lambda *a, **k: {"model_routing": policy})
++    monkeypatch.setattr("agent.model_routing_request.validate_policy", lambda p: None)
++    agent = SimpleNamespace(
++        model="claude-haiku-5-5", provider="anthropic", max_tokens=None,
++        model_routing={"selected_model": "claude-haiku-5-5", "selected_provider": "anthropic",
++                       "requested_class": "fast", "billing_group": "subscription"},
++        _model_routing_requirements={"tools": True, "streaming": True, "min_context_tokens": 64000})
++
++    def request(chars, **extra):
++        return {"model": "claude-haiku-5-5", "messages": [
++            {"role": "user", "content": "x" * chars}], "max_tokens": 4096, **extra}
++    return agent, request
++
++
++def test_bytes_over_cap_but_tokens_under_cap_passes(setup):
++    agent, request = setup
++    req = request(600_000)  # ~150k tokens, 600KB > 200000
++    validate_class_request(agent, req, streaming=True)
++    assert 100_000 < agent._model_routing_requirements["min_context_tokens"] < 200_000
++
++
++def test_genuinely_over_context_fails_and_names_capability(setup):
++    agent, request = setup
++    with pytest.raises(ModelRoutingError, match=r"failing capability: min_context_tokens\(required=\d+, attested=200000\)") as exc:
++        validate_class_request(agent, request(900_000), streaming=True)
++    assert "xxxx" not in str(exc.value)
++
++
++def test_requirement_shrinks_after_compression_and_floor_kept(setup):
++    agent, request = setup
++    validate_class_request(agent, request(600_000), streaming=True)
++    with pytest.raises(ModelRoutingError):
++        validate_class_request(agent, request(900_000), streaming=True)
++    validate_class_request(agent, request(4_000), streaming=True)
++    assert agent._model_routing_requirements["min_context_tokens"] == 64000
++    agent.model_routing["_"] = 1
++    agent._model_routing_context_floor = 250_000  # construction floor above cap still fails closed
++    with pytest.raises(ModelRoutingError, match="min_context_tokens"):
++        validate_class_request(agent, request(10), streaming=True)
++
++
++@pytest.mark.parametrize("extra,key", [
++    ({"tools": None}, "tools"),
++    ({"response_format": {"type": "json_object"}}, "json"),
++    ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u"}}]}]}, "vision"),
++])
++def test_capability_mismatch_still_fails_closed_and_is_named(setup, extra, key):
++    agent, request = setup
++    req = request(10)
++    req.update(extra)
++    if key == "tools":
++        agent._model_routing_requirements.pop("tools")
++        req["tools"] = []
++        agent.model_routing["x"] = 1
++        # tools absent on request -> not required; make the route lack the capability instead
++        req["tools"] = [{"type": "function", "function": {"name": "t", "parameters": {}}}]
++        import hermes_cli.config_effective as ce
++        orig = ce.load_user_config_effective
++        ce.load_user_config_effective = lambda *a, **k: {"model_routing": {
++            "enabled": True, "policy_version": 1, "allow_metered": False,
++            "routes": {"fast": [_route(tools=False)]}}}
++        try:
++            with pytest.raises(ModelRoutingError, match="failing capability: .*tools"):
++                validate_class_request(agent, req, streaming=True)
++        finally:
++            ce.load_user_config_effective = orig
++        return
++    with pytest.raises(ModelRoutingError, match=f"failing capability: .*{key}"):
++        validate_class_request(agent, req, streaming=True)
+-- 
+2.55.0
+
