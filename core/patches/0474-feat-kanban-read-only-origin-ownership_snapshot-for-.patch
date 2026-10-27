@@ -1,0 +1,857 @@
+From 899dfb171b6c0493f1448cb19ec49adbc158d746 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:12:58 +0000
+Subject: [PATCH 474/474] feat(kanban): read-only origin ownership_snapshot for
+ the abandonment guard [daveey]
+
+Nonconsuming, query_only snapshot (owner gateway/profile/board/task + origin
+request uid/digest): qualified binding generation, owner running-claim/PID or
+wake proof, scoped return-consumer health with epoch/incarnation that advances
+on Stop/replacement/disconnect/scope loss. Unknown without proof. Remote owners
+answer via 'hermes kanban ownership-snapshot' over the existing hub courier.
+---
+ hermes_cli/kanban.py                          |   2 +-
+ hermes_cli/kanban_origin_owner.py             |  28 ++
+ hermes_cli/kanban_origin_snapshot.py          | 278 +++++++++++++++++
+ hermes_cli/kanban_parser.py                   |   4 +
+ .../hermes_cli/test_kanban_origin_snapshot.py | 280 ++++++++++++++++++
+ .../test_kanban_consumer_health.py            |  58 ++++
+ tui_gateway/kanban_consumer_health.py         |  60 +++-
+ tui_gateway/session_lifecycle.py              |   2 +
+ tui_gateway/session_notifications.py          |   2 +
+ 9 files changed, 709 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_snapshot.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_snapshot.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index f04b0d98e7..055bda572c 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -162,7 +162,7 @@ def kanban_command(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_origin_adapter import command
+         return command(args)
+ 
+-    if action in {"origin-create", "origin-adopt"}:
++    if action in {"origin-create", "origin-adopt", "ownership-snapshot"}:
+         from hermes_cli.kanban_origin_owner import command
+         return command(args)
+ 
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index 6ee34cfce6..9fb0becf09 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -95,7 +95,35 @@ def _dispatch_result(raw_result):
+     return result
+ 
+ 
++def snapshot_command(args) -> int:
++    """Owner-side read for the origin guard: answer only for this exact gateway/profile route."""
++    try:
++        from hermes_cli.profiles import get_active_profile_name
++        from hermes_cli.kanban_origin_snapshot import owner_evidence
++        raw = sys.stdin.read() if args.request_file == '-' else Path(args.request_file).read_text(encoding="utf-8-sig")
++        request = json.loads(raw)
++        replica = Path(os.environ.get('HERMES_HUB_STATE') or Path.home() / '.local/state/hermes-hub') / 'hub.db'
++        gateway = _gateway(replica)
++        body = request.get('args')
++        owner = body.get('owner')
++        if (request.get('action') != 'ownership-snapshot' or not isinstance(owner, dict)
++                or set(body) != {'owner', 'binding_id'} or owner.get('gateway') != gateway
++                or owner.get('profile') != get_active_profile_name() or request.get('to_gw') != gateway):
++            raise ValueError('origin_route_mismatch')
++        result = owner_evidence(owner, body['binding_id'])
++    except (OSError, sqlite3.Error):
++        result = {'schema': 1, 'state': 'unknown', 'reasons': ['origin_storage_unavailable']}
++    except (KeyError, TypeError, AttributeError, ValueError) as exc:
++        code = str(exc)
++        result = {'schema': 1, 'state': 'unknown',
++                  'reasons': [code if re.fullmatch(r'origin_[a-z_]+', code) else 'origin_request_invalid']}
++    print(json.dumps(result))
++    return 0
++
++
+ def command(args) -> int:
++    if args.kanban_action == 'ownership-snapshot':
++        return snapshot_command(args)
+     try:
+         raw = sys.stdin.read() if args.request_file == '-' else Path(args.request_file).read_text(encoding="utf-8-sig")
+         request = json.loads(raw)
+diff --git a/hermes_cli/kanban_origin_snapshot.py b/hermes_cli/kanban_origin_snapshot.py
+new file mode 100644
+index 0000000000..e67e358581
+--- /dev/null
++++ b/hermes_cli/kanban_origin_snapshot.py
+@@ -0,0 +1,278 @@
++"""Read-only ownership snapshot for the abandonment guard.
++
++``ownership_snapshot`` answers one question without side effects: does the exact
++owner task still have a live continuation AND a result consumer able to return to
++the exact origin request? ``live`` needs every positive proof; anything absent,
++stale, ambiguous or changed between two reads is ``unknown``. Never ``abandoned``:
++absence of evidence is not evidence of abandonment.
++
++Every store is opened ``query_only``. Nothing here refreshes observations, adopts,
++claims, migrates, sends a courier request or starts a poller. Remote owners are
++read through the existing hub courier: the owner runs ``owner_evidence`` itself
++(``hermes kanban ownership-snapshot``) and the origin validates the reply with
++``ownership_snapshot(owner_evidence=...)``; a model- or courier-supplied field is
++never trusted without the scope, binding and expiry checks below.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import sqlite3
++import time
++from contextlib import closing
++from pathlib import Path
++
++SCHEMA = 1
++OWNER_EVIDENCE_TTL = 30.0  # seconds an owner reading may be used by the origin
++_OWNER_KEYS = ("gateway", "profile", "board", "task_id")
++
++
++def _json(value) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++
++
++def digest(text: str) -> str:
++    return hashlib.sha256(text.encode("utf-8")).hexdigest()
++
++
++def _open(path: Path) -> sqlite3.Connection:
++    """Open an existing store strictly ``mode=ro``; never create, migrate, or fall back to rw.
++
++    The shared ``_ro`` fallback reopens ``mode=rw``, and closing the last rw connection on
++    a WAL store can checkpoint and delete the WAL: a write. An unreadable store is
++    ``unknown`` here (the sqlite error is caught by the caller), not a reason to write.
++    """
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++    conn.execute("PRAGMA query_only = ON")
++    conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
++    conn.row_factory = sqlite3.Row
++    return conn
++
++
++def _unknown(reason: str, **extra) -> dict:
++    return {"schema": SCHEMA, "state": "unknown", "reasons": [reason], **extra}
++
++
++def _fresh_number(value, now: float, ttl: float) -> bool:
++    return type(value) in (int, float) and math.isfinite(value) and 0 <= now - value <= ttl
++
++
++def _running(conn, task, profile: str, now: float) -> dict:
++    from hermes_cli.kanban_db_dispatch import _worker_alive
++    from hermes_cli.kanban_host_identity import is_local_claim
++
++    run = conn.execute("SELECT * FROM task_runs WHERE id=? AND task_id=?",
++                       (task["current_run_id"], task["id"])).fetchone()
++    started = run["worker_started_at"] if run else None
++    if (not run or run["profile"] != profile or run["status"] != "running"
++            or run["ended_at"] is not None or run["outcome"] is not None
++            or not run["claim_expires"] or run["claim_expires"] <= now
++            or not is_local_claim(run["claim_lock"]) or not run["worker_pid"] or started is None
++            or not _worker_alive(run["worker_pid"], started)):
++        raise ValueError("owner_live_continuation_unverified")
++    return {"kind": "running", "run_id": run["id"], "claim_expires": run["claim_expires"],
++            "pid": run["worker_pid"], "worker_started_at": str(started)}
++
++
++def _scheduled(conn, task, board_path: Path, profile: str, now: float) -> dict:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_continuation import pending_wake
++
++    wake = pending_wake(conn, task["id"]) or {}
++    when = wake.get("wake_at")
++    if (type(when) not in (int, float) or not math.isfinite(when) or when <= now  # type: ignore[arg-type]
++            or wake.get("resume_status") == "review"):
++        raise ValueError("owner_scheduled_wake_unverified")
++    from gateway.kanban_dispatcher_health import available
++    if not available(kb.kanban_home() / "kanban", board_path, profile, "ready"):
++        raise ValueError("owner_dispatcher_unverified")
++    if conn.execute("SELECT 1 FROM task_links WHERE child_id=? LIMIT 1", (task["id"],)).fetchone():
++        # A wake does not own a blocked DAG; dependency proof is not part of this contract.
++        raise ValueError("owner_dependency_unverified")
++    return {"kind": "scheduled", "wake_at": when, "dispatcher": True}
++
++
++def owner_evidence(owner: dict, binding_id: str, *, now: float | None = None) -> dict:
++    """Owner-native reading, produced ON the owner host. Never raises; never writes."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_constants import get_hermes_home
++
++    now = time.time() if now is None else now
++    try:
++        profile, board = owner["profile"], owner["board"]
++        home = get_hermes_home().resolve()
++        path = home / "kanban.db" if board == "default" else home / "kanban/boards" / board / "kanban.db"
++        if (profile != get_active_profile_name() or kb.kanban_home().resolve() != home
++                or kb.kanban_db_path(board).resolve() != path or not path.is_file()):
++            return _unknown("owner_scope_unavailable")
++        with closing(_open(path)) as conn:
++            conn.execute("BEGIN")
++            task = conn.execute("SELECT * FROM tasks WHERE id=?", (owner["task_id"],)).fetchone()
++            if task is None or task["assignee"] != profile or task["completed_at"] is not None:
++                return _unknown("owner_task_scope_or_state_mismatch")
++            markers = [json.loads(r[0]) for r in conn.execute(
++                "SELECT binding_json FROM origin_creation_intents WHERE task_id=?", (task["id"],))]
++            marker = next((m for m in markers if m.get("binding_id") == binding_id
++                           and m.get("owner") == {**owner}), None)
++            if marker is None:
++                return _unknown("owner_binding_missing")
++            try:
++                if task["status"] == "running":
++                    continuation = _running(conn, task, profile, now)
++                elif task["status"] == "scheduled":
++                    continuation = _scheduled(conn, task, path, profile, now)
++                else:
++                    raise ValueError("owner_wait_state_unverified")
++            except (ValueError, ImportError) as exc:
++                return _unknown(str(exc) if isinstance(exc, ValueError) else "owner_dispatcher_unverified",
++                                owner=owner, observed_at=now)
++            return {"schema": SCHEMA, "state": "live", "reasons": [], "owner": owner,
++                    "binding": {"binding_id": binding_id, "version": marker["version"],
++                                "hash": digest(_json(marker))},
++                    "body_digest": digest(task["body"] or ""), "status": task["status"],
++                    "continuation": continuation, "observed_at": now}
++    except (OSError, sqlite3.Error, KeyError, TypeError, ValueError, json.JSONDecodeError):
++        return _unknown("owner_readback_unavailable")
++
++
++def _validate_owner(evidence, owner: dict, binding_id: str, now: float) -> str | None:
++    """Reason string when a (possibly remote) owner reading is unusable, else None."""
++    if not isinstance(evidence, dict) or evidence.get("schema") != SCHEMA:
++        return "owner_evidence_invalid"
++    if evidence.get("state") != "live":
++        reason = (evidence.get("reasons") or [None])[0]
++        return reason if isinstance(reason, str) and reason.startswith(("origin_", "owner_")) and len(reason) < 80 \
++            else "owner_evidence_unknown"
++    binding, cont = evidence.get("binding"), evidence.get("continuation")
++    if (evidence.get("owner") != owner or not isinstance(binding, dict)
++            or binding.get("binding_id") != binding_id or not isinstance(cont, dict)):
++        return "owner_evidence_scope_mismatch"
++    if not _fresh_number(evidence.get("observed_at"), now, OWNER_EVIDENCE_TTL):
++        return "owner_evidence_stale"
++    if cont.get("kind") == "running":
++        if not (type(cont.get("claim_expires")) in (int, float) and cont["claim_expires"] > now
++                and type(cont.get("pid")) is int and cont.get("worker_started_at")):
++            return "owner_live_continuation_unverified"
++    elif cont.get("kind") == "scheduled":
++        if not (type(cont.get("wake_at")) in (int, float) and cont["wake_at"] > now
++                and cont.get("dispatcher") is True):
++            return "owner_scheduled_wake_unverified"
++    else:
++        return "owner_live_continuation_unverified"
++    return None
++
++
++def _binding_generation(ledger: Path, owner: dict, binding_id: str) -> dict:
++    from hermes_cli.kanban_origin_ledger import _binding_key
++    with closing(_open(ledger)) as conn:
++        conn.execute("BEGIN")
++        row = conn.execute(
++            "SELECT binding_hash,binding_json,resolved_session,observation_version,released "
++            "FROM origin_obligations WHERE binding_id=?",
++            (_binding_key({"owner": owner, "binding_id": binding_id}),)).fetchone()
++    if row is None:
++        raise ValueError("origin_obligation_missing")
++    binding = json.loads(row["binding_json"])
++    return {"binding_id": binding_id, "version": binding["version"], "hash": row["binding_hash"],
++            "publication_version": binding["publication_version"],
++            "observation_version": row["observation_version"], "released": bool(row["released"]),
++            "origin": binding["origin"], "resolved_session": row["resolved_session"]}
++
++
++def _newest_request(state_db: Path, session: str) -> dict:
++    with closing(_open(state_db)) as conn:
++        conn.execute("BEGIN")
++        row = conn.execute("SELECT id,content FROM messages WHERE session_id=? AND role='user' "
++                           "ORDER BY id DESC LIMIT 1", (session,)).fetchone()
++    if row is None or not isinstance(row["content"], str):
++        raise ValueError("origin_request_unavailable")
++    return {"uid": str(row["id"]), "digest": digest(row["content"])}
++
++
++def _consumer(home: Path, session: str, board: Path | None) -> dict:
++    if board is None:
++        return {"available": False, "epoch": None, "incarnation": None, "age": None}
++    from tui_gateway.kanban_consumer_health import snapshot
++    return snapshot(home, session, board)
++
++
++def _compose(*, ledger, state_db, owner, binding_id, request, home, board, evidence, now) -> dict:
++    gen = _binding_generation(ledger, owner, binding_id)
++    session = gen["resolved_session"]
++    reasons = []
++    if gen["released"]:
++        reasons.append("origin_obligation_released")
++    if not isinstance(evidence, dict) or evidence.get("binding", {}).get("hash") is None:
++        reasons.append("owner_evidence_invalid")
++    else:
++        bound = evidence["binding"]
++        # The owner's marker has no publication_version; compare generation, not the ledger hash.
++        if bound.get("version") != gen["version"]:
++            reasons.append("binding_generation_mismatch")
++        if evidence.get("body_digest") != request.get("digest"):
++            reasons.append("owner_request_digest_mismatch")
++    current = _newest_request(state_db, session)
++    if current != {"uid": request.get("uid"), "digest": request.get("digest")}:
++        reasons.append("origin_request_superseded")
++    consumer = _consumer(home, session, board)
++    if not consumer["available"]:
++        reasons.append("result_consumer_unverified")
++    return {"gen": gen, "request": current, "consumer": consumer, "reasons": reasons}
++
++
++def ownership_snapshot(*, ledger: Path, state_db: Path, gateway: str, owner: dict, binding_id: str,
++                       request: dict, home: Path, consumer_board: Path | None = None,
++                       owner_evidence_in: dict | None = None, expected_consumer_epoch: int | None = None,
++                       now: float | None = None) -> dict:
++    """Compose binding generation, owner continuation and return-consumer health.
++
++    ``owner`` is the qualified gateway/profile/board/task_id; ``request`` is the origin
++    request ``{uid, digest}`` the guard believes is current (``digest`` is the sha256 of
++    the exact request text, which must equal the owner task body). ``gateway`` is the
++    trusted local gateway: only an owner on it is read locally; any other owner needs
++    ``owner_evidence_in`` produced by that owner and carried by the hub courier.
++    ``expected_consumer_epoch`` lets a caller detect invalidation between its own reads.
++    """
++    now = time.time() if now is None else now
++    try:
++        if not isinstance(owner, dict) or set(owner) != set(_OWNER_KEYS) or not isinstance(request, dict):
++            return _unknown("snapshot_request_invalid")
++        # A local owner is always read locally: supplied evidence for it would be forgeable.
++        evidence = None if owner["gateway"] == gateway else owner_evidence_in
++        if owner["gateway"] == gateway:
++            evidence = owner_evidence(owner, binding_id, now=now)
++        if evidence is None:
++            return _unknown("owner_evidence_absent", owner=owner)
++        reason = _validate_owner(evidence, owner, binding_id, now)
++        if reason:
++            return _unknown(reason, owner=owner)
++        first = _compose(ledger=ledger, state_db=state_db, owner=owner, binding_id=binding_id,
++                         request=request, home=home, board=consumer_board, evidence=evidence, now=now)
++        # Recheck after composition: a Stop, replacement, refusal or new request in
++        # between must not be reported as the earlier healthy state.
++        second_now = time.time() if now is None else now
++        if owner["gateway"] == gateway:  # re-read the local owner: claim/PID/body may have changed
++            evidence = owner_evidence(owner, binding_id, now=second_now)
++            reason = _validate_owner(evidence, owner, binding_id, second_now)
++            if reason:
++                return _unknown("changed_during_read", owner=owner)
++        second = _compose(ledger=ledger, state_db=state_db, owner=owner, binding_id=binding_id,
++                          request=request, home=home, board=consumer_board, evidence=evidence, now=second_now)
++        reasons = list(first["reasons"])
++        if (first["gen"] != second["gen"] or first["request"] != second["request"]
++                or first["consumer"]["epoch"] != second["consumer"]["epoch"]
++                or first["consumer"]["incarnation"] != second["consumer"]["incarnation"]):
++            reasons.append("changed_during_read")
++        if (expected_consumer_epoch is not None
++                and second["consumer"]["epoch"] != expected_consumer_epoch):
++            reasons.append("consumer_epoch_changed")
++        return {"schema": SCHEMA, "state": "unknown" if reasons else "live", "reasons": reasons,
++                "owner": owner, "binding": second["gen"], "request": second["request"],
++                "continuation": evidence["continuation"], "owner_observed_at": evidence["observed_at"],
++                "consumer": second["consumer"], "observed_at": now}
++    except (OSError, sqlite3.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
++        code = str(exc) if isinstance(exc, ValueError) and str(exc).startswith(("origin_", "owner_")) \
++            else "snapshot_unavailable"
++        return _unknown(code)
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 09f4963bf0..acf9494123 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -179,6 +179,10 @@ _SPECS = [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+         _arg("--json", action="store_true", help="Return pending adoption (always JSON)"),
+     ], help="Attach existing owner work through registered tools, pending origin receipt"),
++    _cmd("ownership-snapshot", [
++        _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
++        _arg("--json", action="store_true", help="Return the owner reading (always JSON)"),
++    ], help="Read-only owner continuation evidence for an origin binding (never writes)"),
+     _cmd("origin-bind", [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+         _arg("--json", action="store_true", help="Return structured receipt (always JSON)"),
+diff --git a/tests/hermes_cli/test_kanban_origin_snapshot.py b/tests/hermes_cli/test_kanban_origin_snapshot.py
+new file mode 100644
+index 0000000000..cce32445a3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_snapshot.py
+@@ -0,0 +1,280 @@
++"""The abandonment guard's ownership snapshot is read-only and unknown without proof."""
++import hashlib
++import json
++import os
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_snapshot as snap
++from hermes_cli.kanban_db_dispatch import _set_worker_pid
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414 -- fixture
++from tests.hermes_cli.test_kanban_origin_evidence import create_bound
++from tests.hermes_cli.test_kanban_origin_ledger import world as world, publish, accept  # noqa: PLC0414
++from tui_gateway import kanban_consumer_health as health
++
++BODY = 'Build the thing exactly'
++
++
++def sha(text):
++    return hashlib.sha256(text.encode()).hexdigest()
++
++
++@pytest.fixture
++def env(world, board, monkeypatch, tmp_path):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    ledger, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding, body=BODY)
++    publish(replica, binding)
++    accept(world)
++    state = tmp_path / 'state.db'
++    with sqlite3.connect(state) as db:
++        db.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY)')
++        db.execute('CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT)')
++        db.execute("INSERT INTO sessions VALUES ('s_current')")
++        db.execute("INSERT INTO messages (session_id,role,content) VALUES ('s_current','user',?)", (BODY,))
++    return {'ledger': ledger, 'state': state, 'tid': tid, 'binding': binding, 'home': tmp_path,
++            'owner': binding['owner'], 'board': tmp_path / 'kanban.db'}
++
++
++def start_worker(tid):
++    with kbc.connect_closing() as conn:
++        assert kb.claim_task(conn, tid)
++        _set_worker_pid(conn, tid, os.getpid())
++
++
++@pytest.fixture
++def consumer(env):
++    stop = threading.Event()
++    ready, polled = threading.Event(), threading.Event()
++    session = {'session_key': 's_current', 'profile_home': str(env['home'])}
++
++    def run():
++        polled.wait(5)
++        health.polled(env['home'], 's_current', env['board'])
++        ready.set()
++        stop.wait(5)
++    thread = threading.Thread(target=run, daemon=True)
++    health.register(session, stop, thread)
++    thread.start()
++    polled.set()
++    assert ready.wait(3)
++    yield {'session': session, 'stop': stop, 'thread': thread}
++    stop.set()
++    thread.join(3)
++
++
++def take(env, **kw):
++    args = dict(ledger=env['ledger'], state_db=env['state'], gateway='owner', owner=env['owner'],
++                binding_id=env['binding']['binding_id'],
++                request={'uid': '1', 'digest': sha(BODY)}, home=env['home'], consumer_board=env['board'])
++    args.update(kw)
++    return snap.ownership_snapshot(**args)
++
++
++def test_live_needs_running_claim_binding_request_and_consumer(env, consumer):
++    start_worker(env['tid'])
++    result = take(env)
++    assert result['state'] == 'live' and result['reasons'] == []
++    assert result['continuation']['kind'] == 'running' and result['continuation']['pid'] == os.getpid()
++    assert result['binding']['version'] == env['binding']['version']
++    assert result['binding']['publication_version'] == 3
++    assert result['consumer']['available'] and result['consumer']['incarnation']
++    assert result['request'] == {'uid': '1', 'digest': sha(BODY)}
++
++
++def test_snapshot_never_writes_or_adopts(env, consumer):
++    start_worker(env['tid'])
++    paths = [env['ledger'], env['board'], env['state']]
++    before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
++    assert take(env)['state'] == 'live'
++    assert take(env, request={'uid': '9', 'digest': 'x'})['state'] == 'unknown'
++    assert [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths] == before
++    with sqlite3.connect(env['ledger']) as db:
++        assert db.execute('SELECT observation_version FROM origin_obligations').fetchone() == (3,)
++
++
++def test_query_only_connection_cannot_write(env):
++    from contextlib import closing
++    with closing(snap._open(env['ledger'])) as conn, pytest.raises(sqlite3.OperationalError):
++        conn.execute('DELETE FROM origin_receipts')
++
++
++def test_unclaimed_task_has_no_continuation(env, consumer):
++    result = take(env)
++    assert result['state'] == 'unknown' and result['reasons'] == ['owner_wait_state_unverified']
++
++
++def test_dead_or_recycled_worker_is_unknown(env, consumer):
++    start_worker(env['tid'])
++    with kbc.connect_closing() as conn:
++        conn.execute('UPDATE task_runs SET worker_pid=2147483000')
++    assert take(env)['reasons'] == ['owner_live_continuation_unverified']
++    with kbc.connect_closing() as conn:
++        conn.execute('UPDATE task_runs SET worker_pid=?, claim_expires=1', (os.getpid(),))
++    assert take(env)['reasons'] == ['owner_live_continuation_unverified']
++
++
++@pytest.mark.parametrize('field,value', [('profile', 'work'), ('board', 'other'), ('task_id', 't_missing')])
++def test_wrong_owner_scope_is_unknown(env, consumer, field, value):
++    start_worker(env['tid'])
++    assert take(env, owner={**env['owner'], field: value})['state'] == 'unknown'
++
++
++def test_wrong_binding_id_is_unknown(env, consumer):
++    start_worker(env['tid'])
++    assert take(env, binding_id='binding-other')['state'] == 'unknown'
++
++
++def test_changed_task_body_or_new_origin_request_is_unknown(env, consumer):
++    start_worker(env['tid'])
++    with sqlite3.connect(env['state']) as db:
++        db.execute("INSERT INTO messages (session_id,role,content) VALUES ('s_current','user','Another ask')")
++    assert 'origin_request_superseded' in take(env)['reasons']
++    assert 'owner_request_digest_mismatch' in take(env, request={'uid': '2', 'digest': sha('Another ask')})['reasons']
++
++
++def test_consumer_absent_stop_replacement_and_refusal_invalidate(env, consumer):
++    start_worker(env['tid'])
++    first = take(env)
++    assert first['state'] == 'live'
++    epoch = first['consumer']['epoch']
++    assert take(env, consumer_board=None)['reasons'] == ['result_consumer_unverified']
++    consumer['session']['_kanban_refused_until'] = health.time.monotonic() + 60
++    health.invalidate(consumer['session'])  # what the refusal path does
++    refused = take(env)
++    assert refused['reasons'] == ['result_consumer_unverified']
++    consumer['session']['_kanban_refused_until'] = 0
++    # Recovery after refusal needs a fresh poll; the discarded receipt does not come back.
++    assert take(env)['reasons'] == ['result_consumer_unverified']
++    assert take(env)['consumer']['epoch'] > epoch
++    consumer['stop'].set()  # Stop / disconnect
++    assert take(env)['reasons'] == ['result_consumer_unverified']
++
++
++def test_replacement_consumer_changes_epoch_and_incarnation(env, consumer):
++    start_worker(env['tid'])
++    before = take(env)['consumer']
++    stop, ready = threading.Event(), threading.Event()
++    session = {'session_key': 's_current', 'profile_home': str(env['home'])}
++
++    def run():
++        health.polled(env['home'], 's_current', env['board'])
++        ready.set()
++        stop.wait(5)
++    thread = threading.Thread(target=run, daemon=True)
++    health.register(session, stop, thread)
++    thread.start()
++    assert ready.wait(3)
++    try:
++        after = take(env, expected_consumer_epoch=before['epoch'])
++        assert after['consumer']['epoch'] > before['epoch']
++        assert 'consumer_epoch_changed' in after['reasons'] and after['state'] == 'unknown'
++    finally:
++        stop.set()
++        thread.join(3)
++
++
++def test_remote_owner_requires_exact_fresh_evidence(env, consumer):
++    start_worker(env['tid'])
++    now = time.time()
++    local = snap.owner_evidence(env['owner'], env['binding']['binding_id'], now=now)
++    assert local['state'] == 'live'
++    remote_owner = {**env['owner'], 'gateway': 'elsewhere'}
++
++    def remote(**kw):
++        return take(env, gateway='origin', owner=remote_owner, owner_evidence_in=kw.pop('evidence', None), now=now, **kw)
++    assert remote()['reasons'] == ['owner_evidence_absent']
++    good = {**local, 'owner': remote_owner}
++    # Remote readings bind to the ledger obligation's owner, so a mismatching one stays unknown.
++    assert remote(evidence=good)['state'] == 'unknown'
++    stale = {**local, 'observed_at': now - 120}
++    assert take(env, owner_evidence_in=stale, now=now)['state'] == 'live'  # local owner ignores supplied evidence
++    assert snap._validate_owner(stale, env['owner'], env['binding']['binding_id'], now) == 'owner_evidence_stale'
++    forged = {**local, 'continuation': {'kind': 'running', 'claim_expires': 1, 'pid': 1, 'worker_started_at': 'x'}}
++    assert snap._validate_owner(forged, env['owner'], env['binding']['binding_id'], now) == 'owner_live_continuation_unverified'
++    assert snap._validate_owner({**local, 'owner': remote_owner}, env['owner'], env['binding']['binding_id'], now) == 'owner_evidence_scope_mismatch'
++    assert snap._validate_owner(local, env['owner'], env['binding']['binding_id'], now) is None
++
++
++def test_remote_owner_composes_with_ledger_when_evidence_matches(env, consumer):
++    """Origin side of a remote owner: the ledger obligation names owner gateway 'owner'."""
++    start_worker(env['tid'])
++    now = time.time()
++    local = snap.owner_evidence(env['owner'], env['binding']['binding_id'], now=now)
++    # This host plays the origin ('origin' gateway); the owner reading arrives via the courier.
++    result = take(env, gateway='origin', owner_evidence_in=local, now=now)
++    assert result['state'] == 'live', result
++    assert take(env, gateway='origin', owner_evidence_in={**local, 'body_digest': sha('other')}, now=now)['reasons'] \
++        == ['owner_request_digest_mismatch']
++
++
++def test_missing_stores_are_unknown(env, consumer, tmp_path):
++    start_worker(env['tid'])
++    assert take(env, ledger=tmp_path / 'absent.db')['state'] == 'unknown'
++    assert not (tmp_path / 'absent.db').exists()
++    assert take(env, state_db=tmp_path / 'absent-state.db')['state'] == 'unknown'
++    assert not (tmp_path / 'absent-state.db').exists()
++
++
++def test_scheduled_without_dispatcher_receipt_is_unknown(env, consumer):
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (env['tid'],))
++        conn.execute("INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)",
++                     (env['tid'], 'continued', json.dumps({'wake_at': time.time() + 600}), int(time.time())))
++    assert take(env)['reasons'] == ['owner_dispatcher_unverified']
++
++
++def test_owner_cli_answers_only_for_its_exact_route_and_writes_nothing(env, monkeypatch, capsys):
++    import argparse
++    import io
++    from hermes_cli import kanban
++    from hermes_cli.kanban_parser import build_parser
++    cfg = env['home'] / 'mail.json'
++    cfg.write_text(json.dumps({'gateway': 'owner'}))
++    monkeypatch.setenv('HERMES_MAIL_CONFIG', str(cfg))
++    monkeypatch.setenv('HERMES_HUB_STATE', str(env['home'] / 'hub'))
++    start_worker(env['tid'])
++
++    def ask(owner, to_gw='owner'):
++        request = {'id': 'req-snapshot-1', 'from': 'gw:origin', 'to_gw': to_gw, 'action': 'ownership-snapshot',
++                   'args': {'owner': owner, 'binding_id': env['binding']['binding_id']}}
++        parser = build_parser(argparse.ArgumentParser().add_subparsers())
++        args = parser.parse_args(['ownership-snapshot', '--request-file', '-', '--json'])
++        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(request)))
++        assert kanban.kanban_command(args) == 0
++        return json.loads(capsys.readouterr().out)
++
++    before = env['board'].read_bytes()
++    good = ask(env['owner'])
++    assert good['state'] == 'live' and good['continuation']['kind'] == 'running'
++    assert ask({**env['owner'], 'gateway': 'elsewhere'})['reasons'] == ['origin_route_mismatch']
++    assert ask(env['owner'], to_gw='other')['reasons'] == ['origin_route_mismatch']
++    assert env['board'].read_bytes() == before
++
++
++def test_open_is_strictly_read_only_on_a_wal_store(tmp_path):
++    path = tmp_path / "wal.db"
++    with sqlite3.connect(path) as db:
++        db.execute("PRAGMA journal_mode=WAL")
++        db.execute("CREATE TABLE t (x)")
++        db.execute("INSERT INTO t VALUES (1)")
++    holder = sqlite3.connect(path)  # a live writer keeps the WAL in place
++    holder.execute("INSERT INTO t VALUES (2)")
++    holder.commit()
++    before = (path.read_bytes(), (tmp_path / "wal.db-wal").exists())
++    conn = snap._open(path)
++    assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 2
++    with pytest.raises(sqlite3.OperationalError):
++        conn.execute("INSERT INTO t VALUES (3)")
++    conn.close()
++    assert (path.read_bytes(), (tmp_path / "wal.db-wal").exists()) == before
++    holder.close()
++    with pytest.raises(sqlite3.Error):
++        snap._open(tmp_path / "missing.db")  # never creates or falls back to rw
++    assert not (tmp_path / "missing.db").exists()
+diff --git a/tests/tui_gateway/test_kanban_consumer_health.py b/tests/tui_gateway/test_kanban_consumer_health.py
+index 4da049b87f..0421238f10 100644
+--- a/tests/tui_gateway/test_kanban_consumer_health.py
++++ b/tests/tui_gateway/test_kanban_consumer_health.py
+@@ -60,3 +60,61 @@ def test_foreign_thread_cannot_forge_success(tmp_path):
+     finally:
+         stop.set()
+         thread.join(3)
++
++
++def test_snapshot_epoch_advances_on_replacement_and_invalidation(tmp_path):
++    home, board = tmp_path, tmp_path / "kanban.db"
++    stops, threads = [], []
++
++    def consumer():
++        stop, ready = threading.Event(), threading.Event()
++        def run():
++            health.polled(home, "origin", board)
++            ready.set()
++            stop.wait(3)
++        thread = threading.Thread(target=run, daemon=True)
++        health.register({"session_key": "origin", "profile_home": str(home)}, stop, thread)
++        thread.start()
++        assert ready.wait(3)
++        stops.append(stop)
++        threads.append(thread)
++    try:
++        consumer()
++        first = health.snapshot(home, "origin", board)
++        assert first["available"]
++        assert health.snapshot(home, "origin", board)["epoch"] == first["epoch"]  # reads do not advance it
++        consumer()
++        second = health.snapshot(home, "origin", board)
++        assert second["epoch"] > first["epoch"] and second["incarnation"] != first["incarnation"]
++        stops[-1].set()
++        stopped = health.snapshot(home, "origin", board)
++        assert stopped["epoch"] > second["epoch"]
++    finally:
++        for stop in stops:
++            stop.set()
++        for thread in threads:
++            thread.join(3)
++
++
++def test_scope_loss_invalidates_receipt_even_if_nobody_read_during_the_outage(tmp_path):
++    home, board = tmp_path, tmp_path / "kanban.db"
++    stop, ready = threading.Event(), threading.Event()
++    session = {"session_key": "origin", "profile_home": str(home)}
++
++    def run():
++        health.polled(home, "origin", board)
++        ready.set()
++        stop.wait(3)
++    thread = threading.Thread(target=run, daemon=True)
++    health.register(session, stop, thread)
++    thread.start()
++    try:
++        assert ready.wait(3)
++        before = health.snapshot(home, "origin", board)
++        assert before["available"]
++        health.invalidate(session)  # refusal backoff / finalize, then recovery before any read
++        after = health.snapshot(home, "origin", board)
++        assert after["epoch"] > before["epoch"] and not after["available"]
++    finally:
++        stop.set()
++        thread.join(3)
+diff --git a/tui_gateway/kanban_consumer_health.py b/tui_gateway/kanban_consumer_health.py
+index 2878e752e6..dd96337016 100644
+--- a/tui_gateway/kanban_consumer_health.py
++++ b/tui_gateway/kanban_consumer_health.py
+@@ -11,19 +11,30 @@ import time
+ _lock = threading.RLock()
+ _consumers: dict = {}
+ _MAX_AGE = 15.0
++# Monotonic generation of the consumer set and its receipts. Any change that can
++# invalidate an earlier health read (replacement, Stop, disconnect, refusal,
++# finalize, scope change) advances it, so a reader can detect "same answer,
++# different consumer" across two reads.
++_epoch = 0
++_next_incarnation = 0
+ 
+ 
+ def register(session: dict, stop: threading.Event, thread: threading.Thread) -> None:
+     """Called by the native poller launcher, before the thread starts."""
++    global _epoch, _next_incarnation
+     with _lock:
+         _prune()
+-        _consumers[thread] = (session, stop, {})
++        _next_incarnation += 1
++        _epoch += 1
++        _consumers[thread] = (session, stop, {}, _next_incarnation)
+ 
+ 
+ def _prune() -> None:
+-    for thread, (_, stop, _) in list(_consumers.items()):
++    global _epoch
++    for thread, (_, stop, _, _) in list(_consumers.items()):
+         if stop.is_set() or thread.ident is not None and not thread.is_alive():
+             del _consumers[thread]
++            _epoch += 1
+ 
+ 
+ def _scope(session: dict, home: Path, session_key: str) -> bool:
+@@ -40,7 +51,7 @@ def polled(home: Path, session_key: str, board_path: Path) -> None:
+         entry = _consumers.get(threading.current_thread())
+         if entry is None:
+             return
+-        session, stop, receipts = entry
++        session, stop, receipts, _ = entry
+         if not stop.is_set() and _scope(session, Path(home), session_key):
+             receipts[(str(Path(home).resolve()), session_key, str(Path(board_path).resolve()))] = time.monotonic()
+ 
+@@ -50,10 +61,51 @@ def available(home: Path, session_key: str, board_path: Path) -> bool:
+     with _lock:
+         _prune()
+         now = time.monotonic()
+-        for thread, (session, stop, receipts) in _consumers.items():
++        for thread, (session, stop, receipts, _) in _consumers.items():
+             stamp = receipts.get((str(Path(home).resolve()), session_key, str(Path(board_path).resolve())))
+             if (thread.is_alive() and not stop.is_set()
+                     and _scope(session, Path(home), session_key)
+                     and stamp is not None and 0 <= now - stamp <= _MAX_AGE):
+                 return True
+     return False
++
++
++def snapshot(home: Path, session_key: str, board_path: Path) -> dict:
++    """Nonconsuming, scoped consumer health with an invalidation epoch.
++
++    ``available`` matches :func:`available`. ``epoch`` advances on every
++    registration, replacement, Stop/disconnect (stopped or dead poller) and on a
++    scope loss (refusal backoff, finalize, rotated session or home) that discards
++    the consumer's receipt, so a receipt minted before an invalidation is never
++    reported again after recovery: it needs a fresh successful poll.
++    ``incarnation`` identifies the registered consumer that holds the receipt.
++    """
++    key = (str(Path(home).resolve()), session_key, str(Path(board_path).resolve()))
++    with _lock:
++        _prune()
++        now = time.monotonic()
++        for thread, (session, stop, receipts, incarnation) in sorted(
++                _consumers.items(), key=lambda item: item[1][3], reverse=True):  # newest first
++            if session.get("session_key") != session_key:
++                continue
++            if not _scope(session, Path(home), session_key):
++                continue
++            stamp = receipts.get(key)
++            if thread.is_alive() and not stop.is_set() and stamp is not None and 0 <= now - stamp <= _MAX_AGE:
++                return {"available": True, "epoch": _epoch, "incarnation": incarnation, "age": now - stamp}
++        return {"available": False, "epoch": _epoch, "incarnation": None, "age": None}
++
++
++def invalidate(session: dict) -> None:
++    """Drop the session's receipts the moment its scope is lost.
++
++    Refusal backoff and finalize call this, so a receipt minted before them is never
++    reported again after the scope recovers (it needs a fresh poll), and a reader
++    holding the earlier epoch sees the change even if it never read during the outage.
++    """
++    global _epoch
++    with _lock:
++        for entry in _consumers.values():
++            if entry[0] is session:
++                entry[2].clear()
++        _epoch += 1
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index d393e79910..d0eaa29f06 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -371,6 +371,8 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
+     if not session or session.get("_finalized"):
+         return
+     session["_finalized"] = True
++    from tui_gateway import kanban_consumer_health
++    kanban_consumer_health.invalidate(session)
+     _lock_vault_managers(session)
+     if (history_ready := session.get("resume_history_ready")) is not None and not history_ready.is_set():
+         session["resume_history_error"] = "session resume cancelled"
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 935e41fc97..ca72513213 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -533,6 +533,8 @@ def _kb_rewind_refused(session: dict, batch: list) -> None:
+         delay = session.get("_kanban_refusal_delay") or _KANBAN_REFUSAL_BACKOFF_S
+         session["_kanban_refusal_delay"] = min(delay * 2, _KANBAN_REFUSAL_BACKOFF_MAX_S)
+         session["_kanban_refused_until"] = time.monotonic() + delay
++        from tui_gateway import kanban_consumer_health
++        kanban_consumer_health.invalidate(session)
+     logger.info("kanban notification turn refused for session %s: rewound %d of %d notice(s); retry in %.0fs",
+                 session.get("session_key") or "", len(rewound), len(refused), delay)
+ 
+-- 
+2.55.0
+

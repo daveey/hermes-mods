@@ -1,0 +1,118 @@
+From 7714db5d62324b606c8ca928530ebdf25bb3aefe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 13:18:19 -0700
+Subject: [PATCH 473/474] test: linked worktrees pass the real-home guard;
+ spawn-refusal test is Linux-only [daveey]
+
+Running scripts/run_tests.sh from a hermes-core-wt worktree failed 206 tests
+in tests/hermes_cli (-k "kanban or session"); 296 of 298 failure blocks were
+"TEST BUG: file I/O against the REAL hermes home: <home>/hermes-agent/.git/
+worktrees/<name>/hermes-update-pull".
+
+Why 1: the CLI's early-recovery probe stats the interrupted-update marker in
+  the running checkout's git dir (_early_recovery._git_dir).
+Why 2: for a linked worktree that git dir is the target of its .git file,
+  under the home's hermes-agent/.git/worktrees/ (hermes-core-wt's layout).
+Why 3: home_io_guard exempts the checkout tree itself (a plain clone's .git
+  is inside it) but not a linked worktree's git dir outside the tree.
+Why not caught: CI runs from a plain clone; only local worktree runs hit it,
+  and those false failures read as "pre-existing" noise and hid real ones.
+Fix: linked_worktree_git_dirs() adds the worktree's own git dir to the same
+  exemption (only that dir; the rest of the home stays refused). Result:
+  206 failed -> 9, the remainder outside the kanban sync work.
+
+test_infrastructure_spawn_refusal_never_charges_the_card drives the systemd
+restart-safe scope refusal; restart_safe_gateway_child_argv returns
+in_process on non-Linux, so on macOS the refusal never happens and the test
+failed. Marked platforms("linux"); verified passing on Linux (hub, clean
+clone of 4cfc27bc).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/hermes_cli/test_kanban_db.py          |  1 +
+ tests/hermes_cli/test_real_home_tripwire.py | 23 +++++++++++++++++++++
+ tests/home_io_guard.py                      | 18 +++++++++++++++-
+ 3 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_kanban_db.py b/tests/hermes_cli/test_kanban_db.py
+index a85c3603fa..330f4cfcb9 100644
+--- a/tests/hermes_cli/test_kanban_db.py
++++ b/tests/hermes_cli/test_kanban_db.py
+@@ -553,6 +553,7 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
+         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
+ 
+ 
++@pytest.mark.platforms("linux")  # restart-safe scopes are systemd-only: elsewhere the probe never refuses
+ def test_infrastructure_spawn_refusal_never_charges_the_card(
+     kanban_home, monkeypatch, all_assignees_spawnable,
+ ):
+diff --git a/tests/hermes_cli/test_real_home_tripwire.py b/tests/hermes_cli/test_real_home_tripwire.py
+index 0e3454f1a4..33724c3d64 100644
+--- a/tests/hermes_cli/test_real_home_tripwire.py
++++ b/tests/hermes_cli/test_real_home_tripwire.py
+@@ -229,3 +229,26 @@ def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
+     )
+     assert result.returncode == 0, result.stdout + result.stderr
+     assert "1 passed" in result.stdout
++
++
++def test_linked_worktree_git_dir_is_the_checkouts_own_metadata(tmp_path):
++    """A linked worktree's ``.git`` file names its git dir (under the home's checkout for
++    hermes-core-wt trees); that dir counts as the checkout's, a plain clone contributes nothing,
++    and the rest of the home stays refused."""
++    from tests.home_io_guard import linked_worktree_git_dirs
++
++    home = tmp_path / "home"
++    own = home / "hermes-agent" / ".git" / "worktrees" / "mine"
++    own.mkdir(parents=True)
++    tree = tmp_path / "wt"
++    tree.mkdir()
++    (tree / ".git").write_text(f"gitdir: {own}\n")
++    assert linked_worktree_git_dirs(tree) == {own.resolve()}
++    relative = tmp_path / "rel"
++    relative.mkdir()
++    (relative / ".git").write_text("gitdir: ../home/hermes-agent/.git/worktrees/mine\n")
++    assert linked_worktree_git_dirs(relative) == {own.resolve()}
++    plain = tmp_path / "plain"
++    (plain / ".git").mkdir(parents=True)
++    assert linked_worktree_git_dirs(plain) == set()
++    assert linked_worktree_git_dirs(tmp_path / "absent") == set()
+diff --git a/tests/home_io_guard.py b/tests/home_io_guard.py
+index 877d27fd7c..0a633b02ca 100644
+--- a/tests/home_io_guard.py
++++ b/tests/home_io_guard.py
+@@ -11,6 +11,19 @@ import sqlite3
+ import sys
+ import threading
+ 
++
++def linked_worktree_git_dirs(checkout: Path) -> set[Path]:
++    """The git dir a linked worktree's ``.git`` file points to (empty for a plain clone)."""
++    dot_git = checkout / ".git"
++    if not dot_git.is_file():
++        return set()
++    first = (dot_git.read_text().splitlines() or [""])[0]
++    if not first.startswith("gitdir:"):
++        return set()
++    target = Path(first.split(":", 1)[1].strip())
++    return {(target if target.is_absolute() else checkout / target).resolve()}
++
++
+ _INTERPRETER_PREFIXES = tuple({
+     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
+ } | {
+@@ -24,7 +37,10 @@ _INTERPRETER_PREFIXES = tuple({
+     # checkout's own .venv is not Hermes state; without this every run from a default install
+     # trips on its first traceback.
+     Path(__file__).resolve().parent.parent,
+-})
++} | linked_worktree_git_dirs(Path(__file__).resolve().parent.parent))
++# ^ A linked worktree of that checkout (hermes-core-wt) keeps its git dir under the home's
++# ``hermes-agent/.git/worktrees/<name>``, where the CLI's interrupted-update probe reads it. That is
++# the checkout's own metadata, which a plain clone already gets through the checkout line above.
+ # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
+ # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
+ # resolve once at import, as before: they are fixed for the process lifetime.
+-- 
+2.55.0
+
