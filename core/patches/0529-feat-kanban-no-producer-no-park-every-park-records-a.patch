@@ -1,0 +1,1557 @@
+From 57094b7a60234bf317232a9fd032c30244b12aed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:06:46 +0000
+Subject: [PATCH] =?UTF-8?q?feat(kanban):=20no=20producer,=20no=20park=20?=
+ =?UTF-8?q?=E2=80=94=20every=20park=20records=20awaiting;=20refuse=20agent?=
+ =?UTF-8?q?-action=20and=20hidden=20human=20waits;=20re-parks=20escalate?=
+ =?UTF-8?q?=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hermes_cli/kanban.py                     |  64 ++-
+ hermes_cli/kanban_awaiting.py            | 500 +++++++++++++++++++++++
+ hermes_cli/kanban_block_policy.py        |   9 +-
+ hermes_cli/kanban_continuation.py        |  18 +
+ hermes_cli/kanban_db.py                  |   6 +-
+ hermes_cli/kanban_db_schedule.py         |  17 +-
+ hermes_cli/kanban_parser.py              |   5 +
+ hermes_cli/kanban_timed_park.py          |  14 +-
+ hermes_cli/kanban_wake_check.py          |   4 +
+ tests/hermes_cli/test_kanban_awaiting.py | 460 +++++++++++++++++++++
+ tests/tools/test_kanban_tools.py         |   4 +-
+ tools/kanban_tools.py                    |  61 ++-
+ tools/kanban_tools_schemas.py            |  54 ++-
+ 13 files changed, 1180 insertions(+), 36 deletions(-)
+ create mode 100644 hermes_cli/kanban_awaiting.py
+ create mode 100644 tests/hermes_cli/test_kanban_awaiting.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 055bda572c..a21f10ca24 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1114,20 +1114,59 @@ def _cli_wake_check(args: argparse.Namespace):
+     return cmd, every, bool(getattr(args, "clock_only", False))
+ 
+ 
+-def _guarded_park(conn, op: str, wake, refused: dict, park, **plan):
+-    """Per-task op: refuse a park > 2 h out with no probe (``kanban_wake_check.guard_error``). [daveey]"""
++def _cli_awaiting(args: argparse.Namespace, wake):
++    """``(awaiting, wake)`` from ``--awaiting KIND:REF|JSON`` (+ ``--awaiting-why``); a card wait
++    with no ``--wake-check`` gets ``hermes kanban wait-check task`` as its probe. [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
++
++    raw = getattr(args, "awaiting", None)
++    if not raw:
++        return None, wake
++    awaiting = kaw.normalize(raw)
++    why = getattr(args, "awaiting_why", None)
++    if why and awaiting is not None:
++        awaiting["why"] = why.strip()[:600]
++    probe = None if wake[0] else kaw.card_probe(awaiting)
++    if probe:
++        from hermes_cli import kanban_wake_check as kwc
++        wake = (probe, kwc.normalize_every(None), wake[2])
++    kaw.confirm_remote(awaiting)  # ssh, so before the park's write txn
++    return awaiting, wake
++
++
++def _guarded_park(conn, op: str, wake, refused: dict, park, awaiting=None, **plan):
++    """Per-task op: refuse a park > 2 h out with no probe (``kanban_wake_check.guard_error``)
++    or one nothing would produce (``kanban_awaiting``), before its comment is written. [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
+     from hermes_cli import kanban_wake_check as kwc
+ 
+     def run(tid):
+-        err = kwc.guard_error(wake_at=kwc.planned_wake(conn, tid, op=op, **plan),
+-                              wake_check=wake[0], clock_only=wake[2])
++        wake_at = kwc.planned_wake(conn, tid, op=op, **plan)
++        err = kwc.guard_error(wake_at=wake_at, wake_check=wake[0], clock_only=wake[2])
+         if err:
+             refused[tid] = f"cannot {op} {tid}: {err}"
+             return False
+-        return park(tid)
++        try:
++            if wake_at is not None:
++                kaw.resolve(conn, tid, awaiting=awaiting, reason=plan.get("reason"), wake_check=wake[0],
++                            clock_only=wake[2], op=op)
++            return park(tid)
++        except kaw.AwaitingError as exc:
++            refused[tid] = f"cannot {op} {tid}: {exc}"
++            return False
+     return run
+ 
+ 
++def _parked_msg(conn, verb: str, suffix: str):
++    """``ok_msg`` for a park that may have escalated to an owner card instead."""
++    from hermes_cli import kanban_awaiting as kaw
++
++    def msg(tid):
++        owner = kaw.escalated_owner(conn, tid)
++        return kaw.escalation_message(tid, owner) if owner else f"{verb} {tid}{suffix}"
++    return msg
++
++
+ def _cmd_block(args: argparse.Namespace) -> int:
+     reason = _joined_words(args.reason)
+     kind = getattr(args, "kind", None)
+@@ -1144,6 +1183,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
+             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
+             landed = kb.get_task(conn, tid)
+             where = landed.status if landed else "blocked"
++            from hermes_cli import kanban_awaiting as kaw
++            if kaw.escalated_owner(conn, tid):
++                return _parked_msg(conn, "Blocked", suffix)(tid)
+             if where == "todo":
+                 return f"{tid} → todo (dependency wait){suffix}"
+             if kind == "dependency" and where == "blocked":
+@@ -1156,6 +1198,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
+ 
+         try:
+             wake = _cli_wake_check(args)
++            awaiting, wake = _cli_awaiting(args, wake)
+         except ValueError as exc:
+             return _err(f"kanban block: {exc}", 2)
+         from hermes_cli.kanban_block_policy import block_policy_error
+@@ -1167,9 +1210,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
+         op = _guarded_park(conn, "block", wake, refused, _commented(
+             conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
+                 conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+-                human_request=request,
++                human_request=request, awaiting=awaiting,
+                 wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
+-            reason=reason, kind=kind)
++            awaiting=awaiting, reason=reason, kind=kind)
+         return _bulk_apply(ids, op, ok_msg, lambda tid: refused.get(tid) or f"cannot block {tid}")
+ 
+ 
+@@ -1181,15 +1224,16 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+     with kbc.connect_closing() as conn:
+         try:
+             wake = _cli_wake_check(args)
++            awaiting, wake = _cli_awaiting(args, wake)
+         except ValueError as exc:
+             return _err(f"kanban schedule: {exc}", 2)
+         refused: dict = {}
+         op = _guarded_park(conn, "schedule", wake, refused, _commented(
+             conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
+-                conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
++                conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid), awaiting=awaiting,
+                 wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
+-            reason=reason)
+-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}",
++            awaiting=awaiting, reason=reason)
++        return _bulk_apply(ids, op, _parked_msg(conn, "Scheduled", suffix),
+                            lambda tid: refused.get(tid) or f"cannot schedule {tid}")
+ 
+ 
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+new file mode 100644
+index 0000000000..01b0e02bbe
+--- /dev/null
++++ b/hermes_cli/kanban_awaiting.py
+@@ -0,0 +1,500 @@
++"""No producer, no park: every timed park records who makes its condition true. [daveey]
++
++A park (``kanban_schedule``, ``kanban_block`` kind=time or a parent-less dependency,
++``kanban_continue`` with ``resume_after_seconds``, and their CLI twins) used to be defined only
++by its wake mechanism (clock, probe, parent). "Waiting on something only an agent can do, with
++no agent assigned" was therefore legal and invisible: on 10-26/27 a hub card parked for 31 h on
++an IAM grant "applied by the supervisor" while the MacBook held the admin rights, and another
++hid a pending ask for David behind a wake probe
++(``~/.hermes/kanban/evidence/orphan-waits-20261027/5whys.md``).
++
++Each park now carries ``awaiting = {kind, ref, why}`` on its parking event:
++
++* ``card``: ``ref`` is a task id (``gateway`` names another board's host). The card must exist
++  (cross-gateway: ``confirm_remote`` runs ``hermes kanban wait-check`` before the write txn) and
++  must not itself be an orphan.
++* ``ci`` / ``deploy``: ``ref`` is a run / job / release id or URL.
++* ``external``: ``ref`` names the vendor or ticket and ``why`` gives the evidence.
++* ``clock``: a real window (a soak, a cooldown, a release slot).
++* ``human``: refused. A wait on David is a visible ``blocked`` card with ``human_request``;
++  an ask he already answered (ask-gate ledger) is never re-asked.
++
++A park with no explicit ``awaiting`` is classified from its text: a pending step for a human is
++refused (``human_wait``), and a wall only an agent action clears (grant, permission, access) is
++refused (``agent_action_wait``) unless the producing card is declared. Anything else is recorded
++as an inferred ``clock`` / ``external`` wait so the checker can tell legacy guesses from declared
++producers. The third park in a row on one premise is not parked again: it becomes one
++agent-owned owner card for a supervisor and the card waits on it (``repark_escalated``).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import shlex
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++KINDS = ("card", "ci", "deploy", "external", "clock", "human")
++AGENT_ACTION_WAIT = "agent_action_wait"
++HUMAN_WAIT = "human_wait"
++INVALID_AWAITING = "invalid_awaiting"
++CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING)
++# Parks in a row on one premise before the next one escalates instead (the 3rd park = 2nd re-park).
++REPARK_LIMIT = 2
++ESCALATION_PREFIX = "repark-escalation:"
++ESCALATED_EVENT = "repark_escalated"
++_TASK_ID = re.compile(r"\bt_[0-9a-f]{8,16}\b")
++_RUN_ID = re.compile(r"\d{4,}|https?://\S+|\b[0-9a-f]{7,40}\b")
++_TICKET = re.compile(r"\d{3,}|https?://\S+")
++# A short continuation (pacing a long job) is not judged by its checkpoint prose.
++CONTINUE_TEXT_GUARD_SECONDS = 2 * 3600
++# A cross-gateway card confirmation (made before the write txn) stays valid this long.
++REMOTE_CONFIRM_TTL = 300
++_REMOTE_CONFIRMED: dict[tuple[str, str], tuple[float, str]] = {}
++
++# Shapes from the 10-26/27 replays (session-idle-check HIDDEN_ASK / AGENT_WALL), narrowed so ordinary
++# vendor/HTTP prose ("403 Forbidden", "AWS support to grant the quota") is not an agent wall.
++HIDDEN_ASK = re.compile(
++    r"\b(?:david|the user|a human)\b(?:['\u2019]s)?\W+(?:\w+\W+){0,6}?(?:decision|approval|answer|reply|confirmation|"
++    r"go-ahead|sign-?off)\b|\bdon['\u2019]?t re-?ask\b|\balready asked (?:him|david|in chat)\b|"
++    r"\bwaiting (?:on|for) (?:david|the user|a human)\b", re.I)
++AGENT_WALL = re.compile(
++    r"\bdenied\b|\bunauthorizedoperation\b|\baccess ?denied|\bnot authori[sz]ed to perform\b|"
++    r"\b(?:missing|needs?|lacks?|without|insufficient)\s+(?:the\s+|a\s+)?(?:[\w:.*/-]+\s+){0,2}permissions?\b|"
++    r"\bpermissions?\s+(?:denied|request|grant)|"
++    r"\blacks? (?:the )?(?:access|role|scope|credential)|"
++    r"\bneeds? (?:the |a )?(?:scoped )?(?:grant|access|credentials?|role)\b|"
++    r"\bgrant\b[^.]{0,80}\bappl|\bsupervisor owns\b|\bsupervisor\b[^.;]{0,60}\bgrant|"
++    r"\bapply the iam\b|\biam change\b", re.I)
++_NEGATED = re.compile(r"\b(no|not|never|without|nor)\b")
++_ANSWERED = re.compile(r"\b(recorded|made|given|answered|received|resolved|done|obtained|approved)\b")
++# Only unambiguous citations of a decision already made; "once/after/with David's approval" is still pending.
++_PAST_CITE = re.compile(r"\b(per|following|given|as)\s*$")
++_WALL_CLEARED = re.compile(r"\b(fixed|resolved|earlier|previously|no longer|used to)\b|"
++                           r"\b(?:was|were|been|got|is now)\s+(?:fixed|resolved|granted|applied|cleared|lifted)\b|"
++                           r"\bno\b[^.;]{0,40}\b(needed|required)\b", re.I)
++_STOPWORDS = frozenset("about after again already being before could david their there these those which while "
++                       "would should waiting until where other parked approval decision status".split())
++
++
++class AwaitingError(ValueError):
++    """A park refused because nothing would ever produce its condition."""
++
++    def __init__(self, code: str, message: str):
++        super().__init__(f"{code}: {message}")
++        self.code = code
++
++
++class RepeatedPark(Exception):
++    """The park repeats its premise a third time; the caller escalates instead of parking."""
++
++    def __init__(self, record: dict):
++        super().__init__(ESCALATED_EVENT)
++        self.record = record
++
++
++_REMEDY = (
++    "A wait needs a producer; agent-action conditions are work, not waits. Either (1) create the owner "
++    "card on the gateway that holds the capability (kanban_create there, or `hermes kanban create` over "
++    "ssh) and park with awaiting={kind:'card', ref:'<owner id>', gateway:'<gw>'}; or (2) kanban_block "
++    "kind='assignment' so a capable supervisor is routed.")
++
++
++# --- parsing ---------------------------------------------------------------------------------
++
++def normalize(value: Any) -> Optional[dict]:
++    """``awaiting`` from a tool/CLI argument (dict, JSON text, or ``kind:ref``), validated for shape."""
++    if value is None or value == "" or value == {}:
++        return None
++    if isinstance(value, str):
++        text = value.strip()
++        if text.startswith("{"):
++            try:
++                value = json.loads(text)
++            except ValueError as exc:
++                raise AwaitingError(INVALID_AWAITING, f"awaiting is not valid JSON: {exc}") from exc
++        else:
++            kind, _, ref = text.partition(":")
++            value = {"kind": kind, "ref": ref}
++    if not isinstance(value, dict):
++        raise AwaitingError(INVALID_AWAITING, "awaiting must be an object {kind, ref, why}")
++    kind = str(value.get("kind") or "").strip().lower()
++    if kind not in KINDS:
++        raise AwaitingError(INVALID_AWAITING, f"awaiting.kind must be one of {list(KINDS)} (got {kind!r})")
++    out = {"kind": kind}
++    for key in ("ref", "why", "gateway", "board"):
++        raw = value.get(key)
++        if raw is not None and not isinstance(raw, str):
++            raise AwaitingError(INVALID_AWAITING, f"awaiting.{key} must be a string")
++        if raw and raw.strip():
++            out[key] = raw.strip()[:600]
++    if kind == "card" and ":" in out.get("ref", "") and "gateway" not in out:
++        gw, _, tid = out["ref"].rpartition(":")
++        out["gateway"], out["ref"] = gw, tid
++    if out.get("gateway") == "local":
++        out.pop("gateway")
++    return out
++
++
++def premise_hash(awaiting: dict, reason: Optional[str]) -> str:
++    """Stable id of what a park waits on: the declared producer (with its why), else the reason."""
++    if awaiting.get("inferred"):
++        basis = " ".join((reason or "").lower().split())[:400]
++    else:
++        basis = "|".join(awaiting.get(k, "") for k in ("kind", "gateway", "ref", "why"))
++    return hashlib.sha256(basis.encode()).hexdigest()[:16]
++
++
++# --- prose ----------------------------------------------------------------------------------
++
++def _hidden_ask(why: str) -> Optional[str]:
++    for m in HIDDEN_ASK.finditer(why):
++        before, after = why[max(0, m.start() - 24):m.start()].lower(), why[m.end():m.end() + 40].lower()
++        if _NEGATED.search(before[-14:]) or _PAST_CITE.search(before) or _ANSWERED.search(after):
++            continue
++        return m.group(0)
++    return None
++
++
++def _agent_wall(why: str) -> Optional[str]:
++    for clause in re.split(r"[.;\n]+", why):
++        m = AGENT_WALL.search(clause)
++        if m and not _WALL_CLEARED.search(clause):
++            return m.group(0)
++    return None
++
++
++def text_wall(text: Optional[str]) -> Optional[tuple[str, str]]:
++    """``(code, matched words)`` when park prose names a hidden human ask or an agent-only wall."""
++    why = " ".join((text or "").split())
++    ask = _hidden_ask(why)
++    if ask:
++        return HUMAN_WAIT, f"a pending step for a human ('{ask}')"
++    wall = _agent_wall(why)
++    if wall:
++        return AGENT_ACTION_WAIT, f"a wall only an agent action clears ('{wall}')"
++    return None
++
++
++# --- producers -------------------------------------------------------------------------------
++
++def _latest_park(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[dict], str]:
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued') "
++        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    try:
++        payload = json.loads(row[0] or "{}") if row else {}
++    except ValueError:
++        payload = {}
++    return payload.get("awaiting"), str(payload.get("reason") or "")
++
++
++def card_orphan_reason(conn: sqlite3.Connection, task_id: str, *, _depth: int = 0) -> Optional[str]:
++    """Why a local card cannot produce anything (None when it is a live producer)."""
++    row = conn.execute("SELECT status, human_request, block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return f"{task_id} does not exist on this board"
++    status = row[0]
++    if status == "archived":
++        return f"{task_id} is archived"
++    if status == "triage":
++        return f"{task_id} sits in triage, where nobody is working it"
++    if status == "blocked" and not row[1] and row[2] not in ("assignment", "dependency"):
++        return f"{task_id} is itself blocked with no human ask (kind={row[2]!r}), so nobody is producing it"
++    if status == "scheduled":
++        awaiting, reason = _latest_park(conn, task_id)
++        if awaiting and awaiting.get("kind") == "card" and not awaiting.get("gateway") and _depth < 4:
++            inner = card_orphan_reason(conn, awaiting.get("ref", ""), _depth=_depth + 1)
++            return f"{task_id} waits on {awaiting.get('ref')}, and {inner}" if inner else None
++        if not awaiting or awaiting.get("inferred"):
++            wall = text_wall(reason)
++            if wall:
++                return f"{task_id} is itself parked on {wall[1]}"
++    return None
++
++
++def confirm_remote(awaiting: Optional[dict]) -> None:
++    """Confirm a cross-gateway producer card exists, BEFORE any write txn (ssh can take 40 s).
++    ``resolve`` then accepts the card from the process-local confirmation."""
++    if not awaiting or awaiting.get("kind") != "card" or not awaiting.get("gateway"):
++        return
++    ref = awaiting.get("ref") or ""
++    if not _TASK_ID.fullmatch(ref):
++        return  # resolve reports the bad ref
++    from hermes_cli import kanban_wait_check as kwait
++    rc, out = kwait.check_remote(awaiting["gateway"], "task", ref, board=awaiting.get("board"))
++    if rc not in (0, 1):
++        raise AwaitingError(INVALID_AWAITING, f"cannot confirm producer card {ref} on {awaiting['gateway']}: "
++                                              f"{out[-200:]}")
++    status = out.split()[-1] if out.split() else ""
++    if status in ("archived", "triage"):
++        raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {ref} on {awaiting['gateway']} "
++                                               f"is {status}, so nobody is producing it. {_REMEDY}")
++    _REMOTE_CONFIRMED[(awaiting["gateway"], ref)] = (time.monotonic(), out[-120:])
++
++
++def _check_card(conn: sqlite3.Connection, task_id: str, awaiting: dict, text: str) -> None:
++    ref = awaiting.get("ref") or ""
++    if not _TASK_ID.fullmatch(ref):
++        raise AwaitingError(INVALID_AWAITING, f"awaiting kind='card' needs ref=<task id> (got {ref!r})")
++    if ref == task_id:
++        raise AwaitingError(INVALID_AWAITING, "a card cannot wait on itself")
++    gateway = awaiting.get("gateway")
++    if gateway:
++        seen = _REMOTE_CONFIRMED.get((gateway, ref))
++        if not seen or time.monotonic() - seen[0] > REMOTE_CONFIRM_TTL:
++            raise AwaitingError(INVALID_AWAITING, (
++                f"producer card {ref} on {gateway} was not confirmed; park through kanban_schedule/kanban_block "
++                "or `hermes kanban schedule --awaiting`, which confirm it with `hermes kanban wait-check`."))
++        awaiting["observed"] = seen[1]
++        return
++    why = card_orphan_reason(conn, ref)
++    if why:
++        raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {why}. {_REMEDY}")
++
++
++def _check_run(conn, task_id, awaiting, text) -> None:
++    if not _RUN_ID.search(awaiting.get("ref", "")):
++        raise AwaitingError(INVALID_AWAITING,
++                            f"awaiting kind={awaiting['kind']!r} needs ref=<run/job/release id or URL>")
++
++
++def _check_external(conn, task_id, awaiting, text) -> None:
++    if not awaiting.get("ref") or not awaiting.get("why"):
++        raise AwaitingError(INVALID_AWAITING, "awaiting kind='external' needs ref=<vendor or ticket> and why=<evidence>")
++    wall = text_wall(text)
++    if wall and not _TICKET.search(awaiting["ref"]):
++        raise wall_error(task_id, wall, text)
++
++
++def _check_clock(conn, task_id, awaiting, text) -> None:
++    wall = text_wall(text)
++    if wall:
++        raise wall_error(task_id, wall, text)
++
++
++def _check_human(conn, task_id, awaiting, text) -> None:
++    raise human_error(task_id, text)
++
++
++_CHECKS: dict[str, Callable[[sqlite3.Connection, str, dict, str], None]] = {
++    "card": _check_card, "ci": _check_run, "deploy": _check_run, "external": _check_external,
++    "clock": _check_clock, "human": _check_human,
++}
++
++
++# --- ask-gate ledger --------------------------------------------------------------------------
++
++def _tokens(text: str) -> set[str]:
++    return {w for w in re.findall(r"[a-z][a-z0-9]{4,}", (text or "").lower()) if w not in _STOPWORDS}
++
++
++def answered_ask(task_id: str, text: str) -> Optional[dict]:
++    """The ask-gate ledger row (``state/ask-ledger.sqlite``) that already answers this ask: same card,
++    or at least 3 distinctive words covering half the answered topic. Terminal (retired) answers
++    count too: they are the permanent ones."""
++    from hermes_constants import get_hermes_home
++    path = Path(os.environ.get("ASK_GATE_LEDGER") or get_hermes_home() / "state" / "ask-ledger.sqlite")
++    if not path.is_file():
++        return None
++    try:
++        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
++        try:
++            rows = c.execute("SELECT topic, answer, card_id, ts FROM answered ORDER BY ts DESC LIMIT 500").fetchall()
++        finally:
++            c.close()
++    except sqlite3.Error:
++        return None
++    toks = _tokens(text)
++    for topic, answer, card_id, ts in rows:
++        topic_toks = _tokens(topic or "")
++        shared = toks & topic_toks
++        if (card_id and card_id == task_id) or (len(shared) >= 3 and len(shared) * 2 >= len(topic_toks)):
++            return {"topic": topic, "answer": answer, "card_id": card_id, "ts": ts}
++    return None
++
++
++def human_error(task_id: str, text: str) -> AwaitingError:
++    hit = answered_ask(task_id, text)
++    if hit:
++        return AwaitingError(HUMAN_WAIT, (
++            f"David already answered this ask ({(hit['topic'] or '')[:120]!r}: {(hit['answer'] or '')[:160]!r}). "
++            "Act on that answer; never re-ask and never park on it."))
++    return AwaitingError(HUMAN_WAIT, (
++        "a wait on a human is not a park: nobody sees a scheduled card. Make it a visible ask with "
++        "kanban_block(kind='needs_input', human_request={action, why_human, interaction, scope, evidence}), "
++        "or drop the dependency on David if the agent can proceed."))
++
++
++def wall_error(task_id: str, wall: tuple[str, str], text: str, *, named: Optional[str] = None) -> AwaitingError:
++    if wall[0] == HUMAN_WAIT:
++        return human_error(task_id, text)
++    hint = (f" If {named} is the card doing it, declare it: awaiting={{kind:'card', ref:'{named}'}}." if named else "")
++    return AwaitingError(AGENT_ACTION_WAIT, (
++        f"this park waits on {wall[1]}, and no producing card is declared, so nothing would ever make it "
++        f"true. {_REMEDY}{hint}"))
++
++
++# --- the gate --------------------------------------------------------------------------------
++
++def resolve(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optional[str],
++            wake_check: Optional[str] = None, clock_only: bool = False, op: str = "schedule",
++            wake_in: Optional[int] = None) -> dict:
++    """The ``awaiting`` record for a park, or ``AwaitingError``. Read-only."""
++    declared = normalize(awaiting)
++    if declared is None:
++        return _infer(conn, task_id, reason=reason, wake_check=wake_check, clock_only=clock_only,
++                      op=op, wake_in=wake_in)
++    text = " ".join(x for x in (reason, declared.get("why"), declared.get("ref")) if x)
++    _CHECKS[declared["kind"]](conn, task_id, declared, text)
++    return declared
++
++
++def _live_card_ref(conn: sqlite3.Connection, task_id: str, text: str) -> Optional[str]:
++    for ref in dict.fromkeys(_TASK_ID.findall(text or "")):
++        if ref != task_id and card_orphan_reason(conn, ref) is None:
++            return ref
++    return None
++
++
++def _infer(conn, task_id, *, reason, wake_check, clock_only, op, wake_in) -> dict:
++    text = reason or ""
++    producer = _live_card_ref(conn, task_id, f"{text} {wake_check or ''}")
++    if not (op == "continue" and (wake_in or 0) <= CONTINUE_TEXT_GUARD_SECONDS):
++        wall = text_wall(text)
++        # A visible ask on the card waited on is not hidden; an agent wall needs a DECLARED owner card.
++        if wall and not (wall[0] == HUMAN_WAIT and producer):
++            raise wall_error(task_id, wall, text, named=producer)
++    if producer:
++        return {"kind": "card", "ref": producer, "inferred": True}
++    if wake_check and not clock_only:
++        return {"kind": "external", "ref": wake_check[:200], "inferred": True}
++    return {"kind": "clock", "inferred": True}
++
++
++def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str) -> int:
++    """Trailing parks of this card on ``premise``, newest first, stopping at the first other
++    premise or at the last escalation (the supervisor acted since)."""
++    count = 0
++    for kind, payload in conn.execute(
++            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued',?) "
++            "ORDER BY id DESC LIMIT 20", (task_id, ESCALATED_EVENT)):
++        if kind == ESCALATED_EVENT:
++            break
++        try:
++            got = (json.loads(payload or "{}").get("awaiting") or {}).get("premise")
++        except (ValueError, AttributeError):
++            got = None
++        if got is None:
++            continue  # a continuation with no wait, or a legacy park
++        if got != premise:
++            break
++        count += 1
++    return count
++
++
++def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optional[str],
++         wake_check: Optional[str] = None, clock_only: bool = False, op: str = "schedule",
++         wake_in: Optional[int] = None) -> dict:
++    """``resolve`` plus re-park escalation: the record to store on the parking event.
++
++    Raises ``RepeatedPark`` on the third park in a row on one premise. Card waits (their producer
++    is accountable) and inferred clock waits (pacing continues, operator drags) never escalate."""
++    record = resolve(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
++                     clock_only=clock_only, op=op, wake_in=wake_in)
++    if record["kind"] == "card" or (record["kind"] == "clock" and record.get("inferred")):
++        return record
++    record["premise"] = premise_hash(record, reason)
++    if prior_same_premise(conn, task_id, record["premise"]) >= REPARK_LIMIT:
++        raise RepeatedPark(record)
++    return record
++
++
++# --- re-park escalation ------------------------------------------------------------------------
++
++def _supervisor_profile(task) -> Optional[str]:
++    """A capable supervisor other than the worker that keeps parking, or None (the card goes to triage)."""
++    from hermes_cli.kanban_assignment_routing import _supervisor
++    name, _required = _supervisor(task)
++    return name
++
++
++def escalate(conn: sqlite3.Connection, task_id: str, *, record: dict, reason: Optional[str],
++             expected_run_id: Optional[int] = None) -> Optional[str]:
++    """Turn a repeated park into one agent-owned issue for a supervisor; the card waits in ``todo``
++    on it (a dependency with a producer). Never a park or a human ask. Caller holds the write txn.
++    Returns the owner card id, or None when the card is no longer the caller's."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    task = kb.get_task(conn, task_id)
++    if task is None:
++        return None
++    sql = ("UPDATE tasks SET status = 'todo', block_kind = NULL, human_request = NULL, claim_lock = NULL, "
++           "claim_expires = NULL, worker_pid = NULL WHERE id = ? AND status IN ('running','ready','blocked','todo')")
++    params: tuple = (task_id,)
++    if expected_run_id is not None:
++        sql += " AND current_run_id = ?"
++        params = (task_id, int(expected_run_id))
++    if conn.execute(sql, params).rowcount != 1:
++        return None
++    key = f"{ESCALATION_PREFIX}{task_id}:{record['premise']}"
++    existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
++    owner = existing[0] if existing and existing[1] not in ("done", "archived") else None
++    if owner is None:
++        supervisor = _supervisor_profile(task)
++        owner = kb.create_task(
++            conn, title=f"Unstick {task_id}: parked 3x on the same premise",
++            body=(f"Card {task_id} ({task.title}) tried to park a third time on the same premise with no new "
++                  f"evidence.\n\nPremise: {json.dumps({k: v for k, v in record.items() if k != 'premise'})}\n"
++                  f"Latest reason: {(reason or '(none)')[:1500]}\n\n"
++                  "This is agent-owned work, not a wait and not a question for David. Remove the cause: "
++                  "do the action (grant, install, fix) where the capability lives, or route the card to the "
++                  "profile/gateway that can, or prove the premise false. Then complete this card with the "
++                  f"evidence; {task_id} waits on it and resumes when it is done."),
++            assignee=supervisor, created_by=task.assignee, workspace_kind="scratch", triage=supervisor is None,
++            idempotency_key=None if existing else key, creator_task_id=task.id, session_id=task.session_id,
++            tenant=task.tenant, priority=task.priority,
++        )
++    kb._link(conn, owner, task_id)
++    run_id = kb._end_or_synthesize_run(conn, task_id, outcome="blocked", status="blocked",
++                                       summary=f"{ESCALATED_EVENT} -> {owner}", synthesize=True)
++    kb._append_event(conn, task_id, ESCALATED_EVENT, {
++        "owner_task_id": owner, "awaiting": record, "reason": reason}, run_id=run_id)
++    kwc.set_check(conn, task_id, None, None)
++    return owner
++
++
++def card_probe(awaiting: Optional[dict]) -> Optional[str]:
++    """The wake probe for a card wait that brought none: ``hermes kanban wait-check task``."""
++    if not awaiting or awaiting.get("kind") != "card" or not _TASK_ID.fullmatch(awaiting.get("ref") or ""):
++        return None
++    argv = ["hermes", "kanban", "wait-check", "task", awaiting["ref"]]
++    if awaiting.get("gateway"):
++        argv += ["--gateway", awaiting["gateway"]]
++    if awaiting.get("board"):
++        argv += ["--board", awaiting["board"]]
++    return shlex.join(argv)
++
++
++def escalated_owner(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """The owner card when this card's latest event is a re-park escalation."""
++    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++                       (task_id,)).fetchone()
++    if not row or row[0] != ESCALATED_EVENT:
++        return None
++    try:
++        return json.loads(row[1] or "{}").get("owner_task_id")
++    except ValueError:
++        return None
++
++
++def escalation_message(task_id: str, owner: Optional[str]) -> str:
++    return (f"{ESCALATED_EVENT}: {task_id} parked on the same premise {REPARK_LIMIT + 1} times with no new "
++            f"evidence, so it was not parked again. It now waits on owner card {owner}, which must remove "
++            "the cause (with no capable supervisor configured it lands in triage for the orchestrator). "
++            "End your turn.")
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index ef0a9bd8a8..0ab4e70d59 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -31,9 +31,12 @@ def block_policy_error(kind, *, human_request=None, wake_check=None, clock_only=
+     return (
+         f"{ERROR_CODE}: kind={kind!r} with no human_request, wake_check or clock_only leaves the "
+         "card with no owner and nothing to wake it. Pick one: (1) a decision/action only David can "
+-        "take -> pass human_request (kind needs_input or capability); (2) a wait on time or a "
+-        "readable fact -> pass wake_check (or clock_only=true) so it parks scheduled and wakes; "
+-        "(3) the wrong worker/tools -> kind='assignment' so a capable supervisor is routed. "
++        "take -> pass human_request (kind needs_input or capability); (2) a condition an agent action "
++        "changes (a grant, a permission, an install, a fix) is work, not a wait -> create the owner "
++        "card on the gateway that holds the capability and park on it (kind='time', "
++        "awaiting={kind:'card', ref, gateway}), or kind='assignment' so a capable supervisor is "
++        "routed; (3) a wait needs a producer -> kind='time' with awaiting naming it (a live card, a "
++        "CI run, a vendor ticket, a real clock window) plus wake_check (or clock_only=true). "
+         "If the work is actually done, call kanban_complete; if it needs another card, "
+         "kanban_create it and link it as a parent."
+     )
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 35ec5b97c0..aa819dde9a 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -86,6 +86,7 @@ def continue_task(
+     resume_after_seconds: int = 0, expected_run_id: Optional[int] = None,
+     max_continuations: Optional[int] = None, metadata: Optional[dict] = None,
+     wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
++    awaiting: Any = None,
+ ) -> dict[str, Any]:
+     """End the running run as ``continued`` and re-queue the card.
+ 
+@@ -135,6 +136,22 @@ def continue_task(
+         new_status = "scheduled" if resume_after > 0 else source_status
+         wake_at = now + resume_after if resume_after > 0 else None
+         from hermes_cli import kanban_wake_check as kwc
++        record = None
++        if wake_at is not None:
++            from hermes_cli import kanban_awaiting as kaw
++            try:
++                record = kaw.gate(conn, task_id, awaiting=awaiting, reason=checkpoint, wake_check=wake_check,
++                                  clock_only=clock_only, op="continue", wake_in=resume_after)
++            except kaw.AwaitingError as exc:
++                return {"ok": False, "error": str(exc), "reason_code": exc.code}
++            except kaw.RepeatedPark as rp:
++                owner = kaw.escalate(conn, task_id, record=rp.record, reason=checkpoint,
++                                     expected_run_id=int(row["current_run_id"]))
++                if owner is None:
++                    return {"ok": False, "error": "task changed state concurrently"}
++                return {"ok": True, "status": "todo", "run_id": None, "continuation": streak,
++                        "wake_at": None, "escalated_to": owner}
++            wake_check = wake_check or kaw.card_probe(record)
+         try:
+             wake_check, check_every = kwc.validate_park(
+                 wake_at=wake_at, wake_check=wake_check,
+@@ -178,6 +195,7 @@ def continue_task(
+         if wake_at is not None:
+             payload["wake_at"] = wake_at
+             payload.update(kwc.park_fields(wake_check, check_every, clock_only))
++            payload["awaiting"] = record
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now)
+     return {"ok": True, "status": new_status, "run_id": run_id,
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 1d606e189a..1e9f13e389 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3136,7 +3136,7 @@ def block_task(
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+     blocker_id: Optional[str] = None, wake_check: Optional[str] = None,
+     check_every: Optional[int] = None, clock_only: bool = False,
+-    human_request: Optional[dict] = None,
++    human_request: Optional[dict] = None, awaiting: Any = None,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+     :func:`kanban_block_routing.route_block`). A wait on time -- ``kind='time'``, a ``dependency``
+@@ -3185,7 +3185,7 @@ def block_task(
+                 reject_timed_request(human_request)
+                 return ktp.park(conn, task_id, reason=reason, requested_kind=kind, source_status="ready",
+                                 from_untyped_block=True, wake_check=wake_check,
+-                                check_every=check_every, clock_only=clock_only)
++                                check_every=check_every, clock_only=clock_only, awaiting=awaiting)
+             requested_kind, rekind_reason = kind, None
+             if kind == "assignment":
+                 kind, rekind_reason = assignment_routing.classify(get_task(conn, task_id), kind, reason, human_request=human_request)
+@@ -3216,7 +3216,7 @@ def block_task(
+             reject_timed_request(human_request)
+             return ktp.park(conn, task_id, reason=reason, requested_kind=kind,
+                             source_status=source_status, expected_run_id=expected_run_id,
+-                            wake_check=wake_check, check_every=check_every, clock_only=clock_only)
++                            wake_check=wake_check, check_every=check_every, clock_only=clock_only, awaiting=awaiting)
+         # Parent-less ``dependency`` behind a shared blocker: sticky ``needs_input`` (todo would respawn it).
+         if kind == "dependency" and no_open_parent:
+             kind = "needs_input"
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 12f1a011e1..c66c31ee98 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -14,17 +14,28 @@ from hermes_cli import kanban_db as _kb
+ def schedule_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     expected_run_id: Optional[int] = None, wake_check: Optional[str] = None,
+-    check_every: Optional[int] = None, clock_only: bool = False,
++    check_every: Optional[int] = None, clock_only: bool = False, awaiting: Any = None,
+ ) -> bool:
+     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
+     (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
+     ``unblock_task``. Refused (False) while the card waits on a human answer: ``scheduled`` is
+-    not on any needs-me surface, so such a park hid the ask (t_6feb6afd). [daveey]"""
++    not on any needs-me surface, so such a park hid the ask (t_6feb6afd). [daveey]
++
++    ``awaiting`` names the producer (``kanban_awaiting``); a park nothing would satisfy raises
++    ``AwaitingError``, and a third park on one premise escalates to an owner card instead."""
+     with _kb.write_txn(conn):
+         if _kb._awaiting_human_answer(conn, task_id):
+             return False
+         from hermes_cli.kanban_timed_park import scheduled_payload
++        from hermes_cli import kanban_awaiting as kaw
+         from hermes_cli import kanban_wake_check as kwc
++        try:
++            record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
++                              clock_only=clock_only, op="schedule")
++        except kaw.RepeatedPark as rp:
++            return kaw.escalate(conn, task_id, record=rp.record, reason=reason,
++                                expected_run_id=expected_run_id) is not None
++        wake_check = wake_check or kaw.card_probe(record)
+         payload = scheduled_payload(reason)
+         wake_check, check_every = kwc.validate_park(
+             wake_at=payload["wake_at"], wake_check=wake_check,
+@@ -49,7 +60,7 @@ def schedule_task(
+             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+         )
+         _kb._append_event(conn, task_id, "scheduled", {
+-            **payload, **kwc.park_fields(wake_check, check_every, clock_only),
++            **payload, **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record,
+         }, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check, check_every)
+         return True
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index acf9494123..1def9bb72a 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -94,6 +94,11 @@ def _WAKE_CHECK_ARGS():
+              help="Seconds between --wake-check probes (default 900, min 120, max 21600)"),
+         _arg("--clock-only", dest="clock_only", action="store_true",
+              help="A pure time wait with nothing to probe (soak window, calendar date)"),
++        _arg("--awaiting", dest="awaiting", default=None, metavar="KIND:REF|JSON",
++             help="Who produces the condition: card:<task id> (JSON adds gateway/board), ci:<run id>, "
++                  "deploy:<id>, external:<vendor/ticket>, clock:<window>. A wait needs a producer; "
++                  "agent-action conditions (grant, permission, install, fix) are work, not waits."),
++        _arg("--awaiting-why", dest="awaiting_why", default=None, help="Evidence for --awaiting"),
+     )
+ _TASK_IDS = _arg("task_ids", nargs="+")
+ _SLUG = _arg("slug")
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index 8ef835c91f..7c5b5576b1 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -84,9 +84,12 @@ def park(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str], requested_kind: Optional[str],
+     source_status: str = "ready", expected_run_id: Optional[int] = None, from_untyped_block: bool = False,
+     wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
++    awaiting=None,
+ ) -> bool:
+     """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn.
+-    ``from_untyped_block``: an untyped ``blocked`` card with no live run (classify-in-place) instead. [daveey]"""
++    ``from_untyped_block``: an untyped ``blocked`` card with no live run (classify-in-place) instead.
++    ``awaiting`` names the producer (``kanban_awaiting.gate``: refused or escalated otherwise). [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
+ 
+@@ -94,6 +97,13 @@ def park(
+     wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
+     guard = ("status = 'blocked' AND block_kind IS NULL AND current_run_id IS NULL" if from_untyped_block
+              else "status IN ('running', 'ready')")
++    try:
++        record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
++                          clock_only=clock_only, op="block")
++    except kaw.RepeatedPark as rp:
++        return kaw.escalate(conn, task_id, record=rp.record, reason=reason,
++                            expected_run_id=expected_run_id) is not None
++    wake_check = wake_check or kaw.card_probe(record)
+     wake_check, check_every = kwc.validate_park(
+         wake_at=wake_at, wake_check=wake_check, check_every=check_every, clock_only=clock_only)
+     sql = ("UPDATE tasks SET status = 'scheduled', human_request = NULL, claim_lock = NULL, claim_expires = NULL, "
+@@ -110,7 +120,7 @@ def park(
+     kb._append_event(conn, task_id, "scheduled", {
+         "reason": reason, "timed_park": True, "requested_kind": requested_kind,
+         "wake_at": wake_at, "resume_status": source_status,
+-        **kwc.park_fields(wake_check, check_every, clock_only),
++        **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record,
+     }, run_id=run_id)
+     kwc.set_check(conn, task_id, wake_check, check_every, now=now)
+     return True
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 7681ef2228..ccdaa1d702 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -92,6 +92,10 @@ def dry_run_error(cmd: Optional[str], *, cwd: Optional[str] = None, env: Optiona
+ 
+ 
+ GUARD_HELP = (
++    "A wait needs a producer (awaiting={kind: card|ci|deploy|external|clock, ref, why}); a probe "
++    "only says when to look. A condition only an agent action changes (a grant, a permission, an "
++    "install, a fix) is work, not a wait: create its owner card where the capability lives and "
++    "point awaiting at it. "
+     "A wait on any readable fact needs wake_check=<shell command>: exit 0 = the condition "
+     "holds (the card wakes at once), exit 1 = not yet (re-probed every check_every seconds, "
+     "default 900, min 120). Examples: "
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+new file mode 100644
+index 0000000000..b8ad105228
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -0,0 +1,460 @@
++"""No producer, no park: a timed park must name who produces its condition. [daveey]
++
++Replays of the four 10-26/27 orphan waits (``~/.hermes/kanban/evidence/orphan-waits-20261027/
++5whys.md``; reasons verbatim from the parking events and the state-branch fixtures in
++``tests/test_session_idle_orphan_wait.py``) must be refused with a typed error, and the controls
++from those fixtures (a running card, an in-progress CI run, a pure clock soak, a wait on a card
++blocked on David with a visible ask) must still park.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_awaiting as kaw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++
++IAM_DESCRIBE = ("Waiting on AWS describe authority for hub role (denied, re-verified). Probe polls hub role ec2 "
++                "describe_vpcs until it succeeds.")
++IAM_MUTATION = ("SCHEDULED_UNTIL=2026-10-28T07:30:00Z \u2014 Read-only discovery works (inventory-20261027.txt), but "
++                "hub role is denied EC2 mutation (DryRun RunInstances/CreateLaunchTemplate/CreateSecurityGroup "
++                "UnauthorizedOperation). Needs the scoped hermes-asg-ci-* us-west-2 grant in mutation-permission-"
++                "request.md applied by the supervisor (same route as the discovery fix); card wakes when a "
++                "CreateSecurityGroup DryRun succeeds.")
++SUPPORT_TICKET = ("Parked by supervisor on a REAL recovery signal (a hermes artifact exists), not the shared "
++                  "github-actions-billing auto-clear. The human step stays unchanged: David's decision on sending "
++                  "support draft attachment180, already asked in chat; don't re-ask. Wakes when artifacts "
++                  "total_count>0 or on unblock.")
++CONSOLE_OUTPUT = ("SCHEDULED_UNTIL=2026-10-27T14:00:00Z \u2014 waiting for supervisor t_4c3070a4 to grant "
++                  "ec2:GetConsoleOutput (and rollback perms) for hermes-hub on Project=hermes-asg-ci; asks posted. "
++                  "Wakes when GetConsoleOutput on the pilot instance stops being denied.")
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setenv("ASK_GATE_LEDGER", str(home / "state" / "ask-ledger.sqlite"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    yield home
++    kwc._shutdown_for_tests()
++
++
++def _running(conn) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return tid
++
++
++def _as_worker(monkeypatch, conn, tid):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
++
++
++def _human_blocked(conn) -> str:
++    tid = _running(conn)
++    assert kb.block_task(conn, tid, reason="Approve the scoped restart", kind="needs_input", human_request={
++        "action": "Approve restart", "why_human": "policy", "interaction": "approval",
++        "scope": "hub gateway", "evidence": "drain plan attached"})
++    return tid
++
++
++def _park_payload(conn, tid) -> dict:
++    return [e for e in kb.list_events(conn, tid) if e.kind in ("scheduled", "continued")][-1].payload
++
++
++def _tool(name, args):
++    from tools import kanban_tools as kt
++    return json.loads(getattr(kt, f"_handle_{name}")(args))
++
++
++# -- replays: refused with a typed error, or turned into a visible ask -------------------------------
++
++@pytest.mark.parametrize("op,args", [
++    ("schedule", {"reason": IAM_DESCRIBE, "wake_check": "python3 aws_hub_ec2_probe.py"}),
++    ("block", {"reason": IAM_MUTATION, "kind": "time", "wake_check": "python3 dryrun.py"}),
++    ("block", {"reason": IAM_MUTATION, "kind": "time", "clock_only": True}),
++    ("schedule", {"reason": CONSOLE_OUTPUT, "wake_check": "python3 asg_console_probe.py"}),
++    ("schedule", {"reason": IAM_MUTATION, "clock_only": True, "awaiting": {"kind": "clock", "why": "31h"}}),
++    ("schedule", {"reason": CONSOLE_OUTPUT, "awaiting": {"kind": "card", "ref": "t_4c3070a4"}}),
++])
++def test_agent_action_waits_with_no_producer_are_refused(kanban_home, monkeypatch, op, args) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool(op, args)
++        assert out.get("code") == kaw.AGENT_ACTION_WAIT or kaw.AGENT_ACTION_WAIT in out.get("error", ""), out
++        assert "owner card" in out["error"] and "assignment" in out["error"]
++        task = kb.get_task(conn, tid)
++        assert task.status == "running" and kwc.get_state(conn, tid) is None
++
++
++@pytest.mark.parametrize("reason,code", [
++    ("Resume once David's approval lands.", kaw.HUMAN_WAIT),
++    ("Park until after David's go-ahead on the migration.", kaw.HUMAN_WAIT),
++    ("with David's approval pending, parking", kaw.HUMAN_WAIT),
++    ("the supervisor was asked to apply the grant", kaw.AGENT_ACTION_WAIT),
++    ("AccessDenied: the role was missing s3:PutObject permission", kaw.AGENT_ACTION_WAIT),
++])
++def test_pending_asks_and_walls_stay_refused(kanban_home, monkeypatch, reason, code) -> None:
++    assert kaw.text_wall(reason)[0] == code
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        assert code in _tool("schedule", {"reason": reason, "wake_check": "exit 1"})["error"]
++
++
++def test_hidden_human_ask_is_refused_as_a_park(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": SUPPORT_TICKET, "wake_check": "gh api artifacts | grep -qv ^0$"})
++        assert kaw.HUMAN_WAIT in out["error"] and "human_request" in out["error"], out
++        out = _tool("schedule", {"reason": "need a call", "awaiting": {"kind": "human", "why": "approve"}})
++        assert kaw.HUMAN_WAIT in out["error"]
++        assert kb.get_task(conn, tid).status == "running"
++        # The visible path still works: a needs_input block with a human_request.
++        out = _tool("block", {"reason": "Send support draft attachment180?", "kind": "needs_input",
++                              "human_request": {"action": "Send draft 180", "why_human": "your account",
++                                                "interaction": "approval", "scope": "GitHub support",
++                                                "evidence": "draft attached"}})
++        assert out.get("status") == "blocked", out
++
++
++def test_answered_ask_is_never_re_asked(kanban_home, monkeypatch) -> None:
++    ledger = Path(kanban_home) / "state" / "ask-ledger.sqlite"
++    ledger.parent.mkdir(parents=True)
++    c = sqlite3.connect(ledger)
++    c.execute("create table answered (id integer primary key, ts real, session text, topic text, answer text, "
++              "card_id text)")
++    c.execute("insert into answered(ts, session, topic, answer, card_id) values (?,?,?,?,?)",
++              (time.time(), "s", "send support draft attachment180 about artifact quota",
++               "will not be solved; drop it", ""))
++    c.commit()
++    c.close()
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": SUPPORT_TICKET, "wake_check": "exit 1"})
++        assert "already answered" in out["error"] and "will not be solved" in out["error"], out
++
++
++def test_cli_refuses_the_same_parks(kanban_home, capsys) -> None:
++    from hermes_cli import kanban as kcli
++
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++
++    def run(*argv):
++        return kcli.kanban_command(parser.parse_args(["kanban", *argv]))
++
++    with kbc.connect_closing() as conn:
++        a, b, ci = _running(conn), _running(conn), _running(conn)
++    assert run("schedule", a, IAM_DESCRIBE, "--wake-check", "exit 1") != 0
++    assert kaw.AGENT_ACTION_WAIT in capsys.readouterr().err
++    assert run("block", b, IAM_MUTATION, "--kind", "time", "--clock-only") != 0
++    assert kaw.AGENT_ACTION_WAIT in capsys.readouterr().err
++    assert run("schedule", ci, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for the release build",
++               "--wake-check", "exit 1", "--awaiting", "ci:40443505012", "--awaiting-why", "in progress") == 0
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, a).status == "running" and kb.get_task(conn, b).status == "running"
++        assert _park_payload(conn, ci)["awaiting"]["ref"] == "40443505012"
++        # A refused park leaves no "SCHEDULED: ..." / "BLOCKED: ..." comment behind.
++        assert not kb.list_comments(conn, a) and not kb.list_comments(conn, b)
++
++
++# -- controls: real waits still park, with their producer recorded ------------------------------------
++
++def test_wait_on_a_running_card_parks_with_a_derived_probe(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        owner = _running(conn)
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "Waiting on scoped IAM grant from owner card (running).",
++                                 "awaiting": {"kind": "card", "ref": owner}})
++        assert out.get("status") == "scheduled", out
++        rec = _park_payload(conn, tid)["awaiting"]
++        assert rec["kind"] == "card" and rec["ref"] == owner and not rec.get("inferred")
++        assert kwc.get_state(conn, tid)["cmd"] == f"hermes kanban wait-check task {owner}"
++
++
++def test_wall_owned_by_a_card_only_named_in_prose_must_be_declared(kanban_home, monkeypatch) -> None:
++    """A mentioned id is not a producer (a tracker card was named on 10-27); the owner is declared."""
++    with kbc.connect_closing() as conn:
++        owner = _running(conn)
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        reason = f"Waiting on scoped IAM grant from owner card {owner} (running); hub role denied."
++        out = _tool("schedule", {"reason": reason, "wake_check": "python3 dryrun.py"})
++        assert kaw.AGENT_ACTION_WAIT in out["error"] and f"ref:'{owner}'" in out["error"], out
++        out = _tool("schedule", {"reason": reason, "wake_check": "python3 dryrun.py",
++                                 "awaiting": {"kind": "card", "ref": owner}})
++        assert out.get("status") == "scheduled", out
++
++
++@pytest.mark.parametrize("status", ["triage", "blocked"])
++def test_replay_tracker_card_that_produces_nothing_is_refused(kanban_home, monkeypatch, status) -> None:
++    """10-27 03:35: t_4c3070a4 existed, as a tracker that was itself idle."""
++    with kbc.connect_closing() as conn:
++        tracker, tid = _running(conn), _running(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=?, current_run_id=NULL, block_kind='transient' WHERE id=?",
++                         (status, tracker))
++        _as_worker(monkeypatch, conn, tid)
++        reason = CONSOLE_OUTPUT.replace("t_4c3070a4", tracker)
++        for extra in ({}, {"awaiting": {"kind": "card", "ref": tracker}}):
++            out = _tool("schedule", {"reason": reason, "wake_check": "exit 1", **extra})
++            assert kaw.AGENT_ACTION_WAIT in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++@pytest.mark.parametrize("reason", [
++    "Waiting for AWS support to grant the quota increase (case 1234567).",
++    "Upstream API returns 403 Forbidden while their maintenance runs; SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++    "Rate limiter returned 401 unauthorized until the token rotates at 02:00.",
++    "No permissions changes needed; waiting for nightly soak.",
++    "Earlier run hit permission denied on cache; fixed in PR 12. Waiting for CI rerun.",
++    "Per David's decision yesterday, deploy then soak 24h.",
++    "Following David's approval in chat, rollout is live; 24h soak.",
++    "David's decision recorded 23:06 (design A); waiting for TestFlight processing build 412.",
++])
++def test_ordinary_park_prose_is_not_a_wall(kanban_home, monkeypatch, reason) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": reason, "wake_check": "exit 1"})
++        assert out.get("status") == "scheduled", out
++
++
++def test_in_progress_ci_run_parks(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        a, b = _running(conn), _running(conn)
++        _as_worker(monkeypatch, conn, a)
++        out = _tool("schedule", {"reason": "Waiting for CI run 40443505012 on PR92 to finish.",
++                                 "wake_check": "gh run view 40443505012 --json status | grep -q completed",
++                                 "awaiting": {"kind": "ci", "ref": "40443505012", "why": "in progress"}})
++        assert out.get("status") == "scheduled", out
++        _as_worker(monkeypatch, conn, b)
++        out = _tool("schedule", {"reason": "Waiting for CI run 40443505012 on PR92 to finish (in progress on a "
++                                           "self-hosted runner).", "wake_check": "gh run view"})
++        assert out.get("status") == "scheduled", out
++        assert _park_payload(conn, b)["awaiting"]["inferred"] is True
++        _as_worker(monkeypatch, conn, b)
++
++
++def test_ci_wait_needs_a_run_id(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "CI", "wake_check": "exit 1", "awaiting": {"kind": "ci", "ref": "soon"}})
++        assert kaw.INVALID_AWAITING in out["error"], out
++
++
++@pytest.mark.parametrize("reason", [
++    "SCHEDULED_UNTIL=2099-01-01T00:00:00Z \u2014 24h OOM soak window after deploy.",
++    "No David decision needed; waiting on the 24h soak. SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++    "Fixed file permissions on the cache dir; waiting for the nightly run at 02:00 to confirm.",
++])
++def test_pure_clock_waits_park(kanban_home, monkeypatch, reason) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("block", {"reason": reason, "kind": "time", "clock_only": True})
++        assert out.get("status") == "scheduled", out
++        assert _park_payload(conn, tid)["awaiting"]["kind"] == "clock"
++
++
++def test_wait_on_a_card_blocked_on_david_with_a_visible_ask_parks(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        ask = _human_blocked(conn)
++        a, b = _running(conn), _running(conn)
++        _as_worker(monkeypatch, conn, a)
++        out = _tool("schedule", {"reason": f"Waiting on David's approval in {ask}.",
++                                 "wake_check": f"hermes kanban wait-check task {ask}"})
++        assert out.get("status") == "scheduled", out
++        _as_worker(monkeypatch, conn, b)
++        out = _tool("schedule", {"reason": "restart approval", "awaiting": {"kind": "card", "ref": ask}})
++        assert out.get("status") == "scheduled", out
++
++
++def test_card_producer_that_is_itself_an_orphan_is_refused(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        orphan, tid = _running(conn), _running(conn)
++        # A legacy park (before awaiting existed) on an agent-only wall.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled', current_run_id=NULL WHERE id=?", (orphan,))
++            kb._append_event(conn, orphan, "scheduled", {"reason": IAM_DESCRIBE})
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "tracker", "awaiting": {"kind": "card", "ref": orphan}})
++        assert kaw.AGENT_ACTION_WAIT in out["error"] and orphan in out["error"], out
++
++
++def test_unconfirmed_remote_card_is_refused_inside_the_txn(kanban_home) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        with pytest.raises(kaw.AwaitingError, match="not confirmed"):
++            kb.schedule_task(conn, tid, reason="x", wake_check="exit 1",
++                             awaiting={"kind": "card", "ref": "t_00000000aaaaaaaa", "gateway": "mini"})
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_cross_gateway_card_is_confirmed_with_wait_check(kanban_home, monkeypatch) -> None:
++    from hermes_cli import kanban_wait_check as kwait
++
++    calls = []
++    monkeypatch.setattr(kwait, "check_remote", lambda gw, kind, ref, board=None, until=None: (
++        calls.append((gw, ref)) or ((1, f"{ref} running") if ref == "t_01a17cee71315bb0" else (2, "error: not found"))))
++    with kbc.connect_closing() as conn:
++        a, b = _running(conn), _running(conn)
++        _as_worker(monkeypatch, conn, a)
++        out = _tool("schedule", {"reason": "MacBook owner card extends the hub role policy.",
++                                 "awaiting": {"kind": "card", "ref": "t_01a17cee71315bb0", "gateway": "macbook"}})
++        assert out.get("status") == "scheduled", out
++        assert kwc.get_state(conn, a)["cmd"] == "hermes kanban wait-check task t_01a17cee71315bb0 --gateway macbook"
++        _as_worker(monkeypatch, conn, b)
++        out = _tool("schedule", {"reason": "x", "awaiting": {"kind": "card", "ref": "macbook:t_0000000000000000"}})
++        assert kaw.INVALID_AWAITING in out["error"] and "cannot confirm" in out["error"], out
++    assert calls == [("macbook", "t_01a17cee71315bb0"), ("macbook", "t_0000000000000000")]
++    monkeypatch.setattr(kwait, "check_remote", lambda gw, kind, ref, board=None, until=None: (1, f"{ref} triage"))
++    with kbc.connect_closing() as conn:
++        c = _running(conn)
++        _as_worker(monkeypatch, conn, c)
++        out = _tool("schedule", {"reason": "x", "awaiting": {"kind": "card", "ref": "t_0000000000000001",
++                                                            "gateway": "macbook"}})
++        assert kaw.AGENT_ACTION_WAIT in out["error"] and "triage" in out["error"], out
++
++
++def test_short_continue_is_not_judged_by_its_checkpoint_prose(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("continue", {"checkpoint": "Earlier the role was denied; fixed. Next: rerun tests.",
++                                 "resume_after_seconds": 300})
++        assert out.get("status") == "scheduled", out
++        assert _park_payload(conn, tid)["awaiting"] == {"kind": "clock", "inferred": True}
++
++
++def test_long_continue_on_an_agent_wall_is_refused(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("continue", {"checkpoint": IAM_MUTATION, "resume_after_seconds": 20000, "clock_only": True})
++        assert kaw.AGENT_ACTION_WAIT in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++# -- re-parks escalate --------------------------------------------------------------------------------
++
++def test_third_park_on_the_same_premise_goes_to_the_supervisor(kanban_home, monkeypatch) -> None:
++    reason = "Waiting for vendor ticket 4711 (AWS quota increase), evidence: case opened {n}"
++    awaiting = {"kind": "external", "ref": "AWS support case 4711", "why": "quota increase pending"}
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        for n in range(2):
++            _as_worker(monkeypatch, conn, tid)
++            out = _tool("schedule", {"reason": reason.format(n=n), "wake_check": "exit 1", "awaiting": awaiting})
++            assert out.get("status") == "scheduled", out
++            assert kb.unblock_task(conn, tid)
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++            assert kb.claim_task(conn, tid, claimer="worker") is not None
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": reason.format(n=9), "wake_check": "exit 1", "awaiting": awaiting})
++        assert out.get("code") == "repark_escalated" and out.get("status") == "todo", out
++        owner = out["owner_task_id"]
++        card = kb.get_task(conn, owner)
++        # No capable supervisor is configured here: the issue lands in triage, never on the parking worker.
++        assert card.status == "triage" and card.assignee != "worker" and "parked 3x" in card.title
++        assert "not a question for David" in card.body and card.human_request is None
++        assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (owner, tid)).fetchone()
++        assert kwc.get_state(conn, tid) is None
++        # A different premise is new evidence: it parks normally.
++        other = _running(conn)
++        _as_worker(monkeypatch, conn, other)
++        assert _tool("schedule", {"reason": reason.format(n=1), "wake_check": "exit 1",
++                                  "awaiting": awaiting}).get("status") == "scheduled"
++        # The supervisor resolves the owner card: the count restarts, so the next park is a park.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready', assignee='boss' WHERE id=?", (owner,))
++        assert kb.claim_task(conn, owner, claimer="boss") is not None
++        assert kb.complete_task(conn, owner, summary="quota raised")
++        assert kb.get_task(conn, tid).status == "ready"
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++        _as_worker(monkeypatch, conn, tid)
++        assert _tool("schedule", {"reason": "again", "wake_check": "exit 1",
++                                  "awaiting": awaiting}).get("status") == "scheduled"
++
++
++def test_escalation_goes_to_a_capable_supervisor(kanban_home, monkeypatch) -> None:
++    monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: "boss")
++    awaiting = {"kind": "deploy", "ref": "release 93ed6b10", "why": "rollout"}
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        for n in range(3):
++            _as_worker(monkeypatch, conn, tid)
++            out = _tool("schedule", {"reason": f"rollout {n}", "wake_check": "exit 1", "awaiting": awaiting})
++            if n < 2:
++                assert kb.unblock_task(conn, tid)
++                with kb.write_txn(conn):
++                    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++                assert kb.claim_task(conn, tid, claimer="worker") is not None
++        card = kb.get_task(conn, out["owner_task_id"])
++        assert (card.assignee, card.status) == ("boss", "ready")
++
++
++def _repark(conn, monkeypatch, tid, name, args):
++    _as_worker(monkeypatch, conn, tid)
++    out = _tool(name, args)
++    if out.get("status") == "scheduled":
++        assert kb.unblock_task(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return out
++
++
++def test_pacing_continues_and_distinct_clock_windows_never_escalate(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        a, b = _running(conn), _running(conn)
++        for _ in range(4):
++            out = _repark(conn, monkeypatch, a, "continue", {
++                "checkpoint": "Build still running; check again.", "resume_after_seconds": 300})
++            assert out.get("status") == "scheduled", out
++        for why in ("24h soak after deploy A", "release slot Monday", "cooldown after B", "soak after C"):
++            out = _repark(conn, monkeypatch, b, "schedule", {
++                "reason": "window", "clock_only": True, "awaiting": {"kind": "clock", "why": why}})
++            assert out.get("status") == "scheduled", out
++
++
++def test_continue_refusal_carries_the_typed_code(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("continue", {"checkpoint": "x", "resume_after_seconds": 600,
++                                 "awaiting": {"kind": "ci", "ref": "soon"}})
++        assert out.get("rejection") == kaw.INVALID_AWAITING or out.get("code") == kaw.INVALID_AWAITING, out
++
++
++def test_unrelated_ledger_topics_do_not_match(kanban_home) -> None:
++    ledger = Path(kanban_home) / "state" / "ask-ledger.sqlite"
++    ledger.parent.mkdir(parents=True)
++    c = sqlite3.connect(ledger)
++    c.execute("create table answered (id integer primary key, ts real, session text, topic text, answer text, "
++              "card_id text)")
++    c.execute("insert into answered(ts, session, topic, answer, card_id) values (?,?,?,?,?)",
++              (time.time(), "s", "Live card status and whether it is blocked on David", "it is not", ""))
++    c.commit()
++    c.close()
++    assert kaw.answered_ask("t_x", "Waiting on David's approval for the hub restart; card status blocked") is None
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 2d990ba6cf..d9e0ce773f 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -467,7 +467,9 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
+         run = kb.latest_run(conn, worker_env)
+         assert (run.outcome, run.summary) == ("scheduled", reason)
+         assert any(
+-            event.kind == "scheduled" and event.payload == {"reason": reason, "wake_at": event.payload.get("wake_at")}
++            event.kind == "scheduled" and event.payload == {
++                "reason": reason, "wake_at": event.payload.get("wake_at"),
++                "awaiting": {"kind": "clock", "inferred": True}}  # no producer named: an inferred clock wait
+             and event.payload["wake_at"]  # SCHEDULED_UNTIL= sets a real wake time
+             for event in kb.list_events(conn, worker_env)
+         )
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8acae0bb0b..d3c58a1ee2 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -224,7 +224,8 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                 from hermes_cli.kanban_capabilities import CapabilityMismatchError
+                 from hermes_cli.kanban_assignment_routing import AssignmentRoutingError
+                 from hermes_cli.kanban_model_assignment import ModelProviderMismatchError
+-                if isinstance(e, (AssignmentRoutingError, ModelProviderMismatchError)):
++                from hermes_cli.kanban_awaiting import AwaitingError
++                if isinstance(e, (AssignmentRoutingError, ModelProviderMismatchError, AwaitingError)):
+                     return tool_error(str(e), code=e.code)
+                 if isinstance(e, CapabilityMismatchError):
+                     return tool_error(str(e), code=e.code, assignee=e.assignee, missing=e.missing)
+@@ -412,6 +413,17 @@ def _ok_landed(kb, conn, tid: str, default_status: str, **extra: Any) -> str:
+                status=landed.status if landed else default_status, **extra)
+ 
+ 
++def _escalated(kb, conn, tid: str) -> Optional[str]:
++    """The result for a park that escalated to an owner card instead (``kanban_awaiting``). [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
++
++    owner = kaw.escalated_owner(conn, tid)
++    if owner is None:
++        return None
++    return _ok_landed(kb, conn, tid, "todo", code="repark_escalated", owner_task_id=owner,
++                      next=kaw.escalation_message(tid, owner))
++
++
+ def _redact(value: Any) -> str:
+     return redact_sensitive_text(str(value), force=True)
+ 
+@@ -976,6 +988,31 @@ def _wake_check_echo(wake: tuple) -> dict:
+     return {"wake_check": wake[0], "check_every": wake[1]} if wake[0] else {}
+ 
+ 
++def _awaiting_arg(args: dict, wake: tuple) -> tuple[Optional[dict], tuple]:
++    """``(awaiting, wake)``: the declared producer (``kanban_awaiting``), and the park's probe
++    with ``hermes kanban wait-check`` filled in for a card wait that brought none. [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
++
++    try:
++        awaiting = kaw.normalize(args.get("awaiting"))
++    except kaw.AwaitingError as exc:
++        raise _Reject(str(exc), exc.code) from exc
++    if awaiting and awaiting["kind"] == "human":
++        exc = kaw.human_error(os.environ.get("HERMES_KANBAN_TASK") or "",
++                              " ".join(str(args.get(k) or "") for k in ("reason", "checkpoint")) + " "
++                              + str(awaiting.get("why") or ""))
++        raise _Reject(str(exc), exc.code)
++    probe = None if wake[0] else kaw.card_probe(awaiting)
++    if probe:
++        from hermes_cli import kanban_wake_check as kwc
++        wake = (probe, kwc.normalize_every(None), wake[2])
++    try:
++        kaw.confirm_remote(awaiting)  # ssh, so before the park's write txn
++    except kaw.AwaitingError as exc:
++        raise _Reject(str(exc), exc.code) from exc
++    return awaiting, wake
++
++
+ def _park_guard(conn, tid: str, op: str, wake: tuple, **plan: Any) -> None:
+     """Refuse a park that wakes > 2 h away with no wake_check and no clock_only. [daveey]"""
+     from hermes_cli import kanban_wake_check as kwc
+@@ -1013,15 +1050,19 @@ def _handle_block(args: dict, **kw) -> str:
+                f"the completion judge will evaluate it.")
+         blocker_id = _blocker_id_arg(args)
+         wake = _wake_check_args(args)
++        awaiting, wake = _awaiting_arg(args, wake)
+         from hermes_cli.kanban_block_policy import ERROR_CODE, block_policy_error
+         _policy = block_policy_error(kind, human_request=args.get("human_request"), wake_check=wake[0],
+                                      clock_only=wake[2], blocker_id=blocker_id, reason=reason)
+         _check(_policy is None, _policy or "", ERROR_CODE)
+         _park_guard(conn, tid, "block", wake, reason=reason, kind=kind, blocker_id=blocker_id)
+         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+-                           blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1],
++                           blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1], awaiting=awaiting,
+                            clock_only=wake[2], human_request=kb.redact_review_value(args.get("human_request")))
+         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
++        escalated = _escalated(kb, conn, tid)
++        if escalated:
++            return escalated
+         landed_kind = kb.get_task(conn, tid).block_kind
+         extra: dict = {"block_kind": landed_kind}
+         if blocker_id:
+@@ -1062,12 +1103,16 @@ def _handle_schedule(args: dict, **kw) -> str:
+                "kanban_block with kind='time' (SCHEDULED_UNTIL=<ISO8601> in the reason sets "
+                "the wake), or kanban_complete so the completion judge can evaluate it.")
+         wake = _wake_check_args(args)
++        awaiting, wake = _awaiting_arg(args, wake)
+         _park_guard(conn, tid, "schedule", wake, reason=reason)
+         ok = kb.schedule_task(
+             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
+-            wake_check=wake[0], check_every=wake[1], clock_only=wake[2])
++            wake_check=wake[0], check_every=wake[1], clock_only=wake[2], awaiting=awaiting)
+         _check(ok, f"could not schedule {tid} (unknown id, not in todo/ready/running/blocked, or it "
+                    "waits on a human answer: needs_input/capability asks stay blocked, never scheduled)")
++        escalated = _escalated(kb, conn, tid)
++        if escalated:
++            return escalated
+         return _ok_landed(kb, conn, tid, "scheduled", reason=reason, **_wake_check_echo(wake))
+ 
+ 
+@@ -1093,11 +1138,17 @@ def _handle_continue(args: dict, **kw) -> str:
+     from hermes_cli.kanban_continuation import continue_task
+     with _board(args.get("board")) as (kb, conn):
+         wake = _wake_check_args(args)
++        awaiting, wake = _awaiting_arg(args, wake)
+         _park_guard(conn, tid, "continue", wake, resume_after=int(raw_after or 0))
+         res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
+-                            expected_run_id=_worker_run_id(tid), metadata=metadata,
++                            expected_run_id=_worker_run_id(tid), metadata=metadata, awaiting=awaiting,
+                             wake_check=wake[0], check_every=wake[1], clock_only=wake[2])
+-        _check(res.get("ok"), f"could not continue {tid}: {res.get('error')}")
++        from hermes_cli.kanban_awaiting import CODES
++        _check(res.get("ok"), f"could not continue {tid}: {res.get('error')}",
++               res.get("reason_code") if res.get("reason_code") in CODES else None)
++        escalated = _escalated(kb, conn, tid)
++        if escalated:
++            return escalated
+         note = ("Checkpoint saved; a fresh run will resume this card"
+                 + (f" after {int(raw_after)}s" if raw_after else " now")
+                 + ". End your turn with a one-line reply; do not call more tools.")
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 16b170200e..4293f9d49e 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -194,6 +194,30 @@ _WAKE_CHECK_PROPS = {
+         "Set true only for a pure time wait with no fact to probe (a soak window, a calendar "
+         "date, a timed re-measure). A park more than 2 h out needs wake_check or clock_only."
+     )},
++    "awaiting": {
++        "type": "object",
++        "description": (
++            "Who produces the condition this park waits on. A wait needs a producer; a probe is "
++            "not one. kind: 'card' (ref=<task id>, gateway=<name> when it lives on another "
++            "gateway; it must be live, and a wake probe is added for you), 'ci' / 'deploy' "
++            "(ref=<run, job or release id/URL>), 'external' (ref=<vendor or ticket>, why=<evidence>), "
++            "'clock' (a real window: soak, cooldown, release slot). 'human' is always refused: a "
++            "wait on David is kanban_block kind='needs_input' with human_request. A condition only "
++            "an agent action changes (a grant, a permission, an install, a fix) is work, not a "
++            "wait: it is refused (agent_action_wait) unless ref names the owner card doing it. "
++            "Omitted: classified from the reason. The third park in a row on the same premise "
++            "goes to the supervisor as an owner card instead of parking again."
++        ),
++        "properties": {
++            "kind": {"type": "string", "enum": ["card", "ci", "deploy", "external", "clock", "human"]},
++            "ref": {"type": "string"},
++            "why": {"type": "string"},
++            "gateway": {"type": "string"},
++            "board": {"type": "string"},
++        },
++        "required": ["kind"],
++        "additionalProperties": False,
++    },
+ }
+ 
+ 
+@@ -240,10 +264,15 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "external event (a cap, a soak, a release window) is not a block: use "
+         "kind='time' (put SCHEDULED_UNTIL=<ISO8601> in the reason to set the wake; "
+         "default 24h), since a blocked card marks its chat as needing a human. "
+-        "A timed wait on any readable fact needs ``wake_check`` (a shell probe; "
+-        "the card wakes the moment it exits 0); a park more than 2 h out without "
+-        "one is refused unless ``clock_only`` is true. A wait on another card on "
+-        "this board is a parent link (kanban_link), not a park."
++        "A timed wait needs a producer, named in ``awaiting`` (a live card, a CI "
++        "run, a vendor ticket, a real clock window); ``wake_check`` only says when "
++        "to look, and a park more than 2 h out without one is refused unless "
++        "``clock_only`` is true. Agent-action conditions (a grant, a permission, "
++        "an install, a fix) are work, not waits: create the owner card on the "
++        "gateway that holds the capability and point ``awaiting`` at it, or use "
++        "kind='assignment'. A wait on David is kind='needs_input' with "
++        "``human_request``, never a park. A wait on another card on this board is "
++        "a parent link (kanban_link), not a park."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+@@ -289,10 +318,15 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+         "time or an external event. This ends the current run and makes the "
+         "task non-dispatchable until an orchestrator unblocks it, or until the "
+         "time named by a ``SCHEDULED_UNTIL=<ISO8601>`` marker in ``reason`` "
+-        "(default 24h), or until ``wake_check`` exits 0. A wait on any readable "
+-        "fact needs ``wake_check``; a park more than 2 h out without one is "
+-        "refused unless ``clock_only`` is true. A wait on another card on this "
+-        "board is a parent link (kanban_link), not a park."
++        "(default 24h), or until ``wake_check`` exits 0. A wait needs a producer, "
++        "named in ``awaiting``: a probe is not one. A park more than 2 h out "
++        "without ``wake_check`` is refused unless ``clock_only`` is true. "
++        "Agent-action conditions (a grant, a permission, an install, a fix) are "
++        "work, not waits: they are refused (agent_action_wait) unless ``awaiting`` "
++        "names the owner card doing it (create it on the gateway that holds the "
++        "capability), and a wait on David is a kanban_block needs_input ask, never "
++        "a park. A wait on another card on this board is a parent link "
++        "(kanban_link), not a park."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+@@ -335,7 +369,9 @@ KANBAN_CONTINUE_SCHEMA = _schema(
+             "Optional. 0 (default) re-queues immediately. N > 0 parks the card in "
+             "'scheduled' and the dispatcher re-queues it after N seconds (max "
+             "86400): use this to hand off a wait instead of polling. Over 7200 "
+-            "needs wake_check (or clock_only for a pure time wait)."
++            "needs wake_check (or clock_only for a pure time wait). The wait needs a "
++            "producer (``awaiting``): agent-action conditions (a grant, a permission, "
++            "an install, a fix) are work, not waits."
+         )},
+         **_WAKE_CHECK_PROPS,
+         "metadata": {"type": "object", "description": (
+-- 
+2.55.0
+
