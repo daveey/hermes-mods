@@ -9,7 +9,7 @@ def test_registration_has_real_tools_and_no_inventory_side_effects(tmp_path, mon
     plugin=importlib.import_module('plugins.runners')
     tools = []
     plugin.register(SimpleNamespace(register_tool=lambda **kw: tools.append(kw)))
-    assert {t['name'] for t in tools} == {'runners_list', 'runners_inspect', 'runners_refresh', 'runners_repair', 'runners_verify'}
+    assert {t['name'] for t in tools} == {'runners_list', 'runners_inspect', 'runners_refresh', 'runners_repair', 'runners_verify', 'runners_operate'}
     assert all(callable(t['handler']) for t in tools)
     assert list(tmp_path.iterdir())==[]
 

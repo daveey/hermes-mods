@@ -180,10 +180,58 @@ but never drains jobs or alters provider evidence. Staleness stays visible.
 The tools `runners_list`, `runners_inspect`, `runners_refresh`, `runners_repair` and
 `runners_verify` use these domain services. Repair/verify require the actual owning
 gateway runtime session; unsupported CLI/isolated runtimes fail explicitly.
-There are no authorized restarts, cleanup, job cancellation or signing operations.
+There are no authorized restarts, cleanup, job cancellation or signing operations;
+the only mutation path is the broker-guarded canary `service_start` below.
 The separate repair ledger is additive and bounded to 100 active reservations and
 10,000 audit/idempotency requests. It fails closed when full rather than forgetting
 an ambiguous request. Generic Store retention does not prune this ledger.
+
+## Guarded management operations (broker)
+
+`runners_operate` is the only management entry point a repair session gets. It forwards
+`{operation, target_id, repair_id}` for the active repair's own bound service to the
+management broker over `/run/hermes-runners-broker/manage.sock`. It never runs a shell.
+The broker (`broker/server.py`, engine in `operations.py`, credential bridge in
+`credentials.py`) runs as its own OS identity `hermes-runners-broker` from a root-owned
+copy of the code (`templates/broker.service`). Policy lives at
+`/etc/hermes-runners-broker/policy.json` (root-owned, not agent-writable) and credentials
+in `/etc/hermes-runners-broker/credentials` (broker-owned 0700/0600). Peers are
+authenticated by kernel `SO_PEERCRED` uid against the policy's client list.
+
+Enforced on every request:
+
+- strict schema: unknown fields (`command`, `argv`, `unit`, ...) and non-opaque IDs are refused.
+  Unit names and argv come only from policy.
+- operation allowlist: `diagnose` (read-only) and `service_start`. Mutation is allowed only on
+  policy targets marked `canary` and only when `management_operations` is true in broker policy.
+  The plugin flag of the same name gates the tool as well.
+- host and service identity: the request host must equal the broker host. The unit's `Id`,
+  `FragmentPath` and description fingerprint must match the provisioned service.
+- the repair subject only: sibling services are refused, and there are no batch, reboot or
+  host verbs.
+- `service_start` runs only on a stopped unit. It needs no `Runner.Worker` in the unit cgroup
+  or runner root, and a fresh (at most 30 s) GitHub runner GET that is not busy. Any
+  busy/unknown/stale activity refuses. A non-blocking host-scoped flock and a 120 s cooldown
+  apply. The broker then reads the unit back and reports `control_plane_started` /
+  `restored_unverified_build`, never build health.
+- restart/drain/quiesce of a running listener stay disabled
+  (`restart_disabled_no_safe_quiesce`). GitHub has no per-runner stop-assignment API, SIGTERM
+  races assignment, and label removal does not stop default-label jobs.
+- install, upgrade, unregister, cache deletion, job cancellation and signing changes are
+  refused with `separate_explicit_approval_required`. The broker holds no approval authority,
+  so a supplied approval is `approval_invalid`.
+- diagnostic and evidence text is returned as `{"trust": "untrusted_data"}` and never widens
+  authority.
+
+`broker/authorization.py` generates the polkit rule that grants the broker user only `start`
+on listed canary units. With no canary listed, it grants nothing. It also provides the
+install boundary check and the forced-command probe key line. The workflow-facing
+execution-claim API (phase G) must be a separate listener; `server.ROUTES` serves only
+`management`.
+
+Limitation: on a host where the agent's Unix user has passwordless sudo, OS separation
+protects credentials and policy from the unprivileged agent but cannot stop a root-capable
+agent. Mutation safety is then only as strong as that session's tool boundary.
 
 ## Boundaries
 
