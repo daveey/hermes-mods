@@ -108,6 +108,7 @@ def test_live_on_hub_creates_the_card_with_the_spec_args(store):
     assert out == {"action": "filed", "card": "t_00000001", "key": f"selfheal:{d['fingerprint']}", "scheduled": None}
     assert opt(argv, "--idempotency-key") == f"selfheal:{d['fingerprint']}"
     assert opt(argv, "--model") == "claude-opus-5-5" and opt(argv, "--max-runtime") == "3600"
+    assert opt(argv, "--provider") == "anthropic"  # hub default provider is openai-codex: a bare opus model is refused
     assert [argv[i + 1] for i, a in enumerate(argv) if a == "--skill"] == ["five-whys", "hermes-mods-repo"]
     assert "--board" not in argv[:4]
     (f,) = ev(store, "selfheal_filed")
@@ -588,6 +589,7 @@ def test_do_it_creates_the_fix_card_with_red_green_acceptance(store, monkeypatch
     argv = r.creates()[-1]
     assert out["action"] == "filed" and opt(argv, "--idempotency-key") == f"selfheal:{fp}:fix"
     assert opt(argv, "--model") == "claude-opus-5-5"
+    assert opt(argv, "--provider") == "anthropic"
     body = opt(argv, "--body")
     for part in ("add test_sort_stable", "FAILING", "PASSING", "Verify live", "--type selfheal-result",
                  f"--key selfheal:{fp}", "Fixed: ", "event fixed"):

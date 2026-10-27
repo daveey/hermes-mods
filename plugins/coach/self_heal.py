@@ -629,6 +629,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 MODEL = "claude-opus-5-5"
+PROVIDER = "anthropic"  # pinned with MODEL: a host whose default provider is another (hub: openai-codex) refuses the bare model (model_provider_mismatch)
 INVESTIGATION_RUNTIME = 3600
 FIX_RUNTIME = 7200
 INVESTIGATION_BUDGET = 8
@@ -1122,7 +1123,7 @@ def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[
     r = route(d, cfg)
     sym = re.sub(r"\s+", " ", d.get("symptom") or "defect").strip()[:90]
     return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
-            "body": investigation_brief(d, previous, cfg), "idempotency_key": key, "model": MODEL,
+            "body": investigation_brief(d, previous, cfg), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY}
 
@@ -1132,6 +1133,8 @@ def kanban_argv(args: dict, hermes: str = "hermes") -> list:
         "create", args["title"], "--body", args["body"], "--assignee", args["assignee"],
         "--idempotency-key", args["idempotency_key"], "--model", args["model"],
         "--max-runtime", str(args["max_runtime"]), "--created-by", args["created_by"], "--json"]
+    if args.get("provider"):
+        argv += ["--provider", args["provider"]]
     for s in args.get("skills") or []:
         argv += ["--skill", s]
     return argv
@@ -1263,7 +1266,7 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
     r = route({"component": st.get("component")})
     key = fix_key(fp, generation(st) or 1)
     args = {"title": f"self-heal fix: {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
-            "idempotency_key": key, "model": MODEL, "max_runtime": FIX_RUNTIME,
+            "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY}
     b = (budget_fn or budget)(args.get("board"), now)
