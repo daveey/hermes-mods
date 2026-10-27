@@ -1,7 +1,8 @@
 # Centralized sync service: Kanban, sessions and Inbox (design)
 
-Patch: proposed `0193` (core apply path) plus a client plugin and a cloud service. **The Kanban source of truth is not
-built yet.** What is built is described under Current state.
+Patch: `0193` (core apply path) plus the sync client and a cloud service. **Phases 0–2 are built; no board has cut
+over yet**, so each gateway's `kanban.db` is still the source of truth for its cards. What is built is described
+under Current state.
 
 Status: design / RFC, 2026-10-23, widened 2026-10-26. It proposes one cloud source of truth for Kanban boards, the
 sessions index and the Inbox, with every gateway keeping a full local cache that serves reads and accepts writes while
@@ -49,6 +50,31 @@ records and its error log (counts grow through the day as more boards publish):
 
 1 and 2 were fixes inside the current design. 3 is structural: with per-gateway authority a remote "done" is a claim
 to verify. With one source of truth it is the card's status.
+
+### Central Kanban sync: built so far (2026-10-27)
+
+- **Phase 0, the Board service** (the service repo's per-board Durable Object): deployed. Since 2026-10-27 it also
+  accepts **row ops**, the push format in Sync protocol (`{op: upsert|delete, table, uid, fields, hlc}`), which is
+  what the capture triggers record. A gateway runs its own card transitions, so the service stores the resulting
+  rows instead of re-deriving them: tasks merge per field by HLC, child rows are keyed by uid, links by
+  `parent>child`. The service keeps the two decisions only it can make: `created_on` (the creating gateway, set
+  once; an `import` of an id another gateway created is refused `id_taken`) and leases (a row op that moves a card
+  under another gateway's live lease is refused `live_claim`). Its task ops (`create`, `complete`, …) are unchanged.
+  Tests: the service repo's `worker/test/rows.test.ts`.
+- **Phase 1, core seams** (triggers, outbox, apply path, lease hooks): shipped behind `kanban.sync.enabled`.
+- **Phase 2, the sync client** (`hermes_cli/kanban_sync_client.py`, `hermes kanban sync …`, a supervised gateway
+  watcher, one gateway per host): pull first, then push the outbox as row ops; a cursor below the retention floor
+  rebuilds from a paged snapshot. Every synced board keeps a **replica** of the whole board in
+  `<root>/kanban/sync-shadow/<board>.db`, applied with no hooks. In `shadow` mode the live board stays local and
+  `hermes kanban sync diff` compares this gateway's live cards with the replica. In `primary` mode the live board
+  also takes this gateway's own cards from the feed (edits made elsewhere, lease changes) and claims through service
+  leases. It never takes another gateway's cards, so the dispatcher's sweeps (stale claims, orphans, concurrency
+  counts) never see foreign work; cross-gateway reads come from the replica. The switch and `kanban.sync.boards`
+  are read from the kanban root's `config.yaml`, because kanban storage is shared by every profile on a host.
+  Tests: `test_kanban_sync_client.py` (against an in-memory fake of the service contract), plus the phase 1 suites.
+
+What is not built yet: Desktop reading linked cards and boards from the replica, the WebSocket feed (the client
+polls every 5 s), and placement beyond "a card runs where it was created" (`runs_on`, Worker nodes and transcripts).
 
 ## Problem
 
@@ -1164,7 +1190,7 @@ Separately, the 821 qualified owner-done links resolve on import, because the im
 | 0. Service skeleton | Worker + per-board DO with schema, `/ops`, `/changes`, WS feed, leases, auth/enroll, R2 presign; conformance tests that replay `kanban_db.py` transition tests against the DO | transition tests green against the service | 1.5–2 wk |
 | 1. Core seams (patch 0193) | triggers + outbox + sync_state, `apply_remote_changes`, lease hooks in claim/heartbeat, tombstone delete, wider ids, hook kwargs, dispatcher wake; all behind `kanban.sync.enabled` (default off) | full upstream kanban test suite green with the flag off and on (no server: outbox only) | 1.5 wk |
 | 2. Backfill + shadow | `hermes kanban sync import <board>` uploads a board (ID remap on collision); `mode='shadow'`: outbox drains and the feed is applied into a **separate** shadow file, never into the live board; a nightly diff job compares live vs shadow | 7 days of zero unexplained diffs on two gateways | 1 wk + soak |
-| 3. Cutover per board | `mode='primary'`: leases are enforced and the feed applies into the live `kanban.db`; Desktop dedupes synced boards; `cross_task` wrapper; server owns timers | one board on all gateways for 7 days with no double-run (leases audited from `changes`) | 1 wk + soak |
+| 3. Cutover per board | `mode='primary'`: leases are enforced and the feed applies this gateway's own cards into the live `kanban.db` (the replica holds the whole board); Desktop reads synced boards from the replica; `cross_task` wrapper; server owns timers | one board on all gateways for 7 days with no double-run (leases audited from `changes`) | 1 wk + soak |
 | 4. Cleanup | retire the 0090 fan-out for synced boards, move follow-through/user-steps to helpers (optional), update the affected `core/kanban-*.md` docs | docs claim only what tests prove | 0.5–1 wk |
 
 Total: about 6–7 weeks of focused work plus two soak periods.
