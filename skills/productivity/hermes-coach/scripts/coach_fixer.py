@@ -26,6 +26,9 @@ HOME = Path.home()
 
 
 def utc_day(ts):
+    ts = float(ts)
+    if ts > 1e11:  # a millisecond epoch (some core writers store task_runs.started_at in ms since 2026-10-27)
+        ts /= 1000.0
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d")
 
 

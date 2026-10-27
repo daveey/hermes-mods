@@ -71,6 +71,16 @@ class Fixer(Base):
         d = fx.spend_by_day(self.home, "hermes", 1, self.now)[fx.utc_day(self.now)]
         self.assertEqual((d["usd"], d["runs"], sorted(d["cards"])), (3.0, 2, ["t_a", "t_b"]))
 
+    def test_run_started_at_in_milliseconds_buckets_by_its_real_day(self):
+        # 2026-10-27: core began writing some task_runs.started_at in ms; utc_day crashed ("year 58792 is out of
+        # range"), which took down engine_budget.snapshot and every lane gate on the hub.
+        self.assertEqual(fx.utc_day(self.now * 1000), fx.utc_day(self.now))
+        self.card("t_ms", "coach-fix:ms", cost=1.25)
+        self.k.execute("update task_runs set started_at = cast(started_at * 1000 as integer) where task_id = 't_ms'")
+        self.k.commit()
+        d = fx.spend_by_day(self.home, "hermes", 1, self.now)[fx.utc_day(self.now)]
+        self.assertEqual((d["usd"], sorted(d["cards"])), (1.25, ["t_ms"]))
+
     def test_log_spend_replaces_rows_idempotently(self):
         self.card("t_a", "coach-fix:a", cost=2.0)
         for _ in range(2):
