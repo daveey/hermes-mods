@@ -73,6 +73,16 @@ to verify. With one source of truth it is the card's status.
   are read from the kanban root's `config.yaml`, because kanban storage is shared by every profile on a host.
   Tests: `test_kanban_sync_client.py` (against an in-memory fake of the service contract), plus the phase 1 suites.
 
+Live since 2026-10-27: the `default` board syncs in `shadow` on all three gateways (import: 162k, 46k and 0.5k
+rows; every `sync diff` clean, sampled hourly into `~/.hermes/logs/kanban-sync-soak.jsonl`). `primary` was run end
+to end on a test board: cards created on the hub and on the mini were claimed through Board leases, run by real
+workers and completed; the other gateways' replicas followed within about 10 s (5 s polling on both ends); their
+live boards never took the card; a status move by a non-holder was refused `live_claim`; an edit from another
+gateway landed on the owner's live board; a holder's `done` ends its lease. Cutover of `default` to `primary` is
+scheduled for 2026-10-28 after 24 h of clean samples. Known: a claim can race the push of its card's creation
+(one deferred tick); the service stalled 15–18 s around a deploy (likely the Durable Object restarting onto new
+code); a lease granted outside a local claim is requeued by the orphan sweep and waits out one TTL.
+
 What is not built yet: Desktop reading linked cards and boards from the replica, the WebSocket feed (the client
 polls every 5 s), and placement beyond "a card runs where it was created" (`runs_on`, Worker nodes and transcripts).
 
