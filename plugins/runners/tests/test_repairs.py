@@ -69,6 +69,29 @@ def core_types(monkeypatch):
     module.StartIntent = StartIntent
     module.get_service = lambda profile: pytest.fail('ambient core runtime used')
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    # Core keys start ledgers by its install authority, not the runners owner UUID.
+    rooms = ModuleType('gateway.hosted_rooms')
+    rooms.local_authority_gateway_id = lambda: CORE_AUTHORITY
+    if 'gateway' not in sys.modules:
+        monkeypatch.setitem(sys.modules, 'gateway', ModuleType('gateway'))
+    monkeypatch.setitem(sys.modules, rooms.__name__, rooms)
+
+
+CORE_AUTHORITY = 'install:fixture-authority'
+
+
+def test_start_owner_uses_core_authority_not_runners_owner(env):
+    # The live RPC builds StartOwner(local_authority_gateway_id(), ...). A
+    # resolver keyed by the runners owner UUID is unreachable (4030).
+    row = reserve(env)
+    owner = env.domain.register(PRINCIPAL)
+    assert owner.gateway_id == CORE_AUTHORITY != env.service.config['owner_gateway_id']
+    rpc_owner = StartOwner(CORE_AUTHORITY, env.service.config['owner_profile'], PRINCIPAL)
+    started = env.core.start(rpc_owner, 'runners', row['session']['start_request_id'])
+    assert started['gateway_id'] == CORE_AUTHORITY
+    repair = env.domain.reconcile(row['id'], principal=PRINCIPAL)
+    assert repair['session']['stored_session_id'] == 'chat_first'
+    assert repair['owner']['gateway_id'] == env.service.config['owner_gateway_id']
 
 
 @pytest.fixture
