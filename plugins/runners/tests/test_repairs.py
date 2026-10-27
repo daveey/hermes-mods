@@ -27,6 +27,7 @@ class StartIntent:
     text: str
     source: str = 'desktop'
     metadata: dict = field(default_factory=dict)
+    toolsets: tuple | list | None = None
 
 F = json.loads((Path(__file__).parents[1] / 'contracts/fixtures.json').read_text())
 PRINCIPAL = 'principal_0000000000000001'
@@ -125,6 +126,33 @@ def test_registered_intent_carries_persisted_repair_metadata(env):
     owner = env.domain.register(PRINCIPAL)
     intent = env.core.resolvers[owner, 'runners'](owner, row['session']['start_request_id'])
     assert intent.metadata == {'runner_repair_id': row['id']}
+
+
+def test_repair_start_requests_closed_runners_only_toolset(env):
+    row = reserve(env)
+    owner = env.domain.register(PRINCIPAL)
+    intent = env.core.resolvers[owner, 'runners'](owner, row['session']['start_request_id'])
+    assert list(intent.toolsets) == ['runners', 'clarify', 'todo']
+    for forbidden in ('terminal', 'code_execution', 'file', 'delegation', 'kanban', 'browser', 'all', '*'):
+        assert forbidden not in intent.toolsets
+
+
+def test_core_without_toolset_support_fails_repair_start_explicitly(env, monkeypatch):
+    import sys
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class OldStartIntent:  # a core before the toolsets field: no such keyword
+        title: str
+        text: str
+        source: str = 'desktop'
+        metadata: dict | None = None
+    monkeypatch.setattr(sys.modules['tui_gateway.session_start_requests'], 'StartIntent', OldStartIntent)
+    row = reserve(env)
+    owner = env.domain.register(PRINCIPAL)
+    with pytest.raises(RuntimeError, match='repair_toolsets_unsupported'):
+        env.core.resolvers[owner, 'runners'](owner, row['session']['start_request_id'])
+    assert env.core.calls == 0
 
 
 def test_brief_preserves_target_provenance_beyond_fleet_limit(env):
