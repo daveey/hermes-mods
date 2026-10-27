@@ -1,0 +1,607 @@
+From cde62e1cf4edb35576177204072138bee92468ad Mon Sep 17 00:00:00 2001
+From: x <x@example.com>
+Date: Tue, 27 Oct 2026 12:26:59 -0700
+Subject: [PATCH] feat(kanban): sidebar tells parked kanban work from running
+ work [daveey]
+
+A chat whose open cards were only parked (scheduled until tomorrow, blocked on an
+operational kind, queued behind an unfinished parent) painted exactly like one
+whose worker was running: 26 rows looked busy while 1 card ran.
+
+Backend stamps two subsets of kanban_active on every session row:
+- kanban_parked: scheduled, non-human blocked/triage, and todo with an open
+  parent (a todo whose parents all finished is about to be promoted: live).
+  Replicated remote todo counts as parked (no parent links in the replica; the
+  owner promotes ready ones on its next tick). Stamped even when 0 so the
+  desktop can tell "none parked" from an older backend.
+- kanban_held: local todo whose ancestors include a card blocked on a validated
+  human request (the chat waits on a human).
+kanban_active itself is unchanged (archive guard and "not done" still see all
+open cards). Parked/held come from the same single projection as the counts.
+
+Desktop: kanbanStripeCounts() feeds every sessionStatusStripe caller. Live cards
+read as working (no stripe), parked-only as grey "waiting", held as red. Against
+a backend without kanban_parked the old behaviour holds.
+
+test_unverified_completion_* expected row dicts gain kanban_parked: 0 (the new
+always-stamped field; unverified completions are live, not parked).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/app/chat/session-tab-accent.tsx       |   6 +-
+ .../src/app/chat/sidebar/session-row.tsx      |   6 +-
+ .../src/store/session-dot-state.test.ts       |  47 +++++++
+ apps/desktop/src/store/session-dot-state.ts   |  28 +++-
+ apps/desktop/src/store/sidebar-automated.ts   |   8 +-
+ .../src/store/sidebar-visible-order.ts        |   6 +-
+ apps/desktop/src/types/hermes.ts              |   7 +
+ hermes_cli/kanban_session_activity.py         | 131 +++++++++++++++++-
+ .../test_kanban_session_activity.py           |  85 +++++++++++-
+ 9 files changed, 308 insertions(+), 16 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/session-tab-accent.tsx b/apps/desktop/src/app/chat/session-tab-accent.tsx
+index 0ebc5679d2..8588c70016 100644
+--- a/apps/desktop/src/app/chat/session-tab-accent.tsx
++++ b/apps/desktop/src/app/chat/session-tab-accent.tsx
+@@ -4,7 +4,7 @@ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+ import { useSessionDotState } from '@/lib/use-session-dot-state'
+ import { useStoreSelector } from '@/lib/use-session-slice'
+ import { $blockedSessionIds, isSessionBlocked } from '@/store/session-blocked'
+-import { sessionStatusStripe } from '@/store/session-dot-state'
++import { kanbanStripeCounts, sessionStatusStripe } from '@/store/session-dot-state'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+ interface SessionTabAccentProps {
+@@ -26,11 +26,11 @@ export function SessionTabAccent({ children, session, storedSessionId }: Session
+         state,
+         (session?.message_count ?? 0) > 0,
+         blocked,
+-        session?.kanban_blocked,
++        kanbanStripeCounts(session ?? {}).blocked,
+         session?.cron_active,
+         session?.review_wait,
+         session?.kanban_attention,
+-        session?.kanban_active
++        kanbanStripeCounts(session ?? {}).waiting
+       )
+ 
+   return (
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index 22597d7ff6..fab7dd244b 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -36,7 +36,7 @@ import { $projects } from '@/store/projects'
+ import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+ import { sessionPinId } from '@/store/session'
+ import { $blockedSessionIds, isSessionBlocked } from '@/store/session-blocked'
+-import { hasLiveTurn, rowBackgroundProcesses, sessionStatusStripe } from '@/store/session-dot-state'
++import { hasLiveTurn, kanbanStripeCounts, rowBackgroundProcesses, sessionStatusStripe } from '@/store/session-dot-state'
+ import { $sessionListDensity } from '@/store/session-list-density'
+ import { $openStoredSessionIds } from '@/store/session-states'
+ import { sessionCostUsd } from '@/store/sidebar-archive'
+@@ -367,11 +367,11 @@ function SidebarSessionRowImpl({
+           dotState,
+           session.message_count > 0,
+           userBlocked,
+-          kanbanBlocked,
++          kanbanStripeCounts(session).blocked,
+           session.cron_active === true,
+           session.review_wait,
+           session.kanban_attention,
+-          kanbanOpen
++          kanbanStripeCounts(session).waiting
+         )
+ 
+   // Card header line: the workspace this belongs to — the project when it
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index afc9bea591..f45d1adf53 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -25,6 +25,7 @@ import {
+   $sessionDotStateById,
+   $unreadSessionCount,
+   hasLiveTurn,
++  kanbanStripeCounts,
+   sessionStatusStripe,
+   showsRunningArc,
+   unreadSessionCount,
+@@ -654,3 +655,49 @@ describe('kanban results waiting for an unloaded session ($kanbanUnseenSessionId
+     expect(withRowActivity('idle', { kanban_active: 0, kanban_observed_at: Date.now() / 1000 })).toBe('idle')
+   })
+ })
++
++// [daveey] Parked vs live kanban work: a chat whose open cards are only parked (scheduled on a timed/event wake,
++// blocked on a non-human kind, queued behind an unfinished parent) waits (grey); one whose queue waits on a human
++// ask upstream is stuck (red); only live cards (running/ready/review/promotable) read as working (no stripe).
++describe('kanbanStripeCounts', () => {
++  it('live cards are working: no waiting count, background dot, no stripe', () => {
++    const row = { kanban_observed_at: Date.now() / 1000, kanban_active: 3, kanban_parked: 1 }
++    expect(kanbanStripeCounts(row)).toEqual({ blocked: 0, waiting: 0 })
++    const state = withRowActivity('idle', row)
++    expect(state).toBe('background')
++    expect(sessionStatusStripe(state, true, false, 0, false, null, 0, kanbanStripeCounts(row).waiting)).toBeNull()
++  })
++
++  it('parked-only work waits (grey) and does not paint the dot as running', () => {
++    const row = { kanban_observed_at: Date.now() / 1000, kanban_active: 2, kanban_parked: 2 }
++    const counts = kanbanStripeCounts(row)
++    expect(counts).toEqual({ blocked: 0, waiting: 2 })
++    const state = withRowActivity('idle', row)
++    expect(state).toBe('idle')
++    expect(sessionStatusStripe(state, true, false, counts.blocked, false, null, 0, counts.waiting)).toBe('waiting')
++  })
++
++  it('a queue held behind a human ask is stuck (red)', () => {
++    const row = { kanban_observed_at: Date.now() / 1000, kanban_active: 1, kanban_parked: 0, kanban_held: 1 }
++    const counts = kanbanStripeCounts(row)
++    expect(counts).toEqual({ blocked: 1, waiting: 0 })
++    expect(sessionStatusStripe(withRowActivity('idle', row), true, false, counts.blocked, false, null, 0, counts.waiting)).toBe('stuck')
++  })
++
++  it('held plus live: a live turn still is not red, but a background row is', () => {
++    const row = { kanban_observed_at: Date.now() / 1000, kanban_active: 2, kanban_parked: 0, kanban_held: 1 }
++    const counts = kanbanStripeCounts(row)
++    expect(sessionStatusStripe('working', true, false, counts.blocked, false, null, 0, counts.waiting)).toBeNull()
++    expect(sessionStatusStripe(withRowActivity('idle', row), true, false, counts.blocked, false, null, 0, counts.waiting)).toBe('stuck')
++  })
++
++  it('a backend without kanban_parked keeps the old behaviour (all open cards wait)', () => {
++    const row = { kanban_observed_at: Date.now() / 1000, kanban_active: 2, kanban_blocked: 1 }
++    expect(kanbanStripeCounts(row)).toEqual({ blocked: 1, waiting: 2 })
++    expect(withRowActivity('idle', row)).toBe('background')
++  })
++
++  it('no kanban work: zero counts', () => {
++    expect(kanbanStripeCounts({})).toEqual({ blocked: 0, waiting: 0 })
++  })
++})
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 84991c3cf7..0e68a1fd9d 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -278,6 +278,31 @@ export const sessionStatusStripe = (
+         : 'done'
+       : null
+ 
++type KanbanCounts = Pick<SessionInfo, 'kanban_active' | 'kanban_blocked' | 'kanban_held' | 'kanban_parked'>
++
++/** [daveey] Open kanban cards someone is actually working (running/ready/review, or a todo about to be promoted).
++ *  `kanban_parked` (scheduled, non-human blocks, todo behind an open parent) and `kanban_held` (todo behind a human
++ *  ask upstream) are subsets of `kanban_active`. A backend that predates them stamps no `kanban_parked`: then every
++ *  open card counts as live, as before. */
++export const liveKanbanCount = (row: KanbanCounts): number =>
++  row.kanban_parked === undefined
++    ? (row.kanban_active ?? 0)
++    : Math.max(0, (row.kanban_active ?? 0) - row.kanban_parked - (row.kanban_held ?? 0))
++
++/** [daveey] The kanban inputs of `sessionStatusStripe`: `blocked` = cards blocked on a human plus queued cards held
++ *  behind one (red); `waiting` = parked cards when nothing is live (grey). Live cards give neither, so a chat whose
++ *  cards are running reads as working (no stripe) instead of grey like one parked until Thursday. Against a
++ *  backend without `kanban_parked` every open card waits, as before. */
++export const kanbanStripeCounts = (row: KanbanCounts): { blocked: number; waiting: number } => {
++  const blocked = (row.kanban_blocked ?? 0) + (row.kanban_held ?? 0)
++
++  if (row.kanban_parked === undefined) {
++    return { blocked, waiting: row.kanban_active ?? 0 }
++  }
++
++  return { blocked, waiting: liveKanbanCount(row) > 0 ? 0 : row.kanban_parked }
++}
++
+ /** [daveey] Fold the row's OWN backend activity stamps into its resolved state.
+  *  `$sessionDotStateById` only reads those stamps off `$sessions` /
+  *  `$messagingSessions`, but a project-mode row older than the recents page
+@@ -287,13 +312,14 @@ export const sessionStatusStripe = (
+ export const withRowActivity = (
+   state: SessionDotState,
+   row: Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active' | 'kanban_blocked'> &
++    Partial<Pick<SessionInfo, 'kanban_held' | 'kanban_parked'>> &
+     Partial<Pick<SessionInfo, 'kanban_observed_at' | 'kanban_remote_stale' | 'kanban_unknown' | 'kanban_unseen' | 'offline_cached'>>
+ ): SessionDotState =>
+   row.offline_cached
+     ? 'idle'
+     : (state === 'idle' || state === 'unread' || state === 'draft') &&
+         (row.goal_active === true ||
+-          (row.kanban_active ?? 0) > 0 ||
++          liveKanbanCount(row) > 0 ||
+           row.kanban_unknown === true ||
+           (row.kanban_remote_stale ?? 0) > 0 ||
+           !hasFreshKanbanObservation(row) ||
+diff --git a/apps/desktop/src/store/sidebar-automated.ts b/apps/desktop/src/store/sidebar-automated.ts
+index 3dd3ba13c9..95071112dc 100644
+--- a/apps/desktop/src/store/sidebar-automated.ts
++++ b/apps/desktop/src/store/sidebar-automated.ts
+@@ -2,7 +2,7 @@ import type { SessionInfo } from '@/types/hermes'
+ 
+ import { $pinnedSessionIds, $sidebarShowAutomated } from './layout'
+ import { isSessionBlocked } from './session-blocked'
+-import { $sessionDotStateById, type SessionDotState, sessionStatusStripe } from './session-dot-state'
++import { $sessionDotStateById, kanbanStripeCounts, type SessionDotState, sessionStatusStripe } from './session-dot-state'
+ 
+ /**
+  * [daveey] Automated / test sessions in the sidebar.
+@@ -27,6 +27,8 @@ type AutomatedRow = Pick<
+   | 'kanban_attention'
+   | 'kanban_active'
+   | 'kanban_blocked'
++  | 'kanban_held'
++  | 'kanban_parked'
+   | 'message_count'
+   | 'pinned'
+   | 'review_wait'
+@@ -51,11 +53,11 @@ export function automatedRowNeedsAttention(row: AutomatedRow, state: SessionDotS
+     state,
+     (row.message_count ?? 0) > 0,
+     userBlocked,
+-    row.kanban_blocked ?? 0,
++    kanbanStripeCounts(row).blocked,
+     row.cron_active === true,
+     row.review_wait,
+     row.kanban_attention ?? 0,
+-    row.kanban_active ?? 0
++    kanbanStripeCounts(row).waiting
+   )
+ 
+   return stripe === 'stuck' || stripe === 'blocked' || stripe === 'attention'
+diff --git a/apps/desktop/src/store/sidebar-visible-order.ts b/apps/desktop/src/store/sidebar-visible-order.ts
+index 2f060f4e8e..774c5e7ef6 100644
+--- a/apps/desktop/src/store/sidebar-visible-order.ts
++++ b/apps/desktop/src/store/sidebar-visible-order.ts
+@@ -1,6 +1,6 @@
+ import { $messagingSessions, $sessions } from '@/store/session'
+ import { isSessionBlocked } from '@/store/session-blocked'
+-import { $sessionDotStateById, sessionStatusStripe, withRowActivity } from '@/store/session-dot-state'
++import { $sessionDotStateById, kanbanStripeCounts, sessionStatusStripe, withRowActivity } from '@/store/session-dot-state'
+ import { sessionHiddenAsAutomated } from '@/store/sidebar-automated'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+@@ -146,11 +146,11 @@ export function sessionHasStatusStripe(id: string): boolean {
+         withRowActivity($sessionDotStateById.get()[id] ?? 'idle', session ?? {}),
+         hasTurns,
+         false,
+-        session?.kanban_blocked ?? 0,
++        kanbanStripeCounts(session ?? {}).blocked,
+         session?.cron_active === true,
+         session?.review_wait,
+         session?.kanban_attention ?? 0,
+-        session?.kanban_active ?? 0
++        kanbanStripeCounts(session ?? {}).waiting
+       )
+     )
+   )
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index bb02ac3b6c..f56d61cfef 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -662,6 +662,13 @@ export interface SessionInfo {
+    *  are blocked on a human, summed over its compression lineage. Shown next
+    *  to the open count on the sidebar row. Absent when zero. */
+   kanban_blocked?: number
++  /** [daveey] How many of `kanban_active` nobody is working: scheduled on a timed/event wake, blocked on a
++   *  non-human kind, or todo behind an unfinished parent. Stamped (even 0) whenever `kanban_active` is, so its
++   *  absence means a backend that predates it. */
++  kanban_parked?: number
++  /** [daveey] How many of `kanban_active` are queued behind a card blocked on a human ask (painted red). Absent
++   *  when zero. */
++  kanban_held?: number
+   /** [daveey] Finished kanban cards (created or subscribed) whose result this
+    *  conversation has not been handed — it was not loaded in any backend when
+    *  they completed. Paints the row green (unread) until the gateway's
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 49246af72d..d1795b5cba 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -37,6 +37,10 @@ _cache: tuple[float, dict[str, int], dict[str, int], dict[str, int], dict[str, i
+ _cache_scope: tuple[str, ...] | None = None
+ _cache_fingerprint: tuple = ()
+ _waiting_cache: list[dict[str, frozenset[str]]] = [{}]
++# (parked, held) per session from the same snapshot as ``_cache`` (see ``_read_parked``); the sink is set while
++# ``_all_counts`` reads local boards, like ``_pairs_sink``. [daveey]
++_parked_cache: list[tuple[dict[str, int], dict[str, int]]] = [({}, {})]
++_parked_sink = threading.local()  # .maps: (parked, held) or None; per thread, so concurrent reads never mix
+ _pairs_lock = threading.Lock()
+ WAITING_ON_CAP = 50
+ 
+@@ -168,6 +172,88 @@ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dic
+     return counts
+ 
+ 
++# [daveey] Open cards nobody is working right now: they still count in ``kanban_active`` (the chat isn't done, and
++# the archive guard must see them), but the sidebar must not paint them as running. ``scheduled`` waits on a time or
++# event wake; a non-human ``blocked``/``triage`` card waits on an operational condition; a ``todo`` card waits on an
++# unfinished parent. "Held" is the subset of those queued cards whose chain waits on a human ask upstream.
++PARKED_STATUSES = ("scheduled",) + BLOCKED_STATUSES
++_FINISHED_STATUSES = ("done", "archived")
++
++
++def _read_parked(path: Path) -> tuple[dict[str, int], dict[str, int]]:
++    """``(parked, held)`` per session over the same (session, task) pairs ``_read_counts`` counts as active.
++
++    A ``todo`` card with every parent finished (or none) is about to be promoted, so it stays live. A ``todo`` card
++    whose ancestors include a card blocked on a validated human request is held, not parked. Boards without
++    ``task_links`` classify by status alone."""
++    conn = _open_ro(path)
++    try:
++        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++        if "session_id" not in cols:
++            return {}, {}
++        match, params = _status_filter(conn, ACTIVE_STATUSES)
++        evidence = "t.human_request" if "human_request" in cols else "NULL"
++        kind = "t.block_kind" if "block_kind" in cols else "NULL"
++        pairs: set[tuple[str, str]] = {
++            (str(sid), str(tid)) for sid, tid in conn.execute(
++                f"SELECT session_id, id FROM tasks t WHERE session_id IS NOT NULL AND session_id != '' AND {match}",
++                params)}
++        try:
++            pairs.update(
++                (str(sid), str(tid)) for sid, tid in conn.execute(
++                    f"SELECT s.chat_id, t.id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++                    f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)} AND {match}",
++                    params))
++        except sqlite3.Error:  # board predates notify subscriptions
++            pass
++        if not pairs:
++            return {}, {}
++        info: dict[str, tuple[str, bool]] = {
++            str(tid): (status, bool(human)) for tid, status, human in conn.execute(
++                f"SELECT t.id, t.status, kanban_needs_human({evidence}, {kind}) FROM tasks t "
++                f"WHERE t.status NOT IN ({','.join('?' * len(_FINISHED_STATUSES))})", _FINISHED_STATUSES)}
++        parents: dict[str, list[str]] = {}
++        try:
++            for parent, child in conn.execute("SELECT parent_id, child_id FROM task_links"):
++                parents.setdefault(str(child), []).append(str(parent))
++        except sqlite3.Error:  # board predates dependencies
++            pass
++    finally:
++        conn.close()
++
++    def open_parents(tid: str) -> list[str]:
++        return [p for p in parents.get(tid, ()) if p in info]  # finished/unknown parents never wait
++
++    def waits_on_human(tid: str) -> bool:
++        seen: set[str] = set()
++        stack = open_parents(tid)
++        while stack:
++            p = stack.pop()
++            if p in seen:
++                continue
++            seen.add(p)
++            status, human = info[p]
++            if status in BLOCKED_STATUSES and human:
++                return True
++            stack.extend(open_parents(p))
++        return False
++
++    parked: dict[str, int] = {}
++    held: dict[str, int] = {}
++    for sid, tid in pairs:
++        status = info.get(tid, ("", False))[0]
++        if status == "todo":
++            if not open_parents(tid):
++                continue
++            into = held if waits_on_human(tid) else parked
++        elif status in PARKED_STATUSES:
++            into = parked
++        else:
++            continue
++        into[sid] = into.get(sid, 0) + 1
++    return parked, held
++
++
+ # Terminal kinds that produce a visible notice (mirrors tui_gateway.session_notifications; silent kinds such as
+ # archived/unblocked never leave a notice waiting).
+ UNSEEN_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status")
+@@ -755,7 +841,13 @@ def _all_counts(*, include_waiting: bool = False) -> tuple:
+     blocked: dict[str, int] = {}
+     unseen: dict[str, int] = {}
+     stale: dict[str, int] = {}
+-    pairs = _read_local_pairs_into(active, blocked, unseen)
++    parked: dict[str, int] = {}
++    held: dict[str, int] = {}
++    _parked_sink.maps = (parked, held)
++    try:
++        pairs = _read_local_pairs_into(active, blocked, unseen)
++    finally:
++        _parked_sink.maps = None
+     waiting: dict[str, set[str]] = {}
+     for sid, tid in pairs:
+         waiting.setdefault(sid, set()).add(tid)
+@@ -766,6 +858,10 @@ def _all_counts(*, include_waiting: bool = False) -> tuple:
+             continue
+         sid = card["session"]
+         into[sid] = into.get(sid, 0) + 1
++        # A replica row has no parent links; its owner promotes a todo whose parents finished on the next tick, so a
++        # replicated todo waits on a parent (parked). Held needs those links, so remote cards are never held.
++        if bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo"):
++            parked[sid] = parked.get(sid, 0) + 1
+         if card.get("stale"):
+             stale[sid] = stale.get(sid, 0) + 1
+     with _cache_lock:
+@@ -773,6 +869,7 @@ def _all_counts(*, include_waiting: bool = False) -> tuple:
+         _cache = (now + _CACHE_TTL_S, active, blocked, unseen, stale)
+         _cache_fingerprint = fingerprint
+         _waiting_cache[0] = {sid: frozenset(ids) for sid, ids in waiting.items()}
++        _parked_cache[0] = (parked, held)
+     counts = (active, blocked, unseen, stale)
+     return (*counts, {sid: frozenset(ids) for sid, ids in waiting.items()}) if include_waiting else counts
+ 
+@@ -791,6 +888,7 @@ def _read_local_pairs_into(active: dict[str, int], blocked: dict[str, int],
+ 
+ 
+ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen: dict[str, int]) -> None:
++    sink = getattr(_parked_sink, "maps", None)
+     for path in _board_db_paths():
+         try:
+             for sid, n in _read_unseen(path).items():
+@@ -800,6 +898,11 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+         for statuses, into in ((ACTIVE_STATUSES, active), (BLOCKED_STATUSES, blocked)):
+             for sid, n in _read_counts(path, statuses).items():
+                 into[sid] = into.get(sid, 0) + n
++        if sink is not None:
++            board_parked, board_held = _read_parked(path)
++            for src, into in zip((board_parked, board_held), sink):
++                for sid, n in src.items():
++                    into[sid] = into.get(sid, 0) + n
+ 
+ 
+ # [daveey] Extra "this chat still waits" sources (plugins): name -> fn() -> {session_id: iterable of task ids}. A
+@@ -839,6 +942,14 @@ def active_task_counts() -> dict[str, int]:
+     return _all_counts()[0]
+ 
+ 
++def parked_task_counts() -> tuple[dict[str, int], dict[str, int]]:
++    """``({session_id: parked count}, {session_id: held count})``: the subsets of ``active_task_counts`` that no
++    worker is running (see ``_read_parked``). Same cache as the counts. [daveey]"""
++    _all_counts()
++    with _cache_lock:
++        return _parked_cache[0]
++
++
+ def blocked_task_counts() -> dict[str, int]:
+     """``{session_id: blocked task count}`` across every kanban board."""
+     return _all_counts()[1]
+@@ -1112,13 +1223,16 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+     observed_at = time.time() - _CACHE_TTL_S
+     try:
+         active, blocked, unseen, remote_stale, waiting = _all_counts(include_waiting=True)
++        with _cache_lock:  # the snapshot that call just read or wrote: never a second projection
++            parked, held = _parked_cache[0]
+         extra = _extra_waiting()
+     except Exception:
+         # [daveey] A failed read is "unknown", never "no work": stamp ``kanban_unknown`` (the sidebar keeps the
+         # row off done) and drop the counts rather than present them as fresh.
+         _log.warning("kanban activity unavailable; rows marked kanban_unknown", exc_info=True)
+         for row in rows:
+-            for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale"):
++            for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale",
++                        "kanban_parked", "kanban_held"):
+                 row.pop(key, None)
+             row.pop("kanban_observed_at", None)
+             row.pop("kanban_waiting_on", None)
+@@ -1146,6 +1260,18 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         pending = {tid for sid in ids for tid in extra.get(sid, ())} - open_ids
+         if pending:
+             row["kanban_active"] = int(row.get("kanban_active") or 0) + len(pending)
++        # [daveey] Parked/held are subsets of kanban_active. kanban_parked is stamped (even 0) whenever there is open
++        # work, so the desktop can tell "none parked" from a backend that predates the field.
++        n_parked = sum(parked.get(sid, 0) for sid in ids)
++        n_held = sum(held.get(sid, 0) for sid in ids)
++        if row.get("kanban_active"):
++            row["kanban_parked"] = n_parked
++        else:
++            row.pop("kanban_parked", None)
++        if n_held:
++            row["kanban_held"] = n_held
++        else:
++            row.pop("kanban_held", None)
+         ids_waiting = sorted(open_ids | pending)
+         if ids_waiting:
+             row["kanban_waiting_on"] = ids_waiting[:WAITING_ON_CAP]
+@@ -1165,3 +1291,4 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+             _remote_last = None
+             _snapshot_saved = None
+         _waiting_cache[0] = {}
++        _parked_cache[0] = ({}, {})
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index df463ed070..8845a84b5b 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -600,7 +600,7 @@ def test_unverified_completion_keeps_origin_and_other_sessions_finish_normally(k
+     ann = [{"id": "s_origin"}, {"id": "s_other"}]
+     ksa.annotate_kanban_activity(ann)
+     assert [{k: v for k, v in row.items() if k != 'kanban_observed_at'} for row in ann] == [
+-        {"id": "s_origin", "kanban_active": 13}, {"id": "s_other"}]
++        {"id": "s_origin", "kanban_active": 13, "kanban_parked": 0}, {"id": "s_other"}]  # unverified = live, not parked
+     cards = ksa.session_tasks(["s_origin"])
+     assert len(cards) == 13
+     assert all(c['status'] == 'unknown' and c['reported_status'] == terminal_status for c in cards)
+@@ -713,3 +713,86 @@ def test_session_tasks_carry_latest_activity_note_and_pr_link(kanban_root):
+     assert got["t_pr"]["note"] == "Superseded by https://github.com/o/r/pull/2 (rebased)"
+     assert got["t_pr"]["pr_url"] == "https://github.com/o/r/pull/2"
+     assert "pr_url" not in got["t_bare"] and "note" not in got["t_bare"]
++
++
++def _add_links(path: Path, links: list[tuple[str, str]]) -> None:
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT)")
++        conn.executemany("INSERT INTO task_links VALUES (?, ?)", links)
++
++
++def test_parked_cards_are_counted_apart_from_live_ones(kanban_root):
++    """[daveey] Parked = open but nobody is working it: scheduled on a time/event wake, blocked on a non-human
++    kind, or todo behind an unfinished parent. A todo whose parents are all done is about to be promoted and stays
++    live. ``kanban_active`` keeps counting all of them (archive guard); ``kanban_parked`` is the parked subset."""
++    path = kanban_root / "kanban.db"
++    _make_board(path, [
++        ("t_run", "running", "s_live"),
++        ("t_sched", "scheduled", "s_parked"),
++        ("t_trans", "blocked", "s_parked"),          # non-human block: operational, parked
++        ("t_par", "running", None),
++        ("t_child", "todo", "s_chain"),              # parent still running -> parked
++        ("t_done_par", "done", None),
++        ("t_promotable", "todo", "s_promotable"),    # only parent done -> live
++        ("t_sched2", "scheduled", "s_live"),
++    ])
++    _add_links(path, [("t_par", "t_child"), ("t_done_par", "t_promotable")])
++    rows = [{"id": s} for s in ("s_live", "s_parked", "s_chain", "s_promotable")]
++
++    ksa.annotate_kanban_activity(rows)
++    got = {r["id"]: r for r in rows}
++
++    assert got["s_live"]["kanban_active"] == 2 and got["s_live"]["kanban_parked"] == 1
++    assert got["s_parked"]["kanban_active"] == 2 and got["s_parked"]["kanban_parked"] == 2
++    assert got["s_chain"]["kanban_parked"] == 1 and "kanban_held" not in got["s_chain"]
++    assert got["s_promotable"]["kanban_active"] == 1 and got["s_promotable"]["kanban_parked"] == 0
++
++
++def test_todo_behind_a_human_blocked_ancestor_is_held_not_parked(kanban_root):
++    """[daveey] A queued card whose chain waits on David (any ancestor blocked with a validated human request) is
++    ``kanban_held``: the chat is waiting on a human even though its own card is only ``todo``."""
++    path = kanban_root / "kanban.db"
++    _make_board(path, [
++        ("t_ask", "blocked", None),
++        ("t_mid", "todo", None),
++        ("t_leaf", "todo", "s_held"),
++        ("t_ops", "blocked", None),                  # non-human block upstream: parked, not held
++        ("t_after_ops", "todo", "s_parked"),
++    ])
++    _add_human_requests(path, "t_ask")
++    _add_links(path, [("t_ask", "t_mid"), ("t_mid", "t_leaf"), ("t_ops", "t_after_ops")])
++    rows = [{"id": "s_held"}, {"id": "s_parked"}]
++
++    ksa.annotate_kanban_activity(rows)
++
++    assert rows[0]["kanban_active"] == 1 and rows[0]["kanban_held"] == 1 and rows[0]["kanban_parked"] == 0
++    assert rows[1]["kanban_parked"] == 1 and "kanban_held" not in rows[1]
++
++
++def test_board_without_links_table_still_classifies_scheduled(kanban_root):
++    _make_board(kanban_root / "kanban.db", [("t1", "scheduled", "s1"), ("t2", "todo", "s1")])
++    rows = [{"id": "s1"}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0]["kanban_active"] == 2 and rows[0]["kanban_parked"] == 1
++
++
++def test_replica_scheduled_and_todo_cards_count_as_parked(kanban_root):
++    """A replica row carries no parent links, but the owner's dispatcher promotes a todo with finished parents to
++    ready on its next tick, so a replicated todo is waiting on a parent: parked, like scheduled."""
++    _make_replica(kanban_root / "hub-state", "macbook", [
++        {"_gw": "hub", "id": "t_r1", "status": "scheduled", "sessions": [_shep("s_remote")]},
++        {"_gw": "hub", "id": "t_r2", "status": "running", "sessions": [_shep("s_remote")]},
++        {"_gw": "hub", "id": "t_r3", "status": "todo", "sessions": [_shep("s_remote")]},
++        {"_gw": "hub", "id": "t_r4", "status": "todo", "sessions": [_shep("s_todo_only")]},
++    ])
++    rows = [{"id": "s_remote"}, {"id": "s_todo_only"}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0].get("kanban_active") == 3 and rows[0].get("kanban_parked") == 2
++    assert rows[1].get("kanban_active") == 1 and rows[1].get("kanban_parked") == 1
++
++
++def test_failed_read_drops_parked_and_held(kanban_root):
++    (kanban_root / "kanban.db").write_bytes(b"not sqlite")
++    rows = [{"id": "s1", "kanban_parked": 2, "kanban_held": 1}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0]["kanban_unknown"] is True and "kanban_parked" not in rows[0] and "kanban_held" not in rows[0]
+-- 
+2.55.0
+

@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-parked-vs-live-sidebar.md](kanban-parked-vs-live-sidebar.md) | 0467 | Sidebar stripe tells live kanban work (no stripe) from parked cards (grey) and queues held behind a human ask (red); new `kanban_parked`/`kanban_held` row stamps. |
 | [model-class-routing.md](model-class-routing.md) | 0405–0430 0432–0438 0441 | Opt-in sticky class allocator (`class:deep|standard|fast`) with managed-subscription fences across CLI, Desktop, API, messaging, delegation, cron, Kanban and auxiliary calls. |
 | [desktop-agent-test-instance-hidden.md](desktop-agent-test-instance-hidden.md) | 0459 | A Desktop test instance a kanban worker launches gets no Dock icon and never shows a window; the owner's own Desktop stays visible. |
 | [at-completion-refresh.md](at-completion-refresh.md) | 0458 | `@` completion sources can `subscribe` so an open popover re-asks when their background fetch lands. |
