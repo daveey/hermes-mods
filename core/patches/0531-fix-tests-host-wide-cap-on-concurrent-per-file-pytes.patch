@@ -1,0 +1,384 @@
+From ffd03f1dec5ed30c78ca3104ff799f3ca72011a0 Mon Sep 17 00:00:00 2001
+From: x <x@example.com>
+Date: Tue, 27 Oct 2026 16:44:20 -0700
+Subject: [PATCH] fix(tests): host-wide cap on concurrent per-file pytest
+ processes across runs [daveey]
+
+Every run_tests_parallel run sized its pool to os.cpu_count() without knowing about other runs. With
+four agent worktrees testing at once, 39 of 67 runnable processes on a 16-core Mac were pytest, the load
+average passed 250, and the gateway's Discord heartbeat kept failing. Each per-file attempt now runs
+while holding one of HERMES_TEST_HOST_SLOTS (default cpu_count) flock slots in HERMES_TEST_SLOT_DIR
+(default /tmp/hermes-test-slots-<uid>), shared by every run on the host. A crashed run frees its slots
+with its fds. Children get HERMES_TEST_SLOT_HELD=1 so a run nested in a test never waits on its
+parent's slot; HERMES_TEST_HOST_SLOTS=0 disables the cap. run_tests.sh forwards the three variables.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/ci/classify_changes.py             |   1 +
+ scripts/run_tests.sh                       |   2 +
+ scripts/run_tests_host_slots.py            |  81 ++++++++++++++
+ scripts/run_tests_parallel.py              |  24 +++++
+ tests/ci/test_flaky_kanban.py              |   1 +
+ tests/scripts/test_run_tests_host_slots.py | 120 +++++++++++++++++++++
+ tests/scripts/test_run_tests_parallel.py   |   1 +
+ tests/scripts/test_run_tests_shell.py      |  21 ++++
+ 8 files changed, 251 insertions(+)
+ create mode 100644 scripts/run_tests_host_slots.py
+ create mode 100644 tests/scripts/test_run_tests_host_slots.py
+
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index 16e8914edc..b0230457a1 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -217,6 +217,7 @@ _PY_TEST_HARNESS = (
+     "tests/e2e/core/_",
+     "scripts/run_tests.sh",
+     "scripts/run_tests_parallel.py",
++    "scripts/run_tests_host_slots.py",
+ )
+ # Both Desktop suites package the app and share this harness (the update
+ # suite imports the core suite's harness and provider).
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index ccae595cbd..32bee5a9f1 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -125,6 +125,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ # The runner's own documented environment knobs must survive the hermetic
+ # `env -i` below, or they are silent no-ops for anyone invoking this script:
+ #
++#   * HERMES_TEST_HOST_SLOTS / SLOT_DIR / SLOT_HELD (host-wide cap, scripts/run_tests_host_slots.py) and
+ #   * HERMES_TEST_WORKERS / PATHS / FILE_TIMEOUT / FILE_RETRIES / SLICE /
+ #     FLAKY_REPORT are read by run_tests_parallel.py at argparse-default
+ #     time — inside the stripped environment.
+@@ -161,6 +162,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ TEST_ENV=()
+ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_FLAKY_REPORT \
++  HERMES_TEST_HOST_SLOTS HERMES_TEST_SLOT_DIR HERMES_TEST_SLOT_HELD \
+   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
+   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
+   HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
+diff --git a/scripts/run_tests_host_slots.py b/scripts/run_tests_host_slots.py
+new file mode 100644
+index 0000000000..b021f5b49e
+--- /dev/null
++++ b/scripts/run_tests_host_slots.py
+@@ -0,0 +1,81 @@
++"""Host-wide cap on concurrent per-file pytest processes, shared by every run on the machine.
++
++Each ``run_tests_parallel`` run sizes its pool to ``os.cpu_count()`` without knowing about the others.
++Several agents testing at once (one run per worktree) multiplied that: four runs started 64 pytest
++processes on a 16-core Mac, the load average passed 200, and the gateway's event loop missed its
++Discord heartbeat. A file subprocess now runs only while its thread holds one of
++``HERMES_TEST_HOST_SLOTS`` (default ``os.cpu_count()``) flock slots in ``HERMES_TEST_SLOT_DIR``
++(default ``/tmp/hermes-test-slots-<uid>``). A slot is a held ``LOCK_EX`` on ``<dir>/<n>.lock``, so a
++crashed run frees its slots with its file descriptors.
++
++A run started from inside a slot holder (a test that runs the runner) inherits
++``HERMES_TEST_SLOT_HELD=1`` and skips the cap, so nested runs cannot wait on slots their own parent
++holds. ``HERMES_TEST_HOST_SLOTS=0`` disables the cap. Non-POSIX hosts are uncapped.
++"""
++from __future__ import annotations
++
++import contextlib
++import os
++import random
++import time
++from collections.abc import Iterator
++
++HELD_ENV = "HERMES_TEST_SLOT_HELD"
++POLL_S = 0.1
++
++
++def host_slot_count() -> int:
++    raw = os.environ.get("HERMES_TEST_HOST_SLOTS", "").strip()
++    if raw:
++        try:
++            return max(0, int(raw))
++        except ValueError:
++            pass
++    return os.cpu_count() or 4
++
++
++def host_slot_dir() -> str:
++    return os.environ.get("HERMES_TEST_SLOT_DIR") or f"/tmp/hermes-test-slots-{os.getuid()}"
++
++
++def host_slots_enabled() -> bool:
++    return os.name == "posix" and host_slot_count() > 0 and os.environ.get(HELD_ENV) != "1"
++
++
++def _try_slot(path: str) -> int | None:
++    import fcntl
++
++    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BlockingIOError:
++        os.close(fd)
++        return None
++    return fd
++
++
++@contextlib.contextmanager
++def host_test_slot(on_wait=None) -> Iterator[None]:
++    """Hold one host slot for the body. ``on_wait()`` is called once if every slot is taken."""
++    if not host_slots_enabled():
++        yield
++        return
++    directory = host_slot_dir()
++    os.makedirs(directory, mode=0o700, exist_ok=True)
++    order = list(range(host_slot_count()))
++    random.shuffle(order)  # spread runs across slots instead of all racing for slot 0
++    waited = False
++    while True:
++        for n in order:
++            fd = _try_slot(os.path.join(directory, f"{n}.lock"))
++            if fd is None:
++                continue
++            try:
++                yield
++            finally:
++                os.close(fd)
++            return
++        if not waited and on_wait is not None:
++            on_wait()
++        waited = True
++        time.sleep(POLL_S)
+diff --git a/scripts/run_tests_parallel.py b/scripts/run_tests_parallel.py
+index b699d7d169..2b62a69fca 100644
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -63,6 +63,7 @@ from typing import Dict, List, Optional, Tuple
+ # "skipped on this host" note and the lanes can never disagree.
+ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
++from scripts.run_tests_host_slots import HELD_ENV as HOST_SLOT_HELD_ENV, host_slot_count, host_slot_dir, host_test_slot
+ 
+ 
+ def _sweep_killed_run_roots(root: str) -> None:
+@@ -728,12 +729,34 @@ _FLAKY_TESTS: list[dict[str, str]] = []
+ _flaky_lock = threading.Lock()
+ 
+ 
++_SLOT_WAIT_NOTED = threading.Event()
++
++
++def _note_host_slot_wait() -> None:
++    if not _SLOT_WAIT_NOTED.is_set():
++        _SLOT_WAIT_NOTED.set()
++        print(f"  (waiting for host test slots: other runs hold all {host_slot_count()} in {host_slot_dir()})",
++              flush=True)
++
++
+ def _run_one_file_once(
+     file: Path,
+     pytest_args: list[str],
+     repo_root: Path,
+     file_timeout: float,
+     targets: list[str] | None = None,
++) -> tuple[Path, int, str, dict[str, int], float]:
++    """One attempt, run while holding a host-wide test slot (scripts/run_tests_host_slots.py)."""
++    with host_test_slot(on_wait=_note_host_slot_wait):
++        return _run_one_file_attempt(file, pytest_args, repo_root, file_timeout, targets)
++
++
++def _run_one_file_attempt(
++    file: Path,
++    pytest_args: list[str],
++    repo_root: Path,
++    file_timeout: float,
++    targets: list[str] | None = None,
+ ) -> tuple[Path, int, str, dict[str, int], float]:
+     """Single attempt of a per-file pytest subprocess (see _run_one_file).
+ 
+@@ -758,6 +781,7 @@ def _run_one_file_once(
+     # One root for each subprocess removes the shared directory that the race
+     # needs. The parent deletes the root after the attempt.
+     env = os.environ.copy()
++    env[HOST_SLOT_HELD_ENV] = "1"  # a run nested in this file must not wait on the slot we hold
+     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+     env["PYTEST_DEBUG_TEMPROOT"] = temproot
+     # Every tempfile.* call inside the test process lands in the same per-run root, so the
+diff --git a/tests/ci/test_flaky_kanban.py b/tests/ci/test_flaky_kanban.py
+index 2cbc49aebc..5c201e3f74 100644
+--- a/tests/ci/test_flaky_kanban.py
++++ b/tests/ci/test_flaky_kanban.py
+@@ -142,6 +142,7 @@ def test_flaky_test_passes_and_files_a_card_while_a_hard_failure_stays_red(tmp_p
+     root = tmp_path / "runner-root"
+     (root / "scripts" / "ci").mkdir(parents=True)
+     shutil.copy2(_ROOT / "scripts" / "run_tests_parallel.py", root / "scripts")
++    shutil.copy2(_ROOT / "scripts" / "run_tests_host_slots.py", root / "scripts")
+     shutil.copy2(_ROOT / "scripts" / "ci" / "list_os_marked_tests.py", root / "scripts" / "ci")
+     marker = tmp_path / "flaked-once"
+     suite = tmp_path / "suite"
+diff --git a/tests/scripts/test_run_tests_host_slots.py b/tests/scripts/test_run_tests_host_slots.py
+new file mode 100644
+index 0000000000..8caa609b46
+--- /dev/null
++++ b/tests/scripts/test_run_tests_host_slots.py
+@@ -0,0 +1,120 @@
++"""Host-wide test slots: concurrent runs share os.cpu_count() pytest processes (scripts/run_tests_host_slots.py)."""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import signal
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(REPO_ROOT))
++from scripts import run_tests_host_slots as slots
++
++pytestmark = pytest.mark.skipif(os.name != "posix", reason="host slots are POSIX flock locks")
++
++
++@pytest.fixture
++def slot_env(tmp_path, monkeypatch):
++    # This test itself runs inside a runner slot, so the inherited HELD flag must be cleared.
++    monkeypatch.delenv(slots.HELD_ENV, raising=False)
++    monkeypatch.setenv("HERMES_TEST_SLOT_DIR", str(tmp_path / "slots"))
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "2")
++    return tmp_path / "slots"
++
++
++def _hold(release: threading.Event, entered: threading.Event):
++    with slots.host_test_slot():
++        entered.set()
++        release.wait(10)
++
++
++def test_third_holder_waits_until_a_slot_frees(slot_env):
++    release = threading.Event()
++    holders = [threading.Event(), threading.Event()]
++    threads = [threading.Thread(target=_hold, args=(release, e)) for e in holders]
++    for t in threads:
++        t.start()
++    assert all(e.wait(5) for e in holders)
++    waits: list[int] = []
++    got = threading.Event()
++
++    def third():
++        with slots.host_test_slot(on_wait=lambda: waits.append(1)):
++            got.set()
++
++    t3 = threading.Thread(target=third)
++    t3.start()
++    assert not got.wait(0.5), "both slots are held: the third run must wait"
++    release.set()
++    assert got.wait(5)
++    for t in (*threads, t3):
++        t.join(5)
++    assert waits == [1], "on_wait fires once per wait, not per poll"
++
++
++def test_killed_holder_frees_its_slot(slot_env, monkeypatch):
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "1")
++    code = ("import sys, time; sys.path.insert(0, sys.argv[1]); from scripts import run_tests_host_slots as s\n"
++            "with s.host_test_slot():\n    print('held', flush=True); time.sleep(60)\n")
++    child = subprocess.Popen([sys.executable, "-c", code, str(REPO_ROOT)], stdout=subprocess.PIPE, text=True,
++                             env=dict(os.environ))
++    try:
++        assert child.stdout.readline().strip() == "held"
++        got = threading.Event()
++        t = threading.Thread(target=lambda: (slots.host_test_slot().__enter__(), got.set()), daemon=True)
++        t.start()
++        assert not got.wait(0.4), "the only slot is held by the child"
++        child.send_signal(signal.SIGKILL)
++        child.wait(5)
++        assert got.wait(5), "a crashed run's slot is released with its file descriptor"
++    finally:
++        if child.poll() is None:
++            child.kill()
++
++
++def test_nested_run_skips_the_cap(slot_env, monkeypatch):
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "1")
++    with slots.host_test_slot():
++        monkeypatch.setenv(slots.HELD_ENV, "1")
++        with slots.host_test_slot():  # would deadlock without the HELD skip
++            pass
++
++
++def test_zero_slots_disables_the_cap(slot_env, monkeypatch):
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "0")
++    assert not slots.host_slots_enabled()
++    with slots.host_test_slot():
++        pass
++    assert not slot_env.exists()
++
++
++def _load_runner():
++    spec = importlib.util.spec_from_file_location("run_tests_parallel", REPO_ROOT / "scripts" / "run_tests_parallel.py")
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def test_runner_attempt_waits_for_a_slot_and_marks_the_child(slot_env, monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "1")
++    mod = _load_runner()
++    test_file = tmp_path / "test_held.py"
++    test_file.write_text("import os\n\ndef test_held():\n    assert os.environ.get('HERMES_TEST_SLOT_HELD') == '1'\n")
++    release, entered = threading.Event(), threading.Event()
++    blocker = threading.Thread(target=_hold, args=(release, entered))
++    blocker.start()
++    assert entered.wait(5)
++    threading.Timer(1.0, release.set).start()
++    started = time.monotonic()
++    _, code, output, _, _ = mod._run_one_file_once(test_file, ["-p", "no:cacheprovider"], tmp_path, 120)
++    blocker.join(5)
++    assert time.monotonic() - started >= 0.9, "the attempt waited for the only slot"
++    assert code == 0, output
++    assert mod._SLOT_WAIT_NOTED.is_set(), "the run says once that it is waiting for slots"
+diff --git a/tests/scripts/test_run_tests_parallel.py b/tests/scripts/test_run_tests_parallel.py
+index c50dba9073..bdadc46196 100644
+--- a/tests/scripts/test_run_tests_parallel.py
++++ b/tests/scripts/test_run_tests_parallel.py
+@@ -45,6 +45,7 @@ def _probe_root(tmp_path):
+     (scripts / "ci").mkdir(parents=True, exist_ok=True)
+     real = Path(__file__).resolve().parents[2] / "scripts"
+     shutil.copy2(real / "run_tests_parallel.py", scripts)
++    shutil.copy2(real / "run_tests_host_slots.py", scripts)
+     # The runner shares the platforms() spec resolver with the CI lane selector.
+     shutil.copy2(real / "ci" / "list_os_marked_tests.py", scripts / "ci")
+     return root
+diff --git a/tests/scripts/test_run_tests_shell.py b/tests/scripts/test_run_tests_shell.py
+index facb6a81e5..bed3c74beb 100644
+--- a/tests/scripts/test_run_tests_shell.py
++++ b/tests/scripts/test_run_tests_shell.py
+@@ -59,3 +59,24 @@ def test_shell_runner_forwards_the_flaky_report_path(tmp_path):
+     import json
+     ids = [e["test_id"] for e in json.loads(report.read_text(encoding="utf-8-sig"))["flaky"]]
+     assert len(ids) == 1 and ids[0].endswith("test_flaky_canary.py::test_flaky_canary"), ids
++
++
++@pytest.mark.platforms("posix")
++def test_shell_runner_forwards_host_slot_settings(tmp_path):
++    """The hermetic env -i keeps HERMES_TEST_HOST_SLOTS / SLOT_DIR; the child sees SLOT_HELD=1."""
++    case = tmp_path / "test_slot_canary.py"
++    case.write_text("import os\ndef test_slot_canary():\n"
++                    "    assert os.environ.get('HERMES_TEST_SLOT_HELD') == '1'\n", encoding="utf-8")
++    slot_dir = tmp_path / "slots"
++    env = {k: v for k, v in os.environ.items() if k != "HERMES_TEST_SLOT_HELD"}
++    root = Path(__file__).resolve().parents[2]
++    result = subprocess.run(
++        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
++        cwd=tmp_path, capture_output=True, text=True, timeout=180,
++        env={**env, "HERMES_PYTHON": sys.executable, "HERMES_TEST_FILE_RETRIES": "0",
++             "HERMES_TEST_HOST_SLOTS": "3", "HERMES_TEST_SLOT_DIR": str(slot_dir)},
++        check=False,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    names = {p.name for p in slot_dir.iterdir()}
++    assert names and names <= {"0.lock", "1.lock", "2.lock"}, names
+-- 
+2.55.0
+
