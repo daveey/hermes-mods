@@ -12,10 +12,9 @@ metadata:
 
 # Kanban hands-on digest
 
-Cards that wait on a human (tap a screen, install a build, flip a setting, answer a question) each block
-separately, so the human gets piecemeal asks and cards sit for hours. This skill turns every such card into
-**one ordered checklist** the human can clear in one sitting, and auto-unblocks cards whose completion a
-machine can verify.
+Clear agent-solvable blockers; consolidate verified human-only actions into **one ordered checklist**.
+For an all-session fleet audit, use the inventory-and-session-join procedure in
+`references/clearing-blockers-yourself.md` before claiming complete coverage.
 
 ## Scope: this session by default
 
@@ -35,14 +34,19 @@ task strip, then `kanban_show` each and report the blocked ones. Also report two
   latest `continued`/`scheduled` event, or a wake cron that no longer exists): they sit unrun
   indefinitely. Re-queue with `hermes kanban unblock <id>` (it accepts scheduled cards). A `needs_input`
   card parked in scheduled is an ask of the user; report it.
-Before treating a blocked card as a human ask, inspect the event that caused the current stop. `gave_up`, `crashed`, `spawn_failed`, model refusal and timeout are operational failures, not evidence of a user obligation. Never turn the task body's first sentence into an unblock instruction. Report the actual cause, whether retries remain, and who owns recovery; say no user action is identified when none is verified. A model refusal should not be repeatedly requeued unchanged or routed around by switching providers. Preserve a paused failure visibly as an agent issue, without a Done button. For genuine human blockers, state the exact action, device, reason, and observable completion condition.
+Before presenting an unblock request:
+1. Read the latest task events; delayed crash notices do not establish current state. Distinguish worker failure from an explicit human ask—never substitute the task body's opening sentence.
+2. Report cause → current retry/paused state → recovery owner. For a genuine ask, name the action, device, reason and observable completion condition. Otherwise say no user action is identified; do not repeatedly requeue a refusal or switch providers to evade it.
+3. `hermes kanban stats` "Waiting on you: N" and diag `waiting_behind_user` are not a list of asks: they include quota-wall holds (`blocker_auth`) and asks that went stale. Check each premise live (`gh workflow list`, device state, `kanban_show` events) before it goes on his list; clear or archive the false ones yourself.
+4. When the user calls the messaging useless, fix its producer and rendered surface, not just the explanation. Keep operational pauses visible as agent issues without Done buttons. Test failure → nonhuman pause → genuine human ask, including rendered buttons/counts; helper tests alone miss misleading controls.
 
 ## This user: clear it yourself, never hand him cards
 
-He wants blockers cleared, not reported. "What are these, you do it" / "you run things for me" means:
-1. Sweep every blocked card and clear each one that is not a genuine human step yourself, in the same turn (recipe by stop cause: `references/clearing-blockers-yourself.md`).
+Treat a complaint about recurring stalls as recovery work, not a sequence of audit/status replies. When correction is authorized, pursue both existing-card recovery and tested prevention with the existing owners; label each separately until deployed behavior is verified.
+1. Sweep blocked cards and clear agent-operable causes through supported transitions (recipe: `references/clearing-blockers-yourself.md`). Keep true approvals and safety holds; verify a new claim or completed acceptance, not merely `ready`.
+Applies to every board-status reply, including "why are only N running": what waits on him is written as concrete actions grouped by where he does them (reply here / phone / Mac / when on site), each with the device and what done looks like. No card ids, no "see t_x", no table of cards for him to open.
 2. Bring genuine decisions to him INLINE as a `clarify` form. Use one question per decision in plain words, recommended option first, and batch the low-stakes defaults into one "accept all recommended" question. Never answer with card ids or links, or with "answer in a comment on t_x". Then record his answers on the cards yourself (comment the decision on the card and on every card waiting on it, then `hermes kanban complete` the decision card).
-   Before you relay a human ask, re-test its premise; block reasons go stale. "Reconnect Desktop / the relay has no connected client" is disproved by a successful `cross_session read` of the target session. Check "needs a credential" against what other profiles on the host already hold. If the premise is false, comment the evidence and the working route, then unblock.
+   Before you relay a human ask, re-test its premise; block reasons go stale. "Reconnect Desktop / the relay has no connected client" is disproved by a successful `cross_session read` of the target session. Check "needs a credential/access" against what other profiles on the host already hold, and against local cloud SSO profiles (`aws sts get-caller-identity --profile <p>` may already be admin in the named account). Check that a PR the ask names is still open, and that a requested restart hasn't already happened. If the premise is false, comment the evidence and the working route, then unblock.
    An old scope-hold comment ("STOP remediation until told") on a card counts as superseded only with evidence, such as sibling cards in the same program now landing under the same authority. Say in your reply that you treated it as lifted and offer to re-hold.
 3. Do sign-in/OAuth blockers yourself through the hub's agent browser before asking him for anything (same reference). Only a step that truly needs his hand or device (a password not in the vault, Touch ID, a physical action) goes to him, and only after you have tried the self-service route.
 4. A "walk me through it" request still means doing everything automatable yourself; the walk-through covers only what remains.

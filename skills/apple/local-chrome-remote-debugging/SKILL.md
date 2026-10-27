@@ -89,7 +89,15 @@ Before handing sign-ins to the user, do every one you can yourself: if the drive
 browser already holds a Google session, click the site's "Continue with Google" and
 pick the account (the work-domain address for workspace-bound services like Slack;
 the personal one is rejected as "no account on this workspace"). Hand over only what
-needs the user's devices (Apple ID 2FA, passkeys). When something is handed over, say
+needs the user's devices (Apple ID 2FA, passkeys). The desktop preview pane can't open
+OAuth popups ("Continue with Google", "Connect with GitHub/LinkedIn" do nothing there), so
+don't route sign-ins or vendor identity checks through it: drive them in
+`browser_exec(local=true)`, whose profile copy already holds the user's Google/GitHub
+sessions, and authorize the OAuth consent yourself. For an emailed magic-link sign-in,
+request the link, read it from Gmail with the google-workspace skill's `google_api.py gmail
+search/get` (run under the Hermes venv python), open it in the driven browser and delete any
+scratch copy. A "can't do this step" from the user means do it this way, not re-ask. Card
+numbers and payments stay the user's: open the exact form, bring it to the front, stop. When something is handed over, say
 what is blocked and why, then numbered steps naming the exact window, what to do, and
 what happens next; a list of links without that leaves the user asking what you want.
 
@@ -187,6 +195,13 @@ Or in Python: `urllib.request.urlopen('http://127.0.0.1:9222/json/list')`.
   by clicking its center (`Input.dispatchMouseEvent`), read back `.value`, and only
   then press Send. It also appends to a prefilled field (sites pre-fill the email
   from the last account), so select-all + Backspace before inserting.
+
+- **Fill web forms (waitlists, access requests) yourself; don't hand them over.** If the
+  user has given the identity to use, submit it in the driven browser. An embedded form
+  stuck on "Loading…" or inside a closed `<dialog>` silently drops `fill_input` and
+  clicks (the values read back empty). Find the real form URL via
+  `performance.getEntriesByType('resource')` (e.g. a `docs.google.com/forms/.../viewform`
+  iframe), open it directly, fill it, and report success only from the confirmation page.
 
 - **`open -a` may find a stale/broken .app.** If you created a test .app in
   `/Applications/` with a malformed Info.plist, remove it before relying on

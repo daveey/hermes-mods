@@ -46,7 +46,28 @@ async () => {
 ```
 
 3. **Before posting**, call `/api/conversations.replies` (same pattern, `ts=<PARENT_TS>`) and check (a) `t.user_id` equals the `user` on the earlier posts (right account), (b) the content isn't already posted (avoid duplicates on retries).
-4. **After posting**, read `conversations.replies` again and confirm the new `ts` is present with `thread_ts == PARENT_TS` and the expected text. Give the user the permalink `https://<workspace>.slack.com/archives/<CHANNEL>/p<ts without dot>?thread_ts=<PARENT_TS>`.
+4. **After posting**, read `conversations.replies` again and verify the returned timestamp, sender, parent thread and expected text. Account for Slack's documented bare-URL → `<url>` normalization before treating a text mismatch as a failed send; inspect the returned message rather than reposting. Obtain the permalink with `chat.getPermalink(channel=<CHANNEL_ID>, message_ts=<returned_ts>)`—the parameter is `channel`, not `conversation_id`.
+
+## Creating a private channel as the user
+
+Use the same authenticated in-page API pattern above for an explicitly requested channel:
+
+1. Resolve people with paginated `users.list`; distinguish human accounts from similarly named bots. Check `conversations.list(types=private_channel, exclude_archived=true)` for an existing channel before creating one.
+2. Call `conversations.create` with `name=<requested name without #>` and `is_private=true`. Keep the returned channel ID; the creator is already a member.
+3. Call `conversations.invite` with `channel=<ID>` and `users=<comma-separated resolved IDs>` for existing workspace members.
+4. Read `conversations.info` and `conversations.members` back; verify `is_private=true`, the exact name, and every intended internal member. Treat external invitations as a separate operation, not as covered by this membership check.
+
+If the workspace sign-in page offers Google SSO, follow its **Sign in with Google** link before asking the user to log in: an existing Google session can authenticate Slack without another prompt. Confirm the resulting identity with `auth.test` before writing.
+
+## Inviting external collaborators with Slack Connect
+
+After creating and verifying the private channel:
+
+1. Send `conversations.inviteShared` using the in-page form-encoded API pattern: `channel=<ID>`, `emails=<recipient email>`, **`external_limited=false`** when the recipient should invite coworkers. The default is limited posting only; the UI equivalent is **Post and invite**, not **Only post**. Keep the returned `invite_id` and distinguish invited from joined.
+2. On `inviter_email_not_verified`, complete the **inviter's** email verification before retrying; switching from API to UI does not bypass it. The channel's Add people flow → external organization → permissions → Send Invitation exposes **Verify Email**. Have the user complete the code through the supported secure/browser flow, then retry the original invitation once. Google SSO authentication alone does not establish this email-verification state.
+3. Read back `conversations.info`: `properties.has_slack_connect_invite_created` confirms an invite was created, but does not prove a particular recipient accepted. For a link to include in an email reply, open channel details → **Settings → Slack Connect → Share Link**. Check that the dialog explicitly says recipients can **post and invite their coworkers**, and note its displayed expiry. Use **Copy Link** to obtain the actual invitation URL; a normal channel URL does not grant access.
+4. If Copy Link reports success but the local clipboard is empty, capture the browser's copy operation instead. Slack may use `document.execCommand('copy')`, so intercepting only `navigator.clipboard.writeText` misses it. Temporarily wrap `document.execCommand`, capture `window.getSelection().toString()` immediately before forwarding the `copy` call to the original function, click Copy Link, read the captured URL, then restore the original function. Keep this capture limited to the invite-link action.
+5. Send the requested email reply with that link and the permission wording, then read back the sent message in the original thread. Call the Slack permission **Post and invite**, not channel admin; GitHub Admin is a separate grant. For a later “why aren't they here?” check, resolve `conversations.members` through `users.info` and inspect connected organizations in `conversations.info`. An old successful invite plus absent membership establishes **invitation sent; not currently joined**, not that the invitation is still pending. Distinguish pending, withdrawn and expired only when current invitation evidence supports it.
 
 ## Finding "our channel" with named people or bots
 

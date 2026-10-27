@@ -28,6 +28,25 @@ A macOS LaunchDaemon needs sudo on that host: run it through `run_in_user_termin
   for Playwright use the bundled `playwright install chromium` + `--browser chromium` instead of
   `install --with-deps chrome` + `--browser-channel chrome`.
 
+## Disposable Docker-capable capacity
+
+1. Put the job-controlled daemon on an isolated node with bounded storage and an outer CPU/memory cgroup.
+   Keep the lifecycle controller outside that daemon; reset only after the `--once` runner exits. Serialize
+   each identity so replacement listeners cannot overlap.
+2. Preload a clean base-image data-root, stop its daemon, and retain a root-only seed. Clone it with
+   `cp --reflink=always -a` on XFS for each job; after completion stop the entire daemon control group and
+   remove the active data-root. Recycling only the runner leaves child containers, volumes and build cache.
+3. Before adding `docker-ci`, run a real build and child-container networking canary, then a second job
+   proving image/container/workspace residue is absent. Exercise denied host-credential bind mounts and
+   host rootful-socket access separately; an ordinary build does not prove those boundaries.
+4. Verify the INSTALLED lease unit and its actual daemon endpoint before judging shutdown safety.
+   Rootful `docker ps` says nothing about rootless jobs. Any runner restart, resize or drain (rootless or
+   not) must withdraw its labels on GitHub, prove GitHub `busy=false` sustained over a settle window, then
+   act; a drain also unregisters, awaits natural listener exit, and proves its job daemon empty. A frozen
+   listener with no `Runner.Worker` child is NOT idle: the listener acquires the job before forking the
+   Worker, so local probes (two idle checks, pidfd children) race job assignment and lose jobs. Treat inspection errors as unknown, never empty. A general-node
+   checker present in the repository is not evidence that it runs on the Docker node.
+
 ## Pitfalls after the move
 
 - Self-hosted checkouts persist between jobs, so anything the build rewrites in a TRACKED file stays dirty and a
@@ -37,5 +56,11 @@ A macOS LaunchDaemon needs sudo on that host: run it through `run_in_user_termin
   `git rm -r --cached` + `.gitignore`, never by cleaning the host.
 - When a migration commit was made from a local checkout, check its `--stat` for accidental bulk adds
   (node_modules, scratch scripts) before calling it done.
+- Diagnose saturation by label, not total queued runs: paginate the runners and each queued/in-progress run's
+  jobs (`repos/OWNER/REPO/actions/runners`, `actions/runs/ID/jobs`), then group online/busy slots, queued job
+  names and age by required custom label. General, Docker and observer lanes can saturate independently;
+  extra general slots cannot consume `docker-ci` jobs. Check workflow concurrency and existing owners before
+  provisioning. Preserve healthy work and current-head tests; use the superseded gate-only latch sweep in
+  SKILL.md rather than cancelling an entire run merely because its commit has a newer descendant.
 - PRs refused during the outage: `gh run rerun` replays the PR head's workflow file, which still has the old
   `runs-on`. Rebase onto `origin/main` and `--force-with-lease` push.

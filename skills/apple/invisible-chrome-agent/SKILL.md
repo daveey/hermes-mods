@@ -54,9 +54,8 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
   `HERMES_CHROME_AGENT_PYTHON=<an interpreter that holds Accessibility>` (default `/usr/bin/python3`, which usually
   holds none). Without the grant the log says `evict: untrusted` once per run and `status` prints it too; Chrome
   re-homing is unaffected;
-- restarts only the child that died: Chrome crash → relaunch (with backoff; its tabs are lost); vdisplay crash →
-  new display, windows re-homed. A stale Chrome left on the profile (SingletonLock pid) is stopped first, since a
-  second launch on the same profile would just hand off to it;
+- restarts dead children: Chrome relaunches with backoff and loses its tabs; vdisplay is recreated and windows
+  re-homed. Startup stops a stale profile holder before launching Chrome;
 - runs a **focus guard** as backstop behind the filter (thread, every 0.25 s, `lsappinfo front`): when the agent Chrome becomes frontmost without
   being asked, it hands focus back to the app the user had in front and logs `focus-guard: agent Chrome took focus
   ... returned it to pid N (App)`. A CDP client causes this with a foreground `Target.createTarget` (no
@@ -103,7 +102,14 @@ launchctl kickstart -k gui/$UID/<label>                    # restart (graceful: 
 tail -f ~/.hermes/logs/chrome-agent.log
 ```
 
-Sign the agent into sites once: `hermes-chrome-agent show`, log in by hand in that window, `hide`.
+### Stop an authorized runaway browser workload
+
+Use `launchctl print gui/$UID/<label>` to verify the actual supervisor label and profile, then
+`launchctl bootout gui/$UID/<label>` to stop it. Killing Chrome alone is a restart, not a shutdown:
+the supervisor relaunches it. Never use `killall Chrome`, which also stops the personal browser.
+Verify the service is unloaded, no main Chrome process holds the agent profile, and its CDP listener is
+closed; then remeasure CPU. Bootout is temporary, not a persistent disable across login. The configured
+CDP endpoint remains offline until the service is started again.
 
 ## How Hermes uses it
 
@@ -189,12 +195,22 @@ real-profile route (`_resolve_real_profile_cdp` returns early when an override i
 - This Chrome shows a second Chrome icon in the Dock / app switcher; activating it does not move its windows.
   Raising the app or `setWindowBounds` onto the main screen just flashes the window: the 1s re-home loop pulls it
   straight back. Show pages the way the next section describes.
+- **"The window keeps flashing" = one window the re-home loop can't move.** The log shows `rehome: window <id>` with
+  the same `from` bounds every second, and `status` lists that window on the main display. `browser_focus {hide:true}`
+  and `setWindowBounds` with `windowState: minimized` don't help. Fix: find the window's tabs
+  (`Target.getTargets` + `Browser.getWindowForTarget` for each page, match `windowId`), then
+  `curl 127.0.0.1:9333/json/close/<id>` each one. The window closes and the flashing stops. Don't restart the
+  supervisor for this, because a restart closes every tab.
 - `show --minutes N` expiry is enforced by the supervisor's re-home loop, so it needs a supervisor restart to take
   effect, and a restart closes every tab. Never restart it while a tab holds a login or an in-flight task the user
   still needs.
 
 ## Showing the user a page (sign-in, 2FA, click)
 The user wants the window brought to them, never "find the Chrome window" instructions, and sent back once done.
+0. **In a Desktop chat, use the side pane instead** for any page the user must type into (sign-ups, passwords,
+   human checks): `desktop_preview open` + `drive_preview` to prefill, user finishes there. A `browser_exec local=true`
+   handoff sets the 20-min show flag, so every later call on that tab re-raises Chrome over their work. If Chrome
+   was already shown: `hermes-chrome-agent hide`, then `curl 127.0.0.1:9333/json/close/<id>` your handoff tabs.
 1. Call `browser_focus` (browser-focus plugin; `match` = URL/title substring). It runs `show --minutes 20`, activates
    the tab over CDP and raises the app. Without the plugin: `hermes-chrome-agent show` FIRST (the focus filter
    swallows activation until the show flag exists), then

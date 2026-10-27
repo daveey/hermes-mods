@@ -111,7 +111,7 @@ back). The endpoint opens every board and replica once and keeps the read-only c
 1–2 ms on the laptop and the mini and 1–5 ms on the hub (it was about 40 ms with a 120–340 ms tail when it opened
 16 files per call). Tests: `test_kanban_chat_links.py`, `test_kanban_ro_cache.py`.
 
-Boards: every board on every host is attached and `primary` (7 on the laptop, 4 on the mini, 5 on the hub). Boards a
+Boards: every board on every host is attached and `primary` (6 on the laptop, 4 on the mini, 5 on the hub). Boards a
 host only knows through links (the laptop's `bb`, `runners` and `unconventional-collab`) keep just a replica. The sync loop now wakes on the service's WebSocket
 feed, on a local outbox write or on its period, instead of polling every 5 s.
 

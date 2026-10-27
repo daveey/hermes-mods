@@ -135,6 +135,14 @@ owner wants the context. Cut cold start instead (local pinned MCP install instea
 unrelated plugins). Measure real latency from `eng_replies` (bot profile `slack-workspace/observed.sqlite`,
 `posted_ts - reply_to`) and drop test-channel rows before reporting; harness posts look like real traffic.
 
+## Project build requests
+
+For requested builds, create a real named session under the designated Desktop project and track its work
+with Kanban; a card alone is not a project session. Return the result to the requesting Slack thread, then
+archive the build session after verified completion. Leave failed or blocked work visible and retain the
+transcript. Treat this as the required workflow, not proof that a scoped session/Kanban integration is installed;
+verify that integration before promising autonomous builds.
+
 ## Policy file
 
 `<HERMES_HOME>/slack-workspace/policy.json` (the operator edits it, or the always-allow button does):
@@ -154,17 +162,18 @@ unrelated plugins). Measure real latency from `eng_replies` (bot profile `slack-
    `quiet_channels`. Those feeds are most of the volume, so this is what keeps context useful.
 5. Add a short "Slack awareness" section to the bot's SOUL.md pointing at this skill: SOUL is always
    loaded, while this skill only loads on demand.
-6. Keep bot traffic out of the Desktop sidebar: set `sessions.automated_sources: ["*"]` on the bot profile
-   AND the follower profile (`hermes -p <p> config set sessions.automated_sources '["*"]' --force`; fork core
-   0166). Follower sessions started by `slack_engage`, smoke-test engagements included, are `source=cli` rows in
-   the follower profile, so `"*"` is what catches them. They are then hidden unless the sidebar filter
-   "Show automated & test sessions" is on. Pinned rows and rows waiting on you (red/grey stripe, needs input)
-   stay visible. Don't hide smoke-test sessions by hand.
+6. Set and read back the default delivery channel before the first live test:
+   `hermes -p <p> config set platforms.slack.home_channel '{"platform":"slack","chat_id":"<channel-id>","name":"<channel-name>"}' --force`,
+   then `hermes -p <p> config get platforms.slack.home_channel`. A successful reply alone misses the
+   separate “No home channel is set” onboarding warning. Inspect the whole test thread, not just the answer;
+   after correcting setup, remove only the bot's exact stale warning and verify the answer remains.
+7. Hide ambient bot/follower traffic with `hermes -p <p> config set sessions.automated_sources '["*"]' --force`
+   on both profiles; follower sessions use `source=cli`. Keep requested project-build sessions visible separately.
 
 ## Pitfalls
 
 - `not_in_channel` → join (public) or ask for an `/invite` (private).
 - `missing_scope` → the app lacks that scope; tell an admin which one (the error names it).
-- Observation starts when the bot joins. For older history use `conversations.history`.
-- Search: bot tokens can't call `search.messages`; `assistant.search.context` needs an
-  `action_token` from a user-triggered event. Prefer `slack_recent` + `conversations.history`.
+- For a thread in an unknown channel, search the bot's observation index before dumping a guessed channel's history; large unrelated threads obscure the target. Use [thread discovery](references/thread-discovery.md), then verify the full thread live.
+- Observation starts when the bot joins; an index miss requires live history discovery, not an absence claim.
+- Bot-token search uses observations/history; `assistant.search.context` requires a user-event `action_token`.

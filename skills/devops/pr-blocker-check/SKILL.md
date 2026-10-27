@@ -27,11 +27,29 @@ Run the checker once per wake; schedule the next look with `kanban_continue(resu
 | blocked_unknown | diagnose (rulesets, required checks, queue); do not guess or ask |
 | ready | attempt the normal merge (never `--admin`, never self-approve, never add bypass labels) |
 
+`checks_pending` with the new head's run stuck `pending` (no jobs) usually means an older run is holding the
+workflow's concurrency group. Cancelled runs do this when an `if: always()` gate or report job
+("All required checks pass", timing report, aggregate) still waits for a busy runner, and a main group
+without cancel-in-progress serializes runs the same way. Read the workflow's `concurrency:` block before
+proposing "add cancel-in-progress": it is usually already there. Release the latch by force-cancelling
+(`gh api -X POST repos/O/R/actions/runs/<id>/force-cancel`) ONLY runs that meet all of these:
+- the head is superseded (no longer the current PR head or main HEAD);
+- the run has at least one job, and every open job is a gate or report job;
+- `run_attempt` is 1 (a rerun may be a deliberate operator action; find its owner first).
+
+For a main run you are timing, record created / first-job / last-real-job times before cancelling. `gh run cancel`
+only *requests* cancellation: read back `completed/cancelled` before you count the run as cleared. The lasting fix
+is to give gate jobs `if: ${{ !cancelled() }}` and run them on a light runner label. PR runs use the PR's own
+workflow file, so open PRs keep the old behavior until they rebase.
+
 Before asking the user anything, check live state again (the head may have changed, a rebase may have reset
 approval) and put the proof in the ask. Do not repeat an ask a restart already made.
 
-Admin override: only with explicit per-PR user authorization, and it can still be refused by repository
-rules ("At least 1 approving review is required"); then the blocker is a real review.
+Admin override: only with explicit per-PR user authorization. Before offering it, read
+`gh api repos/O/R/rulesets/<id> --jq .current_user_can_bypass`: `pull_requests_only` cannot skip a required
+approving review (the merge is refused with "At least 1 approving review is required"), so the blocker is a real
+review and asking for override authorization wastes a turn. Once a write-access approval lands, an authorized
+`--admin` merge can still be needed for leftover policy (e.g. branch out of date).
 
 Tests: `python3 -m pytest -q skills/devops/pr-blocker-check/tests`. Five-whys example:
 `references/five-whys-stuck-approved-pr.md`.
