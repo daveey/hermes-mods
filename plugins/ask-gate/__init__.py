@@ -318,6 +318,15 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             return {"replace":
                     "I suppressed a repeated request because this action has a recorded terminal answer. "
                     "This record does not authorize performing or reopening it."}
+        reconciled = _reconcile_prose(session_id, "pre_final_gate", asks if howto else retirement_candidates)
+        if reconciled is not None:
+            record_verdict(session_id, "approval_reconciled", final_response)
+            try:
+                ledger().set_open_asks(session_id, [])
+            except Exception as e:
+                core.log_event("pending_clear_error", session=session_id, error=repr(e))
+            return {"replace": "I withheld an approval request after checking the authoritative store. "
+                    "No new permission or execution authorization is granted by this notice."}
         budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
         held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
         if held is not None and attempt < budget:
@@ -395,6 +404,19 @@ def _tools_now(session_id: str) -> list[dict]:
     return LOG.get(session_id)
 
 
+def _reconcile_prose(session_id: str, surface: str, asks: list[str]) -> dict | None:
+    # This is candidate text, not a validated request or authority. Resolvers
+    # classify the action and obtain exact scope/head from their own store.
+    for ask in asks:
+        result = approval_reconciliation.preflight({
+            "session_id": session_id, "tool_name": surface,
+            "human_request": {"action": ask},
+        })
+        if result is not None:
+            return result
+    return None
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -449,6 +471,11 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             return _human_request_gate(session_id, tool_name, args)
         if tool_name == "kanban_block" and str(args.get("kind") or "") in _WORKER_NO_ASK_KINDS:
             return None
+        candidate = str(args.get("reason") or "") if tool_name == "kanban_block" else (
+            str(args.get("title") or "") + "\n" + str(args.get("body") or ""))
+        reconciled = _reconcile_prose(session_id, tool_name, core.find_asks(candidate))
+        if reconciled is not None:
+            return reconciled
         gated, text = core.needs_checked(tool_name, args, _is_worker())
         if not gated or "Filed automatically by the `open-asks` plugin" in text:
             return None
