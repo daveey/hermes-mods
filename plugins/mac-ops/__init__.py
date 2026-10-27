@@ -503,6 +503,7 @@ SCHEMAS = {
                    "thread; click(x,y), key(combo), type(text) act on it, after the owner allows screen control in the "
                    "thread (the tool asks; stop and wait for the yes).",
                    {"host": {"type": "string", "description": "the Mac to look at"},
+                    "via": {"type": "string", "description": "Optional configured viewer host, e.g. mini for a backup viewer; defaults to the first other host. No automatic failover."},
                     "op": {"type": "string", "enum": list(SCREEN_OPS)}, "x": {"type": "integer"},
                     "y": {"type": "integer"}, "combo": {"type": "string"}, "text": {"type": "string"}},
                    ["host", "op"], tool_screen),
