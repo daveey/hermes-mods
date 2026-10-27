@@ -729,7 +729,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     const status = operationState(data.operation)
     if (['delivered','cancelled'].includes(status) && data.request.resolution?.operationId !== operationId(data.operation)) throw Error('Delivery not yet confirmed by request readback')
     if (status === 'cancelled' && data.request.state !== 'cancelled') throw Error('Cancellation not yet confirmed by request readback')
-    update({ request: data.request, operation: data.operation, phase: status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? 'Decision recorded; delivery failed. Retry uses the same operation.' : '' })
+    update({ request: data.request, operation: data.operation, phase: status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? 'Decision recorded; delivery unconfirmed. Work may have started. Retry uses the same operation.' : '' })
     if (['delivered','cancelled'].includes(status)) { try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {} }
     saveReadback(route, data.request)
   }
@@ -817,7 +817,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   }
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
-  const phaseText = { idle: r.state === 'needs_context' ? 'Full plan required before approval.' : '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: 'Decision recorded; delivery failed.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
+  const phaseText = { idle: r.state === 'needs_context' ? 'Full plan required before approval.' : '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
   return jsxs('article', { 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
     jsx('h3', { style: { margin: '4px 0', fontSize: 14, overflowWrap: 'anywhere' }, children: `${r.title} · revision ${r.revision}` }),
     jsx('div', { 'data-action-scope': '', style: { ...planStyle, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': 'Complete plan', children: jsx(Linked, { text: r.scope?.markdown || 'The full plan has not been provided.' }) }),
