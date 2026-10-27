@@ -1,0 +1,370 @@
+From 36df211821def79e500d656bba07c299b84ba156 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 14:14:01 -0700
+Subject: [PATCH] fix(kanban): fence lease echoes and reset run heartbeat
+ [daveey]
+
+---
+ hermes_cli/kanban_admission.py                |   7 +-
+ hermes_cli/kanban_db_sync.py                  |  49 ++++----
+ hermes_cli/kanban_sync_client.py              |   3 +-
+ .../test_kanban_claim_heartbeat_reset.py      |  82 ++++++++++++++
+ .../test_kanban_sync_lease_fencing.py         | 105 ++++++++++++++++++
+ 5 files changed, 218 insertions(+), 28 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_claim_heartbeat_reset.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_lease_fencing.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 3370b8219b..d60aa5846f 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -7,14 +7,17 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+     """CAS to running and publish its run/event. Caller owns the fenced transaction."""
+     from hermes_cli import kanban_db as kb
+ 
++    # Activity belongs to this run, not the previous worker. Seed it atomically
++    # so the first expired TTL cannot treat a freshly woken worker as wedged.
+     cur = conn.execute(
+         """
+         UPDATE tasks
+            SET status = 'running', human_request = NULL, claim_lock = ?,
+-               claim_expires = ?, started_at = COALESCE(started_at, ?)
++               claim_expires = ?, started_at = COALESCE(started_at, ?),
++               last_heartbeat_at = ?
+          WHERE id = ? AND status = ? AND claim_lock IS NULL
+         """,
+-        (lock, expires, now, task_id, source_status),
++        (lock, expires, now, now, task_id, source_status),
+     )
+     if cur.rowcount != 1:
+         return None
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9b69c627a5..10a234dee0 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -75,7 +75,7 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+     "tasks": frozenset({
+         "claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at",
+         "workspace_path", "session_id", "project_id", "sync_version", "field_hlc", "lease_holder",
+-        "lease_expires",
++        "lease_expires", "lease_version",
+     }),
+     "task_links": frozenset(),
+     "task_comments": frozenset(),
+@@ -160,6 +160,7 @@ _SYNC_COLUMN_DDL = (
+     ("tasks", "field_hlc", "field_hlc TEXT"),
+     ("tasks", "lease_holder", "lease_holder TEXT"),
+     ("tasks", "lease_expires", "lease_expires INTEGER"),
++    ("tasks", "lease_version", "lease_version INTEGER"),
+     ("tasks", "created_on", "created_on TEXT"),
+     ("kanban_sync_outbox", "retry_after", "retry_after INTEGER"),
+ )
+@@ -514,6 +515,7 @@ class Lease:
+     expires_ms: Optional[int] = None
+     holder: Optional[str] = None
+     reason: Optional[str] = None
++    version: Optional[int] = None
+ 
+ 
+ class LeaseClient(Protocol):
+@@ -604,8 +606,9 @@ def stage_claim(conn: sqlite3.Connection, task_id: str, gate: Optional[ClaimGate
+         return
+     lease = gate.lease
+     conn.execute("UPDATE kanban_sync_state SET pending_run_uid = ?", (lease.run_uid,))
+-    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ? WHERE id = ?",
+-                 (gate._ids[1], lease.expires_ms, task_id))
++    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ?, "
++                 "lease_version = COALESCE(?, lease_version) WHERE id = ?",
++                 (gate._ids[1], lease.expires_ms, lease.version, task_id))
+     gate.consumed = True
+ 
+ 
+@@ -649,7 +652,9 @@ def _renew(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str], ttl_s
+         return None
+     with write_txn(conn):
+         if lease.granted:
+-            conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (lease.expires_ms, task_id))
++            conn.execute("UPDATE tasks SET lease_expires = ?, "
++                         "lease_version = COALESCE(?, lease_version) WHERE id = ?",
++                         (lease.expires_ms, lease.version, task_id))
+             return lease.expires_ms
+         _log.warning("kanban sync: lease for %s lost to %s (%s)", task_id, lease.holder, lease.reason)
+         conn.execute("UPDATE tasks SET lease_holder = ? WHERE id = ?", (lease.holder, task_id))
+@@ -827,24 +832,30 @@ def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: A
+         conn.execute(f"UPDATE tasks SET {assignments}{', ' if cols else ''}sync_version = ? WHERE id = ?",
+                      (*cols.values(), ch.version, ch.uid))
+     if "lease_holder" in ch.fields:  # the service's full row carries its lease mirror
+-        _mirror_lease(conn, ch.uid, ch.fields.get("lease_holder"), ch.fields.get("lease_expires"), own, result)
++        _mirror_lease(conn, ch.uid, ch.fields.get("lease_holder"), ch.fields.get("lease_expires"),
++                      ch.version, own, result)
+     _collect_task_observers(ch, cols.get("status"), changed, result)
+     return True
+ 
+ 
+ def _mirror_lease(conn: sqlite3.Connection, task_id: str, holder: Optional[str], expires: Optional[int],
+-                  own: str, result: ApplyResult) -> None:
++                  version: int, own: str, result: ApplyResult) -> bool:
+     """Mirror the service's lease onto the task. A lease that moved away from this gateway while a local
+     worker holds the claim makes the claim stale now, so the dispatcher's stale-claim path stops the worker."""
+-    row = conn.execute("SELECT status, claim_lock, lease_holder FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-    if row is None:
+-        return
+-    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ? WHERE id = ?", (holder, expires, task_id))
++    # RPC grants/renewals acknowledge only the lease, not the rest of the task.
++    # An older full-row echo may still carry task fields we have never applied.
++    row = conn.execute("SELECT status, claim_lock, lease_holder, lease_version FROM tasks WHERE id = ?",
++                       (task_id,)).fetchone()
++    if row is None or (row["lease_version"] is not None and version < row["lease_version"]):
++        return False
++    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ?, lease_version = ? WHERE id = ?",
++                 (holder, expires, version, task_id))
+     if holder != own and row["claim_lock"] is not None and row["lease_holder"] == own:
+         conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ? AND claim_lock IS NOT NULL",
+                      (int(time.time()) - 1, task_id))
+     if holder is None and row["status"] in _CLAIMABLE:
+         result.wake_dispatcher = True
++    return True
+ 
+ 
+ def _collect_task_observers(ch: RemoteChange, new_status: Optional[str], changed: set[str],
+@@ -908,21 +919,9 @@ def _tombstone(conn: sqlite3.Connection, table: str, uid: str) -> None:
+ 
+ 
+ def _lease_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> bool:
+-    """Mirror a lease change. A lease that moved away from this gateway while a
+-    local worker holds the claim makes the claim stale now, so the dispatcher's
+-    stale-claim path stops the worker (run outcome ``lease_lost``)."""
+-    row = conn.execute("SELECT status, claim_lock, sync_version FROM tasks WHERE id = ?", (ch.uid,)).fetchone()
+-    if row is None or (row["sync_version"] is not None and ch.version <= row["sync_version"]):
+-        return False
+-    holder, expires = ch.fields.get("lease_holder"), ch.fields.get("lease_expires")
+-    conn.execute("UPDATE tasks SET lease_holder = ?, lease_expires = ?, sync_version = ? WHERE id = ?",
+-                 (holder, expires, ch.version, ch.uid))
+-    if holder != own and row["claim_lock"] is not None:
+-        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ? AND claim_lock IS NOT NULL",
+-                     (int(time.time()) - 1, ch.uid))
+-    if holder is None and row["status"] in _CLAIMABLE:
+-        result.wake_dispatcher = True
+-    return True
++    """Lease-only changes share the lease fence and never acknowledge task fields."""
++    return _mirror_lease(conn, ch.uid, ch.fields.get("lease_holder"), ch.fields.get("lease_expires"),
++                         ch.version, own, result)
+ 
+ 
+ _APPLY_HANDLERS = {
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index e4b23fdebf..418f0f43a4 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -855,7 +855,8 @@ class HubLeaseClient:
+         lease = res.get("lease") or {}
+         granted = res.get("status") == "applied" and lease.get("run_uid") == run_uid
+         return sync.Lease(granted=granted, run_uid=run_uid, expires_ms=lease.get("expires"),
+-                          holder=lease.get("holder"), reason=None if granted else res.get("reason"))
++                          holder=lease.get("holder"), reason=None if granted else res.get("reason"),
++                          version=res.get("version"))
+ 
+     def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int,
+                 lane: str = "ready") -> sync.Lease:
+diff --git a/tests/hermes_cli/test_kanban_claim_heartbeat_reset.py b/tests/hermes_cli/test_kanban_claim_heartbeat_reset.py
+new file mode 100644
+index 0000000000..e70c4a0a79
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_claim_heartbeat_reset.py
+@@ -0,0 +1,82 @@
++"""A new run must not inherit the previous worker's stale heartbeat."""
++
++import signal
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("source_status", ["ready", "review"])
++@pytest.mark.parametrize("current_run_stale", [False, True], ids=["fresh", "stale"])
++def test_reclaim_uses_current_run_heartbeat(board, monkeypatch, source_status, current_run_stale):
++    conn = board
++    now = 2_000_000_000
++    old = now - kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS - 600
++    clock = [old]
++    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
++    tid = kb.create_task(conn, title="Wake a previously active task", assignee="worker")
++    previous = kb.claim_task(conn, tid)
++    assert previous is not None
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (old, tid))
++    assert kb.reclaim_task(conn, tid, signal_fn=lambda *_: pytest.fail("No old worker to signal"))
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (source_status, tid))
++
++    clock[0] = now
++    claim = kb.claim_task if source_status == "ready" else kb.claim_review_task
++    current = claim(conn, tid, ttl_seconds=60)
++    assert current is not None
++    assert current.current_run_id != previous.current_run_id
++    # Task age is intentionally retained; only the activity baseline belongs to the new run.
++    assert current.started_at == old
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
++                     (424242, "test-fingerprint", tid))
++
++    alive = [True]
++    monkeypatch.setattr(kb, "_worker_alive", lambda *_: alive[0])
++    monkeypatch.setattr(kb, "_pid_alive", lambda *_: alive[0])
++    monkeypatch.setattr(kbd, "_worker_alive", lambda *_: alive[0])
++    monkeypatch.setattr(kbd, "_pid_recycled", lambda *_: False)
++    signals = []
++
++    def terminate(pid, sig):
++        signals.append((pid, sig))
++        alive[0] = False
++
++    # Both claims expire, but only the control run has actually gone an hour without activity.
++    clock[0] = now + (kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS + 1 if current_run_stale else 61)
++    assert kb.release_stale_claims(conn, signal_fn=terminate) == int(current_run_stale)
++    task = kb.get_task(conn, tid)
++    run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (current.current_run_id,)).fetchone()
++    assert task.last_heartbeat_at == now
++    if current_run_stale:
++        assert signals == [(424242, signal.SIGTERM)]
++        assert task.status == source_status
++        assert task.claim_lock is None
++        assert task.worker_pid is None
++        assert run["outcome"] == "reclaimed"
++        assert run["ended_at"] == clock[0]
++    else:
++        assert signals == []
++        assert task.status == "running"
++        assert task.current_run_id == current.current_run_id
++        assert task.claim_lock == current.claim_lock
++        assert task.claim_expires > clock[0]
++        assert run["claim_expires"] == task.claim_expires
++        assert run["ended_at"] is None
++        assert run["outcome"] is None
+diff --git a/tests/hermes_cli/test_kanban_sync_lease_fencing.py b/tests/hermes_cli/test_kanban_sync_lease_fencing.py
+new file mode 100644
+index 0000000000..56e4afc9a1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_lease_fencing.py
+@@ -0,0 +1,105 @@
++"""Lease RPC acknowledgements fence feed echoes, not unrelated task fields."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def primary(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    for conn in support.synced_conn(home):
++        sync.set_mode(conn, "primary")
++        yield conn
++
++
++@pytest.fixture
++def hub(primary):
++    class Hub:
++        version = 29
++        expires = int(time.time() + 900) * 1000
++        holder = primary.execute("SELECT gateway_id FROM kanban_sync_state").fetchone()[0]
++
++        def leases(self, board, body):
++            return {"status": "applied", "version": self.version,
++                    "lease": {"run_uid": body["run_uid"], "holder": self.holder,
++                              "expires": self.expires}}
++
++    hub = Hub()
++    previous = sync.set_lease_client(client.HubLeaseClient(hub))
++    try:
++        yield hub
++    finally:
++        sync.set_lease_client(previous)
++
++
++def row(conn, tid):
++    return conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++
++
++def apply(conn, tid, version, holder, expires, op="upsert", **fields):
++    sync.apply_remote_changes(conn, [sync.RemoteChange(
++        version, "tasks", tid, op,
++        {"lease_holder": holder, "lease_expires": expires, **fields},
++        version, "", "gw_remote",
++    )], new_cursor=version)
++
++
++@pytest.mark.parametrize("op", ["upsert", "lease"])
++def test_grant_fences_previous_release_and_intermediate_null(primary, hub, op):
++    tid = kb.create_task(primary, title="original", assignee="worker")
++    assert kb.claim_task(primary, tid, ttl_seconds=900, claimer="host:1")
++    before = row(primary, tid)
++    # The grant's final version must NOT acknowledge earlier task fields.
++    assert before["sync_version"] is None
++    for version in (26, 28):
++        apply(primary, tid, version, None, None, op=op,
++              **({"title": "remote edit", "status": "running"} if op == "upsert" else {}))
++        after = row(primary, tid)
++        assert after["claim_expires"] == before["claim_expires"]
++        assert after["lease_holder"] == hub.holder
++        assert after["lease_expires"] == hub.expires
++    apply(primary, tid, 29, hub.holder, hub.expires)
++    after = row(primary, tid)
++    assert after["claim_expires"] == before["claim_expires"]
++    assert after["lease_version"] == 29
++    if op == "upsert":
++        assert after["title"] == "remote edit"
++    assert "lease_version" not in sync.captured_columns(primary, "tasks")
++
++
++@pytest.mark.parametrize("op", ["upsert", "lease"])
++@pytest.mark.parametrize("holder", [None, "gw_other"])
++def test_renewal_fences_old_echo_but_new_takeover_expires(primary, hub, monkeypatch, op, holder):
++    tid = kb.create_task(primary, title="renew", assignee="worker")
++    assert kb.claim_task(primary, tid, ttl_seconds=900, claimer="host:1")
++    old_expires = hub.expires
++    hub.version = 35
++    hub.expires += 300000
++    monkeypatch.setattr(sync, "_renewal_due", lambda *args: True)
++    assert kb.heartbeat_claim(primary, tid, ttl_seconds=900, claimer="host:1")
++    before = row(primary, tid)
++    assert before["sync_version"] is None
++    apply(primary, tid, 30, hub.holder, old_expires, op=op)
++    assert row(primary, tid)["lease_expires"] == hub.expires
++    assert row(primary, tid)["claim_expires"] == before["claim_expires"]
++    assert row(primary, tid)["lease_version"] == 35
++    apply(primary, tid, 36, holder, None if holder is None else hub.expires, op=op)
++    after = row(primary, tid)
++    assert after["lease_holder"] == holder
++    assert after["lease_version"] == 36
++    assert after["claim_expires"] < int(time.time())
++
++
++def test_lease_only_feed_does_not_acknowledge_task_fields(primary, hub):
++    tid = kb.create_task(primary, title="original", assignee="worker")
++    assert kb.claim_task(primary, tid, ttl_seconds=900)
++    apply(primary, tid, 35, hub.holder, hub.expires, op="lease")
++    apply(primary, tid, 30, None, None, title="earlier field edit")
++    assert row(primary, tid)["title"] == "earlier field edit"
++    assert row(primary, tid)["lease_holder"] == hub.holder
++    assert row(primary, tid)["lease_version"] == 35
+-- 
+2.54.0 (Apple Git-157)
+
