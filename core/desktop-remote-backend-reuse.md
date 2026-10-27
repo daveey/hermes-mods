@@ -1,6 +1,6 @@
 # Desktop: reuse remote SSH backends across quit and reconnect
 
-Patches **0443** (`2b3388b95d`), **0444** (`941478b69d`), **0445** (`6f9a0bc29b`).
+Patches **0448** (`2b3388b95d`), **0449** (`941478b69d`), **0450** (`6f9a0bc29b`).
 
 ## Behavior
 
@@ -9,8 +9,8 @@ killed the owned `serve --isolated` backend. Now a teardown reason decides the r
 revalidate, resume and idle-stop RELEASE the backend (tunnel and SSH close; backend and lockfile stay); deliberate
 changes (fingerprint change, removed connection, recycle, config apply, profile teardown) and any unlisted reason
 TERMINATE. Windows remotes are skipped. A released backend exits by itself 900 s after its last client and never
-mid-turn. `connect()` logs `reuse miss: <reasons>` for every present-but-unreused backend (0445 adds the
-stale-runtime-after-update case). 0444 proves ownership of macOS launcher-run backends: exact argv from `/proc`,
+mid-turn. `connect()` logs `reuse miss: <reasons>` for every present-but-unreused backend (0450 adds the
+stale-runtime-after-update case). 0449 proves ownership of macOS launcher-run backends: exact argv from `/proc`,
 `sysctl KERN_PROCARGS2` or last-resort `ps`; for `python -I -c <script>` launchers the single literal
 `sys.argv = [...]` is read with `ast.literal_eval` (never executed); zero/several literals or non-string items stay
 foreign; the owner nonce and token-path rules still apply.
@@ -27,7 +27,7 @@ token, exact miss reasons, stale-proof case, teardown policy table) and `remote-
 
 ## Applying
 
-Apply 0443–0445 in order.
+Apply 0448–0450 in order.
 
 ## Gotchas
 

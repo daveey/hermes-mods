@@ -1,0 +1,111 @@
+From 20ca50ce3fbc8bc339fa89df7f739c894eb8a15a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:05:22 -0700
+Subject: [PATCH] fix(kanban-sync): retry transient rejections instead of
+ stranding rows [daveey]
+
+Problem: after the task_chat_links Worker deploy, 4102/709/28 link rows on
+the three gateways were rejected 'invalid: unknown table task_chat_links'
+(and depends_on_rejected): the busy default Board DO still ran the previous
+code when the reconciler's first batch arrived.
+Why: the client treated every rejection as final; a Durable Object keeps old
+code until it restarts, so any deploy that adds a table races the clients.
+Fix: unknown-table, storage_error and depends_on_rejected rejections stay
+pending (attempts+1) and retry next round, at most 10 times; the batch stops
+on a deferral so nothing loops hot. Anything else stays final.
+Proof: test_transient_rejections_retry_next_round_and_give_up_after_a_cap.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_client.py            | 21 ++++++++++++++++-
+ tests/hermes_cli/test_kanban_sync_client.py | 25 +++++++++++++++++++++
+ 2 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index d8f5e3da85..861e731d94 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -209,12 +209,24 @@ def _full_row_if_unseen(conn: sqlite3.Connection, row: dict) -> dict:
+     return {**row, "fields": _row_fields(conn, "tasks", task)}
+ 
+ 
++# Rejections the service lifts on its own; anything else is final. A capped number of retries keeps a real mismatch
++# (an old service that will never know the table) visible as rejected instead of retrying forever.
++TRANSIENT_REASONS = ("storage_error", "depends_on_rejected")
++MAX_TRANSIENT_ATTEMPTS = 10
++
++
++def transient_rejection(res: dict) -> bool:
++    reason = str(res.get("reason") or "")
++    return reason in TRANSIENT_REASONS or (reason == "invalid" and "unknown table" in str(res.get("detail") or ""))
++
++
+ @dataclass
+ class PushResult:
+     sent: int = 0
+     applied: int = 0
+     merged: int = 0
+     rejected: int = 0
++    deferred: int = 0
+ 
+ 
+ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
+@@ -252,6 +264,13 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     setattr(out, status, getattr(out, status) + 1)
+                     if status == "merged" and primary and res.get("row"):
+                         authoritative.append(_row_change(row["table_name"], res["row"]))
++                elif transient_rejection(res) and row["attempts"] + 1 < MAX_TRANSIENT_ATTEMPTS:
++                    # The service will accept this later (a deploy still rolling out, a storage hiccup, an earlier op
++                    # on the card that was itself transient): keep it pending and retry next round.
++                    reason = f"{res.get('reason')}: {res.get('detail') or ''}".strip(": ")
++                    conn.execute("UPDATE kanban_sync_outbox SET attempts = attempts + 1, last_error = ? WHERE op_id = ?",
++                                 (f"retrying: {reason}"[:500], op_id))
++                    out.deferred += 1
+                 else:
+                     reason = f"{res.get('reason')}: {res.get('detail') or ''}".strip(": ")
+                     conn.execute("UPDATE kanban_sync_outbox SET state = 'rejected', last_error = ?, attempts = attempts + 1 "
+@@ -263,7 +282,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+         if authoritative:
+             cursor = (sync.sync_state(conn) or {}).get("cursor", 0)
+             sync.apply_remote_changes(conn, authoritative, new_cursor=cursor, board=board)
+-        if len(rows) < PUSH_BATCH:
++        if out.deferred or len(rows) < PUSH_BATCH:  # deferred rows retry next round, not in a hot loop
+             break
+     return out
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 5eb088829c..6cf5a4b80e 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -673,3 +673,28 @@ def test_wait_for_work_returns_on_a_remote_change_a_local_write_or_the_period(li
+     started = time.monotonic()
+     assert ksc.wait_for_work(wake, [path], period=10, keep_running=lambda: True, tick=0.05) == "local"
+     assert time.monotonic() - started < 0.5
++
++
++def test_transient_rejections_retry_next_round_and_give_up_after_a_cap(live, svc, monkeypatch):
++    tid = kb.create_task(live, title="during a deploy", assignee="worker")
++    real = svc.hub(ME).ops
++    calls = {"n": 0}
++
++    def rolling_out(board, ops):  # the service has not picked up the new code yet
++        calls["n"] += 1
++        return {"results": [{"client_op_id": o["client_op_id"], "status": "rejected", "reason": "invalid",
++                             "detail": f"unknown table {o['table']}"} for o in ops], "head": 0}
++    hub = svc.hub(ME)
++    hub.ops = rolling_out
++    res = ksc.push(live, hub, BOARD, ME, primary=False)
++    assert res.rejected == 0 and res.deferred >= 1 and calls["n"] == 1  # one batch, no hot loop
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()
++    hub.ops = real  # the rollout finished
++    assert ksc.push(live, hub, BOARD, ME, primary=False).rejected == 0
++    assert tid in svc.board(BOARD)["rows"]["tasks"] and not _pending(live)
++    # A rejection that never clears ends up rejected after the cap.
++    kb.create_task(live, title="old service forever", assignee="worker")
++    hub.ops = rolling_out
++    for _ in range(ksc.MAX_TRANSIENT_ATTEMPTS + 1):
++        ksc.push(live, hub, BOARD, ME, primary=False)
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()[0] >= 1
+-- 
+2.55.0
+

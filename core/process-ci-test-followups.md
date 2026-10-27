@@ -53,9 +53,9 @@ Patches **0327, 0332, 0333, 0337, 0354, 0374–0375** retain the eager-reopen re
 
 Code: `agent/deadline.py`, `evals/cron_timeout_fork_race.py`, `tests/agent/test_deadline_fork_race.py`, session reopen tests, `.github/actions/detect-changes`, `.github/workflows`, and CI runner documentation. Apply the entire ordered series using `git am -3 --empty=keep`; this is core/CI work, not a plugin.
 
-## Routing CI fixtures and cron tick ordering (0440, 0442)
+## Routing CI fixtures and cron tick ordering (0439, 0447)
 
-Patch **0440** (`a3c3c9e928`) makes the routing CI fixtures and approval batching deterministic
+Patch **0439** (`a3c3c9e928`) makes the routing CI fixtures and approval batching deterministic
 (`tests/tui_gateway/test_approval_unadvertised.py`, `test_protocol.py`, gateway child-notice admission). Patch
-**0442** (`bb5e855908`) asserts async cron tick ordering instead of elapsed time (`tests/cron/test_parallel_pool.py`).
+**0447** (`bb5e855908`) asserts async cron tick ordering instead of elapsed time (`tests/cron/test_parallel_pool.py`).
 Test-only changes.

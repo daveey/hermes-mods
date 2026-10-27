@@ -1,6 +1,6 @@
 # Fresh Kanban claims: heartbeat reset and lease echo fencing
 
-Patch: `0476`. Fork commit: `36df211821def79e500d656bba07c299b84ba156`.
+Patch: `0523`. Fork commit: `36df211821def79e500d656bba07c299b84ba156`.
 
 ## Behavior
 

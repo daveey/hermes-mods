@@ -1,4 +1,4 @@
-# Session-start toolset allowlist (0461, 0464)
+# Session-start toolset allowlist (0477, 0486)
 
 Source commit `54178461e4` on fork main (`feat(session-start): pin a closed toolset allowlist on a durable start for the whole session lineage`).
 
@@ -32,9 +32,9 @@ Also run: session-start-requests (33), start-metadata, compute-host hydration, c
 
 ## Applying
 
-Apply patch 0461 after 0460. This mirror trails fork main (other commits since 0460 are not mirrored), so apply by cherry-picking `54178461e4` onto the fork, or take fork main at or after that commit. Deployment is `hermes update`; an already-running backend keeps the old code until it is restarted at an idle moment.
+Apply patch 0477 after 0471. This mirror trails fork main (other commits since 0471 are not mirrored), so apply by cherry-picking `54178461e4` onto the fork, or take fork main at or after that commit. Deployment is `hermes update`; an already-running backend keeps the old code until it is restarted at an idle moment.
 
-## Follow-up 0464
+## Follow-up 0486
 
 Source commit `4af6ea3a81` (`fix(session-start): no session store means no toolset pin, not a crash`). `_make_agent` looks the pin up on `_get_db()`, which is `None` when state.db cannot open (the gateway deliberately runs on without state.db features). `StartStore.session_toolsets_for(None, ...)` raised `AttributeError`, so every agent build without a store crashed. It now returns `None` (no ledger, so nothing pinned); a lookup failure on a real store still propagates and refuses the build. Test: `test_no_session_store_means_no_pin_and_the_build_proceeds` in `tests/tui_gateway/test_start_toolsets.py` (executed: passes).
 

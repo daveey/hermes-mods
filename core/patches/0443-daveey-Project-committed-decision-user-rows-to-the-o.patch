@@ -1,0 +1,528 @@
+From 991588aed4d6d03d7c4bffc9586a17a09ba01375 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 02:49:02 +0000
+Subject: [PATCH] [daveey] Project committed decision user rows to the owning
+ Desktop session
+
+---
+ .../admitted-user-event.test.tsx              | 139 ++++++++++++++++++
+ .../gateway-event/admitted-message.ts         |  63 ++++++++
+ .../use-message-stream/gateway-event/index.ts |   2 +
+ apps/shared/src/gateway-contract.generated.ts |  12 ++
+ apps/shared/src/gateway-contract.openrpc.json |  52 +++++++
+ .../test_prompt_admission_event.py            |  69 +++++++++
+ tui_gateway/PROMPT_ADMISSION.md               |   9 +-
+ tui_gateway/contracts/events.py               |  15 ++
+ tui_gateway/methods_prompt_admission.py       |  16 +-
+ 9 files changed, 373 insertions(+), 4 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-message-stream/admitted-user-event.test.tsx
+ create mode 100644 apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/admitted-message.ts
+ create mode 100644 tests/tui_gateway/test_prompt_admission_event.py
+
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/admitted-user-event.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/admitted-user-event.test.tsx
+new file mode 100644
+index 0000000000..f8a67464d5
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/admitted-user-event.test.tsx
+@@ -0,0 +1,139 @@
++import type { GatewayEvent } from '@hermes/shared'
++import { act, cleanup } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { toChatMessages } from '@/lib/chat-messages'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
++import { recordSessionEventScope } from '@/store/session-states'
++
++import { renderMessageStream } from './test-harness'
++
++const sid = 'admission-runtime'
++
++const payload = {
++  stored_session_id: 'stored-admission', profile: 'work', message_uid: 'decision-uid',
++  user_row_id: 42, text: 'approved exact scope', timestamp: 20
++}
++
++const event = { type: 'message.admitted', session_id: sid, connectionId: 'owner', profile: 'work', payload } as GatewayEvent
++
++function mount() {
++  recordSessionEventScope({ session_id: sid, connectionId: 'owner', profile: 'work' })
++  const hydrate = vi.fn(async () => undefined)
++
++  const stream = renderMessageStream(sid, {
++    states: new Map([[sid, createClientSessionState('stored-admission')]]),
++    hydrateFromStoredSession: hydrate
++  })
++
++  return { stream, hydrate }
++}
++
++afterEach(() => {
++  cleanup()
++  _resetSessionOwnerHintsForTests({ storage: true })
++})
++
++describe('authoritative admitted user row', () => {
++  it('paints before completion once, retains live output on redelivery and hydration', () => {
++    const { stream, hydrate } = mount()
++    act(() => stream.handleEvent(event))
++    expect(stream.state().messages.map(m => m.role)).toEqual(['user'])
++    expect(stream.state().messages[0].rowId).toBe(42)
++    act(() => {
++      stream.handleEvent({ type: 'message.start', session_id: sid, payload: {} })
++      stream.handleEvent({ type: 'message.delta', session_id: sid, payload: { text: 'live answer', timestamp: 21 } })
++      stream.handleEvent({ type: 'message.interim', session_id: sid, payload: { text: 'live answer', timestamp: 21 } })
++    })
++    const before = stream.state().messages
++    act(() => stream.handleEvent(event))
++    expect(stream.state().messages).toBe(before)
++    expect(stream.text()).toBe('live answer')
++    expect(hydrate).not.toHaveBeenCalled()
++
++    // A storage refresh may use a different display ID for the same durable row.
++    stream.states.set(sid, { ...stream.state(), messages: toChatMessages([
++      { role: 'user', content: payload.text, row_id: 42, timestamp: 20 }
++    ]) })
++    act(() => stream.handleEvent(event))
++    expect(stream.state().messages).toHaveLength(1)
++  })
++
++  it('inserts a delayed row ahead of live output without replacing any assistant parts', () => {
++    const { stream } = mount()
++
++    const assistant = { id: 'live', role: 'assistant' as const, timestamp: 21, pending: true,
++      parts: [{ type: 'text' as const, text: 'delta kept' }] }
++
++    stream.states.set(sid, { ...stream.state(), busy: true, turnLive: true, streamId: 'live', messages: [assistant] })
++    act(() => stream.handleEvent(event))
++    expect(stream.state().messages.map(m => m.role)).toEqual(['user', 'assistant'])
++    expect(stream.state().messages[1]).toBe(assistant)
++    expect(stream.state().streamId).toBe('live')
++    expect(stream.state().busy).toBe(true)
++  })
++
++  it('keeps distinct admitted rows even when their text is identical', () => {
++    const { stream } = mount()
++    act(() => {
++      stream.handleEvent(event)
++      stream.handleEvent({ ...event, payload: {
++        ...payload, user_row_id: 43, message_uid: 'another-decision', timestamp: 22
++      } })
++    })
++    expect(stream.state().messages.map(message => message.rowId)).toEqual([42, 43])
++  })
++
++  it('updates only the bound background session, not the foreground', () => {
++    const background = 'admission-background'
++    recordSessionEventScope({ session_id: background, connectionId: 'owner', profile: 'work' })
++    const foreground = createClientSessionState('foreground-stored')
++
++    const stream = renderMessageStream('foreground-runtime', {
++      states: new Map([
++        ['foreground-runtime', foreground],
++        [background, createClientSessionState(payload.stored_session_id)]
++      ])
++    })
++
++    act(() => stream.handleEvent({ ...event, session_id: background }))
++    expect(stream.state(background).messages).toHaveLength(1)
++    expect(stream.state()).toBe(foreground)
++  })
++
++  it('accepts a target profile distinct from its owner socket profile', () => {
++    const runtime = 'admission-multiplexed'
++    setSessionOwnerHint(runtime, { connectionId: 'owner', profile: 'default', targetProfile: 'work' })
++
++    const stream = renderMessageStream(runtime, {
++      states: new Map([[runtime, createClientSessionState(payload.stored_session_id)]])
++    })
++
++    act(() => stream.handleEvent({ ...event, session_id: runtime, profile: 'default' }))
++    expect(stream.state().messages).toHaveLength(1)
++  })
++
++  it('rejects a known runtime with no bound owner', () => {
++    const runtime = 'admission-unbound'
++
++    const stream = renderMessageStream(runtime, {
++      states: new Map([[runtime, createClientSessionState(payload.stored_session_id)]])
++    })
++
++    act(() => stream.handleEvent({ ...event, session_id: runtime }))
++    expect(stream.state().messages).toEqual([])
++  })
++
++  it.each([
++    { session_id: undefined }, { session_id: 'unknown-runtime' },
++    { connectionId: 'foreign' }, { profile: 'foreign' },
++    { payload: { ...payload, profile: 'foreign' } },
++    { payload: { ...payload, stored_session_id: 'other-stored' } }
++  ])('rejects foreign or unbound identity %j', override => {
++    const { stream } = mount()
++    act(() => stream.handleEvent({ ...event, ...override } as GatewayEvent))
++    expect(stream.state().messages).toEqual([])
++    expect(stream.states.size).toBe(1)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/admitted-message.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/admitted-message.ts
+new file mode 100644
+index 0000000000..95354aae72
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/admitted-message.ts
+@@ -0,0 +1,63 @@
++import { registryBackendScopeKey } from '@hermes/shared'
++
++import { toChatMessages } from '@/lib/chat-messages'
++import { knownOwnerForSession } from '@/store/session-states'
++
++import type { GatewayEventContext } from './types'
++
++/** Merge only the committed user row: a busy stream still owns all assistant parts. */
++export function handleAdmittedMessageEvent(ctx: GatewayEventContext): boolean {
++  const { event, deps, explicitSid } = ctx
++
++  if (event.type !== 'message.admitted') {
++    return false
++  }
++
++  const row = event.payload
++  const current = deps.sessionStateByRuntimeIdRef.current.get(explicitSid)
++  const owner = knownOwnerForSession(explicitSid)
++  const profile = typeof owner === 'string' ? owner : owner?.targetProfile ?? owner?.profile
++  const sourceProfile = typeof owner === 'string' ? owner : owner?.profile
++  const connectionId = typeof owner === 'object' ? owner?.connectionId : undefined
++
++  // Never infer the target from the foreground. A background tile can receive
++  // this event, but only its already-bound runtime and owner may consume it.
++  if (
++    !explicitSid || !current || !owner || !row ||
++    current.storedSessionId !== row.stored_session_id || profile !== row.profile ||
++    registryBackendScopeKey(connectionId ?? null, sourceProfile ?? null) !==
++      registryBackendScopeKey(event.connectionId ?? null, event.profile ?? null) ||
++    !Number.isSafeInteger(row.user_row_id) || row.user_row_id <= 0 ||
++    !row.message_uid || typeof row.text !== 'string' || !Number.isFinite(row.timestamp)
++  ) {
++    return true
++  }
++
++  const id = `user-admitted-${row.message_uid}`
++
++  deps.updateSessionState(explicitSid, state => {
++    if (state.storedSessionId !== row.stored_session_id ||
++      state.messages.some(message => message.id === id || message.rowId === row.user_row_id)) {
++      return state
++    }
++
++    const message = { ...toChatMessages([
++      { role: 'user', content: row.text, row_id: row.user_row_id, timestamp: row.timestamp }
++    ])[0], id }
++
++    // Replay may arrive after a delta; insert before that output, never append
++    // a new user boundary after it or replace the transcript with an old page.
++    const nextIndex = state.messages.findIndex(existing =>
++      existing.rowId !== undefined ? existing.rowId > row.user_row_id :
++        existing.timestamp !== undefined && existing.timestamp >= row.timestamp
++    )
++
++    const index = nextIndex < 0 ? state.messages.length : nextIndex
++
++    return { ...state, messages: [
++      ...state.messages.slice(0, index), message, ...state.messages.slice(index)
++    ] }
++  })
++
++  return true
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
+index 901003ab81..7589379ba4 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
+@@ -16,6 +16,7 @@ import { isSessionGone } from '@/store/session-gone-latch'
+ import { noteSessionEvent } from '@/store/session-states'
+ import { setSessionDraftingTool } from '@/store/tool-drafting'
+ 
++import { handleAdmittedMessageEvent } from './admitted-message'
+ import { handleDesktopBridgeEvent } from './desktop-bridge'
+ import { handleFreeTierEvent } from './free-tier'
+ import { handleInputRequestEvent } from './input-requests'
+@@ -85,6 +86,7 @@ const HANDLERS: GatewayEventHandler[] = [
+   handleFreeTierEvent,
+   handleSessionInfoEvent,
+   handleControlEvent,
++  handleAdmittedMessageEvent,
+   handleMessageStreamEvent,
+   handleToolEvent,
+   handleInputRequestEvent,
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 945eb4c20a..8ab18ca5cc 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -4800,6 +4800,15 @@ export interface ErrorSurface {
+   resets_at?: number | null
+   [key: string]: unknown
+ }
++/** ``methods_prompt_admission._dispatch``: committed input, before worker output. */
++export interface AdmittedMessagePayload {
++  stored_session_id: string
++  profile: string
++  user_row_id: number
++  message_uid: string
++  text: string
++  timestamp: number
++}
+ /** ``tui_gateway/model_switch.py`` capability-refresh notice. */
+ export interface NoticePayload {
+   message: string
+@@ -6024,6 +6033,8 @@ export interface BackendGatewayEventMap {
+   'gateway.ready': GatewayReadyPayload
+   /** Apply a named desktop layout preset. */
+   'layout.apply': LayoutApplyPayload
++  /** Authoritative user row for an externally admitted turn; merge by identity, never submit or resume. */
++  'message.admitted': AdmittedMessagePayload
+   /** The turn ended: final text, usage and outcome. */
+   'message.complete': MessageCompletePayload
+   /** One streamed chunk of the assistant reply. */
+@@ -6161,6 +6172,7 @@ export const GATEWAY_EVENT_TYPES = [
+   'free_tier.challenge',
+   'gateway.ready',
+   'layout.apply',
++  'message.admitted',
+   'message.complete',
+   'message.delta',
+   'message.interim',
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 827a4289eb..75b25fcf53 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -5021,6 +5021,46 @@
+         "title": "ActiveSubagent",
+         "type": "object"
+       },
++      "AdmittedMessagePayload": {
++        "additionalProperties": false,
++        "description": "``methods_prompt_admission._dispatch``: committed input, before worker output.",
++        "properties": {
++          "stored_session_id": {
++            "title": "Stored Session Id",
++            "type": "string"
++          },
++          "profile": {
++            "title": "Profile",
++            "type": "string"
++          },
++          "user_row_id": {
++            "title": "User Row Id",
++            "type": "integer"
++          },
++          "message_uid": {
++            "title": "Message Uid",
++            "type": "string"
++          },
++          "text": {
++            "title": "Text",
++            "type": "string"
++          },
++          "timestamp": {
++            "title": "Timestamp",
++            "type": "number"
++          }
++        },
++        "required": [
++          "stored_session_id",
++          "profile",
++          "user_row_id",
++          "message_uid",
++          "text",
++          "timestamp"
++        ],
++        "title": "AdmittedMessagePayload",
++        "type": "object"
++      },
+       "AgentPluginRow": {
+         "additionalProperties": false,
+         "description": "``methods_tools._plugin_rows`` + ``plugins_cmd_catalog.catalog_row_fields`` provenance.",
+@@ -41584,6 +41624,18 @@
+         }
+       ]
+     },
++    {
++      "name": "message.admitted",
++      "summary": "Authoritative user row for an externally admitted turn; merge by identity, never submit or resume.",
++      "params": [
++        {
++          "name": "payload",
++          "schema": {
++            "$ref": "#/components/schemas/AdmittedMessagePayload"
++          }
++        }
++      ]
++    },
+     {
+       "name": "message.complete",
+       "summary": "The turn ended: final text, usage and outcome.",
+diff --git a/tests/tui_gateway/test_prompt_admission_event.py b/tests/tui_gateway/test_prompt_admission_event.py
+new file mode 100644
+index 0000000000..d76a841995
+--- /dev/null
++++ b/tests/tui_gateway/test_prompt_admission_event.py
+@@ -0,0 +1,69 @@
++"""Admission projects its committed row before output, never on cancelled dispatch."""
++from tests.tui_gateway.test_prompt_admission import call, owner
++from tui_gateway import server
++
++
++def test_committed_user_event_precedes_turn_and_retry_does_not_reemit(owner, monkeypatch):
++    db, session, params, started = owner
++    events = []
++    monkeypatch.setattr(server, '_emit', lambda *args, **kwargs: events.append(args))
++
++    def run(*args, **kwargs):
++        assert events[0][0] == 'message.admitted'
++        assert db.get_messages(params['stored_session_id'])[0]['content'] == params['text']
++
++    monkeypatch.setattr(server, '_run_after_agent_ready', run)
++    receipt = call('prompt.admit', params)['result']
++    started[0]()
++    event = next(e for e in events if e[0] == 'message.admitted')
++    assert server._sessions[event[1]] is session
++    assert event[2] == {
++        'stored_session_id': params['stored_session_id'],
++        'profile': params['profile'],
++        'message_uid': receipt['message_uid'],
++        'user_row_id': receipt['user_row_id'],
++        'text': params['text'],
++        'timestamp': session['_submit_user_row']['timestamp'],
++    }
++    assert call('prompt.admit', params)['result'] == receipt
++    assert len([e for e in events if e[0] == 'message.admitted']) == 1
++    assert len(started) == 1
++
++
++def test_cancelled_dispatch_never_projects_permission(owner, monkeypatch):
++    _, _, params, _ = owner
++    events = []
++    callbacks = []
++    monkeypatch.setattr(server, '_emit', lambda *args, **kwargs: events.append(args))
++
++    def refuse(target, **kwargs):
++        callbacks.append(target)
++
++    monkeypatch.setattr(server, '_start_session_work', refuse)
++    assert call('prompt.admit', params)['result']['dispatch'] == 'cancelled'
++    callbacks[0]()
++    assert not any(e[0] == 'message.admitted' for e in events)
++
++
++def test_admitted_event_uses_owner_transport_and_real_contract(owner, monkeypatch):
++    from types import SimpleNamespace
++
++    _, session, params, started = owner
++    owner_frames, foreign_frames = [], []
++    session['transport'] = SimpleNamespace(write=lambda frame: owner_frames.append(frame) or True)
++    foreign = SimpleNamespace(write=lambda frame: foreign_frames.append(frame) or True)
++    receipt = call('prompt.admit', params)['result']
++    # A callback's ambient transport must not steal the session's event.
++    monkeypatch.setattr(server, 'current_transport', lambda: foreign)
++
++    def run(*args, **kwargs):
++        frame = owner_frames[0]['params']
++        assert frame['type'] == 'message.admitted'
++        assert frame['payload']['message_uid'] == receipt['message_uid']
++        assert frame['payload']['profile'] == params['profile']
++        assert frame['seq'] > 0
++
++    monkeypatch.setattr(server, '_run_after_agent_ready', run)
++    started[0]()
++    assert len(owner_frames) == 1
++    assert not foreign_frames
+diff --git a/tui_gateway/PROMPT_ADMISSION.md b/tui_gateway/PROMPT_ADMISSION.md
+index 34d74936db..99e28f56a2 100644
+--- a/tui_gateway/PROMPT_ADMISSION.md
++++ b/tui_gateway/PROMPT_ADMISSION.md
+@@ -114,5 +114,10 @@ transport. Cold/unloaded and busy-owner queue admission are deliberately unsuppo
+ busy requests can retry the same operation once the owner becomes idle. No completion
+ receipt, automatic execution reconciliation, deployment, or real user decision was
+ performed as part of this implementation.
+-The Desktop still needs transcript rehydration to render the admitted user bubble;
+-no new client event or renderer handling is included here.
++The dispatch winner emits `message.admitted` on the existing owner transport before
++model output. Desktop merges only that committed user row into the bound session,
++checks connection/profile/stored-session identity, and deduplicates by row ID or
++message UID without replacing live assistant output. Cancelled unstarted callbacks
++emit no event. Reconnect continues to use canonical transcript hydration. Focused
++Python transport/contract and Desktop event tests cover this seam; packaged live
++acceptance remains a separate release gate.
+diff --git a/tui_gateway/contracts/events.py b/tui_gateway/contracts/events.py
+index 2b6ff7fb32..df147f8323 100644
+--- a/tui_gateway/contracts/events.py
++++ b/tui_gateway/contracts/events.py
+@@ -100,6 +100,21 @@ class ErrorPayload(Payload):
+ event("error", ErrorPayload, doc="A session-level failure outside a turn (agent init, model switch, compression, resume).")
+ 
+ 
++class AdmittedMessagePayload(Payload):
++    """``methods_prompt_admission._dispatch``: committed input, before worker output."""
++
++    stored_session_id: str
++    profile: str
++    user_row_id: int
++    message_uid: str
++    text: str
++    timestamp: float
++
++
++event("message.admitted", AdmittedMessagePayload,
++      doc="Authoritative user row for an externally admitted turn; merge by identity, never submit or resume.")
++
++
+ class NoticePayload(Payload):
+     """``tui_gateway/model_switch.py`` capability-refresh notice."""
+ 
+diff --git a/tui_gateway/methods_prompt_admission.py b/tui_gateway/methods_prompt_admission.py
+index 90703665f9..88fae83b58 100644
+--- a/tui_gateway/methods_prompt_admission.py
++++ b/tui_gateway/methods_prompt_admission.py
+@@ -99,18 +99,30 @@ def _live_owner(server, params, home):
+     return sid, session
+ 
+ 
+-def _dispatch(server, rid, sid, session, text):
++def _dispatch(server, rid, sid, session, text, profile):
+     # Existing build/turn implementation adopts _submit_user_row and retains the
+     # owner's transport. A plugin RPC must not steal the Desktop's connection.
+     if not server._restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
+         server._start_agent_build(sid, session)
+     gate = session['_admission_dispatch_gate']
++    staged = session['_submit_user_row']
++    user_event = {
++        'stored_session_id': staged['_submit_row_session_id'],
++        'profile': profile,
++        'user_row_id': staged['_row_id'],
++        'message_uid': staged['message_uid'],
++        'text': staged['content'],
++        'timestamp': staged['timestamp'],
++    }
+ 
+     def run():
+         with gate['lock']:
+             if gate['cancelled']:
+                 return
+             gate['started'] = True
++        # Only the committed transaction winner projects this row, before any
++        # model output. An unstarted cancellation must never paint permission.
++        server._emit("message.admitted", sid, user_event)
+         server._run_after_agent_ready(rid, sid, session, text, None, None, None, auto_continue=False)
+ 
+     worker = server._start_session_work(run, name="prompt-admission", session=session)
+@@ -212,7 +224,7 @@ def _accept_claimed(server, rid, sid, session, params, text):
+     try:
+         if session.get("_turn_cancel_requested") or session.get("_closing") or not session.get("running"):
+             raise RuntimeError("turn cancelled after durable acceptance")
+-        _dispatch(server, rid, sid, session, text)
++        _dispatch(server, rid, sid, session, text, params['profile'])
+     except Exception as exc:
+         server.logger.exception("Prompt accepted but dispatch failed: %s", params["operation_id"])
+         with gate['lock']:
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # Model class routing (sticky allocator, managed subscriptions)
 
-Patches **0405–0430, 0432–0438, 0441** (source `66d75e8c98`..`7334dc32dd` plus `7d0a99f49b`). Opt-in, profile-local
+Patches **0404–0429, 0431–0437, 0440** (source `66d75e8c98`..`7334dc32dd` plus `7d0a99f49b`). Opt-in, profile-local
 allocator: a workload's model is `class:deep`, `class:standard` or `class:fast` with provider `auto`, and Hermes
 resolves the marker to one exact registered route before any provider request is built. Off by default
 (`model_routing.enabled: false`); with it off, legacy concrete-model behavior is unchanged and class requests fail
@@ -13,25 +13,25 @@ clearly.
   operator attestations). Weights are identical per provider within a class. Billing is `subscription`,
   `credit-funded` or `metered`; metered needs `model_routing.allow_metered`. An empty eligible class fails closed.
 - **Sticky allocation.** The choice is stored transactionally in `model-routing.sqlite3` under the profile home and
-  stays fixed across turns, tools, restarts, resume and compression lineage (0422). Auth, quota or transport recovery
+  stays fixed across turns, tools, restarts, resume and compression lineage (0421). Auth, quota or transport recovery
   may pick another route of the same class only; it never crosses class, billing or capability checks. A failover is
-  published only after the new runtime is prepared (0423), and native clients are retired after same-class recovery
-  (0429).
-- **Entry points carry the class, not a credential.** CLI startup and resume (0407), Desktop/TUI construction and
-  resume (0408), Desktop readiness and side jobs (0409), API completions and runs (0410, 0411, 0433), messaging
-  (0412, 0428), delegation (0413), cron per-fire construction (0414) and Kanban workers with deep-review classes
-  (0415). Each resolves the class at agent construction/recovery (0406) so no legacy provider discovery runs first.
+  published only after the new runtime is prepared (0422), and native clients are retired after same-class recovery
+  (0428).
+- **Entry points carry the class, not a credential.** CLI startup and resume (0406), Desktop/TUI construction and
+  resume (0407), Desktop readiness and side jobs (0408), API completions and runs (0409, 0410, 0432), messaging
+  (0411, 0427), delegation (0412), cron per-fire construction (0413) and Kanban workers with deep-review classes
+  (0414). Each resolves the class at agent construction/recovery (0405) so no legacy provider discovery runs first.
 - **Auxiliary calls are fenced.** Streaming and non-streaming auxiliary, direct and vision clients are checked
-  against the class (0416, 0418–0420); an auxiliary stream recovers only before any delivery (0417). The main
-  request is validated against route capabilities before send (0421). Refresh and reset-turn recovery exclusions are
-  fenced (0432).
-- **Pins.** An explicit gateway pin clears durable class provenance (0424); a temporary pin or `/model --once` does
-  not replace the standing class (0426, 0437, 0438). Caller request overrides survive runtime switches (0441).
+  against the class (0415, 0417–0419); an auxiliary stream recovers only before any delivery (0416). The main
+  request is validated against route capabilities before send (0420). Refresh and reset-turn recovery exclusions are
+  fenced (0431).
+- **Pins.** An explicit gateway pin clears durable class provenance (0423); a temporary pin or `/model --once` does
+  not replace the standing class (0425, 0436, 0437). Caller request overrides survive runtime switches (0440).
 - **Managed subscriptions.** `model_routing.enforce_subscription_only` additionally fences concrete pins, saved
   overrides, auxiliary calls and fallbacks to one unambiguous eligible native subscription route (`anthropic`,
-  `openai-codex`, `xai-oauth`) and overrides `allow_metered` (0434). Deferred managed routes resolve for compression
-  and background work (0436). Gateway hygiene probes use the sticky registry context (0427).
-- Patch 0405 adds the allocator and subscription credential fence; 0435 adds the user doc
+  `openai-codex`, `xai-oauth`) and overrides `allow_metered` (0433). Deferred managed routes resolve for compression
+  and background work (0435). Gateway hygiene probes use the sticky registry context (0426).
+- Patch 0404 adds the allocator and subscription credential fence; 0434 adds the user doc
   `website/docs/user-guide/model-class-routing.md`.
 
 ## How it works
@@ -60,7 +60,7 @@ This mirror task did not re-run them; the claim here is limited to a clean `git 
 
 ## Applying
 
-Apply 0405–0441 in order after 0401. They depend on earlier patches (kanban tier, credential pool) and on
+Apply 0404–0440 in order after 0445. They depend on earlier patches (kanban tier, credential pool) and on
 `kanban_session_activity.py` fixtures adapted in 0393.
 
 ## Gotchas

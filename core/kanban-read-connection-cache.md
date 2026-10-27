@@ -1,6 +1,6 @@
 # Reuse read-only Kanban connections
 
-Patch 0471 (source `f9e611f5db`).
+Patch 0514 (source `f9e611f5db`).
 
 ## Behavior
 
@@ -25,7 +25,7 @@ and replica link additions/releases. No live performance benchmark repeated for 
 
 ## Applying
 
-Apply 0471 with `git am -3` after the preceding fork patches.
+Apply 0514 with `git am -3` after the preceding fork patches.
 
 ## Gotchas
 

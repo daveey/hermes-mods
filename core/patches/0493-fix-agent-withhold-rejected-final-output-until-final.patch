@@ -1,0 +1,1089 @@
+From e73677e9fca8f5ec82d930456da506365301728b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:07:50 -0700
+Subject: [PATCH] fix(agent): withhold rejected final output until final
+ transforms (F3 core companion) (#105)
+
+* fix(agent): withhold rejected final output across delivery boundaries [daveey]
+
+* [daveey] Keep buffered final replies private through output transforms
+
+* feat(hooks): advertise buffered final-publication contract [daveey]
+
+* Keep buffered verification candidates private until final transforms
+
+* fix(agent): satisfy code-health ratchet for final-gate release path
+
+* docs(pre-final-gate): note hold=True is bounded by the attempt budget [daveey]
+
+---------
+
+Co-authored-by: daveey <daveey@users.noreply.github.com>
+---
+ agent/final_gate_fallback.py                  |  40 ++++
+ agent/pre_final_gate.py                       | 128 ++++++++---
+ agent/turn_final_response.py                  |  37 +++-
+ agent/turn_finalizer.py                       |  26 ++-
+ agent/turn_stop_gates.py                      |  75 +++++--
+ .../agent/test_final_gate_budget_contract.py  |  26 +++
+ tests/agent/test_final_gate_composition.py    |  68 ++++++
+ .../test_final_gate_unresolved_composition.py |  75 +++++++
+ tests/agent/test_final_transform_buffer.py    |  65 ++++++
+ tests/agent/test_pre_final_gate.py            | 202 ++++++++++++++++++
+ .../test_pre_final_gate_assessor_order.py     |   9 +-
+ website/docs/user-guide/features/hooks.md     |  19 ++
+ 12 files changed, 706 insertions(+), 64 deletions(-)
+ create mode 100644 agent/final_gate_fallback.py
+ create mode 100644 tests/agent/test_final_gate_budget_contract.py
+ create mode 100644 tests/agent/test_final_gate_composition.py
+ create mode 100644 tests/agent/test_final_gate_unresolved_composition.py
+ create mode 100644 tests/agent/test_final_transform_buffer.py
+
+diff --git a/agent/final_gate_fallback.py b/agent/final_gate_fallback.py
+new file mode 100644
+index 0000000000..180ae6f81e
+--- /dev/null
++++ b/agent/final_gate_fallback.py
+@@ -0,0 +1,40 @@
++"""Validate post-loop budget output before it becomes visible or durable."""
++
++from __future__ import annotations
++
++
++def validate_budget_response(agent, response, messages):
++    """No retry budget remains: run callbacks at their exhaustion boundary.
++
++    Return the validated text and whether it replaced the candidate. Native
++    replay carriers on a rejected summary must not retain the original content.
++    """
++    from agent.pre_final_gate import evaluate, max_attempts
++
++    try:
++        if getattr(agent, "_interrupt_requested", False):
++            replacement = "Response interrupted before validation."
++        else:
++            decision = evaluate(agent, response, messages, max_attempts())
++            replacement = decision.replacement
++            if decision.unresolved_fallback is not None:
++                replacement = decision.unresolved_fallback.render("turn budget exhausted")
++            if replacement is None and decision.append:
++                replacement = f"{response}\n\n{decision.append}"
++            if getattr(agent, "_interrupt_requested", False):
++                replacement = "Response interrupted before validation."
++        if replacement is None:
++            agent._flush_final_gate_buffer()
++            return response, False
++        for row in reversed(messages):
++            if row.get("role") == "assistant" and row.get("content") == response:
++                row.clear()
++                row.update(role="assistant", content=replacement)
++                agent._db_flush_scan_prefix = None
++                break
++        agent._response_was_previewed = False
++        agent._reused_response_text = None
++        return replacement, True
++    finally:
++        agent._discard_final_gate_buffer()
++        agent._final_gate_buffer = None
+diff --git a/agent/pre_final_gate.py b/agent/pre_final_gate.py
+index ce07d57f61..cdb1031c88 100644
+--- a/agent/pre_final_gate.py
++++ b/agent/pre_final_gate.py
+@@ -10,6 +10,12 @@ a candidate; unbuffered legacy gates run after verification and the kanban guard
+   The held row plus the nudge (a synthetic user row) stay in the in-memory turn so the model sees
+   them, and are stripped from the returned/live history at turn end. The turn continues.
+ - ``{"append": str}`` → deliver with ``"\\n\\n" + text`` appended.
++- ``{"replace": str}`` → replace the entire candidate with nonempty safe text, independent of
++  hold budget. Clears native replay carriers and the rejected stream buffer; other completion
++  guards still run against the safe candidate. Requires ``needs_buffer`` to prevent prior streaming.
++  All callbacks inspect the original candidate. Replacements take precedence over ordinary holds
++  and appends regardless of registration order; conflicting replacements yield neutral withheld
++  text. An unresolved rejection or unavailable owning recheck still fails closed.
+ 
+ A hold may also carry ``unresolved_fallback={"goal": str, "evidence_refs": list[str]}``.
+ Only these two keys are allowed: a nonblank goal (at most 2000 characters), and 1–32
+@@ -34,10 +40,12 @@ Callback attributes (set on the function before ``ctx.register_hook``):
+   gate delivers, or at turn end. A held answer is discarded from the buffer, so it never reaches
+   the screen. Neither Desktop nor CLI/gateway streams can retract text already shown, hence the
+   buffer: without it, a held answer that already streamed stays visible.
+-- ``assess_before_holds = True``: run before ordinary gates can short-circuit the initial
+-  assessment. Use for buffered disposition guards that provide an unresolved fallback.
+-  Pending callback ownership still takes precedence; legacy registration order is unchanged
+-  when no callback opts in.
++- ``accepts_hold_budget = True``: opt in to the ``hold_budget`` keyword, the configured total
++  holds allowed this turn (including zero). A callback can replace a rejected draft instead of
++  returning an unusable hold at exhaustion. Strict legacy signatures receive no new keyword.
++- ``assess_before_holds = True``: assess before ordinary gates so the disposition guard's
++  nudge wins. Use for buffered guards that provide an unresolved fallback. Pending callback
++  ownership still takes precedence; registration order is unchanged when no callback opts in.
+ - ``include_background = True``: also run in kanban workers, delegate_task subagents and cron jobs
+   (skipped there by default).
+ """
+@@ -57,6 +65,16 @@ FLAG = "_pre_final_gate_synthetic"
+ DEFAULT_MAX_ATTEMPTS = 2
+ DEFAULT_TIMEOUT_S = 30.0
+ 
++# Explicit plugin compatibility handshake. Publish only with the matching turn
++# consumers: replacement, exhausted-budget kwargs and post-transform emission.
++PRE_FINAL_GATE_CAPABILITIES = {
++    "version": 1,
++    "replace": True,
++    "accepts_hold_budget": True,
++    "needs_buffer": True,
++    "post_transform_release": True,
++}
++
+ 
+ def _agent_cfg() -> dict[str, Any]:
+     try:
+@@ -188,6 +206,7 @@ class GateDecision:
+     hold: bool = False
+     nudge: str = ""
+     append: str = ""
++    replacement: Optional[str] = None
+     unresolved_fallback: Optional[UnresolvedFallback] = None
+     boundary: str = ""
+     recheck_accepted: bool = False
+@@ -203,12 +222,62 @@ def _call(cb: Callable, kwargs: dict[str, Any], limit: float) -> Any:
+         pool.shutdown(wait=False)
+ 
+ 
++_FAILED = object()
++
++
++def _invoke(cb: Callable, kwargs: dict[str, Any], budget: int, limit: float) -> Any:
++    """Run one gate callback; a timeout or exception yields ``_FAILED``."""
++    name = getattr(cb, "__qualname__", repr(cb))
++    call_kwargs = dict(kwargs)
++    if getattr(cb, "accepts_hold_budget", False):
++        call_kwargs["hold_budget"] = budget
++    try:
++        return _call(cb, call_kwargs, limit)
++    except concurrent.futures.TimeoutError:
++        logger.warning("pre_final_gate hook %s timed out after %.1fs", name, limit)
++    except Exception:
++        logger.warning("pre_final_gate hook %s raised", name, exc_info=True)
++    return _FAILED
++
++
++def _absorb_hold(
++    decision: GateDecision, result: dict, cb: Callable, pending: Any, can_hold: bool, name: str,
++    attempt: int,
++) -> bool:
++    """Fold a hold result into ``decision``; True when the callback's result is consumed."""
++    nudge = result.get("nudge")
++    if not (result.get("hold") and isinstance(nudge, str) and nudge.strip()):
++        return False
++    fallback = _unresolved_fallback(result.get("unresolved_fallback"))
++    if fallback is not None:
++        fallback = replace(fallback, recheck_callback=cb)
++    if fallback is None and isinstance(pending, UnresolvedFallback):
++        fallback = pending
++    if can_hold:
++        if not decision.hold:
++            decision.hold = True
++            decision.nudge = nudge.strip()
++        if decision.unresolved_fallback is None:
++            decision.unresolved_fallback = fallback
++        return True
++    if fallback is not None:
++        if decision.unresolved_fallback is None:
++            decision.unresolved_fallback = fallback
++            decision.boundary = "pre-final hold limit reached"
++        return True
++    logger.info("pre_final_gate hold from %s ignored: limit reached (attempt %d)", name, attempt)
++    return False
++
++
+ def evaluate(
+     agent: Any, final_response: Any, messages: list[dict[str, Any]], attempt: int,
+     pending: Any = None,
+ ) -> GateDecision:
+     """Recheck the pending owner first, then disposition assessors, then ordinary gates.
+-    First hold wins (while under the limit); appends accumulate. Never raises."""
++    Inspect the original candidate throughout. Replacement consensus wins over
++    ordinary holds, but cannot erase an unresolved owner's rejection or failed recheck.
++    Otherwise the first hold wins; appends accumulate.
++    """
+     decision = GateDecision()
+     if not isinstance(final_response, str) or not final_response.strip():
+         return decision
+@@ -223,7 +292,8 @@ def evaluate(
+         # Another gate cannot skip the owning recheck. Reload is not acceptance.
+         callbacks = [owner, *(cb for cb in callbacks if cb is not owner)]
+     check_failed = False
+-    limit, can_hold, appends = timeout_s(), attempt < max_attempts(), []
++    budget = max_attempts()
++    limit, can_hold, appends = timeout_s(), attempt < budget, []
+     kwargs = dict(
+         session_id=getattr(agent, "session_id", None) or "",
+         platform=getattr(agent, "platform", "") or "",
+@@ -232,18 +302,11 @@ def evaluate(
+         turn_messages=turn_messages(messages),
+         attempt=attempt,
+     )
++    replacements: list[str] = []
+     for cb in callbacks:
+         name = getattr(cb, "__qualname__", repr(cb))
+-        try:
+-            result = _call(cb, kwargs, limit)
+-        except concurrent.futures.TimeoutError:
+-            logger.warning("pre_final_gate hook %s timed out after %.1fs", name, limit)
+-            if cb is owner:
+-                return _unavailable(pending)
+-            check_failed = True
+-            continue
+-        except Exception:
+-            logger.warning("pre_final_gate hook %s raised", name, exc_info=True)
++        result = _invoke(cb, kwargs, budget, limit)
++        if result is _FAILED:
+             if cb is owner:
+                 return _unavailable(pending)
+             check_failed = True
+@@ -253,27 +316,28 @@ def evaluate(
+             decision.recheck_accepted = True
+         if not isinstance(result, dict):
+             continue
+-        nudge = result.get("nudge")
+-        if result.get("hold") and isinstance(nudge, str) and nudge.strip():
+-            fallback = _unresolved_fallback(result.get("unresolved_fallback"))
+-            if fallback is not None:
+-                fallback = replace(fallback, recheck_callback=cb)
+-            if fallback is None and isinstance(pending, UnresolvedFallback):
+-                fallback = pending
+-            if can_hold:
+-                return GateDecision(
+-                    hold=True, nudge=nudge.strip(),
+-                    unresolved_fallback=fallback,
+-                    recheck_accepted=decision.recheck_accepted,
+-                )
+-            if fallback is not None:
+-                return GateDecision(unresolved_fallback=fallback, boundary="pre-final hold limit reached")
+-            logger.info("pre_final_gate hold from %s ignored: limit reached (attempt %d)", name, attempt)
++        replacement = result.get("replace")
++        if isinstance(replacement, str) and replacement.strip():
++            replacements.append(replacement.strip())
++            continue
++        if _absorb_hold(decision, result, cb, pending, can_hold, name, attempt):
++            continue
+         extra = result.get("append")
+         if isinstance(extra, str) and extra.strip():
+             appends.append(extra.strip())
+     if check_failed and isinstance(pending, UnresolvedFallback):
+         return _unavailable(pending)
++    # A different callback cannot turn a still-unresolved goal into completion.
++    if decision.unresolved_fallback is not None:
++        return decision
++    if replacements:
++        # Every validator inspects the same candidate. Do not let registration
++        # order choose between contradictory replacements or revive rejected
++        # text through an append. Completion guards still inspect the outcome.
++        replacement = replacements[0] if len(set(replacements)) == 1 else (
++            "Response withheld because validation gates disagreed."
++        )
++        return GateDecision(replacement=replacement, recheck_accepted=decision.recheck_accepted)
+     decision.append = "\n\n".join(appends)
+     return decision
+ 
+diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
+index ec0fe4c8b8..d0ae8fb429 100644
+--- a/agent/turn_final_response.py
++++ b/agent/turn_final_response.py
+@@ -329,11 +329,13 @@ def finish_text_response(
+     ):
+         messages.pop()
+ 
++    _held = (final_response, "".join(getattr(agent, "_final_gate_buffer", None) or []))
+     _sg = apply_stop_gates(
+         agent, final_msg, final_response=final_response, messages=messages,
+         conversation_history=conversation_history,
+         pending_verification_response=_pending_verification_response,
+         pending_verification_response_previewed=_pending_verification_response_previewed,
++        defer_stream=True,
+     )
+     _pending_verification_response = _sg.pending_verification_response
+     _pending_verification_response_previewed = _sg.pending_verification_response_previewed
+@@ -353,10 +355,8 @@ def finish_text_response(
+             agent, final_response, turn_id=getattr(agent, "_current_turn_id", "") or "", logger=logger,
+         )
+     if _transformed:
+-        if _promoted:
+-            final_msg["api_content"] = final_response
+-        else:
+-            final_msg["content"] = final_response
++        final_msg["api_content" if _promoted else "content"] = final_response
++    _release_deferred_stream(agent, _sg, final_response, *_held)
+ 
+     append_message(messages, final_msg)
+     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
+@@ -375,3 +375,32 @@ def finish_text_response(
+     if not agent.quiet_mode:
+         agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
+     return _verdict("break")
++
++
++def _release_deferred_stream(agent, verdict, response, candidate, buffered):
++    """Release only the reconciled reply, preserving streaming egress rules.
++
++    A buffered candidate is private until output transforms reconcile it too: releasing in
++    the stop gate leaks a retired ask even when the durable reply is replaced by a transform.
++    """
++    if not verdict.stream_deferred:
++        return
++    from agent.memory_manager import StreamingContextScrubber
++    from agent.think_scrubber import StreamingThinkScrubber
++
++    agent._discard_final_gate_buffer()
++    if getattr(agent, "_interrupt_requested", False):
++        return
++    if response == candidate:
++        # Keep original sanitization and paragraph breaks, including when an
++        # equal gate replacement already cleared the mutable buffer.
++        text = buffered
++    else:
++        # Replacements need fresh scrubbers, not the exhausted original state.
++        think, context = StreamingThinkScrubber(), StreamingContextScrubber()
++        text = think.feed(response) + think.flush()
++        text = context.feed(text) + context.flush()
++        prefix = "\n\n" if buffered.startswith("\n\n") else ""
++        text = prefix + text.lstrip("\n") if text else ""
++    if text:
++        agent._deliver_stream_text(text)
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index c0acbcbaa9..c38011b76e 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -139,6 +139,12 @@ def _resolve_budget_fallback(
+         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
+     ):
+         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
++        from agent.pre_final_gate import eligible_callbacks, needs_buffer, turn_messages
++        _gate_budget_output = bool(eligible_callbacks(agent))
++        _budget_context = turn_messages(messages)
++        _budget_start = len(messages)
++        if needs_buffer(agent):
++            agent._final_gate_buffer = []
+         if _pending_verification_response:
+             # A verification gate withheld a composed answer, then the budget ran out:
+             # preserve it rather than make another fallible call. The explicit pending
+@@ -179,6 +185,16 @@ def _resolve_budget_fallback(
+                 _turn_exit_reason = interrupted_during_api_call_reason(agent)
+                 final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
+ 
++        from agent.pre_final_gate import UnresolvedFallback
++        if _gate_budget_output and not isinstance(_pending_verification_response, UnresolvedFallback):
++            from agent.final_gate_fallback import validate_budget_response
++            # The summary helper adds an unflagged user nudge. Keep the real
++            # turn context for validation, not that internal summary instruction.
++            _budget_context.extend(row for row in messages[_budget_start:] if row.get("role") == "assistant")
++            final_response, replaced = validate_budget_response(agent, final_response, _budget_context)
++            if replaced:
++                preserved_verification_fallback = False
++
+     # A kanban worker must record a terminal outcome whether or not a fallback path
+     # was eligible, so the dispatcher learns the worker could not complete. Only the
+     # dispatcher-owned worker owns the task: an in-process delegate_task child or cron run
+@@ -551,13 +567,12 @@ def _prepare_final_gate_fallback(
+         if isinstance(final_response, str) and final_response and final_response not in held_text:
+             boundary_response += "\n\n" + final_response
+         final_response = boundary_response
++    # Accepted text was flushed by the stop/tool gates. Remaining deltas were
++    # never validated (including error/interrupt exits), so cannot be released.
+     try:
+-        if unresolved:
+-            agent._discard_final_gate_buffer()
+-        else:
+-            agent._flush_final_gate_buffer()
++        agent._discard_final_gate_buffer()
+     except Exception:
+-        logger.debug("pre_final_gate buffer flush failed", exc_info=True)
++        logger.debug("pre_final_gate buffer discard failed", exc_info=True)
+     agent._final_gate_buffer = None
+     return final_response, unresolved
+ 
+@@ -578,6 +593,7 @@ def finalize_turn(
+ ):
+     """Run the post-loop finalization and return the turn ``result`` dict."""
+     from agent.conversation_loop import logger
++
+     final_response, unresolved = _prepare_final_gate_fallback(
+         agent, final_response, _pending_verification_response, interrupted=interrupted, failed=failed,
+         exit_reason=_turn_exit_reason, api_call_count=api_call_count, messages=messages, logger=logger,
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index 7ce4d46f98..3628d05b6e 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -34,6 +34,7 @@ class StopGateVerdict:
+     pending_verification_response: Any
+     pending_verification_response_previewed: Any
+     boundary: str = ""
++    stream_deferred: bool = False
+ 
+     def exit_reason(self, finish_reason: Any) -> str:
+         if self.boundary:
+@@ -102,8 +103,18 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
+ 
+ 
+ def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
+-    """Real content: persist and emit as interim so the user sees the attempted answer;
+-    only the nudge is flagged synthetic (#65919)."""
++    """Keep buffered candidates private until final output transformation.
++
++    Unbuffered legacy responses still emit and persist as verification interims.
++    """
++    if getattr(agent, "_final_gate_buffer", None) is not None:
++        # Output transforms have not reconciled this candidate yet. Retain it
++        # only as ephemeral model context, exactly like a held gate candidate.
++        # The budget fallback still traverses final output transformation.
++        agent._discard_final_gate_buffer()
++        final_msg[_PFG_FLAG] = True
++        append_message(messages, final_msg)
++        return
+     agent._emit_interim_assistant_message(final_msg)
+     append_message(messages, final_msg)
+     try:
+@@ -116,6 +127,7 @@ def apply_stop_gates(
+     agent: Any, final_msg: dict[str, Any], *, final_response: Any, messages: list[dict[str, Any]],
+     conversation_history: Any, pending_verification_response: Any,
+     pending_verification_response_previewed: Any,
++    defer_stream: bool = False,
+ ) -> StopGateVerdict:
+     """Check buffered candidates before verify-on-stop → pre_verify → kanban. Nudges
+     are user-role rows appended only after the assistant answer row, so role alternation
+@@ -154,11 +166,20 @@ def apply_stop_gates(
+     _decision = _pre_final_gate_decision(agent, final_response, messages, pending_verification_response)
+     if _decision.recheck_accepted:
+         pending_verification_response = None
++    if _decision.replacement is not None:
++        agent._discard_final_gate_buffer()
++        final_response = _decision.replacement
++        final_msg.clear()
++        final_msg.update(role="assistant", content=final_response)
++        pending_verification_response = None
++        pending_verification_response_previewed = False
+     if _decision.hold or (
+         _decision.unresolved_fallback is not None and getattr(agent, "_interrupt_requested", False)
+     ):
+         # Silent hold [daveey]: no interim emit, no flush, buffered deltas dropped. The candidate
+         # survives only as the budget-exhaustion fallback; both rows are ephemeral scaffolding.
++        # hold=True is bounded: every hold increments _pre_final_gate_attempts, which
++        # max_attempts() caps, so a plugin cannot hold a turn indefinitely.
+         agent._pre_final_gate_attempts = getattr(agent, "_pre_final_gate_attempts", 0) + 1
+         agent._discard_final_gate_buffer()
+         final_msg["finish_reason"] = "pre_final_gate_hold"
+@@ -173,8 +194,8 @@ def apply_stop_gates(
+     if _decision.unresolved_fallback is not None:
+         agent._discard_final_gate_buffer()
+         final_response = _decision.unresolved_fallback.render(_decision.boundary)
+-        final_msg["content"] = final_response
+-        final_msg.pop("api_content", None)
++        final_msg.clear()
++        final_msg.update(role="assistant", content=final_response)
+         return StopGateVerdict(False, final_response, None, False, _decision.boundary)
+     if early_gate:
+         # Acceptance clears the old rejection before another gate can nudge.
+@@ -184,9 +205,14 @@ def apply_stop_gates(
+                                           conversation_history, _continue)
+         if verdict is not None:
+             return verdict
+-    if _decision.append:
+-        final_response = _append_to_final(agent, final_msg, final_response, _decision.append)
+-    else:
++    stream_deferred = defer_stream and getattr(agent, "_final_gate_buffer", None) is not None
++    if _decision.replacement is not None and not stream_deferred:
++        agent._deliver_stream_text(final_response)
++    elif _decision.append:
++        final_response = _append_to_final(
++            agent, final_msg, final_response, _decision.append, deliver=not stream_deferred,
++        )
++    elif not stream_deferred:
+         agent._flush_final_gate_buffer()
+     return StopGateVerdict(
+         continue_turn=False, final_response=final_response,
+@@ -195,6 +221,7 @@ def apply_stop_gates(
+             else pending_verification_response
+         ),
+         pending_verification_response_previewed=pending_verification_response_previewed,
++        stream_deferred=stream_deferred,
+     )
+ 
+ 
+@@ -251,16 +278,23 @@ _PFG_FLAG = "_pre_final_gate_synthetic"
+ def _pre_final_gate_decision(agent, final_response, messages, pending=None):
+     from agent.pre_final_gate import GateDecision, _unavailable, evaluate
+ 
+-    if getattr(agent, "_interrupt_requested", False):
+-        return GateDecision()
+-    try:
+-        return evaluate(agent, final_response, messages, getattr(agent, "_pre_final_gate_attempts", 0), pending)
+-    except Exception:
+-        logger.warning("pre_final_gate evaluation failed", exc_info=True)
+-        return _unavailable(pending)
+-
+-
+-def _append_to_final(agent, final_msg, final_response: str, extra: str) -> str:
++    decision = GateDecision()
++    if not getattr(agent, "_interrupt_requested", False):
++        try:
++            decision = evaluate(agent, final_response, messages, getattr(agent, "_pre_final_gate_attempts", 0), pending)
++        except Exception:
++            logger.warning("pre_final_gate evaluation failed", exc_info=True)
++            decision = _unavailable(pending)
++    # Check after callback completion too: cancellation can arrive during a slow
++    # callback or its failure path. Unvalidated buffered text must not escape.
++    if (getattr(agent, "_interrupt_requested", False)
++            and getattr(agent, "_final_gate_buffer", None) is not None):
++        return GateDecision(hold=True, nudge="Turn interrupted.",
++                            replacement="Response interrupted before validation.")
++    return decision
++
++
++def _append_to_final(agent, final_msg, final_response: str, extra: str, *, deliver: bool = True) -> str:
+     """Deliver with ``extra`` appended: rewrite the row, release the buffer, stream the suffix so
+     streamed text and the final answer still match."""
+     suffix = "\n\n" + extra
+@@ -268,7 +302,8 @@ def _append_to_final(agent, final_msg, final_response: str, extra: str) -> str:
+     key = "api_content" if final_msg.get("api_content") and not final_msg.get("content") else "content"
+     if isinstance(final_msg.get(key), str):
+         final_msg[key] = final_msg[key].rstrip() + suffix
+-    agent._flush_final_gate_buffer()
+-    if getattr(agent, "_streamed_assistant_text_parts", None):  # only extend a live stream
+-        agent._deliver_stream_text(suffix)
++    if deliver:
++        agent._flush_final_gate_buffer()
++        if getattr(agent, "_streamed_assistant_text_parts", None):  # only extend a live stream
++            agent._deliver_stream_text(suffix)
+     return final_response
+diff --git a/tests/agent/test_final_gate_budget_contract.py b/tests/agent/test_final_gate_budget_contract.py
+new file mode 100644
+index 0000000000..ab56fb57a1
+--- /dev/null
++++ b/tests/agent/test_final_gate_budget_contract.py
+@@ -0,0 +1,26 @@
++"""Opt-in budget contract preserves strict legacy callback signatures."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent import pre_final_gate as gate
++
++
++@pytest.mark.parametrize("budget,attempt", [(0, 0), (1, 1), (3, 2)])
++def test_budget_is_total_and_only_passed_to_opted_in_callback(budget, attempt):
++    seen = []
++
++    def legacy(*, session_id, platform, model, final_response, turn_messages, attempt):
++        seen.append(("legacy", attempt))
++
++    def modern(*, session_id, platform, model, final_response, turn_messages, attempt, hold_budget):
++        seen.append(("modern", attempt, hold_budget))
++        return {"replace": "Checked."}
++
++    modern.accepts_hold_budget = True
++    with patch.object(gate, "eligible_callbacks", return_value=[legacy, modern]), \
++            patch.object(gate, "max_attempts", return_value=budget):
++        decision = gate.evaluate(SimpleNamespace(), "Draft", [], attempt)
++    assert seen == [("legacy", attempt), ("modern", attempt, budget)]
++    assert decision.replacement == "Checked."
+diff --git a/tests/agent/test_final_gate_composition.py b/tests/agent/test_final_gate_composition.py
+new file mode 100644
+index 0000000000..df26879459
+--- /dev/null
++++ b/tests/agent/test_final_gate_composition.py
+@@ -0,0 +1,68 @@
++"""Replacement gates must not skip other registered validators."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.pre_final_gate import evaluate
++
++
++def _evaluate(callbacks):
++    with (
++        patch("agent.pre_final_gate.eligible_callbacks", return_value=callbacks),
++        patch("agent.pre_final_gate.max_attempts", return_value=2),
++        patch("agent.pre_final_gate.timeout_s", return_value=1),
++    ):
++        return evaluate(SimpleNamespace(), "Please reconnect the retired account.", [], 0)
++
++
++def test_replacement_runs_later_validators_without_appending_rejected_text():
++    seen = []
++
++    def later(**kwargs):
++        seen.append(kwargs["final_response"])
++        return {"append": "Please reconnect the retired account."}
++
++    result = _evaluate([lambda **kw: {"replace": "Request suppressed."}, later])
++    assert seen == ["Please reconnect the retired account."]
++    assert result.replacement == "Request suppressed."
++    assert result.append == ""
++
++
++def test_conflicting_replacements_deliver_neither_candidate():
++    result = _evaluate([
++        lambda **kw: {"replace": "First replacement."},
++        lambda **kw: {"replace": "Second replacement."},
++    ])
++    assert result.replacement == "Response withheld because validation gates disagreed."
++    assert not result.hold
++
++
++@pytest.mark.parametrize("reverse", [False, True])
++@pytest.mark.parametrize("other", [{"hold": True, "nudge": "Try again."}, {"append": "Rejected ask."}])
++def test_replacement_overrides_hold_and_append_in_both_orders(reverse, other):
++    callbacks = [lambda **kw: {"replace": "Request suppressed."}, lambda **kw: other]
++    result = _evaluate(list(reversed(callbacks)) if reverse else callbacks)
++    assert result.replacement == "Request suppressed."
++    assert not result.hold
++    assert result.nudge == result.append == ""
++
++
++def test_later_failure_does_not_erase_replacement():
++    def broken(**kw):
++        raise RuntimeError("synthetic validator failure")
++
++    result = _evaluate([lambda **kw: {"replace": "Request suppressed."}, broken])
++    assert result.replacement == "Request suppressed."
++
++
++def test_identical_replacements_are_not_a_conflict():
++    seen = []
++
++    def same(**kw):
++        seen.append(True)
++        return {"replace": "Request suppressed."}
++
++    result = _evaluate([same, same])
++    assert len(seen) == 2
++    assert result.replacement == "Request suppressed."
+diff --git a/tests/agent/test_final_gate_unresolved_composition.py b/tests/agent/test_final_gate_unresolved_composition.py
+new file mode 100644
+index 0000000000..1d6e3cd12e
+--- /dev/null
++++ b/tests/agent/test_final_gate_unresolved_composition.py
+@@ -0,0 +1,75 @@
++"""Replacement suppression must not erase unresolved-goal ownership."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.pre_final_gate import UnresolvedFallback, evaluate
++
++
++def _hold(**kwargs):
++    return {"hold": True, "nudge": "Repair it.", "unresolved_fallback": {
++        "goal": "Repair example", "evidence_refs": ["tool:probe"],
++    }}
++
++
++@pytest.mark.parametrize("reverse", [False, True])
++@pytest.mark.parametrize("attempt", [0, 2])
++def test_replacement_cannot_erase_unresolved_rejection(reverse, attempt):
++    callbacks = [_hold, lambda **kw: {"replace": "Request suppressed."}]
++    if reverse:
++        callbacks.reverse()
++    with patch("agent.pre_final_gate.eligible_callbacks", return_value=callbacks):
++        result = evaluate(SimpleNamespace(), "Rejected diagnosis.", [], attempt)
++    assert result.replacement is None
++    assert result.unresolved_fallback.recheck_callback is _hold
++    assert result.hold is (attempt == 0)
++
++
++@pytest.mark.parametrize("available", [False, True])
++def test_other_replacement_cannot_accept_unavailable_owner(available):
++    def owner(**kwargs):
++        raise RuntimeError("owning check unavailable")
++
++    callbacks = [lambda **kw: {"replace": "Request suppressed."}]
++    if available:
++        callbacks.append(owner)
++    pending = UnresolvedFallback("Repair example", ("tool:probe",), owner)
++    with patch("agent.pre_final_gate.eligible_callbacks", return_value=callbacks):
++        result = evaluate(SimpleNamespace(), "Rejected diagnosis.", [], 1, pending)
++    assert result.unresolved_fallback is pending
++    assert result.boundary == "continuation unavailable"
++    assert result.replacement is None
++
++
++def test_owner_can_accept_via_replacement_with_hold_budget():
++    def owner(hold_budget, **kwargs):
++        assert hold_budget == 0
++        return {"replace": "Request suppressed."}
++
++    owner.accepts_hold_budget = True
++    pending = UnresolvedFallback("Repair example", ("tool:probe",), owner)
++    with (
++        patch("agent.pre_final_gate.eligible_callbacks", return_value=[owner]),
++        patch("agent.pre_final_gate.max_attempts", return_value=0),
++    ):
++        result = evaluate(SimpleNamespace(), "Rejected diagnosis.", [], 1, pending)
++    assert result.recheck_accepted
++    assert result.replacement == "Request suppressed."
++    assert result.unresolved_fallback is None
++
++
++def test_budget_summary_rejection_clears_native_carriers():
++    from agent.final_gate_fallback import validate_budget_response
++    from unittest.mock import Mock
++
++    agent = SimpleNamespace(_interrupt_requested=False, _discard_final_gate_buffer=Mock())
++    messages = [{"role": "assistant", "content": "Rejected diagnosis.",
++                 "codex_message_items": [{"text": "Rejected diagnosis."}]}]
++    with patch("agent.pre_final_gate.eligible_callbacks", return_value=[_hold]):
++        response, changed = validate_budget_response(agent, "Rejected diagnosis.", messages)
++    assert changed
++    assert "Unresolved goal: Repair example" in response
++    assert "turn budget exhausted" in response
++    assert messages == [{"role": "assistant", "content": response}]
++    assert agent._final_gate_buffer is None
+diff --git a/tests/agent/test_final_transform_buffer.py b/tests/agent/test_final_transform_buffer.py
+new file mode 100644
+index 0000000000..60fccc0474
+--- /dev/null
++++ b/tests/agent/test_final_transform_buffer.py
+@@ -0,0 +1,65 @@
++"""Buffered final text stays private through output transformation."""
++from unittest.mock import patch
++
++import pytest
++
++from tests.agent.test_pre_final_gate import Run, _buffered, _run
++from tests.agent import test_pre_final_gate as support
++
++agent = support.agent
++
++
++@pytest.mark.parametrize("directive", [None, {"append": "Additional guidance."},
++                                       {"replace": "A gate replacement."}])
++def test_transform_precedes_buffer_release(agent, directive):
++    run = Run(agent, ["Please repeat the retired action."])
++    safe = "The resolved request remains closed."
++    observed = []
++
++    def hooks(name, logger, **kwargs):
++        if name == "transform_llm_output":
++            observed.append(kwargs["response_text"])
++            assert run.shown == ""
++            return [safe]
++        return []
++
++    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=hooks):
++        result = _run(agent, _buffered(lambda **kw: directive))
++    assert len(observed) == 1
++    assert run.shown == safe
++    assert result["final_response"] == safe
++    assert result["messages"][-1]["content"] == safe
++    assert "retired action" not in str(result["messages"])
++
++
++def test_unchanged_transform_releases_once(agent):
++    text = "An ordinary completed answer."
++    run = Run(agent, [text])
++    result = _run(agent, _buffered(lambda **kw: None))
++    assert run.shown == text
++    assert result["final_response"] == text
++
++
++@pytest.mark.parametrize("transformed", [False, True])
++def test_release_preserves_context_scrubbing(agent, transformed):
++    text = "<memory-context>\nHidden context\n</memory-context>\nVisible answer."
++    run = Run(agent, ["Original answer." if transformed else text])
++    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=lambda name, *a, **kw:
++               [text] if transformed and name == "transform_llm_output" else []):
++        _run(agent, _buffered(lambda **kw: None))
++    assert "Hidden context" not in run.shown
++    assert "Visible answer." in run.shown
++
++
++def test_release_preserves_tool_iteration_separator(agent):
++    run = Run(agent, ["Final answer."])
++    original = run._call
++
++    def call(kwargs):
++        agent._stream_needs_break = True
++        return original(kwargs)
++
++    agent._interruptible_api_call = call
++    agent._interruptible_streaming_api_call = lambda kw, **extra: call(kw)
++    _run(agent, _buffered(lambda **kw: None))
++    assert run.shown == "\n\nFinal answer."
+diff --git a/tests/agent/test_pre_final_gate.py b/tests/agent/test_pre_final_gate.py
+index ead170ca14..4ed634e3ce 100644
+--- a/tests/agent/test_pre_final_gate.py
++++ b/tests/agent/test_pre_final_gate.py
+@@ -105,6 +105,208 @@ def test_hold_once_never_shows_or_persists_first_answer(agent):
+     assert result["messages"][-1]["content"] == "Done: I minted it myself."
+ 
+ 
++@pytest.mark.parametrize("limit", [0, 2])
++def test_replacement_never_exposes_retired_ask(agent, limit):
++    run = Run(agent, ["Please reconnect the retired account."])
++    safe = "The retired request was suppressed."
++    with patch("agent.pre_final_gate.max_attempts", return_value=limit):
++        result = _run(agent, _buffered(lambda **kw: {"replace": safe}))
++    assert result["final_response"] == safe
++    assert run.shown == safe
++    assert result["messages"][-1]["content"] == safe
++    assert "Please reconnect" not in str(result["messages"])
++
++
++def test_replacement_precedes_interim_verification(agent):
++    run = Run(agent, ["Please reconnect the retired account.", "Verified."])
++    safe = "The retired request was suppressed."
++    with patch("agent.turn_stop_gates._verify_on_stop_nudge", side_effect=["Verify again", None]):
++        result = _run(agent, _buffered(lambda **kw: {"replace": safe}))
++    assert result["final_response"] == safe
++    assert "Please reconnect" not in run.shown
++    # Even a replacement still awaits final output transforms.
++    assert run.interims == []
++    assert run.shown == safe
++    assert result["messages"][-1]["content"] == safe
++    assert len(run.requests) == 2
++
++
++@pytest.mark.parametrize("buffered", [False, True])
++@pytest.mark.parametrize("pending", [False, True])
++def test_budget_fallback_validated_before_delivery(agent, pending, buffered):
++    from agent.turn_finalizer import _resolve_budget_fallback
++    run = Run(agent, [])
++    unsafe = "Please reconnect the retired account."
++    safe = "The retired request was suppressed."
++    messages = [{"role": "user", "content": "Summarize progress"}]
++    if pending:
++        messages.extend([
++            {"role": "assistant", "content": unsafe, "codex_message_items": [{"text": unsafe}]},
++            {"role": "user", "content": "Verify", "_pre_verify_synthetic": True},
++        ])
++
++    def summary(rows, count):
++        rows.append({"role": "user", "content": "Runtime summary request"})
++        agent._fire_stream_delta(unsafe)
++        rows.append({"role": "assistant", "content": unsafe,
++                     "codex_message_items": [{"text": unsafe}]})
++        return unsafe
++
++    def hook(turn_messages, **kw):
++        assert turn_messages[0]["content"] == "Summarize progress"
++        return {"replace": safe}
++
++    if buffered:
++        hook = _buffered(hook)
++    with (
++        patch("agent.pre_final_gate.eligible_callbacks", return_value=[hook]),
++        patch.object(agent, "_handle_max_iterations", side_effect=summary),
++    ):
++        result, _, preserved, _ = _resolve_budget_fallback(
++            agent, final_response=None, api_call_count=agent.max_iterations,
++            interrupted=False, failed=False, messages=messages,
++            _turn_exit_reason="budget_exhausted",
++            _pending_verification_response=unsafe if pending else None,
++            _pending_verification_response_previewed=False, logger=logging.getLogger(__name__),
++        )
++    assert result == safe
++    assert not preserved
++    if buffered:
++        assert unsafe not in run.shown
++    assert unsafe not in str(messages)
++    assert agent._final_gate_buffer is None
++
++
++def test_replacement_wins_over_earlier_hold(agent):
++    run = Run(agent, ["Please reconnect the retired account."])
++    safe = "The retired request was suppressed."
++    hold = _buffered(lambda **kw: {"hold": True, "nudge": "Retry"})
++    replace = _buffered(lambda **kw: {"replace": safe})
++    with (
++        patch("agent.pre_final_gate.eligible_callbacks", return_value=[hold, replace]),
++        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
++    ):
++        result = agent.run_conversation("hi")
++    assert result["final_response"] == safe
++    assert run.shown == safe
++    assert len(run.requests) == 1
++
++
++@pytest.mark.parametrize("carrier", ["codex_message_items", "anthropic_content_blocks", "bedrock_content_blocks"])
++def test_replacement_clears_native_answer_carriers(agent, carrier):
++    from agent.turn_stop_gates import apply_stop_gates
++    row = {"role": "assistant", "content": "retired ask", carrier: [{"text": "retired ask"}]}
++    hook = _buffered(lambda **kw: {"replace": "Suppressed."})
++    with patch("agent.pre_final_gate.eligible_callbacks", return_value=[hook]):
++        verdict = apply_stop_gates(
++            agent, row, final_response="retired ask", messages=[], conversation_history=[],
++            pending_verification_response="old rejected ask", pending_verification_response_previewed=False,
++        )
++    assert row == {"role": "assistant", "content": "Suppressed."}
++    assert verdict.final_response == "Suppressed."
++    assert verdict.pending_verification_response is None
++
++
++@pytest.mark.parametrize("exit_kind", ["interrupt", "error"])
++def test_unaccepted_stream_is_discarded_on_abnormal_exit(agent, exit_kind):
++    run = Run(agent, [])
++    calls = []
++
++    def interrupted_call(*args, **kwargs):
++        agent._fire_stream_delta("Please reconnect the retired account.")
++        agent._interrupt_requested = exit_kind == "interrupt"
++        if exit_kind == "error":
++            raise ValueError("synthetic non-retryable stream failure")
++        return _response("Please reconnect the retired account.")
++
++    agent._interruptible_api_call = interrupted_call
++    agent._interruptible_streaming_api_call = interrupted_call
++
++    @_buffered
++    def hook(**kwargs):
++        calls.append(1)
++        return {"replace": "Suppressed."}
++
++    result = _run(agent, hook)
++    assert "Please reconnect" not in run.shown
++    assert "Please reconnect" not in str(result["messages"])
++    assert "Please reconnect" not in (result["final_response"] or "")
++    assert not calls  # cancellation must not wait on plugin/model work
++
++
++@pytest.mark.parametrize("raises", [False, True])
++def test_interrupt_during_gate_never_releases_candidate(agent, raises):
++    from agent.pre_final_gate import GateDecision
++    run = Run(agent, ["Please reconnect the retired account."])
++
++    def evaluate(*args):
++        agent._interrupt_requested = True
++        if raises:
++            raise RuntimeError("gate unavailable")
++        return GateDecision()
++
++    with patch("agent.pre_final_gate.evaluate", side_effect=evaluate):
++        result = _run(agent, _buffered(lambda **kw: None))
++    assert "Please reconnect" not in run.shown
++    assert "Please reconnect" not in str(result["messages"])
++    assert "Please reconnect" not in (result["final_response"] or "")
++
++
++def test_finalizer_discards_unvalidated_buffer(agent):
++    from agent.turn_finalizer import finalize_turn
++    run = Run(agent, [])
++    agent._final_gate_buffer = ["Please reconnect the retired account."]
++
++    class ReachedBudgetResolution(Exception):
++        pass
++
++    # Stop after the real finalizer buffer boundary, before unrelated persistence
++    # and summary work. The ordinary API-error path may already drop its buffer.
++    with patch("agent.turn_finalizer._resolve_budget_fallback", side_effect=ReachedBudgetResolution):
++        with pytest.raises(ReachedBudgetResolution):
++            finalize_turn(
++                agent, final_response=None, api_call_count=1, interrupted=True,
++                failed=False, messages=[], conversation_history=[],
++                effective_task_id=None, turn_id="test-turn", user_message="hi",
++                original_user_message="hi", _should_review_memory=False,
++                _turn_exit_reason="interrupted",
++            )
++    assert run.shown == ""
++    assert agent._final_gate_buffer is None
++
++
++@pytest.mark.parametrize("budget", [False, True])
++def test_conflicting_replacements_sanitize_visible_and_durable_output(agent, budget):
++    rejected = "Please reconnect the retired account."
++    run = Run(agent, [rejected])
++    callbacks = [
++        _buffered(lambda **kw: {"replace": "First replacement."}),
++        _buffered(lambda **kw: {"replace": "Second replacement."}),
++    ]
++    safe = "Response withheld because validation gates disagreed."
++    with (
++        patch("hermes_cli.lifecycle.has_hook", side_effect=lambda name: name == "pre_final_gate"),
++        patch("hermes_cli.plugins.iter_hook_callbacks",
++              side_effect=lambda name: callbacks if name == "pre_final_gate" else ()),
++        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
++    ):
++        if budget:
++            from agent.final_gate_fallback import validate_budget_response
++            messages = [{"role": "assistant", "content": rejected, "api_content": rejected}]
++            agent._final_gate_buffer = [rejected]
++            response, changed = validate_budget_response(agent, rejected, messages)
++            assert changed
++            assert response == safe
++            assert messages == [{"role": "assistant", "content": safe}]
++            assert run.shown == ""
++            assert agent._final_gate_buffer is None
++        else:
++            result = agent.run_conversation("hi")
++            assert result["final_response"] == safe
++            assert run.shown == safe
++            assert rejected not in str(result["messages"])
++
++
+ @pytest.mark.parametrize("streaming", [False, True])
+ def test_unresolved_hold_at_budget_never_releases_diagnosis(agent, streaming):
+     agent.max_iterations = 1
+diff --git a/tests/agent/test_pre_final_gate_assessor_order.py b/tests/agent/test_pre_final_gate_assessor_order.py
+index 71af13d4c9..745670e81d 100644
+--- a/tests/agent/test_pre_final_gate_assessor_order.py
++++ b/tests/agent/test_pre_final_gate_assessor_order.py
+@@ -27,7 +27,10 @@ def test_initial_assessor_runs_before_ordinary_hold(reverse):
+         callbacks.reverse()
+     with patch("agent.pre_final_gate.eligible_callbacks", return_value=callbacks):
+         result = evaluate(SimpleNamespace(), "Diagnosis", [], 0)
+-    assert calls == ["assessor"]
++    # F3 replacement consensus inspects every callback; disposition priority
++    # still chooses the unresolved owner and its nudge, not the ordinary hold.
++    assert calls == ["assessor", "ordinary"]
++    assert result.nudge == "Continue the repair."
+     assert result.hold and result.unresolved_fallback.recheck_callback is assessor
+ 
+ 
+@@ -44,10 +47,10 @@ def test_pending_owner_precedes_new_assessor_and_legacy_order_is_unchanged():
+     callbacks = [ordinary, assessor]
+     with patch("agent.pre_final_gate.eligible_callbacks", return_value=callbacks):
+         assert evaluate(SimpleNamespace(), "Diagnosis", [], 0).hold
+-        assert calls == ["ordinary"]
++        assert calls == ["ordinary", "assessor"]
+         calls.clear()
+         assessor.assess_before_holds = True
+         pending = UnresolvedFallback("Repair example", ("user:0",), ordinary)
+         result = evaluate(SimpleNamespace(), "Diagnosis", [], 1, pending)
+-    assert calls == ["ordinary"]
++    assert calls == ["ordinary", "assessor"]
+     assert result.unresolved_fallback is pending
+diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
+index 1472deb461..2d4d4bc182 100644
+--- a/website/docs/user-guide/features/hooks.md
++++ b/website/docs/user-guide/features/hooks.md
+@@ -903,6 +903,25 @@ def my_gate(session_id: str, platform: str, model: str, final_response: str,
+ - `None` — deliver unchanged.
+ - `{"hold": True, "nudge": "..."}` — withhold the answer and continue the turn. The nudge goes to the model as a private synthetic user message. The held answer is kept only as the fallback if the iteration budget runs out.
+ - `{"append": "..."}` — deliver with `"\n\n" + text` appended.
++- `{"replace": "..."}` — replace the entire candidate with nonempty safe text even when
++  no holds remain. Set `needs_buffer = True` to avoid prior streaming. All callbacks inspect
++  the original candidate; conflicting replacements yield neutral withheld text. Replacement
++  does not bypass completion guards or another callback's unresolved-fallback rejection.
++
++**Compatibility:** `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES` explicitly advertises
++version `1` with `replace`, `accepts_hold_budget`, `needs_buffer`, and
++`post_transform_release` set to `True`. Plugins requiring these behaviors can check the
++advertisement before registering hooks; the existence of the hook alone is insufficient.
++This is not a security permission or proof of an individual transport's behavior.
++`accepts_hold_budget = True` on a callback opts in to the `hold_budget` keyword (including
++zero), allowing a plugin to replace instead of returning a hold that cannot be honored.
++Strict legacy signatures receive no additional keyword. `post_transform_release` means
++accepted buffered final text is released only after output transforms and secret scrubbing,
++not directly from the original pre-transform model draft. Buffered candidates that trigger
++verify-on-stop or `pre_verify` continuation remain private model context: no interim callback
++or durable assistant row is emitted before output transforms. If the budget runs out, the
++candidate still passes through final output transforms before it is returned and persisted.
++Unbuffered legacy verification interims retain their existing delivery behavior.
+ 
+ **Bounded:** `agent.pre_final_gate_max` (default 2) holds per turn. After that a hold is treated as deliver, and its `append` (if any) is still applied. A callback that raises, or runs longer than `agent.pre_final_gate_timeout` seconds (default 30), is logged and the answer is delivered unchanged.
+ 
+-- 
+2.55.0
+

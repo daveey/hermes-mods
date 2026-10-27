@@ -1,6 +1,6 @@
 # Sidebar tells parked kanban work from running work
 
-Patch **0467** (source `cde62e1cf4`).
+Patch **0510** (source `cde62e1cf4`).
 
 ## Behavior
 
@@ -55,7 +55,7 @@ work too.
 
 ## Applying
 
-`git am -3` 0467. It touches only the row stamp and the stripe inputs. If `sessionStatusStripe` gained more call
+`git am -3` 0510. It touches only the row stamp and the stripe inputs. If `sessionStatusStripe` gained more call
 sites, route their kanban arguments through `kanbanStripeCounts`.
 
 ## Gotchas

@@ -1,0 +1,111 @@
+From 193659fa7e9a1c935ddad439d4948ad4f205e0c6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:25:24 -0700
+Subject: [PATCH] fix(kanban-sync): send a child row's unacknowledged card
+ first [daveey]
+
+Seen live on a board attached while busy (bb on one gateway): an event
+captured before the import queued its card reached the service first, was
+refused not_found, and the card's own row behind it in every batch was
+refused depends_on_rejected, round after round.
+
+push() now prepends the full row of any card a child row in the batch belongs
+to that the service has not acknowledged (sync_version NULL), and records the
+acknowledgement; a not_found for a card the gateway still has is transient.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_client.py            | 38 ++++++++++++++++++++-
+ tests/hermes_cli/test_kanban_sync_client.py | 13 +++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 98fb799750..3a1469fca4 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -232,7 +232,35 @@ def _backoff_s(attempts: int) -> int:
+ 
+ def transient_rejection(res: dict) -> bool:
+     reason = str(res.get("reason") or "")
+-    return reason in TRANSIENT_REASONS or (reason == "invalid" and "unknown table" in str(res.get("detail") or ""))
++    detail = str(res.get("detail") or "")
++    return (reason in TRANSIENT_REASONS or (reason == "invalid" and "unknown table" in detail)
++            or (reason == "not_found" and detail.startswith("no task")))  # its card is sent first next round
++
++
++def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -> list[tuple[dict, str]]:
++    """Full task upserts for cards that child rows in this batch belong to but the service has not acknowledged
++    (``sync_version`` NULL), sent ahead of them: a child captured before its card was queued (a board attached
++    while busy, then imported) would otherwise be refused ``not_found`` and hold the card back behind it."""
++    if not any(r["table_name"] != "tasks" for r in rows):
++        return []
++    in_batch = {r["row_uid"] for r in rows if r["table_name"] == "tasks"}
++    wanted: list[str] = []
++    for r in rows:
++        if r["table_name"] in ("tasks", "task_links"):
++            continue
++        fields = r["fields"] if isinstance(r["fields"], dict) else json.loads(r["fields"] or "{}")
++        tid = fields.get("task_id")
++        if tid and tid not in in_batch and tid not in wanted:
++            wanted.append(tid)
++    out: list[tuple[dict, str]] = []
++    for tid in wanted:
++        task = conn.execute("SELECT * FROM tasks WHERE id = ? AND sync_version IS NULL", (tid,)).fetchone()
++        if task is None:
++            continue
++        op = {"client_op_id": sync.uuid7(), "table": "tasks", "uid": tid, "op": "upsert",
++              "fields": _wire_fields("tasks", _row_fields(conn, "tasks", task)), "hlc": _next_hlc(conn, gateway)}
++        out.append((op, tid))
++    return out
+ 
+ 
+ @dataclass
+@@ -257,6 +285,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             break
+         with write_txn(conn):
+             wire = [translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway)) for r in rows]
++            parents = _unacked_parents(conn, rows, gateway)
++            wire = [op for op, _tid in parents] + wire
+         try:
+             resp = hub.ops(board, wire)
+         except (HubError, OSError) as exc:
+@@ -266,9 +296,15 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             raise
+         out.sent += len(rows)
+         authoritative: list[sync.RemoteChange] = []
++        parent_ops = {op["client_op_id"]: tid for op, tid in parents}
+         with write_txn(conn):
+             for res in resp.get("results", []):
+                 status, op_id = res.get("status"), res.get("client_op_id")
++                if op_id in parent_ops:
++                    if status in ("applied", "merged") and res.get("version"):
++                        conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
++                                     (res["version"], parent_ops[op_id]))
++                    continue
+                 row = next((r for r in rows if r["op_id"] == op_id), None)
+                 if row is None:
+                     continue
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 6b974b7229..bebeaf5657 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -719,3 +719,16 @@ def test_a_child_row_update_is_sent_whole_so_it_stands_alone(live, svc):
+     assert ksc.push(live, svc.hub(ME), BOARD, ME, primary=False).rejected == 0
+     comment = next(c for c in svc.board(BOARD)["rows"]["task_comments"].values() if c["task_id"] == tid)
+     assert comment["body"] == "edited" and comment["author"] == "me"
++
++
++def test_a_child_queued_before_its_card_does_not_hold_the_card_back(live, svc):
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)
++    tid = kb.create_task(live, title="made before attach", assignee="worker")  # not captured, never acknowledged
++    sync.install_triggers(live)
++    kb.add_comment(live, tid, "me", "captured first")  # a child queued before any row of its card
++    res = ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    assert res.rejected == 0 and res.deferred == 0
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["title"] == "made before attach"
++    assert live.execute("SELECT sync_version FROM tasks WHERE id = ?", (tid,)).fetchone()[0] is not None
++    assert any(c["body"] == "captured first" for c in svc.board(BOARD)["rows"]["task_comments"].values())
+-- 
+2.55.0
+

@@ -1,0 +1,2378 @@
+From dc5c2455257ff007639b4cbcbc0c714f81c5ef42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 08:22:25 -0700
+Subject: [PATCH] feat(update): cross-process admission fence [daveey] (#98)
+
+* feat(update): fence Desktop reservations and Kanban claims across processes [daveey]
+
+* test(update): retain spawned lock-holder synchronization event [daveey]
+
+* fix(admission): retain turn handoffs and avoid global lock waits [daveey]
+
+* fix(admission): isolate stale handoffs and retry queued prompts [daveey]
+
+* fix(admission): guard refused worker cleanup by turn ownership [daveey]
+
+* fix(admission): preserve generation across nested prompt dispatch [daveey]
+
+* fix(admission): notification claims adopt their own turn generation [daveey]
+
+* fix(admission): settle clears turn generation so later direct turns own the session [daveey]
+
+* test(admission): rebind split prompt submit helpers [daveey]
+
+* [daveey] Admission fence: settled turns still own their own unwinding (fixes running left True after mid-turn settle)
+
+* test(tui): ephemeral profile-override tests use a real temp profile home for the update fence [daveey]
+
+* test(tui): pin mid-turn settle leaves running False after worker exit [daveey]
+
+---------
+
+Co-authored-by: daveey <daveey@users.noreply.github.com>
+---
+ hermes_cli/admission_fence.py                 | 167 +++++++++++
+ hermes_cli/backend_retirement.py              |  34 +++
+ hermes_cli/kanban_admission.py                |  79 +++++
+ hermes_cli/kanban_db.py                       |  62 +---
+ tests/hermes_cli/test_admission_fence.py      | 216 ++++++++++++++
+ .../test_kanban_admission_contention.py       | 156 ++++++++++
+ .../test_bot_live_owner_delivery.py           |   4 +-
+ .../test_ephemeral_profile_override.py        |  14 +-
+ .../test_update_admission_caller.py           | 101 +++++++
+ .../test_update_admission_generation.py       |  91 ++++++
+ .../test_update_admission_handoff.py          | 269 ++++++++++++++++++
+ .../test_update_admission_retry.py            |  71 +++++
+ tui_gateway/admission_retry.py                |  38 +++
+ tui_gateway/compute_host_bridge.py            |   8 +-
+ tui_gateway/methods_prompt.py                 |  31 +-
+ tui_gateway/prompt_turn.py                    |  58 ++--
+ tui_gateway/server.py                         |  11 +-
+ tui_gateway/session_auto_continue.py          |  15 +-
+ tui_gateway/session_history.py                |   6 +
+ tui_gateway/session_lifecycle.py              |  34 +--
+ tui_gateway/session_notifications.py          |  22 +-
+ tui_gateway/session_start_requests.py         |   9 +
+ tui_gateway/turn_admission.py                 | 261 +++++++++++++++++
+ .../docs/developer-guide/update-admission.md  |  79 +++++
+ 24 files changed, 1712 insertions(+), 124 deletions(-)
+ create mode 100644 hermes_cli/admission_fence.py
+ create mode 100644 hermes_cli/kanban_admission.py
+ create mode 100644 tests/hermes_cli/test_admission_fence.py
+ create mode 100644 tests/hermes_cli/test_kanban_admission_contention.py
+ create mode 100644 tests/tui_gateway/test_update_admission_caller.py
+ create mode 100644 tests/tui_gateway/test_update_admission_generation.py
+ create mode 100644 tests/tui_gateway/test_update_admission_handoff.py
+ create mode 100644 tests/tui_gateway/test_update_admission_retry.py
+ create mode 100644 tui_gateway/admission_retry.py
+ create mode 100644 tui_gateway/turn_admission.py
+ create mode 100644 website/docs/developer-guide/update-admission.md
+
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+new file mode 100644
+index 0000000000..604f0a65ac
+--- /dev/null
++++ b/hermes_cli/admission_fence.py
+@@ -0,0 +1,167 @@
++"""POSIX cross-process update admission protocol (stdlib only).
++
++Use an explicit installation root, not a board directory. Never unlink admission.lock.
++The updater sets the hold under the lock, releases the lock, then reads reservations
++BEFORE existing busy ledgers. Zero reservations alone is NOT an idle proof.
++"""
++from contextlib import contextmanager
++import errno
++import json
++import os
++from pathlib import Path
++import threading
++import time
++import uuid
++
++SUPPORTED = os.name == "posix"
++CAPABILITY = {"version": 1, "supported": SUPPORTED, "scope": "installation-root", "lock": "core-update/admission.lock",
++              "hold": "core-update/holds/hermes-sync", "state": "locked-reservations"}
++HOLD_MESSAGE = "Hermes update admission is paused or busy; retry shortly (or after the update completes)."
++
++
++@contextmanager
++def admission_lock(home, *, timeout=10.0):
++    import fcntl
++
++    root = Path(home) / "core-update"
++    root.mkdir(parents=True, exist_ok=True)
++    fd = os.open(root / "admission.lock", os.O_CREAT | os.O_RDWR, 0o600)
++    try:
++        deadline = time.monotonic() + timeout
++        while True:
++            try:
++                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                break
++            except BlockingIOError:
++                if time.monotonic() >= deadline:
++                    raise TimeoutError("Hermes update admission lock is busy") from None
++                time.sleep(0.01)
++        yield root
++    finally:
++        os.close(fd)
++
++
++def is_held(root):
++    # A dangling marker symlink is a hold; permission/I/O errors are NOT absence.
++    try:
++        (Path(root) / "holds" / "hermes-sync").lstat()
++    except FileNotFoundError:
++        return False
++    return True
++
++
++class Reservation:
++    """An independently locked file, automatically unlocked on process exit."""
++    def __init__(self, fd, path):
++        self.fd = fd
++        self.path = path
++        self._lock = threading.Lock()
++
++    def close(self):
++        with self._lock:
++            if self.fd is not None:
++                # Unlink while still locked. Readers hold admission.lock and never wait
++                # on this lock, so no lock inversion or idle gap is possible.
++                try:
++                    self.path.unlink(missing_ok=True)
++                finally:
++                    os.close(self.fd)
++                    self.fd = None
++
++
++def reserve(home):
++    import fcntl
++
++    # Some callers hold the backend session-map lock. Absorb ordinary short
++    # commits, but bound contention to 50ms rather than an updater's timeout.
++    with admission_lock(home, timeout=0.05) as root:
++        if is_held(root):
++            return None
++        directory = root / "reservations"
++        directory.mkdir(exist_ok=True)
++        path = directory / uuid.uuid4().hex
++        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            return Reservation(fd, path)
++        except BaseException:
++            os.close(fd)
++            path.unlink(missing_ok=True)
++            raise
++
++
++def _state_locked(root):
++    import fcntl
++
++    count = 0
++    directory = root / "reservations"
++    try:
++        paths = list(directory.iterdir())
++    except FileNotFoundError:
++        paths = ()
++    for path in paths:
++        try:
++            fd = os.open(path, os.O_RDWR)
++        except FileNotFoundError:  # owner completed while we enumerated
++            continue
++        try:
++            try:
++                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except OSError as exc:
++                if exc.errno not in (errno.EAGAIN, errno.EACCES):
++                    raise
++                count += 1
++            else:
++                path.unlink(missing_ok=True)  # crashed owner; no age/PID heuristic
++        finally:
++            os.close(fd)
++    return {"version": 1, "held": is_held(root), "reservations": count}
++
++
++def state(home):
++    with admission_lock(home) as root:
++        return _state_locked(root)
++
++
++def set_hold(home):
++    with admission_lock(home) as root:
++        directory = root / "holds"
++        directory.mkdir(exist_ok=True)
++        fd = os.open(directory / "hermes-sync", os.O_CREAT | os.O_WRONLY, 0o600)
++        try:
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++        # The marker survives updater crashes; removal is always explicit.
++        for parent in (directory, root, root.parent):
++            fd = os.open(parent, os.O_RDONLY)
++            try:
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++        return _state_locked(root)
++
++
++def clear_hold(home):
++    with admission_lock(home) as root:
++        (root / "holds" / "hermes-sync").unlink(missing_ok=True)
++
++
++def main():
++    import argparse
++
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("action", choices=("capability", "state", "hold", "release"))
++    parser.add_argument("--home", type=Path)
++    args = parser.parse_args()
++    if args.action == "capability":
++        result = CAPABILITY
++    else:
++        if args.home is None:
++            parser.error("--home must name the explicit installation root")
++        result = {"state": state, "hold": set_hold, "release": clear_hold}[args.action](args.home)
++    print(json.dumps(result))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index 9882e8a9b7..3566c8973c 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -56,6 +56,40 @@ class RetirementFence:
+             if admitted:
+                 self.release()
+ 
++    @contextmanager
++    def reservation(self, home=None):
++        """Compose process retirement with the cross-process update reservation.
++
++        Neither lock is held while acquiring the other, or while callers hold
++        session locks. The pending reservation remains visible until publication.
++        """
++        from hermes_constants import get_default_hermes_root, get_hermes_home
++        from hermes_cli.admission_fence import reserve, HOLD_MESSAGE, SUPPORTED
++
++        if not SUPPORTED:
++            with self.work() as admitted:
++                yield admitted
++            return
++
++        admitted = self.acquire()
++        pending = None
++        try:
++            if admitted:
++                try:
++                    pending = reserve(get_default_hermes_root(home=home or get_hermes_home()))
++                except (OSError, TimeoutError):
++                    logging.getLogger(__name__).warning("Update admission unavailable", exc_info=True)
++                if pending is None:
++                    logging.getLogger(__name__).info(HOLD_MESSAGE)
++            yield admitted and pending is not None
++        finally:
++            try:
++                if pending is not None:
++                    pending.close()
++            finally:
++                if admitted:
++                    self.release()
++
+     def prepare(self):
+         from hermes_cli.web_server_idle_proof import idle_proof
+ 
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+new file mode 100644
+index 0000000000..3370b8219b
+--- /dev/null
++++ b/hermes_cli/kanban_admission.py
+@@ -0,0 +1,79 @@
++"""Kanban claim publication boundary for the POSIX updater fence."""
++import contextlib
++import logging
++
++
++def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, event_extra=None, gate=None):
++    """CAS to running and publish its run/event. Caller owns the fenced transaction."""
++    from hermes_cli import kanban_db as kb
++
++    cur = conn.execute(
++        """
++        UPDATE tasks
++           SET status = 'running', human_request = NULL, claim_lock = ?,
++               claim_expires = ?, started_at = COALESCE(started_at, ?)
++         WHERE id = ? AND status = ? AND claim_lock IS NULL
++        """,
++        (lock, expires, now, task_id, source_status),
++    )
++    if cur.rowcount != 1:
++        return None
++    kb._sync.stage_claim(conn, task_id, gate)
++    trow = conn.execute(
++        "SELECT assignee, max_runtime_seconds, current_step_key FROM tasks WHERE id = ?", (task_id,),
++    ).fetchone()
++    run_cur = conn.execute(
++        """
++        INSERT INTO task_runs (
++            task_id, profile, step_key, status, claim_lock, claim_expires, max_runtime_seconds, started_at
++        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
++        """,
++        (task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
++         lock, expires, trow["max_runtime_seconds"] if trow else None, now),
++    )
++    run_id = run_cur.lastrowid
++    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
++    kb._append_event(
++        conn, task_id, "claimed",
++        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
++    )
++    return run_id
++
++
++@contextlib.contextmanager
++def claim_transaction(conn):
++    """Fence check and real SQL commit share admission.lock (never a savepoint).
++
++    Board storage may be overridden independently of the installation. Use the
++    process's installation root, not the board path. Hooks run after both locks.
++    """
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli.admission_fence import admission_lock, is_held, HOLD_MESSAGE, SUPPORTED
++    from hermes_cli.kanban_db import write_txn
++
++    if conn.in_transaction:
++        raise RuntimeError("Kanban claim cannot run inside an existing transaction")
++    if not SUPPORTED:
++        with write_txn(conn):
++            yield True
++        return
++    # BEGIN IMMEDIATE can wait through SQLite's busy timeout and retries. Do
++    # that before taking the installation-wide flock, so a busy board cannot
++    # stall updater holds or unrelated reservations. Never wait for admission
++    # while owning the DB writer lock: an unavailable flock defers this claim.
++    # The stack deliberately OUTLIVES write_txn: accepted claims must COMMIT
++    # (including retries), or roll back on failure, before releasing admission.
++    with contextlib.ExitStack() as stack:
++        with write_txn(conn):
++            try:
++                root = stack.enter_context(admission_lock(get_default_hermes_root(), timeout=0))
++                held = is_held(root)
++            except (OSError, TimeoutError):
++                logging.getLogger(__name__).warning("Update admission unavailable; deferring Kanban claim", exc_info=True)
++                yield False
++                return
++            if held:
++                logging.getLogger(__name__).info(HOLD_MESSAGE)
++                yield False
++            else:
++                yield True
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 4c37e21ee6..1d606e189a 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -31,6 +31,7 @@ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
++from hermes_cli.kanban_admission import claim_transaction, claim_and_open_run
+ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+ from toolsets import get_toolset_names
+ 
+@@ -2153,55 +2154,6 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
+     return [(row["id"], row["status"]) for row in rows]
+ 
+ 
+-def _claim_and_open_run(
+-    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
+-    *, event_extra: Optional[dict] = None, gate: Optional[_sync.ClaimGate] = None,
+-) -> Optional[int]:
+-    """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
+-    when the CAS lost. Caller holds the txn."""
+-    cur = conn.execute(
+-        f"""
+-        UPDATE tasks
+-           SET status        = 'running',
+-               human_request = NULL,
+-               claim_lock    = ?,
+-               claim_expires = ?,
+-               started_at    = COALESCE(started_at, ?)
+-         WHERE id = ?
+-           AND status = '{source_status}'
+-           AND claim_lock IS NULL
+-        """,
+-        (lock, expires, now, task_id),
+-    )
+-    if cur.rowcount != 1:
+-        return None
+-    _sync.stage_claim(conn, task_id, gate)
+-    trow = conn.execute(
+-        "SELECT assignee, max_runtime_seconds, current_step_key "
+-        "FROM tasks WHERE id = ?", (task_id,),
+-    ).fetchone()
+-    run_cur = conn.execute(
+-        """
+-        INSERT INTO task_runs (
+-            task_id, profile, step_key, status,
+-            claim_lock, claim_expires, max_runtime_seconds,
+-            started_at
+-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+-        """,
+-        (
+-            task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
+-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+-        ),
+-    )
+-    run_id = run_cur.lastrowid
+-    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
+-    _append_event(
+-        conn, task_id, "claimed",
+-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
+-    )
+-    return run_id
+-
+-
+ def claim_task(
+     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
+     claimer: Optional[str] = None,
+@@ -2217,7 +2169,9 @@ def claim_task(
+     gate = _sync.claim_gate(conn, task_id, expires)
+     if gate.deferred:
+         return None
+-    with gate, write_txn(conn):
++    with gate, claim_transaction(conn) as admitted:
++        if not admitted:
++            return None
+         # Single enforcement point: never ready -> running with an undone
+         # parent, whichever writer set 'ready'. Demote to 'todo';
+         # recompute_ready re-promotes when the parents finish.
+@@ -2232,7 +2186,7 @@ def claim_task(
+         _reclaim_dangling_run(
+             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
+         )
+-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, gate.expires, now, gate=gate)
++        run_id = claim_and_open_run(conn, task_id, "ready", lock, gate.expires, now, gate=gate)
+         if run_id is None:
+             return None
+         claimed = get_task(conn, task_id)
+@@ -2253,7 +2207,9 @@ def claim_review_task(
+     gate = _sync.claim_gate(conn, task_id, expires, lane="review")
+     if gate.deferred:
+         return None
+-    with gate, write_txn(conn):
++    with gate, claim_transaction(conn) as admitted:
++        if not admitted:
++            return None
+         if not _parents_satisfied(conn, task_id):
+             demoted = conn.execute(
+                 "UPDATE tasks SET status = 'todo' "
+@@ -2265,7 +2221,7 @@ def claim_review_task(
+                     {"reason": "parent_reopened", "source_status": "review"},
+                 )
+             return None
+-        run_id = _claim_and_open_run(
++        run_id = claim_and_open_run(
+             conn, task_id, "review", lock, gate.expires, now, event_extra={"source_status": "review"}, gate=gate,
+         )
+         if run_id is None:
+diff --git a/tests/hermes_cli/test_admission_fence.py b/tests/hermes_cli/test_admission_fence.py
+new file mode 100644
+index 0000000000..b89e338b43
+--- /dev/null
++++ b/tests/hermes_cli/test_admission_fence.py
+@@ -0,0 +1,216 @@
++"""Real flock tests for the updater's cross-process admission protocol."""
++import json
++import multiprocessing
++
++from pathlib import Path
++import subprocess
++import sys
++import threading
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.backend_retirement import RetirementFence
++from tui_gateway import server  # bootstrap before the real-home guard
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++def _reservation_child(home, ready, finish):
++    reservation = af.reserve(home)
++    ready.set()
++    finish.wait(20)
++    reservation.close()
++
++
++def _lock_child(home, ready, finish):
++    with af.admission_lock(home):
++        ready.set()
++        finish.wait(20)
++
++
++def test_hold_refuses_and_existing_reservation_survives(tmp_path):
++    reservation = af.reserve(tmp_path)
++    assert af.state(tmp_path)["reservations"] == 1
++    assert af.set_hold(tmp_path) == {"version": 1, "held": True, "reservations": 1}
++    assert af.reserve(tmp_path) is None
++    reservation.close()
++    reservation.close()
++    assert af.state(tmp_path)["reservations"] == 0
++    af.clear_hold(tmp_path)
++    af.reserve(tmp_path).close()
++
++
++def test_cross_process_reservation_and_crash_cleanup(tmp_path):
++    ctx = multiprocessing.get_context("spawn")
++    ready, finish = ctx.Event(), ctx.Event()
++    child = ctx.Process(target=_reservation_child, args=(tmp_path, ready, finish))
++    child.start()
++    try:
++        assert ready.wait(10)
++        assert af.set_hold(tmp_path)["reservations"] == 1
++        child.kill()
++        child.join(10)
++        assert af.state(tmp_path) == {"version": 1, "held": True, "reservations": 0}
++    finally:
++        if child.is_alive():
++            child.kill()
++        child.join(10)
++
++
++def test_lock_timeout_and_process_crash_releases_lock(tmp_path):
++    ctx = multiprocessing.get_context("spawn")
++    ready, finish = ctx.Event(), ctx.Event()
++    child = ctx.Process(target=_lock_child, args=(tmp_path, ready, finish))
++    child.start()
++    try:
++        assert ready.wait(10)
++        with pytest.raises(TimeoutError):
++            with af.admission_lock(tmp_path, timeout=0.05):
++                pytest.fail("crossed process lock")
++        child.kill()
++        child.join(10)
++        assert af.state(tmp_path)["reservations"] == 0
++    finally:
++        if child.is_alive():
++            child.kill()
++        child.join(10)
++
++
++def test_retirement_composition_and_profile_root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    profile = tmp_path / "profiles" / "test"
++    profile.mkdir(parents=True)
++    fence = RetirementFence()
++    with fence.reservation(profile) as admitted:
++        assert admitted
++        assert af.state(tmp_path)["reservations"] == 1
++        assert fence.prepare() == {"ok": False, "idle": False}
++        af.set_hold(tmp_path)
++    assert fence.active_count() == 0
++    with fence.reservation(profile) as admitted:
++        assert not admitted
++    assert fence.active_count() == 0
++    assert af.state(tmp_path)["reservations"] == 0
++
++
++def test_desktop_pending_and_worker_are_counted(tmp_path, monkeypatch):
++    from hermes_cli import backend_retirement
++    fence = RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session = {"history_lock": threading.RLock(), "profile_home": str(tmp_path)}
++    with server._session_turn_admission(session) as admitted:
++        assert admitted
++        assert af.state(tmp_path)["reservations"] == 1
++    entered, finish = threading.Event(), threading.Event()
++
++    def work():
++        entered.set()
++        assert finish.wait(10)
++
++    thread = server._start_session_work(work, name="test-update-work", session=session)
++    try:
++        assert entered.wait(10)
++        assert af.set_hold(tmp_path)["reservations"] == 1
++        with server._session_turn_admission(session) as admitted:
++            assert not admitted
++        # An already admitted turn may hand off more stages under the hold;
++        # an independent new session must still be denied.
++        fresh = {"history_lock": threading.RLock(), "profile_home": str(tmp_path)}
++        assert server._start_session_work(lambda: pytest.fail("ran"), name="denied", session=fresh) is None
++    finally:
++        finish.set()
++        thread.join(10)
++    assert fence.active_count() == 0
++    assert af.state(tmp_path)["reservations"] == 0
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_hold_blocks_kanban_claims_without_mutation(tmp_path, monkeypatch, review):
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        task = kb.create_task(conn, title="held", assignee="default")
++        status = "review" if review else "ready"
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task))
++        claim = kb.claim_review_task if review else kb.claim_task
++        af.set_hold(tmp_path)
++        assert claim(conn, task) is None
++        assert kb.get_task(conn, task).status == status
++        assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
++        af.clear_hold(tmp_path)
++        assert claim(conn, task).status == "running"
++        assert not conn.in_transaction
++    finally:
++        conn.close()
++
++
++def test_claim_rejects_nested_transaction_before_waiting(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        with kb.write_txn(conn), af.admission_lock(tmp_path):
++            with pytest.raises(RuntimeError, match="existing transaction"):
++                kb.claim_task(conn, "not-needed")
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_claim_fence_spans_commit_and_hooks_run_after_release(tmp_path, monkeypatch, review):
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    observed = []
++    try:
++        task = kb.create_task(conn, title="publication", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", ("review" if review else "ready", task))
++
++        def trace(sql):
++            if sql == "COMMIT":
++                try:
++                    with af.admission_lock(tmp_path, timeout=0):
++                        observed.append("unfenced")
++                except TimeoutError:
++                    observed.append("fenced")
++
++        def hook(*args):
++            with af.admission_lock(tmp_path, timeout=0):
++                observed.append("hook-unlocked")
++
++        monkeypatch.setattr(kb, "_fire_task_hook", hook)
++        conn.set_trace_callback(trace)
++        assert (kb.claim_review_task if review else kb.claim_task)(conn, task)
++        conn.set_trace_callback(None)
++        assert observed == (["fenced"] if review else ["fenced", "hook-unlocked"])
++        assert af.set_hold(tmp_path)["held"]
++        with kbc.connect(tmp_path / "kanban.db") as reader:
++            assert kb.get_task(reader, task).status == "running"
++            assert reader.execute("SELECT count(*) FROM task_runs WHERE status='running'").fetchone()[0] == 1
++    finally:
++        conn.close()
++
++
++def test_retirement_idle_probe_can_read_fence_without_deadlock(tmp_path, monkeypatch):
++    from hermes_cli import web_server_idle_proof
++    fence = RetirementFence()
++    monkeypatch.setattr(web_server_idle_proof, "idle_proof", lambda: {"idle": af.state(tmp_path)["reservations"] == 0})
++    token = fence.prepare()["token"]
++    with fence.reservation(tmp_path) as admitted:
++        assert not admitted
++    assert fence.cancel(token)["ok"]
++    with fence.reservation(tmp_path) as admitted:
++        assert admitted
++
++
++def test_standalone_capability_uses_only_stdlib():
++    result = subprocess.run([sys.executable, "-S", str(Path(af.__file__)), "capability"],
++                            check=True, capture_output=True, text=True)
++    assert json.loads(result.stdout) == af.CAPABILITY
+diff --git a/tests/hermes_cli/test_kanban_admission_contention.py b/tests/hermes_cli/test_kanban_admission_contention.py
+new file mode 100644
+index 0000000000..310f27391b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_admission_contention.py
+@@ -0,0 +1,156 @@
++"""Real SQLite/flock contention at the Kanban publication boundary."""
++import contextlib
++import sqlite3
++import threading
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_admission import claim_transaction
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn, tmp_path
++    finally:
++        conn.close()
++
++
++def _task(conn, review):
++    task = kb.create_task(conn, title="contention", assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", ("review" if review else "ready", task))
++    return task
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_sqlite_wait_does_not_block_admission_and_new_hold_wins(board, review):
++    conn, home = board
++    task = _task(conn, review)
++    began = threading.Event()
++    claim = kb.claim_review_task if review else kb.claim_task
++
++    def worker():
++        # Schema/bootstrap has already run; use a separate real DB connection.
++        with contextlib.closing(sqlite3.connect(home / "kanban.db", timeout=5)) as other:
++            other.row_factory = sqlite3.Row
++            other.set_trace_callback(lambda sql: began.set() if sql == "BEGIN IMMEDIATE" else None)
++            return claim(other, task)
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        conn.execute("BEGIN IMMEDIATE")
++        future = pool.submit(worker)
++        try:
++            assert began.wait(5)
++            assert not future.done()
++            # A blocked BEGIN must leave the global lock free. The updater can
++            # install a hold before the writer is released; the claimant must
++            # check that NEW hold, not a snapshot taken before its SQLite wait.
++            with af.admission_lock(home, timeout=0.2):
++                pass
++            reservation = af.reserve(home)
++            assert reservation is not None
++            reservation.close()
++            assert af.set_hold(home)["held"]
++        finally:
++            conn.execute("ROLLBACK")
++        assert future.result(timeout=10) is None
++    assert kb.get_task(conn, task).status == ("review" if review else "ready")
++    assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
++    assert conn.execute("SELECT count(*) FROM task_events WHERE kind='claimed'").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_busy_admission_defers_without_waiting_or_leaking_writer(board, monkeypatch, review):
++    conn, home = board
++    task = _task(conn, review)
++    real_lock = af.admission_lock
++    attempts = []
++
++    @contextlib.contextmanager
++    def checked_lock(root, *, timeout=10):
++        attempts.append(timeout)
++        assert conn.in_transaction  # DB first, flock second.
++        assert timeout == 0  # No sleep/retry while owning the DB writer.
++        with real_lock(root, timeout=timeout) as locked:
++            yield locked
++
++    with real_lock(home):
++        monkeypatch.setattr(af, "admission_lock", checked_lock)
++        assert (kb.claim_review_task if review else kb.claim_task)(conn, task) is None
++        assert not conn.in_transaction
++        with contextlib.closing(sqlite3.connect(home / "kanban.db", timeout=0)) as other:
++            other.execute("BEGIN IMMEDIATE")
++            other.rollback()
++    assert attempts == [0]
++    assert kb.get_task(conn, task).status == ("review" if review else "ready")
++    assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("fail_commit", [False, True])
++def test_commit_retry_and_failure_remain_fenced(board, monkeypatch, fail_commit):
++    conn, home = board
++    task = _task(conn, False)
++    boundaries = []
++    real_boundary = kbc._execute_boundary_with_retry
++
++    def boundary(connection, sql):
++        if sql == "COMMIT":
++            # Simulate a slow/retried COMMIT boundary. The outer flock must
++            # remain held through the whole helper and through rollback.
++            for _ in range(2):
++                with pytest.raises(TimeoutError):
++                    with af.admission_lock(home, timeout=0):
++                        pytest.fail("commit escaped admission lock")
++                boundaries.append(sql)
++            if fail_commit:
++                raise sqlite3.OperationalError("database is locked")
++        return real_boundary(connection, sql)
++
++    rollbacks = []
++
++    def trace(sql):
++        if sql == "ROLLBACK":
++            try:
++                with af.admission_lock(home, timeout=0):
++                    rollbacks.append("unfenced")
++            except TimeoutError:
++                rollbacks.append("fenced")
++
++    monkeypatch.setattr(kbc, "_execute_boundary_with_retry", boundary)
++    conn.set_trace_callback(trace)
++    if fail_commit:
++        with pytest.raises(sqlite3.OperationalError, match="locked"):
++            kb.claim_task(conn, task)
++    else:
++        assert kb.claim_task(conn, task).status == "running"
++    assert boundaries == ["COMMIT", "COMMIT"]
++    assert rollbacks == (["fenced"] if fail_commit else [])
++    assert not conn.in_transaction
++    with af.admission_lock(home, timeout=0):
++        pass
++    assert kb.get_task(conn, task).status == ("ready" if fail_commit else "running")
++    assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == (0 if fail_commit else 1)
++
++
++def test_body_error_rolls_back_before_unlock(board):
++    conn, home = board
++    task = _task(conn, False)
++    with pytest.raises(ValueError, match="abort"):
++        with claim_transaction(conn) as admitted:
++            assert admitted
++            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task,))
++            raise ValueError("abort")
++    assert not conn.in_transaction
++    assert kb.get_task(conn, task).status == "ready"
++    with af.admission_lock(home, timeout=0):
++        pass
+diff --git a/tests/tui_gateway/test_bot_live_owner_delivery.py b/tests/tui_gateway/test_bot_live_owner_delivery.py
+index 3d6ef13fd1..dbaceb7a40 100644
+--- a/tests/tui_gateway/test_bot_live_owner_delivery.py
++++ b/tests/tui_gateway/test_bot_live_owner_delivery.py
+@@ -25,7 +25,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
+     session = dict(agent=agent, session_key="chat", history_lock=threading.RLock(), running=True)
+     retired = []
+     noop = lambda *args, **kwargs: None
+-    submit = rebind(prompt_turn._run_prompt_submit, {
++    submit = rebind(prompt_turn._run_admitted_prompt, {
+         "threading": threading, "time": time, "logger": logging.getLogger(__name__),
+         "_start_session_work": _start_session_work,
+         "_sessions_lock": threading.RLock(), "_sessions": {},
+@@ -86,6 +86,7 @@ def test_local_work_blocks_mailbox_claim_without_consuming_envelope(monkeypatch,
+         "_session_home": lambda session: tmp_path,
+         "_session_turn_admission": _session_turn_admission,
+         "_run_prompt_submit": submit,
++        "_notif_run_submit": submit,
+         "_notif_release_turn": lambda session: session.update(running=False),
+     })
+     mailbox._root(tmp_path).mkdir(parents=True)  # a delivery was admitted for this profile
+@@ -165,6 +166,7 @@ def test_mailbox_poll_delivers_past_a_schema_damaged_ticket(monkeypatch, tmp_pat
+         "_session_home": lambda session: tmp_path,
+         "_session_turn_admission": _session_turn_admission,
+         "_run_prompt_submit": submit,
++        "_notif_run_submit": submit,
+         "_notif_release_turn": lambda session: session.update(running=False),
+     })
+     session = {"history_lock": threading.RLock(), "agent": object(), "session_key": "chat",
+diff --git a/tests/tui_gateway/test_ephemeral_profile_override.py b/tests/tui_gateway/test_ephemeral_profile_override.py
+index 4dc75f199d..977082edab 100644
+--- a/tests/tui_gateway/test_ephemeral_profile_override.py
++++ b/tests/tui_gateway/test_ephemeral_profile_override.py
+@@ -20,6 +20,7 @@ from ``tui_gateway.server._methods`` with ``threading.Thread`` patched to run th
+ target inline, then asserts on the recorded override set/reset calls and the agent.
+ """
+ 
++import sys
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+@@ -44,10 +45,17 @@ class _InlineThread:
+             self._target()
+ 
+ @pytest.fixture
+-def fake_session():
+-    """A minimal session carrying a non-default ``profile_home``."""
++def fake_session(tmp_path, monkeypatch):
++    """A minimal session carrying a non-default ``profile_home``.
++
++    The profile home is a real temp dir: side-agent admission goes through the
++    cross-process update fence, which creates ``<root>/core-update`` there.
++    """
++    home = tmp_path / "profiles" / "work"
++    home.mkdir(parents=True)
++    monkeypatch.setattr(sys.modules[__name__], "PROFILE_HOME", str(home))
+     agent = MagicMock()
+-    return {"agent": agent, "session_key": "sess_k", "profile_home": PROFILE_HOME}
++    return {"agent": agent, "session_key": "sess_k", "profile_home": str(home)}
+ 
+ @pytest.fixture
+ def override_calls():
+diff --git a/tests/tui_gateway/test_update_admission_caller.py b/tests/tui_gateway/test_update_admission_caller.py
+new file mode 100644
+index 0000000000..a727d73ded
+--- /dev/null
++++ b/tests/tui_gateway/test_update_admission_caller.py
+@@ -0,0 +1,101 @@
++"""Real prompt dispatch refusal must not clear a replacement turn."""
++from contextlib import nullcontext
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import backend_retirement
++from tui_gateway import server, turn_admission as ta
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++def test_prompt_worker_refusal_preserves_replacement_turn(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    with ta.admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a: True)
++    monkeypatch.setattr(server, "_admit_prompt_turn", lambda *a: ([], SimpleNamespace()))
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda *a: nullcontext())
++    monkeypatch.setattr(server, "_routing_provenance_db", lambda *a: nullcontext(None))
++    monkeypatch.setattr(server, "_sessions", {})
++    def replace_on_start(*args):
++        with session["history_lock"]:
++            ta.settle(session)
++            session["running"] = False
++        with ta.admission(session) as accepted:
++            assert accepted
++            session["running"] = True
++            session["inflight_turn"] = {"user": "replacement"}
++    # Interleave Stop/resubmit after admission but before the actual worker start.
++    monkeypatch.setattr(server, "_emit", replace_on_start)
++    try:
++        with ta.stage(session):
++            assert server._run_admitted_prompt("r", "s", session, "old") is False
++            assert session["running"]
++            assert session["inflight_turn"] == {"user": "replacement"}
++        assert fence.active_count() == 1
++    finally:
++        ta.settle(session)
++    assert fence.active_count() == 0
++
++
++@pytest.mark.parametrize("new_claim", [False, True])
++def test_nested_submit_inherits_waiter_but_explicit_followup_adopts(tmp_path, monkeypatch, new_claim):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    with ta.admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++    seen = []
++    monkeypatch.setattr(server, "_run_admitted_prompt", lambda *a, **kw: seen.append(ta.owns(session)))
++    monkeypatch.setattr(server, "_emit", lambda *a: None)
++    try:
++        with ta.stage(session):
++            ta.settle(session)
++            session["running"] = False
++            with ta.admission(session) as accepted:
++                assert accepted
++                session["running"] = True
++            if new_claim:
++                server._dispatch_followup_turn("r", "s", session, "new", "test")
++            else:
++                server._run_prompt_submit("r", "s", session, "old")
++        assert seen == [new_claim]
++        assert session["running"]
++        assert fence.active_count() == 1
++    finally:
++        ta.settle(session)
++    assert fence.active_count() == 0
++
++
++def test_notification_claim_from_stale_worker_context_adopts_new_turn(tmp_path, monkeypatch):
++    """A completion drained after a settled turn (worker context still holds T1)
++    must adopt its own freshly claimed T2 rather than inherit the stale T1."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    with ta.admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++    seen = []
++    monkeypatch.setattr(server, "_run_admitted_prompt", lambda *a, **kw: seen.append(ta.owns(session)) or True)
++    try:
++        with ta.stage(session):
++            ta.settle(session)
++            session["running"] = False
++            assert server._notif_claim_turn(session)
++            assert server._notif_run_submit("r", "s", session, "drained")
++        assert seen == [True]
++    finally:
++        session["running"] = False
++        ta.settle(session)
++    assert fence.active_count() == 0
+diff --git a/tests/tui_gateway/test_update_admission_generation.py b/tests/tui_gateway/test_update_admission_generation.py
+new file mode 100644
+index 0000000000..6d3cc7c567
+--- /dev/null
++++ b/tests/tui_gateway/test_update_admission_generation.py
+@@ -0,0 +1,91 @@
++"""Asynchronous handoffs cannot steal a newer turn's admission generation."""
++import threading
++
++import pytest
++
++from hermes_cli import backend_retirement
++from tui_gateway import turn_admission as ta
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++def test_stale_stage_cannot_launch_worker_for_new_turn(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    with ta.admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++    ran = threading.Event()
++    try:
++        with ta.stage(session):
++            with session["history_lock"]:
++                ta.settle(session)
++                session["running"] = False
++            with ta.admission(session) as accepted:
++                assert accepted
++                session["running"] = True
++            thread = ta.start_work(ran.set, name="stale-handoff", session=session)
++            if thread is not None:
++                thread.join(5)
++            assert thread is None
++            assert not ran.is_set()
++            assert session["running"]
++        assert fence.active_count() == 1
++    finally:
++        with session["history_lock"]:
++            ta.settle(session)
++    assert fence.active_count() == 0
++
++
++def test_stale_callback_retains_original_not_replacement(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    with ta.admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++    cancel = lambda: None
++    try:
++        with ta.stage(session):
++            with session["history_lock"]:
++                ta.settle(session)
++                session["running"] = False
++            with ta.admission(session) as accepted:
++                assert accepted
++                session["running"] = True
++            callback, cancel = ta.retained_callback(session, lambda: ta.settle(session))
++        assert fence.active_count() == 2
++        assert callback() is False
++        assert fence.active_count() == 1
++        assert session["running"]
++    finally:
++        cancel()
++        ta.settle(session)
++    assert fence.active_count() == 0
++
++
++def test_worker_exit_clears_running_after_mid_turn_settle(tmp_path, monkeypatch):
++    """A turn settled mid-turn still unwinds its own ``running`` flag when its worker exits."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    with ta.admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++        thread = ta.start_work(lambda: _settle_mid_turn(session), name="mid-turn-settle", session=session)
++    assert thread is not None
++    thread.join(5)
++    assert not thread.is_alive()
++    assert session["running"] is False
++    assert session.get("_turn_admission_generation") is None
++    assert session.get("_turn_admission") is None
++    assert fence.active_count() == 0
++
++
++def _settle_mid_turn(session):
++    with session["history_lock"]:
++        ta.settle(session)
+diff --git a/tests/tui_gateway/test_update_admission_handoff.py b/tests/tui_gateway/test_update_admission_handoff.py
+new file mode 100644
+index 0000000000..03fc455896
+--- /dev/null
++++ b/tests/tui_gateway/test_update_admission_handoff.py
+@@ -0,0 +1,269 @@
++"""Regression from independent review: publication is not external visibility."""
++import threading
++
++import pytest
++
++from hermes_cli import admission_fence as af, backend_retirement
++from tui_gateway import server
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++def test_unregistered_accepted_turn_stays_busy_until_worker_handoff(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(backend_retirement, "retirement", backend_retirement.RetirementFence())
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    try:
++        with server._session_turn_admission(session) as admitted:
++            assert admitted
++            session["running"] = True
++        # The record is not yet in server._sessions (session.start ordering).
++        # There is no externally readable running ledger, so the reservation
++        # must survive publication and an updater hold arriving before launch.
++        assert af.set_hold(tmp_path)["reservations"] == 1
++    finally:
++        session["running"] = False
++        server._clear_inflight_turn(session)
++
++
++@pytest.fixture
++def admitted(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(), "running": False}
++    with server._session_turn_admission(session) as accepted:
++        assert accepted
++        session["running"] = True
++        session["inflight_turn"] = {"user": "hello", "assistant": ""}
++    yield session, fence, tmp_path
++    with session["history_lock"]:
++        session["running"] = False
++        server._clear_inflight_turn(session)
++
++
++def test_adopt_under_hold_and_retain_through_cleanup(admitted):
++    session, fence, home = admitted
++    assert af.set_hold(home)["reservations"] == 1
++    cleared, finish = threading.Event(), threading.Event()
++    def run():
++        with session["history_lock"]:
++            session["running"] = False
++            server._clear_inflight_turn(session)
++        cleared.set()
++        assert finish.wait(5)
++    thread = server._start_session_work(run, name="handoff-test", session=session)
++    try:
++        assert thread is not None
++        assert cleared.wait(5)
++        assert fence.active_count() == 1
++        assert af.set_hold(home)["reservations"] == 1
++        assert server._start_session_work(lambda: None, name="fresh-test", home=home) is None
++    finally:
++        finish.set()
++        thread.join(5)
++    assert not thread.is_alive()
++    assert fence.active_count() == 0
++    assert af.set_hold(home)["reservations"] == 0
++
++
++def test_failure_snapshot_releases_session_but_not_worker(admitted):
++    session, fence, _ = admitted
++    failed, finish = threading.Event(), threading.Event()
++    def run():
++        with session["history_lock"]:
++            server._fail_inflight_turn(session, "build failed")
++        failed.set()
++        assert finish.wait(5)
++    thread = server._start_session_work(run, name="failure-test", session=session)
++    try:
++        assert failed.wait(5)
++        assert session["inflight_turn"]["error"] == "build failed"
++        assert fence.active_count() == 1
++    finally:
++        finish.set()
++        thread.join(5)
++    assert fence.active_count() == 0
++
++
++def test_nested_wait_worker_handoff_does_not_release_main(admitted):
++    session, fence, home = admitted
++    from tui_gateway.turn_admission import retained_callback
++    build, cancel = retained_callback(session, lambda: None)
++    entered, finish = threading.Event(), threading.Event()
++    threads = []
++    def main():
++        entered.set()
++        assert finish.wait(5)
++    def wait():
++        threads.append(server._start_session_work(main, name="main-test", session=session))
++    af.set_hold(home)
++    waiter = server._start_session_work(wait, name="wait-test", session=session)
++    try:
++        waiter.join(5)
++        assert entered.wait(5)
++        assert session["running"]
++        assert fence.active_count() == 1
++        finish.set()
++        threads[0].join(5)
++        # A cancelled/timed-out wait does not imply that the build unwound.
++        assert fence.active_count() == 1
++        build()
++        cancel()  # idempotent failure cleanup
++        assert fence.active_count() == 0
++    finally:
++        finish.set()
++        cancel()
++
++
++@pytest.mark.parametrize("during_start", [True, False])
++def test_worker_exception_releases_all_refs(admitted, monkeypatch, during_start):
++    import agent.memory_provider
++    session, fence, _ = admitted
++    queued = []
++    class Inline:
++        def __init__(self, run):
++            self.run = run
++        def start(self):
++            if during_start:
++                self.run()
++            else:
++                queued.append(self.run)
++    monkeypatch.setattr(agent.memory_provider, "spawn_context_thread", lambda run, **kw: Inline(run))
++    def fail():
++        raise RuntimeError("worker prologue")
++    with pytest.raises(RuntimeError, match="worker prologue"):
++        server._start_session_work(fail, name="broken", session=session)
++        if queued:
++            queued[0]()
++    assert not session["running"]
++    assert fence.active_count() == 0
++
++
++def test_spawn_failure_releases_all_refs(admitted, monkeypatch):
++    import agent.memory_provider
++    session, fence, _ = admitted
++    class Broken:
++        def start(self):
++            raise RuntimeError("cannot start")
++    monkeypatch.setattr(agent.memory_provider, "spawn_context_thread", lambda *a, **kw: Broken())
++    with pytest.raises(RuntimeError, match="cannot start"):
++        server._start_session_work(lambda: None, name="broken", session=session)
++    assert not session["running"]
++    assert fence.active_count() == 0
++
++
++def test_old_worker_cannot_clear_new_turn(admitted):
++    session, fence, _ = admitted
++    cleared, finish = threading.Event(), threading.Event()
++    def old():
++        with session["history_lock"]:
++            session["running"] = False
++            server._clear_inflight_turn(session)
++        cleared.set()
++        assert finish.wait(5)
++        with session["history_lock"]:
++            server._clear_inflight_turn(session)
++            server._fail_inflight_turn(session, "old failure")
++    thread = server._start_session_work(old, name="old-test", session=session)
++    try:
++        assert cleared.wait(5)
++        with server._session_turn_admission(session) as accepted:
++            assert accepted
++            session["running"] = True
++            session["inflight_turn"] = {"user": "new"}
++        assert fence.active_count() == 2
++    finally:
++        finish.set()
++        thread.join(5)
++    assert session["running"]
++    assert session["inflight_turn"] == {"user": "new"}
++    assert fence.active_count() == 1
++
++
++def test_admission_and_stage_exceptions_release(admitted):
++    from tui_gateway.turn_admission import stage
++    session, fence, _ = admitted
++    with pytest.raises(ValueError):
++        with stage(session):
++            raise ValueError("build scheduling failed")
++    assert fence.active_count() == 0
++    with pytest.raises(ValueError):
++        with server._session_turn_admission(session) as accepted:
++            assert accepted
++            session["running"] = True
++            raise ValueError("publication failed")
++    assert fence.active_count() == 0
++
++
++@pytest.mark.parametrize("terminal_type", ["turn.done", "turn.error"])
++def test_compute_completion_retains_until_callback_cleanup(admitted, monkeypatch, terminal_type):
++    from types import SimpleNamespace
++    session, fence, home = admitted
++    callbacks = []
++    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", dict)
++    monkeypatch.setattr(server, "_compute_host_turn_frame", lambda *a, **kw: {})
++    supervisor = SimpleNamespace(submit_turn=lambda frame, on_complete: callbacks.append(on_complete))
++    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *a: supervisor)
++    for name in ("_compute_host_adopt_frame_meta", "_apply_compute_host_metadata_mirror",
++                 "_release_deferred_active_session_lease", "_emit"):
++        monkeypatch.setattr(server, name, lambda *a, **kw: None)
++    monkeypatch.setattr(server, "_compute_host_session_info", lambda *a: {})
++    seen = []
++    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: seen.append(fence.active_count()))
++    af.set_hold(home)
++    result = server._submit_prompt_to_compute_host("r", "s", session, "hello")
++    assert "error" not in result
++    assert fence.active_count() == 1
++    callbacks[0]({"type": terminal_type})
++    assert seen == [1]
++    assert not session["running"]
++    assert fence.active_count() == 0
++    callbacks[0]({"type": terminal_type})  # duplicate completion cannot underflow
++    assert fence.active_count() == 0
++
++
++def test_compute_send_failure_preserves_inline_handoff(admitted, monkeypatch):
++    from types import SimpleNamespace
++    session, fence, home = admitted
++    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", dict)
++    monkeypatch.setattr(server, "_compute_host_turn_frame", lambda *a, **kw: {})
++    def submit(frame, on_complete):
++        on_complete({"reason": "send_failed"})
++        raise OSError("pipe closed")
++    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *a: SimpleNamespace(submit_turn=submit))
++    af.set_hold(home)
++    assert "error" in server._submit_prompt_to_compute_host("r", "s", session, "hello")
++    assert fence.active_count() == 1
++    thread = server._start_session_work(lambda: None, name="inline-fallback", session=session)
++    thread.join(5)
++    assert fence.active_count() == 0
++
++
++def test_real_wait_failure_and_build_cleanup(admitted, monkeypatch):
++    from tui_gateway.turn_admission import start_build_work
++    session, fence, home = admitted
++    building, finish = threading.Event(), threading.Event()
++    def build():
++        building.set()
++        assert finish.wait(5)
++    build_thread = start_build_work(session, build)
++    assert building.wait(5)
++    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *a: {"error": {"message": "build failed"}})
++    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
++    monkeypatch.setattr(server, "_session_info", lambda *a, **kw: {})
++    monkeypatch.setattr(server, "_emit_terminal_turn_error", lambda sid, record, error, **kw: server._fail_inflight_turn(record, error))
++    af.set_hold(home)
++    try:
++        waiter = server._start_session_work(
++            lambda: server._run_after_agent_ready("r", "s", session, "hello", None, None, None),
++            name="failed-build-wait", session=session)
++        waiter.join(5)
++        assert session["inflight_turn"]["error"] == "build failed"
++        assert not session["running"]
++        assert fence.active_count() == 1
++    finally:
++        finish.set()
++        build_thread.join(5)
++    assert fence.active_count() == 0
++
+diff --git a/tests/tui_gateway/test_update_admission_retry.py b/tests/tui_gateway/test_update_admission_retry.py
+new file mode 100644
+index 0000000000..6dae2c727f
+--- /dev/null
++++ b/tests/tui_gateway/test_update_admission_retry.py
+@@ -0,0 +1,71 @@
++"""Queued prompts remain queued and retry without admitting under a hold."""
++import threading
++
++import pytest
++
++from hermes_cli import admission_fence as af, backend_retirement
++from tui_gateway import admission_retry, server
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.mark.parametrize("hold", [False, True])
++def test_queue_retries_after_admission_unavailable(tmp_path, monkeypatch, hold):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(backend_retirement, "retirement", backend_retirement.RetirementFence())
++    timers = []
++    class Timer:
++        def __init__(self, delay, target):
++            self.target = target
++        def start(self):
++            timers.append(self)
++    monkeypatch.setattr(admission_retry.threading, "Timer", Timer)
++    queued = {"text": "keep me"}
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(),
++               "running": False, "queued_prompt": queued}
++    dispatched = []
++    def dispatch(rid, sid, record, envelope, generation):
++        dispatched.append(envelope)
++        record["running"] = False
++        server._clear_inflight_turn(record)
++        return True
++    monkeypatch.setattr(server, "_dispatch_claimed_queue", dispatch)
++    if hold:
++        af.set_hold(tmp_path)
++        assert server._drain_queued_prompt("r", "s", session)
++        assert server._drain_queued_prompt("r", "s", session)
++    else:
++        with af.admission_lock(tmp_path):
++            assert server._drain_queued_prompt("r", "s", session)
++            assert server._drain_queued_prompt("r", "s", session)
++    assert len(timers) == 1
++    assert session["queued_prompt"] is queued
++    assert not session["running"]
++    assert af.state(tmp_path)["reservations"] == 0
++    if hold:
++        timers.pop().target()
++        assert len(timers) == 1
++        assert not dispatched
++        af.clear_hold(tmp_path)
++    timers.pop().target()
++    assert dispatched == [queued]
++    assert not session.get("queued_prompt")
++    assert af.state(tmp_path)["reservations"] == 0
++    assert not session.get("_admission_retry")
++
++
++def test_pending_retry_does_not_resurrect_closed_queue(monkeypatch):
++    timers = []
++    class Timer:
++        def __init__(self, delay, target):
++            self.target = target
++        def start(self):
++            timers.append(self)
++    monkeypatch.setattr(admission_retry.threading, "Timer", Timer)
++    session = {"history_lock": threading.RLock(), "queued_prompt": {"text": "x"}}
++    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: pytest.fail("closed session retried"))
++    with session["history_lock"]:
++        assert admission_retry.retry_queued_prompt("r", "s", session)
++        session["_closing"] = True
++    timers[0].target()
++    assert "_admission_retry" not in session
+diff --git a/tui_gateway/admission_retry.py b/tui_gateway/admission_retry.py
+new file mode 100644
+index 0000000000..f4805a4ddc
+--- /dev/null
++++ b/tui_gateway/admission_retry.py
+@@ -0,0 +1,38 @@
++"""Retry durable queued prompts after an update hold or transient contention."""
++import threading
++
++
++def retry_queued_prompt(rid, sid, session):
++    """Called under history_lock; retain the envelope, not an admitted turn.
++
++    One timer per session. Each attempt re-enters the normal admission fence.
++    Backend shutdown/Stop may discard the queue; the callback checks it afresh.
++    """
++    from hermes_cli.backend_retirement import retirement
++    # Retirement refusal keeps its original semantics: the client is replacing
++    # this process, not waiting for an update hold/short filesystem contention.
++    if not retirement.acquire():
++        return False
++    retirement.release()
++    if session.get("_closing") or session.get("_finalized") or not session.get("queued_prompt"):
++        return False
++    if session.get("_admission_retry") is not None:
++        return True
++
++    def retry():
++        from tui_gateway import server
++        with session["history_lock"]:
++            session.pop("_admission_retry", None)
++            if session.get("_closing") or session.get("_finalized") or not session.get("queued_prompt"):
++                return
++        server._drain_queued_prompt(rid, sid, session)
++
++    timer = threading.Timer(0.25, retry)
++    timer.daemon = True
++    session["_admission_retry"] = timer
++    try:
++        timer.start()
++    except BaseException:
++        session.pop("_admission_retry", None)
++        raise
++    return True
+diff --git a/tui_gateway/compute_host_bridge.py b/tui_gateway/compute_host_bridge.py
+index ffff073d35..dccca70b95 100644
+--- a/tui_gateway/compute_host_bridge.py
++++ b/tui_gateway/compute_host_bridge.py
+@@ -243,6 +243,9 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
+ 
+ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+     with session["history_lock"]:
++        from tui_gateway.turn_admission import owns
++        if not owns(session):
++            return
+         _compute_host_adopt_frame_meta(session, frame)
+         session["running"] = False
+         session["last_active"] = time.time()
+@@ -290,9 +293,12 @@ def _submit_prompt_to_compute_host(
+                 session.pop("_compute_host_turn_id", None)
+                 session.pop("_compute_host_activity_ns", None)
+             _on_compute_host_turn_done(rid, sid, session, done)
++    from tui_gateway.turn_admission import retained_callback
++    complete, cancel_admission = retained_callback(session, _complete, settle_on_error=True)
+     try:
+-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
++        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=complete)
+     except Exception as exc:
++        cancel_admission()
+         with session["history_lock"]:
+             if session.get("_compute_host_turn_id") == turn_id:
+                 session.pop("_compute_host_turn_id", None)
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 9aef0066a3..991410c1ec 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -667,6 +667,10 @@ def _run_after_agent_ready(
+     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
+     # expires. See #63078.
+     err = _wait_agent_for_prompt(session, rid, sid)
++    from tui_gateway.turn_admission import owns
++    with session["history_lock"]:
++        if not owns(session):
++            return
+     if err:
+         message = (err.get("error") or {}).get("message", "agent initialization failed")
+         # Every exit before _run_prompt_submit is logged: its "tui prompt accepted" line never comes, and
+@@ -679,11 +683,15 @@ def _run_after_agent_ready(
+             sid, session, message,
+             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
+         with session["history_lock"]:
++            if not owns(session):
++                return
+             session["running"] = False
+             session["last_active"] = time.time()
+         _emit("session.info", sid, _session_info(session.get("agent"), session))
+         return
+     with session["history_lock"]:
++        if not owns(session):
++            return
+         if session.get("_turn_cancel_requested") or not session.get("running"):
+             session["running"] = False
+             _clear_inflight_turn(session)
+@@ -713,7 +721,7 @@ def _lock_in_submit_turn(
+     fields = {}
+     with _session_turn_admission(session) as admitted:
+         if not admitted:
+-            return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
++            return _err(rid, 5035, "backend is retiring or update admission is paused; retry after the update"), fields
+         if session.get("running"):
+             return _err(rid, 4009, "session busy", {"reason": "turn_claim_busy"}), fields
+         # A watch session's run lives in the PARENT turn (own running flag False); typing
+@@ -860,6 +868,14 @@ def _(rid, params: dict) -> dict:
+             display_kind=display_kind)
+         if busy_response is not None:
+             return busy_response
++    from tui_gateway.turn_admission import stage
++    with stage(session):
++        return _dispatch_admitted_prompt(rid, sid, session, text, turn_isolation, turn_author,
++            display_kind, display_metadata, survivor_fields, hosted_terminal_callback)
++
++
++def _dispatch_admitted_prompt(rid, sid, session, text, turn_isolation, turn_author,
++        display_kind, display_metadata, survivor_fields, hosted_terminal_callback):
+     if turn_isolation:
+         if turn_author:
+             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
+@@ -897,13 +913,10 @@ def _(rid, params: dict) -> dict:
+     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
+     if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
+         _start_agent_build(sid, session)
+-    run_thread = threading.Thread(
+-        target=lambda: _run_after_agent_ready(
++    _start_session_work(
++        lambda: _run_after_agent_ready(
+             rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
+-        daemon=True)
+-    # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
+-    session["_run_thread"] = run_thread
+-    run_thread.start()
++        name=f"prompt-wait-{sid}", session=session)
+     return _ok(rid, {"status": "streaming", **survivor_fields})
+ 
+ 
+@@ -1386,8 +1399,8 @@ def _spawn_side_agent(
+                 cleanup()
+             _clear_session_context(session_tokens)
+ 
+-    if _start_session_work(run, name=f"side-agent-{task_id}") is None:
+-        return _err(rid, 5035, "backend is retiring; reconnect to continue")
++    if _start_session_work(run, name=f"side-agent-{task_id}", home=session.get("profile_home")) is None:
++        return _err(rid, 5035, "backend is retiring or update admission is paused; retry after the update")
+     return _ok(rid, {"task_id": task_id})
+ 
+ 
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index dbd3c25468..43cecc4a2e 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -134,6 +134,10 @@ def _admit_prompt_turn(
+     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
+     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
+     bypass that once let a second backend run a duplicate turn."""
++    from tui_gateway.turn_admission import owns
++    with session["history_lock"]:
++        if not owns(session):
++            return None
+     held_lease = session.get("active_session_lease")
+     # When the session already holds its lease this is a cheap dict check. See #94778.
+     if not session.get("_closing") and (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
+@@ -142,6 +146,8 @@ def _admit_prompt_turn(
+             session.get("session_key") or sid,
+             getattr(ownership_refusal, "reason", None) or "refused")
+         with session["history_lock"]:
++            if not owns(session):
++                return None
+             session["running"] = False
+             staged = session.pop("_submit_user_row", None)
+             if _retain_unadmitted_submit_row(session["history"], staged):
+@@ -152,6 +158,8 @@ def _admit_prompt_turn(
+             error_surface={"layer": "gateway", "code": reason, "retryable": False})
+         return None
+     with session["history_lock"]:
++        if not owns(session):
++            return None
+         if session.get("_closing") or (
+             queued_prompt_generation is not None
+             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
+@@ -464,6 +472,14 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
+ 
+ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
+                             on_done=None, on_error=None) -> None:
++    # This is an explicitly claimed NEW continuation, unlike an old build waiter
++    # entering _run_prompt_submit. Adopt its generation before nested dispatch.
++    from tui_gateway.turn_admission import stage
++    with stage(session):
++        _dispatch_claimed_followup(rid, sid, session, prompt, what, on_done=on_done, on_error=on_error)
++
++
++def _dispatch_claimed_followup(rid, sid, session, prompt, what, *, on_done=None, on_error=None):
+     """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
+     release ``running``."""
+     try:
+@@ -474,9 +490,9 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
+     except Exception as exc:
+         if on_error is not None:
+             on_error()
++        logger.exception("Follow-up turn dispatch failed: %s", what)
+         _hook_failure(what, exc)
+-        with session["history_lock"]:
+-            session["running"] = False
++        _notif_release_turn(session)
+ 
+ 
+ def _run_post_turn_followups(
+@@ -1175,7 +1191,13 @@ def _reopen_routed_session_row(db, sid: str, session: dict) -> None:
+         logger.debug("routing-provenance reopen failed for %s", session_id, exc_info=True)
+ 
+ 
+-def _run_prompt_submit(
++def _run_prompt_submit(rid, sid, session, text, **kwargs):
++    from tui_gateway.turn_admission import stage
++    with stage(session, inherit=True):
++        return _run_admitted_prompt(rid, sid, session, text, **kwargs)
++
++
++def _run_admitted_prompt(
+     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
+     display_metadata: dict | None = None, image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None,
+@@ -1192,6 +1214,9 @@ def _run_prompt_submit(
+     admitted = _admit_prompt_turn(
+         sid, session, text, image_paths, queued_prompt_generation, display_kind, display_metadata)
+     if admitted is None:
++        from tui_gateway.turn_admission import settle
++        with session["history_lock"]:
++            settle(session)
+         return False
+     images, agent = admitted
+     from gateway.warning_notifications import diagnostic_turn_muted
+@@ -1260,22 +1285,15 @@ def _run_prompt_submit(
+             # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
+             _publish_session_control_snapshot(sid, session, only_if_present=True)
+         except Exception as e:
++            logger.exception("Prompt turn failed")
+             _recover_turn_exception(sid, session, st, e)
+         finally:
+             _release_turn_scopes(sid, session, st)
+             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
+                 _current_runtime_session_record.reset(runtime_session_token)
+                 reset_transport(transport_token)
+-                # A stale interim closure must not fire during a later turn.
+-                st.agent.interim_assistant_callback = None
+-                with session["history_lock"]:
+-                    session["running"] = False
+-                    session["last_active"] = time.time()
+-                    session.pop("_turn_user_input", None)  # per turn: never leaks into the next one
+-                    session.pop("_stop_issuer", None)  # [daveey] ditto: a raised turn never consumed it
+-                    if not st.error_retained:
+-                        _clear_inflight_turn(session)
+-                    _release_hosted_room_turn_slot(session)
++                from tui_gateway.turn_admission import settle_prompt_state
++                settle_prompt_state(session, st)
+                 # Closing bookend of "tui prompt accepted" — exactly one per accepted prompt.
+                 # agent.session_id is re-read because compression may have rotated it (an
+                 # accepted/finished pair whose id changed IS a rotation trace).
+@@ -1295,8 +1313,13 @@ def _run_prompt_submit(
+                     with session["history_lock"]:
+                         if session.get("_active_turn_marker_key") == st.marker_key:
+                             session.pop("_active_turn_marker_key", None)
+-                        session.pop("_hosted_room_task", None)
+-                session.pop("_auto_continue_scheduled", None)
++                        from tui_gateway.turn_admission import owns
++                        if owns(session):
++                            session.pop("_hosted_room_task", None)
++                with session["history_lock"]:
++                    from tui_gateway.turn_admission import owns
++                    if owns(session):
++                        session.pop("_auto_continue_scheduled", None)
+                 _emit_settled_session_info(sid, session, st.agent)
+             finally:
+                 _post_turn_housekeeping(sid, session, st)
+@@ -1322,8 +1345,11 @@ def _run_prompt_submit(
+                 _reopen_routed_session_row(routing_db, sid, session)
+             can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
+     if not can_start:
++        from tui_gateway.turn_admission import owns
+         with session["history_lock"]:
+-            session["running"] = False
++            if owns(session):
++                session["running"] = False
++                _clear_inflight_turn(session)
+     return can_start
+ 
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 68b5281ecd..c53b885118 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1243,10 +1243,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
+                 sid, key, current, notify_registered=notify_registered, scopes=scopes, session_db=session_db)
+             ready.set()
+ 
+-    build_thread = threading.Thread(target=_build, daemon=True)
+-    # _wait_agent_for_prompt handle: dead thread + unset agent_ready = died hard; waiters must not sit out the cap.
+-    session["_agent_build_thread"] = build_thread
+-    build_thread.start()
++    from tui_gateway.turn_admission import start_build_work
++    start_build_work(session, _build)
+ 
+ 
+ def _sess_nowait(params, rid):
+@@ -2967,9 +2965,8 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
+     def _run():
+         if (session := _sessions.get(sid)) is not None:
+             _start_agent_build(sid, session)
+-    timer = threading.Timer(delay, _run)
+-    timer.daemon = True
+-    timer.start()
++    from tui_gateway.turn_admission import start_build_work
++    start_build_work(_sessions.get(sid) or {}, _run, delay=delay)
+ 
+ 
+ def _load_resume_transcript(db, stored_id: str, *, model_history_only: bool = False) -> tuple[list, list, list]:
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index b0378324af..f02b9bfa6f 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -138,7 +138,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         except Exception as exc:
+             _notif_log_failure("auto-continue dispatch failed", exc)
+             _notif_release_turn(session)  # rebound from session_notifications
+-    if _start_session_work(kickoff, name=f"auto-continue-{sid}") is None:
++    if _start_session_work(kickoff, name=f"auto-continue-{sid}", home=session.get("profile_home")) is None:
+         session["_auto_continue_scheduled"] = False
+         return None
+     logger.info("auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago, writer pid %s: %s, "
+@@ -465,7 +465,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+     """Fire a queued next-turn prompt if one is waiting and the session is idle. True when dispatched: the caller
+     skips lower-priority follow-ups this cycle (the user's message wins)."""
+     with _session_turn_admission(session) as admitted:
+-        if not admitted or session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
++        if not admitted:
++            from tui_gateway.admission_retry import retry_queued_prompt
++            return retry_queued_prompt(rid, sid, session)
++        if session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
+             return False
+         queue_generation = int(session.get("_queued_prompt_generation", 0))
+         _ac_set_queue(session, session.get("queued_prompts") or [])
+@@ -477,6 +480,12 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+         # prompt still runs, only the dead pin is dropped.
+         if queued_transport is not None and not _transport_is_dead(queued_transport):
+             _attach_session_transport(session, queued_transport)
++    from tui_gateway.turn_admission import stage
++    with stage(session):
++        return _dispatch_claimed_queue(rid, sid, session, queued, queue_generation)
++
++
++def _dispatch_claimed_queue(rid, sid, session, queued, queue_generation):
+     use_compute_host = _session_uses_compute_host(session)
+     with session["history_lock"]:
+         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+@@ -486,6 +495,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+             advanced = session.get("queued_prompt")
+             _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
+             session["running"] = False
++            _clear_inflight_turn(session)
+             return True
+     kwargs: dict = {"queued_prompt_generation": queue_generation}
+     if queued.get("image_paths"):
+@@ -521,6 +531,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+             _emit("error", sid, {"message": str((resp.get("error") or {}).get("message") or "queued prompt failed")})
+             dispatch_failed = True
+     except Exception as exc:
++        logger.exception("Queued prompt dispatch failed")
+         _notif_log_failure("queued prompt dispatch failed", exc)
+         _notif_release_turn(session)
+         dispatch_failed = True
+diff --git a/tui_gateway/session_history.py b/tui_gateway/session_history.py
+index 941d4d711a..da4e968fc3 100644
+--- a/tui_gateway/session_history.py
++++ b/tui_gateway/session_history.py
+@@ -429,6 +429,9 @@ def _record_inflight_correction(session: dict, text: Any) -> None:
+ 
+ 
+ def _clear_inflight_turn(session: dict) -> None:
++    from tui_gateway.turn_admission import settle
++    if not settle(session):
++        return
+     session["inflight_turn"] = None
+     # A turn that never reached the agent (cancelled/refused before ready) leaves its submit-time row
+     # as the durable record of the send; a later turn must not adopt it as its own input.
+@@ -439,6 +442,9 @@ def _fail_inflight_turn(session: dict, error: Any, error_surface: Optional[dict]
+     """Mark the in-flight turn terminal-error but keep it replayable: a failure's terminal frame can be lost on
+     WS disconnect and the turn may never have been committed, so the snapshot lets ``session.resume`` replay
+     prompt, partial text and error. Lives until the next turn starts or the session closes. Caller holds history_lock."""
++    from tui_gateway.turn_admission import settle
++    if not settle(session):
++        return
+     message = str(error) if not isinstance(error, BaseException) else (str(error) or type(error).__name__)
+     now = time.time()
+     turn = session.get("inflight_turn")
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index d0e658a169..d393e79910 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -14,36 +14,16 @@ from .method_ctx import bind_module
+ 
+ @contextlib.contextmanager
+ def _session_turn_admission(session: dict):
+-    """Hold process admission until the history-locked running claim is visible to idle probes."""
+-    from hermes_cli.backend_retirement import retirement
+-
+-    with retirement.work() as admitted, session["history_lock"]:
++    """Retain admission from the running claim through terminal cleanup."""
++    from tui_gateway.turn_admission import admission
++    with admission(session) as admitted:
+         yield admitted
+ 
+ 
+-def _start_session_work(target, *, name: str, session: dict | None = None):
+-    """Reserve before spawning; release only after the worker (including cleanup) has unwound."""
+-    from agent.memory_provider import spawn_context_thread
+-    from hermes_cli.backend_retirement import retirement
+-
+-    if not retirement.acquire():
+-        return None
+-
+-    def run():
+-        try:
+-            target()
+-        finally:
+-            retirement.release()
+-
+-    try:
+-        thread = spawn_context_thread(run, name=name)
+-        if session is not None:
+-            session["_run_thread"] = thread
+-        thread.start()
+-        return thread
+-    except BaseException:
+-        retirement.release()
+-        raise
++def _start_session_work(target, *, name: str, session: dict | None = None, home=None):
++    """Adopt accepted admission, or reserve fresh work, through worker cleanup."""
++    from tui_gateway.turn_admission import start_work
++    return start_work(target, name=name, session=session, home=home)
+ 
+ 
+ def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> list[str]:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index a3da7c0abe..935e41fc97 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -141,8 +141,10 @@ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = _BOT_DELIVERY_POLL_SECONDS = 5.0
+ 
+ 
+ def _notif_release_turn(session: dict) -> None:
++    from tui_gateway.turn_admission import settle
+     with session["history_lock"]:
+-        session["running"] = False
++        if settle(session):
++            session["running"] = False
+ 
+ 
+ def _notif_claim_turn(session: dict) -> bool:
+@@ -160,6 +162,16 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
+     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
+ 
+ 
++def _notif_run_submit(rid, sid, session, text, **kwargs):
++    """Run a turn this caller just claimed via _notif_claim_turn.
++
++    A plain stage() adopts the freshly claimed generation instead of inheriting a stale
++    one from an enclosing worker context (which would refuse the new turn and leak it)."""
++    from tui_gateway.turn_admission import stage
++    with stage(session):
++        return _run_prompt_submit(rid, sid, session, text, **kwargs)
++
++
+ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> Any:
+     """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure.
+     Returns the gate's verdict (False = refused, no turn runs)."""
+@@ -170,7 +182,7 @@ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwa
+                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
+         # The admission gate's verdict: False = refused (e.g. SESSION_NOT_OWNED, another backend owns the
+         # chat). Callers that already took the notice off a durable store must put it back. [daveey]
+-        return _run_prompt_submit(rid, sid, session, text, **kwargs)
++        return _notif_run_submit(rid, sid, session, text, **kwargs)
+     except Exception as exc:
+         _notif_log_failure(what, exc)
+         _notif_release_turn(session)
+@@ -255,7 +267,7 @@ def _maybe_fire_tui_heartbeat_tick(sid: str, session: dict) -> None:
+     started = False
+     try:
+         _emit("status.update", sid, {"kind": "heartbeat", "text": f"♥ heartbeat #{mgr.state.fire_count} firing…"})
+-        started = bool(_run_prompt_submit(f"__heartbeat__{int(time.time() * 1000)}", sid, session, prompt))
++        started = bool(_notif_run_submit(f"__heartbeat__{int(time.time() * 1000)}", sid, session, prompt))
+     except Exception as exc:
+         _notif_log_failure("heartbeat dispatch failed", exc)
+     if not started:
+@@ -319,7 +331,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
+             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
+         else:
+             _emit("message.start", sid)
+-            _run_prompt_submit(rid, sid, session, wakeup)
++            _notif_run_submit(rid, sid, session, wakeup)
+     except Exception as exc:
+         _notif_log_failure("loop wakeup dispatch failed", exc)
+         _notif_release_turn(session)
+@@ -808,7 +820,7 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
+                           error=error, reason=reason)
+ 
+     try:
+-        started = _run_prompt_submit(f"__bot_dm__{delivery_id}", sid, session, claimed["message"],
++        started = _notif_run_submit(f"__bot_dm__{delivery_id}", sid, session, claimed["message"],
+                                      image_paths=[], terminal_callback=terminal_receipt,
+                                      turn_author=claimed.get("author") or None,
+                                      **({"display_metadata": {"notification_category": "diagnostic"}}
+diff --git a/tui_gateway/session_start_requests.py b/tui_gateway/session_start_requests.py
+index 625f869eec..0179b9736b 100644
+--- a/tui_gateway/session_start_requests.py
++++ b/tui_gateway/session_start_requests.py
+@@ -66,7 +66,16 @@ class GatewayStartRuntime:
+         if error:
+             finish("failed")
+             return
++        from tui_gateway.turn_admission import stage
++        with stage(record):
++            self._schedule_admitted(sid, key, record, intent, finish)
++
++    def _schedule_admitted(self, sid, key, record, intent, finish):
++        server = self.server
+         if server._claim_or_reuse_live(sid, key, record, None) is not None:
++            with record["history_lock"]:
++                record["running"] = False
++                server._clear_inflight_turn(record)
+             finish("failed")
+             return
+         server._schedule_agent_build(sid)
+diff --git a/tui_gateway/turn_admission.py b/tui_gateway/turn_admission.py
+new file mode 100644
+index 0000000000..a6b163d774
+--- /dev/null
++++ b/tui_gateway/turn_admission.py
+@@ -0,0 +1,261 @@
++"""Retained admission ownership across asynchronous turn handoffs.
++
++A session owns one reference until terminal settlement; each executing stage owns
++another. Clearing the UI's in-flight state must not make unwinding work idle.
++"""
++from contextlib import contextmanager, nullcontext
++from contextvars import ContextVar
++import threading
++
++_current: ContextVar[tuple | None] = ContextVar("turn_admission_owner", default=None)
++_KEY = "_turn_admission"
++
++
++class TurnAdmission:
++    def __init__(self, reservation):
++        self.reservation = reservation
++        self.lock = threading.RLock()
++        self.refs = 1
++        self.workers = 0
++
++    def retain(self):
++        with self.lock:
++            if not self.refs:
++                raise RuntimeError("turn admission already released")
++            self.refs += 1
++        return self
++
++    def release(self):
++        with self.lock:
++            self.refs -= 1
++            if self.refs == 0:
++                self.reservation.__exit__(None, None, None)
++
++
++def acquire(home=None):
++    from hermes_cli.backend_retirement import retirement
++    reservation = retirement.reservation(home)
++    if not reservation.__enter__():
++        reservation.__exit__(None, None, None)
++        return None
++    return TurnAdmission(reservation)
++
++
++def owns(session):
++    current = _current.get()
++    if current is None or current[0] is not session:
++        return True
++    # A turn that already settled (generation cleared mid-turn) still owns its own
++    # unwinding; only a newer admitted turn's generation makes this worker stale.
++    generation = session.get("_turn_admission_generation")
++    return generation is None or generation is current[1]
++
++
++def settle(session):
++    """Caller holds history_lock. A stale worker cannot settle a newer turn."""
++    if not owns(session):
++        return False
++    token = session.pop(_KEY, None)
++    if token is not None:
++        if session.get("_turn_admission_generation") is token:
++            session.pop("_turn_admission_generation", None)
++        token.release()
++    return True
++
++
++@contextmanager
++def admission(session):
++    token = acquire(session.get("profile_home"))
++    with session["history_lock"]:
++        claimed = token is not None and not session.get("running")
++        if claimed:
++            old = session.pop(_KEY, None)
++            if old is not None:
++                old.release()
++            session[_KEY] = token
++            session["_turn_admission_generation"] = token
++        try:
++            yield token is not None
++        except BaseException:
++            if claimed:
++                session["running"] = False
++                if session.get(_KEY) is token:
++                    session.pop(_KEY)
++                    if session.get("_turn_admission_generation") is token:
++                        session.pop("_turn_admission_generation", None)
++                    token.release()
++            raise
++        else:
++            if claimed and not session.get("running") and session.get(_KEY) is token:
++                session.pop(_KEY)
++                if session.get("_turn_admission_generation") is token:
++                    session.pop("_turn_admission_generation", None)
++                token.release()
++        finally:
++            if token is not None and not claimed:
++                token.release()
++
++
++@contextmanager
++def stage(session, *, inherit=False):
++    """Protect handoff preparation; nested dispatch inherits its creating turn."""
++    with session["history_lock"]:
++        current = _current.get()
++        token = (current[1] if inherit and current is not None and current[0] is session
++                 else session.get(_KEY))
++        if token is not None:
++            token.retain()
++    context = _current.set((session, token))
++    try:
++        yield
++    except BaseException:
++        with session["history_lock"]:
++            if owns(session):
++                session["running"] = False
++                settle(session)
++        raise
++    finally:
++        _current.reset(context)
++        if token is not None:
++            token.release()
++
++
++def retained_callback(session, target, *, settle_on_error=False):
++    """Return a one-shot callback and cancellation function sharing one reference."""
++    with session.get("history_lock", nullcontext()):
++        current = _current.get()
++        # A callback belongs to its creating stage, not whichever turn happens
++        # to occupy the session after an interrupt and resubmit.
++        token = current[1] if current is not None and current[0] is session else session.get(_KEY)
++        if token is not None:
++            token.retain()
++    lock = threading.Lock()
++    pending = True
++
++    def cancel():
++        nonlocal pending
++        with lock:
++            if pending:
++                pending = False
++                if token is not None:
++                    token.release()
++
++    def run(*args, **kwargs):
++        context = _current.set((session, token))
++        try:
++            return target(*args, **kwargs)
++        except BaseException:
++            if settle_on_error:
++                with session["history_lock"]:
++                    if owns(session):
++                        session["running"] = False
++                        settle(session)
++            raise
++        finally:
++            _current.reset(context)
++            cancel()
++    return run, cancel
++
++
++def settle_prompt_state(session, st):
++    import time
++    from tui_gateway import server
++    with session["history_lock"]:
++        if not owns(session):
++            return
++        st.agent.interim_assistant_callback = None
++        session["running"] = False
++        session["last_active"] = time.time()
++        session.pop("_turn_user_input", None)
++        session.pop("_stop_issuer", None)
++        if not st.error_retained:
++            server._clear_inflight_turn(session)
++        server._release_hosted_room_turn_slot(session)
++
++
++def start_build_work(session, target, *, delay=None):
++    run, cancel = retained_callback(session, target)
++    try:
++        thread = (threading.Thread(target=run, daemon=True) if delay is None
++                  else threading.Timer(delay, run))
++        thread.daemon = True
++        if delay is None:
++            session["_agent_build_thread"] = thread
++        thread.start()
++        return thread
++    except BaseException:
++        cancel()
++        raise
++
++
++def start_work(target, *, name, session=None, home=None):
++    from agent.memory_provider import spawn_context_thread
++    if session is not None:
++        with session["history_lock"]:
++            if not owns(session):
++                return None
++            current = _current.get()
++            token = current[1] if current is not None and current[0] is session else session.get(_KEY)
++            if token is not None:
++                token.retain()
++    else:
++        token = None
++    if token is None:
++        token = acquire(home or (session or {}).get("profile_home"))
++        if token is not None and session is not None:
++            with session["history_lock"]:
++                existing = session.get(_KEY)
++                if existing is not None:
++                    token.release()
++                    token = existing.retain()
++                else:
++                    session[_KEY] = token.retain()
++                    session["_turn_admission_generation"] = token
++    if token is None:
++        return None
++    with token.lock:
++        token.workers += 1
++    finished = False
++    finish_lock = threading.Lock()
++
++    def finish():
++        nonlocal finished
++        with finish_lock:
++            if finished:
++                return
++            finished = True
++        # The final worker also covers failures before normal terminal cleanup.
++        if session is not None:
++            with session["history_lock"], token.lock:
++                token.workers -= 1
++                if token.workers == 0 and session.get("_turn_admission_generation") in (None, token) and not session.get("_compute_host_turn_id"):
++                    session["running"] = False
++                    settle(session)
++        else:
++            with token.lock:
++                token.workers -= 1
++        token.release()
++
++    def run():
++        context = _current.set((session, token))
++        try:
++            target()
++        finally:
++            try:
++                finish()
++            finally:
++                _current.reset(context)
++
++    try:
++        thread = spawn_context_thread(run, name=name)
++        if session is not None:
++            session["_run_thread"] = thread
++        thread.start()
++        return thread
++    except BaseException:
++        context = _current.set((session, token))
++        try:
++            finish()
++        finally:
++            _current.reset(context)
++        raise
+diff --git a/website/docs/developer-guide/update-admission.md b/website/docs/developer-guide/update-admission.md
+new file mode 100644
+index 0000000000..f6ebac8389
+--- /dev/null
++++ b/website/docs/developer-guide/update-admission.md
+@@ -0,0 +1,79 @@
++# Update admission protocol, version 1
++
++This is a prerequisite for an external safe updater, not an updater or a deployment.
++It covers cooperating Desktop/TUI turn reservations and normal/review Kanban claims
++on POSIX. It does not by itself drain messaging gateways, cron, CLI, or old backends.
++Windows advertises `supported: false` and retains its existing admission behavior.
++
++## Capability and standalone interface
++
++The stdlib-only capability probe runs without importing the live backend or using
++its managed environment:
++
++```
++python3 -S <checkout>/hermes_cli/admission_fence.py capability
++python3 -S <checkout>/hermes_cli/admission_fence.py hold --home <root>
++python3 -S <checkout>/hermes_cli/admission_fence.py state --home <root>
++python3 -S <checkout>/hermes_cli/admission_fence.py release --home <root>
++```
++
++Capability version 1 identifies an installation-root scope. The root is the result of
++`get_default_hermes_root(home=<profile-home>)`: named profiles share their root fence;
++independent homes need independent fences. Board storage overrides do not change the
++installation whose dispatcher claims work. Every process consuming changed code must
++be covered; a capability probe of files does NOT prove already-running processes loaded
++that version. The first installation requires operator-owned quiescence/bootstrap.
++
++## Locking and updater order
++
++1. Serialize updaters separately (the existing apply lock). Acquire
++   `<root>/core-update/admission.lock` with exclusive flock. Never delete or replace
++   this lock file: its inode is the cross-process rendezvous.
++2. Create `<root>/core-update/holds/hermes-sync` while holding that lock, then release
++   the lock. The standalone `hold` action does this and returns reservation state.
++   Keep the hold for the entire drain, install and verification. A crashed updater
++   leaves the marker in place; only explicit recovery removes it.
++3. Read reservation state under admission.lock BEFORE reading other busy ledgers.
++   `reservations` counts pending Desktop reservations and detached workers through
++   cleanup. Locked files count as busy regardless of age. Unlocked files are stale
++   crash remnants and can be removed. An unreadable state or lock timeout is unknown,
++   never zero. The state is deliberately not an overall `idle` verdict.
++4. After that snapshot, obtain fresh existing Desktop/backend idle proofs and scan
++   all Kanban boards for running claims/runs, including committed claims that have
++   not published worker PIDs yet. Do not reuse a DB snapshot opened before the hold.
++   Independently stop/drain admission sources outside this protocol before changing
++   their shared code. Never hold admission.lock while making backend RPCs or obtaining
++   other busy-ledger locks.
++5. Only after every covered producer is drained, install and verify. Explicitly
++   remove the hold under admission.lock once safe. Do not auto-clear it on age/PID.
++
++The Desktop reservation composes the process retirement fence with the filesystem
++reservation without holding either lock while acquiring the other. The turn-publication
++reservation is retained across the history-locked running claim, session registration,
++agent build, wait, worker dispatch and compute completion. Each executing stage retains
++its own reference until cleanup. An already admitted turn can hand off under the hold;
++a new turn cannot. New reservations bound lock contention to 50ms, rather than waiting
++for the updater's 10-second timeout while a backend session-map lock is held. Queued
++user prompts retain their envelopes and retry through the fence with one 250ms timer
++per session; new direct submissions report a retryable paused-or-busy error. Pending
++unpublished turns are included in the file count.
++
++This is not a whole-process execution lock. Session-create/resume prewarm builds,
++idle RPC handlers, notification polling, and retry timers can execute without a turn
++reservation. The updater MUST independently quiesce/stop these backend processes
++and suppress supervisor respawn before mutating their source or environment; zero
++reservations does not authorize a live-tree swap. Desktop SSH-isolated `serve` and
++stdio TUI turn submissions both route through this same lifecycle. A source probe
++is never live attestation: unknown/old consumers require the operator bootstrap,
++with verified process exit/restart against the merged revision before using the fence.
++
++Kanban acquires the SQLite write transaction BEFORE trying admission.lock without
++waiting, so database contention cannot monopolize admission. Accepted claims hold
++admission.lock through the actual SQL commit (including retry/rollback). Existing
++transactions are rejected. Successful commit publishes both task and
++run; hooks run after release. Held admissions return no claim and log the pause reason.
++An updater waiting for the lock cannot overtake an in-progress claim commit.
++
++Use local POSIX filesystems with reliable flock semantics. Reservation descriptors are
++close-on-exec; an explicit fork that retains descriptors can conservatively extend busy
++state until the fork exits. This protocol never expires a live lock to manufacture idle.
+-- 
+2.55.0
+

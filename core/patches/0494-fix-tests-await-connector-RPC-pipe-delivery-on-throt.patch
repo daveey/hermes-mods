@@ -1,0 +1,116 @@
+From c65a9c98b51a47544f427d02d0fb45429bc69fad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:07:53 -0700
+Subject: [PATCH] fix(tests): await connector RPC pipe delivery on throttled CI
+ [daveey] (#90)
+
+Co-authored-by: daveey <daveey@users.noreply.github.com>
+---
+ .../test_connector_operation_rpc.py           | 54 +++++++++----------
+ 1 file changed, 24 insertions(+), 30 deletions(-)
+
+diff --git a/tests/tui_gateway/test_connector_operation_rpc.py b/tests/tui_gateway/test_connector_operation_rpc.py
+index 6f6b3b3a09..94161601a8 100644
+--- a/tests/tui_gateway/test_connector_operation_rpc.py
++++ b/tests/tui_gateway/test_connector_operation_rpc.py
+@@ -11,7 +11,6 @@
+ import json
+ import os
+ import threading
+-import time
+ from contextlib import ExitStack, suppress
+ 
+ import pytest
+@@ -31,12 +30,15 @@ class PipeClient:
+         stack.callback(lambda: suppress(BrokenPipeError) and self.writer.close())
+         self.transport = StdioTransport(lambda: self.writer, threading.Lock())
+         self.frames = []
++        self.received = threading.Condition()
+         self.thread = threading.Thread(target=self._read, daemon=True)
+         self.thread.start()
+ 
+     def _read(self):
+         for line in self.reader:
+-            self.frames.append(json.loads(line))
++            with self.received:
++                self.frames.append(json.loads(line))
++                self.received.notify_all()
+ 
+     def write(self, obj):
+         return self.transport.write(obj)
+@@ -45,13 +47,22 @@ class PipeClient:
+         pass
+ 
+     def events(self, kind, *, expect=1):
+-        deadline = time.time() + 2
+-        while time.time() < deadline:
+-            found = [f["params"] for f in list(self.frames) if f.get("method") == "event" and f["params"]["type"] == kind]
+-            if len(found) >= expect:
+-                return found
+-            time.sleep(0.01)
+-        return [f["params"] for f in list(self.frames) if f.get("method") == "event" and f["params"]["type"] == kind]
++        def matching():
++            return [f["params"] for f in self.frames if f.get("method") == "event" and f["params"]["type"] == kind]
++
++        with self.received:
++            assert self.received.wait_for(lambda: len(matching()) >= expect, timeout=30), f"missing {kind} events"
++            return matching()
++
++    def reply(self, before):
++        def matching():
++            return [f for f in self.frames[before:] if f.get("id") == 7]
++
++        # Both the handler pool and the pipe reader need CPU on throttled CI.
++        # Wake on delivery; the generous bound only limits broken tests.
++        with self.received:
++            assert self.received.wait_for(matching, timeout=30), "no reply"
++            return matching()[-1]
+ 
+ 
+ SID = "op-rpc-session"
+@@ -76,26 +87,12 @@ def _rpc(client, method, **params):
+                                 "params": {"owner": {"type": "session", "session_id": SID}, **params}}, client.transport)
+     if response is not None:
+         return response
+-    deadline = time.time() + 2
+-    while time.time() < deadline:
+-        replies = [frame for frame in list(client.frames)[before:] if frame.get("id") == 7]
+-        if replies:
+-            return replies[-1]
+-        time.sleep(0.01)
+-    raise AssertionError("no reply")
++    return client.reply(before)
+ 
+ 
+ def _connect_rpc(client, **params):
+     """``connectors.connect`` runs on the long-handler pool and writes its reply to the transport."""
+-    before = len(client.frames)
+-    _rpc(client, "connectors.connect", **params)
+-    deadline = time.time() + 2
+-    while time.time() < deadline:
+-        replies = [f for f in list(client.frames)[before:] if f.get("id") == 7]
+-        if replies:
+-            return replies[-1]
+-        time.sleep(0.01)
+-    raise AssertionError("no reply")
++    return _rpc(client, "connectors.connect", **params)
+ 
+ 
+ def _open_op():
+@@ -234,11 +231,8 @@ def test_a_failed_reissue_leaves_the_row_failed_with_no_link(owned, monkeypatch,
+     monkeypatch.setattr("tools.connectors.connectors_available", lambda: True)
+     monkeypatch.setattr("model_tools._select_tool_names", lambda *a, **k: {"manage_connections"})
+ 
+-    before = len(owner.frames)
+-    _rpc(owner, "connectors.connect", connectors=["notion"])
+-    deadline = time.time() + 2
+-    while time.time() < deadline and not [f for f in list(owner.frames)[before:] if f.get("id") == 7]:
+-        time.sleep(0.01)
++    reply = _rpc(owner, "connectors.connect", connectors=["notion"])
++    assert "result" in reply, reply
+     target = operation.target("notion")
+     assert target.state == TargetState.failed
+     assert target.connect_url is None
+-- 
+2.55.0
+

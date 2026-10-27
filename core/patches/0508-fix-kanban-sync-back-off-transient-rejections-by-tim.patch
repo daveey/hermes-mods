@@ -1,0 +1,136 @@
+From e1db6f8e773fe7978d25a954a799b4e3e5898b64 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:22:30 -0700
+Subject: [PATCH] fix(kanban-sync): back off transient rejections by time; send
+ child rows whole [daveey]
+
+Seen live after the task_chat_links deploy: the busy default Board took
+far longer than 10 rounds (seconds) to pick up the new code, so requeued
+rows hit the retry cap and were rejected again; and link updates captured
+with only the changed column reached the service after their insert had been
+refused, with no task_id, and were refused not_found.
+
+- Transient rejections set retry_after (2 s doubling to 5 min; 20 attempts,
+  about an hour) instead of retrying every round.
+- Child rows (runs, comments, events, attachments, chat links) always go as
+  the full current row, so every op stands alone.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_db_sync.py                |  1 +
+ hermes_cli/kanban_sync_client.py            | 28 ++++++++++++++++-----
+ tests/hermes_cli/test_kanban_sync_client.py | 21 ++++++++++++++++
+ 3 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index c225ab4044..627ca6f80e 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -161,6 +161,7 @@ _SYNC_COLUMN_DDL = (
+     ("tasks", "lease_holder", "lease_holder TEXT"),
+     ("tasks", "lease_expires", "lease_expires INTEGER"),
+     ("tasks", "created_on", "created_on TEXT"),
++    ("kanban_sync_outbox", "retry_after", "retry_after INTEGER"),
+ )
+ 
+ # Resolved db paths whose triggers this process installed. Empty = no synced
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 861e731d94..98fb799750 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -200,8 +200,17 @@ def translate(row: dict, hlc: str) -> dict:
+ def _full_row_if_unseen(conn: sqlite3.Connection, row: dict) -> dict:
+     """A task edit captured before the service has acknowledged the card (``sync_version`` NULL: it was created
+     before sync was switched on and not imported yet) carries only the changed columns, which the service cannot
+-    insert. Send the card's full current row instead; a later edit is then a plain merge."""
+-    if row["table_name"] != "tasks" or row["op"] != "upsert":
++    insert. Send the card's full current row instead; a later edit is then a plain merge.
++
++    Child rows (runs, comments, events, attachments, chat links) are small and always go whole: an update captured
++    for a row whose insert the service refused earlier (a deploy still rolling out) would otherwise reach it with no
++    ``task_id`` and be refused ``not_found``."""
++    if row["op"] != "upsert":
++        return row
++    if row["table_name"] in sync._UID_TABLES:
++        child = conn.execute(f"SELECT * FROM {row['table_name']} WHERE uid = ?", (row["row_uid"],)).fetchone()
++        return {**row, "fields": _row_fields(conn, row["table_name"], child)} if child is not None else row
++    if row["table_name"] != "tasks":
+         return row
+     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["row_uid"],)).fetchone()
+     if task is None or task["sync_version"] is not None:
+@@ -212,7 +221,13 @@ def _full_row_if_unseen(conn: sqlite3.Connection, row: dict) -> dict:
+ # Rejections the service lifts on its own; anything else is final. A capped number of retries keeps a real mismatch
+ # (an old service that will never know the table) visible as rejected instead of retrying forever.
+ TRANSIENT_REASONS = ("storage_error", "depends_on_rejected")
+-MAX_TRANSIENT_ATTEMPTS = 10
++# Backed off 2 s doubling to 5 min: 20 attempts span about an hour, longer than a Durable Object takes to pick up
++# a deploy (observed: minutes to an hour on a busy board).
++MAX_TRANSIENT_ATTEMPTS = 20
++
++
++def _backoff_s(attempts: int) -> int:
++    return min(2 ** (attempts + 1), 300)
+ 
+ 
+ def transient_rejection(res: dict) -> bool:
+@@ -236,7 +251,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+     out = PushResult()
+     for _ in range(max_batches):
+         rows = [dict(r) for r in conn.execute(
+-            "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' ORDER BY created_at, rowid LIMIT ?", (PUSH_BATCH,))]
++            "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' AND (retry_after IS NULL OR retry_after <= ?) "
++            "ORDER BY created_at, rowid LIMIT ?", (int(time.time()), PUSH_BATCH))]
+         if not rows:
+             break
+         with write_txn(conn):
+@@ -268,8 +284,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     # The service will accept this later (a deploy still rolling out, a storage hiccup, an earlier op
+                     # on the card that was itself transient): keep it pending and retry next round.
+                     reason = f"{res.get('reason')}: {res.get('detail') or ''}".strip(": ")
+-                    conn.execute("UPDATE kanban_sync_outbox SET attempts = attempts + 1, last_error = ? WHERE op_id = ?",
+-                                 (f"retrying: {reason}"[:500], op_id))
++                    conn.execute("UPDATE kanban_sync_outbox SET attempts = attempts + 1, last_error = ?, retry_after = ? "
++                                 "WHERE op_id = ?", (f"retrying: {reason}"[:500], int(time.time()) + _backoff_s(row["attempts"]), op_id))
+                     out.deferred += 1
+                 else:
+                     reason = f"{res.get('reason')}: {res.get('detail') or ''}".strip(": ")
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 6cf5a4b80e..6b974b7229 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -690,6 +690,9 @@ def test_transient_rejections_retry_next_round_and_give_up_after_a_cap(live, svc
+     assert res.rejected == 0 and res.deferred >= 1 and calls["n"] == 1  # one batch, no hot loop
+     assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()
+     hub.ops = real  # the rollout finished
++    assert ksc.push(live, hub, BOARD, ME, primary=False).sent == 0  # backing off: not retried at once
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_outbox SET retry_after = 0")  # the backoff elapsed
+     assert ksc.push(live, hub, BOARD, ME, primary=False).rejected == 0
+     assert tid in svc.board(BOARD)["rows"]["tasks"] and not _pending(live)
+     # A rejection that never clears ends up rejected after the cap.
+@@ -697,4 +700,22 @@ def test_transient_rejections_retry_next_round_and_give_up_after_a_cap(live, svc
+     hub.ops = rolling_out
+     for _ in range(ksc.MAX_TRANSIENT_ATTEMPTS + 1):
+         ksc.push(live, hub, BOARD, ME, primary=False)
++        with kbc.write_txn(live):
++            live.execute("UPDATE kanban_sync_outbox SET retry_after = 0")
+     assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()[0] >= 1
++
++
++def test_transient_backoff_doubles_to_five_minutes():
++    assert [ksc._backoff_s(a) for a in (0, 1, 2, 7, 8, 30)] == [2, 4, 8, 256, 300, 300]
++
++
++def test_a_child_row_update_is_sent_whole_so_it_stands_alone(live, svc):
++    tid = kb.create_task(live, title="parent", assignee="worker")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    kb.add_comment(live, tid, "me", "first")
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")  # the insert was lost (refused during a rollout)
++        live.execute("UPDATE task_comments SET body = 'edited' WHERE task_id = ?", (tid,))  # captures {"body": ...}
++    assert ksc.push(live, svc.hub(ME), BOARD, ME, primary=False).rejected == 0
++    comment = next(c for c in svc.board(BOARD)["rows"]["task_comments"].values() if c["task_id"] == tid)
++    assert comment["body"] == "edited" and comment["author"] == "me"
+-- 
+2.55.0
+

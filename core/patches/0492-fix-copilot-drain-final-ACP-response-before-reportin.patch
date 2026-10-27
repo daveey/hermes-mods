@@ -1,0 +1,81 @@
+From fc979f0c25cc824b2e23166401eabc772e90d963 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 06:56:29 -0700
+Subject: [PATCH] fix(copilot): drain final ACP response before reporting exit
+ [daveey] (#99)
+
+Co-authored-by: daveey <daveey@users.noreply.github.com>
+---
+ agent/copilot_acp_client.py            | 11 +++++++++--
+ tests/agent/test_copilot_acp_client.py | 16 +++++++++++++++-
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/agent/copilot_acp_client.py b/agent/copilot_acp_client.py
+index ff2c65c67c..31bbd7c36f 100644
+--- a/agent/copilot_acp_client.py
++++ b/agent/copilot_acp_client.py
+@@ -398,7 +398,9 @@ class CopilotACPClient:
+             for line in stream or ():
+                 sink(line)
+ 
+-        threading.Thread(target=_pump, args=(proc.stdout, lambda line: inbox.put(_decode(line))), daemon=True).start()
++        stdout_pump = threading.Thread(
++            target=_pump, args=(proc.stdout, lambda line: inbox.put(_decode(line))), daemon=True)
++        stdout_pump.start()
+         stderr_pump = threading.Thread(
+             target=_pump, args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))), daemon=True)
+         stderr_pump.start()
+@@ -413,10 +415,15 @@ class CopilotACPClient:
+             proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
+             proc.stdin.flush()
+             deadline = session_deadline
+-            while time.monotonic() < deadline and proc.poll() is None:
++            while time.monotonic() < deadline:
+                 try:
+                     msg = inbox.get(timeout=0.1)
+                 except queue.Empty:
++                    # Exit can precede delivery of the final response. Only declare
++                    # a crash after the stdout producer has finished AND its queue
++                    # is empty (it may have enqueued after get() timed out).
++                    if proc.poll() is not None and not stdout_pump.is_alive() and inbox.empty():
++                        break
+                     continue
+                 if self._handle_server_message(
+                     msg, process=proc, cwd=self._acp_cwd, text_parts=text_parts,
+diff --git a/tests/agent/test_copilot_acp_client.py b/tests/agent/test_copilot_acp_client.py
+index 5c11466203..c696e0af15 100644
+--- a/tests/agent/test_copilot_acp_client.py
++++ b/tests/agent/test_copilot_acp_client.py
+@@ -452,7 +452,8 @@ for line in sys.stdin:
+     assert client.is_closed is True
+ 
+ 
+-def test_model_discovery_does_not_allow_file_requests(tmp_path):
++@pytest.mark.parametrize("exit_before_response_consumed", [False, True])
++def test_model_discovery_does_not_allow_file_requests(tmp_path, monkeypatch, exit_before_response_consumed):
+     target = tmp_path / "should-not-be-read.txt"
+     target.write_text("private", encoding="utf-8")
+     server = tmp_path / "fake_copilot_acp_fs_request.py"
+@@ -476,6 +477,19 @@ print(json.dumps({{"jsonrpc": "2.0", "id": session["id"], "result": {{"sessionId
+         acp_cwd=str(tmp_path),
+     )
+ 
++    if exit_before_response_consumed:
++        handle_message = client._handle_server_message
++
++        def handle_after_exit(msg, **kwargs):
++            handled = handle_message(msg, **kwargs)
++            if msg.get("method") == "fs/read_text_file":
++                # The child writes its final response and exits after our denial.
++                # Force the consumer to lag behind it, without a scheduling sleep.
++                assert kwargs["process"].wait(timeout=30) == 0
++            return handled
++
++        monkeypatch.setattr(client, "_handle_server_message", handle_after_exit)
++
+     assert client.list_models(timeout_seconds=30) == ["gpt-5.6-sol"]
+ 
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,608 @@
+From da1a3a8443b75f15d86c776e654abeb65ae0fea7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 11:21:30 -0700
+Subject: [PATCH] feat(kanban): chat links synced through the Board (RFC phase
+ 5) [daveey]
+
+Which chats a card belongs to becomes a synced table, task_chat_links (card,
+chat gateway/profile/session, kind created|shepherd, released), so every
+gateway's replica can answer a chat's cards on every gateway.
+
+- kanban_chat_links.reconcile (sync loop, every 60 s per synced board; its
+  first run is the backfill) writes this gateway's links: creating chats
+  (tasks.session_id), shepherd subscriptions (tui notify subs) and this
+  gateway's chats' links to other gateways' cards from the origin-ledger
+  projection with their released state. Missing links are released, never
+  deleted. Writes go through the capture triggers like any synced row.
+- replica_cards answers a lineage's open remote cards from the replicas;
+  session_tasks uses it when kanban.sync.links_reader is 'replica' (default
+  stays the origin ledger).
+- hermes kanban sync links (reconcile now) and links-diff (ledger vs replica
+  per chat; exit 1 when not clean): readers switch only once it is clean.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ hermes_cli/kanban_chat_links.py            | 182 +++++++++++++++++++++
+ hermes_cli/kanban_db_sync.py               |  22 ++-
+ hermes_cli/kanban_parser.py                |   3 +
+ hermes_cli/kanban_session_activity.py      |  18 +-
+ hermes_cli/kanban_sync_cli.py              |  27 ++-
+ hermes_cli/kanban_sync_client.py           |  29 +++-
+ tests/hermes_cli/test_kanban_chat_links.py | 156 ++++++++++++++++++
+ 7 files changed, 430 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_chat_links.py
+ create mode 100644 tests/hermes_cli/test_kanban_chat_links.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+new file mode 100644
+index 0000000000..79051a56ec
+--- /dev/null
++++ b/hermes_cli/kanban_chat_links.py
+@@ -0,0 +1,182 @@
++"""Which chats a card belongs to, synced through the Board (RFC "Retiring the origin ledger", phase 5). [daveey]
++
++``task_chat_links`` rows (card, chat gateway/profile/session, kind ``created``/``shepherd``, ``released``) travel
++like any synced row, so every gateway's replica can answer "which cards does this chat have", on every gateway,
++with one local query.
++
++- :func:`reconcile` (run by the sync loop, idempotent, so its first run is the backfill) writes this gateway's
++  links into a board file: chats that created a card here (``tasks.session_id``), chats that shepherd a card here
++  (``tui`` subscriptions), and this gateway's chats' links to other gateways' cards from the origin-ledger
++  projection, with its released state. Links it no longer finds are marked released, never deleted.
++- :func:`replica_cards` answers a chat lineage's cards on other gateways from the replicas; ``session_tasks`` uses
++  it instead of the origin ledger when ``kanban.sync.links_reader`` is ``replica``.
++- :func:`links_diff` compares the two answers per chat; readers switch only once it is clean.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++_log = logging.getLogger(__name__)
++
++KINDS = ("created", "shepherd")
++OPEN_STATUSES = ("todo", "ready", "running", "scheduled", "blocked", "review", "triage")
++
++
++def link_uid(task_id: str, gateway: str, profile: Optional[str], session: str, kind: str) -> str:
++    return f"{task_id}:{gateway}:{profile or '-'}:{session}:{kind}"
++
++
++def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str, Any]]:
++    """Links from this board file's own data: creating chats and ``tui`` shepherd subscriptions."""
++    from hermes_cli.kanban_session_activity import _counted_sub_clause
++    now = int(time.time())
++    out: dict[str, dict[str, Any]] = {}
++
++    def add(task_id: str, session: str, kind: str, created_at: Any) -> None:
++        uid = link_uid(task_id, gateway, None, session, kind)
++        out[uid] = {"uid": uid, "task_id": task_id, "chat_gateway": gateway, "chat_profile": None,
++                    "chat_session": session, "kind": kind, "released": 0, "created_at": int(created_at or now)}
++
++    for task_id, session, created_at in conn.execute(
++            "SELECT id, session_id, created_at FROM tasks WHERE session_id IS NOT NULL AND session_id != ''"):
++        add(task_id, session, "created", created_at)
++    try:
++        for task_id, session in conn.execute(
++                f"SELECT s.task_id, s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++                f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)}"):
++            if link_uid(task_id, gateway, None, session, "created") not in out:
++                add(task_id, session, "shepherd", None)
++    except sqlite3.Error:  # board predates notify subscriptions
++        pass
++    return out
++
++
++def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
++    """This gateway's chats' links to other gateways' cards on ``board``, from the origin-ledger projection."""
++    from hermes_cli.kanban_session_activity import _remote_links
++    now = int(time.time())
++    out: dict[str, dict[str, Any]] = {}
++    for card in _remote_links():
++        if card.get("board") != board or card.get("origin_gateway") not in (None, gateway) or not card.get("session"):
++            continue
++        kind = "created" if card.get("via") == "origin" else "shepherd"
++        profile = card.get("origin_profile")
++        uid = link_uid(card["id"], gateway, profile, card["session"], kind)
++        out[uid] = {"uid": uid, "task_id": card["id"], "chat_gateway": gateway, "chat_profile": profile,
++                    "chat_session": card["session"], "kind": kind,
++                    "released": 1 if card.get("released") else 0, "created_at": now}
++    return out
++
++
++def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: bool = True) -> dict[str, int]:
++    """Bring this gateway's links in ``conn`` (one board file) up to date. Writes go through the capture triggers,
++    so every new or changed link is pushed to the service. Returns counts of added/changed/released links."""
++    from hermes_cli.kanban_db_connect import write_txn
++    want = _local_links(conn, gateway)
++    if ledger:
++        want.update(_ledger_links(board, gateway))
++    have = {r[0]: r[1] for r in conn.execute(
++        "SELECT uid, released FROM task_chat_links WHERE chat_gateway = ?", (gateway,))}
++    added = changed = released = 0
++    with write_txn(conn):
++        for uid, link in want.items():
++            if uid not in have:
++                conn.execute(
++                    "INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, released, "
++                    "created_at) VALUES (:uid, :task_id, :chat_gateway, :chat_profile, :chat_session, :kind, :released, "
++                    ":created_at)", link)
++                added += 1
++            elif have[uid] != link["released"]:
++                conn.execute("UPDATE task_chat_links SET released = ? WHERE uid = ?", (link["released"], uid))
++                changed += 1
++        for uid, was_released in have.items():
++            if uid not in want and not was_released:
++                conn.execute("UPDATE task_chat_links SET released = 1 WHERE uid = ?", (uid,))
++                released += 1
++    return {"added": added, "changed": changed, "released": released}
++
++
++def replica_cards(session_ids: Iterable[str], gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES,
++                  replicas: Optional[list[tuple[str, Path]]] = None) -> list[dict[str, Any]]:
++    """This gateway's chats' (``session_ids``, one lineage) unreleased links to cards created on OTHER gateways,
++    from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends."""
++    ids = [s for s in dict.fromkeys(str(s) for s in session_ids if s)]
++    if not ids:
++        return []
++    if replicas is None:
++        from hermes_cli import kanban_sync_client as ksc
++        replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
++    ph = ",".join("?" for _ in ids)
++    st = ",".join("?" for _ in statuses)
++    now = time.time()
++    out: dict[str, dict[str, Any]] = {}
++    for board, path in replicas:
++        if not path.exists():
++            continue
++        try:
++            conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
++            conn.row_factory = sqlite3.Row
++            try:
++                rows = conn.execute(
++                    "SELECT t.id, t.title, t.status, t.assignee, t.created_at, t.started_at, t.priority, t.block_kind, "
++                    "t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind FROM task_chat_links l "
++                    f"JOIN tasks t ON t.id = l.task_id WHERE l.chat_gateway = ? AND l.released = 0 AND l.chat_session IN ({ph}) "
++                    f"AND t.status IN ({st}) AND t.created_on IS NOT NULL AND t.created_on != ?",
++                    (gateway, *ids, *statuses, gateway)).fetchall()
++            finally:
++                conn.close()
++        except sqlite3.Error as exc:
++            _log.info("kanban chat links: replica %s unreadable (%s)", path, exc)
++            continue
++        for r in rows:
++            owner = r["created_on"]
++            key = f"{owner}/default/{board}/{r['id']}"
++            if key in out:
++                continue
++            out[key] = {
++                "title": r["title"], "status": r["status"], "assignee": r["assignee"], "created_at": r["created_at"],
++                "started_at": r["started_at"], "priority": r["priority"], "block_kind": r["block_kind"],
++                "human_request": r["human_request"], "id": r["id"], "board": board, "gateway": owner, "key": key,
++                "session": r["chat_session"], "session_id": r["chat_session"], "via": "origin" if r["kind"] == "created" else "shepherd",
++                "remote": True, "profile": "default", "owner_profile": "default", "origin_gateway": gateway,
++                "origin_profile": r["chat_profile"], "ownership_state": "qualified", "unfinished": True,
++                "released": False, "reported_status": r["status"], "synced_at": now, "stale": False,
++                "source": "replica",
++            }
++    return list(out.values())
++
++
++def links_diff(gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES) -> dict[str, Any]:
++    """Per chat, the open remote cards the origin ledger lists against the ones the replicas list. Clean when the
++    two answers match for every chat either side knows."""
++    from hermes_cli.kanban_session_activity import _remote_links
++    ledger: dict[str, set[tuple[str, str, str]]] = {}
++    for card in _remote_links():
++        if card.get("origin_gateway") not in (None, gateway) or not card.get("session"):
++            continue
++        if card.get("status") not in statuses or card.get("released"):
++            continue
++        ledger.setdefault(card["session"], set()).add((card["gateway"], card["board"], card["id"]))
++    sessions = set(ledger)
++    from hermes_cli import kanban_sync_client as ksc
++    replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
++    for _slug, path in replicas:
++        if path.exists():
++            with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2) as conn:
++                sessions |= {r[0] for r in conn.execute(
++                    "SELECT DISTINCT chat_session FROM task_chat_links WHERE chat_gateway = ? AND released = 0", (gateway,))}
++    replica: dict[str, set[tuple[str, str, str]]] = {}
++    for card in replica_cards(sessions, gateway, statuses, replicas):
++        replica.setdefault(card["session"], set()).add((card["gateway"], card["board"], card["id"]))
++    only_ledger = {s: sorted(ledger.get(s, set()) - replica.get(s, set())) for s in sessions}
++    only_replica = {s: sorted(replica.get(s, set()) - ledger.get(s, set())) for s in sessions}
++    only_ledger = {s: v for s, v in only_ledger.items() if v}
++    only_replica = {s: v for s, v in only_replica.items() if v}
++    return {"clean": not only_ledger and not only_replica, "chats": len(sessions),
++            "ledger_links": sum(len(v) for v in ledger.values()), "replica_links": sum(len(v) for v in replica.values()),
++            "only_in_ledger": only_ledger, "only_in_replica": only_replica}
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 5ad9478065..c225ab4044 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -64,6 +64,10 @@ SYNCED_COLUMNS: dict[str, frozenset[str]] = {
+     "task_attachments": frozenset({
+         "task_id", "filename", "content_type", "size", "uploaded_by", "created_at", "blob_key",
+     }),
++    # Which chats a card belongs to (created / shepherd), on any gateway (RFC "Retiring the origin ledger").
++    "task_chat_links": frozenset({
++        "task_id", "chat_gateway", "chat_profile", "chat_session", "kind", "released", "created_at",
++    }),
+ }
+ # Machine-local: host:pid claimers, PIDs, local paths, local session ids and the
+ # read-only lease mirror. Stored locally, never pushed, never overwritten by a pull.
+@@ -78,20 +82,22 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+     "task_events": frozenset(),
+     "task_runs": frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at"}),
+     "task_attachments": frozenset({"stored_path"}),
++    "task_chat_links": frozenset(),
+ }
+ # Set by the service, never by a gateway: applied from the feed, never captured.
+ SERVER_COLUMNS: dict[str, frozenset[str]] = {"tasks": frozenset({"created_on"})}
+ KEY_COLUMNS: dict[str, frozenset[str]] = {
+     "tasks": frozenset({"id"}),
+     "task_links": frozenset(),
+-    **{t: frozenset({"id", "uid"}) for t in ("task_comments", "task_events", "task_runs", "task_attachments")},
++    **{t: frozenset({"id", "uid"}) for t in ("task_comments", "task_events", "task_runs", "task_attachments",
++                                             "task_chat_links")},
+ }
+ REF_COLUMNS: dict[tuple[str, str], str] = {
+     ("tasks", "current_run_id"): "current_run_uid",
+     ("task_events", "run_id"): "run_uid",
+ }
+ SYNCED_TABLES = tuple(SYNCED_COLUMNS)
+-_UID_TABLES = ("task_comments", "task_events", "task_runs", "task_attachments")
++_UID_TABLES = ("task_comments", "task_events", "task_runs", "task_attachments", "task_chat_links")
+ # Append-only rows leave only with their task; a delete trigger there would echo
+ # every cascade row of a task delete the service already cascades itself.
+ _DELETE_CAPTURED = ("tasks", "task_links", "task_attachments")
+@@ -125,6 +131,18 @@ CREATE TABLE IF NOT EXISTS kanban_sync_tombstones (
+     deleted_at INTEGER NOT NULL,
+     PRIMARY KEY (table_name, row_uid)
+ );
++CREATE TABLE IF NOT EXISTS task_chat_links (
++    id           INTEGER PRIMARY KEY,
++    uid          TEXT,
++    task_id      TEXT NOT NULL,
++    chat_gateway TEXT NOT NULL,
++    chat_profile TEXT,
++    chat_session TEXT NOT NULL,
++    kind         TEXT NOT NULL,
++    released     INTEGER NOT NULL DEFAULT 0,
++    created_at   INTEGER NOT NULL
++);
++CREATE INDEX IF NOT EXISTS idx_task_chat_links_chat ON task_chat_links(chat_gateway, chat_session);
+ CREATE TABLE IF NOT EXISTS kanban_sync_state (
+     board_id        TEXT PRIMARY KEY,
+     cursor          INTEGER NOT NULL DEFAULT 0,
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 102f34744d..09f4963bf0 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -506,6 +506,9 @@ _SPECS = [
+         _cmd("import", help="Queue every existing row of the board for upload (idempotent)"),
+         _cmd("diff", [_json_flag()], help="Compare this gateway's live cards with the shadow copy (exit 1 if not clean)"),
+         _cmd("run", [_json_flag()], help="Run one sync round for every synced board now"),
++        _cmd("links", help="Reconcile this gateway's chat links (which chats each card belongs to) now"),
++        _cmd("links-diff", [_json_flag()],
++             help="Compare chat links from the origin ledger with the synced links in the replicas (exit 1 if not clean)"),
+     ]), help="Central Kanban sync (kanban.sync.*): attach, import, status, diff"),
+     _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
+          help="Check kanban.db integrity and auto-repair index-only corruption",
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 53445a10fc..49246af72d 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -943,6 +943,22 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+         found[task_id]["pr_url"] = url
+ 
+ 
++def _remote_cards(ids: list[str], statuses: tuple[str, ...], stale_ok: bool) -> list[dict[str, Any]]:
++    """Cards on other gateways linked to these chats: from the synced chat links in the replicas when
++    ``kanban.sync.links_reader`` is ``replica`` (RFC phase 5), else from the origin-ledger projection."""
++    from hermes_cli import kanban_db_sync as _sync
++    if _sync.sync_config().get("links_reader") == "replica":
++        from hermes_cli import kanban_chat_links as _links
++        from hermes_cli import kanban_sync_client as _ksc
++        try:
++            gateway = _ksc.load_identity().gateway
++        except _ksc.SyncUnavailable:
++            gateway = None
++        if gateway:
++            return _links.replica_cards(ids, gateway, statuses)
++    return _remote_links(stale_ok=stale_ok)
++
++
+ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES, *,
+                   stale_ok: bool = False) -> list[dict[str, Any]]:
+     """Every open/blocked/review task across all boards that the given session
+@@ -960,7 +976,7 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+     # [daveey] Cards on other gateways this lineage owns: the same rows the counts use, owner-qualified
+     # (gateway/board/id), with ``stale``/``synced_at`` from the replica. One row per card.
+     wanted, seen = set(ids), set()
+-    for card in _remote_links(stale_ok=stale_ok):
++    for card in _remote_cards(ids, statuses, stale_ok):
+         belongs = card['session'] in wanted or card.get('origin_session') in wanted
+         listed = card.get('status') in statuses or (card.get('status') == 'unknown' and card.get('unfinished'))
+         if belongs and listed and card['key'] not in seen:
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 10d3e03502..1b94c985ac 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -117,13 +117,36 @@ def _run(args: argparse.Namespace) -> int:
+     return 1 if any(r["error"] for r in rows) else 0
+ 
+ 
+-_ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run}
++def _links(args: argparse.Namespace) -> int:
++    """Reconcile this gateway's chat links in every synced board now (the sync loop does this every minute)."""
++    ident = ksc.load_identity()
++    ksc.reconcile_links(ksc.board_paths(), ident.gateway)
++    print("kanban sync: chat links reconciled")
++    return 0
++
++
++def _links_diff(args: argparse.Namespace) -> int:
++    from hermes_cli import kanban_chat_links
++    report = kanban_chat_links.links_diff(ksc.load_identity().gateway)
++    if args.json:
++        print(json.dumps(report, indent=2, default=str))
++    else:
++        for k in ("clean", "chats", "ledger_links", "replica_links"):
++            print(f"{k:>16}: {report[k]}")
++        for k in ("only_in_ledger", "only_in_replica"):
++            items = [(s, c) for s, cards in report[k].items() for c in cards]
++            print(f"{k:>16}: {len(items)} {items[:8]}")
++    return 0 if report["clean"] else 1
++
++
++_ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
++            "links": _links, "links-diff": _links_diff}
+ 
+ 
+ def cmd_sync(args: argparse.Namespace) -> int:
+     action = getattr(args, "sync_action", None)
+     if action not in _ACTIONS:
+-        print("usage: hermes kanban sync {status,attach,import,diff,run} [--board B]")
++        print("usage: hermes kanban sync {status,attach,import,diff,run,links,links-diff} [--board B]")
+         return 2
+     try:
+         return _ACTIONS[action](args)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 0c86ff5a1c..d8f5e3da85 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -45,7 +45,7 @@ SNAPSHOT_PAGE = 1000
+ HTTP_TIMEOUT_S = 30.0
+ EVENT_IMPORT_WINDOW_S = 30 * 24 * 3600  # the service's event retention (worker board.ts EVENT_RETENTION_MS)
+ # Row order for an import: links need both tasks, everything else names its task.
+-IMPORT_ORDER = ("tasks", "task_links", "task_runs", "task_comments", "task_events", "task_attachments")
++IMPORT_ORDER = ("tasks", "task_links", "task_runs", "task_comments", "task_events", "task_attachments", "task_chat_links")
+ 
+ 
+ class SyncUnavailable(RuntimeError):
+@@ -516,6 +516,27 @@ class FeedWatcher:
+                 backoff = min(backoff * 2, 60.0)
+ 
+ 
++LINKS_EVERY_S = 60.0
++
++
++def reconcile_links(boards: list[tuple[str, Path]], gateway: str) -> None:
++    """Bring this gateway's chat links up to date in every synced board (kanban_chat_links.reconcile)."""
++    from hermes_cli import kanban_chat_links
++    for slug, path in boards:
++        try:
++            conn = _connect(path)
++            try:
++                if sync.board_mode(conn) == "off":
++                    continue
++                counts = kanban_chat_links.reconcile(conn, slug, gateway)
++            finally:
++                conn.close()
++            if any(counts.values()):
++                _log.info("kanban sync: %s chat links %s", slug, counts)
++        except Exception as exc:  # health: allow BLE001 -- one board's links must not stop the sync loop
++            _log.warning("kanban sync: chat links for %s failed (%s: %s)", slug, type(exc).__name__, exc)
++
++
+ def outbox_pending(paths: Iterable[Path]) -> bool:
+     """True when any synced board has a local change waiting to be pushed (one cheap read-only query each)."""
+     for path in paths:
+@@ -564,6 +585,7 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+     _log.info("kanban sync: running as gateway %s against %s (feed sockets; poll every %.1fs)", ident.gateway, ident.url, period)
+     wake = threading.Event()
+     watchers: dict[str, threading.Thread] = {}
++    next_links = 0.0
+     while keep_running():
+         boards = board_paths()
+         for slug, _path in boards:
+@@ -575,6 +597,9 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+             if r.push and (r.push.sent or r.push.rejected):
+                 _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                           r.push.sent, r.push.rejected)
++        if time.monotonic() >= next_links:
++            reconcile_links(boards, ident.gateway)
++            next_links = time.monotonic() + LINKS_EVERY_S
+         wait_for_work(wake, [p for _s, p in boards], period, keep_running)
+ 
+ 
+@@ -692,7 +717,7 @@ def diff(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) ->
+         if bad:
+             fields[tid] = bad
+     children: dict[str, int] = {}
+-    for table in ("task_links", "task_comments", "task_runs"):
++    for table in ("task_links", "task_comments", "task_runs", "task_chat_links"):
+         lv = _child_uids(live, table, checked)
+         sh = _child_uids(shadow, table, checked)
+         n = len(lv ^ sh)
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+new file mode 100644
+index 0000000000..829e4078ab
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -0,0 +1,156 @@
++"""Chat links synced through the Board (RFC phase 5): reconcile writes them from local data and the origin ledger,
++the replica answers a chat's remote cards, links-diff compares the two answers, session_tasks switches on config."""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, OTHER = "macbook", "hub"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, "default", ME)
++    ksa._reset_cache_for_tests()
++    try:
++        yield conn
++    finally:
++        conn.close()
++        ksa._reset_cache_for_tests()
++
++
++def _links(conn):
++    return {(r[0], r[1], r[2], r[3]) for r in conn.execute(
++        "SELECT task_id, chat_session, kind, released FROM task_chat_links ORDER BY task_id")}
++
++
++def _ledger_row(task_id, session, *, via="shepherd", released=False, status="running", board="default"):
++    return {"id": task_id, "board": board, "gateway": OTHER, "key": f"{OTHER}/default/{board}/{task_id}",
++            "session": session, "via": via, "origin_gateway": ME, "origin_profile": "default", "released": released,
++            "status": status, "unfinished": not released, "title": task_id}
++
++
++def test_reconcile_writes_created_and_shepherd_links_once_and_through_capture(live, monkeypatch):
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
++    mine = kb.create_task(live, title="mine", assignee="worker", session_id="s_creator")
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (?, 'tui', 's_watcher', 1)", (mine,))
++        live.execute("DELETE FROM kanban_sync_outbox")
++    assert links.reconcile(live, "default", ME) == {"added": 2, "changed": 0, "released": 0}
++    assert _links(live) == {(mine, "s_creator", "created", 0), (mine, "s_watcher", "shepherd", 0)}
++    queued = [r[0] for r in live.execute("SELECT table_name FROM kanban_sync_outbox")]
++    assert queued.count("task_chat_links") == 2  # pushed like any synced row
++    assert links.reconcile(live, "default", ME) == {"added": 0, "changed": 0, "released": 0}  # idempotent
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_notify_subs")
++    assert links.reconcile(live, "default", ME)["released"] == 1  # an unsubscribe releases, never deletes
++    assert (mine, "s_watcher", "shepherd", 1) in _links(live)
++
++
++def test_reconcile_carries_this_gateways_ledger_links_and_their_release(live, monkeypatch):
++    rows = [_ledger_row("t_remote1", "s_chat"), _ledger_row("t_remote2", "s_chat", via="origin"),
++            _ledger_row("t_other_board", "s_chat", board="runners")]
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: rows)
++    links.reconcile(live, "default", ME)
++    assert _links(live) == {("t_remote1", "s_chat", "shepherd", 0), ("t_remote2", "s_chat", "created", 0)}
++    rows[0] = _ledger_row("t_remote1", "s_chat", released=True, status="done")
++    assert links.reconcile(live, "default", ME)["changed"] == 1
++    assert ("t_remote1", "s_chat", "shepherd", 1) in _links(live)
++
++
++def _replica(path, tasks, chat_links):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, chat_session TEXT, "
++        "kind TEXT, released INTEGER, created_at INTEGER);")
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, 'worker', 1, NULL, 0, NULL, NULL, ?)", tasks)
++    conn.executemany("INSERT INTO task_chat_links VALUES (?, ?, ?, 'default', ?, ?, ?, 1)",
++                     [(links.link_uid(t, g, "default", s, k), t, g, s, k, r) for t, g, s, k, r in chat_links])
++    conn.commit()
++    conn.close()
++
++
++def test_replica_answers_a_chats_open_cards_on_other_gateways(tmp_path):
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_open", "open card", "running", OTHER), ("t_done", "done card", "done", OTHER),
++                   ("t_mine", "local card", "running", ME), ("t_released", "released", "ready", OTHER),
++                   ("t_theirs", "other gateway's chat", "ready", OTHER)],
++             [("t_open", ME, "s1", "shepherd", 0), ("t_done", ME, "s1", "shepherd", 0), ("t_mine", ME, "s1", "created", 0),
++              ("t_released", ME, "s1", "shepherd", 1), ("t_theirs", "mini", "s1", "shepherd", 0)])
++    got = links.replica_cards(["s1", "s0"], ME, replicas=[("default", rep)])
++    assert [(c["id"], c["gateway"], c["board"], c["via"], c["session_id"]) for c in got] == [("t_open", OTHER, "default", "shepherd", "s1")]
++    assert got[0]["title"] == "open card" and got[0]["source"] == "replica"
++
++
++def test_links_diff_is_clean_when_both_answers_match_and_lists_the_difference(kanban_home, monkeypatch, tmp_path):
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_a", "a", "running", OTHER), ("t_b", "b", "ready", OTHER)],
++             [("t_a", ME, "s1", "shepherd", 0), ("t_b", ME, "s1", "shepherd", 0)])
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", kanban_home / "kanban.db")])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: rep)
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [_ledger_row("t_a", "s1"), _ledger_row("t_b", "s1", status="ready")])
++    assert links.links_diff(ME)["clean"]
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [_ledger_row("t_a", "s1"), _ledger_row("t_c", "s1", board="runners")])
++    report = links.links_diff(ME)
++    assert not report["clean"]
++    assert report["only_in_ledger"] == {"s1": [(OTHER, "runners", "t_c")]}
++    assert report["only_in_replica"] == {"s1": [(OTHER, "default", "t_b")]}
++
++
++def test_session_tasks_reads_remote_cards_from_the_replica_when_switched(live, kanban_home, monkeypatch, tmp_path):
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_remote", "from replica", "running", OTHER)], [("t_remote", ME, "s1", "shepherd", 0)])
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", ME))
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", kanban_home / "kanban.db")])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: rep)
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [_ledger_row("t_ledger", "s1")])
++    assert [t["id"] for t in ksa.session_tasks(["s1"])] == ["t_ledger"]  # default: the origin ledger
++    (kanban_home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n    links_reader: replica\n")
++    assert [t["id"] for t in ksa.session_tasks(["s1"])] == ["t_remote"]
++
++
++def test_the_sync_loop_reconciles_every_synced_board(live, kanban_home, monkeypatch):
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [_ledger_row("t_remote", "s_chat")])
++    kb.create_task(live, title="x", assignee="worker", session_id="s_local")
++    ksc.reconcile_links([("default", kanban_home / "kanban.db")], ME)
++    assert {r[1] for r in _links(live)} == {"s_local", "s_chat"}
++
++
++def test_cli_links_and_links_diff(live, kanban_home, monkeypatch, capsys, tmp_path):
++    import argparse
++    from hermes_cli import kanban as kc
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", ME))
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
++    kb.create_task(live, title="x", assignee="worker", session_id="s_local")
++
++    def cli(*argv):
++        parser = argparse.ArgumentParser()
++        kc.build_parser(parser.add_subparsers(dest="cmd"))
++        return kc.kanban_command(parser.parse_args(["kanban", *argv]))
++
++    assert cli("sync", "links") == 0
++    assert any(r[1] == "s_local" for r in _links(live))
++    capsys.readouterr()
++    assert cli("sync", "links-diff", "--json") == 0  # no remote links on either side
++    assert json.loads(capsys.readouterr().out)["clean"] is True
+-- 
+2.55.0
+

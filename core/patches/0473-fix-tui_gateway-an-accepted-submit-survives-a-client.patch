@@ -1,0 +1,521 @@
+From 3c3effe76768534a63ebc40d4fe0d6d3fe4f4c97 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:33:26 -0700
+Subject: [PATCH] fix(tui_gateway): an accepted submit survives a client socket
+ drop; unanswered messages show as not sent [daveey]
+
+An edited message sent during a Desktop reconnect was saved but never ran: no reply, and agent.log showed
+no trace of why (t_ed201037).
+
+Why chain (confirmed against agent.log/gui.log/desktop.log/state.db and reproduced):
+1. prompt.submit accepted the edit (history 25 -> 13, user row 583321 persisted) and started the deferred
+   agent build for the cold-resumed record.
+2. The chat ran on gpt-6-astra/openai-codex all day; at 22:55:37 the Codex OAuth token was gone. With no
+   Codex credentials `_make_agent` raises AuthError ("No Codex credentials stored"), so the build failed.
+3. The build's failure path and every exit of `_run_after_agent_ready` before `_run_prompt_submit` log
+   nothing, so the accepted message read in agent.log as one that never ran. The client only got event
+   frames, which the concurrent renderer socket drop (1006 at 22:55:41) can lose.
+4. The user switched the chat to claude-opus-5-5 (config.set rebuilt the failed agent); the next message
+   ran at once, but the failed one was never re-sent and nothing flagged it as unanswered.
+5. Hypothesis "the socket drop abandons the submit" is refuted for a short reconnect (test below), but a
+   real drop exists for a longer one: past the 20 s orphan-reap grace, a turn still parked on its agent
+   build has no activity clock, so `_ws_orphan_turn_activity_is_fresh` called it wedged, the reaper
+   interrupted it, the waiter's cancel branch sent a bare error to the dead socket and the session was
+   reaped. Live check on a real `hermes serve`: before, resume came back on a new runtime, idle, no
+   inflight, and the message never ran; after, the turn completed.
+
+Fix:
+- The orphan reaper treats a turn waiting on a live agent build as fresh (the wait has its own cap).
+- Log a failed agent build and every pre-agent exit of the turn thread.
+- session.resume (live reattach, cold and deferred) projects an unanswered newest user row as a retained,
+  retryable failed turn ("Not sent ...", error_surface runtime/turn_not_started) when no turn is running,
+  queued, leased by another process or covered by a crash marker. The Desktop renders it with the
+  existing error card and Retry. SessionDB.latest_conversation_tail reads the one row for the deferred
+  path.
+
+Tests: tests/tui_gateway/test_submit_survives_reconnect.py (4 fail before, 6 pass after).
+---
+ hermes_state_messages.py                      |  13 +
+ .../test_submit_survives_reconnect.py         | 233 ++++++++++++++++++
+ tui_gateway/methods_prompt.py                 |  11 +-
+ tui_gateway/methods_session.py                |  13 +-
+ tui_gateway/server.py                         |  16 ++
+ tui_gateway/session_history.py                |  57 +++++
+ tui_gateway/session_lifecycle.py              |   6 +
+ 7 files changed, 345 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tui_gateway/test_submit_survives_reconnect.py
+
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index 94fb0ad46b..c1890293b7 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -743,6 +743,19 @@ class SessionMessagesMixin:
+             "AND role NOT IN ('session_meta', 'system') ORDER BY id DESC LIMIT 1", (session_id,))
+         return row[0] if row else None
+ 
++    def latest_conversation_tail(self, session_id: str) -> Optional[dict[str, Any]]:
++        """``{id, role, content, display_kind}`` of the newest active user/assistant/tool row, or ``None``
++        (same bookkeeping filter as :meth:`latest_conversation_role`). One indexed row: cheap enough for
++        ``session.resume``'s unanswered-message check before the transcript hydrates."""
++        if not session_id:
++            return None
++        row = self._read_one(
++            "SELECT id, role, content, display_kind FROM messages WHERE session_id = ? AND active = 1 "
++            "AND role NOT IN ('session_meta', 'system') ORDER BY id DESC LIMIT 1", (session_id,))
++        if not row:
++            return None
++        return {"id": row[0], "role": row[1], "content": row[2], "display_kind": row[3]}
++
+     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
+         """Role of the active message at *row_id* in *session_id*, or ``None``."""
+         if not session_id:
+diff --git a/tests/tui_gateway/test_submit_survives_reconnect.py b/tests/tui_gateway/test_submit_survives_reconnect.py
+new file mode 100644
+index 0000000000..7bc512a364
+--- /dev/null
++++ b/tests/tui_gateway/test_submit_survives_reconnect.py
+@@ -0,0 +1,233 @@
++"""An accepted prompt.submit must survive a client socket drop, and a message that never got a turn must not idle
++silently (t_ed201037).
++
++Incident: an edit/resend on a Desktop chat persisted the user's row, then the deferred agent build failed (the
++session's provider had lost its credentials) while the renderer socket was dropping. The waiter's exits and the
++build failure logged nothing, so agent.log read as "the message never ran"; the reply never came and nothing
++later flagged the unanswered row. A related path drops a healthy turn outright: once the client is gone past the
++orphan-reap grace, a turn still parked on the build has no activity clock, so the reaper interrupted it.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway import entry, server
++from tui_gateway.transport import bind_transport, reset_transport
++
++
++class Sock:
++    """A client socket: frames while open, a dead peer once closed."""
++
++    def __init__(self):
++        self.frames, self._closed = [], False
++
++    def write(self, obj):
++        if self._closed:
++            return False
++        self.frames.append(obj)
++        return True
++
++    def close(self):
++        self._closed = True
++
++
++def _rpc(transport, method, params):
++    token = bind_transport(transport)
++    try:
++        return server.handle_request({"id": method, "method": method, "params": params})
++    finally:
++        reset_transport(token)
++
++
++@pytest.fixture
++def gateway(monkeypatch, tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
++    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
++    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
++    monkeypatch.setattr(server, "_wire_session_agent", lambda *a: False)
++    monkeypatch.setattr(server, "_announce_built_agent", lambda *a: None)
++    monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
++    created: list[str] = []
++    yield db, created
++    for sid in created:
++        server._sessions.pop(sid, None)
++    db.close()
++
++
++def _seeded_desktop_session(gateway, transport):
++    """A Desktop chat with two finished exchanges whose agent is not built yet (cold resume shape)."""
++    db, created = gateway
++    resp = _rpc(transport, "session.create", {"cols": 96, "source": "desktop"})
++    sid, key = resp["result"]["session_id"], resp["result"]["stored_session_id"]
++    created.append(sid)
++    session = server._sessions[sid]
++    server._ensure_session_db_row(session)
++    for role, text in (("user", "question 1"), ("assistant", "answer 1"),
++                       ("user", "are you still working on this"), ("assistant", "yes")):
++        db.append_message(key, role, text)
++    session["history"] = db.get_messages_as_conversation(key, include_row_ids=True)
++    return sid, key, session
++
++
++def _edit_last_turn(transport, sid, session, text):
++    """The Desktop edit/resend of the last user turn: a row-addressed truncation submit."""
++    users = [m for m in session["history"] if m.get("role") == "user"]
++    return _rpc(transport, "prompt.submit", {
++        "session_id": sid, "text": text, "truncate_before_row_id": users[-1]["_row_id"],
++        "truncate_before_user_ordinal": 1, "confirm_truncate": True})
++
++
++class _ManualTimers:
++    """threading.Timer stand-in: reap callbacks fire only when the test says so."""
++
++    def __init__(self):
++        self.pending = []
++
++    def __call__(self, delay, fn):
++        timer = type("Timer", (), {"daemon": False, "start": lambda self: None, "cancel": lambda self: None})()
++        self.pending.append((timer, fn))
++        return timer
++
++    def fire(self, rounds: int = 3):
++        """Fire each armed reap callback; a re-armed one fires again, up to ``rounds`` grace windows."""
++        for _ in range(rounds):
++            armed, self.pending = self.pending, []
++            for _timer, fn in armed:
++                fn()
++
++
++def test_edit_submit_survives_socket_drop_past_reap_grace_during_agent_build(gateway, monkeypatch):
++    """Submit (edit with truncation) on a session whose agent must be built; the socket drops and the client
++    stays away past the orphan-reap grace while the build runs; it then reconnects. The accepted turn must run."""
++    release, ran, interrupted = threading.Event(), [], []
++    monkeypatch.setattr(server, "_make_agent", lambda sid, key, **kw: release.wait(10) and type(
++        "Agent", (), {"session_id": key})())
++    monkeypatch.setattr(server, "_run_prompt_submit", lambda rid, sid, s, text, **k: ran.append(text) or True)
++    real_interrupt = server._interrupt_session_turn
++    monkeypatch.setattr(server, "_interrupt_session_turn",
++                        lambda *a, **k: interrupted.append(a[0]) or real_interrupt(*a, **k))
++    timers = _ManualTimers()
++    monkeypatch.setattr(server.threading, "Timer", timers)
++    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 20)
++    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *a: False)
++
++    first = Sock()
++    sid, key, session = _seeded_desktop_session(gateway, first)
++    resp = _edit_last_turn(first, sid, session, "are you still working on this, what the hell")
++    assert resp["result"]["status"] == "streaming", resp
++    assert session["running"] and not session["agent_ready"].is_set()
++
++    first.close()
++    assert server._close_sessions_for_transport(first) == (0, 1)  # parked on the drop sentinel
++    timers.fire()  # three grace windows expire with the build still running
++    assert interrupted == [], "the orphan reaper interrupted a turn that was only waiting on its agent build"
++    assert sid in server._sessions
++
++    second = Sock()
++    resumed = _rpc(second, "session.resume", {"session_id": key, "omit_messages": True})["result"]
++    assert resumed["session_id"] == sid and resumed["running"] is True
++
++    release.set()
++    session["_run_thread"].join(15)
++    assert ran == ["are you still working on this, what the hell"]
++
++
++def test_build_failure_and_pre_agent_exits_are_logged(gateway, monkeypatch, caplog):
++    """A failed build ends the waiting turn with a retained error. Both must reach agent.log: without them
++    the accepted message reads as one that silently never ran."""
++    def _fail(*_a, **_k):
++        raise RuntimeError("No Codex credentials stored.")
++
++    monkeypatch.setattr(server, "_make_agent", _fail)
++    ran = []
++    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: ran.append(a) or True)
++    sock = Sock()
++    sid, _key, session = _seeded_desktop_session(gateway, sock)
++    with caplog.at_level(logging.INFO):
++        assert _edit_last_turn(sock, sid, session, "retry this")["result"]["status"] == "streaming"
++        session["_run_thread"].join(15)
++    assert ran == []
++    text = caplog.text
++    assert "agent build failed for session" in text and "No Codex credentials stored." in text
++    assert "failed before the agent was ready" in text
++    assert session["running"] is False
++    assert session["inflight_turn"]["status"] == "error"  # retained for the reconnecting client
++
++
++def test_reattach_flags_an_unanswered_user_row_as_not_sent(gateway):
++    """The newest active row is the user's message, nothing runs, nothing is retained: the reattach must say
++    so (a retryable failed-turn projection) instead of idling."""
++    sock = Sock()
++    _sid, key, session = _seeded_desktop_session(gateway, sock)
++    db, _ = gateway
++    db.append_message(key, "user", "are you still working on this, what the hell")
++    session["history"] = db.get_messages_as_conversation(key, include_row_ids=True)
++
++    inflight = _rpc(Sock(), "session.resume", {"session_id": key, "omit_messages": True})["result"]["inflight"]
++    assert inflight["user"] == "are you still working on this, what the hell"
++    assert inflight["status"] == "error" and inflight["recoverable"] is True
++    assert inflight["error_surface"] == {"layer": "runtime", "code": "turn_not_started", "retryable": True}
++    assert inflight["error"].startswith("Not sent")
++
++
++def test_reattach_leaves_answered_running_and_notice_tails_alone(gateway):
++    sock = Sock()
++    _sid, key, session = _seeded_desktop_session(gateway, sock)
++    db, _ = gateway
++
++    def resume_inflight():
++        return _rpc(Sock(), "session.resume", {"session_id": key, "omit_messages": True})["result"].get("inflight")
++
++    assert resume_inflight() is None  # answered tail
++    db.append_message(key, "user", "a new question")
++    session["history"] = db.get_messages_as_conversation(key, include_row_ids=True)
++    with session["history_lock"]:
++        session["running"] = True
++        server._start_inflight_turn(session, "a new question")
++    live = resume_inflight()  # a live turn shows its own snapshot, never a not-sent error
++    assert live is not None and "error" not in live
++    with session["history_lock"]:
++        session["running"] = False
++        session["inflight_turn"] = None
++    db.append_message(key, "user", "Stopped by you", display_kind="turn_stopped")
++    session["history"] = db.get_messages_as_conversation(key, include_row_ids=True)
++    assert resume_inflight() is None  # a Stop notice tail is not an unsent message
++
++
++def test_reattach_skips_a_session_another_process_is_answering(gateway, monkeypatch):
++    sock = Sock()
++    _sid, key, session = _seeded_desktop_session(gateway, sock)
++    db, _ = gateway
++    db.append_message(key, "user", "answered elsewhere")
++    session["history"] = db.get_messages_as_conversation(key, include_row_ids=True)
++    monkeypatch.setattr(SessionDB, "session_turn_lease_owner", lambda self, k: {"holder": "pid=1:x"})
++    assert _rpc(Sock(), "session.resume", {"session_id": key, "omit_messages": True})["result"].get("inflight") is None
++
++
++def test_deferred_cold_resume_flags_an_unanswered_user_row_from_the_store(gateway):
++    """A backend restart lost the live record: the deferred resume reads the newest durable row."""
++    sock = Sock()
++    sid, key, _session = _seeded_desktop_session(gateway, sock)
++    db, created = gateway
++    db.append_message(key, "user", "never answered")
++    server._sessions.pop(sid, None)  # the old backend is gone
++
++    resp = _rpc(Sock(), "session.resume", {"session_id": key, "omit_messages": True, "defer_history": True})
++    result = resp["result"]
++    created.append(result["session_id"])
++    assert result["status"] == "resuming"
++    assert result["inflight"]["user"] == "never answered"
++    assert result["inflight"]["error_surface"]["code"] == "turn_not_started"
++
++    db.append_message(key, "assistant", "here you go")
++    server._sessions.pop(result["session_id"], None)
++    again = _rpc(Sock(), "session.resume", {"session_id": key, "omit_messages": True, "defer_history": True})
++    created.append(again["result"]["session_id"])
++    assert again["result"]["inflight"] is None
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index f4b0b80c94..af5b5edb01 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -667,10 +667,15 @@ def _run_after_agent_ready(
+     # expires. See #63078.
+     err = _wait_agent_for_prompt(session, rid, sid)
+     if err:
++        message = (err.get("error") or {}).get("message", "agent initialization failed")
++        # Every exit before _run_prompt_submit is logged: its "tui prompt accepted" line never comes, and
++        # without this the accepted message reads in agent.log as one that silently never ran. [daveey]
++        logger.warning("prompt.submit: turn for session %s (%s) failed before the agent was ready: %s",
++                       sid, session.get("session_key") or "", str(message)[:300])
+         # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
+         # the only way resume shows this to a disconnected client.
+         _emit_terminal_turn_error(
+-            sid, session, (err.get("error") or {}).get("message", "agent initialization failed"),
++            sid, session, message,
+             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
+         with session["history_lock"]:
+             session["running"] = False
+@@ -681,6 +686,10 @@ def _run_after_agent_ready(
+         if session.get("_turn_cancel_requested") or not session.get("running"):
+             session["running"] = False
+             _clear_inflight_turn(session)
++            reason = ("cancelled" if session.get("_turn_cancel_requested") else "session no longer running")
++            logger.info("prompt.submit: turn for session %s (%s) ended before the agent was ready: %s%s",
++                        sid, session.get("session_key") or "", reason,
++                        " (client gone)" if session.get("_client_gone_interrupt_requested") else "")
+             # Without this emit the turn vanishes silently after {"status": "streaming"}.
+             _emit("error", sid, {"message": (
+                 "Turn cancelled before the agent was ready"
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 9729fcd944..dd6615bc8a 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -922,6 +922,7 @@ def _resume_response(
+     ctx: _Resume, sid: str, record: dict, *, info: dict, display: list = (), count_source: list | None = None,
+     messages: list | None = None, message_count: int | None = None, running: bool = False,
+     status: str = "idle", hydrating: bool | None = None, started_at=None, auto_continue=None,
++    inflight: dict | None = None,
+ ) -> dict:
+     """Common resume payload; omit_messages counts ``count_source`` (client still learns the stored size)."""
+     if messages is None:
+@@ -930,7 +931,7 @@ def _resume_response(
+         message_count = len(count_source) if ctx.omit_messages else len(messages)
+     payload = {"session_id": sid, "resumed": ctx.target, "message_count": message_count, "messages": messages,
+                **({"messages_omitted": ctx.omit_messages} if hydrating is None else {"hydrating": hydrating}),
+-               "info": info, "inflight": None, "running": running, "session_key": ctx.target,
++               "info": info, "inflight": inflight, "running": running, "session_key": ctx.target,
+                "started_at": record["created_at"] if started_at is None else started_at, "status": status}
+     if auto_continue is not None:
+         payload["auto_continue"] = auto_continue
+@@ -984,10 +985,13 @@ def _resume_deferred(ctx: _Resume) -> dict:
+     _schedule_resume_hydration(
+         sid, ctx.target, ctx.db, close_db=ctx.owns_db,
+         model_history_only=source == "desktop" and ctx.omit_messages)
++    # Before the handle moves to the hydration worker: one indexed read of the newest durable row.
++    unanswered = _unanswered_turn_inflight(record, None, ctx.db)
+     ctx.owns_db = False  # the hydration worker now owns (and closes) the profile-scoped handle
+     _schedule_session_cap_enforcement()
+     return _resume_response(ctx, sid, record, info=ctx.info(cwd, overrides), messages=[],
+-                            message_count=record["resume_message_count"], status="resuming", hydrating=True)
++                            message_count=record["resume_message_count"], status="resuming", hydrating=True,
++                            inflight=unanswered)
+ 
+ 
+ def _resume_cold(ctx: _Resume) -> dict:
+@@ -1007,9 +1011,12 @@ def _resume_cold(ctx: _Resume) -> dict:
+         return reused
+     _schedule_agent_build(sid)
+     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
++    auto_continue = _maybe_schedule_auto_continue(sid, record, ctx.target)
+     return _resume_response(ctx, sid, record, info=ctx.info(cwd, overrides), display=display_history,
+                             count_source=raw_history,
+-                            auto_continue=_maybe_schedule_auto_continue(sid, record, ctx.target))
++                            auto_continue=auto_continue,
++                            # A scheduled auto-continue is about to answer it; otherwise flag it as not sent.
++                            inflight=None if auto_continue else _unanswered_turn_inflight(record, history, ctx.db))
+ 
+ 
+ def _resume_eager(ctx: _Resume) -> dict:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index f809741327..facd76dcb1 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -963,6 +963,14 @@ def _agent_build_wait_cap() -> float:
+     return 600.0
+ 
+ 
++def _agent_build_in_flight(session: dict) -> bool:
++    """True while this record's deferred agent build is still running (ready unset, build thread alive)."""
++    ready = session.get("agent_ready")
++    build_thread = session.get("_agent_build_thread")
++    return (ready is not None and not ready.is_set()
++            and build_thread is not None and build_thread.is_alive())
++
++
+ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
+     """Patient ``_wait_agent`` for deferred prompt.submit: the client already got ``streaming`` and the
+     first message IS the turn, while a cold build routinely outlives the flat 30s ceiling (timing out
+@@ -1212,6 +1220,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
+         except Exception as e:
+             from agent.auxiliary_unavailable import ProviderNotConfiguredError
+             current["agent_error"] = str(e)
++            # Logged: a failed build otherwise leaves no trace, so a prompt waiting on it reads in agent.log as
++            # a message that "never ran" (the client only got an event, which a disconnect can lose). [daveey]
++            logger.warning("agent build failed for session %s (%s): %s: %s",
++                           sid, key, type(e).__name__, str(e)[:300])
+             # A client can route "no provider is set up" to its setup flow instead of a dead-end
+             # error toast — but only if it can tell. The sentence is for the reader, the code is
+             # for the client; older clients keep matching the text.
+@@ -3195,6 +3207,10 @@ def _live_session_payload(
+     else:
+         with _session_db(session) as db:
+             history = _live_visible_history(session, db, in_memory_history)
++    if not (inflight or queued or running):
++        # A reattach after the frame that ended the turn was lost: show the unanswered message as not sent.
++        with contextlib.suppress(Exception), _session_db(session) as db:
++            inflight = _unanswered_turn_inflight(session, in_memory_history, db)
+     # message_count follows _resume_response: the stored size when messages are omitted, else the wire count
+     # (a hidden seed row is in ``history`` but never on the wire).
+     messages = ([] if omit_messages else
+diff --git a/tui_gateway/session_history.py b/tui_gateway/session_history.py
+index 38d8fccea6..941d4d711a 100644
+--- a/tui_gateway/session_history.py
++++ b/tui_gateway/session_history.py
+@@ -459,6 +459,63 @@ def _fail_inflight_turn(session: dict, error: Any, error_surface: Optional[dict]
+     session.pop("_submit_user_row", None)
+ 
+ 
++# A durable user message with no reply and no turn running: prompt.submit accepted and saved it, then the
++# turn ended before the agent ran (build failure, a cancel, a backend death the crash marker did not cover)
++# and the frame saying so went to a socket that was gone. Projected on resume as a retained failed turn so the
++# composer shows it as not sent with the error card's Retry, instead of a chat that idles as if it were fine.
++# [daveey]
++_UNANSWERED_TURN_ERROR = "Not sent: this message never reached the assistant. Retry to send it again."
++_UNANSWERED_TURN_SURFACE = {"layer": "runtime", "code": "turn_not_started", "retryable": True}
++
++
++def _unanswered_tail_text(row: dict | None) -> str:
++    """Display text of ``row`` when it is a plain user message (the newest transcript row), else ``""``."""
++    if not isinstance(row, dict) or row.get("role") != "user" or row.get("display_kind"):
++        return ""
++    return _content_display_text(row.get("content")).strip()
++
++
++def _unanswered_turn_inflight(session: dict, history: list | None = None, db=None) -> dict | None:
++    """The retained-failure ``inflight`` snapshot for an unanswered newest user row, or None.
++
++    ``history`` is the transcript the caller already holds (live record / cold restore); without one, the
++    newest durable row is read from ``db`` (deferred resume, whose transcript is still hydrating). Never
++    fires while a turn could still answer: this record is running, holds an in-flight or queued turn, is a
++    lazy watch window, or any live process holds the session's turn lease (a sibling backend mid-turn).
++    Fails closed to None."""
++    with session["history_lock"]:
++        if (session.get("running") or session.get("inflight_turn") or session.get("queued_prompt")
++                or session.get("queued_prompts") or session.get("lazy")):
++            return None
++    key = str(session.get("session_key") or "")
++    try:
++        if history:
++            tail = next((m for m in reversed(history) if isinstance(m, dict)
++                         and m.get("role") not in ("session_meta", "system")), None)
++        elif db is not None and callable(getattr(db, "latest_conversation_tail", None)):
++            tail = db.latest_conversation_tail(key)
++        else:
++            return None
++        text = _unanswered_tail_text(tail)
++        if not text:
++            return None
++        if key and db is not None and callable(lease_owner := getattr(db, "session_turn_lease_owner", None)):
++            if lease_owner(key):
++                return None
++        from tui_gateway.turn_marker import read_turn_marker
++        if key and read_turn_marker(_session_home(session), key) is not None:
++            return None  # a crash marker: auto-continue (or its live writer) owns this turn
++    except Exception:
++        logger.debug("unanswered-turn check failed for %s", key, exc_info=True)
++        return None
++    if session.get("_unanswered_logged") != text:  # once per message: reattaches repaint often
++        logger.info("session %s: newest user message has no reply and no turn is running; shown as not sent",
++                    key)
++    session["_unanswered_logged"] = text
++    return {"assistant": "", "user": text, "streaming": False, "error": _UNANSWERED_TURN_ERROR,
++            "status": "error", "recoverable": True, "error_surface": dict(_UNANSWERED_TURN_SURFACE)}
++
++
+ _TURN_FAILURE_DETAIL_LIMIT = 240
+ # Shortest prompt run counting as a quote-back: above shared boilerplate, below a quoted sentence.
+ _TURN_PROMPT_ECHO_WINDOW = 24
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index fda95a234b..fd5d449665 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -901,6 +901,12 @@ def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
+             return (session.get("running", False) and isinstance(stamp, int)
+                     and 0 <= (time.perf_counter_ns() - stamp) / 1_000_000_000 < _WS_ORPHAN_ACTIVITY_STALE_S)
+     agent = session.get("agent")
++    if agent is None and _agent_build_in_flight(session):
++        # An accepted prompt parked on the deferred build has no activity clock yet, so the checks below read it
++        # as wedged and the reaper interrupted it at grace: the user's message was dropped with only a bare error
++        # to the dead socket. The build is live work, and the prompt's own wait is bounded
++        # (_agent_build_wait_cap), so keep it running detached. [daveey]
++        return True
+     # Awake-time first: the wall-clock summary counts host sleep as idleness, so a turn that was healthy when
+     # the lid closed looked >600s stale the instant the Mac woke and got interrupted before the Desktop could
+     # reattach (same sleep/wake class as #44183, but on the activity clock instead of the reap Timer).
+-- 
+2.55.0
+

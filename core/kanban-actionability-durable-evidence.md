@@ -3,10 +3,10 @@
 ## Behavior
 
 - **0393:** Human escalation requires actionable evidence, not merely a blocked status. Human requests, counts, migration and recovery retire or preserve evidence through the integrated routing lifecycle. CLI, tool and HTTP request handling are covered by the entry tests below; live Desktop presentation is untested here.
-- **0397:** Owner liveness can come from a fresh matching readable scope heartbeat, avoiding per-task timestamp churn. Legacy per-task timestamps remain supported.
-- **0398–0399:** Legacy aliases reconcile only through exact owner-attested evidence and a distinct wire action. Reconciliation does not release unresolved obligations. Older adapters must not accidentally accept the new operation.
-- **0400:** A failed nonblocking ledger read retains the prior sync timestamp, avoiding repeated replica hashing under writer contention.
-- **0394–0396:** Test-only followups stabilize timestamp/reaping behavior and update the projects fixture to the atomic snapshot API.
+- **0398:** Owner liveness can come from a fresh matching readable scope heartbeat, avoiding per-task timestamp churn. Legacy per-task timestamps remain supported.
+- **0399–0400:** Legacy aliases reconcile only through exact owner-attested evidence and a distinct wire action. Reconciliation does not release unresolved obligations. Older adapters must not accidentally accept the new operation.
+- **0401:** A failed nonblocking ledger read retains the prior sync timestamp, avoiding repeated replica hashing under writer contention.
+- **0394–0397:** Test-only followups stabilize timestamp/reaping behavior and update the projects fixture to the atomic snapshot API.
 
 ## How it works / Code
 
@@ -26,13 +26,13 @@ passed 290 tests across 15 files. Human-request entries exercise CLI/tool/HTTP h
 migration HTTP auth and request lifecycle cover authorization and retirement. Actionability
 counts, graph requests, session activity and triage cover projection. Origin legacy and adapter
 tests cover exact attestation and old-wire rejection; scope heartbeat and projection-contention
-tests cover freshness and contention. Auto-continue, projects RPC and LSP tests cover 0394–0396.
+tests cover freshness and contention. Auto-continue, projects RPC and LSP tests cover 0394–0397.
 No terminal/execute_code end-to-end acceptance or live legacy mutation was performed.
 
 ## Applying
 
 Apply the full numbered series from the documented merge base, not these patches in isolation.
-The 400-patch candidate preserves all old patch numbers. Source 0400 remains unpublished/pending
+The 400-patch candidate preserves all old patch numbers. Source 0401 remains unpublished/pending
 independent review at export time; this documentation does not authorize publication or deployment.
 
 ## Gotchas / plugin?
@@ -42,13 +42,13 @@ coordinate producer rollout before deployment. Unknown/unreadable evidence is no
 The source's Kanban dashboard plugin changes are part of the core patch, not a separate mods
 plugin installation. Existing public scrubs and historical mirror adaptations remain intact.
 
-## Evidence before human access (0402) and migrated fixtures (0431)
+## Evidence before human access (0396) and migrated fixtures (0430)
 
-Patch **0402** (`424209eef9`): `kanban_assignment_routing.classify(task, kind, reason, *, human_request=None)` no
+Patch **0396** (`424209eef9`): `kanban_assignment_routing.classify(task, kind, reason, *, human_request=None)` no
 longer turns an assignment block into a `capability` / `human_access_request` because the free-text reason mentions
 authentication. Only a validated `human_request` (via `kanban_human_request.validate_human_request`) does that;
 otherwise assignment repair stays supervised operational recovery. `kanban_block_routing.classify_stop` forwards
 `human_request` and reclassifies when one is present even if a `blocker_id` is set. Tests:
-`tests/hermes_cli/test_kanban_assignment_routing.py`. Patch **0431** (`b1716989ce`) migrates the actionable-receipt
+`tests/hermes_cli/test_kanban_assignment_routing.py`. Patch **0430** (`b1716989ce`) migrates the actionable-receipt
 and waiting fixtures in `test_kanban_local_receipt_authority.py` and `test_kanban_remote_identity.py`; the
 `test_projects_rpc.py` hunk was already in the merge-adapted 0393 and is not repeated.

@@ -36,9 +36,9 @@ Probes run shell commands: use cheap read-only checks. API state exposure and De
 
 This changes core-owned behavior or its test harness; no disk plugin is required.
 
-## `wait-check` and unreachable probes (0446)
+## `wait-check` and unreachable probes (0451)
 
-Patch **0446** (`fa073eb288`): a wake probe that can never succeed (unrunnable command, missing binary) is reported
+Patch **0451** (`fa073eb288`): a wake probe that can never succeed (unrunnable command, missing binary) is reported
 distinctly from "not yet" instead of silently looking pending, and `hermes kanban wait-check` runs a probe once
 (`hermes_cli/kanban_wait_check.py`, parser entry, `kanban_tools.py` hook). Code: `kanban_wake_check.py`. Tests:
 `tests/hermes_cli/test_kanban_wake_check.py` (CLI path only; the tool-handler path is untested here).
