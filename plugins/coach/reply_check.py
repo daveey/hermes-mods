@@ -261,6 +261,12 @@ probabilities (0-1):
     reproduction it sent.
   * Asking or offering is a different failure: a message that proposes a concrete fix and asks for a go ("Go with
     this policy?", "say if you want it fixed", "want me to apply it?") scores LOW here (the confirm rule covers it).
+  * Finished work does not excuse a leftover. If the message delivers something but ALSO names a gap, caveat or
+    unfinished step the agent could close itself ("haven't tested it on a phone", "worker startup is not yet
+    verified", "remaining gaps include X", "the baseline remains unmeasured", "still open: ...") and nothing in the
+    tool log closes or hands it off, score it high (0.7+), the same as a pure diagnosis.
+  * Passing a leftover to a card, session or owner counts as starting it only when the message says what was sent
+    AND the tool log shows the send. A bare "the owner/card has it" does not.
   Score it LOW when: the user explicitly limited scope ("analysis only", "just tell me", "plan first", "don't change
   anything"); the problem genuinely needs the user's hands, password, money, a physical device or a decision only
   they can make, and the message says so; the message is a plan the user asked for; or no unresolved problem is left.

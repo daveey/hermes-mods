@@ -52,13 +52,21 @@ Measured on 360 real replies against hindsight labels (the labeler also saw the 
 threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
 samples are small (n=120), so treat these numbers as early. `unverified` showed no usable signal.
 `unwatched` checks wake sources deterministically before the judge runs, so a reply with a live watcher costs no LLM call. Of 3,260 recent Desktop replies, 299 matched the prefilter. On three real cases the judge scored the orphaned "once the runs finish, I'll…" reply 0.85 and scored the user-owned next step and the reply that armed a watcher below threshold. Watchers die when their backend restarts, so a promise made before a restart can become orphaned later; the rule only catches this at turn end.
-`report_only` (2026-10-27, 762 labeled MacBook Desktop reply endings, split 70/30 by session; judge = the live
-`coach_reply` model claude-sonnet-5-5; harness `eval/report_only_eval.py`): the prefilter keeps 96% of the positive
-human-turn endings and passes 71% of human-turn replies to the judge. At 0.75, held-out human turns: precision
-0.67, recall 0.43 (10 of 15 fires right, 23 positives); held-out event turns: 2 fires, both right, recall 0.07;
-train human 0.68 / 0.35. The acceptance target (precision >= 0.85 and recall >= 0.6) is NOT met. claude-opus-5-5
-as judge scored 0.82 / 0.39 held out at the same threshold. Most disagreements are label calls: replies that relay a
-problem to a supervisor session (labeled "started") and small caveats left in finished work (labeled report_only).
+`report_only` (2026-10-27, 762 labeled MacBook Desktop reply endings, split 70/30 by session; harness
+`eval/report_only_eval.py`): the prefilter keeps 96% of the original-label positives (89% of the re-labeled ones) and
+passes 71% of human-turn replies to the judge. Baseline (claude-sonnet-5-5, old prompt, 0.75): held-out human P 0.67,
+R 0.43. The acceptance target (precision >= 0.85 and recall >= 0.6 on held-out human turns) is still NOT met.
+Second pass (2026-10-27): every human row was re-labeled blind by claude-opus-5-5 with the same rubric, and the 52
+disagreements were adjudicated by Opus. The two blind labelers agree on 89% of human rows (positives: 55 both, 16
+Sonnet-only, 36 Opus-only), so the label ceiling is low. The judge prompt gained two rules (a named gap in finished
+work counts; a bare "the owner has it" is not a handoff). Held-out human results with that prompt, scored once, by
+label set (precision / recall; positives): consensus labels where both labelers agree, disputed rows excluded:
+0.70 -> 0.71 / 0.63 (19), 0.75 -> 0.69 / 0.47, 0.80 -> 0.88 / 0.37; original Sonnet labels, Opus judge: 0.70 ->
+0.70 / 0.50 (32 under the Opus labels), 0.80 -> 0.90 / 0.28; Sonnet judge, same prompt, 0.75 -> 0.59 / 0.43 (23). On
+train, consensus labels: 0.70 -> 0.79 / 0.64, 0.75 -> 0.83 / 0.56. No threshold reaches both targets on held-out.
+Held-out event turns: no fires at 0.85 (30 positives, labels about 70% right). The remaining errors are mostly
+borderline calls (status lines that mention an owned card, small caveats), not clear judge mistakes. Re-labeling
+files: `~/.hermes/kanban/evidence/report-only/relabel/`.
 Six explicit scope-limit fixtures (`tests/fixtures/report_only_scope_limits.json`) never fire; the deterministic
 `scope_limited()` guard drops them and the judge alone scores them <= 0.1.
 Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` and `COACH_REPLY_THRESHOLDS`
