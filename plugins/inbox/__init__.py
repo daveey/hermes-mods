@@ -221,6 +221,9 @@ def _setup_cli(parser) -> None:
     p.add_argument("--body", default="", help="markdown body ('-' reads stdin)")
     p.add_argument("--prompt", default="", help="instruction 'Do it' runs (required for the default type)")
     p.add_argument("--key")
+    condition = p.add_mutually_exclusive_group()
+    condition.add_argument("--if-absent", action="store_true", help="create only if key has never existed")
+    condition.add_argument("--expected", help="JSON outcome snapshot: refresh only if unchanged and open")
     p.add_argument("--poster")
     p.add_argument("--cwd")
     p.add_argument("--prompt-label", help="one line shown on the card instead of the full prompt")
@@ -257,9 +260,18 @@ def _run_cli(args) -> int:
                 return 2
             fields[k.strip()] = v
         try:
-            print(json.dumps(inbox.post(args.title, body, args.prompt, key=args.key, poster=args.poster,
-                                        cwd=args.cwd, prompt_label=getattr(args, "prompt_label", None),
-                                        type=getattr(args, "type", None), fields=fields or None)))
+            raw_expected = getattr(args, "expected", None)
+            expected = json.loads(raw_expected) if raw_expected is not None else None
+            if raw_expected is not None and not isinstance(expected, dict):
+                raise ValueError("--expected must be a JSON outcome object")
+            result = inbox.post(args.title, body, args.prompt, key=args.key, poster=args.poster,
+                                cwd=args.cwd, prompt_label=getattr(args, "prompt_label", None),
+                                type=getattr(args, "type", None), fields=fields or None,
+                                if_absent=getattr(args, "if_absent", False),
+                                **({"expected": expected} if raw_expected is not None else {}))
+            print(json.dumps(result))
+            if result.get("applied") is False:
+                return 3
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1

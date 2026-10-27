@@ -19,6 +19,8 @@ from before types have ``type`` NULL and behave as the built-in ``default`` type
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+from contextlib import contextmanager
 import json
 import os
 import sqlite3
@@ -40,6 +42,7 @@ MUTE_AFTER = 3
 MUTE_WINDOW_S = 7 * 86400
 
 _lock = threading.RLock()
+_UNSET = object()  # explicit expected=None is invalid, never an unconditional fallback
 
 
 class PosterMuted(ValueError):
@@ -285,7 +288,8 @@ class Inbox:
              poster: Optional[str] = None, cwd: Optional[str] = None,
              model: Optional[str] = None, prompt_label: Optional[str] = None,
              type: Optional[str] = None, fields: Optional[dict] = None,
-             inherited_cwd: Optional[str] = None) -> dict[str, Any]:
+             inherited_cwd: Optional[str] = None, if_absent: bool = False,
+             expected: Any = _UNSET) -> dict[str, Any]:
         """``cwd`` is an explicit caller choice and always wins; ``inherited_cwd`` is the posting
         session's own cwd, which social cards replace with this host's `pr` project folder.
         New cards persist cwd_explicit (including explicit home); reposts retain original provenance."""
@@ -314,6 +318,18 @@ class Inbox:
         # new card with buttons, never a follow-up note in the old chat.
         decision = any(x["kind"] in ("resolve", "task") for x in snap["actions"])
         now = self.clock()
+        if if_absent or expected is not _UNSET:
+            if not key or (if_absent and expected is not _UNSET):
+                raise ValueError("conditional post needs a key and exactly one condition")
+            if expected is not _UNSET and (not isinstance(expected, dict) or
+                    expected.get("key") != key or not expected.get("revision") or
+                    not expected.get("session_id")):
+                raise ValueError("expected must be an outcome snapshot with key, session_id and revision")
+            return self._conditional_post(
+                title=title, body=body, accept_prompt=accept_prompt, key=key, poster=poster,
+                cwd=cwd, inherited_cwd=inherited_cwd, model=model, prompt_label=prompt_label,
+                snap=snap, fvals=fvals, legacy=legacy, now=now,
+                if_absent=if_absent, expected=expected)
         with _lock:
             side = self._side()
             db = self._sessions()
@@ -369,6 +385,145 @@ class Inbox:
             finally:
                 side.close()
                 self._close(db)
+
+    @contextmanager
+    def _atomic(self):
+        """Lock BOTH SQLite writers before reading either store (including core-only writers).
+
+        ATTACH precedes BEGIN IMMEDIATE: this reserves both databases, not a second-read
+        approximation or a process-local lock. WAL gives concurrency atomicity and exception
+        rollback, but SQLite does NOT promise cross-file power-loss atomicity in WAL mode.
+        Keep SessionDB open for its schema setup and WAL generation guard.
+        """
+        with _lock:
+            side = self._side()
+            side.close()
+            db = self._sessions()
+            conn = None
+            try:
+                conn = sqlite3.connect(str(db.db_path), timeout=30, isolation_level=None)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("ATTACH DATABASE ? AS inbox", (str(self.path),))
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn, db
+                conn.commit()
+            except BaseException:
+                if conn is not None:
+                    conn.rollback()
+                raise
+            finally:
+                if conn is not None:
+                    conn.close()
+                self._close(db)
+
+    @staticmethod
+    def _snapshot(conn, key):
+        row = conn.execute("SELECT * FROM inbox.items WHERE key=? ORDER BY updated_at DESC, "
+                           "created_at DESC, rowid DESC LIMIT 1", (key,)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        row = conn.execute("SELECT * FROM sessions WHERE id=?", (item["session_id"],)).fetchone()
+        session = dict(row) if row else None
+        messages = [dict(r) for r in conn.execute(
+            "SELECT * FROM messages WHERE session_id=? ORDER BY id", (item["session_id"],))]
+        # Full content, not merely a count/timestamp: edits and deletes also invalidate the token.
+        revision = hashlib.sha256(json.dumps([item, session, messages], sort_keys=True,
+                                             default=repr).encode()).hexdigest()
+        state, outcome = item["state"], item.get("outcome")
+        if state == "queuing":
+            state, outcome = "open", None
+        elif state in ("open", "accepted"):
+            if not session or session.get("archived"):
+                state, outcome = "archived", outcome or "archived"
+            elif state == "open" and not session.get("hidden"):
+                state = "accepted"
+        elif state == "archived":
+            outcome = outcome or "archived"
+        return {"key": item["key"], "session_id": item["session_id"], "state": state,
+                "outcome": outcome, "value": None if item["state"] == "queuing" else item.get("outcome_value"),
+                "fields": item_fields(item), "at": (item["updated_at"] if item["state"] == "queuing" else
+                                                     item.get("resolved_at") or item["updated_at"]),
+                "type": item.get("type") or "default", "title": item["title"],
+                "task": None if item["state"] == "queuing" else item.get("outcome_task"), "revision": revision,
+                "item_state": item["state"], "updated_at": item["updated_at"],
+                "message_count": len(messages),
+                "last_message_id": messages[-1]["id"] if messages else None}
+
+    def _conditional_post(self, *, title, body, accept_prompt, key, poster, cwd,
+                          inherited_cwd, model, prompt_label, snap, fvals, legacy, now,
+                          if_absent, expected):
+        with self._atomic() as (conn, db):
+            current = self._snapshot(conn, key)
+            conflict = (current is not None) if if_absent else (
+                current is None or current["state"] != "open" or current["item_state"] != "open" or
+                any(current[k] != expected[k] for k in ("key", "session_id", "revision")))
+            if conflict:
+                return {"applied": False, "reason": "exists" if if_absent else "changed",
+                        "snapshot": current}
+            # Reuse core message encoding/counters/guards on THIS transaction, never a nested
+            # SessionDB commit. All helper calls receive conn explicitly.
+            class Writer:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                def _execute_write(self, fn, **kwargs):
+                    return fn(conn)
+
+                def get_session(self, sid):
+                    r = conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+                    return dict(r) if r else None
+
+            writer: Any = Writer()
+            if current is None:
+                if poster and self._ignored_streak(conn, writer, poster, now) >= MUTE_AFTER:
+                    raise PosterMuted(f"poster {poster!r} is muted; fix it before unmuting")
+                from hermes_state_ids import new_session_id
+                sid = new_session_id()
+                rt = routing_module()
+                routed = rt.route_cwd(self.home, explicit=cwd, inherited=inherited_cwd,
+                                      social=rt.is_social(key=key, type=snap["name"], title=title,
+                                                          body=body, poster=poster))
+                type(db)._insert_session_row(writer, sid, "desktop", model=model,
+                                             cwd=routed or str(Path.home()))
+                conn.execute("UPDATE sessions SET hidden=1 WHERE id=?", (sid,))
+                conn.execute("INSERT INTO inbox.items(session_id,key,title,poster,accept_prompt,"
+                             "created_at,updated_at,state,type,fields_json,actions_json,cwd_explicit) "
+                             "VALUES (?,?,?,?,?,?,?,'open',?,?,?,?)",
+                             (sid, key, title, poster, accept_prompt, now, now, snap["name"],
+                              json.dumps(fvals), json.dumps(snap), int(cwd is not None)))
+                text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy else
+                        _typed_post_text(title, body, poster, snap, fvals))
+            else:
+                sid = current["session_id"]
+                conn.execute("UPDATE inbox.items SET title=?,poster=COALESCE(?,poster),accept_prompt=?,"
+                             "updated_at=?,type=?,fields_json=?,actions_json=? WHERE session_id=?",
+                             (title, poster, accept_prompt, now, snap["name"], json.dumps(fvals),
+                              json.dumps(snap), sid))
+                text = (_update_text(body, accept_prompt, now, prompt_label) if legacy else
+                        _typed_update_text(body, snap, fvals, now))
+            db._check_transcript_write_guards(conn, sid, None, reject_active_turn_lease=True)
+            type(db).append_message(writer, sid, "assistant", text)
+            # Match the legacy title collision fallback without reading outside the transaction.
+            for n in range(1, 50):
+                candidate = title if n == 1 else f"{title} ({n})"
+                if not conn.execute("SELECT 1 FROM sessions WHERE title=? AND id<>?",
+                                    (candidate, sid)).fetchone():
+                    conn.execute("UPDATE sessions SET title=?,title_source='user' WHERE id=?",
+                                 (candidate, sid))
+                    break
+            conn.execute("UPDATE sessions SET last_read_at=0 WHERE id=?", (sid,))
+            if current is None:
+                items = self._open_items(conn, writer)
+                extra = max(0, len(items) - MAX_OPEN)
+                read = sorted((i for i in items if not i["unread"]), key=lambda i: i["updated_at"])
+                for item in read[:extra]:
+                    conn.execute("UPDATE sessions SET archived=1 WHERE id=?", (item["session_id"],))
+                    conn.execute("UPDATE inbox.items SET state='archived',outcome=COALESCE(outcome,'archived') "
+                                 "WHERE session_id=?", (item["session_id"],))
+            return {"applied": True, "session_id": sid, "updated": current is not None,
+                    "snapshot": self._snapshot(conn, key)}
 
     def _ignored_streak(self, side, db, poster: str, now: float) -> int:
         """How many of *poster*'s most recent closed cards (inside MUTE_WINDOW_S, after its last unmute)
@@ -671,37 +826,8 @@ class Inbox:
         too (archived from the sidebar = archived). None when no card ever had that key."""
         if not key or not self.exists():
             return None
-        side = self._side()
-        try:
-            row = side.execute("SELECT * FROM items WHERE key=? ORDER BY updated_at DESC, created_at DESC, "
-                               "rowid DESC LIMIT 1",
-                               (str(key),)).fetchone()
-        finally:
-            side.close()
-        if not row:
-            return None
-        item = dict(row)
-        state, outcome = item["state"], item.get("outcome")
-        if state == "queuing":  # a task action is still creating its Kanban card: no decision yet
-            return {"key": item["key"], "state": "open", "outcome": None, "value": None,
-                    "fields": item_fields(item), "at": item["updated_at"], "session_id": item["session_id"],
-                    "type": item.get("type") or "default", "title": item["title"], "task": None}
-        if state in ("open", "accepted"):
-            db = self._sessions()
-            try:
-                s = db.get_session(item["session_id"])
-            finally:
-                self._close(db)
-            if not s or s.get("archived"):  # archived through another door, or the session is gone
-                state, outcome = "archived", outcome or "archived"
-            elif state == "open" and not s.get("hidden"):
-                state = "accepted"
-        elif state == "archived":
-            outcome = outcome or "archived"  # archived before outcomes were recorded
-        return {"key": item["key"], "state": state, "outcome": outcome, "value": item.get("outcome_value"),
-                "fields": item_fields(item), "at": item.get("resolved_at") or item["updated_at"],
-                "session_id": item["session_id"], "type": item.get("type") or "default",
-                "title": item["title"], "task": item.get("outcome_task")}
+        with self._atomic() as (conn, _db):
+            return self._snapshot(conn, str(key))
 
     def on_user_turn(self, session_id: str) -> bool:
         """A user turn started in *session_id*: if it is an open message, accept it."""

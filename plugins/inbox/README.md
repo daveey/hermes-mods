@@ -87,6 +87,47 @@ Acting is atomic across processes (the sidecar row moves only from `open`); `act
 
 Sidecar rows from before card types have no `type` and behave exactly as before (the `default` type).
 
+## Conditional posting for pollers
+
+Default posting behavior is unchanged. Pollers that must not revive a dismissed key or overwrite
+user activity can opt in through the owner-side store or CLI:
+
+```sh
+hermes inbox post 'Draft options' --key draft:example --prompt 'Review options' --if-absent
+hermes inbox outcome draft:example
+hermes inbox post 'Refreshed options' --key draft:example --prompt 'Review options' --expected "$snapshot_json"
+```
+
+- `Inbox.post(..., if_absent=True)` creates only when **no sidecar row with that key exists**,
+  including archived, accepted, resolved, queuing, and missing-session records.
+- `Inbox.post(..., expected=snapshot)` refreshes only the unchanged, still-open newest card.
+  Pass the JSON object returned by `outcome`, or a previous conditional result's `snapshot`.
+  Required fields are `key`, `session_id`, and opaque `revision`; do not manufacture the token.
+- Both modes require `key` and are mutually exclusive. Success returns
+  `{applied: true, session_id, updated, snapshot}`. A failed condition returns
+  `{applied: false, reason: "exists" | "changed", snapshot: <current outcome or null>}` with **no post**.
+  CLI exit codes: **0** applied, **3** condition conflict, **1** invalid payload, **2** argparse errors.
+  Invalid `--expected` JSON (including `null`) fails closed. Do not fall back to unconditional posting
+  on a conflict or error; reassess the current snapshot and caller eligibility policy.
+- Outcomes add `revision`, `item_state`, `updated_at`, `message_count`, and `last_message_id`.
+  The revision hashes the complete sidecar row, authoritative session row and all stored message rows;
+  same-count edits/deletes and messages from core writers invalidate it, as do lifecycle changes.
+  It is a content snapshot token, not a monotonic event counter. Reading/metadata changes can also
+  cause conservative conflicts. Queuing cards retain public `state: open` but cannot be refreshed.
+- `ATTACH inbox.db` **before** `BEGIN IMMEDIATE` reserves both SQLite writers before checking the
+  condition, and holds them through transcript and sidecar updates/commit. Core session writers need
+  no plugin lock participation. Core transcript encoding, counters and lease guards are reused.
+  Exceptions roll back both stores. This guarantees concurrency isolation, **not cross-file
+  power-loss atomicity**: SQLite WAL cannot guarantee the latter for attached databases.
+- The conditional path honors type validation, routing, mute refusal and the read-card cap.
+  Unlike the default path, a conditional mute refusal does not queue a remediation Kanban card.
+  Only the store and CLI expose conditions; the agent tool and REST posting surface remain unchanged.
+
+Tests: `tests/test_conditional.py` uses real SessionDBs, subprocess CLI entry points, competing
+create/refresh processes, independent state/sidecar writers, archive/accept/edit/message changes,
+invalid conditions, snapshot readback and injected rollback. It invokes the plugin's registered
+argparse/CLI implementation without loading unrelated plugins from a live profile.
+
 ## Posting
 
 | Door | Commands |
