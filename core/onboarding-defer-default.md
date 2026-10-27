@@ -1,6 +1,6 @@
 # Provider overlay never overwrites a configured default model
 
-Patch **0470** (source `7dcc9a1d61`).
+Patches **0470, 0472** (sources `7dcc9a1d61`, `4cfc27bc24`).
 
 ## Behavior
 
@@ -35,6 +35,9 @@ The card shows "Begin sets <model> as the default model for new chats." when the
     `pendingEndpoint` for a local endpoint.
   - `saveOnboardingLocalEndpoint` parks the probed endpoint in `pendingEndpoint` on a configured install and skips the
     runtime gate (the custom provider isn't in config yet; the probe already proved it answers).
+  - Local/custom endpoints also defer when the config read fails, fields are absent, or configuration is partial.
+    Only explicit empty model and provider strings allow first-run persistence. The generation guard runs after
+    the options await before either branch, so dismissal during that read cannot write or reopen the card.
 - `apps/desktop/src/components/onboarding/flow.tsx` renders the note; `onboarding.defaultChangeNote` is in every
   locale (`ar_boot`, `zh-hant_boot` for the sparse ones), keys regenerated with `npm run i18n:keys`.
 
@@ -48,9 +51,15 @@ The card shows "Begin sets <model> as the default model for new chats." when the
   the initiating owner.
 - `components/onboarding/flow.test.tsx`: note shown with `deferPersist`, absent on a first run.
 
+- `onboarding-local-confirm.test.ts`: unavailable/missing/partial config defers until Begin (one write of the shown
+  model), dismiss does not write, explicit empty first run persists, and dismissal during empty/configured/failed
+  options reads has no effects. Six regressions failed before 0472; all eight pass after it.
+- Follow-up verification: 75 onboarding tests pass; TypeScript and ESLint pass. The six existing first-run local
+  tests now explicitly return empty config rather than simulating a failed configuration read.
+
 ## Applying
 
-`git am -3` 0470. Touches only the onboarding store, the confirm panel and the onboarding locale blocks.
+`git am -3` 0470 and 0472. Touches only the onboarding store, the confirm panel and the onboarding locale blocks.
 
 ## Gotchas
 

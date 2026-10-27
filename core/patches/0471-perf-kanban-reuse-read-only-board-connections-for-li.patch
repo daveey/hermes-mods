@@ -1,0 +1,330 @@
+From f9e611f5db2ef6fd8c323933eb5155278bfb892a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:54:39 -0700
+Subject: [PATCH] perf(kanban): reuse read-only board connections for
+ linked-card reads [daveey]
+
+The Desktop's linked-card endpoint opened a fresh sqlite connection to every
+board and every sync replica on each call (~16 files): schema parse, WAL-index
+setup and close cost ~2.5 ms a file, so one chat's cards took ~40 ms median
+with 120-340 ms tails, over the phase 5 budget of 40 ms.
+
+cached_ro() keeps one read-only connection per file in the long-lived
+dashboard process, shared across the threadpool behind a per-connection lock,
+reopened when the file's inode changes (a rebuilt replica) or after any
+sqlite error. Idle autocommit readers hold no snapshot, so writers and
+TRUNCATE checkpoints are unaffected. _read_session_tasks and replica_cards use
+it. Live laptop data: 1.3-1.8 ms median per chat (was 40-42 ms), 40 chats
+4.6 ms (was 43.7 ms), same cards.
+
+Tests: reuse + fresh commits, reopen on replace, drop on error, missing file
+never created, checkpoint not blocked, 8-thread sharing, and replica_cards
+seeing a link added and one released after the first read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_chat_links.py            |   8 +-
+ hermes_cli/kanban_session_activity.py      |  71 +++++++++++--
+ tests/hermes_cli/test_kanban_chat_links.py |  15 +++
+ tests/hermes_cli/test_kanban_ro_cache.py   | 110 +++++++++++++++++++++
+ 4 files changed, 190 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ro_cache.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index ac52e0ae57..a6097e9ba4 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -117,6 +117,7 @@ def replica_cards(session_ids: Iterable[str], gateway: str, statuses: tuple[str,
+     if replicas is None:
+         from hermes_cli import kanban_sync_client as ksc
+         replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
++    from hermes_cli.kanban_session_activity import cached_ro  # lazy: that module imports this one
+     ph = ",".join("?" for _ in ids)
+     st = ",".join("?" for _ in statuses)
+     now = time.time()
+@@ -125,17 +126,14 @@ def replica_cards(session_ids: Iterable[str], gateway: str, statuses: tuple[str,
+         if not path.exists():
+             continue
+         try:
+-            conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+-            conn.row_factory = sqlite3.Row
+-            try:
++            with cached_ro(path) as conn:
++                conn.row_factory = sqlite3.Row
+                 rows = conn.execute(
+                     "SELECT t.id, t.title, t.status, t.assignee, t.created_at, t.started_at, t.priority, t.block_kind, "
+                     "t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind FROM task_chat_links l "
+                     f"JOIN tasks t ON t.id = l.task_id WHERE l.chat_gateway = ? AND l.released = 0 AND l.chat_session IN ({ph}) "
+                     f"AND t.status IN ({st}) AND t.created_on IS NOT NULL AND t.created_on != ?",
+                     (gateway, *ids, *statuses, gateway)).fetchall()
+-            finally:
+-                conn.close()
+         except sqlite3.Error as exc:
+             _log.info("kanban chat links: replica %s unreadable (%s)", path, exc)
+             continue
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index d1795b5cba..1f389398bc 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -14,6 +14,7 @@ seconds because the sidebar polls.
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import json
+ import logging
+ import re
+@@ -22,7 +23,7 @@ import sqlite3
+ import threading
+ import time
+ from pathlib import Path
+-from typing import Any, Callable, Iterable
++from typing import Any, Callable, Iterable, Iterator
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -286,19 +287,69 @@ def _hub_db_path() -> Path | None:
+     return path if path.is_file() else None
+ 
+ 
+-def _open_ro(path: Path) -> sqlite3.Connection:
++def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+     """Read-only open that survives a WAL db whose -wal/-shm were just removed (plain ``mode=ro`` then fails);
+     never creates the file."""
+     try:
+-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5, check_same_thread=check_same_thread)
+         conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+         return conn
+     except sqlite3.OperationalError:
+-        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=0.5)
++        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=0.5, check_same_thread=check_same_thread)
+         conn.execute("PRAGMA query_only = ON")
+         return conn
+ 
+ 
++# Linked-card reads run on every sidebar refresh across ~16 boards and replicas; a fresh connection pays schema
++# parse + WAL-index setup + close each time (~2.5 ms a board, the whole latency budget). The dashboard is long-lived,
++# so keep one read-only connection per file, shared across the threadpool (one per thread would hold ~3 fds per
++# board per worker). An idle autocommit reader holds no snapshot, so it never blocks writers or checkpoints.
++_RO_CACHE: dict[str, tuple[sqlite3.Connection, tuple[int, int], threading.Lock]] = {}
++_RO_CACHE_LOCK = threading.Lock()
++
++
++@contextlib.contextmanager
++def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
++    """A shared read-only connection to ``path``, held exclusively for the ``with`` body. Reopened when the file is
++    replaced (new inode: a rebuilt replica) or after any sqlite error. Raises ``sqlite3.OperationalError`` when
++    the file is missing, like ``_open_ro``."""
++    key = str(path)
++    try:
++        st = os.stat(path)
++    except OSError as exc:
++        raise sqlite3.OperationalError(f"unable to open database file {path}: {exc}") from exc
++    ident = (st.st_dev, st.st_ino)
++    stale = None
++    with _RO_CACHE_LOCK:
++        entry = _RO_CACHE.get(key)
++        if entry is not None and entry[1] != ident:
++            stale = _RO_CACHE.pop(key)[0]
++            entry = None
++        if entry is None:
++            entry = (_open_ro(path, check_same_thread=False), ident, threading.Lock())
++            _RO_CACHE[key] = entry
++    if stale is not None:
++        _close_quietly(stale)
++    conn, _ident, lock = entry
++    with lock:  # bodies read every result they start: an unfinished cursor would pin a WAL snapshot
++        conn.row_factory = None
++        try:
++            yield conn
++        except sqlite3.Error:
++            with _RO_CACHE_LOCK:
++                if _RO_CACHE.get(key) is entry:
++                    del _RO_CACHE[key]
++            _close_quietly(conn)
++            raise
++
++
++def _close_quietly(conn: sqlite3.Connection) -> None:
++    try:
++        conn.close()
++    except sqlite3.Error:
++        pass
++
++
+ def _self_gateway(conn: sqlite3.Connection) -> str:
+     try:
+         row = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
+@@ -970,9 +1021,8 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+     of, in ``statuses`` — the same pairs ``_read_counts`` counts."""
+     sid_ph = ",".join("?" for _ in ids)
+     st_ph = ",".join("?" for _ in statuses)
+-    conn = _open_ro(path)
+-    conn.row_factory = sqlite3.Row
+-    try:
++    with cached_ro(path) as conn:
++        conn.row_factory = sqlite3.Row
+         cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+         if "session_id" not in cols:
+             return []  # explicitly supported pre-session schema
+@@ -995,8 +1045,6 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+         except sqlite3.Error:  # board predates notify subscriptions
+             pass
+         _add_card_details(conn, found)
+-    finally:
+-        conn.close()
+     board = _board_slug(path)
+     return [{**t, "board": board} for t in found.values()]
+ 
+@@ -1292,3 +1340,8 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+             _snapshot_saved = None
+         _waiting_cache[0] = {}
+         _parked_cache[0] = ({}, {})
++    with _RO_CACHE_LOCK:
++        held = [entry[0] for entry in _RO_CACHE.values()]
++        _RO_CACHE.clear()
++    for conn in held:
++        _close_quietly(conn)
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 858d34e2d2..4d105fd4ec 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -178,3 +178,18 @@ def test_a_board_only_another_gateway_has_gets_a_link_only_file(live, kanban_hom
+         conn.close()
+     from hermes_cli import kanban_db
+     assert "runners" not in {b.get("slug") for b in kanban_db.list_boards()}  # never a board in the UI
++
++
++def test_replica_reads_stay_fresh_through_the_shared_connection(tmp_path):
++    ksa._reset_cache_for_tests()
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_a", "a", "running", OTHER), ("t_b", "b", "ready", OTHER)], [("t_a", ME, "s1", "shepherd", 0)])
++    assert [c["id"] for c in links.replica_cards(["s1"], ME, replicas=[("default", rep)])] == ["t_a"]
++    conn = sqlite3.connect(rep)
++    conn.execute("INSERT INTO task_chat_links VALUES (?, 't_b', ?, 'default', 's1', 'shepherd', 0, 2)",
++                 (links.link_uid("t_b", ME, "default", "s1", "shepherd"), ME))
++    conn.execute("UPDATE task_chat_links SET released = 1 WHERE task_id = 't_a'")
++    conn.commit()
++    conn.close()
++    assert [c["id"] for c in links.replica_cards(["s1"], ME, replicas=[("default", rep)])] == ["t_b"]
++    ksa._reset_cache_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_ro_cache.py b/tests/hermes_cli/test_kanban_ro_cache.py
+new file mode 100644
+index 0000000000..4c45fc9e20
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ro_cache.py
+@@ -0,0 +1,110 @@
++"""The shared read-only connection cache behind the linked-card reads: one connection per file reused across calls
++and threads, fresh commits visible, reopened when the file is replaced or a read fails, never blocking a writer."""
++
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_session_activity as ksa
++
++
++@pytest.fixture(autouse=True)
++def _clean_cache():
++    ksa._reset_cache_for_tests()
++    yield
++    ksa._reset_cache_for_tests()
++
++
++def _db(path, value):
++    conn = sqlite3.connect(path)
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("CREATE TABLE IF NOT EXISTS t (v TEXT)")
++    conn.execute("DELETE FROM t")
++    conn.execute("INSERT INTO t VALUES (?)", (value,))
++    conn.commit()
++    return conn
++
++
++def _read(path):
++    with ksa.cached_ro(path) as conn:
++        return conn, conn.execute("SELECT v FROM t").fetchone()[0]
++
++
++def test_reuses_one_connection_and_sees_new_commits(tmp_path):
++    path = tmp_path / "b.db"
++    writer = _db(path, "one")
++    first, value = _read(path)
++    assert value == "one"
++    writer.execute("UPDATE t SET v = 'two'")
++    writer.commit()
++    again, value = _read(path)
++    assert again is first and value == "two"
++    writer.close()
++
++
++def test_reopens_when_the_file_is_replaced(tmp_path):
++    path, fresh = tmp_path / "b.db", tmp_path / "new.db"
++    _db(path, "old").close()
++    first, _ = _read(path)
++    _db(fresh, "rebuilt").close()
++    os.replace(fresh, path)
++    second, value = _read(path)
++    assert second is not first and value == "rebuilt"
++
++
++def test_a_failed_read_drops_the_connection(tmp_path):
++    path = tmp_path / "b.db"
++    _db(path, "x").close()
++    first, _ = _read(path)
++    with pytest.raises(sqlite3.OperationalError):
++        with ksa.cached_ro(path) as conn:
++            conn.execute("SELECT nope FROM missing")
++    second, value = _read(path)
++    assert second is not first and value == "x"
++
++
++def test_missing_file_raises_and_is_never_created(tmp_path):
++    path = tmp_path / "absent.db"
++    with pytest.raises(sqlite3.OperationalError):
++        with ksa.cached_ro(path):
++            pass
++    assert not path.exists()
++
++
++def test_idle_cached_reader_does_not_block_writers_or_checkpoints(tmp_path):
++    path = tmp_path / "b.db"
++    writer = _db(path, "a")
++    _read(path)
++    for i in range(50):
++        writer.execute("INSERT INTO t VALUES (?)", (str(i),))
++        writer.commit()
++    busy, _log, _ckpt = writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
++    assert busy == 0
++    assert os.path.getsize(f"{path}-wal") == 0
++    writer.close()
++
++
++def test_threads_share_the_connection_safely(tmp_path):
++    path = tmp_path / "b.db"
++    _db(path, "v").close()
++    seen, errors = set(), []
++
++    def worker():
++        try:
++            for _ in range(50):
++                conn, value = _read(path)
++                assert value == "v"
++                seen.add(id(conn))
++        except Exception as exc:  # surfaced below
++            errors.append(exc)
++
++    threads = [threading.Thread(target=worker) for _ in range(8)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert errors == [] and len(seen) == 1
+-- 
+2.54.0 (Apple Git-157)
+
