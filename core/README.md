@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md) | 0528 | Every gateway's sessions show from the hub replica at once on a cold start (no SSH wait); owners that published within 180 s give ordinary, running-aware rows. |
 | [exhausted-provider-recovery.md](exhausted-provider-recovery.md) | 0521 | Exhausted providers (`failure_kind` exhausted/auth_missing, `provider`, nullable `reset_at` in UNIX seconds) open a recovery screen naming the provider and reset time instead of the first-run picker; nine locales. |
 | [kanban-central-sync-client.md](kanban-central-sync-client.md) | 0466, 0468, 0470, 0472, 0475, 0502, 0503, 0506–0509 | Central Board sync client: pull-then-push, shadow/import/diff, full-row sends, transient-rejection backoff, capture-gap fix, push feed, synced chat links. |
 | [kanban-remote-observation-scope.md](kanban-remote-observation-scope.md) | 0461, 0462, 0483–0485, 0490, 0497, 0498, 0500, 0501, 0505, 0525 | Remote kanban observations scoped to linked cards, non-blocking remote-links projection, retained-row evidence refresh in Desktop. |
