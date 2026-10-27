@@ -213,7 +213,10 @@ one-shot checks, not another long-lived shell loop.
 ## Kanban card parked on an external PR
 
 Use the runtime's read-only terminal-state probe as the `wake_check`, not a `gh ... --jq .state` test (that
-treats API failures as pending and never wakes for a superseded PR):
+treats API failures as pending and never wakes for a superseded PR). Graphite merge queues close the
+original PRs they land: CLOSED, never MERGED. The `kanban-pr-wake-guard` plugin now refuses raw gh PR
+state/merge wake checks on `kanban_block` and `kanban_schedule`, and warns on non-terminal probes such as
+`reviewDecision` that may never become true after closure. Use:
 `hermes --run-module hermes_cli.kanban_pr_wake https://github.com/OWNER/REPO/pull/N`. Exit 1 = OPEN, 0 = merged
 or closed-unmerged (wake to reconcile; neither is acceptance), 2 = evidence/auth error, never pending.
 - When the change will land through a replacement commit while the original PR stays OPEN (a squash train, a
