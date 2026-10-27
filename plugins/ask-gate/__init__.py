@@ -317,16 +317,19 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             pass
         return {"replace": "I withheld a user-step request after checking its lifecycle state. "
                 "No new permission or execution authorization is granted by this notice."}
+    rejected = False
     try:
         users = _user_msgs(session_id)
         howto = bool(users) and core.asked_how_to(users[-1])
         asks = core.find_asks(final_response, howto=howto)
         retirement_candidates = asks + handoff.find_handoffs(final_response)
         if not howto and retirement_candidates and ledger().workflow_stopped(session_id):
+            rejected = True
             record_verdict(session_id, "workflow_stopped", final_response)
             return {"replace": "The workflow remains stopped. I withheld a request to act on it."}
         retired = core.retired_matches(retirement_candidates, ledger().retired_for(session_id, retirement_candidates))
         if retired:
+            rejected = True
             record_verdict(session_id, "retired", final_response)
             return {"replace":
                     "I suppressed a repeated request because this action has a recorded terminal answer. "
@@ -336,6 +339,7 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
         if reconciled is None:
             reconciled = _reconcile_prose(session_id, "pre_final_gate", asks if howto else retirement_candidates)
         if reconciled is not None:
+            rejected = True
             record_verdict(session_id, "approval_reconciled", final_response)
             try:
                 ledger().set_open_asks(session_id, [])
@@ -358,6 +362,7 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
         else:
             return None
         bad = judge_mod.bad(verdicts)
+        rejected = bool(bad)
         core.log_event("verdict", session=session_id, attempt=attempt, asks=asks,
                        verdicts=[(v["verdict"], v.get("reason", "")) for v in verdicts])
         if not bad:
@@ -376,7 +381,12 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             core.log_event("pending_clear_error", session=session_id, error=repr(e))
         return {"replace": "I withheld a request that did not pass the current-state check. "
                 "No action or approval is requested by this notice."}
-    except Exception as e:  # judge down: deliver, log, never break a chat
+    except Exception as e:
+        # Reporting/pending-ledger failures must not resurrect a rejected draft.
+        # Preserve the existing fail-open policy only before a rejection exists.
+        if rejected:
+            return {"replace": "I withheld a request that did not pass the current-state check. "
+                    "No action or approval is requested by this notice."}
         core.log_event("gate_error", session=session_id, error=repr(e))
         return None
 

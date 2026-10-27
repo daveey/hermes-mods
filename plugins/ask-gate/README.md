@@ -133,6 +133,16 @@ the plugin entry point, the actual structured hook, failure rollback, foreign re
 full live PluginManager discovery and real private adapters still require deployment verification.
 
 This seam alone is not an installed approval integration: without a matching adapter the ordinary gate remains.
+## Positive rejection survives reporting failures
+
+Once the final hook has rejected a draft for stopped workflow, retired answer, authoritative
+reconciliation, or a negative judge verdict, failures in unrelated verdict reporting cannot
+release that draft. The response is replaced with a non-action notice. Before any positive
+rejection, the existing judge-unavailable policy is unchanged.
+`tests/test_f3_reporting_failure.py` reproduces corrupt reporting-cache shapes for all four
+rejection paths and checks the non-rejection control. This does not prove old-core replacement
+support or protection before a rejection has been established.
+
 ## Exact user-step source reconciliation (bounded integration)
 
 `user_step_lifecycle.py` reads existing `::user-step` IDs through the adjacent user-steps
