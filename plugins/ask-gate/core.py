@@ -234,7 +234,11 @@ def says_david_must_act(text: str) -> bool:
 # paths / time
 # --------------------------------------------------------------------------------------------------
 def home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:  # Standalone reporting scripts outside Hermes.
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return get_hermes_home()
 
 
 def boards() -> list[Path]:

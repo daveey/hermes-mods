@@ -90,7 +90,12 @@ class Store:
     """
 
     def __init__(self, path: str | Path | None = None):
-        home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        try:
+            from hermes_constants import get_hermes_home
+        except ImportError:  # Standalone plugin tests/reporting.
+            home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        else:
+            home = get_hermes_home()
         self.path = Path(path or os.environ.get("ASK_GATE_LIFECYCLE_DB")
                          or home / "state" / "ask-lifecycle.sqlite").expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
