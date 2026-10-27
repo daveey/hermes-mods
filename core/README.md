@@ -15,19 +15,26 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [model-class-routing.md](model-class-routing.md) | 0405–0430 0432–0438 0441 | Opt-in sticky class allocator (`class:deep|standard|fast`) with managed-subscription fences across CLI, Desktop, API, messaging, delegation, cron, Kanban and auxiliary calls. |
+| [kanban-provider-quota-walls.md](kanban-provider-quota-walls.md) | 0452 | Record provider retry-after walls and re-tier walled Kanban cards, with a storm alert. |
+| [kanban-ownerless-blocks.md](kanban-ownerless-blocks.md) | 0451 | Refuse ownerless agent blocks and undecided blocked cards; sweep old ones through triage once. |
+| [kanban-worker-crash-oom-recovery.md](kanban-worker-crash-oom-recovery.md) | 0439 0449 | Scope-killed workers count as crashes; typed OOM recovery raises MemoryMax with admission and alerts on OOM rate. |
+| [kanban-triage-sweep-default-assignee.md](kanban-triage-sweep-default-assignee.md) | 0447 | CLI create defaults the assignee; stale triage cards are swept to the default profile once. |
+| [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) | 0443–0445 | Release instead of kill remote SSH backends on quit/resume, macOS launcher ownership proof, reuse-miss logging. |
+| [desktop-home-session-placement.md](desktop-home-session-placement.md) | 0404 | New cwd-only sessions keep a visible provisional or Home placement in every sidebar view. |
 | [kanban-sync-seams.md](kanban-sync-seams.md) | 0401 | Phase 1 of the central Kanban sync service, off by default (`kanban.sync.enabled`): outbox capture triggers with a drift guard, `apply_remote_changes`, lease seams in claim/heartbeat/stale-claim, tombstoned deletes, wide ids, dispatcher wake; no network code yet |
-| [kanban-actionability-durable-evidence.md](kanban-actionability-durable-evidence.md) | 0393–0400 | Merge-adapted actionable escalation, scope heartbeat freshness, exact legacy attestation with a distinct wire action, contention timestamp retention, and test followups; locally verified candidate |
+| [kanban-actionability-durable-evidence.md](kanban-actionability-durable-evidence.md) | 0393–0400 0402 0431 | Merge-adapted actionable escalation, scope heartbeat freshness, exact legacy attestation with a distinct wire action, contention timestamp retention, and test followups; locally verified candidate |
 | [unresolved-goal-fallback.md](unresolved-goal-fallback.md) | 0392 | Optional structured `pre_final_gate` fallback retained at budget/cap/unavailable boundaries, ownership-bound rechecks, private held text, scoped Kanban/process/dispatcher health receipts; enforcement stays opt-in (coach plugin) |
 | [retention-observation.md](retention-observation.md) | 0391 | Fail-closed, observation-only non-CI retention slice (`retention_cli observe`); cannot delete or authorize deletion |
 | [kanban-origin-adoption.md](kanban-origin-adoption.md) | 0380–0382 | State-preserving existing-task origin adoption with immutable request replay/conflict checks |
 | [kanban-local-owner-projection.md](kanban-local-owner-projection.md) | 0384–0390 | Exact local owner evidence and alias-qualified dedup, foreign-profile preservation, nonblocking ledger refresh, one scoped annotation snapshot and per-projection alias-read reuse; live acceptance remains separate |
-| [kanban-origin-work-ledger.md](kanban-origin-work-ledger.md) | 0221 0223 0242–0247 0268 0270 0273–0279 0281–0282 0293 0295–0297 0299 0311 0313–0314 0316 0324–0328 0342 0361 | Owner-qualified remote work, durable binding/creation receipts, fresh lifecycle evidence, routed drawers/archive checks and deferred completion notices |
+| [kanban-origin-work-ledger.md](kanban-origin-work-ledger.md) | 0221 0223 0242–0247 0268 0270 0273–0279 0281–0282 0293 0295–0297 0299 0311 0313–0314 0316 0324–0328 0342 0361 0403 0450 | Owner-qualified remote work, durable binding/creation receipts, fresh lifecycle evidence, routed drawers/archive checks and deferred completion notices |
 | [kanban-agent-recovery-routing.md](kanban-agent-recovery-routing.md) | 0269 0301 0307–0308 0334 0365 | Current-run continuation exhaustion and automatic stops route to agent recovery while genuine human asks remain visible |
 | [kanban-assignment-capabilities.md](kanban-assignment-capabilities.md) | 0300 0336 | Shared configured-capability/model preflight and bounded durable assignment repair |
 | [registry-backend-reconnect.md](registry-backend-reconnect.md) | 0309–0310 0315 0317–0323 | Exact-generation Linux registry reconnect, atomic retirement and stopped-owner recovery; repeated source identities retained |
 | [kanban-pr-reconciliation-wakes.md](kanban-pr-reconciliation-wakes.md) | 0339 0343–0344 0346 | Explicit checkpoints do not self-rearm holds; terminal PR and verified supersession wakes reconcile without claiming acceptance |
 | [kanban-dispatch-ownership.md](kanban-dispatch-ownership.md) | 0362–0363 0366–0369 | Canonical-database dispatch authority, native-connection fencing, lifecycle contention and per-board pre-work isolation |
-| [process-ci-test-followups.md](process-ci-test-followups.md) | 0257 0262–0263 0345 0347–0348 0357 | Fresh descendant cleanup, bounded event waits, cancellation handoffs, attribution and repeated Nix pipefail fix |
+| [process-ci-test-followups.md](process-ci-test-followups.md) | 0257 0262–0263 0345 0347–0348 0357 0440 0442 | Fresh descendant cleanup, bounded event waits, cancellation handoffs, attribution and repeated Nix pipefail fix |
 | [managed-chrome-leases.md](managed-chrome-leases.md) | 0370–0372 | Experimental, not release-approved: opt-in owner-scoped default/local/named browser requests, selected vault scope and task/shutdown lease cleanup; configuration docs corrected locally, exact-head CI and changed-head review remain blockers; native core repetition and genuine credential use are unexercised, not claimed |
 | [ci-poll-runner-routing.md](ci-poll-runner-routing.md) | 0330–0331, 0338 | Poll-only CI routing, cancellation-safe aggregators and Detect timeout |
 | [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) | 0349 | Orderly park releases PR guard; broker-aware PR-state reads |
@@ -43,7 +50,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [ci-retry-isolation-followups.md](ci-retry-isolation-followups.md) | 0306 | LSP Git-bearing scratch regression |
 | [kanban-scratch-git-preservation.md](kanban-scratch-git-preservation.md) | 0294 | Tool, CLI and REST completion preserve Git-bearing or uncertain scratch before any optional post-tool cleanup |
 | [kanban-touch-subscriptions.md](kanban-touch-subscriptions.md) | 0260 | Touch subscriptions do not own work |
-| [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0261 0298 | Condition-driven scheduled wakes with generation fencing and shared-park guards |
+| [kanban-condition-wakes.md](kanban-condition-wakes.md) | 0261 0298 0446 | Condition-driven scheduled wakes with generation fencing and shared-park guards |
 | [inline-preview-full-document.md](inline-preview-full-document.md) | 0264 | Whole-document inline previews |
 | [kanban-default-provider.md](kanban-default-provider.md) | 0265 | Default tier provider inference |
 | [test-live-git-config-guard.md](test-live-git-config-guard.md) | 0266 0271 | Protect live git identity during tests |
@@ -138,7 +145,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [file-safety-token-broker.md](file-safety-token-broker.md) | 0222 | Read- and write-deny `~/.config/token-broker` (broker client token) in file tools, search, vision and `@file` refs |
 | [hub-sync-replica.md](hub-sync-replica.md) | 0219 0220 0232 0235 0329 0364 | Desktop reads the hermes-hub replica (hub-sync plugin): owner lookup without probing, Kanban falls back to the replica for an unreachable gateway, and cached sessions of unreachable gateways appear as offline-marked rows in the normal sidebar list (standalone section removed; live rows win) |
 | [chat-closeout.md](chat-closeout.md) | 0253 0254 0255 | Chat close-out seams: session rows carry `kanban_waiting_on`, grey `waiting` sidebar stripe while cards are open, plugin waiting sources, and `_wake_session_turn` to run one turn in an unloaded chat |
-| [kanban-respawn-guard-hold.md](kanban-respawn-guard-hold.md) | 0212 0225 0227 0241 0248 0250 0251 0312 | A held card gets one comment + fix card; `active_pr` lifts for merged/closed PRs or completed queue rejections, quoting the repair reason; one event per hold |
+| [kanban-respawn-guard-hold.md](kanban-respawn-guard-hold.md) | 0212 0225 0227 0241 0248 0250 0251 0312 0448 0453 | A held card gets one comment + fix card; `active_pr` lifts for merged/closed PRs or completed queue rejections, quoting the repair reason; one event per hold |
 | [desktop-kanban-worker-readonly.md](desktop-kanban-worker-readonly.md) | 0213 0229 | Desktop opens a Kanban worker session read-only and quietly instead of a "Resume failed" toast (gateway code 4132) |
 | [api-server-thread-hops.md](api-server-thread-hops.md) | 0214 0228 | API-server SSE flushes worker-thread hops before `assistant.completed`/EOS so the last commentary is not dropped |
 | [codex-subscription-routing.md](codex-subscription-routing.md) | 0236 0237 0238 0239 0240 | Account-gated Codex models route via an entitled ChatGPT/Codex subscription: union catalog, plan-gated pool selection, subscription-first picker |
@@ -279,4 +286,4 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Process and CI followups](process-ci-test-followups.md) | 0327 0332 0333 0337 0354 0374–0375 | Readiness, duplicate deadline identities, curl detection fallback and bounded fast-check lane. |
 | [Session start requests](session-start-requests.md) | 0376–0377 | Trusted metadata, authenticated SSH principal and persisted-owner preservation. |
 
-Current full-series apply instructions and executed tests: [390-patch verification](mirror-390-verification.md). Historical adaptations, duplicate treatment and broader prior tests: [377-patch verification](mirror-377-verification.md).
+Latest appended range (0402–0453): [453-patch verification](mirror-453-verification.md). Current full-series apply instructions and executed tests: [390-patch verification](mirror-390-verification.md). Historical adaptations, duplicate treatment and broader prior tests: [377-patch verification](mirror-377-verification.md).

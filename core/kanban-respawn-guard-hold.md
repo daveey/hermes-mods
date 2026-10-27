@@ -77,3 +77,12 @@ quote its repair reason, and test the full dispatcher release plus queued/merged
 ## Plugin?
 
 No. Dispatcher behavior inside core.
+
+## Never-run cards (0448, 0453)
+
+Patch **0448** (`f75d239f8b`): `active_pr` returns None when the card has no `task_runs` or every PR-naming comment
+predates its first run (`_pr_comments_predate_first_run` in `kanban_db_dispatch_pr_state.py`): a worker that never
+ran cannot have opened a duplicate PR, so a review card is not held on the PR it exists to review. A worker that
+opened a PR then crashed is still held. Tests: `tests/hermes_cli/test_kanban_pr_continuation.py` (never-run and
+crash cases) plus the `worker_ran` fixture in `tests/hermes_cli/kanban_guard_helpers.py`. Patch **0453** is a
+mirror fix-up that syncs `test_kanban_pr_continuation.py` with the source after a merge-adaptation conflict.

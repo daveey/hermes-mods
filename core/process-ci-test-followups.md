@@ -52,3 +52,10 @@ Deadline cleanup, stream transport handling, CI checks and contributor mappings 
 Patches **0327, 0332, 0333, 0337, 0354, 0374–0375** retain the eager-reopen readiness wait, duplicate process-tree deadline fixes, classifier curl fallback, bounded fast-check runner lane and retirement fallback documentation. 0332/0333/0354 are explicit empty duplicates of0257/0263/0348, verified by stable patch IDs. 0338 preserves the final five-minute detect timeout while retaining the curl fallback. Source tests cover deadline process cleanup and eager session readiness; no new hosted runner is provisioned by applying these patches. CI workflow declarations alone do not prove deployed runner capacity.
 
 Code: `agent/deadline.py`, `evals/cron_timeout_fork_race.py`, `tests/agent/test_deadline_fork_race.py`, session reopen tests, `.github/actions/detect-changes`, `.github/workflows`, and CI runner documentation. Apply the entire ordered series using `git am -3 --empty=keep`; this is core/CI work, not a plugin.
+
+## Routing CI fixtures and cron tick ordering (0440, 0442)
+
+Patch **0440** (`a3c3c9e928`) makes the routing CI fixtures and approval batching deterministic
+(`tests/tui_gateway/test_approval_unadvertised.py`, `test_protocol.py`, gateway child-notice admission). Patch
+**0442** (`bb5e855908`) asserts async cron tick ordering instead of elapsed time (`tests/cron/test_parallel_pool.py`).
+Test-only changes.

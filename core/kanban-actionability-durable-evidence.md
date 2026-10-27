@@ -41,3 +41,14 @@ Scope-heartbeat producers require a compatible hub client (source specifies >= 1
 coordinate producer rollout before deployment. Unknown/unreadable evidence is not completion.
 The source's Kanban dashboard plugin changes are part of the core patch, not a separate mods
 plugin installation. Existing public scrubs and historical mirror adaptations remain intact.
+
+## Evidence before human access (0402) and migrated fixtures (0431)
+
+Patch **0402** (`424209eef9`): `kanban_assignment_routing.classify(task, kind, reason, *, human_request=None)` no
+longer turns an assignment block into a `capability` / `human_access_request` because the free-text reason mentions
+authentication. Only a validated `human_request` (via `kanban_human_request.validate_human_request`) does that;
+otherwise assignment repair stays supervised operational recovery. `kanban_block_routing.classify_stop` forwards
+`human_request` and reclassifies when one is present even if a `blocker_id` is set. Tests:
+`tests/hermes_cli/test_kanban_assignment_routing.py`. Patch **0431** (`b1716989ce`) migrates the actionable-receipt
+and waiting fixtures in `test_kanban_local_receipt_authority.py` and `test_kanban_remote_identity.py`; the
+`test_projects_rpc.py` hunk was already in the merge-adapted 0393 and is not repeated.

@@ -109,12 +109,21 @@ CREATE TABLE IF NOT EXISTS repair_domain_verification (
 '''
 
 
+def core_gateway_id():
+    """Core's start-ledger authority. session.start_request builds its StartOwner
+    from local_authority_gateway_id(), not the runners owner UUID; resolvers and
+    status reads must use the same key or the RPC is refused (4030)."""
+    from gateway.hosted_rooms import local_authority_gateway_id
+    return local_authority_gateway_id()
+
+
 class RepairService:
-    def __init__(self, service, *, core_factory=None, config_loader=None):
+    def __init__(self, service, *, core_factory=None, config_loader=None, core_gateway=None):
         self.service = service
         self.config_loader = config_loader
         self.path = Path(service.path)
         self.core_factory = core_factory
+        self._core_gateway = core_gateway
         self._registrations = {}
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,7 +346,7 @@ class RepairService:
             if key in self._registrations:
                 return self._registrations[key][0]
             o = self._owner()
-            owner = StartOwner(o['gateway_id'], o['profile'], principal)
+            owner = StartOwner(self._core_gateway or core_gateway_id(), o['profile'], principal)
             core = (self.core_factory or get_service)(o['profile'])
 
             def resolve(caller, request_id):
@@ -410,7 +419,7 @@ class RepairService:
         if historical:
             from tui_gateway.session_start_requests import StartOwner, get_service
             old = repair['owner']
-            owner = StartOwner(old['gateway_id'], old['profile'], principal)
+            owner = StartOwner(self._core_gateway or core_gateway_id(), old['profile'], principal)
         else:
             owner, core = self._core(principal)
         try:

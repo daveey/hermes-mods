@@ -1,0 +1,261 @@
+From 7d6a49a13e207795ad15a52d435be75630bee674 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 03:23:15 +0000
+Subject: [PATCH 432/453] fix(routing): fence native refresh and reset turn
+ recovery exclusions
+
+(cherry picked from commit 4807fbe851a9c29c65b7c0c37a08c2beed7d0752)
+---
+ agent/agent_runtime_helpers.py          |   7 +-
+ agent/client_lifecycle.py               |   8 +-
+ agent/model_routing_agent.py            |  17 ++++
+ agent/model_routing_runtime.py          |  36 ++++++++
+ tests/agent/test_class_refresh_fence.py | 110 ++++++++++++++++++++++++
+ 5 files changed, 172 insertions(+), 6 deletions(-)
+ create mode 100644 tests/agent/test_class_refresh_fence.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 45cddaad94..c97acabc08 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -1449,11 +1449,8 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
+ def restore_primary_runtime(agent) -> bool:
+     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
+     (long-lived CLI agents and the gateway's cached agents)."""
+-    if not agent._fallback_activated:
+-        # Reset the index even without activation: a failed _try_activate_fallback() can strand
+-        # _fallback_index past the chain end and silently block future fallbacks (#20465).
+-        agent._fallback_index = 0
+-        _revert_credential_rotation(agent)
++    from agent.model_routing_agent import begin_recovery_episode
++    if begin_recovery_episode(agent):
+         return False
+     rt = agent._primary_runtime
+     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
+diff --git a/agent/client_lifecycle.py b/agent/client_lifecycle.py
+index 879ca87398..9e4cb29445 100644
+--- a/agent/client_lifecycle.py
++++ b/agent/client_lifecycle.py
+@@ -516,6 +516,8 @@ class ClientLifecycleMixin:
+         """
+         if self.api_mode == "anthropic_messages":
+             self._try_refresh_anthropic_client_credentials()
++        from agent.model_routing_runtime import verify_agent_class_credentials
++        verify_agent_class_credentials(self)
+         key = self._request_anthropic_client_key()
+         cached, stale = self._checkout_request_slot(_ANTHROPIC_SLOT, key)
+         if cached is not None:
+@@ -898,7 +900,9 @@ class ClientLifecycleMixin:
+             return False
+         try:
+             from agent.anthropic_credentials import resolve_anthropic_token
+-            new_token = resolve_anthropic_token(model=self.model)
++            from agent.model_routing_runtime import refresh_class_anthropic_token
++            new_token = (refresh_class_anthropic_token(self) if getattr(self, "model_routing", None)
++                         else resolve_anthropic_token(model=self.model))
+         except Exception as exc:
+             logger.debug("Anthropic credential refresh failed: %s", exc)
+             return False
+@@ -1032,6 +1036,8 @@ class ClientLifecycleMixin:
+         # A supplied request-local client was already refreshed in _create_request_anthropic_client.
+         if client is None and self.api_mode == "anthropic_messages":
+             self._try_refresh_anthropic_client_credentials()
++        from agent.model_routing_runtime import verify_agent_class_credentials
++        verify_agent_class_credentials(self)
+         # Strips Responses-only kwargs that leak in under an api_mode-flip race.
+         from agent.anthropic_adapter import create_anthropic_message
+         # on_response: rate-limit + credits state live in response headers, which the parsed Message drops.
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 45f5f0627f..b1d1f51bfa 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -36,6 +36,23 @@ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+             runtime["credential_pool"], [])
+ 
+ 
++def begin_recovery_episode(agent):
++    """Reset turn-local attempts, without reallocating a sticky class route.
++
++    Return true when the primary is already active and needs no restoration.
++    Pool cooldowns remain authoritative even though previous attempts are reset.
++    """
++    if getattr(agent, "model_routing", None):
++        agent._model_routing_failed = set()
++    if agent._fallback_activated:
++        return False
++    from agent.agent_runtime_helpers import _revert_credential_rotation
++    # Even failed fallback walks advance the legacy index; reset at the next turn.
++    agent._fallback_index = 0
++    _revert_credential_rotation(agent)
++    return True
++
++
+ def try_class_fallback(agent):
+     """Called only at the existing failed-request recovery boundary, never per tool.
+ 
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 687f189e5d..3c45dbaebf 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -61,6 +61,42 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+             continue
+ 
+ 
++def refresh_class_anthropic_token(agent):
++    """Refresh within the selected billing pool, never the legacy env-key ladder.
++
++    This resolves credentials only: it neither allocates nor changes the sticky
++    provider/model. Native pool resolution retains refresh-grant ownership.
++    """
++    from agent.credential_pool import load_pool
++    from hermes_cli.runtime_provider import _resolve_runtime_from_pool_entry
++
++    metadata = agent.model_routing
++    pool = load_pool("anthropic", allowed_auth_types=
++                     {"oauth"} if metadata["billing_group"] == "subscription" else None)
++    entry = pool.select(model=agent.model)
++    if entry is None:
++        return None
++    runtime = _resolve_runtime_from_pool_entry(
++        provider="anthropic", entry=entry,
++        model_cfg={"provider": "anthropic", "default": agent.model},
++        pool=pool, requested_provider="anthropic", target_model=agent.model)
++    verify_class_runtime(runtime, metadata)
++    agent._credential_pool = pool
++    return runtime["api_key"]
++
++
++def verify_agent_class_credentials(agent):
++    """Recheck the actual native credential immediately before client checkout."""
++    metadata = getattr(agent, "model_routing", None)
++    if metadata:
++        verify_class_runtime({
++            "provider": agent.provider, "api_mode": agent.api_mode,
++            "api_key": agent._anthropic_api_key,
++            "base_url": agent._anthropic_base_url,
++            "credential_pool": agent._credential_pool,
++        }, metadata)
++
++
+ def verify_class_runtime(runtime, metadata):
+     """Check the actual credential/transport, not only manifest labels."""
+     from hermes_cli.auth import DEFAULT_CODEX_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL
+diff --git a/tests/agent/test_class_refresh_fence.py b/tests/agent/test_class_refresh_fence.py
+new file mode 100644
+index 0000000000..4bd2544767
+--- /dev/null
++++ b/tests/agent/test_class_refresh_fence.py
+@@ -0,0 +1,110 @@
++"""Request-time credentials and recovery episodes preserve class billing."""
++import json
++from copy import deepcopy
++from unittest.mock import patch, MagicMock
++
++import anthropic
++import httpx
++import pytest
++
++from hermes_cli.config import atomic_config_write
++from tests.agent import test_model_routing_agent
++from tests.agent.test_class_failure_wire import completion
++
++routing_home = test_model_routing_agent.routing_home
++streaming_route = test_model_routing_agent.streaming_route
++build_agent = test_model_routing_agent.build_agent
++
++
++@pytest.mark.parametrize("reject", [False, True, "rotate"])
++def test_paid_env_never_replaces_subscription_at_dispatch(routing_home, streaming_route, monkeypatch, tmp_path, reject):
++    sent = []
++
++    def respond(request):
++        sent.append(dict(request.headers))
++        if reject == "rotate" and len(sent) == 1:
++            auth_path = tmp_path / "auth.json"
++            auth = json.loads(auth_path.read_text(encoding="utf-8-sig"))
++            for entry in auth["credential_pool"]["anthropic"]:
++                if entry["auth_type"] == "oauth":
++                    entry["access_token"] = "sk-ant-oat-synthetic-rotated"
++            auth_path.write_text(json.dumps(auth), encoding="utf-8")
++        if reject is True or (reject == "rotate" and len(sent) == 1):
++            return httpx.Response(401, json={"type": "error", "error": {
++                "type": "authentication_error", "message": "invalid credential"}})
++        return completion(json.loads(request.content)["model"])
++
++    original = anthropic.Anthropic
++
++    def sdk(**kwargs):
++        kwargs["http_client"] = httpx.Client(transport=httpx.MockTransport(respond))
++        kwargs["max_retries"] = 0
++        return original(**kwargs)
++
++    with patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("agent.turn_recovery.interruptible_backoff_sleep", return_value=None), \
++         patch("anthropic.Anthropic", side_effect=sdk):
++        agent = build_agent(session_id="billing-fence", max_iterations=3)
++        monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-paid-key")
++        try:
++            result = agent.run_conversation("Say ok")
++            if reject is not True:
++                assert result["final_response"] == "ok", result
++            else:
++                assert result.get("failed") or result.get("error"), result
++            assert agent.model_routing["billing_group"] == "subscription"
++        finally:
++            agent.release_clients()
++    assert sent
++    assert all(h.get("authorization", "").startswith("Bearer sk-ant-oat") for h in sent)
++    assert all("x-api-key" not in h for h in sent)
++    if reject == "rotate":
++        assert len(sent) == 2
++        assert sent[-1]["authorization"] == "Bearer sk-ant-oat-synthetic-rotated"
++
++
++@pytest.mark.parametrize("request_local", [False, True])
++def test_invalid_subscription_credential_is_blocked_before_send(routing_home, streaming_route, request_local):
++    from agent.model_routing import ModelRoutingError
++
++    with patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
++        agent = build_agent(session_id="dispatch-guard")
++        try:
++            agent._anthropic_api_key = "synthetic-paid-key"
++            with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False), \
++                 patch("agent.anthropic_adapter.create_anthropic_message") as send:
++                with pytest.raises(ModelRoutingError, match="OAuth token"):
++                    if request_local:
++                        agent._create_request_anthropic_client(reason="test")
++                    else:
++                        agent._anthropic_messages_create({"model": agent.model, "messages": []})
++                send.assert_not_called()
++        finally:
++            agent.release_clients()
++
++
++def test_new_turn_can_reuse_recovered_subscription(routing_home, streaming_route, tmp_path):
++    routes = routing_home["model_routing"]["routes"]["deep"]
++    second = deepcopy(routes[0])
++    second["model"] = "z-anthropic-deep"
++    paid = deepcopy(second)
++    paid.update(model="paid-deep", billing="metered")
++    routes.extend([second, paid])
++    routing_home["model_routing"]["allow_metered"] = True
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    with patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
++        agent = build_agent(session_id="recovered-subscription")
++        try:
++            assert agent.model == "anthropic-deep"
++            assert agent._try_activate_fallback()
++            assert agent.model == "z-anthropic-deep"
++            agent._restore_primary_runtime()
++            assert agent.model == "z-anthropic-deep"  # no turn-start rebalance
++            assert agent._try_activate_fallback()
++            assert agent.model == "anthropic-deep"
++            assert agent.model_routing["billing_group"] == "subscription"
++        finally:
++            agent.release_clients()
+-- 
+2.54.0 (Apple Git-157)
+

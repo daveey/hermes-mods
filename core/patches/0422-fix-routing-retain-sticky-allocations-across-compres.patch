@@ -1,0 +1,255 @@
+From 0d313ada64f00cf952300f163bf12f5510acf81e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:36:19 +0000
+Subject: [PATCH 422/453] fix(routing): retain sticky allocations across
+ compression lineage [daveey]
+
+(cherry picked from commit 15cc52fcf9ebf768a511cb970f54067058ee66a0)
+---
+ agent/conversation_compression.py             | 19 ++--
+ agent/conversation_compression_lineage.py     | 13 +++
+ agent/model_routing_agent.py                  | 14 ++-
+ agent/model_routing_state.py                  | 24 +++++
+ tests/agent/test_class_compression_lineage.py | 95 +++++++++++++++++++
+ 5 files changed, 151 insertions(+), 14 deletions(-)
+ create mode 100644 agent/conversation_compression_lineage.py
+ create mode 100644 tests/agent/test_class_compression_lineage.py
+
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 82777e42ad..2565b95fea 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -1654,6 +1654,8 @@ def _adopt_live_compression_child(
+     confirmed = resolver(session_db, parent_session_id)
+     if not confirmed or str(confirmed) != child_session_id:
+         return None
++    from agent.model_routing_agent import link_compression_route
++    link_compression_route(agent, parent_session_id, child_session_id)
+     agent.session_id = child_session_id
+     _rebind_session_context(child_session_id)
+     _hand_off_metrics_segment(parent_session_id, child_session_id)
+@@ -3300,18 +3302,6 @@ def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: An
+             agent._session_db.set_session_title_source(agent.session_id, _src)
+ 
+ 
+-def _compression_child_source(agent: Any, parent_session_id: str) -> str:
+-    """The parent row's persisted source: a compression child is the same conversation, so a ``--source tool``,
+-    ``oneshot`` or inherited ``kanban`` label must not degrade to the bare ``agent.platform`` (#112550)."""
+-    parent = None
+-    with contextlib.suppress(Exception):
+-        parent = agent._session_db.get_session(parent_session_id)
+-    if parent and parent.get("source"):
+-        return parent["source"]
+-    from agent.session_source import session_source_for
+-    return session_source_for(getattr(agent, "platform", None))
+-
+-
+ def _publish_rotated_compaction(
+     agent: Any, messages: list, compressed: list, *, new_system_prompt: str, lease: _CompressionLease,
+     old_session_id: str, compressed_user_turn_outcome: str,
+@@ -3345,11 +3335,14 @@ def _publish_rotated_compaction(
+     _profile_for_child = None if _profile_for_child == "default" else _profile_for_child
+     old_title = agent._session_db.get_session_title(agent.session_id)
+     new_session_id = mint_session_id()
++    from agent.model_routing_agent import link_compression_route
++    link_compression_route(agent, old_session_id, new_session_id)
+     from agent.context_compressor import _DB_PERSISTED_MARKER
+     from tools.approval_yolo import with_session_yolo
++    from agent.conversation_compression_lineage import compression_child_source
+     agent._session_db.publish_compression_child(
+         parent_session_id=old_session_id, child_session_id=new_session_id,
+-        source=_compression_child_source(agent, old_session_id), model=agent.model,
++        source=compression_child_source(agent, old_session_id), model=agent.model,
+         model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
+         system_prompt=new_system_prompt, messages=compressed,
+         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
+diff --git a/agent/conversation_compression_lineage.py b/agent/conversation_compression_lineage.py
+new file mode 100644
+index 0000000000..b37741671d
+--- /dev/null
++++ b/agent/conversation_compression_lineage.py
+@@ -0,0 +1,13 @@
++"""Persisted identity carried across compression continuations."""
++import contextlib
++
++
++def compression_child_source(agent, parent_session_id):
++    """Keep the parent's persisted source, including tool/oneshot/kanban labels."""
++    parent = None
++    with contextlib.suppress(Exception):
++        parent = agent._session_db.get_session(parent_session_id)
++    if parent and parent.get("source"):
++        return parent["source"]
++    from agent.session_source import session_source_for
++    return session_source_for(getattr(agent, "platform", None))
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index c988f6874b..0e438adfc7 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -7,7 +7,8 @@ def prepare_agent_route(agent, model, provider, session_id, api_key, base_url,
+     """Resolve only class selectors; concrete user pins retain legacy semantics.
+ 
+     Parent sessions here can be delegated jobs, not compression continuations, so
+-    they must not automatically share allocations. Compression keeps session_id.
++    they must not automatically share allocations. Compression publication links
++    rotated IDs explicitly before exposing its child in SessionDB.
+     """
+     agent.model_routing = None
+     if not is_class_selector(model):
+@@ -94,6 +95,17 @@ def try_class_fallback(agent):
+     return True
+ 
+ 
++def link_compression_route(agent, parent_session_id, child_session_id):
++    """Only compression publication/adoption may join main-agent allocations."""
++    if not getattr(agent, "model_routing", None):
++        return
++    from agent.model_routing_state import RoutingState
++    from hermes_constants import get_hermes_home
++
++    RoutingState(get_hermes_home() / "model-routing.sqlite3").link_continuation(
++        child_session_id, parent_session_id)
++
++
+ def persist_class_metadata(agent):
+     """Keep the ordinary session row in sync with the durable allocation store."""
+     metadata = getattr(agent, "model_routing", None)
+diff --git a/agent/model_routing_state.py b/agent/model_routing_state.py
+index 9097e724af..116587562c 100644
+--- a/agent/model_routing_state.py
++++ b/agent/model_routing_state.py
+@@ -29,6 +29,30 @@ class RoutingState:
+                 db.execute("ROLLBACK")
+                 raise
+ 
++    def link_continuation(self, session, parent):
++        """Bind a proven compression child without consuming an allocation slot.
++
++        Call before publishing the child in SessionDB: a failed publish may leave
++        an unreachable alias, but a visible child must never lack its route.
++        Existing independent allocations cannot be merged retroactively.
++        """
++        from agent.model_routing import ModelRoutingError
++
++        with closing(sqlite3.connect(self.path, timeout=30, isolation_level=None)) as db:
++            db.execute("BEGIN IMMEDIATE")
++            try:
++                row = db.execute("SELECT root FROM aliases WHERE session=?", (parent,)).fetchone()
++                if row is None:
++                    raise ModelRoutingError("Compression routing lineage has no allocated parent")
++                existing = db.execute("SELECT root FROM aliases WHERE session=?", (session,)).fetchone()
++                if existing is not None and existing[0] != row[0]:
++                    raise ModelRoutingError("Compression routing lineage conflicts with an independent session")
++                db.execute("INSERT OR IGNORE INTO aliases VALUES (?, ?)", (session, row[0]))
++                db.execute("COMMIT")
++            except BaseException:
++                db.execute("ROLLBACK")
++                raise
++
+     def _allocate(self, db, session, parent, level, candidates, version, excluded):
+         from agent.model_routing import ModelRoutingError
+ 
+diff --git a/tests/agent/test_class_compression_lineage.py b/tests/agent/test_class_compression_lineage.py
+new file mode 100644
+index 0000000000..0c5f67717b
+--- /dev/null
++++ b/tests/agent/test_class_compression_lineage.py
+@@ -0,0 +1,95 @@
++"""Compression publication preserves the allocator identity across restarts."""
++import sqlite3
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent.conversation_compression import _publish_rotated_compaction
++from agent.model_routing import resolve_model_route
++from hermes_state import SessionDB
++from tests.agent import test_model_routing_agent as agent_tests
++
++build_agent = agent_tests.build_agent
++routing_home = agent_tests.routing_home
++streaming_route = agent_tests.streaming_route
++
++
++def counters(home):
++    with sqlite3.connect(home / "model-routing.sqlite3") as db:
++        return db.execute("SELECT pool, position FROM counters ORDER BY pool").fetchall()
++
++
++def rotate(agent):
++    old = agent.session_id
++    _publish_rotated_compaction(
++        agent, [], [{"role": "user", "content": "compacted history"}],
++        new_system_prompt="stable after compression", old_session_id=old,
++        lease=SimpleNamespace(holder=None, ttl=60, watermark=None),
++        compressed_user_turn_outcome="already_present",
++    )
++    return agent.session_id
++
++
++def test_rotated_class_keeps_allocation_across_two_hops_and_restart(routing_home, streaming_route, tmp_path):
++    with SessionDB(tmp_path / "state.db") as db, \
++         patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
++        agent = build_agent(session_id="root", session_db=db)
++        db.create_session("root", source="cli", model=agent.model,
++                          model_config=agent._session_init_model_config)
++        agent._session_db_created = True
++        expected = dict(agent.model_routing)
++        before = counters(tmp_path)
++        for _ in range(2):
++            child = rotate(agent)
++            restarted = build_agent(session_id=child, session_db=db)
++            assert restarted.model_routing == expected
++            assert counters(tmp_path) == before
++        from agent.conversation_compression import _adopt_live_compression_child
++        stale = build_agent(session_id="root", session_db=db)
++        assert _adopt_live_compression_child(stale, db, "root")
++        assert stale.session_id == child
++        assert stale.model_routing == expected
++        assert counters(tmp_path) == before
++        with sqlite3.connect(tmp_path / "model-routing.sqlite3") as state:
++            assert state.execute("SELECT root FROM aliases WHERE session=?", (child,)).fetchone() == ("root",)
++
++
++def test_failed_publication_cannot_change_parent_route(routing_home, streaming_route, tmp_path):
++    with SessionDB(tmp_path / "state.db") as db, \
++         patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
++        agent = build_agent(session_id="root", session_db=db)
++        db.create_session("root", source="cli", model=agent.model)
++        expected = dict(agent.model_routing)
++        before = counters(tmp_path)
++        with patch.object(db, "publish_compression_child", side_effect=RuntimeError("publish failed")):
++            with pytest.raises(RuntimeError, match="publish failed"):
++                rotate(agent)
++        assert agent.session_id == "root"
++        assert build_agent(session_id="root").model_routing == expected
++        assert counters(tmp_path) == before
++
++
++def test_lineage_link_rejects_existing_independent_allocation(tmp_path):
++    from agent.model_routing import ModelRoutingError
++    from agent.model_routing_state import RoutingState
++    from tests.agent.test_model_routing import policy
++    path = tmp_path / "routes.db"
++    for session in ("parent", "independent"):
++        resolve_model_route("class:deep", config=policy(), session_id=session, state_path=path)
++    with pytest.raises(ModelRoutingError, match="lineage"):
++        RoutingState(path).link_continuation("independent", "parent")
++
++
++def test_lineage_link_is_idempotent_and_does_not_allocate(tmp_path):
++    from agent.model_routing_state import RoutingState
++    from tests.agent.test_model_routing import policy
++    path = tmp_path / "routes.db"
++    expected = resolve_model_route("class:deep", config=policy(), session_id="parent", state_path=path)
++    state = RoutingState(path)
++    state.link_continuation("child", "parent")
++    state.link_continuation("child", "parent")
++    state.link_continuation("tip", "child")
++    assert resolve_model_route("class:deep", config=policy(), session_id="tip", state_path=path) == expected
+-- 
+2.54.0 (Apple Git-157)
+
