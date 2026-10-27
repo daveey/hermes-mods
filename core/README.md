@@ -16,6 +16,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | Doc | Patches | What you get |
 |---|---|---|
 | [model-class-routing.md](model-class-routing.md) | 0405–0430 0432–0438 0441 | Opt-in sticky class allocator (`class:deep|standard|fast`) with managed-subscription fences across CLI, Desktop, API, messaging, delegation, cron, Kanban and auxiliary calls. |
+| [desktop-agent-test-instance-hidden.md](desktop-agent-test-instance-hidden.md) | 0459 | A Desktop test instance a kanban worker launches gets no Dock icon and never shows a window; the owner's own Desktop stays visible. |
 | [at-completion-refresh.md](at-completion-refresh.md) | 0458 | `@` completion sources can `subscribe` so an open popover re-asks when their background fetch lands. |
 | [core-update-drain-hold.md](core-update-drain-hold.md) | 0455 | A live `<home>/core-update/drain-hold` stops new Kanban claims so a saturated board drains for a core update; running workers are untouched. |
 | [kanban-provider-quota-walls.md](kanban-provider-quota-walls.md) | 0452 | Record provider retry-after walls and re-tier walled Kanban cards, with a storm alert. |
