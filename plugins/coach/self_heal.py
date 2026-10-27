@@ -1168,8 +1168,76 @@ def _store(store=None):
     return _S()
 
 
+ADOPT_STATUSES = ("ready", "running", "blocked", "todo")
+ADOPT_LOOKBACK_S = 2 * 3600  # no `complaint_at` on the defect: the complaint turn is at most this long before detection
+
+
+def session_owned_cards(session_id: Optional[str], since: float, home: Optional[Path] = None) -> list:
+    """Active kanban cards (ready/running/blocked/todo) the origin session created (tasks.session_id) or subscribed
+    to (kanban_notify_subs.chat_id), created at/after `since`, newest first, across the default and named boards.
+    -> [{id, title, status, created_at, board}]. Unreadable boards are skipped."""
+    if not session_id:
+        return []
+    import sqlite3
+    home = Path(home) if home else Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    dbs = [(None, home / "kanban.db")] + [(p.parent.name, p) for p in sorted((home / "kanban" / "boards").glob("*/kanban.db"))]
+    marks = ",".join("?" * len(ADOPT_STATUSES))
+    rows: list = []
+    for board, path in dbs:
+        if not path.exists():
+            continue
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            db.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except sqlite3.Error:
+            try:
+                db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
+                db.execute("PRAGMA query_only=ON")
+            except sqlite3.Error:
+                continue
+        try:
+            for r in db.execute(
+                    f"SELECT id, title, status, created_at FROM tasks WHERE status IN ({marks}) AND created_at >= ? "
+                    "AND (session_id = ? OR id IN (SELECT task_id FROM kanban_notify_subs WHERE chat_id = ?))",
+                    (*ADOPT_STATUSES, int(since), session_id, session_id)):
+                rows.append({"id": r[0], "title": r[1], "status": r[2], "created_at": r[3], "board": board})
+        except sqlite3.Error:
+            pass
+        finally:
+            db.close()
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return rows
+
+
+def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[Callable] = None) -> Optional[dict]:
+    """If the defect's origin session created/subscribed an active card after the complaint, record the newest as the
+    lane's fix_card (approved) and log `selfheal_adopted_owner`. -> result dict, or None to go on and file."""
+    sid = d.get("session_id")
+    if not sid or (owner_fn is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1"):
+        return None
+    since = d.get("complaint_at") or ((d.get("at") or now) - ADOPT_LOOKBACK_S)
+    try:
+        cards = (owner_fn or session_owned_cards)(sid, since)
+    except Exception as exc:
+        store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
+        return None
+    if not cards:
+        return None
+    c = cards[0]
+    lane = LaneState(store.root)
+    st = lane.get(fp)
+    lane.update(fp, status="approved", fix_card=c["id"], approved_at=now, component=d.get("component"),
+                symptom=d.get("symptom"), session_id=sid, board=c.get("board"), filed_day=_utc_day(now),
+                cards=sorted(known_cards(st) | {c["id"]}))
+    store.log({"event": "selfheal_adopted_owner", "fingerprint": fp, "card": c["id"], "status": c.get("status"),
+               "board": c.get("board"), "session_id": sid, "candidates": [x["id"] for x in cards]})
+    return {"action": "skip", "why": f"adopted owner card {c['id']} from session {sid}", "card": c["id"],
+            "adopted": True}
+
+
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
-                cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None) -> dict:
+                cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
+                owner_fn: Optional[Callable] = None) -> dict:
     """File one defect: {fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at,
     details}. Returns {"action": would_file|filed|skip|forwarded|error, ...}."""
     store = _store(store)
@@ -1199,6 +1267,10 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
     if dec["action"] == "skip":
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
         return {"action": "skip", "why": dec["why"]}
+    if m == "live" and hub:  # the origin session already queued its own fix card: adopt it, file nothing
+        owner = _adopt_session_card(d, fp, store, now, owner_fn)
+        if owner:
+            return owner
     args = card_args(d, dec["key"], dec.get("previous"), cfg)
     b = (budget_fn or budget)(args.get("board"), now)
     sched = None

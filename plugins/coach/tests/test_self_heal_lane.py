@@ -850,3 +850,50 @@ def test_unreadable_card_status_never_marks_stale(store):
     sh.file_defect(defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
     assert sh.reconcile(store, runner=r, now=NOW + 600) == []
     assert sh.reconcile(store, runner=Runner(fail=True), now=NOW + 600) == []
+
+
+# ── origin session already queued a fix card ──
+def _owner(cards):
+    return lambda sid, since: sorted((c for c in cards if c["created_at"] >= since), key=lambda c: -c["created_at"])
+
+
+def test_session_linked_active_card_is_adopted_not_filed(store):
+    r = Runner()
+    d = defect()
+    cards = [{"id": "t_aaaa1111", "status": "ready", "created_at": NOW - 120, "board": None},
+             {"id": "t_bbbb2222", "status": "running", "created_at": NOW - 30, "board": None}]
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN, owner_fn=_owner(cards))
+    assert out["action"] == "skip" and out["adopted"] and out["card"] == "t_bbbb2222"
+    assert not r.creates()
+    st = sh.LaneState(store.root).get(d["fingerprint"])
+    assert st["status"] == "approved" and st["fix_card"] == "t_bbbb2222"
+    (e,) = ev(store, "selfheal_adopted_owner")
+    assert e["card"] == "t_bbbb2222"
+    again = sh.file_defect(d, store=store, m="live", runner=r, now=NOW + 10, cfg=HUB, budget_fn=OPEN)
+    assert again["action"] == "skip" and not r.creates()
+
+
+def test_card_from_before_the_complaint_or_unrelated_still_files(store):
+    r = Runner()
+    old = [{"id": "t_old00000", "status": "running", "created_at": NOW - 60 - sh.ADOPT_LOOKBACK_S - 5, "board": None}]
+    out = sh.file_defect(defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN,
+                         owner_fn=_owner(old))
+    assert out["action"] == "filed" and len(r.creates()) == 1
+    r2 = Runner()
+    out = sh.file_defect(defect(symptom="other thing"), store=store, m="live", runner=r2, now=NOW, cfg=HUB,
+                         budget_fn=OPEN, owner_fn=lambda sid, since: [])
+    assert out["action"] == "filed"
+
+
+def test_session_owned_cards_reads_creator_and_subscription(tmp_path):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / "kanban.db")
+    db.executescript("""create table tasks(id text, title text, status text, created_at int, session_id text);
+        create table kanban_notify_subs(task_id text, chat_id text);
+        insert into tasks values('t_1','a','running',100,'S'),('t_2','b','done',100,'S'),('t_3','c','ready',200,NULL),
+          ('t_4','d','ready',50,'S'),('t_5','e','todo',300,'X');
+        insert into kanban_notify_subs values('t_3','S');""")
+    db.commit()
+    db.close()
+    got = sh.session_owned_cards("S", 90, home=tmp_path)
+    assert [c["id"] for c in got] == ["t_3", "t_1"]
