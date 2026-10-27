@@ -1247,9 +1247,133 @@ above come first, then:
 | 5. Ledger retirement | receipts to session links, shadow diff, readers switched, ledger paths deleted | a week of zero unexplained diffs; one association code path |
 | 6. Sessions and Inbox | the replicated collections become service-owned with the same feed and outbox; session moves come from W3 (Worker nodes and transcripts) | the sidebar and Inbox match on every gateway with one gateway asleep |
 
-Phases 5 and 6 are not estimated yet, so the total above covers only phases 0 to 4. Deleting the ledger paths is the
+Phase 5 is not estimated yet; phase 6 is planned below (about 1–1.5 weeks plus two 7-day soaks). The total above covers only phases 0 to 4. Deleting the ledger paths is the
 last step of phase 5, after its soak: until then the ledger stays read-only, so `sync detach` can still fall back
 to it.
+
+### Phase 6 plan: sessions index and Inbox (approved 2026-10-27)
+
+Approved by David 2026-10-27. Owner: the Claude Code session "Hermes cloud sync status"; the Kanban primary soak and phase 5 stay with "Hermes gateway restart". Nothing below is built yet. Building starts when the `default` board's primary soak is clean.
+
+#### What changes, in one paragraph
+
+Sessions and Inbox cards already live in the cloud: the `Hub` Durable Object in the `hermes-mailbox` Worker
+(`hermes-hub/worker/src/hub.ts`) stores every gateway's records, and every gateway keeps a full replica in
+`~/.local/state/hermes-hub/hub.db`. What phase 6 changes is **who may write**. Today a record has one writer, its
+home gateway, and any other gateway can only queue a request that waits until the owner wakes up (`hub.ts` `ACTIONS`,
+`hermes_hub.py` `handle_requests` / `apply_request`). After phase 6, the fields a person sets (title, pinned,
+archived, hidden; an Inbox card's archive) are written straight to the service by any gateway, merged per field by
+HLC, and show on every gateway at once. The owner applies them to its own `state.db` / `inbox.db` when it is next
+awake. Fields only the owner can know (running, message count, model, end time...) stay owner-written. An Inbox
+**act** (which runs the card's accept prompt, a side effect) still executes on the owner, exactly once, but its
+pending state becomes a shared record so every gateway shows "accepted, runs when <owner> is back".
+
+Exit criterion (phase 6 row above): the sidebar and Inbox match on every gateway with one gateway asleep.
+
+#### Decisions
+
+1. **Extend the Hub DO; do not move sessions into a Board DO.** The Hub already has push, feed, snapshot, digest,
+   WebSocket nudges and 8,000 live session records per replica. Moving them into a `rows.ts`-style per-board object
+   would mean a second import, a second reader path and a second soak for no gain: sessions are not cards (no
+   leases, no transitions). Reused from the Board: the HLC format and `cmpHlc`, the per-field clock map
+   (`field_hlc`), and memoized op results by `op_id` (already in the Hub as `applied_ops`). The client copies the
+   Kanban sync client's outbox rule: a retry after a rejection gets a fresh `op_id`.
+2. **Split fields by who knows them.**
+
+   | Collection | Shared fields (any gateway, per-field LWW) | Owner-only fields (published as today) |
+   |---|---|---|
+   | sessions | `title`, `pinned`, `archived`, `hidden` | `source`, `started_at`, `ended_at`, `end_reason`, `message_count`, `parent_session_id`, `model`, `activity`, `running`, `automated`, `profile`, `id` |
+   | inbox | `archived` (dismiss) | everything else (`state`, `outcome*`, `resolved_at`, `fields`, `actions`, ...) |
+
+   A shared field set elsewhere wins over the owner's published value when its HLC is newer. The owner's own edits
+   (a rename in its Desktop) are also written as shared-field ops, so both sides use one clock.
+3. **One new table and op kind in the Hub.** `overrides(gw, coll, key, field, value, hlc, by_gw, seq)`, keyed by
+   the record's home `gw` plus `coll/key/field`. New op in `/v2/sync/push`: `{op_id, kind: "set", gw, coll, key,
+   field, value, hlc}`. The service checks `field` against an allowlist per collection (the table above), rejects
+   unknown records (`not_found`, so a typo never creates a ghost row), keeps the newer HLC, assigns a feed `seq`, and
+   rejects an HLC more than 5 min ahead of server time (`clock_ahead`, same rule as the Board). `/feed` and
+   `/snapshot` return overrides beside records; `/digest` covers both. A tombstoned record drops its overrides.
+4. **The owner applies, then confirms.** On pull, the owner client applies overrides for its own records to its
+   local store (`hermes sessions rename/pin`, `UPDATE sessions SET archived/hidden`, `hermes inbox archive`), then
+   republishes the record. Readers show the override until the owner's published value has the same value, so
+   there is no flicker. A rename that collides with the unique `title` index gets ` (2)` appended by the owner,
+   which writes the result back as a newer `set` (every gateway converges on the suffixed title).
+5. **Inbox act stays a request, and it becomes visible.** `act` keeps going through `/v2/sync/requests` (owner
+   executes, outcome returns). New: the request's pending state is published in the feed as a read-only
+   `pending_action` on the card (`{request_id, action, by_gw, created_at}`), so all gateways show it as accepted and
+   pending, and a second act from another gateway on the same card is refused `already_pending` instead of queued.
+   Session `origin-bind` / `origin-reconcile-*` requests are phase 5's and are untouched.
+6. **Readers merge in one place.** `hubview.View` (hub-sync plugin) merges record + overrides + pending_action, and
+   Desktop core's `store/offline-sessions.ts` uses that API instead of merging itself. Live `state.db` reads for the
+   gateway's own sessions stay as they are; the owner client applies overrides within one round (≤ 5 s with the
+   WebSocket nudge it already has).
+7. **Flag and modes, like Kanban.** `hub.sync.shared_fields: off | shadow | primary` in the client config, per
+   collection.
+   - `shadow`: Desktop/plugins still send requests as today, and the client also writes the matching `set`.
+     Readers still show today's view. An hourly diff compares today's merged view with the override-merged view
+     on every gateway and logs to `~/.hermes/logs/hub-shared-fields-soak.jsonl`.
+   - `primary`: readers use the override-merged view; rename/pin/archive/hidden/inbox-archive send only `set`;
+     requests remain for `act` and phase 5's actions.
+   - Rollback: `off` stops writing sets and readers ignore overrides; the owners' local stores already hold every
+     applied value, so nothing is lost. Overrides older than 30 days that the owner has applied are swept.
+8. **Deploy order** (from the Kanban rollout): Worker schema and op kind first, then clients (a busy DO can run old
+   code for minutes; the client treats `invalid: unknown kind` as "service not ready, stay in off").
+
+#### Not in phase 6
+
+- Transcripts, owner epochs, moving a session to another machine: Worker nodes W1–W3.
+- Retiring the origin ledger and its request kinds: phase 5 (other session). Phase 6 does not need phase 5 first:
+  it touches different fields and request actions. Shared code (`hermes_hub.py`, `hub.ts`) gets small, separate
+  PRs, rebased on whatever phase 5 lands first.
+- Kanban tasks published through the Hub (`tasks`, `deps` collections): unchanged; the Board service owns cards.
+
+#### Files
+
+- `hermes-hub/worker/src/hub.ts`: `overrides` table, `set` op in `push`, feed/snapshot/digest, tombstone cascade,
+  `pending_action` projection, `already_pending`.
+- `hermes-hub/worker/src/hlc.ts` (new, moved out of `rows.ts` so Board and Hub share one HLC compare).
+- `hermes-hub/client/hermes_hub.py`: HLC clock, `set` queueing in the outbox, apply-overrides-for-own-records on
+  pull, title collision rule, mode flag, soak diff command (`hermes-hub diff-shared`).
+- `hermes-mods/plugins/hub-sync/hubview.py` + `dashboard/plugin_api.py`: merge, and the request endpoint routes
+  shared fields to `set` in primary.
+- `hermes-agent/apps/desktop/src/store/offline-sessions.ts`, `offline-session-actions.ts`: read the merged view;
+  actions call the plugin (no direct request building). Shipped as a core patch in `hermes-mods/core/patches`.
+- `hermes-mods/desktop-plugins/inbox/plugin.js`: show `pending_action`.
+
+#### Acceptance (fixed now; none of these may be weakened later)
+
+Automated, each an entry path:
+
+1. Worker (`worker/test/shared-fields.test.ts`): set applies and appears in feed and snapshot; older HLC loses;
+   field outside the allowlist rejected; unknown record `not_found`; HLC too far ahead rejected; tombstone drops
+   overrides; digest changes with overrides; same `op_id` replay returns the memoized result; second act on a
+   pending card `already_pending`.
+2. Client (`client/tests/test_shared_fields.py`, three fake gateways on one fake service):
+   rename a session owned by an offline gateway → the other two show it at once; the owner comes back → its
+   `state.db` has the title and it publishes it; concurrent renames from two gateways → all three converge on the
+   newer HLC; title collision → all converge on the suffixed title; pin, archive, hidden the same way; Inbox
+   archive with the owner offline; Inbox act with the owner offline shows pending everywhere and runs exactly once
+   when it returns; mode `off` after `primary` loses nothing; shadow diff reports a planted mismatch.
+3. Plugin (`plugins/hub-sync/tests/test_shared_fields_view.py`): merged view prefers a newer override, drops it
+   once the owner's value matches, shows `pending_action`; request endpoint sends `set` in primary and a request
+   in off.
+4. Desktop (`offline-sessions.test.ts` additions): sidebar row shows the merged title/pin/archive for a remote
+   session; archive from the sidebar calls the shared-field path.
+
+Live, before `primary` is left on:
+
+5. On all three gateways in `shadow`: 7 days of hourly diffs with zero unexplained mismatches.
+6. With the mini's hub client stopped (asleep): from the MacBook rename, pin and archive a mini session, archive one
+   mini Inbox card and act on another. The hub and the MacBook show all of it within 10 s (screenshot of both
+   sidebars and Inboxes). Start the mini's client: its `state.db` / `inbox.db` match, the act ran exactly once
+   (one session created by the accept prompt), and all three sidebars match.
+7. 7 days in `primary` with zero unexplained diffs, then the request path for rename/pin/archive/inbox-archive is
+   deleted (only `act` and phase 5's actions remain).
+
+#### Estimate
+
+About 1–1.5 weeks of work, plus the two 7-day soaks. Building starts after this plan is approved and the Kanban
+`default` board's primary soak is clean (David's condition). Primary waits for this phase's shadow soak as well.
 
 **Backfill / import with ID remapping.** `sync import` reads the local board like `export_board` (L114) but keeps
 history (no scrub of synced columns; it scrubs only the local-only columns listed above). It assigns `uid`s to
