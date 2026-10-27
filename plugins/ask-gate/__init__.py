@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_reconciliation, core, handoff, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, core, handoff, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -33,6 +33,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
         return _sys.modules.setdefault(key, mod)
     core, judge_mod, handoff = _sib("core"), _sib("judge"), _sib("handoff")
     approval_reconciliation = _sib("approval_reconciliation")
+    approval_adapter_loading = _sib("approval_adapter_loading")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -469,6 +470,7 @@ def _prewarm() -> None:
 
 
 def register(ctx) -> None:
+    approval_adapter_loading.install(ctx, approval_reconciliation)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)

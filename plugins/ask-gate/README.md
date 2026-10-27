@@ -114,6 +114,17 @@ epoch timestamp (not the age of the approval). Maximum accepted read age is 30 s
 an older/mismatched approval. Readers must be bounded, read-only and return no secrets or raw principal evidence.
 Adapter exceptions fail closed without exposing exception contents. Duplicate names are refused.
 
+For deployment, set `plugins.entries.ask-gate.settings.approval_adapters` to a list of absolute Python file
+paths in trusted private configuration. Each file exports `register(registry)` and calls
+`registry.register(name, resolve, read)`. The gate passes its own registry instance, records every returned
+disposer and removes adapters on plugin unload/reload. Do not separately import the hyphenated plugin package:
+that creates a second registry which the real hook never consults. Configuration is executable trusted code,
+not a tool argument or a place for model-provided paths. Broken configuration/import/registration rolls back
+partial registrations and retains an operational hold on structured asks until configuration is repaired.
+No adapters are enabled by default. `tests/test_approval_adapter_loading.py` exercises registration through
+the plugin entry point, the actual structured hook, failure rollback, foreign registrations and unload/reload;
+full live PluginManager discovery and real private adapters still require deployment verification.
+
 This seam alone is not an installed approval integration: without a matching adapter the ordinary gate remains.
 Adapters own current-head lookup, authenticated proof validation and domain-specific selection. No adapter may
 mint a decision from a model claim or impersonate a user. The gate never calls decide, unblocks/completes a task,
