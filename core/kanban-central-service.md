@@ -1,7 +1,8 @@
 # Centralized sync service: Kanban, sessions and Inbox (design)
 
-Patch: `0193` (core apply path) plus the sync client and a cloud service. **Phases 0–2 are built; no board has cut
-over yet**, so each gateway's `kanban.db` is still the source of truth for its cards. What is built is described
+Patch: `0193` (core apply path) plus the sync client and a cloud service. **Phases 0–2 are built, and the `default`
+board is in `primary` on every gateway since 2026-10-27**: the Board service is the source of truth, each gateway's
+`kanban.db` holds its own cards and the replica holds the whole board. What is built is described
 under Current state.
 
 Status: design / RFC, 2026-10-23, widened 2026-10-26. It proposes one cloud source of truth for Kanban boards, the
@@ -78,8 +79,10 @@ rows; every `sync diff` clean, sampled hourly into `~/.hermes/logs/kanban-sync-s
 to end on a test board: cards created on the hub and on the mini were claimed through Board leases, run by real
 workers and completed; the other gateways' replicas followed within about 10 s (5 s polling on both ends); their
 live boards never took the card; a status move by a non-holder was refused `live_claim`; an edit from another
-gateway landed on the owner's live board; a holder's `done` ends its lease. Cutover of `default` to `primary` is
-scheduled for 2026-10-28 after 24 h of clean samples. Known: a claim can race the push of its card's creation
+gateway landed on the owner's live board; a holder's `done` ends its lease. On 2026-10-27, at the owner's
+request, `default` was cut over to `primary` on all three gateways ahead of the planned 24 h soak (about 40 min of
+clean samples on the final code, plus the end-to-end test); every claim since goes through a Board lease, with no
+rejected ops and clean diffs. Known: a claim can race the push of its card's creation
 (one deferred tick); the service stalled 15–18 s around a deploy (likely the Durable Object restarting onto new
 code); a lease granted outside a local claim is requeued by the orphan sweep and waits out one TTL.
 
