@@ -15,6 +15,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-unloaded-sweep-wake.md](kanban-unloaded-sweep-wake.md) | 0468 | Unclaimed kanban notices start one agent turn (worker thread, budget, skip rules) instead of only a transcript row; a held chat whose poller missed is logged as a "poller miss". |
 | [kanban-read-connection-cache.md](kanban-read-connection-cache.md) | 0471 | Reuse read-only board connections while preserving fresh commits, replacement detection and nonblocking checkpoints. |
 | [onboarding-defer-default.md](onboarding-defer-default.md) | 0470, 0472 | The provider overlay no longer overwrites a configured default model: on a configured install every write waits for Begin on the confirm card (which says it changes the default for new chats); dismiss writes nothing. |
 | [kanban-sync-client-fixes.md](kanban-sync-client-fixes.md) | 0468–0469 | Sync client retries rejected rows under a fresh op id, skips non-board folders, keeps every chat of a shared card and syncs link-only boards. |

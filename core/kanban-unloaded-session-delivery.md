@@ -42,7 +42,7 @@ Patches: 0185 (delivery + reap warning), 0186 (`kanban_unseen` stripe input).
 ## Gotchas
 - The sweeper only handles chats found in a local state.db (launch store, then named profiles); a chat on another
   gateway is swept by that gateway.
-- The notice is a transcript row, not an agent turn: the agent reads it when the chat is next opened.
+- Since 0468 the sweeper first tries a turn with the notice and writes this row only as the fallback ([kanban-unloaded-sweep-wake.md](kanban-unloaded-sweep-wake.md)). Before it, the notice was a transcript row, not an agent turn: the agent read it only when the chat was next opened.
 
 ## Plugin?
 No plugin surface exists for gateway-side delivery or sidebar stripe inputs.
