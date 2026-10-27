@@ -172,3 +172,18 @@ test('API count parity: active host maintenance withholds ready and busy counts 
   assert.equal(sv.rows[0].bucket, 'unknown')
   assert.equal(sv.counts.busy, 1)
 })
+test('chip issue count keeps owner API parity even when display classifies a row as hold-only', () => {
+  const change = drained(); change.readiness_evidence.warned = []; change.readiness_evidence.passed.push('disk')
+  const v = p.projectFleet([{ route, snapshot: setup(change) }], now)
+  assert.equal(v.rows[0].bucket, 'held')
+  assert.equal(p.selectRows(v.rows, '', 'Needs attention').length, 0)
+  // Owner API counts readiness fail and offline registrations as issues.
+  assert.equal(v.counts.issues, 1)
+})
+test('causes that contradict the owner aggregate are ignored in both directions', () => {
+  for (const [readiness, change] of [['pass', { failed: ['service'] }], ['warn', { failed: ['service'] }], ['pass', { warned: ['disk'] }]]) {
+    const r = row(setup({ readiness, readiness_evidence: causes({ required: ['disk', 'service'], passed: [], ...change }) }))
+    assert.equal(r.checks.causes, false, `${readiness} ${JSON.stringify(change)}`)
+    assert.deepEqual(r.checks.unexplained, [])
+  }
+})
