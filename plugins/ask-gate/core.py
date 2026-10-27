@@ -234,7 +234,11 @@ def says_david_must_act(text: str) -> bool:
 # paths / time
 # --------------------------------------------------------------------------------------------------
 def home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:  # Standalone reporting scripts outside Hermes.
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return get_hermes_home()
 
 
 def boards() -> list[Path]:
@@ -337,11 +341,16 @@ def render_cards(cards: list[dict]) -> str:
 
 def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | None = None) -> str | None:
     cards = linked_cards(session_id, db_paths=db_paths)
-    answered = ledger.recent(14 * 86400, limit=8) if ledger else []
-    if not cards and not answered:
+    answered = ledger.relevant(session_id, limit=8) if ledger else []
+    stopped = ledger.workflow_stopped(session_id) if ledger else False
+    if not cards and not answered and not stopped:
         return None
     parts = ["[ask-gate] Live state, read from the database just now. It outranks anything you remember about "
              "these cards; completion notices reach the chat late."]
+    if stopped:
+        parts.append("The current workflow is terminal by an explicit user stop. Do not execute it, "
+                     "request action, or reopen it. Only an explicit current-workflow resume can lift this state; "
+                     "resuming does not grant approvals or clear retired account/action records.")
     if cards:
         parts.append("Cards linked to this chat:\n" + render_cards(cards))
     if answered:
@@ -355,6 +364,58 @@ def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | No
 # --------------------------------------------------------------------------------------------------
 # L4: answered-asks ledger (sqlite under ~/.hermes/state, not synced)
 # --------------------------------------------------------------------------------------------------
+def answer_lineage(session: str) -> list[str]:
+    """Follow compression only, never delegated children or unrelated chats."""
+    ids = [session]
+    seen = {session}
+    try:
+        c = _ro_connect(home() / "state.db", timeout=2)
+        try:
+            while True:
+                row = c.execute("select parent_session_id, source from sessions where id=?", (ids[-1],)).fetchone()
+                if not row or row[1] == "subagent" or not row[0] or row[0] in seen:
+                    break
+                parent = c.execute("select end_reason from sessions where id=?", (row[0],)).fetchone()
+                if not parent or "compress" not in str(parent[0] or "").lower():
+                    break
+                ids.append(row[0])
+                seen.add(row[0])
+        finally:
+            c.close()
+    except sqlite3.Error:
+        pass
+    return ids
+
+
+def retired_matches(asks: list[str], rows: list[dict]) -> dict[int, dict]:
+    """Exact normalized action identity; token overlap is not an entity key.
+
+    A different account or action must not inherit another action's retirement.
+    Paraphrases remain for semantic review, not deterministic suppression.
+    """
+    def key(text):
+        return " ".join(text.split())
+    retired = {key(r["topic"]): r for r in rows if r.get("retired")}
+    return {i: {"i": i, "verdict": "already_answered", "how": "",
+                "reason": "Recorded terminal user answer: " + retired[key(a)]["answer"],
+                "retired": True}
+            for i, a in enumerate(asks) if key(a) in retired}
+
+
+def terminal_answer(answer: str) -> bool:
+    """Conservative terminal-fact recognition, not an intent/approval parser.
+
+    Negation, questions, future and conditional statements must not close work.
+    Only recorded answers enter here; arbitrary tool text is not a user answer.
+    """
+    text = answer.lower().replace("’", "'")
+    if re.search(r"\?|\b(?:not|never|if|unless|might|may|could|would|will)\b|n't\b", text):
+        return False
+    return bool(re.search(
+        r"\b(?:is|was|are|were|been|already)\s+(?:revoked|cancelled|canceled|completed|impossible)\b"
+        r"|\b(?:i|we)\s+(?:have\s+)?(?:revoked|cancelled|canceled|completed)\b", text))
+
+
 class Ledger:
     def __init__(self, path: Path | None = None):
         self.path = Path(path) if path else Path(os.environ.get("ASK_GATE_LEDGER") or home() / "state" / "ask-ledger.sqlite")
@@ -367,6 +428,9 @@ class Ledger:
         c.execute("create table if not exists answered (id integer primary key, ts real, session text, "
                   "topic text, answer text, card_id text)")
         c.execute("create table if not exists open_asks (session text, ts real, text text)")
+        c.execute("create table if not exists retired_answers (answer_id integer primary key)")
+        c.execute("create table if not exists workflow_state (session text primary key, stopped integer not null, "
+                  "evidence text not null, ts real not null)")
         return c
 
     def _init(self) -> None:
@@ -375,12 +439,16 @@ class Ledger:
         except sqlite3.Error:
             pass
 
-    def add(self, topic: str, answer: str, session: str = "", card_id: str = "", ts: float | None = None) -> None:
+    def add(self, topic: str, answer: str, session: str = "", card_id: str = "", ts: float | None = None,
+            retire: bool | None = None) -> None:
         with self._lock:
             try:
                 c = self._conn()
-                c.execute("insert into answered(ts, session, topic, answer, card_id) values (?,?,?,?,?)",
-                          (ts or time.time(), session, topic.strip()[:400], answer.strip()[:400], card_id))
+                row = c.execute("insert into answered(ts, session, topic, answer, card_id) values (?,?,?,?,?)",
+                                (time.time() if ts is None else ts, session, topic.strip()[:1200],
+                                 answer.strip()[:400], card_id))
+                if terminal_answer(answer) and retire is not False:
+                    c.execute("insert into retired_answers(answer_id) values (?)", (row.lastrowid,))
                 c.commit()
                 c.close()
             except sqlite3.Error:
@@ -396,26 +464,140 @@ class Ledger:
             return []
         return [{"ts": r[0], "session": r[1], "topic": r[2], "answer": r[3], "card_id": r[4]} for r in rows]
 
+    @staticmethod
+    def _scope(c: sqlite3.Connection, session: str) -> None:
+        # Connection-local scope avoids SQLite's bound-parameter ceiling for long
+        # compression chains. It never changes durable state or sibling sessions.
+        c.execute("create temp table answer_scope (session text primary key)")
+        c.executemany("insert or ignore into answer_scope values (?)",
+                      ((sid,) for sid in answer_lineage(session)))
+
+    @staticmethod
+    def _answer_rows(rows) -> list[dict]:
+        return [{"ts": ts, "session": sid, "topic": topic, "answer": answer,
+                 "card_id": card, "retired": retired is not None}
+                for ts, sid, topic, answer, card, retired in rows]
+
+    def relevant(self, session: str, window_s: float = 14 * 86400, limit: int = 20) -> list[dict]:
+        """Bounded context: at most limit terminal and limit ordinary records.
+
+        Terminal context has no TTL and cannot be crowded out by ordinary chatter.
+        Enforcement MUST use retired_for, not this lossy context sample.
+        """
+        if limit <= 0:
+            return []
+        c = self._conn()
+        try:
+            self._scope(c, session)
+            base = ("select a.ts, a.session, a.topic, a.answer, a.card_id, r.answer_id "
+                    "from answered a join answer_scope s on s.session=a.session "
+                    "left join retired_answers r on r.answer_id=a.id ")
+            terminal = c.execute(base + "where r.answer_id is not null "
+                                 "order by a.ts desc, a.id desc limit ?", (limit,)).fetchall()
+            ordinary = c.execute(base + "where r.answer_id is null and a.ts>=? "
+                                 "order by a.ts desc, a.id desc limit ?",
+                                 (time.time() - window_s, limit)).fetchall()
+            return self._answer_rows(terminal + ordinary)
+        finally:
+            c.close()
+
+    def retired_for(self, session: str, asks: list[str]) -> list[dict]:
+        """Candidate-specific durable facts; bounded by unique candidate count.
+
+        Whitespace normalization matches retired_matches. Punctuation and case
+        remain significant; this is not a semantic account-identity resolver.
+        """
+        if not asks:
+            return []
+        c = self._conn()
+        try:
+            self._scope(c, session)
+            c.create_function("action_key", 1, lambda text: " ".join(text.split()))
+            rows = []
+            for key in dict.fromkeys(" ".join(a.split()) for a in asks):
+                row = c.execute(
+                    "select a.ts, a.session, a.topic, a.answer, a.card_id, r.answer_id "
+                    "from answered a join answer_scope s on s.session=a.session "
+                    "join retired_answers r on r.answer_id=a.id where action_key(a.topic)=? "
+                    "order by a.ts desc, a.id desc limit 1", (key,)).fetchone()
+                if row is not None:
+                    rows.append(row)
+            return self._answer_rows(rows)
+        finally:
+            c.close()
+
+    def record_workflow_directive(self, session: str, message: str) -> bool:
+        """Bind only explicit whole-message current-workflow directives.
+
+        This scope is the chat's compression lineage, not a global project-name
+        match. A resume clears workflow suppression, never account retirements
+        or security approvals. Ambiguous/quoted/named-other-project text is ignored.
+        """
+        text = message.strip().replace("’", "'")
+        stopped = bool(re.fullmatch(
+            r"(?:(?:cancel|stop|halt) this (?:project|workflow)|we are done with this (?:project|workflow))[.!]?",
+            text, re.I))
+        resumed = bool(re.fullmatch(r"(?:resume|reopen) this (?:project|workflow)[.!]?", text, re.I))
+        if not session or not (stopped or resumed):
+            return False
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("insert into workflow_state values (?,?,?,?) on conflict(session) do update set "
+                          "stopped=excluded.stopped, evidence=excluded.evidence, ts=excluded.ts",
+                          (session, int(stopped), message, time.time()))
+                c.execute("delete from open_asks where session=?", (session,))
+                c.execute("insert into open_asks values (?,?,?)", (session, time.time(), "[]"))
+                c.commit()
+            finally:
+                c.close()
+        return True
+
+    def workflow_stopped(self, session: str) -> bool:
+        c = self._conn()
+        try:
+            self._scope(c, session)
+            row = c.execute(
+                "select w.stopped from workflow_state w join answer_scope s on s.session=w.session "
+                "order by s.rowid limit 1").fetchone()
+            return bool(row[0]) if row is not None else False
+        finally:
+            c.close()
+
     def set_open_asks(self, session: str, asks: list[str]) -> None:
         with self._lock:
             try:
                 c = self._conn()
                 c.execute("delete from open_asks where session=?", (session,))
-                if asks:
-                    c.execute("insert into open_asks values (?,?,?)", (session, time.time(), json.dumps(asks)))
+                # An explicit empty snapshot shadows inherited pending asks.
+                c.execute("insert into open_asks values (?,?,?)", (session, time.time(), json.dumps(asks)))
                 c.commit()
                 c.close()
             except sqlite3.Error:
                 pass
 
     def open_asks(self, session: str, max_age_s: float = 6 * 3600) -> list[str]:
+        return self.pending_snapshot(session, max_age_s) or []
+
+    def pending_snapshot(self, session: str, max_age_s: float = 6 * 3600) -> list[str] | None:
+        """None means no recorded snapshot; [] is authoritative, including expiry."""
+        ids = answer_lineage(session)
         try:
             c = self._conn()
-            row = c.execute("select ts, text from open_asks where session=?", (session,)).fetchone()
-            c.close()
+            try:
+                row = None
+                for sid in ids:
+                    row = c.execute("select ts, text from open_asks where session=? order by ts desc limit 1",
+                                    (sid,)).fetchone()
+                    if row is not None:
+                        break
+            finally:
+                c.close()
         except sqlite3.Error:
             return []
-        if not row or time.time() - row[0] > max_age_s:
+        if row is None:
+            return None
+        if time.time() - row[0] > max_age_s:
             return []
         try:
             return list(json.loads(row[1]))
@@ -602,28 +784,43 @@ def needs_checked(tool_name: str, args: dict, is_worker: bool) -> tuple[bool, st
 _CAP_CACHE: dict[str, Any] = {"t": 0.0, "text": ""}
 
 
-def _run(argv: list[str], timeout: float = 8) -> str:
-    try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
 def broker_scopes() -> list[str]:
-    exe = shutil.which("token-broker") or str(Path.home() / ".local/bin/token-broker")
-    if not Path(exe).exists() and not shutil.which("token-broker"):
-        return []
-    raw = _run([exe, "scopes"])
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return []
-    names = []
-    for s in data if isinstance(data, list) else []:
-        n = s.get("name") if isinstance(s, dict) else None
-        if n:
-            names.append(f"{n} ({s.get('tier', '?')})")
-    return names
+    """Read metadata only; prefer the current user client over stale PATH installs.
+
+    A successful empty catalog is authoritative. Transport/parse failures may
+    try a distinct installed client, but never request or vend credentials.
+    """
+    candidates = [str(Path.home() / ".local/bin/token-broker"), shutil.which("token-broker")]
+    seen = set()
+    for exe in candidates:
+        if not exe:
+            continue
+        try:
+            resolved = str(Path(exe).resolve())
+        except (OSError, RuntimeError):
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            result = subprocess.run([exe, "scopes"], capture_output=True, text=True, timeout=8)
+            if result.returncode:
+                continue
+            data = json.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if not isinstance(data, list):
+            continue
+        names = []
+        for row in data:
+            name = row.get("name") if isinstance(row, dict) else None
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_./:@-]+", name):
+                continue
+            tier = row.get("tier")
+            tier = tier if tier in ("auto", "approval") else "?"
+            names.append(f"{name} ({tier})")
+        return names
+    return []
 
 
 def ssh_hosts(cfg: Path | None = None) -> list[str]:
@@ -662,6 +859,8 @@ def vault_entries() -> list[str]:
 
 
 def capability_sheet(force: bool = False, ttl_s: float = 600) -> str:
+    # Advisory evidence for the LLM judge only. It is NOT a deterministic pre-render
+    # capability check: a listed scope/host is never permission and is not enforced here.
     if not force and _CAP_CACHE["text"] and time.time() - _CAP_CACHE["t"] < ttl_s:
         return _CAP_CACHE["text"]
     scopes, hosts, chrome, vault = broker_scopes(), ssh_hosts(), chrome_accounts(), vault_entries()

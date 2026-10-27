@@ -3,6 +3,15 @@
 What each chat is waiting for **you** to do, shown where you look, with one-click answers. Replaces
 `open-asks` and blocked-panel's composer panel.
 
+## Legacy ledgers without `revision` (migration note)
+
+Ledger files written before revisions existed have no `revision` key. They stay
+editable: the first `Ledger.edit()` migrates them to `revision: 1`. Until that
+edit, `read_exact()` deliberately raises `ValueError`, so lifecycle consumers
+(ask-gate retirement) treat the step as unknown and fail closed instead of
+trusting an unversioned snapshot. Test:
+`tests/test_lifecycle_source.py::test_revision_new_migration_and_noop`.
+
 ## What you see (Hermes Desktop)
 
 - **In the reply:** the paragraph that asks you something becomes an amber **For you** box with the original text
@@ -42,6 +51,65 @@ before the reply is shown, ~2 s). Env `USER_STEPS_PROVIDER` / `USER_STEPS_MODEL`
 
 Trace: one JSON line per extraction in `~/.hermes/cache/user-steps/trace.jsonl` (source model/regex/skip, new and
 resolved ids, framed, errors).
+
+## Buffered publication (core-first rollout)
+
+A no-op `pre_final_gate` callback declares `needs_buffer=True`, independently of
+ask-gate. It neither judges nor holds a reply: it keeps final drafts private until
+the existing output transform reconciles the ledger. Tool-call commentary retains
+core's existing release behavior. Buffered verification interims stay private.
+Registration requires core to advertise literal `True` for `needs_buffer` and
+`post_transform_release` in `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES`.
+Unsupported core refuses this plugin before hooks are installed; update core first.
+This refusal is not a claim of active protection on an older runtime.
+
+Buffering is static for foreground turns while the plugin is loaded, including
+when the extraction off switch is set; disable the plugin itself to remove its
+buffering contribution. Core still excludes its normal background contexts.
+
+`tests/integration_f3/test_user_steps_only.py` exercises real normal discovery,
+AIAgent streaming, verification continuation, source retirement, and SQLite
+publication with only user-steps enabled (plain and framed replies). See
+`tests/integration_f3/README.md` for the explicit checkout command. Compatibility
+integration also checks refusal and registration rollback for both plugins.
+
+## Lifecycle source contract
+
+Every successful `Ledger.edit` advances a writer-owned integer `revision` under
+its existing cross-process lock. Legacy records without a revision migrate on
+the next edit. Corrupt evidence, invalid revisions, and root mismatches fail
+rather than being silently reset. Atomic replacement follows a file fsync;
+directory-sync failures after replacement are logged as durability errors, not
+reported as aborted edits (the new state is already visible).
+
+`Ledger.read_exact(root, step_id)` reads only that root's regular file, limited
+to 1 MiB, and returns `{root, revision, step}`. It rejects missing, corrupt,
+oversized, unrevisioned, symlinked, mismatched-root, or duplicate-target evidence;
+it never searches other sessions. IDs are opaque exact source keys; directive
+consumers must validate their own syntax and establish the compression root
+from the current session, not treat the directive's session attribute as a root.
+The snapshot limit does not restrict legacy writes or prevent resolving steps.
+
+This is a source API, not a deployed lifecycle adapter. A resolved snapshot is
+only conservative suppression evidence. Neither `resolved_by` nor a model/REST
+resolution string proves a trusted human transition, grants execution permission,
+or authorizes reopening. Trusted reopen integration remains separate work.
+
+`process_reply` now reconciles extracted actions inside the source edit lock,
+using exact `(kind, text, verbatim_span, ordered options)` identity in that root.
+Open repeats reuse their ID; a resolved exact match holds the entire draft before
+new steps, framing or card creation. Whole-draft holding deliberately sacrifices
+unrelated narrative/actions because the evidence span cannot delimit dependent
+approval instructions in other paragraphs. A positive retirement finding survives
+later write/card-sync exceptions; failures before a finding retain the existing
+fail-open behavior. Model fields cannot reopen a step. This is not paraphrase or
+account matching: changed extraction fields and omitted extractions remain gaps.
+Publication after lock release is not atomic with a later source resolution.
+
+`tests/test_action_continuity.py` covers exact reuse/retirement, source lock races,
+compression/profile isolation, budgets, regex fallback, forged reopen fields,
+whole-draft holds and actual transform-wrapper write/card failures. These are
+isolated tests, not live deployment or full final-gate ordering proof.
 
 ## Limits
 
