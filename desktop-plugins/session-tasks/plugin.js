@@ -124,6 +124,11 @@ function taskChip(t, status) {
     stale: Boolean(t.stale),
     state: status,
     label: str(t.title) || t.id,
+    assignee: str(t.assignee) || null,
+    note: str(t.note) || null,
+    prUrl: /^https:\/\/github\.com\//.test(str(t.pr_url)) ? str(t.pr_url) : null,
+    activity: str(t.activity_kind) || null,
+    activityAt: Number(t.activity_at) || 0,
     title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}`,
     since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
   }
@@ -320,10 +325,103 @@ function api(path, connection, timeoutMs = 15_000, profile) {
 // rotates the stored id; kanban tasks keep the id they were created under).
 const lineageCache = new Map()
 
+// ── last-known cards per chat (instant paint on switch) ─────────────────────
+// Switching chats paints that chat's last-known kanban + machine chips at once
+// from this cache (memory, persisted to localStorage), then the network refresh
+// replaces them. Bounded to the newest CACHE_MAX chats.
+const CACHE_KEY = 'hermes.sessionTasks.cache.v1'
+const CACHE_MAX = 200
+const chipCache = new Map()
+let cacheLoaded = false
+let cacheSaveTimer = null
+
+function storage() {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage : null
+  } catch {
+    return null
+  }
+}
+
+function loadCache() {
+  if (cacheLoaded) return
+  cacheLoaded = true
+  try {
+    const raw = JSON.parse(storage()?.getItem(CACHE_KEY) || '{}')
+    for (const [scope, v] of Object.entries(raw)) {
+      if (v && Array.isArray(v.kanban) && Array.isArray(v.machines)) chipCache.set(scope, v)
+    }
+  } catch {
+    // corrupt or unavailable: start empty
+  }
+}
+
+function saveCacheSoon() {
+  if (cacheSaveTimer) return
+  cacheSaveTimer = setTimeout(() => {
+    cacheSaveTimer = null
+    try {
+      const newest = [...chipCache.entries()].sort((a, b) => b[1].at - a[1].at).slice(0, CACHE_MAX)
+      chipCache.clear()
+      for (const [k, v] of newest) chipCache.set(k, v)
+      storage()?.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(newest)))
+    } catch {
+      // quota or unavailable: the memory copy still serves this window
+    }
+  }, 1000)
+}
+
+/** Last-known chips for a chat scope (exported for tests). */
+export function cachedChips(scope) {
+  loadCache()
+  return chipCache.get(scope) || null
+}
+
+/** Remember a chat's chips; warning chips (kind kanban-status) are never cached. */
+export function rememberChips(scope, kanban, machines) {
+  loadCache()
+  const keep = chips => (chips || []).filter(c => c && c.kind !== 'kanban-status')
+  const prev = chipCache.get(scope)
+  chipCache.set(scope, { at: Date.now(), kanban: keep(kanban ?? prev?.kanban), machines: keep(machines ?? prev?.machines) })
+  saveCacheSoon()
+}
+
+// A complete parent chain never changes (compression adds a new id on top; old ids keep their parent), so it
+// is kept across launches: a revisited chat skips the one-request-per-hop ancestry walk.
+const LINEAGE_KEY = 'hermes.sessionTasks.lineage.v1'
+const LINEAGE_MAX = 500
+
+function savedLineage(cacheKey) {
+  try {
+    const ids = JSON.parse(storage()?.getItem(LINEAGE_KEY) || '{}')[cacheKey]
+    return Array.isArray(ids) && ids.length ? new Set(ids) : null
+  } catch {
+    return null
+  }
+}
+
+function saveLineage(cacheKey, ids) {
+  try {
+    const all = JSON.parse(storage()?.getItem(LINEAGE_KEY) || '{}')
+    delete all[cacheKey]
+    all[cacheKey] = [...ids]
+    const keys = Object.keys(all)
+    for (const k of keys.slice(0, Math.max(0, keys.length - LINEAGE_MAX))) delete all[k]
+    storage()?.setItem(LINEAGE_KEY, JSON.stringify(all))
+  } catch {
+    // unavailable: the in-memory cache still serves this window
+  }
+}
+
 async function lineageIds(storedId, connection, profile = 'default') {
   const cacheKey = JSON.stringify([connection || '', profile, storedId])
   const hit = lineageCache.get(cacheKey)
   if (hit && Date.now() - hit.at < LINEAGE_TTL_MS) return hit.ids
+  const saved = savedLineage(cacheKey)
+  if (saved) {
+    lineageCache.set(cacheKey, { at: Date.now(), ids: saved })
+    return saved
+  }
   const ids = new Set([storedId])
   let cur = storedId
   for (let hop = 0; hop < 12 && cur; hop++) {
@@ -346,6 +444,7 @@ async function lineageIds(storedId, connection, profile = 'default') {
     return ids
   }
   lineageCache.set(cacheKey, { at: Date.now(), ids })
+  saveLineage(cacheKey, ids)
   return ids
 }
 
@@ -476,10 +575,34 @@ export async function archiveGuard({ sessionId, ids, profile, connectionId } = {
   return machineArchiveLines(chips)
 }
 
+function focusScope() {
+  const route = focusedRoute()
+  return { route, scope: JSON.stringify([route.connectionId || '', route.profile, host.state.focusedStoredSessionId.get()]) }
+}
+
+/** Paint the focused chat's last-known cards now (before any network), when focus moved to another chat. */
+function paintCached() {
+  const runtime = host.state.focusedSessionId.get()
+  const stored = host.state.focusedStoredSessionId.get()
+  const { route, scope } = focusScope()
+  if (!stored || !route.connectionId || scope === snapshot.scope) return false
+  const cached = cachedChips(scope)
+  if (!cached) return false // nothing known yet: the strip already hides another chat's snapshot
+  kanbanCache = cached.kanban
+  machineCache = cached.machines
+  lastKanbanAt = 0
+  lastMachinesAt = 0
+  snapshot = { runtime, stored, scope, chips: [...kanbanCache, ...machineCache] }
+  emit()
+  return true
+}
+
 export async function refresh() {
   // A focus change during an in-flight round must not be dropped (that left the
-  // strip empty for a whole poll interval after opening a chat): run again after.
+  // strip empty for a whole poll interval after opening a chat): run again after,
+  // but paint the new chat's last-known cards right away instead of after the old round.
   if (running) {
+    paintCached()
     rerun = true
     return
   }
@@ -488,18 +611,12 @@ export async function refresh() {
   try {
     const runtime = host.state.focusedSessionId.get()
     const stored = host.state.focusedStoredSessionId.get()
-    const route = focusedRoute()
-    const scope = JSON.stringify([route.connectionId || '', route.profile, stored])
-    const stillFocused = () => {
-      const current = focusedRoute()
-      return host.state.focusedSessionId.get() === runtime &&
-        JSON.stringify([current.connectionId || '', current.profile, host.state.focusedStoredSessionId.get()]) === scope
-    }
+    const { route, scope } = focusScope()
+    const stillFocused = () => host.state.focusedSessionId.get() === runtime && focusScope().scope === scope
     if (!runtime && !stored) {
       snapshot = { runtime, stored, chips: [] }
       return emit()
     }
-    const sameSession = scope === snapshot.scope
     if (!route.connectionId) {
       lastKanbanAt = 0
       lastMachinesAt = 0
@@ -512,15 +629,36 @@ export async function refresh() {
       }
       return emit()
     }
-    const [procs, subagents] = await Promise.all([
-      runtime ? safe(() => host.request('process.list', { session_id: runtime }), null) : null,
-      runtime ? safe(() => host.request('subagent.list', { session_id: runtime }), null) : null
-    ])
+    paintCached() // a switch paints the cached cards before anything below waits on the network
+    const sameSession = scope === snapshot.scope && snapshot.fresh === true
+    let procs = null
+    let subagents = null
+    // Each source publishes as soon as it lands: kanban never waits on the process/subagent RPCs or the
+    // machine inventory, and vice versa.
+    const publish = () => {
+      if (!stillFocused()) return
+      snapshot = {
+        runtime, stored, scope, fresh: true,
+        chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
+      }
+      emit()
+    }
+    const rpc = runtime
+      ? Promise.all([
+          safe(() => host.request('process.list', { session_id: runtime }), null),
+          safe(() => host.request('subagent.list', { session_id: runtime }), null)
+        ]).then(([p, sa]) => {
+          procs = p
+          subagents = sa
+          publish()
+        })
+      : Promise.resolve()
     const kanbanDue = stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)
     const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
     if (kanbanDue || machinesDue) {
       const ids = await lineageIds(stored, route.connectionId, route.profile)
       if (ids.incomplete) {
+        await rpc
         if (!stillFocused()) return
         // Never turn a partial ancestry read into an authoritative empty answer.
         // Keep only this owner's previous chips and retry ancestry next poll.
@@ -528,7 +666,7 @@ export async function refresh() {
         lastMachinesAt = 0
         snapshot = {
           runtime, stored, scope,
-          chips: [...(sameSession ? staleChips(snapshot.chips).filter(c => c.key !== `lineage-status:${scope}`) : []), {
+          chips: [...staleChips(snapshot.scope === scope ? snapshot.chips : []).filter(c => c.key !== `lineage-status:${scope}`), {
             key: `lineage-status:${scope}`, kind: 'kanban-status', state: 'unknown', stale: true,
             label: 'Session lineage unavailable', title: 'Could not read full session ancestry; work may still be unfinished.'
           }]
@@ -536,30 +674,36 @@ export async function refresh() {
         emit()
         return
       }
-      const [kChips, mChips] = await Promise.all([
-        kanbanDue ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)) : undefined,
-        machinesDue ? ((lastMachinesAt = Date.now()), loadMachines(ids)) : undefined
-      ])
-      if (!stillFocused()) return
-      // null = fetch failed: keep this chat's last good list, never the previous chat's.
-      if (kChips) kanbanCache = kChips
-      else if (kanbanDue && !sameSession) kanbanCache = []
-      if (mChips) machineCache = mChips
-      else if (machinesDue && !sameSession) machineCache = []
+      const kanban = kanbanDue
+        ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)).then(kChips => {
+            if (!stillFocused()) return
+            // null = fetch failed: keep this chat's last good list (cached or live), never the previous chat's.
+            if (kChips) {
+              kanbanCache = kChips
+              rememberChips(scope, kChips, undefined)
+            }
+            publish()
+          })
+        : null
+      const machines = machinesDue
+        ? ((lastMachinesAt = Date.now()), loadMachines(ids)).then(mChips => {
+            if (!stillFocused()) return
+            if (mChips) {
+              machineCache = mChips
+              rememberChips(scope, undefined, mChips)
+            }
+            publish()
+          })
+        : null
+      await Promise.all([kanban, machines, rpc])
+    } else {
+      await rpc
     }
     if (!stored) {
       kanbanCache = []
       machineCache = []
     }
-    // Focus moved while we were fetching: drop this round, the next tick reloads.
-    if (!stillFocused()) return
-    snapshot = {
-      runtime,
-      stored,
-      scope,
-      chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
-    }
-    emit()
+    publish()
   } catch (e) {
     log('refresh failed', e)
   } finally {
@@ -649,6 +793,76 @@ export function subscribeDecisionChanges(fn, target = window) {
   return () => target.removeEventListener('hermes:user-steps-changed', fn)
 }
 
+const ACTIVITY_LABEL = {
+  claimed: 'claimed', completed: 'completed', blocked: 'blocked', unblocked: 'unblocked', review_requested: 'review requested',
+  commented: 'comment', scheduled: 'scheduled', continued: 'checkpointed', created: 'created', assigned: 'assigned',
+  reclaimed: 'reclaimed', crashed: 'crashed', timed_out: 'timed out', heartbeat: 'working'
+}
+
+/** One linked card as a readable row (exported for tests): status, full title, who, what happened last, PR. */
+export function cardRowModel(chip, now = Date.now()) {
+  const activity = chip.activity ? (ACTIVITY_LABEL[chip.activity] || chip.activity.replace(/_/g, ' ')) : ''
+  const age = elapsed(chip.activityAt || chip.since, now)
+  const pr = chip.prUrl ? chip.prUrl.match(/\/pull\/(\d+)$/) : null
+  return {
+    status: chip.state,
+    title: chip.label,
+    meta: [chip.assignee, chip.gateway ? `on ${chip.gateway}` : '', activity && age ? `${activity} ${age} ago` : activity || (age ? `${age}` : '')]
+      .filter(Boolean).join(' · '),
+    note: chip.note || '',
+    prLabel: pr ? `PR #${pr[1]}` : chip.prUrl ? 'PR' : '',
+    prUrl: chip.prUrl || null
+  }
+}
+
+function CardRow({ chip, now }) {
+  const m = cardRowModel(chip, now)
+  const color = chipColor(chip.state)
+  const clickable = !!chip.connectionId && !!chip.profile
+  return jsxs(clickable ? 'button' : 'div', {
+    type: clickable ? 'button' : undefined,
+    onClick: clickable ? () => openTaskChip(chip) : undefined,
+    title: chip.title,
+    'data-session-task': 'kanban-row',
+    style: {
+      display: 'grid', gridTemplateColumns: 'auto 1fr auto', columnGap: 8, alignItems: 'start', width: '100%',
+      textAlign: 'left', padding: '5px 8px', borderRadius: 8, border: '1px solid color-mix(in srgb, var(--border, #8884) 70%, transparent)',
+      background: 'color-mix(in srgb, var(--card, transparent) 70%, transparent)', color: 'var(--foreground, inherit)',
+      cursor: clickable ? 'pointer' : 'default', opacity: chip.stale ? 0.6 : 1, fontFamily: 'inherit'
+    },
+    children: [
+      jsx('span', {
+        className: chip.state === 'running' ? 'session-tasks-pulse' : undefined,
+        style: {
+          fontSize: 10.5, lineHeight: '16px', padding: '0 6px', borderRadius: 999, whiteSpace: 'nowrap', marginTop: 1,
+          color, border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, background: `color-mix(in srgb, ${color} 12%, transparent)`
+        },
+        children: m.status
+      }),
+      jsxs('span', {
+        style: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 },
+        children: [
+          jsx('span', {
+            style: { fontSize: 12, lineHeight: '16px', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
+            children: m.title
+          }),
+          (m.meta || m.note) && jsx('span', {
+            style: { fontSize: 11, lineHeight: '15px', opacity: 0.7, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+            children: [m.meta, m.note].filter(Boolean).join(' — ')
+          })
+        ]
+      }),
+      m.prUrl
+        ? jsx('a', {
+            href: m.prUrl, target: '_blank', rel: 'noreferrer', onClick: e => e.stopPropagation(),
+            style: { fontSize: 11, lineHeight: '16px', whiteSpace: 'nowrap', color: 'var(--accent, #3b82f6)' },
+            children: m.prLabel
+          })
+        : jsx('span', {})
+    ]
+  })
+}
+
 function Strip() {
   const [snap, setSnap] = useState(snapshot)
   const [now, setNow] = useState(Date.now())
@@ -667,11 +881,29 @@ function Strip() {
   useEffect(() => void refresh(), [focused, scope])
   const chips = snap.runtime === focused && snap.scope === scope ? progressChips(snap.chips) : []
   if (!chips.length) return null
+  const cards = chips.filter(c => c.kind === 'kanban')
+  const others = chips.filter(c => c.kind !== 'kanban')
   return jsxs('details', {
     'data-slot': 'session-tasks',
     style: { width: '100%', minWidth: 0, marginBottom: 2 },
-    children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Agent progress (${chips.length}) — no decision required` }), jsx('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4 }, children: chips.map(chip => jsx(Chip, { chip, now }, chip.key)) })]
+    children: [
+      jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: progressSummary(chips) }),
+      jsx('div', {
+        style: { display: 'flex', flexWrap: 'wrap', gap: 4 },
+        children: [
+          ...others.map(chip => jsx(Chip, { chip, now }, chip.key)),
+          ...cards.map(chip => jsx(CardRow, { chip, now }, chip.key)) // full-width rows below the chips
+        ]
+      })
+    ]
   })
+}
+
+/** The collapsed strip's one line: the count plus the most urgent card, so cards are readable without opening it. */
+export function progressSummary(chips) {
+  const base = `Agent progress (${chips.length}) — no decision required`
+  const top = (chips || []).find(c => c.kind === 'kanban')
+  return top ? `${base} · ${top.state}: ${top.label}` : base
 }
 
 export function progressChips(chips, lookup = source => window.__userSteps?.requestForSource?.(source)) {
