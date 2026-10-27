@@ -18,7 +18,7 @@ Keyboard shortcuts are summarized in [../shortcuts.md](../shortcuts.md).
 | [model-class-routing.md](model-class-routing.md) | 0405–0430 0432–0438 0441 | Opt-in sticky class allocator (`class:deep|standard|fast`) with managed-subscription fences across CLI, Desktop, API, messaging, delegation, cron, Kanban and auxiliary calls. |
 | [desktop-agent-test-instance-hidden.md](desktop-agent-test-instance-hidden.md) | 0459 | A Desktop test instance a kanban worker launches gets no Dock icon and never shows a window; the owner's own Desktop stays visible. |
 | [at-completion-refresh.md](at-completion-refresh.md) | 0458 | `@` completion sources can `subscribe` so an open popover re-asks when their background fetch lands. |
-| [core-update-drain-hold.md](core-update-drain-hold.md) | 0455 | A live `<home>/core-update/drain-hold` stops new Kanban claims so a saturated board drains for a core update; running workers are untouched. |
+| [core-update-drain-hold.md](core-update-drain-hold.md) | 0455, 0460 | A live `<home>/core-update/drain-hold` stops new Kanban claims so a saturated board drains for a core update; running workers are untouched, and wake probes, promotion and reclaim keep running (0460). |
 | [kanban-provider-quota-walls.md](kanban-provider-quota-walls.md) | 0452 | Record provider retry-after walls and re-tier walled Kanban cards, with a storm alert. |
 | [kanban-ownerless-blocks.md](kanban-ownerless-blocks.md) | 0451 | Refuse ownerless agent blocks and undecided blocked cards; sweep old ones through triage once. |
 | [kanban-worker-crash-oom-recovery.md](kanban-worker-crash-oom-recovery.md) | 0439 0449 | Scope-killed workers count as crashes; typed OOM recovery raises MemoryMax with admission and alerts on OOM rate. |
