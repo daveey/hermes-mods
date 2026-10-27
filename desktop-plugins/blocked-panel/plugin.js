@@ -26,7 +26,7 @@
  * renders the focused chat's panel only when that tile is the focused one.
  *
  * Retired as a composer panel when user-steps is loaded (window.__userSteps.ownsComposer): its "For you"
- * strip shows these cards via window.__blockedPanel.{snapshot,subscribe,unblockCard,openCard,checklist}.
+ * strip shows these cards via window.__blockedPanel.{snapshot,subscribe,openCard,checklist}.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import * as sdk from '@hermes/plugin-sdk'
@@ -918,8 +918,8 @@ export default {
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
     // version 6: explicit non-human pauses (transient) surface as agent issues; failure reasons are plain (no raw error)
-    // version 4: subscribe/unblockCard/openCard for user-steps' "For you" strip (it reuses this poller + actions)
-    window.__blockedPanel = { version: 6, askSummary, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
+    // Shared adapter is read-only: semantic decisions belong to user-steps.
+    window.__blockedPanel = { version: 6, askSummary, get snapshot() { return snapshot }, refresh, checklist, subscribe, openCard }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel

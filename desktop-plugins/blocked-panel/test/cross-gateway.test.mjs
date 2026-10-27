@@ -33,6 +33,7 @@ test('live list, replica discovery, details, snapshot and actions preserve owner
   } } }
   const dispose = m.default.register({ register() {} })
   try {
+    assert.equal(window.__blockedPanel.unblockCard, undefined, 'shared adapter must not expose generic approval bypass')
     await m.refresh(true)
     const { items, issues } = window.__blockedPanel.snapshot
     const lineage = calls.find(c => c.path.startsWith('/api/sessions/'))
