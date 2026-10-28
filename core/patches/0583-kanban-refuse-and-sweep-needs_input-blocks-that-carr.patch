@@ -1,0 +1,193 @@
+From b2e351c918cb5744b01ec2852b72ec1725f222d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:42:27 +0000
+Subject: [PATCH 583/584] kanban: refuse and sweep needs_input blocks that
+ carry no human_request
+
+An ask-less needs_input block was accepted, never swept, and classified active
+by the sidebar, so nobody saw it. block_policy_error now refuses it (typed
+agent_owned_block with a needs=/human_request remedy) and the sweep escalates
+existing ones past the grace period.
+---
+ hermes_cli/kanban_block_policy.py            |  17 +++-
+ tests/tools/test_kanban_block_needs_input.py | 100 +++++++++++++++++++
+ tests/tools/test_kanban_tools.py             |   7 +-
+ 3 files changed, 120 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tools/test_kanban_block_needs_input.py
+
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index 0ab4e70d59..2b57841a74 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -13,7 +13,9 @@ import sqlite3
+ import time
+ from typing import Optional
+ 
+-AGENT_OWNED_KINDS = (None, "capability", "transient")
++# needs_input is agent-owned when it carries no human_request: the sidebar only shows a block as
++# blocked when needs_human() holds, so an ask-less needs_input looks like work in progress.
++AGENT_OWNED_KINDS = (None, "capability", "transient", "needs_input")
+ AGENT_BLOCK_GRACE_SECONDS = 2 * 3600
+ ERROR_CODE = "agent_owned_block"
+ _DECISION_TITLE = re.compile(r"^\s*(for you\s*:|choose\b|decide\b|approve\b)", re.IGNORECASE)
+@@ -28,6 +30,17 @@ def block_policy_error(kind, *, human_request=None, wake_check=None, clock_only=
+         return None
+     if reason and "SCHEDULED_UNTIL=" in reason:
+         return None
++    if kind == "needs_input":
++        return (
++            f"{ERROR_CODE}: kind='needs_input' with no human_request is invisible to David (the "
++            "sidebar shows it as active) and nothing wakes it. Pick one: (1) a step only David can "
++            "take -> pass human_request (action, why_human, interaction, scope, evidence); (2) a "
++            "file, permission or tool another gateway holds -> declare the capability need "
++            "(needs=['host:<gateway>'] or the exact capability, e.g. 'ssh:mini') so an owner card "
++            "is opened on that gateway, or kanban_create the owner card there and park on it "
++            "(kind='time', awaiting={kind:'card', ref, gateway}); (3) a timed wait -> kind='time' "
++            "with awaiting plus wake_check (or clock_only=true)."
++        )
+     return (
+         f"{ERROR_CODE}: kind={kind!r} with no human_request, wake_check or clock_only leaves the "
+         "card with no owner and nothing to wake it. Pick one: (1) a decision/action only David can "
+@@ -63,7 +76,7 @@ def sweep_agent_owned_blocks(conn: sqlite3.Connection, *, now: Optional[int] = N
+     escalated: list[str] = []
+     rows = conn.execute(
+         "SELECT id, block_kind FROM tasks WHERE status = 'blocked' AND human_request IS NULL "
+-        "AND current_run_id IS NULL AND (block_kind IS NULL OR block_kind IN ('capability','transient'))"
++        "AND current_run_id IS NULL AND (block_kind IS NULL OR block_kind IN ('capability','transient','needs_input'))"
+     ).fetchall()
+     for row in rows:
+         tid = row["id"]
+diff --git a/tests/tools/test_kanban_block_needs_input.py b/tests/tools/test_kanban_block_needs_input.py
+new file mode 100644
+index 0000000000..ed750c4a00
+--- /dev/null
++++ b/tests/tools/test_kanban_block_needs_input.py
+@@ -0,0 +1,100 @@
++"""needs_input blocks need a human_request: refused, swept, and classified as blocked on the sidebar."""
++import json
++import time
++
++import pytest
++
++CUTOVER_REASON = (
++    "1) Put GATEWAY-MIGRATION.md (Mac: ~/code/hermes/hosts/hermes-ci-capacity/) on the hub, e.g. attach "
++    "it to this card or copy to ~/asg-ci-controller/, or tell me how to read a ci-gw docker box "
++    "(docker3-5) config. 2) Then unblock this card"
++)
++ASK = {"action": "Copy GATEWAY-MIGRATION.md to the hub", "why_human": "only on the MacBook",
++       "interaction": "reply", "scope": "ASG CI cutover", "evidence": "file absent on hub"}
++
++
++@pytest.fixture
++def worker_env(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return tid
++
++
++def _status(tid):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        t = kb.get_task(conn, tid)
++        return t.status, t.block_kind
++    finally:
++        conn.close()
++
++
++def test_cutover_reason_without_human_request_is_refused(worker_env):
++    from tools import kanban_tools as kt
++    d = json.loads(kt._handle_block({"reason": CUTOVER_REASON, "kind": "needs_input"}))
++    blob = json.dumps(d)
++    assert "error" in d and "agent_owned_block" in blob
++    assert "human_request" in blob and "needs=" in blob
++    assert _status(worker_env) == ("running", None)
++
++
++def test_needs_input_with_human_request_blocks_and_sidebar_shows_blocked(worker_env):
++    from hermes_cli.kanban_session_activity import _replica_bucket
++    from tools import kanban_tools as kt
++    d = json.loads(kt._handle_block({"reason": CUTOVER_REASON, "kind": "needs_input", "human_request": ASK}))
++    assert d.get("ok") is True
++    assert _status(worker_env) == ("blocked", "needs_input")
++    assert _replica_bucket({"status": "blocked", "block_kind": "needs_input", "human_request": ASK}) == "blocked"
++    assert _replica_bucket({"status": "blocked", "block_kind": "needs_input", "human_request": None}) == "active"
++
++
++def test_cli_refuses_needs_input_without_human_request():
++    from hermes_cli.kanban_block_policy import block_policy_error
++    assert "agent_owned_block" in block_policy_error("needs_input", reason=CUTOVER_REASON)
++    assert block_policy_error("needs_input", human_request=ASK) is None
++    assert block_policy_error("needs_input", wake_check="test -f /x") is None
++    assert block_policy_error("needs_input", clock_only=True) is None
++    assert block_policy_error("needs_input", blocker_id="gh-billing") is None
++
++
++def test_sweep_escalates_askless_needs_input_and_spares_asked(worker_env):
++    import json as _json
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_block_policy import sweep_agent_owned_blocks
++    conn = kbc.connect()
++    try:
++        asked = kb.create_task(conn, title="asked", assignee="test-worker")
++        askless = worker_env
++        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input', human_request=NULL, "
++                     "current_run_id=NULL WHERE id=?", (askless,))
++        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input', human_request=?, "
++                     "current_run_id=NULL WHERE id=?", (_json.dumps(ASK), asked))
++        conn.commit()
++        assert sweep_agent_owned_blocks(conn) == []  # inside the grace period
++        later = int(time.time()) + 3 * 3600
++        assert sweep_agent_owned_blocks(conn, now=later) == [askless]
++        assert kb.get_task(conn, askless).status == "triage"
++        assert kb.get_task(conn, asked).status == "blocked"
++    finally:
++        conn.close()
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index d9e0ce773f..05279a2d4b 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -435,7 +435,10 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
+ 
+ def test_block_happy_path(worker_env):
+     from tools import kanban_tools as kt
+-    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input"})
++    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input",
++                            "human_request": {"action": "clarify", "why_human": "ambiguous spec",
++                                              "interaction": "reply", "scope": "worker-test",
++                                              "evidence": "spec has two readings"}})
+     d = json.loads(out)
+     assert d["ok"] is True
+     from hermes_cli import kanban_db as kb
+@@ -1665,7 +1668,7 @@ def test_block_agent_owned_allowed_with_wake_check_routes_scheduled(worker_env):
+ def test_block_capability_with_human_request_allowed():
+     from hermes_cli.kanban_block_policy import block_policy_error
+     assert block_policy_error("capability", human_request={"action": "x"}) is None
+-    assert block_policy_error("needs_input") is None
++    assert block_policy_error("needs_input", human_request={"action": "x"}) is None
+     assert block_policy_error("assignment") is None
+     assert block_policy_error("capability", clock_only=True) is None
+     assert block_policy_error("transient", blocker_id="gh-billing") is None
+-- 
+2.55.0
+

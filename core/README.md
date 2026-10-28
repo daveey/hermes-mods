@@ -56,7 +56,7 @@ The last public/private series reconciliation (what was already equivalent, what
 | [at-completion-refresh.md](at-completion-refresh.md) | 0464 | `@` completion sources can `subscribe` so an open popover re-asks when their background fetch lands. |
 | [core-update-drain-hold.md](core-update-drain-hold.md) | 0459, 0471 | A live `<home>/core-update/drain-hold` stops new Kanban claims so a saturated board drains for a core update; running workers are untouched, and wake probes, promotion and reclaim keep running (0471). |
 | [kanban-provider-quota-walls.md](kanban-provider-quota-walls.md) | 0457 | Record provider retry-after walls and re-tier walled Kanban cards, with a storm alert. |
-| [kanban-ownerless-blocks.md](kanban-ownerless-blocks.md) | 0456 | Refuse ownerless agent blocks and undecided blocked cards; sweep old ones through triage once. |
+| [kanban-ownerless-blocks.md](kanban-ownerless-blocks.md) | 0456 0583–0584 | Refuse ownerless agent blocks (incl. needs_input with no human_request) and undecided blocked cards; sweep old ones through triage once. |
 | [kanban-worker-crash-oom-recovery.md](kanban-worker-crash-oom-recovery.md) | 0438 0454 0570 | Scope-killed workers count as crashes; typed OOM recovery raises MemoryMax with admission and alerts on OOM rate. |
 | [kanban-triage-sweep-default-assignee.md](kanban-triage-sweep-default-assignee.md) | 0452 | CLI create defaults the assignee; stale triage cards are swept to the default profile once. |
 | [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) | 0448–0450 | Release instead of kill remote SSH backends on quit/resume, macOS launcher ownership proof, reuse-miss logging. |
