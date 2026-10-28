@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import sys
 import threading
 import time
+import traceback
 from collections import Counter
 from typing import Any, Callable, Dict, Optional
 
@@ -69,7 +71,8 @@ def _task_chain(task) -> tuple:
 
 
 class _Req:
-    __slots__ = ("id", "method", "path", "t0", "task", "resp_at", "status", "samples", "others", "last_sample")
+    __slots__ = ("id", "method", "path", "t0", "task", "resp_at", "status", "samples", "others", "workers",
+                 "last_sample")
 
     def __init__(self, rid: int, method: str, path: str, t0: float, task) -> None:
         self.id, self.method, self.path, self.t0, self.task = rid, method, path, t0, task
@@ -77,6 +80,7 @@ class _Req:
         self.status: Optional[int] = None
         self.samples: Counter = Counter()
         self.others: Counter = Counter()
+        self.workers: Counter = Counter()
         self.last_sample = 0.0
 
 
@@ -140,6 +144,8 @@ class ReqTrace:
             "samples": sum(req.samples.values()),
             "awaiting": [{"n": n_, "chain": list(c)} for c, n_ in req.samples.most_common(TOP_N)],
             "other_tasks": [{"n": n_, "chain": list(c)} for c, n_ in req.others.most_common(TOP_N)],
+            "worker_threads": [{"n": n_, "thread": t, "stack": list(st)}
+                               for (t, st), n_ in req.workers.most_common(TOP_N)],
         }
         try:
             self.sink(rep)
@@ -156,7 +162,9 @@ class ReqTrace:
         if not due:
             return
         others = None
+        workers = _worker_stacks()
         for r in due:
+            r.workers.update(workers)
             r.last_sample = now
             if r.task is not None:
                 r.samples[_task_chain(r.task)] += 1
@@ -168,7 +176,7 @@ class ReqTrace:
                         if id(t) in req_tasks:
                             continue
                         ch = _task_chain(t)
-                        if ch and not _idle_chain(ch):
+                        if ch and not _idle_chain(ch) and not _middleware_hop(ch):
                             others[ch] += 1
                 except RuntimeError:
                     pass
@@ -191,6 +199,44 @@ class ReqTrace:
 # websocket reader, periodic sleeper); listing them would bury the one task the request waits on.
 _IDLE_TAILS = ("sleep", "serve_forever", "wait_closed", "_accept_connection", "receive", "_run_until_stopped",
                "main_loop", "on_tick", "startup", "_serve")
+
+
+# Executor threads that run request work: anyio's (sync FastAPI handlers and dependencies), asyncio's
+# default executor (run_in_executor(None) / to_thread), and plugin pools (hub-sync). A request parked on
+# ``run_sync_in_worker_thread`` is waiting on one of these; their stacks say what the handler is doing.
+_WORKER_PREFIXES = ("AnyIO worker", "asyncio_", "ThreadPoolExecutor", "hub-sync")
+# Innermost frames of an executor thread waiting for work (not running any).
+_IDLE_WORKER_TAILS = {"_worker", "run", "get", "wait", "acquire", "_wait_for_tstate_lock"}
+
+
+def _worker_stacks(depth: int = 10) -> Counter:
+    out: Counter = Counter()
+    try:
+        names = {t.ident: t.name for t in threading.enumerate()}
+        frames = sys._current_frames()
+    except Exception:  # noqa: BLE001
+        return out
+    me = threading.get_ident()
+    for tid, frame in frames.items():
+        name = names.get(tid) or ""
+        if tid == me or not name.startswith(_WORKER_PREFIXES):
+            continue
+        st = tuple("%s:%d %s" % (_short(fs.filename), fs.lineno, fs.name)
+                   for fs in traceback.extract_stack(frame)[-depth:])
+        if not st:
+            continue
+        # Idle = parked in the pool's own queue wait: every frame is threading/queue/pool plumbing.
+        if all(any(m in x for m in ("threading.py", "queue.py", "thread.py", "to_thread", "_asyncio.py"))
+               for x in st) and st[-1].rsplit(" ", 1)[-1] in _IDLE_WORKER_TAILS:
+            continue
+        pool = name.rsplit("_", 1)[0] if name.startswith("asyncio_") else name.split(" ")[0]
+        out[(pool, st)] += 1
+    return out
+
+
+def _middleware_hop(chain: tuple) -> bool:
+    """A BaseHTTPMiddleware task parked in ``call_next`` only forwards to the next layer: pure noise."""
+    return any(c.endswith(" call_next") for c in chain[-5:])
 
 
 def _idle_chain(chain: tuple) -> bool:

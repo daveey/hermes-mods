@@ -75,7 +75,8 @@ def test_busy_other_thread_is_listed():
         lp.loop.call_soon_threadsafe(_blocking_handler_in_loop, 0.8)
         rep = w.check_once()
         assert rep is not None
-        assert any(b["thread"] == "hog" and "_busy_python" in b["stack"][-1] for b in rep["busy_threads"])
+        # The hog's innermost frame is _busy_python or the Event.is_set it calls each spin; either way it's listed.
+        assert any(b["thread"] == "hog" and any("_busy_python" in f for f in b["stack"]) for b in rep["busy_threads"])
     finally:
         stop.set()
         hog.join(2)

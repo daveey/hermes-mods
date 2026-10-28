@@ -12,10 +12,14 @@ rt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rt)
 
 
+def _slow_handler_body(seconds):
+    time.sleep(seconds)  # e.g. a sync kanban read waiting on a sqlite lock
+
+
 async def _parked_on_executor(scope, receive, send):
     # Loop stays free; the request waits on an executor future, as a slow handler behind a full pool does.
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, time.sleep, 1.6)
+    await loop.run_in_executor(None, _slow_handler_body, 1.6)
     await send({"type": "http.response.start", "status": 200, "headers": []})
     await send({"type": "http.response.body", "body": b"{}"})
 
@@ -65,6 +69,8 @@ def test_slow_request_reports_the_await_it_was_parked_on():
     assert rep["samples"] >= 3
     joined = " | ".join(" ".join(a["chain"]) for a in rep["awaiting"])
     assert "_parked_on_executor" in joined  # names the handler frame that was awaiting
+    # ...and what the executor thread it waits on was running.
+    assert any("_slow_handler_body" in " ".join(w["stack"]) for w in rep["worker_threads"])
     json.dumps(rep)
 
 
