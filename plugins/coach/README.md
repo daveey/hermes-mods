@@ -33,6 +33,19 @@ clones pass. A backtest over 37.6k past Hermes terminal calls blocks 43, and eve
 HEAD move or repack. Escape hatch for a change the user explicitly asked for: start the command with
 `COACH_ALLOW_LIVE=1`. Blocks are logged as `agent_block` in `log.jsonl`.
 
+**Compute envelope (`compute_envelope.py`; `pre_tool_call` on `kanban_block` + `pre_verify`).** The standing rule
+(rent-machine skill, `~/AGENTS.md`): after the user's go on a job that needs a GPU, an agent may rent one single-GPU
+machine up to $25 total without asking. A deterministic classifier (no model call) catches a `kanban_block`
+(direct or through `tool_call`) or a final reply with a sentence that asks for a decision (approve, may I, want me
+to, reply "…") about compute or money (GPU, rent, Vast/RunPod, outside Slurm, budget, $N), in a text about compute.
+It stays silent when any total is above the envelope (hourly rates don't count), the machine is multi-GPU /
+multi-node, or the sentence is about a credential (token-broker grant, SSH key, password, 2FA, sudo). The first hit
+per session and surface holds the block / the turn once with a note to rent within budget and carry on (logged
+`agent_hint` / `reply_nudge`, rule `compute_envelope`); a repeat goes through and is logged as `agent_fault`.
+Origin: defect agent-962f3f10ff, where three blocks and an "approve $20 / use metta1 directly" menu left a ~$5-10
+experiment blocked for 5 days; `tests/test_compute_envelope.py` replays both verbatim. Env:
+`COACH_COMPUTE_ENVELOPE=0` turns it off, `COACH_COMPUTE_ENVELOPE_USD` changes the cap (default 25).
+
 ### Reply check (`pre_verify`, before the turn ends)
 
 When the agent stops with its final message, `reply_check.py` looks at it once per turn. A regex prefilter

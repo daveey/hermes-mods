@@ -104,7 +104,43 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             log.debug("coach transform_tool_result: %s", exc)
             return None
 
-    def pre_tool_call(tool_name="", args=None, **_):
+    envelope_told: set = set()  # (session_id, where) already given the compute-envelope note
+
+    def _envelope(session_id, where, text, may_hold=True):
+        """Compute-envelope check (compute_envelope.py). First hit per session/surface -> the note (the caller holds
+        the block / the reply); a repeat after the note goes through and is logged as an agent fault."""
+        try:
+            ce = _load("compute_envelope")
+            if not ce.enabled():
+                return None
+            hit = ce.classify(text)
+            if not hit:
+                return None
+            key = (session_id or "", where)
+            if key in envelope_told or not may_hold:
+                if key in envelope_told:
+                    store.log({"event": "agent_fault", "rule": "compute_envelope", "session_id": session_id,
+                               "where": where, "evidence": hit["sentence"][:200]})
+                return None
+            envelope_told.add(key)
+            store.log({"event": "agent_hint" if where == "block" else "reply_nudge", "rule": "compute_envelope",
+                       "session_id": session_id, "where": where, "p": 1.0, "usd": hit.get("usd"),
+                       "evidence": hit["sentence"][:200]})
+            return ce.note(hit, where)
+        except Exception as exc:
+            log.debug("coach compute_envelope: %s", exc)
+            return None
+
+    def pre_tool_call(tool_name="", args=None, session_id="", **_):
+        if tool_name in ("kanban_block", "tool_call"):
+            try:
+                text = _load("compute_envelope").block_text(tool_name, args)
+            except Exception as exc:
+                log.debug("coach compute_envelope: %s", exc)
+                text = ""
+            msg = _envelope(session_id, "block", text) if text else None
+            if msg:
+                return {"action": "block", "message": msg}
         try:
             what = rules.blocks_live_checkout(tool_name, args if isinstance(args, dict) else {}, coach.checkout)
         except Exception as exc:
@@ -274,6 +310,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         """Check the agent's final answer before the turn ends; a hit keeps the turn going with a nudge.
         At most one nudge per turn (attempt 0 only); fail-open on every error."""
         try:
+            if session_id and final_response and platform not in ("cron",):
+                msg = _envelope(session_id, "reply", final_response, may_hold=not attempt)
+                if msg:
+                    return {"action": "continue", "message": msg}
             if attempt or not session_id or not final_response or platform in ("cron",):
                 return None
             rc = _load("reply_check")
