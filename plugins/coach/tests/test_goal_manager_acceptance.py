@@ -44,16 +44,27 @@ def environment(tmp_path, monkeypatch):
     (tmp_path / 'config.yaml').write_text(yaml.safe_dump({
         'plugins': {'enabled': list(ORDERS[0])},
         'agent': {'pre_verify_every_turn': True, 'max_verify_nudges': 1}}))
-    events = []
+    class Events(list):
+        # Compute-envelope gate observations stay out of the goal-gate event stream the tests assert on.
+        envelope = []
+    events = Events()
+    events.envelope = []
     original = PluginContext.register_hook
     def recording_register(ctx, name, callback):
         if name == 'pre_final_gate':
+            # coach registers two pre_final_gate callbacks: the goal gate and, since b532676, the compute-envelope
+            # gate (key 'pre_final_gate:compute_envelope'). Keep their identities distinct.
+            envelope = ctx.plugin_id == 'coach' and callback.__name__ == 'envelope_gate'
+            label = 'coach:compute_envelope' if envelope else ctx.plugin_id
             @functools.wraps(callback)
             def recorded(**kwargs):
                 result = callback(**kwargs)
-                events.append((ctx.plugin_id, kwargs['attempt'], copy.deepcopy(result)))
+                if envelope:
+                    events.envelope.append((kwargs['attempt'], copy.deepcopy(result)))
+                else:
+                    events.append((ctx.plugin_id, kwargs['attempt'], copy.deepcopy(result)))
                 return result
-            recorded.acceptance_plugin = ctx.plugin_id
+            recorded.acceptance_plugin = label
             return original(ctx, name, recorded)
         return original(ctx, name, callback)
     monkeypatch.setattr(PluginContext, 'register_hook', recording_register)
@@ -72,14 +83,19 @@ def environment(tmp_path, monkeypatch):
             manager._load_plugin(manifests[name])
             assert not manager._plugins[name].error
         hooks = manager.iter_hook_callbacks('pre_final_gate')
-        assert len(hooks) == 3
+        # goal gate + compute-envelope gate (coach, b532676), ask-gate, chat-closeout.
+        assert len(hooks) == 4
         # Wrappers retain callback identity/attributes, including guard priority.
         actual = [h.acceptance_plugin for h in hooks]
-        assert actual == list(order)
+        expected = [x for name in order for x in
+                    (('coach', 'coach:compute_envelope') if name == 'coach' else (name,))]
+        assert actual == expected
         print('REGISTERED', actual)
         return configure()
     try:
         yield manager, order_plugins, configure, events
+        # The envelope gate sees the same candidate text but must never hold or rewrite it here.
+        assert all(result is None for _, result in events.envelope), events.envelope
     finally:
         manager.unload()
 

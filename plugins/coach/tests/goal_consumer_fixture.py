@@ -40,6 +40,12 @@ def consumer(owner, monkeypatch, request):
     collector_globals['_kb_poll_board'] = types.FunctionType(
         notifications._kb_poll_board.__code__, collector_globals,
         argdefs=notifications._kb_poll_board.__defaults__)
+    # Core split the per-board claim loop (the formatter call site) out of _kb_poll_board into
+    # _kb_poll_board_now: rebind it too, or the real formatter runs instead of the test formatter.
+    if hasattr(notifications, '_kb_poll_board_now'):
+        collector_globals['_kb_poll_board_now'] = types.FunctionType(
+            notifications._kb_poll_board_now.__code__, collector_globals,
+            argdefs=notifications._kb_poll_board_now.__defaults__)
     collector_globals['_kb_board_key'] = types.FunctionType(
         notifications._kb_board_key.__code__, collector_globals)
     # Formatter is pure but its helper globals are rebound by the server too.

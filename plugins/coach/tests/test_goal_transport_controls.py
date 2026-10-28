@@ -171,8 +171,12 @@ def test_cli_pty_ctrl_c(tmp_path):
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     try:
-        wait_for(lambda: b'No thanks' in output)
-        os.write(master, b'\r')
+        # First-run consent ("No thanks") is only offered by installs that have not answered it; the
+        # fork default reads as already decided (shared_metrics_consent.consent_state), so wait for
+        # whichever comes first and answer the offer only when it is shown.
+        wait_for(lambda: b'No thanks' in output or b'\x1b[?2004h' in output)
+        if b'\x1b[?2004h' not in output:
+            os.write(master, b'\r')
         wait_for(lambda: b'\x1b[?2004h' in output)
         os.write(master, PROMPTS['abandoned'].encode())
         wait_for(lambda: b'fixed it yet?' in output)
