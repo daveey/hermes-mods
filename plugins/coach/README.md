@@ -45,32 +45,43 @@ this user's agents can reach). A hit keeps the turn going with a nudge the user 
 | `handoff` | the reply hands the user a step the agent could do itself (log in, click, run, paste...) | try it first with shell/ssh/browser/vault/token-broker; hand off only what needs hands or judgment, and say why |
 | `confirm` | the reply ends with "Want me to…?" about a reversible, in-scope step | proceed, verify, report; ask only before irreversible or external actions |
 | `unwatched` | the reply promises to continue after outside work finishes ("I'll write the report once the runs finish", "waiting on CI") and `wake_sources()` finds nothing armed: no live background process for the session or its compression ancestors, no open kanban card, no active goal, and no delegate/kanban/cron call this turn. A row like this gets painted done and its follow-up never runs | arm one `terminal(background=true, notify=true)` watcher on the real completion signal with a time cap (a kanban card for multi-hour work), or say plainly that the user owns the follow-up |
-| `report_only` | the reply describes or diagnoses a problem the agent could fix and ends there: no fix, no started fix (card, worker or PR this turn) and no concrete proposal ("Not fixed. No action is needed from you.", "relayed to the existing owner", an "Open:" list). An explicit scope limit in the user's ask ("analysis only", "just tell me why", "plan first", "don't change anything", "no edits", "read-only") drops it before the judge runs. Own threshold: `report_only=0.75` | fix it now if small or reversible; otherwise start it (`kanban_create` with acceptance criteria, linked to the chat) and name the card; if it really is the user's call, propose the exact fix |
+| `report_only` | the reply describes or diagnoses a problem the agent could fix and ends there: no fix, no started fix (card, worker or PR this turn) and no concrete proposal ("Not fixed. No action is needed from you.", "relayed to the existing owner", an "Open:" list). An explicit scope limit in the user's ask ("analysis only", "just tell me why", "plan first", "don't change anything", "no edits", "read-only") drops it before the judge runs. Two-stage: the Sonnet screen at 0.75 hands the reply to a second opinion on claude-opus-5-5 (aux task `coach_report_only`, real tool arguments); only the second opinion nudges (see below) | fix it now if small or reversible; otherwise start it (`kanban_create` with acceptance criteria, linked to the chat) and name the card; if it really is the user's call, propose the exact fix |
 | `unverified` (off by default) | "done/fixed" with no check on the user's real path | verify on the user's path or say what's unchecked. With `diff_review` on it is also judged on turns that changed a git repo, and a hit there runs an Opus review of the diff (see Second opinions) |
 
 Measured on 360 real replies against hindsight labels (the labeler also saw the user's next message). At
 threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
 samples are small (n=120), so treat these numbers as early. `unverified` showed no usable signal.
 `unwatched` checks wake sources deterministically before the judge runs, so a reply with a live watcher costs no LLM call. Of 3,260 recent Desktop replies, 299 matched the prefilter. On three real cases the judge scored the orphaned "once the runs finish, I'll…" reply 0.85 and scored the user-owned next step and the reply that armed a watcher below threshold. Watchers die when their backend restarts, so a promise made before a restart can become orphaned later; the rule only catches this at turn end.
-`report_only` (2026-10-27, 762 labeled MacBook Desktop reply endings, split 70/30 by session; harness
-`eval/report_only_eval.py`): the prefilter keeps 96% of the original-label positives (89% of the re-labeled ones) and
-passes 71% of human-turn replies to the judge. Baseline (claude-sonnet-5-5, old prompt, 0.75): held-out human P 0.67,
-R 0.43. The acceptance target (precision >= 0.85 and recall >= 0.6 on held-out human turns) is still NOT met.
-Second pass (2026-10-27): every human row was re-labeled blind by claude-opus-5-5 with the same rubric, and the 52
-disagreements were adjudicated by Opus. The two blind labelers agree on 89% of human rows (positives: 55 both, 16
-Sonnet-only, 36 Opus-only), so the label ceiling is low. The judge prompt gained two rules (a named gap in finished
-work counts; a bare "the owner has it" is not a handoff). Held-out human results with that prompt, scored once, by
-label set (precision / recall; positives): consensus labels where both labelers agree, disputed rows excluded:
-0.70 -> 0.71 / 0.63 (19), 0.75 -> 0.69 / 0.47, 0.80 -> 0.88 / 0.37; original Sonnet labels, Opus judge: 0.70 ->
-0.70 / 0.50 (32 under the Opus labels), 0.80 -> 0.90 / 0.28; Sonnet judge, same prompt, 0.75 -> 0.59 / 0.43 (23). On
-train, consensus labels: 0.70 -> 0.79 / 0.64, 0.75 -> 0.83 / 0.56. No threshold reaches both targets on held-out.
-Held-out event turns: no fires at 0.85 (30 positives, labels about 70% right). The remaining errors are mostly
-borderline calls (status lines that mention an owned card, small caveats), not clear judge mistakes. Re-labeling
-files: `~/.hermes/kanban/evidence/report-only/relabel/`.
+`report_only` cascade (2026-10-27). Gold set: 1,190 human-question reply endings from the MacBook (Oct 1 to Oct 27, 762-row
+labeled set plus 716 newly sampled rows) and the hub (96 rows); 175 positives. Labels: two blind labelers (Sonnet and
+Opus, same rubric, counts-only tool log) where they agree, and claude-opus-5-5 with the real tool arguments deciding the
+91 disputed rows. Gold is mostly Opus-defined, so the numbers below are agreement with that rubric, not human truth.
+Split 70/30 by session hash; the operating point was chosen on train only, held-out scored once
+(`eval/report_only_cascade_eval.py`; files in `~/.hermes/kanban/evidence/report-only/v2/`). The prefilter keeps 81% of
+the gold positives, which caps recall. Production path: prefilter, scope-limit guard, Sonnet `coach_reply` screen; when
+the screen's report_only p >= 0.75 (`CONFIRM_FLOOR`) one call to `coach_report_only` (claude-opus-5-5, labeling rubric
+plus the real args of kanban_create, delegate_task, patch and terminal calls) labels the outcome; a report_only +
+agent_fixable label is p 0.9 and nudges (`report_only=0.5`). Capped at 100 confirm calls per host per day (events
+`report_only_confirm` and `report_only_confirm_capped` in `log.jsonl`; `COACH_REPORT_ONLY_CONFIRM_CAP`, set
+`COACH_REPORT_ONLY_CONFIRM=0` to turn it off); at the cap, on error, or with no confirm wired, the screen alone must
+reach `report_only_screen=0.85`.
+Held-out human turns (59 positives; precision / recall, 95% Wilson CI): cascade at screen floor 0.75: 0.957 (0.79-0.99) /
+0.373 (0.26-0.50); Sonnet screen alone at 0.75: 0.647 / 0.373, at 0.85: 0.562 / 0.153. Train (116 positives), cascade at
+0.75: 0.811 (0.66-0.91) / 0.259 (0.19-0.35); floor 0.5: 0.679 / 0.474. Pooled train + held-out (175 positives): floor 0.75
+0.867 (0.76-0.93) / 0.297 (0.23-0.37); floor 0.7 0.836 / 0.320; floor 0.5 0.750 / 0.514; screen alone at 0.75 0.594 /
+0.326. Held-out was much kinder than train (floor 0.5: 0.897 / 0.593 vs 0.679 / 0.474), so trust the pooled figures.
+Acceptance (P >= 0.80, best recall, aiming at R >= 0.55): precision is met at floor 0.75; the 0.55 recall aim is NOT
+(0.37 held-out, 0.30 pooled). Lowering the floor to 0.5 buys recall (pooled 0.51) at precision 0.75, below the 0.80
+bar, so it was not shipped. Misses are backstopped by the Opus default chat model, the weekly report_only KPI and the
+Oct 30 re-measure; the live check stays with t_01a17f79ade9cbdd. Event turns were not re-scored in this pass.
+Earlier passes (same day): the original target (precision >= 0.85, recall >= 0.6 on the 472 human rows of the first set)
+was not reached by a single judge; Sonnet 0.67 / 0.43, Opus 0.82 / 0.39 at 0.75 on original labels, and the prompt rule
+about named gaps in finished work moved Opus to 0.69 / 0.47 at 0.75 on consensus labels. Eval spend was not metered per call: the labeling passes alone used 1.17M input tokens (0.51M Sonnet, 0.66M Opus), the
+cascade eval added one Sonnet screen call per candidate and one Opus call per screen p >= floor, so no dollar figure is claimed.
 Six explicit scope-limit fixtures (`tests/fixtures/report_only_scope_limits.json`) never fire; the deterministic
 `scope_limited()` guard drops them and the judge alone scores them <= 0.1.
 Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` and `COACH_REPLY_THRESHOLDS`
-(`rule=th,...` per-rule overrides; default `report_only=0.75`). Needs core
+(`rule=th,...` per-rule overrides; defaults `report_only=0.5` for the second opinion, `report_only_screen=0.85`). Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
 

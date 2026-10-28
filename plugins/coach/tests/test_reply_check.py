@@ -112,7 +112,7 @@ def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_THRESHOLDS", raising=False)
     cfg = rc.settings()
     assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only"] and cfg["threshold"] == 0.7
-    assert set(cfg["thresholds"]) == {"report_only"}
+    assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85}
 
 
 ORPHAN = ("Everything is running.\n\nOnce the last runs finish, around 03:30 UTC, I'll build the tables from the "
@@ -217,15 +217,15 @@ def test_check_fires_report_only_with_spec_nudge():
 
 
 def test_check_report_only_respects_its_own_threshold():
-    th = rc.settings()["thresholds"]["report_only"]
+    th = rc.settings()["thresholds"]["report_only_screen"]  # no second opinion: the screen's own threshold
     llm, _ = _judge({"report_only": max(0.0, th - 0.05), "evidence": "e"})
     assert rc.check(REPORT_REPLY, REPORT_ASK, [], llm, threshold=0.0, only=["report_only"],
-                    thresholds={"report_only": th}) is None
+                    thresholds=rc.settings()["thresholds"]) is None
 
 
 def test_thresholds_env_override(monkeypatch):
     monkeypatch.setenv("COACH_REPLY_THRESHOLDS", "report_only=0.95,bogus=0.1,handoff=x")
-    assert rc.settings()["thresholds"] == {"report_only": 0.95}
+    assert rc.settings()["thresholds"] == {"report_only": 0.95, "report_only_screen": 0.85}
 
 
 SCOPE_LIMITED_ASKS = [  # explicit limits: a diagnosis is exactly what was asked for
@@ -273,3 +273,70 @@ def test_pre_verify_hook_holds_a_report_only_reply(tmp_path, monkeypatch):
     assert out and out["action"] == "continue" and "Don't end on the diagnosis." in out["message"]
     logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
     assert any(r["event"] == "reply_nudge" and r["rule"] == "report_only" for r in logged)
+
+
+# --- report_only cascade: the screen's p >= CONFIRM_FLOOR gets a second opinion on the strong model ----------------
+def _ro_verdict(p):
+    return {"handoff": 0, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": p, "evidence": "screen"}
+
+
+def test_confirm_replaces_the_screen_p_and_can_veto_it():
+    llm, calls = _judge(_ro_verdict(0.9))
+    asked = []
+    ths = rc.settings()["thresholds"]
+    hit = rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths,
+                   confirm=lambda: asked.append(1) or (0.9, "confirmed: no fix started"), confirm_floor=rc.CONFIRM_FLOOR)
+    assert hit and hit["p"] == 0.9 and hit["verdict"]["report_only_src"] == "confirm" and "confirmed: no fix" in hit["nudge"]
+    assert rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths,
+                    confirm=lambda: (0.1, "fix was sent to the owner"), confirm_floor=rc.CONFIRM_FLOOR) is None
+    # a screen p below the floor never reaches the second opinion
+    llm2, _ = _judge(_ro_verdict(0.6))
+    assert rc.check(REPORT_REPLY, REPORT_ASK, [], llm2, only=["report_only"], thresholds=ths,
+                    confirm=lambda: asked.append("below floor") or (0.9, "x"), confirm_floor=rc.CONFIRM_FLOOR) is None
+    assert "below floor" not in asked
+
+
+def test_confirm_unavailable_falls_back_to_the_stricter_screen_threshold():
+    ths = rc.settings()["thresholds"]
+    for p, fires in ((0.80, False), (0.90, True)):  # 0.80 clears the floor but not report_only_screen (0.85)
+        llm, _ = _judge(_ro_verdict(p))
+        hit = rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths,
+                       confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR)
+        assert bool(hit) is fires
+        # without a confirm callable at all the screen is held to the same screen threshold
+        assert bool(rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths)) is fires
+
+
+def test_parse_confirm_reads_the_strong_models_label():
+    assert rc.parse_confirm('{"outcome": "report_only", "agent_fixable": true, "quote": "not fixed"}') == (0.9, "not fixed")
+    for o in ('{"outcome": "started", "agent_fixable": true}', '{"outcome": "report_only", "agent_fixable": false}', "nope"):
+        r = rc.parse_confirm(o)
+        assert r is None or r[0] == 0.1
+    assert "kanban_create" in rc.CONFIRM_SYS and "report_only" in rc.CONFIRM_SYS
+
+
+def test_pre_verify_hook_runs_the_confirm_with_real_args_and_honours_the_daily_cap(tmp_path, monkeypatch):
+    monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
+    monkeypatch.setenv("COACH_REPORT_ONLY_CONFIRM_CAP", "2")
+    spec = importlib.util.spec_from_file_location("coach_init_ro2", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcl = mod._load("reply_check")
+    monkeypatch.setattr(rcl, "aux_judge", lambda s, p: json.dumps(_ro_verdict(0.93)))
+    prompts = []
+    monkeypatch.setattr(rcl, "aux_confirm", lambda s, p: prompts.append(p) or json.dumps(
+        {"outcome": "report_only", "agent_fixable": True, "quote": "stops at the diagnosis"}))
+    store = core.Store(root=tmp_path / "coach")
+    coach, hooks = mod.build(store=store, checkout=None)
+    for i in range(3):
+        sid = f"s{i}"
+        hooks["pre_llm_call"](session_id=sid, user_message=REPORT_ASK)
+        hooks["post_tool_call"](tool_name="kanban_create", args={"title": "Fix stale panel", "body": "cache never refreshes"},
+                                result="ok", session_id=sid)
+        out = hooks["pre_verify"](session_id=sid, attempt=0, final_response=REPORT_REPLY)
+        assert out and out["action"] == "continue"  # the third falls back to the screen (0.93 >= 0.85)
+    assert len(prompts) == 2 and "Fix stale panel" in prompts[0] and "cache never refreshes" in prompts[0]
+    logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert sum(r["event"] == "report_only_confirm" for r in logged) == 2
+    assert sum(r["event"] == "report_only_confirm_capped" for r in logged) == 1

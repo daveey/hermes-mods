@@ -2,6 +2,7 @@
 User channel = dashboard/plugin_api.py + desktop-plugins/coach (one-button panels above the composer)."""
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import logging
 import threading
@@ -295,10 +296,31 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             m = s1.mode()
             screen = ((lambda cands: s1.reply_screen(cands, ask, log_lines, final_response, rc.profile_text()))
                       if m != "off" else None)
+            def confirm():
+                """report_only second opinion on the strong model (aux task coach_report_only) with the turn's real
+                tool arguments. None = not made (off, daily cap reached, error): the screen's own p decides."""
+                if os.environ.get("COACH_REPORT_ONLY_CONFIRM", "1").strip().lower() in ("0", "off", "false", "no"):
+                    return None
+                try:
+                    cap = int(os.environ.get("COACH_REPORT_ONLY_CONFIRM_CAP", rc.CONFIRM_DAILY_CAP))
+                except ValueError:
+                    cap = rc.CONFIRM_DAILY_CAP
+                day0 = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                used = sum(1 for r in store.read_log(since=day0) if r.get("event") == "report_only_confirm")
+                if used >= cap:
+                    store.log({"event": "report_only_confirm_capped", "session_id": session_id, "used": used, "cap": cap})
+                    return None
+                raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), final_response))
+                res = rc.parse_confirm(raw)
+                store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
+                           "p": res[0] if res else None, "evidence": res[1] if res else ""})
+                return res
+
             hit = rc.check(final_response, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
                            only=only, changed_paths=changed_paths,
                            wake=lambda: rc.wake_sources(session_id, log_lines),
                            screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log,
+                           confirm=confirm, confirm_floor=rc.CONFIRM_FLOOR,
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
@@ -307,7 +329,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 if "unverified" not in cfg["rules"]:  # added only for the review: fall back to the next real rule
                     v = hit["verdict"]
                     rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response)
-                            and v.get(r, 0) >= (cfg.get("thresholds") or {}).get(r, cfg["threshold"])
+                            and v.get(r, 0) >= rc.rule_threshold(r, v, cfg.get("thresholds") or {}, cfg["threshold"])
                             and r != "unwatched" and not (r == "report_only" and rc.scope_limited(ask))]
                     hit = None
                     if rest:

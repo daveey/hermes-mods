@@ -396,6 +396,27 @@ def attach_hint(result: Any, hint: str) -> Any:
     return result
 
 
+
+def rich_tool_line(tool: str, args: dict, arg: str = "") -> str:
+    """One tool-log line with the arguments that show what the agent started or handed off."""
+    try:
+        a = args if isinstance(args, dict) else {}
+        if tool == "kanban_create":
+            return (f"-> kanban_create(title={str(a.get('title'))[:200]!r}, assignee={a.get('assignee')}, "
+                    f"body={str(a.get('body'))[:500]!r})")
+        if tool == "delegate_task":
+            ts = a.get("tasks") or [{"goal": a.get("goal")}]
+            return "-> delegate_task(" + " | ".join(str((t or {}).get("goal"))[:300] for t in ts[:3]) + ")"
+        if tool in ("patch", "write_file", "read_file"):
+            return f"-> {tool}(path={a.get('path')}, {str(a.get('new_string') or a.get('content') or '')[:120]!r})"
+        if tool in ("kanban_comment", "kanban_complete", "kanban_block", "cross_session"):
+            return f"-> {tool}({json.dumps(a, default=str)[:400]})"
+        if tool == "terminal":
+            return f"-> terminal({str(a.get('command'))[:300]})"
+    except Exception:
+        pass
+    return f"-> {tool}({arg[:140]})"
+
 class AgentCoach:
     def __init__(self, checkout: Optional[Path] = None, signals=None, clock: Callable[[], float] = time.monotonic):
         self.checkout = checkout
@@ -408,7 +429,7 @@ class AgentCoach:
         if s is None:
             s = self.sessions[sid] = {"turn": 0, "turn_tools": 0, "fails": {}, "recent": deque(maxlen=POLL_WINDOW),
                                       "fired": set(), "pending": [], "bg": {}, "ask": "",
-                                      "turn_log": deque(maxlen=60), "loop": {"fails": []}}
+                                      "turn_log": deque(maxlen=60), "turn_rich": deque(maxlen=60), "loop": {"fails": []}}
         return s
 
     def _fire(self, s: dict, sid: str, rule: str, key: str, **fmt) -> None:
@@ -425,6 +446,7 @@ class AgentCoach:
         s["turn"] += 1
         s["turn_tools"] = 0
         s["turn_log"].clear()
+        s["turn_rich"].clear()
         s["turn_t0"] = time.time()  # wall clock: the diff review asks git for commits made since the turn began
         if isinstance(user_message, str) and user_message.strip():
             s["ask"] = user_message[:2000]
@@ -450,6 +472,11 @@ class AgentCoach:
         """(latest user ask, this turn's tool log) for the reply check."""
         s = self._s(sid)
         return s["ask"], list(s["turn_log"])
+
+    def turn_rich(self, sid: str) -> list[str]:
+        """This turn's tool log with real arguments (kanban_create title and body, delegate goals, patch paths), for the
+        report_only second opinion."""
+        return list(self._s(sid).get("turn_rich") or [])
 
     def turn_started(self, sid: str) -> float | None:
         """Wall-clock start of the session's current turn (None before the first turn)."""
@@ -486,6 +513,7 @@ class AgentCoach:
         except Exception:
             arg = ""
         s["turn_log"].append(f"-> {tool}({arg[:140]})")
+        s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
         if failed(tool, result, status):
             s["turn_log"].append(f"   <- ERROR {str(result)[:120]}")
 

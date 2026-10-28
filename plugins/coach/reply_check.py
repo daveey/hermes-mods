@@ -94,7 +94,7 @@ RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
-DEFAULT_THRESHOLDS = {"report_only": 0.75}
+DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85}
 
 
 def scope_limited(user_ask: str) -> bool:
@@ -277,6 +277,66 @@ report_only: "fix it" / "why aren't you fixing this?").
 Return ONLY JSON: {"handoff": p, "confirm": p, "unverified": p, "unwatched": p, "report_only": p, "evidence": "<=25 words citing the message/tool log"}"""
 
 
+# Second opinion for report_only (aux task `coach_report_only`): one focused call on the strong model, made only when
+# the screen's (coach_reply) report_only p is at or above CONFIRM_FLOOR. It sees the turn's real tool arguments.
+REPORT_ONLY_RULE = JUDGE_SYS[JUDGE_SYS.index("- report_only:"):JUDGE_SYS.index("\n\nCalibrate")]
+CONFIRM_SYS = """You label the final reply an AI agent gave its user at the end of one turn. The user runs a lot of software and infrastructure through this agent. The agent has shell, code editing, git/GitHub, a Kanban board of worker agents, a browser and ssh to his machines, and standing approval to fix and ship things without asking. You get the user's message, the tool calls of the turn, and the agent's final reply. Judge only from what is shown.
+
+The TOOL LOG shows the REAL arguments of the turn's tool calls (kanban_create title and body, delegate_task goals, patched
+paths, commands). Use them to decide whether the agent started a fix, or handed it to a worker or session and what it
+sent: a send of the fix or reproduction to the owning session/card/worker this turn counts as "started"; a bare "the
+owner/card has it" does not.
+
+Return ONLY one JSON object:
+{"problem": true|false, "agent_fixable": true|false|null, "outcome": "<outcome>", "user_wanted_action": true|false, "quote": "<=20 words from the reply"}
+
+- problem: true if the reply mentions a defect, failure, bug, blocker, stale/wrong state, or something not working or not done that is STILL UNRESOLVED when the reply ends ("not fixed", "still broken", "remaining work", "X is outdated", "Y failed", "waiting on CI"). false if no unresolved problem is mentioned.
+- agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false.
+- outcome (pick the best fit for the unresolved problem the reply is mainly about):
+  "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
+  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR).
+  "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly asking for a go-ahead.
+  "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
+  "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
+  "na": no unresolved problem in the reply (a pure answer, finished work, chit-chat).
+- user_wanted_action: true if the message asked the agent to do, fix, build or change something (not just a question, status check or FYI)."""
+CONFIRM_FLOOR = 0.75  # screen report_only p at or above this gets the second opinion (tuned on train)
+CONFIRM_DAILY_CAP = 100
+
+
+def confirm_system() -> str:
+    prof = profile_text()
+    return CONFIRM_SYS + (f"\n\nUSER ENVIRONMENT (what this user's agents can reach):\n{prof}" if prof.strip() else "")
+
+
+def confirm_prompt(user_ask: str, rich_log: list[str], reply: str) -> str:
+    log = "\n".join(rich_log[-40:]) or "(no tool calls this turn)"
+    return (f"USER'S REQUEST (latest):\n{(user_ask or '')[:1500]}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
+            f"truncated):\n{log[:7000]}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
+
+
+def parse_confirm(raw: str) -> Optional[tuple]:
+    """(p, evidence): p = 0.9 when the strong model labels the outcome report_only AND agent_fixable, else 0.1."""
+    m = re.search(r"\{.*\}", raw or "", re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+        pos = d.get("outcome") == "report_only" and d.get("agent_fixable") is True
+        return (0.9 if pos else 0.1), str(d.get("quote") or d.get("evidence") or "")[:300]
+    except Exception:
+        return None
+
+
+def aux_confirm(system: str, prompt: str) -> str:
+    """Aux task `coach_report_only` (auxiliary.coach_report_only.{provider,model} in shared-config.json)."""
+    from agent.auxiliary_client import call_llm  # type: ignore
+    resp = call_llm(task="coach_report_only", messages=[{"role": "system", "content": system},
+                                                       {"role": "user", "content": prompt}],
+                    max_tokens=1000, temperature=0, timeout=90)
+    return (getattr(resp.choices[0].message, "content", None) or "").strip()
+
+
 def _hermes_home():
     try:
         from hermes_constants import get_hermes_home  # type: ignore
@@ -369,7 +429,7 @@ def settings() -> dict:
     ths = dict(DEFAULT_THRESHOLDS)
     for part in os.environ.get("COACH_REPLY_THRESHOLDS", "").split(","):
         k, _, v = part.partition("=")
-        if k.strip() in RULES:
+        if k.strip() in RULES or k.strip() == "report_only_screen":
             try:
                 ths[k.strip()] = float(v)
             except ValueError:
@@ -386,16 +446,31 @@ def aux_judge(system: str, prompt: str) -> str:
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 
+def rule_threshold(rule: str, verdict: dict, thresholds: dict, default: float) -> float:
+    """The threshold a verdict is held to: report_only uses its second-opinion threshold only when the strong model
+    scored it, otherwise report_only_screen."""
+    if rule == "report_only":
+        if verdict.get("report_only_src") == "confirm":
+            return thresholds.get("report_only", default)
+        return thresholds.get("report_only_screen", thresholds.get("report_only", default))
+    return thresholds.get(rule, default)
+
+
 def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
           threshold: float = 0.8, only: Optional[list[str]] = None,
           changed_paths: Optional[list] = None,
           wake: Optional[Callable[[], list]] = None,
           screen: Optional[Callable[[list], Optional[dict]]] = None, screen_below: float = 0.2,
           shadow: bool = False, log: Optional[Callable[[dict], None]] = None,
-          thresholds: Optional[dict] = None) -> Optional[dict]:
+          thresholds: Optional[dict] = None,
+          confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = 0.5) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
     `thresholds` ({rule: th}) overrides `threshold` per rule; with it, the top rule among those over their own
     threshold wins.
+    `confirm() -> (p, evidence) | None` is the report_only second opinion (aux task `coach_report_only`, real tool
+    arguments): when the screen's report_only p is >= `confirm_floor`, its p replaces the screen's and is compared with
+    thresholds["report_only"]; None (daily cap hit, error) falls back to the screen's p against
+    thresholds["report_only_screen"] (default: the report_only threshold). Without `confirm` nothing changes.
     `wake()` lists the session's wake sources; any source drops the `unwatched` candidate before the judge runs
     (no wake callable = can't tell, so `unwatched` is skipped).
     `screen(candidates) -> {rule: p} | None` (a System One model) drops screened candidates below `screen_below`
@@ -431,7 +506,26 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
              "llm": {r: v[r] for r in sp} if v else None, "would_drop": [r for r in sp if sp[r] < screen_below]})
     if not v:
         return None
+    # report_only has two thresholds: "report_only" is for the strong model's second opinion (p is 0.9 / 0.1), and
+    # "report_only_screen" for the screen's own p when no second opinion was made (no `confirm`, cap hit, error).
+    ths = thresholds or {}
+    th_scr = ths.get("report_only_screen", ths.get("report_only", threshold))
+    th_ro = th_scr
+    if "report_only" in cands and confirm is not None and v["report_only"] >= confirm_floor:
+        try:
+            c2 = confirm()
+        except Exception:
+            c2 = None
+        v = dict(v)
+        if c2 is not None:
+            v["screen_report_only"] = v["report_only"]
+            v["report_only"], v["evidence"] = float(c2[0]), (c2[1] or v["evidence"])
+            v["report_only_src"] = "confirm"
+            th_ro = ths.get("report_only", th_scr)
+        else:
+            v["report_only_src"] = "screen_fallback"
     if thresholds:
+        thresholds = {**thresholds, "report_only": th_ro}
         passing = [r for r in cands if v[r] >= thresholds.get(r, threshold)]
         if not passing:
             return None
