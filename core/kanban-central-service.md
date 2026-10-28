@@ -132,6 +132,20 @@ back). The endpoint opens every board and replica once and keeps the read-only c
 1–2 ms on the laptop and the mini and 1–5 ms on the hub (it was about 40 ms with a 120–340 ms tail when it opened
 16 files per call). Tests: `test_kanban_chat_links.py`, `test_kanban_ro_cache.py`.
 
+Count and list from one reader (2026-10-28): with `links_reader: replica` the sidebar counts still read the origin
+ledger while the linked-card strip read the replica, and the replica dropped done cards whose release was never
+verified. The Upkeep chat said "Waiting on 14 cards" over 9 chips. Both now read `_remote_cards`, so in each mode the
+count and the list are one projection. In the replica: an unreleased link to a `done`/`archived` card, or to a card
+row the replica lacks, is an `unknown`, unfinished row (only a released link drops it); only the active origin
+profile's links count; `stale`/`synced_at` come from the replica's last successful pull (`kanban_sync_state.pulled_at`,
+stamped by `_pull_replica`); an unreadable replica keeps its last rows as stale, or on a cold start shows the ledger's
+rows for that board as stale; each (chat, card) is one row, keyed with the owner profile the chat's ledger row names.
+A card shared by two sessions of one compression lineage counts once. `links-diff` now compares `unknown` unfinished
+rows too, never uses that fallback, and is not clean while a needed replica is unreadable (it had reported 771/771
+clean while counts and list differed by 5). Tests: `test_kanban_chat_links_parity.py` (count == listed rows for each
+case), `test_kanban_sync_client.py::test_a_replica_pull_stamps_pulled_at_and_a_failed_one_does_not`. Local cards
+shared across a lineage still count twice (follow-up card).
+
 Boards: every board on every host is attached and `primary` (6 on the laptop, 4 on the mini, 5 on the hub). Boards a
 host only knows through links (the laptop's `bb`, `runners` and `unconventional-collab`) keep just a replica. The sync loop now wakes on the service's WebSocket
 feed, on a local outbox write or on its period, instead of polling every 5 s.
