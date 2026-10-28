@@ -25,6 +25,13 @@ CLI = "@session:default/cli-chat"
 WORKER = "@session:default@hub/20261028_035724_f6cfc3"
 
 
+@pytest.fixture(autouse=True)
+def _no_live_subscriptions(monkeypatch):
+    """A refusal subscribes the chat to the worker's card; never let a test write the real board."""
+    monkeypatch.setattr(sm.rf, "_default_add_sub", lambda **_kw: None)
+    monkeypatch.setattr(sm.rf, "_this_gateway", lambda: "")
+
+
 @pytest.fixture
 def relay(tmp_path, monkeypatch):
     sent = []

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -345,13 +346,93 @@ def worker_send_refusal(target: Any, *, kanban_task: str | None = None, source_l
         if source_l
         else f"{target} (source could not be confirmed as a worker session)"
     )
+    head = f"Refused: a Kanban worker (HERMES_KANBAN_TASK={task}) cannot send into a human chat {where}. "
+    sub = subscribe_refused_chat(target, task) if source_l else None
+    if sub:
+        return (
+            head
+            + f"That injects a turn into the owner's conversation. This chat is now subscribed ({sub}) to YOUR card "
+            f"{task} in notify mode, so it receives the standard done notice when you complete. Put the message in "
+            f"your kanban_complete summary instead of sending it; to deliver exact text, add a line "
+            f"`FINAL SEND for {_ref_of(target)}: <text>` and that text replaces the summary in the notice. "
+            f"Do NOT create a relay card for this: a worker on it would be refused the same way. "
+            f"If the work itself must run on {gw}, place a card there (hermes-hub create-task {gw} or kanban_create "
+            f"with placement on that gateway); if that gateway's executor is down, kanban_block with blocker_id "
+            f"for the outage (MacBook: hermes-desktop-gateway-unavailable)."
+        )
     return (
-        f"Refused: a Kanban worker (HERMES_KANBAN_TASK={task}) cannot send into a human chat {where}. "
-        f"That injects a turn into the owner's conversation. Place a card on {gw} instead "
+        head
+        + f"That injects a turn into the owner's conversation. Place a card on {gw} instead "
         f"(hermes-hub create-task {gw} or kanban_create with placement on that gateway). "
         f"If that gateway's executor is down, kanban_block with blocker_id for the outage "
         f"(MacBook: hermes-desktop-gateway-unavailable) — do not message the chat."
     )
+
+
+_REF = re.compile(
+    r"^(?:@session:)+(?:(?P<profile>[A-Za-z0-9_.-]+)(?:@(?P<gw>[A-Za-z0-9_.-]+))?/)?(?P<sid>[A-Za-z0-9_.-]+)$"
+)
+
+
+def parse_session_ref(target: Any) -> tuple[str, str, str] | None:
+    """(profile, gateway or '', session id) from `@session:p@gw/id`, `@session:p/id` or `gw:id`; else None."""
+    text = str(target or "").strip().strip("`\"'")
+    m = _REF.match(text)
+    if m:
+        if m.group("profile") is None:
+            return ("default", "", m.group("sid"))
+        return (m.group("profile"), norm_name(m.group("gw") or ""), m.group("sid"))
+    m = re.match(r"^(?P<gw>[A-Za-z0-9_.-]+):(?P<sid>[A-Za-z0-9_.-]+)$", text)
+    if m:
+        return ("default", norm_name(m.group("gw")), m.group("sid"))
+    return None
+
+
+def _ref_of(target: Any) -> str:
+    parsed = parse_session_ref(target)
+    if not parsed:
+        return str(target)
+    profile, gw, sid = parsed
+    return f"@session:{profile}" + (f"@{gw}" if gw else "") + f"/{sid}"
+
+
+def _this_gateway() -> str:
+    try:
+        from hermes_cli import kanban_origin
+
+        return norm_name(kanban_origin.gateway_names()[0])
+    except Exception:
+        return ""
+
+
+def _default_add_sub(**kw: Any) -> None:
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    with kbc.connect_closing() as conn:
+        kbn.add_notify_sub(conn, **kw)
+
+
+def subscribe_refused_chat(target: Any, task: str, *, add_sub=None, this_gateway: str | None = None) -> str | None:
+    """Subscribe the chat a worker was refused into to the worker's OWN card, notify mode. Idempotent
+    (add_notify_sub keys on task+platform+chat). Same-gateway chat -> ``tui:<sid>``; chat on another gateway
+    -> the cross-gateway row hub cards use, ``hub:<gw>/<profile>/<sid>``. Returns a short description, or
+    None when the target is not a session ref or the card DB could not be written (never raises)."""
+    parsed = parse_session_ref(target)
+    if not parsed or not task:
+        return None
+    profile, gw, sid = parsed
+    me = norm_name(this_gateway if this_gateway is not None else _this_gateway())
+    add = add_sub or _default_add_sub
+    try:
+        if gw and gw != me:
+            add(task_id=task, platform="hub", chat_id=f"{gw}/{profile}/{sid}", notifier_profile=profile)
+            return f"hub:{gw}/{profile}/{sid}"
+        add(task_id=task, platform="tui", chat_id=sid, notifier_profile=profile,
+            delivery_metadata={"reason": "send_refused"})
+        return f"tui:{sid}"
+    except Exception:
+        return None
 
 
 def enqueue(req: Any, base: Path | None = None) -> bool:
