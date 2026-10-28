@@ -597,6 +597,19 @@ def test_write_file_of_py_reading_data_file_allows(tmp_path):
     "env --chdir /tmp {p}",
     "env --chdir=/tmp {p}",
     "env -u FOO -C /tmp {p}",
+    # A lone `-` means -i. Attached -S / --split-string= is the command: the
+    # value is executed, so it must be scanned, not consumed like -C.
+    "env - {p}",
+    "env -S{p}",
+    "env --split-string={p}",
+    "env -S {p}",
+    "env --split-string {p}",
+    "env -i -S{p}",
+    "env -u FOO -S{p}",
+    "env -C /tmp -S{p}",
+    "env --chdir /tmp -S{p}",
+    "sudo env -S{p}",
+    "cd {d} && env -S./burn.sh",
 ])
 def test_sudo_env_wrapped_argv0_blocks(tmp_path, fmt):
     p = tmp_path / "burn.sh"
@@ -613,6 +626,12 @@ def test_sudo_env_wrapped_argv0_blocks(tmp_path, fmt):
     "env -u FOO cat {t}",
     "env -C /tmp cat {t}",
     "env --chdir=/tmp head {t}",
+    # Lone `-` is a flag, not argv0. -S= prints the environment and does not
+    # execute. An assignment ends option parsing, so -S after it is a command
+    # name, not a split.
+    "env - cat {t}",
+    "env -S={t}",
+    "env FOO=1 -S{t}",
 ])
 def test_sudo_env_wrapped_reader_allows(tmp_path, fmt):
     t = _data_txt(tmp_path)

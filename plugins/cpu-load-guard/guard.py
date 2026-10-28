@@ -73,13 +73,35 @@ PY_FILE_RE = re.compile(
 # A path in command position: `./x.sh`, `/abs/load-suite`, `nohup ~/x &`, `"/abs/x"`.
 # A quote still counts as a boundary so `terminal('"/abs/x" &')` inside execute_code is
 # found. A path that is only an argument of a reader is dropped later, not here.
-CMD_POS_RE = re.compile(
+# sudo [-E] [-u user] /x and env [-i] [-] [-u NAME] [-C DIR] [VAR=val ...] /x run /x
+# as argv0. env -u/--unset take a name (not a path, so the command is not swallowed).
+# env -C/--chdir take a directory, including -C/tmp and --chdir=/tmp; that value is
+# not executed. -S and --split-string= values are executed, so they are scanned, not
+# consumed. A lone `-` is -i, and only when the next character is whitespace, so it
+# does not steal -u / -C. The attached alternative is first: otherwise
+# `env -C /tmp -S/x` backtracks to a hit on /tmp and the script is never scanned.
+# `env -S=` prints the environment and is not a command. A lone `-` or a NAME=VALUE
+# ends option parsing, so an attached -S after either is a command name, not a split.
+_CMD_PATH = (
+    r"(?:'((?:~|\.{1,2})?/[^']+)'"
+    r"|\"((?:~|\.{1,2})?/[^\"]+)\""
+    r"|((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+))"
+)
+_CMD_ENV_SPLIT = (
     r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*"
-    # sudo [-E] [-u user] /x and env [-i] [-u NAME] [-C DIR] [VAR=val ...] /x run /x as argv0.
-    # env -u/--unset take a name (not a path, so the command is not swallowed).
-    # env -C/--chdir take a directory, including -C/tmp and --chdir=/tmp.
-    r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s/.~-]\S*|\s+-[-\w=]+)*|env(?:\s+(?:-u|--unset)\s+[^\s/.~-]\S*|\s+-C(?:\s+)?\S+|\s+--chdir(?:=\S+|\s+\S+)|\s+-[-\w=]+)*(?:\s+\w+=\S*)*)\s+)*"
-    r"(?:'((?:~|\.{1,2})?/[^']+)'|\"((?:~|\.{1,2})?/[^\"]+)\"|((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+))"
+    r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s/.~-]\S*|\s+-[-\w=]+)*)\s+)*"
+    r"env(?:\s+(?:-u|--unset)\s+[^\s/.~-]\S*|\s+-C(?:\s+)?\S+|\s+--chdir(?:=\S+|\s+\S+)|\s+-[-\w=]+)*"
+    r"\s+(?:-S|--split-string=)"
+)
+CMD_POS_RE = re.compile(
+    _CMD_ENV_SPLIT
+    + _CMD_PATH
+    + r"|"
+    + r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*"
+    + r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s/.~-]\S*|\s+-[-\w=]+)*"
+    + r"|env(?:\s+(?:-u|--unset)\s+[^\s/.~-]\S*|\s+-C(?:\s+)?\S+|\s+--chdir(?:=\S+|\s+\S+)"
+    + r"|\s+-[-\w=]+|\s+-(?!\S))*(?:\s+\w+=\S*)*)\s+)*"
+    + _CMD_PATH
 )
 # Operands that a command hands to exec: `git bisect run ./x`, `xargs ./x`, `find . -exec ./x {} \;`.
 EXEC_OPERAND_RE = re.compile(
