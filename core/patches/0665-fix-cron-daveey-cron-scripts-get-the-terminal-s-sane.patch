@@ -1,0 +1,290 @@
+From f82fc23d9acf7d73c916a85e268a28c8994dd46f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 08:09:33 +0000
+Subject: [PATCH] fix(cron): [daveey] cron scripts get the terminal's sane PATH
+ whichever process won the tick lock
+
+A Desktop-over-SSH hermes serve backend takes the cron tick lock while the
+gateway restarts during hermes update. Its PATH comes from a non-login SSH
+shell without ~/.local/bin, so no-agent scripts calling token-broker failed
+with FileNotFoundError only on those runs (hermes-hub bb-dependency-audit-watch,
+upkeep-pr1280-watch: 6 failures in 14 h).
+
+- _run_job_script and the restart-safe external worker env run PATH through
+  _append_missing_sane_path_entries (standard dirs, managed runtimes,
+  ~/.local/bin appended; caller entries keep precedence), as the terminal does.
+- Detection: run documents carry **Runner:** <gateway|serve|dashboard|cron-worker>
+  pid N, and agent.log names the runner on 'Running job' / 'Cron script' lines.
+
+Tests: tests/cron/test_cron_script_minimal_path.py (6, red on base).
+---
+ cron/scheduler.py                           |  11 +-
+ cron/scheduler_script.py                    |  30 +++-
+ tests/cron/test_cron_script_minimal_path.py | 153 ++++++++++++++++++++
+ 3 files changed, 188 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cron/test_cron_script_minimal_path.py
+
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 75ae091de3..7c069f05b6 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1499,7 +1499,7 @@ def _job_doc_header(job_name: str, job_id: str, now_iso: str, mode: str) -> str:
+         f"# Cron Job: {job_name}\n\n"
+         f"**Job ID:** {job_id}\n"
+         f"**Run Time:** {now_iso}\n"
+-        f"**Mode:** {mode}\n"
++        f"**Mode:** {mode}\n**Runner:** {cron_runner_label()}\n"
+     )
+ 
+ 
+@@ -2247,7 +2247,7 @@ def _run_doc_header(job: dict, title: str, job_id: str, prompt: str, *, prompt_s
+     return (
+         f"# Cron Job: {title}\n\n"
+         f"**Job ID:** {job_id}\n"
+-        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
++        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n**Runner:** {cron_runner_label()}\n"
+         f"**Schedule:** {job.get('schedule_display', 'N/A')}\n\n"
+         f"{prompt_stamp}{_PROMPT_HEADING}{prompt}{_PROMPT_SEPARATOR}"
+     )
+@@ -2586,7 +2586,7 @@ def run_job(
+     from run_agent import AIAgent
+ 
+     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+-    logger.info("Running job '%s' (ID: %s)", job_name, job_id)
++    logger.info("Running job '%s' (ID: %s) on %s", job_name, job_id, cron_runner_label())
+     logger.info("Prompt: %s", prompt[:100])
+ 
+     agent = None
+@@ -3748,11 +3748,11 @@ def _launch_external_cron_worker(job: dict) -> bool:
+     with _fire_secret_scope():
+         # No restore_managed_env here: the worker re-runs load_hermes_dotenv -> _apply_managed_env at
+         # import, and strip_launch_profile_env leaves managed keys in place.
+-        worker_env = strip_launch_profile_env(build_subprocess_env(
++        worker_env = with_sane_path(strip_launch_profile_env(build_subprocess_env(
+             scrub_secrets=multiplex_active,
+             inherit_profile_home=True,
+             extra={"HERMES_HOME": str(profile_home)},
+-        ))
++        )))
+     worker_env = systemd_user_bus_env(worker_env)
+     # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set
+     # the other two), and an inherited presence var makes every env-fallback consumer in the
+@@ -4430,6 +4430,7 @@ from cron.scheduler_delivery import (
+ )
+ from cron.scheduler_script import (
+     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
++    cron_runner_label, with_sane_path,
+ )
+ from cron.scheduler_prompt import (
+     _PROMPT_FRAME, _PROMPT_HEADING, _PROMPT_SEPARATOR, _RESPONSE_FRAME, _RESPONSE_HEADING,
+diff --git a/cron/scheduler_script.py b/cron/scheduler_script.py
+index 6ab2dce41a..9f710993f8 100644
+--- a/cron/scheduler_script.py
++++ b/cron/scheduler_script.py
+@@ -429,6 +429,33 @@ def _script_argv(
+     return [python_exe, str(path)], env_overlay, None
+ 
+ 
++def with_sane_path(env: dict) -> dict:
++    """*env* with the terminal tool's PATH normalisation: missing standard dirs, managed runtimes
++    and ``~/.local/bin`` appended, the caller's own entries kept first. Whichever process wins the
++    cron tick lock (gateway, a Desktop-over-SSH ``hermes serve`` whose non-login shell PATH lacks
++    ``~/.local/bin``, the dashboard) must hand its children the same PATH, or a script that calls a
++    ``~/.local/bin`` CLI fails only on the runs that process picked up (hermes-hub, token-broker).
++    Windows env blocks are left as they are (the helper is a POSIX no-op there)."""
++    from tools.environments.local import _append_missing_sane_path_entries
++    if "PATH" in env:
++        env["PATH"] = _append_missing_sane_path_entries(env["PATH"])
++    return env
++
++
++def cron_runner_label() -> str:
++    """Which process runs this cron job, e.g. ``serve pid 123``: recorded in the run document and
++    agent.log so a failure that depends on the process that won the tick lock is visible."""
++    from cron.worker_bootstrap import WORKER_MARKER
++    from hermes_cli.update_cmd import _hermes_holder_subcommand
++    if os.environ.get(WORKER_MARKER):
++        kind = "cron-worker"
++    else:
++        # sys.argv[1:] are the entry point's own arguments for ``hermes X``, ``-m hermes_cli.main X``
++        # and the ``python -c <bootstrap> X`` launcher alike; argv[0] differs between them.
++        kind = _hermes_holder_subcommand(" ".join(["hermes", *sys.argv[1:]])) or "other"
++    return f"{kind} pid {os.getpid()}"
++
++
+ def _run_job_script(
+     script_path: str, workdir: Optional[str] = None,
+     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+@@ -478,8 +505,9 @@ def _run_job_script(
+         # semantics) before the sanitizer, which also overlays the names the owning profile declares
+         # in terminal.env_passthrough from that scope (#114209). The factory snapshots the process
+         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
+-        env = build_subprocess_env(strip_launch_profile=True)
++        env = with_sane_path(build_subprocess_env(strip_launch_profile=True))
+         env.update(env_overlay)
++        logger.info("Cron script %s running on %s", path.name, cron_runner_label())
+         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
+         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
+         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
+diff --git a/tests/cron/test_cron_script_minimal_path.py b/tests/cron/test_cron_script_minimal_path.py
+new file mode 100644
+index 0000000000..33d48bdb48
+--- /dev/null
++++ b/tests/cron/test_cron_script_minimal_path.py
+@@ -0,0 +1,153 @@
++"""A cron script's PATH must not depend on which process won the tick lock (hub cron-730227131a).
++
++During a gateway restart, a Desktop-over-SSH ``hermes serve`` backend takes the cron tick lock. Its
++PATH comes from a non-login SSH shell and lacks ``~/.local/bin``, so no-agent scripts calling
++``token-broker`` failed with ``FileNotFoundError`` only on those runs. The terminal tool already
++appends the sane PATH entries (#111778); cron scripts must get the same normalisation, and every
++run document must name the process that ran it so a runner-dependent failure is visible.
++"""
++
++from __future__ import annotations
++
++import os
++import stat
++import sys
++from pathlib import Path
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).parent.parent.parent))
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++def _tool(directory: Path, name: str, output: str) -> Path:
++    directory.mkdir(parents=True, exist_ok=True)
++    tool = directory / name
++    tool.write_text(f"#!/bin/sh\necho {output}\n")
++    tool.chmod(tool.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
++    return tool
++
++
++@pytest.fixture
++def minimal_path_home(tmp_path, monkeypatch):
++    """HERMES_HOME + a HOME whose ~/.local/bin holds ``fake-tool``; process PATH = SSH-minimal."""
++    hermes_home = tmp_path / ".hermes"
++    (hermes_home / "scripts").mkdir(parents=True)
++    (hermes_home / "cron" / "output").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    home = tmp_path / "home"
++    _tool(home / ".local" / "bin", "fake-tool", "from-local-bin")
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setenv("PATH", "/usr/bin:/bin")
++    return hermes_home
++
++
++_CALL_TOOL = (
++    "import os, subprocess\n"
++    "print(subprocess.run(['fake-tool'], capture_output=True, text=True, check=True).stdout.strip())\n"
++    "print(os.environ['PATH'])\n"
++)
++
++
++def test_script_finds_user_local_bin_tool_under_minimal_path(minimal_path_home):
++    from cron.scheduler_script import _run_job_script
++
++    script = minimal_path_home / "scripts" / "uses_tool.py"
++    script.write_text(_CALL_TOOL)
++
++    success, output = _run_job_script(str(script))
++    assert success is True, output
++    assert output.splitlines()[0] == "from-local-bin"
++
++
++def test_user_path_entry_keeps_precedence(minimal_path_home, tmp_path, monkeypatch):
++    from cron.scheduler_script import _run_job_script
++
++    user_bin = tmp_path / "userbin"
++    _tool(user_bin, "fake-tool", "from-user-path")
++    monkeypatch.setenv("PATH", f"{user_bin}:/usr/bin:/bin")
++    script = minimal_path_home / "scripts" / "uses_tool.py"
++    script.write_text(_CALL_TOOL)
++
++    success, output = _run_job_script(str(script))
++    assert success is True, output
++    first, child_path = output.splitlines()[:2]
++    assert first == "from-user-path"
++    entries = child_path.split(":")
++    assert entries.index(str(user_bin)) < entries.index(str(Path(os.environ["HOME"]) / ".local" / "bin"))
++
++
++def test_shell_script_finds_user_local_bin_tool(minimal_path_home):
++    from cron.scheduler_script import _run_job_script
++
++    script = minimal_path_home / "scripts" / "uses_tool.sh"
++    script.write_text("#!/usr/bin/env bash\nfake-tool\n")
++
++    success, output = _run_job_script(str(script))
++    assert success is True, output
++    assert output == "from-local-bin"
++
++
++def test_external_worker_env_path_is_normalised(minimal_path_home, monkeypatch):
++    """The restart-safe worker (``_launch_external_cron_worker``) gets the same PATH."""
++
++    from cron import scheduler
++
++    captured: dict = {}
++
++    class _Stop(Exception):
++        pass
++
++    def fake_popen(argv, *a, **kw):
++        captured["env"] = kw.get("env")
++        raise _Stop()
++
++    import tools.process_registry as registry
++
++    monkeypatch.setattr(scheduler.subprocess, "Popen", fake_popen)
++    monkeypatch.setattr(
++        registry, "restart_safe_gateway_child_argv",
++        lambda command, **kw: registry.GatewayChildDispatch("degraded", command))
++    monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", lambda eid: {"id": eid})
++    with pytest.raises(_Stop):
++        scheduler._launch_external_cron_worker(
++            {"id": "abc123", "execution_id": "e1", "name": "w", "prompt": "x"})
++    env = captured.get("env")
++    assert env is not None, "worker spawn not reached"
++    local_bin = str(Path(os.environ["HOME"]) / ".local" / "bin")
++    assert local_bin in env["PATH"].split(":")
++
++
++def test_no_agent_run_doc_names_the_runner_process(minimal_path_home):
++    import importlib
++
++    import hermes_constants
++    importlib.reload(hermes_constants)
++    import cron.jobs
++    importlib.reload(cron.jobs)
++    import cron.scheduler
++    importlib.reload(cron.scheduler)
++    from cron.jobs import create_job
++    from cron.scheduler import run_job
++
++    (minimal_path_home / "scripts" / "hi.sh").write_text("#!/usr/bin/env bash\necho hi\n")
++    job = create_job(prompt=None, schedule="every 5m", script="hi.sh", no_agent=True, deliver="local")
++    success, doc, _final, _err = run_job(job)
++    assert success is True
++    assert "**Runner:** " in doc
++    assert f"pid {os.getpid()}" in doc
++
++
++def test_runner_label_names_serve_gateway_and_dashboard(monkeypatch):
++    from cron.scheduler_script import cron_runner_label
++
++    for argv, kind in [
++        (["/x/bin/hermes", "serve", "--port", "1"], "serve"),
++        (["/x/bin/hermes", "gateway", "run"], "gateway"),
++        (["/x/bin/hermes", "dashboard"], "dashboard"),
++        (["/x/hermes_cli/main.py", "--profile", "p", "gateway", "run"], "gateway"),
++        (["-c", "serve", "--port", "1"], "serve"),
++    ]:
++        monkeypatch.setattr(sys, "argv", argv)
++        assert cron_runner_label() == f"{kind} pid {os.getpid()}"
+-- 
+2.55.0
+
