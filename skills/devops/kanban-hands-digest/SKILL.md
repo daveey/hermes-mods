@@ -130,9 +130,13 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
 - Inside a Kanban worker the `hermes kanban` CLI refuses mutations, so auto-unblock only works from cron or
   a normal session; run on-demand with `--no-unblock` there.
 - **Your own reply text can become an ask.** On Desktop, the user-steps output transform publishes any reply
-  sentence that tells the user to do or decide something as a "For you" prompt, and agents can't close those.
-  - Two sentences that did this: "Answering either with 'no action needed' clears it", and a closing note that
-    an option was deliberately not taken.
-  - State settled facts as statements. Put a genuine decision in one `action_request`.
-  - To fix a stale prompt you posted, call `action_request` with its `requestId` and `expectedRevision` = its
-    current revision. Give it accurate text and a "No action needed" choice. Revising works; closing doesn't.
+  sentence that tells the user to do or decide something as a "For you" prompt.
+  - Sentences that did this: "Answering either with 'no action needed' clears it", a closing note that an
+    option was deliberately not taken, and a reminder that an already-open request "needs a Mac name, or
+    'Wait'" (published as a duplicate of that request, more than once).
+  - State settled facts as statements. Put a genuine decision in one `action_request`; when one is already
+    open, refer to it by its subject ("the build-Mac request is still open") without telling him what to answer.
+  - After each reply, check the hook's open-request list for an auto-filed duplicate or stale prompt and
+    remove it with `action_request {"withdraw": {"requestId", "reason"}}` (alone, no `request`); readback
+    shows `state: withdrawn`. To correct one that is still needed, re-send it with its `requestId` and
+    `expectedRevision` = current revision.
