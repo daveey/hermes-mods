@@ -58,14 +58,19 @@ until one run or tag contains all of them.
 How to run it from an agent:
 - Start it with `terminal(background=true, notify=true)` and end the turn. Don't run a foreground sleep loop:
   it hits the tool timeout. Don't poll a background job either.
-- Core with the update-pause job-receipt fix (549b7f1e71b) explicitly stops owned non-persist background
-  jobs at the pause boundary (`termination_source: core_update_pause`). The resumed turn lists each job's
-  id, command head and UTC start, says to restart it if still needed, and includes a completion notice
-  saying "killed by the Hermes update" for notify jobs. Inspect each stopped job and restart required waits;
-  a completion notice does not mean the wait succeeded. `persist_on_release` is unchanged. Older running
-  cores may still kill silently: after an update-pause resume, check each job once with `process_manage poll`.
-  If a deploy or promised report depends on the wait, put that step on a durable Kanban card with a
-  `wake_check` instead of relying on a chat-owned chain.
+- A Hermes update or backend restart stops the chat's background job; it does not survive. On a core with
+  91f48a91a20 (and 549b7f1e71b for a turn in flight) the chat is told, except in the cases below. If your turn was running, the
+  resumed turn lists the job. If the chat was idle (you started the wait and ended the turn), the next
+  backend starts a report turn whose note says "the Hermes backend shut down while background jobs from this
+  chat were running". Each listing gives the job id, UTC start, command head and "restart it if you still need it",
+  and a notify job also gets its completion notice ("killed by the Hermes update" or "killed when the
+  Hermes backend shut down"). That notice means the wait was cut short, not that CI finished: run `--once`,
+  then restart the wait if it's still needed. `persist_on_release` jobs are not stopped this way.
+- When it's not covered: older cores; a backend that is SIGKILLed; auto-continue turned off
+  (`desktop.auto_continue.enabled: false`); a message you type before the report turn starts; a receipt
+  older than 24 h. In those cases the job can still die without a word. So after any update or restart, check
+  each wait you promised with `process_manage poll` (or `--once`). If a deploy or a promised report depends
+  on the wait, put that step on a durable Kanban card with a `wake_check`, not a chat-owned chain.
 - When a script chains steps after the wait, send the wait's output to a log file (`>> log 2>&1`), never
   through `| tail -n`. tail prints nothing until the wait exits, so a killed or hung wait leaves no record of
   what it was waiting on.
