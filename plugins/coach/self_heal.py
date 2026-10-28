@@ -630,7 +630,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # Lane: defect -> investigation card (hub) -> proposal file (What happened / Why / Plan) -> auto-approve -> fix card
-#       -> ONE Inbox card "Fixed: ..." (selfheal-result). auto_approve false restores the Inbox proposal + Do it gate.
+#       -> result stored quietly (selfheal-results/<fp>.md, no Inbox card). auto_approve false restores the Inbox proposal + Do it gate.
 #
 #   file_defect(d)    any entry path (complaint, admission, machine signal, digest backstop, monitors). On the hub it
 #                     decides locally; elsewhere (live) it pipes `d` to `self_heal.py file` on the hub over ssh, so
@@ -641,7 +641,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #                     claude-opus-5-5, 1 h. Investigates LIVE (kanban.db, logs, processes, git log), writes the
 #                     five-whys chain, posts Inbox type `selfheal` (Do it / Not now / Never) under key selfheal:<fp>.
 #   Do it             -> file_fix (hub cron sync, or `self_heal.py fix <fp>`): fix card `selfheal:<fp>[:r<gen>]:fix` (red-then-green regression test, ship,
-#                     verify live, re-post the same key as `selfheal-result` "Fixed: …").
+#                     verify live, `event fixed --result result.md` stores the proof; nothing is posted to the Inbox).
 #   sync (cron)       reads Inbox outcomes every 5 min: Do it (a resolve) files the fix card, Not now snoozes the
 #                     fingerprint 14 days, Never suppresses it. It also reconciles against the board: a `filed`/`approved`
 #                     fingerprint whose card is done/archived/gone with no proposed/fixed event becomes `stale`
@@ -672,7 +672,8 @@ BB_SKILLS = ("five-whys", "bb-self-fix")
 FIX_SKILLS = ("five-whys", "hermes-mods-repo", "systematic-debugging")
 CREATED_BY = "self-heal"
 INBOX_TYPE = "selfheal"
-RESULT_TYPE = "selfheal-result"
+RESULT_TYPE = "selfheal-result"  # legacy Inbox card type; results are no longer posted (see RESULTS_DIR)
+RESULTS_DIR = "selfheal-results"  # <coach>/selfheal-results/<fp>.md: finished-work proof, never an Inbox card
 SELF = "~/code/hermes-mods/plugins/coach/self_heal.py"  # how cards and Inbox actions call this file on the hub
 FP_RE = re.compile(r"^[a-z]+-[0-9a-f]{8,}$")
 
@@ -884,7 +885,7 @@ def fix_brief(fp: str, st: dict) -> str:
             "--no-verify), core changes through a hermes-core-wt worktree + ship, settings through shared-config.json "
             "(hermes-mods-repo skill).")
     return f"""Self-heal FIX for defect `{fp}`. The proposal below is approved (David's standing self-heal approval;
-the lane auto-approves every proposal). The Inbox card you post at the end is the first thing David sees of it.
+the lane auto-approves every proposal). Post nothing to the Inbox: the result is recorded quietly (step 6).
 Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGET}.
 
 ## Approved proposal
@@ -899,14 +900,12 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
    PASSING, plus the module's existing tests.
 4. {ship}
 5. Verify live on the real path (the surface/command/session type where it happened), and capture the proof.
-6. Post the result on the SAME Inbox key (default home on this host, not a test's exported HERMES_HOME).
-   Preflight immediately before posting: `env HERMES_HOME="$HOME/.hermes" hermes inbox post --help`.
-   If it fails, repair CLI discovery or use the inbox_post tool; do not record fixed until posting succeeds.
-   Do not pipe the post through tail/grep: preserve its exit status. Verify the returned session/key with
-   inbox_outcome before recording the event.
-   `env HERMES_HOME="$HOME/.hermes" hermes inbox post --type {RESULT_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "Fixed: <what>" < <result.md>`
-   with what changed (commits), the red/green test output, the live proof, and the undo command.
-   Then `python3 {SELF} event fixed {fp} --card $HERMES_KANBAN_TASK --note "<commit sha>"`.
+6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post` for a finished fix
+   (David archived those unread and the inbox muted the poster). Write `result.md` (what changed with commits,
+   the red/green test output, the live proof, and the undo command) and run
+   `python3 {SELF} event fixed {fp} --card $HERMES_KANBAN_TASK --note "<commit sha>" --result result.md`.
+   That stores the result under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed; the card's
+   kanban_complete summary carries it too. Nothing reaches the Inbox.
 7. Complete the card. If something irreversible or external blocks the fix, kanban_block with the exact ask instead.
 """
 
@@ -1861,8 +1860,10 @@ EVENT_STATUS = {"proposed": "proposed", "fixed": "fixed", "not_defect": "not_def
 
 
 def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None,
-                 owner: str = "") -> dict:
-    """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>."""
+                 owner: str = "", result: str = "") -> dict:
+    """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>.
+    `result` (a file path, `fixed` only) is copied to <coach>/selfheal-results/<fp>.md: the quiet home for
+    finished work (the Inbox is for decisions only)."""
     store = _store(store)
     now = now or time.time()
     if kind not in EVENT_STATUS:
@@ -1873,6 +1874,17 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     st = lane.get(fp)
     kw: dict = {"status": EVENT_STATUS[kind]}
     cron_check = None
+    if result and kind != "fixed":
+        raise ValueError("--result applies to event fixed only")
+    result_path = ""
+    if result:
+        src = Path(result).expanduser()
+        if not src.is_file():
+            raise ValueError(f"--result file not found: {src}")
+        dest = Path(store.root) / RESULTS_DIR / f"{fp}.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(src.read_text())
+        result_path = str(dest)
     if kind == "fixed" and fp.startswith("cron-"):
         # A cron fix is only fixed once the job runs green: refuse while it is still at core's nudge streak
         # (cron-5aa82ca809 was marked fixed at streak 7 and climbing, and came back hours later).
@@ -1898,7 +1910,8 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     e = lane.update(fp, **kw)
     store.log({"event": f"selfheal_{kind}", "fingerprint": fp, "card": card or e.get("card"),
                "component": e.get("component"), "note": note[:300], "recurrence": bool(e.get("recurrences")),
-               **({"cron_check": cron_check} if cron_check else {})})
+               **({"cron_check": cron_check} if cron_check else {}),
+               **({"result_file": result_path} if result_path else {})})
     return e
 
 
@@ -2170,6 +2183,7 @@ def main(argv=None) -> int:
     e.add_argument("--card", default="")
     e.add_argument("--note", default="")
     e.add_argument("--owner", default="", help="existing owner card for event duplicate")
+    e.add_argument("--result", default="", help="event fixed: result.md to store quietly (no Inbox post)")
     sub.add_parser("sync", help="act on Inbox outcomes (Do it / Not now / Never)")
     b = sub.add_parser("backstop", help="detector over new user turns in the coach digests")
     b.add_argument("--data", default=os.environ.get("COACH_DATA") or str(Path.home() / "code/hermes-coach-data"))
@@ -2185,7 +2199,7 @@ def main(argv=None) -> int:
         print(json.dumps(file_fix(a.fp)))
     elif a.cmd == "event":
         try:
-            e = record_event(a.kind, a.fp, a.card, a.note, owner=a.owner)
+            e = record_event(a.kind, a.fp, a.card, a.note, owner=a.owner, result=a.result)
         except FixPending as fx:
             s = fx.state
             print(json.dumps({"fingerprint": a.fp, "status": fx.entry.get("status"), "fix_pending": True,

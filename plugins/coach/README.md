@@ -478,8 +478,9 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
 - **Auto-approve** (default; `auto_approve` in `selfheal-config.json`, env `COACH_SELFHEAL_AUTO_APPROVE`): the hub
   cron (every 5 min) runs `file_fix` for every `proposed` fingerprint (also `self_heal.py fix <fp>` by hand): fix
   card `selfheal:<fp>:fix` whose acceptance is the regression test red before / green after, ship under the standing
-  approval, verify live, and post the key `selfheal:<fp>` as a `selfheal-result` card "Fixed: …" with the proof
-  (OK / Undo). That result is the only self-heal card in the Inbox. A legacy open `selfheal` proposal card is resolved
+  approval, verify live, and record the proof quietly with `event fixed --result result.md` (stored in
+  `<coach>/selfheal-results/<fp>.md`, logged as `selfheal_fixed`). Results are never posted to the Inbox (it is for
+  decisions only; archived "Fixed:" cards got the poster muted). A legacy open `selfheal` proposal card is resolved
   as Do it by the same pass; an explicit Not now / Never on it is still honoured. Budget/concurrency denials leave the
   fingerprint `proposed`, so the next pass retries.
 - **`auto_approve: false`**: proposals wait in `proposed` until `self_heal.py fix <fp>`; Inbox outcomes on an existing

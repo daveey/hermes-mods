@@ -576,8 +576,21 @@ class Inbox:
                       f"Inbox. Then run `hermes inbox unmute '{poster}'` on the gateway that refused it.\n\n"
                       f"Refused post:\n\n**{title}**\n\n{body[:3000]}"),
                 assignee="default", idempotency_key=f"inbox-muted:{poster}")
-        except Exception:
-            pass  # the refusal itself is the guard; the card is best-effort
+        except Exception as exc:
+            # The refusal itself is the guard; the card is best-effort but never silent: a Kanban worker's
+            # terminal is fenced from board writes (HERMES_DELEGATED_CHILD_CONTEXT) and used to hide that here.
+            msg = (f"inbox: poster {poster!r} is muted but the Kanban fix card (inbox-muted:{poster}) could "
+                   f"NOT be filed: {type(exc).__name__}: {str(exc)[:200]}. File it from outside a worker "
+                   f"fence (hub cron / kanban_create).")
+            try:
+                import logging
+                logging.getLogger(__name__).warning(msg)
+            except Exception:
+                pass
+            try:
+                print(msg, file=sys.stderr)
+            except Exception:
+                pass
 
     def unmute(self, poster: str) -> None:
         with _lock:

@@ -684,8 +684,7 @@ def test_do_it_creates_the_fix_card_with_red_green_acceptance(store, monkeypatch
     assert opt(argv, "--model") == "claude-opus-5-5"
     assert opt(argv, "--provider") == "anthropic"
     body = opt(argv, "--body")
-    for part in ("add test_sort_stable", "FAILING", "PASSING", "Verify live", "--type selfheal-result",
-                 f"--key selfheal:{fp}", "Fixed: ", "event fixed"):
+    for part in ("add test_sort_stable", "FAILING", "PASSING", "Verify live", "event fixed", "--result result.md"):
         assert part in body, part
     (a,) = ev(store, "selfheal_approved")
     assert a["card"] == out["card"] and a["trigger"] == "do_it"
@@ -806,7 +805,8 @@ def test_investigation_brief_posts_nothing_to_the_inbox():
     b = sh.investigation_brief({"fingerprint": "fp1", "component": "agent", "symptom": "x", "at": NOW})
     assert "hermes inbox post" not in b and "Post NOTHING to the Inbox" in b and "event proposed" in b
     fx = sh.fix_brief("agent-0123456789", {"component": "agent"})
-    assert "--type selfheal-result" in fx and "Do it" not in fx
+    assert "hermes inbox post --type" not in fx and "--result result.md" in fx and "Do it" not in fx
+    assert "do NOT run `hermes inbox post`" in fx
 
 
 def test_not_a_defect_closes_without_inbox_and_is_not_refiled_for_a_week(store):
@@ -1256,3 +1256,23 @@ def test_a_fixed_family_lane_is_not_adopted(store):
     sh.LaneState(store.root).update(d1["fingerprint"], status="fixed", fixed_at=NOW + 100)
     out = sh.file_defect(_corrupt_signal(), store=store, m="live", runner=r, now=NOW + 600, cfg=HUB, budget_fn=OPEN)
     assert out["action"] == "filed" and len(r.creates()) == 2
+
+
+def test_fixed_result_is_stored_quietly_and_creates_no_inbox_item(store, tmp_path):
+    """A result never becomes an Inbox item: it lands in <coach>/selfheal-results/<fp>.md and the log."""
+    fp = "agent-0123456789"
+    res = tmp_path / "result.md"
+    res.write_text("Fixed: x\nred/green proof")
+    called = []
+    orig = sh._run
+    sh._run = lambda argv, *a, **k: called.append(argv) or (0, "", "")
+    try:
+        sh.record_event("fixed", fp, card="t_abc", note="sha1", store=store, result=str(res))
+    finally:
+        sh._run = orig
+    assert (Path(store.root) / "selfheal-results" / f"{fp}.md").read_text() == res.read_text()
+    assert not [c for c in called if "inbox" in c]
+    (e,) = [x for x in ev(store, "selfheal_fixed")]
+    assert e["result_file"].endswith(f"{fp}.md")
+    with pytest.raises(ValueError):
+        sh.record_event("proposed", fp, store=store, result=str(res))

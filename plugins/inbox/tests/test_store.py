@@ -310,3 +310,20 @@ def test_rekey_update_of_open_card_is_not_refused(tmp_path, monkeypatch):
     _post_and_archive(inbox, clock, "p", 3)
     assert inbox.post("open one v2", "b2", "go", key="keep", poster="p")["updated"] is True
     db.close()
+
+
+def test_mute_card_failure_is_visible_not_silent(tmp_path, monkeypatch, capsys, caplog):
+    """A fenced worker terminal cannot create the Kanban card: the refusal still fires and says so."""
+    inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
+
+    def fenced(**kw):
+        raise RuntimeError("board writes are fenced (HERMES_DELEGATED_CHILD_CONTEXT)")
+    inbox._task_creator = fenced
+    _post_and_archive(inbox, clock, "p-fenced", 3)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(store.PosterMuted):
+            inbox.post("x", "b", "go", key="k:x", poster="p-fenced")
+    err = capsys.readouterr().err
+    assert "inbox-muted:p-fenced" in err and "NOT be filed" in err and "fenced" in err
+    assert "NOT be filed" in caplog.text
+    db.close()
