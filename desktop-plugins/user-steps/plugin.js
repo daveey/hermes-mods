@@ -866,8 +866,17 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   ] })
 }
 
+const MINIMIZED_KEY = 'hermes.userSteps.minimized.v1'
+function readMinimized() {
+  try { const v = JSON.parse(window.localStorage.getItem(MINIMIZED_KEY) || '[]'); return Array.isArray(v) ? v.filter(k => typeof k === 'string') : [] } catch { return [] }
+}
+function writeMinimized(keys) {
+  try { if (keys.length) window.localStorage.setItem(MINIMIZED_KEY, JSON.stringify(keys.slice(-200))); else window.localStorage.removeItem(MINIMIZED_KEY) } catch {}
+}
 export function ActionQueue() {
   const [snap, setSnap] = useState(canonical), [filter, setFilter] = useState('')
+  const [minimizedKeys, setMinimizedState] = useState(readMinimized)
+  const setMinimized = keys => { writeMinimized(keys); setMinimizedState(keys) }
   useValue(host.state.focusedStoredSessionId)
   useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
   useValue(host.state.profile || host.state.focusedStoredSessionId)
@@ -884,12 +893,20 @@ export function ActionQueue() {
   const requests = snap.requests.filter(r => (!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r))
   if (!requests.length && !snap.error) return null
   const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
+  // Minimized holds only while every shown request was already shown when the user minimized; a new one (or a new
+  // revision) reopens the panel so a fresh ask is never hidden. Persisted so it survives reloads and chat switches.
+  const openKeys = requests.map(r => `${requestKey(r)}#${r.revision}`)
+  const minimized = !snap.error && openKeys.length > 0 && openKeys.every(k => minimizedKeys.includes(k))
   return jsxs('section', { 'data-action-queue': '', 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)' }, children: [
     jsx('style', { children: '[data-action-queue] [data-streamdown="strong"]{font-weight:600}[data-decision-outcome]{margin:4px 0}[data-decision-outcome] .aui-md,[data-decision-outcome] .aui-md>div,[data-decision-outcome] p{display:inline;margin:0}[data-action-queue] button:disabled{opacity:.5;cursor:not-allowed}[data-action-queue] button:not(:disabled):hover{filter:brightness(1.15)}[data-action-scope] :is(pre,table){max-width:100%;overflow:auto}[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
-    jsx('h2', { style: { margin: 0, fontSize: 14 }, children: (n => n ? `For you (${n})` : `Waiting on the agent (${requests.length}) — nothing needed from you`)(requests.filter(r => ['open','needs_context'].includes(r.state) && !agentPending(r)).length) }),
-    snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
-    requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
-    jsx('div', { onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
+    jsxs('div', { 'data-action-queue-header': '', style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
+      jsx('h2', { style: { margin: 0, fontSize: 14, flex: 'none' }, children: (n => n ? `For you (${n})` : `Waiting on the agent (${requests.length}) — nothing needed from you`)(requests.filter(r => ['open','needs_context'].includes(r.state) && !agentPending(r)).length) }),
+      minimized && jsx('span', { 'data-action-queue-summary': '', style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12.5, color: 'var(--muted-foreground)' }, children: requests.map(r => r.title).join(' · ') }),
+      jsx('button', { type: 'button', 'data-action-queue-toggle': '', 'aria-expanded': !minimized, 'aria-label': minimized ? 'Expand decisions' : 'Minimize decisions', title: minimized ? 'Expand' : 'Minimize (reopens when a new decision arrives)', onClick: () => setMinimized(minimized ? minimizedKeys.filter(k => !openKeys.includes(k)) : [...new Set([...minimizedKeys, ...openKeys])]), style: { ...btn(), marginLeft: 'auto', flex: 'none', minHeight: 28, minWidth: 28, padding: '2px 6px' }, children: jsx('i', { 'aria-hidden': true, className: `codicon ${minimized ? 'codicon-chevron-up' : 'codicon-chevron-down'}` }) })
+    ] }),
+    !minimized && snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
+    !minimized && requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
+    !minimized && jsx('div', { onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
   ] })
 }
 

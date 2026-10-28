@@ -349,3 +349,28 @@ test('backfilled legacy rows: real Diplomacy options, Done for user steps, agent
  assert.match(el().querySelector('h2').textContent,/^Waiting on the agent \(1\)/)
  await show(null);delete window.hermesDesktop
 })
+
+test('panel minimizes to one header line, stays minimized across remount, and reopens for a new request',async()=>{
+ window.localStorage.clear()
+ const a=freshRequest({title:'Put the doc on the hub'})
+ let list=[a]
+ window.hermesDesktop={api:async()=>({requests:list})}
+ await show(React.createElement(m.ActionQueue,{key:'min-1'}))
+ const toggle=()=>el().querySelector('[data-action-queue-toggle]')
+ assert.equal(toggle().getAttribute('aria-expanded'),'true')
+ assert.ok(el().querySelector('[data-action-request]'))
+ await React.act(async()=>{toggle().click();await flush()})
+ assert.equal(toggle().getAttribute('aria-expanded'),'false')
+ assert.equal(el().querySelector('[data-action-request]'),null,'body hidden')
+ assert.match(el().querySelector('h2').textContent,/^For you \(1\)$/)
+ assert.match(el().querySelector('[data-action-queue-summary]').textContent,/Put the doc on the hub/)
+ await show(null);await show(React.createElement(m.ActionQueue,{key:'min-2'}))
+ assert.equal(el().querySelector('[data-action-request]'),null,'minimized survives remount')
+ list=[a,freshRequest({title:'Brand new ask'})]
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.equal(el().querySelectorAll('[data-action-request]').length,2,'new request reopens the panel')
+ await React.act(async()=>{toggle().click();await flush()})
+ await React.act(async()=>{toggle().click();await flush()})
+ assert.equal(el().querySelectorAll('[data-action-request]').length,2,'expand restores body')
+ await show(null);delete window.hermesDesktop;window.localStorage.clear()
+})
