@@ -85,6 +85,35 @@ def test_real_approve_20_menu_reply_gets_the_note(tmp_path, monkeypatch):
     assert any(r["event"] == "agent_fault" and r.get("rule") == "compute_envelope" for r in _log(tmp_path))
 
 
+def test_pre_final_gate_holds_the_menu_before_user_steps_can_formalize_it(tmp_path, monkeypatch):
+    """Live run 20261028_045516_156dfd: user-steps' pre_final_gate held the "approve $15" reply and pushed the agent
+    to publish an action_request (the same ::user-step the original menu carried), then replaced it, so pre_verify
+    never saw the ask. The envelope must hold first, at pre_final_gate, ahead of ordinary gates."""
+    hooks = _hooks(tmp_path, monkeypatch)
+    gate = hooks.get("pre_final_gate:compute_envelope")
+    assert gate is not None and getattr(gate, "assess_before_holds", False) is True
+    out = gate(session_id="s5", platform="cli", final_response=REAL_MENU_REPLY, attempt=0)
+    assert out and out.get("hold") is True and "$25" in out["nudge"]
+    assert gate(session_id="s6", platform="cli", final_response=BIG_ASK, attempt=0) is None
+    # Same reply again after the note: the pre_verify backstop logs the fault instead of holding twice.
+    assert gate(session_id="s5", platform="cli", final_response=REAL_MENU_REPLY, attempt=1) is None
+    assert hooks["pre_verify"](session_id="s5", attempt=0, final_response=REAL_MENU_REPLY) is None
+    assert any(r["event"] == "agent_fault" and r.get("rule") == "compute_envelope" for r in _log(tmp_path))
+
+
+def test_register_adds_both_pre_final_gate_callbacks(monkeypatch):
+    spec = importlib.util.spec_from_file_location("coach_init_ce2", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    seen = []
+
+    class Ctx:
+        def register_hook(self, name, fn):
+            seen.append(name)
+    mod.register(Ctx())
+    assert seen.count("pre_final_gate") == 2 and all(":" not in n for n in seen)
+
+
 def test_big_multi_gpu_ask_still_reaches_the_user(tmp_path, monkeypatch):
     hooks = _hooks(tmp_path, monkeypatch)
     assert hooks["pre_tool_call"](tool_name="kanban_block", args={"reason": BIG_ASK}, session_id="w3") is None

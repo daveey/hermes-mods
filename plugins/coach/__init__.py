@@ -64,7 +64,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                               conversation_history=conversation_history,
                               canonical_user_content=_.get("canonical_user_content"))
             rec = store.user_turn(session_id, user_message) or {}
-            hint = coach.turn_start(session_id, user_message)
+            hint = coach.turn_start(session_id, user_message, platform=platform or "",
+                                    parent_session_id=parent_session_id or "",
+                                    replied_before=bool(_last_assistant(conversation_history)))
             # The fix-loop window survives process boundaries (`hermes chat -q --resume`, backend restarts): the
             # in-memory loop state is re-seeded from the session file, and windows count persistent user turns.
             st = coach.loop_state(session_id)
@@ -98,6 +100,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     def transform_tool_result(tool_name="", result=None, session_id="", args=None, **_):
         try:
             coach.check_live(session_id, tool_name, args)
+            coach.check_plan_first(session_id, tool_name, args)
             hint = coach.take(session_id)
             return rules.attach_hint(result, hint) if hint and isinstance(result, str) else None
         except Exception as exc:
@@ -130,6 +133,16 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             log.debug("coach compute_envelope: %s", exc)
             return None
+
+    def envelope_gate(session_id="", platform="", final_response="", attempt=0, **_):
+        """pre_final_gate: hold an in-envelope compute/spend ask once, ahead of ordinary gates (user-steps would
+        otherwise push it into a formal approval request and replace it before pre_verify sees it)."""
+        if attempt or not session_id or platform in ("cron",) or not isinstance(final_response, str):
+            return None
+        msg = _envelope(session_id, "reply", final_response)
+        return {"hold": True, "nudge": msg} if msg else None
+
+    envelope_gate.assess_before_holds = True
 
     def pre_tool_call(tool_name="", args=None, session_id="", **_):
         if tool_name in ("kanban_block", "tool_call"):
@@ -391,11 +404,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             log.debug("coach pre_verify: %s", exc)
             return None
 
-    return coach, {"pre_final_gate": goal_gate, "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
+    return coach, {"pre_final_gate": goal_gate, "pre_final_gate:compute_envelope": envelope_gate,
+                   "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
                    "transform_tool_result": transform_tool_result}
 
 
 def register(ctx) -> None:
     _, hooks = build()
     for name, fn in hooks.items():
-        ctx.register_hook(name, fn)
+        ctx.register_hook(name.split(":", 1)[0], fn)  # "event:label" = a second callback on the same event
