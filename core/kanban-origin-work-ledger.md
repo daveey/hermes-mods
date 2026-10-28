@@ -129,3 +129,17 @@ Patch **0455** (`d52e183104`), requires 0402, 0398 (scope heartbeat) and 0399–
   `tests/hermes_cli/test_kanban_origin_alias_release.py::test_unproven_intermediate_alias_needs_verified_owner_release`.
 - **Residual.** Five ledger-bound goal cards owned by hub task `t_b11f0591` still need owner verification; the
   ledger `project()` is untouched.
+
+## Follow-up patch (0710)
+
+**0710** (fork `44f3ca1e39`): legacy goal completions, long receipts, and owner-observed archives.
+
+- A goal card completed before the board's first `goal_verified` event can verify as `basis=legacy_completed` when the closing run is `completed`, the contract is `local-only` (or the completion event, if the board still has it, is that run's and is before the receipt epoch). A receipt-era card without a receipt stays unverified. A board that never recorded a receipt gets no legacy pass.
+- Receipt evidence may match the closing run's full `summary` when the completed event stored only `_first_line(evidence, 400)`. Comparing the event's first line alone is not enough; the run id must be the event's run and the judged evidence must equal the run summary.
+- An owner-observed archive without `verified` completion is `closed_uncompleted`: not unfinished, not released as completed, in `project()` and in the replica link reader. An archived card whose owner is offline still waits.
+
+Code: `hermes_cli/kanban_origin_ledger.py` (`observe_owner_task`, `_receipt_epoch`, `project`), `hermes_cli/kanban_session_activity.py` (`_owner_attests_terminal`, `_project_replica`).
+
+Tests: `tests/hermes_cli/test_kanban_origin_legacy_release.py` (the `test_goal_card_completed_before_the_first_receipt_is_owner_verified`, `test_goal_card_without_receipt_after_the_epoch_stays_unverified`, `test_board_without_any_receipt_gets_no_legacy_pass`, `test_receipt_verified_card_keeps_the_lifecycle_basis`, `test_receipt_binds_the_full_handoff_not_the_events_first_line`, `test_legacy_card_whose_completed_event_was_lost_is_verified_by_its_closing_run`, `test_lost_completed_event_needs_every_other_proof`, `test_legacy_goal_card_releases_its_origin_obligation`, `test_archived_without_verified_completion_is_closed_not_waiting_nor_completed`, `test_archived_card_from_an_offline_owner_still_waits`, `test_archived_replica_card_is_closed_in_the_link_reader` cases) and `tests/hermes_cli/test_kanban_origin_evidence.py::test_archive_without_current_completion_proof_is_closed_not_completed`.
+
+A live origin session releasing a real historical card is untested in this patch.

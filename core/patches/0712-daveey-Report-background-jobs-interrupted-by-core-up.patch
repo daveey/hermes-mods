@@ -1,0 +1,729 @@
+From 549b7f1e71b4bb1055b4fff4d2271175ca24973c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:59:01 +0000
+Subject: [PATCH] [daveey] Report background jobs interrupted by core update
+ pauses
+
+---
+ .../tui_gateway/test_update_pause_failures.py |  82 +++++++
+ .../test_update_pause_killed_jobs.py          | 232 ++++++++++++++++++
+ tools/process_registry.py                     |   8 +-
+ tools/process_registry_notifications.py       |   2 +
+ tools/process_registry_termination.py         |   9 +
+ tui_gateway/prompt_turn.py                    |   4 +-
+ tui_gateway/session_auto_continue.py          |   6 +-
+ tui_gateway/turn_marker.py                    |  64 ++++-
+ tui_gateway/update_pause.py                   | 112 ++++++++-
+ 9 files changed, 495 insertions(+), 24 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_failures.py
+ create mode 100644 tests/tui_gateway/test_update_pause_killed_jobs.py
+
+diff --git a/tests/tui_gateway/test_update_pause_failures.py b/tests/tui_gateway/test_update_pause_failures.py
+new file mode 100644
+index 00000000000..6568201d1d3
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_failures.py
+@@ -0,0 +1,82 @@
++"""Failure injection at the update pause's durable notification boundary."""
++import types
++
++from tests.tui_gateway.test_update_pause_killed_jobs import (
++    _job, _install, _session, _request_pause,
++)
++
++pytest_plugins = ["tests.tui_gateway.test_update_pause_killed_jobs"]
++from tui_gateway import update_pause as up, turn_marker as tm, server
++from tools.process_registry_notifications import format_process_notification
++
++
++def test_write_failure_does_not_kill_or_release(home, registry, monkeypatch):
++    proc = _job('proc_write_fail', owner='turn', command='sleep 600', notify=True)
++    _install(registry, proc)
++    tm.record_turn_start(home, 'session-key', 'wait')
++    _request_pause(home)
++    def fail(*a, **k):
++        raise OSError('disk unavailable')
++    monkeypatch.setattr(tm, 'atomic_json_write', fail)
++    session = _session(agent=types.SimpleNamespace(_process_owner_task_ids=('turn',)), profile_home=str(home))
++    assert up.boundary_pause_hook(session, 'session-key')() is None
++    assert not proc.exited
++
++
++def test_kill_failure_refuses_pause_and_retains_intent(home, registry, monkeypatch):
++    proc = _job('proc_fail', owner='turn', command='sleep 600')
++    _install(registry, proc)
++    tm.record_turn_start(home, 'session-key', 'wait')
++    _request_pause(home)
++    monkeypatch.setattr(registry, 'kill_process', lambda *a, **k: {'status': 'error'})
++    session = _session(agent=types.SimpleNamespace(_process_owner_task_ids=('turn',)), profile_home=str(home))
++    assert up.boundary_pause_hook(session, 'session-key')() is None
++    job, = tm.read_turn_marker(home, 'session-key')['killed_jobs']
++    assert job['session_id'] == proc.id and job['kill_state'] == 'pending'
++
++
++def test_receipt_and_normal_notice_are_redacted_and_name_update(home, registry):
++    secret = 'sk-ant-api03-' + 'x' * 100
++    proc = _job('proc_secret', owner='turn', command='echo ' + secret, notify=True)
++    proc.output_buffer = secret
++    _install(registry, proc)
++    tm.record_turn_start(home, 'session-key', 'wait')
++    _request_pause(home)
++    session = _session(agent=types.SimpleNamespace(_process_owner_task_ids=('turn',)), profile_home=str(home))
++    assert up.boundary_pause_hook(session, 'session-key')() == up.PAUSE_REASON
++    persisted = (home / 'desktop' / 'interrupted_turns.json').read_text()
++    assert secret not in persisted
++    note = up.pause_note('wait', tm.read_turn_marker(home, 'session-key')['killed_jobs'])
++    assert secret not in note
++    event = registry.completion_queue.get_nowait()
++    assert 'killed by the Hermes update' in format_process_notification(event)
++
++
++def test_retry_marker_retains_interruption_receipts(home):
++    job = {'session_id': 'proc_dead', 'command': 'sleep 600', 'started_at': 123,
++           'kill_state': 'killed', 'notify_on_complete': True, 'exit_code': -15}
++    session = _session(profile_home=str(home), _auto_continue_prompt='wait',
++                       _auto_continue_killed_jobs=[job], _auto_continue_attempt=0, _auto_continue_pauses=1)
++    server._record_turn_marker(session, 'continuation')
++    assert tm.read_turn_marker(home, 'session-key')['killed_jobs'] == [job]
++
++
++def test_write_after_signal_failure_leaves_uncertain_receipt(home, registry, monkeypatch):
++    proc = _job('proc_second_write', owner='turn', command='sleep 600', notify=True)
++    _install(registry, proc)
++    tm.record_turn_start(home, 'session-key', 'wait')
++    _request_pause(home)
++    write = tm.atomic_json_write
++    calls = []
++    def fail_second(*a, **k):
++        calls.append(1)
++        if len(calls) > 1:
++            raise OSError('disk unavailable after kill')
++        return write(*a, **k)
++    monkeypatch.setattr(tm, 'atomic_json_write', fail_second)
++    session = _session(agent=types.SimpleNamespace(_process_owner_task_ids=('turn',)), profile_home=str(home))
++    assert up.boundary_pause_hook(session, 'session-key')() is None
++    assert proc.exited
++    job, = tm.read_turn_marker(home, 'session-key')['killed_jobs']
++    assert job['kill_state'] == 'pending'
++    assert proc.id in up.pause_note('wait', [job])
+diff --git a/tests/tui_gateway/test_update_pause_killed_jobs.py b/tests/tui_gateway/test_update_pause_killed_jobs.py
+new file mode 100644
+index 00000000000..081bb401519
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_killed_jobs.py
+@@ -0,0 +1,232 @@
++"""A core-update pause must not silently drop a resuming chat's background jobs.
++
++At a successful pause boundary, owned non-persist jobs are stopped with source
++``core_update_pause`` and ``consume_output=False``. The jobs actually killed are
++written into the durable interrupted-turn marker before the pause is released, and
++the resume note lists each one (id, command head, start time, restart advice). A
++``notify=true`` job also carries the normal completion text with reason
++"killed by the Hermes update". That note is read back from the marker file, not
++from the in-memory completion queue. Session-end close and ``persist_on_release``
++stay as they are; a foreign owner's job is not stopped.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import threading
++import time
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++from tools.process_registry import ProcessRegistry, ProcessSession
++from tools.process_registry_notifications import format_process_notification
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True,
++                                     "freshness_minutes": 240, "max_attempts": 2}}}
++STARTED = 1_700_000_000.0
++KILL_REASON = "killed by the Hermes update"
++
++
++class _LiveProc:
++    """Stays running until the kill path signals it, so list/reconcile cannot steal the exit."""
++
++    def __init__(self):
++        self.pid = 4242
++        self._alive = True
++        self.stdout = self.stderr = self.stdin = None
++
++    def poll(self):
++        return None if self._alive else 0
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++def _session(agent=None, **extra):
++    return {"agent": agent if agent is not None else types.SimpleNamespace(),
++            "session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++            "history_version": 0, "running": False, "attached_images": [], "image_counter": 0,
++            "cols": 80, "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all",
++            "inflight_turn": None, **extra}
++
++
++def _job(sid, *, owner, command, notify=False, persist=False, session_key="session-key"):
++    session = ProcessSession(id=sid, command=command, task_id=owner, owner_task_id=owner,
++                             session_key=session_key, started_at=STARTED)
++    session.notify_on_complete = notify
++    session.persist_on_release = persist
++    session.process = _LiveProc()
++    return session
++
++
++def _start(epoch=STARTED) -> str:
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    return tmp_path
++
++
++@pytest.fixture()
++def registry(monkeypatch):
++    reg = ProcessRegistry()
++
++    def _stop(pid, expected_start=None):
++        for session in (*reg._running.values(), *reg._finished.values()):
++            proc = session.process
++            if proc is not None and getattr(proc, "pid", None) == pid:
++                proc._alive = False
++
++    monkeypatch.setattr(reg, "_terminate_host_pid", _stop)
++    monkeypatch.setattr(reg, "_write_checkpoint", lambda *a, **k: None)
++    monkeypatch.setattr("tools.process_registry.save_completed_result", lambda *a, **k: None)
++    monkeypatch.setattr("tools.process_registry.process_registry", reg)
++    return reg
++
++
++def _request_pause(root):
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 120)
++
++
++def _install(registry, *sessions):
++    for session in sessions:
++        registry._running[session.id] = session
++
++
++def test_update_pause_records_killed_jobs_and_resume_note_lists_them(home, registry, monkeypatch):
++    """Pause → durable marker → resumed note, including a notify completion that outlives the queue."""
++    notify = _job("proc_notify", owner="turn-1", command="sleep 600", notify=True)
++    quiet = _job("proc_quiet", owner="turn-1", command="echo quiet-job")
++    persisted = _job("proc_persist", owner="turn-1", command="sleep 9999", notify=True, persist=True)
++    foreign = _job("proc_foreign", owner="other-turn", command="sleep 42", notify=True,
++                   session_key="other-session")
++    _install(registry, notify, quiet, persisted, foreign)
++    record_turn_start(home, "session-key", "fix the flaky test")
++    _request_pause(home)
++    agent = types.SimpleNamespace(_process_owner_task_ids=("turn-1",))
++    session = _session(agent=agent, profile_home=str(home))
++
++    assert up.boundary_pause_hook(session, "session-key")() == up.PAUSE_REASON
++
++    assert notify.exited is True and notify.termination_source == up.PAUSE_REASON
++    assert quiet.exited is True and quiet.termination_source == up.PAUSE_REASON
++    assert notify.id not in registry._completion_consumed
++    assert quiet.id not in registry._completion_consumed
++    assert persisted.exited is False and foreign.exited is False
++
++    on_disk = json.loads((home / "desktop" / "interrupted_turns.json").read_text())
++    stored = on_disk["session-key"]["killed_jobs"]
++    assert [job["session_id"] for job in stored] == ["proc_notify", "proc_quiet"]
++    by_id = {job["session_id"]: job for job in stored}
++    assert by_id["proc_notify"]["command"] == "sleep 600"
++    assert by_id["proc_notify"]["started_at"] == STARTED
++    assert by_id["proc_notify"]["notify_on_complete"] is True
++    assert by_id["proc_quiet"]["notify_on_complete"] is False
++    assert "proc_persist" not in by_id and "proc_foreign" not in by_id
++
++    # The resume path reads the marker file. Drop the in-memory queue first so a
++    # passing note cannot be explained by a completion that dies with the process.
++    registry.completion_queue.queue.clear()
++    marker = read_turn_marker(home, "session-key")
++    assert [job["session_id"] for job in marker["killed_jobs"]] == ["proc_notify", "proc_quiet"]
++
++    # The next backend resumes after the update window releases the hold. Leaving it
++    # set makes admission refuse the continuation, which is not the resume path.
++    af.clear_pause_request(home)
++    af.clear_hold(home)
++    submitted = []
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda session, rid, timeout=30.0: None)
++    monkeypatch.setattr(server, "_run_prompt_submit",
++                        lambda rid, sid, session, text, **kw: submitted.append(text))
++    fresh = _session(profile_home=str(home))
++    assert server._maybe_schedule_auto_continue("sid", fresh, "session-key") is not None
++    (text,) = submitted
++    assert text.startswith(up.pause_note("fix the flaky test"))
++    started = _start()
++    for sid, command in (("proc_notify", "sleep 600"), ("proc_quiet", "echo quiet-job")):
++        assert sid in text and command in text and started in text
++        assert "restart it if you still need it" in text
++    notice = format_process_notification({
++        "type": "completion", "session_id": "proc_notify", "command": "sleep 600",
++        "exit_code": -15, "completion_reason": "killed", "termination_source": up.PAUSE_REASON,
++        "kill_reason": KILL_REASON, "output": "",
++    })
++    assert notice in text
++    assert KILL_REASON in notice
++    assert "Background process proc_quiet" not in text
++    assert "proc_persist" not in text and "proc_foreign" not in text
++    assert registry.completion_queue.empty()
++
++
++def test_agent_close_still_kills_owned_jobs_and_skips_persist(registry, monkeypatch):
++    """A real session end still kills with agent_close and consume_output=True; persist is unchanged."""
++    from agent.client_lifecycle import ClientLifecycleMixin
++    import run_agent as ra
++    import tools.computer_use.tool as cu
++
++    owned = _job("proc_owned", owner="turn-1", command="sleep 600", notify=True)
++    persisted = _job("proc_persist", owner="turn-1", command="sleep 9999", persist=True)
++    _install(registry, owned, persisted)
++    monkeypatch.setattr(ra, "cleanup_vm", lambda *a, **k: None)
++    monkeypatch.setattr(ra, "cleanup_browser", lambda *a, **k: None)
++    monkeypatch.setattr(cu, "release_computer_use_session", lambda *a, **k: None)
++    agent = types.SimpleNamespace(_process_owner_task_ids=("turn-1",))
++
++    ClientLifecycleMixin._close_task_resources(agent, "turn-1")
++
++    assert owned.exited is True and owned.termination_source == "agent_close"
++    assert owned.id in registry._completion_consumed
++    assert persisted.exited is False
++
++
++def test_lifecycle_kill_is_logged_with_session_process_and_source(registry, caplog):
++    """Lifecycle kills are logged once, centrally, with the chat session, process id and source."""
++    owned = _job("proc_owned", owner="turn-1", command="sleep 600", notify=True)
++    _install(registry, owned)
++
++    with caplog.at_level(logging.INFO, logger="tools.process_registry"):
++        result = registry.kill_process(owned.id, source="agent_close", consume_output=True)
++
++    assert result["status"] == "killed"
++    matches = [r for r in caplog.records if r.levelno == logging.INFO and "lifecycle kill" in r.getMessage()]
++    assert len(matches) == 1
++    message = matches[0].getMessage()
++    assert "session=session-key" in message
++    assert "process=proc_owned" in message
++    assert "source=agent_close" in message
++
++
++def test_operator_kill_is_not_a_lifecycle_log(registry, caplog):
++    """An explicit stop is not a lifecycle kill and does not use that log line."""
++    owned = _job("proc_owned", owner="turn-1", command="sleep 600")
++    _install(registry, owned)
++
++    with caplog.at_level(logging.INFO, logger="tools.process_registry"):
++        registry.kill_process(owned.id, source="process.kill", consume_output=True)
++
++    assert not any("lifecycle kill" in r.getMessage() for r in caplog.records)
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 51f0fc742ee..d5f6f6cd0c0 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -2263,10 +2263,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+                 session.exit_code = -15  # SIGTERM
+                 session.completion_reason = "killed"
+                 session.termination_source = source
+-            # The reader thread can finalise the session while the signal path
+-            # blocks in the SIGKILL grace window: its ``save_completed_result``
+-            # then persists this kill as a plain ``exited``. Re-write the receipt
+-            # so the durable record matches what the caller was told.
++            self._log_lifecycle_kill(session, source)
++            # A reader can persist a plain exit during the SIGKILL wait; rewrite the receipt.
+             if not self._move_to_finished(session):
+                 save_completed_result(session)
+             self._write_checkpoint()
+@@ -2539,7 +2537,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+     # recovery / turn abandon), not a deliberate stop: those must skip persist_on_release
+     # sessions. An explicit stop (process_manage kill, CLI /stop) passes its own source
+     # string and still reaches them.
+-    _LIFECYCLE_KILL_SOURCES = frozenset({"kill_all", "gateway_turn_timeout", "agent_close"})
++    _LIFECYCLE_KILL_SOURCES = frozenset({"kill_all", "gateway_turn_timeout", "agent_close", "core_update_pause"})
+ 
+     def kill_started_since(self, task_id: str, baseline_ids, *, source: str) -> int:
+         """Kill ``task_id`` processes created after ``baseline_ids``. Output is
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index 6ba9a03470a..efb7ac34389 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -424,6 +424,8 @@ def _delegation_attribution_line(evt: dict) -> str | None:
+ def _completion_status(evt: dict) -> str:
+     reason = evt.get("completion_reason") or "exited"
+     if reason == "killed":
++        if evt.get("termination_source") == "core_update_pause":
++            return "killed by the Hermes update"
+         return f"terminated by {evt.get('termination_source') or 'Hermes'}"
+     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
+ 
+diff --git a/tools/process_registry_termination.py b/tools/process_registry_termination.py
+index 875c0ca69cc..632759fae7a 100644
+--- a/tools/process_registry_termination.py
++++ b/tools/process_registry_termination.py
+@@ -20,6 +20,15 @@ class ProcessTerminationMixin:
+     """The subclass supplies ``_host_pid_is_ours``, ``_is_host_pid_alive``,
+     ``_detached_host_fate`` and ``_daemon_term_grace_seconds``. See ProcessRegistry."""
+ 
++    def _log_lifecycle_kill(self, session, source: str) -> None:
++        """One INFO line per agent-lifecycle kill: chat session, process id, source."""
++        if source not in getattr(self, "_LIFECYCLE_KILL_SOURCES", ()):
++            return
++        logger.info(
++            "lifecycle kill session=%s process=%s source=%s",
++            getattr(session, "session_key", None) or getattr(session, "owner_task_id", None) or "",
++            session.id, source)
++
+     @staticmethod
+     def _proc_alive(proc) -> bool:
+         """True if a psutil.Process is running and not a zombie (already dead, just unreaped)."""
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 723ef053017..662b4d63310 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -217,6 +217,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     marker_key = str(session.get("session_key") or "")
+     marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
+     marker_pauses = int(session.pop("_auto_continue_pauses", 0) or 0)
++    killed_jobs = session.pop("_auto_continue_killed_jobs", None)
+     marker_text = session.pop("_auto_continue_prompt", None) or text
+     # [daveey] A core-update pause kept the previous turn's marker; this turn owns (and retires) its own.
+     session.pop("_update_pause_marker_key", None)
+@@ -224,7 +225,8 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+         with session["history_lock"]:
+             session["_active_turn_marker_key"] = marker_key
+         record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
+-                          auto_continue=auto_continue, **({"pauses": marker_pauses} if marker_pauses else {}),
++                          auto_continue=auto_continue, **({"killed_jobs": killed_jobs} if killed_jobs else {}),
++                          **({"pauses": marker_pauses} if marker_pauses else {}),
+                           **({"notification_category": "diagnostic"}
+                              if notification_category == "diagnostic" else {}))
+         with session["history_lock"]:
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 42904104542..b1b7aa240ef 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -126,9 +126,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     paused = marker.get("reason") == "core_update_pause"
+     if paused:
+         from tui_gateway.update_pause import pause_note
+-        attempt, text = marker["attempts"], pause_note(marker["prompt"])
++        attempt, text = marker["attempts"], pause_note(marker["prompt"], marker.get("killed_jobs"))
+     else:
+         attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"])
++    if not paused and marker.get("killed_jobs"):
++        from tui_gateway.update_pause import pause_note
++        text += "\n\n" + pause_note("", marker["killed_jobs"])
+     pauses = int(marker.get("pauses") or 0)
+ 
+     def kickoff() -> None:
+@@ -163,6 +166,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+             # nested notes). Set here, not at schedule time, so a bail above leaves nothing for a racing user turn.
+             session["_auto_continue_attempt"], session["_auto_continue_prompt"] = attempt, marker["prompt"]
+             session["_auto_continue_pauses"] = pauses
++            session["_auto_continue_killed_jobs"] = marker.get("killed_jobs", [])
+         try:
+             from gateway.warning_notifications import render_notification
+             diagnostic = marker.get("notification_category") == "diagnostic"
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 98c9d7742ee..07672063284 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -100,7 +100,7 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
+     atomic_json_write(path, entries, indent=None, mode=0o600)
+ 
+ 
+-def _update(home: Path | str, session_key: str, mutate, what: str) -> None:
++def _update(home: Path | str, session_key: str, mutate, what: str) -> bool:
+     """Load → ``mutate(entries)`` → store under the lock; ``mutate`` returns None to skip the write."""
+     try:
+         with _lock:
+@@ -108,13 +108,15 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> None:
+             entries = mutate(_load(path))
+             if entries is not None:
+                 _store(path, entries)
++                return True
+     except Exception:
+-        logger.debug("failed to %s turn marker for %s", what, session_key, exc_info=True)
++        logger.warning("failed to %s turn marker for %s", what, session_key, exc_info=True)
++    return False
+ 
+ 
+ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
+                       auto_continue: bool = True, notification_category: str | None = None,
+-                      pauses: int = 0) -> None:
++                      pauses: int = 0, killed_jobs: list | None = None) -> None:
+     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
+     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume.
+     ``pauses`` = core-update pauses this logical turn already took (``mark_turn_paused``), counted apart
+@@ -124,6 +126,8 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
+     now = time.time()
+     entry = {"attempts": max(0, int(attempts)), "prompt": prompt[:_MAX_PROMPT_CHARS], "started_at": now,
+              "auto_continue": bool(auto_continue), **_writer_identity()}
++    if killed_jobs:
++        entry["killed_jobs"] = list(killed_jobs)
+     if pauses:
+         entry["pauses"] = max(0, int(pauses))
+     if notification_category == "diagnostic":
+@@ -139,24 +143,54 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
+         _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
+ 
+ 
+-def mark_turn_paused(home: Path | str, session_key: str, reason: str) -> bool:
++def mark_turn_paused(home: Path | str, session_key: str, reason: str,
++                     *, killed_jobs: list | None = None, increment: bool = True) -> bool:
+     """[daveey] Stamp a live turn's marker as paused at a step boundary for a core update: ``reason``,
+     ``paused_at``, ``pauses`` + 1, and this process as its writer. ``auto_continue`` stays as recorded.
+-    True when a marker existed to stamp."""
+-    stamped = []
+-
++    ``killed_jobs`` are the jobs this pause actually stopped; they ride the same write so a resume
++    after restart can list them. True when a marker existed to stamp."""
+     def mutate(entries):
+         entry = entries.get(session_key)
+         if not isinstance(entry, dict):
+             return None
+-        entry.update(reason=str(reason), paused_at=time.time(), pauses=int(entry.get("pauses") or 0) + 1,
++        entry.update(reason=str(reason), paused_at=time.time(), pauses=int(entry.get("pauses") or 0) + int(increment),
+                      **_writer_identity())
+-        stamped.append(True)
++        if killed_jobs:
++            entry["killed_jobs"] = list(killed_jobs)
+         return entries
+ 
+     if session_key:
+-        _update(home, session_key, mutate, "pause")
+-    return bool(stamped)
++        return _update(home, session_key, mutate, "pause")
++    return False
++
++
++def _paused_killed_jobs(entry: dict) -> list[dict]:
++    """Jobs a core-update pause actually stopped, or [] when the marker has none / junk."""
++    raw = entry.get("killed_jobs")
++    if not isinstance(raw, list):
++        return []
++    jobs = []
++    for item in raw:
++        if not isinstance(item, dict):
++            continue
++        sid = str(item.get("session_id") or "")
++        if not sid:
++            continue
++        try:
++            started = float(item.get("started_at") or 0)
++        except (TypeError, ValueError):
++            started = 0.0
++        job = {"session_id": sid, "command": str(item.get("command") or ""), "started_at": started,
++               "notify_on_complete": bool(item.get("notify_on_complete")),
++               "kill_state": str(item.get("kill_state") or "killed")}
++        if item.get("notice"):
++            job["notice"] = str(item["notice"])
++        if item.get("exit_code") is not None:
++            job["exit_code"] = item["exit_code"]
++        if item.get("output"):
++            job["output"] = str(item["output"])
++        jobs.append(job)
++    return jobs
+ 
+ 
+ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | None:
+@@ -166,9 +200,12 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+     try:
+         with _lock:
+             entry = _load(_marker_path(home)).get(session_key)
+-        prompt = str(entry.get("prompt") or "") if isinstance(entry, dict) else ""
++        if not isinstance(entry, dict):
++            return None
++        prompt = str(entry.get("prompt") or "")
+         if not prompt.strip():
+             return None
++        killed = _paused_killed_jobs(entry)
+         return {"attempts": max(0, int(entry.get("attempts") or 0)), "prompt": prompt, "started_at": _started_at(entry),
+                 "auto_continue": bool(entry.get("auto_continue", True)),
+                 "pauses": max(0, int(entry.get("pauses") or 0)),
+@@ -176,6 +213,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+                 **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                 **({"reason": str(entry["reason"])} if entry.get("reason") else {}),
+                 **({"notification_category": "diagnostic"}
+-                   if entry.get("notification_category") == "diagnostic" else {})}
++                   if entry.get("notification_category") == "diagnostic" else {}),
++                **({"killed_jobs": killed} if killed else {})}
+     except Exception:
+         return None
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 6bbd29f7d85..99baa377a3f 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -29,6 +29,7 @@ from typing import Any, Callable
+ logger = logging.getLogger(__name__)
+ 
+ PAUSE_REASON = "core_update_pause"
++UPDATE_KILL_REASON = "killed by the Hermes update"
+ MAX_PAUSES = 3
+ PAUSE_STATUS_TEXT = "Paused for a Hermes update; continues automatically"
+ # The update itself takes a few minutes: a turn that would age out of the freshness window meanwhile is
+@@ -96,6 +97,73 @@ def not_resumable_reason(session: dict, marker_key: str) -> str | None:
+     return None
+ 
+ 
++def _command_head(command: str, limit: int = 80) -> str:
++    head = " ".join(str(command or "").split())
++    return head if len(head) <= limit else head[:limit - 3] + "..."
++
++
++def _format_start(started_at: Any) -> str:
++    try:
++        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(started_at)))
++    except (TypeError, ValueError, OSError, OverflowError):
++        return "unknown"
++
++
++def _killed_job_notice(receipt: dict) -> str:
++    """The normal completion text, with the update named as the reason."""
++    from tools.process_registry_notifications import format_process_notification
++    text = format_process_notification({
++        "type": "completion", "session_id": receipt["session_id"], "command": receipt.get("command") or "",
++        "exit_code": receipt.get("exit_code", -15), "completion_reason": "killed",
++        "termination_source": PAUSE_REASON, "kill_reason": UPDATE_KILL_REASON,
++        "output": receipt.get("output") or "",
++    })
++    return text or ""
++
++
++def _update_jobs(session: dict) -> list[dict]:
++    """Snapshot and redact before journaling intent, so no kill can go unmentioned after a crash."""
++    from tools.process_registry import process_registry, _redact_process_result
++    owners = set(getattr(session.get("agent"), "_process_owner_task_ids", ()) or ())
++    jobs = []
++    for proc in process_registry.list_sessions():
++        if proc.get("owner_task_id") not in owners or proc.get("status") != "running" or proc.get("persist_on_release"):
++            continue
++        live = process_registry.get(proc["session_id"])
++        if live is not None:
++            job = _redact_process_result({"session_id": live.id, "command": live.command,
++                "started_at": live.started_at, "notify_on_complete": live.notify_on_complete,
++                "kill_state": "pending"})
++            job["command"] = _command_head(job["command"])
++            jobs.append(job)
++    return jobs
++
++
++def stop_owned_jobs_for_update_pause(jobs: list[dict], save: Callable[[], bool]) -> bool:
++    """Journal intent BEFORE signaling, and each outcome before proceeding. Refuse pause on failure."""
++    from tools.process_registry import process_registry, _redact_process_result
++    for job in jobs:
++        if job.get("kill_state") == "killed":
++            continue
++        sid = job["session_id"]
++        result = process_registry.kill_process(sid, source=PAUSE_REASON, consume_output=False)
++        if result.get("status") == "already_exited":
++            job["kill_state"] = "already_exited"
++        elif result.get("status") == "killed":
++            live = process_registry.get(sid)
++            job.update(kill_state="killed", exit_code=getattr(live, "exit_code", -15),
++                       output=result.get("output") or "")
++            _redact_process_result(job)
++            if job.get("notify_on_complete"):
++                job["notice"] = _killed_job_notice(job)
++        else:
++            logger.warning("core-update pause: job %s not stopped; refusing pause (%s)", sid, result.get("status"))
++            return False
++        if not save():
++            return False
++    return True
++
++
+ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | None]:
+     """The per-turn ``agent.step_boundary_pause``: one stat per step while no pause is requested."""
+     declined: list[str] = []
+@@ -109,8 +177,26 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+                 declined.append(why)
+                 logger.info("core-update pause: session %s keeps running (%s)", marker_key, why)
+             return None
+-        from tui_gateway.turn_marker import mark_turn_paused
+-        if not mark_turn_paused(_home(session), marker_key, PAUSE_REASON):
++        from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker
++        home = _home(session)
++        marker = read_turn_marker(home, marker_key)
++        if marker is None:
++            return None
++        jobs = {job["session_id"]: job for job in marker.get("killed_jobs", [])}
++        jobs.update({job["session_id"]: job for job in _update_jobs(session)})
++        killed = list(jobs.values())
++        # Write-ahead journal: even a crash during kill or a later disk failure leaves an
++        # explicit uncertain-outcome record. Never claim an unverified kill succeeded.
++        if not mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed,
++                                increment=marker.get("reason") != PAUSE_REASON):
++            return None
++        def save() -> bool:
++            return mark_turn_paused(home, marker_key, PAUSE_REASON, killed_jobs=killed, increment=False)
++        try:
++            if not stop_owned_jobs_for_update_pause(killed, save):
++                return None
++        except Exception:
++            logger.warning("core-update pause: background cleanup failed; refusing pause for %s", marker_key, exc_info=True)
+             return None
+         with session["history_lock"]:
+             session["_update_pause_marker_key"] = marker_key
+@@ -120,11 +206,29 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+     return hook
+ 
+ 
+-def pause_note(prompt: str) -> str:
++def pause_note(prompt: str, killed_jobs: list | None = None) -> str:
+     from tui_gateway.session_history import _AUTO_CONTINUE_NOTE_PREFIX
+-    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} — it was paused at a step boundary for a Hermes update. Every "
++    note = (f"{_AUTO_CONTINUE_NOTE_PREFIX} — it was paused at a step boundary for a Hermes update. Every "
+             "tool result above is complete; continue with the next step and don't redo finished steps. "
+             f"The paused request was:]\n\n{prompt}")
++    jobs = [job for job in (killed_jobs or []) if isinstance(job, dict) and job.get("session_id")]
++    if not jobs:
++        return note
++    lines = [note, "", "Background jobs stopped for this Hermes update:"]
++    for job in jobs:
++        command = job.get("command") or "(no command)"
++        state = job.get("kill_state", "killed")
++        if state != "killed":
++            lines.append(f"- {job['session_id']} started {_format_start(job.get('started_at'))}: {command} "
++                         f"— update interruption outcome {state}; inspect its result before restarting")
++            continue
++        lines.append(f"- {job['session_id']} started {_format_start(job.get('started_at'))}: {command} "
++                     f"— restart it if you still need it")
++        if job.get("notify_on_complete"):
++            notice = job.get("notice") or _killed_job_notice(job)
++            if notice:
++                lines.append(notice)
++    return "\n".join(lines)
+ 
+ 
+ def announce_pause(sid: str, payload: dict) -> None:
+-- 
+2.55.0
+

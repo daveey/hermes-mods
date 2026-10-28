@@ -33,3 +33,16 @@ This adds a supported adoption primitive, not a migration of historical ownerles
 ## Plugin relationship
 
 Core owns the transactional intent and authority boundary. Plugins may call the registered action but cannot replace its lifecycle checks with a task-ID-only match.
+
+## Follow-up patch (0708)
+
+**0708** (fork `a8ebd66ee6`): the trusted origin courier selects the Kanban toolset around the real registry check and dispatch.
+
+`receive` used `registry.get_definitions` against whatever toolsets the chat profile had enabled. A worker-only profile with no chat toolsets therefore returned `kanban_tool_unavailable` forever. `_dispatch_owner_tool` wraps `kanban_origin_adopt` and `kanban_create` in `scoped_kanban_toolset_selection(['kanban'])`. It does not write profile config or process env. A missing registration still returns `pending` / `kanban_tool_unavailable`. Child fences stay on the real dispatch path.
+
+Tests in `tests/hermes_cli/test_kanban_origin_owner.py`:
+
+- `test_real_cli_process_replays_persisted_creation` — empty-config subprocess replay of a persisted create.
+- `test_courier_selection_is_scoped_and_preserves_child_fence` — selection is scoped; the child fence still refuses.
+
+A live courier between two gateways is untested in this patch.

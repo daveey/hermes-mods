@@ -98,7 +98,8 @@ the new `awaiting` parameter, the `agent_owned_block` remedy text and the long-p
 ## Gotchas
 
 - The text classifier is a backstop for parks that declare nothing. A worker that declares
-  `awaiting={kind:'external', ref:'<ticket id>', why:…}` is trusted on the producer.
+  `awaiting={kind:'external', ref:'<ticket id>', why:…}` is trusted on an agent wall. A human wait is
+  refused even when that ref contains a number or URL (0707).
 - A remote producer is only checked for existence and archived/triage status; its own orphan chain
   is not followed across gateways.
 - The re-park count only sees parks written by this patch (events carrying `awaiting.premise`).
@@ -110,3 +111,22 @@ the new `awaiting` parameter, the `agent_owned_block` remedy text and the long-p
 **0608** (`2f6f37d635`): `kanban_wait_info` treats an ask-less `needs_input` block as agent-owned, matching `AGENT_OWNED_KINDS`. Tests: `tests/hermes_cli/test_kanban_wait_info.py`, `tests/hermes_cli/test_kanban_block_kinds.py` (`_cmd_block` refusal).
 
 **0626** (`1ad73c1350`, self-heal kanban-92e96c16fd): a card's own worker (`HERMES_KANBAN_TASK` == card) parking on a wake_check that names no card or CI run (`kanban_wait_info.producer_from_wake_check` -> `probe`) with no declared awaiting is refused with `opaque_probe_wait`. Exempt: continues <= 2 h, `clock_only`, operator parks (dashboard/terminal; still recorded as inferred so the checker flags them). Repeat counting also keys on the whitespace-normalised probe (`awaiting.probe`), so the 3rd park on the same probe escalates however the reason is worded. Code: `hermes_cli/kanban_awaiting.py` (`opaque_probe`, `parked_by_own_worker`, `opaque_probe_error`, `probe_premise`, `prior_same_premise(probe=)`, gate), `tools/kanban_tools_schemas.py` wake_check text. Tests: `tests/hermes_cli/test_kanban_awaiting.py` (`test_opaque_probe_with_no_producer_is_refused` x4 [schedule, block, continue, tool], `test_opaque_probe_with_a_declared_external_producer_parks`, `test_named_producers_and_short_continues_still_park`, `test_same_probe_reparked_with_new_wording_escalates`, `test_worker_cli_park_on_its_own_card_is_refused_but_an_operator_park_is_not` [CLI + direct `kb.schedule_task`]); `test_kanban_wake_check.py` fixtures now declare awaiting. The dashboard REST path is covered only as "unchanged" by `test_kanban_dashboard_plugin.py::test_dashboard_scheduled_park_guard`.
+
+## Follow-up patch (0707)
+
+**0707** (fork `85fbaa93b5`): a numbered ref or URL no longer excuses a human wait.
+
+- `_check_external` still lets a vendor ticket excuse an agent wall. If the text is a human wait, it raises `human_wait` whether or not the ref matches `_TICKET`.
+- An inferred producer excuses a human wait only when that card is `blocked` or `triage` and has a `human_request` or `block_kind=needs_input` (`_carries_visible_ask`). A merely live card does not.
+- The human-wait error still says to block with `needs_input`. It also says an ask that already exists elsewhere (a pending approval, a PR review) is still a visible block, and that `approval_reconciliation.preflight` must not file a second approval for the same scope. That preflight path is untested in this patch.
+- `HIDDEN_ASK` also matches `daveey`, `approving review`, and `his ok`. Those tokens are the detector; this doc does not narrate a particular park.
+
+Tests in `tests/hermes_cli/test_kanban_awaiting.py`:
+
+- `test_external_park_naming_a_human_wait_is_refused_whatever_the_ref`
+- `test_external_park_on_a_vendor_ticket_still_parks`
+- `test_vendor_ticket_ref_still_excuses_an_agent_wall_why`
+- `test_merge_queue_wording_is_a_human_wait`
+- `test_inferred_wait_on_a_running_card_does_not_excuse_a_human_wait`
+
+The dashboard drag-to-scheduled path remains untested.

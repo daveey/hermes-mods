@@ -1,7 +1,8 @@
 # A core-update-paused turn waits for a successor backend only while one is coming
 
 Patch: [`patches/0704-fix-core-update-a-paused-turn-continues-in-place-onc.patch`](patches/0704-fix-core-update-a-paused-turn-continues-in-place-onc.patch)
-(fork commit `e96d22b072`, card t_01a18300e42c3364)
+(fork commit `e96d22b072`), and [`patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch`](patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch)
+(fork commit `549b7f1e71`, owned background jobs stopped for the pause)
 
 ## Why
 
@@ -60,5 +61,21 @@ runs, the session is busy, so the idle proof refuses retirement.
 covers `skew_watchdog_armed()` and `RetirementFence.retiring()`. `tests/tui_gateway/test_update_pause.py::test_in_place_resume_decision`
 covers the decision order.
 
-Not covered by a test: a live drain window on David-MBP where the paused turn's serve survives the update. That
-check is tracked on its own card.
+Not covered by a test: a live drain window where the paused turn's serve survives the update.
+
+## Follow-up patch (0712)
+
+**0712** (fork `549b7f1e71`): a permitted core-update pause stops owned background jobs and says so. It does not try to keep them alive across the update.
+
+At the step boundary, before any signal, the pause journals each owned running job that is not `persist_on_release`: redacted session id, command head (80 chars), start time, notify flag, and `kill_state=pending`. It then calls `kill_process(source="core_update_pause", consume_output=False)` and journals each outcome before the next kill. `core_update_pause` is a lifecycle kill source, so `persist_on_release` jobs are still skipped. A lifecycle kill logs one INFO line: `lifecycle kill session=<chat> process=<id> source=<source>`. An operator kill does not. The completion notice for a notified job says `killed by the Hermes update`.
+
+The resume note lists each stopped job with its id, start, and command head, and says to restart it if still needed. A non-killed outcome says to inspect before restarting. A notified job's completion text is included. Continuation retries keep `killed_jobs` on the marker (`record_turn_start` / `mark_turn_paused(increment=False)`).
+
+If the journal write fails, nothing is killed and the pause is refused. If a kill fails, or the write after a signal fails, the pause is refused and the marker keeps the uncertain receipt. Session-end `agent_close` still kills owned jobs and still skips persist jobs.
+
+Tests:
+
+- `tests/tui_gateway/test_update_pause_killed_jobs.py`: `test_update_pause_records_killed_jobs_and_resume_note_lists_them`, `test_agent_close_still_kills_owned_jobs_and_skips_persist`, `test_lifecycle_kill_is_logged_with_session_process_and_source`, `test_operator_kill_is_not_a_lifecycle_log`.
+- `tests/tui_gateway/test_update_pause_failures.py`: `test_write_failure_does_not_kill_or_release`, `test_kill_failure_refuses_pause_and_retains_intent`, `test_receipt_and_normal_notice_are_redacted_and_name_update`, `test_retry_marker_retains_interruption_receipts`, `test_write_after_signal_failure_leaves_uncertain_receipt`.
+
+A live scheduler submitting a real background job, and a real drain window, are untested in this patch. The tests drive the registry and the marker directly.

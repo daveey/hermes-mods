@@ -1,0 +1,167 @@
+From 85fbaa93b5035c1c1d6b060aadc893dc502a103a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:34:36 +0000
+Subject: [PATCH] fix(kanban): a human wait never passes as kind=external
+ because its ref has a number [daveey]
+
+A ticket number or URL in an external ref excuses an agent wall only. A human
+wait is refused whatever the ref. An inferred producer card excuses a human
+wait only when that card is itself blocked with a visible ask, not when it is
+merely live.
+---
+ hermes_cli/kanban_awaiting.py            | 31 +++++++++--
+ tests/hermes_cli/test_kanban_awaiting.py | 70 ++++++++++++++++++++++++
+ 2 files changed, 95 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 2b03579cf99..969509d2835 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -69,10 +69,12 @@ _REMOTE_CONFIRMED: dict[tuple[str, str], tuple[float, str]] = {}
+ 
+ # Shapes from the 10-26/27 replays (session-idle-check HIDDEN_ASK / AGENT_WALL), narrowed so ordinary
+ # vendor/HTTP prose ("403 Forbidden", "AWS support to grant the quota") is not an agent wall.
++# 10-28: also the merge queue's own wording ("needs daveey's approving review (or his OK on Discord...)").
+ HIDDEN_ASK = re.compile(
+-    r"\b(?:david|the user|a human)\b(?:['\u2019]s)?\W+(?:\w+\W+){0,6}?(?:decision|approval|answer|reply|confirmation|"
+-    r"go-ahead|sign-?off)\b|\bdon['\u2019]?t re-?ask\b|\balready asked (?:him|david|in chat)\b|"
+-    r"\bwaiting (?:on|for) (?:david|the user|a human)\b", re.IGNORECASE)
++    r"\b(?:david|daveey|the user|a human)\b(?:['\u2019]s)?\W+(?:\w+\W+){0,6}?(?:decision|approval|approving review|"
++    r"answer|reply|confirmation|go-ahead|sign-?off)\b|\bhis ok\b|\bdon['\u2019]?t re-?ask\b|"
++    r"\balready asked (?:him|david|daveey|in chat)\b|"
++    r"\bwaiting (?:on|for) (?:david|daveey|the user|a human)\b", re.IGNORECASE)
+ AGENT_WALL = re.compile(
+     r"\bdenied\b|\bunauthorizedoperation\b|\baccess ?denied|\bnot authori[sz]ed to perform\b|"
+     r"\b(?:missing|needs?|lacks?|without|insufficient)\s+(?:the\s+|a\s+)?(?:[\w:.*/-]+\s+){0,2}permissions?\b|"
+@@ -382,7 +384,10 @@ def _check_external(conn, task_id, awaiting, text) -> None:
+     if not awaiting.get("ref") or not awaiting.get("why"):
+         raise AwaitingError(INVALID_AWAITING, "awaiting kind='external' needs ref=<vendor or ticket> and why=<evidence>")
+     wall = text_wall(text)
+-    if wall and not _TICKET.search(awaiting["ref"]):
++    # A vendor ticket/URL in the ref names who clears an agent-looking wall (AWS support grants the
++    # quota). It never excuses a human wait: a numbered ref is not a vendor ticket.
++    # The ticket exemption covers agent walls only.
++    if wall and (wall[0] == HUMAN_WAIT or not _TICKET.search(awaiting["ref"])):
+         raise wall_error(task_id, wall, text)
+ 
+ 
+@@ -442,7 +447,14 @@ def human_error(task_id: str, text: str) -> AwaitingError:
+     return AwaitingError(HUMAN_WAIT, (
+         "a wait on a human is not a park: nobody sees a scheduled card. Make it a visible ask with "
+         "kanban_block(kind='needs_input', human_request={action, why_human, interaction, scope, evidence}), "
+-        "or drop the dependency on David if the agent can proceed."))
++        "or drop the dependency on David if the agent can proceed. If the ask already exists elsewhere (a "
++        "pending approval already delivered to Discord, Slack or an inbox, a PR review request), still block "
++        "this card that way so the board shows the wait on David: name that approval/PR in action and put a "
++        "`Checked: <command> - <its pending state>` line in evidence. ask-gate's "
++        "approval_reconciliation.preflight reads the approval store through the adapter registered for it (if "
++        "any): pending lets the block through as the visible wait (the block files no new approval request), "
++        "approved means reuse the "
++        "recorded approval, denied means stop. Never file a second approval request for the same scope."))
+ 
+ 
+ def wall_error(task_id: str, wall: tuple[str, str], text: str, *, named: Optional[str] = None) -> AwaitingError:
+@@ -478,6 +490,12 @@ def _live_card_ref(conn: sqlite3.Connection, task_id: str, text: str) -> Optiona
+     return None
+ 
+ 
++def _carries_visible_ask(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when the card is itself blocked on a human with a visible ask (human_request or needs_input)."""
++    row = conn.execute("SELECT status, human_request, block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return bool(row) and row[0] in ("blocked", "triage") and (bool(row[1]) or row[2] == "needs_input")
++
++
+ def _short_continue(op: str, wake_in: Optional[int]) -> bool:
+     return op == "continue" and (wake_in or 0) <= CONTINUE_TEXT_GUARD_SECONDS
+ 
+@@ -515,7 +533,8 @@ def _infer(conn, task_id, *, reason, wake_check, clock_only, op, wake_in) -> dic
+     if not short:
+         wall = text_wall(text)
+         # A visible ask on the card waited on is not hidden; an agent wall needs a DECLARED owner card.
+-        if wall and not (wall[0] == HUMAN_WAIT and producer):
++        # A merely live card (running, scheduled) does not carry David's ask, so it excuses nothing.
++        if wall and not (wall[0] == HUMAN_WAIT and producer and _carries_visible_ask(conn, producer)):
+             raise wall_error(task_id, wall, text, named=producer)
+     if producer:
+         return {"kind": "card", "ref": producer, "inferred": True}
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+index 5b50a97a15d..02122c547d5 100644
+--- a/tests/hermes_cli/test_kanban_awaiting.py
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -648,3 +648,73 @@ def test_mutual_card_wait_is_refused(kanban_home, monkeypatch) -> None:
+         assert "cycles" in (out.get("error") or "")
+         assert kb.get_task(conn, a).status == "running"
+ 
++
++
++# A human wait must not pass as kind='external' because its ref carries a number.
++
++P4B_AWAITING = {"kind": "external", "ref": "PR 1777 approval",
++                "why": "merge policy red tier needs David's approval on head 46754d080"}
++MERGE_QUEUE_WHY = ("needs daveey's approving review (or his OK on Discord, Slack or the Inbox) "
++                   "before the red tier merges")
++
++
++@pytest.mark.parametrize("awaiting", [
++    P4B_AWAITING,
++    {"kind": "external", "ref": "https://github.com/o/r/pull/1777", "why": MERGE_QUEUE_WHY},
++])
++def test_external_park_naming_a_human_wait_is_refused_whatever_the_ref(kanban_home, monkeypatch,
++                                                                        awaiting) -> None:
++    """A numbered ref must not let a human wait through as kind=external."""
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "Upkeep P4b: waiting for the PR to merge.",
++                                 "wake_check": "gh pr view 1777 --json state | grep -q MERGED",
++                                 "awaiting": awaiting})
++        assert kaw.HUMAN_WAIT in out.get("error", ""), out
++        assert "needs_input" in out["error"] and "approval_reconciliation" in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++@pytest.mark.parametrize("awaiting", [
++    {"kind": "external", "ref": "AWS support case 4711", "why": "AWS support to grant the quota increase"},
++    {"kind": "external", "ref": "https://status.example.com/incidents/123",
++     "why": "upstream API returns 403 Forbidden while their maintenance runs"},
++])
++def test_external_park_on_a_vendor_ticket_still_parks(kanban_home, monkeypatch, awaiting) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "Waiting on the vendor.", "clock_only": True, "awaiting": awaiting})
++        assert out.get("status") == "scheduled", out
++
++
++def test_vendor_ticket_ref_still_excuses_an_agent_wall_why(kanban_home, monkeypatch) -> None:
++    """The ticket exemption keeps covering agent walls: a vendor holds the grant, not an agent."""
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "Waiting on the vendor.", "clock_only": True, "awaiting": {
++            "kind": "external", "ref": "Vendor ticket 55821",
++            "why": "their tenant lacks the role our integration needs; they apply it"}})
++        assert out.get("status") == "scheduled", out
++
++
++@pytest.mark.parametrize("text", [
++    MERGE_QUEUE_WHY,
++    "PR 1777 needs daveey's approving review",
++    "parked until his OK on Discord",
++    "waiting on daveey to merge",
++])
++def test_merge_queue_wording_is_a_human_wait(text) -> None:
++    assert kaw.text_wall(text)[0] == kaw.HUMAN_WAIT
++
++
++def test_inferred_wait_on_a_running_card_does_not_excuse_a_human_wait(kanban_home, monkeypatch) -> None:
++    """Only a producer card that carries the visible ask excuses a human wait named in prose."""
++    with kbc.connect_closing() as conn:
++        other, tid = _running(conn), _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": f"Waiting on David's approval; {other} merges after.",
++                                 "wake_check": f"hermes kanban wait-check task {other}"})
++        assert kaw.HUMAN_WAIT in out.get("error", ""), out
+-- 
+2.55.0
+

@@ -1,0 +1,434 @@
+From 44f3ca1e39d1ca87ad816bbe22499b07569a976b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:01:46 +0000
+Subject: [PATCH] fix(kanban): release legacy goal completions, long receipts
+ and archives at the origin [daveey]
+
+- Goal cards completed before the board's first goal_verified receipt are owner-verified on basis
+  legacy_completed (closing run + local-only contract; completed event bound to that run when the board
+  still has it). Receipt-era cards without a receipt stay unverified; boards with no receipt get no pass.
+- Receipt evidence is compared with the closing run's full handoff when the completed event only kept its
+  first line (400 chars): 13 of 15 hub receipts could never verify before.
+- An owner-observed archive without a verified completion closes the origin obligation as
+  closed_uncompleted (not unfinished, never released/completed), in the ledger and the replica link reader.
+---
+ hermes_cli/kanban_origin_ledger.py            |  73 ++++++-
+ hermes_cli/kanban_session_activity.py         |  12 +-
+ .../hermes_cli/test_kanban_origin_evidence.py |  11 +-
+ .../test_kanban_origin_legacy_release.py      | 205 ++++++++++++++++++
+ 4 files changed, 288 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_legacy_release.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 12e91d0a1e4..6ceaeef15e8 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import os
+ import re
+ import sqlite3
+ from contextlib import closing, contextmanager
+@@ -137,7 +138,7 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+         "SELECT id,run_id,created_at,payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+         (task['id'],)).fetchone()
+     run = conn.execute(
+-        "SELECT id,status,outcome,ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++        "SELECT id,status,outcome,ended_at,summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+         (task['id'],)).fetchone()
+     terminal = row[0] == 'done'
+     if row[0] == 'archived' and event:
+@@ -169,29 +170,81 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+             "SELECT payload,run_id FROM task_events WHERE id=? AND task_id=? AND kind='goal_verified' AND id<?",
+             (receipt_id, task['id'], event[0])).fetchone() if type(receipt_id) is int else None
+         if receipt and receipt[1] is not None and receipt[1] == event[1]:
++            from hermes_cli.kanban_db import _first_line
+             from hermes_cli.kanban_goal_receipt import digest
+             proof = json.loads(receipt[0] or '{}')
+             subject = proof.get('subject') if isinstance(proof, dict) else None
+             current = conn.execute('SELECT title,body FROM tasks WHERE id=?', (task['id'],)).fetchone()
++            recorded = (completed.get('summary') or completed.get('result') or '').strip()
++            judged = subject.get('evidence') if isinstance(subject, dict) else None
++            # [daveey] The completed event keeps only the handoff's first line (400 chars). A longer or multi-line
++            # handoff is bound through the closing run, which stores it whole, so it can still match the judged
++            # evidence; comparing against the event alone never released such a card.
++            evidence_ok = isinstance(judged, str) and (judged == recorded or (
++                _first_line(judged, 400) == recorded and run is not None and run[0] == event[1]
++                and judged == (run[4] or '').strip()))
+             goal_verified = bool(isinstance(subject, dict) and proof.get('snapshot') == digest(subject)
+                                  and subject.get('task_id') == task['id']
+                                  and subject.get('title') == current[0] and subject.get('body') == current[1]
+                                  and subject.get('contract') == row[4]
+-                                 and subject.get('evidence') == (completed.get('summary') or completed.get('result') or '').strip())
++                                 and evidence_ok)
++    run_closed = bool(run and run[1] in ('done', 'completed') and run[2] == 'completed'
++                      and row[1] is not None and run[3] is not None and run[3] >= row[1])
+     verified = bool(terminal and row[2] is None and goal_verified and contract_verified
+-                    and event and run and event[1] == run[0] and run[1] in ('done', 'completed') and run[2] == 'completed'
+-                    and row[1] is not None and event[2] >= row[1] and run[3] is not None and run[3] >= row[1])
++                    and event and run_closed and event[1] == run[0] and event[2] >= row[1])
++    legacy = False
++    if not verified and row[2] is None and run_closed and (event or row[0] == 'done'):
++        # [daveey] Completed before this board's first judge receipt: no receipt could exist then, and holding the
++        # card ``unknown`` forever left every origin session waiting on work nobody will produce. A completion
++        # event (when the board still has it) must be the one that closed this run; a board whose completion
++        # events were lost keeps only the closing run, which ``complete_task`` writes in the same transaction.
++        # Receipt-era cards and boards that never recorded a receipt get no legacy pass.
++        epoch = _receipt_epoch(conn)
++        if epoch is not None:
++            if event:
++                legacy = bool(terminal and event[0] < epoch[0] and event[1] == run[0] and event[2] >= row[1])
++                contract_ok = contract_verified
++            else:
++                legacy = row[1] < epoch[1]
++                contract_ok = row[4] == 'local-only'
++            legacy = bool(legacy and contract_ok)
++            verified = legacy
+     payload = {k: v for k, v in task.items() if k != 'origin_observation'}
+     if row[0] in ('scheduled', 'blocked'):
+         from hermes_cli.kanban_wait_replica import observe_wait
+         payload['wait_observation'] = observe_wait(conn, task['id'], now=now)
+     # No per-task timestamp: an unchanged task must publish an identical record, or every sync republishes
+     # every task. Owner liveness is the collector's per-scope heartbeat (``task_scopes[].observed_at``).
+-    return {**payload, 'origin_observation': {
++    observation = {
+         'schema': 1,
+         'task_hash': hashlib.sha256(_json(payload).encode()).hexdigest(),
+         'verified': verified,
+-    }}
++    }
++    if legacy:
++        observation['basis'] = 'legacy_completed'  # only here, so every other record publishes unchanged
++    return {**payload, 'origin_observation': observation}
++
++
++# db file:inode -> (id, created_at) of its first ``goal_verified`` event. Immutable once it exists: events are append-only.
++_receipt_epochs: dict[str, tuple[int, int]] = {}
++
++
++def _receipt_epoch(conn: sqlite3.Connection) -> tuple[int, int] | None:
++    """``(event id, created_at)`` of the board's first judge receipt, or None when it never recorded one. [daveey]"""
++    try:
++        path = next((f for _, name, f in conn.execute('PRAGMA database_list') if name == 'main'), '') or ''
++        main = f'{path}:{os.stat(path).st_ino}' if path else ''  # a swapped-in (recovered) file is a new board
++    except (OSError, sqlite3.Error):
++        main = ''
++    if main and main in _receipt_epochs:
++        return _receipt_epochs[main]
++    found = conn.execute(
++        "SELECT id,created_at FROM task_events WHERE kind='goal_verified' ORDER BY id LIMIT 1").fetchone()
++    if found is None or type(found[0]) is not int or type(found[1]) is not int:
++        return None
++    if main:
++        _receipt_epochs[main] = (found[0], found[1])
++    return found[0], found[1]
+ 
+ 
+ def _recent(observed_at: object, now: float, window: float = 180) -> bool:
+@@ -397,7 +450,10 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                 # terminal publication. Unknown status also remains unfinished.
+                 known = status in ('todo', 'ready', 'running', 'scheduled', 'review',
+                                    'blocked', 'triage', 'done', 'archived')
+-                if not current or not known or (status in ('done', 'archived') and not released):
++                # [daveey] A currently observed owner archive without a verified completion produces nothing: the
++                # card is closed, not completed. It neither waits nor counts as done, and never releases as done.
++                closed = bool(current and status == 'archived' and not released and _owner_evidence(task))
++                if not current or not known or (status in ('done', 'archived') and not released and not closed):
+                     status = 'unknown'
+                 result.append({
+                     **{k: task.get(k) for k in ('title', 'assignee', 'block_kind', 'created_at', 'started_at', 'priority')},
+@@ -407,7 +463,8 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     'origin_profile': origin['profile'], 'origin_gateway': origin['gateway'],
+                     'binding_id': binding['binding_id'], 'observation_version': version,
+                     'status': status, 'reported_status': task.get('status'),
+-                    'unfinished': not (current and released and status in ('done', 'archived')),
++                    'unfinished': not (current and (released or closed) and status in ('done', 'archived')),
++                    **({'closed_uncompleted': True} if closed else {}),
+                     'stale': not current, 'synced_at': last_ok,
+                     'remote': True, 'via': 'origin',
+                     'legacy_aliases': aliases_for_projection(alias_receipts.get(binding_hash(binding), []), binding),
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 38894a559be..8419f7a04e4 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -646,7 +646,9 @@ def _owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str |
+         return False
+     # A card bound through the origin ledger keeps the ledger's stricter release: its owner must
+     # have verified the completion (lifecycle event, run, contract and goal receipts), not just closed it.
+-    if task.get('origin_bindings') and evidence.get('verified') is not True:
++    # An archive is the exception: it produces nothing, so it closes the link without counting as completed
++    # (``closed_uncompleted`` on the row). [daveey]
++    if task.get('origin_bindings') and evidence.get('verified') is not True and task.get('status') != 'archived':
+         return False
+     beat = heartbeats.get((gw, owner_profile, board))
+     return beat is not None and 0 <= now - beat <= SCOPE_HEARTBEAT_FRESH_S
+@@ -889,6 +891,8 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+                 "ownership_state": 'unknown' if owner_profile is None else 'qualified',
+                 "unfinished": not closed and (t.get("status") in LISTED_STATUSES or bool(t.get("unfinished"))),
+                 "released": closed,
++                **({"closed_uncompleted": True} if closed and t.get("status") == "archived"
++                   and _owner_evidence_of(t).get("verified") is not True else {}),
+                 "reported_status": t.get('reported_status', t.get('status')),
+                 "synced_at": synced, "stale": stale,
+                 "legacy_record": legacy_records.get((gw, owner_profile, board, tid)),
+@@ -900,6 +904,12 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+     return list(found.values())
+ 
+ 
++def _owner_evidence_of(task: dict[str, Any]) -> dict[str, Any]:
++    """The hash-bound owner observation of a replica record, or {} (``kanban_origin_ledger._owner_evidence``)."""
++    from hermes_cli.kanban_origin_ledger import _owner_evidence
++    return _owner_evidence(task) if isinstance(task, dict) else {}
++
++
+ def _park_of(task: dict[str, Any]) -> dict[str, Any] | None:
+     """[daveey] The bounded run fields a replicated card's wait info needs (``kanban_wait_info.park_fields``)."""
+     try:
+diff --git a/tests/hermes_cli/test_kanban_origin_evidence.py b/tests/hermes_cli/test_kanban_origin_evidence.py
+index dab222dfe09..401dffd3f3e 100644
+--- a/tests/hermes_cli/test_kanban_origin_evidence.py
++++ b/tests/hermes_cli/test_kanban_origin_evidence.py
+@@ -79,12 +79,15 @@ def test_archive_releases_only_previously_verified_completion(world, board, comp
+         publish_observed(conn, replica, binding, version=4)
+     row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
+     assert row['reported_status'] == 'archived'
+-    assert row['unfinished'] is not completed
+-    assert row['status'] == ('archived' if completed else 'unknown')
++    # [daveey] An archive never waits: a verified completion releases it as done work, anything else is closed
++    # without counting as completed.
++    assert row['unfinished'] is False
++    assert row['status'] == 'archived'
++    assert row.get('closed_uncompleted', False) is not completed
+ 
+ 
+ @pytest.mark.parametrize('fault', ['reopened', 'legacy', 'null', 'malformed'])
+-def test_archive_without_current_completion_proof_stays_unknown(world, board, fault):
++def test_archive_without_current_completion_proof_is_closed_not_completed(world, board, fault):
+     path, replica, binding = world
+     with kbc.connect_closing() as conn:
+         tid = create_bound(conn, binding)
+@@ -99,7 +102,7 @@ def test_archive_without_current_completion_proof_stays_unknown(world, board, fa
+             conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='archived'", (payload, tid))
+         publish_observed(conn, replica, binding, version=4)
+     row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
+-    assert row['status'] == 'unknown' and row['unfinished']
++    assert row['status'] == 'archived' and not row['unfinished'] and row['closed_uncompleted'] is True
+ 
+ 
+ def test_current_owner_verified_completion_releases(world, board):
+diff --git a/tests/hermes_cli/test_kanban_origin_legacy_release.py b/tests/hermes_cli/test_kanban_origin_legacy_release.py
+new file mode 100644
+index 00000000000..961d5f2877b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_legacy_release.py
+@@ -0,0 +1,205 @@
++"""Goal cards closed before a board's first judge receipt, and archived cards, never wait forever. [daveey]
++
++A goal card completed before its board ever recorded a ``goal_verified`` receipt could not have one, so the owner
++attests it on basis ``legacy_completed``. Receipt-era goal cards without a receipt stay unverified. An archived card
++that was never completed produces nothing: the origin shows it closed, not waiting and not completed.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_cli.kanban_goal_receipt import GoalVerification
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414 -- pytest fixture registration
++from tests.hermes_cli.test_kanban_origin_evidence import create_bound, publish_observed
++from tests.hermes_cli.test_kanban_origin_ledger import world as world, accept  # noqa: PLC0414 -- pytest fixture registration
++
++
++def goal_card(conn, title='Build'):
++    tid = kb.create_task(conn, title=title, assignee='default', goal_mode=True, completion_contract='local-only')
++    claim(conn, tid)
++    return tid
++
++
++def claim(conn, tid):
++    """Start a real run, so completion closes it like a dispatched worker's would."""
++    assert kb.claim_task(conn, tid) is not None
++
++
++def complete(conn, tid, *, receipt=False):
++    proof = GoalVerification.for_handoff(kb.get_task(conn, tid), 'Tested') if receipt else None
++    assert kb.complete_task(conn, tid, summary='Tested', goal_verification=proof)
++
++
++def open_epoch(conn):
++    """The board's first judge receipt, one second after every earlier completion."""
++    tid = goal_card(conn, 'Receipt era starts')
++    complete(conn, tid, receipt=True)
++    conn.execute("UPDATE task_events SET created_at=created_at+1 WHERE kind='goal_verified'")
++    for column, table in (('created_at', 'task_events'), ('completed_at', 'tasks'), ('ended_at', 'task_runs')):
++        key = 'task_id' if table != 'tasks' else 'id'
++        conn.execute(f'UPDATE {table} SET {column}={column}+1 WHERE {key}=?', (tid,))
++    conn.commit()
++    return tid
++
++
++def observe(conn, tid):
++    conn.execute('BEGIN')
++    try:
++        status = conn.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()[0]
++        return ledger.observe_owner_task(conn, {'id': tid, 'status': status}, now=1000)['origin_observation']
++    finally:
++        conn.rollback()
++
++
++def drop_completed_event(conn, tid):
++    """History lost after completion (a recovered board): only the closing run remains."""
++    conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='completed'", (tid,))
++    conn.commit()
++
++
++def test_goal_card_completed_before_the_first_receipt_is_owner_verified(board):
++    with kbc.connect_closing() as conn:
++        legacy = goal_card(conn)
++        complete(conn, legacy)
++        open_epoch(conn)
++        evidence = observe(conn, legacy)
++    assert evidence['verified'] is True
++    assert evidence['basis'] == 'legacy_completed'
++
++
++def test_goal_card_without_receipt_after_the_epoch_stays_unverified(board):
++    with kbc.connect_closing() as conn:
++        open_epoch(conn)
++        late = goal_card(conn)
++        complete(conn, late)
++        evidence = observe(conn, late)
++    assert evidence['verified'] is False
++    assert 'basis' not in evidence
++
++
++def test_board_without_any_receipt_gets_no_legacy_pass(board):
++    with kbc.connect_closing() as conn:
++        legacy = goal_card(conn)
++        complete(conn, legacy)
++        evidence = observe(conn, legacy)
++    assert evidence['verified'] is False
++
++
++def test_receipt_verified_card_keeps_the_lifecycle_basis(board):
++    with kbc.connect_closing() as conn:
++        tid = open_epoch(conn)
++        evidence = observe(conn, tid)
++    assert evidence['verified'] is True
++    assert 'basis' not in evidence  # unchanged observations publish identical records
++
++
++@pytest.mark.parametrize('summary', ['x' * 750, 'Delivered.\n\nDetails line two', '  padded summary  '])
++def test_receipt_binds_the_full_handoff_not_the_events_first_line(board, summary):
++    """The completed event keeps only the summary's first line (400 chars); the receipt binds the whole handoff."""
++    with kbc.connect_closing() as conn:
++        tid = goal_card(conn)
++        proof = GoalVerification.for_handoff(kb.get_task(conn, tid), summary.strip())
++        assert kb.complete_task(conn, tid, summary=summary, goal_verification=proof)
++        assert observe(conn, tid)['verified'] is True
++        # A closing run whose handoff no longer matches the judged evidence is not proof.
++        conn.execute("UPDATE task_runs SET summary='different' WHERE task_id=?", (tid,))
++        conn.commit()
++        assert observe(conn, tid)['verified'] is (summary.strip() == kb._first_line(summary, 400))
++
++
++def test_legacy_card_whose_completed_event_was_lost_is_verified_by_its_closing_run(board):
++    with kbc.connect_closing() as conn:
++        goal, plain = goal_card(conn), kb.create_task(conn, title='Plain', assignee='default',
++                                                      completion_contract='local-only')
++        claim(conn, plain)
++        complete(conn, goal)
++        complete(conn, plain)
++        open_epoch(conn)
++        drop_completed_event(conn, goal)
++        drop_completed_event(conn, plain)
++        assert observe(conn, goal) == {**observe(conn, goal), 'verified': True, 'basis': 'legacy_completed'}
++        assert observe(conn, plain)['verified'] is True
++
++
++@pytest.mark.parametrize('fault', ['after_epoch', 'run_not_completed', 'no_epoch', 'pr_contract'])
++def test_lost_completed_event_needs_every_other_proof(board, fault):
++    with kbc.connect_closing() as conn:
++        if fault == 'after_epoch':
++            open_epoch(conn)
++        tid = goal_card(conn)
++        complete(conn, tid)
++        if fault not in ('after_epoch', 'no_epoch'):
++            open_epoch(conn)
++        else:  # completed after the first receipt (open_epoch moved it a second ahead)
++            conn.execute('UPDATE tasks SET completed_at=completed_at+2 WHERE id=?', (tid,))
++            conn.execute('UPDATE task_runs SET ended_at=ended_at+2 WHERE task_id=?', (tid,))
++        if fault == 'run_not_completed':
++            conn.execute("UPDATE task_runs SET outcome='crashed' WHERE task_id=?", (tid,))
++        if fault == 'pr_contract':
++            conn.execute("UPDATE tasks SET completion_contract='https://github.com/o/r/pull/1' WHERE id=?", (tid,))
++        drop_completed_event(conn, tid)
++        evidence = observe(conn, tid)
++    assert evidence['verified'] is False, fault
++
++
++def test_legacy_goal_card_releases_its_origin_obligation(world, board):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding, goal_mode=True)
++        claim(conn, tid)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        complete(conn, tid)
++        open_epoch(conn)
++        publish_observed(conn, replica, binding, version=4)
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
++    assert (row['status'], row['unfinished']) == ('done', False)
++
++
++@pytest.mark.parametrize('history', ['blocked', 'completed_unverified'])
++def test_archived_without_verified_completion_is_closed_not_waiting_nor_completed(world, board, history):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding, goal_mode=history == 'completed_unverified')
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        if history == 'blocked':
++            assert kb.block_task(conn, tid, reason='needs a decision')
++        else:
++            complete(conn, tid)
++        assert kb.archive_task(conn, tid)
++        publish_observed(conn, replica, binding, version=4)
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
++    assert row['reported_status'] == 'archived'
++    assert row['status'] == 'archived'
++    assert row['unfinished'] is False
++    assert row['closed_uncompleted'] is True
++    # Never completion: the ledger obligation itself stays unreleased.
++    assert ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]['unfinished']
++
++
++def test_archived_card_from_an_offline_owner_still_waits(world, board):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        assert kb.archive_task(conn, tid)
++        publish_observed(conn, replica, binding, version=4)
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=2000)[0]
++    assert (row['status'], row['unfinished']) == ('unknown', True)
++    assert 'closed_uncompleted' not in row
++
++
++def test_archived_replica_card_is_closed_in_the_link_reader(tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    from hermes_cli import kanban_session_activity as activity
++    from tests.hermes_cli.test_kanban_remote_terminal_release import NOW, card, observed, replica
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    record = observed(card('archived', origin_bindings=[{'b': 1}]))
++    rows = activity._read_remote_links(replica(tmp_path, [('default/default/t_1', record)]), now=NOW)
++    assert [(r['status'], r['unfinished'], r.get('closed_uncompleted')) for r in rows] == [('archived', False, True)]
++    assert [r for r in rows if activity._replica_bucket(r) is not None] == []
++    json.dumps(rows)
+-- 
+2.55.0
+
