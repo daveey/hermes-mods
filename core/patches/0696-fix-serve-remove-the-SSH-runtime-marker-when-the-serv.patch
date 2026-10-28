@@ -1,0 +1,206 @@
+From e4222cf97baf3c89000a3cc7d6163b5cbe604b35 Mon Sep 17 00:00:00 2001
+From: David Bloomin <452472+daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 10:59:43 +0000
+Subject: [PATCH] fix(serve): remove the SSH runtime marker when the serve
+ exits, prune markers of dead serves [daveey]
+
+The serve wrote .hermes-ssh-runtime-<nonce> into purelib and never removed it (13 piled up on
+the hub). Unlink this process's marker at lifespan shutdown and atexit, only while it still
+records this pid; at boot prune markers whose recorded pid is provably dead. Live, unreadable and
+malformed markers are left alone.
+---
+ hermes_cli/web_server.py                      | 64 ++++++++++++++
+ .../hermes_cli/test_ssh_ownership_endpoint.py | 83 +++++++++++++++++++
+ 2 files changed, 147 insertions(+)
+
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 62d81a7c37..dc5f2e0510 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -12,6 +12,7 @@ import asyncio
+ from collections import deque
+ import hmac
+ import logging
++import atexit
+ import os
+ import re
+ import secrets
+@@ -357,6 +358,7 @@ async def _lifespan(app: FastAPI):
+             shutdown_local_runtime()
+         except Exception:
+             pass
++        _release_ssh_runtime_marker()
+         if desktop_owned:
+             _terminate_desktop_managed_gateway()
+         eager_reconcile_thread.join()
+@@ -491,6 +493,63 @@ def _write_ssh_runtime_marker(marker: str) -> bool:
+         return False
+ 
+ 
++_SSH_RUNTIME_MARKER_NAME_RE = re.compile(r"\.hermes-ssh-runtime-[0-9a-f]{16}")
++_SSH_RUNTIME_ATEXIT_ARMED = False
++
++
++def _ssh_marker_pid(marker: str) -> Optional[int]:
++    """[daveey] The pid a marker file records (``pid=<n>``), None when unreadable or malformed."""
++    try:
++        with open(marker, "r", encoding="utf-8") as fh:
++            text = fh.read(64)
++    except (OSError, UnicodeDecodeError):
++        return None
++    m = re.fullmatch(r"pid=(\d+)\n?", text)
++    return int(m.group(1)) if m else None
++
++
++def _release_ssh_runtime_marker() -> None:
++    """[daveey] Unlink this process's marker on exit, only while it still records this pid, so a
++    marker rewritten by another serve (same nonce, new process) is never removed from under it."""
++    marker = _SSH_RUNTIME_MARKER
++    if marker is None or _ssh_marker_pid(marker) != os.getpid():
++        return
++    try:
++        os.unlink(marker)
++    except OSError:
++        pass
++
++
++def _prune_stale_ssh_runtime_markers(purelib: str) -> None:
++    """[daveey] Remove markers whose recorded pid is gone (a serve that died without cleanup, e.g.
++    SIGKILL). Conservative: a marker is kept unless its pid is parseable and provably dead, so a
++    live serve's marker, an unreadable one, and a permission-denied probe are all left alone."""
++    try:
++        names = os.listdir(purelib)
++    except OSError:
++        return
++    for name in names:
++        if not _SSH_RUNTIME_MARKER_NAME_RE.fullmatch(name):
++            continue
++        marker = os.path.join(purelib, name)
++        pid = _ssh_marker_pid(marker)
++        if pid is None or pid == os.getpid():
++            continue
++        try:
++            os.kill(pid, 0)
++        except ProcessLookupError:
++            pass
++        except OSError:
++            continue
++        else:
++            continue
++        if _ssh_marker_pid(marker) == pid:
++            try:
++                os.unlink(marker)
++            except OSError:
++                pass
++
++
+ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
+     global _SSH_OWNER_NONCE, _SSH_RUNTIME_PURELIB, _SSH_RUNTIME_MARKER, _SSH_RUNTIME_FINGERPRINT
+     _SSH_OWNER_NONCE = nonce
+@@ -509,7 +568,12 @@ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
+         # The marker name must stay in step with pm.store.RUNTIME_STATE_FILE_RE: PM digests skip
+         # exactly that shape, so an intact runtime holding markers is never "repaired" away.
+         marker = os.path.join(purelib, f".hermes-ssh-runtime-{nonce}")
++        _prune_stale_ssh_runtime_markers(purelib)
+         if _write_ssh_runtime_marker(marker):
++            global _SSH_RUNTIME_ATEXIT_ARMED
++            if not _SSH_RUNTIME_ATEXIT_ARMED:
++                _SSH_RUNTIME_ATEXIT_ARMED = True
++                atexit.register(_release_ssh_runtime_marker)
+             _SSH_RUNTIME_MARKER = marker
+             _SSH_RUNTIME_FINGERPRINT = _ssh_runtime_fingerprint(purelib)
+         # else: read-only site-packages — fall back to the stat snapshot
+diff --git a/tests/hermes_cli/test_ssh_ownership_endpoint.py b/tests/hermes_cli/test_ssh_ownership_endpoint.py
+index 9adc871c40..ade9916f1e 100644
+--- a/tests/hermes_cli/test_ssh_ownership_endpoint.py
++++ b/tests/hermes_cli/test_ssh_ownership_endpoint.py
+@@ -210,3 +210,86 @@ def test_ssh_ownership_endpoint_is_absent_without_owner_nonce(monkeypatch):
+         headers={"X-Hermes-Session-Token": token},
+     )
+     assert response.status_code == 404
++
++
++def _purelib_at(tmp_path, monkeypatch):
++    purelib = tmp_path / "venv" / "lib" / "site-packages"
++    purelib.mkdir(parents=True)
++    monkeypatch.setattr(
++        web_server,
++        "sysconfig",
++        types.SimpleNamespace(get_paths=lambda *a, **k: {"purelib": str(purelib)}),
++    )
++    return purelib
++
++
++def test_serve_that_exits_cleanly_leaves_no_runtime_marker(tmp_path):
++    """A real interpreter that boots as an SSH-isolated serve and exits normally (atexit path)."""
++    import subprocess
++    import sys
++    import textwrap
++
++    purelib = tmp_path / "site-packages"
++    purelib.mkdir()
++    script = textwrap.dedent(
++        f"""
++        import types
++        from hermes_cli import web_server
++        web_server.sysconfig = types.SimpleNamespace(
++            get_paths=lambda *a, **k: {{"purelib": {str(purelib)!r}}})
++        web_server._apply_ssh_owner_nonce("0123456789abcdef")
++        import os
++        assert os.path.exists({str(purelib / ".hermes-ssh-runtime-0123456789abcdef")!r})
++        """
++    )
++    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++    subprocess.run([sys.executable, "-c", script], cwd=repo, check=True, timeout=120)
++    assert list(purelib.iterdir()) == []
++
++
++def test_release_removes_own_marker_but_not_one_rewritten_by_another_process(tmp_path, monkeypatch):
++    purelib = _purelib_at(tmp_path, monkeypatch)
++    marker = purelib / ".hermes-ssh-runtime-0123456789abcdef"
++    web_server._apply_ssh_owner_nonce("0123456789abcdef")
++    try:
++        assert marker.exists()
++        marker.write_text(f"pid={os.getpid() + 1}\n")  # a successor serve reused the nonce
++        web_server._release_ssh_runtime_marker()
++        assert marker.exists()
++        marker.write_text(f"pid={os.getpid()}\n")
++        web_server._release_ssh_runtime_marker()
++        assert not marker.exists()
++    finally:
++        web_server._apply_ssh_owner_nonce(None)
++
++
++def test_prune_removes_dead_serve_markers_and_leaves_live_ones(tmp_path, monkeypatch):
++    import subprocess
++    import sys
++
++    purelib = _purelib_at(tmp_path, monkeypatch)
++    dead = subprocess.Popen([sys.executable, "-c", "pass"])
++    dead.wait()
++    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++    try:
++        stale = purelib / ".hermes-ssh-runtime-aaaaaaaaaaaaaaaa"
++        held = purelib / ".hermes-ssh-runtime-bbbbbbbbbbbbbbbb"
++        odd = purelib / ".hermes-ssh-runtime-cccccccccccccccc"
++        unrelated = purelib / ".hermes-ssh-runtime-notanonce"
++        stale.write_text(f"pid={dead.pid}\n")
++        held.write_text(f"pid={live.pid}\n")
++        odd.write_text("garbage")
++        unrelated.write_text(f"pid={dead.pid}\n")
++
++        web_server._apply_ssh_owner_nonce("0123456789abcdef")
++        try:
++            assert not stale.exists()
++            assert held.exists()
++            assert odd.exists()
++            assert unrelated.exists()
++            assert (purelib / ".hermes-ssh-runtime-0123456789abcdef").exists()
++        finally:
++            web_server._apply_ssh_owner_nonce(None)
++    finally:
++        live.kill()
++        live.wait()
+-- 
+2.55.0
+

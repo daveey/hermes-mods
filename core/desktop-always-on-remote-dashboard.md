@@ -1,7 +1,7 @@
 # Desktop: keep remote gateways warm (always-on dashboard, prewarm, probe skip)
 
 Patches **0526** (`4dbfb50490`), **0535** (`7c62393349`, named-profile prewarm), **0595** (`19c6caabe0`, retire on a
-replaced runtime) and **0671** (`8e6534e7ad`, no marker drift or retire loop). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
+replaced runtime) and **0671** (`8e6534e7ad`, no marker drift or retire loop) and **0696** (`e4222cf97b`, the serve unlinks its own `.hermes-ssh-runtime-<nonce>` marker at lifespan shutdown/atexit only while it still records its pid, and prunes markers of provably dead pids at boot; live or unreadable markers are kept). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
 
 ## Behavior
 
