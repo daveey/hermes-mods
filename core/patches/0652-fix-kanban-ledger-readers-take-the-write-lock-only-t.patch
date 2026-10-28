@@ -1,0 +1,234 @@
+From 599752f5c9b299dc9b7e9bfedf33a325de592115 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:17:20 -0700
+Subject: [PATCH] fix(kanban): ledger readers take the write lock only to
+ advance an observation; a busy refresh is not a stale replica [daveey]
+
+Every origin projection (Desktop backend, gateways, TUI) ran refresh_observations, which opened BEGIN IMMEDIATE
+unconditionally. Readers collided with each other; the loser's refresh raised "database is locked" and project()
+set fresh=False, so every hub row read stale/unknown for that poll (2 of 40 back-to-back projection pairs on the
+live ~/.hermes; sidebar badges flickered).
+
+- refresh_observations scans read-only first and takes the write lock only when some obligation's replica record
+  is newer (re-checked inside the transaction).
+- project() treats a busy/locked refresh as "not advanced": a row is still current only when the replica holds
+  exactly its stored version, so a row the refresh would have advanced reads not-current on its own. Other
+  errors keep marking the replica stale.
+- Contention test: with a held writer and nothing to advance the row is now current (advance=True unchanged:
+  stale/unknown). New: no write lock when nothing advances; two concurrent readers never see a stale row.
+
+Live: 120 projection pairs, 0 stale rows, 0 refresh errors (differences: synced_at from real hub pulls only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_origin_ledger.py            | 84 ++++++++++++++-----
+ ...est_kanban_origin_projection_contention.py | 61 +++++++++++++-
+ 2 files changed, 120 insertions(+), 25 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 382fc4d6e9..189690af16 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -214,12 +214,42 @@ def _owner_evidence(task: dict) -> dict:
+     return evidence
+ 
+ 
++def _advanced_observation(binding_raw: str, observed: int, source: sqlite3.Connection) -> tuple | None:
++    """``(task, version, released)`` when the replica holds a newer, exactly bound record for this obligation."""
++    binding = json.loads(binding_raw)
++    validate_binding(binding)
++    row = source.execute(
++        "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
++        (binding['owner']['gateway'], binding['task_record_key'])).fetchone()
++    if not row or type(row[0]) is not int or row[0] <= observed:
++        return None
++    task = json.loads(row[1])
++    owner = binding['owner']
++    if (not isinstance(task, dict)
++            or any(task.get(f) != owner[f] for f in ('gateway', 'profile', 'board'))
++            or task.get('id') != owner['task_id']):
++        return None
++    marker = {k: v for k, v in binding.items() if k != 'publication_version'}
++    markers = task.get('origin_bindings')
++    if not isinstance(markers, list) or marker not in [
++            {k: v for k, v in m.items() if k != 'publication_version'}
++            for m in markers if isinstance(m, dict)]:
++        return None
++    released = (task.get('status') in ('done', 'archived')
++                and _owner_evidence(task).get('verified') is True)
++    return task, row[0], released
++
++
+ def refresh_observations(path: Path, replica: Path, *, timeout: float = 5) -> None:
+     """Advance durable observations only from newer, exactly bound owner records.
+ 
+     Disappearance is not completion. Corrupt/unreadable stores raise to let callers
+     display unknown, rather than returning an empty successful projection. A newer
+     nonterminal publication reopens a previously released obligation.
++
++    [daveey] The write lock is taken only when some observation would advance: a read-only scan decides first.
++    Every projection in every process refreshes, so an unconditional ``BEGIN IMMEDIATE`` made readers collide with
++    each other, and the loser's projection went stale for a poll.
+     """
+     if not path.is_file() or not replica.is_file():
+         return
+@@ -227,38 +257,39 @@ def refresh_observations(path: Path, replica: Path, *, timeout: float = 5) -> No
+ 
+     source = _ro(replica)
+     try:
++        try:
++            with closing(_ro(path)) as ledger:
++                pending = any(
++                    _advanced_observation(raw, observed, source) is not None
++                    for raw, observed in ledger.execute(
++                        "SELECT binding_json,observation_version FROM origin_obligations").fetchall())
++        except sqlite3.OperationalError:
++            pending = True  # no table yet (or unreadable read-only): the locked path below decides
++        if not pending:
++            return
+         with _db(path, timeout=timeout) as conn, conn:
+             conn.execute("BEGIN IMMEDIATE")
+             for key, raw, observed in conn.execute(
+                     "SELECT binding_id,binding_json,observation_version FROM origin_obligations").fetchall():
+-                binding = json.loads(raw)
+-                validate_binding(binding)
+-                row = source.execute(
+-                    "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+-                    (binding['owner']['gateway'], binding['task_record_key'])).fetchone()
+-                if not row or type(row[0]) is not int or row[0] <= observed:
+-                    continue
+-                task = json.loads(row[1])
+-                owner = binding['owner']
+-                if (not isinstance(task, dict)
+-                        or any(task.get(f) != owner[f] for f in ('gateway', 'profile', 'board'))
+-                        or task.get('id') != owner['task_id']):
++                advanced = _advanced_observation(raw, observed, source)
++                if advanced is None:
+                     continue
+-                marker = {k: v for k, v in binding.items() if k != 'publication_version'}
+-                markers = task.get('origin_bindings')
+-                if not isinstance(markers, list) or marker not in [
+-                        {k: v for k, v in m.items() if k != 'publication_version'}
+-                        for m in markers if isinstance(m, dict)]:
+-                    continue
+-                released = (task.get('status') in ('done', 'archived')
+-                            and _owner_evidence(task).get('verified') is True)
++                task, version, released = advanced
+                 conn.execute(
+                     "UPDATE origin_obligations SET task_json=?,observation_version=?,released=? WHERE binding_id=?",
+-                    (_json(task), row[0], int(released), key))
++                    (_json(task), version, int(released), key))
+     finally:
+         source.close()
+ 
+ 
++def _lock_busy(exc: sqlite3.Error) -> bool:
++    code = getattr(exc, "sqlite_errorcode", None)
++    if code is not None:
++        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
++    text = str(exc).lower()
++    return "locked" in text or "busy" in text
++
++
+ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+             now: float | None = None) -> list[dict]:
+     """Owner-qualified receipt rows, including explicit unknown and released rows.
+@@ -284,8 +315,15 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+             meta = dict(source.execute("SELECT k,v FROM meta"))
+             last_ok = float(meta.get('last_ok') or 0)
+             # Inventory readers must not queue behind a receipt/sync writer.
+-            # Only a successful refresh can make these observations current.
+-            refresh_observations(path, replica, timeout=0)
++            try:
++                refresh_observations(path, replica, timeout=0)
++            except sqlite3.OperationalError as exc:
++                # [daveey] Another process holds the ledger's write lock (it is advancing these same
++                # observations). The stored ones are still evidence: below, a row is current only when the
++                # replica holds exactly its stored version, so a row this refresh would have advanced reads
++                # not-current on its own. Marking the whole replica stale here flickered every hub row.
++                if not _lock_busy(exc):
++                    raise
+             fresh = (0 <= now - last_ok <= 180 and not meta.get('offline_since'))
+     except (OSError, sqlite3.Error, ValueError, TypeError):
+         # A failed refresh never erases a receipt. Reading the ledger below
+diff --git a/tests/hermes_cli/test_kanban_origin_projection_contention.py b/tests/hermes_cli/test_kanban_origin_projection_contention.py
+index 90c38eeb2b..98e0b62e99 100644
+--- a/tests/hermes_cli/test_kanban_origin_projection_contention.py
++++ b/tests/hermes_cli/test_kanban_origin_projection_contention.py
+@@ -50,10 +50,16 @@ def test_projection_keeps_sync_timestamp_but_not_freshness_during_write_contenti
+         elapsed = time.monotonic() - start
+         assert elapsed < 2, f'projection queued behind a writer for {elapsed:.3f}s'
+         assert row['synced_at'] == 1000
+-        assert row['stale'] and row['unfinished']
+-        assert row['status'] == 'unknown'
++        assert row['unfinished']
+         assert row['reported_status'] == 'running'
+         assert row['observation_version'] == 3
++        if advance:
++            # The busy refresh could not record the newer publication: this row is behind the replica.
++            assert row['stale'] and row['status'] == 'unknown'
++        else:
++            # [daveey] Nothing to advance: the stored observation is exactly the replica's, so the held writer
++            # changes nothing. It used to mark every row stale (the sidebar's stale/unknown flicker).
++            assert not row['stale'] and row['status'] == 'running'
+ 
+     # Retry refreshes the durable observation, not the replica's sync timestamp.
+     row, = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
+@@ -62,3 +68,54 @@ def test_projection_keeps_sync_timestamp_but_not_freshness_during_write_contenti
+     assert row['unfinished']
+     assert row['status'] == row['reported_status'] == ('blocked' if advance else 'running')
+     assert row['observation_version'] == (4 if advance else 3)
++
++
++def _fresh_replica(world, last_ok):
++    path, replica, binding = world
++    publish(replica, binding)
++    accept(world)
++    with sqlite3.connect(replica) as db:
++        db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++        db.execute("INSERT INTO meta VALUES ('last_ok',?)", (str(last_ok),))
++        db.execute("INSERT INTO replica VALUES ('owner','gateway','info',5,?)",
++                   (json.dumps({'gateway': 'owner', 'task_scopes': [
++                       {'profile': 'work', 'board': 'build', 'state': 'ok', 'observed_at': last_ok}]}),))
++    return path, replica
++
++
++def test_a_projection_with_nothing_to_advance_takes_no_write_lock(world):
++    """[daveey] Readers stay readers: with every observation current, refresh never opens a write transaction."""
++    path, replica = _fresh_replica(world, 1000)
++    ledger.refresh_observations(path, replica)
++    with sqlite3.connect(path, timeout=0) as writer:
++        writer.execute('BEGIN IMMEDIATE')  # held for the whole call: any write attempt would raise "locked"
++        ledger.refresh_observations(path, replica, timeout=0)
++        row, = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++    assert not row['stale'] and row['status'] == 'running'
++
++
++def test_concurrent_readers_never_see_each_other_as_stale(world):
++    """[daveey] Two readers projecting at once (the Desktop backend and a gateway) used to make each other's
++    refresh fail with "database is locked", flipping every row stale for that poll."""
++    import threading
++
++    path, replica = _fresh_replica(world, 1000)
++    stale, errors = [], []
++    start = threading.Barrier(2)
++
++    def reader():
++        start.wait()
++        try:
++            for _ in range(150):
++                row, = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++                if row['stale'] or row['status'] != 'running':
++                    stale.append(row)
++        except Exception as exc:  # surfaced by the assertion below
++            errors.append(exc)
++
++    threads = [threading.Thread(target=reader) for _ in range(2)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert errors == [] and stale == []
+-- 
+2.55.0
+
