@@ -430,7 +430,15 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
             with text (or the cap). None when a request failed or the budget stopped it."""
             msgs, calls, text, cost = list(ep["messages"]), [], "", 0.0
             for step in range(MAX_STEPS):
-                got = budget.call(runner, {"messages": msgs, "tools": meta["tools"]}, home=root, cwd=cwd, model=model)
+                for attempt in range(3):  # a failed request (dropped or stalled stream) is retried as a new request
+                    try:
+                        got = budget.call(runner, {"messages": msgs, "tools": meta["tools"]}, home=root, cwd=cwd,
+                                          model=model)
+                        break
+                    except RuntimeError as exc:
+                        log(f"  {ep['id']}#{k} step {step}: {str(exc)[:160]}")
+                        if attempt == 2:
+                            raise
                 if got is None:
                     return None
                 text, usage = got

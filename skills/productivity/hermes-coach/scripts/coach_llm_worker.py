@@ -228,6 +228,20 @@ class CodexBackend:
             kw["max_output_tokens"] = max_tokens
         stream = self.client.responses.create(**kw)
         parts, done, chars, usage, stop, seen, calls = [], [], 0, {}, "end_turn", {}, []
+        # Wall-clock deadline: a stream can stay open on keep-alives with no content for 15+ minutes (seen on a
+        # bench-v3 rollout), which the per-read client timeout never trips. Closing it ends the iteration.
+        import threading
+        fired = []
+
+        def _expire():
+            fired.append(1)
+            try:
+                stream.close()
+            except Exception:
+                pass
+        timer = threading.Timer(float(os.environ.get("COACH_CODEX_DEADLINE_S") or 300), _expire)
+        timer.daemon = True
+        timer.start()
         try:
             for ev in stream:
                 t = _get(ev, "type", "")
@@ -268,13 +282,20 @@ class CodexBackend:
                 if chars > max_tokens * self.CHARS_PER_TOKEN:
                     stop = "max_tokens"
                     break
+        except Exception:
+            if fired:
+                raise RuntimeError("codex stream passed its wall-clock deadline (closed)")
+            raise
         finally:
+            timer.cancel()
             close = getattr(stream, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     pass
+        if fired and not usage:
+            raise RuntimeError("codex stream passed its wall-clock deadline (closed)")
         if not usage:  # closed early or no terminal frame: bill the cap, not zero
             usage = {"input_tokens": 0, "output_tokens": max_tokens if stop == "max_tokens" else chars // self.CHARS_PER_TOKEN,
                      "cache_write_tokens": 0, "cache_read_tokens": 0}
