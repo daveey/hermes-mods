@@ -133,6 +133,22 @@ def test_complete_allowed_with_linked_followup(board):
     assert plugin.classify("kanban_complete", {"summary": summary}, OWN, paths) is None
 
 
+def test_complete_allowed_with_16_hex_followup_id(board):
+    """Board ids are 16 hex now (t_01a180e6df026f02). The 8-hex-only id regex never matched them, so a correctly
+    created and linked follow-up was refused (self-heal card t_01a180b0887f570c, 2026-10-28)."""
+    fu = "t_01a180e6df026f02"
+    paths = board(tasks=[(OWN, "x", "running"), (fu, "verify live", "todo")], created_by=[(fu, OWN)])
+    summary = "Fixed it. The rental and teardown proof is follow-up card t_01a180e6df026f02."
+    assert plugin.classify("kanban_complete", {"summary": summary}, OWN, paths) is None
+
+
+def test_complete_refused_when_16_hex_card_is_unrelated(board):
+    other = "t_01a180e6df026fff"
+    paths = board(tasks=[(OWN, "x", "running"), (other, "unrelated", "todo")])
+    why = plugin.classify("kanban_complete", {"summary": f"I could not run it; see {other}."}, OWN, paths)
+    assert why and other in why
+
+
 def test_complete_refused_when_named_card_is_unrelated(board):
     paths = board(tasks=[(OWN, "x", "running"), ("t_cccccccc", "other work", "ready")])
     why = plugin.classify("kanban_complete", {"summary": "I could not run it; see t_cccccccc."}, OWN, paths)
@@ -206,6 +222,11 @@ def test_edit_own_via_execute_code_refused(board):
     code = ("from hermes_tools import terminal\n"
             f"terminal(\"hermes kanban edit {OWN} --body 'dropped the iMac run'\")\n")
     assert "Don't narrow" in plugin.classify("execute_code", {"code": code}, OWN, paths)
+
+
+def test_python_edit_regex_captures_whole_16_hex_id():
+    m = core._PY_EDIT_RE.search("hermes kanban edit t_01a180b0887f570c --title narrowed")
+    assert m and m.group(1) == "t_01a180b0887f570c"  # an 8-hex prefix never equals the own id: edit slipped through
 
 
 def test_complete_via_execute_code_refused(board):

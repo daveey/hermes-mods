@@ -12,7 +12,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")  # legacy 8-hex and current 16-hex board ids
 
 # Each pattern names a way a handoff admits part of the card's work was not done. Matched per sentence against the
 # completion summary (and the card title, see TITLE_KINDS). Keep these narrow: every false hit refuses a real
@@ -483,7 +483,7 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
     return None
 
 
-_PY_EDIT_RE = re.compile(r"kanban\s+edit\s+[\"']?(t_[0-9a-f]{8}|\$\{?HERMES_KANBAN_TASK\}?)[\"']?[^\n]*?--(?:title|body)\b")
+_PY_EDIT_RE = re.compile(r"kanban\s+edit\s+[\"']?(t_[0-9a-f]{8}(?:[0-9a-f]{8})?|\$\{?HERMES_KANBAN_TASK\}?)[\"']?[^\n]*?--(?:title|body)\b")
 
 
 def check_python(code: str, own: str, paths_fn) -> Optional[str]:
