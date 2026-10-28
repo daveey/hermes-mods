@@ -12,12 +12,18 @@ home (``~/.hermes``, ``$HERMES_HOME``), outside scratch, cache, archive and back
   last few hours (a ``<db>.corrupt.*.bak`` sibling). Reads, ``-readonly`` and ``mode=ro``/``immutable=1``
   URIs pass; plain DML into a healthy board passes (SQLite locks it correctly).
 
-Swapping a recovered copy in goes through ``swap_db.py`` next to this file, which takes a per-database
-recovery lock, refuses while any process holds the file, checks the replacement and keeps the originals.
+A damaged Kanban board is rebuilt with ``hermes kanban [--board <slug>] recover``: it holds the board's
+recovery lock, installs in place through the SQLite backup API (no rename under open WAL connections) and
+writes a loss report. The refusal names that command and, while a recovery runs, its holder (pid, session,
+card from ``<db>.recover.pid``). Other databases' recovered copies go in through ``swap_db.py`` next to this
+file (same lock; it refuses Kanban boards unless an operator passes ``--allow-kanban``). Every refusal is
+appended to ``<home>/logs/sqlite-live-guard.log`` (JSON lines; ``HERMES_SQLITE_GUARD_LOG`` overrides).
 """
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 import re
 import shlex
@@ -29,6 +35,7 @@ HELPER = Path(__file__).resolve().parent / "swap_db.py"
 HELPER_DISPLAY = str(HELPER).replace(str(Path.home()), "~")
 
 DISABLE_ENV = "HERMES_SQLITE_GUARD"  # "off" disables (an operator-approved, single-owner recovery only)
+LOG_ENV = "HERMES_SQLITE_GUARD_LOG"
 
 _LIVE_NAME = re.compile(r"\.db(?:-wal|-shm|-journal)?$")
 # Paths under the Hermes home that never hold a live database.
@@ -208,11 +215,16 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[s
         else:
             sql.append(a)
         i += 1
+    text = "\n".join(sql)
+    for stmt in _statements(text):  # `.backup [schema] FILE` / `.save FILE` write FILE, whatever db is open
+        m = re.match(r"\s*\.(?:backup|save)\s+(?:(?!-)\S+\s+)?(?P<t>\S+)\s*$", stmt)
+        target = m.group("t").strip("'\"") if m else ""
+        if target and is_live(target, in_home):
+            return f"`sqlite3 .backup/.save` would overwrite live database file {target}"
     if db is None or not is_live(db, in_home):
         return None
     if readonly or re.search(r"[?&](?:mode=ro|immutable=1)", db):
         return None
-    text = "\n".join(sql)
     kind = _sql_kind(text) or ("write" if fed and not text else None)
     if kind == "maintenance":
         return f"`sqlite3` would run maintenance (REINDEX/VACUUM/checkpoint/journal pragma) on live database {db}"
@@ -222,6 +234,45 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[s
         if bak:
             return (f"`sqlite3` would write to live database {db}, which was quarantined as corrupt "
                     f"recently ({bak}); writes into a damaged b-tree spread the damage")
+    return None
+
+
+def _dir_like(path: str) -> bool:
+    if path.endswith("/"):
+        return True
+    full = _expand(path).rstrip("/")
+    if full == _home().rstrip("/") or _HOME_PREFIX.sub("", path) == "" or re.fullmatch(
+            r"(?:~|\$\{?HOME\}?|/home/[^/]+|/Users/[^/]+|/root)/\.hermes/?|\$\{?HERMES_HOME\}?/?", path):
+        return True
+    if re.search(r"/kanban/boards/[^/]+/?$", path):
+        return True
+    try:
+        return os.path.isdir(full)
+    except OSError:
+        return False
+
+
+def _into_directory(args: list[str], ops: list[str], in_home: bool) -> Optional[str]:
+    """``mv|cp|rsync|install SRC... DIR`` (or ``-t DIR`` / ``--target-directory=DIR``): the file lands at
+    DIR/basename(SRC). Returns that live path, if any."""
+    tdir = None
+    for i, a in enumerate(args):
+        if a in ("-t", "--target-directory") and i + 1 < len(args):
+            tdir = args[i + 1]
+        elif a.startswith("--target-directory="):
+            tdir = a.split("=", 1)[1]
+    if tdir is not None:
+        srcs = [o for o in ops if o != tdir]
+    elif len(ops) >= 2:
+        tdir, srcs = ops[-1], ops[:-1]
+    else:
+        return None
+    if not _dir_like(tdir):
+        return None
+    for src in srcs:
+        cand = tdir.rstrip("/") + "/" + src.rstrip("/").rsplit("/", 1)[-1]
+        if is_live(cand, in_home):
+            return cand
     return None
 
 
@@ -248,6 +299,19 @@ def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
         elif word in ("cp", "install", "rsync", "ln", "sqlite3_rsync"):
             if ops and is_live(ops[-1], in_home):
                 return f"`{word}` would overwrite live database file {ops[-1]}"
+        if word in ("mv", "cp", "install", "rsync", "ln"):
+            hit = _into_directory(args, ops, in_home)
+            if hit:
+                return f"`{word}` would put a file over live database file {hit}"
+        if word == "tee":
+            hit = next((o for o in ops if is_live(o, in_home)), None)
+            if hit:
+                return f"`tee` would overwrite live database file {hit}"
+        elif re.fullmatch(r"python(?:3(?:\.\d+)?)?", word) and "-c" in args:
+            i = args.index("-c")
+            why = check_python(args[i + 1]) if i + 1 < len(args) else None
+            if why:
+                return why
         elif word == "dd":
             hit = next((a[3:] for a in args if a.startswith("of=") and is_live(a[3:], in_home)), None)
             if hit:
@@ -271,6 +335,94 @@ _PY_DESTRUCTIVE = (
     re.compile(r"\bopen\s*\(\s*" + _Q + r"\s*,\s*[\"'][wa+]"),
 )
 _PY_STR = re.compile(r"""(?P<q>["'])(?P<s>[^"'\n]{1,400})(?P=q)""")
+# Board files built from a home-derived path (``home / 'kanban.db'``, ``os.path.join(home, 'kanban.db')``,
+# ``kb.kanban_db_path()``) are found with an AST walk, so code that merely prints such text is not a hit.
+_BOARD_FILE = re.compile(r"^kanban\.db(?:-wal|-shm|-journal)?$")
+_HOME_HINT = re.compile(r"\.hermes\b|HERMES_HOME|hermes_home|get_hermes_home|kanban_home|kanban_db_path")
+_TMP_HINT = re.compile(r"tmp|temp|scratch|fixture|cache", re.I)
+_PY_MOVE_FUNCS = {("os", "rename"), ("os", "replace"), ("shutil", "move"), ("shutil", "copy"), ("shutil", "copy2"),
+                  ("shutil", "copyfile")}
+_PY_DELETE_FUNCS = {("os", "remove"), ("os", "unlink"), ("os", "truncate")}
+
+
+def _py_assignments(tree: ast.AST) -> dict[str, ast.AST]:
+    out: dict[str, ast.AST] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            out[node.targets[0].id] = node.value
+    return out
+
+
+def _py_src(node: ast.AST, names: dict, depth: int = 0) -> str:
+    """Source text of an expression with simple variable assignments inlined (to judge home vs tmp)."""
+    try:
+        text = ast.unparse(node)
+    except Exception:
+        return ""
+    if depth < 3:
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id in names:
+                text += " " + _py_src(names[n.id], names, depth + 1)
+    return text
+
+
+def _py_board(node: Optional[ast.AST], names: dict, depth: int = 0) -> Optional[str]:
+    """The live board file an expression names, or None."""
+    if node is None or depth > 4:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value if is_live(_expand(node.value)) else None
+    if isinstance(node, ast.Name) and node.id in names:
+        return _py_board(names[node.id], names, depth + 1)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        right = node.right
+        if isinstance(right, ast.Constant) and isinstance(right.value, str) and _BOARD_FILE.match(right.value):
+            base = _py_src(node.left, names)
+            if _HOME_HINT.search(base) and not _TMP_HINT.search(base):
+                return right.value
+        return None
+    if isinstance(node, ast.Call):
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
+        if name == "kanban_db_path":
+            return "kanban.db"
+        if name == "join" and node.args:
+            last = node.args[-1]
+            if isinstance(last, ast.Constant) and isinstance(last.value, str) and _BOARD_FILE.match(last.value):
+                base = " ".join(_py_src(a, names) for a in node.args[:-1])
+                if _HOME_HINT.search(base) and not _TMP_HINT.search(base):
+                    return last.value
+        if name in ("str", "Path", "PurePath", "fspath", "expanduser", "resolve", "absolute") and node.args:
+            return _py_board(node.args[0], names, depth + 1)
+        if name in ("expanduser", "resolve", "absolute") and isinstance(fn, ast.Attribute):
+            return _py_board(fn.value, names, depth + 1)
+    return None
+
+
+def _check_python_ast(code: str) -> Optional[str]:
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return None
+    names = _py_assignments(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        fn = node.func
+        mod = fn.value.id if isinstance(fn.value, ast.Name) else ""
+        target = None
+        if (mod, fn.attr) in _PY_MOVE_FUNCS and len(node.args) >= 2:
+            target = node.args[1]
+        elif (mod, fn.attr) in _PY_DELETE_FUNCS and node.args:
+            target = node.args[0]
+        elif fn.attr in ("replace", "rename") and len(node.args) == 1 and not node.keywords:
+            target = node.args[0]  # Path(x).replace(dst); str.replace takes two arguments
+        elif fn.attr in ("unlink", "write_bytes", "write_text", "touch") and mod not in ("os", "shutil"):
+            target = fn.value  # (home / 'kanban.db-wal').unlink()
+        hit = _py_board(target, names)
+        if hit:
+            return f"Python file operations on live database file {hit} ({ast.unparse(node)[:160]})"
+    return None
 
 
 def check_python(code: str) -> Optional[str]:
@@ -287,6 +439,9 @@ def check_python(code: str) -> Optional[str]:
             hit = next((c for c in cands if is_live(_expand(c))), None)
             if hit:
                 return f"Python file operations on live database file {hit}"
+    why = _check_python_ast(code)
+    if why:
+        return why
     for lit in (m.group("s") for m in _PY_STR.finditer(code)):  # os.system("rm ...") / shell=True strings
         if " " in lit:
             why = check_shell(lit)
@@ -295,17 +450,136 @@ def check_python(code: str) -> Optional[str]:
     return None
 
 
+_BOARD_IN_WHY = re.compile(r"(?:^|(?<=[\s`'\"(]))(?P<p>(?:[^\s`'\"()]*/)?kanban\.db)(?:-wal|-shm|-journal)?(?![\w.])")
+
+
+def kanban_board(why: str) -> Optional[tuple[str, Path]]:
+    """``(slug, db_path)`` of the Kanban board a refusal is about, or None for any other database.
+    ``<home>/kanban.db`` (or a bare relative ``kanban.db``) is ``default``; ``<home>/kanban/boards/<slug>/kanban.db``
+    is ``<slug>``; any other ``.../kanban.db`` (a profile's own home) is ``""`` with its own path."""
+    m = _BOARD_IN_WHY.search(why or "")
+    if not m:
+        return None
+    raw = m.group("p")
+    home = Path(_home())
+    if raw == "kanban.db":
+        return "default", home / "kanban.db"
+    full = Path(_expand(raw))
+    if full == home / "kanban.db":
+        return "default", full
+    if full.parent.parent == home / "kanban" / "boards":
+        return full.parent.name, full
+    return "", full
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def recovery_holder(db: Path) -> Optional[dict]:
+    """The live holder of ``<db>.recovery.lock`` as recorded in ``<db>.recover.pid`` by ``hermes kanban
+    recover`` / ``swap_db.py`` (``{pid, session_id, task_id, started_at}``), or None. Read-only: probing the
+    flock itself could make a recovery that starts at that instant report busy."""
+    try:
+        raw = db.with_name(db.name + ".recover.pid").read_text().strip()
+    except OSError:
+        return None
+    try:
+        info = json.loads(raw)
+    except ValueError:
+        info = {"pid": raw}
+    if not isinstance(info, dict):
+        info = {"pid": info}
+    try:
+        info["pid"] = int(info.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    if not _pid_alive(info["pid"]):
+        return None
+    if info.get("proc_start") and proc_start(info["pid"]) not in (None, str(info["proc_start"])):
+        return None  # the recorded process died and its pid was reused
+    return info
+
+
+def proc_start(pid: int) -> Optional[str]:
+    """Linux process start time in clock ticks (/proc/<pid>/stat field 22); tells a reused pid apart."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def describe_holder(info: dict) -> str:
+    parts = [f"pid {info['pid']}"]
+    if info.get("session_id"):
+        parts.append(f"session {info['session_id']}")
+    if info.get("task_id"):
+        parts.append(f"card {info['task_id']}")
+    return ", ".join(parts)
+
+
+def recover_command(slug: str, db: Optional[Path] = None) -> str:
+    if slug == "default":
+        return "hermes kanban recover"
+    if slug:
+        return f"hermes kanban --board {slug} recover"
+    home = str(db.parent if db else "<home>").replace(str(Path.home()), "~")
+    return f"HERMES_HOME={home} hermes kanban recover"
+
+
 def message(why: str) -> str:
-    return (
+    head = (
         f"SQLITE LIVE GUARD: blocked: {why}. Another process may have this database open; deleting its "
         "-wal/-shm or swapping the file under it splits writers across WAL views and corrupts the board on the "
         "next checkpoint (hub incident: default kanban.db, 2026-10-28). Read with `sqlite3 -readonly` or a "
-        "`file:...?immutable=1` copy; change Kanban data through the kanban tools or `hermes kanban` (repair: "
-        "`hermes kanban repair`). To put a recovered copy in place, one owner uses the locked helper: "
+        "`file:...?immutable=1` copy. "
+    )
+    board = kanban_board(why)
+    if board:
+        slug, db = board
+        holder = recovery_holder(db)
+        running = (f"A recovery is running now ({describe_holder(holder)}): do not start another; comment on "
+                   f"{'card ' + holder['task_id'] if holder.get('task_id') else 'its owner'} and wait for its report. "
+                   if holder else "")
+        return head + running + (
+            "This is a Kanban board: change its data through the kanban tools or `hermes kanban` (index damage: "
+            f"`hermes kanban repair`). A damaged board is rebuilt by ONE owner with `{recover_command(slug, db)}` "
+            "(single-owner recovery lock, installs in place through the SQLite backup API without renaming the "
+            "file, writes a loss report; a second run exits busy and names the holder). Verify afterwards with "
+            "`sqlite3 -readonly <db> 'pragma integrity_check'` (must print ok) and the report path it prints. "
+            "Do not hand-swap the file and do not work around this guard."
+        )
+    return head + (
+        "To put a recovered copy in place, one owner uses the locked helper: "
         f"`python3 {HELPER_DISPLAY} --db <live.db> --replacement <recovered.db>` (it refuses while any process "
         "holds the file or another recovery holds the lock, verifies integrity, and keeps the originals). "
         "Do not work around this guard."
     )
+
+
+def log_path() -> Path:
+    return Path(os.environ.get(LOG_ENV) or os.path.join(_home(), "logs", "sqlite-live-guard.log"))
+
+
+def log_refusal(tool: str, why: str, command: str, session_id: str = "", task_id: str = "") -> None:
+    """Append one JSON line per refusal (best effort: logging never changes the decision)."""
+    record = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tool": tool, "reason": why,
+              "command": (command or "")[:500], "pid": os.getpid(),
+              "session_id": session_id or os.environ.get("HERMES_SESSION_ID") or None,
+              "task_id": task_id or os.environ.get("HERMES_KANBAN_TASK") or None}
+    try:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
 
 
 def enabled() -> bool:

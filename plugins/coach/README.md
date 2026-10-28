@@ -405,6 +405,8 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   share a fingerprint by source host, normalized DB path and UTC event-hour. Explicit `db_path` wins, then a path
   in evidence; pathless Kanban tracebacks default to `~/.hermes/kanban.db`. Other pathless SQLite errors are not
   merged. Hub filing is locked across concurrent corruption detections. Later hits comment on the incident card;
+  the card of a live `hermes kanban recover` (or `swap_db.py`) holding that DB's recovery lock, read from the
+  `<db>.recover.pid` record, is adopted first (also when it sits on the damaged board itself); otherwise
   a running local card with `corrupt` and that DB in its title is adopted (oldest matching owner first). Different
   source hosts, DB paths and hours remain distinct. Remote-board owner lookup is not implemented.
   `event duplicate <fp> --card <duplicate-id> --owner <owner-id>` adopts real-defect ownership instead of imposing

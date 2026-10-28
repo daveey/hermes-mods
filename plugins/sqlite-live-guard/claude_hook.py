@@ -24,6 +24,7 @@ except Exception:
 
 why = guard.check_shell(cmd, cwd) if guard.enabled() else None
 if why:
+    guard.log_refusal("claude:Bash", why, cmd, str(payload.get("session_id") or ""))
     sys.stderr.write(guard.message(why) + "\n")
     sys.exit(2)
 sys.exit(0)

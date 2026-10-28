@@ -1335,8 +1335,8 @@ def signature_owned_cards(sig: dict, home: Optional[Path] = None) -> list:
     """Open (not done/archived) cards on this host's boards whose title+body match `sig` (signature_matches).
     -> [{id, title, status, created_at, board}], newest first. Opened read-only like session_owned_cards."""
     import sqlite3
-    home = Path(home) if home else Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    dbs = [(None, home / "kanban.db")] + [(p.parent.name, p) for p in sorted((home / "kanban" / "boards").glob("*/kanban.db"))]
+    home = Path(home) if home else _kanban_home()
+    dbs = _board_dbs(home)
     rows: list = []
     for board, path in dbs:
         if not path.exists():
@@ -1368,7 +1368,100 @@ def signature_owned_cards(sig: dict, home: Optional[Path] = None) -> list:
             db.close()
     # Prefer the original incident owner over later running dedupe/follow-up cards.
     rows.sort(key=lambda r: r["created_at"] or 0, reverse=not bool(sig.get("corruption_db")))
+    if sig.get("corruption_db") and sig.get("host") == host_name():
+        holder = recovery_holder_card(sig["corruption_db"], home, dbs)
+        if holder:
+            rows = [holder] + [r for r in rows if r["id"] != holder["id"]]
     return rows
+
+
+def _kanban_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _board_dbs(home: Path) -> list:
+    return [(None, home / "kanban.db")] + [(p.parent.name, p) for p in
+                                           sorted((home / "kanban" / "boards").glob("*/kanban.db"))]
+
+
+def _proc_start(pid: int) -> Optional[str]:
+    """Linux process start time in clock ticks (/proc/<pid>/stat field 22): tells a reused pid apart."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def incident_holder_card(d: dict) -> Optional[dict]:
+    """The live recovery-lock holder's card for this SQLite incident's DB, on this host only (the record and
+    the pid are local facts). None for remote incidents, non-incidents, or under COACH_SELFHEAL_NO_EXEC."""
+    inc = d.get("incident") or {}
+    if not inc.get("db") or inc.get("host") != host_name() or os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":
+        return None
+    home = _kanban_home()
+    return recovery_holder_card(inc["db"], home, _board_dbs(home))
+
+
+def _adopt_recovery_holder(d: dict, fp: str, st: dict, store, now: float, runner=None) -> Optional[dict]:
+    """A live `hermes kanban recover` owns its DB's incident: point the lane at its card and comment there."""
+    holder = incident_holder_card(d)
+    if not holder:
+        return None
+    lane = LaneState(store.root)
+    if st.get("fix_card") != holder["id"] or st.get("status") != "approved":
+        lane.update(fp, status="approved", fix_card=holder["id"], approved_at=now, component=d.get("component"),
+                    symptom=d.get("symptom"), board=holder.get("board"), filed_day=_utc_day(now),
+                    cards=sorted(known_cards(st) | {holder["id"]}))
+        store.log({"event": "selfheal_adopted_owner", "via": "recovery_lock", "fingerprint": fp,
+                   "card": holder["id"], "status": holder.get("status"), "board": holder.get("board"),
+                   "previous_card": st.get("fix_card") or st.get("card")})
+    commented = _corruption_comment(d, lane.get(fp), store, runner)
+    if commented["action"] == "error":
+        return commented
+    return {"action": "skip", "why": f"adopted recovery-lock holder card {holder['id']}", "card": holder["id"],
+            "adopted": True, "via": "recovery_lock"}
+
+
+def recovery_holder_card(db: str, home: Path, dbs: list) -> Optional[dict]:
+    """The card of the live `hermes kanban recover` (or swap_db.py) holding this DB's recovery lock, from the
+    `<db>.recover.pid` record it writes ({pid, session_id, task_id}); it owns the incident while it runs. None
+    when there is no record, its process is gone, it names no card, or that card is already done/archived.
+    `db` is the incident's home-relative spelling (`~/.hermes/...`), resolved against this host's home."""
+    import sqlite3
+    rel = re.sub(r"^~/\.hermes/?", "", db)
+    if rel == db:
+        return None
+    path = Path(home) / rel
+    try:
+        info = json.loads(path.with_name(path.name + ".recover.pid").read_text())
+        pid, card = int(info["pid"]), str(info.get("task_id") or "")
+        os.kill(pid, 0)
+    except PermissionError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, AttributeError):
+        return None
+    if info.get("proc_start") and _proc_start(pid) not in (None, str(info["proc_start"])):
+        return None  # the recorded process died and its pid was reused
+    if not _CARD_ID.fullmatch(card):
+        return None
+    for board, kdb in dbs:  # the card's status and board, from whichever readable board holds it
+        try:
+            con = sqlite3.connect(f"file:{kdb}?mode=ro", uri=True, timeout=5)
+            try:
+                r = con.execute("SELECT id, title, status, created_at FROM tasks WHERE id = ?", (card,)).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        if r:
+            if r[2] in ("done", "archived"):
+                return None
+            return {"id": r[0], "title": r[1], "status": r[2], "created_at": r[3], "board": board,
+                    "via": "recovery_lock"}
+    # Not readable anywhere: usually the card lives on the board being rebuilt. Its live holder still owns it.
+    board = path.parent.name if path.parent.parent.name == "boards" else None
+    return {"id": card, "title": "", "status": "running", "created_at": None, "board": board, "via": "recovery_lock"}
 
 
 def _adopt_signature_card(d: dict, fp: str, store, now: float,
@@ -1540,6 +1633,11 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         return res
     lane = LaneState(store.root)
     st = lane.get(fp)
+    if (d.get("incident") and m == "live" and hub and not st.get("suppressed")
+            and (st.get("snooze_until") or 0) <= now):
+        adopted = _adopt_recovery_holder(d, fp, st, store, now, runner)
+        if adopted:
+            return adopted
     dec = decide(d, st, now)
     if dec["action"] == "skip":
         if (d.get("incident") and m == "live" and hub and not st.get("suppressed")

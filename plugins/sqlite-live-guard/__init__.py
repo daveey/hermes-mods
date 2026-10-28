@@ -44,7 +44,15 @@ def classify(tool_name: str, args: Any) -> Optional[str]:
     return None
 
 
-def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[dict]:
+def _command_text(tool_name: str, args: Any) -> str:
+    args = args if isinstance(args, dict) else {}
+    if tool_name in {"tool_call", "mcp__tool_call"}:
+        return " ; ".join(_command_text(str(c.get("name") or ""), c.get("arguments"))
+                          for c in (args.get("calls") or []) if isinstance(c, dict))
+    return str(args.get("command") or args.get("code") or args.get("input") or args.get("data") or "")
+
+
+def _pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any) -> Optional[dict]:
     try:
         if not guard.enabled():
             return None
@@ -55,6 +63,11 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[
     if not why:
         return None
     logger.info("sqlite-live-guard blocked %s: %s", tool_name, why)
+    try:
+        # The hook's own task_id is the agent's tool-task id, not a Kanban card: the card comes from the env.
+        guard.log_refusal(tool_name, why, _command_text(tool_name, args), str(session_id or ""))
+    except Exception:
+        logger.debug("sqlite-live-guard log failed", exc_info=True)
     return {"action": "block", "message": guard.message(why)}
 
 

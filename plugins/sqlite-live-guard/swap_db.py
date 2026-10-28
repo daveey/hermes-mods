@@ -4,8 +4,12 @@
     python3 swap_db.py --db ~/.hermes/kanban.db --replacement /path/recovered.db [--stop-unit hermes-gateway.service]
 
 Steps, each of which aborts the swap (exit 2) instead of guessing:
-1. Take ``<db>.recovery.lock`` (non-blocking flock). A second recovery of the same file is refused, so two
-   agents can no longer swap over each other.
+0. A Kanban board (``kanban.db``) is refused: ``hermes kanban [--board <slug>] recover`` rebuilds it in place
+   through the SQLite backup API without renaming the file under open WAL connections. ``--allow-kanban`` is
+   for an operator who has stopped every Kanban process and decided a rename is required.
+1. Take ``<db>.recovery.lock`` (non-blocking flock; the same lock ``hermes kanban recover`` takes) and record
+   the holder (pid, session, card) in ``<db>.recover.pid`` (removed on release). A second recovery of the
+   same file is refused, so two agents can no longer swap over each other.
 2. Check the replacement: ``PRAGMA integrity_check`` must return exactly ``ok`` and it must hold every table
    the live file declares.
 3. Stop the listed systemd user units (restarted at the end, also on abort).
@@ -20,6 +24,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import json
 import os
 import shutil
 import sqlite3
@@ -86,22 +91,58 @@ def systemctl(action: str, unit: str) -> None:
     subprocess.run(["systemctl", "--user", action, unit], check=False, timeout=120)
 
 
-def swap(db: Path, replacement: Path, units: list[str], wait_s: float = 10.0) -> int:
+def _proc_start(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _holder_record(db: Path) -> Path:
+    return db.with_name(db.name + ".recover.pid")  # same record hermes_cli.kanban_db_recover writes
+
+
+def _describe_holder(db: Path) -> str:
+    try:
+        info = json.loads(_holder_record(db).read_text())
+    except (OSError, ValueError):
+        return "holder unknown"
+    if not isinstance(info, dict):
+        return f"pid {info}"
+    return ", ".join(f"{k} {info[v]}" for k, v in (("pid", "pid"), ("session", "session_id"), ("card", "task_id"))
+                     if info.get(v))
+
+
+def swap(db: Path, replacement: Path, units: list[str], wait_s: float = 10.0, allow_kanban: bool = False) -> int:
     db = db.expanduser().absolute()
     replacement = replacement.expanduser().absolute()
+    if db.name == "kanban.db" and not allow_kanban:
+        board = db.parent.name if db.parent.parent.name == "boards" else "default"
+        cmd = "hermes kanban recover" if board == "default" else f"hermes kanban --board {board} recover"
+        print(f"ABORT: {db} is a Kanban board; rebuild it in place with `{cmd}` (single-owner lock, SQLite "
+              "backup-API install, loss report). --allow-kanban is for an operator who stopped every Kanban "
+              "process first.", file=sys.stderr)
+        return 2
     lock_path = db.with_name(db.name + ".recovery.lock")
     with open(lock_path, "a+b") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"ABORT: another recovery holds {lock_path}; one owner swaps at a time", file=sys.stderr)
+            print(f"ABORT: another recovery holds {lock_path} ({_describe_holder(db)}); one owner swaps at a time",
+                  file=sys.stderr)
             return 2
-        why = check_replacement(db, replacement)
-        if why:
-            print(f"ABORT: {why}", file=sys.stderr)
-            return 2
+        with contextlib.suppress(OSError):
+            _holder_record(db).write_text(json.dumps({
+                "pid": os.getpid(), "proc_start": _proc_start(os.getpid()), "started_at": time.time(),
+                "tool": "swap_db.py", "session_id": os.environ.get("HERMES_SESSION_ID") or None,
+                "task_id": os.environ.get("HERMES_RECOVERY_HOLDER_TASK") or os.environ.get("HERMES_KANBAN_TASK")
+                or None}) + "\n")
         stopped = []
         try:
+            why = check_replacement(db, replacement)
+            if why:
+                print(f"ABORT: {why}", file=sys.stderr)
+                return 2
             for unit in units:
                 systemctl("stop", unit)
                 stopped.append(unit)
@@ -135,6 +176,8 @@ def swap(db: Path, replacement: Path, units: list[str], wait_s: float = 10.0) ->
             for unit in reversed(stopped):
                 systemctl("start", unit)
             with contextlib.suppress(OSError):
+                _holder_record(db).unlink()
+            with contextlib.suppress(OSError):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
@@ -144,8 +187,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--replacement", required=True, type=Path, help="recovered database to put in place")
     ap.add_argument("--stop-unit", action="append", default=[], help="systemd --user unit to stop during the swap")
     ap.add_argument("--wait", type=float, default=10.0, help="seconds to wait for holders to close")
+    ap.add_argument("--allow-kanban", action="store_true",
+                    help="swap a kanban.db anyway (operator only, every Kanban process stopped; prefer "
+                         "`hermes kanban recover`)")
     a = ap.parse_args(argv)
-    return swap(a.db, a.replacement, a.stop_unit, a.wait)
+    return swap(a.db, a.replacement, a.stop_unit, a.wait, a.allow_kanban)
 
 
 if __name__ == "__main__":
