@@ -1,0 +1,201 @@
+From fa44287eb6071154d885cbe19934dfa2b36ac702 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:44:23 -0700
+Subject: [PATCH] perf(kanban): remote-links projection keyed on hub replica
+ content, 15 s max age [daveey]
+
+hub-sync rewrites ~10k replica sessions rows continuously, so the stat-keyed fingerprint changed
+on nearly every read and every reader re-projected 2.4k cards. The hub part of the fingerprint
+is now the tasks/gateway rows' seq signature (memoized on the file stat), and the projection's
+max age is its own 15 s (its fingerprint covers every store but state.db alias tips).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_session_activity.py         | 57 ++++++++++++++++--
+ .../test_kanban_remote_inventory_cache.py     |  2 +-
+ .../test_kanban_session_activity.py           | 59 +++++++++++++++++++
+ 3 files changed, 111 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 9df66a9512..05f10a4330 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -794,13 +794,50 @@ def _park_of(task: dict[str, Any]) -> dict[str, Any] | None:
+         return None
+ 
+ 
++_HUB_SIGNATURE_SQL = ("SELECT coll, COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll IN ('tasks', 'gateway') "
++                      "GROUP BY coll")
++_hub_signature_memo: tuple | None = None  # ((path, stat key), signature)
++
++
++def _hub_content_signature(hub: Path) -> tuple:
++    """What the remote-links projection reads from the hub replica (``tasks`` and ``gateway`` rows, ``meta``
++    gateway), not the file's stat: hub-sync rewrites ~10k ``sessions`` rows continuously, so a stat-keyed
++    fingerprint changed on nearly every read and every caller re-projected 2.4k cards (~19% of a Desktop
++    backend's GIL time, 2026-10-27). ``seq`` is the replica's global write sequence, so COUNT + MAX + TOTAL of it
++    moves on any insert, update or delete of those rows. The query (~10 ms) re-runs only when the file's stat
++    moves; an unreadable replica falls back to the stat itself. [daveey]"""
++    global _hub_signature_memo
++    stat_key = []
++    for path in (hub, Path(str(hub) + "-wal")):
++        try:
++            st = path.stat()
++            stat_key.append((st.st_ino, st.st_size, st.st_mtime_ns))
++        except FileNotFoundError:
++            stat_key.append(None)
++    memo_key = (str(hub), tuple(stat_key))
++    memo = _hub_signature_memo
++    if memo is not None and memo[0] == memo_key:
++        return memo[1]
++    try:
++        conn = _open_ro(hub)
++        try:
++            rows = tuple(tuple(r) for r in conn.execute(_HUB_SIGNATURE_SQL).fetchall())
++            meta = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
++        finally:
++            conn.close()
++        signature = (str(hub), stat_key[0][0] if stat_key[0] else None, rows, meta[0] if meta else None)
++    except (sqlite3.Error, OSError):
++        signature = memo_key
++    _hub_signature_memo = (memo_key, signature)
++    return signature
++
++
+ def _activity_fingerprint() -> tuple:
+-    """Invalidate on cross-process commits, including WAL writes and board replacement."""
++    """Invalidate on cross-process commits, including WAL writes and board replacement. The hub replica counts by
++    content (``_hub_content_signature``), the boards by stat."""
+     paths = _board_db_paths()
+     hub = _hub_db_path()
+-    if hub is not None:
+-        paths.append(hub)
+-    signature = []
++    signature = [_hub_content_signature(hub)] if hub is not None else []
+     for db in paths:
+         for path in (db, Path(str(db) + "-wal")):
+             try:
+@@ -891,6 +928,12 @@ _links_lock = threading.Lock()
+ _links_cache: tuple[float, tuple, tuple, list[dict[str, Any]]] | None = None  # (expires, scope, fingerprint, cards)
+ 
+ 
++# The links projection's fingerprint covers every store it reads except state.db (compression alias tips), so its
++# max age only bounds how late a rotated alias tip shows. Re-projecting every _CACHE_TTL_S (3 s) for that alone cost
++# a busy Desktop backend ~10% of a core. [daveey]
++_LINKS_MAX_AGE_S = 15.0
++
++
+ def _links_fingerprint() -> tuple:
+     """Every store the remote inventory reads except state.db (alias tips), which the TTL bounds instead."""
+     from hermes_constants import get_hermes_home
+@@ -909,7 +952,7 @@ def _links_fingerprint() -> tuple:
+ def _remote_links(stale_ok: bool = False) -> list[dict[str, Any]]:
+     """Shared origin-ledger projection, with preserved legacy associations.
+ 
+-    One projection per scope serves every reader (counts, session task lists, plugins) for ``_CACHE_TTL_S`` while
++    One projection per scope serves every reader (counts, session task lists, plugins) for ``_LINKS_MAX_AGE_S`` while
+     no store it reads has changed. Single-flight: concurrent readers wait for the running projection and share it
+     instead of each rebuilding. Failures are never cached.
+ 
+@@ -940,7 +983,7 @@ def _store_links(scope: tuple, fingerprint: tuple) -> list[dict[str, Any]]:
+     change during the projection leaves the cache stale and triggers another rebuild."""
+     global _links_cache
+     cards = _project_remote_links()
+-    _links_cache = (time.monotonic() + _CACHE_TTL_S, scope, fingerprint, cards)
++    _links_cache = (time.monotonic() + _LINKS_MAX_AGE_S, scope, fingerprint, cards)
+     return list(cards)
+ 
+ 
+@@ -1660,7 +1703,9 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+ 
+ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+     global _cache, _attention_cache, _remote_last, _links_cache, _snapshot_saved, _remote_read_memo
++    global _hub_signature_memo
+     _remote_read_memo = None
++    _hub_signature_memo = None
+     with _links_lock:
+         _links_cache = None
+     with _cache_lock:
+diff --git a/tests/hermes_cli/test_kanban_remote_inventory_cache.py b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+index c6d93b636d..62d6ca4188 100644
+--- a/tests/hermes_cli/test_kanban_remote_inventory_cache.py
++++ b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+@@ -65,7 +65,7 @@ def test_a_store_change_reprojects(projection):
+ 
+ def test_ttl_expiry_reprojects(projection, monkeypatch):
+     calls, _ = projection
+-    monkeypatch.setattr(activity, '_CACHE_TTL_S', 0.0)
++    monkeypatch.setattr(activity, '_LINKS_MAX_AGE_S', 0.0)  # the projection's own max age, not the counts TTL
+     activity._remote_links()
+     activity._remote_links()
+     assert calls['n'] == 2
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 84e33a1709..ece2dc4568 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -831,3 +831,62 @@ def test_concurrent_sidebar_reads_share_one_recompute_while_the_board_keeps_chan
+     assert len(results) == 8
+     assert all(active == {"s_live": 1} for active in results)
+     assert len(reads) <= 2, f"{len(reads)} recomputes for 8 concurrent readers"
++
++
++def _replica_write(path: Path, gw: str, coll: str, key: str, seq: int, data: str = "{}") -> None:
++    with sqlite3.connect(path) as conn:
++        conn.execute("INSERT OR REPLACE INTO replica VALUES (?, ?, ?, 1, ?, ?, 0)", (gw, coll, key, seq, data))
++
++
++def test_hub_session_rows_do_not_invalidate_the_remote_links_projection(kanban_root, monkeypatch):
++    """hub-sync rewrites ~10k replica ``sessions`` rows continuously. The projection reads only ``tasks`` and
++    ``gateway`` rows, so a sessions write must not force every reader to re-project (2026-10-27: ~19% of a Desktop
++    backend's GIL time); a tasks or gateway write still must."""
++    path = _make_replica(kanban_root / "hub-state", "macbook", [
++        {"_gw": "hub", "id": "t_r1", "status": "running", "sessions": [_shep("s_mac")]}])
++    projections: list[int] = []
++    real = ksa._project_remote_links
++    monkeypatch.setattr(ksa, "_project_remote_links", lambda: projections.append(1) or real())
++    monkeypatch.setattr(ksa, "_CACHE_TTL_S", 300.0)  # isolate the fingerprint from the TTL
++
++    first = ksa._remote_links()
++    for n in range(5):
++        _replica_write(path, "mini", "sessions", f"s_{n}", seq=10 + n)
++        assert ksa._remote_links() == first
++    assert len(projections) == 1
++
++    _replica_write(path, "hub", "gateway", "info", seq=20, data='{"seen": 1}')
++    ksa._remote_links()
++    assert len(projections) == 2
++    _replica_write(path, "hub", "tasks", "default/default/t_r1", seq=21,
++                   data=_json.dumps({"id": "t_r1", "status": "done", "profile": "default", "board": "default",
++                                     "sessions": [_shep("s_mac")], "children": [], "parents": []}))
++    ksa._remote_links()
++    assert len(projections) == 3
++
++
++def test_hub_signature_is_reused_until_the_file_changes_and_falls_back_on_old_replicas(kanban_root, tmp_path, monkeypatch):
++    path = _make_replica(kanban_root / "hub-state", "macbook", [])
++    queries: list[str] = []
++    real_open = ksa._open_ro
++
++    def _spy_open(p, *a, **k):
++        queries.append(str(p))
++        return real_open(p, *a, **k)
++
++    monkeypatch.setattr(ksa, "_open_ro", _spy_open)
++    a = ksa._hub_content_signature(path)
++    b = ksa._hub_content_signature(path)
++    assert a == b and len(queries) == 1  # unchanged file: the memo answers
++    _replica_write(path, "mini", "sessions", "s_x", seq=5)
++    assert ksa._hub_content_signature(path) == a and len(queries) == 2  # file moved: re-queried, same content
++
++    old = tmp_path / "old-hub.db"
++    with sqlite3.connect(old) as conn:  # pre-seq replica: no seq column, so the signature is the file stat
++        conn.executescript("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);"
++                           "CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER);")
++    sig = ksa._hub_content_signature(old)
++    with sqlite3.connect(old) as conn:
++        conn.execute("INSERT INTO replica VALUES ('mini', 'sessions', 's', '{}', 0)")
++    assert ksa._hub_content_signature(old) != sig
++
+-- 
+2.55.0
+

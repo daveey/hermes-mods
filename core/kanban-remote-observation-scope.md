@@ -1,6 +1,6 @@
 # Kanban remote observation scope, replica read path and retained-row evidence
 
-Patches **0461**, **0462**, **0490**, **0497**, **0498**, **0500**, **0501**, **0505** (backend) and **0483**, **0484**, **0485**,
+Patches **0461**, **0462**, **0490**, **0497**, **0498**, **0500**, **0501**, **0505**, **0598** (backend) and **0483**, **0484**, **0485**,
 **0525** (Desktop). Sources: `4695da764b`, `e90c1654a4`, `236b07480e`, `d121f4c697`, `b23a0d382e`, `12758cf08f`,
 `78130169e3`, `ca4285335f`, `5803147af6`, `ffeb8f66fc`, `589534bac5`, `98906dadc7`. Extends
 [retention-observation.md](retention-observation.md) and [kanban-all-gateways.md](kanban-all-gateways.md).
@@ -18,6 +18,12 @@ Patches **0461**, **0462**, **0490**, **0497**, **0498**, **0500**, **0501**, **
   rebuild replaces it (only the first projection per scope is built inline; a failed rebuild keeps the previous).
   `session_tasks` rows also carry `activity_kind`/`activity_at`, `note` and `pr_url` (0501). Stale remote-links reads
   apply only to the linked-card strip (0505).
+- The remote-links projection is keyed on the hub replica's content, not its file: the `tasks`/`gateway` rows' write
+  sequence (`COUNT`, `MAX`, `TOTAL` of `seq`) plus `meta.gateway`, re-read only when hub.db's stat moves. hub-sync
+  rewrites ~10k `sessions` rows continuously, so the stat-keyed fingerprint changed on nearly every read and every
+  reader re-projected 2.4k cards. The projection's own max age is 15 s (`_LINKS_MAX_AGE_S`; counts keep the 3 s
+  TTL), since its fingerprint covers every store but state.db alias tips. A replica without `seq` falls back to the
+  file stat (0599).
 - Desktop refreshes kanban evidence for retained older sessions outside the recency page on their own owner, fills an
   unannotated detail row without replacing its metadata, clears old counts on an authoritative zero, marks a failed
   read unknown, and rejects another profile with the same session id (0483/0484); freshness-only (remote-stale) row
@@ -40,7 +46,7 @@ Files above. Tests listed next.
 `tests/hermes_cli/test_kanban_observation_scope.py`, `test_kanban_activity_scope.py`, `test_kanban_actionability_counts.py`,
 `test_kanban_remote_inventory_cache.py` (background re-projection, readers never wait, activity/note/PR fields),
 `test_kanban_remote_terminal_release.py`, `test_kanban_origin_scope_heartbeat.py`, `test_kanban_origin_legacy_path.py`,
-`test_session_detail_kanban.py`; renderer `refresh-retained-kanban.test.ts`, `use-session-list-actions.test.tsx`,
+`test_session_detail_kanban.py`, `test_kanban_session_activity.py::test_hub_session_rows_do_not_invalidate_the_remote_links_projection` and `::test_hub_signature_is_reused_until_the_file_changes_and_falls_back_on_old_replicas` (0599); renderer `refresh-retained-kanban.test.ts`, `use-session-list-actions.test.tsx`,
 `use-background-sync.test.ts`. Live multi-gateway behavior is untested here.
 
 ## Applying
