@@ -1,7 +1,8 @@
 # ⌘N on This device, ⌘⇧N on the current gateway
 
 ## Behavior
-- **⌘N** (`session.new`) starts a new chat **on This device**. If another gateway (remote/cloud) is selected, the
+- **⌘N** (`session.new`) starts a new chat on the gateway saved with **Use for new sessions** (patch 0722, see
+  [new-session-target.md](new-session-target.md)). With none saved, it starts **on This device**. If another gateway (remote/cloud) is selected, the
   desktop switches the active source to the `local` connection (its last-used profile) and the fresh draft lands there.
   If This device is already selected it behaves like upstream ⌘N. If the local runtime isn't installed, the hotkey
   keeps the current gateway (it never launches the installer).

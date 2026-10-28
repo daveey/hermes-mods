@@ -1,0 +1,879 @@
+From 066b48864de70d51189ad468335f3a2a494a4f2c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:09:45 -0700
+Subject: [PATCH] =?UTF-8?q?desktop:=20right-click=20a=20gateway=20in=20the?=
+ =?UTF-8?q?=20device=20switcher=20=E2=86=92=20"Use=20for=20new=20sessions"?=
+ =?UTF-8?q?=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+New sessions get a sticky target separate from the gateway on screen. The device
+switcher's per-row right-click saves the app-wide default route (Electron-persisted,
+survives relaunch); opening a session on another gateway never changes it. ⌘N, the
+command palette and the shell menu's New session now run session.new, which uses the
+saved route (else 0042's This device). An unreachable saved gateway keeps the draft
+bound there and offers "Create on This device instead" for that one session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/desktop-profile.test.ts |  19 ++
+ .../chat/sidebar/connection-switcher.test.tsx |  45 +++-
+ .../app/chat/sidebar/connection-switcher.tsx  |  68 +++++-
+ .../desktop/src/app/command-palette/index.tsx |   8 +-
+ .../new-session-target.test.tsx               |  52 +++++
+ .../context-menu/app-context-menu.test.tsx    |  19 ++
+ .../src/app/context-menu/shell-menu-items.tsx |   8 +-
+ .../hooks/use-keybinds-new-session.test.tsx   |  33 +++
+ apps/desktop/src/app/hooks/use-keybinds.ts    |  17 +-
+ .../session/hooks/new-session-target.test.tsx | 209 ++++++++++++++++++
+ .../src/app/session/new-session-route.ts      |  41 +++-
+ apps/desktop/src/i18n/en.ts                   |   9 +-
+ apps/desktop/src/i18n/overlay-gaps.json       |   9 +-
+ apps/desktop/src/i18n/types.ts                |   7 +
+ locales/_keys.desktop.json                    |   7 +
+ 15 files changed, 532 insertions(+), 19 deletions(-)
+ create mode 100644 apps/desktop/src/app/command-palette/new-session-target.test.tsx
+ create mode 100644 apps/desktop/src/app/session/hooks/new-session-target.test.tsx
+
+diff --git a/apps/desktop/electron/desktop-profile.test.ts b/apps/desktop/electron/desktop-profile.test.ts
+index 9cb528e61d..53a4365bae 100644
+--- a/apps/desktop/electron/desktop-profile.test.ts
++++ b/apps/desktop/electron/desktop-profile.test.ts
+@@ -214,3 +214,22 @@ test.each([null, 'local'])(
+     }
+   }
+ )
++
++// [daveey] The device switcher's "Use for new sessions" saves this route; it must
++// survive a relaunch and later workspace switches (remember) in any window.
++test('a gateway saved for new sessions survives relaunch and workspace switches', () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-profile-new-session-'))
++  const target = path.join(root, 'active-profile.json')
++  const hub = { connectionId: 'hermes-hub', profile: 'default' }
++
++  try {
++    const first = createDesktopProfilePreferences(target)
++
++    first.setDefault(hub)
++    first.remember('other')
++
++    assert.deepEqual(createDesktopProfilePreferences(target).getDefault(), hub)
++  } finally {
++    fs.rmSync(root, { force: true, recursive: true })
++  }
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/connection-switcher.test.tsx b/apps/desktop/src/app/chat/sidebar/connection-switcher.test.tsx
+index e0362e004b..e5aa418669 100644
+--- a/apps/desktop/src/app/chat/sidebar/connection-switcher.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/connection-switcher.test.tsx
+@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import type { DesktopConnectionsRegistry } from '@/global'
++import { $defaultProfileRoute } from '@/store/default-profile'
+ import { $findInPage } from '@/store/find-in-page'
+ 
+ import { ConnectionSwitcher } from './connection-switcher'
+@@ -31,7 +32,12 @@ vi.mock('@/i18n', () => ({
+       profiles: {
+         switchConnectionFailed: (name: string) => `Could not connect to ${name}`,
+         switchToConnection: (name: string) => `Switch to ${name}`,
+-        connectGateway: 'Manage gateways…'
++        connectGateway: 'Manage gateways…',
++        failedSetDefault: 'Could not set the default profile',
++        newSessionsDescription: 'Opening a session on another gateway does not change this.',
++        newSessionsSet: (name: string) => `New sessions will start on ${name}`,
++        newSessionsStartHere: 'New sessions start here',
++        useForNewSessions: 'Use for new sessions'
+       },
+       settings: {
+         connections: {
+@@ -76,6 +82,7 @@ afterEach(() => {
+   $connectionsRegistry.set(null)
+   $activeConnectionId.set('local')
+   $pendingConnectionId.set(null)
++  $defaultProfileRoute.set(null)
+   $findInPage.set({ active: false, query: '', matchOrdinal: 0, matchCount: 0, focusRequest: 0 })
+ })
+ 
+@@ -248,4 +255,40 @@ describe('ConnectionSwitcher', () => {
+     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+     expect(screen.getByRole('menuitemradio', { name: 'W2Probe' })).toBeTruthy()
+   })
++
++  // [daveey] Right-click a gateway → "Use for new sessions": saves the app-wide
++  // new-session route without switching what is on screen.
++  it('right-click saves a gateway for new sessions without switching to it', async () => {
++    const setDefault = vi.fn(async (route: { connectionId: null | string; profile: string }) => route)
++    window.hermesDesktop = { profile: { setDefault } } as never
++    $connectionsRegistry.set(
++      registry([
++        connection('local', 'This device', 'local'),
++        connection('mac-mini', 'mac-mini'),
++        connection('hermes-hub', 'hub (EC2)')
++      ])
++    )
++    render(<ConnectionSwitcher onConnect={onConnect} />)
++
++    fireEvent.pointerDown(screen.getByRole('button', { name: 'Registered gateways: This device' }), {
++      button: 0,
++      pointerType: 'mouse'
++    })
++    fireEvent.contextMenu(screen.getByRole('menuitemradio', { name: 'hub (EC2)' }))
++    fireEvent.click(await screen.findByRole('menuitem', { name: 'Use for new sessions' }))
++
++    await waitFor(() => expect($defaultProfileRoute.get()).toEqual({ connectionId: 'hermes-hub', profile: 'default' }))
++    expect(setDefault).toHaveBeenCalledWith({ connectionId: 'hermes-hub', profile: 'default' })
++    expect(selectConnection).not.toHaveBeenCalled()
++    expect($activeConnectionId.get()).toBe('local')
++
++    // The saved row is marked, and its own right-click item is the checked state.
++    const hubRow = screen.getByRole('menuitemradio', { name: /hub \(EC2\)/ })
++    expect(hubRow.hasAttribute('data-new-session-target')).toBe(true)
++    expect(screen.getByRole('menuitemradio', { name: 'mac-mini' }).hasAttribute('data-new-session-target')).toBe(false)
++    fireEvent.contextMenu(hubRow)
++    expect(
++      (await screen.findByRole('menuitem', { name: 'New sessions start here' })).getAttribute('aria-disabled')
++    ).toBe('true')
++  })
+ })
+diff --git a/apps/desktop/src/app/chat/sidebar/connection-switcher.tsx b/apps/desktop/src/app/chat/sidebar/connection-switcher.tsx
+index d847fc07b0..9bfc55c84c 100644
+--- a/apps/desktop/src/app/chat/sidebar/connection-switcher.tsx
++++ b/apps/desktop/src/app/chat/sidebar/connection-switcher.tsx
+@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
+ 
+ import { Button } from '@/components/ui/button'
+ import { Codicon } from '@/components/ui/codicon'
++import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
+ import {
+   DropdownMenu,
+   DropdownMenuContent,
+@@ -26,8 +27,9 @@ import { triggerHaptic } from '@/lib/haptics'
+ import { Loader2 } from '@/lib/icons'
+ import { cn } from '@/lib/utils'
+ import { $activeConnectionId, $connectionsRegistry, $pendingConnectionId, selectConnection } from '@/store/connections'
++import { $defaultProfileRoute, setDefaultProfile } from '@/store/default-profile'
+ import { closeFindBar } from '@/store/find-in-page'
+-import { notifyError } from '@/store/notifications'
++import { notify, notifyError } from '@/store/notifications'
+ 
+ import { ConnectionGlyph } from './connection-glyph'
+ import { useLocalDeviceSwitch } from './local-device-switch'
+@@ -37,6 +39,7 @@ export function ConnectionSwitcher({ compact = false, onConnect }: { compact?: b
+   const registry = useStore($connectionsRegistry)
+   const activeConnectionId = useStore($activeConnectionId)
+   const pendingConnectionId = useStore($pendingConnectionId)
++  const newSessionConnectionId = useStore($defaultProfileRoute)?.connectionId ?? null
+   const [searchQuery, setSearchQuery] = useState('')
+   const [menuOpen, setMenuOpen] = useState(false)
+   const connectionListRef = useRef<HTMLDivElement>(null)
+@@ -115,6 +118,22 @@ export function ConnectionSwitcher({ compact = false, onConnect }: { compact?: b
+     })()
+   }
+ 
++  // [daveey] Right-click a gateway → "Use for new sessions". It only saves the
++  // app-wide default route (Electron-persisted); it never switches what is on
++  // screen, and opening a session elsewhere never changes it.
++  const makeNewSessionTarget = async (connection: DesktopRegistryConnection) => {
++    try {
++      await setDefaultProfile({ connectionId: connection.id, profile: 'default' })
++      notify({
++        kind: 'success',
++        title: t.profiles.newSessionsSet(connection.label),
++        message: t.profiles.newSessionsDescription
++      })
++    } catch (error) {
++      notifyError(error, t.profiles.failedSetDefault)
++    }
++  }
++
+   return (
+     <div
+       aria-busy={pendingConnectionId !== null}
+@@ -207,15 +226,44 @@ export function ConnectionSwitcher({ compact = false, onConnect }: { compact?: b
+                 {t.settings.connections.noSearchResults}
+               </div>
+             ) : (
+-              displayedConnections.map(connection => (
+-                <DropdownMenuRadioItem
+-                  className={cn('min-w-0', searchable && dropdownMenuRow)}
+-                  key={connection.id}
+-                  value={connection.id}
+-                >
+-                  <ConnectionLabel connection={connection} />
+-                </DropdownMenuRadioItem>
+-              ))
++              displayedConnections.map(connection => {
++                const isNewSessionTarget = connection.id === newSessionConnectionId
++
++                return (
++                  <ContextMenu key={connection.id}>
++                    <ContextMenuTrigger asChild>
++                      <DropdownMenuRadioItem
++                        className={cn('min-w-0', searchable && dropdownMenuRow)}
++                        data-new-session-target={isNewSessionTarget ? '' : undefined}
++                        value={connection.id}
++                      >
++                        <ConnectionLabel connection={connection} />
++                        {isNewSessionTarget && (
++                          <span
++                            aria-label={t.profiles.newSessionsStartHere}
++                            className="ml-auto flex shrink-0 items-center text-(--ui-text-tertiary)"
++                            role="img"
++                            title={t.profiles.newSessionsStartHere}
++                          >
++                            <Codicon aria-hidden="true" name="home" size="0.75rem" />
++                          </span>
++                        )}
++                      </DropdownMenuRadioItem>
++                    </ContextMenuTrigger>
++                    <ContextMenuContent aria-label={connection.label} className="min-w-44">
++                      <ContextMenuItem
++                        disabled={isNewSessionTarget || !window.hermesDesktop?.profile?.setDefault}
++                        onSelect={() => void makeNewSessionTarget(connection)}
++                      >
++                        <Codicon name={isNewSessionTarget ? 'check' : 'home'} size="0.875rem" />
++                        <span>
++                          {isNewSessionTarget ? t.profiles.newSessionsStartHere : t.profiles.useForNewSessions}
++                        </span>
++                      </ContextMenuItem>
++                    </ContextMenuContent>
++                  </ContextMenu>
++                )
++              })
+             )}
+           </DropdownMenuRadioGroup>
+           <DropdownMenuSeparator className={searchable ? 'm-0' : undefined} />
+diff --git a/apps/desktop/src/app/command-palette/index.tsx b/apps/desktop/src/app/command-palette/index.tsx
+index f2033ee174..333d969dde 100644
+--- a/apps/desktop/src/app/command-palette/index.tsx
++++ b/apps/desktop/src/app/command-palette/index.tsx
+@@ -59,6 +59,7 @@ import {
+   Wrench,
+   Zap
+ } from '@/lib/icons'
++import { runBuiltinAction } from '@/lib/keybinds/plugin-actions'
+ import { getServers } from '@/lib/mcp-servers'
+ import { normalize } from '@/lib/text'
+ import { rollbackSentence } from '@/lib/update-copy'
+@@ -959,7 +960,12 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
+             id: 'nav-new',
+             keywords: ['chat', 'create'],
+             label: cc.nav.newChat.title,
+-            run: go(NEW_CHAT_ROUTE)
++            // [daveey] Same as ⌘N: the saved new-session gateway, not the one on screen.
++            run: () => {
++              if (!runBuiltinAction('session.new')) {
++                go(NEW_CHAT_ROUTE)()
++              }
++            }
+           },
+           ...(canOpenNewWindow()
+             ? [
+diff --git a/apps/desktop/src/app/command-palette/new-session-target.test.tsx b/apps/desktop/src/app/command-palette/new-session-target.test.tsx
+new file mode 100644
+index 0000000000..869cc10e8a
+--- /dev/null
++++ b/apps/desktop/src/app/command-palette/new-session-target.test.tsx
+@@ -0,0 +1,52 @@
++// @vitest-environment jsdom
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
++import { MemoryRouter } from 'react-router'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import type * as HermesApi from '@/hermes'
++import { registerBuiltinActionRunner } from '@/lib/keybinds/plugin-actions'
++import { $commandPaletteOpen } from '@/store/command-palette'
++
++vi.mock('@/hermes', async importActual => ({
++  ...(await importActual<typeof HermesApi>()),
++  getHermesConfigRecord: async () => ({}),
++  listAllProfileSessions: async () => ({ sessions: [], total: 0 })
++}))
++
++import { CommandPalette } from './index'
++
++// [daveey] The palette's "New session" row is ⌘N: it lands on the saved
++// new-session gateway (session.new), not whichever gateway is on screen.
++describe('command palette New session', () => {
++  afterEach(() => {
++    act(() => $commandPaletteOpen.set(false))
++    cleanup()
++  })
++
++  it('runs the session.new action', async () => {
++    const runner = vi.fn(() => true)
++    const unregister = registerBuiltinActionRunner(runner)
++
++    render(
++      <QueryClientProvider client={new QueryClient()}>
++        <MemoryRouter>
++          <CommandPalette />
++        </MemoryRouter>
++      </QueryClientProvider>
++    )
++    act(() => $commandPaletteOpen.set(true))
++
++    const row = await waitFor(() => {
++      const found = document.querySelector('[data-value$="nav-new"]')
++      expect(found).not.toBeNull()
++
++      return found!
++    })
++
++    fireEvent.click(row)
++
++    expect(runner).toHaveBeenCalledWith('session.new')
++    unregister()
++  })
++})
+diff --git a/apps/desktop/src/app/context-menu/app-context-menu.test.tsx b/apps/desktop/src/app/context-menu/app-context-menu.test.tsx
+index 82b40bde0f..24f54279bb 100644
+--- a/apps/desktop/src/app/context-menu/app-context-menu.test.tsx
++++ b/apps/desktop/src/app/context-menu/app-context-menu.test.tsx
+@@ -6,6 +6,8 @@ import { registerTerminalContextMenu } from '@/app/right-sidebar/terminal/termin
+ import { DirectiveContent } from '@/components/assistant-ui/directive-text'
+ import { ContextMenu, ContextMenuTrigger, HERMES_CONTEXT_MENU_TRIGGER_ATTR } from '@/components/ui/context-menu'
+ import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
++import { en } from '@/i18n/en'
++import { registerBuiltinActionRunner } from '@/lib/keybinds/plugin-actions'
+ import { $previewTabs, closeRightRail } from '@/store/preview'
+ import { $connection } from '@/store/session'
+ 
+@@ -19,6 +21,7 @@ import {
+ } from './store'
+ import { resolveDomTarget } from './target'
+ 
++const NEW_CHAT_LABEL = en.commandCenter.nav.newChat.title
+ const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
+ 
+ function installBridge(partial: Partial<Window['hermesDesktop']> = {}) {
+@@ -379,6 +382,22 @@ describe('AppContextMenu', () => {
+     expect(await screen.findByText('Settings')).toBeTruthy()
+   })
+ 
++  // [daveey] The shell menu's New chat is ⌘N: it lands on the saved new-session
++  // gateway (session.new), not whichever gateway is on screen.
++  it('runs the session.new action from the shell New chat item', async () => {
++    installBridge()
++    const runner = vi.fn(() => true)
++    const unregister = registerBuiltinActionRunner(runner)
++    mountMenu()
++    const host = attach('<div><p>plain chrome</p></div>')
++
++    fireEvent.contextMenu(host.querySelector('p')!)
++    fireEvent.click(await screen.findByText(NEW_CHAT_LABEL))
++
++    expect(runner).toHaveBeenCalledWith('session.new')
++    unregister()
++  })
++
+   it('skips plain right-clicks inside a skip-marked surface, but not links in it', async () => {
+     installBridge()
+     mountMenu()
+diff --git a/apps/desktop/src/app/context-menu/shell-menu-items.tsx b/apps/desktop/src/app/context-menu/shell-menu-items.tsx
+index ec1967bdc2..9da0311130 100644
+--- a/apps/desktop/src/app/context-menu/shell-menu-items.tsx
++++ b/apps/desktop/src/app/context-menu/shell-menu-items.tsx
+@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router'
+ import { toggleTargetZoneTabStrip } from '@/components/pane-shell/tree/store'
+ import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
+ import { type Translations, useI18n } from '@/i18n'
++import { runBuiltinAction } from '@/lib/keybinds/plugin-actions'
+ import { openCommandPalette } from '@/store/command-palette'
+ import { toggleProfileRailVisible } from '@/store/profile-rail-prefs'
+ import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
+@@ -23,7 +24,12 @@ function shellSections(
+     icon: 'add',
+     key: 'shell-new-chat',
+     label: t.commandCenter.nav.newChat.title,
+-    onSelect: () => navigateToWorkspacePage(navigate, NEW_CHAT_ROUTE)
++    // [daveey] Same as ⌘N: the saved new-session gateway, not the one on screen.
++    onSelect: () => {
++      if (!runBuiltinAction('session.new')) {
++        navigateToWorkspacePage(navigate, NEW_CHAT_ROUTE)
++      }
++    }
+   })
+ 
+   const settings = renderActionItem(kit, {
+diff --git a/apps/desktop/src/app/hooks/use-keybinds-new-session.test.tsx b/apps/desktop/src/app/hooks/use-keybinds-new-session.test.tsx
+index 19c172a6bf..aa1829d11b 100644
+--- a/apps/desktop/src/app/hooks/use-keybinds-new-session.test.tsx
++++ b/apps/desktop/src/app/hooks/use-keybinds-new-session.test.tsx
+@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { isMacPlatform } from '@/lib/platform'
+ import type * as Connections from '@/store/connections'
++import { $defaultProfileRoute } from '@/store/default-profile'
+ import { resetBinding } from '@/store/keybinds'
++import { $newChatRoute, ensureGatewayAgent } from '@/store/profile'
+ 
+ import { useKeybinds } from './use-keybinds'
+ 
+@@ -20,6 +22,11 @@ vi.mock('@/store/connections', async importOriginal => ({
+   selectThisDeviceForNewChat: mocks.selectThisDeviceForNewChat
+ }))
+ 
++vi.mock('@/store/profile', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  ensureGatewayAgent: vi.fn(async () => undefined)
++}))
++
+ vi.mock('@/themes/context', () => ({
+   useTheme: () => ({ resolvedMode: 'light', setMode: vi.fn() })
+ }))
+@@ -65,6 +72,9 @@ describe('⌘N / ⌘⇧N new session gateway targeting', () => {
+     resetBinding('session.newSameGateway')
+     deps.startFreshSession.mockReset()
+     mocks.selectThisDeviceForNewChat.mockClear()
++    $defaultProfileRoute.set(null)
++    $newChatRoute.set(null)
++    vi.mocked(ensureGatewayAgent).mockClear()
+   })
+ 
+   it('⌘N starts a new session and switches the gateway to This device', () => {
+@@ -82,4 +92,27 @@ describe('⌘N / ⌘⇧N new session gateway targeting', () => {
+     expect(deps.startFreshSession).toHaveBeenCalledOnce()
+     expect(mocks.selectThisDeviceForNewChat).not.toHaveBeenCalled()
+   })
++
++  // [daveey] A gateway saved with "Use for new sessions" wins over This device.
++  it('⌘N starts the new session on the saved new-session gateway instead of This device', () => {
++    $defaultProfileRoute.set({ connectionId: 'hermes-hub', profile: 'default' })
++
++    const event = pressN(false)
++
++    expect(event.defaultPrevented).toBe(true)
++    expect(deps.startFreshSession).toHaveBeenCalledOnce()
++    expect(mocks.selectThisDeviceForNewChat).not.toHaveBeenCalled()
++    expect($newChatRoute.get()).toEqual({ connectionId: 'hermes-hub', profile: 'default' })
++    expect(ensureGatewayAgent).toHaveBeenCalledWith('hermes-hub', 'default')
++  })
++
++  it('⌘⇧N still starts on the gateway on screen when a new-session gateway is saved', () => {
++    $defaultProfileRoute.set({ connectionId: 'hermes-hub', profile: 'default' })
++
++    pressN(true)
++
++    expect(deps.startFreshSession).toHaveBeenCalledOnce()
++    expect($newChatRoute.get()).toBeNull()
++    expect(ensureGatewayAgent).not.toHaveBeenCalled()
++  })
+ })
+diff --git a/apps/desktop/src/app/hooks/use-keybinds.ts b/apps/desktop/src/app/hooks/use-keybinds.ts
+index f4df2c92bc..272ecc59fa 100644
+--- a/apps/desktop/src/app/hooks/use-keybinds.ts
++++ b/apps/desktop/src/app/hooks/use-keybinds.ts
+@@ -7,6 +7,7 @@ import { setTerminalTakeover } from '@/app/right-sidebar/store'
+ import { toggleTerminalPane } from '@/app/right-sidebar/terminal/reveal-focus'
+ import { closeActiveTerminal, createTerminal, cycleTerminal } from '@/app/right-sidebar/terminal/terminals'
+ import { appViewForPath, isOverlayView } from '@/app/routes'
++import { defaultNewSessionTarget, prepareDefaultNewSession } from '@/app/session/new-session-route'
+ import {
+   activateTreeTabSlot,
+   cycleTreeTabInFocusedZone,
+@@ -336,9 +337,21 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
+     'nav.cron': () => navigate(CRON_ROUTE),
+     'nav.agents': () => navigate(AGENTS_ROUTE),
+ 
+-    // Fork ⌘N: new chat on This device — re-homes onto the local gateway when
+-    // another one is selected (the switch re-homes the fresh draft).
++    // Fork ⌘N: new chat on the saved new-session gateway (right-click a gateway
++    // in the device switcher → "Use for new sessions"), like the sidebar's New
++    // session row. Opening a session elsewhere never moves it. With no saved
++    // target: This device — re-homes onto the local gateway when another one is
++    // selected (the switch re-homes the fresh draft).
+     'session.new': () => {
++      if (defaultNewSessionTarget()) {
++        setWorkspaceScope('sessions')
++        prepareDefaultNewSession()
++        deps.startFreshSession()
++        window.dispatchEvent(new CustomEvent('hermes:new-session-shortcut'))
++
++        return
++      }
++
+       startNewSessionHere()
+       void selectThisDeviceForNewChat().catch((error: unknown) =>
+         notifyError(error, translateNow('profiles.switchConnectionFailed', thisDeviceLabel()))
+diff --git a/apps/desktop/src/app/session/hooks/new-session-target.test.tsx b/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
+new file mode 100644
+index 0000000000..e200484395
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/new-session-target.test.tsx
+@@ -0,0 +1,209 @@
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { notifyNewSessionTargetUnreachable, prepareDefaultNewSession } from '@/app/session/new-session-route'
++import type { DesktopProfileRoute } from '@/global'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $connectionsRegistry } from '@/store/connections'
++import { $defaultProfileRoute, setDefaultProfile } from '@/store/default-profile'
++import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
++import { $notifications, clearNotifications } from '@/store/notifications'
++import {
++  $activeGatewayProfile,
++  $newChatConnectionId,
++  $newChatProfile,
++  $newChatRoute,
++  captureNewChatSource,
++  ensureGatewayAgent
++} from '@/store/profile'
++import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
++import {
++  _resetSessionOwnerHintsForTests,
++  applyConfiguredDefaultProjectDir,
++  setActiveSessionId,
++  setConnection,
++  setSessions
++} from '@/store/session'
++
++import { useSessionActions } from './use-session-actions'
++
++// [daveey] "New sessions on <gateway>": the saved default route (device
++// switcher → right-click → "Use for new sessions") decides where a generic new
++// session is created, no matter which gateway's session is on screen.
++
++vi.mock('@/store/profile', async original => ({
++  ...(await original<Record<string, unknown>>()),
++  ensureGatewayAgent: vi.fn(async () => undefined),
++  ensureGatewayProfile: vi.fn(async () => undefined)
++}))
++vi.mock('@/store/gateway', async original => ({
++  ...(await original<Record<string, unknown>>()),
++  activeGatewayConnectionId: vi.fn(() => 'local'),
++  requestGatewayForAgent: vi.fn(),
++  retainGatewayForAgent: vi.fn(async () => () => undefined)
++}))
++
++const HUB = { connectionId: 'hermes-hub', profile: 'default' }
++const FOREGROUND_CREATE_DIAL = [undefined, undefined, { spawnPriority: 'foreground' }] as const
++
++function mountActions() {
++  const ref = <T,>(current: T) => ({ current })
++  const state = createClientSessionState()
++
++  return renderHook(() =>
++    useSessionActions({
++      activeSessionId: null,
++      activeSessionIdRef: ref<string | null>(null),
++      busyRef: ref(false),
++      creatingSessionRef: ref(false),
++      ensureSessionState: () => state,
++      getRouteToken: () => 'route',
++      getRoutedStoredSessionId: () => null,
++      navigate: vi.fn(),
++      requestGateway: vi.fn(async () => ({ session_id: 'ambient', stored_session_id: 'ambient-stored' }) as never),
++      resetViewSync: vi.fn(),
++      routedSessionId: null,
++      runtimeIdByStoredSessionIdRef: ref(new Map()),
++      selectedStoredSessionId: null,
++      selectedStoredSessionIdRef: ref<string | null>(null),
++      sessionStateByRuntimeIdRef: ref(new Map()),
++      syncSessionStateToView: vi.fn(),
++      updateSessionState: () => state
++    })
++  )
++}
++
++beforeEach(() => {
++  _resetSessionOwnerHintsForTests()
++  $defaultProfileRoute.set(null)
++  $newChatRoute.set(null)
++  $newChatProfile.set(null)
++  $activeGatewayProfile.set('default')
++  $projectScope.set(ALL_PROJECTS)
++  $connectionsRegistry.set({
++    connections: [
++      { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
++      { id: 'mac-mini', kind: 'ssh', label: 'mac-mini', tokenPreview: null, tokenSet: false },
++      { id: 'hermes-hub', kind: 'ssh', label: 'hub (EC2)', tokenPreview: null, tokenSet: false }
++    ],
++    primary: 'local',
++    secureTokenStorage: true,
++    version: 2
++  } as never)
++  setSessions([])
++  setActiveSessionId(null)
++  setConnection({
++    baseUrl: 'http://localhost:7070',
++    connectionId: 'local',
++    isFullscreen: false,
++    logs: [],
++    mode: 'local',
++    nativeOverlayWidth: 0,
++    token: '',
++    windowButtonPosition: null,
++    wsUrl: 'ws://localhost:7070'
++  })
++  window.hermesDesktop = {
++    api: vi.fn(async () => ({ messages: [], total: 0 })),
++    profile: { setDefault: async (route: DesktopProfileRoute) => route }
++  } as never
++  vi.mocked(requestGatewayForAgent).mockReset()
++  vi.mocked(requestGatewayForAgent).mockResolvedValue({
++    session_id: 'created',
++    stored_session_id: 'created-stored',
++    info: {}
++  })
++})
++
++afterEach(() => {
++  cleanup()
++  applyConfiguredDefaultProjectDir('')
++  window.history.replaceState(null, '', '/')
++  $defaultProfileRoute.set(null)
++  $newChatRoute.set(null)
++  $newChatProfile.set(null)
++  $newChatConnectionId.set(null)
++  $connectionsRegistry.set(null)
++  captureNewChatSource(null)
++  setActiveSessionId(null)
++  setConnection(null)
++  setSessions([])
++  clearNotifications()
++  vi.clearAllMocks()
++})
++
++describe('new-session gateway target', () => {
++  it('opening a session on another gateway leaves new sessions on the saved gateway', async () => {
++    const { result } = mountActions()
++    await act(() => setDefaultProfile(HUB))
++
++    // A click on a mac-mini session: resume through its owner route, which
++    // brings mac-mini to the foreground (the ambient source new sessions used
++    // to follow).
++    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
++      session_id: 'mini-runtime',
++      stored_session_id: 'mini-stored',
++      info: {},
++      messages: []
++    })
++    await act(() =>
++      result.current.resumeSession('mini-stored', false, { connectionId: 'mac-mini', profile: 'default' })
++    )
++    vi.mocked(activeGatewayConnectionId).mockReturnValue('mac-mini')
++
++    expect($defaultProfileRoute.get()).toEqual(HUB)
++
++    act(() => result.current.selectSidebarItem({ action: 'new-session' } as never))
++    await act(() => result.current.createBackendSessionForSend())
++
++    expect(requestGatewayForAgent).toHaveBeenLastCalledWith(
++      'hermes-hub',
++      'default',
++      'session.create',
++      expect.objectContaining({ profile: 'default' }),
++      ...FOREGROUND_CREATE_DIAL
++    )
++  })
++
++  it('without a saved gateway a new session still follows the gateway on screen (upstream)', async () => {
++    vi.mocked(activeGatewayConnectionId).mockReturnValue('mac-mini')
++    const { result } = mountActions()
++
++    act(() => result.current.selectSidebarItem({ action: 'new-session' } as never))
++    await act(() => result.current.createBackendSessionForSend())
++
++    expect(requestGatewayForAgent).toHaveBeenLastCalledWith(
++      'mac-mini',
++      'default',
++      'session.create',
++      expect.anything(),
++      ...FOREGROUND_CREATE_DIAL
++    )
++  })
++
++  it('an unreachable saved gateway keeps the draft there and offers This device for this session only', async () => {
++    await act(() => setDefaultProfile(HUB))
++    vi.mocked(ensureGatewayAgent).mockRejectedValueOnce(new Error('ssh: connect to host hub: timed out'))
++
++    act(() => prepareDefaultNewSession())
++    await vi.waitFor(() => expect($notifications.get()).toHaveLength(1))
++
++    const [notice] = $notifications.get()
++    expect(notice).toMatchObject({ kind: 'warning', detail: 'ssh: connect to host hub: timed out' })
++    expect(notice.title).toContain('hub (EC2)')
++    // No silent fallback: the draft is still owned by the hub.
++    expect($newChatRoute.get()).toEqual(HUB)
++    expect(ensureGatewayAgent).not.toHaveBeenCalledWith('local', expect.anything())
++
++    act(() => notice.action?.onClick())
++
++    expect($newChatRoute.get()).toEqual({ connectionId: 'local', profile: 'default' })
++    expect($defaultProfileRoute.get()).toEqual(HUB)
++  })
++
++  it('offers no fallback when the saved gateway is This device itself', () => {
++    notifyNewSessionTargetUnreachable({ connectionId: 'local', profile: 'default' }, new Error('down'))
++
++    expect($notifications.get()[0]?.action).toBeUndefined()
++  })
++})
+diff --git a/apps/desktop/src/app/session/new-session-route.ts b/apps/desktop/src/app/session/new-session-route.ts
+index f86cab13e9..e8bc61336d 100644
+--- a/apps/desktop/src/app/session/new-session-route.ts
++++ b/apps/desktop/src/app/session/new-session-route.ts
+@@ -1,6 +1,10 @@
++import { LOCAL_CONNECTION_ID } from '@hermes/shared'
++
+ import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
++import { translateNow } from '@/i18n/runtime'
++import { $connectionsRegistry, thisDeviceLabel } from '@/store/connections'
+ import { $defaultProfileRoute } from '@/store/default-profile'
+-import { notifyError } from '@/store/notifications'
++import { notify, notifyError } from '@/store/notifications'
+ import {
+   $newChatProfile,
+   $newChatRoute,
+@@ -8,6 +12,7 @@ import {
+   captureNewChatSource,
+   ensureGatewayAgent,
+   ensureGatewayProfile,
++  newSessionInAgent,
+   pinLegacyNewChatProfile
+ } from '@/store/profile'
+ import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
+@@ -65,6 +70,38 @@ export function prepareDefaultNewSession(): void {
+     : ensureGatewayProfile(target.profile, { forceLegacyRoute: true })
+ 
+   void activation.catch(error => {
+-    notifyError(error, `Failed to open profile "${target.profile}"`)
++    if (target.route) {
++      notifyNewSessionTargetUnreachable(target.route, error)
++    } else {
++      notifyError(error, `Failed to open profile "${target.profile}"`)
++    }
++  })
++}
++
++/** [daveey] The saved new-session gateway did not answer. The draft stays
++ *  bound to it (session.create never falls back to another gateway on its
++ *  own); the notice offers this one session on This device instead, without
++ *  changing the saved target. */
++export function notifyNewSessionTargetUnreachable(route: AgentProfileRoute, error: unknown): string {
++  const label =
++    $connectionsRegistry.get()?.connections.find(connection => connection.id === route.connectionId)?.label ??
++    route.connectionId
++
++  const reason = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
++
++  return notify({
++    id: `new-session-target-unreachable:${route.connectionId}`,
++    kind: 'warning',
++    title: translateNow('profiles.newSessionTargetUnreachable', label),
++    message: translateNow('profiles.newSessionTargetUnreachableDetail'),
++    ...(reason ? { detail: reason } : {}),
++    ...(route.connectionId === LOCAL_CONNECTION_ID
++      ? {}
++      : {
++          action: {
++            label: translateNow('profiles.createOnThisDevice', thisDeviceLabel()),
++            onClick: () => newSessionInAgent({ connectionId: LOCAL_CONNECTION_ID, profile: 'default' })
++          }
++        })
+   })
+ }
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 578d4ffd86..7da916d5fb 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -561,7 +561,7 @@ export const en: Translations = {
+       'nav.artifacts': 'Open artifacts',
+       'nav.cron': 'Open scheduled jobs',
+       'nav.agents': 'Open agents',
+-      'session.new': 'New session on this device',
++      'session.new': 'New session on saved gateway',
+       'session.newTab': 'New session tab',
+       'session.newSameGateway': 'New session on current gateway',
+       'session.newWindow': 'New window',
+@@ -2951,6 +2951,13 @@ export const en: Translations = {
+     defaultSet: name => `${name} is now the default`,
+     defaultDescription: 'Used when Hermes opens and for new chats. Existing sessions stay in their profiles.',
+     failedSetDefault: 'Could not set the default profile',
++    useForNewSessions: 'Use for new sessions',
++    newSessionsStartHere: 'New sessions start here',
++    newSessionsSet: name => `New sessions will start on ${name}`,
++    newSessionsDescription: 'Opening a session on another gateway does not change this.',
++    newSessionTargetUnreachable: name => `${name} isn't reachable`,
++    newSessionTargetUnreachableDetail: 'New sessions are set to start there. Nothing was created on another gateway.',
++    createOnThisDevice: name => `Create on ${name} instead`,
+     setColor: color => `Set color ${color}`,
+     autoColor: 'Auto',
+     noProfiles: 'No profiles yet.',
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index 6a3c581f37..09bdc23bc1 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -2274,5 +2274,12 @@
+   "zones.closeRunningTitle": ["ja","zh-hant"],
+   "zones.newSessionTab": ["ar"],
+   "zones.newTab": ["ar","ru"],
+-  "zones.zoneMenuLabel": ["ja","zh-hant"]
++  "zones.zoneMenuLabel": ["ja","zh-hant"],
++  "profiles.useForNewSessions": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "profiles.newSessionsStartHere": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "profiles.newSessionsSet": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "profiles.newSessionsDescription": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "profiles.newSessionTargetUnreachable": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "profiles.newSessionTargetUnreachableDetail": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "profiles.createOnThisDevice": ["ar","de","es","fr","ja","ru","zh","zh-hant"]
+ }
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 41b15bcfc0..8419935843 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -2576,6 +2576,13 @@ export interface Translations extends NoticeTranslations {
+     defaultSet: (name: string) => string
+     defaultDescription: string
+     failedSetDefault: string
++    useForNewSessions: string
++    newSessionsStartHere: string
++    newSessionsSet: (name: string) => string
++    newSessionsDescription: string
++    newSessionTargetUnreachable: (name: string) => string
++    newSessionTargetUnreachableDetail: string
++    createOnThisDevice: (name: string) => string
+     setColor: (color: string) => string
+     autoColor: string
+     noProfiles: string
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 2bff93cf71..408a80c1da 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -2321,6 +2321,7 @@
+     "profiles.count",
+     "profiles.createAction",
+     "profiles.createDesc",
++    "profiles.createOnThisDevice",
+     "profiles.created",
+     "profiles.creating",
+     "profiles.default",
+@@ -2379,6 +2380,11 @@
+     "profiles.nameRequired",
+     "profiles.newNameLabel",
+     "profiles.newProfile",
++    "profiles.newSessionTargetUnreachable",
++    "profiles.newSessionTargetUnreachableDetail",
++    "profiles.newSessionsDescription",
++    "profiles.newSessionsSet",
++    "profiles.newSessionsStartHere",
+     "profiles.noProfiles",
+     "profiles.notSet",
+     "profiles.openInNewWindow",
+@@ -2442,6 +2448,7 @@
+     "profiles.switchToProfile",
+     "profiles.title",
+     "profiles.unsavedChanges",
++    "profiles.useForNewSessions",
+     "prompts.gatewayDisconnected",
+     "prompts.reconnect",
+     "prompts.secretDesc",
+-- 
+2.55.0
+
