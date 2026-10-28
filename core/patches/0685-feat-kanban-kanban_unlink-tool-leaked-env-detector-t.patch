@@ -1,0 +1,357 @@
+From 14e8670d854700d214e6b95a5043726b78a59cd5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 09:07:42 +0000
+Subject: [PATCH] feat(kanban): kanban_unlink tool; leaked-env detector treats
+ a parked card's live worker as alive; worker may close its card after
+ unlinking [daveey]
+
+---
+ agent/transports/hermes_tools_mcp_server.py |  2 +-
+ hermes_cli/top_level_env.py                 | 15 +++-
+ tests/hermes_cli/test_leaked_worker_env.py  | 46 +++++++++++
+ tests/tools/test_kanban_tools.py            | 87 +++++++++++++++++++++
+ tools/kanban_tools.py                       | 41 +++++++++-
+ tools/kanban_tools_schemas.py               | 16 ++++
+ toolsets.py                                 |  2 +-
+ website/docs/reference/tools-reference.md   |  1 +
+ 8 files changed, 205 insertions(+), 5 deletions(-)
+
+diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
+index 5265639cf2..d2459ed675 100644
+--- a/agent/transports/hermes_tools_mcp_server.py
++++ b/agent/transports/hermes_tools_mcp_server.py
+@@ -64,7 +64,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+     "kanban_request_changes", "kanban_comment",
+     "kanban_heartbeat", "kanban_show", "kanban_list",
+     # Orchestrator-only (the kanban tool gates them on HERMES_KANBAN_TASK unset).
+-    "kanban_create", "kanban_unblock", "kanban_link",
++    "kanban_create", "kanban_unblock", "kanban_link", "kanban_unlink",
+ )
+ 
+ 
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index 768bdd2406..99a9a30ff3 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -89,6 +89,9 @@ def _board_db(env: Mapping[str, str]) -> Optional[Path]:
+         return None
+ 
+ 
++_TERMINAL_STATUSES = frozenset({"done", "archived"})
++
++
+ def _task_state(db: Path, task_id: str) -> Optional[tuple[str, Optional[int]]]:
+     """``(status, worker_pid)`` of ``task_id``; ``("", None)`` when absent; ``None`` when unreadable."""
+     import sqlite3
+@@ -104,6 +107,16 @@ def _task_state(db: Path, task_id: str) -> Optional[tuple[str, Optional[int]]]:
+             conn.execute("PRAGMA query_only=ON")
+         try:
+             row = conn.execute("SELECT status, worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
++            if row is not None and not row[1] and str(row[0] or "") not in _TERMINAL_STATUSES:
++                # A live worker whose card was parked (kanban_block -> todo/blocked) has its pid cleared on
++                # the card but retained on its latest run: that is still the worker, not a leak.
++                try:
++                    run = conn.execute("SELECT worker_pid FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++                                       (task_id,)).fetchone()
++                except sqlite3.Error:
++                    run = None
++                if run is not None and run[0]:
++                    row = (row[0], run[0])
+         finally:
+             conn.close()
+     except sqlite3.Error:
+@@ -177,7 +190,7 @@ def leaked_worker_env_diagnosis(environ: Optional[Mapping[str, str]] = None) ->
+     status, worker_pid = state
+     if not status:
+         reason = f"its worker card {tid} is not on the board"
+-    elif status != "running":
++    elif status != "running" and (status in _TERMINAL_STATUSES or not worker_pid):
+         reason = f"its worker card {tid} is {status}"
+     elif worker_pid and not _pid_alive(worker_pid):
+         reason = f"{tid}'s worker pid {worker_pid} is gone"
+diff --git a/tests/hermes_cli/test_leaked_worker_env.py b/tests/hermes_cli/test_leaked_worker_env.py
+index 0564017a88..372cca95f4 100644
+--- a/tests/hermes_cli/test_leaked_worker_env.py
++++ b/tests/hermes_cli/test_leaked_worker_env.py
+@@ -217,3 +217,49 @@ def test_cli_refusal_names_the_leak(leaked_desktop, capsys):
+     text = err.err + err.out
+     assert "cannot mutate Kanban tasks via the CLI" in text and "leaked worker env" in text and tid in text
+ 
++
++
++# ── a live worker whose card was parked by kanban_block is not a leak ──────────────────────────
++
++def _parked_board(tmp_path, status, run_pid):
++    """A card parked by kanban_block: card pid cleared, latest run keeps its worker pid."""
++    db = _board(tmp_path, [("t_45d5a361", status, None)])
++    conn = sqlite3.connect(db)
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, worker_pid INTEGER)")
++    conn.execute("INSERT INTO task_runs (task_id, worker_pid) VALUES ('t_45d5a361', 99999999)")  # older run
++    conn.execute("INSERT INTO task_runs (task_id, worker_pid) VALUES ('t_45d5a361', ?)", (run_pid,))
++    conn.commit()
++    conn.close()
++    return db
++
++
++@pytest.mark.parametrize("status", ["todo", "blocked", "scheduled"])
++def test_no_diagnosis_for_a_live_worker_whose_card_was_parked(tmp_path, status):
++    """kanban_block(kind=dependency) moves the card to todo while the worker keeps running."""
++    db = _parked_board(tmp_path, status, os.getpid())
++    assert tle.leaked_worker_env_diagnosis(_leak_env(db)) is None
++
++
++def test_parked_card_whose_worker_pid_is_gone_is_still_a_leak(tmp_path):
++    p = subprocess.Popen([sys.executable, "-c", "pass"])
++    p.wait()
++    db = _parked_board(tmp_path, "todo", p.pid)
++    msg = tle.leaked_worker_env_diagnosis(_leak_env(db))
++    assert msg and f"worker pid {p.pid} is gone" in msg
++
++
++def test_parked_card_with_a_foreign_live_pid_is_still_a_leak(tmp_path):
++    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++    try:
++        db = _parked_board(tmp_path, "todo", p.pid)
++        msg = tle.leaked_worker_env_diagnosis(_leak_env(db))
++        assert msg and "does not descend from" in msg
++    finally:
++        p.kill()
++        p.wait()
++
++
++def test_parked_card_without_any_run_pid_is_still_a_leak(tmp_path):
++    db = _board(tmp_path, [("t_45d5a361", "todo", None)])
++    msg = tle.leaked_worker_env_diagnosis(_leak_env(db))
++    assert msg and "is todo" in msg
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 05279a2d4b..501ae51a5e 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -1711,3 +1711,90 @@ def test_sweep_escalates_old_agent_owned_block_once(worker_env):
+         assert sweep_agent_owned_blocks(conn, now=later) == []  # only one respawn per block
+     finally:
+         conn.close()
++
++
++# ---------------------------------------------------------------------------
++# kanban_unlink
++# ---------------------------------------------------------------------------
++
++def test_worker_blocks_on_dependency_then_unlinks_and_completes(worker_env):
++    """link own card under a parent -> block(dependency) -> unlink -> complete own card."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    with kbc.connect() as conn:
++        parent = kb.create_task(conn, title="upstream")
++    assert json.loads(kt._handle_link({"parent_id": parent, "child_id": worker_env}))["ok"] is True
++    blocked = json.loads(kt._handle_block({"reason": "waiting on upstream", "kind": "dependency"}))
++    assert blocked["ok"] is True
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, worker_env).status == "todo"
++
++    out = json.loads(kt._handle_unlink({"parent_id": parent, "child_id": worker_env}))
++    assert out["ok"] is True and out["unlinked"] is True
++    with kbc.connect() as conn:
++        assert kb.parent_ids(conn, worker_env) == []
++
++    done = json.loads(kt._handle_complete({"summary": "no longer needs the parent"}))
++    assert "error" not in done, done
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, worker_env).status == "done"
++
++
++def test_unlink_rejects_foreign_edge_and_missing_link(worker_env):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    with kbc.connect() as conn:
++        a = kb.create_task(conn, title="a")
++        b = kb.create_task(conn, title="b")
++        kb.link_tasks(conn, a, b)
++    foreign = json.loads(kt._handle_unlink({"parent_id": a, "child_id": b}))
++    assert "only unlink edges of its own card" in foreign["error"]
++    with kbc.connect() as conn:
++        assert kb.parent_ids(conn, b) == [a]
++    missing = json.loads(kt._handle_unlink({"parent_id": a, "child_id": worker_env}))
++    assert "no such link" in missing["error"]
++    assert "required" in json.loads(kt._handle_unlink({"parent_id": a}))["error"]
++
++
++def test_unlink_orchestrator_may_unlink_any_edge(worker_env, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    with kbc.connect() as conn:
++        a = kb.create_task(conn, title="a")
++        b = kb.create_task(conn, title="b")
++        kb.link_tasks(conn, a, b)
++    assert json.loads(kt._handle_unlink({"parent_id": a, "child_id": b}))["ok"] is True
++    with kbc.connect() as conn:
++        assert kb.parent_ids(conn, b) == []
++
++
++def test_unlink_tool_registered_for_workers():
++    from tools import kanban_tools as kt
++    assert any(t[0] == "kanban_unlink" for t in kt._TOOLS)
++    assert "kanban_unlink" not in kt._ORCHESTRATOR_TOOLS
++
++
++def test_old_run_cannot_complete_once_the_card_was_reclaimed(worker_env):
++    """The late-completion path ends at the next claim: a stale run must not close the new run's card."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    with kbc.connect() as conn:
++        parent = kb.create_task(conn, title="upstream")
++    kt._handle_link({"parent_id": parent, "child_id": worker_env})
++    assert json.loads(kt._handle_block({"reason": "waiting", "kind": "dependency"}))["ok"] is True
++    kt._handle_unlink({"parent_id": parent, "child_id": worker_env})
++    with kbc.connect() as conn:
++        assert kb.claim_task(conn, worker_env) is not None  # dispatcher respawns the card
++    out = json.loads(kt._handle_complete({"summary": "late"}))
++    assert out.get("rejection") == "stale_run"
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, worker_env).status == "running"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 7b58a27dab..4192b7b95c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -24,7 +24,8 @@ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+     KANBAN_COMPLETE_SCHEMA, KANBAN_CONTINUE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+     KANBAN_LIST_SCHEMA, KANBAN_ORIGIN_ADOPT_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+-    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_ARCHIVE_SCHEMA)
++    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_ARCHIVE_SCHEMA,
++    KANBAN_UNLINK_SCHEMA)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -864,6 +865,18 @@ def _handle_list(args: dict, **kw) -> str:
+             "promoted": promoted})
+ 
+ 
++def _parked_by_own_run(conn, tid: str, run_id: int) -> bool:
++    """True when ``run_id`` is the card's latest run, ended by ``kanban_block``, and nothing has
++    claimed the card since (no current run, no claim lock, status ready/blocked)."""
++    row = conn.execute("SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    if row is None or row["current_run_id"] is not None or row["claim_lock"] \
++            or row["status"] not in ("ready", "blocked"):
++        return False
++    last = conn.execute("SELECT id, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++                        (tid,)).fetchone()
++    return bool(last and last["id"] == run_id and last["outcome"] == "blocked")
++
++
+ @_kanban_handler("kanban_complete", classify_rejections=True)
+ def _handle_complete(args: dict, **kw) -> str:
+     """Mark the current task done with a structured handoff. Every refusal
+@@ -893,9 +906,14 @@ def _handle_complete(args: dict, **kw) -> str:
+         task = kb.get_task(conn, tid)
+         goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+         try:
++            run_id = _worker_run_id(tid)
++            if run_id is not None and _parked_by_own_run(conn, tid, run_id):
++                # This worker parked its card with kanban_block, then edited its own edges (kanban_unlink):
++                # its run is over but nothing has claimed the card since, so it may still close its own card.
++                run_id = None
+             ok = kb.complete_task(
+                 conn, tid, result=result, summary=summary, metadata=metadata,
+-                created_cards=created_cards, expected_run_id=_worker_run_id(tid), goal_verification=goal_verification)
++                created_cards=created_cards, expected_run_id=run_id, goal_verification=goal_verification)
+         except kb.ArtifactPreservationError as artifact_err:
+             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
+             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
+@@ -1860,6 +1878,24 @@ def _handle_link(args: dict, **kw) -> str:
+                    **({"gated_by": parent_id} if gated else {}))
+ 
+ 
++@_kanban_handler("kanban_unlink")
++def _handle_unlink(args: dict, **kw) -> str:
++    """Remove a dependency edge. Same ownership rule as kanban_link: a dispatcher worker
++    edits only its OWN card's edges (it is the child or the parent); orchestrators any."""
++    _reject_delegated_child_mutation("kanban_unlink")
++    parent_id = args.get("parent_id")
++    child_id = args.get("child_id")
++    _check(parent_id and child_id, "both parent_id and child_id are required")
++    parent_id, child_id = str(parent_id), str(child_id)
++    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    if env_tid and env_tid not in (parent_id, child_id):
++        raise _Reject(f"kanban_unlink refused: this worker owns {env_tid}, not the edge "
++                      f"{parent_id} -> {child_id}; it may only unlink edges of its own card")
++    with _board(args.get("board")) as (kb, conn):
++        _check(kb.unlink_tasks(conn, parent_id, child_id), f"no such link: {parent_id} -> {child_id}")
++        return _ok(parent_id=parent_id, child_id=child_id, unlinked=True)
++
++
+ @_kanban_handler("kanban_origin_adopt")
+ def _handle_origin_adopt(args: dict, **kw) -> str:
+     _reject_delegated_child_mutation("kanban_origin_adopt")
+@@ -1906,6 +1942,7 @@ _TOOLS = (
+     ("kanban_origin_adopt", KANBAN_ORIGIN_ADOPT_SCHEMA, _handle_origin_adopt, "🔗"),
+     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
++    ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "✂"),
+     ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"))
+ 
+ for _name, _sch, _handler, _emoji in _TOOLS:
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index d846f271fe..e7446aed8d 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -787,6 +787,22 @@ KANBAN_LINK_SCHEMA = _schema(
+     ["parent_id", "child_id"],
+ )
+ 
++KANBAN_UNLINK_SCHEMA = _schema(
++    "kanban_unlink",
++    (
++        "Remove a parent→child dependency edge. A dispatcher worker may "
++        "only remove edges of its own card (its dependencies or its "
++        "children), e.g. to undo a kanban_link it made before a "
++        "kanban_block(kind='dependency'); an orchestrator may unlink any "
++        "edge. A child that no longer waits on anything is promoted at once."
++    ),
++    {
++        "parent_id": {"type": "string", "description": "Parent task id."},
++        "child_id":  {"type": "string", "description": "Child task id."},
++    },
++    ["parent_id", "child_id"],
++)
++
+ KANBAN_ARCHIVE_SCHEMA = _schema(
+     "kanban_archive",
+     (
+diff --git a/toolsets.py b/toolsets.py
+index 2d81be2354..153c528ed4 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -30,7 +30,7 @@ _HERMES_CORE_TOOLS = [
+     "kanban_complete", "kanban_block", "kanban_request_review",
+     "kanban_request_changes",
+     "kanban_heartbeat",
+-    "kanban_comment", "kanban_create", "kanban_link",
++    "kanban_comment", "kanban_create", "kanban_link", "kanban_unlink",
+     "kanban_unblock", "kanban_archive",
+     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+     "computer_use",
+diff --git a/website/docs/reference/tools-reference.md b/website/docs/reference/tools-reference.md
+index 8db7d9e7d3..0a9459b0a4 100644
+--- a/website/docs/reference/tools-reference.md
++++ b/website/docs/reference/tools-reference.md
+@@ -156,6 +156,7 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
+ | `kanban_comment` | Add a comment to the task thread without changing its state — useful for surfacing intermediate findings. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+ | `kanban_create` | Fan out child tasks from the current task. Used by orchestrators and follow-up-spawning workers. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+ | `kanban_link` | Link tasks with a parent → child dependency edge. | `HERMES_KANBAN_TASK` or `kanban` toolset |
++| `kanban_unlink` | Remove a parent → child dependency edge (a worker: only edges of its own card). | `HERMES_KANBAN_TASK` or `kanban` toolset |
+ | `kanban_unblock` | Move a blocked task to `ready` when all parents are done, or `todo` while any parent remains open. Orchestrator-only; hidden from dispatcher-spawned task workers. | profile with `kanban` toolset |
+ | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64). Stored as a real attachment under the task's attachments dir, capped at 25 MB. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+ | `kanban_attach_url` | Attach a file to a task by URL — Hermes downloads it server-side and stores it as a real attachment (capped at 25 MB). Only http/https URLs. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+-- 
+2.55.0
+

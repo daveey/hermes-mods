@@ -1,0 +1,355 @@
+From f359ad12a39b918fe88bee57dfd3df503c73a716 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 09:01:41 +0000
+Subject: [PATCH] fix(agent): [daveey] refuse a bare vendor model id on
+ OpenRouter/Nous before any request; API worker logs carry the session tag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A Kanban worker (MacBook, 2026-10-27 22:00 PT) resolved provider=openrouter
+while keeping the bare id claude-opus-5-5, and its only request died with
+HTTP 400 "claude-opus-5-5 is not a valid model ID" — an error naming neither
+the route nor why it was taken. The pin-without-provider route itself was
+fixed by 9c943cbd2f; nothing stopped any other route (auto config, fallback,
+cron, CLI) from doing the same.
+
+- agent/model_provider_guard.py: after the client is built (the provider is
+  final only then), a bare id with a known vendor (claude-*, gpt-*, ...) on
+  openrouter/nous raises ModelProviderMismatchError, logged at WARNING, naming
+  provider, base URL, model and route (pinned/fallback/auto) and suggesting
+  vendor/model or --provider <vendor>. Ids with "/" and unknown house ids pass.
+  agent.model_provider_guard: false turns it off.
+- chat_completion_helpers._context_thread_target now carries the thread-local
+  session id into the API worker thread, so "Streaming failed before delivery"
+  reaches errors.log tagged [<sid>] and the errors signal can name the session.
+- test_provider_parity's Nous fixture used bare "gpt-5" (not a Nous id; every
+  Nous catalogue entry is vendor/model); it now uses openai/gpt-5.
+
+Self-heal agent-1572c64e24.
+---
+ agent/agent_init.py                           |  3 +
+ agent/chat_completion_helpers.py              | 18 ++++-
+ agent/model_provider_guard.py                 | 76 +++++++++++++++++
+ hermes_cli/config_defaults.py                 |  3 +
+ tests/agent/test_model_provider_guard.py      | 81 +++++++++++++++++++
+ tests/agent/test_provider_parity.py           |  2 +-
+ tests/agent/test_worker_thread_session_tag.py | 50 ++++++++++++
+ website/docs/user-guide/configuration.md      |  2 +
+ 8 files changed, 232 insertions(+), 3 deletions(-)
+ create mode 100644 agent/model_provider_guard.py
+ create mode 100644 tests/agent/test_model_provider_guard.py
+ create mode 100644 tests/agent/test_worker_thread_session_tag.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index a5c7321383..90c27554b6 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2434,6 +2434,9 @@ def init_agent(
+     _setup_logging(agent)
+     _set_defaults(agent, _STREAM_STATE)
+     _build_client(agent, api_key, base_url, fallback_model)
++    # [daveey] The provider is final only now (routed/fallback clients rewrite it).
++    from agent.model_provider_guard import check_model_matches_provider
++    check_model_matches_provider(agent)
+     _init_fallback_chain(agent, fallback_model)
+     _load_tools(agent, enabled_toolsets, disabled_toolsets)
+     _init_session_state(
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index f99248698e..6e0e7cef16 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -75,9 +75,23 @@ _STREAM_5XX_PROBE_WINDOW_S = 60.0
+ 
+ 
+ def _context_thread_target(callback):
+-    """Bind a no-argument thread target to the caller's ContextVars."""
++    """Bind a no-argument thread target to the caller's ContextVars and log session tag.
++
++    [daveey] The session id that tags log lines (``[<sid>]``) is a thread-local, not a ContextVar,
++    so without carrying it the API worker's errors (``Streaming failed before delivery``) reached
++    errors.log untagged and the errors signal could not name the session (agent-1572c64e24).
++    """
+     context = contextvars.copy_context()
+-    return lambda: context.run(callback)
++    from hermes_logging import _session_context, set_session_context
++
++    session_id = getattr(_session_context, "session_id", None)
++
++    def _run():
++        if session_id:
++            set_session_context(session_id)
++        return context.run(callback)
++
++    return _run
+ 
+ 
+ def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
+diff --git a/agent/model_provider_guard.py b/agent/model_provider_guard.py
+new file mode 100644
+index 0000000000..3d1c9dcffd
+--- /dev/null
++++ b/agent/model_provider_guard.py
+@@ -0,0 +1,76 @@
++"""[daveey] Refuse a bare vendor model id on a vendor/model-namespaced aggregator before any request.
++
++OpenRouter and the Nous Portal only know ``vendor/model`` slugs: ``claude-opus-5-5`` there can only
++come back as HTTP 400 "is not a valid model ID", an error that names neither the route nor why it was
++taken. That happens when a route switches provider without switching the model (a Kanban pin with no
++provider late-bound to an ``auto`` config, self-heal agent-1572c64e24). This check runs once the
++client is built, so the error names the provider, base URL, model and how the route was chosen.
++
++``agent.model_provider_guard: false`` in config.yaml turns it off.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++# Aggregators whose catalogues are vendor-namespaced end to end.
++_NAMESPACED_AGGREGATORS = frozenset({"openrouter", "nous"})
++
++
++class ModelProviderMismatchError(ValueError):
++    """The resolved provider cannot serve this model id as written."""
++
++
++def _guard_enabled() -> bool:
++    try:
++        from hermes_cli.config import load_config
++
++        return (load_config().get("agent") or {}).get("model_provider_guard", True) is not False
++    except Exception:
++        logger.debug("model_provider_guard: config unreadable, guard stays on", exc_info=True)
++        return True
++
++
++def route_origin(agent: Any) -> str:
++    """How the provider was chosen: ``fallback`` (init-time chain), ``auto`` (no provider named,
++    or ``auto``), else ``pinned`` (named by the caller, config or a Kanban pin)."""
++    if getattr(agent, "_fallback_activated", False):
++        return "fallback"
++    requested = str(getattr(agent, "requested_provider", "") or "").strip().lower()
++    return "auto" if requested in {"", "auto"} else "pinned"
++
++
++def mismatch_message(provider: str, base_url: str, model: str, route: str) -> str | None:
++    """The refusal text when ``model`` is a bare id of a known vendor on a namespaced aggregator."""
++    if provider not in _NAMESPACED_AGGREGATORS or not model or "/" in model:
++        return None
++    from hermes_cli.model_normalize import detect_vendor
++
++    vendor = detect_vendor(model)
++    if not vendor:
++        return None  # unknown house ids pass: only a certainly-wrong id is refused
++    # First line stays short: the CLI init-failure copy shows only the first ~120 chars of it.
++    return (
++        f"'{model}' on {provider} needs '{vendor}/{model}' (route: {route}); or use --provider {vendor}\n"
++        f"Provider {provider} at {base_url or 'its default base URL'} only accepts vendor/model ids, "
++        f"so this bare {vendor} id would fail with HTTP 400 \"is not a valid model ID\". "
++        f"Turn this check off with `hermes config set agent.model_provider_guard false`."
++    )
++
++
++def check_model_matches_provider(agent: Any) -> None:
++    """Raise :class:`ModelProviderMismatchError` (logged at WARNING) for a 400-bound model/provider pair."""
++    provider = str(getattr(agent, "provider", "") or "").strip().lower()
++    model = str(getattr(agent, "model", "") or "").strip()
++    base_url = str(getattr(agent, "base_url", "") or "")
++    client_kwargs = getattr(agent, "_client_kwargs", None)
++    if isinstance(client_kwargs, dict) and client_kwargs.get("base_url"):
++        base_url = str(client_kwargs["base_url"])
++    message = mismatch_message(provider, base_url, model, route_origin(agent))
++    if message is None or not _guard_enabled():
++        return
++    logger.warning("model/provider mismatch refused before any request: %s", message)
++    raise ModelProviderMismatchError(message)
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 70626c79ab..1885eafad1 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -77,6 +77,9 @@ DEFAULT_CONFIG = {
+         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
+         # `hermes chat --run-budget N`.
+         "run_budget_seconds": None,
++        # [daveey] Refuse a bare vendor id (claude-*) routed to OpenRouter / Nous Portal at agent init,
++        # naming provider, base URL and route, instead of sending a request that can only 400.
++        "model_provider_guard": True,
+         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
+         # while calling tools or receiving API responses. 0 = unlimited.
+         "gateway_timeout": 1800,
+diff --git a/tests/agent/test_model_provider_guard.py b/tests/agent/test_model_provider_guard.py
+new file mode 100644
+index 0000000000..263163433b
+--- /dev/null
++++ b/tests/agent/test_model_provider_guard.py
+@@ -0,0 +1,81 @@
++"""[daveey] A bare vendor model id (``claude-opus-5-5``) on a vendor/model-namespaced aggregator
++(OpenRouter, Nous Portal) can only 400 ("is not a valid model ID"). The agent must refuse it at
++init, before any request, with an error that names the provider, base URL, model and how the
++route was chosen, instead of sending the request (self-heal agent-1572c64e24)."""
++
++import logging
++
++import pytest
++
++
++def _agent(**kw):
++    from run_agent import AIAgent
++
++    params = dict(
++        model="claude-opus-5-5",
++        provider="openrouter",
++        api_key="sk-dummy",
++        base_url="https://openrouter.ai/api/v1",
++        quiet_mode=True,
++        skip_context_files=True,
++        skip_memory=True,
++        platform="cli",
++    )
++    params.update(kw)
++    return AIAgent(**params)
++
++
++def test_bare_claude_on_openrouter_is_refused_before_any_request(caplog):
++    with caplog.at_level(logging.WARNING, logger="agent.model_provider_guard"):
++        with pytest.raises(ValueError) as exc:  # today: no error, the 400-bound agent is built
++            _agent()
++    assert type(exc.value).__name__ == "ModelProviderMismatchError"
++    msg = str(exc.value)
++    assert "openrouter" in msg
++    assert "https://openrouter.ai/api/v1" in msg
++    assert "claude-opus-5-5" in msg
++    assert "anthropic/claude-opus-5-5" in msg  # the fix it suggests
++    assert "route: pinned" in msg
++    from hermes_cli.cli_chat_error_copy import agent_init_failure_message
++    shown = agent_init_failure_message(exc.value)  # what `hermes chat` prints: first line only
++    assert "anthropic/claude-opus-5-5" in shown and "openrouter" in shown and "…" not in shown
++    assert any("claude-opus-5-5" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
++
++
++def test_auto_route_that_lands_on_openrouter_is_named_auto():
++    """The incident route: provider ``auto`` resolved to OpenRouter while the model stayed bare."""
++    from agent.model_provider_guard import ModelProviderMismatchError
++
++    with pytest.raises(ModelProviderMismatchError) as exc:
++        _agent(requested_provider="auto")
++    assert "route: auto" in str(exc.value)
++
++
++def test_bare_claude_on_nous_is_refused():
++    from agent.model_provider_guard import ModelProviderMismatchError
++
++    with pytest.raises(ModelProviderMismatchError):
++        _agent(provider="nous", base_url="https://inference-api.nousresearch.com/v1")
++
++
++@pytest.mark.parametrize("model", ["anthropic/claude-opus-5-5", "openrouter/auto", "some-house-model"])
++def test_namespaced_or_unknown_ids_pass(model):
++    agent = _agent(model=model)
++    assert agent.model == model
++
++
++def test_direct_anthropic_keeps_bare_claude():
++    agent = _agent(provider="anthropic", base_url="https://api.anthropic.com", api_key="sk-ant-dummy")
++    assert agent.provider == "anthropic"
++
++
++def test_config_switch_turns_the_guard_off():
++    """``agent.model_provider_guard: false`` in the profile's config.yaml, read by the real loader."""
++    import os
++    from pathlib import Path
++
++    home = Path(os.environ["HERMES_HOME"])
++    home.mkdir(parents=True, exist_ok=True)
++    (home / "config.yaml").write_text("agent:\n  model_provider_guard: false\n", encoding="utf-8")
++    agent = _agent()
++    assert agent.model == "claude-opus-5-5"
+diff --git a/tests/agent/test_provider_parity.py b/tests/agent/test_provider_parity.py
+index b9e9a1d0d4..1a817b7962 100644
+--- a/tests/agent/test_provider_parity.py
++++ b/tests/agent/test_provider_parity.py
+@@ -351,7 +351,7 @@ class TestBuildApiKwargsNousPortal:
+             monkeypatch,
+             "nous",
+             base_url="https://inference-api.nousresearch.com/v1",
+-            model="gpt-5",
++            model="openai/gpt-5",
+         )
+         messages = [{"role": "user", "content": "hi"}]
+         kwargs = agent._build_api_kwargs(messages)
+diff --git a/tests/agent/test_worker_thread_session_tag.py b/tests/agent/test_worker_thread_session_tag.py
+new file mode 100644
+index 0000000000..4dc8a13c15
+--- /dev/null
++++ b/tests/agent/test_worker_thread_session_tag.py
+@@ -0,0 +1,50 @@
++"""[daveey] Errors logged on the API worker thread carry the session tag (self-heal agent-1572c64e24).
++
++The session id that prefixes log lines is thread-local; the streaming/API worker runs on its own
++thread, so "Streaming failed before delivery" reached errors.log without ``[<sid>]`` and the errors
++signal (which reads the tag) filed the defect with an empty session id.
++"""
++
++import logging
++import threading
++
++
++def test_worker_thread_logs_carry_the_callers_session_tag():
++    from agent.chat_completion_helpers import _context_thread_target
++    from hermes_logging import _install_session_record_factory, clear_session_context, set_session_context
++
++    _install_session_record_factory()
++    records = []
++
++    class _Capture(logging.Handler):
++        def emit(self, record):
++            records.append(record)
++
++    log = logging.getLogger("agent.chat_completion_helpers.test_session_tag")
++    handler = _Capture()
++    log.addHandler(handler)
++    log.setLevel(logging.ERROR)
++    try:
++        set_session_context("20261027_220000_5326d3")
++        worker = threading.Thread(
++            target=_context_thread_target(lambda: log.error("Streaming failed before delivery: boom")))
++        worker.start()
++        worker.join(5)
++    finally:
++        clear_session_context()
++        log.removeHandler(handler)
++    assert [r.session_tag for r in records] == [" [20261027_220000_5326d3]"]
++
++
++def test_worker_thread_without_a_session_stays_untagged():
++    from agent.chat_completion_helpers import _context_thread_target
++    from hermes_logging import _install_session_record_factory, clear_session_context
++
++    _install_session_record_factory()
++    clear_session_context()
++    tags = []
++    worker = threading.Thread(target=_context_thread_target(
++        lambda: tags.append(logging.getLogRecordFactory()("x", logging.ERROR, "", 0, "m", (), None).session_tag)))
++    worker.start()
++    worker.join(5)
++    assert tags == [""]
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 9f750524a5..a3e4c90dd2 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1242,6 +1242,8 @@ A rate limit that names its reset (`Retry-After` or a `retry_after` body field)
+ 
+ `agent.auto_recovery_cycles` is the safety net *after* both the retries and the fallback chain are spent. When the failure is a transient outage (HTTP 5xx, an `overloaded`/529 response, a connect or read timeout) and no answer text has reached you yet, Hermes does not end the turn with "API failed after N retries" — it waits and tries again, up to this many cycles (default `5`), with a jittered 15/30/60/60/60 s schedule. A provider `Retry-After` header wins over the schedule (honoured up to 120 s). Every surface shows the same line while it waits — `⏳ Provider temporarily unavailable — retrying automatically in 30s (cycle 2/5); press Esc to stop` on the CLI/TUI/Desktop, a status bubble on messaging platforms (`send /stop to cancel`), a `hermes.status` SSE event on the API server, and a log line for cron jobs. Pressing Esc (or `/stop`) cancels the wait immediately. Fallback still comes first: with a fallback chain configured, exhaustion moves to the next provider as before, and the ladder only engages once the chain has nothing left. Authentication, billing, request-format, entitlement, content-policy and account-policy errors never enter the ladder. Set `0` to disable it.
+ 
++`agent.model_provider_guard` (default `true`) stops an agent at startup when the route resolved to OpenRouter or the Nous Portal but the model is a bare vendor id such as `claude-opus-5-5`. Those services only accept `vendor/model` ids, so the request could only fail with HTTP 400 ("is not a valid model ID"). The error names the provider, the base URL, the model and how the route was chosen (`pinned`, `fallback` or `auto`), and suggests `anthropic/claude-opus-5-5` or `--provider anthropic`. Ids with a `/` (such as `openrouter/auto`) and ids with no recognisable vendor pass. Set it to `false` to turn the check off.
++
+ ## Wall-Clock Run Budget
+ 
+ Separate from the iteration budget, you can give each conversation run an optional **wall-clock** budget. This is designed for one-shot and eval-harness invocations that run under a hard external ceiling (e.g. a 900-second per-task limit): without it, a run can time out with the work essentially done — one generation short of emitting the final answer, or stuck in a single hung provider call.
+-- 
+2.55.0
+

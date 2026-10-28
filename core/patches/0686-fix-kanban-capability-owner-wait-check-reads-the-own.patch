@@ -1,0 +1,160 @@
+From 41a1d7ce4d248b473bc598b2d03fd5cd8dd9e7f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 09:16:51 +0000
+Subject: [PATCH] fix(kanban): capability-owner wait-check reads the owner id
+ from every applier result shape [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+owner_status() took the owner card id only from result['task']. MacBook-applied
+owner creates came back as {"output": <hermes kanban create --json text>}, clipped
+to 2000 chars by hermes-hub (so not valid JSON): the wait-check returned rc 2
+'done without a task id' and woke four hub cards wake_check_broken although their
+owner cards were done. Read task / task_id / id, then output's JSON id, then the
+first "id": "t_…" in the output text; rc 2 only when none holds one.
+
+Hub card t_01a181a33c586660.
+---
+ hermes_cli/kanban_capability_routing.py       | 34 +++++++++-
+ .../test_kanban_capability_routing.py         | 68 +++++++++++++++++++
+ 2 files changed, 100 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 5f22f3d0ce..a40988957e 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -38,7 +38,7 @@ import subprocess
+ import time
+ import hashlib
+ from datetime import UTC, datetime
+-from typing import Callable, Optional
++from typing import Any, Callable, Optional
+ 
+ from agent.redact import redact_sensitive_text
+ from hermes_cli import kanban_capability_registry as reg
+@@ -367,6 +367,36 @@ def preflight(conn, task_id: str, *, board: Optional[str] = None, **lookup) -> O
+ 
+ # --- wait-check ----------------------------------------------------------------------------
+ 
++_OUTPUT_ID_RE = re.compile(r'"id"\s*:\s*"(t_[0-9a-f]+)"')
++
++
++def owner_task_id(result: Any) -> Optional[str]:
++    """The owner card id in an applied create's result, whichever applier wrote it: ``task`` (current
++    hermes-hub), ``task_id`` (placement creates), ``id``, or the ``hermes kanban create --json`` text an
++    older applier stored in ``output``, clipped to 2000 chars and so often not valid JSON (hub card
++    t_01a181a33c586660). None when no shape holds an id."""
++    if not isinstance(result, dict):
++        return None
++    for key in ("task", "task_id", "id"):
++        val = result.get(key)
++        if isinstance(val, str) and val:
++            return val
++    out = result.get("output")
++    if not isinstance(out, str) or not out:
++        return None
++    try:
++        parsed = json.loads(out)
++    except ValueError:
++        parsed = None
++    if isinstance(parsed, dict):
++        for key in ("id", "task_id"):
++            val = parsed.get(key)
++            if isinstance(val, str) and val:
++                return val
++    m = _OUTPUT_ID_RE.search(out)
++    return m.group(1) if m else None
++
++
+ def owner_status(rid: str) -> tuple[int, str]:
+     """(rc, message) for one owner request: 0 done, 1 pending, 2 cannot tell / rejected."""
+     try:
+@@ -384,7 +414,7 @@ def owner_status(rid: str) -> tuple[int, str]:
+         if state != "done":
+             return 1, f"{rid} request {state}"
+         result = json.loads(row[2] or "{}") or {}
+-        tid = result.get("task") if isinstance(result, dict) else None
++        tid = owner_task_id(result)
+         if not tid:
+             return 2, f"error: request {rid} done without a task id: {str(row[2])[:300]}"
+         gw = body.get("to_gw")
+diff --git a/tests/hermes_cli/test_kanban_capability_routing.py b/tests/hermes_cli/test_kanban_capability_routing.py
+index d303f022a8..5a3e5d3f88 100644
+--- a/tests/hermes_cli/test_kanban_capability_routing.py
++++ b/tests/hermes_cli/test_kanban_capability_routing.py
+@@ -496,3 +496,71 @@ def test_retry_after_partial_failure_keeps_queued_owner_even_if_holder_went_stal
+ def test_background_refresh_never_runs_real_probes_under_tests(monkeypatch):
+     monkeypatch.setenv("HERMES_TEST_ISOLATION", "1")
+     assert reg.maybe_refresh_async() is False
++
++
++# --- owner results as appliers report them (hub card t_01a181a33c586660) ----------------------
++
++def _create_json_output(owner_tid: str) -> str:
++    """What the MacBook applier stored on 10-28: `hermes kanban create --json` text in `output`, clipped
++    to 2000 chars with a trailing ellipsis (hermes-hub `clip`), so it is not valid JSON."""
++    text = json.dumps({"id": owner_tid, "title": "Capability owner: host:macbook for hub/t_x (verify)",
++                       "body": "Capability owner card for waiting card hub/default/default/t_x. " + "x" * 3000,
++                       "assignee": "default", "status": "ready"}, indent=2)
++    return text[:1999] + "\u2026"
++
++
++def _owner_result(hub, rid: str, result: dict, owner_tid: str = "t_01a18131b2b44af4", status: str = "done"):
++    hub.execute("INSERT OR REPLACE INTO sent (id, body, state, result, created_at, done_at, posted) "
++                "VALUES (?, ?, 'done', ?, 0, 0, 1)",
++                (rid, json.dumps({"to_gw": "macbook", "key": "default/default/new"}), json.dumps(result)))
++    hub.execute("INSERT OR REPLACE INTO replica VALUES ('macbook', 'tasks', ?, 1, 1, ?, ?)",
++                (f"default/default/{owner_tid}", json.dumps({"id": owner_tid, "status": status}), int(time.time())))
++    hub.commit()
++
++
++@pytest.mark.parametrize("shape", ["task", "task_id", "id", "output_json", "output_clipped"])
++def test_owner_status_reads_the_owner_id_from_every_applier_shape(env, shape):
++    rid = "capability-owner:t_01a180daf776c25e:host:macbook"
++    tid = "t_01a18131b2b44af4"
++    result = {
++        "task": {"task": tid},
++        "task_id": {"ok": True, "created": True, "task_id": tid},
++        "id": {"id": tid},
++        "output_json": {"output": json.dumps({"id": tid, "status": "ready"}, indent=2)},
++        "output_clipped": {"output": _create_json_output(tid)},
++    }[shape]
++    _owner_result(env["hub"], rid, result, tid, "done")
++    assert kcr.owner_status(rid) == (0, f"{rid} -> macbook/{tid} done")
++    _owner_result(env["hub"], rid, result, tid, "ready")
++    assert kcr.owner_status(rid)[0] == 1
++
++
++def test_owner_status_without_any_id_is_cannot_tell(env):
++    rid = "capability-owner:t_x:host:macbook"
++    for result in ({"output": "garbage"}, {"output": ""}, {}, {"output": {"no": "id"}}):
++        _owner_result(env["hub"], rid, result)
++        rc, msg = kcr.owner_status(rid)
++        assert rc == 2 and "done without a task id" in msg, (result, msg)
++
++
++def test_woken_card_needing_another_gateway_is_claimed_here_once_its_owner_is_done(env):
++    """After the owner card is done the wake check exits 0 and the waiting card lands `ready` on THIS
++    gateway, where a worker can claim it although `requires` names host:macbook (hub
++    t_01a180daf776c25e). The need was routed and fulfilled; only its evidence is left to record."""
++    from hermes_cli import kanban_wake_check as kwc
++    need = "host:macbook"
++    publish(env["hub"], "macbook", {need: time.time()})
++    with kbc.connect_closing() as conn:
++        tid = running(conn, requires=[need])
++        kcr.route(conn, tid, [need], reason="verify on the MacBook")
++        state = kwc.get_state(conn, tid)
++    rid = kcr.request_id(tid, need)
++    _owner_result(env["hub"], rid, {"output": _create_json_output("t_01a1814e609954cb")}, "t_01a1814e609954cb", "done")
++    rc, out = kcr.wait_check(rid)
++    assert rc == 0, out
++    with kbc.connect_closing() as conn:
++        assert kwc.apply_result(conn, tid, state["cmd"], rc, out, generation=state["generation"]) == \
++            kwc.CONDITION_MET_EVENT
++        assert kb.get_task(conn, tid).status == "ready"
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++        assert kb.get_task(conn, tid).status == "running"
+-- 
+2.55.0
+

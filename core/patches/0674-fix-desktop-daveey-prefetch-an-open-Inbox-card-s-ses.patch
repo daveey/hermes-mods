@@ -1,0 +1,183 @@
+From 29e02765f4b83978cb2851e576cf9983be1f0e7c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 01:18:30 -0700
+Subject: [PATCH] fix(desktop): [daveey] prefetch an open Inbox card's session
+ even when hidden or archived
+
+After 3285003cc2 the Inbox opens of new hub sessions (2026-10-28 01:12) still
+painted from REST: every one was a hidden session, some archived too. The
+prefetcher dropped hidden/archived records before the Inbox-first rule, and the
+replica's /sessions list leaves archived rows out entirely.
+
+- A hidden or archived record is kept when an open Inbox card points at it.
+- A card whose session the list left out gets a minimal record built from the
+  card (gateway, profile, session id, activity), so it is prefetched too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../electron/transcript-cache-host.test.ts    | 17 ++++-
+ .../desktop/electron/transcript-cache-host.ts | 63 +++++++++++++++----
+ .../electron/transcript-prefetch.test.ts      | 13 ++++
+ apps/desktop/electron/transcript-prefetch.ts  |  3 +-
+ 4 files changed, 81 insertions(+), 15 deletions(-)
+
+diff --git a/apps/desktop/electron/transcript-cache-host.test.ts b/apps/desktop/electron/transcript-cache-host.test.ts
+index 23ef500895..c23fe2f9ae 100644
+--- a/apps/desktop/electron/transcript-cache-host.test.ts
++++ b/apps/desktop/electron/transcript-cache-host.test.ts
+@@ -86,9 +86,22 @@ describe('[daveey] open Inbox cards in prefetch', () => {
+       { gateway: 'mini', id: 's1', profile: 'default' }
+     ]
+ 
+-    const marked = markInboxSessions(records, new Set(['hub\u0000default\u0000s1', 'hub\u0000default\u0000s2']))
++    const marked = markInboxSessions(records, [
++      { gateway: 'hub', profile: 'default', session_id: 's1' },
++      { gateway: 'hub', profile: 'default', session_id: 's2' }
++    ])
+ 
+-    expect(marked.map(record => Boolean(record.inbox))).toEqual([true, false, false])
++    expect(marked.slice(0, 3).map(record => Boolean(record.inbox))).toEqual([true, false, false])
++  })
++
++  it('adds a record for a card whose session the list left out (archived sessions are not listed)', () => {
++    const marked = markInboxSessions(
++      [{ gateway: 'hub', id: 's1', profile: 'default' }],
++      [{ created_at: 7, gateway: 'hub', profile: 'default', session_id: 'archived-card' }]
++    )
++
++    expect(marked).toContainEqual({ activity: 7, gateway: 'hub', id: 'archived-card', inbox: true, profile: 'default' })
++    expect(marked).toHaveLength(2)
+   })
+ 
+   it('reads the replica Inbox on the primary and fetches a card\'s session first', async () => {
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index 4c0558fc55..fac89b9c83 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -36,15 +36,56 @@ const HUB_LIST_LIMIT = 2000
+ const inboxKey = (gateway: unknown, profile: unknown, sessionId: unknown) =>
+   `${String(gateway ?? '')}\u0000${String(profile ?? '').trim() || 'default'}\u0000${String(sessionId ?? '')}`
+ 
+-/** [daveey] Flag the hub session records an open Inbox card points at (the prefetcher fetches those first). */
+-export function markInboxSessions(records: HubSessionRecord[], inbox: ReadonlySet<string>): HubSessionRecord[] {
+-  if (!inbox.size) {
++/** An open Inbox card, as the hub-sync `/inbox` route serves it. */
++export interface OpenInboxItem {
++  created_at?: null | number
++  gateway: string
++  profile?: null | string
++  session_id: string
++  updated_at?: null | number
++}
++
++/**
++ * [daveey] Flag the hub session records an open Inbox card points at (the prefetcher fetches those first, even
++ * hidden or archived ones: a card's session usually is). A card whose session the list left out (archived rows
++ * are not listed) gets a minimal record of its own, so it is prefetched too.
++ */
++export function markInboxSessions(records: HubSessionRecord[], inbox: readonly OpenInboxItem[]): HubSessionRecord[] {
++  if (!inbox.length) {
+     return records
+   }
+ 
+-  return records.map(record =>
+-    inbox.has(inboxKey(record.gateway, record.profile, record.id)) ? { ...record, inbox: true } : record
+-  )
++  const keys = new Set(inbox.map(item => inboxKey(item.gateway, item.profile, item.session_id)))
++  const listed = new Set<string>()
++
++  const marked = records.map(record => {
++    const key = inboxKey(record.gateway, record.profile, record.id)
++
++    if (!keys.has(key)) {
++      return record
++    }
++
++    listed.add(key)
++
++    return { ...record, inbox: true }
++  })
++
++  for (const item of inbox) {
++    const key = inboxKey(item.gateway, item.profile, item.session_id)
++
++    if (!listed.has(key)) {
++      listed.add(key)
++      marked.push({
++        activity: item.updated_at ?? item.created_at ?? null,
++        gateway: item.gateway,
++        id: item.session_id,
++        inbox: true,
++        profile: item.profile ?? 'default'
++      })
++    }
++  }
++
++  return marked
+ }
+ 
+ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+@@ -173,18 +214,16 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+   }
+ 
+   // Open Inbox items of every gateway, from this Mac's replica; an unreadable Inbox only drops the priority.
+-  const openInboxSessions = async (descriptor: unknown): Promise<Set<string>> => {
++  const openInboxSessions = async (descriptor: unknown): Promise<OpenInboxItem[]> => {
+     try {
+       const body = await deps.getJson(descriptor, '/api/plugins/hub-sync/inbox', { timeoutMs: 8_000 })
+       const items = Array.isArray(body?.items) ? body.items : []
+ 
+-      return new Set(
+-        items
+-          .filter((item: any) => item?.session_id && item?.gateway)
+-          .map((item: any) => inboxKey(item.gateway, item.profile, item.session_id))
++      return items.filter(
++        (item: any) => typeof item?.session_id === 'string' && item.session_id && typeof item?.gateway === 'string'
+       )
+     } catch {
+-      return new Set()
++      return []
+     }
+   }
+ 
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index 669024cb41..4aef069e76 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -58,6 +58,19 @@ describe('prefetch selection', () => {
+     expect(targets[0].inbox).toBe(true)
+   })
+ 
++  it('[daveey] prefetches a hidden or archived session when an open Inbox card points at it, and only then', () => {
++    const records = [
++      record('hub', 'card', 1, { hidden: true, inbox: true }),
++      record('hub', 'archived-card', 2, { archived: true, inbox: true }),
++      record('hub', 'hidden-chat', 9, { hidden: true }),
++      record('hub', 'chat', 5)
++    ]
++
++    const targets = selectPrefetchTargets(records, gateway => CONNECTIONS[gateway])
++
++    expect(targets.map(target => target.key.sessionId)).toEqual(['archived-card', 'card', 'chat'])
++  })
++
+   it('caps each gateway separately', () => {
+     const records = [
+       ...Array.from({ length: 250 }, (_, index) => record('mini', `m${index}`, index)),
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index 01063ad061..8cea69e42b 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -76,7 +76,8 @@ export function selectPrefetchTargets(
+   const byGateway = new Map<string, HubSessionRecord[]>()
+ 
+   for (const record of records) {
+-    if (!record?.id || !record.gateway || record.archived || record.hidden) {
++    // An open Inbox card's session is prefetched even when hidden or archived (cards usually own such sessions).
++    if (!record?.id || !record.gateway || ((record.archived || record.hidden) && !record.inbox)) {
+       continue
+     }
+ 
+-- 
+2.55.0
+

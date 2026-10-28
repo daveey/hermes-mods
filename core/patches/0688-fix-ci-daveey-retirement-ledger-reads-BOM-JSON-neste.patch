@@ -1,0 +1,208 @@
+From b3489b119f3dbe08ea204ed3a4b3e0936f5b10d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 09:36:06 +0000
+Subject: [PATCH] fix(ci): [daveey] retirement ledger reads BOM JSON; nested
+ binary open is not a text footgun
+
+Problem: origin/main fails scripts/check-windows-footguns.py --all, so the
+blocking Windows footguns job cannot go green.
+Why 1: web_server_skew_exit reads the retirement ledger with encoding=utf-8.
+A BOM makes json.loads raise, the except returns {}, and the restart-loop
+backoff looks empty.
+Why 2: open(os.path.join(..., "pyvenv.cfg"), "rb") is flagged because the
+mode regex stops at the nested comma and treats "pyvenv.cfg" as the mode.
+Root: the reader is not utf-8-sig, and the checker cannot see a binary mode
+past a nested call. Both landed in 8e6534e7ad; that push CI was cancelled
+before the footgun job ran.
+---
+ hermes_cli/web_server_skew_exit.py            |  2 +-
+ scripts/check-windows-footguns.py             | 79 ++++++++++++++-----
+ tests/hermes_cli/test_web_server_skew_exit.py |  9 +++
+ .../test_footgun_nested_binary_open.py        | 38 +++++++++
+ 4 files changed, 107 insertions(+), 21 deletions(-)
+ create mode 100644 tests/scripts/test_footgun_nested_binary_open.py
+
+diff --git a/hermes_cli/web_server_skew_exit.py b/hermes_cli/web_server_skew_exit.py
+index d517bd756b..dc7b687afd 100644
+--- a/hermes_cli/web_server_skew_exit.py
++++ b/hermes_cli/web_server_skew_exit.py
+@@ -91,7 +91,7 @@ class RuntimeRetireLedger:
+         import json
+ 
+         try:
+-            data = json.loads(self.path.read_text(encoding="utf-8"))
++            data = json.loads(self.path.read_text(encoding="utf-8-sig"))
+         except (OSError, ValueError):
+             return {}
+         return data if isinstance(data, dict) else {}
+diff --git a/scripts/check-windows-footguns.py b/scripts/check-windows-footguns.py
+index c28bdcafa6..c5eb14ff0d 100644
+--- a/scripts/check-windows-footguns.py
++++ b/scripts/check-windows-footguns.py
+@@ -140,6 +140,61 @@ class Footgun:
+     post_filter: Callable[..., Any] | None = None
+ 
+ 
++# A real open() mode. The regex stops at the first comma, so
++# open(os.path.join(a, b), "rb") captures "b"'s sibling argument, not the mode.
++_FILE_MODE = re.compile(r"^[rwaxbtU+]*$")
++_BINARY_MODE_LIT = re.compile(r"""['"][rwaxutU+]*b[rwaxutU+]*['"]""")
++
++
++def _code_before_comment(line: str) -> str:
++    """Drop a trailing # comment. Quotes are tracked so a '#' inside a string stays."""
++    out: list[str] = []
++    quote: str | None = None
++    escaped = False
++    for ch in line:
++        if quote:
++            out.append(ch)
++            if escaped:
++                escaped = False
++            elif ch == "\\":
++                escaped = True
++            elif ch == quote:
++                quote = None
++            continue
++        if ch in "\"'":
++            quote = ch
++            out.append(ch)
++            continue
++        if ch == "#":
++            break
++        out.append(ch)
++    return "".join(out)
++
++
++def _bare_text_open(match, line: str) -> bool:
++    """True when this open()/fdopen() match is text mode with no encoding=.
++
++    Nested calls make the regex capture an inner argument as the mode
++    (open(os.path.join(sys.prefix, "pyvenv.cfg"), "rb") captured
++    "pyvenv.cfg"). A capture that is not a file mode, plus a binary-mode
++    literal in the code, is binary — flagging it blocks CI on a correct
++    read of bytes.
++    """
++    if "encoding=" in line or "encoding =" in line or "**" in line:
++        return False
++    stripped = line.lstrip()
++    if stripped.startswith(("def ", "async def ")):
++        return False
++    mode = match.group("mode") or ""
++    if _FILE_MODE.fullmatch(mode) and "b" in mode:
++        return False
++    # Empty or non-mode capture means the regex stopped inside a nested call
++    # (open(os.path.join(a, b), "rb") leaves mode unset when b is an identifier).
++    if (not mode or not _FILE_MODE.fullmatch(mode)) and _BINARY_MODE_LIT.search(_code_before_comment(line)):
++        return False
++    return True
++
++
+ FOOTGUNS: list[Footgun] = [
+     Footgun(
+         name="open() without encoding= on text mode",
+@@ -166,20 +221,9 @@ FOOTGUNS: list[Footgun] = [
+             "reads: open(path, 'r', encoding='utf-8-sig')  writes: "
+             "open(path, 'w', encoding='utf-8')"
+         ),
+-        # Filter: only flag if mode is missing-or-text AND the line doesn't
+-        # already pass encoding=. Skip binary mode (contains "b").
+-        post_filter=lambda m, line: (
+-            "b" not in (m.group("mode") or "")
+-            and "encoding=" not in line
+-            and "encoding =" not in line
+-            # Skip `def open(` and `async def open(` (method definitions)
+-            and not line.lstrip().startswith("def ")
+-            and not line.lstrip().startswith("async def ")
+-            # Skip open(path, **kwargs) patterns — encoding may be in the dict.
+-            # Too expensive to trace; require the author to set encoding in
+-            # the dict and trust them (or they can add a # windows-footgun: ok).
+-            and "**" not in line
+-        ),
++        # Filter: only flag text mode with no encoding=. Skip binary mode,
++        # including when a nested call's comma hid the real mode argument.
++        post_filter=_bare_text_open,
+     ),
+     Footgun(
+         name="os.fdopen() without encoding= on text mode",
+@@ -201,12 +245,7 @@ FOOTGUNS: list[Footgun] = [
+             "reads: os.fdopen(fd, 'r', encoding='utf-8-sig')  writes: "
+             "os.fdopen(fd, 'w', encoding='utf-8')  binary: mode 'rb'/'wb'"
+         ),
+-        post_filter=lambda m, line: (
+-            "b" not in (m.group("mode") or "")
+-            and "encoding=" not in line
+-            and "encoding =" not in line
+-            and "**" not in line
+-        ),
++        post_filter=_bare_text_open,
+     ),
+     Footgun(
+         name="os.kill(pid, 0)",
+diff --git a/tests/hermes_cli/test_web_server_skew_exit.py b/tests/hermes_cli/test_web_server_skew_exit.py
+index d2c470cc7d..c4b4c75b96 100644
+--- a/tests/hermes_cli/test_web_server_skew_exit.py
++++ b/tests/hermes_cli/test_web_server_skew_exit.py
+@@ -197,6 +197,15 @@ def test_the_respawned_backend_does_not_retire_again_inside_the_backoff_window(t
+     assert late.should_exit is True and after.committed is True
+ 
+ 
++def test_runtime_retire_ledger_reads_a_bom_prefixed_file(tmp_path):
++    """A PowerShell-written ledger still holds the backoff. utf-8 (not utf-8-sig) makes json.loads raise and the guard looks empty."""
++    from hermes_cli.web_server_skew_exit import RuntimeRetireLedger
++
++    path = tmp_path / "ledger.json"
++    path.write_bytes(b"\xef\xbb\xbf" + b'{"8d94c4a7dd14f7b1": 1000.0}\n')
++    assert RuntimeRetireLedger(path).last("8d94c4a7dd14f7b1") == 1000.0
++
++
+ def test_the_backoff_never_holds_a_code_revision_retirement(tmp_path):
+     from hermes_cli.web_server_skew_exit import RuntimeRetireLedger
+ 
+diff --git a/tests/scripts/test_footgun_nested_binary_open.py b/tests/scripts/test_footgun_nested_binary_open.py
+new file mode 100644
+index 0000000000..7b6e8e288d
+--- /dev/null
++++ b/tests/scripts/test_footgun_nested_binary_open.py
+@@ -0,0 +1,38 @@
++"""open(os.path.join(...), "rb") is binary, even when the mode regex stops at the nested comma."""
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++
++OPEN = "open() without encoding= on text mode"
++
++
++@pytest.fixture(scope="module")
++def linter():
++    path = Path(__file__).resolve().parents[2] / "scripts/check-windows-footguns.py"
++    spec = importlib.util.spec_from_file_location("nested_open_footguns", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++@pytest.mark.parametrize("source,flagged", [
++    ('with open(os.path.join(sys.prefix, "pyvenv.cfg"), "rb") as fh:', False),
++    ("open(os.path.join(a, b), 'wb')", False),
++    ("open(path, 'rb')", False),
++    ("open(path, 'w')", True),
++    ("open(path)", True),
++    ("open(os.path.join(a, b), 'w')", True),
++    ('open(os.path.join(a, b), "rb")  # not a text read', False),
++    ('open(path, "w")  # was "rb" once', True),
++])
++def test_nested_binary_open_is_not_a_text_footgun(linter, tmp_path, source, flagged):
++    path = tmp_path / "input.py"
++    path.write_text(source + "\n", encoding="utf-8")
++    rules = [rule for rule in linter.FOOTGUNS if rule.name == OPEN]
++    assert len(rules) == 1
++    hits = linter.scan_file(path, rules)
++    assert bool(hits) is flagged
+-- 
+2.55.0
+

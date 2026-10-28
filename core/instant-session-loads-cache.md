@@ -89,3 +89,16 @@ Apply 0532, 0533 and 0548 with `git am -3` after the preceding fork patches. 053
 ## Follow-up patches (0623)
 
 **0623** (`3285003cc2`): opens of another gateway's session spent 4.5-6.8 s in an "owner" stage. The owner probe (`probeStoredSession`) now answers at once from an awake hub-replica row that matches the named owner (`fallbackSessionRow`); a resume that names no owner takes it from the awake replica row so the cached transcript paints before any await (asleep rows keep the read-only path); the prefetcher puts sessions behind open Inbox cards first, ahead of the per-gateway 200-slot people-first ordering. Code: `electron/transcript-cache-host.ts`, `transcript-prefetch.ts`, `src/app/session/hooks/use-session-actions/{index,utils}.ts`. Tests: `transcript-cache-host.test.ts`, `transcript-prefetch.test.ts`, `use-session-actions.test.tsx`, `resolve-stored-session.test.ts`.
+
+## Follow-up patch (0674)
+
+**0674** (`29e02765f4`): after 0623, Inbox opens of new hub sessions still painted from REST. Every one was a hidden session, and some were archived. The prefetcher dropped hidden and archived records before the Inbox-first rule, and the replica's `/sessions` list leaves archived rows out entirely.
+
+- A hidden or archived record is kept when an open Inbox card points at it, and only then.
+- A card whose session the list left out gets a minimal record built from the card (gateway, profile, session id, activity), so it is prefetched too.
+
+Code: `electron/transcript-cache-host.ts`, `electron/transcript-prefetch.ts`. Tests: `transcript-cache-host.test.ts` (`adds a record for a card whose session the list left out`) and `transcript-prefetch.test.ts` (`prefetches a hidden or archived session when an open Inbox card points at it, and only then`). This mirror did not re-run the Desktop suite. A live Inbox open against a hidden hub session is untested.
+
+## plugin?
+
+No. Prefetch runs in the Electron main process before the renderer asks. A disk plugin cannot see the selection.

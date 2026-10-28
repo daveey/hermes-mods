@@ -40,3 +40,19 @@ marker files inside the home folder are not a documented exclusion. Renaming to 
   sides, so it is unaffected.
 - The migration runs lazily on the first `get_scratch_dir()`/`uv_cache_dir()` call after the update. A host can also
   be migrated by hand: `mv scratch scratch.noindex && ln -s scratch.noindex scratch` in `<home>/cache`.
+
+## Follow-up patch (0683)
+
+**0683** (`59528bfd7c`) is a test fix, not a product change.
+
+- Scratch and uv-cache Spotlight tests no longer monkeypatch `sys.platform = 'darwin'`. Migration, symlink, dangling-link, conflict and `HERMES_SPOTLIGHT_INDEX_CACHE` opt-out run on the real macOS host via `@pytest.mark.platforms("macos")` and call `get_scratch_dir` / `uv_cache_dir`. Non-macOS hosts only assert `get_scratch_dir` stays a plain directory (`@pytest.mark.platforms("not macos")`, `test_other_platforms_keep_a_plain_scratch_dir`).
+- Two scratch-prune tests scan only their own psutil children.
+- The same commit binds a leading `Request` on the direct caller in `tests/hermes_cli/test_session_detail_malformed_db.py::test_messages_endpoint_reports_corruption` (`request=`, `session_id=`, explicit `order`). That file was not re-run by this mirror. Mark that path untested here. The history-page callers with the same shift are [transcript-page-request-arg.md](transcript-page-request-arg.md) (0684).
+
+Do not put the darwin contracts back behind a `sys.platform` fake. `ensure_spotlight_noindex_dir(path, platform=)` is the pure-data seam; the shipped tests use the native marker instead.
+
+A prior Linux run of `tests/test_scratch_dir.py` and `tests/pm/test_uv_cache.py` reported 25 passed, 5 skipped, with the macos-marked tests deferred to the macOS lane. This mirror did not re-run them. The macOS lane itself is untested here.
+
+## plugin?
+
+No. The directories are created by core path helpers.
