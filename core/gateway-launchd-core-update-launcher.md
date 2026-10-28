@@ -60,4 +60,5 @@ It only matters where something installs `~/.hermes/bin/hermes-gateway-launcher`
 - `stderr_timestamp` spawns the gateway with `close_fds`, so the gateway itself does not hold the lock.
   If `stderr_timestamp` is SIGKILLed alone, the gateway is orphaned without the lock. Only the updater's
   busy recheck covers that case.
-- Every launcher in a home writes the same `launcher.json`. Run one long-lived launcher per home.
+- Every launcher writes `core-update/launchers/<pid>.json` (not one shared `launcher.json`: an orphan
+  overwrote the live job's attestation). Run one long-lived launcher per home; a dead pid's file is reaped.
