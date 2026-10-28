@@ -19,6 +19,7 @@ and you work in Desktop.
 | 0016 | no "Switch to This device?" dialog when the local runtime is installed | none, always on |
 | 0066 | `hermes update` swaps in a desktop app you prebuilt from the new HEAD instead of packing it | env `HERMES_DESKTOP_PREBUILT_APP` (unset) |
 | 0672 | The update keeps (or swaps in) a desktop app stamped with an ancestor of HEAD when no desktop input changed since that commit | always on |
+| 0698 | An installed prebuilt app stays current after the checkout that packed it (hermes-sync's stage) moves on | always on |
 
 ## The fork workflow
 
@@ -385,7 +386,7 @@ pushes before calling `hermes update`. You lose the off-tree merge and the confl
 can add UI but can't remove an existing confirmation dialog, so it has to stay a core patch.
 
 
-## Prebuilt desktop app (0066, 0672)
+## Prebuilt desktop app (0066, 0672, 0698)
 
 **Behavior.** With `HERMES_DESKTOP_PREBUILT_APP=<path to Hermes.app>` in its environment, `hermes update`'s desktop
 step installs that bundle instead of running `npm run build` + electron-builder, which takes a few minutes. That
@@ -423,6 +424,21 @@ Tests (`tests/hermes_cli/test_source_build.py`): `test_update_swaps_in_a_prebuil
 `test_update_builds_when_a_desktop_input_changed_since_the_prebuilt_commit` (apps/desktop, apps/shared,
 package-lock.json each refused), `test_packaged_desktop_is_reused_only_while_it_names_head` (unrelated history refused),
 `test_desktop_input_paths_mirror_the_desktop_source_hash`.
+
+**Receipt outlives the stage (0698).** A bundle packed in another checkout (hermes-sync's
+`~/.hermes/cache/core-update/stage`) carries a receipt (`app.asar.unpacked/dist/hermes-build.json`) whose prepared
+inputs (icons, native deps, the baked stamp) are absolute paths in that checkout. Before 0698, once the stage checked
+out the next commit, the installed app read stale: `hermes desktop` rebuilt it and `desktop_update_verify` flagged it.
+`productCurrent` in `scripts/build/freshness.mjs` now judges a packaged bundle's (`out` under `app.asar.unpacked`)
+prepared inputs that lie outside `--source` by the bundle itself: the stamp by its `Resources/install-stamp.json`
+(identity hash and `stampClock`, so the restamp-race guard still holds), icons and native deps as recorded (the install
+verified the signed bundle). If the bundle has no stamp, the old re-hash applies. Inputs inside `--source` (an in-place
+pack) are re-hashed as before, and `sourceHash` is always taken from the live checkout. `source_product_current`
+resolves the checkout path, because `freshness.mjs` prints nothing when reached through a symlink (`isMain`).
+Tests (`tests/hermes_cli/test_source_build.py`): `test_installed_prebuilt_desktop_stays_current_after_the_stage_moves`
+(stage restamped, inputs regenerated and deleted: still current; bundle stamp with another clock, other provenance or
+missing: stale; a live desktop source change: stale), `test_in_place_packaged_desktop_still_tracks_its_own_prepared_inputs`,
+`test_product_freshness_reads_through_a_symlinked_checkout`.
 
 **Plugin?** No. The desktop build step has no plugin hook. The companion
 [core-update](../plugins/core-update/) plugin only shows the state.
