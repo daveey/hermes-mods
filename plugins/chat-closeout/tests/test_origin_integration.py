@@ -69,7 +69,8 @@ def origin(tmp_path, monkeypatch):
                        ('owner', 'tasks', binding['task_record_key'], version, json.dumps(task)))
             db.execute('INSERT INTO replica VALUES (?,?,?,?,?)', ('owner', 'gateway', 'info', version,
                        json.dumps({'gateway': 'owner', 'task_scopes': [
-                           {'profile': 'work', 'board': 'build', 'state': 'ok'}]})))
+                           {'profile': 'work', 'board': 'build', 'state': 'ok',
+                                         'observed_at': now}]})))  # core releases only on a fresh per-scope heartbeat
             db.execute("INSERT OR REPLACE INTO meta VALUES ('last_ok',?)", (str(now),))
     publish('running', 3)
     ledger.accept_binding(path=path, replica=replica, binding=binding, request_id='request-0001',
