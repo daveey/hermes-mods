@@ -92,6 +92,11 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 
 ## Notes
 
+- `gh` repo: the script passes `-R OWNER/NAME` from the checkout's `origin` remote to every `gh` call (override
+  with `--gh-repo`). Before that, in a fork checkout that also has an `upstream` remote, a bare `gh run list`
+  read the upstream repo's runs. The fork's commit was never found, and every wait ended "stalled" with no run
+  named. Any hand-run `gh run`/`gh pr` in such a checkout needs `-R` too.
+
 - `--repo` is a LOCAL checkout path (the script runs `git -C <repo> fetch`). An `owner/name` slug resolves to `~/code/<name>` only when that checkout's origin is the same repo; anything else exits with "not a local checkout". Run it from inside the checkout or pass the path.
 
 - Workflows with `paths:` filters don't run for every commit. Without `--workflow`, the script waits on the
@@ -195,7 +200,8 @@ Order: exact-head review verdict AND exact-head required aggregate ("All require
 ## Rescuing a stalled merge watch
 
 For an open PR, inspect blockers before restarting a watcher:
-`gh pr view N --repo OWNER/REPO --json state,headRefOid,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,autoMergeRequest`.
+`gh pr view N --repo OWNER/REPO --json state,headRefOid,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,autoMergeRequest`,
+plus unresolved review threads, which that JSON omits (query in pr-blocker-check).
 A loop checking only OPEN/MERGED/CLOSED cannot detect conflicts or failed checks; approval and auto-merge are not
 proof of progress. If the watcher repeatedly dies on restarts, move follow-through to a durable task with scheduled
 one-shot checks, not another long-lived shell loop.

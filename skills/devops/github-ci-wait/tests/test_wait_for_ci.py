@@ -92,3 +92,53 @@ class ResolveRepoTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as e:
             w.resolve_repo(Path("someone/proj"))
         self.assertIn("not a local checkout", str(e.exception))
+
+
+class GhRepoTests(unittest.TestCase):
+    """Every gh call names the checkout's origin repo. A bare `gh run list` in a fork checkout with an `upstream`
+    remote listed the upstream repo's runs, so the fork's commit was never found and every wait ended "stalled"."""
+
+    def setUp(self):
+        import subprocess
+        import tempfile
+        self.repo = Path(tempfile.mkdtemp()) / "fork"
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        self.git = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a], check=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.repo.parent, ignore_errors=True)
+
+    def test_fork_checkout_uses_origin_not_upstream(self):
+        self.git("remote", "add", "upstream", "git@github.com:other/project.git")
+        self.git("remote", "add", "origin", "git@github.com:me/fork.git")
+        self.assertEqual(w.gh_repo(self.repo), "me/fork")
+
+    def test_https_and_ssh_origin_urls(self):
+        self.git("remote", "add", "origin", "https://github.com/me/fork.git")
+        self.assertEqual(w.gh_repo(self.repo), "me/fork")
+        self.git("remote", "set-url", "origin", "https://github.com/me/fork")
+        self.assertEqual(w.gh_repo(self.repo), "me/fork")
+        self.git("remote", "set-url", "origin", "ssh://git@github.com/me/fork.git")
+        self.assertEqual(w.gh_repo(self.repo), "me/fork")
+
+    def test_no_or_non_github_origin_leaves_gh_default(self):
+        self.assertIsNone(w.gh_repo(self.repo))
+        self.git("remote", "add", "origin", "git@gitlab.example.com:me/fork.git")
+        self.assertIsNone(w.gh_repo(self.repo))
+        self.assertEqual(w.gh_cmd(None, "run", "list"), ["gh", "run", "list"])
+
+    def test_list_runs_and_dispatch_name_the_repo(self):
+        from unittest import mock
+        calls = []
+
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            import subprocess
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+        with mock.patch.object(w.subprocess, "run", side_effect=fake):
+            w.list_runs(self.repo, "main", ["ci.yaml"], "me/fork")
+        self.assertEqual(calls[0][:3], ["gh", "run", "list"])
+        self.assertIn(["-R", "me/fork"], [calls[0][i:i + 2] for i in range(len(calls[0]) - 1)])
+        self.assertEqual(w.gh_cmd("me/fork", "workflow", "run", "ci.yaml", "--ref", "main"),
+                         ["gh", "workflow", "run", "ci.yaml", "--ref", "main", "-R", "me/fork"])

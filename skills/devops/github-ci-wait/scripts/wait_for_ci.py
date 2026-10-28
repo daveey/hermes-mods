@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import re
 import subprocess
 import sys
 import time
@@ -103,11 +104,27 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
     return state
 
 
-def list_runs(repo: Path, branch: str, workflows: list[str]) -> list[dict]:
+def gh_repo(repo: Path) -> str | None:
+    """OWNER/NAME of the checkout's `origin` on GitHub, passed to every `gh` call as `-R`.
+
+    Without it `gh` picks its own default repo. In a fork checkout that also has an `upstream` remote (e.g. a
+    Hermes core checkout: origin = your fork, upstream = NousResearch/hermes-agent) it listed the UPSTREAM repo's
+    runs, never found the fork's commit in them, and every wait ended "stalled" with no failing run named.
+    """
+    out = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True)
+    m = re.search(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", out.stdout.strip())
+    return f"{m.group(1)}/{m.group(2)}" if out.returncode == 0 and m else None
+
+
+def gh_cmd(slug: str | None, *args: str) -> list[str]:
+    return ["gh", *args, *(["-R", slug] if slug else [])]
+
+
+def list_runs(repo: Path, branch: str, workflows: list[str], slug: str | None = None) -> list[dict]:
     fields = "databaseId,headSha,status,conclusion,workflowName,url,event"
     runs: list[dict] = []
     for wf in workflows or [None]:
-        cmd = ["gh", "run", "list", "--branch", branch, "-L", "40" if wf else "100", "--json", fields]
+        cmd = gh_cmd(slug, "run", "list", "--branch", branch, "-L", "40" if wf else "100", "--json", fields)
         if wf:
             cmd += ["--workflow", wf]
         out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
@@ -147,8 +164,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--interval", type=float, default=60)
     p.add_argument("--once", action="store_true")
     p.add_argument("--dispatch", action="store_true")
+    p.add_argument("--gh-repo", help="OWNER/NAME for gh (default: the checkout's origin remote)")
     a = p.parse_args(argv)
     repo = resolve_repo(a.repo)
+    slug = a.gh_repo or gh_repo(repo)
 
     def fetch():
         git(repo, "fetch", "-q", "--tags", "--force", "origin", a.branch)
@@ -166,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     deadline = start + a.timeout_min * 60
     dispatches, idle, last = 0, 0, ""
     while True:
-        runs = list_runs(repo, a.branch, a.workflow)
+        runs = list_runs(repo, a.branch, a.workflow, slug)
         if a.tag_glob:
             tags = tags_done(repo, shas, a.tag_glob)
             if all(tags.values()):
@@ -200,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                       if failed else "no run containing the commit succeeded and none is queued or running")
             if a.dispatch and a.workflow and dispatches < 2:
                 for wf in a.workflow:
-                    subprocess.run(["gh", "workflow", "run", wf, "--ref", a.branch], cwd=repo, check=True)
+                    subprocess.run(gh_cmd(slug, "workflow", "run", wf, "--ref", a.branch), cwd=repo, check=True)
                 dispatches += 1
                 idle = 0
                 print(f"stalled ({reason}); dispatched {', '.join(a.workflow)} #{dispatches}", flush=True)
