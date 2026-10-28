@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-worker-task-marker.md](kanban-worker-task-marker.md) | 0705 | A Kanban worker's tool children (terminal, background processes, execute_code) get `HERMES_KANBAN_WORKER_TASK=<card>` so shell tooling knows its card; `HERMES_KANBAN_TASK` stays scrubbed, and a process with only the marker is not a worker. |
 | [held-session-refusal-backoff.md](held-session-refusal-backoff.md) | 0702 | A completion or other automatic turn refused because another backend holds the chat backs off (30 s doubling to 300 s) and shows one "open in another Hermes window or device" notice per streak instead of an "internal error" card every poll; the event waits and is delivered once the chat is free. |
 | [serve-update-wait.md](serve-update-wait.md) | 0697 | `hermes serve` waits out a live core update (600 s) or hermes-sync's admission hold (60 s) before loading the agent, so no backend boots on a tree about to be swapped. |
 | [update-pause-in-place-handoff.md](update-pause-in-place-handoff.md) | 0704 | A core-update-paused turn whose checkout moved waits for a successor backend only while one is coming (retiring, or skew watchdog + idle proof); with no watchdog it continues at once, kept busy 60 s it continues in place (backstop 300 s, was 900 s). |

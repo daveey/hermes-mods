@@ -1,0 +1,279 @@
+From 29c83d3719802f588e1002cf88a9ed2c26ff343a Mon Sep 17 00:00:00 2001
+From: David Bloomin <452472+daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:00:09 +0000
+Subject: [PATCH] fix(kanban): worker tool children carry
+ HERMES_KANBAN_WORKER_TASK [daveey]
+
+scrub_kanban_env removes HERMES_KANBAN_TASK from every process a Kanban
+worker's tools spawn (b578261584) so a nested hermes cannot act as the worker.
+That is protective and stays. It also left shell tooling (gh-shim call
+attribution, bb-land card notes, the swift/xcodebuild compile cap) unable to
+tell it runs for a card: 0 of 4 worker child shells on David-MBP had it.
+
+Export the informational HERMES_KANBAN_WORKER_TASK=<card> to every scrubbed
+tool child instead: terminal foreground, background (process registry),
+execute_code. Taken from the worker's HERMES_KANBAN_TASK (passed env, then this
+process, since execute_code passes a HERMES_*-filtered env), then an inherited
+marker so descendants of a worker shell keep it. No identity/tool/board code
+reads it; a process with only the marker gets no worker-lifecycle tools.
+
+Tests: tests/tools/test_kanban_worker_task_marker.py, one per entry path in a
+worker context, the same three outside one, delegate child of a chat,
+grandchild of a worker shell, and a nested hermes with only the marker (with a
+HERMES_KANBAN_TASK control). RED with the assignment disabled: 4 failed.
+---
+ agent/delegation_context.py                   |  24 +++
+ tests/tools/test_kanban_worker_task_marker.py | 183 ++++++++++++++++++
+ .../docs/reference/environment-variables.md   |   1 +
+ 3 files changed, 208 insertions(+)
+ create mode 100644 tests/tools/test_kanban_worker_task_marker.py
+
+diff --git a/agent/delegation_context.py b/agent/delegation_context.py
+index 1487d8da9c9..ab210ec0a47 100644
+--- a/agent/delegation_context.py
++++ b/agent/delegation_context.py
+@@ -35,6 +35,12 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
+     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+     "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+ )
++# [daveey] Informational only: the card a Kanban worker's tool children (terminal, background
++# processes, execute_code, ...) run for. ``scrub_kanban_env`` removes ``HERMES_KANBAN_TASK`` from
++# them so a nested ``hermes`` never acts as the worker, which also left shell tooling (gh-shim
++# attribution, bb-land card notes, the compile cap) unable to tell it runs for a card. Nothing
++# that decides worker identity, tools or board scope may read this name; use ``owned_kanban_task``.
++KANBAN_WORKER_TASK_ENV = "HERMES_KANBAN_WORKER_TASK"
+ 
+ # --- Agent-scope env: what a top-level surface must never inherit. [daveey] -----------------
+ # A worker's terminal subprocesses carry DELEGATED_CHILD_ENV_MARKER by design
+@@ -355,9 +361,27 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
+     cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+     if not (cleaned.get(DELEGATED_CHILD_OWNER_ENV) or "").strip():
+         cleaned[DELEGATED_CHILD_OWNER_ENV] = _owner_token()
++    worker_task = _worker_task_for_children(env)
++    if worker_task:
++        cleaned[KANBAN_WORKER_TASK_ENV] = worker_task
+     return cleaned
+ 
+ 
++def _worker_task_for_children(env: Mapping[str, str]) -> str:
++    """[daveey] The card id to export as :data:`KANBAN_WORKER_TASK_ENV` to a scrubbed child.
++
++    The worker's own ``HERMES_KANBAN_TASK`` first: from *env*, else from this process, since some
++    callers pass an env already filtered of ``HERMES_*`` (execute_code's sandbox). Then an inherited
++    marker, so a worker terminal's own descendants keep naming the card. ``""`` outside any worker
++    (a delegate child of an interactive chat has no card)."""
++    for key in ("HERMES_KANBAN_TASK", KANBAN_WORKER_TASK_ENV):
++        for source in (env, os.environ):
++            value = (source.get(key) or "").strip()
++            if value:
++                return value
++    return ""
++
++
+ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
+     """Whether Kanban mutations at *path* (a board DB or board-metadata root) are denied for this
+     process: always for an in-process delegate child (the parent's own board); for a spawned
+diff --git a/tests/tools/test_kanban_worker_task_marker.py b/tests/tools/test_kanban_worker_task_marker.py
+new file mode 100644
+index 00000000000..b5c2bcac5dc
+--- /dev/null
++++ b/tests/tools/test_kanban_worker_task_marker.py
+@@ -0,0 +1,183 @@
++"""[daveey] Tool children of a Kanban worker carry ``HERMES_KANBAN_WORKER_TASK``, never the worker identity.
++
++The descendant scrub (``agent.delegation_context.scrub_kanban_env``) removes ``HERMES_KANBAN_TASK``
++from every process a worker's tools spawn, so a nested ``hermes`` cannot act as the worker. That
++left shell tooling (gh-shim attribution, bb-land card notes, the swift/xcodebuild compile cap) with
++no way to tell it runs for a card. The informational marker restores that, one test per entry path:
++terminal foreground, background process (process registry), execute_code sandbox.
++"""
++import json
++import os
++import shlex
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from agent.delegation_context import KANBAN_WORKER_TASK_ENV
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++from tools.environments.local import LocalEnvironment
++
++ROOT = Path(__file__).resolve().parents[2]
++PROBE = ("import os, json; print('ENV_RESULT=' + json.dumps({k: os.environ.get(k) for k in "
++         "('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_KANBAN_RUN_ID')}))")
++
++
++def _row(output: str) -> dict:
++    return json.loads(next(line.split("ENV_RESULT=", 1)[1] for line in output.splitlines() if "ENV_RESULT=" in line))
++
++
++def _worker_env(tmp_path, monkeypatch) -> str:
++    db = tmp_path / "assigned.db"
++    conn = connect(db)
++    own = kb.create_task(conn, title="own")
++    kb.claim_task(conn, own)
++    task = kb.get_task(conn, own)
++    conn.close()
++    for key, value in {
++        "HERMES_KANBAN_DB": str(db), "HERMES_KANBAN_BOARD": "default",
++        "HERMES_KANBAN_TASK": own, "HERMES_KANBAN_RUN_ID": str(task.current_run_id),
++        "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock, "HOME": str(tmp_path),
++    }.items():
++        monkeypatch.setenv(key, value)
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    monkeypatch.delenv(KANBAN_WORKER_TASK_ENV, raising=False)
++    return own
++
++
++def _non_worker_env(tmp_path, monkeypatch) -> None:
++    monkeypatch.setenv("HOME", str(tmp_path))
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
++                "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_DELEGATED_CHILD_CONTEXT",
++                "HERMES_DELEGATED_CHILD_OWNER", KANBAN_WORKER_TASK_ENV):
++        monkeypatch.delenv(key, raising=False)
++
++
++def _foreground(tmp_path) -> dict:
++    script = tmp_path / "probe.py"
++    script.write_text(PROBE)
++    terminal = LocalEnvironment(cwd=str(tmp_path))
++    try:
++        result = terminal.execute(f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}")
++    finally:
++        terminal.cleanup()
++    return _row(result.get("output", ""))
++
++
++def _background(tmp_path) -> dict:
++    from tools.process_registry import ProcessRegistry
++
++    script = tmp_path / "probe.py"
++    script.write_text(PROBE)
++    registry = ProcessRegistry()
++    session = registry.spawn_local(f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}", cwd=str(tmp_path))
++    try:
++        deadline = time.monotonic() + 20
++        while time.monotonic() < deadline:
++            poll = registry.poll(session.id)
++            if poll["status"] == "exited":
++                break
++            time.sleep(0.05)
++        else:
++            pytest.fail("background probe never exited")
++        return _row(registry.read_log(session.id, limit=200)["output"])
++    finally:
++        registry.kill_process(session.id)
++
++
++def _execute_code(tmp_path) -> dict:
++    from tools.code_execution_env import _build_child_env
++
++    env = _build_child_env(rpc_endpoint="fixture", rpc_token="fixture", tmpdir=str(tmp_path),
++                           child_python=sys.executable)
++    proc = subprocess.run([sys.executable, "-c", PROBE], env=env, cwd=tmp_path, stdin=subprocess.DEVNULL,
++                          capture_output=True, text=True, timeout=45, check=False)
++    assert proc.returncode == 0, proc.stderr
++    return _row(proc.stdout)
++
++
++ENTRY_PATHS = {"terminal_foreground": _foreground, "background_process": _background, "execute_code": _execute_code}
++
++
++@pytest.mark.parametrize("path", sorted(ENTRY_PATHS))
++def test_worker_tool_child_sees_marker_not_identity(tmp_path, monkeypatch, path):
++    own = _worker_env(tmp_path, monkeypatch)
++    row = ENTRY_PATHS[path](tmp_path)
++    assert row["HERMES_KANBAN_WORKER_TASK"] == own, row
++    assert row["HERMES_KANBAN_TASK"] is None and row["HERMES_KANBAN_RUN_ID"] is None, row
++
++
++@pytest.mark.parametrize("path", sorted(ENTRY_PATHS))
++def test_non_worker_tool_child_sees_neither_variable(tmp_path, monkeypatch, path):
++    _non_worker_env(tmp_path, monkeypatch)
++    row = ENTRY_PATHS[path](tmp_path)
++    assert row["HERMES_KANBAN_WORKER_TASK"] is None and row["HERMES_KANBAN_TASK"] is None, row
++
++
++def test_delegate_child_of_a_chat_gets_no_marker(tmp_path, monkeypatch):
++    """A delegate_task child outside any worker also crosses the scrub; there is no card to name."""
++    from agent.delegation_context import delegated_child_context
++
++    _non_worker_env(tmp_path, monkeypatch)
++    with delegated_child_context("child"):
++        row = _foreground(tmp_path)
++    assert row["HERMES_KANBAN_WORKER_TASK"] is None and row["HERMES_KANBAN_TASK"] is None, row
++
++
++def test_grandchild_of_worker_terminal_keeps_marker(tmp_path, monkeypatch):
++    """A shell started by a worker terminal (nested scrub, TASK already gone) still names the card."""
++    own = _worker_env(tmp_path, monkeypatch)
++    script = tmp_path / "nested.py"
++    script.write_text(
++        "import os, sys, subprocess\n"
++        f"sys.path.insert(0, {str(ROOT)!r})\n"
++        "from agent.delegation_context import delegated_child_subprocess_env\n"
++        f"subprocess.run([sys.executable, '-c', {PROBE!r}], env=delegated_child_subprocess_env(dict(os.environ)), check=True)\n"
++    )
++    terminal = LocalEnvironment(cwd=str(tmp_path))
++    try:
++        result = terminal.execute(f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}")
++    finally:
++        terminal.cleanup()
++    row = _row(result.get("output", ""))
++    assert row["HERMES_KANBAN_WORKER_TASK"] == own and row["HERMES_KANBAN_TASK"] is None, row
++
++
++def test_nested_hermes_with_only_marker_gets_no_worker_lifecycle_tools(tmp_path, monkeypatch):
++    """The marker is informational: a process carrying only it is not the worker."""
++    _non_worker_env(tmp_path, monkeypatch)
++    env = {**os.environ, KANBAN_WORKER_TASK_ENV: "t_fixture", "HERMES_HOME": str(tmp_path / "home")}
++    (tmp_path / "home").mkdir()
++    code = (
++        "import json, sys\n"
++        f"sys.path.insert(0, {str(ROOT)!r})\n"
++        "from agent.delegation_context import owned_kanban_task, explicit_board_intent_is_pinned\n"
++        "from tools import kanban_tools as kt\n"
++        "from tools.tool_search import _in_kanban_worker\n"
++        "from tools.registry import registry\n"
++        "import model_tools  # registers every tool\n"
++        "lifecycle = ('kanban_complete', 'kanban_block', 'kanban_heartbeat', 'kanban_request_review')\n"
++        "avail = {n: bool(registry.get_entry(n) and registry.get_entry(n).check_fn and registry.get_entry(n).check_fn())"
++        " for n in lifecycle}\n"
++        "registered = [n for n in lifecycle if registry.get_entry(n) is not None]\n"
++        "print('ENV_RESULT=' + json.dumps({'owned': owned_kanban_task(), 'in_worker': _in_kanban_worker(),"
++        " 'pinned': explicit_board_intent_is_pinned(), 'default_task': kt._default_task_id(None), 'avail': avail,"
++        " 'registered': registered}))\n"
++    )
++    proc = subprocess.run([sys.executable, "-c", code], env=env, cwd=ROOT, stdin=subprocess.DEVNULL,
++                          capture_output=True, text=True, timeout=90, check=False)
++    assert proc.returncode == 0, proc.stderr
++    row = _row(proc.stdout)
++    assert row["owned"] == "" and row["in_worker"] is False and row["pinned"] is False, row
++    assert row["default_task"] is None, row
++    assert len(row["registered"]) == 4, row  # the check below is not vacuous
++    assert not any(row["avail"].values()), row
++    # Control: the same probe WITH the worker identity does see them, so the gate is what hides them.
++    proc = subprocess.run([sys.executable, "-c", code], env={**env, "HERMES_KANBAN_TASK": "t_fixture"}, cwd=ROOT,
++                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90, check=False)
++    assert proc.returncode == 0, proc.stderr
++    control = _row(proc.stdout)
++    assert control["in_worker"] is True and all(control["avail"].values()), control
+diff --git a/website/docs/reference/environment-variables.md b/website/docs/reference/environment-variables.md
+index 7ee649abd2a..aaca6b786c9 100644
+--- a/website/docs/reference/environment-variables.md
++++ b/website/docs/reference/environment-variables.md
+@@ -832,6 +832,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
+ | `HERMES_QUIET` | Suppress non-essential output (`true`/`false`) |
+ | `CODEX_HOME` | When [Codex app-server runtime](../user-guide/features/codex-app-server-runtime) is enabled, override the directory Codex CLI reads its config + auth from (default: `~/.codex`). Hermes' migration writes the managed block to `<CODEX_HOME>/config.toml`. |
+ | `HERMES_KANBAN_TASK` | Set by the kanban dispatcher when spawning a worker (task UUID). Workers and the spawned `hermes-tools` MCP subprocess inherit it so kanban tools gate correctly. Don't set manually. |
++| `HERMES_KANBAN_WORKER_TASK` | Informational: the card id a kanban worker's tool children (terminal commands, background processes, `execute_code`) run for. Those children never see `HERMES_KANBAN_TASK` (it is scrubbed so a nested `hermes` cannot act as the worker), so shell tooling reads this instead (build caps, call attribution). Nothing in Hermes treats it as worker identity. Don't set manually. |
+ | `HERMES_ACP_SKIP_CONFIGURED_MCP` | Set by an [ACP host](../user-guide/features/acp#host-integration) on the Hermes subprocess it spawns. `1` skips starting the globally configured `config.yaml` MCP servers before the ACP JSON-RPC loop, for hosts that pass the session's MCP servers through `session/new` themselves. Servers supplied by the ACP session are still registered; any other value keeps the default. Don't set manually. |
+ | `HERMES_API_TIMEOUT` | LLM API call timeout in seconds (default: `1800`) |
+ | `HERMES_API_CALL_STALE_TIMEOUT` | Non-streaming stale-call timeout in seconds (default: `90`). Auto-disabled for local providers when left unset, and may scale upward for very large contexts. Also configurable via `providers.<id>.stale_timeout_seconds` or `providers.<id>.models.<model>.stale_timeout_seconds` in `config.yaml`. |
+-- 
+2.55.0
+
