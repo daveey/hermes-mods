@@ -1306,3 +1306,68 @@ def test_fixed_result_is_stored_quietly_and_creates_no_inbox_item(store, tmp_pat
     assert e["result_file"].endswith(f"{fp}.md")
     with pytest.raises(ValueError):
         sh.record_event("proposed", fp, store=store, result=str(res))
+
+
+# ── in-flight reservation + serialized admission (go-live review: $268 spent against a $200 cap) ──
+def _eb(usd, cap, cards, spent=0.0):
+    import re
+
+    def check(snap, lane, extra=0.0):
+        t = snap["lanes"][lane] + extra
+        return (False, f"{lane} lane spend today ${t:.2f} >= ${cap:g} cap") if t >= cap else (True, "")
+
+    return SimpleNamespace(
+        snapshot=lambda **kw: {"lanes": {"selfheal": usd}, "caps": {"selfheal": cap}},
+        check=check, engine_cards=lambda home, b, st: [c for c in cards if c["status"] in st],
+        card_budget=lambda c, snap: float(re.search(r"<= \$(\d+)", c["body"]).group(1)),
+        card_cost=lambda home, b, tid: spent)
+
+
+def test_budget_reserves_inflight_and_new_card(monkeypatch):
+    cards = [{"id": f"t_{i}", "lane": "selfheal", "status": s, "body": "Budget for this card <= $8."}
+             for i, s in enumerate(["running", "running", "ready"])]
+    monkeypatch.setattr(sh, "_budget_mod", lambda: _eb(usd=170.0, cap=200.0, cards=cards))
+    b = sh.budget(now=NOW)  # 170 spent < 200, but 3 x $8 in flight + $8 new = 32 -> 202 >= 200
+    assert b["available"] and b["usd"] == 170.0 and b["reserved"] == 32.0
+    assert not b["ok_usd"] and "reserved" in b["why"] and b["running"] == 2
+    monkeypatch.setattr(sh, "_budget_mod", lambda: _eb(usd=170.0, cap=200.0, cards=cards[:1]))
+    assert sh.budget(now=NOW)["ok_usd"]  # 170 + 8 + 8 = 186
+    monkeypatch.setattr(sh, "_budget_mod", lambda: _eb(usd=170.0, cap=200.0, cards=cards[:1], spent=7.0))
+    assert sh.budget(now=NOW, new_card_usd=sh.FIX_BUDGET)["reserved"] == 16.0  # 1 unspent + 15 fix
+
+
+def test_concurrent_admissions_cannot_both_take_the_last_headroom(store, monkeypatch):
+    import threading
+    created, gate = [], threading.Event()
+
+    def budget_fn(board=None, now=None):
+        ok = not created  # headroom for exactly one more card
+        gate.wait(0.3)  # widen the read->create window the lock must close
+        return {"usd": 1.0, "cap": 25.0, "running": len(created), "ok_usd": ok, "ok_running": True, "why": "full"}
+
+    def runner(argv, **kw):
+        if "create" in argv:
+            created.append(argv)
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"id": f"t_{len(created):08x}"}), stderr="")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    outs = []
+    ds = [defect(component=c, symptom=f"distinct symptom {c}") for c in ("desktop", "kanban")]
+    ts = [threading.Thread(target=lambda d=d: outs.append(
+        sh.file_defect(d, store=store, m="live", runner=runner, now=NOW, cfg=HUB, budget_fn=budget_fn)))
+        for d in ds]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(created) == 1
+    assert sorted(o["action"] for o in outs) == ["deferred", "filed"]
+
+
+def test_file_fix_reserves_fix_budget_by_default(store, monkeypatch):
+    seen = []
+    monkeypatch.setattr(sh, "budget", lambda board=None, now=None, new_card_usd=None: (
+        seen.append(new_card_usd) or {"usd": 1, "cap": 200, "running": 0, "ok_usd": False, "ok_running": True,
+                                      "available": True, "why": "full", "reserved": 0}))
+    d = defect()
+    sh.LaneState(store.root).update(d["fingerprint"], status="proposed", component="desktop")
+    r = sh.file_fix(d["fingerprint"], store=store, runner=Runner(), now=NOW)
+    assert seen == [sh.FIX_BUDGET] and r["action"] == "deferred"

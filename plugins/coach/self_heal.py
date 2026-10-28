@@ -21,6 +21,7 @@ README's "Self-heal lane" section). Fail-open everywhere.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -973,11 +974,41 @@ def _budget_mod():
     return mod
 
 
-def budget(board: Optional[str] = None, now: Optional[float] = None) -> dict:
-    """{"usd", "cap", "running", "ok_usd", "ok_running", "why"} for the selfheal lane today (UTC)."""
+@contextlib.contextmanager
+def _admission_lock(store, live: bool = True, timeout: float = 180.0):
+    """One lock across every admission path (lane cron, signals cron, Do-it sync, CLI): budget read + card
+    create is a single transaction, so two concurrent admissions cannot both see the same headroom. A lock
+    that cannot be taken in `timeout` seconds fails closed (RuntimeError) instead of admitting unserialized."""
+    if not live:
+        yield
+        return
+    import fcntl
+    Path(store.root).mkdir(parents=True, exist_ok=True)
+    with (Path(store.root) / "selfheal-admission.lock").open("a") as lock:
+        end = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= end:
+                    raise RuntimeError("self-heal admission lock busy")
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def budget(board: Optional[str] = None, now: Optional[float] = None,
+           new_card_usd: float = INVESTIGATION_BUDGET) -> dict:
+    """{"usd", "cap", "running", "ok_usd", "ok_running", "why"} for the selfheal lane today (UTC).
+    ok_usd reserves in-flight work: every running/ready/todo selfheal card's unspent card budget plus
+    `new_card_usd` for the card being admitted must still fit under the cap (spend alone is a lagging
+    measure; the Oct 28 overshoot was $268 against $200)."""
     now = now or time.time()
     out = {"usd": None, "cap": USD_DAY, "running": None, "ok_usd": False,
-           "ok_running": False, "available": False, "why": ""}
+           "ok_running": False, "available": False, "why": "", "reserved": None}
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     b = board or os.environ.get("COACH_KANBAN_BOARD") or "default"
     try:
@@ -991,10 +1022,18 @@ def budget(board: Optional[str] = None, now: Optional[float] = None) -> dict:
         if (not isinstance(usd, (int, float)) or not isinstance(cap, (int, float))
                 or not math.isfinite(usd) or not math.isfinite(cap) or usd < 0 or cap <= 0):
             raise ValueError("invalid self-heal spend or cap")
-        ok, why = eb.check(snap, "selfheal")
-        running = sum(1 for c in eb.engine_cards(home, b, ("running",)) if c["lane"] == "selfheal")
-        # Commit the observation only after BOTH reads succeed. Unknown is not zero spend.
-        out.update(usd=usd, cap=cap, running=running, ok_usd=ok,
+        inflight = [c for c in eb.engine_cards(home, b, ("running", "ready", "todo")) if c["lane"] == "selfheal"]
+        running = sum(1 for c in inflight if c.get("status", "running") == "running")
+        reserved = float(new_card_usd)
+        for c in inflight:
+            cb = eb.card_budget(c, snap) if hasattr(eb, "card_budget") else float(INVESTIGATION_BUDGET)
+            spent = eb.card_cost(home, b, c["id"]) if hasattr(eb, "card_cost") else 0.0
+            reserved += max(0.0, float(cb) - float(spent))
+        ok, why = eb.check(snap, "selfheal", reserved)
+        if not ok and usd < cap:
+            why = f"{why} (spend ${usd:.2f} + ${reserved:.2f} reserved for in-flight and the new card)"
+        # Commit the observation only after ALL reads succeed. Unknown is not zero spend.
+        out.update(usd=usd, cap=cap, running=running, ok_usd=ok, reserved=round(reserved, 2),
                    ok_running=running < MAX_RUNNING, available=True, why=why)
     except Exception as exc:
         out["why"] = f"budget read failed: {exc}"
@@ -1651,7 +1690,8 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
         d = {**d, "incident": incident, "host": incident["host"],
              "fingerprint": "sqlitecorrupt-" + hashlib.sha1(key.encode()).hexdigest()[:16]}
     def run():
-        return _file_defect(d, store, m, runner, now, cfg, budget_fn, owner_fn, sig_owner_fn)
+        with _admission_lock(store, live=(m or mode()) == "live" and is_hub(cfg)):
+            return _file_defect(d, store, m, runner, now, cfg, budget_fn, owner_fn, sig_owner_fn)
     if not incident or (m or mode()) != "live" or not is_hub(cfg):
         return run()
     # Lane JSON is a read/check/create/write transaction. One lock also protects different
@@ -1776,6 +1816,15 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
 
 def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budget_fn=None,
              trigger: str = "do_it") -> dict:
+    """Admission is serialized with investigations (see _admission_lock) and reserves FIX_BUDGET."""
+    store = _store(store)
+    bf = budget_fn or (lambda bd, n: budget(bd, n, new_card_usd=FIX_BUDGET))
+    with _admission_lock(store, live=True):
+        return _file_fix(fp, store, runner, now, bf, trigger)
+
+
+def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budget_fn=None,
+              trigger: str = "do_it") -> dict:
     """Do it: the fix card `selfheal:<fp>[:r<gen>]:fix` on the hub, keyed to the current generation (idempotent
     within it; a key that returns an earlier card of this fingerprint is an error, never an approval)."""
     store = _store(store)
