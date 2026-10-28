@@ -184,9 +184,12 @@ def _sweep(ledger, force, deadline):
         if remaining <= 0 or (index and remaining < .1):
             return
         ledger._daemon_cursor = cap
-        # Reserve a fair share for later owners, with enough minimum time for
-        # real IPC when there are more owners than fit into one sweep.
-        budget = min(.5, max(.1, remaining / (len(candidates) - index)))
+        # Give this owner up to half a second, still bounded by the sweep
+        # deadline. Splitting that deadline across every remaining owner left
+        # each of them less time than a loaded host needs to finish one
+        # exchange, so a rotated owner was visited and not retired. The cursor
+        # is what keeps a large ledger fair across sweeps.
+        budget = min(.5, remaining)
         try:
             _candidate(ledger, force, cap, snapshot, owned[cap], min(deadline, time.monotonic() + budget))
         except (OSError, ValueError, KeyError, TypeError):
