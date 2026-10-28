@@ -7,8 +7,10 @@ home (``~/.hermes``, ``$HERMES_HOME``), outside scratch, cache, archive and back
   ``cp`` / ``install`` / ``rsync`` / ``ln`` / ``dd of=`` / a ``>`` redirect. Deleting the ``-wal`` or
   ``-shm`` of a database that another process has open, or swapping the main file under it, splits the
   writers onto different WAL views, and the next checkpoint corrupts the b-trees.
-- ``sqlite3`` writes against a live file (DML, DDL, ``REINDEX``, ``VACUUM``, ``.recover``/``.restore`` into
-  it, journal or checkpoint pragmas). Reads, ``-readonly`` and ``mode=ro``/``immutable=1`` URIs pass.
+- ``sqlite3`` maintenance against a live file (``REINDEX``, ``VACUUM``, checkpoint / journal-mode pragmas,
+  ``.restore``), and ``sqlite3`` writes (DML/DDL) into a live file that was quarantined as corrupt in the
+  last few hours (a ``<db>.corrupt.*.bak`` sibling). Reads, ``-readonly`` and ``mode=ro``/``immutable=1``
+  URIs pass; plain DML into a healthy board passes (SQLite locks it correctly).
 
 Swapping a recovered copy in goes through ``swap_db.py`` next to this file, which takes a per-database
 recovery lock, refuses while any process holds the file, checks the replacement and keeps the originals.
@@ -19,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -35,13 +38,46 @@ _HOME_PREFIX = re.compile(
     r"^(?:~|\$\{?HOME\}?|/home/[^/]+|/Users/[^/]+|/root)/\.hermes(?:/|$)|^\$\{?HERMES_HOME\}?(?:/|$)")
 _SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")", "|&"}
 _WRAPPERS = {"sudo", "env", "command", "nice", "nohup", "exec", "time", "ionice", "stdbuf"}
-_SQL_WRITE = re.compile(
-    r"\b(?:insert|update|delete|replace|upsert|reindex|vacuum|drop|create|alter|attach)\b"
-    r"|\bpragma\s+(?:main\.)?(?:journal_mode|wal_checkpoint|writable_schema|user_version|schema_version|"
-    r"secure_delete|page_size|auto_vacuum|incremental_vacuum|optimize)\b"
-    r"|^\s*\.(?:recover|restore|import|load|read|clone)\b",
-    re.IGNORECASE | re.MULTILINE,
+_SQL_MAINT = re.compile(
+    r"^\s*(?:reindex|vacuum|attach)\b"
+    r"|^\s*pragma\s+(?:\w+\.)?(?:journal_mode\s*=|wal_checkpoint\b|writable_schema\s*=|page_size\s*=|auto_vacuum\s*=|"
+    r"incremental_vacuum\b|schema_version\s*=)"
+    r"|^\s*\.(?:restore|clone)\b",
+    re.IGNORECASE,
 )
+_SQL_DML = re.compile(r"^\s*(?:insert|update|delete|replace|upsert|drop|create|alter|begin|with)\b", re.IGNORECASE)
+QUARANTINE_WINDOW_S = 2 * 3600
+
+
+def _statements(text: str) -> Iterable[str]:
+    for stmt in re.split(r"[;\n]", text or ""):
+        yield re.sub(r"^\s*(?:--[^\n]*|/\*.*?\*/)\s*", "", stmt, flags=re.S)
+
+
+def _sql_kind(text: str) -> Optional[str]:
+    """``"maintenance"`` (REINDEX, VACUUM, checkpoint/journal pragmas), ``"write"`` (DML/DDL) or ``None``.
+    Only a statement's leading verb counts: ``replace(`` or ``like '%delete%'`` inside a SELECT do not."""
+    kind = None
+    for stmt in _statements(text):
+        if _SQL_MAINT.search(stmt):
+            return "maintenance"
+        if _SQL_DML.search(stmt):
+            kind = "write"
+    return kind
+
+
+def recently_quarantined(db: str) -> Optional[str]:
+    """Name of a ``<db>.corrupt.*.bak`` quarantine younger than the window, if any (the board was judged
+    corrupt recently, so raw writes into it are a repair attempt on a damaged file)."""
+    path = Path(_expand(db[5:].split("?", 1)[0] if db.startswith("file:") else db))
+    try:
+        now = time.time()
+        for bak in path.parent.glob(path.name + ".corrupt.*.bak"):
+            if now - bak.stat().st_mtime < QUARANTINE_WINDOW_S:
+                return bak.name
+    except OSError:
+        return None
+    return None
 
 
 def _home() -> str:
@@ -77,7 +113,11 @@ def is_live(path: str, in_home: bool = False) -> bool:
     rooted = _under_home(path) or (in_home and not path.startswith(("/", "~", "$")))
     if not rooted:
         return False
-    return not any(part in path for part in _NOT_LIVE_PARTS)
+    # Judge scratch/backup locations only below the Hermes home (the home itself may sit under /tmp in tests).
+    full = _expand(path)
+    home = _home().rstrip("/") + "/"
+    rel = "/" + (full[len(home):] if full.startswith(home) else _HOME_PREFIX.sub("", path))
+    return not any(part in rel for part in _NOT_LIVE_PARTS)
 
 
 def _tokens(cmd: str) -> list[str]:
@@ -112,7 +152,8 @@ def _strip_wrappers(seg: list[str]) -> list[str]:
         elif tok in _WRAPPERS:
             i += 1
             while i < len(seg) and seg[i].startswith("-"):
-                i += 1
+                takes_arg = tok == "sudo" and seg[i] in ("-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t")
+                i += 2 if takes_arg else 1
         elif tok == "timeout":
             i += 1
             while i < len(seg) and (seg[i].startswith("-") or re.match(r"^\d+[smhd]?$", seg[i])):
@@ -134,9 +175,8 @@ def _operands(args: list[str]) -> list[str]:
 
 def _check_redirects(seg: list[str], in_home: bool) -> Optional[str]:
     for i, tok in enumerate(seg[:-1]):
-        if tok in (">", ">>", ">|", "&>") or (tok == ">" and i + 1 < len(seg)):
-            if is_live(seg[i + 1], in_home):
-                return f"a `>` redirect would overwrite live database file {seg[i + 1]}"
+        if tok in (">", ">>", ">|", "&>") and is_live(seg[i + 1], in_home):
+            return f"a `>` redirect would overwrite live database file {seg[i + 1]}"
     return None
 
 
@@ -145,8 +185,16 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[s
     sql: list[str] = []
     db = None
     i = 0
+    fed = False
     while i < len(args):
         a = args[i]
+        if a in ("<", "<<", "<<<"):
+            fed = True
+            i += 2
+            continue
+        if a in (">", ">>", ">|"):
+            i += 2
+            continue
         if a in ("-cmd", "--cmd", "-init", "--init", "-separator", "-newline", "-nullvalue"):
             if a in ("-cmd", "--cmd") and i + 1 < len(args):
                 sql.append(args[i + 1])
@@ -165,9 +213,15 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[s
     if readonly or re.search(r"[?&](?:mode=ro|immutable=1)", db):
         return None
     text = "\n".join(sql)
-    fed = "<" in seg or "<<" in seg or "<<<" in seg
-    if _SQL_WRITE.search(text) or (fed and not text):
-        return f"`sqlite3` would write to live database {db}"
+    kind = _sql_kind(text) or ("write" if fed and not text else None)
+    if kind == "maintenance":
+        return f"`sqlite3` would run maintenance (REINDEX/VACUUM/checkpoint/journal pragma) on live database {db}"
+    if kind == "write":
+        bak = recently_quarantined(os.path.join(_home(), db) if in_home and not db.startswith(("/", "~", "$", "file:"))
+                                   else db)
+        if bak:
+            return (f"`sqlite3` would write to live database {db}, which was quarantined as corrupt "
+                    f"recently ({bak}); writes into a damaged b-tree spread the damage")
     return None
 
 
@@ -208,19 +262,32 @@ def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
     return None
 
 
-_PY_DESTRUCTIVE = re.compile(
-    r"\bos\.(?:remove|unlink|rename|replace|truncate)\s*\(|\bshutil\.(?:move|copy|copy2|copyfile)\s*\("
-    r"|\.(?:unlink|rename|replace|write_bytes|write_text)\s*\(|\bopen\s*\([^)]*[\"'][wa+][b+]?[\"']")
+_Q = r"""["'](?P<p>[^"'\n]{1,400})["']"""
+_PY_DESTRUCTIVE = (
+    re.compile(r"\bos\.(?:remove|unlink|rename|replace|truncate)\s*\((?P<a>[^)]*)\)"),
+    re.compile(r"\bshutil\.move\s*\((?P<a>[^)]*)\)"),
+    re.compile(r"\bshutil\.(?:copy|copy2|copyfile)\s*\((?P<dst>[^)]*)\)"),  # only the destination counts
+    re.compile(r"\bPath\s*\(\s*" + _Q + r"\s*\)\s*\.(?:unlink|rename|replace|write_bytes|write_text)\s*\("),
+    re.compile(r"\bopen\s*\(\s*" + _Q + r"\s*,\s*[\"'][wa+]"),
+)
 _PY_STR = re.compile(r"""(?P<q>["'])(?P<s>[^"'\n]{1,400})(?P=q)""")
 
 
 def check_python(code: str) -> Optional[str]:
     code = code or ""
-    literals = [m.group("s") for m in _PY_STR.finditer(code)]
-    live = [s for s in literals if is_live(os.path.expanduser(s)) or is_live(s)]
-    if live and _PY_DESTRUCTIVE.search(code):
-        return f"Python file operations on live database file {live[0]}"
-    for lit in literals:  # os.system("rm ...") / subprocess.run("...", shell=True)
+    for pat in _PY_DESTRUCTIVE:
+        for m in pat.finditer(code):
+            groups = m.groupdict()
+            if groups.get("p"):
+                cands = [groups["p"]]
+            elif groups.get("dst") is not None:
+                cands = [s.group("s") for s in _PY_STR.finditer(groups["dst"])][-1:]
+            else:
+                cands = [s.group("s") for s in _PY_STR.finditer(groups.get("a") or "")]
+            hit = next((c for c in cands if is_live(_expand(c))), None)
+            if hit:
+                return f"Python file operations on live database file {hit}"
+    for lit in (m.group("s") for m in _PY_STR.finditer(code)):  # os.system("rm ...") / shell=True strings
         if " " in lit:
             why = check_shell(lit)
             if why:
