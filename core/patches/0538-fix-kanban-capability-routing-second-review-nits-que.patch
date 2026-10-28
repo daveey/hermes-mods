@@ -1,0 +1,181 @@
+From dab4688bccc85c7ee968ba7f772a4dc0c6b86639 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:47:48 +0000
+Subject: [PATCH] =?UTF-8?q?fix(kanban):=20capability=20routing=20second-re?=
+ =?UTF-8?q?view=20nits=20=E2=80=94=20queued=20owners=20survive=20registry?=
+ =?UTF-8?q?=20changes=20on=20retry,=20'::g'=20generations,=20redacted=20ti?=
+ =?UTF-8?q?tles,=20no=20probes=20under=20tests=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hermes_cli/kanban_capability_registry.py      |  2 +
+ hermes_cli/kanban_capability_routing.py       | 49 ++++++++++---------
+ .../test_kanban_capability_routing.py         | 33 ++++++++++++-
+ 3 files changed, 60 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_capability_registry.py b/hermes_cli/kanban_capability_registry.py
+index 2066e99e1f..a1c2ac7997 100644
+--- a/hermes_cli/kanban_capability_registry.py
++++ b/hermes_cli/kanban_capability_registry.py
+@@ -257,6 +257,8 @@ def maybe_refresh_async(*, now: Optional[float] = None) -> bool:
+     never raises: the dispatcher tick calls this."""
+     global _thread
+     try:
++        if os.environ.get("HERMES_TEST_ISOLATION"):
++            return False  # never run real probes (gh, sudo, ssh) from the test suite
+         cfg = _config()
+         if cfg.get("enabled") is False:
+             return False
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index f2308ca1b8..72a6e00d2a 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -40,6 +40,7 @@ import hashlib
+ from datetime import UTC, datetime
+ from typing import Callable, Optional
+ 
++from agent.redact import redact_sensitive_text
+ from hermes_cli import kanban_capability_registry as reg
+ 
+ OWNER_PREFIX = "capability-owner:"
+@@ -64,7 +65,7 @@ def request_id(task_id: str, need: str, generation: int = 1) -> str:
+     Readable ``capability-owner:<card>:<need>`` when the need fits the id alphabet and length;
+     otherwise a digest suffix keeps distinct needs distinct (no truncation/substitution merges).
+     """
+-    gen = f":g{generation}" if generation > 1 else ""
++    gen = f"::g{generation}" if generation > 1 else ""  # needs never contain '::' 
+     plain = f"{OWNER_PREFIX}{task_id}:{need}{gen}"
+     if re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", plain):
+         return plain
+@@ -161,23 +162,6 @@ def _sent(rid: str) -> Optional[dict]:
+         db.close()
+ 
+ 
+-def _sent(rid: str) -> Optional[dict]:
+-    """The stored hermes-hub envelope + state for ``rid`` on this gateway (None if never queued)."""
+-    try:
+-        db = reg._ro(reg.hub_db_path())
+-    except Exception:
+-        return None
+-    try:
+-        row = db.execute("SELECT body, state FROM sent WHERE id = ?", (rid,)).fetchone()
+-        if row is None:
+-            return None
+-        return {"body": json.loads(row[0] or "{}"), "state": row[1]}
+-    except Exception:
+-        return None
+-    finally:
+-        db.close()
+-
+-
+ def _previous_routes(conn, task_id: str) -> dict[str, dict]:
+     out: dict[str, dict] = {}
+     for (payload,) in conn.execute(
+@@ -193,13 +177,13 @@ def _previous_routes(conn, task_id: str) -> dict[str, dict]:
+ 
+ def owner_body(task, need: str, *, self_gw: str, board: str, reason: str) -> str:
+     """Deterministic for (card, need, reason): retries resend an identical envelope."""
+-    from agent.redact import redact_sensitive_text
+     ref = f"{self_gw}/default/{board}/{task.id}"
+     excerpt = redact_sensitive_text((reason or "").strip(), force=True)
++    title = redact_sensitive_text((task.title or "")[:160], force=True)
+     if len(excerpt) > 3000:
+         excerpt = excerpt[:3000] + "…"
+     return (
+-        f"Capability owner card for waiting card {ref} (\"{(task.title or '')[:160]}\").\n"
++        f"Capability owner card for waiting card {ref} (\"{title}\").\n"
+         f"It needs `{need}`. This gateway holds it (live-checked in the hermes-hub capability registry); "
+         f"{self_gw} does not.\n\n"
+         "## Action (from the waiting card, inside its approved plan)\n"
+@@ -268,7 +252,27 @@ def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[i
+     if not self_gw:
+         raise CapabilityRouteError("capability_hub_unavailable",
+                                    "this gateway has no hermes-hub identity (~/.config/hermes-mail/config.json)")
+-    decided = plan(needs, now=now, self_gw=self_gw, **lookup)
++    # A need whose request for this generation is already queued (an earlier attempt failed after
++    # sending it) routes from the stored envelope, whatever the registry says now: the owner card
++    # exists or will, and it must not be orphaned by a refusal on retry.
++    queued: list[dict] = []
++    fresh_needs: list[str] = []
++    for need in needs:
++        stored = _sent(request_id(task_id, need, generations.get(need, 1)))
++        if stored is not None and stored["state"] not in ("rejected", "expired"):
++            queued.append({"need": need, "gateway": stored["body"].get("to_gw"), "checked_at": None})
++        else:
++            fresh_needs.append(need)
++    if fresh_needs:
++        try:
++            decided = plan(fresh_needs, now=now, self_gw=self_gw, **lookup)
++        except CapabilityRouteError as exc:
++            if not (queued and exc.code == "capability_held_locally"):
++                raise
++            decided = {"routes": [], "local": exc.details.get("local", [])}
++    else:
++        decided = {"routes": [], "local": []}
++    decided["routes"] = queued + decided["routes"]
+     board_slug = board or kb.get_current_board() or "default"
+     hub = _hub_cli()
+     routes: list[dict] = []
+@@ -284,7 +288,8 @@ def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[i
+             assignee = args.get("assignee") or _owner_assignee()
+         else:
+             gw = r["gateway"]
+-            title = f"Capability owner: {r['need']} for {self_gw}/{task_id} ({(task.title or '')[:80]})"
++            title = redact_sensitive_text(
++                f"Capability owner: {r['need']} for {self_gw}/{task_id} ({(task.title or '')[:80]})", force=True)
+             body = owner_body(task, r["need"], self_gw=self_gw, board=board_slug, reason=reason)
+             assignee = _owner_assignee()
+         argv = [hub, "create-task", gw, title, "--body", body, "--assignee", assignee,
+diff --git a/tests/hermes_cli/test_kanban_capability_routing.py b/tests/hermes_cli/test_kanban_capability_routing.py
+index c00a6d1bc5..ce522c6fe3 100644
+--- a/tests/hermes_cli/test_kanban_capability_routing.py
++++ b/tests/hermes_cli/test_kanban_capability_routing.py
+@@ -425,8 +425,8 @@ def test_rejected_owner_request_may_be_rerouted_once(env):
+         kb.unblock_task(conn, tid)
+         assert kb.claim_task(conn, tid, claimer="worker") is not None
+         res = kcr.route(conn, tid, [NEED], reason="x")
+-        assert res["routes"][0]["request_id"] == kcr.request_id(tid, NEED, 2) == f"{rid}:g2"
+-        env["hub"].execute("UPDATE sent SET state='rejected', result='{}' WHERE id=?", (f"{rid}:g2",))
++        assert res["routes"][0]["request_id"] == kcr.request_id(tid, NEED, 2) == f"{rid}::g2"
++        env["hub"].execute("UPDATE sent SET state='rejected', result='{}' WHERE id=?", (f"{rid}::g2",))
+         env["hub"].commit()
+         kb.unblock_task(conn, tid)
+         assert kb.claim_task(conn, tid, claimer="worker") is not None
+@@ -457,3 +457,32 @@ def test_hub_collector_output_is_what_routing_reads(env, tmp_path, monkeypatch):
+                        (mod.canon(rec),))
+     env["hub"].commit()
+     assert reg.locate(NEED)["holders"][0][0] == "macbook"
++
++
++def test_retry_after_partial_failure_keeps_queued_owner_even_if_holder_went_stale(env, monkeypatch):
++    now = time.time()
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": now})
++    publish(env["hub"], "mini", {"ssh:mini-lan": now})
++    real = kcr.hub_runner
++    fail = {"on": "mini"}
++
++    def flaky(argv):
++        if argv[2] == fail["on"]:
++            return 2, "boom"
++        return real(argv)
++
++    monkeypatch.setattr(kcr, "hub_runner", flaky)
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        with pytest.raises(kcr.CapabilityRouteError):
++            kcr.route(conn, tid, [NEED, "ssh:mini-lan"], reason=REASON_2239)
++        publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": now - 3 * 3600})  # stale now
++        fail["on"] = None
++        res = kcr.route(conn, tid, [NEED, "ssh:mini-lan"], reason=REASON_2239)
++        assert kb.get_task(conn, tid).status == "scheduled"
++    assert [r["gateway"] for r in res["routes"]] == ["macbook", "mini"]
++
++
++def test_background_refresh_never_runs_real_probes_under_tests(monkeypatch):
++    monkeypatch.setenv("HERMES_TEST_ISOLATION", "1")
++    assert reg.maybe_refresh_async() is False
+-- 
+2.55.0
+

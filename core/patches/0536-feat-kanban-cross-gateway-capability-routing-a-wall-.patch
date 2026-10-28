@@ -1,0 +1,1470 @@
+From 677f512e1230f91df3391ef63d2020aebd380568 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:21:18 +0000
+Subject: [PATCH] =?UTF-8?q?feat(kanban):=20cross-gateway=20capability=20ro?=
+ =?UTF-8?q?uting=20=E2=80=94=20a=20wall=20opens=20an=20owner=20card=20wher?=
+ =?UTF-8?q?e=20the=20capability=20lives=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hub workers hit walls another gateway could clear in minutes (hub IAM role lacked EC2
+Describe 10-26 02:03-23:56 PT while the MacBook held AWS SSO admin; later EC2 mutation,
+GetConsoleOutput, ssh to the mini). kind='assignment' only reaches a same-gateway supervisor
+that lacks the capability too, so the cards parked on probes nobody was producing.
+
+- kanban_capability_registry: each gateway live-checks its capabilities (config probes such as
+  `aws sts get-caller-identity --profile ...`, ssh BatchMode reachability, sudo -n, gh login and
+  scopes) off-thread from the dispatcher tick and writes kanban/capabilities.json (names, ok,
+  checked_at; no commands or output). hermes-hub >= 1.6.2 publishes it as the `capabilities`
+  collection; lookups trust only entries checked within stale_after_seconds.
+- kanban_capability_routing: kanban_block/kanban_schedule take optional `needs`
+  (CLI --need). When this gateway lacks a need and another holds it fresh, ONE owner card is
+  created there via `hermes-hub create-task <gw> ... --id capability-owner:<card>:<need>`
+  (scoped action, readback, wake; the owner card, not the worker, files any human_request),
+  and the card parks scheduled on `hermes kanban wait-check capability-owner <request ids>`.
+  Typed refusals, nothing written: no_capability_holder (points at human_request),
+  capability_registry_stale, capability_held_locally, capability_route_exhausted.
+- Placement preflight: namespaced gateway needs in `requires` pass through profile validation
+  (PR47 validate_assignment) and are pre-routed at creation.
+---
+ hermes_cli/kanban.py                          |  49 +++
+ hermes_cli/kanban_capabilities.py             |  15 +-
+ hermes_cli/kanban_capability_registry.py      | 378 ++++++++++++++++++
+ hermes_cli/kanban_capability_routing.py       | 319 +++++++++++++++
+ hermes_cli/kanban_continuation.py             |   2 +
+ hermes_cli/kanban_parser.py                   |  22 +-
+ hermes_cli/kanban_wait_check.py               |   7 +
+ .../test_kanban_capability_routing.py         | 339 ++++++++++++++++
+ tools/kanban_tools.py                         |  43 ++
+ tools/kanban_tools_schemas.py                 |  21 +-
+ 10 files changed, 1186 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_capability_registry.py
+ create mode 100644 hermes_cli/kanban_capability_routing.py
+ create mode 100644 tests/hermes_cli/test_kanban_capability_routing.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a21f10ca24..dd424135fa 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -459,6 +459,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             _maybe_auto_subscribe(conn, task_id)
+         if origin is not None:  # idempotent, so a retried create still (re)binds
+             origin_binding = kanban_origin.bind(conn, task_id, origin, board=getattr(args, "board", None))
++        placement = None
++        if getattr(args, "requires", None) and not idem_hit:
++            # Placement preflight: declared gateway needs this gateway lacks are owned first. [daveey]
++            from hermes_cli.kanban_capability_routing import preflight
++            placement = preflight(conn, task_id, board=getattr(args, "board", None))
+         task = kb.get_task(conn, task_id)
+     if not in_worker and not session_id and not idem_hit and _agent_invoked():
+         # An agent shelled out but no chat could be stamped (unknown/missing session env:
+@@ -473,9 +478,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         out = _task_to_dict(task)
+         if origin_binding:
+             out["origin_binding"] = origin_binding
++        if placement:
++            out["capability_placement"] = placement
+         _print_json(out)
+     else:
+         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
++        for r in (placement or {}).get("routes") or []:
++            print(f"Pre-routed {r['need']}: owner card requested on {r['gateway']} "
++                  f"(hermes-hub request {r['request_id']}); {task_id} waits on it")
++        if placement and placement.get("warning"):
++            print(f"⚠  {placement['warning']}", file=sys.stderr)
+         if origin_binding:
+             print(f"Bound to {origin_binding['origin']} (readback pending: on the origin gateway run "
+                   f"`{origin_binding['verify_on_origin']}`)")
+@@ -584,6 +596,36 @@ def _cmd_wait_check(args: argparse.Namespace) -> int:
+     return kanban_wait_check.run(args)
+ 
+ 
++def _cmd_capabilities(args: argparse.Namespace) -> int:
++    from hermes_cli import kanban_capability_registry
++    return kanban_capability_registry.run_cli(args)
++
++
++def _cli_route_needs(op: str, args: argparse.Namespace, reason: str) -> Optional[int]:
++    """``--need`` on block/schedule: route to the gateway holding the capability. [daveey]"""
++    needs = getattr(args, "needs", None)
++    if not needs:
++        return None
++    from hermes_cli import kanban_capability_routing as kcr
++    ids = _bulk_ids(args)
++    if len(ids) != 1:
++        return _err(f"kanban {op}: --need routes one card at a time", 2)
++    if getattr(args, "human_request", None) is not None:
++        return _err(f"kanban {op}: --need routes to an agent; --human-request asks David. Pass one.", 2)
++    tid = ids[0]
++    with kbc.connect_closing() as conn:
++        try:
++            res = kcr.route(conn, tid, needs, reason=reason or "", expected_run_id=_worker_run_id_for(tid))
++        except kcr.CapabilityRouteError as exc:
++            return _err(f"kanban {op}: {exc}", 2)
++        except ValueError as exc:
++            return _err(f"kanban {op}: {exc}", 2)
++    for r in res["routes"]:
++        print(f"{tid} → scheduled: owner card for {r['need']} requested on {r['gateway']} "
++              f"(hermes-hub request {r['request_id']})")
++    return 0
++
++
+ def _cmd_show(args: argparse.Namespace) -> int:
+     rsk, rc = _run_state_kwargs(args, "show")
+     if rc:
+@@ -1170,6 +1212,9 @@ def _parked_msg(conn, verb: str, suffix: str):
+ def _cmd_block(args: argparse.Namespace) -> int:
+     reason = _joined_words(args.reason)
+     kind = getattr(args, "kind", None)
++    routed = _cli_route_needs("block", args, reason)
++    if routed is not None:
++        return routed
+     from hermes_cli.kanban_human_request import validate_human_request
+     request = validate_human_request(getattr(args, "human_request", None), kind=kind)
+     if getattr(args, "metadata_only", False):
+@@ -1218,6 +1263,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
+ 
+ def _cmd_schedule(args: argparse.Namespace) -> int:
+     reason = _joined_words(args.reason)
++    routed = _cli_route_needs("schedule", args, reason)
++    if routed is not None:
++        return routed
+     author = _profile_author()
+     ids = _bulk_ids(args)
+     suffix = f": {reason}" if reason else ""
+@@ -1551,6 +1599,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
+ _HANDLERS = {
+     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "wait-check": _cmd_wait_check,
++    "capabilities": _cmd_capabilities,
+     "assign": _cmd_assign, "set-model": _cmd_set_model,
+     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
+     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+diff --git a/hermes_cli/kanban_capabilities.py b/hermes_cli/kanban_capabilities.py
+index 480764090c..b50baa8d8d 100644
+--- a/hermes_cli/kanban_capabilities.py
++++ b/hermes_cli/kanban_capabilities.py
+@@ -39,11 +39,20 @@ def _required_capabilities(requires, workspace_kind: str) -> list[str]:
+         requires = []
+     if not isinstance(requires, (list, tuple, set, frozenset)):
+         raise ValueError("requires must be a collection of capability names")
++    # Namespaced gateway capabilities (``aws:<acct>:<role>``, ``ssh:<host>`` ...) are needs of
++    # the card, not of the profile: kept in order after the profile ones and never checked
++    # against profile policy. Placement/routing lives in kanban_capability_routing. [daveey]
++    from hermes_cli.kanban_capability_registry import is_gateway_need
++    gateway_needs: list[str] = []
+     for name in requires:
++        if is_gateway_need(name):
++            if name not in gateway_needs:
++                gateway_needs.append(name)
++            continue
+         if not isinstance(name, str) or name not in _CAPABILITIES:
+             raise ValueError(f"Unknown required capability: {name!r}")
+     required = set(requires) | set(_WORKSPACE_REQUIRES[workspace_kind])
+-    return [name for name in _CAPABILITIES if name in required]
++    return [name for name in _CAPABILITIES if name in required] + gateway_needs
+ 
+ 
+ def _check_policy_shape(config) -> None:
+@@ -113,14 +122,14 @@ def validate_assignment(
+     guessed into requirements. Callers must supply explicit ``requires`` instead.
+     """
+     required = _required_capabilities(requires, workspace_kind)
+-    if not required or assignee is None:
++    if not any(name in _CAPABILITIES for name in required) or assignee is None:
+         # Unassigned drafts cannot dispatch; assign_task validates before binding.
+         return required
+     try:
+         available = _profile_capabilities(assignee)
+     except Exception as exc:
+         raise CapabilityMismatchError(assignee, required, reason=f"profile policy unavailable: {exc}") from exc
+-    missing = [name for name in required if name not in available]
++    missing = [name for name in required if name in _CAPABILITIES and name not in available]
+     if missing:
+         raise CapabilityMismatchError(assignee, missing)
+     return required
+diff --git a/hermes_cli/kanban_capability_registry.py b/hermes_cli/kanban_capability_registry.py
+new file mode 100644
+index 0000000000..401fc7e5cb
+--- /dev/null
++++ b/hermes_cli/kanban_capability_registry.py
+@@ -0,0 +1,378 @@
++"""Gateway capability registry: what this gateway can do, live-checked, shared via hermes-hub. [daveey]
++
++A *capability* is a namespaced, secret-free name for something a gateway can do on behalf of any
++card, whatever profile runs it: ``aws:123456789012:admin``, ``github:daveey:repo``,
++``ssh:mini``, ``sudo:nopasswd``, ``token-broker:user/cf-dbloom-infra``, ``browser:signed-in``.
++Each one is held only while its probe (a cheap shell command: ``aws sts get-caller-identity
++--profile …``, ``gh auth status``, ``ssh -o BatchMode=yes <host> true``) exits 0, and every
++entry carries the time it was last checked.
++
++This gateway writes ``<kanban home>/kanban/capabilities.json``. The hermes-hub client publishes
++that file as its ``capabilities`` record (names, ok, checked_at; never commands or output), so
++every gateway's replica (``~/.local/state/hermes-hub/hub.db``) knows who holds what. Routing
++(:mod:`hermes_cli.kanban_capability_routing`) reads it and only trusts entries checked within
++``stale_after_seconds``: stale data never routes.
++
++Config (``config.yaml``, default profile of the gateway)::
++
++    kanban:
++      capabilities:
++        probes:                       # name -> shell command; exit 0 = held
++          "aws:123456789012:admin": "aws sts get-caller-identity --profile my-sso-profile"
++        ssh_hosts:                    # ssh:<name> held while BatchMode ssh to the host works
++          hub: ubuntu@192.0.2.10
++        builtin: true                 # sudo:nopasswd and github:<login>[:<scope>]
++        refresh_seconds: 600
++        stale_after_seconds: 1800
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import shlex
++import subprocess
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from typing import Optional
++
++SCHEMA = 1
++NEED_RE = re.compile(r"[a-z][a-z0-9-]*(?::[A-Za-z0-9._@/+-]+)+")
++COVERING_LEAVES = ("admin", "*")
++DEFAULT_REFRESH_SECONDS = 600
++DEFAULT_STALE_AFTER_SECONDS = 1800
++PROBE_TIMEOUT = 20
++MAX_NAME_LEN = 160
++
++_lock = threading.Lock()
++_thread: Optional[threading.Thread] = None
++
++
++# --- names ---------------------------------------------------------------------------------
++
++def is_gateway_need(value) -> bool:
++    """A namespaced capability name (``ns:part[:part…]``), never a profile tool name."""
++    return isinstance(value, str) and len(value) <= MAX_NAME_LEN and bool(NEED_RE.fullmatch(value))
++
++
++def normalize_needs(value) -> list[str]:
++    """Validated, deduplicated, order-preserving list of capability needs (ValueError if bad)."""
++    if value is None:
++        return []
++    if isinstance(value, str):
++        value = [value]
++    if not isinstance(value, (list, tuple)):
++        raise ValueError("needs must be a list of capability names")
++    out: list[str] = []
++    for item in value:
++        if not is_gateway_need(item):
++            raise ValueError(
++                f"invalid capability need {item!r}: use a namespaced name such as "
++                "'aws:<account>:<action-or-role>', 'ssh:<host>', 'github:<owner>:<scope>', "
++                "'token-broker:<scope>', 'sudo:nopasswd' or 'browser:signed-in'")
++        if item not in out:
++            out.append(item)
++    return out
++
++
++def satisfies(held: str, need: str) -> bool:
++    """``held`` covers ``need``: equal; a covering leaf (``aws:1:admin`` covers ``aws:1:x``);
++    or a more specific holding of a broader need (``aws:1:admin`` covers ``aws:1``)."""
++    if held == need:
++        return True
++    h, n = held.split(":"), need.split(":")
++    if h[-1] in COVERING_LEAVES and len(n) >= len(h) and n[: len(h) - 1] == h[:-1]:
++        return True
++    return len(h) > len(n) and h[: len(n)] == n
++
++
++# --- config / paths ------------------------------------------------------------------------
++
++def _config() -> dict:
++    try:
++        from hermes_cli.config import load_config_readonly
++        cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
++        caps = cfg.get("capabilities") or {}
++        return caps if isinstance(caps, dict) else {}
++    except Exception:
++        return {}
++
++
++def _seconds(cfg: dict, key: str, default: int) -> int:
++    try:
++        return max(30, int(cfg.get(key, default)))
++    except (TypeError, ValueError):
++        return default
++
++
++def stale_after(cfg: Optional[dict] = None) -> int:
++    return _seconds(_config() if cfg is None else cfg, "stale_after_seconds", DEFAULT_STALE_AFTER_SECONDS)
++
++
++def registry_path() -> Path:
++    from hermes_cli.kanban_db import kanban_home
++    return kanban_home() / "kanban" / "capabilities.json"
++
++
++def hub_db_path() -> Path:
++    return Path(os.environ.get("HERMES_HUB_STATE") or Path.home() / ".local/state/hermes-hub") / "hub.db"
++
++
++def self_gateway() -> Optional[str]:
++    """This gateway's hermes-hub name (hermes-mail config, else the replica's meta)."""
++    cfg = Path(os.environ.get("HERMES_MAIL_CONFIG") or Path.home() / ".config/hermes-mail/config.json")
++    try:
++        gw = json.loads(cfg.read_text(encoding="utf-8-sig")).get("gateway")
++        if isinstance(gw, str) and gw:
++            return gw
++    except (OSError, ValueError, AttributeError):
++        pass
++    try:
++        db = _ro(hub_db_path())
++        try:
++            row = db.execute("SELECT v FROM meta WHERE k='gateway'").fetchone()
++            return row[0] if row and row[0] else None
++        finally:
++            db.close()
++    except Exception:
++        return None
++
++
++def _ro(path: Path):
++    import sqlite3
++    if not path.exists():
++        raise FileNotFoundError(str(path))
++    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
++
++
++# --- probes --------------------------------------------------------------------------------
++
++def _run(cmd, timeout: int = PROBE_TIMEOUT) -> tuple[int, str]:
++    try:
++        p = subprocess.run(cmd if isinstance(cmd, list) else ["bash", "-lc", cmd],
++                           capture_output=True, text=True, timeout=timeout, check=False,
++                           stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
++        return p.returncode, (p.stdout or "") + (p.stderr or "")
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return 124, str(exc)
++
++
++def _builtin_github() -> list[tuple[str, bool]]:
++    rc, out = _run(["gh", "api", "user", "--jq", ".login"])
++    login = out.strip().splitlines()[0] if rc == 0 and out.strip() else ""
++    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", login or ""):
++        return []
++    found = [(f"github:{login}", True)]
++    rc, status = _run(["gh", "auth", "status"])
++    m = re.search(r"Token scopes:\s*(.+)", status or "") if rc == 0 else None
++    for scope in re.findall(r"'([a-z:_]+)'", m.group(1) if m else ""):
++        found.append((f"github:{login}:{scope.replace(':', '-')}", True))
++    return found
++
++
++def probe_specs(cfg: dict) -> list[tuple[str, object]]:
++    """(name, command) pairs from config, plus ssh hosts."""
++    specs: list[tuple[str, object]] = []
++    probes = cfg.get("probes") or {}
++    if isinstance(probes, dict):
++        for name, cmd in probes.items():
++            if is_gateway_need(name) and isinstance(cmd, str) and cmd.strip():
++                specs.append((name, cmd))
++    hosts = cfg.get("ssh_hosts") or {}
++    if isinstance(hosts, dict):
++        for name, host in hosts.items():
++            if isinstance(host, str) and host.strip() and is_gateway_need(f"ssh:{name}"):
++                specs.append((f"ssh:{name}", ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
++                                              host.strip(), "true"]))
++    return specs
++
++
++def refresh(cfg: Optional[dict] = None, *, now: Optional[float] = None) -> dict:
++    """Run every probe now and atomically rewrite the registry file. Returns the record."""
++    cfg = _config() if cfg is None else cfg
++    specs = probe_specs(cfg)
++    results: dict[str, dict] = {}
++
++    def one(spec):
++        name, cmd = spec
++        rc, _ = _run(cmd)
++        return name, rc == 0, time.time()
++
++    with ThreadPoolExecutor(max_workers=8) as pool:
++        futures = [pool.submit(one, s) for s in specs]
++        if cfg.get("builtin", True):
++            futures.append(pool.submit(lambda: ("sudo:nopasswd", _run(["sudo", "-n", "true"])[0] == 0, time.time())))
++            gh = pool.submit(_builtin_github)
++        else:
++            gh = None
++        for fut in futures:
++            name, ok, at = fut.result()
++            results[name] = {"name": name, "ok": ok, "checked_at": round(at, 3)}
++        if gh is not None:
++            at = round(time.time(), 3)
++            for name, ok in gh.result():
++                results.setdefault(name, {"name": name, "ok": ok, "checked_at": at})
++    record = {
++        "schema": SCHEMA,
++        "gateway": self_gateway(),
++        "refreshed_at": round(time.time() if now is None else now, 3),
++        "refresh_seconds": _seconds(cfg, "refresh_seconds", DEFAULT_REFRESH_SECONDS),
++        "stale_after_seconds": stale_after(cfg),
++        "capabilities": sorted(results.values(), key=lambda r: r["name"]),
++    }
++    path = registry_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
++    tmp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
++    os.replace(tmp, path)
++    return record
++
++
++def read_local() -> Optional[dict]:
++    try:
++        data = json.loads(registry_path().read_text(encoding="utf-8"))
++        return data if isinstance(data, dict) and data.get("schema") == SCHEMA else None
++    except (OSError, ValueError):
++        return None
++
++
++def maybe_refresh_async(*, now: Optional[float] = None) -> bool:
++    """Start a background refresh when the file is older than ``refresh_seconds``. Never waits,
++    never raises: the dispatcher tick calls this."""
++    global _thread
++    try:
++        cfg = _config()
++        if cfg.get("enabled") is False:
++            return False
++        now = time.time() if now is None else now
++        local = read_local()
++        if local and now - float(local.get("refreshed_at") or 0) < _seconds(cfg, "refresh_seconds",
++                                                                              DEFAULT_REFRESH_SECONDS):
++            return False
++        with _lock:
++            if _thread is not None and _thread.is_alive():
++                return False
++            _thread = threading.Thread(target=_safe_refresh, args=(cfg,), name="kanban-capabilities",
++                                       daemon=True)
++            _thread.start()
++        return True
++    except Exception:
++        return False
++
++
++def _safe_refresh(cfg):
++    try:
++        refresh(cfg)
++    except Exception:
++        import logging
++        logging.getLogger(__name__).warning("kanban capability refresh failed", exc_info=True)
++
++
++# --- lookup --------------------------------------------------------------------------------
++
++def _entries(record) -> list[dict]:
++    caps = record.get("capabilities") if isinstance(record, dict) else None
++    return [c for c in caps or [] if isinstance(c, dict) and isinstance(c.get("name"), str)]
++
++
++def _match(record, need: str, now: float, limit: int) -> tuple[Optional[float], Optional[float]]:
++    """(freshest fresh checked_at, freshest stale checked_at) of ok entries covering ``need``."""
++    fresh = stale = None
++    for c in _entries(record):
++        if not c.get("ok") or not satisfies(c["name"], need):
++            continue
++        raw = c.get("checked_at")
++        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
++            continue
++        at = float(raw)
++        if now - at <= limit:
++            fresh = max(fresh or 0, at)
++        else:
++            stale = max(stale or 0, at)
++    return fresh, stale
++
++
++def remote_records(*, exclude: Optional[str] = None) -> dict[str, dict]:
++    """``{gateway: capabilities record}`` from the hermes-hub replica (empty if unreadable)."""
++    try:
++        db = _ro(hub_db_path())
++    except Exception:
++        return {}
++    try:
++        rows = db.execute("SELECT gw, data FROM replica WHERE coll = 'capabilities' AND key = 'info'").fetchall()
++    except Exception:
++        rows = []
++    finally:
++        db.close()
++    out = {}
++    for gw, data in rows:
++        if gw == exclude:
++            continue
++        try:
++            rec = json.loads(data)
++        except ValueError:
++            continue
++        if isinstance(rec, dict) and rec.get("schema") == SCHEMA:
++            out[gw] = rec
++    return out
++
++
++def locate(need: str, *, now: Optional[float] = None, cfg: Optional[dict] = None,
++           local: Optional[dict] = None, remote: Optional[dict] = None,
++           self_gw: Optional[str] = None) -> dict:
++    """Where ``need`` is held: ``{need, local: fresh|stale|absent, holders: [(gw, at)…] fresh
++    newest first, stale: [(gw, at)…]}``. Only fresh entries are routable."""
++    now = time.time() if now is None else now
++    limit = stale_after(cfg)
++    local = read_local() if local is None else local
++    self_gw = self_gateway() if self_gw is None else self_gw
++    remote = remote_records(exclude=self_gw) if remote is None else remote
++    lf, ls = _match(local or {}, need, now, limit)
++    holders, stale = [], []
++    for gw, rec in sorted(remote.items()):
++        if gw == self_gw:
++            continue
++        f, s = _match(rec, need, now, limit)
++        if f is not None:
++            holders.append((gw, f))
++        elif s is not None:
++            stale.append((gw, s))
++    holders.sort(key=lambda x: -x[1])
++    return {"need": need, "local": "fresh" if lf is not None else ("stale" if ls is not None else "absent"),
++            "holders": holders, "stale": stale}
++
++
++# --- CLI -----------------------------------------------------------------------------------
++
++def run_cli(args) -> int:
++    action = getattr(args, "cap_action", None) or "list"
++    if action == "refresh":
++        rec = refresh()
++        print(json.dumps(rec, indent=2, sort_keys=True))
++        return 0
++    if action == "locate":
++        try:
++            needs = normalize_needs(args.needs)
++        except ValueError as exc:
++            print(str(exc))
++            return 2
++        out = [locate(n) for n in needs]
++        print(json.dumps(out, indent=2))
++        return 0 if all(o["local"] == "fresh" or o["holders"] for o in out) else 1
++    local = read_local()
++    gws = {self_gateway() or "local": local or {}}
++    gws.update(remote_records(exclude=self_gateway()))
++    now = time.time()
++    limit = stale_after()
++    for gw, rec in gws.items():
++        for c in _entries(rec):
++            age = now - float(c.get("checked_at") or 0)
++            state = ("held" if c.get("ok") else "not held") + (" (stale)" if age > limit else "")
++            print(f"{gw:10} {c['name']:48} {state:18} checked {int(age)}s ago")
++    return 0
++
++
++def describe_probe(cmd) -> str:
++    return shlex.join(cmd) if isinstance(cmd, list) else str(cmd)
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+new file mode 100644
+index 0000000000..5a8fa47c63
+--- /dev/null
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -0,0 +1,319 @@
++"""Cross-gateway capability routing: a wall on one gateway opens an owner card where the
++capability lives. [daveey]
++
++A worker that hits a wall declares what it needs (``kanban_block(needs=[...])`` /
++``kanban_schedule(needs=[...])``, CLI ``--need``, or a card's ``requires`` entries that are
++namespaced capability names). When this gateway lacks a need and another gateway holds it
++(fresh entry in the hermes-hub capability registry, :mod:`kanban_capability_registry`):
++
++1. ONE owner card is created on the holder through ``hermes-hub create-task`` with request id
++   ``capability-owner:<card>:<need>`` (exact retries are idempotent on both ends). Its body is
++   the scoped action, the readback and the wake of the waiting card. If the action goes beyond
++   the approved plan, the owner card -- not the worker -- files the real ``human_request``.
++2. The waiting card parks ``scheduled`` on that owner card: wake_check
++   ``hermes kanban wait-check capability-owner <request ids>`` exits 0 once every owner card is
++   done (1 while the request or card is pending, 2 if the request was rejected).
++
++Refusals are typed (:class:`CapabilityRouteError`), and nothing is written:
++
++* ``no_capability_holder`` -- no gateway holds it: if only David can grant it, block with
++  kind='needs_input' and a ``human_request`` naming the exact command.
++* ``capability_registry_stale`` -- a holder exists but was not live-checked recently; stale
++  registry data never routes.
++* ``capability_held_locally`` -- this gateway holds it: the wall is the worker's profile
++  (kind='assignment') or a real failure, not a missing capability.
++* ``capability_route_exhausted`` -- this card already routed that need once; the existing owner
++  card must finish or report why.
++"""
++from __future__ import annotations
++
++import json
++import re
++import subprocess
++import time
++from datetime import datetime, timezone, UTC
++from typing import Callable, Optional
++
++from hermes_cli import kanban_capability_registry as reg
++
++OWNER_PREFIX = "capability-owner:"
++ROUTED_EVENT = "capability_routed"
++WAKE_EVERY = 120
++WAKE_HORIZON = 72 * 3600
++HUB_TIMEOUT = 60
++
++
++class CapabilityRouteError(ValueError):
++    """No owner card can be routed; nothing was written. ``code`` is the typed reason."""
++
++    def __init__(self, code: str, message: str, *, details: Optional[dict] = None):
++        self.code = code
++        self.details = details or {}
++        super().__init__(f"{code}: {message}")
++
++
++def request_id(task_id: str, need: str) -> str:
++    """Stable hermes-hub request id (and owner idempotency) for one card's need."""
++    return re.sub(r"[^A-Za-z0-9._:-]", "-", f"{OWNER_PREFIX}{task_id}:{need}")[:128]
++
++
++def needs_from_requires(requires) -> list[str]:
++    """Namespaced capability needs declared in a card's ``requires``."""
++    return [r for r in (requires or []) if reg.is_gateway_need(r)]
++
++
++def _hub_cli() -> str:
++    cfg = reg._config()
++    value = cfg.get("hub_cli")
++    return value if isinstance(value, str) and value.strip() else "hermes-hub"
++
++
++def _owner_assignee() -> str:
++    value = reg._config().get("owner_assignee")
++    return value if isinstance(value, str) and value.strip() else "default"
++
++
++def _default_runner(argv: list[str]) -> tuple[int, str]:
++    try:
++        p = subprocess.run(argv, capture_output=True, text=True, timeout=HUB_TIMEOUT, check=False,
++                           stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
++        return p.returncode, (p.stdout or "").strip() + ("\n" + p.stderr.strip() if p.stderr else "")
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return 127, str(exc)
++
++
++# Tests replace this with a fake that records argv.
++hub_runner: Callable[[list[str]], tuple[int, str]] = _default_runner
++
++
++def _ago(at: float, now: float) -> str:
++    s = int(max(0, now - at))
++    return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
++
++
++def plan(needs: list[str], *, now: Optional[float] = None, **lookup) -> dict:
++    """Decide routing without writing. Raises CapabilityRouteError for the typed refusals.
++
++    Returns ``{"routes": [{need, gateway, checked_at}], "local": [needs held here]}``.
++    """
++    now = time.time() if now is None else now
++    found = [reg.locate(n, now=now, **lookup) for n in needs]
++    local = [f["need"] for f in found if f["local"] == "fresh"]
++    missing = [f for f in found if f["local"] != "fresh"]
++    if not missing:
++        raise CapabilityRouteError(
++            "capability_held_locally",
++            f"this gateway holds {', '.join(local)} (live-checked); the wall is not a missing gateway "
++            "capability. If this worker's profile cannot use it, block with kind='assignment'; "
++            "otherwise fix the failure yourself.", details={"local": local})
++    routes = []
++    for f in missing:
++        if f["holders"]:
++            gw, at = f["holders"][0]
++            routes.append({"need": f["need"], "gateway": gw, "checked_at": at})
++            continue
++        if f["stale"]:
++            gws = ", ".join(f"{gw} ({_ago(at, now)} ago)" for gw, at in f["stale"])
++            raise CapabilityRouteError(
++                "capability_registry_stale",
++                f"{f['need']} was last confirmed on {gws}, older than the {reg.stale_after()}s freshness "
++                "window, so it is not routed. That gateway's probe or hermes-hub sync is not running; "
++                "fix that, or if only David can grant it, block with kind='needs_input' and a "
++                "human_request naming the exact command.", details={"need": f["need"], "stale": f["stale"]})
++        raise CapabilityRouteError(
++            "no_capability_holder",
++            f"no gateway holds {f['need']} (hermes-hub capability registry). If only David can grant it, "
++            "block with kind='needs_input' and a human_request naming the exact command and scope.",
++            details={"need": f["need"]})
++    return {"routes": routes, "local": local}
++
++
++def _previous_routes(conn, task_id: str) -> dict[str, dict]:
++    out: dict[str, dict] = {}
++    for (payload,) in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id", (task_id, ROUTED_EVENT)):
++        try:
++            for r in json.loads(payload or "{}").get("routes") or []:
++                if isinstance(r, dict) and r.get("need"):
++                    out[r["need"]] = r
++        except ValueError:
++            continue
++    return out
++
++
++def owner_body(task, need: str, *, self_gw: str, board: str, reason: str, checked_at: float, now: float) -> str:
++    ref = f"{self_gw}/default/{board}/{task.id}"
++    excerpt = (reason or "").strip()
++    if len(excerpt) > 3000:
++        excerpt = excerpt[:3000] + "…"
++    return (
++        f"Capability owner card for waiting card {ref} (\"{(task.title or '')[:160]}\").\n"
++        f"It needs `{need}`. This gateway holds it (live-checked {_ago(checked_at, now)} before routing); "
++        f"{self_gw} does not.\n\n"
++        "## Action (from the waiting card, inside its approved plan)\n"
++        f"{excerpt or '(no reason given; read the waiting card first)'}\n\n"
++        "## Do\n"
++        f"1. Read the waiting card: `hermes-hub tasks --gw {self_gw} --json` (or cross_task read "
++        f"@task:{board}@{self_gw}/{task.id}).\n"
++        f"2. Perform exactly the scoped action above with this gateway's `{need}`. Keep it to the minimum "
++        "the waiting card needs (least privilege, tag/resource conditions where they apply).\n"
++        "3. If the action goes beyond the waiting card's approved plan or scope, do NOT do it: block THIS "
++        "card with kind='needs_input' and a human_request naming the exact command. The waiting worker "
++        "does not ask David; this card does.\n\n"
++        "## Readback\n"
++        "Verify the effect from the waiting card's side where you can (for example run its failing call "
++        "again from that gateway) and record the evidence in your completion summary.\n\n"
++        "## Wake\n"
++        f"The waiting card is parked on this card: completing it wakes {ref} within its next probe "
++        f"(about {WAKE_EVERY // 60} min). Also comment the result on it: "
++        f"`hermes-hub request {self_gw} tasks default/{board}/{task.id} comment --arg text=...`.\n"
++    )
++
++
++def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[int] = None,
++          board: Optional[str] = None, now: Optional[float] = None, **lookup) -> dict:
++    """Route ``needs`` for a running/ready card: create owner cards, then park it on them.
++
++    Raises CapabilityRouteError (typed, nothing written) or ValueError for bad input.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_timed_park as ktp
++
++    needs = reg.normalize_needs(needs)
++    if not needs:
++        raise ValueError("needs is empty")
++    task = kb.get_task(conn, task_id)
++    if task is None:
++        raise ValueError(f"unknown task {task_id}")
++    if task.status not in ("running", "ready"):
++        raise CapabilityRouteError("capability_route_invalid_state",
++                                   f"{task_id} is {task.status}; only a running or ready card can be routed")
++    now = time.time() if now is None else now
++    previous = _previous_routes(conn, task_id)
++    repeat = [n for n in needs if n in previous]
++    if repeat:
++        p = previous[repeat[0]]
++        raise CapabilityRouteError(
++            "capability_route_exhausted",
++            f"{task_id} already routed {repeat[0]} to {p.get('gateway')} (hermes-hub request "
++            f"{p.get('request_id')}). That owner card must finish or report why; check it with "
++            f"`hermes kanban wait-check capability-owner {p.get('request_id')}` and `hermes-hub requests`. "
++            "If it is done and the grant was insufficient, comment the exact gap on it and reopen it.",
++            details={"need": repeat[0], **p})
++    self_gw = lookup.pop("self_gw", None) or reg.self_gateway()
++    if not self_gw:
++        raise CapabilityRouteError("capability_hub_unavailable",
++                                   "this gateway has no hermes-hub identity (~/.config/hermes-mail/config.json)")
++    decided = plan(needs, now=now, self_gw=self_gw, **lookup)
++    board_slug = board or kb.get_current_board() or "default"
++    hub = _hub_cli()
++    routes = []
++    for r in decided["routes"]:
++        rid = request_id(task_id, r["need"])
++        title = f"Capability owner: {r['need']} for {self_gw}/{task_id} ({(task.title or '')[:80]})"
++        body = owner_body(task, r["need"], self_gw=self_gw, board=board_slug, reason=reason,
++                          checked_at=r["checked_at"], now=now)
++        argv = [hub, "create-task", r["gateway"], title, "--body", body, "--assignee", _owner_assignee(),
++                "--origin-session", "", "--id", rid]
++        rc, out = hub_runner(argv)
++        # 0 = sent, 3 = queued locally (hub unreachable; sent on the next sync). Both are durable.
++        if rc not in (0, 3):
++            raise CapabilityRouteError("capability_hub_unavailable",
++                                       f"hermes-hub create-task to {r['gateway']} failed (exit {rc}): {out[-400:]}",
++                                       details={"need": r["need"], "gateway": r["gateway"]})
++        routes.append({**r, "request_id": rid, "queued_only": rc == 3})
++    ids = ",".join(x["request_id"] for x in routes)
++    until = datetime.fromtimestamp(int(now) + WAKE_HORIZON, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++    summary = "; ".join(f"{x['need']} on {x['gateway']} (request {x['request_id']})" for x in routes)
++    park_reason = (f"Waiting on capability owner card(s): {summary}. Wakes when they are done. "
++                   f"SCHEDULED_UNTIL={until}\n{(reason or '').strip()[:1500]}")
++    wake_check = f"hermes kanban wait-check capability-owner {ids}"
++    with kb.write_txn(conn):
++        cur = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        source = kb._retry_status_for_run(conn, task_id) if cur and cur[0] == "running" else "ready"
++        ok = ktp.park(conn, task_id, reason=park_reason, requested_kind="capability", source_status=source,
++                      expected_run_id=expected_run_id, wake_check=wake_check, check_every=WAKE_EVERY)
++        if not ok:
++            raise CapabilityRouteError(
++                "capability_route_invalid_state",
++                f"owner request(s) {ids} were queued but {task_id} could not be parked (claim lost?)",
++                details={"routes": routes})
++        kb._append_event(conn, task_id, ROUTED_EVENT, {
++            "routes": routes, "local": decided["local"], "self_gateway": self_gw,
++            # A named live producer for the park (see the no-producer-no-park contract).
++            "awaiting": [{"kind": "card", "ref": f"{x['gateway']}/request/{x['request_id']}",
++                          "why": f"capability {x['need']}"} for x in routes],
++        })
++    return {"status": "scheduled", "routes": routes, "wake_check": wake_check, "local": decided["local"]}
++
++
++def preflight(conn, task_id: str, *, board: Optional[str] = None, **lookup) -> Optional[dict]:
++    """Placement preflight for a just-created card whose ``requires`` declare gateway needs.
++
++    Pre-routes needs this gateway lacks but another holds (owner card first, the card waits).
++    Returns the route result, a ``{"warning": ...}`` dict when nothing can be routed, or None
++    when there is nothing to do. Never raises.
++    """
++    from hermes_cli import kanban_db as kb
++    try:
++        task = kb.get_task(conn, task_id)
++        if task is None:
++            return None
++        needs = needs_from_requires(task.requires)
++        if not needs:
++            return None
++        if task.status != "ready":
++            return {"warning": f"declared needs {needs} not preflighted: card is {task.status}"}
++        return route(conn, task_id, needs, reason=(task.body or task.title or "")[:3000],
++                     board=board, **lookup)
++    except CapabilityRouteError as exc:
++        if exc.code == "capability_held_locally":
++            return None
++        return {"warning": str(exc), "code": exc.code}
++    except Exception as exc:
++        return {"warning": f"capability preflight failed: {exc}"}
++
++
++# --- wait-check ----------------------------------------------------------------------------
++
++def owner_status(rid: str) -> tuple[int, str]:
++    """(rc, message) for one owner request: 0 done, 1 pending, 2 cannot tell / rejected."""
++    try:
++        db = reg._ro(reg.hub_db_path())
++    except Exception as exc:
++        return 2, f"error: hermes-hub replica unreadable: {exc}"
++    try:
++        row = db.execute("SELECT body, state, result FROM sent WHERE id = ?", (rid,)).fetchone()
++        if row is None:
++            return 2, f"error: no hermes-hub request {rid} on this gateway"
++        body = json.loads(row[0] or "{}")
++        state = row[1]
++        if state in ("rejected", "expired", "failed"):
++            return 2, f"error: request {rid} {state}: {str(row[2])[:300]}"
++        if state != "done":
++            return 1, f"{rid} request {state}"
++        result = json.loads(row[2] or "{}") or {}
++        tid = result.get("task") if isinstance(result, dict) else None
++        if not tid:
++            return 2, f"error: request {rid} done without a task id: {str(row[2])[:300]}"
++        gw = body.get("to_gw")
++        board = (body.get("key") or "default/default/new").split("/")[1] if body.get("key") else "default"
++        rec = db.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?",
++                         (gw, f"default/{board}/{tid}")).fetchone()
++        if rec is None:
++            return 1, f"{rid} -> {gw}/{tid} not replicated yet"
++        status = json.loads(rec[0]).get("status")
++        return (0 if status in ("done", "archived") else 1), f"{rid} -> {gw}/{tid} {status}"
++    except Exception as exc:  # cannot tell, never "not yet"
++        return 2, f"error: {exc}"
++    finally:
++        db.close()
++
++
++def wait_check(target: str) -> tuple[int, str]:
++    rids = [r for r in (target or "").split(",") if r.strip()]
++    if not rids:
++        return 2, "error: no request id"
++    results = [owner_status(r.strip()) for r in rids]
++    rc = 2 if any(r[0] == 2 for r in results) else (0 if all(r[0] == 0 for r in results) else 1)
++    return rc, "; ".join(m for _, m in results)
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index aa819dde9a..98ce5c3036 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -243,6 +243,8 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     from hermes_cli.kanban_wake_check import run_due_wake_checks
+ 
+     run_due_wake_checks(conn)  # condition wakes: start due probes off-thread, never waits [daveey]
++    from hermes_cli.kanban_capability_registry import maybe_refresh_async
++    maybe_refresh_async()  # live-check this gateway's capabilities off-thread, throttled [daveey]
+     now = int(time.time()) if now is None else int(now)
+     woken: list[str] = []
+     for row in conn.execute("SELECT id, block_kind FROM tasks WHERE status = 'scheduled'").fetchall():
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 1def9bb72a..445020bd7b 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -100,6 +100,9 @@ def _WAKE_CHECK_ARGS():
+                   "agent-action conditions (grant, permission, install, fix) are work, not waits."),
+         _arg("--awaiting-why", dest="awaiting_why", default=None, help="Evidence for --awaiting"),
+     )
++_NEED = _arg("--need", dest="needs", action="append", default=None, metavar="CAPABILITY",
++             help="Gateway capability the wall needs (repeatable), e.g. aws:<acct>:<action>, ssh:<host>. "
++                  "If another gateway holds it, an owner card opens there and this card parks on it.")
+ _TASK_IDS = _arg("task_ids", nargs="+")
+ _SLUG = _arg("slug")
+ _TENANT = _arg("--tenant", help="Tenant namespace")
+@@ -209,8 +212,10 @@ _SPECS = [
+                   "newlines or flag-like lines survive shell quoting. "
+                   "Mutually exclusive with --body."),
+         _arg("--assignee", help="Profile name to assign"),
+-        _arg("--requires", action="append", choices=["terminal", "file", "git", "host_repo"],
+-             help="Required configured capability (repeatable); repo work also infers requirements"),
++        _arg("--requires", action="append",
++             help="Required configured capability (repeatable): terminal, file, git, host_repo, or a "
++                  "namespaced gateway capability such as aws:<acct>:<action> or ssh:<host> "
++                  "(placed/pre-routed where it is held); repo work also infers requirements"),
+         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
+         _arg("--workspace",
+              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
+@@ -295,8 +300,9 @@ _SPECS = [
+              help="Restrict to tasks with this current_step_key"),
+     ], aliases=["ls"], help="List tasks"),
+     _cmd("wait-check", [
+-        _arg("check", choices=("task", "board-empty"), help="task <id> | board-empty <slug>"),
+-        _arg("target", help="Task id (task) or board slug (board-empty)"),
++        _arg("check", choices=("task", "board-empty", "capability-owner"),
++             help="task <id> | board-empty <slug> | capability-owner <hermes-hub request id[,id...]>"),
++        _arg("target", help="Task id (task), board slug (board-empty) or owner request ids (capability-owner)"),
+         _arg("--gateway", default=None, help="Gateway to read via ssh (e.g. hub); omit for this machine"),
+         _arg("--board", default=None, help="Board slug for `task` (default board if omitted)"),
+         _arg("--until", default="done,blocked,archived", help="Comma-separated statuses that count as met"),
+@@ -381,12 +387,14 @@ _SPECS = [
+                   "mismatches to a capable supervisor; 'transient' marks a maybe-flaky failure. "
+                   "Repeated same-kind re-blocks after unblock route the task to "
+                   "triage to break unblock loops. Omit for a generic block."),
++        _NEED,
+         *_WAKE_CHECK_ARGS(),
+     ], help="Mark one or more tasks blocked"),
+     _cmd("schedule", [
+         _TASK_ID,
+         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+         _bulk_ids("schedule"),
++        _NEED,
+         *_WAKE_CHECK_ARGS(),
+     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
+     _cmd("unblock", [
+@@ -498,6 +506,12 @@ _SPECS = [
+               "routed to specialist profiles by description. Falls back "
+               "to specify-style single-task promotion when the task "
+               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
++    _cmd("capabilities", children=("cap_action", [
++        _cmd("list", help="Capabilities held by this gateway and its hermes-hub peers, with check age"),
++        _cmd("refresh", help="Run every capability probe now and rewrite kanban/capabilities.json"),
++        _cmd("locate", [_arg("needs", nargs="+", metavar="CAPABILITY")],
++             help="Where each capability is held (exit 1 if some need has no fresh holder)"),
++    ]), help="Gateway capability registry used for cross-gateway owner-card routing"),
+     _cmd("gc", [
+         _arg("--worktree-retention-days", type=_nonnegative_int, default=None,
+              help="Archive committed work and reap terminal task worktrees after N days (config/default: 7; 0 disables)"),
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index f915d39a71..040a88a817 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -80,6 +80,13 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+ def run(args) -> int:
+     until = tuple(u for u in (args.until or "").split(",") if u) or DEFAULT_UNTIL
+     gw = getattr(args, "gateway", None)
++    if args.check == "capability-owner":
++        # Owner cards live on another gateway; the hermes-hub replica on THIS gateway is the
++        # source (request result -> owner task id -> replicated status). [daveey]
++        from hermes_cli.kanban_capability_routing import wait_check
++        rc, msg = wait_check(args.target)
++        print(msg, file=sys.stderr if rc == 2 else sys.stdout)
++        return rc
+     if gw in (None, "", "local"):
+         rc, msg = check_local(args.check, args.target, board=args.board, until=until)
+     else:
+diff --git a/tests/hermes_cli/test_kanban_capability_routing.py b/tests/hermes_cli/test_kanban_capability_routing.py
+new file mode 100644
+index 0000000000..046d08fcff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capability_routing.py
+@@ -0,0 +1,339 @@
++"""Cross-gateway capability routing: a wall on one gateway opens an owner card where the
++capability lives (hub card t_01a17f851d7e9777). [daveey]
++
++Replays the 10-26 22:39 PT block of hub t_5bc8e125: the hub role was denied EC2 Describe*,
++the MacBook held AWS SSO admin for account 123456789012, and the card sat parked on a probe
++for an hour with no producer until David asked.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_capability_registry as reg
++from hermes_cli import kanban_capability_routing as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++ACCOUNT = "123456789012"
++NEED = f"aws:{ACCOUNT}:ec2-describe"
++# hub t_5bc8e125 run 2494 (blocked 10-26 22:39 PT, kind=transient, no human_request)
++REASON_2239 = (
++    "Live pilot blocked on AWS authority; nothing provisioned, no spend or routing change. The hub role "
++    "hermes-hub in 123456789012 is denied on ec2:DescribeVpcs, DescribeInstanceTypes, "
++    "autoscaling:DescribeAutoScalingGroups and SecretsManager ListSecrets (re-verified this run). The "
++    "earlier audit read the account through the MacBook SSO profile my-sso-profile (us-west-2), which "
++    "the hub worker cannot use. Retry once any route works from the hub."
++)
++
++HUB_SCHEMA = """
++CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
++CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT,
++  updated_at INTEGER, PRIMARY KEY (gw, coll, key));
++CREATE TABLE sent (id TEXT PRIMARY KEY, body TEXT, state TEXT, result TEXT, created_at REAL,
++  done_at REAL, posted INTEGER DEFAULT 0);
++"""
++
++
++@pytest.fixture
++def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    mail = tmp_path / "mail.json"
++    mail.write_text(json.dumps({"gateway": "hub"}))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(mail))
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    hub = sqlite3.connect(state / "hub.db")
++    hub.executescript(HUB_SCHEMA)
++    hub.execute("INSERT INTO meta VALUES ('gateway', 'hub')")
++    hub.commit()
++    calls: list[list[str]] = []
++
++    def fake_hub(argv):
++        # What `hermes-hub create-task` does locally: journal the request in `sent`.
++        calls.append(argv)
++        assert argv[1] == "create-task"
++        rid = argv[argv.index("--id") + 1]
++        body = {"id": rid, "to_gw": argv[2], "coll": "tasks", "key": "default/default/new", "action": "create",
++                "args": {"title": argv[3], "body": argv[argv.index("--body") + 1],
++                         "assignee": argv[argv.index("--assignee") + 1]}}
++        hub.execute("INSERT INTO sent (id, body, state, created_at) VALUES (?, ?, 'local', ?) ON CONFLICT(id) DO NOTHING",
++                    (rid, json.dumps(body), time.time()))
++        hub.commit()
++        return 0, rid
++
++    monkeypatch.setattr(kcr, "hub_runner", fake_hub)
++    kb.init_db()
++    yield {"home": home, "hub": hub, "calls": calls}
++    hub.close()
++
++
++def publish(hub, gw: str, caps: dict[str, float], ok: bool = True):
++    """A peer's capabilities record as hermes-hub replicates it (coll=capabilities, key=info)."""
++    rec = {"schema": 1, "gateway": gw, "refreshed_at": max(caps.values()),
++           "capabilities": [{"name": n, "ok": ok, "checked_at": at} for n, at in caps.items()]}
++    hub.execute("INSERT OR REPLACE INTO replica VALUES (?, 'capabilities', 'info', 1, 1, ?, ?)",
++                (gw, json.dumps(rec), int(time.time())))
++    hub.commit()
++
++
++def running(conn, **kw) -> str:
++    tid = kb.create_task(conn, title="ASG persistent runner pilot", assignee="worker", **kw)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return tid
++
++
++def as_worker(monkeypatch, conn, tid):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
++
++
++def owner_applies(hub, rid: str, owner_tid: str, status: str):
++    """The MacBook applies the create request and its card status replicates back."""
++    hub.execute("UPDATE sent SET state='done', result=? WHERE id=?", (json.dumps({"task": owner_tid}), rid))
++    hub.execute("INSERT OR REPLACE INTO replica VALUES ('macbook', 'tasks', ?, 1, 1, ?, ?)",
++                (f"default/default/{owner_tid}", json.dumps({"id": owner_tid, "status": status}), int(time.time())))
++    hub.commit()
++
++
++# --- names -----------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("held,need,ok", [
++    (f"aws:{ACCOUNT}:admin", NEED, True),
++    (f"aws:{ACCOUNT}:admin", f"aws:{ACCOUNT}", True),
++    (f"aws:{ACCOUNT}:admin", "aws:999999999999:ec2-describe", False),
++    (NEED, NEED, True),
++    (NEED, f"aws:{ACCOUNT}:ec2-mutate", False),
++    ("ssh:mini", "ssh:mini", True),
++    ("ssh:mini", "ssh:hub", False),
++    ("github:daveey:admin", "github:daveey:repo", True),
++])
++def test_satisfies(held, need, ok):
++    assert reg.satisfies(held, need) is ok
++
++
++def test_needs_are_namespaced_and_pass_through_profile_requires(env):
++    with pytest.raises(ValueError):
++        reg.normalize_needs(["terminal"])
++    assert reg.normalize_needs([NEED, NEED, "ssh:mini"]) == [NEED, "ssh:mini"]
++    from hermes_cli.kanban_capabilities import validate_assignment
++    # A gateway need never fails profile policy and is kept on the card.
++    assert validate_assignment("worker", requires=[NEED]) == [NEED]
++
++
++# --- acceptance: replay of the 22:39 block ----------------------------------------------------
++
++def test_replay_t5bc8e125_block_opens_macbook_owner_card_and_parks(env, monkeypatch):
++    from tools import kanban_tools as kt
++    now = time.time()
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": now - 60})
++    publish(env["hub"], "mini", {"ssh:hub": now - 60})
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_block({"reason": REASON_2239, "kind": "transient", "needs": [NEED]}))
++    assert out.get("status") == "scheduled", out
++    rid = kcr.request_id(tid, NEED)
++    assert rid == f"capability-owner:{tid}:{NEED}"
++    assert [r["gateway"] for r in out["capability_routes"]] == ["macbook"]
++
++    # ONE owner card requested on the holder, through hermes-hub create-task.
++    (argv,) = env["calls"]
++    assert argv[:3] == ["hermes-hub", "create-task", "macbook"]
++    assert argv[argv.index("--id") + 1] == rid
++    assert argv[argv.index("--origin-session") + 1] == ""
++    body = argv[argv.index("--body") + 1]
++    assert "my-sso-profile" in body and NEED in body
++    assert "human_request" in body and f"hub/default/default/{tid}" in body
++
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.status == "scheduled" and task.human_request is None
++        state = conn.execute("SELECT cmd, every FROM task_wake_checks WHERE task_id=?", (tid,)).fetchone()
++        assert state[0] == f"hermes kanban wait-check capability-owner {rid}" and state[1] == kcr.WAKE_EVERY
++        routed = [e for e in kb.list_events(conn, tid) if e.kind == kcr.ROUTED_EVENT][-1].payload
++        assert routed["routes"][0]["request_id"] == rid
++        assert routed["awaiting"][0] == {"kind": "card", "ref": f"macbook/request/{rid}",
++                                         "why": f"capability {NEED}"}
++
++    # The hub card waits on the owner card: pending -> running -> done wakes it.
++    assert kcr.wait_check(rid)[0] == 1
++    owner_applies(env["hub"], rid, "t_owner1", "running")
++    assert kcr.wait_check(rid) == (1, f"{rid} -> macbook/t_owner1 running")
++    owner_applies(env["hub"], rid, "t_owner1", "done")
++    assert kcr.wait_check(rid)[0] == 0
++
++
++def test_second_route_of_same_need_is_exhausted_not_a_new_owner(env, monkeypatch):
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time()})
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        kcr.route(conn, tid, [NEED], reason=REASON_2239)
++        kb.unblock_task(conn, tid)
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++        with pytest.raises(kcr.CapabilityRouteError) as exc:
++            kcr.route(conn, tid, [NEED], reason="again")
++    assert exc.value.code == "capability_route_exhausted"
++    assert len(env["calls"]) == 1
++
++
++# --- acceptance: refusals ---------------------------------------------------------------------
++
++def test_need_no_gateway_holds_gets_typed_refusal_pointing_at_human_request(env, monkeypatch):
++    from tools import kanban_tools as kt
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time()})
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_block({"reason": "need billing admin", "needs": ["aws:111111111111:billing"]}))
++    assert out.get("rejection") == "no_capability_holder", out
++    assert "human_request" in out["error"]
++    assert env["calls"] == []
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_stale_registry_data_triggers_no_routing(env, monkeypatch):
++    from tools import kanban_tools as kt
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time() - 2 * 3600})
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_block({"reason": REASON_2239, "needs": [NEED]}))
++    assert out.get("rejection") == "capability_registry_stale", out
++    assert "macbook" in out["error"]
++    assert env["calls"] == []
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running"
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == kcr.ROUTED_EVENT]
++
++
++def test_not_held_entry_never_routes(env):
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time()}, ok=False)
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        with pytest.raises(kcr.CapabilityRouteError) as exc:
++            kcr.route(conn, tid, [NEED], reason="x")
++    assert exc.value.code == "no_capability_holder"
++
++
++def test_capability_held_locally_is_not_routed(env):
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time()})
++    reg.registry_path().parent.mkdir(parents=True, exist_ok=True)
++    reg.registry_path().write_text(json.dumps({"schema": 1, "refreshed_at": time.time(), "capabilities": [
++        {"name": NEED, "ok": True, "checked_at": time.time()}]}))
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        with pytest.raises(kcr.CapabilityRouteError) as exc:
++            kcr.route(conn, tid, [NEED], reason="x")
++    assert exc.value.code == "capability_held_locally"
++    assert env["calls"] == []
++
++
++def test_needs_with_human_request_is_refused(env, monkeypatch):
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++        as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_block({"reason": "x", "needs": [NEED], "kind": "needs_input",
++                                       "human_request": {"action": "a", "why_human": "b", "interaction": "approval",
++                                                         "scope": "c", "evidence": "d"}}))
++    assert "error" in out and env["calls"] == []
++
++
++def test_rejected_owner_request_is_cannot_tell_not_not_yet(env):
++    env["hub"].execute("INSERT INTO sent VALUES ('capability-owner:t_x:ssh:mini', ?, 'rejected', ?, 0, 0, 1)",
++                       (json.dumps({"to_gw": "mini", "key": "default/default/new"}), json.dumps({"error": "no"})))
++    env["hub"].commit()
++    assert kcr.wait_check("capability-owner:t_x:ssh:mini")[0] == 2
++    assert kcr.wait_check("capability-owner:t_unknown:ssh:mini")[0] == 2
++
++
++# --- placement preflight ----------------------------------------------------------------------
++
++def test_card_declaring_needs_is_prerouted_at_creation(env, monkeypatch):
++    from tools import kanban_tools as kt
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time()})
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    out = json.loads(kt._handle_create({"title": "ASG pilot", "assignee": "worker", "body": "Provision the pilot",
++                                        "requires": [NEED]}))
++    assert out.get("ok") is not False and out.get("task_id"), out
++    tid = out["task_id"]
++    placed = out["capability_placement"]
++    assert placed["routes"][0]["gateway"] == "macbook"
++    assert out["status"] == "scheduled"
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.requires == [NEED]
++        assert task.status == "scheduled"
++    assert env["calls"][0][2] == "macbook"
++
++
++def test_preflight_without_holder_creates_with_warning(env, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    out = json.loads(kt._handle_create({"title": "t", "assignee": "worker", "requires": ["ssh:nowhere"]}))
++    assert out["task_id"] and out["status"] == "ready"
++    assert out["capability_placement"]["code"] == "no_capability_holder"
++    assert env["calls"] == []
++
++
++# --- registry ---------------------------------------------------------------------------------
++
++def test_refresh_live_checks_configured_probes(env):
++    cfg = {"builtin": False, "probes": {f"aws:{ACCOUNT}:admin": "true", "browser:signed-in": "false"},
++           "ssh_hosts": {}}
++    rec = reg.refresh(cfg)
++    by = {c["name"]: c for c in rec["capabilities"]}
++    assert by[f"aws:{ACCOUNT}:admin"]["ok"] is True
++    assert by["browser:signed-in"]["ok"] is False
++    assert all(abs(c["checked_at"] - time.time()) < 60 for c in by.values())
++    assert rec["gateway"] == "hub"
++    # Metadata only: the file never carries probe commands or output.
++    text = reg.registry_path().read_text()
++    assert "true" not in text.replace('"ok": true', "")
++    assert reg.read_local()["capabilities"] == rec["capabilities"]
++
++
++# --- CLI ----------------------------------------------------------------------------------------
++
++def _cli(*argv: str) -> int:
++    import argparse
++
++    from hermes_cli import kanban as kc
++    top = argparse.ArgumentParser()
++    kc.build_parser(top.add_subparsers(dest="_top"))
++    return kc.kanban_command(top.parse_args(["kanban", *argv]))
++
++
++def test_cli_block_need_routes_and_wait_check_reads_the_owner(env, capsys):
++    publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time()})
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++    assert _cli("block", tid, REASON_2239, "--need", NEED) == 0
++    assert "requested on macbook" in capsys.readouterr().out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "scheduled"
++    rid = kcr.request_id(tid, NEED)
++    assert _cli("wait-check", "capability-owner", rid) == 1
++    owner_applies(env["hub"], rid, "t_owner2", "done")
++    assert _cli("wait-check", "capability-owner", rid) == 0
++
++
++def test_cli_block_need_without_holder_exits_2_and_keeps_card(env, capsys):
++    with kbc.connect_closing() as conn:
++        tid = running(conn)
++    assert _cli("block", tid, "x", "--need", "ssh:nowhere") == 2
++    assert "no_capability_holder" in capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index d3c58a1ee2..05a5aeedf5 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1022,6 +1022,36 @@ def _park_guard(conn, tid: str, op: str, wake: tuple, **plan: Any) -> None:
+     _check(err is None, f"kanban_{op} {err}", "invalid_args")
+ 
+ 
++def _route_needs(op: str, args: dict, tid: str, reason: Optional[str]) -> Optional[str]:
++    """Cross-gateway capability routing for ``needs`` on block/schedule; None when absent. [daveey]"""
++    needs = args.get("needs")
++    if needs in (None, [], ""):
++        return None
++    from hermes_cli import kanban_capability_routing as kcr
++    try:
++        needs = kcr.reg.normalize_needs(needs)
++    except ValueError as exc:
++        raise _Reject(str(exc), "invalid_args") from None
++    _check(args.get("human_request") is None,
++           "needs routes the wall to the gateway that holds the capability; a human_request asks David. "
++           "Pass one: if only David can grant it, drop needs.")
++    _check(not args.get("blocker_id"), "needs cannot be combined with blocker_id")
++    with _board(args.get("board")) as (kb, conn):
++        task = kb.get_task(conn, tid)
++        _check(not (task and task.goal_mode),
++               "goal_mode tasks cannot park on an owner card; finish with kanban_complete")
++        try:
++            res = kcr.route(conn, tid, needs, reason=reason or "", expected_run_id=_worker_run_id(tid),
++                            board=args.get("board"))
++        except kcr.CapabilityRouteError as exc:
++            raise _Reject(str(exc), exc.code) from None
++        return _ok_landed(kb, conn, tid, "scheduled", requested_kind=args.get("kind"), op=op,
++                          capability_routes=res["routes"], wake_check=res["wake_check"],
++                          note=("Parked on the capability owner card(s) above; it wakes when they are "
++                                "done. Do not ask David: the owner card does, if the action exceeds "
++                                "the approved scope. End your turn."))
++
++
+ @_kanban_handler("kanban_block")
+ def _handle_block(args: dict, **kw) -> str:
+     """Transition the task to blocked with a reason a human will read."""
+@@ -1029,6 +1059,9 @@ def _handle_block(args: dict, **kw) -> str:
+     reason = _redact(
+         _require_text(args, "reason", "reason is required — explain what input you need"))
+     kind = args.get("kind")
++    routed = _route_needs("block", args, tid, reason)
++    if routed is not None:
++        return routed
+     with _board(args.get("board")) as (kb, conn):
+         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+@@ -1094,6 +1127,9 @@ def _handle_schedule(args: dict, **kw) -> str:
+     raw_reason = args.get("reason")
+     _check(raw_reason is None or isinstance(raw_reason, str), "reason must be a string")
+     reason = _redact(raw_reason.strip()) if raw_reason and raw_reason.strip() else None
++    routed = _route_needs("schedule", args, tid, reason)
++    if routed is not None:
++        return routed
+     with _board(args.get("board")) as (kb, conn):
+         # The goal loop treats ``scheduled`` as terminal like ``blocked``, so
+         # parking would bypass the completion judge (see kanban_block, #38696).
+@@ -1488,6 +1524,13 @@ def _handle_create(args: dict, **kw) -> str:
+             }}
+         if origin is not None:
+             extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
++        if origin_intent is None and args.get("requires"):
++            # Placement preflight: declared gateway needs this gateway lacks are owned first. [daveey]
++            from hermes_cli.kanban_capability_routing import preflight
++            placed = preflight(conn, new_tid, board=args.get("board"))
++            if placed:
++                extra["capability_placement"] = placed
++                landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+         if origin_intent is not None:
+             return json.dumps({"ok": False, "created": True, "code": "origin_bind_pending",
+                                "task_id": new_tid, **landed, **gate,
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 4293f9d49e..8ec7a9f9b8 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -177,6 +177,17 @@ KANBAN_COMPLETE_SCHEMA = _schema(
+     [],
+ )
+ 
++_NEEDS_PROP = {
++    "needs": {"type": "array", "items": {"type": "string"}, "description": (
++        "Optional. Gateway capabilities the wall needs, namespaced: 'aws:<account>:<action-or-role>', "
++        "'ssh:<host>', 'github:<owner>:<scope>', 'token-broker:<scope>', 'sudo:nopasswd', "
++        "'browser:signed-in'. When this gateway lacks one and another gateway holds it (live-checked "
++        "hermes-hub capability registry), ONE owner card is opened on that gateway with your reason as "
++        "its scoped action, and this card parks on it (no human ask; the owner card asks David only if "
++        "the action exceeds the approved plan). A need no gateway holds is refused with a typed error: "
++        "then use kind='needs_input' with a human_request.")},
++}
++
+ _WAKE_CHECK_PROPS = {
+     "wake_check": _prop("string", (
+         "Shell command probed by the dispatcher while the card is parked (bash -lc, 30 s "
+@@ -306,6 +317,7 @@ KANBAN_BLOCK_SCHEMA = _schema(
+             "dispatcher then holds every card behind it and runs one probe card per "
+             "interval; a run that ends without the id clears it and releases the rest."
+         )),
++        **_NEEDS_PROP,
+         **_WAKE_CHECK_PROPS,
+     },
+     ["reason"],
+@@ -334,6 +346,7 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+             "Optional reason or machine-readable wake-up marker recorded on "
+             "the completed run and scheduled event."
+         )),
++        **_NEEDS_PROP,
+         **_WAKE_CHECK_PROPS,
+     },
+     [],
+@@ -578,9 +591,13 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "Omit to use the creating agent's profile. Requirements are checked before creation."
+         )),
+         "requires": {"type": "array", "items": {"type": "string",
+-                     "enum": ["terminal", "file", "git", "host_repo", "kanban"]},
++                     "pattern": "^(terminal|file|git|host_repo|kanban|[a-z][a-z0-9-]*(:[A-Za-z0-9._@/+-]+)+)$"},
+                      "description": "Required configured capabilities, including skill prerequisites. "
+-                     "Worktree/dir workspaces infer host repo access; git means terminal access, not an executable probe."},
++                     "Worktree/dir workspaces infer host repo access; git means terminal access, not an executable probe. "
++                     "Gateway capabilities the plan needs (namespaced, e.g. 'aws:123456789012:ec2-describe', "
++                     "'ssh:mini', 'github:daveey:admin', 'sudo:nopasswd') are placement needs: if this "
++                     "gateway lacks one and another holds it, an owner card is opened there first and "
++                     "this card waits on it."},
+         "body": _prop("string", (
+                 "Opening post: full spec, acceptance criteria, "
+                 "links. The assigned worker reads this as part of "
+-- 
+2.55.0
+
