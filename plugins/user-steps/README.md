@@ -386,6 +386,18 @@ Desktop disk code can hot-reload. Backend router/module activation must be verif
 separately through the normal deployment route; no ad hoc restart is required by
 this plugin documentation.
 
+## Decisions for a session blocked in clarify
+
+A decision is delivered as a new turn, which the runtime refuses while the session's turn is active. When that turn is
+blocked in `clarify` on the same human, `clarify_early.py` (a provider for core's `tools/clarify_early.py`, core
+patch 0722) hands the session's recorded-but-undelivered decisions to the clarify as
+`{status: answered_elsewhere, decisions: [{requestId, title, choice, decidedAt, via}]}` before it asks and every 2 s
+while it waits. "The session" is the owner's stored id or a compression ancestor/descendant of it. The operations are
+then delivered with a receipt `run: {destination: clarify_early_answer, toolCallId}` (cards and inbox as usual, no
+turn admitted), so the retrier never repeats them. A busy refusal is counted in `busyRefusals`, not `attempts`, so
+waiting out a long turn cannot exhaust the retry cap. Delivery after a turn ends is still the 15 s retrier (no
+turn-end hook). Tests: `tests/test_clarify_early.py`.
+
 ## Tests
 
 From the repository root:

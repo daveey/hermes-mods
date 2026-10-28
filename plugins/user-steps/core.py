@@ -1450,9 +1450,11 @@ class ActionStore:
                       (_json(resolution), ns, r['requestId']))
             return self._operation(c, owner, oid)
 
-    def dispatch(self, owner, oid, receiver):
+    def dispatch(self, owner, oid, receiver, *, early_tool_call_id=None):
         # Commit the attempt then release the DB lock BEFORE external I/O. Other
         # requests stay usable; concurrent retries share the receiver's durable key.
+        # early_tool_call_id: deliver through a blocked clarify's tool result (receiver.deliver_early) instead of
+        # admitting a new turn; that is not a delivery attempt either.
         with self._tx() as c:
             result = self._operation(c, owner, oid); op = result['operation']
             if op['dispatchState'] in ('delivered', 'cancelled'): return result
@@ -1466,7 +1468,8 @@ class ActionStore:
         busy = False
         try:
             if receiver is None: raise RuntimeError('No durable delivery receiver configured')
-            receipt = receiver.deliver(op)
+            receipt = (receiver.deliver_early(op, early_tool_call_id) if early_tool_call_id
+                       else receiver.deliver(op))
             confirmed = bool(receiver.readback(op, receipt))
         except Exception as exc:
             # Never expose credentials, receiver URLs or raw transport bodies: only classify.
@@ -1475,6 +1478,11 @@ class ActionStore:
             result = self._operation(c, owner, oid); op = result['operation']
             # A slow failed retry cannot downgrade a concurrently confirmed delivery.
             if op['dispatchState'] in ('delivered', 'cancelled'): return result
+            if busy or early_tool_call_id:
+                # Not a delivery failure: a busy owner refuses admission until its turn ends, and an early answer
+                # never admits a turn. Neither may exhaust the retry budget.
+                op['attempts'] = max(0, op['attempts'] - 1)
+            if busy: op['busyRefusals'] = op.get('busyRefusals', 0) + 1
             if confirmed:
                 cancelled = receipt.get('terminalCancelled') is True
                 op.update(dispatchState='cancelled' if cancelled else 'delivered', receipt=receipt)
@@ -1495,6 +1503,13 @@ class ActionStore:
             owners = {_json(op['owner']): op['owner'] for row in c.execute('SELECT body FROM operations')
                       if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')}
             return list(owners.values())
+
+    def undelivered(self, gateway_id, profile):
+        """Recorded-but-undelivered operations (any effect) of this gateway/profile, oldest first."""
+        with self._tx() as c:
+            return [op for row in c.execute('SELECT body FROM operations WHERE namespace=? ORDER BY rowid',
+                                            (_json([gateway_id, profile]),))
+                    if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')]
 
     def reconcile(self, owner, receiver, *, max_attempts=None):
         with self._tx() as c:

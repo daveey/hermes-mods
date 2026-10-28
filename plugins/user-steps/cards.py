@@ -462,6 +462,9 @@ class QualifiedCardDelivery:
         return True
 
 
+EARLY_DESTINATION = 'clarify_early_answer'
+
+
 class DecisionDelivery:
     """Production composite: card preflight, run admission, cards, passive receipt.
 
@@ -499,7 +502,24 @@ class DecisionDelivery:
         return {'inbox': inbox, 'cards': card_receipts, 'run': run,
                 'destination': 'canonical_decision_delivery', 'executionStarted': False}
 
+    def deliver_early(self, op, tool_call_id):
+        """Deliver through a blocked clarify's tool result instead of admitting a turn: cards and the passive inbox
+        projection as usual, with the clarify's tool_call_id as the run receipt so no later turn repeats it."""
+        if not isinstance(tool_call_id, str) or not tool_call_id: raise RuntimeError('Early delivery needs a tool_call_id')
+        self.cards.validate(op)
+        run = {'destination': EARLY_DESTINATION, 'toolCallId': tool_call_id, 'executionStarted': False}
+        card_receipts = self.cards.deliver(op)
+        if not self.cards.readback(op, card_receipts): raise RuntimeError('Card readback failed')
+        inbox = self.inbox._record(op)
+        return {'inbox': inbox, 'cards': card_receipts, 'run': run,
+                'destination': 'canonical_decision_delivery', 'executionStarted': False}
+
     def readback(self, op, receipt):
+        run = receipt.get('run')
+        if isinstance(run, dict) and run.get('destination') == EARLY_DESTINATION:
+            return (receipt.get('terminalCancelled') is not True and isinstance(run.get('toolCallId'), str)
+                    and bool(run['toolCallId']) and run.get('executionStarted') is False
+                    and self.inbox.readback(op, receipt['inbox']) and self.cards.readback(op, receipt['cards']))
         if receipt.get('terminalCancelled') is True:
             return (op['intent']['effect'] != 'decline'
                     and receipt.get('run', {}).get('terminalCancelled') is True

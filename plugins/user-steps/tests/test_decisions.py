@@ -325,9 +325,13 @@ def test_busy_session_is_classified_and_background_retry_delivers_same_operation
 
 
 def test_reconcile_stops_after_max_attempts(tmp_path):
+    # Busy refusals no longer count (see test_clarify_early); the cap applies to real delivery failures.
     s = store(tmp_path); r = s.create(OWNER, request())
     op = s.decide(OWNER, decision(r))['operation']
-    receiver = BusyReceiver()
+    class Broken:
+        def deliver(self, o): raise RuntimeError('transport down')
+        def readback(self, o, receipt): return False
+    receiver = Broken()
     for _ in range(3): s.dispatch(OWNER, op['operationId'], receiver)
     assert s.reconcile(OWNER, receiver, max_attempts=3) == []
     assert len(s.reconcile(OWNER, receiver, max_attempts=4)) == 1

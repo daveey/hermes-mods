@@ -1,0 +1,470 @@
+From 7cf108dab277c73a3efef85ed1e49977e8dcf16a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:06:25 +0000
+Subject: [PATCH] feat(clarify): a decision recorded in the For-you queue ends
+ a blocked clarify (answered_elsewhere) [daveey]
+
+---
+ agent/inline_tool_executors.py           |   2 +
+ tests/tools/test_clarify_early_answer.py | 164 +++++++++++++++++++++++
+ tests/tui_gateway/test_protocol.py       |  18 +++
+ tools/clarify_early.py                   | 129 ++++++++++++++++++
+ tools/clarify_tool.py                    |  17 ++-
+ tui_gateway/agent_callbacks.py           |  17 ++-
+ tui_gateway/server_requests.py           |   5 +-
+ 7 files changed, 345 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tools/test_clarify_early_answer.py
+ create mode 100644 tools/clarify_early.py
+
+diff --git a/agent/inline_tool_executors.py b/agent/inline_tool_executors.py
+index a540786564..61dc412490 100644
+--- a/agent/inline_tool_executors.py
++++ b/agent/inline_tool_executors.py
+@@ -252,6 +252,8 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
+     "clarify": _tool(
+         "tools.clarify_tool", "clarify_tool", ("questions", "questions"),
+         callback=lambda agent, ctx: agent.clarify_callback,
++        session_id=lambda agent, ctx: getattr(agent, "session_id", None) or "",
++        tool_call_id=lambda agent, ctx: ctx.tool_call_id or "",
+     ),
+     "read_terminal": _callback_tool(
+         "tools.read_terminal_tool", "read_terminal_tool", "read_terminal_callback",
+diff --git a/tests/tools/test_clarify_early_answer.py b/tests/tools/test_clarify_early_answer.py
+new file mode 100644
+index 0000000000..abffdc2d76
+--- /dev/null
++++ b/tests/tools/test_clarify_early_answer.py
+@@ -0,0 +1,164 @@
++"""A decision recorded elsewhere (user-steps For-you queue) ends a blocked clarify instead of letting it time out."""
++
++import json
++import threading
++import time
++
++import pytest
++
++from tools import clarify_early
++from tools.clarify_tool import clarify_tool
++
++QUESTIONS = [{"question": "Which request does 'approved' cover?", "choices": ["canary", "aws", "both"]}]
++DECISION = {"requestId": "r1", "title": "Canary runner", "choice": "approve", "decidedAt": "2026-10-28T21:19:45+00:00",
++            "via": "for-you-queue"}
++
++
++@pytest.fixture(autouse=True)
++def _clean(monkeypatch):
++    monkeypatch.setattr(clarify_early, "POLL_INTERVAL_S", 0.05)
++    clarify_early.reset_for_tests()
++    yield
++    clarify_early.reset_for_tests()
++
++
++class Blocking:
++    """A surface callback that blocks until answered or cancelled, like the TUI bridge."""
++
++    def __init__(self):
++        self.event = threading.Event()
++        self.reply = None
++        self.calls = 0
++        self.cancel_reasons = []
++
++    def __call__(self, questions):
++        self.calls += 1
++        self.event.wait(5)
++        return self.reply or {"answers": {}, "outcome": "cancelled"}
++
++    def cancel_early(self, reason):
++        self.cancel_reasons.append(reason)
++        self.event.set()
++        return True
++
++
++def _answer(commits, decisions=(DECISION,)):
++    return clarify_early.EarlyAnswer(
++        {"status": "answered_elsewhere", "decisions": list(decisions)}, commit=lambda: commits.append("done"))
++
++
++def test_pending_decision_is_returned_instead_of_asking():
++    """(c) check before asking."""
++    commits, seen = [], []
++    clarify_early.register_provider(lambda sid, tcid: seen.append((sid, tcid)) or _answer(commits))
++    cb = Blocking()
++    out = json.loads(clarify_tool(QUESTIONS, callback=cb, session_id="s1", tool_call_id="call_1"))
++    assert cb.calls == 0
++    assert out["status"] == "answered_elsewhere"
++    assert out["decisions"][0]["requestId"] == "r1"
++    assert out["notice"].startswith("David answered in the For-you queue")
++    assert "responses" not in out  # never shaped like text the user typed
++    assert commits == ["done"]
++    assert seen == [("s1", "call_1")]
++
++
++def test_decision_recorded_while_blocked_ends_the_clarify():
++    """(a) end the clarify early."""
++    commits, state = [], {"ready": False}
++    clarify_early.register_provider(lambda sid, tcid: _answer(commits) if state["ready"] else None)
++    cb = Blocking()
++    box = {}
++    t = threading.Thread(target=lambda: box.update(
++        out=json.loads(clarify_tool(QUESTIONS, callback=cb, session_id="s1", tool_call_id="call_1"))))
++    started = time.monotonic()
++    t.start()
++    time.sleep(0.2)
++    assert t.is_alive() and cb.calls == 1  # genuinely blocked, nothing to deliver yet
++    state["ready"] = True
++    t.join(3)
++    assert not t.is_alive()
++    assert time.monotonic() - started < 3
++    assert box["out"]["status"] == "answered_elsewhere"
++    assert cb.cancel_reasons == ["answered_elsewhere"]
++    assert commits == ["done"]
++
++
++def test_decision_for_another_session_does_not_end_the_clarify():
++    """Guard: the provider says None for a session it does not own; the clarify keeps waiting for the user."""
++    commits = []
++    clarify_early.register_provider(lambda sid, tcid: _answer(commits) if sid == "other" else None)
++    cb = Blocking()
++    box = {}
++    t = threading.Thread(target=lambda: box.update(
++        out=json.loads(clarify_tool(QUESTIONS, callback=cb, session_id="s1", tool_call_id="call_1"))))
++    t.start()
++    time.sleep(0.4)
++    assert t.is_alive() and cb.cancel_reasons == [] and commits == []
++    cb.reply = {"answers": {"q0": "both"}, "outcome": "submitted"}
++    cb.event.set()
++    t.join(3)
++    assert box["out"]["responses"][0]["user_response"] == "both"
++    assert commits == []
++
++
++def test_a_real_answer_that_wins_the_race_is_not_replaced():
++    """The human answered at the same moment: their answer is returned and the decision stays undelivered."""
++    commits, state = [], {"ready": False}
++    clarify_early.register_provider(lambda sid, tcid: _answer(commits) if state["ready"] else None)
++
++    class Uncancellable(Blocking):
++        def cancel_early(self, reason):
++            self.cancel_reasons.append(reason)
++            return False
++
++    cb = Uncancellable()
++    cb.reply = {"answers": {"q0": "aws"}, "outcome": "submitted"}
++    box = {}
++    t = threading.Thread(target=lambda: box.update(
++        out=json.loads(clarify_tool(QUESTIONS, callback=cb, session_id="s1", tool_call_id="call_1"))))
++    t.start()
++    time.sleep(0.2)
++    state["ready"] = True
++    cb.event.set()
++    t.join(3)
++    assert box["out"]["responses"][0]["user_response"] == "aws"
++    assert commits == []
++
++
++def test_provider_failure_never_breaks_the_clarify():
++    def boom(sid, tcid):
++        raise RuntimeError("store unavailable")
++
++    clarify_early.register_provider(boom)
++    cb = Blocking()
++    cb.reply = {"answers": {"q0": "aws"}, "outcome": "submitted"}
++    cb.event.set()
++    out = json.loads(clarify_tool(QUESTIONS, callback=cb, session_id="s1", tool_call_id="call_1"))
++    assert out["responses"][0]["user_response"] == "aws"
++
++
++def test_without_a_session_or_cancel_hook_behaviour_is_unchanged():
++    """Surfaces with no cancel hook (plain CLI) and calls with no session id never poll."""
++    seen = []
++    clarify_early.register_provider(lambda sid, tcid: seen.append(sid))
++    out = json.loads(clarify_tool(QUESTIONS, callback=lambda qs: {"answers": {"q0": "aws"}, "outcome": "submitted"},
++                                  session_id="s1", tool_call_id="call_1"))
++    assert out["responses"][0]["user_response"] == "aws"
++    assert seen == ["s1"]  # the pre-ask check still runs; there is no watcher thread
++    seen.clear()
++    clarify_tool(QUESTIONS, callback=lambda qs: {"answers": {}, "outcome": "submitted"})
++    assert seen == []
++
++
++def test_inline_executor_passes_session_and_tool_call_id():
++    """The agent path (inline executor) hands the clarify tool the agent's session id and the call's id."""
++    from types import SimpleNamespace
++
++    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext
++
++    seen = []
++    clarify_early.register_provider(lambda sid, tcid: seen.append((sid, tcid)))
++    agent = SimpleNamespace(session_id="stored-1", clarify_callback=lambda qs: {"answers": {"q0": "x"}, "outcome": "submitted"})
++    out = INLINE_TOOL_EXECUTORS["clarify"](agent, {"questions": QUESTIONS}, InlineToolContext("t", tool_call_id="call_9"))
++    assert json.loads(out)["outcome"] == "submitted"
++    assert seen == [("stored-1", "call_9")]
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index 796039c5c4..81193c3b19 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -2107,3 +2107,21 @@ def test_session_branch_stored_accepts_idempotency_key(server, monkeypatch):
+     assert "error" not in second, second.get("error")
+     assert second["result"]["session_id"] == first_sid
+     assert len(server._sessions) == 1
++
++
++def test_clarify_callback_cancel_early_ends_only_the_clarify_request(capture):
++    """The Desktop clarify bridge exposes ``cancel_early`` so a decision recorded in the For-you queue can end the wait
++    (tools/clarify_early.py). It withdraws that session's open clarify, leaves other methods alone, and the tool gets
++    ``outcome: cancelled``."""
++    server, buf = capture
++    from tui_gateway import server_requests
++    thread, box, _req = _start_batch_clarify(server, buf, ["q0"])
++    callback = server._agent_cbs("s1")["clarify_callback"]
++    assert callable(callback.cancel_early)
++    assert server_requests.cancel("s1", "answered_elsewhere", method="sudo") == 0
++    assert callback.cancel_early("answered_elsewhere") is True
++    thread.join(2)
++    assert not thread.is_alive()
++    assert box["answer"]["outcome"] == "cancelled"
++    assert server._open_requests("s1") == []
++    assert callback.cancel_early("answered_elsewhere") is False  # nothing left to cancel
+diff --git a/tools/clarify_early.py b/tools/clarify_early.py
+new file mode 100644
+index 0000000000..b6401246ba
+--- /dev/null
++++ b/tools/clarify_early.py
+@@ -0,0 +1,129 @@
++"""Early answers for a blocked clarify: a decision recorded elsewhere (user-steps For-you queue) ends the wait.
++
++Plugins register a provider ``fn(session_id, tool_call_id) -> EarlyAnswer | None``. ``clarify_tool`` asks providers
++before showing a question and, while a surface is blocked waiting on the human, every ``POLL_INTERVAL_S``. A provider
++returns an answer only for decisions that belong to that session; ``commit()`` marks them delivered and is called only
++when the early answer is the one the clarify returns (never when the human answered first).
++"""
++
++from __future__ import annotations
++
++import contextvars
++import json
++import logging
++import threading
++from dataclasses import dataclass
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++POLL_INTERVAL_S = 2.0
++STATUS = "answered_elsewhere"
++
++
++@dataclass
++class EarlyAnswer:
++    result: dict
++    commit: Callable[[], Any]
++
++
++_lock = threading.Lock()
++_providers: list[Callable[[str, str], Optional[EarlyAnswer]]] = []
++
++
++def register_provider(fn):
++    """Add a provider; returns a disposer."""
++    with _lock:
++        _providers.append(fn)
++
++    def dispose():
++        with _lock:
++            if fn in _providers:
++                _providers.remove(fn)
++    return dispose
++
++
++def reset_for_tests() -> None:
++    with _lock:
++        _providers.clear()
++
++
++def has_providers() -> bool:
++    with _lock:
++        return bool(_providers)
++
++
++def poll(session_id: str, tool_call_id: str) -> Optional[EarlyAnswer]:
++    """First provider answer for this session, or None. A failing provider never affects the clarify."""
++    with _lock:
++        providers = list(_providers)
++    for fn in providers:
++        try:
++            found = fn(session_id, tool_call_id)
++        except Exception:
++            logger.debug("clarify early-answer provider failed", exc_info=True)
++            continue
++        if found is not None:
++            return found
++    return None
++
++
++def render(early: EarlyAnswer) -> str:
++    """Tool result JSON. Deliberately not the ``responses`` shape: this is never text the user typed."""
++    result = dict(early.result)
++    result.setdefault("status", STATUS)
++    result.setdefault("outcome", STATUS)
++    if not result.get("notice"):
++        parts = [f"{d.get('title', d.get('requestId', ''))}: {d.get('choice', '')}" for d in result.get("decisions", [])]
++        result["notice"] = "David answered in the For-you queue: " + "; ".join(parts)
++    return json.dumps(result, ensure_ascii=False)
++
++
++def _commit(early: EarlyAnswer) -> None:
++    try:
++        early.commit()
++    except Exception:
++        logger.warning("clarify early-answer commit failed", exc_info=True)
++
++
++def ask(callback: Callable, normalized: list, session_id: str, tool_call_id: str) -> tuple[Optional[dict], Optional[str]]:
++    """Run ``callback(normalized)`` with early-answer support -> ``(reply, early_json)``; exactly one is not None."""
++    if session_id and has_providers():
++        early = poll(session_id, tool_call_id)
++        if early is not None:
++            _commit(early)
++            return None, render(early)
++    cancel = getattr(callback, "cancel_early", None)
++    if not (session_id and has_providers() and callable(cancel)):
++        return callback(normalized), None
++    box: dict[str, Any] = {}
++    done = threading.Event()
++    ctx = contextvars.copy_context()
++
++    def run():
++        try:
++            box["reply"] = ctx.run(callback, normalized)
++        except BaseException as exc:  # re-raised on the caller's thread
++            box["error"] = exc
++        finally:
++            done.set()
++
++    threading.Thread(target=run, name="clarify-wait", daemon=True).start()
++    while not done.wait(POLL_INTERVAL_S):
++        early = poll(session_id, tool_call_id)
++        if early is None:
++            continue
++        cancelled = False
++        try:
++            cancelled = bool(cancel(STATUS))
++        except Exception:
++            logger.debug("clarify cancel_early failed", exc_info=True)
++        done.wait(5)
++        reply = box.get("reply")
++        if cancelled or reply is None or reply.get("outcome") == "cancelled":
++            _commit(early)
++            return None, render(early)
++        break  # the human answered first: their answer stands, the decision stays undelivered
++    if "error" in box:
++        raise box["error"]
++    return box["reply"], None
+diff --git a/tools/clarify_tool.py b/tools/clarify_tool.py
+index 40bfeca9a6..b4f2fbed3a 100644
+--- a/tools/clarify_tool.py
++++ b/tools/clarify_tool.py
+@@ -108,7 +108,7 @@ def _result(normalized: list[dict], reply: dict) -> str:
+     return json.dumps(result, ensure_ascii=False)
+ 
+ 
+-def clarify_tool(questions, callback: Optional[Callable] = None) -> str:
++def clarify_tool(questions, callback: Optional[Callable] = None, *, session_id: str = "", tool_call_id: str = "") -> str:
+     """Ask 1-5 questions in one call. ``callback(questions) -> {"answers", "outcome", "notice"?}``
+     is platform injected (cli.py / gateway / tui_gateway) and receives the normalized list."""
+     normalized, error = _normalize_questions(questions)
+@@ -120,7 +120,11 @@ def clarify_tool(questions, callback: Optional[Callable] = None) -> str:
+     # Observers see the questions only; the answers stay in the tool result.
+     with human_input_request("clarify", prompt="\n".join(q["question"] for q in normalized)) as human:
+         try:
+-            reply = callback(normalized)
++            from tools import clarify_early
++            reply, early = clarify_early.ask(callback, normalized, session_id or "", tool_call_id or "")
++            if early is not None:
++                human.outcome = clarify_early.STATUS
++                return early
+             human.outcome = str(reply.get("outcome") or "")
+             return _result(normalized, reply)
+         except Exception as exc:
+@@ -152,7 +156,10 @@ CLARIFY_SCHEMA = {
+         "Each response has status answered, skipped or unanswered "
+         "(user_response is null unless answered); outcome is submitted, "
+         "cancelled, timed_out or undelivered, with a notice saying why "
+-        "when the wait ended without a submit. Prefer deciding "
++        "when the wait ended without a submit. If David already answered the "
++        "same ask in the For-you queue, the result is instead "
++        "{status: answered_elsewhere, decisions: [...]}: treat those "
++        "decisions as his answer. Prefer deciding "
+         "low-stakes questions yourself; don't use this for dangerous-command "
+         "confirmation (the terminal tool handles that)."
+     ),
+@@ -195,7 +202,9 @@ registry.register(
+     name="clarify",
+     toolset="clarify",
+     schema=CLARIFY_SCHEMA,
+-    handler=lambda args, **kw: clarify_tool(args.get("questions"), callback=kw.get("callback")),
++    handler=lambda args, **kw: clarify_tool(args.get("questions"), callback=kw.get("callback"),
++                                            session_id=kw.get("session_id") or "",
++                                            tool_call_id=kw.get("tool_call_id") or ""),
+     check_fn=check_clarify_requirements,
+     emoji="❓",
+ )
+diff --git a/tui_gateway/agent_callbacks.py b/tui_gateway/agent_callbacks.py
+index 5a4d0f6344..fd2e378621 100644
+--- a/tui_gateway/agent_callbacks.py
++++ b/tui_gateway/agent_callbacks.py
+@@ -143,6 +143,21 @@ def _setup_choose_request(sid: str, payload: dict) -> dict | None:
+     return server_requests.send("setup_choose", sid, dict(payload), timeout=_clarify_timeout_seconds())
+ 
+ 
++class _ClarifyCallback:
++    """The clarify tool's callback for this UI session. ``cancel_early`` lets tools/clarify_early.py end the wait when
++    the same decision was recorded elsewhere (user-steps For-you queue); True when a clarify was withdrawn."""
++
++    def __init__(self, sid: str) -> None:
++        self.sid = sid
++
++    def __call__(self, questions):
++        return _clarify_block(self.sid, questions)
++
++    def cancel_early(self, reason: str = "answered_elsewhere") -> bool:
++        from tui_gateway import server_requests
++        return server_requests.cancel(self.sid, reason, method="clarify") > 0
++
++
+ def _agent_cbs(sid: str) -> dict:
+     def _read_block(method: str, timeout: int):
+         # read_terminal / read_preview (desktop GUI): server request like clarify; the preview
+@@ -167,7 +182,7 @@ def _agent_cbs(sid: str) -> dict:
+         # Credits/notice spine: AgentNotice → notification.show; recovery → notification.clear.
+         "notice_callback": lambda n: _agent_notice_update(sid, n),
+         "notice_clear_callback": lambda key: _emit("notification.clear", sid, {"key": key}),
+-        "clarify_callback": lambda questions: _clarify_block(sid, questions),
++        "clarify_callback": _ClarifyCallback(sid),
+         "read_terminal_callback": _read_block("terminal.read", 30),
+         "read_preview_callback": _read_block("preview.read", 45),
+         # drive_preview / annotate_preview (desktop GUI): same budget as the preview read it ends with.
+diff --git a/tui_gateway/server_requests.py b/tui_gateway/server_requests.py
+index 4b10f15951..1771ad6f56 100644
+--- a/tui_gateway/server_requests.py
++++ b/tui_gateway/server_requests.py
+@@ -347,13 +347,14 @@ def lock_answer(request_id: str, question_id: str, answer: str | None) -> list[s
+     return remaining
+ 
+ 
+-def cancel(sid: str | None = None, reason: str = "interrupted") -> int:
++def cancel(sid: str | None = None, reason: str = "interrupted", method: str | None = None) -> int:
+     """Withdraw open requests — only *sid*'s (session.interrupt must not touch other sessions'), or
+     every one when *sid* is None (shutdown). Blocked waits return None (a batch returns its locked
+     answers with ``outcome: cancelled``); queue-backed requests run ``on_result(None)`` so their
+     owner can settle. Returns the number withdrawn."""
+     with _lock:
+-        targets = [req for req in _open.values() if sid is None or req.sid == sid]
++        targets = [req for req in _open.values()
++                   if (sid is None or req.sid == sid) and (method is None or req.method == method)]
+         for req in targets:
+             _open.pop(req.id, None)
+             if req.qids is not None:
+-- 
+2.55.0
+

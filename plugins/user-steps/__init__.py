@@ -424,8 +424,31 @@ PRODUCER_SCHEMA = {
                                                'description': 'Use alone (no request). Removes this session\'s undecided request from the user\'s For you queue; refused once a decision is recorded.'}}}}
 
 
+_EARLY_DISPOSE = None
+
+
+def _register_clarify_early() -> None:
+    """Hand recorded decisions to a session blocked in clarify (core tools/clarify_early.py). Older cores lack it."""
+    global _EARLY_DISPOSE
+    try:
+        from tools import clarify_early as core_early  # type: ignore
+    except ImportError:
+        return
+    try:
+        from . import clarify_early as provider_mod
+    except ImportError:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location("user_steps_clarify_early", Path(__file__).with_name("clarify_early.py"))
+        provider_mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(provider_mod)  # type: ignore[union-attr]
+    if _EARLY_DISPOSE:
+        _EARLY_DISPOSE()
+    _EARLY_DISPOSE = core_early.register_provider(provider_mod.make_provider())
+
+
 def register(ctx) -> None:
     _require_publication_contract()
+    _register_clarify_early()
     ctx.register_hook("pre_final_gate", publication_buffer)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)
