@@ -13,7 +13,7 @@ pending at the end of a turn rides the next turn's `pre_llm_call` context. Each 
 | `repeat_failure` | the same (whitespace-normalized) command or code fails 3× | stop retrying, reproduce, form one hypothesis, test it (systematic-debugging) |
 | `poll_loop` | `sleep` inside a `while/until/for` loop, or ≥3 sleep/poll calls in the last 10 | `terminal(background=true, notify=true)` or a Kanban card, then end the turn |
 | `no_checkpoint` | 40 tool calls in one user turn | write a state summary before more tool calls |
-| `live_checkout` | `write_file`/`patch` under the running Hermes checkout, or `git commit/pull/reset/…`, `sed -i`, `npm run pack` there | use `hermes-core-wt new/ship` |
+| `live_checkout` | `write_file`/`patch` under the running Hermes checkout, or `git commit/pull/reset/…`, `sed -i`, `npm run pack` there (HEAD moves, repacks and non-ignored file writes are refused up front by the guard below) | use `hermes-core-wt new/ship` |
 | `plan_first` | the user's message is a new build ask (build/implement/extend/create… plus 25+ words, not a fix/bug report, not a "go"), the user has seen no reply in this session (no final reply, no answered `clarify`), and the agent makes its first project edit: `write_file`/`patch` outside scratch (`/tmp`, `$TMPDIR`, `~/.hermes/cache`, `~/.hermes/plans`; `COACH_SCRATCH_ROOTS` overrides), or a terminal `git commit` / `git worktree add` / `git apply` / `sed -i` / output redirect into a git repo, or the same `write_file`/`patch`/`terminal` helper calls inside `execute_code` (literal strings, string assignments, concatenation, f-strings, `os.path.join`/`Path(...)`/`/`, `expanduser`, `$TMPDIR` lookups, loops over string literals, imported aliases). A path with a dynamic tail is judged by its statically known prefix: `R + k` in a loop with `R` outside scratch fires, the same under `/tmp` or `$TMPDIR` does not. A path with no static prefix at all (a function's return value) is not inferred and stays quiet. Comments, code quoted as content and calls hidden behind user-defined functions do not count. Never for cron runs or subagents. Once per session | post the plan as the reply and end the turn for the user's go |
 
 The live checkout is the tree that `hermes_cli` is imported from. Override it with `COACH_LIVE_CHECKOUT`.
@@ -34,6 +34,16 @@ clones pass. A backtest over 37.6k past Hermes terminal calls blocks 43, and eve
 HEAD move or repack. Escape hatch for a change the user explicitly asked for: start the command with
 `COACH_ALLOW_LIVE=1`. Blocks are logged as `agent_block` in `log.jsonl`.
 
+**Live-tree file writes are refused too.** `write_file`/`patch` (incl. V4A `*** Update File:` paths) on a path in
+the live checkout, `execute_code` that writes a tree path (or hands `terminal()` such a command), and terminal writes
+there: output redirects, `sed -i`/`perl -pi`, `cp/mv/install/rsync/ln` destinations, `tee/rm/truncate/touch`,
+`patch`, `git stash/apply/rm/mv`, and Python heredocs / `python -c` scripts that have a write call and name a tree
+path (relative paths resolve against the last `cd`/`workdir`/`os.chdir`). Why: backends lazily import from the tree,
+so even a transient edit can load live, and `hermes update` stamps the version `.dirty` (2026-10-28: a heredoc
+`open(p,'w').write(...)` on `hermes_cli/kanban_wake_check.py`, reverted a minute later). Gitignored paths (`logs/`,
+`venv/`, `node_modules/`) and reads (`read_file`, `cat`, `grep`, `sed -n`, `git log/status/diff`, `git stash list`,
+`git apply --check`) pass. Escape hatch: `COACH_ALLOW_LIVE=1` at the start of the command or in the `execute_code`
+source; for `write_file`/`patch`, in the process env. Tests: `tests/test_live_checkout_writes.py`.
 **Compute envelope (`compute_envelope.py`; `pre_tool_call` on `kanban_block` + `pre_verify`).** The standing rule
 (rent-machine skill, `~/AGENTS.md`): after the user's go on a job that needs a GPU, an agent may rent one single-GPU
 machine up to $25 total without asking. A deterministic classifier (no model call) catches a `kanban_block`

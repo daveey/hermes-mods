@@ -405,7 +405,8 @@ def test_live_checkout_block_allows_reads_worktrees_and_escape(tmp_path):
                 f"cd {tmp_path}/scratch/pp && U=$(git -C {live} rev-parse upstream/main); git checkout -q -f $U",
                 f"cd {live} && WT={tmp_path}/wt && git worktree add -q --detach $WT upstream/main && cd $WT && git am x.patch"):
         assert not blk("terminal", {"command": cmd}, live), cmd
-    assert not blk("write_file", {"path": str(live / "x.py")}, live)  # edits stay a post-hoc hint
+    assert not blk("write_file", {"path": str(tmp_path / "elsewhere" / "x.py")}, live)
+    # live-tree file writes are refused now too: tests/test_live_checkout_writes.py
 
 
 def test_pre_tool_call_hook_returns_block(tmp_path):

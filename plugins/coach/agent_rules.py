@@ -709,15 +709,33 @@ def _target_dir(cmd: str, pos: int, explicit: str, workdir: str) -> Optional[str
 
 def blocks_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Optional[str]:
     """The live-checkout change that must be refused BEFORE it runs: anything that moves HEAD (every running
-    backend then reports code skew and the Desktop restarts, killing in-flight turns in every chat) or
-    repacks the running Hermes.app. Plain file edits stay a post-hoc hint. `COACH_ALLOW_LIVE=1` in the
-    command is the escape hatch for a change the user explicitly asked to make in the live tree."""
-    if not checkout or tool != "terminal":
+    backend then reports code skew and the Desktop restarts, killing in-flight turns in every chat), repacks
+    the running Hermes.app, or writes a source file in the tree (backends lazily import from it, so even a
+    transient edit can load live, and `hermes update` stamps the version `.dirty`). Writes to gitignored
+    paths (logs, venv, node_modules, build output) stay allowed. `COACH_ALLOW_LIVE=1` in the command (or the
+    process env, for write_file/patch/execute_code) is the escape hatch for a change the user explicitly asked
+    to make in the live tree."""
+    if not checkout:
+        return None
+    root = str(checkout)
+    if tool in ("write_file", "patch", "execute_code"):
+        if os.environ.get("COACH_ALLOW_LIVE") == "1":
+            return None
+        if tool == "execute_code":
+            code = str(args.get("code") or "")
+            if ALLOW_LIVE_RE.search(code):
+                return None
+            return _execute_code_live_write(code, root)
+        for path in _edit_tool_paths(tool, args):
+            hit = _live_write_target(path, "", root)
+            if hit:
+                return f"{tool} of `{hit}`"
+        return None
+    if tool != "terminal":
         return None
     raw = str(args.get("command") or "")
     if ALLOW_LIVE_RE.search(raw):
         return None
-    root = str(checkout)
     cmd = shell_code(raw)
     wd = str(args.get("workdir") or "")
     if any(not re.match(r"[^;&|\n]*--help", cmd[m.end():]) for m in UPDATE_RE.finditer(cmd)):
@@ -733,11 +751,208 @@ def blocks_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Opt
         d = _target_dir(cmd, m.start(), "", wd)
         if d and _inside(d, root):
             return f"`{m.group(1).strip()}`"
+    return _terminal_live_write(raw, cmd, wd, root)
+
+
+# ── live-tree file writes (refused in pre_tool_call) ──
+PY_RUNNER_RE = re.compile(r"(?:^|[\s;&|(/])(?:python[\d.]*|pypy[\d.]*)(?=\s|$)")
+PY_DASH_C_RE = re.compile(r"""(?:^|[\s;&|(/])(?:python[\d.]*|pypy[\d.]*)\s+(?:-\w+\s+)*-c\s+("(?:[^"\\]|\\.)*"|'[^']*')""")
+PY_WRITE_RE = re.compile(r"(?<!stdout)(?<!stderr)\.write\(|\.write_text\(|\.write_bytes\(|\.writelines\(|\bopen\([^)\n]*?['\"][rb]*[wax]\+?[bt]?['\"]"
+                         r"|\bmode\s*=\s*['\"][rb]*[wax]|\bshutil\.(?:copy\w*|move)\(|\bos\.(?:replace|rename|remove|unlink)\("
+                         r"|\.unlink\(|\.rename\(|\.touch\(")
+PY_CHDIR_RE = re.compile(r"""\bos\.chdir\(\s*(?:os\.path\.expanduser\(\s*)?(['"])([^'"\n]+)\1""")
+PY_LITERAL_RE = re.compile(r"""(['"])((?:(?!\1)[^\\\n]|\\.)*)\1""")
+INPLACE_EDIT_RE = re.compile(r"(\bsed\s+(?:-\w+\s+)*-i\b|\bperl\s+-\w*i\w*\b)")
+FILE_CMD_RE = re.compile(r"(?:^|(?<=[;&|(\n]))\s*(?:sudo\s+)?(cp|mv|install|rsync|ln|tee|rm|truncate|touch|patch)(?=\s)")
+GIT_FILE_WRITE_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)[^;&|\n]*?\s(stash|apply|rm|mv)(?![-\w])")
+
+
+def _rel(path: str, root: str) -> str:
+    try:
+        return os.path.relpath(path, root)
+    except ValueError:
+        return path
+
+
+def _ignored(path: str, root: str) -> bool:
+    """True when git ignores `path` in the live tree (logs, venv, node_modules, build output). Tracked files are
+    never ignored. Unknown (not a repo, git missing, timeout) counts as NOT ignored, so the write is refused."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", root, "check-ignore", "-q", "--", _rel(path, root)],
+                           capture_output=True, timeout=3)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _live_write_target(target: str, base: str, root: str) -> Optional[str]:
+    """`target` (resolved against `base`) as a root-relative path, when it is a non-ignored path inside the tree."""
+    t = (target or "").strip().strip("\"'")
+    if not t or t.startswith("&") or "$" in t or "`" in t or "\n" in t or set(t) <= {"_"}:
+        return None
+    t = os.path.expanduser(t)
+    if not os.path.isabs(t):
+        if not base or not os.path.isabs(base):
+            return None
+        t = os.path.join(base, t)
+    t = os.path.normpath(t)
+    if not _inside(t, root):
+        return None
+    try:
+        rp = str(Path(t).resolve())
+    except Exception:
+        rp = t
+    if rp == root or _ignored(rp, root):
+        return None
+    return _rel(rp, root)
+
+
+def _edit_tool_paths(tool: str, args: dict) -> list:
+    out = [str(args.get("path") or "")]
+    if tool == "patch":  # V4A multi-file patches name their files in the body
+        body = str(args.get("patch") or "")
+        out += re.findall(r"(?m)^\*\*\* (?:Update|Add|Delete) File:\s*(.+?)\s*$", body)
+        out += re.findall(r"(?m)^\*\*\* Move to:\s*(.+?)\s*$", body)
+    return [p for p in out if p]
+
+
+def _py_literals(src: str) -> list:
+    try:
+        return [n.value for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    except Exception:
+        return [m.group(2) for m in PY_LITERAL_RE.finditer(src)]
+
+
+def _python_live_write(src: str, cwd: str, root: str) -> Optional[str]:
+    """A tree path Python `src` probably writes: it has a write call and names a non-ignored tree path
+    (absolute, `~`-relative, or relative to its cwd / an `os.chdir` literal)."""
+    if not PY_WRITE_RE.search(src):
+        return None
+    m = PY_CHDIR_RE.search(src)
+    if m:
+        cwd = os.path.expanduser(m.group(2))
+    for lit in _py_literals(src):
+        if not lit or len(lit) > 400 or "\n" in lit or " " in lit.strip():
+            continue
+        if not ("/" in lit or re.search(r"\.\w{1,5}$", lit)):
+            continue
+        hit = _live_write_target(lit, cwd, root)
+        if hit:
+            return hit
     return None
+
+
+def _execute_code_live_write(code: str, root: str) -> Optional[str]:
+    hit = _python_live_write(code, "", root)
+    if hit:
+        return f"an execute_code write to `{hit}`"
+    for lit in _py_literals(code):  # shell commands handed to terminal(...) from inside the script
+        if len(lit) < 6 or " " not in lit or ALLOW_LIVE_RE.search(lit):
+            continue
+        what = _terminal_live_write(lit, shell_code(lit), "", root)
+        if what:
+            return f"{what} (from execute_code)"
+    return None
+
+
+def _heredoc_python_bodies(raw: str):
+    """(body, text before the opener) for every heredoc fed to a Python interpreter."""
+    pos = 0
+    while True:
+        m = HEREDOC_RE.search(raw, pos)
+        if not m:
+            return
+        nl = raw.find("\n", m.end())
+        if nl < 0:
+            return
+        line_start = raw.rfind("\n", 0, m.start()) + 1
+        end = re.compile(r"^\t*" + re.escape(m.group(2)) + r"[ \t]*$", re.M).search(raw, nl + 1)
+        if PY_RUNNER_RE.search(raw[line_start:m.start()]):
+            yield raw[nl + 1:end.start() if end else len(raw)], raw[:m.start()]
+        pos = end.end() if end else len(raw)
+
+
+def _seg_words(seg: str) -> list:
+    import shlex
+    try:
+        return shlex.split(seg)
+    except Exception:
+        return seg.split()
+
+
+def _terminal_live_write(raw: str, cmd: str, wd: str, root: str) -> Optional[str]:
+    """A file write into the live tree by a terminal command: an output redirect, `sed -i`/`perl -pi`,
+    cp/mv/tee/rm-style file commands, `git stash/apply/rm/mv`, or a Python heredoc / `-c` script that writes a
+    tree path. `raw` is the command as sent; `cmd` is `shell_code(raw)` (quoted data and heredoc bodies masked)."""
+    home_form = root.replace(str(Path.home()), "~", 1)
+    for m in REDIRECT_RE.finditer(cmd):
+        hit = _live_write_target(m.group(1), _target_dir(cmd, m.start(), "", wd) or "", root)
+        if hit:
+            return f"a write to `{hit}`"
+    for m in INPLACE_EDIT_RE.finditer(cmd):
+        seg = _segment(cmd, m.start())
+        d = _target_dir(cmd, m.start(), "", wd) or ""
+        for w in _seg_words(seg)[1:]:
+            hit = None if w.startswith("-") else _live_write_target(w, d, root)
+            if hit:
+                return f"`{m.group(1).strip()}` of `{hit}`"
+    for m in FILE_CMD_RE.finditer(cmd):
+        name = m.group(1)
+        seg = _segment(cmd, m.start(1))
+        d = _target_dir(cmd, m.start(1), "", wd) or ""
+        words = [w for w in _seg_words(seg)[1:] if not w.startswith("-")]
+        if name == "patch":
+            if d and _inside(d, root) and not _ignored(d, root):
+                return "`patch`"
+            continue
+        if name in ("cp", "install", "rsync", "ln"):
+            words = words[-1:]
+        for w in words:
+            hit = _live_write_target(w, d, root)
+            if hit:
+                return f"`{name}` of `{hit}`"
+    for m in GIT_FILE_WRITE_RE.finditer(cmd):
+        rest = cmd[m.end():]
+        if m.group(2) == "stash" and re.match(r"\s+(list|show)\b", rest):
+            continue
+        if m.group(2) == "apply" and re.match(r"[^;&|\n]*\s--(check|stat|numstat|summary)\b", rest):
+            continue
+        explicit = re.sub(r"^\s*-C\s+", "", m.group(1) or "")
+        d = _target_dir(cmd, m.start(), explicit, wd)
+        if (d and _inside(d, root)) or (d is None and (root in explicit or home_form in explicit)):
+            return f"`git {m.group(2)}`"
+    for body, prefix in _heredoc_python_bodies(raw):
+        pre = shell_code(prefix)
+        hit = _python_live_write(body, _target_dir(pre, len(pre), "", wd) or "", root)
+        if hit:
+            return f"a Python heredoc write to `{hit}`"
+    for m in PY_DASH_C_RE.finditer(raw):
+        src = m.group(1)[1:-1]
+        if m.group(1).startswith('"'):
+            src = re.sub(r'\\(["\\$`])', r"\1", src)
+        pre = shell_code(raw[:m.start()])
+        hit = _python_live_write(src, _target_dir(pre, len(pre), "", wd) or "", root)
+        if hit:
+            return f"a `python -c` write to `{hit}`"
+    return None
+
+
+WRITE_BLOCK_PREFIXES = ("a ", "write_file", "patch", "`sed", "`perl", "`cp", "`mv", "`install", "`rsync", "`ln",
+                        "`tee", "`rm", "`truncate", "`touch", "`patch", "`git stash", "`git apply", "`git rm", "`git mv")
 
 
 def block_message(what: str, checkout: Path) -> str:
     path = str(checkout).replace(str(Path.home()), "~", 1)
+    if what.startswith(WRITE_BLOCK_PREFIXES):
+        return (f"COACH LIVE-CHECKOUT GUARD: blocked {what} in {path}, the checkout every running Hermes backend "
+                "executes. Backends lazily import from this tree, so even a transient edit can be loaded live, and "
+                "`hermes update` then stamps the version `.dirty`. Reading is fine (read_file, grep, cat, git diff); "
+                "write in a worktree: `~/.hermes/bin/hermes-core-wt new <slug>` -> edit/test/commit there -> "
+                f"`hermes-core-wt ship <slug>` (no hermes-core-wt on this host: `git -C {path} worktree add -b "
+                "fix/<slug> ~/code/_wt/<slug> origin/main`). Probe scripts go in $TMPDIR, not the tree. Only if the "
+                "user explicitly asked for this exact change in the live tree, rerun with `COACH_ALLOW_LIVE=1` at "
+                "the start of the command.")
     return (f"COACH LIVE-CHECKOUT GUARD: blocked {what} in {path}, the checkout every running Hermes backend executes. "
             "Moving its HEAD or repacking the app makes Desktop restart and kills in-flight turns in every chat "
             "(measured: ~10 Desktop quits on 2026-10-13, mostly from live-tree commits). Do core work in a worktree: "
