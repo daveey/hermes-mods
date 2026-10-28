@@ -82,7 +82,10 @@ Opus, same rubric, counts-only tool log) where they agree, and claude-opus-5-5 w
 91 disputed rows. Gold is mostly Opus-defined, so the numbers below are agreement with that rubric, not human truth.
 Split 70/30 by session hash; the operating point was chosen on train only, held-out scored once
 (`eval/report_only_cascade_eval.py`; files in `~/.hermes/kanban/evidence/report-only/v2/`). The prefilter keeps 81% of
-the gold positives, which caps recall. Production path: prefilter, scope-limit guard, Sonnet `coach_reply` screen; when
+the gold positives, which caps recall. The prefilter also passes leftovers named by likeness ("O-7 through O-11 have
+the same ... problem", "are also affected") and workarounds handed to the user ("if it holds one, pressing 'Post now'
+will work", "you can click Retry to ..."); added for bot-dc58243931, they change no row of the 762-row MacBook set
+(identical candidates, so identical judge precision) and replays of that turn through `pre_verify` nudged 4 of 5. Production path: prefilter, scope-limit guard, Sonnet `coach_reply` screen; when
 the screen's report_only p >= 0.75 (`CONFIRM_FLOOR`) one call to `coach_report_only` (claude-opus-5-5, labeling rubric
 plus the real args of kanban_create, delegate_task, patch and terminal calls) labels the outcome; a report_only +
 agent_fixable label is p 0.9 and nudges (`report_only=0.5`). Capped at 100 confirm calls per host per day (events

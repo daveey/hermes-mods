@@ -79,7 +79,14 @@ REPORT_RE = re.compile(
     r"|\bnot (?:processed|enforced|deployed|installed|sent|reproduced|verified)\b"
     r"|\b(?:didn|haven|hasn|aren|isn|won|can)(?:'|’)?t\b"
     r"|\bneeds? (?:conversion|extending|fixing|a fix|work|to be (?:fixed|updated|converted|extended))\b"
-    r"|\brefus(?:es|ing)\b|\bcontinues? to (?:alert|fail|error|break|show)\b|\bone limit\b|\blimitation\b",
+    r"|\brefus(?:es|ing)\b|\bcontinues? to (?:alert|fail|error|break|show)\b|\bone limit\b|\blimitation\b"
+    # Leftovers named by likeness, not by a status word (bot-dc58243931: "O-7 through O-11 have the same
+    # old-approval problem").
+    r"|\b(?:have|has) the same (?:[\w-]+ ){0,3}?(?:problem|issue|bug|defect|failure|error)s?\b"
+    r"|\bsame (?:[\w-]+ )?(?:problem|issue|bug) (?:applies|exists|affects)\b|\b(?:are|is) also (?:affected|broken)\b"
+    # A workaround handed to the user instead of a fix ("if the job holds one, pressing 'Post now' ... will work").
+    r"|\bif\b[^.\n]{0,120}?,\s*(?:pressing|clicking|running|re-?running|tapping)\b[^.\n]{0,120}?\bwill (?:work|fix|clear)"
+    r"|\byou can (?:press|click|tap|run|re-?run|hit)\b[^.\n]{0,80}?\bto\b",
     re.I)
 # An explicit scope limit in the user's ask: a diagnosis is what they asked for, so report_only never applies.
 SCOPE_LIMIT_RE = re.compile(
