@@ -279,13 +279,26 @@ withdrawn and closed requests are never a target, so asking again after a decisi
 or withdrawal is still a fresh ask. The final-reply plan gate uses the same matcher,
 so a reworded restatement of a published approval no longer holds the reply.
 
-`action_request`: a new request whose title matches an open, undecided, card-free
-request of the session revises that request (newest one) and withdraws older
-duplicates (`by: agent`, `Duplicate of <id>`); a decided request is never touched.
-A request that says it asks nothing ("No decision needed: ...", scope "Settled,
-nothing to decide") is never published: a revision withdraws the request, a new one
-is refused with the withdraw instruction. None of this records a decision or grants
-anything. `tests/test_one_open_ask.py` replays each live duplicate.
+Card and menu rules also need the same words: two different asks about one card
+("register a runner for t_X" / "delete t_X's stale branch") stay separate, a card
+named only in the evidence sentence anchors nothing, and a menu must share the
+approval's labels and topic. Evidence-sentence rules need a specific sentence (30+
+characters, 5+ words), so "Let me know which you prefer." merges nothing.
+
+`action_request`: a new request whose title (20+ characters) matches an open,
+undecided, card-free request of the session revises that request in place when it
+is provably the same ask (an extracted or plan-less tile, or the same plan re-sent)
+and withdraws older such duplicates (`by: agent`, `Duplicate of <id>`). A complete
+plan with a different scope under the same title is published separately and the
+result's `note` names the other open request to withdraw if it is replaced. The
+in-place revision is refused if a decision was recorded meanwhile
+(`revise(..., undecided=True)`), and the request is then published as new: the
+decision wins. A request that says, unscoped, that it asks nothing (title "No
+decision needed: ...", scope "Settled, nothing to decide.") is never published: a
+revision (with `expectedRevision`) withdraws the request, a new one is refused with
+the withdraw instruction. None of this records a decision or grants anything.
+`tests/test_one_open_ask.py` replays each live duplicate and the adversarial
+review's keep-both cases.
 
 ## Limits
 

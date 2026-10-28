@@ -49,11 +49,11 @@ def live(store, session='session-a'):
     return [r for r in store.requests(dict(OWNER, storedSessionId=session)) if r['state'] in ('open', 'needs_context')]
 
 
-def approval(title, markdown='Change example.py; run its tests.', aliases=None):
+def approval(title, markdown='Change example.py; run its tests.', aliases=None, labels=('Approve', 'Revise', 'Decline')):
     return dict(schemaVersion=2, owner=OWNER.copy(), requestId=str(uuid.uuid4()), revision=1, kind='approval',
                 title=title, scope=dict(markdown=markdown, complete=True, sourceRefs=[]), limits=[], exclusions=[],
                 outcomes=dict(approve='Do exactly this', revise='Keep it blocked', decline='Cancel'),
-                choices=[dict(id=e, label=e.title(), effect=e) for e in ('approve', 'revise', 'decline')],
+                choices=[dict(id=e, label=l, effect=e) for e, l in zip(('approve', 'revise', 'decline'), labels)],
                 aliases=aliases or [], state='open')
 
 
@@ -124,7 +124,7 @@ def test_extractor_restating_a_published_title_does_not_mint_a_second_tile(tmp_p
 def test_extractor_choice_menu_of_the_open_approval_is_not_a_second_ask(tmp_path):
     # Same chat: "**Your choices:** Approve fix / Change plan / Decline" became its own choice tile.
     store, ledger = env(tmp_path)
-    store.create(OWNER, approval('Approve the notify fix?'))
+    store.create(OWNER, approval('Approve the notify fix?', labels=('Approve fix', 'Change plan', 'Decline')))
     text = ('**Your choices:**\n- **Approve fix:** an agent does steps 1-6.\n- **Change plan:** tell me what to '
             'change.\n- **Decline:** nothing changes.')
     reply(store, ledger, text, [{'text': 'Choose: approve fix, change plan, or decline the notify repair',
@@ -239,13 +239,28 @@ def test_gate_still_holds_an_approval_ask_with_no_published_plan(plugin, monkeyp
 
 # ---- tool path (action_request) ---------------------------------------------------------------------------
 
-def test_tool_reask_with_the_same_title_revises_the_open_request(plugin, tmp_path):
+def test_tool_reask_with_the_same_title_and_plan_revises_the_open_request(plugin, tmp_path):
     first = publish(plugin, {'request': payload_of(approval('Approve the notify fix?'))})['request']
-    again = publish(plugin, {'request': payload_of(approval('Approve the notify fix?', markdown='Better plan.'))})
+    again = publish(plugin, {'request': payload_of(approval('Approve the notify fix?'))})
     store = plugin.core.ActionStore()
     assert [r['requestId'] for r in live(store)] == [first['requestId']]
     assert again['request']['requestId'] == first['requestId'] and again['request']['revision'] == 2
     assert 'revised' in again['note'] and first['requestId'] in again['note']
+
+
+def test_tool_same_title_with_a_different_complete_plan_keeps_both_and_says_so(plugin):
+    # Reviewer L5: "Approve the plan." for plan B must not overwrite plan A in place.
+    first = publish(plugin, {'request': payload_of(approval('Approve the migration plan.', markdown='Migrate DB A.'))})
+    second = publish(plugin, {'request': payload_of(approval('Approve the migration plan.', markdown='Delete bucket B.'))})
+    assert second['request']['requestId'] != first['request']['requestId']
+    assert first['request']['requestId'] in second['note'] and 'withdraw' in second['note']
+    assert len(live(plugin.core.ActionStore())) == 2
+
+
+def test_tool_short_generic_titles_are_never_folded(plugin):
+    publish(plugin, {'request': payload_of(approval('OK?'))})
+    publish(plugin, {'request': payload_of(approval('OK.'))})
+    assert len(live(plugin.core.ActionStore())) == 2
 
 
 def test_tool_reask_collapses_existing_duplicates_and_keeps_extracted_aliases(plugin, tmp_path):
@@ -303,3 +318,107 @@ def test_rerender_of_an_extracted_step_keeps_its_request_id(tmp_path):
     step = ledger.read('session-a')['steps'][0]
     again = store.migrate_step(OWNER, step)
     assert again['requestId'] == out['steps'][0]['requestId'] and len(store.requests(OWNER)) == 1
+
+
+# ---- adversarial review cases: distinct asks that must stay separate ----------------------------------------
+
+def test_two_different_asks_about_one_card_stay_separate(tmp_path):
+    store, ledger = env(tmp_path)  # reviewer L1
+    a = 'Should I register a spare runner for t_aaaa1111 now?'
+    b = 'Should I delete the stale branch of t_aaaa1111 as well?'
+    reply(store, ledger, a, [{'text': 'Approve registering a spare runner for t_aaaa1111', 'kind': 'approve',
+                              'verbatim_span': a, 'options': []}])
+    reply(store, ledger, b, [{'text': 'Approve deleting the stale branch of t_aaaa1111', 'kind': 'approve',
+                              'verbatim_span': b, 'options': []}])
+    assert len(live(store)) == 2
+
+
+def test_a_card_named_only_in_the_evidence_does_not_anchor(tmp_path):
+    store, ledger = env(tmp_path)  # reviewer L2
+    a = 'Should I register a spare runner for t_aaaa1111 now?'
+    b = 'Once t_aaaa1111 lands, should I also rotate the deploy key?'
+    reply(store, ledger, a, [{'text': 'Approve registering a spare runner for t_aaaa1111', 'kind': 'approve',
+                              'verbatim_span': a, 'options': []}])
+    reply(store, ledger, b, [{'text': 'Approve rotating the deploy key', 'kind': 'approve',
+                              'verbatim_span': b, 'options': []}])
+    assert len(live(store)) == 2
+
+
+def test_a_generic_closing_sentence_does_not_merge_two_questions(tmp_path):
+    store, ledger = env(tmp_path)  # reviewer L3
+    tail = 'Let me know which you prefer.'
+    reply(store, ledger, 'Cache in Redis or SQLite? ' + tail, [{'text': 'Pick the cache store', 'kind': 'choose',
+          'verbatim_span': tail, 'options': ['Redis', 'SQLite']}])
+    reply(store, ledger, 'Logo in blue or green? ' + tail, [{'text': 'Pick the logo colour', 'kind': 'choose',
+          'verbatim_span': tail, 'options': ['Blue', 'Green']}])
+    assert len(live(store)) == 2
+
+
+def test_a_menu_about_another_topic_is_not_the_open_approvals_menu(tmp_path):
+    store, ledger = env(tmp_path)  # reviewer L4
+    store.create(OWNER, approval('Approve deploying build 9?'))
+    text = 'For the vendor contract: approve, request changes, or decline?'
+    reply(store, ledger, text, [{'text': 'Approve, request changes, or decline the vendor contract', 'kind': 'choose',
+                                 'verbatim_span': text, 'options': ['Approve', 'Request changes', 'Decline']}])
+    assert len(live(store)) == 2
+
+
+def test_scoped_no_action_wording_is_a_real_ask(plugin):
+    # reviewer L7/L8: a scoped "no input needed for steps 1-3" or "from ops" still asks something.
+    r = publish(plugin, {'request': payload_of(approval('Approve the rollout plan for the API'))})['request']
+    rev = payload_of(approval('Approve the rollout plan for the API',
+                              markdown='No input needed from you for steps 1-3. Step 4 needs your approval.'))
+    out = publish(plugin, {'request': rev, 'requestId': r['requestId'], 'expectedRevision': 1})
+    assert out['request']['state'] == 'open' and out['request']['revision'] == 2
+    new = publish(plugin, {'request': payload_of(approval('No action required from ops: approve the budget increase?'))})
+    assert new['request']['state'] == 'open'
+
+
+def test_noop_revision_needs_expected_revision(plugin):
+    r = publish(plugin, {'request': payload_of(approval('Add a backup model to settings?'))})['request']
+    out = publish(plugin, {'request': payload_of(approval('No decision needed: already set')), 'requestId': r['requestId']})
+    assert 'error' in out and live(plugin.core.ActionStore())
+
+
+def test_model_repeat_naming_an_extracted_tile_by_its_step_id_is_honoured(tmp_path):
+    store, ledger = env(tmp_path)  # reviewer D1
+    first = reply(store, ledger, 'Which region should the cluster use?', [{
+        'text': 'Pick the cluster region', 'kind': 'input', 'verbatim_span': 'Which region should the cluster use?',
+        'options': []}])
+    span = 'Still need the region for the cluster before I continue, please.'
+    reply(store, ledger, span, [{'text': 'Choose the region for the cluster', 'kind': 'input', 'verbatim_span': span,
+                                 'options': []}], repeats=[{'id': first['steps'][0]['id'], 'verbatim_span': span}])
+    assert len(live(store)) == 1
+
+
+def test_malformed_repeats_keep_the_model_result(tmp_path):
+    store, ledger = env(tmp_path)  # reviewer C1
+    out = reply(store, ledger, 'Should I deploy build 12 to staging?', [{
+        'text': 'Approve deploying build 12', 'kind': 'approve', 'verbatim_span': 'Should I deploy build 12 to staging?',
+        'options': []}], repeats=5)
+    assert out['source'] == 'model' and len(out['steps']) == 1
+
+
+def test_gate_holds_a_reask_of_an_open_plan_less_approval(plugin, monkeypatch):
+    # reviewer G1: a listed open title must not drop the approval before the gate judges it.
+    store, ledger = plugin.core.ActionStore(), plugin.core.Ledger()
+    plugin.core.process_reply('Want me to deploy build 9 to prod?', 'session-a', ledger=ledger, action_store=store,
+                              action_owner=OWNER, llm=lambda *a: json.dumps({'steps': [{
+                                  'text': 'Approve deploying build 9', 'kind': 'approve',
+                                  'verbatim_span': 'Want me to deploy build 9 to prod?', 'options': []}], 'resolved': []}))
+    monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps({'steps': [{
+        'text': 'Approve deploying build 9', 'kind': 'approve', 'verbatim_span': 'Want me to deploy build 9 to prod?',
+        'options': []}], 'resolved': []}))
+    out = plugin.publication_buffer(session_id='session-a', platform='cli',
+                                    final_response='Want me to deploy build 9 to prod?')
+    assert out and out.get('hold') is True
+
+
+def test_automatic_reask_revision_loses_to_a_recorded_decision(tmp_path):
+    store, _ = env(tmp_path)  # reviewer S4
+    r = store.create(OWNER, approval('Approve the notify fix?'))
+    store.decide(OWNER, dict(requestId=r['requestId'], expectedRevision=1, choiceId='approve', idempotencyKey='k',
+                             revisionText=None))
+    with pytest.raises(core.ActionError):
+        store.revise(OWNER, r['requestId'], 1, dict(r, title='Approve the notify fix?'), undecided=True)
+    assert store.get(OWNER, r['requestId'])['resolution']['choiceId'] == 'approve'

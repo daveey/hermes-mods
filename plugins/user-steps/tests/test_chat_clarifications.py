@@ -138,7 +138,7 @@ def test_missing_plan_returns_agent_work(monkeypatch, env):
     monkeypatch.setattr(plugin.core, 'server_owner', lambda _: OWNER)
     monkeypatch.setattr(plugin.core, 'ActionStore', lambda: st)
     monkeypatch.setattr(plugin.core, '_worth_asking', lambda _: True)
-    monkeypatch.setattr(plugin.core, 'extract', lambda *_: {'steps': [{'kind': 'approve', 'text': 'Approve the changes?'}]})
+    monkeypatch.setattr(plugin.core, 'extract', lambda *_, **__: {'steps': [{'kind': 'approve', 'text': 'Approve the changes?'}]})
     assert plugin.publication_buffer(session_id='session', final_response='Approve?')['hold']
     assert 'replace' in plugin.publication_buffer(session_id='session', final_response='Approve?', attempt=2)
     result = json.loads(plugin.publish_action_request({'request': {'kind': 'approval', 'scope': {'complete': False}}}, 'session'))
@@ -154,7 +154,7 @@ def test_missing_plan_returns_agent_work(monkeypatch, env):
         choices=[{'id':e, 'label':e, 'effect':e} for e in ('approve','revise','decline')])
     st.revise(OWNER, broken['requestId'], 1, complete)
     assert plugin.publication_buffer(session_id='session', final_response='Approve?') is None
-    monkeypatch.setattr(plugin.core, 'extract', lambda *_: {'steps': [{'kind': 'choose', 'text': QUESTION}]})
+    monkeypatch.setattr(plugin.core, 'extract', lambda *_, **__: {'steps': [{'kind': 'choose', 'text': QUESTION}]})
     assert plugin.publication_buffer(session_id='session', final_response=QUESTION) is None
 
 

@@ -216,8 +216,9 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     # words is covered by it. Without them every paraphrase held the reply and pushed the agent to publish
     # the same approval again (hub chat 67cb2d).
     open_asks = core.open_asks(store, owner, _ledger().read(session_id).get('steps', []))
+    # continuity=True: the listed titles must not silently drop a re-ask before covered() judges it.
     res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks],
-                       '', aux_llm)
+                       '', aux_llm, continuity=True)
     approvals = [s for s in res.get('steps', []) if s['kind'] == 'approve']
     if not approvals:
         return None
@@ -285,6 +286,7 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
                 raise core.ActionError('Nothing to ask: this request says no decision is needed, so it is not '
                                        'published. If an open request is moot, withdraw it with '
                                        '{"withdraw": {"requestId": "<id>", "reason": "<why>"}}.')
+            if 'expectedRevision' not in args: raise core.ActionError('expectedRevision required')
             out = core.withdraw_request(st, _ledger(), owner, args['requestId'], by='agent',
                                         reason=payload.get('title') or 'No decision needed',
                                         expected_revision=args.get('expectedRevision'))
@@ -312,39 +314,63 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         else:
             if 'expectedRevision' in args: raise core.ActionError('New requests have no expectedRevision')
             if refs: raise core.ActionError('Card aliases must be created by decisionCard, not supplied')
-            same = [] if 'decisionCard' in args else [
+            key = core.ask_key(payload.get('title'))
+            scope_md = (payload.get('scope') or {}).get('markdown') if isinstance(payload.get('scope'), dict) else None
+            same = [] if 'decisionCard' in args or len(key) < 20 else [
                 r for r in st.requests(owner)
                 if r['state'] in ('open', 'needs_context') and not r.get('resolution')
-                and not any(a['type'] == 'kanban' for a in r['aliases'])
-                and core.ask_key(r['title']) == core.ask_key(payload.get('title'))]
-            if same:
-                # A re-ask of an open, undecided request with the same title revises that tile (newest one)
-                # and withdraws older duplicates, instead of publishing another tile. Never a decision.
-                target = same[-1]
+                and not any(a['type'] == 'kanban' for a in r['aliases']) and core.ask_key(r['title']) == key]
+            # Revise in place only what is provably the same ask: an extracted or plan-less tile (the agent now
+            # supplies its plan) or the same plan re-sent. A complete plan with different scope under the same
+            # title may be a different decision: keep both and tell the agent.
+            fold = [r for r in same if any(a['type'] == 'user_step' for a in r['aliases'])
+                    or not r['scope']['complete'] or r['scope']['markdown'] == scope_md]
+            others = [r for r in same if r not in fold]
+            note = None
+            if fold:
+                # A re-ask of an open, undecided request revises that tile (newest one) and withdraws older
+                # duplicates, instead of publishing another tile. Never a decision; a decision always wins.
+                target = fold[-1]
                 payload.update(requestId=target['requestId'],
                                aliases=target['aliases'] + [a for a in payload.get('aliases', [])
                                                             if a not in target['aliases']])
-                out = st.revise(owner, target['requestId'], target['revision'], payload, bind=adapter.bind_request)
-                gone = []
-                for r in same[:-1]:
-                    try:
-                        core.withdraw_request(st, _ledger(), owner, r['requestId'], by='agent',
-                                              reason=f"Duplicate of {target['requestId']}",
-                                              expected_revision=r['revision'])
-                        gone.append(r['requestId'])
-                    except core.ActionError:
-                        pass  # decided or moved on meanwhile: the decision wins, keep it
-                note = (f"An open request with this title already existed, so it was revised in place: "
-                        f"{target['requestId']} revision {out['revision']}.")
-                if gone:
-                    note += ' Withdrew duplicates: ' + ', '.join(gone) + '.'
-                return json.dumps({'request': out, 'note': note})
+                try:
+                    out = st.revise(owner, target['requestId'], target['revision'], payload,
+                                    bind=adapter.bind_request, undecided=True)
+                except core.ActionError as exc:
+                    if exc.status != 409: raise
+                    payload.update(requestId=rid, aliases=[a for a in payload['aliases'] if a not in target['aliases']])
+                    fold = []  # decided or moved on meanwhile: publish as a new request below
+                else:
+                    gone = []
+                    for r in fold[:-1]:
+                        try:
+                            core.withdraw_request(st, _ledger(), owner, r['requestId'], by='agent',
+                                                  reason=f"Duplicate of {target['requestId']}",
+                                                  expected_revision=r['revision'])
+                            gone.append(r['requestId'])
+                        except core.ActionError:
+                            pass  # decided or moved on meanwhile: the decision wins, keep it
+                    note = (f"An open request with this title already existed, so it was revised in place: "
+                            f"{target['requestId']} revision {out['revision']}.")
+                    if gone:
+                        note += ' Withdrew duplicates: ' + ', '.join(gone) + '.'
+                    if others:
+                        note += (' Also open with the same title and a different plan: '
+                                 + ', '.join(r['requestId'] for r in others) + '; withdraw any it replaces.')
+                    return json.dumps({'request': out, 'note': note})
+            if others:
+                note = ('Published as a new request. Also open with the same title and a different plan: '
+                        + ', '.join(r['requestId'] for r in others) + '. If this replaces it, withdraw it '
+                        '(or revise it instead of publishing a new one).')
             payload = core.validate_action(payload)
             if 'decisionCard' in args:
                 core._object(args['decisionCard'], ('board',))
                 ref = adapter.prepare(payload, args['decisionCard']['board'])
                 payload['aliases'].append(ref)
             out = st.create(owner, payload, bind=adapter.bind_request)
+            if note:
+                return json.dumps({'request': out, 'note': note})
         return json.dumps({'request': out})
     except (ValueError, TypeError, RuntimeError) as exc:
         return json.dumps({'error': str(exc), 'status': getattr(exc, 'status', 422)})

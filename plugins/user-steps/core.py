@@ -636,8 +636,9 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
         try:
             d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg)))
             resolved = [str(x) for x in (d.get("resolved") or []) if str(x) in ids]
+            raw = d.get("repeats")
             repeats = [{"id": str(x["id"]), "verbatim_span": str(x["verbatim_span"])}
-                       for x in (d.get("repeats") or []) if isinstance(x, dict) and str(x.get("id")) in ids
+                       for x in (raw if isinstance(raw, list) else []) if isinstance(x, dict) and str(x.get("id")) in ids
                        and isinstance(x.get("verbatim_span"), str) and locate(reply, x["verbatim_span"]) is not None]
             return {"steps": validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), "resolved": resolved,
                     "repeats": repeats, "source": "model", "dropped": dropped}
@@ -981,12 +982,25 @@ def reminder(open_steps: list[dict]) -> str:
 
 _EXTRACTED_KIND = {'approve': 'approval', 'choose': 'choice', 'input': 'input', 'do': 'external_step'}
 _MENU = re.compile(r"\bapprov\w*\b.*\b(?:chang|revis)\w*\b.*\bdeclin\w*", re.I | re.S)
-_ASK_KEY_MIN = 8
+_MENU_WORDS = re.compile(r"^(?:approv\w*|chang\w*|revis\w*|declin\w*|choos\w*|request\w*|plan|whether|either|"
+                         r"decide|pick|option\w*)$")
+_ASK_KEY_MIN = 8          # a title/text key shorter than this ("OK?") identifies nothing
+_SPAN_KEY_MIN = 30        # an evidence sentence must be this specific to identify an ask on its own
+_OVERLAP = 0.6
 
 
 def ask_key(text) -> str:
     """Comparison key for a title or evidence sentence: markdown, list marks and end punctuation off."""
     return _LIST_MARK.sub("", _norm(str(text or ""))).strip(" ?.!:;,")
+
+
+def _words(text, drop=None) -> set:
+    out = {w for w in re.findall(r"[a-z0-9][a-z0-9'-]{3,}", _CARD_ID.sub(" ", _norm(str(text or ""))))}
+    return {w for w in out if not (drop and drop.match(w))}
+
+
+def _overlap(a: set, b: set) -> float:
+    return len(a & b) / min(len(a), len(b)) if a and b else 0.0
 
 
 def open_asks(store, owner, steps=()) -> list[dict]:
@@ -995,7 +1009,8 @@ def open_asks(store, owner, steps=()) -> list[dict]:
     sid = owner['storedSessionId']
     by_rid = {s['requestId']: s for s in steps
               if s.get('requestId') and s.get('status') == 'open' and s.get('session') == sid}
-    return [{'id': r['requestId'], 'kind': r['kind'], 'title': r['title'], 'step': by_rid.get(r['requestId'])}
+    return [{'id': r['requestId'], 'kind': r['kind'], 'title': r['title'], 'step': by_rid.get(r['requestId']),
+             'labels': [c.get('label') for c in r.get('choices', [])]}
             for r in store.requests(owner)
             if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
 
@@ -1003,57 +1018,74 @@ def open_asks(store, owner, steps=()) -> list[dict]:
 def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None) -> Optional[dict]:
     """The open ask ``candidate`` (an extracted step) repeats, or None (it is a new ask).
 
-    Same decision when: its text or evidence sentence IS an open ask's title, or the same evidence sentence an
-    open ask was extracted from; the model marked that sentence as a repeat of an open id; it names exactly one
-    Kanban card and every open ask of the same kind naming only that card; or it is the approve/change/decline
-    menu and exactly one open approval exists (or its sentence was already read as one approval). With
-    several candidates, the newest open ask wins (older duplicates are left for withdrawal, not merged)."""
+    Same decision when: its text IS an open ask's title; its evidence sentence (a specific one) is an open
+    ask's title or the sentence an open ask was extracted from in an earlier reply; the model marked that
+    sentence as a repeat of an open id; its text names exactly one Kanban card that an open ask of the same
+    kind names, and the two say mostly the same words; or it is the approve/change/decline menu of the only
+    open approval (the same labels and topic), or its sentence was already read as one approval. With several
+    candidates the newest open ask wins (older duplicates are left for withdrawal, not merged)."""
     text, span = ask_key(candidate.get('text')), ask_key(candidate.get('verbatim_span'))
+    long_span = len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5
 
     def pick(xs):
         return xs[-1] if xs else None
 
     hit = pick([a for a in asks if (len(text) >= _ASK_KEY_MIN and text == ask_key(a['title']))
-                or (len(span) >= _ASK_KEY_MIN and span == ask_key(a['title']))
+                or (long_span and span == ask_key(a['title']))
                 # One sentence can carry two different asks: the same-sentence rule is for LATER replies only.
-                or (a['step'] is not None and not a.get('fresh') and len(span) >= _ASK_KEY_MIN
+                or (long_span and a['step'] is not None and not a.get('fresh')
                     and span == ask_key(a['step'].get('verbatim_span')))])
     if hit:
         return hit
-    ids = {a['id']: a for a in asks}
-    for r in repeats or ():
-        if r.get('id') in ids and len(span) >= _ASK_KEY_MIN and ask_key(r.get('verbatim_span')) == span:
-            return ids[r['id']]
+    ids = {}
+    for a in asks:  # the model sees extracted tiles under their ledger step id, producer ones under the request id
+        ids[a['id']] = a
+        if a['step'] is not None and a['step'].get('id'):
+            ids[a['step']['id']] = a
+    if len(span) >= _ASK_KEY_MIN:
+        for r in repeats or ():
+            if isinstance(r, dict) and r.get('id') in ids and ask_key(r.get('verbatim_span')) == span:
+                return ids[r['id']]
     kind = _EXTRACTED_KIND.get(candidate.get('kind'), 'input')
-    cards = set(_CARD_ID.findall(f"{candidate.get('text') or ''} {candidate.get('verbatim_span') or ''}"))
+    cards = set(_CARD_ID.findall(str(candidate.get('text') or '')))
     if len(cards) == 1:
-        hit = pick([a for a in asks if a['kind'] == kind and set(_CARD_ID.findall(a['title'])) == cards])
+        words = _words(candidate.get('text'))
+        hit = pick([a for a in asks if a['kind'] == kind and set(_CARD_ID.findall(a['title'])) == cards
+                    and _overlap(words, _words(a['title'])) >= _OVERLAP])
         if hit:
             return hit
-    menu = ' '.join([str(candidate.get('text') or '')] + [str(o) for o in candidate.get('options') or []])
-    if candidate.get('kind') == 'choose' and _MENU.search(menu):
-        approvals = [a for a in asks if a['kind'] == 'approval']
-        if len(approvals) == 1:
-            return approvals[0]
+    options = [str(o) for o in candidate.get('options') or []]
+    if candidate.get('kind') == 'choose' and _MENU.search(' '.join([str(candidate.get('text') or '')] + options)):
         prior = (mapped or {}).get(span)  # the same sentence already read as that approval in this reply
         if prior is not None and prior['kind'] == 'approval':
             return prior
+        approvals = [a for a in asks if a['kind'] == 'approval']
+        if len(approvals) == 1:
+            a = approvals[0]
+            labels = {ask_key(x) for x in a.get('labels') or []}
+            topic = _words(candidate.get('text'), _MENU_WORDS)
+            if (len(labels & {ask_key(o) for o in options}) >= 2
+                    and (not topic or _overlap(topic, _words(a['title'])) >= 0.5)):
+                return a
     return None
 
 
-_NOOP_ASK = re.compile(
+# "No decision needed: ..." / scope "Settled, nothing to decide." Unscoped only: "No action required from ops:
+# approve the budget?" or "No input needed for steps 1-3; step 4 needs approval" are real asks.
+_NOOP_TITLE = re.compile(
     r"^(?:no (?:decision|action|answer|input|reply|choice)s? (?:is |are )?(?:needed|required)"
-    r"|nothing (?:to (?:decide|answer|approve|do)|(?:is )?(?:needed|required|waiting)|for you)"
-    r"|settled\b[,:;.]? nothing)\b", re.I)
+    r"|nothing to (?:decide|answer|approve))(?:\s*(?:[:.\u2014\u2013-]|$))", re.I)
+_NOOP_SCOPE = re.compile(r"^(?:settled[,:;.]?\s*)?nothing (?:is )?(?:left )?to decide[.!]?$", re.I)
 
 
 def declares_no_ask(request: dict) -> bool:
-    """The request itself says there is nothing to decide ("No decision needed: ...", "Settled, nothing to
-    decide."). Such a tile is a status note, never an ask: it is withdrawn, not published."""
-    title = _LIST_MARK.sub("", _plain(request.get('title') or "")).strip()
-    md = _LIST_MARK.sub("", _plain((request.get('scope') or {}).get('markdown') or "")).strip()
-    first = _SENTENCE_BREAK.split(md)[0] if md else ""
-    return bool(_NOOP_ASK.match(title) or _NOOP_ASK.match(first))
+    """The request itself says there is nothing to decide. Such a tile is a status note, never an ask: it is
+    withdrawn, not published."""
+    title = _LIST_MARK.sub("", _plain(str(request.get('title') or ""))).strip()
+    scope = request.get('scope')
+    md = _LIST_MARK.sub("", _plain(str(scope.get('markdown') or "") if isinstance(scope, dict) else "")).strip()
+    first = _SENTENCE_BREAK.split(md)[0].strip() if md else ""
+    return bool(_NOOP_TITLE.match(title) or _NOOP_SCOPE.match(first))
 
 
 # ---- ActionRequest v2: immutable scope versions + durable decision outbox -----
@@ -1308,10 +1340,13 @@ class ActionStore:
             return [json.loads(row[0]) for row in c.execute(
                 'SELECT body FROM revisions WHERE namespace=? AND id=? ORDER BY revision', (self._ns(owner), rid))]
 
-    def revise(self, owner, rid, expected, replacement, *, bind=None, fresh=True):
+    def revise(self, owner, rid, expected, replacement, *, bind=None, fresh=True, undecided=False):
         with self._tx() as c:
             old = self._get(c, owner, rid); ns = self._ns(owner)
             if type(expected) is not int or old['revision'] != expected: raise ActionError('Stale revision', 409)
+            if undecided and (old.get('resolution') or old['state'] not in ('open', 'needs_context')):
+                # An automatic re-ask revision lost a race with a decision: the decision wins.
+                raise ActionError('A decision is already recorded for this revision', 409)
             pending = c.execute('SELECT body FROM operations WHERE namespace=? AND request=? AND revision=?',
                                 (ns, rid, expected)).fetchone()
             if pending and json.loads(pending[0])['dispatchState'] not in ('delivered', 'cancelled'):
