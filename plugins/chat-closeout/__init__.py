@@ -17,6 +17,7 @@ import contextlib
 import importlib.util
 import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -204,6 +205,42 @@ def open_card_ids(session_id: str) -> list[str]:
     return sorted({core.card_key(t) for t in ksa.session_tasks([session_id], ksa.LISTED_STATUSES)})
 
 
+_ACTIVE_FALLBACK = ("todo", "ready", "running", "scheduled", "review")
+
+
+def subscribed_open_cards(session_id: str, db_paths: Optional[list[Path]] = None) -> list[str]:
+    """Working cards created elsewhere that notify this chat (``kanban_notify_subs``): a worker's follow-up card, or
+    a card the chat commented on. Their completion notice arrives here as a new turn, so they back a promise just
+    like a card the chat created. ``session_tasks`` only sees cards whose creator/origin is the chat, so without
+    this a chat waiting on four subscribed cards was told it had none. Same link rule as ask-gate's
+    ``linked_cards``; a board without the subs table (older core) contributes nothing."""
+    try:
+        from hermes_cli import kanban_session_activity as ksa
+        active = tuple(ksa.ACTIVE_STATUSES)
+    except Exception:
+        active = _ACTIVE_FALLBACK
+    ids = [i for i in _lineage(session_id) if i]
+    if not ids:
+        return []
+    found: set[str] = set()
+    for path in db_paths if db_paths is not None else board_paths():
+        try:
+            conn = core.ro_connect(Path(path))
+        except sqlite3.Error:
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT t.id FROM tasks t JOIN kanban_notify_subs s ON s.task_id = t.id "
+                f"WHERE s.chat_id IN ({','.join('?' for _ in ids)}) "
+                f"AND t.status IN ({','.join('?' for _ in active)})", (*ids, *active)).fetchall()
+            found.update(str(r[0]) for r in rows)
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+    return sorted(found)
+
+
 def session_proof(sid: str, tid: str, card: dict) -> bool:
     """Transcript evidence that a finished card's final notice was delivered to the chat and answered."""
     try:
@@ -277,6 +314,12 @@ def _backed(session_id: str) -> bool:
     except Exception:
         logger.debug("chat-closeout: card probe failed; letting the reply through", exc_info=True)
         return True  # every hook fails open: a broken probe never blocks a reply
+    try:
+        if subscribed_open_cards(session_id):
+            return True
+    except Exception:
+        logger.debug("chat-closeout: subscription probe failed; letting the reply through", exc_info=True)
+        return True
     try:
         from hermes_cli import process_session_activity as psa
         if psa.background_process_counts().get(session_id):
