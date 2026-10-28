@@ -1,0 +1,900 @@
+From 6d29976569aec76a27bcf75f9425d14dda30de8d Mon Sep 17 00:00:00 2001
+From: David Bloomin <452472+daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 02:31:46 -0700
+Subject: [PATCH] feat(kanban): worker nodes run other gateways' cards through
+ Board leases; runs_on placement (#137)
+
+Worker nodes (card runs): runs_on placement, pickup through Board leases (kanban.sync.pickup explicit|true), creator-side held_elsewhere. CI: the only failures are ones main carries too (web_server.py Windows footguns; test_session_detail_malformed_db, test_history_commentary_display, tests/pm/test_source_update_launch fail identically on other PRs off main: runs 40654732974, 40654072745, 40651636161); kanban suites, ruff and the code-health ratchet pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban.py                        |   2 +-
+ hermes_cli/kanban_db.py                     |   8 +-
+ hermes_cli/kanban_db_dispatch.py            |  12 +-
+ hermes_cli/kanban_db_sync.py                |  42 ++-
+ hermes_cli/kanban_parser.py                 |   3 +
+ hermes_cli/kanban_sync_client.py            |   4 +
+ hermes_cli/kanban_worker_node.py            | 281 +++++++++++++++++
+ tests/hermes_cli/test_kanban_worker_node.py | 317 ++++++++++++++++++++
+ tools/kanban_tools.py                       |  13 +-
+ tools/kanban_tools_schemas.py               |   9 +-
+ 10 files changed, 676 insertions(+), 15 deletions(-)
+ create mode 100644 hermes_cli/kanban_worker_node.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_node.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e5998e762b..5db8e2d376 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -453,7 +453,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 human_request=getattr(args, "human_request", None),
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+-                validate_workspace=True, validate_skills=True,
++                validate_workspace=True, validate_skills=True, runs_on=getattr(args, "runs_on", None),
+             )
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index aab01b2c3b..a6d1f87a90 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1212,14 +1212,13 @@ def create_task(
+     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
+     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
+     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
+-    project_source_task_id: Optional[str] = None,
+-    creator_task_id: Optional[str] = None,
++    project_source_task_id: Optional[str] = None, creator_task_id: Optional[str] = None,
+     completion_contract: Optional[str] = None,
+     validate_workspace: bool = False, validate_skills: bool = False,
+     human_request: Optional[dict] = None,
+     origin_intent: Optional[dict] = None,
+     requires: Optional[list[str]] = None,
+-    lint_blocked: bool = True,
++    lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1228,7 +1227,7 @@ def create_task(
+     ``origin_intent`` atomically persists the task and receipt intent, not origin readback.
+     ``validate_workspace=True`` (agent/CLI create surfaces) rejects a non-project ``worktree`` workspace
+     that could never resolve at spawn (``WorktreeWorkspaceConfigError``); ``validate_skills=True`` rejects
+-    a pinned skill the assignee cannot load (``UnknownSkillError``). [daveey]
++    a pinned skill the assignee cannot load (``UnknownSkillError``). [daveey] ``runs_on``: placement labels.
+ 
+     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
+     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+@@ -1374,6 +1373,7 @@ def create_task(
+                         json.dumps(required),
+                     ),
+                 )
++                _sync.set_runs_on(conn, task_id, runs_on)  # placement labels (RFC "Placement"), synced boards only
+                 for pid in parents:
+                     _link(conn, pid, task_id)
+                 from hermes_cli.kanban_db_creation import record_created
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 564140d970..03a768fa19 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -920,7 +920,7 @@ def detect_stale_running(
+         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+         "FROM tasks t "
+         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+-        "WHERE t.status = 'running'"
++        "WHERE t.status = 'running'" + _kb._sync.held_elsewhere_sql(conn, "t")
+     ).fetchall()
+ 
+     for row in rows:
+@@ -1005,7 +1005,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+     rows = conn.execute(
+         "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at FROM tasks "
+         "WHERE status = 'running' "
+-        "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
++        "  AND (claim_lock IS NULL OR claim_expires IS NULL)" + _kb._sync.held_elsewhere_sql(conn)
+     ).fetchall()
+     for row in rows:
+         tid = row["id"]
+@@ -2094,7 +2094,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
+     try:
+         return int(
+             conn.execute(
+-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
++                "SELECT COUNT(*) FROM tasks WHERE status = 'running'" + _kb._sync.held_elsewhere_sql(conn)
+             ).fetchone()[0]
+         )
+     except Exception:
+@@ -2628,6 +2628,7 @@ def _dispatch_once_locked(
+             sweep_stale_triage(conn, default_assignee=_resolve_default_assignee(default_assignee))
+         except Exception:
+             _kb._log.debug("kanban dispatch: triage sweep failed", exc_info=True)
++    _kb._sync.worker_pickup(conn, spawn_budget, dry_run, _profile_exists_fn)  # worker node (RFC "Placement")
+     ready_rows = lane_rows(conn, "ready")
+     # Review rows are enumerated up front so the budget split can see whether
+     # review work exists at all.
+@@ -2647,9 +2648,8 @@ def _dispatch_once_locked(
+     per_profile_running: dict[str, int] = {}
+     if per_profile_cap is not None:
+         for prow in conn.execute(
+-            "SELECT assignee, COUNT(*) AS n FROM tasks "
+-            "WHERE status = 'running' AND assignee IS NOT NULL "
+-            "GROUP BY assignee"
++            "SELECT assignee, COUNT(*) AS n FROM tasks WHERE status = 'running' AND assignee IS NOT NULL"
++            + _kb._sync.held_elsewhere_sql(conn) + " GROUP BY assignee"
+         ):
+             per_profile_running[prow["assignee"]] = int(prow["n"])
+     # Review-lane reservation: the ready loop runs first and would otherwise
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 3439b47a2e..1d548da99a 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -52,7 +52,7 @@ SYNCED_COLUMNS: dict[str, frozenset[str]] = {
+         "consecutive_failures", "last_failure_error", "max_runtime_seconds", "current_run_id",
+         "workflow_template_id", "current_step_key", "skills", "requires", "model_override",
+         "provider_override", "reasoning_effort", "max_retries", "goal_mode", "goal_max_turns",
+-        "block_kind", "human_request", "block_recurrences", "completion_contract",
++        "block_kind", "human_request", "block_recurrences", "completion_contract", "runs_on",
+     }),
+     "task_links": frozenset({"parent_id", "child_id"}),
+     "task_comments": frozenset({"task_id", "author", "body", "created_at"}),
+@@ -88,7 +88,8 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+     "task_chat_links": frozenset(),
+ }
+ # Set by the service, never by a gateway: applied from the feed, never captured.
+-SERVER_COLUMNS: dict[str, frozenset[str]] = {"tasks": frozenset({"created_on"})}
++# ``ready_since``: when the card last became ready (ms), for the Board's ``home_grace`` placement rule.
++SERVER_COLUMNS: dict[str, frozenset[str]] = {"tasks": frozenset({"created_on", "ready_since"})}
+ KEY_COLUMNS: dict[str, frozenset[str]] = {
+     "tasks": frozenset({"id"}),
+     "task_links": frozenset(),
+@@ -209,6 +210,9 @@ _SYNC_COLUMN_DDL = (
+     ("tasks", "lease_expires", "lease_expires INTEGER"),
+     ("tasks", "lease_version", "lease_version INTEGER"),
+     ("tasks", "created_on", "created_on TEXT"),
++    ("tasks", "ready_since", "ready_since INTEGER"),
++    # Placement (RFC "Placement"): JSON list of labels the claiming machine must all carry; NULL = default.
++    ("tasks", "runs_on", "runs_on TEXT"),
+     ("kanban_sync_outbox", "retry_after", "retry_after INTEGER"),
+     # 1 once repair_ms_timestamps ran on this file (the one-time repair of rows applied before the guard).
+     ("kanban_sync_state", "seconds_repaired", "seconds_repaired INTEGER NOT NULL DEFAULT 0"),
+@@ -749,6 +753,40 @@ def release_lease(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str]
+         _log.info("kanban sync: lease release for %s failed (%s); it expires on the server", task_id, exc)
+ 
+ 
++def held_elsewhere_sql(conn: sqlite3.Connection, alias: str = "") -> str:
++    """SQL condition (``AND NOT ...``) that leaves out cards whose Board lease another gateway holds.
++
++    On a primary board a card this gateway created can run on another machine (Placement): its status is
++    ``running`` here with no local claim. The dispatcher's sweeps (orphans, stale heartbeats) and its concurrency
++    counts must not see it, or they would requeue a card that is running elsewhere, or spend a local slot on it.
++    Empty on a board that is not primary."""
++    if board_mode(conn) != "primary":
++        return ""
++    own = str(_state(conn)["gateway_id"]).replace("'", "''")
++    a = f"{alias}." if alias else ""
++    return f" AND NOT ({a}lease_holder IS NOT NULL AND {a}lease_holder != '{own}' AND {a}claim_lock IS NULL)"
++
++
++def set_runs_on(conn: sqlite3.Connection, task_id: str, runs_on: Any) -> None:
++    """``create_task(runs_on=...)``: validate the labels and write them (captured and pushed like any field).
++    None is the default placement and writes nothing; a board that does not sync cannot carry them."""
++    if runs_on is None:
++        return
++    from hermes_cli import kanban_worker_node as wn
++    wn.set_runs_on(conn, task_id, wn.normalize_runs_on(runs_on if isinstance(runs_on, str) else list(runs_on)))
++
++
++def worker_pickup(conn: sqlite3.Connection, budget: Optional[int], dry_run: bool, profile_exists_fn: Any) -> None:
++    """Dispatcher seam: a worker node copies eligible cards other gateways created (``kanban_worker_node``)."""
++    if dry_run or board_mode(conn) != "primary":
++        return
++    from hermes_cli import kanban_worker_node as wn
++    try:
++        wn.pickup(conn, budget=budget, profile_exists=profile_exists_fn())
++    except Exception:  # health: allow BLE001 -- a failed pickup must not stop the tick dispatching local work
++        _log.warning("kanban: worker-node pickup failed", exc_info=True)
++
++
+ def run_uid(conn: sqlite3.Connection, run_id: Optional[int]) -> Optional[str]:
+     if run_id is None or board_mode(conn) == "off":
+         return None
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 5ca3117ea3..e84d2e736d 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -216,6 +216,9 @@ _SPECS = [
+              help="Required configured capability (repeatable): terminal, file, git, host_repo, or a "
+                   "namespaced gateway capability such as aws:<acct>:<action> or ssh:<host> "
+                   "(placed/pre-routed where it is held); repo work also infers requirements"),
++        _arg("--runs-on", dest="runs_on", default=None, metavar="LABELS",
++             help="Machine labels the card needs, comma-separated (synced boards only): linux, "
++                  "macos,xcode, machine:<name>; '' or '[]' = any machine; omit for the default placement"),
+         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
+         _arg("--workspace",
+              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index e56e42ce6b..8e558477b1 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -128,6 +128,10 @@ class Hub:
+     def leases(self, board: str, body: dict) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/leases", body)
+ 
++    def machines(self) -> dict:
++        """The machine registry (RFC "One machine registry"): ``{me, machines: [{name, labels, pinned_only, ...}]}``."""
++        return self._call("GET", "/v2/machines")
++
+ 
+ # --- boards ---------------------------------------------------------------------------------------
+ 
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+new file mode 100644
+index 0000000000..94083a79ca
+--- /dev/null
++++ b/hermes_cli/kanban_worker_node.py
+@@ -0,0 +1,281 @@
++"""Worker nodes: run cards another gateway created (RFC "Worker nodes and transcripts", Placement). [daveey]
++
++A primary board's live file holds only this gateway's own cards; the replica (``sync-shadow/<board>.db``) holds the
++whole board. On a gateway with ``kanban.sync.pickup`` (``explicit``: only cards with ``runs_on``; true: any), each dispatcher tick with free slots copies eligible
++``ready`` cards from the replica into the live file (rows applied with no capture, so nothing is pushed), and the
++normal claim path then asks the Board for a lease. The Board is the authority: it checks the machine registry
++(labels, ``pinned_only``, ``hold``, ``max_card_runs``) and ``runs_on`` on every grant, so the local check here only
++avoids asking for cards the Board would refuse. A refused grant leaves the card ``ready`` and unclaimed, and the
++next tick evicts it. A copied card that ends (or is leased elsewhere) is evicted once its outbox is drained.
++
++Placement rules mirrored from the Board (``runs_on`` a JSON list of labels):
++
++* ``runs_on`` set: every label must be on this machine (``[]`` = any machine).
++* ``runs_on`` NULL (default): another machine may take the card only when its labels include the creator's (minus
++  ``machine:*``), the workspace is not ``dir``/``worktree``, and the card has been ready for ``home_grace`` or the
++  creator has gone silent. The Board decides the time part; locally only the label and workspace parts are checked.
++* a ``pinned_only`` machine takes another gateway's card only when its ``runs_on`` names the machine's
++  ``machine:`` label; its own cards are always its own.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import re
++import sqlite3
++import time
++from typing import Any, Callable, Iterable, Mapping, Optional
++
++from hermes_cli import kanban_db_sync as sync
++
++_log = logging.getLogger(__name__)
++
++LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9:._-]{0,63}$")
++MAX_LABELS = 32
++REGISTRY_TTL_S = 60
++# Copy at most this many cards per tick when the dispatcher has no cap.
++DEFAULT_PICKUP_BATCH = 4
++# History copied with a card: enough for the worker's context, without the whole event log.
++EVENT_TAIL = 200
++_CHILD_TABLES = ("task_runs", "task_comments", "task_attachments", "task_events")
++
++_REGISTRY: dict[str, Any] = {"at": 0.0, "value": None}
++_FETCH: Optional[Callable[[], Mapping[str, Any]]] = None
++
++
++# --- runs_on --------------------------------------------------------------------------------------
++
++def normalize_runs_on(value: Any) -> Optional[list[str]]:
++    """``runs_on`` from a CLI/tool argument: None (default placement), a list, or a comma string. Raises ValueError."""
++    if value is None:
++        return None
++    if isinstance(value, str):
++        value = json.loads(value) if value.strip().startswith("[") else [v for v in value.split(",") if v.strip()]
++    if not isinstance(value, (list, tuple)):
++        raise ValueError("runs_on must be a list of labels")
++    labels = [str(v).strip() for v in value]
++    bad = [v for v in labels if not LABEL_RE.match(v)]
++    if bad or len(labels) > MAX_LABELS:
++        raise ValueError(f"invalid runs_on label(s) {bad or labels!r}: lowercase [a-z0-9:._-], at most {MAX_LABELS}")
++    return sorted(set(labels))
++
++
++def set_runs_on(conn: sqlite3.Connection, task_id: str, runs_on: Optional[list[str]]) -> None:
++    """Write ``runs_on`` on a card of a synced board (captured and pushed like any field)."""
++    if "runs_on" not in sync.table_columns(conn, "tasks"):
++        raise ValueError("runs_on needs a board that syncs to the Board service (kanban.sync)")
++    conn.execute("UPDATE tasks SET runs_on = ? WHERE id = ?",
++                 (None if runs_on is None else json.dumps(runs_on), task_id))
++
++
++def placement_runs_on(conn: sqlite3.Connection, placement: Any) -> Optional[list[str]]:
++    """``placement=<gateway>`` on a primary board, naming another active machine in the registry ->
++    ``[machine:<gateway>]``. None for ``auto``/``local``/this gateway/unknown names (today's placement applies)."""
++    name = str(placement or "").strip()
++    if not name or name in ("auto", "local") or sync.board_mode(conn) != "primary" or name == _own(conn):
++        return None
++    reg = registry()
++    entry = (reg or {}).get("machines", {}).get(name)
++    if not entry or entry.get("state", "active") != "active":
++        return None
++    return [f"machine:{name}"]
++
++
++def _parse(value: Any) -> Optional[list[str]]:
++    if value is None or value == "":
++        return None
++    try:
++        out = json.loads(value) if isinstance(value, str) else value
++    except ValueError:
++        return []  # unreadable: treat as "no machine matches" rather than "default"
++    return [str(v) for v in out] if isinstance(out, list) else []
++
++
++# --- registry -------------------------------------------------------------------------------------
++
++def set_registry_fetch(fn: Optional[Callable[[], Mapping[str, Any]]]) -> None:
++    """Tests (and the sync loop) inject how ``GET /v2/machines`` is read; resets the cache."""
++    global _FETCH
++    _FETCH = fn
++    _REGISTRY.update(at=0.0, value=None)
++
++
++def registry() -> Optional[Mapping[str, Any]]:
++    """``{me, machines: {name: entry}}``, cached for :data:`REGISTRY_TTL_S`; None when unreachable."""
++    now = time.monotonic()
++    if _REGISTRY["value"] is not None and now - _REGISTRY["at"] < REGISTRY_TTL_S:
++        return _REGISTRY["value"]
++    fetch = _FETCH
++    if fetch is None:
++        from hermes_cli import kanban_sync_client as ksc
++        hub = ksc.Hub(ksc.load_identity())
++        fetch = hub.machines
++    try:
++        raw = fetch()
++    except Exception as exc:  # health: allow BLE001 -- registry unreachable: pick up nothing this tick
++        _log.info("kanban worker node: machine registry unavailable (%s: %s)", type(exc).__name__, exc)
++        return _REGISTRY["value"]
++    value = {"me": raw.get("me"), "machines": {m["name"]: m for m in raw.get("machines") or [] if m.get("name")}}
++    _REGISTRY.update(at=now, value=value)
++    return value
++
++
++def effective_labels(entry: Optional[Mapping[str, Any]], name: str) -> set[str]:
++    return set((entry or {}).get("labels") or []) | {f"machine:{name}"}
++
++
++def eligible(card: Mapping[str, Any], me: str, machines: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
++    """None when this machine may ask for the card's lease, else the Board's refusal reason it would get."""
++    entry = machines.get(me) or {}
++    if entry.get("hold"):
++        return "held"
++    mine = effective_labels(entry, me)
++    runs_on = _parse(card.get("runs_on"))
++    creator = card.get("created_on")
++    own = creator in (None, me)
++    # pinned_only keeps other gateways' work off a personal machine; its own cards stay its own.
++    if entry.get("pinned_only") and not own and f"machine:{me}" not in (runs_on or []):
++        return "pinned_only"
++    if runs_on is not None:
++        return None if set(runs_on) <= mine else "labels_mismatch"
++    if own:
++        return None
++    if card.get("workspace_kind") in ("dir", "worktree"):
++        return "labels_mismatch"
++    wanted = {lb for lb in effective_labels(machines.get(creator), creator) if not lb.startswith("machine:")}
++    return None if wanted <= mine else "labels_mismatch"
++
++
++# --- pickup ---------------------------------------------------------------------------------------
++
++def pickup_mode() -> Optional[str]:
++    """``kanban.sync.pickup``: unset/false = off; ``explicit`` = only cards whose ``runs_on`` is set (placement
++    asked for a machine like this one); true/``all`` = also default-placement cards the Board lets it take."""
++    value = sync.sync_config().get("pickup")
++    if value in (None, False, "off", "false"):
++        return None
++    return "explicit" if value == "explicit" else "all"
++
++
++def _replica_path(conn: sqlite3.Connection):
++    from hermes_cli import kanban_sync_client as ksc
++    return ksc.shadow_path(sync.board_slug_for_path(sync._db_key(conn) or ""))
++
++
++def _own(conn: sqlite3.Connection) -> str:
++    return str(sync._state(conn)["gateway_id"])
++
++
++def evict(conn: sqlite3.Connection) -> list[str]:
++    """Drop copied foreign cards this gateway is not running (no claim, not ``running``) and has nothing left to
++    push. Deleted with capture suppressed, so the Board never sees a delete."""
++    own = _own(conn)
++    rows = conn.execute(
++        "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ? AND claim_lock IS NULL "
++        "AND status != 'running'", (own,)).fetchall()
++    gone: list[str] = []
++    if not rows:
++        return gone
++    present = {t for t in (*_CHILD_TABLES, "task_chat_links")
++               if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()}
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        for (tid,) in rows:
++            if conn.execute(
++                    "SELECT 1 FROM kanban_sync_outbox WHERE state != 'rejected' AND (row_uid = ? OR "
++                    "json_extract(fields, '$.task_id') = ?) LIMIT 1", (tid, tid)).fetchone():
++                continue
++            for table in present:
++                conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (tid,))
++            conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
++            conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++            gone.append(tid)
++        conn.execute("UPDATE kanban_sync_state SET applying = 0")
++    return gone
++
++
++def candidates(replica: sqlite3.Connection, own: str, *, now_ms: Optional[int] = None) -> list[sqlite3.Row]:
++    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
++    return replica.execute(
++        "SELECT * FROM tasks WHERE status = 'ready' AND created_on IS NOT NULL AND created_on != ? "
++        "AND (lease_holder IS NULL OR COALESCE(lease_expires, 0) < ?) ORDER BY priority DESC, created_at, id",
++        (own, now_ms)).fetchall()
++
++
++def _changes_for(replica: sqlite3.Connection, tid: str, card: sqlite3.Row) -> list[sync.RemoteChange]:
++    from hermes_cli import kanban_sync_client as ksc
++    fields = ksc._row_fields(replica, "tasks", card)
++    for column in sync.SERVER_COLUMNS["tasks"]:
++        if column in card.keys():
++            fields[column] = card[column]
++    out = [sync.RemoteChange(0, "tasks", tid, "upsert", fields, int(card["sync_version"] or 0), "", "")]
++    for table in _CHILD_TABLES:
++        order = f"id DESC LIMIT {EVENT_TAIL}" if table == "task_events" else "id"
++        for row in replica.execute(f"SELECT * FROM {table} WHERE task_id = ? ORDER BY {order}", (tid,)).fetchall():
++            if row["uid"] is None:
++                continue
++            version = int(row["sync_version"] or 0) if "sync_version" in row.keys() else 0
++            out.append(sync.RemoteChange(0, table, row["uid"], "upsert", ksc._row_fields(replica, table, row),
++                                         version, "", ""))
++    return out
++
++
++def import_cards(conn: sqlite3.Connection, replica: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
++    """Copy cards (and their history) from the replica into the live file, without capture and without hooks."""
++    changes: list[sync.RemoteChange] = []
++    done: list[str] = []
++    for tid in ids:
++        card = replica.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        if card is None:
++            continue
++        changes.extend(_changes_for(replica, tid, card))
++        done.append(tid)
++    if changes:
++        cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++        sync.apply_remote_changes(conn, changes, new_cursor=cursor, observers=False)
++    return done
++
++
++def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
++           profile_exists: Optional[Callable[[str], bool]] = None) -> list[str]:
++    """One tick's pickup: evict finished copies, then copy up to ``budget`` eligible foreign cards. Returns the
++    ids copied. A no-op unless the board is primary and ``kanban.sync.pickup`` is on."""
++    mode = pickup_mode()
++    if sync.board_mode(conn) != "primary" or mode is None:
++        return []
++    evict(conn)
++    limit = DEFAULT_PICKUP_BATCH if budget is None else budget
++    if limit <= 0:
++        return []
++    reg = registry()
++    if not reg:
++        return []
++    own = _own(conn)
++    machines = reg["machines"]
++    path = _replica_path(conn)
++    if not path.exists():
++        return []
++    from hermes_cli import kanban_lockguard
++    replica = kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
++    replica.row_factory = sqlite3.Row
++    try:
++        picked: list[str] = []
++        for card in candidates(replica, own):
++            if len(picked) >= limit:
++                break
++            if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (card["id"],)).fetchone():
++                continue
++            if mode == "explicit" and card["runs_on"] is None:
++                continue
++            if eligible(dict(card), own, machines) is not None:
++                continue
++            if profile_exists is not None and card["assignee"] and not profile_exists(card["assignee"]):
++                continue
++            picked.append(card["id"])
++        imported = import_cards(conn, replica, picked)
++    finally:
++        replica.close()
++    if imported:
++        _log.info("kanban worker node: picked up %d card(s) from other gateways: %s", len(imported), imported)
++    return imported
+diff --git a/tests/hermes_cli/test_kanban_worker_node.py b/tests/hermes_cli/test_kanban_worker_node.py
+new file mode 100644
+index 0000000000..f9095896d8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_node.py
+@@ -0,0 +1,317 @@
++"""Worker nodes (RFC "Worker nodes and transcripts", Placement): a gateway with ``kanban.sync.pickup`` copies cards
++another gateway created from its replica, claims them through a Board lease and runs them; the creator's own
++dispatcher never requeues or counts a card running under another gateway's lease. ``runs_on`` and
++``placement=<machine>`` on create. The Board service is the in-memory fake (``kanban_sync_fake_board``); the
++Board's own registry and grant checks are tested in the service repo (``worker/test/machines.test.ts``)."""
++
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++HUB, WORKER, BOARD = "hub", "worker-1", "default"
++MACHINES = {
++    HUB: {"name": HUB, "state": "active", "labels": ["linux"], "pinned_only": False, "max_card_runs": None,
++          "hold": False},
++    WORKER: {"name": WORKER, "state": "active", "labels": ["linux"], "pinned_only": False, "max_card_runs": 12,
++             "hold": False},
++    "macbook": {"name": "macbook", "state": "active", "labels": ["macos"], "pinned_only": True,
++                "max_card_runs": None, "hold": False},
++}
++
++
++class Gateway:
++    """One gateway's kanban root (HERMES_HOME) with a primary ``default`` board, on a shared fake service."""
++
++    def __init__(self, root, name, svc, monkeypatch, *, pickup):
++        self.home, self.name, self.svc, self.mp = root / name / ".hermes", name, svc, monkeypatch
++        self.home.mkdir(parents=True)
++        self.enter()
++        (self.home / "config.yaml").write_text(
++            "kanban:\n  sync:\n    enabled: true\n" + (f"    pickup: {pickup}\n" if pickup else ""))
++        self.conn = kbc.connect(self.home / "kanban.db")
++        ksc.ensure_identity(self.conn, BOARD, name)
++        sync.set_mode(self.conn, "primary")
++
++    def enter(self):
++        self.mp.setenv("HERMES_HOME", str(self.home))
++        sync.set_lease_client(ksc.HubLeaseClient(self.svc.hub(self.name)))
++        wn.set_registry_fetch(lambda: {"me": self.name, "machines": list(MACHINES.values())})
++        return self.conn if hasattr(self, "conn") else None
++
++    def round(self):
++        self.enter()
++        return ksc.sync_board(BOARD, self.home / "kanban.db", self.svc.hub(self.name), self.name)
++
++    def tick(self, **kw):
++        self.enter()
++        return kbd.dispatch_once(self.conn, spawn_fn=lambda task, ws, board=None: os.getpid(), board=BOARD, **kw)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)  # like the Board: a grant writes the run and the task's lease mirror
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _runs(conn, tid):
++    return conn.execute("SELECT uid, status FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)).fetchall()
++
++
++# --- placement rules ------------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("card,me,want", [
++    ({"runs_on": '["linux"]', "created_on": HUB}, WORKER, None),
++    ({"runs_on": '["macos"]', "created_on": HUB}, WORKER, "labels_mismatch"),
++    ({"runs_on": "[]", "created_on": HUB}, WORKER, None),
++    ({"runs_on": '["machine:worker-1"]', "created_on": HUB}, WORKER, None),
++    ({"runs_on": '["machine:hub"]', "created_on": HUB}, WORKER, "labels_mismatch"),
++    ({"runs_on": '["linux"]', "created_on": HUB}, "macbook", "pinned_only"),
++    ({"runs_on": '["machine:macbook"]', "created_on": HUB}, "macbook", None),
++    ({"runs_on": None, "created_on": "macbook"}, "macbook", None),  # pinned_only never refuses its own cards
++    ({"runs_on": '["macos"]', "created_on": "macbook"}, "macbook", None),
++    ({"runs_on": None, "created_on": HUB, "workspace_kind": "scratch"}, WORKER, None),  # creator labels ⊆ mine
++    ({"runs_on": None, "created_on": HUB, "workspace_kind": "worktree"}, WORKER, "labels_mismatch"),
++    ({"runs_on": None, "created_on": HUB, "workspace_kind": "dir"}, WORKER, "labels_mismatch"),
++    ({"runs_on": None, "created_on": "macbook", "workspace_kind": "scratch"}, WORKER, "labels_mismatch"),
++    ({"runs_on": None, "created_on": WORKER}, WORKER, None),
++])
++def test_eligible_mirrors_the_board_rules(card, me, want):
++    assert wn.eligible(card, me, MACHINES) == want
++
++
++def test_a_held_machine_takes_nothing():
++    held = {**MACHINES, WORKER: {**MACHINES[WORKER], "hold": True}}
++    assert wn.eligible({"runs_on": "[]", "created_on": HUB}, WORKER, held) == "held"
++
++
++def test_a_machine_label_is_always_its_own():
++    assert wn.effective_labels({"labels": ["linux"]}, "w") == {"linux", "machine:w"}
++
++
++@pytest.mark.parametrize("raw,want", [("linux", ["linux"]), ("macos,xcode", ["macos", "xcode"]), ("", []),
++                                      ("[]", []), ('["machine:w"]', ["machine:w"]), (["b", "a", "a"], ["a", "b"]),
++                                      (None, None)])
++def test_normalize_runs_on(raw, want):
++    assert wn.normalize_runs_on(raw) == want
++
++
++@pytest.mark.parametrize("raw", ["Linux", "has space", ["ok", "BAD!"], 3])
++def test_normalize_runs_on_refuses_bad_labels(raw):
++    with pytest.raises(ValueError):
++        wn.normalize_runs_on(raw)
++
++
++# --- create paths ---------------------------------------------------------------------------------------------
++
++def test_create_task_runs_on_syncs_to_the_board(gws, svc):
++    hub, _ = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="linux only", assignee="default", runs_on=["linux"])
++    hub.round()
++    assert json.loads(svc.board(BOARD)["rows"]["tasks"][tid]["runs_on"]) == ["linux"]
++
++
++def test_runs_on_on_an_unsynced_board_is_refused(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        with pytest.raises(ValueError, match="syncs"):
++            kb.create_task(conn, title="x", assignee="default", runs_on=["linux"])
++    finally:
++        conn.close()
++
++
++def test_cli_create_runs_on(gws, svc):
++    hub, _ = gws
++    hub.enter()
++    from hermes_cli import kanban as kcli
++    out = kcli.run_slash('create "cli card" --assignee default --runs-on linux,machine:worker-1 --json')
++    tid = json.loads(out)["id"]
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
++        "linux", "machine:worker-1"]
++
++
++def _tool_create(args):
++    from tools import kanban_tools
++    return json.loads(kanban_tools._handle_create(args))
++
++
++def test_tool_create_runs_on_and_placement_to_an_enrolled_machine(gws, monkeypatch):
++    hub, _ = gws
++    hub.enter()
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    out = _tool_create({"title": "on the worker", "assignee": "default", "placement": WORKER})
++    assert out.get("ok", True) and "error" not in out, out
++    tid = out["task_id"]
++    row = hub.conn.execute("SELECT runs_on, created_on FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert json.loads(row["runs_on"]) == ["machine:worker-1"]  # created here, runs only there
++    out = _tool_create({"title": "explicit", "assignee": "default", "runs_on": ["linux"]})
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?",
++                                       (out["task_id"],)).fetchone()[0]) == ["linux"]
++
++
++def test_tool_placement_to_an_unknown_gateway_still_refuses(gws, monkeypatch):
++    hub, _ = gws
++    hub.enter()
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    before = hub.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
++    out = _tool_create({"title": "nowhere", "assignee": "default", "placement": "no-such-box"})
++    assert "placement_unavailable" in json.dumps(out)
++    assert hub.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
++
++
++# --- pickup, run, creator side --------------------------------------------------------------------------------
++
++def _hub_card(hub, **kw):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title=kw.pop("title", "work"), assignee="default", **kw)
++    hub.round()
++    return tid
++
++
++def test_worker_runs_a_hub_card_and_the_hub_never_requeues_or_counts_it(gws, svc):
++    hub, worker = gws
++    tid = _hub_card(hub, runs_on=["linux"])
++    # The hub is at capacity this tick, so the worker gets the card.
++    worker.round()
++    res = worker.tick()
++    assert tid in [c for c in (getattr(res, "spawned", None) or [])] or kb.get_task(worker.conn, tid).status == "running"
++    lease = svc.board(BOARD)["leases"][tid]
++    assert lease["holder"] == WORKER
++    [(run_uid, status)] = _runs(worker.conn, tid)
++    assert status == "running" and lease["run_uid"] == run_uid
++    worker.round()  # push the claim
++    hub.round()
++    t = hub.conn.execute("SELECT status, lease_holder, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (t["status"], t["lease_holder"], t["claim_lock"]) == ("running", WORKER, None)
++    # The hub's sweeps leave it alone, and it does not take a hub slot.
++    hub.enter()
++    assert kbd.count_running_tasks(hub.conn) == 0
++    assert tid not in kbd.reconcile_orphaned_running(hub.conn)
++    hub.tick(stale_timeout_seconds=1)
++    assert kb.get_task(hub.conn, tid).status == "running"
++    assert len(svc.board(BOARD)["rows"].get("task_runs", {})) == 1
++    # Nor a per-profile slot: with a cap of 1 for `default`, the hub still starts its own `default` card.
++    own = kb.create_task(hub.conn, title="hub's own", assignee="default", runs_on=["machine:hub"])
++    hub.tick(max_in_progress_per_profile=1)
++    assert kb.get_task(hub.conn, own).status == "running"
++    # The worker finishes; the hub sees the result; the worker's copy goes away.
++    worker.enter()
++    run_id = worker.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert kb.complete_task(worker.conn, tid, result="done on the worker", expected_run_id=run_id)
++    worker.round()
++    hub.round()
++    t = kb.get_task(hub.conn, tid)
++    assert t.status == "done" and t.result == "done on the worker"
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None
++
++
++def test_default_placement_cards_and_pinned_cards_follow_the_rules(gws, svc):
++    hub, worker = gws
++    wt = _hub_card(hub, title="worktree", workspace_kind="worktree", workspace_path="/tmp/x")
++    mac = _hub_card(hub, title="mac", runs_on=["macos"])
++    pinned_hub = _hub_card(hub, title="hub only", runs_on=["machine:hub"])
++    worker.round()
++    worker.tick()
++    for tid in (wt, mac, pinned_hub):
++        assert kb.get_task(worker.conn, tid) is None
++        assert tid not in svc.board(BOARD)["leases"]
++
++
++@pytest.mark.parametrize("mode,taken", [("true", True), ("explicit", False)])
++def test_explicit_pickup_takes_only_cards_with_runs_on(tmp_path, monkeypatch, svc, mode, taken):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup=mode)
++    try:
++        default = _hub_card(hub, title="default placement")  # the Board would let worker-1 take it after home_grace
++        placed = _hub_card(hub, title="placed", runs_on=["machine:worker-1"])
++        worker.round()
++        worker.tick()
++        assert (kb.get_task(worker.conn, default) is not None) is taken
++        assert kb.get_task(worker.conn, placed).status == "running"
++    finally:
++        hub.conn.close()
++        worker.conn.close()
++        sync.set_lease_client(None)
++        wn.set_registry_fetch(None)
++
++
++def test_pickup_is_off_unless_configured(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    other = Gateway(tmp_path, "mini", svc, monkeypatch, pickup=False)
++    try:
++        tid = _hub_card(hub, runs_on=[])
++        other.round()
++        other.tick()
++        assert kb.get_task(other.conn, tid) is None
++    finally:
++        hub.conn.close()
++        other.conn.close()
++        sync.set_lease_client(None)
++        wn.set_registry_fetch(None)
++
++
++def test_a_refused_grant_leaves_no_run_and_the_copy_is_evicted(gws, svc):
++    hub, worker = gws
++    tid = _hub_card(hub, runs_on=["linux"])
++    worker.round()
++    # Another gateway wins the lease between the replica read and the grant.
++    svc.board(BOARD)["leases"][tid] = {"task_id": tid, "holder": "mini", "run_uid": "r-mini", "expires": 9e12}
++    worker.tick()
++    assert _runs(worker.conn, tid) == []
++    t = kb.get_task(worker.conn, tid)
++    assert t is None or t.status == "ready"
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", tid, {"lease_holder": "mini", "lease_expires": 9_999_999_999_999}, "mini", None,
++             f"{9_999_999_999_997:013d}-0000-board")
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None
++    assert not [o for o in worker.conn.execute("SELECT row_uid FROM kanban_sync_outbox")]  # nothing pushed
++
++
++def test_hub_and_worker_never_both_run_one_card(gws, svc):
++    hub, worker = gws
++    tids = [_hub_card(hub, title=f"c{i}", runs_on=["linux"]) for i in range(6)]
++    worker.round()
++    worker.tick()
++    hub.tick()
++    worker.round()
++    hub.round()
++    worker.tick()
++    hub.tick()
++    holders = {t: svc.board(BOARD)["leases"].get(t, {}).get("holder") for t in tids}
++    assert all(holders.values())
++    for tid in tids:
++        local_runs = [conn for conn in (hub.conn, worker.conn)
++                      if kb.get_task(conn, tid) is not None and _runs(conn, tid)
++                      and _runs(conn, tid)[-1]["status"] == "running"
++                      and conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0]]
++        assert len(local_runs) == 1, tid  # exactly one gateway holds a live local claim
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 4192b7b95c..f6617d775c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1633,6 +1633,17 @@ def _handle_create(args: dict, **kw) -> str:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
+         marker_placement = None
++        # Placement on a synced board: ``runs_on`` labels, and a pin to an enrolled machine becomes
++        # ``runs_on=[machine:<name>]`` (created here, run there through the Board lease). [daveey]
++        from hermes_cli import kanban_worker_node as _wn
++        try:
++            runs_on = _wn.normalize_runs_on(args.get("runs_on"))
++        except ValueError as exc:
++            return tool_error(str(exc))
++        if runs_on is None and origin_intent is None:
++            runs_on = _wn.placement_runs_on(conn, args.get("placement"))
++            if runs_on is not None:
++                args = {**args, "placement": "local"}
+         if origin_intent is None and origin is None:
+             # Default placement: no local-only need -> the card runs on the routed gateway. [daveey]
+             remote, marker_placement = _place_remote(
+@@ -1660,7 +1671,7 @@ def _handle_create(args: dict, **kw) -> str:
+             creator_task_id=self_tid,
+             idempotency_key=args.get("idempotency_key"),
+             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+-            requires=args.get("requires"),
++            requires=args.get("requires"), runs_on=runs_on,
+             model_override=model_override, provider_override=provider_override,
+             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+             completion_contract=args.get("completion_contract"),
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index e7446aed8d..49a23372e0 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -664,6 +664,11 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "it unfinished; the result's origin_binding says how to "
+                 "read the binding back on the origin gateway."
+         )),
++        "runs_on": {"type": "array", "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9:._-]{0,63}$"},
++                    "description": "Machine labels the card needs (all of them), on a board that syncs to the "
++                    "Board service: e.g. ['linux'], ['macos', 'xcode'], ['machine:<name>'] for one machine, "
++                    "[] for any machine. Omit for the default: it runs here, or on a machine like this one "
++                    "if it waits too long."},
+         "placement": _prop("string", (
+                 "Where the card runs. 'auto' (default): on a gateway with a "
+                 "kanban.placement route (e.g. the MacBook -> hermes-hub), a "
+@@ -676,7 +681,9 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "non-scratch workspace, a non-default board, an origin-bound "
+                 "card, target not live, ...) the call fails with code "
+                 "placement_unavailable and creates nothing (never a silent "
+-                "local card). Your own gateway's name means local."
++                "local card). Your own gateway's name means local. On a board that syncs to the "
++                "Board service, the name of an enrolled machine (e.g. a worker node) creates the card "
++                "here with runs_on=['machine:<name>'], so only that machine runs it."
+         )),
+         "max_runtime_seconds": _prop("integer", (
+                 "Per-task runtime cap. When exceeded, the "
+-- 
+2.55.0
+

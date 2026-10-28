@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-central-service.md](kanban-central-service.md) | 0673 | Worker nodes (card runs): `runs_on` placement labels (`kanban create --runs-on`, `kanban_create(runs_on=...)`, `placement=<enrolled machine>` → `runs_on=[machine:<it>]`); `kanban.sync.pickup` (`explicit` / `true`) copies eligible cards other gateways created from the replica and claims them through Board leases, which check the operator-set machine registry (labels, `pinned_only`, `hold`, `max_card_runs`); the creator's orphan/stale sweeps and concurrency counts skip cards running under another gateway's lease. |
 | [kanban-local-lineage-counts.md](kanban-local-lineage-counts.md) | 0671 | Local cards shared across compression aliases count once, matching the task strip; parked, held and stalled subsets deduplicate with the same snapshot. Distinct boards/cards remain distinct. |
 | [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md) | 0670 | A model pin the managed routing registry cannot serve is refused at create and set-model (code `model_pin_not_in_routing_registry`), not at worker startup. |
 | [standing-instructions.md](standing-instructions.md) | 0669 | Standing instructions survive compaction word for word, reach workers ahead of the comment cap, and hold a don't-wait block once. |

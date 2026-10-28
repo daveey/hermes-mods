@@ -153,8 +153,46 @@ Boards: every board on every host is attached and `primary` (6 on the laptop, 4 
 host only knows through links (the laptop's `bb`, `runners` and `unconventional-collab`) keep just a replica. The sync loop now wakes on the service's WebSocket
 feed, on a local outbox write or on its period, instead of polling every 5 s.
 
-What is not built yet: Desktop reading whole boards from the replica (only linked cards do), and placement beyond
-"a card runs where it was created" (`runs_on`, Worker nodes and transcripts).
+Worker nodes, card runs only (2026-10-28). Cards can now run on machines other than the one that created them. The
+rules are the ones in Worker nodes and transcripts (registry, labels, `pinned_only`, `max_card_runs`, Placement); this
+is what is built and what tests prove:
+
+- **Registry** (Board service, hermes-hub#40, #42): each enrolled gateway's entry carries `labels`, `pinned_only`,
+  `max_card_runs` and `hold`, plus `machine:<name>`, which is always its own and never another's. Only the operator
+  path writes them: `PATCH /v2/op/gateways/{name}` (Cloudflare Access operator) or `POST /v1/admin/gateways/{name}/machine`
+  (the admin key, `hermes-mail admin machine <name> --labels ... --max-card-runs N --hold`); every write is audited
+  (`admin machine-audit`). A gateway key can only read (`GET /v2/machines`). Tests: `worker/test/machines.test.ts`.
+- **Lease grant** checks, in order: `hold` (`held`), `pinned_only` (a pinned machine takes another gateway's card
+  only when its `runs_on` names `machine:<it>`; its own cards stay its own), `runs_on` labels (`labels_mismatch`; `[]`
+  = any machine), default placement (`runs_on` NULL: the creator at once; another machine needs the creator's labels
+  minus `machine:*`, a workspace that is not `dir`/`worktree`, and `ready_since` older than the board's
+  `home_grace_s` (default 600, `PUT /v2/op/boards/{id}/settings`) or a creator silent for 180 s → `home_grace`), and
+  `max_card_runs` (`capacity`; counted per board, since each board is its own Durable Object; the host-wide cap is the
+  worker's own `kanban.max_in_progress`). Revoking a gateway makes its renewals fail, so its runs stop before the lease
+  expires and the cards return to `ready`; `hold` drains (renewals still work, no new grants). Tests:
+  `machines.test.ts` (each refusal, hold, revoke then regrant elsewhere).
+- **Core** (patches in the core/README row): `runs_on` is a synced task column (`kanban create --runs-on linux,...`,
+  `kanban_create(runs_on=[...])`), and `ready_since` comes from the Board. `placement=<gateway>` naming an enrolled
+  machine, on a primary board, creates the card here with `runs_on=[machine:<gateway>]`; an unknown name is still
+  refused `placement_unavailable` (card t_01a18094c9791eea). A gateway with `kanban.sync.pickup` set copies eligible
+  `ready` cards that other gateways created from its replica into its live board each dispatcher tick (no capture, so
+  nothing is pushed), and the normal claim path takes the Board lease. `pickup: explicit` (what worker nodes run)
+  takes only cards whose `runs_on` is set, so a hub's default-placement cards (often about the hub itself) stay on
+  the hub; `pickup: true` also takes default-placement cards the Board allows. A refused grant leaves no run, and the copy is
+  evicted on a later tick; so is a copy that ended, once its outbox has drained. On the creator, a card running under
+  another gateway's lease with no local claim is left out of the orphan requeue, the stale-heartbeat sweep and the
+  host and per-profile concurrency counts. Tests: `test_kanban_worker_node.py` (CLI and tool `runs_on`, placement to an
+  enrolled machine and to an unknown one, the eligibility rules, `explicit` and `true` pickup, pickup → lease → run →
+  result on the creator → eviction, creator sweeps and counts, a refused grant, never two live claims).
+- **Infra**: worker boxes come from Terraform in the private config repo (`hosts/hermes-workers/`, one map entry per
+  node, state in S3), and `enroll.sh <name>` does the rest: deploy key, the fork, the token-broker client, Board
+  enrollment, registry labels, config and the gateway service. That repo's README is the runbook.
+
+Not built: operator actions do not yet need a user-device signature (no device keys exist before W1); the
+operator path is the Access login or the admin key. Workspace jobs keep their own registry. Sessions do not run on
+worker nodes. Desktop still reads whole boards only from each card's own gateway.
+
+What is not built yet: Desktop reading whole boards from the replica (only linked cards do).
 
 ## Problem
 
@@ -1550,12 +1588,15 @@ For the Kanban source of truth, none yet. Proposed: `hermes_cli/kanban_db_sync.p
 `plugins/kanban-sync/` (sync worker, enroll/import/detach CLI), and the existing separate service repo (Worker +
 Durable Object), which already runs the replication described under Current state. Built for Liveness: scope
 heartbeats in the service client and core `kanban_origin_ledger.project` (tests:
-`test_kanban_origin_scope_heartbeat.py`). Worker nodes and transcripts: none yet; the worker node model reuses the
-runners plugin's workspace-job contract (`plugins/runners/contracts/`).
+`test_kanban_origin_scope_heartbeat.py`). Worker nodes, card runs: `hermes_cli/kanban_worker_node.py` (pickup,
+eligibility, `runs_on`), seams in `kanban_db_sync.py` (`held_elsewhere_sql`, `set_runs_on`, `worker_pickup`), and the
+service's `worker/src/mailbox.ts` (registry) and `transitions.ts` (`checkPlacement`). Transcripts: none yet; workspace
+jobs keep the runners plugin's contract (`plugins/runners/contracts/`).
 
 ## Tests
 
-None yet. Required before any feature doc claims behavior: the upstream kanban suite with sync on and off; the
+Built so far: the suites named under "Central Kanban sync: built so far" and Liveness; worker nodes (card runs):
+`tests/hermes_cli/test_kanban_worker_node.py` (core) and `worker/test/machines.test.ts` (Board service). Required before any feature doc claims behavior: the upstream kanban suite with sync on and off; the
 apply-path tests (echo suppression, run uid translation, hooks fire once after commit, cursor advances
 atomically); lease tests (two gateways race, lease expiry mid-run, a stale holder's `complete` rejected); offline
 replay (outbox survives restart, idempotent re-POST); and the import/remap tests. Added by Ownership: a holder that
