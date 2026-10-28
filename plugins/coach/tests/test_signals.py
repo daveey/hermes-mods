@@ -119,6 +119,22 @@ def test_failed_cron_runs(home):
     assert all(s["fp"].startswith("cron-") for s in crons)
 
 
+def test_gateway_shutdown_cron_kill_is_one_off_unless_repeated(home):
+    gw = "Gateway shutdown (post-interrupt) killed the job's tool subprocess before the run finished."
+
+    def job(i, streak, detail):
+        return {"id": i, "name": f"job {i}", "last_status": "error", "failure_streak": streak,
+                "last_failure": {"at": "2026-10-22T08:10:00+00:00", "detail": detail}}
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [
+        job("g1", 1, gw), job("g2", 2, gw), job("o1", 1, "Script exited with code 1")]}))
+    cur = {}
+    names = sorted(s["symptom"].split("'")[1] for s in sg.collect_cron(home, cur, NOW, "macbook"))
+    assert names == ["job g2", "job o1"]
+    # the suppressed run still advanced the seen cursor: no re-emit on the next pass
+    assert cur["cron"]["default:g1"] > 0
+    assert sg.collect_cron(home, cur, NOW + 60, "macbook") == []
+
+
 def test_kanban_cards_failed_twice(home):
     ks = kinds(sg.collect(home, {}, "hubhost", NOW), "kanban")
     assert [s["symptom"].split()[2] for s in ks] == ["t_crash2"]  # once is not enough; self-heal's own cards skip

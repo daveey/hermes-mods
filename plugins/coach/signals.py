@@ -232,6 +232,8 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
             seen[k] = at
             name = job.get("name") or job.get("id")
             detail = str(lf.get("detail") or job.get("last_error") or "run failed")
+            if detail.startswith("Gateway shutdown (") and int(job.get("failure_streak") or 0) < 2:
+                continue  # one-off run killed by a gateway restart (cursor already advanced); a streak still files
             out.append({"kind": "cron", "component": "cron", "at": at, "profile": prof,
                         "symptom": f"cron job '{name}' failed on {host}: {detail.splitlines()[0][:120] if detail else ''}",
                         "details": home_tilde(f"job {job.get('id')} ({name}, profile {prof}) failure_streak="
