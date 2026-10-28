@@ -69,6 +69,71 @@ def test_fd_redirections_are_not_crontab_args():
         assert blocked("terminal", command=cmd), cmd
 
 
+def test_prose_is_not_a_command():
+    for cmd in [
+        'git commit -m "fix: not crontab file args; edit crontab -r docs"',
+        'echo "the crontab is fine"',
+        "printf 'crontab -'",
+        'echo "crontab -r; crontab /tmp/x"',
+        "echo crontab -r",
+        "printf '%s' '$(crontab -r)'",
+        'bash -c \'echo "crontab -r"\'',
+        "ssh host 'echo crontab -r'",
+        "command -v crontab",
+        "command -V crontab",
+        "echo 'crontab -r' # crontab -r",
+        'echo "\\$(crontab -r)"',
+        "crontab '-l'",
+        "crontab -l 2>/dev/null | echo ok",
+    ]:
+        assert not blocked("terminal", command=cmd), cmd
+
+
+def test_command_positions_and_prefixes():
+    for cmd in [
+        "ssh host -p 22 crontab -r",
+        "ssh host -t crontab -r",
+        "ssh -o X=1 host -- crontab -r",
+        "bash -o pipefail -c 'crontab -r'",
+        "bash --norc -c 'crontab -r'",
+        "env -S 'crontab -r'",
+        "env --split-string='crontab -r'",
+        "env -Scrontab -r",
+        "{ crontab -r; }",
+        "if true; then crontab -r; fi",
+        "while false; do crontab -r; done",
+        "! crontab -r",
+        "time crontab -r",
+        "eval 'crontab -r'",
+        "dash -c 'crontab -r'",
+        "ksh -c 'crontab -r'",
+        "xargs -p crontab -r",
+        "ssh mini crontab -r",
+        "ssh -o ConnectTimeout=5 -i k host 'crontab -'",
+        "ssh -p 22 -l user -J jump host 'crontab -'",
+        "sudo -n -u root crontab -u root -",
+        "bash -c 'crontab /tmp/x'",
+        "sh -lc 'crontab -r'",
+        "zsh -c 'crontab -'",
+        "timeout 5 crontab -r",
+        "timeout -s TERM -k 2 5 crontab -r",
+        "(crontab -l; echo x) | crontab -",
+        "env FOO=1 crontab -",
+        "nice -n 5 nohup crontab -r",
+        "exec command crontab -",
+        "xargs -I {} crontab {}",
+        "echo ok; crontab -r",
+        "true && crontab -r",
+        "false || crontab -r",
+        "echo ok & crontab -r",
+        "echo ok\ncrontab -r",
+        'echo "$(crontab -r)"',
+        'echo "`crontab -r`"',
+        "echo $(echo $(crontab -r))",
+    ]:
+        assert blocked("terminal", command=cmd), cmd
+
+
 def test_python_and_nested_calls():
     assert blocked("execute_code", code='subprocess.run(["crontab", "-"], input=t)')
     assert blocked("execute_code", code="os.system('crontab /tmp/x')")
@@ -90,6 +155,18 @@ def test_claude_hook():
     ok = subprocess.run([sys.executable, hook], input='{"tool_input": {"command": "crontab -l"}}',
                         capture_output=True, text=True)
     assert ok.returncode == 0
+    import json
+    for cmd, expected in [
+        ('git commit -m "fix: not crontab file args; edit crontab -r docs"', 0),
+        ('echo "the crontab is fine"', 0),
+        ("printf 'crontab -'", 0),
+        ("ssh -o ConnectTimeout=5 -i k host 'crontab -'", 2),
+        ("bash -c 'crontab /tmp/x'", 2),
+    ]:
+        result = subprocess.run([sys.executable, hook],
+                                input=json.dumps({"tool_input": {"command": cmd}}),
+                                capture_output=True, text=True)
+        assert result.returncode == expected, (cmd, result.stderr)
 
 
 def test_line_helper(tmp_path):
