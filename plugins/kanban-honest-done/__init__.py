@@ -10,6 +10,8 @@ B. completing its own card (``kanban_complete`` tool, or ``hermes kanban complet
    (``t_xxxxxxxx``) that exists, is open (or already done), and was created by or is linked to this card.
 D. completing its own card while the body/comments name an origin chat (``origin ... @session:X``) that is not
    linked to the card (chat link, notify subscription, or ``follow-through: SENT`` comment), so it never hears.
+E. (any session, not only workers) ``kanban_create`` whose title/body names an origin chat on ANOTHER gateway
+   (``origin ... @session:<profile>@<gw>/<id>``) without ``origin_session`` binding it: the chat would never see it.
 
 The refusal says what to do instead.
 
@@ -91,12 +93,31 @@ def classify(tool_name: str, args: Any, own: str, paths_fn=None) -> Optional[str
     return None
 
 
+CREATE_TOOLS = {"kanban_create"}
+
+
+def classify_create(tool_name: str, args: Any, names_fn=None, env=None) -> Optional[str]:
+    """E: refusal for creating a card that names another gateway's origin chat without binding it. Any session."""
+    args = args if isinstance(args, dict) else {}
+    name = _strip(str(tool_name or ""))
+    if name in CREATE_TOOLS:
+        return core.check_create(args, env=env, names_fn=names_fn)
+    if name == "tool_call":
+        for call in args.get("calls") or []:
+            if isinstance(call, dict):
+                why = classify_create(str(call.get("name") or ""), call.get("arguments"), names_fn, env)
+                if why:
+                    return why
+    return None
+
+
 def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[dict]:
+    own = None
     try:
-        if not _in_worker():
-            return None
-        own = core.own_task_id()
-        why = classify(tool_name, args, own) if own else None
+        why = classify_create(tool_name, args)
+        if not why and _in_worker():
+            own = core.own_task_id()
+            why = classify(tool_name, args, own) if own else None
     except Exception:  # never let this plugin break a tool call
         logger.debug("kanban-honest-done classify failed", exc_info=True)
         return None

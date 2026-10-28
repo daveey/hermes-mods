@@ -331,16 +331,60 @@ def origin_refusal(task_id: str, sessions: list[str]) -> str:
     s = sessions[0]
     return (
         f"[kanban-honest-done] Refused: {task_id} names origin chat @session:{s} (body/comments), but that chat is "
-        "not linked to this card, so it will never see that the card finished. Link it, then complete again:\n"
-        f"1) Chat on this gateway: `hermes kanban notify-subscribe {task_id} --platform tui --chat-id {s}`.\n"
-        f"2) Chat on another gateway (@session:<profile>@<gateway>/{s}): `hermes kanban notify-subscribe {task_id} "
-        f"--platform hub --chat-id <gateway>/<profile>/{s}` (add `--board <slug>` before `notify-subscribe` when "
-        "the card is not on the default board); hermes-hub publishes it to that chat's task list.\n"
-        "3) Or send it the result yourself (cross_session action=send) and record it with `kanban_comment`: "
-        f"\"follow-through: SENT via cross_session to @session:{s} at <time>; delivery verified|not verified\". "
-        "If none of these work, kanban_block this card with the exact step instead."
+        "not linked to this card, so it will never see that the card finished (only the linked chats are told). "
+        "Before completing:\n"
+        "1) Send that chat the result yourself: cross_session action=send, target = the @session link from the "
+        "card body, message = what finished, the proof, and anything still open.\n"
+        f"2) Record it with kanban_comment on {task_id}: \"follow-through: SENT via cross_session to @session:{s} "
+        "at <time>; delivery verified|not verified\" (verified = the send returned delivered/replied). Then complete "
+        "again.\n"
+        "3) If the send fails (no relay, chat gone), kanban_block this card with that error instead of completing.\n"
+        "(Whoever creates such a card should bind the chat up front: kanban_create origin_session='@session:…'.)"
         + (f" Other unlinked origin chats: {', '.join(sessions[1:])}." if len(sessions) > 1 else "")
     )
+
+
+# --- E: a card created FOR another gateway's chat must be bound to it -----------------------------------------
+
+ORIGIN_REF_RE = re.compile(
+    r"\borigin(?:_session)?\b[^\n@]{0,60}@session:(?P<profile>[\w.-]+)@(?P<gw>[\w.-]+)/(?P<sid>[A-Za-z0-9][\w-]{5,})",
+    re.I)
+
+
+def _gateway_names() -> Optional[tuple[str, set[str]]]:
+    try:
+        from hermes_cli import kanban_origin  # type: ignore
+
+        return kanban_origin.gateway_names()
+    except Exception:
+        return None
+
+
+def check_create(args: dict, env=None, names_fn=None) -> Optional[str]:
+    """Refusal for a ``kanban_create`` whose title/body names an origin chat on ANOTHER gateway while the card is
+    not bound to it (no ``origin_session`` argument / ``HERMES_ORIGIN_SESSION`` naming that chat). Unbound, the
+    chat never sees the card or its completion. None (allow) when this gateway's name is unknown."""
+    env = os.environ if env is None else env
+    text = _DQUOTED.sub('""', f"{args.get('title') or ''}\n{args.get('body') or ''}")
+    refs = [m.groupdict() for m in ORIGIN_REF_RE.finditer(text)]
+    if not refs:
+        return None
+    bound = f"{args.get('origin_session') or ''} {env.get('HERMES_ORIGIN_SESSION') or ''}"
+    if any(r["sid"] in bound for r in refs):
+        return None
+    names = (names_fn or _gateway_names)()
+    if not names or not names[0]:
+        return None
+    me, known = names
+    remote = [r for r in refs if r["gw"] != me and (not known or r["gw"] in known)]
+    if not remote:
+        return None
+    r = remote[0]
+    ref = f"@session:{r['profile']}@{r['gw']}/{r['sid']}"
+    return (f"[kanban-honest-done] Refused: this card's text names origin chat {ref}, but the card would not be "
+            "bound to it, so that chat never sees the card or hears when it finishes (only the creating chat is "
+            f"told). Call kanban_create again with origin_session='{ref}' (same title/body). If that chat is not "
+            "what the card is for, reword the body so it doesn't call it the origin.")
 
 
 _OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}")

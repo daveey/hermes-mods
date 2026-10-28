@@ -148,7 +148,7 @@ def test_origin_chat_only_in_prose_refused(tmp_path):
     """The incident's chat links: only the hub supervisor, not the origin chat the body names."""
     paths = make_board(tmp_path)
     why = plugin.classify("kanban_complete", {"summary": "Shipped and verified on both hosts."}, OWN, paths)
-    assert why and ORIGIN in why and "notify-subscribe" in why and "cross_session" in why
+    assert why and ORIGIN in why and "cross_session" in why and "follow-through: SENT" in why
 
 
 def test_origin_chat_linked_allowed(tmp_path):
@@ -167,9 +167,55 @@ def test_origin_chat_cross_gateway_hub_sub_allowed(tmp_path):
     assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
 
 
-def test_refusal_names_both_link_commands(tmp_path):
+def test_refusal_routes_are_worker_runnable(tmp_path):
+    """Workers are fenced from `hermes kanban notify-subscribe` on their own board, so the refusal must not send
+    them there: it names the cross_session send + follow-through comment, and kanban_block as the fallback."""
     why = plugin.classify("kanban_complete", {"summary": "Shipped."}, OWN, make_board(tmp_path))
-    assert f"--platform tui --chat-id {ORIGIN}" in why and f"--platform hub --chat-id <gateway>/<profile>/{ORIGIN}" in why
+    assert "notify-subscribe" not in why and "kanban_block" in why
+    assert f"follow-through: SENT via cross_session to @session:{ORIGIN}" in why
+
+
+# --- E: kanban_create naming another gateway's origin chat must bind it -------------------------------------------
+
+NAMES = lambda: ("hub", {"hub", "macbook", "mac-mini"})  # noqa: E731
+CREATE_ARGS = {"title": "Session activity: shepherd links", "body": BODY}
+
+
+def test_create_naming_remote_origin_unbound_refused():
+    """t_c4cc0cc4 was created on the hub with the MacBook origin only in its body."""
+    why = plugin.classify_create("kanban_create", CREATE_ARGS, NAMES, env={})
+    assert why and f"origin_session='@session:default@macbook/{ORIGIN}'" in why
+
+
+def test_create_bound_by_arg_or_env_allowed():
+    ref = f"@session:default@macbook/{ORIGIN}"
+    assert plugin.classify_create("kanban_create", dict(CREATE_ARGS, origin_session=ref), NAMES, env={}) is None
+    assert plugin.classify_create("kanban_create", CREATE_ARGS, NAMES, env={"HERMES_ORIGIN_SESSION": ref}) is None
+
+
+@pytest.mark.parametrize("body", [
+    f"Origin chat: @session:default@hub/{ORIGIN}",  # same gateway: origin_session can't bind it, Gate D covers it
+    f"Origin chat: @session:default/{ORIGIN}",  # no gateway in the ref
+    f"See @session:default@macbook/{ORIGIN} for context.",  # not called the origin
+    f'Plan said "report to origin chat @session:default@macbook/{ORIGIN}".',  # quoted
+])
+def test_create_without_remote_origin_allowed(body):
+    assert plugin.classify_create("kanban_create", {"title": "x", "body": body}, NAMES, env={}) is None
+
+
+def test_create_fails_open_without_gateway_names():
+    assert plugin.classify_create("kanban_create", CREATE_ARGS, lambda: None, env={}) is None
+    assert plugin.classify_create("kanban_create", CREATE_ARGS, lambda: ("", set()), env={}) is None
+
+
+def test_create_gate_via_tool_call_and_hook_outside_worker(monkeypatch):
+    wrapped = {"calls": [{"name": "kanban_create", "arguments": CREATE_ARGS}]}
+    assert plugin.classify_create("tool_call", wrapped, NAMES, env={})
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_ORIGIN_SESSION", raising=False)
+    monkeypatch.setattr(core, "_gateway_names", NAMES)
+    out = plugin._pre_tool_call("kanban_create", CREATE_ARGS)
+    assert out and out["action"] == "block" and "origin_session" in out["message"]
 
 
 def test_single_quoted_pattern_talk_is_not_an_admission():
