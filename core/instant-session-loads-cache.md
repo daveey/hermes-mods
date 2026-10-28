@@ -1,6 +1,6 @@
 # Instant session loads: local transcript cache
 
-Patches 0532 (source `307ab56d4b`) and 0533 (source `8914c58a90`). Part C1 of the "instant session loads"
+Patches 0532 (source `307ab56d4b`), 0533 (source `8914c58a90`) and 0548 (source `0c02a4eb07`). Part C1 of the "instant session loads"
 plan; part A (sidebar rows from the hub replica) is [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md).
 
 ## Behavior
@@ -14,6 +14,8 @@ plan; part A (sidebar rows from the hub replica) is [desktop-sidebar-replica-liv
   automations). A session is refetched when its `activity` or `message_count` moved, at most every 30 s while
   it keeps moving. Gateway names map to registry connections through each connection's own
   `/api/plugins/hub-sync/status`, remembered in the cache file. A gateway whose route fails is skipped for 60 s.
+  Remote gateways are dialed passively (0548): prefetch rides the pool entry the remote prewarmer holds and never
+  starts a cold SSH dial or spawn, bumps `lastActiveAt`, or records a profile as opened. The local backend may start.
 - **Open and reconcile.** When the clicked row names its owner, the REST read starts at the click (not after
   the owner lookup and gateway switch) and the cold resume reuses that same request. The fresh page replaces
   the cached paint display-only; an unchanged session keeps the painted array (no re-render, no flicker), and a
@@ -51,6 +53,7 @@ plan; part A (sidebar rows from the hub replica) is [desktop-sidebar-replica-liv
 
 - Cache write/read, merge, scoping, corruption: `electron/transcript-cache.test.ts` (and the renderer side,
   bridge and in-memory, `src/store/transcript-tail-cache.test.ts`).
+- Passive remote dials and the sync read IPC: `electron/transcript-cache-host.test.ts`.
 - LRU and size bounds: `electron/transcript-cache.test.ts` "LRU and size bounds" (count, bytes, per-entry trim).
 - Prefetch selection and refresh on activity change: `electron/transcript-prefetch.test.ts` (per-gateway cap,
   chats before automations, refetch on `activity`/`message_count`, 30 s throttle, gateway backoff, 404).
@@ -72,7 +75,7 @@ showed the asleep notice with the draft kept.
 
 ## Applying
 
-Apply 0532 then 0533 with `git am -3` after the preceding fork patches. 0533 touches `use-session-actions`,
+Apply 0532, 0533 and 0548 with `git am -3` after the preceding fork patches. 0533 touches `use-session-actions`,
 `submit.ts`, `main.ts` and `preload.ts`, so it depends on the fork's Desktop series (offline rows from 0528).
 
 ## Gotchas

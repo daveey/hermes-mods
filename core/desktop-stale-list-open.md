@@ -1,0 +1,46 @@
+# A stale-list row still opens and names its connection
+
+Patch: 0529. Fixes a gap in the offline fallback ([hub-sync-replica.md](hub-sync-replica.md),
+[desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md)) found on 2026-10-27.
+
+## Why
+
+The Desktop app's own backend stalled its event loop for 6–18 s under GIL pressure (2.3 GB RSS, 4 concurrent turns).
+One sidebar session list failed, so `$sessionListFreshness` marked the local connection not fresh.
+`mergeOfflineFallback` then turned every live local row into `{ ...row, offline_cached: true }` with no
+`offline_gateway` and no `offline_synced_at`. `useOfflineFallback` refused to open those rows, and the toast read
+"its gateway is offline, so this chat can't be opened right now (cached, never synced)". The gateway was running.
+
+## What it does
+
+- **Stale-list stamp.** A row that `mergeOfflineFallback` (`src/store/offline-sessions.ts`) keeps from a failed
+  list, and that has no replica copy, gets `offline_stale_list: true` (a new `SessionInfo` field) as well as
+  `offline_cached` and `is_active: false`. Replica rows never get it.
+- **Open still tries.** Clicking a stale-list row (`useOfflineFallback`, `src/app/chat/sidebar/use-offline-fallback.ts`)
+  shows "<connection> is not responding (its last session list failed). Trying to open this chat anyway." and then
+  calls `resumeSession` live (`clearAsleepOpen`, never the read-only asleep open from
+  [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md)'s transcript cache), with resume's own timeout.
+  `<connection>` is the registry label, for example "This computer", found through `sessionGatewayId`.
+- **Replica rows are unchanged.** A replica row of an unreachable gateway opens read-only from this Mac's
+  transcript cache when it has one. Without one, it is refused with the old "<gateway> is offline … can't be opened"
+  notice.
+- **Row mark.** The tooltip on a stale-list row reads "Not responding · <connection>, showing its last list" instead of
+  "Offline · cached from its gateway, never synced".
+
+## Tests
+
+- `src/app/chat/sidebar/offline-fallback.integration.test.tsx`: a stale-list row of a busy local backend opens
+  (resume is called), and the notice and tooltip name "This computer". A remote stale-list row that has a cached
+  transcript resumes live, not read-only. A replica row with no cached transcript stays refused while its owner's
+  list is also failing.
+- `src/store/offline-sessions.test.ts`: only rows without a replica copy get `offline_stale_list`.
+- `src/store/offline-session-actions.test.ts`: the notice names the connection and never says "offline",
+  "never synced" or "its gateway".
+
+## Gotchas
+
+- Archive and rename of a stale-list row still take the offline hub-queue path (`requireOfflineOwner`), which needs
+  `offline_gateway`, so they fail with "Offline session owner could not be resolved". This was already true before
+  this patch.
+- The watchdog alert for a stalled app backend lives in the private repo (`home/scripts/hermes_watchdog.py`,
+  `desktop-app-backend`). It is not part of this patch.
