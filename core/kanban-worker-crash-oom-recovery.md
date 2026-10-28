@@ -37,3 +37,5 @@ No.
 ## Follow-up patch (0570)
 
 **0570** (source `8b741ea26b`): the first run of a worker scope gets `MemoryMax` at 2x the base, bounded by admission (the same `MemAvailable` minus reserve check as recovery); typed OOM recovery doubles from that value. `hermes_cli/kanban_worker_scope.py`; test `test_first_run_base_uplift_is_admission_bounded` in `tests/hermes_cli/test_kanban_oom_recovery.py`.
+
+**0594** (source `529b6c9f66`), test-only: `test_managed_gateway_worker_is_spawned_in_restart_safe_scope` pins `hermes_cli.kanban_worker_scope.mem_available_bytes` to 16 GiB and expects the doubled first-run cap (`MemoryMax=1073741824`). 0570 updated `test_kanban_oom_recovery.py` but not this Linux-only sibling, so a host with enough free memory failed the old 512 MiB assert. Skipped on macOS (untested there).
