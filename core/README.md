@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-local-lineage-counts.md](kanban-local-lineage-counts.md) | 0671 | Local cards shared across compression aliases count once, matching the task strip; parked, held and stalled subsets deduplicate with the same snapshot. Distinct boards/cards remain distinct. |
 | [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md) | 0670 | A model pin the managed routing registry cannot serve is refused at create and set-model (code `model_pin_not_in_routing_registry`), not at worker startup. |
 | [standing-instructions.md](standing-instructions.md) | 0669 | Standing instructions survive compaction word for word, reach workers ahead of the comment cap, and hold a don't-wait block once. |
 | [bare-checkout-recover.md](bare-checkout-recover.md) | 0667–0668 | `hermes update` resets `core.bare` on a work tree that `git init --bare` flipped; a genuine bare repo is left alone. The `.git` marker is read as utf-8-sig. |
