@@ -776,18 +776,48 @@ def _frontmatter(text):
     return meta, text[m.end():] if m else text
 
 
+def _global_context_files(home):
+    """agent.global_context_files from the eval home's config.yaml (copied from the live one), ~-expanded; stdlib
+    only, so a flow list or a block list under `agent:`."""
+    try:
+        cfg = (Path(home) / "config.yaml").read_text()
+    except OSError:
+        return []
+    m = re.search(r"(?ms)^agent:\n(.*?)(?=^\S|\Z)", cfg)
+    if not m:
+        return []
+    g = re.search(r"(?m)^([ \t]+)global_context_files:[ \t]*(\[.*\])?[ \t]*$\n?((?:\1[ \t]*- .*\n?)*)", m.group(1))
+    if not g:
+        return []
+    raw = re.findall(r"[^,\[\]]+", g.group(2)) if g.group(2) else re.findall(r"- (.*)", g.group(3))
+    return [Path(x.strip().strip("'\"")).expanduser() for x in raw if x.strip().strip("'\"")]
+
+
 def compose_system(home, cwd, preload=()):
     """The replay system prompt, layered the way Hermes builds it (agent/system_prompt.py): identity (SOUL.md) ->
-    project context (cwd AGENTS.md) -> skills index -> memory (MEMORY.md, USER.md); skills named in `preload` are
+    global context files (agent.global_context_files) -> project context (cwd AGENTS.md) -> skills index -> memory (MEMORY.md, USER.md); skills named in `preload` are
     appended in full the way a session launched with --skills sees them. Reads only the eval home + its cwd."""
     home, cwd = Path(home), Path(cwd)
     parts = []
     soul = home / "SOUL.md"
     parts.append(soul.read_text().strip() if soul.is_file() else "You are Hermes, a helpful AI agent.")
+    # agent.global_context_files (core): each file is its own "## <path> (global)" section ahead of the project
+    # chain, whatever the cwd. ~/AGENTS.md is the copy prepare_home put in cwd (candidate edits applied there), so
+    # it renders once, as the global section; other global paths are read as-is.
+    sections, seen = [], set()
+    for g in _global_context_files(home):
+        src = cwd / "AGENTS.md" if g == HOME / "AGENTS.md" else g
+        text = src.read_text(errors="replace").strip() if src.is_file() else ""
+        if text and text not in seen:
+            seen.add(text)
+            label = "~/" + str(g.relative_to(HOME)) if g.is_relative_to(HOME) else str(g)
+            sections.append(f"## {label} (global)\n\n{text}")
     agents = cwd / "AGENTS.md"
-    if agents.is_file():
+    if agents.is_file() and agents.read_text().strip() not in seen:
+        sections.append("## AGENTS.md\n\n" + agents.read_text().strip())
+    if sections:
         parts.append("# Project Context\n\nThe following project context files have been loaded and should be "
-                     "followed:\n\n## AGENTS.md\n\n" + agents.read_text().strip())
+                     "followed:\n\n" + "\n".join(sections))
     cats = {}
     for f in sorted((home / "skills").rglob("SKILL.md")) if (home / "skills").is_dir() else []:
         meta, _ = _frontmatter(f.read_text(errors="replace"))

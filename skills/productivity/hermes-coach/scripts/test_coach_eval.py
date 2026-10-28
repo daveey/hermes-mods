@@ -489,6 +489,26 @@ class Direct(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertNotIn("DEMO BODY", ce.compose_system(self.home, self.cwd))
 
+    def test_global_context_files_layer_before_project_once(self):
+        """agent.global_context_files: ~/AGENTS.md renders from the eval cwd copy as the global section (no second
+        project copy); another global file is read as-is; unset config keeps the plain project section."""
+        extra = self.tmp / "extra-rules.md"
+        extra.write_text("EXTRA-RULE\n")
+        (self.home / "config.yaml").write_text(
+            f"model: {{}}\nagent:\n  max_turns: 5\n  global_context_files:\n    - ~/AGENTS.md\n    - {extra}\nmemory: {{}}\n")
+        s = ce.compose_system(self.home, self.cwd)
+        self.assertEqual(s.count("RULE-A"), 1)
+        self.assertIn("## ~/AGENTS.md (global)\n\nRULE-A", s)
+        self.assertNotIn("## AGENTS.md\n", s)
+        order = [s.index(x) for x in ("I am SOUL", "# Project Context", "RULE-A", "EXTRA-RULE", "MEMORY (your")]
+        self.assertEqual(order, sorted(order))
+        (self.home / "config.yaml").write_text("agent:\n  global_context_files: ['~/AGENTS.md']\n")
+        self.assertEqual(ce._global_context_files(self.home), [ce.HOME / "AGENTS.md"])
+        (self.home / "config.yaml").write_text("agent:\n  max_turns: 5\n")
+        s = ce.compose_system(self.home, self.cwd)
+        self.assertIn("## AGENTS.md\n\nRULE-A", s)
+        self.assertNotIn("(global)", s)
+
     def test_bound_covers_bytes_and_max_tokens_and_settles_to_measured(self):
         from decimal import Decimal
         req = self.runner.prepare("hello", home=self.home, cwd=self.cwd, model="m")
