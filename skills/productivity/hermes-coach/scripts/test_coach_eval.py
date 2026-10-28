@@ -853,6 +853,15 @@ class CodexWire(unittest.TestCase):
         be, c = self.backend(codex_events("hi", extra=[{"type": "response.reasoning_summary_text.delta", "delta": "r" * 300}]))
         self.assertEqual(be.call(self.req)["stop_reason"], "max_tokens")
 
+    def test_final_message_item_is_the_text_when_the_stream_has_no_deltas(self):
+        item = {"type": "message", "content": [{"type": "output_text", "text": "whole answer"}]}
+        be, _ = self.backend([{"type": "response.output_item.done", "item": item}, *codex_events("")[1:]])
+        self.assertEqual(be.call(self.req)["text"], "whole answer")
+        done = {"type": "response.completed", "response": {"output": [item], "usage": {"input_tokens": 3, "output_tokens": 2}}}
+        be, _ = self.backend([done])
+        out = be.call(self.req)
+        self.assertEqual((out["text"], out["usage"]["input_tokens"]), ("whole answer", 3))
+
     def test_refusal_and_failure(self):
         be, _ = self.backend([{"type": "response.refusal.delta", "delta": "no"}, *codex_events("")[1:]])
         out = be.call(self.req)

@@ -92,6 +92,13 @@ class AnthropicBackend:
             "cache_read_tokens": getattr(u, "cache_read_input_tokens", 0) or 0}}
 
 
+def _item_texts(item):
+    """output_text parts of a finished Responses `message` item."""
+    if _get(item, "type", "") != "message":
+        return []
+    return [_get(c, "text", "") for c in _get(item, "content", []) or [] if _get(c, "type", "") == "output_text"]
+
+
 class CodexBackend:
     """Codex Responses wire: ONE streaming responses.create per call, instructions = system, no tools, store=False,
     no retries. `client` is an openai.OpenAI built with max_retries=0 (tests inject a fake)."""
@@ -111,10 +118,13 @@ class CodexBackend:
         if not self.chatgpt_backend:  # the ChatGPT Codex endpoint 400s on max_output_tokens
             kw["max_output_tokens"] = max_tokens
         stream = self.client.responses.create(**kw)
-        parts, chars, usage, stop = [], 0, {}, "end_turn"
+        parts, done, chars, usage, stop, seen = [], [], 0, {}, "end_turn", {}
         try:
             for ev in stream:
                 t = _get(ev, "type", "")
+                seen[t] = seen.get(t, 0) + 1
+                if t == "response.output_item.done":  # the final message, for streams that carry no text deltas
+                    done += _item_texts(_get(ev, "item", {}))
                 if t == "response.output_text.delta":
                     d = _get(ev, "delta", "")
                     parts.append(d)
@@ -128,6 +138,9 @@ class CodexBackend:
                     raise RuntimeError(f"codex stream {t}: {str(_get(err, 'message', err))[:200]}")
                 elif t in ("response.completed", "response.incomplete"):
                     r = _get(ev, "response", {})
+                    if not done:
+                        for it in _get(r, "output", None) or []:
+                            done += _item_texts(it)
                     u = _get(r, "usage", {})
                     cached = int(_get(_get(u, "input_tokens_details", {}), "cached_tokens", 0) or 0)
                     usage = {"input_tokens": max(0, int(_get(u, "input_tokens", 0) or 0) - cached),
@@ -149,7 +162,11 @@ class CodexBackend:
         if not usage:  # closed early or no terminal frame: bill the cap, not zero
             usage = {"input_tokens": 0, "output_tokens": max_tokens if stop == "max_tokens" else chars // self.CHARS_PER_TOKEN,
                      "cache_write_tokens": 0, "cache_read_tokens": 0}
-        return {"text": "" if stop == "refusal" else "".join(parts), "stop_reason": stop, "usage": usage}
+        text = "".join(parts) or "".join(done)
+        if not text.strip() and stop == "end_turn" and os.environ.get("COACH_WORKER_DEBUG_FILE"):
+            with open(os.environ["COACH_WORKER_DEBUG_FILE"], "a") as fh:
+                fh.write(json.dumps({"empty_reply_events": seen, "usage": usage}) + "\n")
+        return {"text": "" if stop == "refusal" else text, "stop_reason": stop, "usage": usage}
 
 
 def build_backend(provider):
