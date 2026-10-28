@@ -13,6 +13,7 @@ Every hook fails open. [daveey]
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import logging
 import os
@@ -88,6 +89,11 @@ def remote_cards() -> list[dict]:
     path = get_hermes_home() / 'kanban' / 'origin-ledger.db'
     if not path.exists():
         return ksa._remote_links()
+    shared = getattr(ksa, "remote_links_and_origin_rows", None)
+    if shared is not None:
+        # Newer cores keep the ledger rows of their cached projection: same rows, no second project() per pass.
+        cards, rows = shared()
+        return [card for card in cards if card.get('via') != 'origin'] + rows
     replica = ksa._hub_db_path()
     rows = project(path, replica=replica,
                    gateway=_gateway(replica or path.with_name('absent-replica.db')),
@@ -157,11 +163,39 @@ def _pass_reader() -> Callable[[list[str]], dict]:
     return read
 
 
+# One waiting pass (``_proof_pass``): its connections, SessionDB and lineage lookups, reused by every proof in it.
+_pass_local = threading.local()
+
+
+@contextlib.contextmanager
+def _proof_pass():
+    """Share reads across one ``pending_closeouts`` pass: ~50 proofs each opened a SessionDB (for the compression
+    tip) and a connection per state.db, ~45 ms of the sidebar's waiting source. Closed when the pass ends."""
+    if getattr(_pass_local, "res", None) is not None:
+        yield
+        return
+    res: dict[str, Any] = {"pool": core.ReadPool(), "tips": {}, "db": None}
+    _pass_local.res = res
+    try:
+        yield
+    finally:
+        _pass_local.res = None
+        res["pool"].close()
+        if res["db"] is not None:
+            res["db"].close()
+
+
 def state_dbs() -> list[Path]:
+    res = getattr(_pass_local, "res", None)
+    if res is not None and "state_dbs" in res:
+        return res["state_dbs"]
     root = _kanban_root()
     out = [root / "state.db"]
     out += sorted((root / "profiles").glob("*/state.db")) if (root / "profiles").is_dir() else []
-    return [p for p in out if p.is_file()]
+    out = [p for p in out if p.is_file()]
+    if res is not None:
+        res["state_dbs"] = out
+    return out
 
 
 def open_card_ids(session_id: str) -> list[str]:
@@ -176,7 +210,9 @@ def session_proof(sid: str, tid: str, card: dict) -> bool:
         at = card.get("completed_at")
         if at is None:
             return False
-        return core.ack_proven(state_dbs(), _lineage(sid), tid, float(at))
+        res = getattr(_pass_local, "res", None)
+        return core.ack_proven(state_dbs(), _lineage(sid), tid, float(at),
+                               pool=res["pool"] if res is not None else None)
     except Exception:
         logger.debug("chat-closeout: ack proof unavailable", exc_info=True)
         return False
@@ -288,7 +324,8 @@ def waiting_source() -> dict[str, list[str]]:
         if hit and time.monotonic() - hit[0] < 3.0:
             return hit[1]
         try:
-            out = core.pending_closeouts(ledger(), _pass_reader(), proof=session_proof)
+            with _proof_pass():
+                out = core.pending_closeouts(ledger(), _pass_reader(), proof=session_proof)
         except Exception:
             logger.debug("chat-closeout waiting source failed", exc_info=True)
             out = {}
@@ -418,6 +455,13 @@ def _compression_tip(sid: str) -> Optional[str]:
     runs schema init plus a system-wide open-file scan (~60 ms CPU) and was never closed: 23 of them per sidebar
     poll held the Desktop backend near 100% CPU (core/backend-writable-open-guard.md)."""
     from hermes_state import SessionDB
+    res = getattr(_pass_local, "res", None)
+    if res is not None:  # one read-only SessionDB and one lookup per session for the whole waiting pass
+        if sid not in res["tips"]:
+            if res["db"] is None:
+                res["db"] = SessionDB(read_only=True)
+            res["tips"][sid] = res["db"].get_compression_tip(sid)
+        return res["tips"][sid]
     db = SessionDB(read_only=True)
     try:
         return db.get_compression_tip(sid)

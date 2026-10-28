@@ -41,6 +41,29 @@ def ro_connect(path: Path, timeout: float = 2.0) -> sqlite3.Connection:
     return c
 
 
+class ReadPool:
+    """``ro_connect`` once per path for one pass, closed by ``close()``. The sidebar's waiting pass proves ~50
+    finished cards against every state.db; a fresh connection per proof was most of its cost."""
+
+    def __init__(self) -> None:
+        self._conns: dict[str, sqlite3.Connection] = {}
+
+    def get(self, path: Path) -> sqlite3.Connection:
+        key = str(path)
+        if key not in self._conns:
+            self._conns[key] = ro_connect(Path(path))
+        return self._conns[key]
+
+    def drop(self, path: Path) -> None:
+        conn = self._conns.pop(str(path), None)
+        if conn is not None:
+            conn.close()
+
+    def close(self) -> None:
+        for key in list(self._conns):
+            self.drop(Path(key))
+
+
 def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
@@ -228,20 +251,23 @@ def reconcile_done(row: dict[str, Any], cards: dict[str, dict[str, Any]],
     return out
 
 
-def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: float) -> bool:
+def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: float,
+               pool: Optional[ReadPool] = None) -> bool:
     """An owner-exact final notice followed by a successful final assistant reply.
 
     Missing legacy completion metadata is ambiguous, not acknowledgement. Inactive,
     commentary, failed, interrupted and tool-calling messages cannot close work.
+    ``pool`` (one pass's connections) is reused and left open; without it each db is opened and closed here.
     """
     ids = [i for i in dict.fromkeys(ids) if i]
     if not ids or not tid:
         return False
     for path in state_dbs:
         try:
-            conn = ro_connect(Path(path))
+            conn = pool.get(Path(path)) if pool is not None else ro_connect(Path(path))
         except sqlite3.Error:
             continue
+        failed = False
         try:
             required = {'display_kind', 'finish_reason', 'tool_calls', 'active'}
             if not required.issubset(_cols(conn, 'messages')):
@@ -263,9 +289,12 @@ def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: f
                       and r['tool_calls'] in (None, '', '[]', 'null')):
                     return True
         except sqlite3.Error:
-            pass
+            failed = True
         finally:
-            conn.close()
+            if pool is None:
+                conn.close()
+            elif failed:
+                pool.drop(Path(path))
     return False
 
 
