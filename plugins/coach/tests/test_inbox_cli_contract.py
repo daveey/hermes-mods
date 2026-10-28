@@ -1,10 +1,7 @@
 """The lane's generated commands must survive test-home pollution in a persistent terminal."""
 import importlib.util
-import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import sys
 
 import pytest
@@ -25,28 +22,10 @@ def test_investigation_brief_runs_no_inbox_command():
     assert not re.findall(r"`([^`]*hermes inbox[^`]*)`", sh.investigation_brief({"fingerprint": "desktop-12345678"}))
 
 
-@pytest.mark.parametrize("index", [0], ids=["fix"])
-def test_post_and_preflight_pin_the_lane_home(index):
-    text = briefs()[index]
-    commands = re.findall(r"`([^`]*hermes inbox[^`]*)`", text)
-    assert len(commands) == 2, commands
-    for command in commands:
-        assert command.startswith('env HERMES_HOME="$HOME/.hermes" hermes inbox ')
-    assert commands[0].endswith("post --help")
-    assert "Do not pipe" in text
-    assert "inbox_outcome" in text
-
-
-@pytest.mark.skipif(not shutil.which("hermes"), reason="installed Hermes CLI required")
-@pytest.mark.parametrize("index", [0], ids=["fix"])
-def test_real_generated_preflight_with_contaminated_home(tmp_path, index):
-    # Real discovery, not an import of inbox.register or a mocked subprocess. Never posts data.
-    text = briefs()[index]
-    commands = re.findall(r"`([^`]*hermes inbox[^`]*)`", text)
-    preflight = next(command for command in commands if command.endswith("post --help"))
-    env = dict(os.environ, HERMES_HOME=str(tmp_path / "diagnostic-home"))
-    env.pop("HERMES_PLUGINS_DEBUG", None)
-    run = subprocess.run(["/bin/sh", "-c", preflight], env=env, capture_output=True, text=True, timeout=120)
-    assert run.returncode == 0, run.stdout + run.stderr
-    assert "usage: hermes inbox post" in run.stdout
-    assert "--field" in run.stdout
+def test_fix_brief_forbids_inbox_post_and_records_quietly():
+    # Finished fixes are recorded under selfheal-results/, never posted: the brief only names the
+    # command to forbid it, so no generated Inbox command exists to pin to the lane home.
+    text = briefs()[0]
+    assert re.findall(r"`([^`]*hermes inbox[^`]*)`", text) == ["hermes inbox post"]
+    assert "do NOT run `hermes inbox post`" in text
+    assert "event fixed" in text and "selfheal-results" in text
