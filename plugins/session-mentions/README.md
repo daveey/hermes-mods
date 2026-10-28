@@ -77,6 +77,13 @@ bridge: cold cache shows Loading then signals and offers the session; a failed s
 fetch each show an error row; rows saved by one run answer the next run's first query, slimmed; corrupt or
 foreign warm data is ignored. Redraw inside a running Desktop with patch 0458 is untested.
 
+`test_worker_send_guard.py` covers the Kanban-worker send guard on both entry paths. A worker
+(`HERMES_KANBAN_TASK` set, or `sender.kanban_task` on `POST /enqueue`) is refused before any outbox
+write when the target source is `desktop` or `cli`, or when the source cannot be confirmed. A worker
+send to a `kanban` session, and a non-worker send to a desktop chat, are still queued. The refusal
+names the card to place on the target gateway and `kanban_block` with `blocker_id` when that
+gateway's executor is down.
+
 ## Deployment
 
 Update the linked plugin checkout on each sender. Fresh plugin imports use the

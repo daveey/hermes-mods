@@ -71,7 +71,17 @@ async def result(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 
 @router.post("/enqueue")
 async def enqueue(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    return {"ok": bool(_rf().enqueue(payload.get("request")))}
+    rf = _rf()
+    req = payload.get("request")
+    if isinstance(req, dict) and req.get("action") == "send" and hasattr(rf, "worker_send_refusal"):
+        sender = req.get("sender")
+        args = req.get("args")
+        sender_task = sender.get("kanban_task") if isinstance(sender, dict) else ""
+        target = args.get("target") if isinstance(args, dict) else None
+        err = rf.worker_send_refusal(target, kanban_task=str(sender_task or ""))
+        if err:
+            return {"ok": False, "error": err}
+    return {"ok": bool(rf.enqueue(req))}
 
 
 @router.get("/status/{req_id}")

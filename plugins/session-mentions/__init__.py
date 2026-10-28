@@ -8,6 +8,7 @@ and posts the result to ``POST /api/plugins/session-mentions/result``. The tool 
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 
@@ -42,7 +43,9 @@ SCHEMA = {
         "- action=list: find sessions (optional `query` matches titles; `gateway` filters).\n"
         "- action=read: transcript of `target` (last `limit` messages, default 40).\n"
         "- action=send: deliver `message` into `target` as a new user turn, attributed to this "
-        "session. With `wait_for_reply` (seconds, max 600) it waits for that session's next reply "
+        "session. A Kanban worker (HERMES_KANBAN_TASK set) cannot send into a human chat "
+        "(desktop/cli source); that send is refused and names the card to place instead. "
+        "With `wait_for_reply` (seconds, max 600) it waits for that session's next reply "
         "and returns it; otherwise it returns once delivered.\n"
         "Requires the Hermes Desktop app to be running (it relays the request)."
     ),
@@ -80,6 +83,9 @@ def _sender_info(session_id: str | None) -> dict:
         info["profile"] = get_active_profile_name() or "default"
     except Exception:
         info["profile"] = "default"
+    task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if task:
+        info["kanban_task"] = task
     return info
 
 
@@ -126,6 +132,11 @@ def handle(args: dict, session_id: str | None = None, **_kw) -> str:
                     + (", ".join(got) or "none"))
     if action == "send" and not str(args.get("message") or "").strip():
         return _err("message is required for send — pass the text as `message`")
+
+    if action == "send":
+        refusal = rf.worker_send_refusal(args.get("target"))
+        if refusal:
+            return _err(refusal)
 
     wait = 0
     if action == "send":

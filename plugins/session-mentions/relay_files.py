@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -224,11 +225,147 @@ def write_result(req_id: Any, result: dict, base: Path | None = None) -> bool:
     return True
 
 
+# Human chats a Kanban worker must not inject a turn into. Worker/kanban sessions (and anything
+# else we can identify) stay sendable; an unknown target fails closed so a missed lookup cannot
+# land in the owner's open conversation.
+HUMAN_CHAT_SOURCES = frozenset({"desktop", "cli"})
+
+
+def session_id_of(target: Any) -> str:
+    """Session id from `@session:profile@gw/id`, `@session:profile/id`, `gw:id`, or a bare id."""
+    text = str(target or "").strip().strip("`\"'")
+    for prefix in ("@session:", "@task:"):
+        while text.startswith(prefix):
+            text = text[len(prefix):].strip("`\"'")
+    if "/" in text:
+        text = text.split("/", 1)[1]
+    elif ":" in text:
+        text = text.split(":", 1)[1]
+    return text.strip()
+
+
+def _ro_connect(path: Path, timeout: float = 2.0):
+    """Read-only open. mode=ro fails on a WAL db whose -wal/-shm were deleted, so fall back to
+    mode=rw + query_only (reads the same data, never writes, never creates a missing db)."""
+    uri = path.resolve().as_posix()
+    try:
+        con = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+
+def _hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(str(get_hermes_home()))
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
+
+def replica_db() -> Path:
+    return Path.home() / ".local/state/hermes-hub/hub.db"
+
+
+def _query_source(db: Path, sql: str, params: tuple) -> str | None:
+    if not db.is_file():
+        return None
+    try:
+        con = _ro_connect(db)
+    except sqlite3.OperationalError:
+        return None
+    try:
+        row = con.execute(sql, params).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if not row or row[0] is None:
+        return None
+    text = str(row[0]).strip().lower()
+    return text or None
+
+
+def session_source(target: Any) -> str | None:
+    """Source of the target session: this gateway's state.db, else the hermes-hub replica."""
+    sid = session_id_of(target)
+    if not sid:
+        return None
+    local = _query_source(
+        _hermes_home() / "state.db",
+        "SELECT source FROM sessions WHERE id = ?",
+        (sid,),
+    )
+    if local:
+        return local
+    gw = route_of_target(target)
+    if gw:
+        return _query_source(
+            replica_db(),
+            "SELECT json_extract(data, '$.source') FROM replica "
+            "WHERE coll = 'sessions' AND gw = ? AND key GLOB ?",
+            (gw, f"*/{sid}"),
+        )
+    return _query_source(
+        replica_db(),
+        "SELECT json_extract(data, '$.source') FROM replica "
+        "WHERE coll = 'sessions' AND key GLOB ?",
+        (f"*/{sid}",),
+    )
+
+
+def worker_task_from_env() -> str:
+    return os.environ.get("HERMES_KANBAN_TASK", "").strip()
+
+
+def worker_send_refusal(target: Any, *, kanban_task: str | None = None, source_lookup=None) -> str | None:
+    """Refusal text when a Kanban worker would inject into a human chat; None when the send may proceed.
+
+    ``kanban_task=None`` reads HERMES_KANBAN_TASK (the tool). An explicit string, including ``""``,
+    is the caller's identity and does not consult the process env (the REST route, which runs in
+    the dashboard, not the worker).
+    """
+    task = worker_task_from_env() if kanban_task is None else str(kanban_task).strip()
+    if not task:
+        return None
+    lookup = source_lookup or session_source
+    try:
+        source = lookup(target)
+    except Exception:
+        source = None
+    source_l = str(source or "").strip().lower()
+    if source_l and source_l not in HUMAN_CHAT_SOURCES:
+        return None
+    gw = route_of_target(target) or "the target gateway"
+    where = (
+        f"{target} (source={source_l})"
+        if source_l
+        else f"{target} (source could not be confirmed as a worker session)"
+    )
+    return (
+        f"Refused: a Kanban worker (HERMES_KANBAN_TASK={task}) cannot send into a human chat {where}. "
+        f"That injects a turn into the owner's conversation. Place a card on {gw} instead "
+        f"(hermes-hub create-task {gw} or kanban_create with placement on that gateway). "
+        f"If that gateway's executor is down, kanban_block with blocker_id for the outage "
+        f"(MacBook: hermes-desktop-gateway-unavailable) — do not message the chat."
+    )
+
+
 def enqueue(req: Any, base: Path | None = None) -> bool:
     """Queue a request forwarded by another Desktop's courier for this gateway's home courier."""
     base = base or root()
     if not isinstance(req, dict):
         return False
+    if req.get("action") == "send":
+        sender = req.get("sender")
+        args = req.get("args")
+        sender_task = sender.get("kanban_task") if isinstance(sender, dict) else ""
+        target = args.get("target") if isinstance(args, dict) else None
+        if worker_send_refusal(target, kanban_task=str(sender_task or "")):
+            return False
     rid = safe_id(req.get("id"))
     if not rid or rid == HOME_COURIER_ID or req.get("action") not in ACTIONS:
         return False
