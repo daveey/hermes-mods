@@ -155,6 +155,12 @@ Undone notices are always plain cards.
   change, blind-judge a few hundred of the new model's endings (fixed / started / proposed / offered / report_only)
   and compare them per trigger (human question vs action ask vs automated event) with the old model's, before trusting
   the detectors. Questions about a problem are where models diverge most. Explicit "fix X" asks barely differ.
+- An instruction fix (`~/AGENTS.md`, SOUL.md, a skill) is live only in sessions whose prompt contains it. Core loads
+  AGENTS.md from the git-root → cwd chain only, so a home-level rule reached 0% of Kanban workers (scratch cwd), 0%
+  of cron and 55% of chats (those opened in a project folder missed it) until the fork's `agent.global_context_files`
+  loaded it everywhere. Before reporting a rule change live, count sessions started after it whose stored prompt
+  (`state.db` `sessions.system_prompt_hash` → `system_prompts.prompt`) contains a phrase from the new text, per
+  source and per host. Delegated child agents load no context files by design; judge the parent.
 - Verify a regex detector's hits (e.g. `coach_askgate.py`) against what the agent said just before, not the quote alone,
   because quotes like "why didnt the agent…" or "…yourself" fire on third-party bots and on handoffs nobody asked for.
   Local sessions: the previous assistant row in `state.db` `messages`. Other hosts: the digest
