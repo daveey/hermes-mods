@@ -1,4 +1,24 @@
+import importlib.util
+import os
+
 import pytest
+
+# Tests set HERMES_HOME=tmp_path. The first lazy import of hermes_bootstrap under that home (e.g. SessionDB.append_message
+# -> agent.conversation_loop -> hermes_bootstrap) otherwise runs a full dependency sync into the tmp home: ~400MB
+# (cache/uv/archive-v0 + installs/<id>/environments) per test basetemp. When the interpreter already has Hermes'
+# dependencies (the test environment), turn the lazy sync off. Without them the sync is the only way the import works.
+if importlib.util.find_spec("ruamel") is not None:
+    os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_dependency_sync_in_tmp_home(tmp_path):
+    """Regression guard: a test basetemp must never hold a uv cache or a built environment."""
+    yield
+    leaked = [str(p.relative_to(tmp_path)) for pattern in ("cache/uv/archive-v0", "installs/*/environments")
+              for p in tmp_path.glob(pattern)]
+    assert not leaked, f"dependency sync ran inside the test home (~400MB per test): {leaked}"
+
 
 
 @pytest.fixture(autouse=True)
