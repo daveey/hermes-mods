@@ -1,7 +1,8 @@
 # Kanban default placement: a card with no local-only need is created on the routed gateway
 
 Patches **0565** (source `89b72a8684`), **0567** (`8d1ca16533`, `hub_cli_path()` fix-up), **0569** (`d57aebb0cb`,
-configuration docs) and **0572** (`5ac187baca`, carried options). Companion: [kanban-capability-routing.md](kanban-capability-routing.md) (the route back).
+configuration docs), **0572** (`5ac187baca`, carried options) and **0630** (`7f117fa465`, the hub task id comes back;
+no duplicate on retry). Companion: [kanban-capability-routing.md](kanban-capability-routing.md) (the route back).
 
 ## Behavior
 
@@ -17,8 +18,12 @@ kanban:
 `kanban_create` then creates the card on the target through
 `hermes-hub create-task <gw> <title> --body ... --assignee ... --id <request id> --origin-session <chat> --origin-profile <p> --creator-session <kanban.placement.creator_session[target]>`.
 The card shows in the chat that asked for it and runs (and burns CPU) on the target. The tool result carries
-`placed: {gateway, request_id, task_id, origin_session, queued_only}`; `task_id` is filled when the hub applies
-the request within `kanban.placement.wait_seconds` (default 8 s).
+`placed: {gateway, request_id, task_id, origin_session, queued_only, retry}`. Since **0630** the tool waits up to
+`kanban.placement.wait_seconds` (default 10 s) for the target to make the card and returns its id as the top-level
+`task_id` with the target's `status` (`ready`...), the same shape as a local create. If the target has not made it
+yet, the result is `ok: true, task_id: null, status: "queued"` and the note says the card IS created and that
+calling `kanban_create` again creates a duplicate. An identical retry (same request id) is never sent again; its
+result has `placed.retry: true` and returns the same card.
 
 The card stays local (created here as before) when any of these holds:
 
@@ -58,6 +63,16 @@ gateway has, so capability routing opens an owner card back there.
   lack the login shell's `PATH`, so a bare `hermes-hub` raised ENOENT and every cross-gateway create failed. Capability
   routing (`kanban_capability_routing._hub_cli`) and placement both use it.
 
+- **0630** — why: a chat got `task_id: null` back, read it as "not created", called `kanban_create` again and
+  made a stray card. The request result reached the MacBook only in its next full `hermes-hub sync` (~30 s on a busy
+  Mac), and an origin-bound create stays `waiting` on the hub until that sync accepts the binding, so the 8 s poll of
+  the local `sent` table never saw it. `kanban_placement.await_task_id()` now asks
+  `hermes-hub outcomes --id <rid>` (client 1.9.1+, probed from `hermes-hub --help`) about once a second; that fetches
+  finished outcomes and reads the hub's copy of the request, whose `waiting` result already carries the owner's
+  task id. An older client gets ONE detached `hermes-hub sync --quiet` (it outlives the wait and records a late
+  result) while the replica is polled. `create_remote()` skips `create-task` when the request id is already
+  `queued/sent/done` locally. `remote_task_id()` also reads a plain (unbound) create's truncated `output` text.
+
 ## Code
 
 `hermes_cli/kanban_placement.py` (new), `hermes_cli/kanban_capability_registry.py` (`hub_cli_path`),
@@ -76,6 +91,13 @@ gateway has, so capability routing opens an owner card back there.
 - a non-live target falls back to local; `decide` never raises; `target_live` needs a recent sync and a fresh target record;
 - a chat card is created on the hub bound to its chat; the hub task id is returned once applied; an unpersisted session creates an unbound hub card;
 - a Mac-only card never calls the hub; a hub refusal falls back to a local card; an offline hub is queued, not duplicated; a retry reuses the request id;
+- 0630 (each RED without the change): `test_task_id_comes_back_once_the_outcome_fetch_sees_the_hub_apply_it`,
+  `test_task_id_comes_back_while_the_origin_binding_is_still_waiting`, `test_old_client_gets_one_detached_sync_and_the_task_id`,
+  `test_still_queued_after_the_wait_says_the_card_is_created_and_not_to_call_again`,
+  `test_identical_retry_returns_the_same_request_and_sends_no_second_card`, `test_remote_task_id_reads_a_plain_create_output`.
+  The hermes-hub side (`outcomes`) is tested in the hermes-hub repo (`client/tests/test_outcomes_cli.py`). Live: a plain
+  `hermes chat -q` that called `kanban_create` once got back hub task id `t_01a18119d1bf4d6e` in 12.5 s and left exactly
+  one hub card.
 - 0567: `test_hub_cli_resolves_without_the_login_shell_path` (PATH without the install dir, `~/.local/bin` fallback, configured value wins, routing uses it) and `test_remote_body_names_the_capability_to_route_back_with`.
 
 - 0590–0591 (`fc317cf6f7`, `2ddf72b986`): `placement=<gateway>` that cannot be honoured returns `tool_error` code `placement_unavailable` and creates no card (never a silent local card). Tests: unrouted pin (`mini`, typos); no route configured (the hub-worker case, `placement='macbook'` on `hub`); hub refusal of a pinned card; structural limit and non-live target through the tool; exception while placing; `origin_session` set; `decide()` returns `refuse`. Controls: `placement` `local`, `here`, the own gateway name (any case, with or without a route) still create locally.

@@ -1,0 +1,413 @@
+From 7f117fa465f461351b4c4f3b494a7d3e3e6f63eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:47:47 -0700
+Subject: [PATCH] fix(kanban): placed kanban_create returns the hub task id
+ (bounded outcome fetch), says a queued card IS created, never resends an
+ identical retry [daveey]
+
+A chat that got task_id null from a hub-placed kanban_create read it as not created and called
+kanban_create again, creating a stray card (10-27 drill). The request result only reached the
+MacBook on a later full hermes-hub sync (~30 s), so the 8 s poll of the local replica never saw it.
+
+- await_task_id: hermes-hub outcomes (client 1.9.1+) about once a second, else ONE detached sync,
+  for wait_seconds (default 10); the task id and hub status come back top-level.
+- Still pending: status queued, note says the card IS created and a second call duplicates it.
+- An identical retry (same stable request id) is not sent again and is flagged retry.
+- remote_task_id also reads a plain create's truncated output text.
+---
+ hermes_cli/kanban_placement.py            | 148 ++++++++++++++++++++--
+ tests/hermes_cli/test_kanban_placement.py | 104 ++++++++++++++-
+ tools/kanban_tools.py                     |  39 +++---
+ 3 files changed, 260 insertions(+), 31 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index c57a43e931..2606334e15 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -27,6 +27,12 @@ A card stays local when any of these holds:
+ A worker on the target that still hits a local-only wall blocks with ``needs=[...]``; capability
+ routing (:mod:`hermes_cli.kanban_capability_routing`) then opens an owner card back here.
+ 
++After queuing the card, ``kanban_create`` waits up to ``wait_seconds`` (default 10) for the target's
++answer (:func:`await_task_id`) and returns its task id like a local create. Still pending, it returns
++``status: "queued"`` with a note that the card IS created: a chat model that read ``task_id: null``
++as "not created" once called kanban_create again and made a duplicate card. An identical retry
++maps to the same request id (:func:`request_id`) and is never sent twice.
++
+ Unset ``route`` (upstream default) never places anything remotely.
+ """
+ from __future__ import annotations
+@@ -188,6 +194,20 @@ def hub_carries_options(hub_cli: str) -> bool:
+     return ok
+ 
+ 
++def hub_has_outcomes(hub_cli: str) -> bool:
++    """True when the client has ``hermes-hub outcomes`` (1.9.1+): a one-second outcome fetch. Older
++    clients only learn a request's result in a full ``sync`` (~30 s on a busy Mac). Cached like
++    :func:`hub_carries_options`."""
++    key = (hub_cli, "outcomes")
++    hit = _help_cache.get(key)
++    if hit and time.monotonic() - hit[0] < HELP_CACHE_SECONDS:
++        return hit[1]
++    rc, out, _ = hub_runner([hub_cli, "--help"])
++    ok = rc == 0 and re.search(r"\boutcomes\b", out) is not None
++    _help_cache[key] = (time.monotonic(), ok)
++    return ok
++
++
+ def _hub_cli(c: _Cfg) -> str:
+     return reg.hub_cli_path(c.raw.get("hub_cli"))
+ 
+@@ -325,17 +345,27 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         return {"where": "local", "why": f"placement check failed: {exc}"}
+ 
+ 
+-def _default_runner(argv: list[str]) -> tuple[int, str, str]:
++def _default_runner(argv: list[str], timeout: float = HUB_TIMEOUT) -> tuple[int, str, str]:
+     try:
+         p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+-                           timeout=HUB_TIMEOUT, check=False, stdin=subprocess.DEVNULL)
++                           timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+     except (OSError, subprocess.TimeoutExpired) as exc:
+         return 127, "", str(exc)
+ 
+ 
+-# Tests replace this with a fake that records argv.
++def _default_spawn(argv: list[str]) -> None:
++    """Start ``argv`` detached: it finishes (and records its result) even after the tool call returns."""
++    try:
++        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++                         start_new_session=True)
++    except OSError:
++        pass
++
++
++# Tests replace these with fakes that record argv.
+ hub_runner: Callable[[list[str]], tuple[int, str, str]] = _default_runner
++hub_spawn: Callable[[list[str]], None] = _default_spawn
+ 
+ 
+ def request_id(self_gw: str, args: dict, origin_session: str, options: Optional[dict] = None) -> str:
+@@ -375,6 +405,10 @@ def create_remote(args: dict, *, target: str, origin_session: Optional[str], ori
+     carried = hub_carries_options(hub_cli)
+     options = carried_options(args) if carried else {}
+     rid = request_id(self_gw, args, origin_session or "", options)
++    prior = remote_state(rid)
++    if prior in ("queued", "sent", "done"):
++        # An identical earlier call already sent this request: never send it again, return it as is.
++        return {"ok": True, "request_id": rid, "queued_only": False, "retry": True}
+     argv = [hub_cli, "create-task", target, str(args.get("title") or "untitled").strip()[:300],
+             "--body", remote_body(args, self_gw=self_gw, target=target, carried=carried),
+             "--assignee", str(args.get("assignee") or "default"), "--id", rid]
+@@ -393,20 +427,112 @@ def create_remote(args: dict, *, target: str, origin_session: Optional[str], ori
+     return {"ok": False, "request_id": rid, "rc": rc, "error": (err or out)[-400:]}
+ 
+ 
+-def remote_task_id(rid: str) -> Optional[str]:
+-    """The target's task id once the request is done (None while pending/unknown)."""
++def _sent_row(rid: str) -> Optional[tuple]:
+     try:
+         db = reg._ro(reg.hub_db_path())
+     except Exception:
+         return None
+     try:
+-        row = db.execute("SELECT state, result FROM sent WHERE id = ?", (rid,)).fetchone()
+-        if not row or row[0] != "done":
+-            return None
+-        res = json.loads(row[1] or "{}")
+-        tid = res.get("task_id") or res.get("task") if isinstance(res, dict) else None
+-        return tid if isinstance(tid, str) else None
++        return db.execute("SELECT state, result FROM sent WHERE id = ?", (rid,)).fetchone()
+     except Exception:
+         return None
+     finally:
+         db.close()
++
++
++def remote_state(rid: str) -> Optional[str]:
++    """The request's state in this gateway's hermes-hub replica (local/queued/done/...), None if unknown."""
++    row = _sent_row(rid)
++    return row[0] if row else None
++
++
++_OUTPUT_ID = re.compile(r'"id"\s*:\s*"(t_[A-Za-z0-9_]+)"')
++
++
++def remote_task_id(rid: str) -> Optional[str]:
++    """The target's task id once the request is done (None while pending/unknown)."""
++    row = _sent_row(rid)
++    if not row or row[0] != "done":
++        return None
++    try:
++        res = json.loads(row[1] or "{}")
++    except Exception:
++        return None
++    return _task_id_in(res)
++
++
++def _task_id_in(res) -> Optional[str]:
++    if not isinstance(res, dict):
++        return None
++    tid = res.get("task_id") or res.get("task")
++    if isinstance(tid, str):
++        return tid
++    # A plain (unbound) create returns the owner's `hermes kanban create --json` text as "output",
++    # truncated by the hub, so read the id with a pattern rather than a JSON parse.
++    m = _OUTPUT_ID.search(res.get("output") or "") if isinstance(res.get("output"), str) else None
++    return m.group(1) if m else None
++
++
++def _owner_card(stdout: str) -> tuple[Optional[str], Optional[str]]:
++    """(task id, status) from ``hermes-hub outcomes --id`` output when the hub already holds the owner's
++    card: an origin-bound create stays ``waiting`` until this gateway's next full sync accepts the
++    binding, but the card exists from the moment the owner posts it."""
++    for line in reversed((stdout or "").splitlines()):
++        line = line.strip()
++        if not line.startswith("{"):
++            continue
++        try:
++            out = json.loads(line)
++        except ValueError:
++            continue
++        if isinstance(out, dict) and out.get("remote_state") in ("waiting", "done"):
++            res = out.get("remote_result")
++            st = res.get("status") if isinstance(res, dict) else None
++            return _task_id_in(res), st if isinstance(st, str) else None
++        return None, None
++    return None, None
++
++
++def remote_status(rid: str) -> Optional[str]:
++    """The created card's status on the target (``ready``, ``triage``...) when its result names one."""
++    row = _sent_row(rid)
++    try:
++        res = json.loads(row[1] or "{}") if row and row[0] == "done" else {}
++    except Exception:
++        return None
++    st = res.get("status") if isinstance(res, dict) else None
++    return st if isinstance(st, str) else None
++
++
++def await_task_id(rid: str, *, hub_cli: str, budget: float, clock: Callable[[], float] = time.monotonic,
++                  sleep: Callable[[float], None] = time.sleep) -> tuple[Optional[str], Optional[str]]:
++    """Wait up to ``budget`` seconds for the target to make the card of request ``rid``.
++
++    Returns (task id, status on the target), (None, None) while still pending.
++
++    The result only reaches this gateway when its hermes-hub client fetches outcomes. A client with
++    ``hermes-hub outcomes`` is asked about once a second; an older one gets ONE detached ``sync``
++    (it outlives this wait, so a late result is still recorded) while the replica is polled."""
++    tid = remote_task_id(rid)
++    if tid or budget <= 0:
++        return tid, remote_status(rid) if tid else None
++    deadline = clock() + budget
++    fast = hub_has_outcomes(hub_cli)
++    if not fast:
++        hub_spawn([hub_cli, "sync", "--quiet"])
++    while True:
++        if fast:
++            left = max(1.0, min(5.0, deadline - clock()))
++            argv = [hub_cli, "outcomes", "--id", rid, "--wait", f"{left:.1f}"]
++            # Bound the call itself too (the client's HTTP timeout is 60 s); a test fake takes argv only.
++            _, out, _ = (hub_runner(argv) if hub_runner is not _default_runner
++                         else _default_runner(argv, timeout=left + 5))
++            tid, st = _owner_card(out)
++            if tid:
++                return tid, st
++        tid = remote_task_id(rid)
++        if tid:
++            return tid, remote_status(rid)
++        if clock() >= deadline:
++            return None, None
++        sleep(1.0)
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index b3ac3abf06..fd1a3e2364 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -252,25 +252,52 @@ def mac(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+     calls: list[list[str]] = []
+     result = {"rc": 0, "help": "usage: hermes-hub create-task [--id ID]"}  # pre-1.8.0 client by default
+ 
++    def apply(rid=None):
++        rows = [rid] if rid else [r[0] for r in hub.execute("SELECT id FROM sent WHERE state != 'done'")]
++        for r in rows:
++            hub.execute("UPDATE sent SET state='done', result=? WHERE id=?",
++                        (json.dumps({"ok": True, "task_id": "t_hub0001", "status": "ready"}), r))
++        hub.commit()
++
+     def fake_hub(argv):
+         if argv[1:] == ["create-task", "--help"]:
+             return 0, result["help"], ""
++        if argv[1:] == ["--help"]:
++            return 0, result.get("top_help", "{sync,status,requests,create-task}"), ""
++        if argv[1] in ("sync", "outcomes"):
++            refreshes.append(argv[1:])
++            if result.get("apply_on") == argv[1]:
++                apply()
++            if result.get("apply_on") == "remote_waiting" and argv[1] == "outcomes":
++                # hermes-hub 1.9.1: the owner made the card; the request waits on our binding acceptance.
++                rid = argv[argv.index("--id") + 1]
++                return 0, json.dumps({"id": rid, "state": "queued", "result": None, "remote_state": "waiting",
++                                      "remote_result": {"ok": True, "task_id": "t_hub0002", "status": "ready",
++                                                        "handoff_complete": False}}), ""
++            return 0, "", ""
+         calls.append(argv)
+         rid = argv[argv.index("--id") + 1]
+         if result["rc"] in (0, 3):
+             hub.execute("INSERT OR IGNORE INTO sent (id, body, state, created_at) VALUES (?, ?, 'sent', ?)",
+                         (rid, json.dumps({"id": rid, "to_gw": argv[2]}), time.time()))
+-            if result.get("apply"):
+-                hub.execute("UPDATE sent SET state='done', result=? WHERE id=?",
+-                            (json.dumps({"ok": True, "task_id": "t_hub0001"}), rid))
+             hub.commit()
++            if result.get("apply"):
++                apply(rid)
+         return result["rc"], rid, "" if result["rc"] == 0 else "boom"
+ 
++    def fake_spawn(argv):
++        spawned.append(argv[1:])
++        if result.get("apply_on") == "spawn":
++            apply()
++
++    refreshes: list[list[str]] = []
++    spawned: list[list[str]] = []
+     monkeypatch.setattr(kp, "hub_runner", fake_hub)
++    monkeypatch.setattr(kp, "hub_spawn", fake_spawn, raising=False)
+     monkeypatch.setattr(kp, "_help_cache", {})
+     monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 0})
+     kb.init_db()
+-    yield {"hub": hub, "calls": calls, "result": result}
++    yield {"hub": hub, "calls": calls, "result": result, "refreshes": refreshes, "spawned": spawned}
+     hub.close()
+ 
+ 
+@@ -362,6 +389,75 @@ def test_hub_task_id_is_returned_once_the_hub_applies_it(mac, monkeypatch):
+     assert out["task_id"] == "t_hub0001" and out["placed"]["task_id"] == "t_hub0001", out
+ 
+ 
++def test_task_id_comes_back_once_the_outcome_fetch_sees_the_hub_apply_it(mac, monkeypatch):
++    """10-27 drill: the request was applied on the hub, but its result reached the MacBook only on a
++    later sync, so kanban_create returned task_id null and the chat created a second card."""
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 5})
++    mac["result"].update(top_help="{sync,requests,create-task,outcomes}", apply_on="outcomes")
++    out = json.loads(kt._handle_create({"title": "Placement drill", "session_id": "20261027_183000_abc123"}))
++    assert out["ok"] and out["task_id"] == "t_hub0001" and out["status"] == "ready", out
++    assert out["placed"]["task_id"] == "t_hub0001" and "IS created" not in out["note"]
++    assert mac["refreshes"][0][0] == "outcomes" and mac["spawned"] == []
++
++
++def test_task_id_comes_back_while_the_origin_binding_is_still_waiting(mac, monkeypatch):
++    """Live shape: the hub made the card within seconds, but the request stays 'waiting' on the hub
++    until the MacBook's next full sync accepts the binding (~1-4 min on 10-27)."""
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 5})
++    mac["result"].update(top_help="{sync,requests,create-task,outcomes}", apply_on="remote_waiting")
++    out = json.loads(kt._handle_create({"title": "Placement drill", "session_id": "20261027_183000_abc123"}))
++    assert out["task_id"] == "t_hub0002" and out["status"] == "ready", out
++    rid = out["placed"]["request_id"]
++    assert mac["refreshes"][0] == ["outcomes", "--id", rid, "--wait", mac["refreshes"][0][-1]]
++
++
++def test_old_client_gets_one_detached_sync_and_the_task_id(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 5})
++    mac["result"]["apply_on"] = "spawn"
++    out = json.loads(kt._handle_create({"title": "Placement drill", "session_id": "20261027_183000_abc123"}))
++    assert out["task_id"] == "t_hub0001", out
++    assert mac["spawned"] == [["sync", "--quiet"]] and mac["refreshes"] == []
++
++
++def test_still_queued_after_the_wait_says_the_card_is_created_and_not_to_call_again(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 1})
++    out = json.loads(kt._handle_create({"title": "Placement drill", "session_id": "20261027_183000_abc123"}))
++    assert out["ok"] is True and out["task_id"] is None and out["status"] == "queued", out
++    note = out["note"]
++    assert "The card IS created" in note and out["placed"]["request_id"] in note
++    assert "Do NOT call kanban_create again" in note and "duplicate" in note
++    assert len(mac["spawned"]) == 1  # one bounded sync, never one per poll
++
++
++def test_identical_retry_returns_the_same_request_and_sends_no_second_card(mac):
++    from tools import kanban_tools as kt
++    args = {"title": "Placement drill", "body": "Run hostname.", "session_id": "20261027_183000_abc123"}
++    first = json.loads(kt._handle_create(dict(args)))
++    again = json.loads(kt._handle_create(dict(args)))
++    assert len(mac["calls"]) == 1, mac["calls"]  # create-task ran once
++    assert again["placed"]["request_id"] == first["placed"]["request_id"]
++    assert again["placed"]["retry"] is True and first["placed"]["retry"] is False
++    assert "already made" in again["note"] and _local_count() == 0
++    mac["result"]["apply"] = False
++    mac["hub"].execute("UPDATE sent SET state='done', result=? WHERE id=?",
++                       (json.dumps({"ok": True, "task_id": "t_hub0001"}), first["placed"]["request_id"]))
++    mac["hub"].commit()
++    assert json.loads(kt._handle_create(dict(args)))["task_id"] == "t_hub0001"
++    assert len(mac["calls"]) == 1
++
++
++def test_remote_task_id_reads_a_plain_create_output(mac):
++    """An unbound create's result is the owner's truncated `kanban create --json` text."""
++    mac["hub"].execute("INSERT INTO sent (id, body, state, result) VALUES ('placement:macbook:x1', '{}', 'done', ?)",
++                       (json.dumps({"output": '{\n  "id": "t_01a180ef6421a3f0",\n  "title": "Shrink\u2026'}),))
++    mac["hub"].commit()
++    assert kp.remote_task_id("placement:macbook:x1") == "t_01a180ef6421a3f0"
++
++
+ def test_unpersisted_session_creates_an_unbound_hub_card(mac):
+     from tools import kanban_tools as kt
+     out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "session_id": "nope"}))
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index ec107d94b5..8c01c445d9 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1457,22 +1457,29 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             if kp.explicit_foreign_pin(view, reg.self_gateway()):
+                 return _placement_refused(target, f"{target} refused the card: {placed.get('error')}")
+             return None
+-        tid = None
+-        deadline = time.monotonic() + float(cfg.get("wait_seconds", 8) or 0)
+-        while not placed.get("queued_only"):
+-            tid = kp.remote_task_id(placed["request_id"])
+-            if tid or time.monotonic() >= deadline:
+-                break
+-            time.sleep(1.0)
+-        note = (f"Created on {target}, not here: {decision['why']} (kanban.placement). It runs there and "
+-                + ("shows in this chat's tasks once the hub applies it. " if session_id else "")
+-                + (f"Read it with cross_task @task:default@{target}/{tid} or `hermes-hub tasks --gw {target}`."
+-                   if tid else f"The task id appears once {target} applies request {placed['request_id']} "
+-                   "(`hermes-hub requests`)."))
+-        return _ok(task_id=tid, placed={"gateway": target, "request_id": placed["request_id"],
+-                                        "task_id": tid, "origin_session": session_id,
+-                                        "queued_only": bool(placed.get("queued_only"))},
+-                   note=note)
++        rid = placed["request_id"]
++        # A chat model reads task_id null as "not created" and calls kanban_create again, which made a
++        # duplicate card (10-27 drill). Fetch the target's answer for a bounded wait so the id comes
++        # back like a local create's; otherwise say plainly that the card exists. [daveey]
++        tid, remote_status = (None, None) if placed.get("queued_only") else kp.await_task_id(
++            rid, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")), budget=float(cfg.get("wait_seconds", 10) or 0))
++        retry = ("This identical kanban_create call was already made, so no second card was sent; this is "
++                 "the same card. " if placed.get("retry") else "")
++        fields = {"placed": {"gateway": target, "request_id": rid, "task_id": tid, "origin_session": session_id,
++                             "queued_only": bool(placed.get("queued_only")), "retry": bool(placed.get("retry"))}}
++        if tid:
++            shows = " and shows in this chat's tasks" if session_id else ""
++            note = (f"{retry}Created on {target} as {tid}, not here: {decision['why']} (kanban.placement). It runs "
++                    f"there{shows}. Read it with cross_task @task:default@{target}/{tid} or "
++                    f"`hermes-hub tasks --gw {target}`.")
++            return _ok(task_id=tid, status=remote_status or "created", **fields, note=note)
++        note = (f"{retry}The card IS created: it is queued on {target} as request {rid} and {target} makes the "
++                f"card from it (it runs there, not here: {decision['why']}). Do NOT call kanban_create again "
++                "for this card: an identical call returns this same request, and any changed call creates a "
++                f"second, duplicate card. Its task id appears once {target} applies the request "
++                + ("(this chat's tasks, " if session_id else "(")
++                + "`hermes-hub requests`).")
++        return _ok(task_id=None, status="queued", **fields, note=note)
+     except Exception as exc:
+         logger.warning("kanban placement failed", exc_info=True)
+         try:
+-- 
+2.55.0
+
