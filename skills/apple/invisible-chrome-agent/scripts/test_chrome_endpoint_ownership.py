@@ -6,7 +6,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 import urllib.request
 import urllib.error
@@ -15,7 +14,9 @@ from unittest import mock
 from test_hermes_chrome_agent import hca
 from chrome_agent_lifecycle import Ledger, Lifecycle, LifecycleError
 from chrome_agent_process import fingerprint
-from chrome_test_fixtures import chrome_environment
+from chrome_test_fixtures import (
+    CHROME_READY_S, chrome_environment, cleanup_disposable_tree, reap_profile_processes,
+    wait_until_ready)
 
 
 def free_port():
@@ -26,11 +27,20 @@ def free_port():
     return port
 
 
+def _log_tail(handle, limit=800):
+    handle.flush()
+    try:
+        text = Path(handle.name).read_text(errors='replace')
+    except OSError as exc:
+        return 'log unreadable: %s' % exc
+    return text[-limit:]
+
+
 @unittest.skipUnless(sys.platform == 'linux' and shutil.which('google-chrome'), 'isolated Linux Chrome required')
 class EndpointOwnershipTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix='astra-endpoint-')
-        self.addCleanup(tmp.cleanup)
+        self.addCleanup(lambda: cleanup_disposable_tree(tmp))
         self.root = Path(tmp.name)
         environment = mock.patch.dict(os.environ, chrome_environment(self.root))
         environment.start()
@@ -55,19 +65,18 @@ class EndpointOwnershipTests(unittest.TestCase):
             '--no-first-run', '--no-default-browser-check', '--user-data-dir=' + str(self.root / 'foreign'),
             '--remote-debugging-port=' + str(self.port)], stdout=self.log, stderr=self.log)
         def cleanup():
-            proc.terminate()
+            if proc.poll() is None:
+                proc.terminate()
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+            reap_profile_processes(self.root / 'foreign')
             self.assertIsNone(fingerprint(proc.pid))
         self.addCleanup(cleanup)
-        deadline = time.monotonic() + 20
-        while not hca.cdp_version(port=self.port):
-            self.assertIsNone(proc.poll())
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(.05)
+        wait_until_ready(lambda: hca.cdp_version(port=self.port), proc, CHROME_READY_S,
+                         lambda: _log_tail(self.log))
         return proc
 
     def test_real_foreign_chrome_refused_before_launch_or_commands(self):

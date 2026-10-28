@@ -1,7 +1,10 @@
 """Short, private Unix-socket fixtures; never change tempfile's global root."""
+import errno
 import os
 from pathlib import Path
 import select
+import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -59,6 +62,10 @@ def socket_directory():
 # peer returns at once; these bounds are not behavioral assertions.
 PEER_READY_S = 20
 PEER_EXIT_S = 30
+# Real headless Chrome on a busy GitHub runner. start_chrome waits 30s; a 20s
+# test budget failed main while the process was still alive (missed by <50ms
+# after a full wait). A ready browser returns at once.
+CHROME_READY_S = 60
 
 
 def announce_ready():
@@ -189,3 +196,129 @@ def retire_until(ledger, predicate, seconds=15, slice_s=1):
     if not predicate():
         raise AssertionError('retirement did not reach expected state within %ss' % seconds)
     return remaining
+
+
+def wait_until_ready(ready, process, seconds, detail):
+    """Block until ``ready()`` is truthy. The bound is a load budget, not behavior.
+
+    ``detail`` is called only on failure so a Chrome log is not read on the
+    success path.
+    """
+    deadline = time.monotonic() + seconds
+    while not ready():
+        code = process.poll()
+        if code is not None:
+            raise AssertionError('process %s exited %s before ready: %s' % (
+                process.pid, code, detail()))
+        if time.monotonic() >= deadline:
+            raise AssertionError('process %s not ready within %ss: %s' % (
+                process.pid, seconds, detail()))
+        threading.Event().wait(0.05)
+
+
+def processes_holding_profile(profile):
+    """Pids whose argv names this exact ``--user-data-dir``. Empty without /proc."""
+    profile = os.path.realpath(os.fspath(profile))
+    needle = os.fsencode(profile)
+    flag = b'--user-data-dir=' + needle
+    if not needle or not os.path.isdir('/proc'):
+        return []
+    found = []
+    me = os.getpid()
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid <= 1 or pid == me:
+            continue
+        try:
+            with open(os.path.join(entry.path, 'cmdline'), 'rb') as stream:
+                raw = stream.read()
+        except OSError:
+            continue
+        for part in raw.split(b'\0'):
+            if part == flag or part == needle:
+                found.append(pid)
+                break
+            if not part.startswith(b'--user-data-dir='):
+                continue
+            try:
+                named = os.path.realpath(os.fsdecode(part.split(b'=', 1)[1]))
+            except (OSError, UnicodeError):
+                continue
+            if named == profile:
+                found.append(pid)
+                break
+    return found
+
+
+def reap_profile_processes(profile, wait_s=2):
+    """Stop Chrome children that outlive the parent and keep writing the profile.
+
+    Returns pids still alive. Callers must not treat a non-empty return as success:
+    ignoring it hides the leak that slows the next launch.
+    """
+    def _signal(sig):
+        for pid in processes_holding_profile(profile):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+
+    _signal(signal.SIGTERM)
+    deadline = time.monotonic() + wait_s
+    while processes_holding_profile(profile) and time.monotonic() < deadline:
+        threading.Event().wait(0.05)
+    _signal(signal.SIGKILL)
+    deadline = time.monotonic() + wait_s
+    while processes_holding_profile(profile) and time.monotonic() < deadline:
+        threading.Event().wait(0.05)
+    return processes_holding_profile(profile)
+
+
+def remove_tree_retrying(root, attempts=8):
+    """Delete ``root`` after reaping profile holders.
+
+    Python 3.11 ``shutil.rmtree`` raises ``ENOTEMPTY`` when Chrome creates a file
+    in ``Default`` between scandir and rmdir. Retry; do not ignore a live process.
+    """
+    root = os.fspath(root)
+    left = reap_profile_processes(root)
+    if left:
+        raise AssertionError('profile processes still running: %s' % left)
+    busy = (errno.ENOTEMPTY, errno.EBUSY, errno.EACCES, errno.EPERM)
+    last = None
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(root)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last = exc
+            if exc.errno not in busy:
+                raise
+            threading.Event().wait(0.05 * (attempt + 1))
+    shutil.rmtree(root, ignore_errors=True)
+    if os.path.exists(root):
+        raise OSError(last.errno if last else errno.ENOTEMPTY,
+                      'profile tree still present after %s attempts: %s' % (attempts, last),
+                      root)
+
+
+def cleanup_disposable_tree(directory, attempts=8):
+    """Remove a TemporaryDirectory once Chrome has stopped writing it.
+
+    ``cleanup()`` detaches its finalizer before ``rmtree``. On ``ENOTEMPTY`` the
+    finalizer is already gone, so the retry owns the rest of the removal.
+    """
+    if not isinstance(directory, tempfile.TemporaryDirectory):
+        raise ValueError('a live disposable TemporaryDirectory is required')
+    busy = (errno.ENOTEMPTY, errno.EBUSY, errno.EACCES, errno.EPERM)
+    try:
+        directory.cleanup()
+        return
+    except OSError as exc:
+        if exc.errno not in busy:
+            raise
+    remove_tree_retrying(directory.name, attempts=attempts)
