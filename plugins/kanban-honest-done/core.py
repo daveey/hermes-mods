@@ -286,6 +286,10 @@ def check_complete(task_id: str, summary: str, paths: list[Path], title: Optiona
 ORIGIN_SESSION_RE = re.compile(
     r"\borigin(?:_session)?\b[^\n@]{0,60}@session:(?:[\w.-]+(?:@[\w.-]+)?/)?([A-Za-z0-9][\w-]{5,})", re.I)
 REPORTED_RE = re.compile(r"\bfollow-through:\s*SENT\b", re.I)
+# A "SENT" note that carries the send's failure is not a send (live test: ok:false, "No connected Hermes Desktop").
+FAILED_SEND_RE = re.compile(r"\"?ok\"?\s*:\s*false|\bno connected\b|\b(?:send|delivery) failed\b"
+                            r"|\bfailed to (?:send|deliver)\b|\berror\b|\bnot (?:actually )?(?:sent|delivered|messaged)\b",
+                            re.I)
 _DQUOTED = re.compile(r"\"[^\"\n]{0,400}\"|\u201c[^\u201d\n]{0,400}\u201d")
 
 
@@ -317,7 +321,7 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
             reached |= {(r[0] or "").rsplit("/", 1)[-1] for r in conn.execute(
                 "SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (task_id,))}
         for c in comments:
-            if REPORTED_RE.search(c):
+            if REPORTED_RE.search(c) and not FAILED_SEND_RE.search(c):
                 reached |= {s for s in wanted if s in c}
         missing = [s for s in wanted if s not in reached]
     except sqlite3.Error:
@@ -337,7 +341,7 @@ def origin_refusal(task_id: str, sessions: list[str]) -> str:
         "card body, message = what finished, the proof, and anything still open.\n"
         f"2) Record it with kanban_comment on {task_id}: \"follow-through: SENT via cross_session to @session:{s} "
         "at <time>; delivery verified|not verified\" (verified = the send returned delivered/replied). Then complete "
-        "again.\n"
+        "again. \"not verified\" means it went out with no readback; a send that returned an error does not count.\n"
         "3) If the send fails (no relay, chat gone), kanban_block this card with that error instead of completing.\n"
         "(Whoever creates such a card should bind the chat up front: kanban_create origin_session='@session:…'.)"
         + (f" Other unlinked origin chats: {', '.join(sessions[1:])}." if len(sessions) > 1 else "")

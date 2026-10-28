@@ -48,7 +48,7 @@ def origin_unreached(conn, tid):
     except Exception:
         pass
     for c in comments:
-        if core.REPORTED_RE.search(c):
+        if core.REPORTED_RE.search(c) and not core.FAILED_SEND_RE.search(c):
             reached |= {s for s in wanted if s in c}
     return wanted, [s for s in wanted if s not in reached]
 

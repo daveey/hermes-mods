@@ -233,6 +233,21 @@ def test_origin_chat_reported_comment_allowed(tmp_path):
     assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
 
 
+def test_origin_chat_sent_without_readback_allowed(tmp_path):
+    note = f"follow-through: SENT via cross_session to @session:default@macbook/{ORIGIN} at 15:30Z; delivery not verified"
+    paths = make_board(tmp_path, comments=[note])
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
+
+
+def test_origin_chat_failed_send_comment_refused(tmp_path):
+    """Live test t_01a1808c7af7225a: the send failed, the worker still wrote a SENT note, and the gate passed it."""
+    note = (f"follow-through: SENT via cross_session to @session:default@hub/{ORIGIN} at 2026-10-28 03:28 UTC; "
+            'delivery not verified. Send result: {"ok": false, "error": "No connected Hermes Desktop that can reach '
+            '`hub` picked up the request"}')
+    paths = make_board(tmp_path, comments=[note])
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths)
+
+
 def test_origin_named_in_comment_refused(tmp_path):
     body = "Fix the runner counts."
     note = f"Mac receipt, relayed by the supervisor from origin @session:default@macbook/{ORIGIN}: still 11."
