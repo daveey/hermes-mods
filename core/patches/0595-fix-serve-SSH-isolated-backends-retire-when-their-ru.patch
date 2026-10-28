@@ -1,0 +1,116 @@
+From 19c6caabe0eaba30767dff08cf88d2fc745fd4c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:48:34 -0700
+Subject: [PATCH] fix(serve): SSH-isolated backends retire when their runtime
+ is replaced, not only on a revision change
+
+A runtime rebuild can swap site-packages under a running serve --isolated while the checkout
+revision stays put. /api/ssh/ownership then says runtimeIntact false, every Desktop refuses to
+reuse it, and the git-revision skew watchdog never fires, so the always-on dashboard sat stale
+and unreusable (Desktop cold start waited 20 s and spawned). The watchdog now also retires on a
+lost runtime marker, still only between turns and never mid-update.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/web_server_skew_exit.py            | 27 +++++++++++++++---
+ tests/hermes_cli/test_web_server_skew_exit.py | 28 +++++++++++++++++++
+ 2 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/web_server_skew_exit.py b/hermes_cli/web_server_skew_exit.py
+index b74c6b29f5..8a0cc8f6f3 100644
+--- a/hermes_cli/web_server_skew_exit.py
++++ b/hermes_cli/web_server_skew_exit.py
+@@ -11,6 +11,12 @@ with the checkout on disk) and, once no update is in flight and the retirement f
+ backend idle (and closes admission so no turn can start mid-teardown), exits cleanly. The client's
+ reconnect path respawns it from the new code. Every uncertain read (unknown revision, busy or
+ indeterminate ledgers, a live update) keeps the process up.
++
++The checkout revision is not the only thing an update replaces: a runtime rebuild can swap the
++venv/site-packages under the backend while the revision stays put. ``/api/ssh/ownership`` then
++reports ``runtimeIntact: false`` and every client refuses to reuse the backend, so the watchdog
++also retires on a lost runtime marker; otherwise a long-lived backend (the always-on dashboard)
++would sit stale and unreusable until the next checkout change.
+ """
+ 
+ from __future__ import annotations
+@@ -45,6 +51,15 @@ def _update_in_progress() -> bool:
+         return True  # cannot prove the swap is over: wait
+ 
+ 
++def _runtime_intact() -> bool:
++    try:
++        from hermes_cli.web_server import _ssh_runtime_intact
++
++        return _ssh_runtime_intact()
++    except Exception:
++        return True  # cannot prove the runtime moved: stay up
++
++
+ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fence, poll_s: float,
+                              max_polls: Optional[int], thread_name: str) -> threading.Thread:
+     """Daemon thread shared by the SSH-isolated retirement watchdogs: ``observe`` returns the log
+@@ -76,6 +91,7 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
+ 
+ def start_code_skew_watchdog(server, *, skew_fn: Optional[Callable[[], Skew]] = None,
+                              update_probe: Callable[[], bool] = _update_in_progress,
++                             runtime_probe: Callable[[], bool] = _runtime_intact,
+                              fence=None, poll_s: float = DEFAULT_SKEW_POLL_S,
+                              max_polls: Optional[int] = None) -> threading.Thread:
+     """Daemon thread that sets ``server.should_exit`` once the loaded code is provably stale and
+@@ -88,10 +104,13 @@ def start_code_skew_watchdog(server, *, skew_fn: Optional[Callable[[], Skew]] =
+ 
+     def _observe() -> Optional[str]:
+         skew = read_skew()
+-        if not (skew and should_retire_for_skew(skew=skew, update_in_progress=update_probe())):
+-            return None
+-        return ("SSH-isolated backend loaded {} but the install is now at {}; "
+-                "retiring so its client respawns it on the new code.".format(*skew))
++        if skew and should_retire_for_skew(skew=skew, update_in_progress=update_probe()):
++            return ("SSH-isolated backend loaded {} but the install is now at {}; "
++                    "retiring so its client respawns it on the new code.".format(*skew))
++        if not runtime_probe() and not update_probe():
++            return ("SSH-isolated backend's runtime was replaced under it (runtimeIntact false); "
++                    "retiring so its client respawns it on the new runtime.")
++        return None
+ 
+     return _run_retirement_watchdog(server, observe=_observe, fence=fence, poll_s=poll_s,
+                                     max_polls=max_polls, thread_name="ssh-isolated-skew-watchdog")
+diff --git a/tests/hermes_cli/test_web_server_skew_exit.py b/tests/hermes_cli/test_web_server_skew_exit.py
+index bcbb6f2164..e8c0d1f013 100644
+--- a/tests/hermes_cli/test_web_server_skew_exit.py
++++ b/tests/hermes_cli/test_web_server_skew_exit.py
+@@ -95,3 +95,31 @@ def test_default_probe_retires_once_the_checkout_moves_past_the_boot_revision(tm
+     start_code_skew_watchdog(moved, update_probe=lambda: False, fence=fence,
+                              poll_s=0.01, max_polls=4).join(timeout=5)
+     assert moved.should_exit is True
++
++
++def _run_runtime(fence, intact, *, update=False):
++    server = _Server()
++    seq = iter(intact)
++    thread = start_code_skew_watchdog(
++        server, skew_fn=lambda: None, update_probe=lambda: update,
++        runtime_probe=lambda: next(seq, intact[-1]), fence=fence, poll_s=0.01, max_polls=len(intact) + 2)
++    thread.join(timeout=5)
++    return server
++
++
++def test_a_replaced_runtime_retires_even_when_the_revision_did_not_move():
++    # A runtime rebuild swapped site-packages but left the checkout revision alone: clients see
++    # runtimeIntact false and refuse reuse, so the backend must retire instead of sitting stale.
++    fence = _Fence(idle=True)
++    assert _run_runtime(fence, [False, False]).should_exit is True
++    assert fence.committed is True
++
++
++def test_an_intact_runtime_or_a_single_blip_stays_up():
++    assert _run_runtime(_Fence(idle=True), [True, True]).should_exit is False
++    assert _run_runtime(_Fence(idle=True), [False, True, False, True]).should_exit is False
++
++
++def test_a_replaced_runtime_waits_for_idle_and_for_the_update_to_finish():
++    assert _run_runtime(_Fence(idle=False), [False, False]).should_exit is False
++    assert _run_runtime(_Fence(idle=True), [False, False], update=True).should_exit is False
+-- 
+2.55.0
+

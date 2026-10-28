@@ -1,6 +1,7 @@
 # Desktop: keep remote gateways warm (always-on dashboard, prewarm, probe skip)
 
-Patches **0526** (`4dbfb50490`) and **0535** (`7c62393349`, named-profile prewarm). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
+Patches **0526** (`4dbfb50490`), **0535** (`7c62393349`, named-profile prewarm) and **0595** (`19c6caabe0`, retire on a
+replaced runtime). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
 
 ## Behavior
 
@@ -67,6 +68,11 @@ Apply after 0448–0450. Then on each remote host: `hermes always-on-dashboard i
   warm by the prewarm once it was opened in the last 24 h (the first open of a new profile still pays the spawn).
 - A host's HERMES_HOME seen by the SSH shell must match the record's (`$HOME/.hermes` in the unit), or Desktop logs
   `always-on dashboard serves X, not Y` and spawns as before.
+- An update can rebuild the runtime (site-packages) without moving the checkout revision. The serve then reports
+  `runtimeIntact: false`, Desktop refuses to reuse it (waits 20 s, logs "runs a replaced runtime", spawns), and the
+  revision-based skew watchdog never fired, so the dashboard sat stale until the next checkout change. 0595 makes the
+  skew watchdog also retire on a lost runtime marker (between turns, never mid-update); the supervisor restarts it on
+  the new runtime. Test: `test_a_replaced_runtime_retires_even_when_the_revision_did_not_move` and its two neighbours.
 - Rotate the token by uninstalling, deleting `~/.hermes/desktop-ssh/always-on`, and installing again.
 
 ## Plugin?
