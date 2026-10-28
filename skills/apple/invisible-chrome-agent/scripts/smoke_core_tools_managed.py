@@ -26,6 +26,7 @@ import time
 
 from chrome_agent_lifecycle import Config, Ledger, Lifecycle
 from chrome_test_fixtures import chrome_environment, fresh_profile_arguments
+import host_slot
 from smoke_chrome_lifecycle import reserve_port, validate_isolation
 
 PAGE = (b'<!doctype html><title>start</title><h1>Lease smoke</h1>'
@@ -91,6 +92,14 @@ def main():
     api = importlib.util.module_from_spec(spec)
     loader.exec_module(api)
 
+    slot = host_slot.acquire(core, lambda: print('smoke: waiting for a free host slot', flush=True))
+    try:
+        return _run(args, core, runner, api)
+    finally:
+        host_slot.release(slot)
+
+
+def _run(args, core, runner, api):
     allocation = tempfile.TemporaryDirectory(prefix='core-lease-smoke-')
     with allocation as directory:
         root = Path(directory)
