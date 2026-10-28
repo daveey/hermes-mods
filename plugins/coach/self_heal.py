@@ -829,8 +829,12 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
    **Plan**: the exact changes (files/skills/config), the regression test (fails before, passes after), the
    detection guard, and what gets verified live after shipping.
    **Cost / risk**, then **Undo**: how to revert.
-   Then post it (one card; a re-post of the same key updates it):
-   `hermes inbox post --type {INBOX_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "<one-line title: what is broken>" < {proposal}`
+   The lane posts to the default home on this host, not a diagnostic HERMES_HOME exported by a test.
+   Preflight immediately before posting: `env HERMES_HOME="$HOME/.hermes" hermes inbox post --help`.
+   If it fails, repair CLI discovery or use the inbox_post tool; do not record proposed until posting succeeds.
+   Do not pipe the post through tail/grep: preserve its exit status. Verify the returned session/key with
+   inbox_outcome before recording the event. Then post it (one card; a re-post of the same key updates it):
+   `env HERMES_HOME="$HOME/.hermes" hermes inbox post --type {INBOX_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "<one-line title: what is broken>" < {proposal}`
    and record it: `python3 {SELF} event proposed {fp} --card $HERMES_KANBAN_TASK`.
 5. Complete this card with the proposal's first line as the summary. Do not start the fix.
 """
@@ -863,8 +867,12 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
    PASSING, plus the module's existing tests.
 4. {ship}
 5. Verify live on the real path (the surface/command/session type where it happened), and capture the proof.
-6. Post the result on the SAME Inbox key:
-   `hermes inbox post --type {RESULT_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "Fixed: <what>" < <result.md>`
+6. Post the result on the SAME Inbox key (default home on this host, not a test's exported HERMES_HOME).
+   Preflight immediately before posting: `env HERMES_HOME="$HOME/.hermes" hermes inbox post --help`.
+   If it fails, repair CLI discovery or use the inbox_post tool; do not record fixed until posting succeeds.
+   Do not pipe the post through tail/grep: preserve its exit status. Verify the returned session/key with
+   inbox_outcome before recording the event.
+   `env HERMES_HOME="$HOME/.hermes" hermes inbox post --type {RESULT_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "Fixed: <what>" < <result.md>`
    with what changed (commits), the red/green test output, the live proof, and the undo command.
    Then `python3 {SELF} event fixed {fp} --card $HERMES_KANBAN_TASK --note "<commit sha>"`.
 7. Complete the card. If something irreversible or external blocks the fix, kanban_block with the exact ask instead.
