@@ -331,3 +331,49 @@ def test_reconcile_stops_after_max_attempts(tmp_path):
     for _ in range(3): s.dispatch(OWNER, op['operationId'], receiver)
     assert s.reconcile(OWNER, receiver, max_attempts=3) == []
     assert len(s.reconcile(OWNER, receiver, max_attempts=4)) == 1
+
+
+# ---- go options on a run-timing question authorize exactly the tile's scope (self-heal agent-aa8d66631c) ----
+TIMING = {'id': 'step-timing', 'session': 'session-a', 'kind': 'choose',
+          'text': 'When should I run the Mac mini launcher migration?',
+          'paragraph': 'When should I run the Mac mini launcher migration: now, when idle, or later?',
+          'verbatim_span': 'now, when idle, or later?', 'options': ['now', 'when idle', 'later']}
+
+
+def _decide_label(tmp_path, step, label):
+    s = store(tmp_path)
+    r = s.migrate_step(OWNER, dict(step))
+    choice = next(c for c in r['choices'] if c['label'] == label)
+    out = s.decide(OWNER, decision(r, key=f'k-{label}', choice=choice['id'], text=label))
+    return r, choice, out['operation']['intent']
+
+
+@pytest.mark.parametrize('label', ['now', 'when idle'])
+def test_go_answer_to_run_timing_question_authorizes_the_tile_scope(tmp_path, label):
+    r, choice, intent = _decide_label(tmp_path, TIMING, label)
+    assert choice.get('authorizes') is True
+    assert intent['executionAuthorized'] is True
+    assert intent['request']['scope']['markdown'] == TIMING['paragraph']  # frozen scope only
+    assert 'approve' in r['outcomes']['answer'].lower()
+
+
+def test_wait_answer_and_free_text_grant_nothing(tmp_path):
+    r, choice, intent = _decide_label(tmp_path, TIMING, 'later')
+    assert not choice.get('authorizes') and intent['executionAuthorized'] is False
+    (tmp_path / 'b').mkdir(exist_ok=True); s = store(tmp_path / 'b')
+    r = s.migrate_step(OWNER, dict(TIMING, id='step-2'))
+    out = s.decide(OWNER, decision(r, key='free', choice='answer-text', text='now please'))
+    assert out['operation']['intent']['executionAuthorized'] is False
+
+
+def test_go_word_on_a_non_run_question_grants_nothing(tmp_path):
+    step = {'id': 'step-color', 'session': 'session-a', 'kind': 'choose', 'text': 'Which colour do you want?',
+            'paragraph': 'Which colour do you want: yes-blue or no-red?', 'options': []}
+    s = store(tmp_path)
+    r = s.migrate_step(OWNER, step)
+    assert not any(c.get('authorizes') for c in r['choices'])
+
+
+def test_authorizes_flag_is_only_valid_on_answer_choices():
+    r = request(); r['choices'][0]['authorizes'] = True  # on an approve choice: rejected
+    with pytest.raises(core.ActionError): core.validate_action(dict(r))
