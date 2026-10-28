@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-spawn-tests-host-independent.md](kanban-spawn-tests-host-independent.md) | 0663 | Kanban spawn env/PYTHONPATH tests pin the restart-safe scope wrapper so they pass with or without systemd. |
 | [git-consumer-fallback-tests.md](git-consumer-fallback-tests.md) | 0662 | Inject consumer failures at public PM boundary; cover missing-runtime preflight without losing callback assertions. |
 | [kanban-session-poll-coalescing.md](kanban-session-poll-coalescing.md) | 0661 | Overlapping session-list polls share one annotation refresh; failures remain unknown. |
 | [kanban-wait-replica.md](kanban-wait-replica.md) | 0658 | Unreachable SSH card waits use fresh owner-qualified replica rows; missing/stale evidence errors, orphan producers are refused, and automatic probes share the route. |
