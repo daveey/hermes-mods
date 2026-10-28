@@ -64,7 +64,18 @@ active. On each wakeup:
 2. Report rows that finished; archive per the rule.
 3. Note sessions idle and stuck (not running, last turn ended in an error or a question) and
    surface them once, not every sweep.
-4. Reschedule. Set `noop: true` when nothing changed.
+4. Rewrite `~/.claude/dispatcher/status.md`: one line per live workstream (theme, session
+   links, running/idle, PR state), under 30 lines.
+5. Reschedule. Set `noop: true` when nothing changed.
+
+## Speed
+
+- "What are we working on" / status questions: `cat ~/.claude/dispatcher/status.md` and answer
+  from it. Call `list_sessions` (limit 15) only if it is older than ~30 min, or if the user asks
+  for fresh data.
+- At most one tool call before replying to a question. Don't load this skill again on every
+  turn; reload it only after compaction.
+- Keep replies to a few short lines. No insight blocks, no restating the routing.
 
 ## Reply style
 
