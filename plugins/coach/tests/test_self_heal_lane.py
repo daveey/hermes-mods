@@ -1030,3 +1030,75 @@ def test_signature_adoption_is_injectable_and_skips_known_cards(store):
     assert out["adopted"] and out["card"] == "t_0a0e00000004" and not r.creates()
     assert seen[0]["exc_msg"] == "disk I/O error" and seen[0]["func"] == "_read_counts"
     assert seen[0]["file"] == "kanban_session_activity.py"
+
+
+# ── one root, several faces: Kanban DB read failures from a stale per-process view are one family ──
+CORRUPT_TB = ("Traceback (most recent call last):\n"
+              '  File "~/.hermes/hermes-agent/hermes_cli/kanban_db_connect.py", line 561, in _guard_existing_db_is_healthy\n'
+              "    raise KanbanDbCorruptError(path, detail)\n"
+              "hermes_cli.kanban_db_connect.KanbanDbCorruptError: Refusing to open corrupt kanban DB at "
+              "/home/ubuntu/.hermes/kanban.db: integrity_check returned '*** in database main ***\\n"
+              "Tree 52 page 1997: Rowid 1997 out of order'\n")
+
+
+def _corrupt_signal(**kw):
+    return defect(component="kanban", source="signal", session_id="", quote="", details=CORRUPT_TB,
+                  symptom="KanbanDbCorruptError in _guard_existing_db_is_healthy (kanban_db_connect.py): kanban_show failed",
+                  **kw)
+
+
+def test_replay_kanban_disk_io_then_corrupt_signal_adopts_the_first_lane(store):
+    """Replay of 2026-10-27: kanban-759104eb56 (disk I/O error) filed; kanban-7fbb819bc1 (KanbanDbCorruptError,
+    no session) must join that lane's card instead of opening a second investigation of the same root."""
+    r = Runner()
+    first = sh.file_defect(_signal_defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert first["action"] == "filed" and len(r.creates()) == 1
+    owner = first["card"]
+    second_d = _corrupt_signal(at=NOW + 2000)
+    second = sh.file_defect(second_d, store=store, m="live", runner=r, now=NOW + 2040, cfg=HUB, budget_fn=OPEN)
+    assert len(r.creates()) == 1, "second face of the same Kanban root filed its own card"
+    assert second["action"] == "skip" and second["adopted"] and second["card"] == owner
+    assert second["via"] == "family"
+    (e,) = [x for x in ev(store, "selfheal_adopted_owner") if x.get("via") == "family"]
+    assert e["card"] == owner and e["family"] == "kanban-db-view"
+    st = sh.LaneState(store.root).get(second["fingerprint"])
+    assert st["status"] == "approved" and st["fix_card"] == owner
+
+
+def test_unreliable_view_error_joins_an_open_corrupt_lane(store):
+    r = Runner()
+    first = sh.file_defect(_corrupt_signal(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert first["action"] == "filed"
+    d = defect(component="kanban", source="signal", session_id="", quote="",
+               symptom="KanbanDbUnreliableViewError in connect (kanban_db_connect.py): board view unreliable",
+               details="hermes_cli.kanban_db_connect.KanbanDbUnreliableViewError: unreliable view of ~/.hermes/kanban.db\n")
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW + 600, cfg=HUB, budget_fn=OPEN)
+    assert len(r.creates()) == 1 and out["adopted"] and out["card"] == first["card"]
+
+
+def test_unrelated_kanban_error_is_not_in_the_db_view_family(store):
+    r = Runner()
+    sh.file_defect(_signal_defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    d = defect(component="kanban", source="signal", session_id="", quote="",
+               symptom="KeyError in _render_card (kanban_cli.py): 'assignee'",
+               details="KeyError: 'assignee'\n")
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW + 600, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and len(r.creates()) == 2
+    assert sh.root_family(d) is None
+
+
+def test_disk_io_error_outside_kanban_is_not_in_the_family():
+    d = defect(component="inbox", symptom="OperationalError in _write_outcome (inbox_store.py): write failed",
+               details="sqlite3.OperationalError: disk I/O error\n")
+    assert sh.root_family(d) is None
+    assert sh.root_family(_signal_defect()) == "kanban-db-view"
+    assert sh.root_family(_corrupt_signal()) == "kanban-db-view"
+
+
+def test_a_fixed_family_lane_is_not_adopted(store):
+    r = Runner()
+    d1 = _signal_defect()
+    sh.file_defect(d1, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    sh.LaneState(store.root).update(d1["fingerprint"], status="fixed", fixed_at=NOW + 100)
+    out = sh.file_defect(_corrupt_signal(), store=store, m="live", runner=r, now=NOW + 600, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and len(r.creates()) == 2

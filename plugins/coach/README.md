@@ -411,6 +411,13 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   the seven-day `not_defect` suppression. Its brief directs investigators to this event.
   `tests/test_sqlite_corruption.py` replays six sanitized actual traceback tails (one card, five comments), concurrent
   filing, path/hour/host isolation, real owner-query filtering, comment failures, shadow safety and duplicate CLI.
+- **Root families:** some exceptions are faces of one root. `kanban-db-view` = `disk I/O error`,
+  `KanbanDbCorruptError`, `KanbanDbUnreliableViewError` or `database disk image is malformed` from Kanban code or a
+  Kanban DB (a stale per-process view of a board). Before filing (after session adoption), a defect in a family
+  joins the oldest open lane (filed/proposed/approved, not suppressed) of the same family: the lane gets that card
+  as `fix_card`, `family_owner=<fp>`, and `selfheal_adopted_owner via=family` is logged. A fixed or closed family
+  lane is not adopted, so a recurrence still files. Lanes record `family` when filed (`root_family()`). Tests:
+  `test_self_heal_lane.py` replays the disk-I/O-then-corrupt pair (`test_replay_kanban_disk_io_then_corrupt_...`).
 - **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
   hermes-mods-repo (Baby Bear: board `bb`, five-whys + bb-self-fix). Its brief makes it investigate live, with a
   per-component checklist (Kanban events/runs, surface writer + backing state, processes/launchd/logs, git log), write

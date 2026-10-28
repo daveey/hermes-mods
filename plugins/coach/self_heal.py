@@ -1402,6 +1402,57 @@ def _adopt_signature_card(d: dict, fp: str, store, now: float,
             "adopted": True, "via": "signature"}
 
 
+# Root families: different exceptions that are faces of ONE root, so one open lane owns them all. A Kanban board
+# read through a stale per-process view (deleted -wal/-shm, dropped locks) shows up as "disk I/O error", as a false
+# KanbanDbCorruptError from the health guard, or (after the quarantine fix) as KanbanDbUnreliableViewError.
+_KANBAN_DB_FACE = re.compile(r"KanbanDbCorruptError|KanbanDbUnreliableViewError|disk I/O error|"
+                             r"database disk image is malformed", re.I)
+_KANBAN_DB_WHERE = re.compile(r"kanban_db_connect|kanban_session_activity|kanban\.db|kanban DB", re.I)
+
+
+def root_family(d: dict) -> Optional[str]:
+    """Family name for a defect whose exception is one face of a known shared root, else None."""
+    text = "\n".join(str(d.get(k) or "") for k in ("symptom", "details"))
+    if not _KANBAN_DB_FACE.search(text):
+        return None
+    if re.search(r"KanbanDb(?:Corrupt|UnreliableView)Error", text) or _KANBAN_DB_WHERE.search(text):
+        return "kanban-db-view"
+    return None
+
+
+def _lane_family(e: dict) -> Optional[str]:
+    return e.get("family") or root_family({"symptom": e.get("symptom")})
+
+
+def _adopt_family_lane(d: dict, fp: str, store, now: float) -> Optional[dict]:
+    """Another open lane (filed/proposed/approved) already owns this defect's root family: join its card instead of
+    filing a second investigation of the same root. The oldest open lane wins. Logs selfheal_adopted_owner via=family."""
+    fam = root_family(d)
+    if not fam:
+        return None
+    lane = LaneState(store.root)
+    owners = []
+    for ofp, e in lane.read().items():
+        if ofp == fp or e.get("suppressed") or e.get("status") not in ("filed", "proposed", "approved"):
+            continue
+        card = e.get("fix_card") or e.get("card")
+        if card and _lane_family(e) == fam:
+            first = min([h[0] for h in (e.get("history") or []) if h] or [e.get("filed_at") or now])
+            owners.append((first, ofp, card, e.get("board")))
+    if not owners:
+        return None
+    _, ofp, card, board = sorted(owners)[0]
+    st = lane.get(fp)
+    lane.update(fp, status="approved", fix_card=card, approved_at=now, component=d.get("component"),
+                symptom=d.get("symptom"), session_id=d.get("session_id"), board=board, family=fam,
+                family_owner=ofp, filed_day=_utc_day(now), cards=sorted(known_cards(st) | {card}))
+    store.log({"event": "selfheal_adopted_owner", "via": "family", "family": fam, "fingerprint": fp, "card": card,
+               "owner_fingerprint": ofp, "board": board, "session_id": d.get("session_id"),
+               "candidates": [o[2] for o in sorted(owners)]})
+    return {"action": "skip", "why": f"adopted {ofp}'s card {card}: same root family {fam}", "card": card,
+            "adopted": True, "via": "family", "fingerprint": fp}
+
+
 def corruption_incident(d: dict, now: float) -> Optional[dict]:
     """One SQLite incident per source host, DB identity and UTC event-hour, not per callsite.
     Pathless kanban tracebacks refer to the source's default board, never the hub's env override.
@@ -1497,8 +1548,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
         return {"action": "skip", "why": dec["why"]}
     if m == "live" and hub:  # the origin session already queued its own fix card: adopt it, file nothing
-        owner = (_adopt_signature_card(d, fp, store, now, sig_owner_fn) if d.get("incident") else
-                 (_adopt_session_card(d, fp, store, now, owner_fn) or
+        owner = ((_adopt_family_lane(d, fp, store, now) or _adopt_signature_card(d, fp, store, now, sig_owner_fn))
+                 if d.get("incident") else
+                 (_adopt_session_card(d, fp, store, now, owner_fn) or _adopt_family_lane(d, fp, store, now) or
                   _adopt_signature_card(d, fp, store, now, sig_owner_fn)))
         if owner:
             if d.get("incident"):
@@ -1544,7 +1596,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     kw: dict = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
               filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
               fix_card=None if not prev else st.get("fix_card"), gen=gen,
-              cards=sorted(known | {tid}), proposed_at=None)
+              cards=sorted(known | {tid}), proposed_at=None, family=root_family(d))
     if prev:
         kw["recurrences"] = int(st.get("recurrences") or 0) + 1
     elif dec["why"] == "refile":
