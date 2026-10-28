@@ -294,24 +294,31 @@ delivery card *moved*. Defect agent-38a817308d: the rollout card of a 5-card gra
 (any `task_chat_links` kind) plus everything downstream of them (`task_links` children; not parents or siblings,
 because boards share parents and an undirected walk merges unrelated graphs). A delivery card is an open sink of
 that graph with at least one parent. It is stalled when its status is `todo`/`ready`/`triage`/`blocked`/`review`
-(not running, not `scheduled`, not a `needs_input`/`time` block, which are intended waits), its last status event and
-last run start are older than `COACH_STALLED_GOAL_HOURS` (default 24), and the graph's other cards started at least
-`COACH_STALLED_GOAL_RUNS` (default 20) runs since then.
+(not running, not `scheduled`, not a human wait: `block_kind` `needs_input`/`time`, or `blocked` with a
+`human_request`), its last status event and last run start are older than `COACH_STALLED_GOAL_HOURS` (default 24),
+and the graph's other cards started at least `COACH_STALLED_GOAL_RUNS` (default 20) runs since then.
+
+A delivery card whose only remaining wall is a human is not a stall. The open-ancestor frontier is the nearest
+ancestors that are not done or archived and whose own parents are all done or archived (open intermediates are
+walked past; done cards are walked through). If every frontier card is a human wait, the record is
+`waiting_on_human` and names those cards. The hook stays quiet: there is nothing for the chat to take over. A
+frontier card that is `running`, `scheduled`, `ready` or `todo` is agent work, so the delivery card stays
+`stalled_goal`. Liveness is not progress.
 
 - **Hook.** On the next user turn of a linked chat (lineage-aware), `pre_llm_call` adds one context line naming the
   card, its idle hours and the busy cards, and telling the agent to take the next step over itself or name the one
   wall; it says not to reopen, re-review or add another watcher. One line per chat per incident (`card@since`), and
-  one Kanban comment per incident on the card (local boards only, in a background thread). Ledger:
+  one Kanban comment per incident on the card (local boards only, in a background thread). `waiting_on_human` is
+  not a takeover: no context line and no comment. Ledger:
   `<coach root>/stalled_goal.json`; logged as `agent_hint` with `rule=stalled_goal`. Board reads are cached per chat
   for 10 minutes. An idle chat gets it on its next turn (no push into an idle chat). `COACH_STALLED_GOAL=0` turns it
   off; cron turns are skipped.
 - **CLI (read-only).** `python3 stalled_goal.py [--db PATH ...] [--replicas] [--session SID] [--now TS] [--json]`.
   Without `--db` it scans this home's boards; `--replicas` adds `kanban/sync-shadow/*.db` (other gateways' boards).
-  `--comment` comments once per stall on boards this home owns.
+  Text and `--json` include both kinds (`stalled_goal`, `waiting_on_human` with the frontier cards). `--comment`
+  comments once per `stalled_goal` on boards this home owns, never a human wait.
 
-Measured 2026-10-28 on the hub (its own boards plus the MacBook replica): 8 distinct stalled delivery cards, among
-them this defect's rollout card (122 h, 168 runs by its own chat's cards). Tests: `tests/test_stalled_goal.py`, on the
-real graph's rows copied from the replica (`tests/fixtures/stalled_goal_balancer.json`, titles scrubbed).
+Measured 2026-10-28 on the hub (its own boards plus the MacBook replica), before the frontier split: 8 distinct stalled delivery cards, among them this defect's rollout card (122 h, 168 runs by its own chat's cards). After the split, a card whose open-ancestor frontier is entirely a human wait is `waiting_on_human` instead; a frontier card that is running, scheduled, ready or todo keeps it a stall. Tests: `tests/test_stalled_goal.py`, on the real graph's rows copied from the replica (`tests/fixtures/stalled_goal_balancer.json`, titles scrubbed) plus synthetic frontiers (human wait walked past an open intermediate, blocked with a human_request and no block_kind, mixed frontier, scheduled/todo/ready/running agent parent).
 
 ### Second opinions that run (`second_opinion.py`)
 
@@ -650,7 +657,7 @@ Both calls fail open when coach isn't loaded.
 - `core.py`: the file store under `<HERMES_HOME>/coach/` (`sessions/<id>.json`, `bugs.jsonl`, `log.jsonl`), the gate, the user-rule evaluation, the briefs (spin-out's transcript reader + aux task `coach`) and stats.
 - `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the
   neutral reviewer prompt); `eval/second_opinion_replay.py` counts how often each would fire over `state.db`.
-- `stalled_goal.py`: the stalled-goal detector (a chat's delivery card idle while its graph spends runs), hook helper
+- `stalled_goal.py`: the stalled-goal detector (a chat's delivery card idle while its graph spends runs; a human-wait ancestor frontier is `waiting_on_human`, not a takeover), hook helper
   and read-only CLI.
 - `curriculum.py` + `curriculum.yaml`: the tips (loading/overlay, live triggers, spacing, adoption read).
 - `dashboard/plugin_api.py`: `/state`, `/offer`, `/event`, `/restart`, `/board`, `/file-bug`, `/stats`.

@@ -10,10 +10,17 @@ those cards through task_links. Delivery cards: open sinks of the graph (no open
 parent. A delivery card is stalled when
 
   * its status is todo/ready/triage/blocked/review (not running, scheduled = an intended wait, a human block
-    `block_kind` needs_input/time, done, archived), and
+    `block_kind` needs_input/time or status blocked with a human_request, done, archived), and
   * its last status event (created/promoted/claimed/spawned/completed/blocked/unblocked/scheduled/...) and last run
     start are older than COACH_STALLED_GOAL_HOURS (default 24), and
-  * the graph's OTHER cards started at least COACH_STALLED_GOAL_RUNS runs (default 20) since then.
+  * the graph's OTHER cards started at least COACH_STALLED_GOAL_RUNS runs (default 20) since then, and
+  * its open-ancestor frontier is not entirely a human wait.
+
+Open-ancestor frontier: the nearest ancestors that are not done/archived and whose own parents are all done or
+archived (walk past open intermediates and through done cards). If every frontier card is a human wait, the
+delivery card is `waiting_on_human` instead of `stalled_goal`: there is nothing for an agent to take over. A
+frontier card that is running, scheduled, ready or todo is agent work — liveness is not progress, so that still
+emits `stalled_goal`. The hook only speaks for `stalled_goal`. The CLI prints both.
 
 Two delivery paths:
   * hook (coach `pre_llm_call`, the origin chat's own gateway): the next turn of a linked chat gets one
@@ -43,7 +50,33 @@ STATUS_EVENTS = ("created", "promoted", "claimed", "spawned", "completed", "bloc
                  "review_requested", "changes_requested", "archived", "reclaimed", "crashed", "gave_up", "timed_out",
                  "continued", "status", "goal_verified")
 HUMAN_WAITS = ("needs_input", "time")
+AGENT_STATUSES = ("running", "scheduled", "ready", "todo")  # a frontier card in one of these is not a human wall
+CLOSED = ("done", "archived")
 MAX_GRAPH = 400
+
+
+def _has_request(raw) -> bool:
+    text = str(raw).strip() if raw else ""
+    return bool(text) and text not in ("null", "{}", "[]")
+
+
+def card_human_wait(info: Optional[dict]) -> bool:
+    """The card itself is an intended human wait, whatever else it is doing."""
+    if not info:
+        return False
+    if info.get("block_kind") in HUMAN_WAITS:
+        return True
+    return info.get("status") == "blocked" and _has_request(info.get("human_request"))
+
+
+def frontier_human_wait(info: Optional[dict]) -> bool:
+    """A frontier card silences the stall only when it is a human wait and not agent work.
+
+    running/scheduled/ready/todo stay stalls even with a stale needs_input block_kind: liveness is not progress.
+    """
+    if not info or info.get("status") in AGENT_STATUSES:
+        return False
+    return card_human_wait(info)
 
 
 def hours() -> float:
@@ -109,6 +142,7 @@ def _scan_db(c, sessions: Optional[set], now: float, h: float, n: int) -> list:
     if not by_session:
         return []
     has_bk = "block_kind" in _cols(c, "tasks")
+    has_hr = "human_request" in _cols(c, "tasks")
     edges = list(c.execute("select parent_id, child_id from task_links"))
     parents: dict = {}
     children: dict = {}
@@ -119,11 +153,57 @@ def _scan_db(c, sessions: Optional[set], now: float, h: float, n: int) -> list:
 
     def info(tid):
         if tid not in info_cache:
-            r = c.execute(f"select title, status, created_at{', block_kind' if has_bk else ''} from tasks where id=?",
-                          (tid,)).fetchone()
-            info_cache[tid] = None if not r else {"title": r[0], "status": r[1], "created_at": r[2],
-                                                    "block_kind": r[3] if has_bk else None}
+            extra = (", block_kind" if has_bk else "") + (", human_request" if has_hr else "")
+            r = c.execute(f"select title, status, created_at{extra} from tasks where id=?", (tid,)).fetchone()
+            if not r:
+                info_cache[tid] = None
+            else:
+                row = {"title": r[0], "status": r[1], "created_at": r[2], "block_kind": None, "human_request": None}
+                idx = 3
+                if has_bk:
+                    row["block_kind"] = r[idx]
+                    idx += 1
+                if has_hr:
+                    row["human_request"] = r[idx]
+                info_cache[tid] = row
         return info_cache[tid]
+
+    def frontier(delivery):
+        """Nearest non-closed ancestors whose own parents are all done or archived.
+
+        Walk past open intermediates (their parents are not all closed) and through done/archived cards.
+        A missing ancestor is kept: it is not a human wait, so the stall is not silenced. A walk that hits
+        MAX_GRAPH is truncated and must not silence the stall either.
+        """
+        found, seen, truncated = [], set(), False
+
+        def walk(tid):
+            nonlocal truncated
+            if truncated or tid in seen:
+                return
+            if len(seen) >= MAX_GRAPH:
+                truncated = True
+                return
+            seen.add(tid)
+            node = info(tid)
+            if node is None:
+                found.append(tid)
+                return
+            if node["status"] in CLOSED:
+                for p in parents.get(tid, ()):
+                    walk(p)
+                return
+            blocking = [p for p in parents.get(tid, ())
+                        if not (info(p) and info(p)["status"] in CLOSED)]
+            if blocking:
+                for p in blocking:
+                    walk(p)
+                return
+            found.append(tid)
+
+        for p in parents.get(delivery, ()):
+            walk(p)
+        return found, truncated
 
     found: dict = {}
     for sid, seeds in by_session.items():
@@ -141,7 +221,7 @@ def _scan_db(c, sessions: Optional[set], now: float, h: float, n: int) -> list:
             todo += list(children.get(t, ()))
         for d in graph:
             i = info(d)
-            if i["status"] not in OPEN or i.get("block_kind") in HUMAN_WAITS:
+            if i["status"] not in OPEN or card_human_wait(i):
                 continue
             if not parents.get(d):  # a delivery card waits on other work; a lone card is its own (watcher, task)
                 continue
@@ -162,9 +242,19 @@ def _scan_db(c, sessions: Optional[set], now: float, h: float, n: int) -> list:
             total = sum(b["runs"] for b in busy)
             if total < n:
                 continue
+            fr, truncated = frontier(d)
+            fr_rows = []
+            for f in sorted(set(fr)):
+                fi = info(f) or {}
+                fr_rows.append({"card": f, "title": fi.get("title") or "", "status": fi.get("status"),
+                                "block_kind": fi.get("block_kind")})
+            human = bool(fr) and not truncated and all(frontier_human_wait(info(f)) for f in fr)
+            kind = "waiting_on_human" if human else "stalled_goal"
             rec = found.setdefault(d, {"card": d, "title": i["title"], "status": i["status"], "since": last,
                                        "stalled_hours": round((now - last) / 3600, 1), "other_runs": -1,
-                                       "busy": [], "sessions": []})
+                                       "busy": [], "sessions": [], "kind": kind, "frontier": fr_rows})
+            if kind == "waiting_on_human":
+                rec["waiting_on"] = fr_rows
             rec["sessions"].append(sid)
             if total > rec["other_runs"]:  # report the busiest chat's graph; each chat's own is in by_session
                 rec["other_runs"], rec["busy"] = total, sorted(busy, key=lambda b: -b["runs"])[:5]
@@ -173,9 +263,13 @@ def _scan_db(c, sessions: Optional[set], now: float, h: float, n: int) -> list:
     return list(found.values())
 
 
-def find_stalls(dbs: Iterable, now: Optional[float] = None, sessions: Optional[set] = None,
-                h: Optional[float] = None, n: Optional[int] = None) -> list:
-    """Stalled delivery cards across the given board dbs (paths or (board, path, owned) tuples), newest stall first."""
+def find_incidents(dbs: Iterable, now: Optional[float] = None, sessions: Optional[set] = None,
+                   h: Optional[float] = None, n: Optional[int] = None) -> list:
+    """Stalled delivery cards and human-wait frontiers across the given board dbs.
+
+    Each record has ``kind`` ``stalled_goal`` or ``waiting_on_human``. Paths or (board, path, owned) tuples.
+    Oldest idle card first.
+    """
     now = time.time() if now is None else now
     h = hours() if h is None else h
     n = min_runs() if n is None else n
@@ -194,6 +288,12 @@ def find_stalls(dbs: Iterable, now: Optional[float] = None, sessions: Optional[s
         finally:
             c.close()
     return sorted(out, key=lambda r: r["since"])
+
+
+def find_stalls(dbs: Iterable, now: Optional[float] = None, sessions: Optional[set] = None,
+                h: Optional[float] = None, n: Optional[int] = None) -> list:
+    """``stalled_goal`` records only. The hook tells a chat to take over these, never a human wait."""
+    return [r for r in find_incidents(dbs, now=now, sessions=sessions, h=h, n=n) if r.get("kind") == "stalled_goal"]
 
 
 def _busy_text(s: dict) -> str:
@@ -294,6 +394,28 @@ def session_hint(session_ids: list, root: Path, now: Optional[float] = None, dbs
     return takeover_message(out)
 
 
+def _frontier_text(s: dict) -> str:
+    rows = s.get("waiting_on") or s.get("frontier") or []
+    return ", ".join(
+        f"{f['card']} ({f.get('status') or '?'}"
+        + (f", {f['block_kind']}" if f.get("block_kind") else "")
+        + (", human_request" if f.get("status") == "blocked" and not f.get("block_kind") else "")
+        + ")"
+        for f in rows[:6])
+
+
+def _print_incident(s: dict) -> None:
+    kind = s.get("kind") or "stalled_goal"
+    print(f"{kind} {s['card']} [{s['board'] or 'default'}] {s['status']} {s['stalled_hours']:.0f}h, "
+          f"{s['other_runs']} other runs: {s['title'][:80]}")
+    wall = _frontier_text(s)
+    if wall:
+        label = "waits on" if kind == "waiting_on_human" else "frontier"
+        print(f"  {label}: {wall}")
+    print(f"  busy: {_busy_text(s)}")
+    print(f"  chats: {', '.join(s['sessions'][:5])}{' …' if len(s['sessions']) > 5 else ''}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--db", action="append", help="board db to scan (repeatable); default: this home's boards")
@@ -304,7 +426,8 @@ def main(argv=None) -> int:
     ap.add_argument("--comment", action="store_true", help="comment once per stall on cards of boards this home owns")
     a = ap.parse_args(argv)
     dbs = [(None, Path(p), True) for p in a.db] if a.db else board_dbs(replicas=a.replicas)
-    stalls = find_stalls(dbs, now=a.now, sessions=set(a.session) if a.session else None)
+    incidents = find_incidents(dbs, now=a.now, sessions=set(a.session) if a.session else None)
+    stalls = [s for s in incidents if s.get("kind") == "stalled_goal"]
     if a.comment:
         led = Ledger(home() / "coach")
         d = led.read()
@@ -315,13 +438,11 @@ def main(argv=None) -> int:
                 d["commented"][inc] = time.time()
         led.write(d)
     if a.json:
-        print(json.dumps(stalls, indent=1))
+        print(json.dumps(incidents, indent=1))
     else:
-        for s in stalls:
-            print(f"{s['card']} [{s['board'] or 'default'}] {s['status']} {s['stalled_hours']:.0f}h, "
-                  f"{s['other_runs']} other runs: {s['title'][:80]}\n  busy: {_busy_text(s)}\n"
-                  f"  chats: {', '.join(s['sessions'][:5])}{' …' if len(s['sessions']) > 5 else ''}")
-        if not stalls:
+        for s in incidents:
+            _print_incident(s)
+        if not incidents:
             print("no stalled goals")
     return 0
 

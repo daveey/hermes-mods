@@ -28,7 +28,7 @@ def _mod():
 
 SCHEMA = """
 create table tasks (id text primary key, title text not null, status text not null, created_at integer not null,
-                    block_kind text);
+                    block_kind text, human_request text);
 create table task_links (parent_id text not null, child_id text not null, primary key (parent_id, child_id));
 create table task_chat_links (id integer primary key, task_id text not null, chat_gateway text not null,
                               chat_profile text, chat_session text not null, kind text not null,
@@ -46,8 +46,9 @@ def write_board(path: Path, fx: dict, shift: int = 0) -> Path:
     c = sqlite3.connect(path)
     c.executescript(SCHEMA)
     for t in fx["tasks"]:
-        c.execute("insert into tasks values (?,?,?,?,?)",
-                  (t["id"], t["title"], t["status"], t["created_at"] + shift, t.get("block_kind")))
+        c.execute("insert into tasks values (?,?,?,?,?,?)",
+                  (t["id"], t["title"], t["status"], t["created_at"] + shift, t.get("block_kind"),
+                   t.get("human_request")))
     c.executemany("insert into task_links values (?,?)", [tuple(l) for l in fx["links"]])
     for l in fx["chat_links"]:
         c.execute("insert into task_chat_links (task_id, chat_gateway, chat_profile, chat_session, kind, released, "
@@ -180,3 +181,100 @@ def test_cli_dry_run_reports_without_commenting(tmp_path, capsys):
     assert sg.main(["--db", str(db), "--now", str(CUTOFF), "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert [r["card"] for r in rows] == [ROLLOUT]
+    assert rows[0]["kind"] == "stalled_goal"
+
+
+ASK = json.dumps({"action": "Choose a host", "why_human": "only the operator can name the machine",
+                  "interaction": "reply", "scope": "one build host", "evidence": "no free host is registered"})
+NOW = 1_000_000
+OLD = 1_000
+
+
+def _mini(path, tasks, links):
+    """A delivery card plus a chat-linked watcher that has spent runs, so the stall threshold is met."""
+    fx = {
+        "tasks": list(tasks) + [{"id": "t_watch", "title": "Watcher", "status": "running", "created_at": OLD}],
+        "links": links,
+        "chat_links": [
+            {"task_id": "t_deliv", "chat_session": SID, "kind": "origin", "released": 0},
+            {"task_id": "t_watch", "chat_session": SID, "kind": "context", "released": 0},
+        ],
+        "events": [],
+        "runs": [["t_watch", OLD + 100 + i, OLD + 200 + i, "done"] for i in range(21)],
+    }
+    return write_board(path, fx)
+
+
+def _incidents(sg, db):
+    return sg.find_incidents([db], now=NOW, h=1, n=1)
+
+
+def test_human_wait_frontier_emits_waiting_on_human_not_stalled_goal(tmp_path):
+    sg = _mod()
+    # open intermediate whose own parent is the human wall: the frontier is the wall, not the intermediate
+    db = _mini(tmp_path / "kanban.db", [
+        {"id": "t_deliv", "title": "Ship the result", "status": "todo", "created_at": OLD},
+        {"id": "t_mid", "title": "Middle step", "status": "todo", "created_at": OLD},
+        {"id": "t_human", "title": "Choose a host", "status": "blocked", "created_at": OLD,
+         "human_request": ASK},
+    ], [["t_human", "t_mid"], ["t_mid", "t_deliv"]])
+    assert sg.find_stalls([db], now=NOW, h=1, n=1) == []
+    inc = _incidents(sg, db)
+    assert [r["kind"] for r in inc] == ["waiting_on_human"]
+    assert inc[0]["card"] == "t_deliv"
+    assert [w["card"] for w in inc[0]["waiting_on"]] == ["t_human"]
+    hint = sg.session_hint([SID], tmp_path / "coach", now=NOW, dbs=[db])
+    assert hint is None
+
+
+def test_blocked_human_request_without_block_kind_is_a_human_wait(tmp_path, capsys):
+    sg = _mod()
+    db = _mini(tmp_path / "kanban.db", [
+        {"id": "t_deliv", "title": "Ship the result", "status": "todo", "created_at": OLD},
+        {"id": "t_human", "title": "Choose a host", "status": "blocked", "created_at": OLD, "block_kind": None,
+         "human_request": ASK},
+    ], [["t_human", "t_deliv"]])
+    assert sg.find_stalls([db], now=NOW, h=1, n=1) == []
+    assert sg.main(["--db", str(db), "--now", str(NOW)]) == 0
+    out = capsys.readouterr().out
+    assert "waiting_on_human t_deliv" in out
+    assert "t_human" in out and "human_request" in out
+    assert "stalled_goal t_deliv" not in out
+
+
+def test_mixed_frontier_stays_stalled_goal(tmp_path):
+    sg = _mod()
+    db = _mini(tmp_path / "kanban.db", [
+        {"id": "t_deliv", "title": "Ship the result", "status": "todo", "created_at": OLD},
+        {"id": "t_human", "title": "Choose a host", "status": "blocked", "created_at": OLD, "block_kind": "needs_input"},
+        {"id": "t_agent", "title": "Agent step", "status": "todo", "created_at": OLD},
+    ], [["t_human", "t_deliv"], ["t_agent", "t_deliv"]])
+    stalls = sg.find_stalls([db], now=NOW, h=1, n=1)
+    assert [s["card"] for s in stalls] == ["t_deliv"]
+    assert stalls[0]["kind"] == "stalled_goal"
+    inc = _incidents(sg, db)
+    assert all(r["kind"] != "waiting_on_human" for r in inc)
+
+
+@pytest.mark.parametrize("status", ["scheduled", "todo", "ready", "running"])
+def test_scheduled_agent_parent_stays_stalled_goal(tmp_path, status):
+    sg = _mod()
+    db = _mini(tmp_path / "kanban.db", [
+        {"id": "t_deliv", "title": "Ship the result", "status": "todo", "created_at": OLD},
+        # a stale needs_input on an agent-status card must not silence the stall
+        {"id": "t_agent", "title": "Agent step", "status": status, "created_at": OLD, "block_kind": "needs_input"},
+    ], [["t_agent", "t_deliv"]])
+    stalls = sg.find_stalls([db], now=NOW, h=1, n=1)
+    assert [s["card"] for s in stalls] == ["t_deliv"]
+    assert _incidents(sg, db)[0]["kind"] == "stalled_goal"
+
+
+def test_delivery_card_blocked_with_only_a_human_request_is_not_a_stall(tmp_path):
+    sg = _mod()
+    db = _mini(tmp_path / "kanban.db", [
+        {"id": "t_deliv", "title": "Ship the result", "status": "blocked", "created_at": OLD,
+         "human_request": ASK},
+        {"id": "t_parent", "title": "Done parent", "status": "done", "created_at": OLD},
+    ], [["t_parent", "t_deliv"]])
+    assert sg.find_stalls([db], now=NOW, h=1, n=1) == []
+    assert _incidents(sg, db) == []
